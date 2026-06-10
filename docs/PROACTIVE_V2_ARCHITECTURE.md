@@ -575,11 +575,11 @@ Proactive V2 的系统契约是：
 11. iOS Settings 新增 Proactive 控制面板，可以切换用户状态、刷新 proactive state、手动发送 Dynamic Island wake。
 12. iOS app 全局监听 screen broadcast 状态变化，并同步 `broadcast_state` 到 backend。
 13. resident proactive chat context 增加时间戳、相对时间和 fresh/stale 标记；默认回看 50 条做 attention facts，6 小时内最多注入 20 条 fresh 上下文，超过 6 小时只注入最近 2 条 stale 背景。
+14. (2026-06-11) Hosted Model API 用户接入同一套 wake/action contract：backend 内置 hosted wake consumer（append_proactive_job 钩子 + per-job daemon 线程）消费感知与心跳 wake；backend 内置 hosted tick scheduler（FEEDLING_HOSTED_TICK_INTERVAL_SEC，默认 30 分钟）定期为托管用户创建心跳 wake；api_key 走 require_user/WS 的进程内缓存（明文只在内存，不落盘），进程重启后该用户首个请求前自动降级跳过。
+15. (2026-06-11) 感知 wake 增加 enabled/dnd/away 机械拦截（此前绕过平台承诺），被拦截的 wake 记 suppressed 事件保留观测；感知 job 补齐 trigger/wake_kind 与 V2 job schema 一致。
 
 本轮没有完整落地：
 
-1. Hosted API 内置 proactive runtime 还没有独立消费 V2 wake job；当前可用路径主要是 resident consumer。
-2. iOS Live Activity / widget 还没有根据 `ai_state` 做专门视觉状态；当前只在 Settings 中展示状态。
-3. `request_broadcast` 目前先作为可见 chat 请求写出，后续需要 backend message metadata 和 iOS action message 承接接受/拒绝。
-4. Hosted API 用户的 V2 proactive worker 还没有和 resident 路径完全等价，需要单独接入同一套 wake/action contract。
-5. dashboard 仍保留部分 legacy Gate review 文案和旧 review 标签，后续应拆成 Wake / Agent Action review。
+1. iOS Live Activity / widget 还没有根据 `ai_state` 做专门视觉状态；当前只在 Settings 中展示状态。
+2. `request_broadcast` 目前先作为可见 chat 请求写出，后续需要 backend message metadata 和 iOS action message 承接接受/拒绝。
+3. dashboard 仍保留部分 legacy Gate review 文案和旧 review 标签，后续应拆成 Wake / Agent Action review。
