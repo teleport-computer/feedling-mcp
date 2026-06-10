@@ -95,7 +95,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:56a26ec
+    image: ghcr.io/teleport-computer/feedling:cf52baa
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -147,7 +147,7 @@ services:
   # unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:56a26ec
+    image: ghcr.io/teleport-computer/feedling:cf52baa
     # gunicorn = production WSGI (the Werkzeug dev server stalls on large
     # responses under TDX). -w 1 is mandatory: app.py binds the :9998 WS
     # ingest at import time, so multiple workers would collide on it.
@@ -201,7 +201,7 @@ services:
   # (a) drops the MCP-TLS pin row, or (b) pins the ingress cert SPKI via
   # a new attested fingerprint. See header TODO.
   mcp:
-    image: ghcr.io/teleport-computer/feedling:56a26ec
+    image: ghcr.io/teleport-computer/feedling:cf52baa
     command: ["python", "-u", "backend/mcp_server.py"]
     restart: unless-stopped
     environment:
