@@ -232,6 +232,37 @@ def _maybe_unlock_wake(user_id, patch, written, prev_state, now, wake_candidates
 # Wake triggering (debounced; reuses the existing proactive-job mechanism)
 # ---------------------------------------------------------------------------
 
+def _app_proactive_settings(user_id: str) -> dict:
+    """Best-effort read of the app-level proactive settings (enabled/dnd/
+    user_state). Lazy import like _fire_wake; failures mean "no block" so a
+    broken app layer can't silently kill perception observability."""
+    import app  # lazy
+    return app.get_store(user_id).load_proactive_settings()
+
+
+def _wake_block_reason(user_id: str) -> str:
+    """Mechanical gate for AUTOMATIC perception wakes, mirroring the tick
+    path's enabled/dnd/away suppression (app.py
+    _build_proactive_v2_wake_decision). Perception wakes are all automatic —
+    manual summons go through the tick path — so there is no manual bypass.
+    Away is honored from EITHER source: the app proactive settings (iOS
+    Proactive panel) or perception's own focus/manual stack."""
+    try:
+        settings = _app_proactive_settings(user_id) or {}
+    except Exception as e:
+        log.warning("wake gate settings read failed for %s: %s", user_id, e)
+        settings = {}
+    if settings and not settings.get("enabled", True):
+        return "proactive_disabled"
+    if settings.get("dnd", False):
+        return "dnd_enabled"
+    if str(settings.get("user_state") or "") == "away":
+        return "user_away"
+    if effective_user_state(user_id) == "away":
+        return "user_away"
+    return ""
+
+
 def _last_wake_ts(user_id: str, cap_key: str) -> float:
     for ev in reversed(store.read_events(user_id, limit=50)):
         if ev.get("cap") == cap_key and ev.get("type") == "wake":
@@ -240,6 +271,13 @@ def _last_wake_ts(user_id: str, cap_key: str) -> float:
 
 
 def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
+    block = _wake_block_reason(user_id)
+    if block:
+        store.append_event(user_id, {
+            "cap": cap_key, "type": "suppressed", "reason": block,
+            "field": field, "old": old, "new": new_v, "ts": now,
+        }, now)
+        return
     if debounce and (now - _last_wake_ts(user_id, cap_key)) < debounce:
         store.append_event(user_id, {
             "cap": cap_key, "type": "debounced", "field": field,
@@ -282,6 +320,10 @@ def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
             "source": app.PROACTIVE_JOB_SOURCE,
             "status": "pending",
             "intent_label": f"perception_{cap_key}"[:120],
+            # trigger/wake_kind keep the V2 job schema consistent with the
+            # tick path so consumers and the wake dashboard see one shape.
+            "trigger": f"perception_{cap_key}"[:120],
+            "wake_kind": "presence",
             "context_hint": hint[:2000],
             "connections": [],
             "connection": {},
@@ -416,7 +458,12 @@ def photo_evaluate(user_id: str, metadata: dict,
     store.item_upsert(user_id, "photo", photo_id, now, doc, expires_at=None)
 
     # Burst de-dup backstop: only wake once per cluster window.
-    if (now - _last_wake_ts(user_id, "photos")) >= catalog.PHOTO_CLUSTER_SEC:
+    block = _wake_block_reason(user_id)
+    if block:
+        store.append_event(user_id, {"cap": "photos", "type": "suppressed",
+                                     "reason": block, "item": photo_id,
+                                     "ts": now}, now)
+    elif (now - _last_wake_ts(user_id, "photos")) >= catalog.PHOTO_CLUSTER_SEC:
         store.append_event(user_id, {"cap": "photos", "type": "wake",
                                      "item": photo_id, "ts": now}, now)
         _fire_wake(user_id, "photos",

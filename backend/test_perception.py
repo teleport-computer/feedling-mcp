@@ -527,3 +527,100 @@ def test_report_items_malformed_400(env, monkeypatch):
     for bad in ({"workout": {"a": 1}}, {"workout": [123]}, {"workout": "x"}):
         r = client.post("/v1/perception/report", json={"items": bad})
         assert r.status_code == 400, bad
+
+
+# ---------------------------------------------------------------------------
+# Mechanical wake gate (enabled / dnd / away) — mirrors the tick path
+# ---------------------------------------------------------------------------
+
+def _ingest_location(uid, label):
+    return service.ingest_snapshot(uid, [{
+        "key": "location_signal",
+        "data": json.dumps({"place_label": label}),
+    }])
+
+
+def test_wake_suppressed_when_perception_user_state_away(env, monkeypatch):
+    fake, wakes = env
+    monkeypatch.setattr(service, "_app_proactive_settings", lambda uid: {})
+    uid = "u_away"
+    service.ingest_snapshot(uid, [{"key": "user_state", "data": json.dumps("away")}])
+    _ingest_location(uid, "gym")
+    assert wakes == []
+    events = fake.read_events(uid)
+    assert any(e.get("type") == "suppressed" and e.get("reason") == "user_away"
+               for e in events)
+    assert not any(e.get("type") == "wake" for e in events)
+
+
+def test_wake_suppressed_when_settings_disabled_or_dnd_or_away(env, monkeypatch):
+    fake, wakes = env
+    cases = [
+        ({"enabled": False}, "proactive_disabled"),
+        ({"enabled": True, "dnd": True}, "dnd_enabled"),
+        ({"enabled": True, "dnd": False, "user_state": "away"}, "user_away"),
+    ]
+    for i, (settings, reason) in enumerate(cases):
+        monkeypatch.setattr(service, "_app_proactive_settings", lambda uid, s=settings: s)
+        uid = f"u_gate_{i}"
+        _ingest_location(uid, "gym")
+        assert wakes == [], f"case {reason}: wake should be suppressed"
+        assert any(e.get("type") == "suppressed" and e.get("reason") == reason
+                   for e in fake.read_events(uid)), f"case {reason}"
+
+
+def test_wake_fires_normally_when_gate_open(env, monkeypatch):
+    fake, wakes = env
+    monkeypatch.setattr(service, "_app_proactive_settings", lambda uid: {"enabled": True})
+    uid = "u_open"
+    _ingest_location(uid, "gym")
+    assert len(wakes) == 1
+    assert any(e.get("type") == "wake" for e in fake.read_events(uid))
+
+
+def test_wake_recovers_after_away_clears(env, monkeypatch):
+    fake, wakes = env
+    monkeypatch.setattr(service, "_app_proactive_settings", lambda uid: {})
+    uid = "u_recover"
+    service.ingest_snapshot(uid, [{"key": "user_state", "data": json.dumps("away")}])
+    _ingest_location(uid, "gym")
+    assert wakes == []
+    service.ingest_snapshot(uid, [{"key": "user_state", "data": json.dumps("default")}])
+    _ingest_location(uid, "home")
+    assert len(wakes) == 1
+
+
+def test_app_settings_failure_does_not_block_wake(env, monkeypatch):
+    """app 不可达（如单测环境 import 失败）时不拦截——拦截是 best-effort。"""
+    fake, wakes = env
+
+    def boom(uid):
+        raise RuntimeError("no app here")
+    monkeypatch.setattr(service, "_app_proactive_settings", boom)
+    uid = "u_no_app"
+    _ingest_location(uid, "gym")
+    assert len(wakes) == 1
+
+
+def test_photo_suppressed_when_dnd_enabled(env, monkeypatch):
+    """DND 开启时：照片仍被存储，但 wake 被压制；事件记录 suppressed/dnd_enabled。"""
+    fake, wakes = env
+    monkeypatch.setattr(service, "_app_proactive_settings",
+                        lambda uid: {"enabled": True, "dnd": True})
+    uid = "u_photo_dnd"
+    out, code = service.photo_evaluate(
+        uid, {"scene_hint": "food"}, {"id": "p_dnd", "body_ct": "cipher"})
+    # 照片应被存储（gate 只影响 wake，不影响存储）
+    assert code == 200 and out["status"] == "stored"
+    # wakes 列表为空（未触发 _fire_wake）
+    assert wakes == []
+    events = fake.read_events(uid)
+    # 有 suppressed 事件，携带 item == photo_id
+    suppressed = [e for e in events
+                  if e.get("cap") == "photos" and e.get("type") == "suppressed"]
+    assert len(suppressed) == 1
+    assert suppressed[0]["reason"] == "dnd_enabled"
+    assert suppressed[0]["item"] == "p_dnd"
+    # 无 wake 事件
+    assert not any(e.get("cap") == "photos" and e.get("type") == "wake"
+                   for e in events)
