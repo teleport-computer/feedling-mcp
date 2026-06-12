@@ -130,7 +130,7 @@ V1 在平台侧放了一个"该不该打扰用户"的系统级 LLM Gate，被否
                     ▲ iOS 经 dstack-gateway "-5003s." 直连做证书 pin
 ```
 
-- **backend**（`backend/app.py`，~88 条路由）：iOS API、MCP 后端、
+- **backend**（`backend/` 领域包 + `app.py` 装配层，~88 条路由；2026-06-12 拆分，见 CHANGELOG）：iOS API、MCP 后端、
   resident-consumer API、proactive、model_api、admin。gunicorn 单 worker
   多线程，全局唯一进程内缓存。
 - **mcp**（`backend/mcp_server.py`，31 个 `feedling_*` 工具）：agent 的手。
@@ -157,7 +157,7 @@ Flask/MCP→enclave 走其自签 TLS）。
   `frame_envelopes`（屏幕帧大信封）、`user_logs`（proactive jobs /
   decisions 等流式日志）、`server_config`（pepper 等）。所有用户内容列
   存的是 v1 信封 JSONB——库管理员只见密文。
-- **UserStore 写穿缓存**（`backend/app.py`）：per-user 内存工作副本 +
+- **UserStore 写穿缓存**（`backend/core/store.py`）：per-user 内存工作副本 +
   细粒度锁，写操作同步落库；带 15 分钟 TTL 原地刷新（refresh-in-place，
   不换对象，避免写入竞态）和 `POST /v1/admin/store/evict` 定向驱逐
   （2026-06-07 引入，修复带外改库后缓存陈旧问题）。
@@ -438,7 +438,7 @@ Alembic 出现之前就已建表的生产 RDS 上。
 
 ### 7.4 Memory 系统（记忆花园）怎么做的
 
-**类型与分区**（`backend/app.py` 的 `MEMORY_TYPES` / `TAB_FOR_TYPE`）：
+**类型与分区**（`backend/memory/service.py` 的 `MEMORY_TYPES` / `TAB_FOR_TYPE`）：
 6 种类型映射到 iOS 三个 tab——
 
 | 类型 | Tab | 语义 |

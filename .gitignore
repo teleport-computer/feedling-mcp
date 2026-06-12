@@ -34,3 +34,6 @@ ios/vendor/dcap-qvl/target/
 .claude/
 buildServer.json
 deploy/backups/
+
+# Local dev virtualenv (created for running the test suite)
+.venv/

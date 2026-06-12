@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import app as appmod  # noqa: E402
+from core import config as core_config  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -20,7 +21,7 @@ def _b64(raw: bytes) -> str:
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "admin-test-token")
     appmod._users[:] = []
     appmod._key_to_user.clear()

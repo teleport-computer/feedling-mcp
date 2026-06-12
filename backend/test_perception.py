@@ -313,9 +313,8 @@ def test_app_open_via_get_route(env, monkeypatch):
     import perception.routes as routes
 
     fake, _ = env
-    fake_app = types.ModuleType("app")
-    fake_app.require_user = lambda: types.SimpleNamespace(user_id=UID)
-    monkeypatch.setitem(sys.modules, "app", fake_app)
+    import accounts.auth as accounts_auth
+    monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
 
     app = Flask("t")
     app.register_blueprint(routes.bp)
@@ -414,9 +413,8 @@ def test_report_endpoint_context_snapshot(env, monkeypatch):
     import perception.routes as routes
 
     fake, _ = env
-    fake_app = types.ModuleType("app")
-    fake_app.require_user = lambda: types.SimpleNamespace(user_id=UID)
-    monkeypatch.setitem(sys.modules, "app", fake_app)
+    import accounts.auth as accounts_auth
+    monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
 
     app = Flask("t")
     app.register_blueprint(routes.bp)
@@ -458,9 +456,8 @@ def _report_client(env, monkeypatch):
     from flask import Flask
     import perception.routes as routes
     fake, _ = env
-    fake_app = types.ModuleType("app")
-    fake_app.require_user = lambda: types.SimpleNamespace(user_id=UID)
-    monkeypatch.setitem(sys.modules, "app", fake_app)
+    import accounts.auth as accounts_auth
+    monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
     app = Flask("t")
     app.register_blueprint(routes.bp)
     return fake, app.test_client()

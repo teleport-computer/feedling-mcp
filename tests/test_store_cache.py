@@ -17,6 +17,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import app as appmod  # noqa: E402
+from core import store as core_store  # noqa: E402
+from core import config as core_config  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -25,7 +27,7 @@ def _b64(raw: bytes) -> str:
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "admin-test-token")
     appmod._users[:] = []
     appmod._key_to_user.clear()
@@ -76,7 +78,7 @@ def test_get_store_reloads_in_place_after_ttl_expiry(client, monkeypatch):
     # Expire the cache → next get_store refreshes IN PLACE (same instance, so a
     # concurrent holder that writes through the same object can't be lost), and
     # the refreshed state now includes the out-of-band row.
-    monkeypatch.setattr(appmod, "STORE_CACHE_TTL_SECONDS", 0)
+    monkeypatch.setattr(core_store, "STORE_CACHE_TTL_SECONDS", 0)
     store2 = appmod.get_store(user_id)
     assert store2 is store1  # stable identity — no swap race
     assert any(m["id"] == "ooband" for m in store2.chat_messages)

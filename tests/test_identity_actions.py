@@ -10,6 +10,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import app as appmod  # noqa: E402
+import provider_client  # noqa: E402
+from core import config as core_config  # noqa: E402
+from core import enclave as core_enclave  # noqa: E402
+from core import envelope as core_envelope  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -18,7 +22,7 @@ def _b64(raw: bytes) -> str:
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._users[:] = []
     appmod._key_to_user.clear()
     appmod._stores.clear()
@@ -129,11 +133,11 @@ def test_identity_profile_patch_reencrypts_existing_card(client, monkeypatch):
     captured_plaintexts: list = []
 
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_enclave_get_json_for_gate",
         lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
     )
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     res = client.post(
         "/v1/identity/actions",
@@ -166,12 +170,12 @@ def test_model_api_chat_background_runtime_executes_detected_identity_rename(cli
     captured_plaintexts: list = []
 
     monkeypatch.setattr(
-        appmod,
+        provider_client,
         "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
     )
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -196,8 +200,8 @@ def test_model_api_chat_background_runtime_executes_detected_identity_rename(cli
             }
         return {"reply": "收到，我以后就叫小秘。", "usage": {"total_tokens": 9}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -225,8 +229,8 @@ def test_model_api_chat_background_runtime_updates_relationship_days(client, mon
     user_id, api_key = _register(client)
     _seed_identity(user_id)
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -251,8 +255,8 @@ def test_model_api_chat_background_runtime_updates_relationship_days(client, mon
             }
         return {"reply": "你说得对，我会按 68 天记。", "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -280,9 +284,9 @@ def test_model_api_chat_background_runtime_nudges_identity_dimension(client, mon
     _seed_identity(user_id)
     captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -310,8 +314,8 @@ def test_model_api_chat_background_runtime_nudges_identity_dimension(client, mon
             }
         return {"reply": "好，我会更重视上下文连续性。", "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -342,11 +346,11 @@ def test_memory_content_patch_reencrypts_existing_card(client, monkeypatch):
     captured_plaintexts: list = []
 
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: json.dumps(_plain_memory()).encode("utf-8"),
     )
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     res = client.post(
         "/v1/memory/actions",
@@ -380,15 +384,15 @@ def test_model_api_chat_background_runtime_executes_memory_context_patch(client,
     _seed_memory(user_id)
     captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
 
     def fake_decrypt(envelope, key, purpose):
         if purpose == "model_api_provider_key":
             return b"sk-test"
         return json.dumps(_plain_memory()).encode("utf-8")
 
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", fake_decrypt)
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -419,8 +423,8 @@ def test_model_api_chat_background_runtime_executes_memory_context_patch(client,
             return {"reply": '{"memories":[]}', "usage": {}}
         return {"reply": "我把这条记忆改成东京了。", "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -454,9 +458,9 @@ def test_model_api_chat_background_runtime_writes_general_correction_memory(clie
     captured_plaintexts: list = []
     context_params: list[dict] = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -498,8 +502,8 @@ def test_model_api_chat_background_runtime_writes_general_correction_memory(clie
             return {"reply": '{"memories":[]}', "usage": {}}
         return {"reply": '{"reply":"我以后不会再用这个设定。","thinking_summary":"记下了这条纠正。"}', "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -534,9 +538,9 @@ def test_model_api_chat_background_runtime_patches_user_preferred_name(client, m
     _seed_identity(user_id)
     captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -564,8 +568,8 @@ def test_model_api_chat_background_runtime_patches_user_preferred_name(client, m
             }
         return {"reply": '{"reply":"好，以后叫你 Seven。","thinking_summary":"更新了称呼偏好。"}', "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -598,7 +602,7 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
     _seed_memory(user_id, memory_id="mom_delete")
     captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
 
     def fake_decrypt(envelope, key, purpose):
         if purpose == "model_api_provider_key":
@@ -609,8 +613,8 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
             "type": "fact",
         }).encode("utf-8")
 
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", fake_decrypt)
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -656,8 +660,8 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
             }
         return {"reply": "已处理。", "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -699,9 +703,9 @@ def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(cli
     _seed_identity(user_id)
     captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -717,8 +721,8 @@ def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(cli
         provider_calls.append(joined)
         return {"reply": "今天可以简单吃点。", "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",

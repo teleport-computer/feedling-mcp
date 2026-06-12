@@ -12,6 +12,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import app as appmod  # noqa: E402
+from accounts import registry as accounts_registry  # noqa: E402
+from hosted import turn as hosted_turn  # noqa: E402
+import provider_client  # noqa: E402
+from core import config as core_config  # noqa: E402
+from core import enclave as core_enclave  # noqa: E402
+from core import envelope as core_envelope  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -20,13 +26,13 @@ def _b64(raw: bytes) -> str:
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._users[:] = []
     appmod._key_to_user.clear()
     appmod._stores.clear()
     appmod._save_users()
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_get_enclave_info",
         lambda: {"content_pk_hex": ("22" * 32), "compose_hash": "test"},
     )
@@ -108,7 +114,7 @@ def test_chat_response_plaintext_reasoning_builds_thinking_extra(monkeypatch):
         user_id = "user_test"
 
     monkeypatch.setattr(
-        appmod,
+        core_envelope,
         "_build_shared_envelope_for_store",
         _fake_shared_envelope_builder(captured_plaintexts),
     )
@@ -140,7 +146,7 @@ def test_chat_response_plaintext_reasoning_default_is_summary(monkeypatch):
         user_id = "user_test"
 
     monkeypatch.setattr(
-        appmod,
+        core_envelope,
         "_build_shared_envelope_for_store",
         _fake_shared_envelope_builder(captured_plaintexts),
     )
@@ -161,7 +167,7 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     raw_provider_key = "sk-test-secret"
 
     monkeypatch.setattr(
-        appmod,
+        provider_client,
         "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
     )
@@ -212,22 +218,22 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
 def test_model_api_runtime_status_tracks_hosted_runtime_and_action_trace(client, monkeypatch):
     user_id, api_key = _register(client)
 
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-test",
     )
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_enclave_get_json_for_gate",
         lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
         if path == "/v1/chat/history"
         else ({"identity": {}}, ""),
     )
     monkeypatch.setattr(
-        appmod,
+        provider_client,
         "chat_completion",
         lambda cfg, messages, **kwargs: {"reply": "Hosted runtime reply.", "usage": {"total_tokens": 7}},
     )
@@ -273,10 +279,10 @@ def test_model_api_chat_uses_memory_selection_trace_without_prompting_rejected_c
     history_params: list[dict] = []
     provider_messages: list[list[dict]] = []
 
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-test",
     )
@@ -337,8 +343,8 @@ def test_model_api_chat_uses_memory_selection_trace_without_prompting_rejected_c
         provider_messages.append(messages)
         return {"reply": "先把明天那个项目收个尾，别让自己硬扛。", "usage": {"total_tokens": 10}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -374,15 +380,15 @@ def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
     provider_calls: list[list[dict]] = []
     search_requests: list[dict] = []
 
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-test",
     )
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_enclave_get_json_for_gate",
         lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
         if path == "/v1/chat/history"
@@ -444,8 +450,8 @@ def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
                 "usage": {"total_tokens": 8},
             }
 
-    monkeypatch.setattr(appmod, "_run_model_api_web_searches", fake_web_search)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(hosted_turn, "_run_model_api_web_searches", fake_web_search)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -473,11 +479,11 @@ def test_model_api_chat_surfaces_provider_reasoning_before_context_summary(clien
     _, api_key = _register(client)
     provider_kwargs: list[dict] = []
 
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_enclave_get_json_for_gate",
         lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
         if path == "/v1/chat/history"
@@ -495,7 +501,7 @@ def test_model_api_chat_surfaces_provider_reasoning_before_context_summary(clien
             "usage": {"total_tokens": 9},
         }
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -525,17 +531,17 @@ def test_model_api_chat_does_not_treat_generic_query_as_web_search_request(clien
     provider_calls: list[list[dict]] = []
     search_requests: list[dict] = []
 
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_enclave_get_json_for_gate",
         lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
         if path == "/v1/chat/history"
         else ({"identity": {}}, ""),
     )
-    monkeypatch.setattr(appmod, "_run_model_api_web_searches", lambda requests: search_requests.extend(requests) or {})
+    monkeypatch.setattr(hosted_turn, "_run_model_api_web_searches", lambda requests: search_requests.extend(requests) or {})
 
     def fake_chat_completion(cfg, messages, **kwargs):
         provider_calls.append(messages)
@@ -547,7 +553,7 @@ def test_model_api_chat_does_not_treat_generic_query_as_web_search_request(clien
             "usage": {"total_tokens": 4},
         }
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -599,9 +605,9 @@ def test_model_api_memory_repair_archives_noisy_cards_only_after_replacements(cl
             plain = {"title": "Unknown", "description": "Unknown memory.", "type": "fact"}
         return appmod.json.dumps(plain).encode("utf-8")
 
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder(captured_plaintexts))
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", fake_decrypt)
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
 
     def fake_chat_completion(cfg, messages, **kwargs):
         return {
@@ -636,7 +642,7 @@ def test_model_api_memory_repair_archives_noisy_cards_only_after_replacements(cl
             "usage": {},
         }
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -742,7 +748,7 @@ def test_model_api_setup_logs_provider_test_failure(client, monkeypatch, capsys)
             "provider_http_404: model: claude-3-5-haiku-latest", status_code=404
         )
 
-    monkeypatch.setattr(appmod, "test_provider_key", boom)
+    monkeypatch.setattr(provider_client, "test_provider_key", boom)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -771,7 +777,7 @@ def test_model_api_setup_can_reuse_saved_key_when_model_changes(client, monkeypa
         calls.append((cfg.provider, cfg.model, cfg.api_key, cfg.base_url))
         return {"reply": "ok", "usage": {"total_tokens": 1}}
 
-    monkeypatch.setattr(appmod, "test_provider_key", fake_test_provider_key)
+    monkeypatch.setattr(provider_client, "test_provider_key", fake_test_provider_key)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -782,7 +788,7 @@ def test_model_api_setup_can_reuse_saved_key_when_model_changes(client, monkeypa
     first = setup.get_json()["config"]
 
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-existing",
     )
@@ -824,12 +830,12 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     user_id, api_key = _register(client)
 
     monkeypatch.setattr(
-        appmod,
+        provider_client,
         "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
     )
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-test-secret",
     )
@@ -850,7 +856,7 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
             return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "I can answer from the imported history now.", "usage": {"total_tokens": 12}}
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -931,7 +937,7 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
             return {"identity": _identity_payload()}, ""
         return {}, ""
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
 
     chat = client.post(
         "/v1/model_api/chat/send",
@@ -985,12 +991,12 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
     provider_entered = threading.Event()
 
     monkeypatch.setattr(
-        appmod,
+        provider_client,
         "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
     )
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-test-secret",
     )
@@ -1013,7 +1019,7 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
             return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "Ready.", "usage": {}}
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -1048,12 +1054,12 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
     captured = {}
 
     monkeypatch.setattr(
-        appmod,
+        provider_client,
         "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
     )
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-test-secret",
     )
@@ -1063,7 +1069,7 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
             captured["messages"] = messages
         return {"reply": "I can see the image.", "usage": {"total_tokens": 11}}
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -1099,12 +1105,12 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
     user_id, api_key = _register(client)
 
     monkeypatch.setattr(
-        appmod,
+        provider_client,
         "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
     )
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-test-secret",
     )
@@ -1126,7 +1132,7 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
             return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "ok", "usage": {}}
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -1466,7 +1472,7 @@ def test_candidate_extraction_repairs_malformed_provider_json(monkeypatch):
             }
         return {"reply": "Readable memory is important, but this is not JSON.", "usage": {}}
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     candidates, warnings = appmod._extract_memory_candidates_with_provider(
         appmod.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
@@ -1488,7 +1494,7 @@ def test_onboarding_greeting_for_unknown_name_asks_for_name(monkeypatch):
         captured["prompt"] = "\n".join(str(m.get("content") or "") for m in messages)
         return {"reply": "我先把能读懂的部分记下来了。现在我还没有名字，你想怎么叫我？", "usage": {}}
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     text, warnings = appmod._generate_model_api_onboarding_greeting(
         appmod.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
@@ -1637,7 +1643,7 @@ def test_identity_without_ai_source_does_not_use_user_profile_as_companion(monke
             "usage": {},
         }
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     identity, warnings = appmod._derive_identity_with_provider(
         appmod.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
@@ -1691,7 +1697,7 @@ def test_support_materials_ignore_account_metadata_json():
 
 
 def test_import_language_prefers_user_archive_language(monkeypatch):
-    monkeypatch.setattr(appmod, "_get_user_archive_language", lambda user_id: "zh-Hans-US")
+    monkeypatch.setattr(accounts_registry, "_get_user_archive_language", lambda user_id: "zh-Hans-US")
     store = type("Store", (), {"user_id": "usr_test"})()
 
     language = appmod._import_language_for_store(
@@ -1706,12 +1712,12 @@ def test_history_import_allows_confirmed_fresh_start_without_materials(client, m
     user_id, api_key = _register(client)
 
     monkeypatch.setattr(
-        appmod,
+        provider_client,
         "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
     )
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-test-secret",
     )
@@ -1733,7 +1739,7 @@ def test_history_import_allows_confirmed_fresh_start_without_materials(client, m
             return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "ok", "usage": {}}
 
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",

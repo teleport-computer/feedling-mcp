@@ -47,6 +47,40 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-12
+
+### [DONE] backend 单体拆分：app.py 17.6K 行 → 14 个领域包 + 898 行装配层
+- 按「功能域分包为主 + hosted 条线单独成包」拆分（方案见 2026-06-11 拍板）：
+  `core/`（config/util/enclave/envelope/store——UserStore+缓存）、`accounts/`
+  （registry/auth/onboarding/access/recover/routes）、`push/`（apns/tokens/
+  live_activity/service/routes）、`screen/`（frames/ws/summary/routes）、
+  `proactive/`（service/gate/dashboard/routes）、`identity/`、`memory/`、
+  `bootstrap/`（gates+routes）、`chat/`（service/consumer/routes/verify_loop）、
+  `tracking/`、`admin/`、`content/`、`hosted/`（model_api 托管条线 8 模块：
+  config_store/setup_routes/history_import/context/turn/chat_routes/
+  onboarding_validation/wake_consumer）。`mcp_server.py` 2,029 行 → `mcpsrv/`
+  包（session/client/server/tools_{push,screen,chat,identity,memory,meta}/tls）
+  + 75 行入口。
+- 路由全部转 Blueprint，url_map 与拆分前逐条 diff 为零；gunicorn `app:app`
+  入口、四容器部署拓扑、`python -u backend/mcp_server.py` 入口零改动。
+- 解耦手段：`core/store.py` 新增 `on_proactive_job_appended` 钩子（替代
+  UserStore→hosted 的向上调用）；`core/envelope.get_user_public_key`、
+  `push/live_activity.load_identity`、`hosted/wake_consumer.flask_app`、
+  admin 的 onboarding 验证函数均由 app.py 装配段注入。`_load_users` 改为
+  `_users[:]` 就地替换（避免 re-export 分叉）；pepper 改 lazy（import 不再
+  要求 DB 可达）。
+- 决策变更：`hosted_runtime.py` 与 `model_api_runtime/` 保持原位不吸收进
+  hosted/（本就是独立清晰模块，吸收只增加 shim 风险）。
+- app.py 仍保留「COMPAT re-exports（迁移期）」段 + hosted 符号兜底回灌循环，
+  供测试/工具按旧路径取符号；收敛为白名单是后续独立 PR（见 backlog #6）。
+- 测试：436 通过，与拆分前基线完全一致（仅剩 2 个迁移前就长期红的
+  enclave 依赖用例）；测试的 monkeypatch 目标已同步迁到新模块。
+- 依赖层级（低→高）：db/content_encryption/provider_client → core →
+  accounts → push/screen → proactive/identity/memory → bootstrap.gates →
+  chat → tracking/admin/content → hosted → app.py（装配）。跨模块调用一律
+  `from pkg import module` + `module.func()`，保证 monkeypatch 单点生效。
+
+
 ---
 
 ## 2026-06-07

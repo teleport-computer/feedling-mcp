@@ -10,6 +10,11 @@ os.environ.setdefault("FEEDLING_DATA_DIR", _DATA_DIR)
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 appmod = importlib.import_module("app")
+from chat import service as chat_service  # noqa: E402
+from bootstrap import gates as boot_gates  # noqa: E402
+from proactive import dashboard as proactive_dashboard  # noqa: E402
+from push import apns as push_apns  # noqa: E402
+from core import config as core_config  # noqa: E402
 
 
 def test_device_event_payload_is_redacted():
@@ -35,7 +40,7 @@ def test_device_event_payload_is_redacted():
 
 
 def test_manual_proactive_wake_creates_hidden_job(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive")
 
     decision = appmod._build_proactive_v2_wake_decision(
@@ -65,7 +70,7 @@ def test_manual_proactive_wake_creates_hidden_job(tmp_path, monkeypatch):
 
 
 def test_proactive_debug_derives_job_delivery_state(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_delivery")
 
     decision = appmod._build_proactive_v2_wake_decision(
@@ -111,7 +116,7 @@ def test_proactive_debug_derives_job_delivery_state(tmp_path, monkeypatch):
 
 
 def test_proactive_debug_folds_legacy_no_frame_ticks(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_folded_gate")
 
     no_frame = {
@@ -180,7 +185,7 @@ def test_proactive_debug_folds_legacy_no_frame_ticks(tmp_path, monkeypatch):
 
 
 def test_proactive_debug_dashboard_defaults_to_deep_full_view(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_deep_dashboard")
 
     for i in range(12):
@@ -263,7 +268,7 @@ def test_proactive_debug_dashboard_defaults_to_deep_full_view(tmp_path, monkeypa
 
 
 def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_debug_translate")
     reason = "The screen has a concrete connection to the user's memory garden."
     context_hint = "The user is comparing a dense note and may want one gentle nudge."
@@ -309,7 +314,7 @@ def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch)
     snapshot = appmod._proactive_debug_snapshot(store)
 
     monkeypatch.setattr(
-        appmod,
+        proactive_dashboard,
         "_translate_debug_texts_to_zh",
         lambda texts: {
             reason: "屏幕内容和用户的记忆花园有明确关联。",
@@ -335,7 +340,7 @@ def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch)
 
 
 def test_proactive_settings_persists_timezone(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_timezone_key"
@@ -364,7 +369,7 @@ def test_proactive_settings_persists_timezone(tmp_path, monkeypatch):
 
 
 def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_key"
@@ -423,8 +428,8 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
 
 
 def test_auto_proactive_v2_wake_samples_frames_without_gate_llm(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(proactive_dashboard, "OPENROUTER_API_KEY", "sk-test")
     appmod._stores.clear()
 
     monkeypatch.setattr(
@@ -463,8 +468,8 @@ def test_auto_proactive_v2_wake_samples_frames_without_gate_llm(tmp_path, monkey
 
 
 def test_auto_proactive_v2_wake_does_not_block_after_recent_user_chat(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(proactive_dashboard, "OPENROUTER_API_KEY", "sk-test")
     appmod._stores.clear()
 
     api_key = "test_proactive_recent_chat_key"
@@ -499,8 +504,8 @@ def test_auto_proactive_v2_wake_does_not_block_after_recent_user_chat(tmp_path, 
 
 
 def test_auto_proactive_v2_wake_does_not_require_gate_model(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "")
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(proactive_dashboard, "OPENROUTER_API_KEY", "")
     appmod._stores.clear()
 
     api_key = "test_proactive_auto_no_model_key"
@@ -527,7 +532,7 @@ def test_auto_proactive_v2_wake_does_not_require_gate_model(tmp_path, monkeypatc
 
 
 def test_auto_proactive_v2_wake_suppresses_job_without_frames(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_auto_false_key"
@@ -550,7 +555,7 @@ def test_auto_proactive_v2_wake_suppresses_job_without_frames(tmp_path, monkeypa
 
 
 def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_auto_schedule_key"
@@ -606,7 +611,7 @@ def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(t
 
 
 def test_auto_proactive_v2_away_suppresses_automatic_but_manual_bypasses(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_away_key"
@@ -633,7 +638,7 @@ def test_auto_proactive_v2_away_suppresses_automatic_but_manual_bypasses(tmp_pat
 
 
 def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_gate_review_key"
@@ -673,7 +678,7 @@ def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
 
 
 def test_proactive_job_claim_and_status_lifecycle(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_claim_key"
@@ -717,8 +722,8 @@ def test_proactive_job_claim_and_status_lifecycle(tmp_path, monkeypatch):
 
 
 def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent_push_types = []
@@ -727,7 +732,7 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
         sent_push_types.append(push_type)
         return {"status": "delivered"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     api_key = "test_proactive_delivery_key"
     user_id = "usr_endpoint_proactive_delivery"
@@ -786,8 +791,8 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
 
 
 def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent = []
@@ -800,7 +805,7 @@ def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
         })
         return {"status": "delivered"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     api_key = "test_ai_push_background_key"
     user_id = "usr_ai_push_background"
@@ -860,8 +865,8 @@ def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
 
 
 def test_ai_chat_response_suppresses_push_when_app_foreground(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent = []
@@ -870,7 +875,7 @@ def test_ai_chat_response_suppresses_push_when_app_foreground(tmp_path, monkeypa
         sent.append(push_type)
         return {"status": "delivered"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     api_key = "test_ai_push_foreground_key"
     user_id = "usr_ai_push_foreground"
@@ -916,8 +921,8 @@ def test_ai_chat_response_suppresses_push_when_app_foreground(tmp_path, monkeypa
 
 
 def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "CHAT_HISTORY_INLINE_BODY_CT_MAX", 64)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(chat_service, "CHAT_HISTORY_INLINE_BODY_CT_MAX", 64)
     appmod._stores.clear()
 
     api_key = "test_chat_history_lightweight_key"
@@ -1019,8 +1024,8 @@ def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, mo
 
 
 def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent = []
@@ -1035,7 +1040,7 @@ def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_p
         })
         return {"status": "delivered"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     api_key = "test_proactive_start_key"
     user_id = "usr_endpoint_proactive_start"
@@ -1110,8 +1115,8 @@ def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_p
 
 
 def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent = []
@@ -1126,7 +1131,7 @@ def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, mon
         })
         return {"status": "delivered"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     api_key = "test_proactive_update_key"
     user_id = "usr_endpoint_proactive_update"
@@ -1199,9 +1204,9 @@ def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, mon
 
 
 def test_apns_retries_production_when_sandbox_rejects_testflight_token(monkeypatch):
-    monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
-    monkeypatch.setattr(appmod, "APNS_SANDBOX", True)
-    monkeypatch.setattr(appmod, "_make_apns_jwt", lambda: "jwt")
+    monkeypatch.setattr(push_apns, "APNS_KEY", "test-key")
+    monkeypatch.setattr(push_apns, "APNS_SANDBOX", True)
+    monkeypatch.setattr(push_apns, "_make_apns_jwt", lambda: "jwt")
 
     calls = []
 
@@ -1243,9 +1248,9 @@ def test_apns_retries_production_when_sandbox_rejects_testflight_token(monkeypat
 
 
 def test_apns_retries_production_when_sandbox_returns_bad_environment_key(monkeypatch):
-    monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
-    monkeypatch.setattr(appmod, "APNS_SANDBOX", True)
-    monkeypatch.setattr(appmod, "_make_apns_jwt", lambda: "jwt")
+    monkeypatch.setattr(push_apns, "APNS_KEY", "test-key")
+    monkeypatch.setattr(push_apns, "APNS_SANDBOX", True)
+    monkeypatch.setattr(push_apns, "_make_apns_jwt", lambda: "jwt")
 
     calls = []
 
@@ -1287,7 +1292,7 @@ def test_apns_retries_production_when_sandbox_returns_bad_environment_key(monkey
 
 
 def test_chat_alert_falls_back_from_bad_latest_device_token(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_bad_device_token_key"
@@ -1317,7 +1322,7 @@ def test_chat_alert_falls_back_from_bad_latest_device_token(tmp_path, monkeypatc
             return {"status": "delivered", "apns_env": "production"}
         return {"status": "error", "code": 400, "reason": '{"reason":"BadDeviceToken"}', "apns_env": "production"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     result = appmod._send_chat_alert(store, "hello", alert_title="Dora")
 
@@ -1332,7 +1337,7 @@ def test_chat_alert_falls_back_from_bad_latest_device_token(tmp_path, monkeypatc
 
 
 def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_bad_live_activity_token_key"
@@ -1369,7 +1374,7 @@ def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatc
             "apns_env": "production",
         }
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     with appmod.app.test_client() as client:
         resp = client.post(
@@ -1387,7 +1392,7 @@ def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatc
 
 
 def test_live_activity_expires_environment_mismatch_token(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_bad_live_activity_env_key"
@@ -1424,7 +1429,7 @@ def test_live_activity_expires_environment_mismatch_token(tmp_path, monkeypatch)
             "apns_env": "production",
         }
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     with appmod.app.test_client() as client:
         resp = client.post(
@@ -1443,7 +1448,7 @@ def test_live_activity_expires_environment_mismatch_token(tmp_path, monkeypatch)
 
 
 def test_live_activity_expiring_error_requests_token_refresh(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_refresh_bad_live_activity_key"
@@ -1468,7 +1473,7 @@ def test_live_activity_expiring_error_requests_token_refresh(tmp_path, monkeypat
             "apns_env": "production",
         }
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     with appmod.app.test_client() as client:
         resp = client.post(
@@ -1488,7 +1493,7 @@ def test_live_activity_expiring_error_requests_token_refresh(tmp_path, monkeypat
 
 
 def test_register_token_persists_client_push_metadata(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_token_metadata_key"
@@ -1522,9 +1527,9 @@ def test_register_token_persists_client_push_metadata(tmp_path, monkeypatch):
 
 
 def test_apns_prefers_token_recorded_environment(monkeypatch):
-    monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
-    monkeypatch.setattr(appmod, "APNS_SANDBOX", True)
-    monkeypatch.setattr(appmod, "_make_apns_jwt", lambda: "jwt")
+    monkeypatch.setattr(push_apns, "APNS_KEY", "test-key")
+    monkeypatch.setattr(push_apns, "APNS_SANDBOX", True)
+    monkeypatch.setattr(push_apns, "_make_apns_jwt", lambda: "jwt")
 
     calls = []
 

@@ -64,12 +64,16 @@
 - **方向**：密文模型下对象存储是安全的（内容本来就是密文），DB 只存
   元数据 + 指针。
 
-### #6 app.py 巨石化 ⬜ P3 · 渐进
+### #6 app.py 巨石化 ✅ 已完成（2026-06-12）
 
-- **现状**：701KB / 88 条路由单文件，定位、review、merge 都贵。
-- **方向**：按 `backend/perception/`（routes/service/store 分层）的示范，
-  把 chat / memory / proactive / model_api 渐进拆成 blueprint。机械工作，
-  可穿插做。
+- **结果**：17.6K 行单体拆为 14 个领域包（core/accounts/push/screen/
+  proactive/identity/memory/bootstrap/chat/tracking/admin/content/hosted/
+  mcpsrv），app.py 降至 ~900 行装配层；url_map 零 diff、部署入口零改动。
+  详见 CHANGELOG 2026-06-12。
+- **遗留**：app.py 的迁移期 COMPAT re-export 段（含 hosted 兜底回灌循环）
+  待收敛为白名单（`app`、`get_store`、`UserStore`、`require_user`、`_users`、
+  `_key_to_user`、`_stores`、`_save_users`、`_register_user`、`db`）——
+  独立小 PR，删除前 `grep -rn "appmod\.|app\._" tests/ tools/ backend/` 终核。
 
 ## 三、安全 / 信任链
 

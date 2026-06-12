@@ -59,6 +59,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 # Importing mcp_server starts a FastMCP instance at module scope; that's
 # fine — we don't run it, we just call its helpers.
 import mcp_server  # noqa: E402
+from mcpsrv import client as mcp_client  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +131,8 @@ def test_chat_history_merges_verify_ping_plaintext(monkeypatch):
         ]
     }
 
-    monkeypatch.setattr(mcp_server, "_get_decrypted", lambda *args, **kwargs: decrypted)
-    monkeypatch.setattr(mcp_server, "_get", lambda *args, **kwargs: plain)
+    monkeypatch.setattr(mcp_client, "_get_decrypted", lambda *args, **kwargs: decrypted)
+    monkeypatch.setattr(mcp_client, "_get", lambda *args, **kwargs: plain)
 
     out = mcp_server.chat_get_history(limit=20)
 

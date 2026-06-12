@@ -14,7 +14,7 @@ bp = Blueprint("perception", __name__, url_prefix="/v1/perception")
 
 
 def _uid() -> str:
-    from app import require_user  # lazy; avoids import cycle at module load
+    from accounts.auth import require_user  # accounts sits below this blueprint — no cycle
     store = require_user()        # aborts 401 on bad auth
     return store.user_id
 

@@ -23,6 +23,8 @@ def test_relationship_days_use_calendar_dates_and_memory_anchor(tmp_path, monkey
             return cls(2026, 5, 22, 1, 30, tzinfo=tz)
 
     monkeypatch.setattr(app, "datetime", FakeDatetime)
+    import identity.service as identity_service
+    monkeypatch.setattr(identity_service, "datetime", FakeDatetime)
     # Moments now live in PostgreSQL (see backend/db.py), so seed them through
     # the persistence layer instead of writing a memory.json file.
     app.db.memory_replace_all("usr_test", [

@@ -236,8 +236,8 @@ def _app_proactive_settings(user_id: str) -> dict:
     """Best-effort read of the app-level proactive settings (enabled/dnd/
     user_state). Lazy import like _fire_wake; failures mean "no block" so a
     broken app layer can't silently kill perception observability."""
-    import app  # lazy
-    return app.get_store(user_id).load_proactive_settings()
+    from core import store as core_store  # lazy; assembly loads core first
+    return core_store.get_store(user_id).load_proactive_settings()
 
 
 def _wake_block_reason(user_id: str) -> str:
@@ -311,13 +311,15 @@ def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
     """Enqueue a proactive job so the resident agent wakes. Lazy-imports app to
     avoid an import cycle (app registers this module at the bottom of startup)."""
     try:
-        import app  # lazy
-        s = app.get_store(user_id)
+        from core import store as core_store  # lazy
+        from core import util as core_util  # lazy
+        from proactive import service as proactive_service  # lazy
+        s = core_store.get_store(user_id)
         job = {
-            "job_id": app._new_public_id("pj"),
+            "job_id": core_util._new_public_id("pj"),
             "ts": now,
             "created_at": datetime.fromtimestamp(now).isoformat(),
-            "source": app.PROACTIVE_JOB_SOURCE,
+            "source": proactive_service.PROACTIVE_JOB_SOURCE,
             "status": "pending",
             "intent_label": f"perception_{cap_key}"[:120],
             # trigger/wake_kind keep the V2 job schema consistent with the
