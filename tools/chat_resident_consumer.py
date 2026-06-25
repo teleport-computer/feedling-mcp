@@ -330,6 +330,52 @@ _HEADERS = {
     "X-Feedling-Consumer-Commit": os.environ.get("FEEDLING_CONSUMER_COMMIT", _consumer_commit()),
 }
 
+# Stage D: when hosted, the supervisor writes a short-lived runtime token to this
+# file (and refreshes it). We authenticate with the token instead of the
+# long-term API key, re-reading the file so refreshes are picked up. Unset/empty
+# (e.g. a self-hosted VPS user) → we keep using X-API-Key, unchanged.
+FEEDLING_RUNTIME_TOKEN_FILE = os.environ.get("FEEDLING_RUNTIME_TOKEN_FILE", "").strip()
+
+
+def _runtime_token_exp(token: str) -> float | None:
+    """Read the ``exp`` claim from a runtime token WITHOUT verifying its signature
+    (no secret here). Lets us avoid sending a token we can already see is expired.
+    Returns the exp epoch, or None if unparseable."""
+    try:
+        payload_b64 = token.split(".", 1)[0]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return float(claims.get("exp"))
+    except Exception:
+        return None
+
+
+def _refresh_auth_header() -> None:
+    """Choose the request auth header from the runtime-token file (Stage D).
+
+    Uses the token only when the file holds one that is NOT already expired
+    (decoding its ``exp``); otherwise falls back to the long-term api key. This
+    avoids wedging on a stale token if the supervisor stops refreshing the file.
+    Mutates ``_HEADERS`` in place so all existing call sites pick it up."""
+    if not FEEDLING_RUNTIME_TOKEN_FILE:
+        return
+    token = ""
+    try:
+        token = Path(FEEDLING_RUNTIME_TOKEN_FILE).read_text().strip()
+    except OSError:
+        token = ""
+    exp = _runtime_token_exp(token) if token else None
+    fresh = exp is not None and exp > time.time() + 5  # small skew margin
+    if fresh:
+        _HEADERS.pop("X-API-Key", None)
+        _HEADERS["X-Feedling-Runtime-Token"] = token
+    else:
+        _HEADERS.pop("X-Feedling-Runtime-Token", None)
+        _HEADERS["X-API-Key"] = FEEDLING_API_KEY
+
+
+_refresh_auth_header()  # adopt a token immediately if one is already present
+
 # Separate HTTP client for the enclave (self-signed TLS, verify=False).
 _ENCLAVE_CLIENT: httpx.Client | None = (
     httpx.Client(timeout=20, verify=False) if FEEDLING_ENCLAVE_URL else None
@@ -3755,6 +3801,7 @@ def run() -> None:
 
     while _running:
         try:
+            _refresh_auth_header()  # pick up a freshly-minted runtime token (Stage D)
             if proactive_enabled:
                 try:
                     if scheduled_fire_enabled and time.monotonic() >= next_scheduled_fire_mono:

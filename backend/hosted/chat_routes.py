@@ -74,6 +74,7 @@ from memory_index_selector import select_memory_index_items
 from accounts import auth
 from push import service as push_service
 import provider_client
+from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
 from hosted import context as hosted_context
 from hosted import turn as hosted_turn
@@ -370,6 +371,18 @@ def model_api_chat_send():
         content_type="image" if has_image else "text",
     )
     store.notify_chat_waiters()
+
+    # P3 cutover: a flagged user is served by the out-of-process agent runtime
+    # (agent-runner) instead of the inline LLM call below. The user message is
+    # already in the chat store, so the agent-runner consumer picks it up and
+    # posts a reply; we wait briefly and return it synchronously, else
+    # "processing". Default 'legacy' leaves the inline path below unchanged, so
+    # rollback is just flipping the flag back.
+    # Image turns stay on the legacy multimodal path (the runtime is text-only).
+    _arc_driver = agent_runtime_cutover.resolve_driver(hosted_config_store._load_model_api_config(store))
+    if agent_runtime_cutover.should_route(_arc_driver, has_image=has_image):
+        _arc_body, _arc_status = agent_runtime_cutover.handle_send(store, user_row, _arc_driver)
+        return jsonify(_arc_body), _arc_status
 
     effects: list[dict] = []
     identity_action_results: list[dict] = []

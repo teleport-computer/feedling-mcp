@@ -1,0 +1,14 @@
+# Local-dev deps for running the supervisor + resident consumer outside the
+# image. The agent-runner IMAGE installs the backend's hash-locked
+# requirements.lock instead (see deploy/Dockerfile.agent-runner) so the resident
+# consumer's full import graph resolves.
+#
+# The supervisor needs httpx (whoami / enclave decrypt) + psycopg (lease table).
+# The resident consumer (tools/chat_resident_consumer.py) it spawns adds
+# content_encryption (cryptography / PyNaCl) and lazily the proactive-v2 stack.
+# The `claude` / `codex` CLIs are Node binaries (npm), not pip deps.
+httpx[http2]>=0.27.0
+psycopg[binary]>=3.1.0
+psycopg-pool>=3.2.0
+cryptography>=42.0.0
+PyNaCl>=1.5.0

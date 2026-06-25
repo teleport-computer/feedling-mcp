@@ -1,0 +1,54 @@
+# agent-runner — the 4th Phala service (plan §Runtime 拓扑).
+#
+# ⚠️ compose_hash / on-chain: this is delivered as a SEPARATE overlay rather than
+# edited straight into deploy/docker-compose.phala.yaml because every literal in
+# the prod compose becomes part of compose_hash. Folding this service in changes
+# the hash and REQUIRES re-authorizing on-chain (FeedlingAppAuth.addComposeHash)
+# + a redeploy — see deploy/docker-compose.phala.yaml header and CONTRIBUTING §7.
+# Merge the `agent-runner` service + the `feedling_agent_runtime` volume into the
+# prod compose in the SAME deploy that rolls the on-chain hash.
+#
+# Local test (compose merge):
+#   docker compose \
+#     -f deploy/docker-compose.phala.yaml \
+#     -f deploy/docker-compose.agent-runner.yaml up
+#
+# The agent-runner image is built from deploy/Dockerfile.agent-runner (publish
+# to ghcr.io/teleport-computer/feedling-agent-runner:<digest>).
+
+name: feedling-enclave
+
+services:
+  agent-runner:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:dev
+    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
+    restart: unless-stopped
+    environment:
+      FEEDLING_API_URL: "http://backend:5001"
+      FEEDLING_ENCLAVE_URL: "https://enclave:5003"
+      AGENT_DATA_ROOT: "/agent-data"
+      AGENT_LEASE_TTL_SEC: "60"
+      AGENT_TICK_INTERVAL_SEC: "15"
+      # Isolation strategy: process (default, v1) | container (opt-in strong
+      # isolation — see docs/AGENT_RUNTIME_ISOLATION.md; not fully wired).
+      AGENT_RUNTIME_ISOLATION: "process"
+      # Lease table (same external Postgres as the backend). Encrypted env
+      # channel — carries DB creds, must include sslmode=require.
+      DATABASE_URL: "${DATABASE_URL:-}"
+      # Internal supervisor secret — mints per-user runtime tokens. Encrypted
+      # env channel; rotate independently of user provider keys. NOT baked.
+      FEEDLING_AGENT_RUNTIME_SECRET: "${FEEDLING_AGENT_RUNTIME_SECRET:-}"
+      # Roster of users to service (JSON: [{"api_key":...,"provider_key":...}]).
+      # Encrypted env channel — carries per-user keys, never baked into the hash.
+      AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
+    volumes:
+      - feedling_agent_runtime:/agent-data
+    depends_on:
+      backend:
+        condition: service_started
+      enclave:
+        condition: service_healthy
+
+volumes:
+  feedling_agent_runtime:
+    name: feedling_agent_runtime

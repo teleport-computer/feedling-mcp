@@ -3,7 +3,9 @@
 from flask import abort, g, request
 
 from accounts import registry
+from accounts import runtime_auth
 from core import store as core_store
+from core.runtime_token import TokenError
 from core.store import UserStore
 
 def _extract_api_key() -> str | None:
@@ -24,7 +26,25 @@ def _extract_api_key() -> str | None:
 
 
 def require_user() -> UserStore:
-    """Return the UserStore for the current request. Aborts 401 on bad auth."""
+    """Return the UserStore for the current request. Aborts 401 on bad auth.
+
+    A runtime token (Stage D) is tried first when present: it carries its own
+    user identity, so the consumer never needs the long-term API key. A token
+    that is present but invalid/expired fails closed (no fall-back). When no
+    token is sent — or the feature is disabled — the API-key path is unchanged.
+    """
+    try:
+        claims = runtime_auth.resolve_claims()
+    except TokenError:
+        abort(401)
+    if claims is not None:
+        user_id = str(claims.get("user_id") or "")
+        if not user_id or registry._user_entry_snapshot(user_id) is None:
+            abort(401)
+        g.user_id = user_id
+        g.runtime_token_claims = claims
+        return core_store.get_store(user_id)
+
     key = _extract_api_key()
     if not key:
         abort(401)

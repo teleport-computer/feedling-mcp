@@ -16,6 +16,7 @@ import threading
 
 from accounts import auth
 from accounts import registry
+from accounts import runtime_auth
 from bootstrap import gates as boot_gates
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
@@ -232,6 +233,7 @@ def memory_threads():
 @bp.route("/v1/memory/actions", methods=["POST"])
 def memory_actions():
     store = auth.require_user()
+    runtime_auth.authorize_scope("memory")  # slice 4: token must carry the memory scope
     api_key = auth._extract_api_key()
     payload = request.get_json(silent=True) or {}
     actions = payload.get("actions")

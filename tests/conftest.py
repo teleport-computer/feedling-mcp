@@ -97,6 +97,10 @@ if not _provisioned:
         "test_screen_caption_flag.py",
         "test_tool_loop_v2.py",
         "test_agent_perception_route.py",
+        "test_agent_runtime_tokens.py",
+        "test_agent_runtime_spawners.py",
+        "test_agent_runtime_resident_contract.py",
+        "test_hosted_agent_runtime_cutover.py",
     }
     collect_ignore = sorted(
         f

@@ -484,11 +484,38 @@ def _extract_api_key() -> str:
     return request.args.get("key", "").strip()
 
 
+def _caller_runtime_token() -> str:
+    """The caller's runtime token (Stage D), if present. The enclave doesn't
+    verify it — it forwards it to the backend whoami, which does. Returns "" when
+    called outside a request context (so cached resolvers can call it safely)."""
+    try:
+        return request.headers.get("X-Feedling-Runtime-Token", "").strip()
+    except RuntimeError:
+        return ""
+
+
+def _forward_auth_headers(api_key: str, runtime_token: str) -> dict:
+    """Headers to forward the caller's credential to the backend: a runtime token
+    (preferred when present) or the long-term API key — same scope, nothing more."""
+    if runtime_token:
+        return {"X-Feedling-Runtime-Token": runtime_token}
+    if api_key:
+        return {"X-API-Key": api_key}
+    return {}
+
+
 def _flask_get(path: str, api_key: str, params: dict | None = None) -> dict:
-    """Fetch JSON from the backend Flask as the authenticated user. The
-    enclave forwards the caller's key rather than using a privileged one —
-    same scope the user granted, nothing more."""
-    headers = {"X-API-Key": api_key} if api_key else {}
+    """Fetch JSON from the backend Flask as the authenticated caller. The enclave
+    forwards the caller's credential rather than a privileged one — same scope the
+    user granted, nothing more. Stage D: when the request carries a runtime token
+    (api_key absent), forwards the token so decrypt-and-serve routes work without
+    the long-term key."""
+    return _flask_get_headers(path, _forward_auth_headers(api_key, _caller_runtime_token()), params)
+
+
+def _flask_get_headers(path: str, headers: dict, params: dict | None = None) -> dict:
+    """Like ``_flask_get`` but forwarding caller-supplied auth headers verbatim
+    (api_key OR runtime token) — see ``_forward_auth_headers``."""
     with httpx.Client(timeout=15) as client:
         r = client.get(f"{FLASK_URL}{path}", params=params, headers=headers)
         r.raise_for_status()
@@ -517,15 +544,31 @@ _whoami_cache_lock = threading.Lock()
 _whoami_inflight: dict[str, threading.Lock] = {}
 
 
-def _whoami_cached(api_key: str) -> dict:
-    """whoami via the backend, memoised per sha256(api_key) for a short TTL.
+def _prune_whoami_cache(now: float | None = None) -> None:
+    """Drop cache entries past the TTL. Called on every write so rotating runtime
+    tokens (each a new cache key) can't grow the dict unboundedly. Caller holds
+    ``_whoami_cache_lock``."""
+    clock = time.monotonic() if now is None else now
+    for h in [h for h, (ts, _) in _whoami_cache.items() if clock - ts >= _WHOAMI_CACHE_TTL]:
+        _whoami_cache.pop(h, None)
 
-    Misses call `_flask_get` and propagate its httpx errors uncached, so every
-    caller keeps its existing 401-on-HTTPStatusError / 502-on-HTTPError mapping.
-    Concurrent misses for the same key are serialised via singleflight: the
-    first does the round-trip, the rest wait and reuse its cached result.
+
+def _whoami_cached(api_key: str) -> dict:
+    """whoami via the backend, memoised per sha256(credential) for a short TTL.
+
+    Misses call `_flask_get`/`_flask_get_headers` and propagate their httpx errors
+    uncached, so every caller keeps its existing 401-on-HTTPStatusError /
+    502-on-HTTPError mapping. Concurrent misses for the same key are serialised
+    via singleflight: the first does the round-trip, the rest wait and reuse its
+    cached result.
+
+    Stage D: when the caller presents a runtime token (read from the request
+    here, so the 7 decrypt-and-serve routes need no change), resolve + cache by
+    the token instead of the api_key — the api-key path is unchanged.
     """
-    h = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    runtime_token = _caller_runtime_token()
+    cred = ("rt:" + runtime_token) if runtime_token else ("ak:" + api_key)
+    h = hashlib.sha256(cred.encode("utf-8")).hexdigest()
     with _whoami_cache_lock:
         hit = _whoami_cache.get(h)
         if hit is not None and time.monotonic() - hit[0] < _WHOAMI_CACHE_TTL:
@@ -543,10 +586,15 @@ def _whoami_cached(api_key: str) -> dict:
             if hit is not None and time.monotonic() - hit[0] < _WHOAMI_CACHE_TTL:
                 return hit[1]
         try:
-            whoami = _flask_get("/v1/users/whoami", api_key)
+            if runtime_token:
+                whoami = _flask_get_headers("/v1/users/whoami", {"X-Feedling-Runtime-Token": runtime_token})
+            else:
+                whoami = _flask_get("/v1/users/whoami", api_key)
             if isinstance(whoami, dict) and whoami.get("user_id"):
                 with _whoami_cache_lock:
-                    _whoami_cache[h] = (time.monotonic(), whoami)
+                    now = time.monotonic()
+                    _whoami_cache[h] = (now, whoami)
+                    _prune_whoami_cache(now)  # evict expired so token rotation can't leak
             return whoami
         finally:
             # Retire this in-flight lock so the registry stays bounded and a
@@ -697,7 +745,8 @@ def v1_envelope_decrypt():
         return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
 
     api_key = _extract_api_key()
-    if not api_key:
+    runtime_token = _caller_runtime_token()
+    if not api_key and not runtime_token:
         return jsonify({"error": "missing_api_key"}), 401
 
     try:
@@ -707,7 +756,14 @@ def v1_envelope_decrypt():
         # revoked / a reset account for up to the TTL, so we resolve the caller
         # live every time. The decrypt-and-serve routes below only read the
         # user's own stored data, so they can tolerate the cached resolver.
-        whoami = _flask_get("/v1/users/whoami", api_key)
+        # The caller may present a runtime token instead of the api_key (Stage
+        # D); the backend whoami resolves either — the enclave just forwards it.
+        # The api-key path stays on _flask_get (unchanged); only a token request
+        # takes the header-forwarding path.
+        if runtime_token:
+            whoami = _flask_get_headers("/v1/users/whoami", _forward_auth_headers(api_key, runtime_token))
+        else:
+            whoami = _flask_get("/v1/users/whoami", api_key)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
@@ -1122,7 +1178,7 @@ def _memory_readside_auth_context() -> tuple[str | None, str | None, object | No
     if not _state["ready"]:
         return None, None, None, ({"error": "not_ready", "detail": _state["error"]}, 503)
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
         return None, None, None, ({"error": "missing api_key"}, 401)
     try:
         whoami = _whoami_cached(api_key)
@@ -1249,7 +1305,9 @@ def v1_chat_history():
         return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
 
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
 
     # Resolve whose content we're decrypting — returns the caller's usr_...
@@ -1419,7 +1477,9 @@ def v1_memory_list():
     if not _state["ready"]:
         return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
 
     try:
@@ -1515,7 +1575,9 @@ def v1_identity_get():
     if not _state["ready"]:
         return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
 
     try:
@@ -1626,7 +1688,9 @@ def v1_frame_decrypt(frame_id):
         return jsonify({"error": "bad frame id"}), 400
 
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
 
     try:
@@ -1723,7 +1787,9 @@ def v1_frame_caption(frame_id):
         return jsonify({"error": "screen_caption_unconfigured"}), 503
 
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
     try:
         whoami = _whoami_cached(api_key)
@@ -1835,7 +1901,9 @@ def v1_frame_image(frame_id):
         return jsonify({"error": "bad frame id"}), 400
 
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
 
     try:

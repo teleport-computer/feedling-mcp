@@ -663,6 +663,43 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
 
 
+def list_agent_runtime_enabled_users() -> list[dict]:
+    """Users opted into the hosted agent runtime (Stage C auto-discovery).
+
+    A ``model_api`` config that is tested-ok and has hosting enabled
+    (``agent_runtime_driver`` set to anything other than legacy/off, via POST
+    /v1/model_api/driver). The agent is DERIVED from the provider, never chosen:
+    anthropic/deepseek → claude, openai → codex (keep this CASE in sync with
+    hosted/agent_runtime_cutover.driver_for_provider). Providers with no hosted
+    fit (gemini/openrouter/…) are excluded. Returns ``[{"user_id", "driver"}]``
+    sorted by user_id. The supervisor reads this directly (it already holds a DB
+    pool for leases) to discover who to run instead of a static roster."""
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                  CASE LOWER(COALESCE(doc->>'provider', ''))
+                    WHEN 'anthropic' THEN 'claude'
+                    WHEN 'claude'    THEN 'claude'
+                    WHEN 'deepseek'  THEN 'claude'
+                    WHEN 'openai'    THEN 'codex'
+                  END AS driver
+                FROM user_blobs
+                WHERE kind = 'model_api'
+                  AND COALESCE(doc->>'test_status', '') = 'ok'
+                  AND LOWER(COALESCE(doc->>'agent_runtime_driver', 'legacy'))
+                      NOT IN ('', 'legacy', 'off', 'false', '0', 'no', 'disabled')
+                  AND LOWER(COALESCE(doc->>'provider', '')) IN ('anthropic', 'claude', 'deepseek', 'openai')
+                ORDER BY user_id
+                """,
+            ).fetchall()
+        return [{"user_id": uid, "driver": driver} for uid, driver in rows]
+    except Exception as e:
+        log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
+        return []
+
+
 def try_stamp_hosted_tick(user_id: str, doc: dict, now: float, interval_sec: float) -> bool:
     """Atomically claim this user's next hosted-heartbeat slot. Stamps the
     ``hosted_tick`` blob with ``doc`` iff there is no prior stamp or the prior

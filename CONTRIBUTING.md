@@ -26,11 +26,18 @@ backend/
 ├── identity/  memory/  ← 身份卡、记忆花园（service / actions / routes 三层）
 ├── bootstrap/      ← 门禁 gates + onboarding 路由
 ├── chat/           ← Resident 聊天条线：service / consumer / routes / verify_loop
+├── agent/          ← resident agent 感知端点（routes-only，依赖 accounts/perception/proactive）
 ├── tracking/  admin/  content/  ← 埋点 ｜ data-track 后台 ｜ swap/rewrap/export
 ├── hosted/         ← Model API 托管条线（config_store / context / turn /
 │                      chat_routes / history_import / wake_consumer …）
+├── model_api_runtime/ ← Model API 线的 agent 运行时：prompts / tools /
+│                      memory_tools / wake（独立包，与 hosted/ 平级；
+│                      被 hosted·proactive·perception 复用）
 ├── perception/     ← 扩展感知（此模式的最早范本）
-└── db.py · content_encryption.py · provider_client.py · enclave_app.py
+└── db.py · content_encryption.py · provider_client.py · enclave_app.py ·
+    dstack_tls.py · hosted_runtime.py · semantic_analysis.py ·
+    memory_readside_core.py · memory_index_selector.py ·
+    context_memory_selection.py · migrate_to_pg.py
                     ← 底层独立模块，保持无业务依赖
 ```
 
@@ -40,7 +47,8 @@ backend/
 |---|---|
 | 新增一个 `/v1/...` HTTP 端点 | 对应领域包的 `routes.py`，挂在该包的 Blueprint 上 |
 | 新增业务逻辑/存取逻辑 | 对应包的 `service.py`（或 `actions.py`，如果是 envelope-action） |
-| 新增只属于 hosted（model_api）条线的逻辑 | `hosted/` 下对应模块 |
+| 新增 Model API 托管线的 HTTP/存储逻辑 | `hosted/` 下对应模块 |
+| 新增 Model API agent 运行时（prompt/工具/wake）逻辑 | `model_api_runtime/` 下对应模块（独立包，与 `hosted/` 平级） |
 | 新增跨域共享的工具函数 | `core/util.py`（必须无业务依赖才算「共享」） |
 | 新增一个完整的新功能域 | 新建包，照抄 `perception/` 的形态：`__init__.py` 提供 `register(app)`，内部 `routes.py` + `service.py` 分层 |
 | 新增测试 | 仓库根的 `tests/`，**绝不放 backend/**（规则见 §6） |
@@ -57,15 +65,18 @@ backend/
 
 ```
 app.py（装配，最高）
-  ↑ hosted
+  ↑ hosted / agent
   ↑ tracking / admin / content
   ↑ chat
   ↑ bootstrap.gates
-  ↑ proactive / identity / memory     （identity.service 可用 memory.service，反向禁止）
+  ↑ model_api_runtime     （自身只依赖 core/memory；被 hosted·proactive·perception 复用）
+  ↑ proactive / identity / memory / perception     （identity.service 可用 memory.service，反向禁止）
   ↑ push / screen
   ↑ accounts
   ↑ core
-  ↑ db / content_encryption / provider_client（最低）
+  ↑ db / content_encryption / provider_client / dstack_tls / hosted_runtime /
+     semantic_analysis / memory_readside_core / memory_index_selector /
+     context_memory_selection（最低；均为无业务依赖的共享/底层模块）
 ```
 
 - `routes.py` 可以 import 平级或更低的任何 service；`service.py` 只准向下。

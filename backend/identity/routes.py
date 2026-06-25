@@ -15,6 +15,7 @@ from flask import Blueprint, Response
 import threading
 
 from accounts import auth
+from accounts import runtime_auth
 from bootstrap import gates as boot_gates
 from identity import actions as identity_actions_mod
 from identity import service as identity_service
@@ -25,6 +26,7 @@ bp = Blueprint("identity", __name__)
 @bp.route("/v1/identity/actions", methods=["POST"])
 def identity_actions():
     store = auth.require_user()
+    runtime_auth.authorize_scope("identity")  # slice 4: token must carry the identity scope
     api_key = auth._extract_api_key()
     payload = request.get_json(silent=True) or {}
     actions = payload.get("actions")

@@ -118,12 +118,12 @@
 > **触发判断综合结论:通过。** 明确问会查、模糊说(累/找餐厅)主动查、该不查时(笑话)不乱调、
 > 拿不到的(静息心率/定位)诚实报空且**抗诱导不编造**——这是本轮最想要的能力,已验。
 
-## 增补(2026-06-26)· 后端 catch-up 新信号 + focus 修复 + chat 端到端
+## 增补(2026-06-25)· 后端 catch-up 新信号 + focus 修复 + chat 端到端
 
 - **focus.in_focus 修好 ✅**:iOS `2504c3e`(Communication Notifications entitlement)+ 新包 → 开勿扰拉到 `true`。原"已交工程师"项关闭。
 - **后端 catch-up 上线**(`7a8be95`):agent 现在能 pull iOS 全部新信号——`reminders` + 全 `weather`(体感/湿度/降水/UV/预警)+ `sleep` 分期(core/deep/rem)+ 全 `vitals`(current_hr/hrv/呼吸/血氧/vo2max)+ `activity/body/metabolic/cycle/mood`。
 - **新信号真机真值已验** ✅:sleep 511/298/76/137、vitals 心率 68/呼吸 17、body 身高 156/体重 52、activity 能量。无数据项诚实 null(metabolic/cycle/mood/部分 vitals)、weather 仍 WeatherKit 阻塞、reminders 视权限。
-- **chat 端到端 ✅**(2026-06-26 凌晨):问专注/心率/睡眠/步数/整体状态,agent 均触发对应 `perception_*`、报准真值(步数 10=跨天后真值,非编造)、模糊问会综合多信号。**感知 读+触发+主动 整体验收完成。**
+- **chat 端到端 ✅**(2026-06-25 凌晨):问专注/心率/睡眠/步数/整体状态,agent 均触发对应 `perception_*`、报准真值(步数 10=跨天后真值,非编造)、模糊问会综合多信号。**感知 读+触发+主动 整体验收完成。**
 - F 组三开关:已在 `PROACTIVE_COMPANION_FUNCTION_AND_TEST_SPEC` C 组验过(C1/C2/C3 gate + 不连坐通过)。
 
 ## 已知问题(测试中发现)· focus
@@ -155,7 +155,7 @@
 - 「我现在也有点困」→ 据疲倦调整建议(对话连贯)
 - (发图)→ consumer whoami SSL EOF → 回复被丢(见上"已知问题"),11:20 恢复
 - (再发图 11:26)→ 正常回复("像酒店 lounge/餐吧感")✅ 图片链路本身通
-- 「明天我有什么工作事项吗」→ 查日历 → "我查了你明天 2026-06-26(周五,Asia/Shanghai)的日历…" ✅ calendar 触发 + 本地时区;io_cli 证实 events 列表完整含参会人
+- 「明天我有什么工作事项吗」→ 查日历 → "我查了你明天 2026-06-25(周五,Asia/Shanghai)的日历…" ✅ calendar 触发 + 本地时区;io_cli 证实 events 列表完整含参会人
 - 「讲个笑话」→ "有个产品经理去算命…" ✅ **负向对照**:不调任何感知工具,不乱触发
 ### 2026-06-25 12:09–12:16 UTC · focus/audio/workout/静息心率/定位诚实
 - 「我现在方便被打扰吗?」→ "现在算方便"(据 in_focus=false)

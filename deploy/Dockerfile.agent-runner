@@ -1,0 +1,59 @@
+# Feedling — agent-runner container image.
+#
+# Runs backend/agent_runtime/supervisor.py: a multi-tenant supervisor that hosts
+# the VPS resident consumer (tools/chat_resident_consumer.py) — one process per
+# user, driven in cli mode against `claude` / `codex exec`. So the image ships
+# the backend + the resident consumer + the agent CLIs (Node).
+#
+# Hardening TODO (match the backend image before prod): pin the base by digest;
+# pin the npm CLI versions. Deps are hash-locked via the backend's
+# requirements.lock (the resident consumer's full import graph resolves from it).
+
+FROM python:3.11-slim-bookworm AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# System deps: build toolchain for cryptography/pynacl wheels + curl for the
+# NodeSource setup script.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential libssl-dev libffi-dev curl ca-certificates \
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/*
+
+# Agent backend CLIs the resident consumer drives in cli mode:
+#  - Claude Code CLI (`claude`)
+#  - Codex CLI (`codex exec --json`)
+RUN npm install -g @anthropic-ai/claude-code @openai/codex
+
+# Python deps: reuse the backend's hash-locked set so the resident consumer's
+# whole import graph (content_encryption, proactive-v2, db, …) + the supervisor
+# (httpx, psycopg) all resolve.
+COPY backend/requirements.lock ./requirements.lock
+RUN pip install --require-hashes -r requirements.lock
+
+# Ship the backend (content_encryption / db / proactive imported by the resident
+# consumer) AND tools/ (the resident consumer itself, spawned per user).
+COPY backend/ ./backend/
+COPY tools/ ./tools/
+
+ARG FEEDLING_GIT_COMMIT=dev
+ENV FEEDLING_GIT_COMMIT=${FEEDLING_GIT_COMMIT}
+
+# Non-root; /agent-data is the per-user runtime volume mount point.
+RUN useradd --system --uid 1000 --home-dir /home/feedling --create-home feedling \
+ && mkdir -p /agent-data \
+ && chown -R feedling:feedling /agent-data /app
+USER feedling
+
+# Base default only — each per-user consumer overrides CLAUDE_CONFIG_DIR /
+# CODEX_HOME to its own /agent-data/users/<uid>/… so agent homes are never shared.
+ENV CLAUDE_CONFIG_DIR=/agent-data/.claude
+
+CMD ["python", "-u", "backend/agent_runtime/supervisor.py"]

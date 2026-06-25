@@ -68,6 +68,7 @@ from memory import service as memory_service
 import provider_client
 from hosted import config_store as hosted_config_store
 from hosted import turn as hosted_turn
+from hosted import agent_runtime_cutover
 
 
 bp = Blueprint("hosted_setup_routes", __name__)
@@ -159,6 +160,49 @@ def model_api_setup():
 def model_api_get():
     store = auth.require_user()
     return jsonify({"config": hosted_config_store._public_model_api_config(hosted_config_store._load_model_api_config(store))})
+
+
+@bp.route("/v1/model_api/driver", methods=["POST"])
+def model_api_set_hosting():
+    """Enable/disable the hosted agent runtime for this user (gradual-rollout
+    toggle). Body: ``{"enabled": true|false}``.
+
+    The AGENT is NOT user-chosen — it is auto-derived from the configured
+    provider (anthropic/deepseek → claude, openai → codex). This endpoint only
+    flips hosting on/off; the response reports the derived ``driver``. A provider
+    key must be configured first (404 otherwise)."""
+    store = auth.require_user()
+    payload = request.get_json(silent=True) or {}
+    enabled = bool(payload.get("enabled"))
+    config = hosted_config_store._load_model_api_config(store)
+    if not config:
+        return jsonify({"error": "model_api_not_configured"}), 404
+    config["agent_runtime_driver"] = "auto" if enabled else "legacy"
+    hosted_config_store._save_model_api_config(store, config)
+    driver = agent_runtime_cutover.resolve_driver(config)
+    print(f"[model_api:{store.user_id}] hosting enabled={enabled} provider={config.get('provider')} -> driver={driver}")
+    return jsonify({
+        "status": "ok",
+        "enabled": enabled,
+        "driver": driver,
+        "config": hosted_config_store._public_model_api_config(config),
+    })
+
+
+@bp.route("/v1/model_api/key_envelope", methods=["GET"])
+def model_api_key_envelope():
+    """Return the caller's OWN ``api_key_envelope`` ciphertext.
+
+    Lets the agent-runner supervisor (authenticating with the user's API key)
+    self-fetch the provider-key envelope and enclave-decrypt it JIT, instead of a
+    static roster carrying per-user secrets. The envelope is ciphertext the server
+    cannot decrypt; only the enclave can — so this never exposes the provider key."""
+    store = auth.require_user()
+    config = hosted_config_store._load_model_api_config(store)
+    envelope = (config or {}).get("api_key_envelope")
+    if not isinstance(envelope, dict):
+        return jsonify({"error": "model_api_key_envelope_missing"}), 404
+    return jsonify({"api_key_envelope": envelope})
 
 
 @bp.route("/v1/model_api/test", methods=["POST"])

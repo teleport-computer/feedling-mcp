@@ -32,7 +32,7 @@ def test_step_count_aggregates_and_reads_as_daily_total():
     d = history.record_daily(None, "health_vitals", {"step_count": 1000, "current_heart_rate": 65})
     d = history.record_daily(d, "health_vitals", {"step_count": 1801, "current_heart_rate": 68})
     assert d["step_count"]["max"] == 1801.0
-    rows = [{"date": "2026-06-26", "doc": d}]
+    rows = [{"date": "2026-06-25", "doc": d}]
     t = history.read_trend(rows, "health_vitals", "step_count")
     assert t["current"] == 1801.0  # daily total, not avg
 
@@ -115,7 +115,7 @@ def test_tally_music_digest_minutes_and_top():
     assert d["by_artist"]["B"] == 5.0
     assert set(d["distinct"]) == {"t1", "t2"}
     # total_minutes is trendable
-    t = history.read_trend([{"date": "2026-06-26", "doc": d}], "playback", "total_minutes")
+    t = history.read_trend([{"date": "2026-06-25", "doc": d}], "playback", "total_minutes")
     assert t["current"] == 15.0
 
 
