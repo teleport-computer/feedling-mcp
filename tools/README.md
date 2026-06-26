@@ -138,6 +138,34 @@ make it a child job inside the current Hermes chat turn or the top-level
 Hermes gateway; otherwise the IO chat loop dies or restarts with that host
 process.
 
+### Auto-update
+
+Once installed, the consumer keeps itself on the commit the backend deploys —
+you no longer have to remember to `git pull` + restart after a release.
+
+How it works: the backend advertises its deployed commit in every chat-poll
+response (`client_release.expected_consumer_commit`). At an idle poll the
+consumer compares it to its own `HEAD`. **Only if** the difference actually
+touches a file this consumer loads does it `git fetch` + check out that commit
+and re-exec in place. The relevant-file set is auto-derived from the modules it
+imports, plus `tools/io_cli.py`, the requirements files, and the lazily-imported
+runtime surface (`backend/proactive/`, `backend/content_encryption.py`) that may
+not be in `sys.modules` yet on a fresh idle consumer. A backend release that
+doesn't touch any consumer code triggers nothing. `io_cli.py` rides along in the
+same checkout — no separate update.
+
+- **Default on.** Set `FEEDLING_AUTO_UPDATE=0` in your env file to opt out and
+  manage updates manually (the verification steps above).
+- **Dirty working tree is never touched.** If you have local uncommitted edits,
+  the consumer logs a warning and skips the update instead of clobbering them.
+  `git stash` / commit (or set `FEEDLING_AUTO_UPDATE=0`) to control this.
+- **Detached HEAD after update.** Updating pins the checkout to the backend's
+  exact commit (detached HEAD). To take over manually, `git checkout main`.
+- **If requirements changed**, the consumer runs `pip install -r` for the
+  changed requirements file before re-exec, best-effort.
+- **Hosted (in-CVM) runs are excluded** — that code is baked into an attested,
+  immutable image and is updated by redeploying the image, not by self-pull.
+
 ### ⚠️ Decrypt source is mandatory
 
 The backend stores all user chat messages as v1 encrypted envelopes.

@@ -357,6 +357,9 @@ def chat_poll():
     chat_consumer._record_consumer_event(store, "poll")
     from proactive import resident_runtime_v2  # lazy: chat poll should not own proactive startup
     runtime_profile = resident_runtime_v2.resident_runtime_v2_public_profile(store)
+    # Advertise the commit a self-hosted resident consumer should run, so it can
+    # self-update to the commit this backend deploys (see chat_consumer).
+    client_release = {"expected_consumer_commit": chat_consumer.expected_consumer_commit()}
     try:
         since = float(request.args.get("since", 0))
     except (TypeError, ValueError):
@@ -375,6 +378,7 @@ def chat_poll():
         return jsonify({
             "messages": pending,
             "runtime_v2": runtime_profile,
+            "client_release": client_release,
             "timed_out": False,
             "consumer_id": consumer_id,
             "claimed": claim,
@@ -402,6 +406,7 @@ def chat_poll():
         return jsonify({
             "messages": pending,
             "runtime_v2": runtime_profile,
+            "client_release": client_release,
             "timed_out": False,
             "consumer_id": consumer_id,
             "claimed": claim,
@@ -409,6 +414,7 @@ def chat_poll():
     return jsonify({
         "messages": [],
         "runtime_v2": runtime_profile,
+        "client_release": client_release,
         "timed_out": True,
         "consumer_id": consumer_id,
         "claimed": claim,

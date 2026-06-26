@@ -47,6 +47,17 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-26
+
+### [DONE] resident consumer 自动更新（路径感知锁步）
+
+自托管 consumer/io_cli 走 git clone 分发，onboarding 后除非手动 `git pull`+重启否则永远跑旧代码。现在让 consumer 自动跟上后端部署的 commit：
+
+- **后端下发期望版本**：`backend/chat/consumer.py` 新增 `expected_consumer_commit()`（`FEEDLING_EXPECTED_CONSUMER_COMMIT` 显式 pin → 回退 `FEEDLING_GIT_COMMIT`）；`/v1/chat/poll` 三个 return 加 `client_release.expected_consumer_commit`。后端不需要 `.git`。
+- **consumer 路径感知自更新**（`tools/chat_resident_consumer.py`）：idle（timed_out）poll 时比对本地 `HEAD` 与下发 commit；**仅当** `git diff HEAD..target` 命中本进程实际加载的 repo 文件（从 `sys.modules` 自动推导 + 显式补 `io_cli.py`/requirements）才 `git fetch`+`checkout --detach`+`os.execv` 原地重启。**无关后端发版不触发**（解决"每次发版都 pull"）。
+- **安全边界**：默认开（`FEEDLING_AUTO_UPDATE=0` 关）；脏工作区跳过并告警，不丢本地改动；requirements 变了先 `pip install` 兜底；hosted（`FEEDLING_RUNTIME_TOKEN_FILE` 存在的 in-CVM）禁用（镜像不可变 + attestation）。io_cli 同仓库免费搭车。
+- 测试：`tests/test_chat_resident_self_update.py`（纯函数真值表 + 编排 mock）、`tests/test_expected_consumer_commit.py`、`tests/test_chat_poll_client_release.py`。文档：`tools/README.md` § Auto-update、`deploy/chat_resident.env.example`。
+
 ## 2026-06-25
 
 ### [DONE] 主动陪伴系统打通（心跳/三开关/定时器）+ 感知后端 catch-up（全新信号暴露给 agent）

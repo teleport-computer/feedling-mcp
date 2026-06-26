@@ -376,6 +376,258 @@ def _refresh_auth_header() -> None:
 
 _refresh_auth_header()  # adopt a token immediately if one is already present
 
+
+# ---------------------------------------------------------------------------
+# Self-update — keep a self-hosted resident on the commit the backend deploys.
+#
+# The backend advertises its deployed commit in the chat-poll response
+# (``client_release.expected_consumer_commit``). When ours differs AND the
+# difference actually touches a file this consumer loads, we fetch + checkout
+# that commit and re-exec in place. Hosted (supervisor-managed CVM) runs are
+# excluded — their code is baked into an attested, immutable image.
+# ---------------------------------------------------------------------------
+
+_REPO = Path(__file__).resolve().parent.parent
+
+# Default-on; a self-hoster can set FEEDLING_AUTO_UPDATE=0 to opt out.
+AUTO_UPDATE = os.environ.get("FEEDLING_AUTO_UPDATE", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+)
+# A runtime-token file is only written by the in-CVM supervisor — treat its
+# presence as "hosted" and never self-mutate there.
+_HOSTED = bool(FEEDLING_RUNTIME_TOKEN_FILE)
+
+
+def _runtime_repo_files() -> set[str]:
+    """Repo-relative ``.py`` files this process actually loaded (auto-derived
+    dependency whitelist), plus files distributed alongside us that never show
+    up in ``sys.modules`` (io_cli is shelled out; requirements gate pip).
+
+    Used to decide whether a backend release touches anything we run — a pure
+    backend change (routes/db/accounts the consumer never imports) must not
+    trigger a needless restart."""
+    files: set[str] = set()
+    for mod in list(sys.modules.values()):
+        f = getattr(mod, "__file__", None)
+        if not f:
+            continue
+        try:
+            rel = Path(f).resolve().relative_to(_REPO)
+        except ValueError:
+            continue  # stdlib / site-packages / outside the repo
+        if rel.suffix == ".py":
+            files.add(str(rel))
+    files.update(
+        {
+            "tools/io_cli.py",
+            "tools/chat_resident_requirements.txt",
+            "backend/requirements.txt",
+        }
+    )
+    return files
+
+
+def _should_self_update(
+    local: str,
+    target: str,
+    dirty: bool,
+    enabled: bool,
+    hosted: bool,
+    relevant_changed: bool,
+) -> bool:
+    """Pure decision: should we update from ``local`` to ``target`` now?
+
+    Side-effect-free so it is exhaustively unit-tested. The caller owns the git
+    work and is responsible for warning when a dirty tree blocks an update."""
+    if not enabled or hosted:
+        return False
+    if not target or target == "dev" or not local:
+        return False
+    # Short vs full hash of the same commit -> already there, nothing to do.
+    if target.startswith(local) or local.startswith(target):
+        return False
+    if dirty:
+        return False  # protect uncommitted local edits (caller warns)
+    return relevant_changed
+
+
+# Don't re-attempt the git fetch/diff dance more than once per window — the
+# backend re-advertises the target on every (often timed-out) poll.
+_SELF_UPDATE_MIN_INTERVAL_SEC = 300.0
+_last_self_update_mono = 0.0
+
+_REQUIREMENTS_FILES = {
+    "tools/chat_resident_requirements.txt",
+    "backend/requirements.txt",
+}
+
+# Repo paths that are part of this consumer's runtime but may be imported
+# LAZILY (e.g. proactive.adapters_v2 / runtime_v2 only load once a proactive job
+# runs), so they won't appear in sys.modules on a fresh, idle consumer. We still
+# want a release touching them to trigger an update — hence a static layer on
+# top of the sys.modules-derived set in _runtime_repo_files().
+_RELEVANT_PATH_PREFIXES = ("backend/proactive/",)
+_RELEVANT_PATH_FILES = {"backend/content_encryption.py"}
+
+
+def _git(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(_REPO), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _git_tree_dirty() -> bool:
+    """True if there are uncommitted changes — or if we can't tell (fail safe:
+    an unknown state must not be overwritten)."""
+    try:
+        r = _git("status", "--porcelain", timeout=10)
+    except Exception:
+        return True
+    if r.returncode != 0:
+        return True
+    return bool(r.stdout.strip())
+
+
+def _git_fetch(target: str) -> bool:
+    try:
+        return _git("fetch", "--quiet", "origin", target, timeout=120).returncode == 0
+    except Exception:
+        return False
+
+
+def _git_changed_files(local: str, target: str) -> set[str]:
+    try:
+        r = _git("diff", "--name-only", local, target, "--", timeout=30)
+    except Exception:
+        return set()
+    if r.returncode != 0:
+        return set()
+    return {ln.strip() for ln in r.stdout.splitlines() if ln.strip()}
+
+
+def _git_checkout(target: str) -> bool:
+    # Detached checkout pins us exactly to the backend's commit (lockstep). A
+    # self-hoster who wants to take over manually can `git checkout main`.
+    try:
+        r = _git("checkout", "--detach", "--force", target, timeout=60)
+    except Exception as e:
+        log.error("self-update checkout error: %s", e)
+        return False
+    if r.returncode != 0:
+        log.error("self-update checkout failed: %s", r.stderr.strip())
+        return False
+    return True
+
+
+def _pip_install(req_rel: str) -> None:
+    # Best-effort: a re-exec into new code that needs new deps would otherwise
+    # crash-loop. Failure here only warns; systemd will still respawn.
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", str(_REPO / req_rel)],
+            timeout=600,
+            check=False,
+        )
+    except Exception as e:
+        log.warning("self-update pip install %s failed: %s", req_rel, e)
+
+
+def _relevant_changed(changed: set[str]) -> bool:
+    """Does this release touch anything this consumer actually runs?
+
+    Combines the auto-derived (sys.modules) dependency set with a static layer
+    for lazily-imported runtime code that may not be loaded yet."""
+    if changed & _runtime_repo_files():
+        return True
+    for path in changed:
+        if path in _RELEVANT_PATH_FILES:
+            return True
+        if any(path.startswith(p) for p in _RELEVANT_PATH_PREFIXES):
+            return True
+    return False
+
+
+def _apply_self_update(local: str, target: str, changed: set[str]) -> None:
+    """Checkout the target commit, install any changed deps, then re-exec.
+
+    Checkout happens FIRST so _pip_install reads the target commit's
+    requirements file — installing the deps the new code needs, not the old
+    ones (a release adding a dependency must not re-exec into code that can't
+    import it)."""
+    if not _git_checkout(target):
+        return
+    for req in sorted(changed & _REQUIREMENTS_FILES):
+        log.info("self-update: %s changed — pip installing after checkout", req)
+        _pip_install(req)
+    log.info("self-update %s -> %s applied; re-exec into new code", local, target)
+    try:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+    except Exception as e:
+        # execv replaces the process and normally never returns; if it failed,
+        # exit cleanly so the supervisor/systemd respawns the new code.
+        log.error("self-update re-exec failed (%s); exiting for restart", e)
+        sys.exit(0)
+
+
+def _run_self_update(target: str) -> None:
+    """Decide and (if warranted) apply a self-update to ``target``.
+
+    Cheap pre-checks short-circuit before any git network call; the expensive
+    fetch/diff only runs when an update is genuinely plausible. Re-exec happens
+    inside ``_apply_self_update`` and does not return."""
+    global _last_self_update_mono
+    if not AUTO_UPDATE or _HOSTED or not target or target == "dev":
+        return
+    now = time.monotonic()
+    if now - _last_self_update_mono < _SELF_UPDATE_MIN_INTERVAL_SEC:
+        return
+    local = _consumer_commit()
+    if not local or target.startswith(local) or local.startswith(target):
+        return  # unknown local, or already on the target commit
+    _last_self_update_mono = now  # throttle the fetch/diff attempt below
+
+    if not _git_fetch(target):
+        log.warning("self-update: could not fetch %s; will retry later", target)
+        return
+    changed = _git_changed_files(local, target)
+    relevant = _relevant_changed(changed)
+    if not relevant:
+        return  # backend release doesn't touch anything this consumer loads
+    dirty = _git_tree_dirty()
+    if not _should_self_update(local, target, dirty, AUTO_UPDATE, _HOSTED, relevant):
+        if dirty:
+            log.warning(
+                "self-update %s -> %s available but working tree has uncommitted "
+                "changes; skipping (run `git stash` / commit to allow it)",
+                local,
+                target,
+            )
+        return
+    _apply_self_update(local, target, changed)
+
+
+def _maybe_self_update(poll_result: Any) -> None:
+    """Extract the backend-advertised target commit from a chat-poll response
+    and run the self-update check. Called at idle (timed-out) polls only."""
+    if not isinstance(poll_result, dict):
+        return
+    release = poll_result.get("client_release")
+    target = ""
+    if isinstance(release, dict):
+        target = str(release.get("expected_consumer_commit") or "").strip()
+    if target:
+        _run_self_update(target)
+
+
 # Separate HTTP client for the enclave (self-signed TLS, verify=False).
 _ENCLAVE_CLIENT: httpx.Client | None = (
     httpx.Client(timeout=20, verify=False) if FEEDLING_ENCLAVE_URL else None
@@ -3877,6 +4129,9 @@ def run() -> None:
             consecutive_errors = 0
 
             if result.get("timed_out"):
+                # Idle moment: safe to swap to the backend's commit and re-exec
+                # (no in-flight message to interrupt). Does not return if it updates.
+                _maybe_self_update(result)
                 continue
 
             poll_messages = result.get("messages") or []

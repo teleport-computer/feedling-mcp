@@ -18,6 +18,21 @@ _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
 _CONSUMER_RECENT_SEC = int(os.environ.get("FEEDLING_CONSUMER_RECENT_SEC", "180"))
 
 
+def expected_consumer_commit() -> str:
+    """The git commit a self-hosted resident consumer should be running.
+
+    Advertised to consumers (see chat poll response) so they can self-update to
+    the commit this backend deploys — keeping client and server in lockstep.
+    Operators may pin an explicit value; otherwise we fall back to this
+    backend's own deployed commit (the same ``FEEDLING_GIT_COMMIT`` used by the
+    enclave RELEASE block). Read at call time so it is unit-testable."""
+    return (
+        os.environ.get("FEEDLING_EXPECTED_CONSUMER_COMMIT")
+        or os.environ.get("FEEDLING_GIT_COMMIT")
+        or ""
+    ).strip()
+
+
 def _load_consumer_state(store: UserStore) -> dict:
     try:
         data = db.get_blob(store.user_id, "consumer_state")
