@@ -92,6 +92,7 @@ from hosted import turn as hosted_turn
 from hosted import wake_consumer as hosted_wake_consumer
 import bootstrap as bootstrap_pkg
 import content as content_pkg
+import copytext as copytext_pkg
 import tracking as tracking_pkg
 from admin import data_track as admin_data_track
 from content import routes as content_routes
@@ -444,6 +445,7 @@ chat_pkg.register(app)
 tracking_pkg.register(app)
 admin_pkg.register(app)
 content_pkg.register(app)
+copytext_pkg.register(app)
 hosted_pkg.register(app)
 screen_pkg.register(app)
 from perception import snapshot_for_wake as _perception_wake_snapshot  # noqa: E402
