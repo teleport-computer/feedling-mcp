@@ -77,6 +77,7 @@ if not _provisioned:
     # Pure-unit modules that neither import app nor touch the DB — keep them
     # collectable so a no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        "test_object_storage.py",
         "test_wake_bus.py",
         "test_semantic_analysis.py",
         "test_model_api_wake.py",

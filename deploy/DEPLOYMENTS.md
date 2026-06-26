@@ -57,6 +57,16 @@ Screen perception captioning is opt-in per user via the `screen_caption_enabled`
 1. **Privacy disclosure**: Disclose to users that screen pixels egress to OpenRouter (third-party inference provider) for captioning. Although the backend never holds plaintext pixels (enclave decrypts, captions only), this is a new privacy expansion.
 2. **Data retention policy**: Configure the OpenRouter account to disable prompt logging, model training, and other retention policies. Prefer zero-retention settings or an explicit no-training SLA.
 
+### Screen frame ciphertext offload to R2 (object storage)
+
+The heavy frame ciphertext (`frame_envelopes.doc.body_ct`, >150KB ChaCha20-Poly1305 screenshot blob) is offloaded to Cloudflare R2 (S3-compatible) so it stops bloating Postgres rows/TOAST and backups. PG keeps only the small envelope metadata (`env_meta`) + an R2 pointer (`body_key`); see `backend/object_storage.py` and migration `0006_frame_body_to_r2`.
+
+- **Required secrets** (all four; from Cloudflare → R2 → Manage API Tokens, scoped to the target bucket's object read/write only, NOT account-level): `FEEDLING_R2_ENDPOINT` (`https://<accountid>.r2.cloudflarestorage.com`), `FEEDLING_R2_ACCESS_KEY`, `FEEDLING_R2_SECRET_KEY`, `FEEDLING_R2_BUCKET`. Injected via `phala deploy -e FEEDLING_R2_*=<value>` (encrypted env channel, **not in compose_hash** — same mechanism as `FEEDLING_SCREEN_VLM_API_KEY` / `CF_API_TOKEN`).
+- **Fail-open to legacy**: if the four vars are absent, the backend keeps storing `body_ct` inline in the row (legacy shape) — the feature is gated on config, so a missing/incomplete secret degrades gracefully rather than dropping frames.
+- **Egress**: the non-TEE backend (not the enclave) makes outbound HTTPS to R2 on the frame write/read paths. The enclave is unaffected — it still pulls frame envelopes via the backend's `/v1/screen/frames/<id>/envelope` route, which now transparently reconstructs `body_ct` from R2.
+- **Threat model**: R2 creds live in the TDX CVM; a leak exposes only ciphertext blobs (content_sk is in the enclave/iOS, never the backend) — equivalent to a `DATABASE_URL` leak today.
+- **Migrating existing rows**: run `backend/backfill_frames_to_r2.py` offline against prod `DATABASE_URL` + the R2 creds (`--dry-run` first to count/size). Idempotent + resumable; already-offloaded rows are skipped. The schema migration (`0006`) only adds columns — it does NOT move data.
+
 ### Retired VPS (historical, redacted)
 
 | | |

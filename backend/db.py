@@ -35,6 +35,8 @@ import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+import object_storage  # lowest-layer peer: R2 offload for frame body_ct
+
 log = logging.getLogger("feedling.db")
 
 # ---------------------------------------------------------------------------
@@ -972,13 +974,38 @@ def memory_replace_all(user_id: str, moments: list[dict]) -> None:
 
 
 def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
+    """Persist a v1 frame envelope.
+
+    With R2 configured, the heavy ``body_ct`` is offloaded to object storage and
+    the row keeps only the small envelope metadata (``env_meta``) plus the R2
+    pointer (``body_key``); ``doc`` is NULL. Without R2 — or if the upload fails
+    — the full envelope is stored inline in ``doc`` (legacy shape). The caller's
+    ``doc`` dict is never mutated."""
+    env_meta: dict | None = None
+    body_key: str | None = None
+    store_doc: dict | None = doc
+    if object_storage.enabled() and isinstance(doc, dict) and doc.get("body_ct") is not None:
+        try:
+            body_key = object_storage.put_frame_body(user_id, frame_id, doc["body_ct"])
+            env_meta = {k: v for k, v in doc.items() if k != "body_ct"}
+            store_doc = None
+        except Exception as e:  # noqa: BLE001 — fall back to inline doc, never drop the frame
+            log.error("[db] frame_upsert(%s,%s) R2 upload failed, storing inline: %s",
+                      user_id, frame_id, e)
+            env_meta = None
+            body_key = None
+            store_doc = doc
     try:
         with get_pool().connection() as conn:
             conn.execute(
-                "INSERT INTO frame_envelopes (user_id, frame_id, ts, doc) "
-                "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT (user_id, frame_id) DO UPDATE SET ts = EXCLUDED.ts, doc = EXCLUDED.doc",
-                (user_id, frame_id, float(ts), Jsonb(doc)),
+                "INSERT INTO frame_envelopes (user_id, frame_id, ts, doc, env_meta, body_key) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (user_id, frame_id) DO UPDATE SET ts = EXCLUDED.ts, "
+                "doc = EXCLUDED.doc, env_meta = EXCLUDED.env_meta, body_key = EXCLUDED.body_key",
+                (user_id, frame_id, float(ts),
+                 Jsonb(store_doc) if store_doc is not None else None,
+                 Jsonb(env_meta) if env_meta is not None else None,
+                 body_key),
             )
     except Exception as e:
         log.error("[db] frame_upsert(%s,%s) failed: %s", user_id, frame_id, e)
@@ -1000,16 +1027,33 @@ def frame_exists(user_id: str, frame_id: str) -> bool:
 
 
 def frame_get(user_id: str, frame_id: str) -> dict | None:
+    """Return the full v1 envelope, reconstructing ``body_ct`` from R2 for
+    offloaded rows (``body_key`` set) and returning the inline ``doc`` for
+    legacy rows."""
     try:
         with get_pool().connection() as conn:
             row = conn.execute(
-                "SELECT doc FROM frame_envelopes WHERE user_id = %s AND frame_id = %s",
+                "SELECT doc, env_meta, body_key FROM frame_envelopes "
+                "WHERE user_id = %s AND frame_id = %s",
                 (user_id, frame_id),
             ).fetchone()
-        return row[0] if row is not None else None
     except Exception as e:
         log.error("[db] frame_get(%s,%s) failed: %s", user_id, frame_id, e)
         return None
+    if row is None:
+        return None
+    doc, env_meta, body_key = row
+    if body_key:
+        body_ct = object_storage.get_frame_body(user_id, frame_id)
+        if body_ct is None:
+            # The pointer row exists but its R2 body is missing/unreadable.
+            # Report not-found rather than a metadata-only dict — callers treat
+            # any dict as a valid envelope and would serve an undecryptable frame.
+            log.error("[db] frame_get(%s,%s) R2 body missing for key %s",
+                      user_id, frame_id, body_key)
+            return None
+        return {**(env_meta or {}), "body_ct": body_ct}
+    return doc
 
 
 def frame_delete(user_id: str, frame_id: str) -> None:
@@ -1020,7 +1064,12 @@ def frame_delete(user_id: str, frame_id: str) -> None:
                 (user_id, frame_id),
             )
     except Exception as e:
+        # Row delete failed → the pointer row survives, so leave the R2 body in
+        # place; deleting it now would corrupt later reads of the still-present row.
         log.error("[db] frame_delete(%s,%s) failed: %s", user_id, frame_id, e)
+        return
+    if object_storage.enabled():
+        object_storage.delete_frame_body(user_id, frame_id)
 
 
 def frame_list_meta(user_id: str) -> list[dict]:
@@ -1029,8 +1078,8 @@ def frame_list_meta(user_id: str) -> list[dict]:
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
-                "SELECT frame_id, ts, doc FROM frame_envelopes WHERE user_id = %s "
-                "ORDER BY ts",
+                "SELECT frame_id, ts, COALESCE(env_meta, doc) FROM frame_envelopes "
+                "WHERE user_id = %s ORDER BY ts",
                 (user_id,),
             ).fetchall()
     except Exception as e:
@@ -1074,6 +1123,9 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
                         "DELETE FROM frame_envelopes WHERE user_id = %s AND frame_id = ANY(%s)",
                         (user_id, evicted),
                     )
+        if evicted and object_storage.enabled():
+            for fid in evicted:
+                object_storage.delete_frame_body(user_id, fid)
         return evicted
     except Exception as e:
         log.error("[db] frame_prune_to(%s) failed: %s", user_id, e)
@@ -1219,4 +1271,8 @@ def delete_user_data(user_id: str) -> None:
                 ):
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
     except Exception as e:
+        # Rows survive on failure → keep the R2 bodies so they still resolve.
         log.error("[db] delete_user_data(%s) failed: %s", user_id, e)
+        return
+    if object_storage.enabled():
+        object_storage.delete_user_frames(user_id)

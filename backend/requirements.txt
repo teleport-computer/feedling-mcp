@@ -34,3 +34,10 @@ psycopg[binary,pool]>=3.2
 # request path still talks to Postgres directly via the psycopg pool. The
 # migration engine connects with the psycopg3 driver (postgresql+psycopg://).
 alembic>=1.13
+
+# Cloudflare R2 (S3-compatible) object storage for the heavy frame ciphertext
+# (see backend/object_storage.py). The >150KB body_ct blob is offloaded to R2 so
+# it stops bloating frame_envelopes rows / TOAST; PG keeps only metadata + a
+# pointer. Gated on FEEDLING_R2_* env — absent, the backend keeps storing body_ct
+# inline in the row (legacy shape), so this dep is only exercised in prod.
+boto3>=1.34
