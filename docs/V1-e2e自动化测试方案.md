@@ -19,13 +19,36 @@
 
 逐条断言(只看结构+事实存活+状态):
 
-1. **genesis / onboarding**:seed 一段含已知事实("我叫 Z""狗叫蛋子")的历史 → 跑蒸馏 → 断言 identity 写了(名字非空)+ ≥N memory 卡 + **有卡含该事实** + 能解密读回 + job=done。
-2. **capture 写记忆**:发含"我叫 Z"的消息 →(Codex 自己的 consumer / force capture)→ 断言 **有卡含 Z** + 能读回。
-3. **memory 读**:`index`/`fetch` 返回 seeded 卡;claude driver 下再验 **agent 真走了 index→fetch**(flow-trace)+ 回复含事实。
-4. **route / flow-trace**:消息 → 走 `agent_runtime` + 对应 trace 事件冒出。
-5. **migration 回归**:`c9c5a5e` 后的 legacy→v1(id 稳 + 能解密 + CAS stale + done),纳入回归。
+> ⚠️ **硬约束(最高优先级):绝不影响正常业务代码。** 纯**新增**测试文件(harness/seed)+ 测试 env 旋钮;**backend/consumer 业务逻辑一行不动**。只在 **throwaway 账号 / 隔离环境**跑,不碰真实用户/数据/prod。**若某条断言要改业务码才测得到(如加埋点)→ 不改、降级或标 TODO**,别为测试动业务。
 
-**产出**:① 一条命令跑完的报告(逐条 pass/fail);② harness 提到 **分支 `feat/v1-e2e-suite`**(不直接进 test,留给 hx review 后合);③ 失败项贴断言 + 现象。
+目标:把 **memory 场景尽量测全**(能测多少测多少)。每条只断 **结构 + 事实存活 + 状态**。
+
+**写**
+- **W1 显式稳定事实不静默丢(北极星)**:"我叫 Z""狗叫蛋子" → 有卡含该事实。
+- **W2 dedup / resolve-before-create**:同一事实重复说 → 不重复建卡(桶不膨胀)。
+- **W3 supersede / 纠正**:先"蛋子"后"改名球球" → 旧卡 superseded、新卡 active、内容更新。
+- **W4 不该写不写**:寒暄 / 一次性闲聊 → 不落卡(W1 反例)。
+- **W5 触发**:turn backstop / 安静窗口到 → capture 真 fire。
+- **W6 语言**:中文对话 → 卡字段中文(无 "pets"/"travel"),专名保留。
+
+**读**
+- **R1 相关召回**:问存过的 → index 命中 → fetch → 回复含事实。
+- **R2 没相关不编**:问没存过的 → 不 fetch / 说没找到。
+- **R3 结构**:卡有 bucket/threads(非"未分类"占位)。
+- **R4(claude 路)agent 真走 index→fetch**:flow-trace M1 埋点未做 → **本次降级为只断 index/fetch 端点 + readside 能读到**(不为此改 consumer)。
+
+**生命周期 / 其它**
+- **L1 genesis 蒸馏** → identity + memory(含已知事实、能解密、done)。
+- **L2 migration** legacy→v1(`c9c5a5e`:id 稳 + 能解密 + CAS stale + done)回归。
+- **L3 CAS 并发**不覆盖用户改动。
+- **L4 可见性**:local_only / 敏感卡 agent 读不到。
+- **L5 route** → `agent_runtime` + flow-trace 事件。
+
+**= eval 不是 e2e(标注,不在本次)**:召回相关性质量、voice 像不像、重写顺不顺。
+
+**API 路确认**:顺带确认 test 上 IO 托管 agent_runtime 开没开 + API(model-key)路能否纳入本次(后端共用已覆盖,只差"托管 spawn"那段);开着加一条,没开标 blocked。
+
+**产出**:① 一条命令的报告(逐条 pass/fail/blocked + **Codex 改了哪些设计点、为什么**);② harness 提到 **分支 `feat/v1-e2e-suite`**(不直接进 test,留 hx review 后合);③ 失败/blocked 项贴断言 + 现象。
 
 ---
 
