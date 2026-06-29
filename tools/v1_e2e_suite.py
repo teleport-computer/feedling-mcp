@@ -104,6 +104,21 @@ class Http:
     def put(self, path: str, payload: dict | None = None, *, timeout: int = 30) -> dict:
         return self.request("PUT", path, payload=payload or {}, timeout=timeout)
 
+    def request_status(self, method: str, path: str, *, payload: dict | None = None, timeout: int = 30) -> tuple[int, dict]:
+        url = f"{self.api_url}{path}"
+        resp = requests.request(
+            method,
+            url,
+            headers=self._headers(),
+            json=payload,
+            timeout=timeout,
+        )
+        try:
+            body = resp.json() if resp.text else {}
+        except ValueError:
+            body = {"raw": resp.text[:800]}
+        return resp.status_code, body
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -378,6 +393,45 @@ def case_capture_noop_chitchat(http: Http, consumer) -> CaseResult:
     )
 
 
+def case_capture_dedup_duplicate_fact(http: Http, consumer) -> CaseResult:
+    existing_id = seed_v1_memory(
+        consumer,
+        summary="Z 的狗叫蛋子",
+        content="记忆：Z 养了一只狗，名字叫蛋子，是一只比熊。\n\n上下文：已有事实。\n\n使用提示：重复提到蛋子时不要重复建卡。",
+        bucket="宠物",
+        threads=["蛋子", "比熊"],
+    )
+    before_items = http.post("/v1/memory/index", {"limit": 1000}).get("items") or []
+    before_buckets = http.get("/v1/memory/buckets")
+    before_threads = http.get("/v1/memory/threads")
+    msg_id = post_chat_message(http, consumer, "再说一遍,我的狗叫蛋子,是一只比熊。")
+    require_history_contains(consumer, msg_id=msg_id, needles=["蛋子", "比熊"])
+
+    def stub_agent(_prompt: str):
+        # This verifies the executor/job path does not create a duplicate when
+        # the agent resolves-before-create and decides the old card is enough.
+        return json.dumps({"cards": []}, ensure_ascii=False)
+
+    statuses = run_capture_job_with_stub(http, consumer, stub_agent, use_force=True)
+    after_items = http.post("/v1/memory/index", {"limit": 1000, "query": "蛋子 比熊"}).get("items") or []
+    if len(after_items) != len(before_items):
+        raise SuiteFailure(f"duplicate fact changed memory count before={len(before_items)} after={len(after_items)}")
+    if existing_id not in {str(i.get("id") or "") for i in after_items if isinstance(i, dict)}:
+        raise SuiteFailure(f"existing fact disappeared after duplicate capture existing_id={existing_id}")
+    after_buckets = http.get("/v1/memory/buckets")
+    after_threads = http.get("/v1/memory/threads")
+    if json.dumps(before_buckets, sort_keys=True, ensure_ascii=False) != json.dumps(after_buckets, sort_keys=True, ensure_ascii=False):
+        raise SuiteFailure("duplicate fact changed bucket vocabulary")
+    if json.dumps(before_threads, sort_keys=True, ensure_ascii=False) != json.dumps(after_threads, sort_keys=True, ensure_ascii=False):
+        raise SuiteFailure("duplicate fact changed thread vocabulary")
+    return CaseResult(
+        "capture_dedup_duplicate_fact",
+        "pass",
+        "duplicate explicit fact did not create another card or grow bucket/thread vocabulary; covers W2 executor path",
+        {"existing_id": existing_id, "memory_count": len(after_items), "job_status": statuses},
+    )
+
+
 def case_supersede_correction(http: Http, consumer) -> CaseResult:
     old_id = seed_v1_memory(
         consumer,
@@ -458,6 +512,19 @@ def case_local_only_visibility(http: Http, consumer) -> CaseResult:
         "pass",
         "local_only card is hidden from index and unavailable to fetch; covers L4 local-only path",
         {"memory_id": mid},
+    )
+
+
+def case_no_related_readside_empty(http: Http, consumer) -> CaseResult:
+    index = http.post("/v1/memory/index", {"limit": 1000, "query": "火星旅游签证 从未存过的事情"})
+    items = index.get("items") or []
+    if items:
+        raise SuiteFailure(f"empty throwaway user returned unrelated memories: {_pretty(index)}")
+    return CaseResult(
+        "no_related_readside_empty",
+        "pass",
+        "empty throwaway user returns no index items for an unknown fact; covers R2 readside empty path",
+        {"index_count": 0},
     )
 
 
@@ -652,7 +719,12 @@ def case_genesis(api_url: str) -> CaseResult:
     provider = os.environ.get("GENESIS_E2E_PROVIDER", "deepseek")
     model = os.environ.get("GENESIS_E2E_MODEL", "deepseek-chat")
     base_url = os.environ.get("GENESIS_E2E_BASE_URL", "")
-    transcript = "me: 我叫 Z, 是 INFJ, 我家狗叫蛋子, 是一只比熊。\nher: 蛋子今天乖吗？\nme: 上周我们去了西湖骑车。\n"
+    transcript = (
+        "me: 我叫 Z, 是 INFJ, 我家狗叫蛋子, 是一只比熊。\n"
+        "her: 我是乔伊, ENFP, 广告设计师, 平时自己做自媒体, 也喜欢小狗。\n"
+        "her: 蛋子今天乖吗？\n"
+        "me: 上周我们去了西湖骑车。\n"
+    )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
         f.write(transcript)
         transcript_path = f.name
@@ -701,14 +773,75 @@ def case_genesis(api_url: str) -> CaseResult:
         idx = http.post("/v1/memory/index", {"limit": 1000, "query": "Z 蛋子 西湖"})
         ident = http.get("/v1/identity/get")
         assert_text_contains(idx, ["蛋子"], context="genesis memory index")
+        memory_count = len(idx.get("items") or [])
         if not ident.get("identity"):
-            raise SuiteFailure(f"identity missing after genesis: {_pretty(ident)}")
-        return CaseResult("genesis_onboarding", "pass", "genesis job done; identity and memory are readable", {"job_id": job_id, "memory_count": len(idx.get("items") or [])})
+            raise SuiteFailure(f"identity missing after genesis; memory_count={memory_count}; identity={_pretty(ident)}")
+        return CaseResult("genesis_onboarding", "pass", "genesis job done; identity and memory are readable", {"job_id": job_id, "memory_count": memory_count})
     finally:
         try:
             Path(transcript_path).unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def case_hosted_agent_runtime(api_url: str) -> CaseResult:
+    provider_key = os.environ.get("GENESIS_E2E_PROVIDER_API_KEY", "").strip()
+    if not provider_key:
+        return CaseResult("hosted_agent_runtime_smoke", "blocked", "GENESIS_E2E_PROVIDER_API_KEY is not set; hosted model_api setup skipped")
+    provider = os.environ.get("GENESIS_E2E_PROVIDER", "deepseek")
+    model = os.environ.get("GENESIS_E2E_MODEL", "deepseek-chat")
+    base_url = os.environ.get("GENESIS_E2E_BASE_URL", "")
+    _user_id, api_key = register_user(api_url)
+    http = Http(api_url, api_key)
+    setup_payload = {"provider": provider, "model": model, "api_key": provider_key}
+    if base_url:
+        setup_payload["base_url"] = base_url
+    setup_status, setup = http.request_status("POST", "/v1/model_api/setup", payload=setup_payload, timeout=90)
+    if setup_status >= 400:
+        return CaseResult(
+            "hosted_agent_runtime_smoke",
+            "blocked",
+            "model_api setup did not complete; hosted spawn smoke skipped",
+            {"status_code": setup_status, "error": setup.get("error", ""), "detail": str(setup.get("detail", ""))[:240]},
+        )
+    runtime = http.get("/v1/model_api/runtime")
+    if not runtime.get("configured"):
+        return CaseResult("hosted_agent_runtime_smoke", "blocked", "model_api runtime is not configured after setup", {"runtime": runtime})
+    send_status, send = http.request_status(
+        "POST",
+        "/v1/model_api/chat/send",
+        payload={"message": "v1 e2e hosted runtime smoke：请简短回复 pong。"},
+        timeout=180,
+    )
+    if send_status == 503 and send.get("error") == "hosting_runtime_unavailable":
+        return CaseResult(
+            "hosted_agent_runtime_smoke",
+            "blocked",
+            "hosted agent_runtime supervisor is not live on test",
+            {"status_code": send_status, "reason": send.get("reason", "")},
+        )
+    if send_status >= 400:
+        return CaseResult(
+            "hosted_agent_runtime_smoke",
+            "blocked",
+            "hosted chat/send did not complete",
+            {"status_code": send_status, "error": send.get("error", ""), "reason": send.get("reason", "")},
+        )
+    route = http.get("/v1/debug/trace?subsystem=route&limit=20")
+    events = route.get("events") or []
+    return CaseResult(
+        "hosted_agent_runtime_smoke",
+        "pass",
+        "model_api setup and hosted agent_runtime chat/send returned successfully",
+        {
+            "runtime_mode": runtime.get("runtime_mode", ""),
+            "runtime_version": runtime.get("runtime_version", ""),
+            "provider": runtime.get("provider", ""),
+            "model": runtime.get("model", ""),
+            "route_events": len(events),
+            "response_keys": sorted([k for k in send.keys() if k not in {"reply", "message", "content"}]),
+        },
+    )
 
 
 def run_case(results: list[CaseResult], name: str, fn) -> None:
@@ -742,9 +875,9 @@ def coverage_matrix(results: list[CaseResult]) -> dict[str, dict[str, Any]]:
             "note": "用户明说名字/INFJ/狗名/犬种, capture 后 index/fetch 可读。",
         },
         "W2_dedup_resolve_before_create": {
-            "status": "todo",
-            "case": "",
-            "note": "真正的 dedup 取决于 agent 对已有卡的判断; deterministic stub 只能伪造不重复,不能证明真实 prompt 行为。",
+            "status": status_for("capture_dedup_duplicate_fact"),
+            "case": "capture_dedup_duplicate_fact",
+            "note": "已有卡存在时,重复事实经 resolve/noop 不新增卡、不膨胀桶/线;真实 agent 判断仍需 eval。",
         },
         "W3_supersede_correction": {
             "status": status_for("capture_supersede_correction"),
@@ -772,9 +905,9 @@ def coverage_matrix(results: list[CaseResult]) -> dict[str, dict[str, Any]]:
             "note": "seeded v1 卡经 index 命中、fetch 解密读回。",
         },
         "R2_no_related_no_hallucination": {
-            "status": "degraded",
-            "case": "",
-            "note": "index 设计是宽召回,没有真实 agent 回复/trace 时不能证明'不编';留给 eval/agent trace。",
+            "status": status_for("no_related_readside_empty"),
+            "case": "no_related_readside_empty",
+            "note": "空 throwaway 用户查询未存事实,index 为空;真实 agent 回复不编仍留给 eval/agent trace。",
         },
         "R3_bucket_threads_structure": {
             "status": status_for("memory_read_index_fetch"),
@@ -811,6 +944,11 @@ def coverage_matrix(results: list[CaseResult]) -> dict[str, dict[str, Any]]:
             "case": "flow_trace_route",
             "note": "resident chat/message 产生 route trace 事件。",
         },
+        "API_hosted_agent_runtime": {
+            "status": status_for("hosted_agent_runtime_smoke"),
+            "case": "hosted_agent_runtime_smoke",
+            "note": "若 provider key 可用,尝试 model_api setup + hosted chat/send;否则 blocked。",
+        },
     }
 
 
@@ -832,7 +970,7 @@ def main() -> int:
         "agent index→fetch behavior is downgraded to endpoint/readside coverage; no reliable consumer agent_call trace exists yet.",
         "capture/migration use deterministic call_agent stubs; this suite tests backend/encryption/state, not LLM wording quality.",
         "resident capture requires a direct enclave decrypt URL; test-api itself returns opaque chat envelopes.",
-        "genesis is blocked unless GENESIS_E2E_PROVIDER_API_KEY is present.",
+        "genesis runs when GENESIS_E2E_PROVIDER_API_KEY is present; otherwise it is reported as blocked.",
     ]
 
     consumer = None
@@ -848,14 +986,17 @@ def main() -> int:
 
     if consumer is not None:
         run_case(results, "memory_read_index_fetch", lambda: case_memory_read(new_context(args.api_url, enclave_url, consumer)[1], consumer))
+        run_case(results, "no_related_readside_empty", lambda: case_no_related_readside_empty(new_context(args.api_url, enclave_url, consumer)[1], consumer))
         run_case(results, "capture_write_memory", lambda: case_capture_write(new_context(args.api_url, enclave_url, consumer)[1], consumer))
         run_case(results, "capture_noop_chitchat", lambda: case_capture_noop_chitchat(new_context(args.api_url, enclave_url, consumer)[1], consumer))
+        run_case(results, "capture_dedup_duplicate_fact", lambda: case_capture_dedup_duplicate_fact(new_context(args.api_url, enclave_url, consumer)[1], consumer))
         run_case(results, "capture_supersede_correction", lambda: case_supersede_correction(new_context(args.api_url, enclave_url, consumer)[1], consumer))
         run_case(results, "local_only_visibility", lambda: case_local_only_visibility(new_context(args.api_url, enclave_url, consumer)[1], consumer))
         run_case(results, "flow_trace_route", lambda: case_flow_trace(new_context(args.api_url, enclave_url, consumer)[1], consumer))
         run_case(results, "legacy_migration", lambda: case_migration(new_context(args.api_url, enclave_url, consumer)[1], consumer))
 
     run_case(results, "genesis_onboarding", lambda: case_genesis(args.api_url))
+    run_case(results, "hosted_agent_runtime_smoke", lambda: case_hosted_agent_runtime(args.api_url))
 
     counts: dict[str, int] = {}
     for result in results:
