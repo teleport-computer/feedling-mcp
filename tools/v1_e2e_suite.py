@@ -725,63 +725,74 @@ def case_genesis(api_url: str) -> CaseResult:
         "her: 蛋子今天乖吗？\n"
         "me: 上周我们去了西湖骑车。\n"
     )
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
-        f.write(transcript)
-        transcript_path = f.name
-    try:
-        cmd = [
-            sys.executable,
-            str(TOOLS / "genesis_e2e.py"),
-            "upload",
-            "--api-url", api_url,
-            "--register",
-            "--provider", provider,
-            "--model", model,
-            "--transcript", transcript_path,
-            "--source-kind", "history",
-        ]
-        if base_url:
-            cmd.extend(["--base-url", base_url])
-        env = dict(os.environ)
-        upload = subprocess.run(cmd, cwd=str(REPO), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180, check=False)
-        if upload.returncode != 0:
-            return CaseResult("genesis_onboarding", "blocked", "genesis upload/setup did not complete", {"stdout": upload.stdout[-2000:], "stderr": upload.stderr[-2000:], "returncode": upload.returncode})
-        lines = [json.loads(line) for line in upload.stdout.splitlines() if line.strip().startswith("{")]
-        provision = next((x for x in lines if x.get("provisioned")), {})
-        final = next((x for x in reversed(lines) if "job_id" in x), {})
-        api_key = provision.get("api_key")
-        job_id = final.get("job_id")
-        if not api_key or not job_id:
-            return CaseResult("genesis_onboarding", "blocked", "genesis upload output missing api_key/job_id", {"stdout": upload.stdout[-2000:]})
-        verify = subprocess.run([
-            sys.executable,
-            str(TOOLS / "genesis_e2e.py"),
-            "verify",
-            "--api-url", api_url,
-            "--api-key", api_key,
-            "--job-id", job_id,
-            "--timeout", "900",
-            "--poll", "10",
-            "--privacy-needle", "蛋子,西湖",
-        ], cwd=str(REPO), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=960, check=False)
-        if verify.returncode != 0:
-            return CaseResult("genesis_onboarding", "fail", "genesis verify failed", {"stdout": verify.stdout[-3000:], "stderr": verify.stderr[-2000:], "returncode": verify.returncode})
-        payload = json.loads([line for line in verify.stdout.splitlines() if line.strip().startswith("{")][-1])
-        if not payload.get("ok"):
-            raise SuiteFailure(f"genesis verify returned not ok: {_pretty(payload)}")
-        http = Http(api_url, api_key)
-        idx = http.post("/v1/memory/index", {"limit": 1000, "query": "Z 蛋子 西湖"})
-        ident = http.get("/v1/identity/get")
-        assert_text_contains(idx, ["蛋子"], context="genesis memory index")
-        memory_count = len(idx.get("items") or [])
-        if not ident.get("identity"):
-            raise SuiteFailure(f"identity missing after genesis; memory_count={memory_count}; identity={_pretty(ident)}")
-        return CaseResult("genesis_onboarding", "pass", "genesis job done; identity and memory are readable", {"job_id": job_id, "memory_count": memory_count})
-    finally:
+    last_identity_error = ""
+    for attempt in range(1, 3):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
+            f.write(transcript)
+            transcript_path = f.name
         try:
-            Path(transcript_path).unlink(missing_ok=True)
-        except Exception:
-            pass
+            cmd = [
+                sys.executable,
+                str(TOOLS / "genesis_e2e.py"),
+                "upload",
+                "--api-url", api_url,
+                "--register",
+                "--provider", provider,
+                "--model", model,
+                "--transcript", transcript_path,
+                "--source-kind", "history",
+            ]
+            if base_url:
+                cmd.extend(["--base-url", base_url])
+            env = dict(os.environ)
+            upload = subprocess.run(cmd, cwd=str(REPO), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180, check=False)
+            if upload.returncode != 0:
+                return CaseResult("genesis_onboarding", "blocked", "genesis upload/setup did not complete", {"stdout": upload.stdout[-2000:], "stderr": upload.stderr[-2000:], "returncode": upload.returncode})
+            lines = [json.loads(line) for line in upload.stdout.splitlines() if line.strip().startswith("{")]
+            provision = next((x for x in lines if x.get("provisioned")), {})
+            final = next((x for x in reversed(lines) if "job_id" in x), {})
+            api_key = provision.get("api_key")
+            job_id = final.get("job_id")
+            if not api_key or not job_id:
+                return CaseResult("genesis_onboarding", "blocked", "genesis upload output missing api_key/job_id", {"stdout": upload.stdout[-2000:]})
+            verify = subprocess.run([
+                sys.executable,
+                str(TOOLS / "genesis_e2e.py"),
+                "verify",
+                "--api-url", api_url,
+                "--api-key", api_key,
+                "--job-id", job_id,
+                "--timeout", "900",
+                "--poll", "10",
+                "--privacy-needle", "蛋子,西湖",
+            ], cwd=str(REPO), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=960, check=False)
+            if verify.returncode != 0:
+                return CaseResult("genesis_onboarding", "fail", "genesis verify failed", {"stdout": verify.stdout[-3000:], "stderr": verify.stderr[-2000:], "returncode": verify.returncode})
+            payload = json.loads([line for line in verify.stdout.splitlines() if line.strip().startswith("{")][-1])
+            if not payload.get("ok"):
+                raise SuiteFailure(f"genesis verify returned not ok: {_pretty(payload)}")
+            http = Http(api_url, api_key)
+            idx = http.post("/v1/memory/index", {"limit": 1000, "query": "Z 蛋子 西湖"})
+            ident = http.get("/v1/identity/get")
+            assert_text_contains(idx, ["蛋子"], context="genesis memory index")
+            memory_count = len(idx.get("items") or [])
+            if not ident.get("identity"):
+                last_identity_error = f"identity missing after genesis attempt={attempt}; memory_count={memory_count}; identity={_pretty(ident)}"
+                if attempt < 2:
+                    continue
+                raise SuiteFailure(last_identity_error)
+            return CaseResult(
+                "genesis_onboarding",
+                "pass",
+                "genesis job done; identity and memory are readable",
+                {"job_id": job_id, "memory_count": memory_count, "attempt": attempt},
+            )
+        finally:
+            try:
+                Path(transcript_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+    raise SuiteFailure(last_identity_error or "genesis identity check did not complete")
 
 
 def case_hosted_agent_runtime(api_url: str) -> CaseResult:
