@@ -157,20 +157,82 @@ def evaluate_supervisor_heartbeat(
     return (True, "")
 
 
+def evaluate_supervisor_instances(
+    instances: list[dict] | None, *, now: float, max_age: float, require_gateway: bool = True
+) -> tuple[bool, str]:
+    """Aggregate verdict across the per-owner heartbeat rows of a runner cluster.
+
+    The cluster is live iff AT LEAST ONE fresh runner is actually hosting
+    (``host_all``, plus ``gateway`` when ``require_gateway``). Capacity is NOT
+    considered here: a runner at ``max_children`` still proves the cluster is up —
+    the message simply parks in the DB until a runner with room polls it, so
+    gating sends on capacity would wrongly 503 a healthy cluster.
+
+    When no instance is live, the reported reason is taken from the freshest row
+    so the operator sees the most current cluster state (e.g. gateway just turned
+    off) rather than an arbitrary stale one. Reuses the single-heartbeat verdict
+    per row."""
+    if not instances:
+        return (False, "no_supervisor_heartbeat")
+    not_live: list[tuple[dict, str]] = []
+    for hb in instances:
+        live, reason = evaluate_supervisor_heartbeat(
+            hb, now=now, max_age=max_age, require_gateway=require_gateway)
+        if live:
+            return (True, "")
+        not_live.append((hb, reason))
+
+    def _ts(hb: dict) -> float:
+        try:
+            return float(hb.get("ts") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    freshest = max(not_live, key=lambda pair: _ts(pair[0]))
+    return (False, freshest[1])
+
+
+def _instance_is_fresh(hb: dict, *, now: float, max_age: float) -> bool:
+    """Whether a per-owner heartbeat row is recent enough to be authoritative."""
+    try:
+        ts = float(hb.get("ts") or 0)
+    except (TypeError, ValueError):
+        return False
+    return ts > 0 and (now - ts) <= max_age
+
+
 def check_supervisor_live(*, require_gateway: bool = True, now: float | None = None) -> tuple[bool, str]:
-    """Read the supervisor heartbeat and evaluate it. Fail-OPEN on a DB error —
-    the guard must never become a new outage vector; only a heartbeat that is
-    present-and-not-live (or definitively absent) blocks a send.
+    """Evaluate whether any runner is hosting. Prefers the per-owner multi-instance
+    heartbeats (multiple runners don't clobber each other); falls back to the
+    legacy single-key heartbeat when the new table has no FRESH row — i.e. it is
+    empty (pre-migration) OR holds only stale rows from dead/rolled-back runners,
+    so an old supervisor still writing the legacy key is honoured. Fail-OPEN on a
+    legacy-read DB error — the guard must never become a new outage vector; only a
+    heartbeat that is present-and-not-live (or definitively absent) blocks a send.
+
+    A FRESH instance row IS authoritative even when it reports not-hosting (e.g.
+    host_all off): that's the real cluster state, so we do not fall back then.
 
     Pass ``require_gateway=False`` for providers that do not route through the
     in-CVM LiteLLM gateway so they are not blocked by a gateway-off heartbeat."""
     now = time.time() if now is None else now
+    max_age = _heartbeat_max_age()
+    try:
+        instances = db.list_supervisor_instance_heartbeats()
+    except Exception as e:  # noqa: BLE001 — new table unreadable → try legacy key
+        log.warning("supervisor instance heartbeats read failed; trying legacy key: %s", e)
+        instances = []
+    if any(_instance_is_fresh(hb, now=now, max_age=max_age) for hb in instances):
+        return evaluate_supervisor_instances(
+            instances, now=now, max_age=max_age, require_gateway=require_gateway)
+    # No FRESH multi-instance row (empty, or only stale orphan rows): fall back to
+    # the legacy single-key heartbeat a transitional/rolled-back runner may write.
     try:
         hb = db.read_supervisor_heartbeat()
     except Exception as e:  # noqa: BLE001 — DB hiccup → don't block sends
         log.warning("supervisor heartbeat read failed; routing send anyway (fail-open): %s", e)
         return (True, "")
-    return evaluate_supervisor_heartbeat(hb, now=now, max_age=_heartbeat_max_age(), require_gateway=require_gateway)
+    return evaluate_supervisor_heartbeat(hb, now=now, max_age=max_age, require_gateway=require_gateway)
 
 
 def _is_assistant(row: dict) -> bool:

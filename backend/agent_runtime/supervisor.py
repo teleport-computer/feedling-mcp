@@ -91,6 +91,7 @@ class Supervisor:
         enclave_url: str | None = None,
         introduction_enqueuer=None,
         max_spawns_per_tick: int = 0,
+        max_children: int = 0,
     ) -> None:
         self.owner = owner
         self.lease_ttl = lease_ttl
@@ -106,6 +107,10 @@ class Supervisor:
         # unlimited, legacy behaviour). Spreads a many-user cold start across
         # ticks so the CVM isn't hit by dozens of simultaneous process forks.
         self.max_spawns_per_tick = int(max_spawns_per_tick or 0)
+        # Steady-state per-runner capacity ceiling (0 = unlimited). Unlike the
+        # per-tick spawn RATE cap above, this bounds the TOTAL live children so one
+        # runner doesn't grab every user — the rest get acquired by other runners.
+        self.max_children = int(max_children or 0)
         self._now = now
         self.children: dict[str, dict] = {}  # user_id -> {pid, entry, home}
         # Guards self.children against concurrent mutation by the main tick
@@ -142,10 +147,16 @@ class Supervisor:
         except Exception as e:  # noqa: BLE001 — introduction is best-effort, spawn must continue
             log.warning("introduction enqueue failed for %s: %s", user_id, e)
 
-    def tick(self, roster: list[dict]) -> None:
+    def tick(self, roster: list[dict], *, pre_spawn=None) -> None:
         """One supervision pass: heartbeat live children, reap dead ones, drop
         children whose user left the roster, and acquire+spawn for any user we
-        don't already run."""
+        don't already run.
+
+        ``pre_spawn(new_user_ids)`` (optional) is invoked ONCE after all of this
+        tick's new leases are acquired but BEFORE any new consumer is spawned, so a
+        side-channel a consumer needs at startup (e.g. its LiteLLM ``gw-<uid>``
+        gateway route) can be configured first. It is best-effort — a failure logs
+        and the spawns still proceed."""
         # Reap children whose user is no longer in the (re-derived) roster — e.g.
         # a user who disabled hosting. Kill + release so disable takes effect this
         # tick rather than lingering until lease expiry.
@@ -161,6 +172,7 @@ class Supervisor:
                     self.children.pop(user_id, None)
 
         spawned_this_tick = 0
+        newly_acquired: list[tuple[str, dict, str]] = []  # (user_id, entry, home)
         for entry in roster:
             user_id = str(entry.get("user_id") or "")
             if not user_id:
@@ -215,6 +227,15 @@ class Supervisor:
                 # (no genesis) and done/failed both fall through to spawn.
                 log.info("genesis in progress for %s; deferring spawn this tick", user_id)
                 continue
+            with self._lock:
+                # Count this tick's not-yet-spawned acquisitions toward the cap so
+                # a single tick can't blow past max_children before they're tracked.
+                at_capacity = (self.max_children
+                               and len(self.children) + len(newly_acquired) >= self.max_children)
+            if at_capacity:
+                # At capacity: don't acquire a new user — leave it for another runner.
+                # Existing children above were already renewed, never force-reaped.
+                continue
             if self.max_spawns_per_tick and spawned_this_tick >= self.max_spawns_per_tick:
                 # Per-tick spawn cap reached — spawn the remaining users next tick
                 # (don't even acquire, so another supervisor could take them).
@@ -224,8 +245,24 @@ class Supervisor:
                                   runtime_home=home, lease_owner=self.owner,
                                   ttl=self.lease_ttl, now=self._now()):
                 continue  # another supervisor holds a live lease
-            pid = self.spawn_fn(entry, user_id, home)
+            # Acquired — defer the spawn so the gateway route can be configured for
+            # the whole batch first (route-before-spawn; avoids a queued first turn
+            # hitting a missing gw-<uid> route).
             spawned_this_tick += 1
+            newly_acquired.append((user_id, entry, home))
+
+        # Configure any side-channel the new consumers need at startup (gateway
+        # routes) for the now-owned batch BEFORE starting them. Lease-scoped: only
+        # users we just acquired this tick. Best-effort — a blip must not strand
+        # the spawn; the post-tick reconcile still converges.
+        if newly_acquired and pre_spawn is not None:
+            try:
+                pre_spawn([uid for uid, _, _ in newly_acquired])
+            except Exception as e:  # noqa: BLE001
+                log.warning("pre-spawn reconcile failed; spawning anyway: %s", e)
+
+        for user_id, entry, home in newly_acquired:
+            pid = self.spawn_fn(entry, user_id, home)
             self._write_token(user_id, home)  # initial short-lived token for the child
             leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
                          status="running", now=self._now())
@@ -841,6 +878,23 @@ def _gateway_entries(roster: list[dict]) -> list[dict]:
     return out
 
 
+def _owned_gateway_entries(gateway_entries: list[dict], owned) -> list[dict]:
+    """Scope the gateway routing entries to ONLY users this runner currently holds
+    a lease/child for, so a user owned by another runner never enters this runner's
+    LiteLLM config (multi-node: provider keys don't fan out to every runner).
+
+    ``owned`` is the set of owned user_ids (or the children mapping, whose keys are
+    those ids). Callers should pass a SNAPSHOT taken under ``Supervisor._lock`` —
+    the renew thread mutates the live children dict concurrently.
+
+    Each entry's key is taken AS-IS from ``gateway_entries`` (built from the freshly
+    resolved roster this tick), NOT from the stored child entry — so an upstream
+    key rotation reaches LiteLLM on the next tick even though it deliberately does
+    not respawn the consumer (``_spawn_identity`` excludes the gateway key)."""
+    owned_ids = set(owned)
+    return [g for g in gateway_entries if g.get("user_id") in owned_ids]
+
+
 def _drop_gateway_users(roster: list[dict]) -> list[dict]:
     """Remove codex users that would need the LiteLLM gateway — used when the
     gateway is DISABLED. Without a running proxy, spawning them as gateway codex
@@ -948,10 +1002,26 @@ def _supervisor_heartbeat_payload(owner: str, *, host_all: bool, gateway: bool, 
             "host_all": bool(host_all), "gateway": bool(gateway)}
 
 
+def _supervisor_instance_payload(owner: str, *, host: str | None, host_all: bool,
+                                 gateway: bool, active_children: int, max_children: int,
+                                 shard_index: int, shard_count: int, version: str | None,
+                                 ts: float) -> dict:
+    """Rich per-owner heartbeat row (migration 0009). Beyond the legacy payload's
+    host_all/gateway, it carries this runner's live capacity (active vs max
+    children) and shard config, so multiple runners report independently and the
+    backend can aggregate without one clobbering another."""
+    return {"ts": float(ts), "owner": str(owner), "host": host,
+            "host_all": bool(host_all), "gateway": bool(gateway),
+            "active_children": int(active_children), "max_children": int(max_children),
+            "shard_index": int(shard_index), "shard_count": int(shard_count),
+            "version": version}
+
+
 def _heartbeat_loop(*, owner: str, host_all: bool, gateway: bool,
-                    interval: float, stop_event) -> None:
-    """Write the global supervisor heartbeat on a fixed cadence from a dedicated
-    thread, decoupled from the (potentially slow) discover→resolve→spawn loop.
+                    interval: float, stop_event, instance_payload_fn=None,
+                    prune_max_age_sec: float | None = None) -> None:
+    """Write the supervisor heartbeat on a fixed cadence from a dedicated thread,
+    decoupled from the (potentially slow) discover→resolve→spawn loop.
 
     The backend's wedge guard reads this heartbeat to confirm a supervisor is
     hosting before routing a send. During a cold start of many users, the main
@@ -959,11 +1029,27 @@ def _heartbeat_loop(*, owner: str, host_all: bool, gateway: bool,
     in a single pass; if the heartbeat were written inline at the top of that loop
     it would lag with it and the guard would wrongly 503 every send. Writing it
     from here keeps it fresh regardless of how long supervision takes. Best-effort
-    — a write blip must never kill the thread (else one DB blip wedges sends)."""
+    — a write blip must never kill the thread (else one DB blip wedges sends).
+
+    Writes the per-owner multi-instance row (via ``instance_payload_fn(ts)``, which
+    closes over the live supervisor so active_children is current) AND, as a
+    transitional fallback, the legacy single global key. Each is independently
+    guarded so one failing never starves the other or kills the thread."""
     while not stop_event.is_set():
+        ts = time.time()
+        if instance_payload_fn is not None:
+            try:
+                db.set_supervisor_instance_heartbeat(owner, instance_payload_fn(ts))
+            except Exception as e:  # noqa: BLE001
+                log.warning("supervisor instance heartbeat write failed: %s", e)
+            if prune_max_age_sec is not None:
+                try:
+                    db.prune_supervisor_instance_heartbeats(prune_max_age_sec)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("supervisor instance heartbeat prune failed: %s", e)
         try:
             db.set_supervisor_heartbeat(_supervisor_heartbeat_payload(
-                owner, host_all=host_all, gateway=gateway, ts=time.time()))
+                owner, host_all=host_all, gateway=gateway, ts=ts))
         except Exception as e:  # noqa: BLE001
             log.warning("supervisor heartbeat write failed: %s", e)
         stop_event.wait(interval)
@@ -1003,6 +1089,11 @@ def main() -> int:
     # Spread a many-user cold start across ticks (default 8/tick) instead of
     # forking dozens of consumers in one pass. Set 0 to restore unlimited.
     max_spawns_per_tick = int(os.environ.get("AGENT_MAX_SPAWNS_PER_TICK", "8"))
+    # Steady-state per-runner capacity ceiling (0 = unlimited). Multi-node: with
+    # several runners scanning the same host-all set, this bounds how many users a
+    # single runner takes so the rest get acquired elsewhere. Distinct from the
+    # per-tick spawn rate above.
+    max_children = int(os.environ.get("AGENT_MAX_CHILDREN", "0"))
     data_root = os.environ.get("AGENT_DATA_ROOT", "/agent-data")
     isolation = os.environ.get("AGENT_RUNTIME_ISOLATION", "process").strip().lower()
 
@@ -1071,9 +1162,10 @@ def main() -> int:
         owner=owner, lease_ttl=lease_ttl, data_root=data_root,
         spawn_fn=spawn_fn, alive_fn=alive_fn, kill_fn=kill_fn,
         token_writer=token_writer, max_spawns_per_tick=max_spawns_per_tick,
+        max_children=max_children,
     )
-    log.info("supervisor up — owner=%s base_users=%d autodiscover=%s host_all=%s gateway=%s ttl=%.0fs",
-             owner, len(base_roster), autodiscover, host_all_active, gateway_enabled, lease_ttl)
+    log.info("supervisor up — owner=%s base_users=%d autodiscover=%s host_all=%s gateway=%s ttl=%.0fs max_children=%d",
+             owner, len(base_roster), autodiscover, host_all_active, gateway_enabled, lease_ttl, max_children)
 
     # Genesis CVM worker — runs in its own daemon thread (never inline in the tick
     # loop). Default OFF; activates only when FEEDLING_GENESIS_WORKER_ENABLED is set
@@ -1108,11 +1200,27 @@ def main() -> int:
     # stall the wedge-guard heartbeat (else the backend 503s every send). Capped
     # well under the wedge's ~90s staleness threshold.
     hb_stop = threading.Event()
+
+    def _instance_payload(ts):
+        # Closes over `sup` so active_children is read live each beat (under the
+        # children lock). shard defaults (0/1) until sharding is wired.
+        with sup._lock:
+            active = len(sup.children)
+        return _supervisor_instance_payload(
+            owner, host=socket.gethostname(), host_all=host_all_active,
+            gateway=gateway_enabled, active_children=active,
+            max_children=sup.max_children, shard_index=0, shard_count=1,
+            version=None, ts=ts)
+
     threading.Thread(
         target=_heartbeat_loop, daemon=True,
         kwargs={"owner": owner, "host_all": host_all_active,
                 "gateway": gateway_enabled, "interval": min(interval, 15.0),
-                "stop_event": hb_stop},
+                "stop_event": hb_stop, "instance_payload_fn": _instance_payload,
+                # Drop rows from dead runners (each restart is a new hostname:pid
+                # owner). Generous so a briefly-paused runner isn't pruned mid-life.
+                "prune_max_age_sec": float(os.environ.get(
+                    "AGENT_SUPERVISOR_HEARTBEAT_PRUNE_SEC", "3600"))},
     ).start()
 
     # Lease renewal from its own thread, on the same cadence — decoupled from the
@@ -1145,9 +1253,26 @@ def main() -> int:
                 # gate 4 C. No kill, no in-place prompt rewrite.
                 for _entry in roster:
                     _entry["persona_version"] = _persona_version(_entry.get("user_id", ""))
-                if gateway_mgr is not None:
-                    gateway_mgr.reconcile(gateways)
-                sup.tick(roster)
+                # Lease-scoped gateway, race-free across spawn: configure the
+                # gw-<uid> routes for users acquired THIS tick BEFORE their consumers
+                # start (pre_spawn), then converge AFTER tick to drop routes for
+                # users that left/were reaped. Both passes only ever include users
+                # this runner owns, so another runner's key never enters our config
+                # (multi-node key isolation). ``gateways`` carries this tick's
+                # freshly-resolved upstream keys, so a key rotation still reaches
+                # LiteLLM even though it deliberately doesn't respawn the consumer.
+                # owned ids are snapshotted under the lock — the renew thread mutates
+                # sup.children concurrently (iterating it live could raise
+                # "dictionary changed size during iteration" and abort the tick).
+                def _reconcile_gateway(extra_ids=()):
+                    if gateway_mgr is None:
+                        return
+                    with sup._lock:
+                        owned_ids = set(sup.children) | set(extra_ids)
+                    gateway_mgr.reconcile(_owned_gateway_entries(gateways, owned_ids))
+
+                sup.tick(roster, pre_spawn=_reconcile_gateway)
+                _reconcile_gateway()
                 # Gate 4 B-3: after the spawn reconcile, top up voice for no-blob users
                 # (bounded + cooldown'd so it never blocks the tick). Off by default.
                 if _lazy_persona_backfill_enabled():

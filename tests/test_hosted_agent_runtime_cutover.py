@@ -277,6 +277,9 @@ def test_evaluate_heartbeat_missing_ts_is_not_live():
 
 
 def test_check_supervisor_live_fails_open_on_db_error(monkeypatch):
+    # No multi-instance rows → legacy path; a legacy read error must fail-open.
+    monkeypatch.setattr(cutover.db, "list_supervisor_instance_heartbeats",
+                        lambda: [], raising=False)
     def boom():
         raise RuntimeError("pg down")
     monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat", boom)
@@ -284,9 +287,128 @@ def test_check_supervisor_live_fails_open_on_db_error(monkeypatch):
 
 
 def test_check_supervisor_live_reads_db_and_evaluates(monkeypatch):
+    # Empty multi-instance table → fall back to the legacy single-key heartbeat.
+    monkeypatch.setattr(cutover.db, "list_supervisor_instance_heartbeats",
+                        lambda: [], raising=False)
     monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat",
                         lambda: {"ts": 999.0, "host_all": True, "gateway": True})
     assert cutover.check_supervisor_live(now=1000.0)[0] is True
     monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat", lambda: None)
     ok, reason = cutover.check_supervisor_live(now=1000.0)
     assert ok is False and reason == "no_supervisor_heartbeat"
+
+
+# ---- multi-instance (per-owner) heartbeat aggregate verdict ----
+# Multiple runners each write their own per-owner heartbeat row (no mutual
+# clobber like the legacy single key). The cluster is "live" iff at least one
+# fresh runner is hosting (host_all, + gateway when required). The backend does
+# NOT gate on capacity — a full runner still means the cluster is up; the message
+# parks in the DB until a runner with room polls it.
+
+def test_evaluate_instances_empty_is_not_live():
+    ok, reason = cutover.evaluate_supervisor_instances([], now=1000.0, max_age=90)
+    assert ok is False and reason == "no_supervisor_heartbeat"
+
+
+def test_evaluate_instances_one_fresh_live_is_live():
+    insts = [{"ts": 1000.0, "owner": "h:1", "host_all": True, "gateway": True}]
+    assert cutover.evaluate_supervisor_instances(insts, now=1010.0, max_age=90) == (True, "")
+
+
+def test_evaluate_instances_one_stale_one_live_is_live():
+    insts = [
+        {"ts": 800.0, "owner": "h:1", "host_all": True, "gateway": True},   # stale
+        {"ts": 1000.0, "owner": "h:2", "host_all": True, "gateway": True},  # fresh
+    ]
+    assert cutover.evaluate_supervisor_instances(insts, now=1010.0, max_age=90) == (True, "")
+
+
+def test_evaluate_instances_all_stale_is_not_live():
+    insts = [
+        {"ts": 800.0, "owner": "h:1", "host_all": True, "gateway": True},
+        {"ts": 700.0, "owner": "h:2", "host_all": True, "gateway": True},
+    ]
+    ok, reason = cutover.evaluate_supervisor_instances(insts, now=1010.0, max_age=90)
+    assert ok is False and reason.startswith("stale_supervisor_heartbeat")
+
+
+def test_evaluate_instances_reason_from_freshest_when_none_live():
+    # No instance is live; the reported reason comes from the freshest row so the
+    # operator sees the most current cluster state.
+    insts = [
+        {"ts": 1000.0, "owner": "h:1", "host_all": True, "gateway": False},  # gateway off
+        {"ts": 1005.0, "owner": "h:2", "host_all": False, "gateway": True},  # host_all off (freshest)
+    ]
+    ok, reason = cutover.evaluate_supervisor_instances(
+        insts, now=1010.0, max_age=90, require_gateway=True)
+    assert ok is False and reason == "supervisor_host_all_inactive"
+
+
+def test_evaluate_instances_require_gateway_false_ignores_gateway_off():
+    insts = [{"ts": 1000.0, "owner": "h:1", "host_all": True, "gateway": False}]
+    assert cutover.evaluate_supervisor_instances(
+        insts, now=1010.0, max_age=90, require_gateway=False) == (True, "")
+
+
+def test_evaluate_instances_require_gateway_true_all_gateway_off_is_not_live():
+    insts = [
+        {"ts": 1000.0, "owner": "h:1", "host_all": True, "gateway": False},
+        {"ts": 1001.0, "owner": "h:2", "host_all": True, "gateway": False},
+    ]
+    ok, reason = cutover.evaluate_supervisor_instances(
+        insts, now=1010.0, max_age=90, require_gateway=True)
+    assert ok is False and reason == "supervisor_gateway_disabled"
+
+
+def test_check_supervisor_live_prefers_multi_instance(monkeypatch):
+    monkeypatch.setattr(cutover.db, "list_supervisor_instance_heartbeats",
+                        lambda: [{"ts": 999.0, "owner": "h:1", "host_all": True, "gateway": True}],
+                        raising=False)
+    # Legacy read must NOT be consulted when fresh instance rows exist.
+    monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat",
+                        lambda: (_ for _ in ()).throw(AssertionError("legacy must not be read")))
+    assert cutover.check_supervisor_live(now=1000.0) == (True, "")
+
+
+def test_check_supervisor_live_falls_back_to_legacy_when_only_stale_instances(monkeypatch):
+    # Only STALE instance rows (dead/rolled-back runners) → the new table is not
+    # authoritative; fall back to a legacy heartbeat an old runner may still write
+    # fresh. (Transitional: a rollback must not 503 every send on orphan rows.)
+    monkeypatch.setattr(cutover.db, "list_supervisor_instance_heartbeats",
+                        lambda: [{"ts": 800.0, "owner": "h:1", "host_all": True, "gateway": True}],
+                        raising=False)
+    monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat",
+                        lambda: {"ts": 999.0, "host_all": True, "gateway": True})
+    assert cutover.check_supervisor_live(now=1000.0) == (True, "")
+
+
+def test_check_supervisor_live_stale_instances_and_dead_legacy_is_not_live(monkeypatch):
+    # All stale + no legacy → genuinely down (legacy fallback consulted, finds none).
+    monkeypatch.setattr(cutover.db, "list_supervisor_instance_heartbeats",
+                        lambda: [{"ts": 800.0, "owner": "h:1", "host_all": True, "gateway": True}],
+                        raising=False)
+    monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat", lambda: None)
+    ok, reason = cutover.check_supervisor_live(now=1000.0)
+    assert ok is False and reason == "no_supervisor_heartbeat"
+
+
+def test_check_supervisor_live_fresh_instance_not_hosting_does_not_fall_back(monkeypatch):
+    # A FRESH instance that says host_all=false means the cluster genuinely isn't
+    # hosting — the new table IS authoritative here; do NOT fall back to legacy.
+    monkeypatch.setattr(cutover.db, "list_supervisor_instance_heartbeats",
+                        lambda: [{"ts": 999.0, "owner": "h:1", "host_all": False, "gateway": True}],
+                        raising=False)
+    monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat",
+                        lambda: (_ for _ in ()).throw(AssertionError("legacy must not be read")))
+    ok, reason = cutover.check_supervisor_live(now=1000.0)
+    assert ok is False and reason == "supervisor_host_all_inactive"
+
+
+def test_check_supervisor_live_instance_read_error_falls_back_to_legacy(monkeypatch):
+    # New table unreadable (e.g. pre-migration) → try the legacy key, not fail-open.
+    def boom():
+        raise RuntimeError("relation does not exist")
+    monkeypatch.setattr(cutover.db, "list_supervisor_instance_heartbeats", boom, raising=False)
+    monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat",
+                        lambda: {"ts": 999.0, "host_all": True, "gateway": True})
+    assert cutover.check_supervisor_live(now=1000.0) == (True, "")

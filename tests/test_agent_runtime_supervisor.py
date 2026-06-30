@@ -964,3 +964,210 @@ def test_heartbeat_loop_survives_write_errors(monkeypatch):
 
     assert not t.is_alive()
     assert calls["n"] >= 2                     # 写失败后继续重试，没有退出
+
+
+# ---- PR A: per-owner multi-instance heartbeat ----
+# Multiple runners each write their OWN row (no clobber of the legacy single key).
+# The loop also prunes dead-runner rows and survives write/prune blips.
+
+def test_supervisor_instance_payload_shape():
+    p = supervisor_mod._supervisor_instance_payload(
+        "host:7", host="host", host_all=True, gateway=False,
+        active_children=3, max_children=4, shard_index=1, shard_count=2,
+        version="abc", ts=123.5)
+    assert p == {
+        "ts": 123.5, "owner": "host:7", "host": "host", "host_all": True,
+        "gateway": False, "active_children": 3, "max_children": 4,
+        "shard_index": 1, "shard_count": 2, "version": "abc",
+    }
+
+
+def test_heartbeat_loop_writes_per_owner_instance_row(monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat", lambda payload: None)
+    inst_writes = []
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_instance_heartbeat",
+                        lambda owner, payload: inst_writes.append((owner, payload)))
+    stop = threading.Event()
+    t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
+        owner="host:1", host_all=True, gateway=True, interval=0.01, stop_event=stop,
+        instance_payload_fn=lambda ts: supervisor_mod._supervisor_instance_payload(
+            "host:1", host="host", host_all=True, gateway=True, active_children=2,
+            max_children=4, shard_index=0, shard_count=1, version=None, ts=ts)))
+    t.start()
+    time.sleep(0.05)
+    stop.set()
+    t.join(timeout=2)
+
+    assert not t.is_alive()
+    assert len(inst_writes) >= 1
+    owner, payload = inst_writes[0]
+    assert owner == "host:1"
+    assert payload["active_children"] == 2 and payload["max_children"] == 4
+    assert payload["host_all"] is True and payload["gateway"] is True
+    assert "ts" in payload
+
+
+def test_heartbeat_loop_instance_write_error_does_not_kill_loop(monkeypatch):
+    import threading
+    import time
+
+    legacy = {"n": 0}
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat",
+                        lambda payload: legacy.__setitem__("n", legacy["n"] + 1))
+
+    def boom(owner, payload):
+        raise RuntimeError("db blip")
+
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_instance_heartbeat", boom)
+    stop = threading.Event()
+    t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
+        owner="o", host_all=True, gateway=True, interval=0.01, stop_event=stop,
+        instance_payload_fn=lambda ts: {"owner": "o", "ts": ts}))
+    t.start()
+    time.sleep(0.05)
+    stop.set()
+    t.join(timeout=2)
+
+    assert not t.is_alive()
+    assert legacy["n"] >= 2  # legacy write keeps going despite instance-write errors
+
+
+def test_heartbeat_loop_prunes_dead_instance_rows(monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat", lambda payload: None)
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_instance_heartbeat",
+                        lambda owner, payload: None)
+    prunes = []
+    monkeypatch.setattr(supervisor_mod.db, "prune_supervisor_instance_heartbeats",
+                        lambda max_age: prunes.append(max_age))
+    stop = threading.Event()
+    t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
+        owner="o", host_all=True, gateway=True, interval=0.01, stop_event=stop,
+        instance_payload_fn=lambda ts: {"owner": "o", "ts": ts},
+        prune_max_age_sec=3600.0))
+    t.start()
+    time.sleep(0.05)
+    stop.set()
+    t.join(timeout=2)
+
+    assert not t.is_alive()
+    assert prunes and prunes[0] == 3600.0
+
+
+# ---- PR B: AGENT_MAX_CHILDREN (per-runner capacity ceiling) ----
+# Steady-state TOTAL ceiling (vs max_spawns_per_tick's RATE limit) so one runner
+# doesn't grab every user — the rest get acquired by other runners (lease-backed).
+
+def _sup_cap(procs, *, max_children=0, max_spawns_per_tick=0, owner="sup_A", clock=lambda: T0):
+    return Supervisor(owner=owner, lease_ttl=300.0, data_root="/agent-data",
+                      spawn_fn=procs.spawn, alive_fn=procs.is_alive, kill_fn=procs.kill,
+                      now=clock, max_children=max_children,
+                      max_spawns_per_tick=max_spawns_per_tick)
+
+
+def test_tick_caps_total_children_at_max_children():
+    procs = FakeProcTable()
+    sup = _sup_cap(procs, max_children=2)
+    roster = _roster("u1", "u2", "u3", "u4")
+    sup.tick(roster)
+    assert len(sup.children) == 2          # capped
+    sup.tick(roster)
+    assert len(sup.children) == 2          # does not creep up over ticks
+    assert len(procs.spawned) == 2
+
+
+def test_tick_max_children_unlimited_when_zero():
+    procs = FakeProcTable()
+    sup = _sup_cap(procs, max_children=0)
+    sup.tick(_roster("u1", "u2", "u3"))
+    assert len(sup.children) == 3
+
+
+def test_tick_existing_children_not_killed_when_over_max():
+    # A redeploy that LOWERS max_children must not kill already-running consumers.
+    procs = FakeProcTable()
+    sup = _sup_cap(procs, max_children=2)
+    sup.tick(_roster("u1", "u2"))
+    assert len(sup.children) == 2
+    sup.max_children = 1                    # simulate redeploy with a smaller cap
+    sup.tick(_roster("u1", "u2", "u3"))
+    assert procs.killed == []               # neither existing child killed
+    assert "u3" not in sup.children         # but no NEW user acquired over the cap
+    assert len(sup.children) == 2
+
+
+def test_tick_does_not_acquire_beyond_max_children():
+    # At capacity a new user is never lease-acquired here — left for another runner.
+    procs = FakeProcTable()
+    sup = _sup_cap(procs, max_children=1)
+    sup.tick(_roster("u1", "u2"))
+    assert len(sup.children) == 1
+    assert leases.get("u2") is None         # u2 over cap → never acquired
+
+
+# ---- PR B: lease-scoped gateway (owned-children filter) ----
+
+def test_owned_gateway_entries_scopes_to_owned_children_with_fresh_key():
+    # LiteLLM config includes ONLY gateway users this runner owns a child for, and
+    # the key comes from the freshly-resolved entry (so a rotation reaches LiteLLM
+    # without a respawn) — NOT from a stale stored child entry.
+    gw_all = [
+        {"user_id": "u1", "provider": "gemini", "model": "gemini-pro", "base_url": "", "provider_key": "fresh-u1"},
+        {"user_id": "u2", "provider": "openrouter", "model": "x", "base_url": "", "provider_key": "fresh-u2"},
+    ]
+    children = {"u1": {"entry": {"user_id": "u1", "provider_key": "stale-u1"}}}
+    owned = supervisor_mod._owned_gateway_entries(gw_all, children)
+    assert len(owned) == 1
+    assert owned[0]["user_id"] == "u1"
+    assert owned[0]["provider_key"] == "fresh-u1"   # fresh roster key, not stale child
+    assert owned[0]["model"] == "gemini-pro"
+
+
+def test_tick_pre_spawn_runs_before_new_consumers_start():
+    # The gateway route for a newly-acquired user must be configured BEFORE its
+    # consumer process starts, so a queued first turn can't hit a missing route.
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    events = []
+    orig_spawn = procs.spawn
+
+    def tracking_spawn(entry, uid, home):
+        events.append(("spawn", uid))
+        return orig_spawn(entry, uid, home)
+
+    sup.spawn_fn = tracking_spawn
+    sup.tick(_roster("u1", "u2"),
+             pre_spawn=lambda ids: events.append(("pre_spawn", sorted(ids))))
+
+    # pre_spawn fires ONCE for the whole batch, before any of those spawns.
+    assert events[0] == ("pre_spawn", ["u1", "u2"])
+    assert ("spawn", "u1") in events and ("spawn", "u2") in events
+    assert events.index(("pre_spawn", ["u1", "u2"])) < events.index(("spawn", "u1"))
+    assert events.index(("pre_spawn", ["u1", "u2"])) < events.index(("spawn", "u2"))
+
+
+def test_tick_pre_spawn_not_called_without_new_acquisitions():
+    # Steady state (only live children, nothing new) → no pre_spawn callback, so
+    # no needless gateway reconcile/restart.
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick(_roster("u1"))                 # initial acquire+spawn
+    calls = []
+    sup.tick(_roster("u1"), pre_spawn=lambda ids: calls.append(list(ids)))
+    assert calls == []                      # u1 already live → nothing acquired
+
+
+def test_owned_gateway_entries_accepts_id_set_snapshot():
+    # main() passes a locked SET snapshot of owned ids (not the live children dict)
+    # to avoid "dict changed size during iteration" vs the renew thread.
+    gw_all = [
+        {"user_id": "u1", "provider": "gemini", "model": "m1", "provider_key": "k1"},
+        {"user_id": "u2", "provider": "openrouter", "model": "m2", "provider_key": "k2"},
+    ]
+    owned = supervisor_mod._owned_gateway_entries(gw_all, {"u2"})
+    assert [g["user_id"] for g in owned] == ["u2"]

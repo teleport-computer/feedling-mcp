@@ -225,6 +225,83 @@ def read_supervisor_heartbeat() -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
+# Per-owner supervisor heartbeats (migration 0009). Unlike the single global key
+# above, each runner writes its OWN row keyed by ``owner`` ("<host>:<pid>"), so
+# multiple runners don't clobber one another. The backend's wedge guard lists
+# these and treats the cluster as live iff any fresh row is actually hosting.
+# Liveness alone is in the lease table; this row additionally carries the
+# cluster-capability flags (host_all/gateway) + shard/capacity config.
+
+def set_supervisor_instance_heartbeat(owner: str, payload: dict) -> None:
+    """Upsert this runner's heartbeat row. ``payload`` is the rich heartbeat dict;
+    the typed columns are projected out of it for cheap aggregation, and the full
+    dict is also stored as JSONB for diagnostics. ``updated_at`` is stamped now()."""
+    def _i(key, default=0):
+        try:
+            return int(payload.get(key, default))
+        except (TypeError, ValueError):
+            return default
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO agent_runtime_supervisor_heartbeats "
+            "(owner, host, shard_index, shard_count, max_children, active_children, "
+            " host_all, gateway, version, payload, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
+            "ON CONFLICT (owner) DO UPDATE SET "
+            "  host = EXCLUDED.host, shard_index = EXCLUDED.shard_index, "
+            "  shard_count = EXCLUDED.shard_count, max_children = EXCLUDED.max_children, "
+            "  active_children = EXCLUDED.active_children, host_all = EXCLUDED.host_all, "
+            "  gateway = EXCLUDED.gateway, version = EXCLUDED.version, "
+            "  payload = EXCLUDED.payload, updated_at = now()",
+            (
+                str(owner),
+                payload.get("host"),
+                _i("shard_index", 0),
+                _i("shard_count", 1),
+                _i("max_children", 0),
+                _i("active_children", 0),
+                bool(payload.get("host_all")),
+                bool(payload.get("gateway")),
+                payload.get("version"),
+                json.dumps(payload),
+            ),
+        )
+
+
+def list_supervisor_instance_heartbeats() -> list[dict]:
+    """All runner heartbeat rows. Each dict carries the typed flags plus ``ts``
+    (the row's ``updated_at`` as an epoch float) so the caller can age-filter in
+    pure code. Freshness/aggregation is the guard's job, not this query's. Raises
+    on a DB error so the caller can fall back to the legacy key."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT owner, host, shard_index, shard_count, max_children, "
+            "       active_children, host_all, gateway, version, "
+            "       extract(epoch FROM updated_at) AS ts "
+            "FROM agent_runtime_supervisor_heartbeats"
+        ).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "owner": r[0], "host": r[1], "shard_index": r[2], "shard_count": r[3],
+            "max_children": r[4], "active_children": r[5],
+            "host_all": bool(r[6]), "gateway": bool(r[7]), "version": r[8],
+            "ts": float(r[9]),
+        })
+    return out
+
+
+def prune_supervisor_instance_heartbeats(max_age_sec: float) -> None:
+    """Delete heartbeat rows older than ``max_age_sec`` (dead runners that never
+    released). Best-effort housekeeping so the table doesn't accrete forever."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM agent_runtime_supervisor_heartbeats "
+            "WHERE updated_at < now() - make_interval(secs => %s)",
+            (float(max_age_sec),),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Global (non-per-user) JSON documents
 # ---------------------------------------------------------------------------

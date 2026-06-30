@@ -294,6 +294,73 @@ def test_delete_user_data_wipes_everything():
     assert db.log_read_all(uid, "gate_decisions") == []
 
 
+# ---- multi-instance supervisor heartbeats (agent_runtime_supervisor_heartbeats) ----
+# Each runner writes its OWN per-owner row, so multiple runners don't clobber a
+# single global key (the legacy server_config heartbeat's flaw). The backend's
+# wedge guard aggregates these rows to decide whether any runner is hosting.
+
+
+def _owner() -> str:
+    return f"sup_{uuid.uuid4().hex[:12]}"
+
+
+def _hb_payload(owner, **over):
+    base = {
+        "ts": 1_000_000.0, "owner": owner, "host": "runner-A",
+        "host_all": True, "gateway": True,
+        "active_children": 3, "max_children": 4,
+        "shard_index": 0, "shard_count": 1, "version": "abc123",
+    }
+    base.update(over)
+    return base
+
+
+def test_supervisor_instance_heartbeat_roundtrip():
+    owner = _owner()
+    db.set_supervisor_instance_heartbeat(owner, _hb_payload(owner))
+    rows = [r for r in db.list_supervisor_instance_heartbeats() if r["owner"] == owner]
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["host_all"] is True and r["gateway"] is True
+    assert r["active_children"] == 3 and r["max_children"] == 4
+    assert r["shard_index"] == 0 and r["shard_count"] == 1
+    # ``ts`` is the row's updated_at as an epoch float so the guard can age-check it.
+    assert isinstance(r["ts"], float) and r["ts"] > 0
+
+
+def test_supervisor_instance_heartbeats_do_not_clobber_across_owners():
+    a, b = _owner(), _owner()
+    db.set_supervisor_instance_heartbeat(a, _hb_payload(a, host="A", active_children=1))
+    db.set_supervisor_instance_heartbeat(b, _hb_payload(b, host="B", active_children=2))
+    owners = {r["owner"]: r for r in db.list_supervisor_instance_heartbeats()}
+    assert a in owners and b in owners
+    assert owners[a]["active_children"] == 1
+    assert owners[b]["active_children"] == 2
+
+
+def test_supervisor_instance_heartbeat_upsert_updates_same_owner():
+    owner = _owner()
+    db.set_supervisor_instance_heartbeat(owner, _hb_payload(owner, active_children=1))
+    db.set_supervisor_instance_heartbeat(owner, _hb_payload(owner, active_children=5))
+    rows = [r for r in db.list_supervisor_instance_heartbeats() if r["owner"] == owner]
+    assert len(rows) == 1 and rows[0]["active_children"] == 5
+
+
+def test_prune_supervisor_instance_heartbeats_removes_old_rows():
+    owner = _owner()
+    db.set_supervisor_instance_heartbeat(owner, _hb_payload(owner))
+    # Age the row well past the prune window via raw SQL (set() always stamps now()).
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_runtime_supervisor_heartbeats "
+            "SET updated_at = now() - interval '1 hour' WHERE owner = %s",
+            (owner,),
+        )
+    db.prune_supervisor_instance_heartbeats(60.0)  # older than 60s → gone
+    rows = [r for r in db.list_supervisor_instance_heartbeats() if r["owner"] == owner]
+    assert rows == []
+
+
 def test_envelope_fields_stored_byte_for_byte():
     """Crypto-fidelity guard: the opaque base64 envelope fields the enclave
     needs to decrypt must survive a store→load round-trip unchanged."""
