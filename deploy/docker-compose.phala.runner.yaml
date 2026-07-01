@@ -1,0 +1,110 @@
+# docker-compose.phala.runner.yaml — STANDALONE agent-runner CVM (multi-node Form B)
+#
+# A SEPARATE Phala CVM that runs ONLY agent-runner supervisors — no backend, no
+# enclave, no ingress. It scales the hosted agent-runtime horizontally off the
+# main CVM: if this CVM (or a runner here) dies, the main CVM's ingress/backend/
+# enclave are untouched, and the per-user Postgres lease lets the surviving
+# runners (here or on the main CVM) take over.
+#
+# Multi-node coordination needs NO per-runner index: each container's lease owner
+# is "<hostname>:<pid>" (distinct per container), the per-owner heartbeat table
+# (migration 0010) records each runner independently, and AGENT_MAX_CHILDREN
+# bounds how many users each takes so they split the host-all set. The backend's
+# wedge guard aggregates the heartbeats; a stale/empty table falls back to the
+# legacy key. (No static shard — runners all scan the full set and race-acquire.)
+#
+# ── How a runner CVM reaches the main CVM ──────────────────────────────────────
+#   FEEDLING_API_URL     → the main CVM backend via its PUBLIC ingress domain
+#                          (e.g. https://test-api.feedling.app). NOT the
+#                          compose-internal http://backend:5001 — that DNS name
+#                          does not exist in this CVM.
+#   FEEDLING_ENCLAVE_URL → the main CVM enclave via the dstack-gateway passthrough
+#                          that already carries its in-enclave TLS + attestation
+#                          (e.g. https://<main-app-id>-5003s.dstack-pha-prod9.phala.network).
+#                          This is the SAME authenticated decrypt endpoint clients
+#                          already use; the runner authenticates per-user with a
+#                          short-lived Stage-D runtime token (no api key, no
+#                          long-term secret), so this widens nothing beyond the
+#                          existing exposure. Confirm /v1/envelope/decrypt accepts
+#                          the runtime token over this path before rollout.
+#
+# ── Deploy ─────────────────────────────────────────────────────────────────────
+#   This is its OWN dstack app (own app-id, own compose_hash, own on-chain auth).
+#   Adding/redeploying this CVM = a NEW compose_hash → addComposeHash() on-chain
+#   (see deploy/DEPLOYMENTS.md “How to re-run the deploy”). All secrets below flow
+#   through the ENCRYPTED env channel (`phala deploy -e …`) — never baked.
+#
+#   Required encrypted env (must match the main CVM where noted):
+#     DATABASE_URL                  same external Postgres as the backend
+#     FEEDLING_RUNTIME_TOKEN_SECRET MUST equal the main backend's value (token auth)
+#     FEEDLING_API_URL              main CVM public ingress URL
+#     FEEDLING_ENCLAVE_URL          main CVM enclave gateway-passthrough URL
+#     FEEDLING_HOST_ALL=1           mirror the backend
+#     FEEDLING_LITELLM_ENABLE=1     if hosting gemini/openrouter/openai_compatible
+#     FEEDLING_LITELLM_API_KEY      gateway bearer (per-runner LiteLLM child)
+#     AGENT_MAX_CHILDREN            per-runner capacity ceiling (sum across ALL
+#                                   runners, here + main CVM, must cover the user
+#                                   count or some users go unserved)
+
+name: feedling-runner
+
+x-agent-runner-env: &agent-runner-env
+  FEEDLING_API_URL: "${FEEDLING_API_URL:-}"          # main CVM ingress URL
+  FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"  # main CVM enclave passthrough URL
+  AGENT_DATA_ROOT: "/agent-data"
+  AGENT_LEASE_TTL_SEC: "${AGENT_LEASE_TTL_SEC:-300}"
+  AGENT_TICK_INTERVAL_SEC: "${AGENT_TICK_INTERVAL_SEC:-15}"
+  AGENT_ENVELOPE_REFETCH_SEC: "${AGENT_ENVELOPE_REFETCH_SEC:-300}"
+  AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
+  AGENT_RUNTIME_ISOLATION: "process"
+  DATABASE_URL: "${DATABASE_URL:-}"
+  AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
+  AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
+  FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+  FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+  FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
+  # in-CVM LiteLLM gateway — each runner that hosts non-openai codex users runs
+  # its OWN proxy child on 127.0.0.1:<port>; codex on that runner connects locally.
+  FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+  FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
+  FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
+  # Genesis import worker: safe to run on multiple runners (claim is FOR UPDATE
+  # SKIP LOCKED). Default OFF here — run it where you prefer (often the main CVM
+  # agent-runner). Turn on per-CVM if this CVM should also drain genesis jobs.
+  FEEDLING_GENESIS_WORKER_ENABLED: "${FEEDLING_GENESIS_WORKER_ENABLED:-}"
+  FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "${FEEDLING_GENESIS_WORKER_INTERVAL_SEC:-10}"
+  FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "${FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC:-7200}"
+
+services:
+  # Two runners per CVM to start. Distinct container_name → distinct hostname →
+  # distinct lease owner + heartbeat row, with no per-runner config. Each owns its
+  # OWN data volume: a corrupt per-user home on one runner can't affect the other,
+  # and (unlike same-CVM shared-volume) a cross-runner takeover re-materializes the
+  # home (cheap; the driver resume handle lives in the lease row, not the volume).
+  agent-runner-0:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:0000000   # CI pins the sha
+    container_name: agent-runner-0
+    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
+    restart: unless-stopped
+    environment:
+      <<: *agent-runner-env
+      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-8}"
+    volumes:
+      - feedling_agent_runtime_r0:/agent-data
+
+  agent-runner-1:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:0000000   # CI pins the sha
+    container_name: agent-runner-1
+    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
+    restart: unless-stopped
+    environment:
+      <<: *agent-runner-env
+      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-8}"
+    volumes:
+      - feedling_agent_runtime_r1:/agent-data
+
+volumes:
+  feedling_agent_runtime_r0:
+    name: feedling_agent_runtime_r0
+  feedling_agent_runtime_r1:
+    name: feedling_agent_runtime_r1

@@ -132,6 +132,57 @@ agent-runner。以下三个变量必须同时设置；缺任何一个会导致�
 部署顺序：先设 `FEEDLING_RUNTIME_TOKEN_SECRET`（backend + agent-runner 共享同一 secret），
 确认 token 鉴权通过、行为不变；再同步开启 `FEEDLING_HOST_ALL` 和 `FEEDLING_LITELLM_ENABLE`。
 
+### 横向扩展 — 多节点 agent-runner
+
+The supervisor is **multi-node ready with no per-runner index**. Coordination is
+entirely via Postgres: the per-user lease (`agent_runtime_instances`, owner =
+`<hostname>:<pid>`) guarantees exactly one consumer per user and lets a survivor
+take over a dead runner's users after the lease TTL; the per-owner heartbeat table
+(`agent_runtime_supervisor_heartbeats`, migration `0010`) records each runner
+independently so the backend's `check_supervisor_live` aggregates the cluster
+(any one fresh hosting runner ⇒ live; empty/all-stale ⇒ legacy-key fallback, so a
+rollback/mixed fleet doesn't 503). There is **no static shard** — every runner
+scans the full host-all set and races to acquire; `AGENT_MAX_CHILDREN` bounds how
+many each takes so they split the load.
+
+| Env (per runner) | Purpose | Default |
+|---|---|---|
+| `AGENT_MAX_CHILDREN` | steady-state per-runner capacity ceiling (0 = unlimited). **Σ across ALL runners must ≥ hosted-user count**, else some users go unserved. Distinct from `AGENT_MAX_SPAWNS_PER_TICK` (cold-start rate). | 0 |
+| `AGENT_SUPERVISOR_HEARTBEAT_PRUNE_SEC` | drop dead-runner heartbeat rows older than this (each restart is a new `<host>:<pid>` owner) | 3600 |
+
+**Form A — multiple containers, same CVM** (quickest validation): duplicate the
+inline `agent-runner` service into `agent-runner-0` / `agent-runner-1` (distinct
+container names ⇒ distinct owners). Same-CVM containers MAY share the
+`feedling_agent_runtime*` volume so a takeover reuses the per-user home; set
+`AGENT_MAX_CHILDREN` on each. Editing the compose changes `compose_hash` →
+requires `addComposeHash()` on-chain. Caveat: CPU/OOM still share the main CVM.
+
+**Form B — independent runner CVM(s)** (production scale-out, fault-isolated):
+`deploy/docker-compose.phala.runner.yaml` is a standalone runner-only CVM (no
+backend / enclave / ingress; 2 runner containers, each its own volume). It is its
+**own dstack app** (own app-id + compose_hash + on-chain auth) sharing the main
+CVM's Postgres + secrets via the encrypted env channel.
+
+Cross-CVM reachability (the only real wiring):
+- `FEEDLING_API_URL` → the main CVM's **public ingress** domain (e.g.
+  `https://test-api.feedling.app`), NOT `http://backend:5001`.
+- `FEEDLING_ENCLAVE_URL` → the main CVM enclave's **dstack-gateway passthrough**
+  (`https://<main-app-id>-5003s.dstack-pha-prod9.phala.network`) — the same
+  attested, in-enclave-TLS decrypt endpoint clients already use. The runner auths
+  per-user with a short-lived Stage-D runtime token (no api key), so this is the
+  existing exposure, not a new one. Confirm `/v1/envelope/decrypt` accepts the
+  runtime token over this path before rollout.
+- `DATABASE_URL` + `FEEDLING_RUNTIME_TOKEN_SECRET` (MUST equal the main backend's)
+  + `FEEDLING_LITELLM_API_KEY` via encrypted env.
+
+Rollout: provision the runner CVM (own dstack app) → build/pin
+`feedling-agent-runner:<sha>` → set the encrypted env above → boot with
+`AGENT_RUNTIME_USERS` empty / `FEEDLING_HOST_ALL` matching the main CVM →
+`addComposeHash()` on-chain for the runner app. Verify: both runners appear as
+distinct rows in `agent_runtime_supervisor_heartbeats`, users distribute across
+owners in `agent_runtime_instances`, and killing one runner lets the other take
+over its users after the TTL — all while the main CVM ingress/backend stay up.
+
 ## Enclave configuration
 
 ### Screen frame VLM captioning
