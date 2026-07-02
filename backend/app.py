@@ -109,6 +109,7 @@ from proactive import dashboard as proactive_dashboard
 from proactive import gate as proactive_gate
 from proactive import service as proactive_service
 import screen as screen_pkg
+import observability as observability_pkg
 from push import apns as push_apns
 from push import live_activity as push_live_activity
 from push import service as push_service
@@ -430,6 +431,8 @@ content_pkg.register(app)
 copytext_pkg.register(app)
 hosted_pkg.register(app)
 screen_pkg.register(app)
+observability_pkg.register(app)
+core_leader.run_singleton("obs-sampler", observability_pkg.start_sampler)
 from perception import snapshot_for_wake as _perception_wake_snapshot  # noqa: E402
 register_perception(app)
 

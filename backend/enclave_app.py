@@ -473,6 +473,13 @@ def healthz():
     return jsonify({"ok": False, "ready": False, "error": _state["error"]}), 503
 
 
+@app.route("/internal/resource", methods=["GET"])
+def internal_resource():
+    from observability.sysread import read_cgroup
+    c = read_cgroup()
+    return jsonify({"ok": True, "mem_bytes": c["mem_bytes"], "cpu_usage_usec": c["cpu_usage_usec"]})
+
+
 @app.route("/attestation", methods=["GET"])
 def attestation():
     if not _state["ready"]:

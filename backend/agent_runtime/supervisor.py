@@ -271,6 +271,12 @@ class Supervisor:
             log.info("spawned resident consumer for %s (pid=%s, home=%s)", user_id, pid, home)
             self._enqueue_introduction(user_id, entry)
 
+        try:
+            from observability import report_self_resource
+            report_self_resource("agent-runner")
+        except Exception:
+            pass  # 观测失败绝不影响托管
+
     def renew_live(self) -> None:
         """Renew leases for every currently-live child — and ONLY that.
 
