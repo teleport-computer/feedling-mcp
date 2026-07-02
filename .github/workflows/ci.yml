@@ -384,6 +384,72 @@ jobs:
           fi
           echo "cvm_id=$CVM_ID" >> "$GITHUB_OUTPUT"
 
+      - name: Notify Lark deploy starting
+        continue-on-error: true
+        env:
+          LARK_BOT_WEBHOOK: ${{ secrets.LARK_BOT_WEBHOOK }}
+          LARK_BOT_SECRET: ${{ secrets.LARK_BOT_SECRET }}
+          CVM_ID: ${{ steps.cvmid.outputs.cvm_id }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$LARK_BOT_WEBHOOK" ]; then
+            echo "LARK_BOT_WEBHOOK is not configured; skip Lark deploy-start notification."
+            exit 0
+          fi
+
+          RUN_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
+          COMMIT_URL="${SERVER_URL}/${REPOSITORY}/commit/${SHA}"
+          SHORT_SHA="${SHA:0:7}"
+          CONTENT=$(cat <<EOF
+          [START] Feedling MCP deploy starting
+
+          repo: $REPOSITORY
+          branch: $REF_NAME
+          actor: $ACTOR
+          commit: $SHORT_SHA
+          cvm: $CVM_ID
+          stage: before phala deploy
+
+          actions: $RUN_URL
+          commit: $COMMIT_URL
+          EOF
+          )
+
+          SIGN_TS=""
+          SIGN=""
+          if [ -n "$LARK_BOT_SECRET" ]; then
+            SIGN_TS=$(date +%s)
+            export SIGN_TS LARK_BOT_SECRET
+            SIGN=$(python3 - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import os
+
+          string_to_sign = f"{os.environ['SIGN_TS']}\n{os.environ['LARK_BOT_SECRET']}".encode("utf-8")
+          print(base64.b64encode(hmac.new(string_to_sign, digestmod=hashlib.sha256).digest()).decode("utf-8"))
+          PY
+          )
+          fi
+
+          jq -n \
+            --arg content "$CONTENT" \
+            --arg timestamp "$SIGN_TS" \
+            --arg sign "$SIGN" \
+            'if $timestamp == "" then
+               {msg_type:"text", content:{text:$content}}
+             else
+               {timestamp:$timestamp, sign:$sign, msg_type:"text", content:{text:$content}}
+             end' \
+            | curl -fsS -X POST "$LARK_BOT_WEBHOOK" \
+                -H "Content-Type: application/json" \
+                --data-binary @-
+
       - name: Deploy CVM via phala
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
@@ -495,6 +561,82 @@ jobs:
             fi
           done
           exit "$publish_status"
+
+      - name: Notify Lark deploy finished
+        if: always()
+        continue-on-error: true
+        env:
+          LARK_BOT_WEBHOOK: ${{ secrets.LARK_BOT_WEBHOOK }}
+          LARK_BOT_SECRET: ${{ secrets.LARK_BOT_SECRET }}
+          STATUS: ${{ job.status }}
+          CVM_ID: ${{ steps.cvmid.outputs.cvm_id }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$LARK_BOT_WEBHOOK" ]; then
+            echo "LARK_BOT_WEBHOOK is not configured; skip Lark deploy-finish notification."
+            exit 0
+          fi
+
+          if [ "$STATUS" = "success" ]; then
+            PREFIX="[OK]"
+          elif [ "$STATUS" = "cancelled" ]; then
+            PREFIX="[CANCELLED]"
+          else
+            PREFIX="[FAIL]"
+          fi
+
+          RUN_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
+          COMMIT_URL="${SERVER_URL}/${REPOSITORY}/commit/${SHA}"
+          SHORT_SHA="${SHA:0:7}"
+          CONTENT=$(cat <<EOF
+          $PREFIX Feedling MCP deploy finished: $STATUS
+
+          repo: $REPOSITORY
+          branch: $REF_NAME
+          actor: $ACTOR
+          commit: $SHORT_SHA
+          cvm: $CVM_ID
+          stage: phala deploy + compose_hash publish
+
+          actions: $RUN_URL
+          commit: $COMMIT_URL
+          EOF
+          )
+
+          SIGN_TS=""
+          SIGN=""
+          if [ -n "$LARK_BOT_SECRET" ]; then
+            SIGN_TS=$(date +%s)
+            export SIGN_TS LARK_BOT_SECRET
+            SIGN=$(python3 - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import os
+
+          string_to_sign = f"{os.environ['SIGN_TS']}\n{os.environ['LARK_BOT_SECRET']}".encode("utf-8")
+          print(base64.b64encode(hmac.new(string_to_sign, digestmod=hashlib.sha256).digest()).decode("utf-8"))
+          PY
+          )
+          fi
+
+          jq -n \
+            --arg content "$CONTENT" \
+            --arg timestamp "$SIGN_TS" \
+            --arg sign "$SIGN" \
+            'if $timestamp == "" then
+               {msg_type:"text", content:{text:$content}}
+             else
+               {timestamp:$timestamp, sign:$sign, msg_type:"text", content:{text:$content}}
+             end' \
+            | curl -fsS -X POST "$LARK_BOT_WEBHOOK" \
+                -H "Content-Type: application/json" \
+                --data-binary @-
 
   deploy-test-cvm:
     name: deploy CVM (test)
