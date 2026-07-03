@@ -805,3 +805,53 @@ def test_agent_home_files_identity_block_sits_above_persona():
         persona_content="You are Kai.")
     append = files["/h/agent-tools-prompt.md"]
     assert append.index("你的真实身份") < append.index("You are Kai.")
+# ---- pi driver: cli template, models.json seed, env isolation, stale prune ----
+
+
+def test_consumer_env_uses_pi_cli_and_home_for_pi_driver():
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider_key": "sk-relay", "driver": "pi",
+             "provider": "openai_compatible", "model": "qwen-max",
+             "base_url": "https://my.host/v1"},
+        user_id="u_1", home="/h",
+    )
+    cmd = env["AGENT_CLI_CMD"]
+    assert cmd.startswith("pi --mode json -t bash ")
+    assert "--append-system-prompt /h/agent-tools-prompt.md" in cmd
+    assert "--model feedling/qwen-max" in cmd
+    assert "--session-id {session_id}" in cmd
+    # message rides STDIN, NOT argv (pi arg-parses positionals — a @/-/-- message
+    # would be mis-parsed), so the template ends at --session-id with no {message}.
+    assert "{message}" not in cmd
+    assert cmd.rstrip().endswith("--session-id {session_id}")
+    assert env["PI_CODING_AGENT_DIR"] == "/h/pi-home/agent"
+    assert env["PI_PROVIDER_API_KEY"] == "sk-relay"
+    assert env["PI_OFFLINE"] == "1"
+    # 不能沾别的 driver 的 env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "CODEX_API_KEY" not in env
+    assert "CLAUDE_CONFIG_DIR" not in env
+
+
+def test_agent_home_files_pi_seeds_models_json_with_relay_provider():
+    files = spawners.agent_home_files(
+        "/h", driver="pi", model="qwen-max", base_url="https://my.host/v1/")
+    doc = json.loads(files["/h/pi-home/agent/models.json"])
+    prov = doc["providers"]["feedling"]
+    assert prov["baseUrl"] == "https://my.host/v1"          # 尾斜杠被剥掉
+    assert prov["api"] == "openai-completions"              # 中转站只收 chat/completions
+    assert prov["apiKey"] == "$PI_PROVIDER_API_KEY"         # $ENV 插值，key 不落盘
+    assert prov["compat"] == {"supportsDeveloperRole": False,
+                              "supportsReasoningEffort": False}
+    assert prov["models"] == [{"id": "qwen-max"}]
+    # 工具 how-to 照常 seed；不写 claude/codex 的 home 文件
+    assert "/h/agent-tools-prompt.md" in files
+    assert "/h/claude-home/settings.json" not in files
+    assert "/h/codex-home/AGENTS.md" not in files
+
+
+def test_stale_home_files_prunes_pi_models_json_when_not_pi():
+    stale = spawners.stale_home_files("/h", driver="codex", codex_transport="native")
+    assert "/h/pi-home/agent/models.json" in stale
+    stale_pi = spawners.stale_home_files("/h", driver="pi")
+    assert "/h/pi-home/agent/models.json" not in stale_pi

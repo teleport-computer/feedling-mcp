@@ -654,7 +654,7 @@ def test_effective_roster_gateway_on_wires_models():
 def test_effective_roster_autodiscover_intersects_enabled(monkeypatch):
     base = [{"user_id": "a", "api_key": "k1"}, {"user_id": "b", "api_key": "k2"}]
     monkeypatch.setattr(supervisor_mod, "_discover_enabled",
-                        lambda include_gateway: {"a": {"driver": "claude", "provider": "anthropic",
+                        lambda include_gateway, include_pi=False: {"a": {"driver": "claude", "provider": "anthropic",
                                                        "model": "x", "base_url": ""}})
     roster, gateways = supervisor_mod._effective_roster(base, autodiscover=True, gateway_enabled=False)
     assert [e["user_id"] for e in roster] == ["a"]   # b not backend-enabled → excluded
@@ -664,7 +664,7 @@ def test_effective_roster_autodiscover_intersects_enabled(monkeypatch):
 def test_effective_roster_empty_is_tolerated_not_fatal(monkeypatch):
     # A live agent-runner must idle (not exit/crashloop) when no user is enabled yet
     # — discovery returns nothing → empty effective roster, no exception.
-    monkeypatch.setattr(supervisor_mod, "_discover_enabled", lambda include_gateway: {})
+    monkeypatch.setattr(supervisor_mod, "_discover_enabled", lambda include_gateway, include_pi=False: {})
     roster, gateways = supervisor_mod._effective_roster([], autodiscover=True, gateway_enabled=False)
     assert roster == [] and gateways == []
 
@@ -818,13 +818,14 @@ def test_discover_enabled_threads_include_gateway_to_db(monkeypatch):
     # host_all parameter removed; _discover_enabled now only passes include_gateway
     captured = {}
 
-    def fake_list(include_gateway=False):
+    def fake_list(include_gateway=False, include_pi=False):
         captured["include_gateway"] = include_gateway
+        captured["include_pi"] = include_pi
         return []
 
     monkeypatch.setattr(supervisor_mod.db, "list_agent_runtime_enabled_users", fake_list)
     supervisor_mod._discover_enabled(include_gateway=True)
-    assert captured == {"include_gateway": True}
+    assert captured == {"include_gateway": True, "include_pi": False}
 
 
 # ---- Codex P2: preserve a cached provider key across transient credential failures ----
@@ -951,8 +952,8 @@ def test_supervisor_heartbeat_payload_shape():
     """每 tick 写入 server_config 的全局心跳载荷：ts + owner + host_all + gateway。
     backend 的 wedge 守卫据此判断 supervisor 是否在托管。"""
     p = supervisor_mod._supervisor_heartbeat_payload(
-        "host:7", host_all=True, gateway=False, ts=123.5)
-    assert p == {"ts": 123.5, "owner": "host:7", "host_all": True, "gateway": False}
+        "host:7", host_all=True, gateway=False, pi=True, ts=123.5)
+    assert p == {"ts": 123.5, "owner": "host:7", "host_all": True, "gateway": False, "pi": True}
 
 
 def test_heartbeat_loop_writes_on_cadence_until_stopped(monkeypatch):
@@ -966,7 +967,7 @@ def test_heartbeat_loop_writes_on_cadence_until_stopped(monkeypatch):
                         lambda payload: writes.append(payload))
     stop = threading.Event()
     t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
-        owner="host:1", host_all=True, gateway=True, interval=0.01, stop_event=stop))
+        owner="host:1", host_all=True, gateway=True, pi=True, interval=0.01, stop_event=stop))
     t.start()
     time.sleep(0.05)
     stop.set()
@@ -977,6 +978,7 @@ def test_heartbeat_loop_writes_on_cadence_until_stopped(monkeypatch):
     assert writes[0]["owner"] == "host:1"
     assert writes[0]["host_all"] is True
     assert writes[0]["gateway"] is True
+    assert writes[0]["pi"] is True
     assert "ts" in writes[0]
 
 
@@ -994,7 +996,7 @@ def test_heartbeat_loop_survives_write_errors(monkeypatch):
     monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat", flaky)
     stop = threading.Event()
     t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
-        owner="o", host_all=False, gateway=False, interval=0.01, stop_event=stop))
+        owner="o", host_all=False, gateway=False, pi=False, interval=0.01, stop_event=stop))
     t.start()
     time.sleep(0.05)
     stop.set()
@@ -1010,12 +1012,12 @@ def test_heartbeat_loop_survives_write_errors(monkeypatch):
 
 def test_supervisor_instance_payload_shape():
     p = supervisor_mod._supervisor_instance_payload(
-        "host:7", host="host", host_all=True, gateway=False,
+        "host:7", host="host", host_all=True, gateway=False, pi=True,
         active_children=3, max_children=4, shard_index=1, shard_count=2,
         version="abc", ts=123.5)
     assert p == {
         "ts": 123.5, "owner": "host:7", "host": "host", "host_all": True,
-        "gateway": False, "active_children": 3, "max_children": 4,
+        "gateway": False, "pi": True, "active_children": 3, "max_children": 4,
         "shard_index": 1, "shard_count": 2, "version": "abc",
     }
 
@@ -1030,9 +1032,9 @@ def test_heartbeat_loop_writes_per_owner_instance_row(monkeypatch):
                         lambda owner, payload: inst_writes.append((owner, payload)))
     stop = threading.Event()
     t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
-        owner="host:1", host_all=True, gateway=True, interval=0.01, stop_event=stop,
+        owner="host:1", host_all=True, gateway=True, pi=True, interval=0.01, stop_event=stop,
         instance_payload_fn=lambda ts: supervisor_mod._supervisor_instance_payload(
-            "host:1", host="host", host_all=True, gateway=True, active_children=2,
+            "host:1", host="host", host_all=True, gateway=True, pi=True, active_children=2,
             max_children=4, shard_index=0, shard_count=1, version=None, ts=ts)))
     t.start()
     time.sleep(0.05)
@@ -1062,7 +1064,7 @@ def test_heartbeat_loop_instance_write_error_does_not_kill_loop(monkeypatch):
     monkeypatch.setattr(supervisor_mod.db, "set_supervisor_instance_heartbeat", boom)
     stop = threading.Event()
     t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
-        owner="o", host_all=True, gateway=True, interval=0.01, stop_event=stop,
+        owner="o", host_all=True, gateway=True, pi=True, interval=0.01, stop_event=stop,
         instance_payload_fn=lambda ts: {"owner": "o", "ts": ts}))
     t.start()
     time.sleep(0.05)
@@ -1085,7 +1087,7 @@ def test_heartbeat_loop_prunes_dead_instance_rows(monkeypatch):
                         lambda max_age: prunes.append(max_age))
     stop = threading.Event()
     t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
-        owner="o", host_all=True, gateway=True, interval=0.01, stop_event=stop,
+        owner="o", host_all=True, gateway=True, pi=True, interval=0.01, stop_event=stop,
         instance_payload_fn=lambda ts: {"owner": "o", "ts": ts},
         prune_max_age_sec=3600.0))
     t.start()
@@ -1231,3 +1233,54 @@ def test_spawn_identity_changes_when_identity_model_changes():
          "identity_model": "gemini-2.0-flash"}
     b = dict(a, identity_model="gemini-1.5-pro")
     assert supervisor_mod._spawn_identity(a) != supervisor_mod._spawn_identity(b)
+# ---- pi driver: include_pi threads through discovery; pi entries survive drop ----
+
+
+def test_discover_enabled_passes_include_pi(monkeypatch):
+    seen = {}
+
+    def fake_list(include_gateway=False, include_pi=False):
+        seen["include_gateway"] = include_gateway
+        seen["include_pi"] = include_pi
+        return [{"user_id": "u1", "driver": "pi", "provider": "openai_compatible",
+                 "model": "qwen-max", "base_url": "https://my.host/v1",
+                 "supports_responses": False}]
+
+    monkeypatch.setattr(supervisor_mod.db, "list_agent_runtime_enabled_users", fake_list)
+    enabled = supervisor_mod._discover_enabled(include_gateway=False, include_pi=True)
+    assert seen == {"include_gateway": False, "include_pi": True}
+    assert enabled["u1"]["driver"] == "pi"
+    assert enabled["u1"]["base_url"] == "https://my.host/v1"
+
+
+def test_drop_gateway_users_keeps_pi_entries():
+    roster = [
+        {"user_id": "pi_u", "driver": "pi", "provider": "openai_compatible"},
+        {"user_id": "gw_u", "driver": "codex", "provider": "gemini"},
+    ]
+    kept = supervisor_mod._drop_gateway_users(roster)
+    assert [e["user_id"] for e in kept] == ["pi_u"]
+
+
+def test_spawn_identity_includes_base_url_so_relay_change_respawns():
+    # pi(及 deepseek 等)的 base_url 只在 spawn 时写进 models.json/env；若不进
+    # _spawn_identity，用户改中转站地址(其他不变)就不会 respawn → 一直连旧 relay。
+    base = {"driver": "pi", "provider": "openai_compatible", "model": "m",
+            "provider_key": "k", "api_key": "ak"}
+    e1 = {**base, "base_url": "https://a.host/v1"}
+    e2 = {**base, "base_url": "https://b.host/v1"}
+    assert supervisor_mod._spawn_identity(e1) != supervisor_mod._spawn_identity(e2)
+    # 同址不变则 identity 一致(不会无谓 bounce)
+    assert supervisor_mod._spawn_identity(e1) == supervisor_mod._spawn_identity(dict(e1))
+
+
+def test_heartbeat_payloads_include_pi_capability():
+    # backend 靠心跳里的 pi 能力位判断该 runner 是否真在跑 pi driver（跨服务 flag
+    # 漂移防护，与 host_all/gateway 同构）。
+    legacy = supervisor_mod._supervisor_heartbeat_payload(
+        "o", host_all=True, gateway=False, pi=True, ts=1.0)
+    assert legacy["pi"] is True
+    inst = supervisor_mod._supervisor_instance_payload(
+        "o", host=None, host_all=True, gateway=False, pi=True,
+        active_children=0, max_children=1, shard_index=0, shard_count=1, version=None, ts=1.0)
+    assert inst["pi"] is True

@@ -172,3 +172,26 @@ def test_list_enabled_users_ignores_explicit_opt_out_flag(_clean_blobs):
     _seed_model_api("usr_d", provider="openai", test_status="ok", agent_runtime_driver="legacy")
     rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users()}
     assert "usr_d" in rows and rows["usr_d"]["driver"] == "codex"
+
+
+# ---- pi driver: openai_compatible discovered directly, no gateway ----
+
+
+def test_list_enabled_users_pi_takes_openai_compatible(_clean_blobs):
+    # pi 开关开：openai_compatible 被发现为 pi driver，且不需要 gateway
+    _seed_all(_clean_blobs)
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_pi=True)}
+    assert rows["compat_on"]["driver"] == "pi"
+    assert rows["compat_on"]["base_url"] == "https://my.host/v1"   # 直连中转站要用
+    # gateway 仍关：gemini/openrouter 照旧不被发现
+    assert "gemini_on" not in rows and "openrouter_on" not in rows
+
+
+def test_list_enabled_users_pi_and_gateway_together(_clean_blobs):
+    # 两开关都开：openai_compatible 归 pi，gemini/openrouter 仍是 codex+gateway
+    _seed_all(_clean_blobs)
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(
+        include_gateway=True, include_pi=True)}
+    assert rows["compat_on"]["driver"] == "pi"
+    assert rows["gemini_on"]["driver"] == "codex"
+    assert rows["openrouter_on"]["driver"] == "codex"

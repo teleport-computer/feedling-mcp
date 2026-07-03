@@ -238,3 +238,72 @@ def test_default_claude_cli_renders_json_and_resumes_session(tmp_path):
     assert t2[_index(t2, "--resume") + 1] == "sess-123"
     assert _index(t2, "--resume") < _index(t2, "-p")
     assert t2[-2:] == ["-p", "second message"]
+
+
+# ---- pi driver contract: env names + cli rendering (--mode json, bounded sid) ----
+
+_CHILD_PI = textwrap.dedent(
+    """
+    import json, os, sys, importlib.util
+    from pathlib import Path
+
+    repo = Path(sys.argv[1])
+    home = Path(sys.argv[2]); home.mkdir(parents=True, exist_ok=True)
+    fakebin = Path(sys.argv[3]); fakebin.mkdir(parents=True, exist_ok=True)
+
+    sys.path.insert(0, str(repo / "backend" / "agent_runtime"))
+    import spawners
+    env = spawners.consumer_env(
+        {"PATH": os.environ["PATH"], "FEEDLING_API_URL": "http://localhost:5001"},
+        {"api_key": "k-abc", "driver": "pi", "provider": "openai_compatible",
+         "provider_key": "sk-relay", "model": "qwen-max",
+         "base_url": "https://my.host/v1"},
+        user_id="u1", home=str(home),
+    )
+    for k, v in env.items():
+        os.environ[k] = v
+
+    fp = fakebin / "pi"; fp.write_text("#!/bin/sh\\necho '{}'\\n"); fp.chmod(0o755)
+    os.environ["PATH"] = f"{fakebin}:{os.environ['PATH']}"
+
+    spec = importlib.util.spec_from_file_location(
+        "resident", str(repo / "tools" / "chat_resident_consumer.py")
+    )
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    turn1 = m._prepare_cli_command("hello world")[1:]
+    turn2 = m._prepare_cli_command("second message")[1:]
+    print(json.dumps({
+        "pi_agent_dir": os.environ.get("PI_CODING_AGENT_DIR", ""),
+        "pi_offline": os.environ.get("PI_OFFLINE", ""),
+        "turn1": turn1, "turn2": turn2,
+    }))
+    """
+)
+
+
+def test_default_pi_cli_renders_mode_json_and_bounded_session(tmp_path):
+    home = tmp_path / "home"
+    fakebin = tmp_path / "bin"
+    proc = subprocess.run(
+        [sys.executable, "-c", _CHILD_PI, str(REPO), str(home), str(fakebin)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["pi_agent_dir"] == f"{home}/pi-home/agent"
+    assert out["pi_offline"] == "1"
+
+    def _flag(argv, name):
+        return argv[argv.index(name) + 1]
+
+    t1, t2 = out["turn1"], out["turn2"]
+    assert "--mode" in t1 and _flag(t1, "--mode") == "json"
+    assert _flag(t1, "--model") == "feedling/qwen-max"
+    assert _flag(t1, "--append-system-prompt") == f"{home}/agent-tools-prompt.md"
+    sid1, sid2 = _flag(t1, "--session-id"), _flag(t2, "--session-id")
+    assert sid1 and sid1 == sid2                 # 两轮续接同一 bounded session
+    # message rides STDIN (call_agent_cli), not argv — so the rendered command must
+    # NOT contain the user message (pi would arg-parse a @/-/-- message otherwise).
+    assert "hello world" not in t1 and "second message" not in t2

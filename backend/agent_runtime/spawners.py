@@ -214,6 +214,38 @@ def _attach_dirs_add_dir(home: str) -> str:
 # Keep in sync with hosted/agent_runtime_cutover._CLAUDE_PROVIDERS.
 _CLAUDE_COMPAT_BASE_URLS = {"deepseek": "https://api.deepseek.com"}
 
+# pi 自定义 provider id（models.json 与 --model feedling/<id> 引用同一名字）。
+_PI_PROVIDER_ID = "feedling"
+
+
+def _pi_models_json(*, base_url: str, model: str) -> str:
+    """pi ``models.json`` registering the user's relay as a custom provider.
+
+    ``api: openai-completions`` — relays only accept /chat/completions (the
+    LiteLLM chat-bridge lesson, 2026-06); pi speaks that wire natively so no
+    bridge/gateway hop is needed. ``apiKey: $PI_PROVIDER_API_KEY`` — pi resolves
+    ``$ENV`` at runtime (resolve-config-value), so the real relay key stays in
+    the consumer process env and never lands on disk. The compat flags mirror
+    what the LiteLLM bridge effectively sent (plain ``system`` role, no
+    ``reasoning_effort``) — relay OpenAI-compat is the weak point, so default
+    to the most conservative wire."""
+    doc = {
+        "providers": {
+            _PI_PROVIDER_ID: {
+                "name": "Feedling relay",
+                "baseUrl": (base_url or "").strip().rstrip("/"),
+                "api": "openai-completions",
+                "apiKey": "$PI_PROVIDER_API_KEY",
+                "compat": {
+                    "supportsDeveloperRole": False,
+                    "supportsReasoningEffort": False,
+                },
+                "models": [{"id": (model or "").strip() or "default"}],
+            }
+        }
+    }
+    return json.dumps(doc, indent=2) + "\n"
+
 
 def _claude_anthropic_base_url(entry: dict) -> str:
     """For a claude-driver entry, the ANTHROPIC_BASE_URL the CLI must use, or "".
@@ -275,14 +307,38 @@ def _identity_override_block(provider: str, model: str, base_url: str) -> str:
     )
 
 
-def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
-    """Default cli command per driver (resident substitutes ``{message}``).
+def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str = "") -> str:
+    """Default cli command per driver (resident substitutes ``{message}`` /
+    ``{session_id}``).
 
     For claude we pre-grant the io_cli verbs (so an unattended
     ``claude -p`` runs them without an interactive permission prompt) and append
-    the how-to as a system prompt from the per-user home. Operators can override
-    the whole thing per roster entry via ``cli_cmd``.
+    the how-to as a system prompt from the per-user home. ``model`` is only used
+    by the pi driver (claude reads it from env, codex from config.toml).
+    Operators can override the whole thing per roster entry via ``cli_cmd``.
     """
+    if driver == "pi":
+        # --mode json: headless JSONL event stream (pi's analogue of codex --json;
+        #   auto-selects print mode, no -p needed).
+        # -t bash: builtin-tool whitelist — the hosted tool contract is entirely
+        #   io_cli-via-bash, so this is tighter than codex's bypassed sandbox and
+        #   close to claude's allow-rules posture. pi has no permission prompts in
+        #   headless mode; the CVM/TEE + per-user home stays the isolation boundary.
+        # --session-id {session_id}: resident-owned bounded session. pi's semantics
+        #   are "use exact id, CREATE if missing", so the resident's generated id
+        #   gives resume for free — the gap codex never closed.
+        # NO {message} placeholder: the resident feeds the user message via STDIN
+        #   (call_agent_cli). pi arg-parses every positional — a message starting
+        #   with @/-/-- would otherwise be eaten as a file ref / flag — so keeping
+        #   it out of argv makes arbitrary user text safe. Images still ride argv as
+        #   native @<path> refs (_inject_pi_images).
+        prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
+        model_part = f"--model {_PI_PROVIDER_ID}/{model} " if model else ""
+        return (
+            f"pi --mode json -t bash --append-system-prompt {prompt_file} "
+            f"{model_part}"
+            "--session-id {session_id}"
+        )
     if driver == "codex":
         # --skip-git-repo-check: the consumer's cwd is the user's home, not a git
         # repo; without it `codex exec` refuses ("Not inside a trusted directory")
@@ -380,8 +436,8 @@ def agent_home_files(
     codex_transport: str = "native",
     gateway_base_url: str = "",
     model: str = "",
-    persona_content: str = "",
     base_url: str = "",
+    persona_content: str = "",
     provider: str = "",
     identity_model: str = "",
 ) -> dict[str, str]:
@@ -427,6 +483,11 @@ def agent_home_files(
         if codex_transport == "gateway":
             files[f"{home}/codex-home/config.toml"] = _codex_gateway_config(
                 base_url=gateway_base_url, model=model)
+    elif driver == "pi":
+        # pi reads the tools how-to via --append-system-prompt (same mechanism as
+        # claude); the relay is registered as a custom provider in models.json.
+        files[f"{home}/pi-home/agent/models.json"] = _pi_models_json(
+            base_url=base_url, model=model)
     else:
         # defaultMode acceptEdits is REQUIRED, not cosmetic: a settings.json that
         # carries `permissions.allow` but no defaultMode makes `claude -p` (esp. in
@@ -463,6 +524,11 @@ def stale_home_files(home: str, *, driver: str, codex_transport: str = "native")
     stale: list[str] = []
     if codex_transport != "gateway":
         stale.append(f"{home}/codex-home/config.toml")
+    if driver != "pi":
+        # A user who switched off the pi driver leaves a models.json pointing at
+        # the old relay; prune it so a future switch-back always reseeds fresh
+        # (symmetric to the codex config.toml lesson above).
+        stale.append(f"{home}/pi-home/agent/models.json")
     return stale
 
 
@@ -474,8 +540,8 @@ def materialize_home(
     codex_transport: str = "native",
     gateway_base_url: str = "",
     model: str = "",
-    persona_content: str = "",
     base_url: str = "",
+    persona_content: str = "",
     provider: str = "",
     identity_model: str = "",
 ) -> None:
@@ -574,7 +640,8 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     cli_cmd = entry.get("cli_cmd")
     if not cli_cmd and driver == "claude" and _claude_cli_should_stream_thinking(entry):
         cli_cmd = _default_thinking_claude_cmd(home)
-    env["AGENT_CLI_CMD"] = cli_cmd or _default_cli_cmd(driver, home)
+    env["AGENT_CLI_CMD"] = cli_cmd or _default_cli_cmd(
+        driver, home, model=str(entry.get("model") or "") if driver == "pi" else "")
     # Per-user isolation: separate checkpoint, agent session, image temp dir, and
     # a per-user agent home (Claude/Codex) so nothing is shared across users.
     env["CHECKPOINT_FILE"] = f"{home}/checkpoint.json"
@@ -624,6 +691,15 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
                 env["CODEX_API_KEY"] = gw_key
         elif entry.get("provider_key"):
             env["CODEX_API_KEY"] = entry["provider_key"]
+    elif driver == "pi":
+        # 每用户 pi 配置隔离（models.json/sessions 都落在 agent dir 下，pi 从
+        # PI_CODING_AGENT_DIR 派生 sessions/，无需单独 session env）。
+        env["PI_CODING_AGENT_DIR"] = f"{home}/pi-home/agent"
+        # 禁 pi 启动期网络操作（自更新检查/遥测）——CVM 内且供应链已 pin。
+        env["PI_OFFLINE"] = "1"
+        # 真 relay key 只进进程环境（models.json 用 $PI_PROVIDER_API_KEY 引用）。
+        if entry.get("provider_key"):
+            env["PI_PROVIDER_API_KEY"] = entry["provider_key"]
     else:
         env["CLAUDE_CONFIG_DIR"] = f"{home}/claude-home"
         if entry.get("provider_key"):
@@ -756,6 +832,7 @@ _CONSUMER_ENV_KEYS = (
     # container's default UTC (the process-spawn path sets it in consumer_env;
     # without this the container strategy would silently drop it).
     "TZ",
+    "PI_CODING_AGENT_DIR", "PI_PROVIDER_API_KEY", "PI_OFFLINE",
 )
 
 

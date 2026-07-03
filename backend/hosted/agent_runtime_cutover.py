@@ -44,16 +44,27 @@ _CODEX_NATIVE_PROVIDERS = {"openai"}
 # Codex-driven providers reachable today (native or via gateway). A provider not
 # here and not in _CLAUDE_PROVIDERS has no hosted fit → ``legacy``.
 _CODEX_PROVIDERS = {"openai", "gemini", "openrouter", "openai_compatible"}
+# pi-driven providers (behind FEEDLING_PI_DRIVER_ENABLE): pi speaks the
+# openai-completions wire natively with a per-user custom baseUrl, so
+# openai_compatible relays connect DIRECTLY — no LiteLLM gateway hop. Flag off
+# → these fall back to the codex+gateway derivation (the rollback path). Keep
+# in sync with the SQL CASE in db.list_agent_runtime_enabled_users.
+_PI_PROVIDERS = {"openai_compatible"}
+
 
 def driver_for_provider(provider: str) -> str:
     """The agent driver for a provider key — auto-derived, NOT user-chosen.
 
-    anthropic / deepseek → ``claude`` (Anthropic-wire CLI); openai / gemini /
-    openrouter / openai_compatible → ``codex`` (the catch-all; non-openai via
-    the LiteLLM gateway). A provider with no configured fit → ``legacy``."""
+    anthropic / deepseek → ``claude`` (Anthropic-wire CLI); openai_compatible →
+    ``pi`` when FEEDLING_PI_DRIVER_ENABLE is on (direct relay, no gateway), else
+    ``codex`` via gateway; openai / gemini / openrouter → ``codex`` (the
+    catch-all; non-openai via the LiteLLM gateway). No configured fit →
+    ``legacy``."""
     p = provider_client.normalize_provider(provider)
     if p in _CLAUDE_PROVIDERS:
         return "claude"
+    if p in _PI_PROVIDERS and pi_driver_enabled():
+        return "pi"
     if p in _CODEX_PROVIDERS:
         return "codex"
     return "legacy"
@@ -62,10 +73,12 @@ def driver_for_provider(provider: str) -> str:
 def codex_transport(provider: str) -> str:
     """For a codex-driven provider, how Codex reaches it: ``native`` (direct
     OpenAI Responses, openai only) or ``gateway`` (via the in-CVM LiteLLM
-    Responses endpoint). Empty string when the provider is not codex-driven
-    (claude-driven or unconfigured) — the caller has nothing to wire."""
+    Responses endpoint). Empty string when the provider is not codex-driven —
+    including an openai_compatible user the pi driver has taken over (their
+    sends must not be gated on the LiteLLM gateway heartbeat), and
+    claude-driven / unconfigured providers."""
     p = provider_client.normalize_provider(provider)
-    if p not in _CODEX_PROVIDERS:
+    if driver_for_provider(p) != "codex":
         return ""
     return "native" if p in _CODEX_NATIVE_PROVIDERS else "gateway"
 
@@ -78,16 +91,28 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
+def pi_driver_enabled() -> bool:
+    """Whether the pi driver takes over _PI_PROVIDERS (single read point for
+    FEEDLING_PI_DRIVER_ENABLE — supervisor/db wiring receives it as a param)."""
+    return _env_truthy("FEEDLING_PI_DRIVER_ENABLE")
+
+
 def assert_hosting_ready() -> None:
     """进程启动时校验托管前置齐全，否则 fail-fast。
 
     收口后 backend 把配了 fit provider 的用户无条件路由到 agent-runner (resolve_driver)。
     这些用户只有在 supervisor 的 host-all 发现激活时才会被 spawn consumer——host-all 激活需
-    FEEDLING_HOST_ALL + FEEDLING_RUNTIME_TOKEN_SECRET (supervisor host_all_active)；gateway-only
-    codex 还需 FEEDLING_LITELLM_ENABLE。任一缺失即启动失败，避免请求被路由却无 consumer 而永远
-    卡在 processing。须与 supervisor 的 host_all_active / gateway 判定保持一致。"""
+    FEEDLING_HOST_ALL + FEEDLING_RUNTIME_TOKEN_SECRET (supervisor host_all_active)。任一缺失即
+    启动失败，避免请求被路由却无 consumer 而永远卡在 processing。须与 supervisor 的
+    host_all_active / gateway 判定保持一致。
+
+    FEEDLING_LITELLM_ENABLE 只在 gateway 是「触达某 hosted provider 的唯一路径」时才硬性要求：
+    pi driver 开启后 openai_compatible 直连中转站、不经 gateway，故 pi-only 部署无需 LiteLLM 即
+    可就绪；gateway-only provider (gemini/openrouter) 在 gateway 关时不被发现，其发送侧
+    check_supervisor_live(require_gateway=True) 给清晰 503（chat_routes 写库前拦），不会卡
+    processing。因此 pi 开时不再把 LiteLLM 列为启动前置。"""
     missing = []
-    if not _env_truthy("FEEDLING_LITELLM_ENABLE"):
+    if not pi_driver_enabled() and not _env_truthy("FEEDLING_LITELLM_ENABLE"):
         missing.append("FEEDLING_LITELLM_ENABLE")
     if not _env_truthy("FEEDLING_HOST_ALL"):
         missing.append("FEEDLING_HOST_ALL")
@@ -102,13 +127,13 @@ def assert_hosting_ready() -> None:
 
 
 def resolve_driver(config: dict | None) -> str:
-    """该用户该走的 agent driver：``claude`` 或 ``codex``。
+    """该用户该走的 agent driver：``claude`` / ``codex`` / ``pi``。
 
     配了能 fit 的 provider 即托管（等价于 host-all 永远 on，无 per-user 开关、
     无 gateway 回退）。无法托管时 raise ``UnsupportedProviderError``。"""
     provider = str((config or {}).get("provider") or "")
     driver = driver_for_provider(provider)
-    if driver not in ("claude", "codex"):
+    if driver not in ("claude", "codex", "pi"):
         raise UnsupportedProviderError(provider or "unconfigured")
     return driver
 
@@ -124,7 +149,8 @@ def _heartbeat_max_age() -> float:
 
 
 def evaluate_supervisor_heartbeat(
-    hb: dict | None, *, now: float, max_age: float, require_gateway: bool = True
+    hb: dict | None, *, now: float, max_age: float,
+    require_gateway: bool = True, require_pi: bool = False
 ) -> tuple[bool, str]:
     """Pure verdict on whether a supervisor is actively hosting, from its
     heartbeat dict. Returns ``(live, reason)``; ``reason`` is "" when live.
@@ -138,7 +164,13 @@ def evaluate_supervisor_heartbeat(
     default). Pass ``require_gateway=False`` for providers that do not route
     through the in-CVM LiteLLM gateway (e.g. anthropic, deepseek via claude
     driver, openai via codex-native) — those users must not be blocked just
-    because the supervisor's gateway happens to be off."""
+    because the supervisor's gateway happens to be off.
+
+    ``require_pi=True`` (pi-driven openai_compatible sends) additionally requires
+    the runner to report ``pi`` — else a backend-pi-on / runner-pi-off drift would
+    route the send with ``require_gateway=False`` to a runner that never spawned a
+    pi consumer, parking it in ``processing``. An old runner whose heartbeat has no
+    ``pi`` key reads as pi-off → 503 (the safe direction: clean fail, not stuck)."""
     if not isinstance(hb, dict):
         return (False, "no_supervisor_heartbeat")
     try:
@@ -154,11 +186,14 @@ def evaluate_supervisor_heartbeat(
         return (False, "supervisor_host_all_inactive")
     if require_gateway and not hb.get("gateway"):
         return (False, "supervisor_gateway_disabled")
+    if require_pi and not hb.get("pi"):
+        return (False, "supervisor_pi_disabled")
     return (True, "")
 
 
 def evaluate_supervisor_instances(
-    instances: list[dict] | None, *, now: float, max_age: float, require_gateway: bool = True
+    instances: list[dict] | None, *, now: float, max_age: float,
+    require_gateway: bool = True, require_pi: bool = False
 ) -> tuple[bool, str]:
     """Aggregate verdict across the per-owner heartbeat rows of a runner cluster.
 
@@ -177,7 +212,8 @@ def evaluate_supervisor_instances(
     not_live: list[tuple[dict, str]] = []
     for hb in instances:
         live, reason = evaluate_supervisor_heartbeat(
-            hb, now=now, max_age=max_age, require_gateway=require_gateway)
+            hb, now=now, max_age=max_age, require_gateway=require_gateway,
+            require_pi=require_pi)
         if live:
             return (True, "")
         not_live.append((hb, reason))
@@ -201,7 +237,8 @@ def _instance_is_fresh(hb: dict, *, now: float, max_age: float) -> bool:
     return ts > 0 and (now - ts) <= max_age
 
 
-def check_supervisor_live(*, require_gateway: bool = True, now: float | None = None) -> tuple[bool, str]:
+def check_supervisor_live(*, require_gateway: bool = True, require_pi: bool = False,
+                          now: float | None = None) -> tuple[bool, str]:
     """Evaluate whether any runner is hosting. Prefers the per-owner multi-instance
     heartbeats (multiple runners don't clobber each other); falls back to the
     legacy single-key heartbeat when the new table has no FRESH row — i.e. it is
@@ -214,7 +251,9 @@ def check_supervisor_live(*, require_gateway: bool = True, now: float | None = N
     host_all off): that's the real cluster state, so we do not fall back then.
 
     Pass ``require_gateway=False`` for providers that do not route through the
-    in-CVM LiteLLM gateway so they are not blocked by a gateway-off heartbeat."""
+    in-CVM LiteLLM gateway so they are not blocked by a gateway-off heartbeat.
+    Pass ``require_pi=True`` for pi-driven providers so a runner that isn't running
+    the pi driver is treated as not-live for them (avoids stuck ``processing``)."""
     now = time.time() if now is None else now
     max_age = _heartbeat_max_age()
     try:
@@ -224,7 +263,8 @@ def check_supervisor_live(*, require_gateway: bool = True, now: float | None = N
         instances = []
     if any(_instance_is_fresh(hb, now=now, max_age=max_age) for hb in instances):
         return evaluate_supervisor_instances(
-            instances, now=now, max_age=max_age, require_gateway=require_gateway)
+            instances, now=now, max_age=max_age, require_gateway=require_gateway,
+            require_pi=require_pi)
     # No FRESH multi-instance row (empty, or only stale orphan rows): fall back to
     # the legacy single-key heartbeat a transitional/rolled-back runner may write.
     try:
@@ -232,7 +272,8 @@ def check_supervisor_live(*, require_gateway: bool = True, now: float | None = N
     except Exception as e:  # noqa: BLE001 — DB hiccup → don't block sends
         log.warning("supervisor heartbeat read failed; routing send anyway (fail-open): %s", e)
         return (True, "")
-    return evaluate_supervisor_heartbeat(hb, now=now, max_age=max_age, require_gateway=require_gateway)
+    return evaluate_supervisor_heartbeat(
+        hb, now=now, max_age=max_age, require_gateway=require_gateway, require_pi=require_pi)
 
 
 def _is_assistant(row: dict) -> bool:

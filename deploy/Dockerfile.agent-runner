@@ -36,7 +36,11 @@ RUN apt-get update \
 # Agent backend CLIs the resident consumer drives in cli mode:
 #  - Claude Code CLI (`claude`)
 #  - Codex CLI (`codex exec --json`)
-RUN npm install -g @anthropic-ai/claude-code@2.1.195 @openai/codex@0.142.4
+#  - pi CLI (`pi --mode json`) — openai_compatible relays, direct (no gateway),
+#    gated behind FEEDLING_PI_DRIVER_ENABLE. Exact pin only (pi iterates fast;
+#    bump explicitly after reviewing its JSON-event/CLI-flag changelog).
+RUN npm install -g @anthropic-ai/claude-code@2.1.195 @openai/codex@0.142.4 \
+        @earendil-works/pi-coding-agent@0.80.3
 
 # Python deps: reuse the backend's hash-locked set so the resident consumer's
 # whole import graph (content_encryption, proactive-v2, db, …) + the supervisor
