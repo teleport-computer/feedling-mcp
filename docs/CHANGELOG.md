@@ -421,6 +421,42 @@ provider 名）。身份块置于 persona 之上、与人设解耦（只压「�
 `_spawn_identity`。
 spec/plan：`docs/superpowers/{specs,plans}/2026-07-02-agent-model-identity-honesty*.md`。
 
+### [DONE] pi 第三 driver（openai_compatible 试点，开关默认关，未部署）
+
+新增 `pi`（[earendil-works/pi](https://github.com/earendil-works/pi)，pin
+`@earendil-works/pi-coding-agent@0.80.3`）作为第三个托管 agent driver，与
+claude / codex 并行。**只切 `openai_compatible`（中转站）**：原路径走 codex + CVM 内
+LiteLLM gateway（Responses→ChatCompletions 桥），链路最长；pi 原生
+`openai-completions` wire + 自定义 baseUrl，直连中转站、**完全绕开 gateway**。回滚开关
+`FEEDLING_PI_DRIVER_ENABLE`（默认关；关闭时 openai_compatible 回落 codex+gateway，秒级回滚）。
+
+改动四层（均 TDD，324 tests green）：cutover 派生（`driver_for_provider`/`codex_transport`/
+`resolve_driver` 认 pi）→ DB 发现（`list_agent_runtime_enabled_users(include_pi=)`，
+openai_compatible 不依赖 gateway 即被发现）→ supervisor 透传 `include_pi` → spawner
+（pi 命令模板 `pi --mode json -t bash`、`models.json` 注册 relay 为自定义 provider、
+`PI_CODING_AGENT_DIR`/`PI_PROVIDER_API_KEY`/`PI_OFFLINE` env 隔离、stale 清理）→ resident
+consumer（`--session-id` create-if-missing 续接=补上 codex resume 缺口、JSONL 事件流解析
+reply/thinking 分离、`message_end` 错误提取、per-turn `usage.cost.total` 成本日志、**图像/vision
+经 pi 原生 `@<path>` 注入**=仿 codex `--image=` 的 `_inject_pi_images`，file-processor 按内容嗅探
+mime 喂真 ImageContent，非模型看不到的文本路径；**用户消息走 STDIN 而非 argv**=托管模板去掉
+`{message}` 占位、`call_agent_cli` 给 pi 子进程 `input=message`——因 pi arg-parse 每个 positional，
+`@`/`-`/`--` 开头的消息在 argv 里会被当文件引用/flag 吞掉，走 stdin 才对任意用户文本安全，图像仍走
+argv `@ref`）。真 key 只进
+进程环境（`$PI_PROVIDER_API_KEY` 插值，不落盘）；`-t bash` 收窄工具面，CVM/TEE 为隔离边界。
+
+**本地半冒烟（真实 pi 0.80.3，假 key）抓到一个 fixture 没覆盖的 bug 并已修**：pi 在
+API 错误时 **exit=0**（错误在带内 `message_end.stopReason=error`），且**会把用户 prompt 也
+emit 成 `message_end role=user`**。原实现 error turn 时 `_pi_turn_from_stream` 正确返回空、
+但 `call_agent_cli` fall through 到通用提取器 → **把用户自己的消息当回复回显**。修复：pi 分支
+设为终结——空回复即 raise 真实 `errorMessage`（如 401），绝不 fall through；加真实形状回归测试。
+同轮验证：`--session-id smoke-1` create-if-missing（header `id`=传入值）、`usage.cost.total`
+字段路径、事件黑名单、models.json 被 pi 正确解析。
+
+**部署需 bump agent-runner 镜像**（新增 pi CLI），并显式开 `FEEDLING_PI_DRIVER_ENABLE`。
+spec `docs/superpowers/specs/2026-07-02-pi-driver-design.md` / plan
+`docs/superpowers/plans/2026-07-02-pi-driver.md`。**未提交、未部署；打通真 API 的端到端冒烟
+（真实中转站 key）待补**。
+
 ## 2026-06-29
 
 ### [DONE] photo_added 唤醒加 new-photo 提示（拉取式）

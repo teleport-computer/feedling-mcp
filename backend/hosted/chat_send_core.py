@@ -91,9 +91,15 @@ def model_api_chat_send_core(
     # Only gate on gateway if this provider actually routes through the in-CVM
     # LiteLLM gateway. anthropic/deepseek (claude driver) and openai (codex-native)
     # bypass the gateway entirely and must not be blocked by a gateway-off heartbeat.
+    # For a pi-driven provider (openai_compatible when the pi driver is on) require
+    # the runner to report the pi capability instead — a runner-pi-off drift would
+    # otherwise pass the gateway-free liveness check yet spawn no consumer, parking
+    # the send in "processing".
     _provider = str((config or {}).get("provider") or "")
     _require_gateway = agent_runtime_cutover.codex_transport(_provider) == "gateway"
-    live, reason = agent_runtime_cutover.check_supervisor_live(require_gateway=_require_gateway)
+    _require_pi = agent_runtime_cutover.driver_for_provider(_provider) == "pi"
+    live, reason = agent_runtime_cutover.check_supervisor_live(
+        require_gateway=_require_gateway, require_pi=_require_pi)
     if not live:
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",

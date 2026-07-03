@@ -543,17 +543,19 @@ def _resolve_roster(roster: list[dict]) -> list[dict]:
     return resolved
 
 
-def _discover_enabled(include_gateway: bool = False) -> dict[str, dict]:
+def _discover_enabled(include_gateway: bool = False, include_pi: bool = False) -> dict[str, dict]:
     """Map ``user_id -> {"driver", "provider", "model", "base_url"}`` for users
     whose ``model_api`` config is test_ok and uses a fit provider (Stage C+).
     No per-user flag required — aligned with hosted/agent_runtime_cutover.resolve_driver.
     ``include_gateway`` mirrors whether the LiteLLM gateway is running — when off,
     gateway-only providers are excluded so they aren't spawned against a proxy that
-    isn't there."""
+    isn't there. ``include_pi`` mirrors FEEDLING_PI_DRIVER_ENABLE — openai_compatible
+    users are then discovered as the pi driver WITHOUT needing the gateway."""
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
                            "model": u.get("model", ""), "base_url": u.get("base_url", ""),
                            "supports_responses": bool(u.get("supports_responses", False))}
-            for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway)}
+            for u in db.list_agent_runtime_enabled_users(
+                include_gateway=include_gateway, include_pi=include_pi)}
 
 
 def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]:
@@ -848,7 +850,10 @@ def _spawn_identity(entry: dict) -> tuple:
     ``provider_key`` is EXCLUDED for gateway users (it goes to LiteLLM, not the
     consumer env), so rotating it doesn't bounce the consumer. ``persona_version``
     (genesis_persona digest) IS included so a voice backfill/Dream re-seeds the
-    persona prompt via a natural respawn (gate 4 C)."""
+    persona prompt via a natural respawn (gate 4 C). ``base_url`` IS included: it
+    only reaches the consumer via a spawn-time home file (pi ``models.json``, or
+    claude's ANTHROPIC_BASE_URL), so a relay-address change with everything else
+    unchanged must respawn — else the consumer keeps hitting the old endpoint."""
     driver = (entry.get("driver") or "claude").strip().lower()
     gateway = spawners._codex_transport(entry) == "gateway"
     return (
@@ -936,7 +941,7 @@ def _wire_gateway_models(roster: list[dict]) -> tuple[list[dict], list[dict]]:
 
 
 def _effective_roster(base_roster: list[dict], *, autodiscover: bool,
-                      gateway_enabled: bool,
+                      gateway_enabled: bool, pi_enabled: bool = False,
                       host_all_discovered: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
     """Compute the roster to actually run this tick + the gateway routing entries.
 
@@ -959,7 +964,7 @@ def _effective_roster(base_roster: list[dict], *, autodiscover: bool,
                 by_uid[e["user_id"]] = e        # dev override wins
         roster = list(by_uid.values())
     elif autodiscover:
-        enabled = _discover_enabled(include_gateway=gateway_enabled)
+        enabled = _discover_enabled(include_gateway=gateway_enabled, include_pi=pi_enabled)
         roster = _apply_discovery(base_roster, enabled)
     else:
         roster = base_roster
@@ -1003,30 +1008,34 @@ def _genesis_worker_loop(*, api_url, enclave_url, mint_genesis, interval, stop_e
         stop_event.wait(interval)
 
 
-def _supervisor_heartbeat_payload(owner: str, *, host_all: bool, gateway: bool, ts: float) -> dict:
-    """Global heartbeat the backend's wedge guard reads. ``host_all``/``gateway``
-    let the backend detect the cross-service config divergence (supervisor up but
-    not actually hosting / gateway off) that its own startup check can't see."""
+def _supervisor_heartbeat_payload(owner: str, *, host_all: bool, gateway: bool,
+                                  pi: bool, ts: float) -> dict:
+    """Global heartbeat the backend's wedge guard reads. ``host_all``/``gateway``/
+    ``pi`` let the backend detect the cross-service config divergence (supervisor
+    up but not actually hosting / gateway off / pi driver off) that its own startup
+    check can't see — the backend requires ``pi`` before routing a pi-driven
+    openai_compatible send with ``require_gateway=False``, else a runner-pi-off
+    config would park those sends in ``processing`` forever."""
     return {"ts": float(ts), "owner": str(owner),
-            "host_all": bool(host_all), "gateway": bool(gateway)}
+            "host_all": bool(host_all), "gateway": bool(gateway), "pi": bool(pi)}
 
 
 def _supervisor_instance_payload(owner: str, *, host: str | None, host_all: bool,
-                                 gateway: bool, active_children: int, max_children: int,
+                                 gateway: bool, pi: bool, active_children: int, max_children: int,
                                  shard_index: int, shard_count: int, version: str | None,
                                  ts: float) -> dict:
     """Rich per-owner heartbeat row (migration 0009). Beyond the legacy payload's
-    host_all/gateway, it carries this runner's live capacity (active vs max
+    host_all/gateway/pi, it carries this runner's live capacity (active vs max
     children) and shard config, so multiple runners report independently and the
     backend can aggregate without one clobbering another."""
     return {"ts": float(ts), "owner": str(owner), "host": host,
-            "host_all": bool(host_all), "gateway": bool(gateway),
+            "host_all": bool(host_all), "gateway": bool(gateway), "pi": bool(pi),
             "active_children": int(active_children), "max_children": int(max_children),
             "shard_index": int(shard_index), "shard_count": int(shard_count),
             "version": version}
 
 
-def _heartbeat_loop(*, owner: str, host_all: bool, gateway: bool,
+def _heartbeat_loop(*, owner: str, host_all: bool, gateway: bool, pi: bool,
                     interval: float, stop_event, instance_payload_fn=None,
                     prune_max_age_sec: float | None = None) -> None:
     """Write the supervisor heartbeat on a fixed cadence from a dedicated thread,
@@ -1058,7 +1067,7 @@ def _heartbeat_loop(*, owner: str, host_all: bool, gateway: bool,
                     log.warning("supervisor instance heartbeat prune failed: %s", e)
         try:
             db.set_supervisor_heartbeat(_supervisor_heartbeat_payload(
-                owner, host_all=host_all, gateway=gateway, ts=ts))
+                owner, host_all=host_all, gateway=gateway, pi=pi, ts=ts))
         except Exception as e:  # noqa: BLE001
             log.warning("supervisor heartbeat write failed: %s", e)
         stop_event.wait(interval)
@@ -1107,6 +1116,8 @@ def main() -> int:
     isolation = os.environ.get("AGENT_RUNTIME_ISOLATION", "process").strip().lower()
 
     gateway_enabled = os.environ.get("FEEDLING_LITELLM_ENABLE", "").strip().lower() in ("1", "true", "yes")
+    # pi driver takes over openai_compatible (direct relay, no gateway) when on.
+    pi_enabled = _truthy(os.environ.get("FEEDLING_PI_DRIVER_ENABLE", ""))
     autodiscover = os.environ.get("AGENT_RUNTIME_AUTODISCOVER", "").strip().lower() in ("1", "true", "yes")
     # Stage D host-all: every configured user is hosted with NO api_key roster —
     # the supervisor mints a runtime token per DB-discovered user and resolves the
@@ -1217,14 +1228,15 @@ def main() -> int:
             active = len(sup.children)
         return _supervisor_instance_payload(
             owner, host=socket.gethostname(), host_all=host_all_active,
-            gateway=gateway_enabled, active_children=active,
+            gateway=gateway_enabled, pi=pi_enabled, active_children=active,
             max_children=sup.max_children, shard_index=0, shard_count=1,
             version=None, ts=ts)
 
     threading.Thread(
         target=_heartbeat_loop, daemon=True,
         kwargs={"owner": owner, "host_all": host_all_active,
-                "gateway": gateway_enabled, "interval": min(interval, 15.0),
+                "gateway": gateway_enabled, "pi": pi_enabled,
+                "interval": min(interval, 15.0),
                 "stop_event": hb_stop, "instance_payload_fn": _instance_payload,
                 # Drop rows from dead runners (each restart is a new hostname:pid
                 # owner). Generous so a briefly-paused runner isn't pruned mid-life.
@@ -1248,13 +1260,13 @@ def main() -> int:
                 # (or the gateway) takes effect without restarting the supervisor.
                 discovered = None
                 if host_all_active:
-                    enabled = _discover_enabled(include_gateway=gateway_enabled)
+                    enabled = _discover_enabled(include_gateway=gateway_enabled, include_pi=pi_enabled)
                     discovered = _resolve_discovered(
                         enabled, mint_token=mint_token, api_url=api_url,
                         enclave_url=enclave_url, cache=cred_cache)
                 roster, gateways = _effective_roster(
                     base_roster, autodiscover=autodiscover, gateway_enabled=gateway_enabled,
-                    host_all_discovered=discovered)
+                    pi_enabled=pi_enabled, host_all_discovered=discovered)
                 # Tag each entry with the genesis_persona digest (unified point: covers
                 # base + discovered). _spawn_identity includes it, so when a voice
                 # backfill/Dream writes a new persona blob the next tick respawns and

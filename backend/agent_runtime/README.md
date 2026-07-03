@@ -11,7 +11,15 @@ The **canonical consumer is the VPS resident consumer**
 reply / output cleaning / verify-ping / proactive / images. This package is the
 **multi-tenant hosting layer** the resident consumer lacks: it runs one resident
 consumer per API-key user inside the CVM, driven in `cli` mode against
-`claude` / `codex exec`.
+`claude` / `codex exec` / `pi --mode json`.
+
+Drivers are auto-derived from the user's provider (never user-chosen):
+anthropic/deepseek → `claude`; openai → `codex` native; gemini/openrouter →
+`codex` via the in-CVM LiteLLM gateway; **openai_compatible → `pi`** (direct
+relay over the openai-completions wire, **no gateway hop**) when
+`FEEDLING_PI_DRIVER_ENABLE` is on, else `codex` via gateway (the rollback path).
+pi resumes sessions with `--session-id` (create-if-missing) — the only driver
+that natively closes codex's missing-resume gap.
 
 So API-key users become "hosted resident users": their own agent (own session /
 home / provider key), same backend tools/encryption/protocol as VPS users — the
