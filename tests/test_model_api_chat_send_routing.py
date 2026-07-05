@@ -112,7 +112,8 @@ def _setup_openrouter(client, api_key: str, monkeypatch) -> None:
     assert res.status_code == 200, res.get_data(as_text=True)
 
 
-def test_chat_response_marks_first_model_api_success_once(client, monkeypatch):
+@pytest.mark.parametrize("source", ["chat", "model_api"])
+def test_chat_response_marks_first_user_success_once_for_real_chat_sources(client, monkeypatch, source):
     user_id, api_key = _register(client)
     monkeypatch.setattr(
         boot_gates,
@@ -123,41 +124,63 @@ def test_chat_response_marks_first_model_api_success_once(client, monkeypatch):
     store = appmod.get_store(user_id)
     assert store.proactive_activation_ready() is False
 
-    chat_user = store.append_chat("user", "chat", _chat_envelope(user_id, "ordinary-user-1"))
-    ordinary = client.post(
-        "/v1/chat/response",
-        json={"envelope": _chat_envelope(user_id, "ordinary-assistant-1"), "reply_to_message_id": chat_user["id"]},
-        headers=_headers(api_key),
-    )
-    assert ordinary.status_code == 200, ordinary.get_data(as_text=True)
-    assert store.proactive_activation_ready() is False
-
-    model_user = store.append_chat("user", "model_api", _chat_envelope(user_id, "model-user-1"))
+    bad_user = store.append_chat("user", source, _chat_envelope(user_id, f"{source}-bad-user-1"))
     bad = client.post(
         "/v1/chat/response",
-        json={"reply_to_message_id": model_user["id"]},
+        json={"reply_to_message_id": bad_user["id"]},
         headers=_headers(api_key),
     )
     assert bad.status_code == 400
     assert store.proactive_activation_ready() is False
 
+    user_msg = store.append_chat("user", source, _chat_envelope(user_id, f"{source}-user-1"))
     first = client.post(
         "/v1/chat/response",
-        json={"envelope": _chat_envelope(user_id, "model-assistant-1"), "reply_to_message_id": model_user["id"]},
+        json={
+            "envelope": _chat_envelope(user_id, f"{source}-assistant-1"),
+            "reply_to_message_id": user_msg["id"],
+        },
         headers=_headers(api_key),
     )
     assert first.status_code == 200, first.get_data(as_text=True)
     first_chat_ok_at = store.first_chat_ok_at()
     assert first_chat_ok_at
 
-    second_user = store.append_chat("user", "model_api", _chat_envelope(user_id, "model-user-2"))
+    second_user = store.append_chat("user", source, _chat_envelope(user_id, f"{source}-user-2"))
     second = client.post(
         "/v1/chat/response",
-        json={"envelope": _chat_envelope(user_id, "model-assistant-2"), "reply_to_message_id": second_user["id"]},
+        json={
+            "envelope": _chat_envelope(user_id, f"{source}-assistant-2"),
+            "reply_to_message_id": second_user["id"],
+        },
         headers=_headers(api_key),
     )
     assert second.status_code == 200, second.get_data(as_text=True)
     assert store.first_chat_ok_at() == first_chat_ok_at
+
+
+def test_chat_response_does_not_mark_first_chat_ok_for_verify_ping(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        boot_gates,
+        "_gate_bootstrap_for_chat",
+        lambda store, allow_verify_reply=False: None,
+    )
+
+    store = appmod.get_store(user_id)
+    ping_user = store.append_chat("user", "verify_ping", _chat_envelope(user_id, "verify-ping-user-1"))
+
+    reply = client.post(
+        "/v1/chat/response",
+        json={
+            "envelope": _chat_envelope(user_id, "verify-ping-assistant-1"),
+            "reply_to_message_id": ping_user["id"],
+        },
+        headers=_headers(api_key),
+    )
+
+    assert reply.status_code == 200, reply.get_data(as_text=True)
+    assert store.proactive_activation_ready() is False
 
 
 def test_send_configured_routes_to_agent_runner(client, monkeypatch):

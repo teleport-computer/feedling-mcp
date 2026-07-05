@@ -113,11 +113,17 @@ def _chat_message_by_id(store: UserStore, msg_id: str) -> dict | None:
     return None
 
 
-def _maybe_mark_model_api_first_chat_ok(store: UserStore, reply_to_message_id: str) -> None:
+FIRST_CHAT_OK_USER_SOURCES = {"chat", "model_api"}
+
+
+def _maybe_mark_first_chat_ok(store: UserStore, reply_to_message_id: str) -> None:
     user_msg = _chat_message_by_id(store, reply_to_message_id)
     if not user_msg:
         return
-    if str(user_msg.get("role") or "") == "user" and str(user_msg.get("source") or "") == "model_api":
+    if (
+        str(user_msg.get("role") or "") == "user"
+        and str(user_msg.get("source") or "") in FIRST_CHAT_OK_USER_SOURCES
+    ):
         store.mark_first_chat_ok()
 
 
@@ -466,7 +472,7 @@ def write_response(
             "replied_by": consumer_id,
             "replied_at": f"{time.time():.3f}",
         })
-        _maybe_mark_model_api_first_chat_ok(store, reply_to_message_id)
+        _maybe_mark_first_chat_ok(store, reply_to_message_id)
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
     # Any plaintext AI reply supplied by the caller enters the same app-state
