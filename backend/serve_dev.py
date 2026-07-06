@@ -18,13 +18,23 @@ import os
 
 
 def main() -> None:
-    # Fail-fast: gateway-only codex providers have no consumer spawned unless
-    # the in-CVM LiteLLM gateway is up; validate here so a misconfig surfaces
-    # at launch, not at request time (gunicorn runs the same check in
-    # on_starting).
+    # Mirror gunicorn_conf.on_starting — the two boot duties the old
+    # ``python backend/app.py`` entry performed at import time:
+    #
+    # 1. Fail-fast hosting check: gateway-only codex providers have no
+    #    consumer spawned unless the in-CVM LiteLLM gateway is up; a
+    #    misconfig should surface at launch, not at request time.
+    # 2. ``db.init_schema()`` (alembic upgrade head): ``import asgi_app`` is
+    #    deliberately side-effect-free, so without this a fresh database
+    #    (e.g. CI's empty feedling_ci) serves with no tables and every
+    #    route 500s.
     from hosted import agent_runtime_cutover
 
     agent_runtime_cutover.assert_hosting_ready()
+
+    import db
+
+    db.init_schema()
 
     import uvicorn
 
