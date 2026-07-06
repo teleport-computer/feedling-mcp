@@ -85,7 +85,7 @@ services:
   # + chat checkpoint always live in one place, so a lease that re-acquires here
   # resumes from a consistent cursor (no cross-runner stale-checkpoint wedge).
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:f8f13e4   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:04979c8   # CI pins the sha
     container_name: agent-runner
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
