@@ -833,11 +833,11 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
                 )
                 SELECT day,
                        COUNT(*)::int AS jobs,
-                       (COUNT(*) FILTER (WHERE status IN ('posted','delivered')))::int AS delivered,
+                       (COUNT(*) FILTER (WHERE status IN ('posted','delivered','completed')))::int AS delivered,
                        (COUNT(*) FILTER (WHERE status IN ('failed','skipped')))::int AS failed,
                        (COUNT(*) FILTER (WHERE status = 'pending'))::int AS pending,
                        (COUNT(*) FILTER (WHERE kind IN {screen_kinds}))::int AS screen,
-                       (COUNT(*) FILTER (WHERE kind LIKE 'heartbeat%%'
+                       (COUNT(*) FILTER (WHERE (kind = 'presence' OR kind LIKE 'heartbeat%%')
                                           AND kind NOT IN {screen_kinds}))::int AS heartbeat
                 FROM jobs
                 GROUP BY day
@@ -908,7 +908,7 @@ def admin_events_overview() -> dict:
             CASE
               WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','heartbeat_broadcast_on') THEN 'screen'
               WHEN k.kind IN ('perception_event','scene_change','photo_added','arrived_at_anchor','location','unlock_after_absence','scheduled_wake') THEN 'trigger'
-              WHEN left(k.kind, 9) = 'heartbeat' THEN 'heartbeat'
+              WHEN k.kind = 'presence' OR left(k.kind, 9) = 'heartbeat' THEN 'heartbeat'
               ELSE 'other'
             END AS lane
           FROM user_logs l,
