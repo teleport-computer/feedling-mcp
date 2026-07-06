@@ -216,7 +216,7 @@ def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeyp
     }
     monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
 
-    html = admin_core.page_html("view=debug&user_id=user_a&q=reply")
+    html = admin_core.page_html("view=debug&mode=flat&user_id=user_a&q=reply")
 
     assert "Debug" in html
     assert "user_a" in html
@@ -249,7 +249,7 @@ def test_debug_page_renders_load_more_when_paginated(monkeypatch):
     }
     monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
 
-    html = admin_core.page_html("view=debug&user_id=user_a&limit=2&offset=0")
+    html = admin_core.page_html("view=debug&mode=flat&user_id=user_a&limit=2&offset=0")
 
     assert "Showing 1-2 of 3 events" in html
     assert "Next" in html
