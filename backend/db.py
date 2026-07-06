@@ -865,10 +865,13 @@ _EVENTS_ROUTES_CTE = (
     "lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route "
     "FROM user_blobs WHERE kind = 'onboarding_route')"
 )
-# EXTRACT epoch of (completed_at - created_at) from two JSONB iso strings, NULL-safe.
+# EXTRACT epoch from terminal_at - created_at, guarded to ISO-ish strings so
+# malformed values degrade to NULL instead of aborting the whole aggregate.
 _JOB_DUR_SEC = (
-    "CASE WHEN doc->>'completed_at' ~ '^[0-9]' AND doc->>'created_at' ~ '^[0-9]' "
-    "THEN EXTRACT(EPOCH FROM ((doc->>'completed_at')::timestamptz "
+    "CASE WHEN COALESCE(doc->>'completed_at',doc->>'posted_at',doc->>'failed_at') "
+    "~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "
+    "AND doc->>'created_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "
+    "THEN EXTRACT(EPOCH FROM ((COALESCE(doc->>'completed_at',doc->>'posted_at',doc->>'failed_at'))::timestamptz "
     "- (doc->>'created_at')::timestamptz)) ELSE NULL END"
 )
 
@@ -911,6 +914,7 @@ def admin_events_overview() -> dict:
           FROM user_logs l,
             LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),NULLIF(l.doc->>'wake_kind',''),NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
           WHERE l.stream = 'proactive_jobs'
+            AND COALESCE(l.doc->>'job_kind','') NOT IN ('memory_capture','memory_dream','memory_migrate')
         ) j LEFT JOIN routes r ON r.user_id = j.user_id
         GROUP BY route, j.lane
     """)
@@ -926,11 +930,19 @@ def admin_events_overview() -> dict:
         {_EVENTS_ROUTES_CTE}
         SELECT COALESCE(r.route,'resident') AS route,
                COUNT(*)::int AS total,
-               (COUNT(*) FILTER (WHERE l.doc->>'status' = 'completed'))::int AS success,
-               (COUNT(*) FILTER (WHERE l.doc->>'status' IN ('failed','error','skipped')))::int AS failed,
-               percentile_cont(0.5) WITHIN GROUP (ORDER BY {_JOB_DUR_SEC.replace('doc','l.doc')}) AS median_dur
-        FROM user_logs l LEFT JOIN routes r ON r.user_id = l.user_id
-        WHERE l.stream = 'memory_capture_jobs'
+               (COUNT(*) FILTER (WHERE m.status = 'completed'))::int AS success,
+               (COUNT(*) FILTER (WHERE m.status IN ('failed','error','skipped')))::int AS failed,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY m.dur) AS median_dur
+        FROM (
+          SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
+          FROM user_logs l
+          WHERE l.stream = 'memory_capture_jobs'
+          UNION ALL
+          SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
+          FROM user_logs l
+          WHERE l.stream = 'proactive_jobs'
+            AND COALESCE(l.doc->>'job_kind','') IN ('memory_capture','memory_dream','memory_migrate')
+        ) m LEFT JOIN routes r ON r.user_id = m.user_id
         GROUP BY route
     """)
     out["capture"] = [
