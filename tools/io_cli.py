@@ -30,6 +30,7 @@ import re
 import ssl
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -565,6 +566,48 @@ def _poll_genesis_job(api_url, auth, job_id, *, timeout, interval=2.0):
         _time.sleep(interval)
 
 
+def _read_add_memory_input(args):
+    """Resolve the text to distill: --file (wins) -> --text -> stdin. Empty if none."""
+    if args.file:
+        try:
+            with open(args.file, encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            _emit({"ok": False, "error": f"could not read --file: {e}"}, 2)
+    if args.text:
+        return args.text
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return ""
+
+
+def cmd_add_memory(args):
+    """Distill a file/text into memory (default) or identity via the genesis
+    plaintext pipeline (POST /v1/genesis/imports/plaintext), then poll to done."""
+    api_url, auth = _require_backend()
+    text = _read_add_memory_input(args)
+    if not text.strip():
+        _emit({"ok": False, "error": "empty_input: need --file/--text with content or piped stdin"}, 2)
+    as_kind = "identity" if args.as_kind == "identity" else "memory"
+    filename = os.path.basename(args.file) if args.file else ""
+    prefix = "vps-update-identity" if as_kind == "identity" else "vps-add-memory"
+    client_job_id = f"{prefix}-{uuid.uuid4()}"
+    payload = _add_memory_payload(text, filename, as_kind, client_job_id)
+    code, body = _http_json("POST", f"{api_url}/v1/genesis/imports/plaintext", auth, payload=payload)
+    if code >= 400:
+        _emit({"ok": False, "status": "error", "http_status": code, "error": body}, 1)
+    job = body.get("job") if isinstance(body, dict) else {}
+    job_id = (job.get("job_id") if isinstance(job, dict) else None) or (
+        body.get("job_id") if isinstance(body, dict) else None)
+    if not job_id:
+        _emit({"ok": False, "status": "error", "error": "no job_id in response", "body": body}, 1)
+    if args.no_wait:
+        _emit({"ok": True, "status": "submitted", "job_id": job_id, "as": as_kind})
+    result = _poll_genesis_job(api_url, auth, job_id, timeout=args.timeout)
+    result["as"] = as_kind
+    _emit(result, 0 if result.get("ok") else 1)
+
+
 def cmd_identity_write(args):
     """Patch the agent's display identity card (self_introduction / signature).
 
@@ -676,6 +719,17 @@ def main():
     iw.add_argument("--signature", action="append", default=[],
                     help="repeatable short string(s) for the signature")
     iw.set_defaults(func=cmd_identity_write)
+
+    am = sub.add_parser("add-memory",
+                        help="Distill a file/text into memory (default) or identity via genesis.")
+    am.add_argument("--file", default="", help="path to a file to distill")
+    am.add_argument("--text", default="", help="inline text to distill (or pipe via stdin)")
+    am.add_argument("--as", dest="as_kind", choices=["memory", "identity"], default="memory",
+                    help="memory (default) or identity")
+    am.add_argument("--no-wait", dest="no_wait", action="store_true",
+                    help="submit and return job_id without polling")
+    am.add_argument("--timeout", type=float, default=120.0, help="poll timeout seconds (default 120)")
+    am.set_defaults(func=cmd_add_memory)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")

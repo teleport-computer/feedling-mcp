@@ -75,3 +75,21 @@ def test_poll_http_error(monkeypatch):
     assert out["ok"] is False
     assert out["status"] == "error"
     assert out["http_status"] == 500
+
+
+import json as _json  # noqa: E402
+import subprocess  # noqa: E402
+
+_TOOLS = Path(__file__).parent.parent / "tools"
+_IO_CLI = str(_TOOLS / "io_cli.py")
+
+
+def test_add_memory_missing_env_clean_error():
+    r = subprocess.run(
+        [sys.executable, _IO_CLI, "add-memory", "--text", "hi"],
+        capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"},
+    )
+    assert "conflicting subparser" not in r.stderr
+    assert "Traceback" not in r.stderr
+    payload = _json.loads(r.stdout.strip().splitlines()[-1])
+    assert payload.get("ok") is False  # missing FEEDLING_API_URL/auth -> clean JSON error
