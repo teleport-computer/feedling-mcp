@@ -600,16 +600,11 @@ jobs:
       # decrypt → reset, proving the whole write/seal/decrypt loop on the live
       # CVM. Inert until PROD_MAIN_ENCLAVE_URL is set (same gate as §2). The
       # canary self-cleans its throwaway account (finally: /v1/account/reset).
-      #
-      # TEMPORARY continue-on-error (2026-07-05): after a prod CVM restart the
-      # single-runner respawn storm (102 users reconnecting) can wedge the
-      # backend for ~60s; the canary's single-attempt whoami then times out and
-      # false-fails the deploy (run #664). Still runs and logs for signal — the
-      # hard key-drift guard is §2 above. Remove once the canary gets
-      # transport-level retries / a backend readiness wait.
+      # Transient transport/gateway failures (post-restart respawn storm, run
+      # #664) are absorbed by the canary's built-in retries (~62s budget), so
+      # this is a hard gate again.
       - name: Post-deploy canary round-trip
         if: ${{ vars.PROD_MAIN_ENCLAVE_URL != '' }}
-        continue-on-error: true
         env:
           FEEDLING_API_URL:     ${{ vars.PROD_API_URL || 'https://api.feedling.app' }}
           FEEDLING_ENCLAVE_URL: ${{ vars.PROD_MAIN_ENCLAVE_URL }}

@@ -48,6 +48,44 @@ def _stub_http(reset_status: int):
     return _http
 
 
+def test_transient_transport_failure_is_retried(canary_env, monkeypatch, capsys):
+    """A transient transport blip (status 0, e.g. TLS EOF right after a CVM
+    deploy) on whoami must be retried, not fail the deploy — CI run #664 /
+    PR #703 pattern."""
+    inner = _stub_http(reset_status=200)
+    blips = {"whoami": 2, "reset": 1}
+
+    def flaky(method, url, **kw):
+        for key, path in (("whoami", "/v1/users/whoami"), ("reset", "/v1/account/reset")):
+            if url.endswith(path) and blips[key] > 0:
+                blips[key] -= 1
+                return 0, {"error": "transport: [SSL: UNEXPECTED_EOF_WHILE_READING]"}
+        return inner(method, url, **kw)
+
+    monkeypatch.setattr(dc, "_http", flaky)
+    monkeypatch.setattr(dc.time, "sleep", lambda s: None)
+    dc.main()  # no SystemExit
+    assert "CANARY OK" in capsys.readouterr().out
+    assert blips == {"whoami": 0, "reset": 0}  # retries actually consumed the blips
+
+
+def test_persistent_transport_failure_still_fails(canary_env, monkeypatch, capsys):
+    """Transport failure on every attempt is a real finding — must still exit 1."""
+    inner = _stub_http(reset_status=200)
+
+    def dead_whoami(method, url, **kw):
+        if url.endswith("/v1/users/whoami"):
+            return 0, {"error": "transport: connection refused"}
+        return inner(method, url, **kw)
+
+    monkeypatch.setattr(dc, "_http", dead_whoami)
+    monkeypatch.setattr(dc.time, "sleep", lambda s: None)
+    with pytest.raises(SystemExit) as e:
+        dc.main()
+    assert e.value.code == 1
+    assert "CANARY OK" not in capsys.readouterr().out
+
+
 def test_reset_failure_fails_the_canary(canary_env, monkeypatch, capsys):
     monkeypatch.setattr(dc, "_http", _stub_http(reset_status=403))
     with pytest.raises(SystemExit) as e:

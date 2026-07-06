@@ -44,6 +44,12 @@ ENCLAVE_URL = os.environ.get("FEEDLING_ENCLAVE_URL", "http://127.0.0.1:5003").rs
 SHA = os.environ.get("GITHUB_SHA", "local")[:12]
 LABEL = os.environ.get("FEEDLING_CANARY_LABEL", f"deploy-canary-{SHA}")
 DECRYPT_RETRIES = int(os.environ.get("FEEDLING_CANARY_RETRIES", "4"))
+HTTP_TRIES = int(os.environ.get("FEEDLING_CANARY_HTTP_TRIES", "5"))
+
+# Transient right after a CVM (re)deploy: 0 = transport layer (TLS EOF, timeout,
+# connection refused — the run #664 / PR #703 class), 502/503/504 = gateway while
+# the backend is still coming up or wedged by the runner respawn storm.
+_RETRYABLE = {0, 502, 503, 504}
 
 _RAW = serialization.Encoding.Raw, serialization.PublicFormat.Raw
 _INSECURE = ssl._create_unverified_context()
@@ -79,6 +85,21 @@ def _http(method: str, url: str, *, body: dict | None = None, api_key: str | Non
         return 0, {"error": f"transport: {getattr(e, 'reason', e)}"}
 
 
+def _http_retry(method: str, url: str, **kw) -> tuple[int, dict]:
+    """_http with exponential backoff on transient statuses (_RETRYABLE). Sleeps
+    2,4,8,16,32s between the default 5 tries (~62s total) — sized to outlast the
+    ~60s backend wedge after a CVM restart. A status that persists through every
+    try is returned to the caller as a real finding."""
+    for attempt in range(1, HTTP_TRIES + 1):
+        st, body = _http(method, url, **kw)
+        if st not in _RETRYABLE or attempt == HTTP_TRIES:
+            return st, body
+        print(f"[canary] {method} {url} -> {st}: {body.get('error')} "
+              f"(attempt {attempt}/{HTTP_TRIES}, retrying)")
+        time.sleep(2 ** attempt)
+    return st, body  # unreachable; keeps type-checkers happy
+
+
 def _box_seal(pt: bytes, recipient_pk: X25519PublicKey) -> bytes:
     """X25519 ECDH → HKDF-SHA256(salt=None, info='feedling-box-seal-v1') →
     nonce = SHA256(ek_pub || recipient_pub)[:12] → ChaCha20-Poly1305.
@@ -104,7 +125,7 @@ def main() -> None:
     print(f"[canary] api={API_URL} enclave={ENCLAVE_URL} label={LABEL}")
 
     # 1. attested enclave content pk (ground truth from the TDX quote path)
-    st, att = _http("GET", f"{ENCLAVE_URL}/attestation", insecure=True)
+    st, att = _http_retry("GET", f"{ENCLAVE_URL}/attestation", insecure=True)
     if st != 200:
         _fail(f"/attestation returned {st}: {att.get('error')}")
     attested_pk = str(att.get("enclave_content_pk_hex") or "")
@@ -115,7 +136,7 @@ def main() -> None:
     # 2. register a throwaway user (fresh keypair → no orphan-backstop collision)
     user_sk = X25519PrivateKey.generate()
     user_pk = user_sk.public_key()
-    st, reg = _http("POST", f"{API_URL}/v1/users/register",
+    st, reg = _http_retry("POST", f"{API_URL}/v1/users/register",
                     body={"public_key": _b64(user_pk.public_bytes(*_RAW)),
                           "platform": "deploy-canary", "label": LABEL})
     if st != 201:
@@ -125,7 +146,7 @@ def main() -> None:
 
     try:
         # 3. whoami's advertised pk MUST equal the attested pk
-        st, who = _http("GET", f"{API_URL}/v1/users/whoami", api_key=api_key)
+        st, who = _http_retry("GET", f"{API_URL}/v1/users/whoami", api_key=api_key)
         if st != 200:
             _fail(f"whoami returned {st}: {who.get('error')}")
         advertised_pk = str(who.get("enclave_content_public_key_hex") or "")
@@ -169,8 +190,8 @@ def main() -> None:
             _fail(f"enclave decrypt never succeeded after {DECRYPT_RETRIES} tries; last={last}")
     finally:
         # 6. always delete the canary account — must never accumulate
-        reset_status, _ = _http("POST", f"{API_URL}/v1/account/reset",
-                                body={"confirm": "delete-all-data"}, api_key=api_key)
+        reset_status, _ = _http_retry("POST", f"{API_URL}/v1/account/reset",
+                                      body={"confirm": "delete-all-data"}, api_key=api_key)
         print(f"[canary] account reset -> {reset_status}")
 
     # Only reached on the SUCCESS path: a _fail() inside the try raises SystemExit
