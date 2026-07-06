@@ -550,23 +550,35 @@ def _complete_json_retry_empty(
 ) -> dict:
     attempts = max(1, int(max_attempts))
     last: dict = {}
+    last_exc: BaseException | None = None
     for attempt in range(attempts):
         suffix = "" if attempt == 0 else f"-empty-retry-{attempt}"
         key_suffix = "" if attempt == 0 else f":empty_retry:{attempt}"
-        last = _complete_json(
-            llm,
-            user_id=user_id,
-            job_id=job_id,
-            task_id=f"{task_id}{suffix}",
-            runtime=runtime,
-            messages=messages,
-            max_tokens=max_tokens,
-            idempotency_key=f"{idempotency_key}{key_suffix}",
-            temperature=temperature,
-        )
+        try:
+            last = _complete_json(
+                llm,
+                user_id=user_id,
+                job_id=job_id,
+                task_id=f"{task_id}{suffix}",
+                runtime=runtime,
+                messages=messages,
+                max_tokens=max_tokens,
+                idempotency_key=f"{idempotency_key}{key_suffix}",
+                temperature=temperature,
+            )
+        except provider_client.ProviderError as e:
+            if provider_client.classify_provider_error(e) == "provider_config":
+                raise  # hard error (402/401/403/quota/key) — never retry
+            last_exc = e
+            continue  # transient/unknown — try again next attempt
+        except GenesisWorkerError as e:  # bad/invalid JSON — treat as transient
+            last_exc = e
+            continue
         if not is_empty(last):
-            return last
-    return last
+            return last  # got usable content — success
+    if last_exc is not None and not last:
+        raise last_exc  # every attempt errored, nothing usable — surface the last error
+    return last  # got a result at some point (possibly empty) — let caller handle it
 
 
 def _combined_map_empty(output: dict) -> bool:

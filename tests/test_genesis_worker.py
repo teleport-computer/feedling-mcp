@@ -908,3 +908,40 @@ def test_reap_stale_blob_sync_failure_still_counts_job_reaped(monkeypatch):
 
     assert synced == ["job_b"]
     assert {r["job_id"] for r in reaped} == {"job_a", "job_b"}
+
+
+class _FakeLLM:
+    def __init__(self, seq):
+        self.seq = list(seq)
+        self.calls = 0
+
+    def complete(self, *a, **k):
+        item = self.seq[self.calls]
+        self.calls += 1
+        if isinstance(item, Exception):
+            raise item
+        return type("R", (), {"text": item, "usage": None})()
+
+
+def test_retry_empty_also_retries_transient_then_succeeds(monkeypatch):
+    # 1st call ReadTimeout (transient) -> 2nd call returns usable JSON.
+    llm = _FakeLLM([provider_client.ProviderError("provider network error: ReadTimeout"),
+                    '{"fact_candidates":[{"about":"user","summary":"x"}]}'])
+    out = worker._complete_json_retry_empty(
+        llm, user_id="u", job_id="j", task_id="fact-map-0",
+        runtime=object(), messages=[{"role": "user", "content": "x"}],
+        max_tokens=100, idempotency_key="k", is_empty=worker._combined_map_empty, max_attempts=3)
+    assert out["fact_candidates"][0]["summary"] == "x"
+    assert llm.calls == 2
+
+
+def test_retry_empty_does_not_retry_provider_config(monkeypatch):
+    # 402 provider_config -> raises immediately, no retry.
+    llm = _FakeLLM([provider_client.ProviderError("insufficient credit", status_code=402),
+                    '{"fact_candidates":[]}'])
+    with pytest.raises(provider_client.ProviderError):
+        worker._complete_json_retry_empty(
+            llm, user_id="u", job_id="j", task_id="fact-map-0",
+            runtime=object(), messages=[{"role": "user", "content": "x"}],
+            max_tokens=100, idempotency_key="k", is_empty=worker._combined_map_empty, max_attempts=3)
+    assert llm.calls == 1
