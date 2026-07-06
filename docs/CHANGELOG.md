@@ -49,6 +49,46 @@
 
 ## 2026-07-06
 
+### [DONE] 仓库清理：陈旧文档删除 + ASGI 迁移收尾（§13.2/13.3 执行完毕）
+
+四轮探查 + 分批执行的大扫除。三块：
+
+- **文档**：删 34 份陈旧文档——docs/ 顶层 6 份与 docs/memory/ 逐字节重复的旧
+  副本、`docs/generated/` 快照、18 份已 ship 的一次性时点文档（V1 测试系列、
+  WAKE_INTERVAL、AFULL_PLAN、BACKEND_ASGI_ROUTE_MATRIX 等）、docs/superpowers/
+  已落地的 plans/specs 10 份（含 backend-asgi-migration-plan，其 §13 剩余项本次
+  执行完毕）。恢复 2 份仍被 `IO-v1-下一期-TODO.md` 未勾选事项引用的 V1 清单。
+  所有被删文件的悬空引用已清（指向 git 历史）。长期文档同步去 Flask 时代描述：
+  README / PROJECT_OVERVIEW / CONTENT_ENCRYPTION_INTERACTION_CURRENT / MEMORY /
+  AUDIT / DEPLOYMENTS / SELF_HOSTING / CONTRIBUTING（MEMORY.md 头部加了
+  「行号基于拆分前单体」的显著提示；DEPLOYMENTS 现状表去掉已下线的 MCP 行）。
+- **死代码**：删 `tools/worldbook_e2e.py`（零引用）、
+  `deploy/docker-compose.asgi-parallel.yaml`（迁移期 :5005 工装，cutover 已完成）、
+  `backend/proactive/eval_v2.py`（+其 2 个测试；observability_v2 的 4 个生产覆盖
+  保留）、`bootstrap/gates.py` 的 DEPRECATED `_gate_required_for_missing_tabs`、
+  requirements 里的 Pillow（全仓无 import PIL；lock 已用 uv 重生成）。
+- **ASGI 迁移收尾（migration plan §13.2/§13.3/§16）**：61 个测试文件从
+  `import app as appmod` 重写为直接驱动领域包 + `asgi_test_client.make_client()`
+  （新增 conftest `backend_env`/`client` fixture；make_client 镜像 lifespan 的
+  wake-hook 与 envelope 接线）；子进程/CI 入口 `python backend/app.py` →
+  新 `backend/serve_dev.py`（5 处 + ci.yml）；**删除 `backend/app.py`**（803 行
+  facade + 符号回灌循环）、`hosted/setup_routes.py`（13 行空壳）、
+  `hosted/chat_routes.py`（Flask 时代 native tool loop，生产零引用，连带
+  test_hosted_memory_tool_loop.py 与 2 处测试引用；AUTOSEED_SCRUB_FLAGS 的
+  字符串条目保留——那是存量档案清洗清单，与代码无关）。
+  守护换代：test_asgi_app_import_guard →
+  `tests/test_no_app_py_regression.py`（app.py 不得重生 + 测试不得再 import 旧
+  facade，覆盖 `import backend.app` 变体）。
+- **⚠️ 生产行为变化（有意，修 cutover 遗留 bug）**：app.py:756-762 的 3 处装配
+  注入（`push_live_activity.load_identity`、admin data-track 的
+  `_latest_history_import_job`/`_onboarding_validation_payload`）在 ASGI 切换时
+  漏接，生产上 Live Activity identity 与 admin 数据面板一直是 stub 空值；现已
+  接进 `asgi_app.py` 末尾装配段。上线后这两处从空值变有值属修复生效。
+- 验证：全量 pytest 对基线零新增失败（5 个 pre-existing 失败与本次无关）；
+  `import app` 全形态 grep 归零；路由面与 07-03 快照逐条 diff 对账——本次清理
+  零路由增删（139 vs 133 = 方法合并行拆分 +5、cutover 已删的 static -1、
+  同期 WIP 新增 debug 路由 +2）；requirements.lock diff 仅 -pillow。
+
 ### [DONE] Proactive 日报口径修复 + memory-maintenance 失败退避
 
 排查「日报成功率 3%」：真因不是投递管线坏，而是 memory-maintenance
@@ -58,16 +98,20 @@
 pending（1200-1400/天），切换后被消费、坏钥用户变成大声失败。
 
 - **日报口径**（`db.admin_data_track_proactive_daily` + `admin/data_track.py`）：
-  成功率只算 wake lane（delivered/(delivered+failed)），failed 只含
-  status='failed'；gate 拒绝的 skipped 单独计数；maintenance 单独成列
-  （表格新增 Skipped / 维护(失败) 列）；「心跳」列分类器补上现网 kind
-  `presence`（旧 SQL 只匹配 heartbeat*，恒 0）。
+  成功率只算 wake lane，且 completed（醒了、正常决策、只是没发消息——
+  sleep/纯动作）算成功：(delivered+completed)/(delivered+completed+failed)，
+  口径衡量「系统是否健康」而非「醒了的里面有多少真正送达」（拍板
+  2026-07-06）；failed 只含 status='failed'；gate 拒绝的 skipped 单独计数；
+  maintenance 单独成列（表格新增 完成 / Skipped / 维护(失败) 列）；「心跳」列
+  分类器补上现网 kind `presence`（旧 SQL 只匹配 heartbeat*，恒 0）。
 - **失败退避**（`proactive/capture_jobs.py` 新增 `failure_backoff_sec`/
   `in_failure_backoff`，capture/dream/migrate 三条 lane 接入）：terminal=failed
   后同一窗口指数退避（base 600s × 2^(streak-1)，封顶 6h；
   `FEEDLING_MAINTENANCE_FAIL_BACKOFF_{BASE,MAX}_SEC` 可调），completed 重置
   streak，debug 面板 force 绕过；migrate 终态此前无人记录，补了
   `record_migrate_job_status` + `proactive_core.job_status` 接线。
+  Codex review 后修复：`job_status` 只在状态真正转变时才调 recorder——
+  consumer 重复上报同一终态 failed 不再重复累 streak/无故翻倍退避。
 - 测试：`tests/test_proactive_daily_report.py`（SQL lane 拆分/payload/分类器/
   渲染）+ `tests/test_capture_failure_backoff.py`（三 lane 退避、翻倍、重置、
   force 绕过、route 接线）。`test_memory_capture_trace.py::

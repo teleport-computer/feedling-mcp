@@ -415,8 +415,7 @@ legacy inline 线现在做、agent-runner **还没做**的：
     `FEEDLING_ENCLAVE_WORKERS` compose 默认 2 × 每 worker 32 线程），reentrant
     whoami 也已优化大半（`_local_user_id_from_token` 本地 HMAC 跳过回调 backend）。
     2026-07-02 调查结论：decrypt 丢周期是 **backend 线程饱和 + 内存墙**的下游，
-    不是 enclave 并发问题——见
-    `docs/superpowers/specs/2026-07-02-backend-longpoll-concurrency-investigation.md`
+    不是 enclave 并发问题——见 2026-07-02 longpoll 并发调查稿（已删，见 git 历史）
 [ ] url_map diff 已 review；客户端（iOS）已适配 chat/send 的 202 异步契约
 [ ] 全量 pytest 零新增失败；pyflakes 干净；`python -c "import app"` 通过
 [ ] 删除在 PR 描述里列清路由集 + compose/加密路径变更
@@ -429,7 +428,7 @@ legacy inline 线现在做、agent-runner **还没做**的：
   gthread（compose 默认 2 worker × 32 线程），reentrant whoami 已本地 HMAC 优化。
   2026-07-02 复核认定真正的墙是 **backend 线程饱和 + 内存**（4 worker≈2.4GB，纵向
   扩容被内存否决），enclave decrypt 丢周期只是 backend 饱和的下游症状。详见
-  `docs/superpowers/specs/2026-07-02-backend-longpoll-concurrency-investigation.md`。
+  2026-07-02 longpoll 并发调查稿（已删，见 git 历史）。
 - **provider 成本 / 延迟**：真实 agent loop 比一次 LLM call 贵；需成本观测。
 - **契约破坏**：`/v1/model_api/chat/send` 由「200+reply」变「202 异步」，被迁的
   用户其客户端必须支持「走 poll 取密文回复」。迁移名单要和客户端版本对齐。

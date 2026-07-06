@@ -1,7 +1,7 @@
 # Runtime Unification Spec — VPS ⇄ API 统一
 
 > 来源：2026-06-23 语音过代码 + 架构讨论。这份文档把当时口头定的结论落成可执行的 spec。
-> 给 浩轩 / 志豪：先读这一篇，再读 `MODEL_API_PATH_P0.md` 和 `PROACTIVE_V2_ARCHITECTURE.md`。
+> 给 浩轩 / 志豪：先读这一篇，再读 `MODEL_API_PATH_P0.md`（`PROACTIVE_V2_ARCHITECTURE.md` 已删，见 git 历史）。
 >
 > **一句话**：现在 VPS 用户和 API 用户在后端走两条完全不同的代码路径，没有理由。
 > 产品的核心卖点是"让用户自己的 agent 实时感知屏幕"，但现在 agent 根本拿不到屏幕图像。

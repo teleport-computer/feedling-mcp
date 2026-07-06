@@ -51,7 +51,7 @@ Before you start:
 ssh <user>@<host> "git clone https://github.com/teleport-computer/feedling-mcp ~/feedling-mcp"
 ```
 
-**Verify:** `ssh <user>@<host> "ls ~/feedling-mcp/backend/app.py"` prints the path.
+**Verify:** `ssh <user>@<host> "ls ~/feedling-mcp/backend/asgi_app.py"` prints the path.
 
 ---
 

@@ -71,11 +71,11 @@ shell + code-read + web access.
 | 3 | The deployed `compose_hash` is in the on-chain release log. | `cast call --rpc-url <sepolia> 0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F "isAppAllowed(bytes32)(bool)" 0x<compose_hash>`. Expect `true`. | 1 min |
 | 4 | The TDX quote was signed by Intel hardware. | Run `tools/audit_live_cvm.py`; rows 1–3 are Intel's signature chain + measurement integrity. The script is small enough to read end to end. | 5 min |
 | 5 | The attestation TLS cert on the `-5003s.` URL is the one the enclave attested. | `tools/audit_live_cvm.py` row 7 pins `sha256(cert.DER)` vs the attested fingerprint. Row 8 is now a disclosure row: the MCP service was removed 2026-06-12 (`mcp_tls_cert_pubkey_fingerprint_hex` stays empty in the bundle); content privacy is enforced by envelopes sealed to `enclave_content_pk`. | 1 min |
-| 6 | The backend code doesn't decrypt content. | Read `backend/app.py`. `/v1/chat/message`, `/v1/memory/add`, `/v1/identity/init`, `/v1/content/swap` all require v1 envelopes and store them verbatim — no crypto primitives called, and plaintext bodies now 400. The only place envelope bodies are decrypted is `backend/enclave_app.py`, which runs inside the TDX container. | 20 min |
+| 6 | The backend code doesn't decrypt content. | Read the route modules (`backend/*/routes_asgi.py`, assembled by `backend/asgi_app.py`). `/v1/chat/message`, `/v1/memory/add`, `/v1/identity/init`, `/v1/content/swap` all require v1 envelopes and store them verbatim — no crypto primitives called, and plaintext bodies now 400. The only place envelope bodies are decrypted is `backend/enclave_app.py`, which runs inside the TDX container. | 20 min |
 | 7 | Identity.nudge can't silently mutate encrypted cards. | The HTTP `/v1/identity/nudge` endpoint was removed in the 2026-04-20 v0 strip; the MCP nudge tool was removed with the MCP line on 2026-06-12. Identity mutation now only happens via `/v1/identity/actions` envelope-rewrap actions (decrypt happens in the enclave). Plaintext mutation is not expressible on the wire. | 2 min |
 | 8 | The iOS app actually pins the TLS cert, not just displays a green check. | Read `testapp/FeedlingTest/AuditCardView.swift` `PinningCaptureDelegate` + `AuditViewModel.run`. The delegate captures the server's `sha256(cert.DER)` during the TLS handshake; the viewmodel compares it to `bundle.enclave_tls_cert_fingerprint_hex`. Mismatch ⇒ red row + "MITM detected". | 10 min |
 | 9 | The iOS app decrypts client-side, not via the server. | Read `testapp/FeedlingTest/ContentEncryption.swift` + `ChatMessage.decryptedIfNeeded`. Envelopes land in view models, are unsealed with `user_sk` from Keychain, body AEAD-opened with the recovered `K`. | 15 min |
-| 10 | Reset actually deletes the ciphertext (not just local). | Read `backend/app.py` `/v1/account/reset`. Calls `shutil.rmtree(store.dir)` + removes the user from `users.json` + evicts the `api_key_hash` cache. Second call with the same key 401s because the user no longer exists. | 5 min |
+| 10 | Reset actually deletes the ciphertext (not just local). | Read `backend/content/routes_asgi.py` `/v1/account/reset`. Calls `shutil.rmtree(store.dir)` + removes the user from `users.json` + evicts the `api_key_hash` cache. Second call with the same key 401s because the user no longer exists. | 5 min |
 
 If rows 4, 5, and 3 pass in that order, the "something real is
 running, and the Feedling team authorized it" claim is cryptographic.
@@ -123,10 +123,11 @@ source-review work.
 
 ### Backend data handling
 
-- `backend/app.py` — Flask API. **Read this carefully if you're
-  auditing data handling.** Every endpoint that accepts user data
-  either stores ciphertext verbatim or is explicitly marked as a
-  plaintext metadata field.
+- `backend/asgi_app.py` + `backend/*/routes_asgi.py` — the ASGI API
+  (FastAPI; assembly in `asgi_app.py`, routes in the domain packages).
+  **Read these carefully if you're auditing data handling.** Every
+  endpoint that accepts user data either stores ciphertext verbatim or
+  is explicitly marked as a plaintext metadata field.
 
 ### Deploy
 

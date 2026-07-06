@@ -635,7 +635,7 @@ def cmd_phase2(args):
     _emit({"ok": False,
            "error": f"'{args.verb}' is not an io_cli tool — emit it as an agent output action "
                     f"(messages/send_message/sleep/schedule_wake), not a tool call.",
-           "see": "docs/AFULL_PLAN.md"}, 3)
+           "see": "docs/PROACTIVE_PERCEPTION_SPEC_V2.md"}, 3)
 
 
 def main():

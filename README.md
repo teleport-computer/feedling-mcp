@@ -13,8 +13,8 @@ Agent 是大脑，Feedling 是身体。
 > the 31 `feedling_*` tools) was removed. Historical mentions below are kept
 > only where they describe past milestones.
 
-1. **Flask HTTP backend** (`backend/app.py`) — iOS, resident-consumer, and proactive APIs
-3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + Flask + enclave services running inside one Phala TDX CVM
+1. **HTTP backend** (FastAPI/ASGI, `backend/asgi_app.py`) — iOS, resident-consumer, and proactive APIs
+3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + backend + enclave services running inside one Phala TDX CVM
 4. **Enclave app** (`backend/enclave_app.py`) — owns the content private key, serves `/attestation` on its own pinnable TLS port, and runs the decrypt proxy
 5. **iOS app** — now lives in the companion repo <https://github.com/teleport-computer/feedling-mcp-ios>. It owns Chat · Identity · Garden · Settings, Live Activity / Dynamic Island, Broadcast Extension for screen capture, and the live audit card.
 6. **Skill** — the agent's bootstrap + behavior spec. Lives in a separate public repo so it can be hot-updated without an iOS rebuild: <https://github.com/teleport-computer/io-onboarding>. Current onboarding splits users into three routes: own server / resident consumer, model API key, and official app import.
@@ -23,7 +23,7 @@ Agent 是大脑，Feedling 是身体。
 
 ```
 feedling-mcp-v1/
-├── backend/        ← Flask (5001) + enclave_app (5003)
+├── backend/        ← ASGI backend (5001) + enclave_app (5003)
 ├── deploy/         ← docker-compose.yaml (local/self-host)
 │                     + docker-compose.phala.yaml (production CVM)
 │                     + Caddyfile/systemd/setup.sh for self-hosting
@@ -195,15 +195,15 @@ shipped:
 ## Architecture
 
 ```
-Official app / MCP import             Hermes / OpenClaw / Mac / server
-clients                               agents via feedling-chat-resident
+Official app clients                  Hermes / OpenClaw / Mac / server
+                                      agents via feedling-chat-resident
         │                                      │
-        │ MCP SSE (import/tools)               │ poll + HTTP/CLI agent entry
+        │ HTTPS (iOS API)                      │ poll + HTTP/CLI agent entry
         ▼                                      ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                    Phala prod9 TDX CVM                         │
 │  dstack-ingress (443, LE TLS)                                  │
-│      └── api.feedling.app ──► backend (Flask API, WS, 5001)    │
+│      └── api.feedling.app ──► backend (ASGI API, WS, 5001)    │
 │                                      │                         │
 │                                      ▼                         │
 │                              enclave_app (5003)                │
@@ -232,14 +232,14 @@ clients                               agents via feedling-chat-resident
 | Process | File | Port | Purpose |
 |---------|------|------|---------|
 | dstack-ingress | `deploy/docker-compose.phala.yaml` | 443 | Production TLS for `api.feedling.app` inside the CVM |
-| Flask backend | `backend/app.py` | 5001 | iOS + agent HTTP API, envelope storage |
+| ASGI backend | `backend/asgi_app.py` | 5001 | iOS + agent HTTP API, envelope storage (FastAPI, gunicorn + UvicornWorker) |
 | Enclave app | `backend/enclave_app.py` | 5003 | TDX CVM: `/attestation`, own pinnable TLS, decrypt proxy |
 
 Production is CVM-only. `deploy/docker-compose.phala.yaml` runs
-`ingress`, `backend`, `mcp`, and `enclave` together inside the Phala
+`ingress`, `backend`, and `enclave` together inside the Phala
 prod9 TDX CVM; that file's live `compose_hash` is what the on-chain
-contract authorizes. `api.feedling.app` and `mcp.feedling.app` are
-plain HTTP upstreams behind `dstack-ingress`. The `enclave` service
+contract authorizes. `api.feedling.app` is a
+plain HTTP upstream behind `dstack-ingress`. The `enclave` service
 keeps its own TLS on `:5003` and is reached through the dstack-gateway
 `-5003s.` passthrough so iOS can pin its cert fingerprint against
 REPORT_DATA.
@@ -308,7 +308,7 @@ HTTP, so they look empty of useful detail. To read a specific service, pass
 `-c <container>`:
 
 ```bash
-# backend (Flask API + the [req] access log below). -f follows, -t adds timestamps.
+# backend (ASGI API + the [req] access log below). -f follows, -t adds timestamps.
 phala cvms logs feedling-enclave-v2 -c feedling-enclave-backend-1 --tail 200 -t
 ```
 
@@ -318,14 +318,13 @@ something the CLI lists (`phala cvms` has no `ps`/`exec`). The live containers:
 
 | service | `-c` name |
 |---------|-----------|
-| backend (Flask API) | `feedling-enclave-backend-1` |
-| mcp (FastMCP SSE) | `feedling-enclave-mcp-1` |
+| backend (ASGI API) | `feedling-enclave-backend-1` |
 | enclave (attestation + decrypt) | `feedling-enclave-enclave-1` |
 | ingress (HAProxy — the default when `-c` is omitted) | `feedling-enclave-ingress-1` |
 
-**Per-request access log.** The backend runs under gunicorn in production, which
-does not reproduce Flask's old dev-server access line, so the backend emits its
-own structured line per request:
+**Per-request access log.** The backend runs under gunicorn (UvicornWorker) in
+production, which has no built-in per-request access line here, so the backend
+emits its own structured line per request:
 
 ```
 [req] uid=usr_xxx GET /v1/chat/history?limit=40 status=200 bytes=960515 enc=br dur_ms=37
@@ -599,8 +598,7 @@ Caddy, DNS, iOS pointing at your URL+key).
 | `FEEDLING_CVM_APP_ID` | `9798850e096d770293c67305c6cfdceed68c1d28` (production iOS default) |
 | `FEEDLING_CVM_GATEWAY_DOMAIN` | `dstack-pha-prod9.phala.network` |
 | Public API domain | `api.feedling.app` via dstack-ingress |
-| Public MCP domain | `mcp.feedling.app` via dstack-ingress |
-| Flask port | `5001` |
+| Backend port | `5001` |
 | Enclave port | `5003` (in CVM only) |
 | WebSocket port | `9998` (`wss://<app_id>-9998.<gateway>/ingest` in production) |
 | App Group | `group.com.feedling.mcp` |

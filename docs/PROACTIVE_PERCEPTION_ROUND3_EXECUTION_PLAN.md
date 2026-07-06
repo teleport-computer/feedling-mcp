@@ -10,8 +10,8 @@ meant to be read by Codex / Claude Code before writing or reviewing code.
 - iOS perception producer contract: sibling repo `../feedling-mcp-ios`,
   especially `PerceptionContextSnapshot`, `PerceptionPermissionsManager`,
   `FeedlingAPI.reportPerceptionSnapshot`, and the photo/broadcast pipelines.
-- Historical context only: `docs/PROACTIVE_V2_ARCHITECTURE.md`,
-  `docs/PROACTIVE_GATE_V1.md`
+- Historical context only: `PROACTIVE_V2_ARCHITECTURE.md`、`PROACTIVE_GATE_V1.md`
+  （两份均已删，见 git 历史）
 
 If this plan conflicts with `PROACTIVE_PERCEPTION_SPEC_V2.md`, the spec wins.
 If code already implements an older shape, use the strangler migration below

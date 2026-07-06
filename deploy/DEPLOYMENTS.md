@@ -54,16 +54,16 @@ retirement when keeping the exact value no longer helps verification.
 | CVM ID | `0711c9a4-afdc-40c6-ba49-d8cb95f7e850` |
 | App ID | `9798850e096d770293c67305c6cfdceed68c1d28` |
 | Instance ID | `6fe9b54c9f2b428158c3e74de615d0f0a0c457ba` |
-| Compose | `deploy/docker-compose.phala.yaml` — `ingress`, `backend`, `mcp`, `enclave` |
+| Compose | `deploy/docker-compose.phala.yaml` — `ingress`, `backend`, `enclave`（`mcp` 服务已随 MCP 线于 2026-06-12 移除） |
 | Current image | `ghcr.io/teleport-computer/feedling:22b0ed6` |
 | Live git commit | `22b0ed6aa92a05d76951768f1924f45010ecda15` |
 | Live built at | `2026-07-02T19:04:02Z` |
 | Live compose hash | `0x0f136ba9dbc65dadfe2ad20cb663e6621d37d1e0c460830e22f6275bce3bad5d` |
 | Public API | `https://api.feedling.app` via `dstack-ingress` |
-| Public MCP | `https://mcp.feedling.app/sse?key=<api_key>` via `dstack-ingress` |
+| Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除；`mcp.feedling.app` 不再服务） |
 | Attestation | `https://9798850e096d770293c67305c6cfdceed68c1d28-5003s.dstack-pha-prod9.phala.network/attestation` |
 | WS ingest | `wss://9798850e096d770293c67305c6cfdceed68c1d28-9998.dstack-pha-prod9.phala.network/ingest` |
-| TLS model | `api.feedling.app` + `mcp.feedling.app` terminate at `dstack-ingress`; `/attestation` keeps its own dstack-KMS-derived TLS on `:5003` for iOS pinning. |
+| TLS model | `api.feedling.app` terminates at `dstack-ingress`; `/attestation` keeps its own dstack-KMS-derived TLS on `:5003` for iOS pinning. |
 | MCP pubkey pin | Retired in prod9 architecture: `mcp_tls_cert_pubkey_fingerprint_hex` is empty by design; content-layer envelopes sealed to `enclave_content_pk` are the privacy boundary. |
 | **Enclave content pk** | `2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620` — **THE prod9 content-key baseline.** Verified against live `/attestation` 2026-07-03. Envelope `enclave_pk_fpr` = `sha256(pk)[:16]` = `50f9a01800d4a230de85507d25b86eb1`, a constant stamped on envelopes April→July → the enclave content key has **never changed**. ⚠️ Do NOT confuse with the retired prod5 value `f50c90f7…` (app `051a174f`) that still appears in the Phase A/B tables below — that is a different, dead CVM and is NOT this baseline. |
 | mr-kms | `692afc6d7a86a32cfc1ebd9cad1a576aab012bab46986ba609bc8d6407270572` (live `/attestation` 2026-07-03) |
@@ -78,9 +78,9 @@ retirement when keeping the exact value no longer helps verification.
 | CVM ID | `5bfa1543-c5b4-42ca-842d-fd88984e5edf` (also in `deploy/test-cvm-id.txt`) |
 | App ID | `173c7f49aeb54acb424676b17b17f78e5e2b2938` |
 | Created | 2026-07-01 as `feedling-io-test`, instance `tdx.small`, **Phala KMS** (prod9 chain-0). Account migration (path B): the old test CVM `19b13ebe-d12e-4d19-97d1-6cf41389b663` / app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` under `sxysun` was abandoned (balance exhausted 2026-06-18). Fresh app_id → new `enclave_content_pk`, so the reused test RDS was wiped of undecryptable rows. iOS test build repointed to the new app_id. Bootstrapped via the one-shot `.github/workflows/bootstrap-test-cvm.yml` (push to `bootstrap-cvm` branch). CI deploy key is now `TEST_PHALA_CLOUD_API_KEY` (separate from prod's `PHALA_CLOUD_API_KEY`). |
-| Compose | `deploy/docker-compose.phala.test.yaml` — same 4 services as prod, with test domains + `_test` volumes |
+| Compose | `deploy/docker-compose.phala.test.yaml` — same 3 services as prod (`ingress`/`backend`/`enclave`), with test domains + `_test` volumes |
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
-| Public MCP | `https://test-mcp.feedling.app/sse?key=<api_key>` (via dstack-ingress — live, SSE 200) |
+| Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除） |
 | Database | Dedicated test RDS `feedling-mcp-test-t4g-micro.cgh0oucoe0x9.us-east-1.rds.amazonaws.com:5432/postgres` — fully isolated from prod (separate instance → separate `enclave_content_pk` self-consistent, no shared schema). Injected via `TEST_DATABASE_URL`. |
 | On-chain | **Separate** Sepolia FeedlingAppAuth `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5` (owner = the `ETH_DEPLOYER_KEY` address `0xa0eBcd26…`, so the CI `addComposeHash` is authorized), kept apart from prod's contract so the prod release log stays clean. Address lives in repo var `TEST_FEEDLING_APP_AUTH_CONTRACT`. Each `deploy-test-cvm` run publishes the live compose_hash here, fail-loud, same as prod. Deployed 2026-06-09 via a one-shot `workflow_dispatch` (since removed). |
 | Deploy path | GitHub Actions `deploy-test-cvm` job (in `ci.yml`) on push to the `test` branch. Mirrors prod but targets the test compose / CVM / DB / contract and is branch-gated to `refs/heads/test`. |

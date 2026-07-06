@@ -1,8 +1,11 @@
 # Memory（记忆花园）系统说明
 
-> 本文档描述 **Memory Garden**——MCP server 给 AI/用户存取「记忆卡」的业务功能。
+> 本文档描述 **Memory Garden**——后端给 AI/用户存取「记忆卡」的业务功能。
 > 与 Claude Code 自身的 `.claude` memory 无关。
-> 行号基于撰写时的代码（landmark commit `857c09e`），点进去以函数名为准。
+> ⚠️ 行号基于撰写时的单体 `app.py`（landmark commit `857c09e`）。此后代码已拆分
+> 领域包（2026-06-12）并完成 Flask→ASGI 迁移（2026-07-04）：记忆逻辑现在
+> `backend/memory/`，路由在 `backend/memory/routes_asgi.py`。文中 `app.py:NNNN`
+> 行号全部失效，请以函数名 grep 领域包为准；机制描述仍有效。
 
 ---
 
@@ -22,7 +25,7 @@
 数据流：
 
 ```
-AI 调用 MCP 工具 → 构造 v1 加密信封 → Flask HTTP 路由 → 加密信封原样落库 → PostgreSQL
+AI 调用工具 → 构造 v1 加密信封 → 后端 HTTP 路由（ASGI） → 加密信封原样落库 → PostgreSQL
                                                               ↓
 聊天补记忆 ← 分层关键词相关性评分 ← 全量读出 ← memory_moments 表
 ```

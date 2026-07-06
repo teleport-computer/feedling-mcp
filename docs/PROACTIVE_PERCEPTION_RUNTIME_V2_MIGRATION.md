@@ -12,10 +12,10 @@ The PR-by-PR execution and audit plan is
 
 Older proactive docs are historical context only:
 
-- `docs/PROACTIVE_V2_ARCHITECTURE.md` describes the previous Proactive V2
-  architecture and contains superseded `user_state/ai_state/proactive_jobs`
-  concepts.
-- `docs/PROACTIVE_GATE_V1.md` is the archived platform-gate design.
+- `PROACTIVE_V2_ARCHITECTURE.md`（已删，见 git 历史）described the previous
+  Proactive V2 architecture and contained superseded
+  `user_state/ai_state/proactive_jobs` concepts.
+- `PROACTIVE_GATE_V1.md`（已删，见 git 历史）was the archived platform-gate design.
 
 ## Contract
 

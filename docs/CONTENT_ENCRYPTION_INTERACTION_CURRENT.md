@@ -22,7 +22,7 @@ iOS 负责端上加密和本地解密；后端负责存储 envelope、分发 key
 
 ```mermaid
 flowchart LR
-    IOS[iOS App<br/>content_sk in Keychain] -->|build v1 envelope| API[Flask Backend<br/>stores ciphertext]
+    IOS[iOS App<br/>content_sk in Keychain] -->|build v1 envelope| API[Backend (ASGI)<br/>stores ciphertext]
     API --> DB[(DB / object storage<br/>envelopes only)]
     API -->|opaque envelope| IOS
     IOS -->|open K_user locally| UI[User UI plaintext]
@@ -148,7 +148,7 @@ iOS 当前主 content key 存在 device-local Keychain 槽:
 sequenceDiagram
     participant IOS as iOS
     participant Keychain as Keychain
-    participant API as Flask Backend
+    participant API as Backend (ASGI)
     participant DB as User Registry
 
     IOS->>Keychain: load content_private_key_v2_local
@@ -236,12 +236,12 @@ Broadcast extension 写入:
 - `shared` 必须有 `K_enclave`。
 - `owner_user_id` 匹配当前认证用户。
 
-后端 Flask 层通常不解密。因此写入成功不等于之后一定可解密。如果 `K_enclave`、AAD、`id`、owner 或 enclave key 不匹配，读时才失败。
+后端 API 层通常不解密。因此写入成功不等于之后一定可解密。如果 `K_enclave`、AAD、`id`、owner 或 enclave key 不匹配，读时才失败。
 
 ```mermaid
 sequenceDiagram
     participant IOS as iOS App
-    participant API as Flask Backend
+    participant API as Backend (ASGI)
     participant DB as DB
 
     IOS->>IOS: ensure userContentPK + enclaveContentPK + userId
@@ -273,7 +273,7 @@ sequenceDiagram
 
 用户设备读取:
 
-1. iOS 从 Flask 后端拉 envelope。
+1. iOS 从后端拉 envelope。
 2. 用 Keychain 中候选 content private keys 依次打开 `K_user`。
 3. 用得到的 `K` 和 AAD 打开 `body_ct`。
 4. 解不开时 UI 标记 `[encrypted -- decrypt failed]`，不会静默丢行。
@@ -291,7 +291,7 @@ Agent / hosted 读取:
 ```mermaid
 sequenceDiagram
     participant IOS as iOS UI
-    participant API as Flask Backend
+    participant API as Backend (ASGI)
     participant Keychain as Keychain
 
     IOS->>API: GET chat / memory / identity
@@ -312,7 +312,7 @@ sequenceDiagram
 sequenceDiagram
     participant Agent as Agent / hosted runtime
     participant Enclave as TDX Enclave
-    participant API as Flask Backend
+    participant API as Backend (ASGI)
     participant DB as DB
 
     Agent->>Enclave: agent-facing read request
@@ -358,7 +358,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant IOS as iOS
-    participant API as Flask Backend
+    participant API as Backend (ASGI)
     participant Enclave as TDX Enclave
     participant DB as DB
 
@@ -448,7 +448,7 @@ flowchart LR
 ## 7. 当前边界和风险点
 
 1. **写入层不做完整 decrypt verify。**  
-   Flask 后端保存 envelope 前通常不验证 `K_user` / `K_enclave` 是否真的能打开。坏 envelope 可能入库，读时才暴露。
+   后端保存 envelope 前通常不验证 `K_user` / `K_enclave` 是否真的能打开。坏 envelope 可能入库，读时才暴露。
 
 2. **Attestation fetch 和加密写入之间存在信任时序。**  
    iOS 启动路径为了拿 `enclave_content_pk` 接受 self-signed cert；完整 pinning / DCAP 检查在 Audit UI。若要把加密写入严格绑定 verified attestation，需要再收紧这条路径。

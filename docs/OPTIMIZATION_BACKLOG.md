@@ -39,7 +39,7 @@
   `_gunicorn_options`/`_enclave_worker_count` @ `backend/enclave_app.py`；
   `FEEDLING_ENCLAVE_WORKERS` compose 默认 2 × 每 worker 32 线程，保留自签 TLS）。
   → **enclave 早已不是「单线程 Werkzeug」**。真正残余瓶颈是 backend 线程饱和 +
-  内存墙，见 `docs/superpowers/specs/2026-07-02-backend-longpoll-concurrency-investigation.md`。
+  内存墙，见 2026-07-02 longpoll 并发调查稿（`2026-07-02-backend-longpoll-concurrency-investigation.md`，已删，见 git 历史）。
 
 ### #3 enclave→backend 回环鉴权耦合 ⬜ P2 · 中等
 
