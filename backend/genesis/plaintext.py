@@ -20,7 +20,7 @@ import db
 import debug_trace
 from accounts import runtime_auth
 from core import enclave as core_enclave
-from genesis import dedup, foreground, foreground_identity, genesis_core, service, worker
+from genesis import dedup, foreground, foreground_identity, genesis_core, lightweight_identity, service, worker
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
@@ -720,9 +720,38 @@ def _run_plaintext_genesis_v2(
         days_with_user=days, language=language,
     )
     provider_failure = _provider_identity_failure(id_warnings)
-    if provider_failure:
-        service.mark_failed(store, job_id, f"foreground_identity_failed:{provider_failure}")
-        return True
+    if provider_failure or not foreground_identity.has_identity_signal(identity_payload):
+        # Non-LLM lightweight fallback: try to salvage a name from the uploaded
+        # character card / profile text (never calls the LLM). Covers the common
+        # real failure mode (provider hiccup) that used to hard-fail the job.
+        support_texts = [str(m.get("content") or "") for m in msgs
+                         if history_import._is_import_support_message(m)]
+        lite = lightweight_identity.derive_from_support(
+            support_texts, days_with_user=days, language=language)
+        if lightweight_identity.has_signal(lite):
+            identity_payload = lite
+        else:
+            # fresh_start detection: the synthetic fresh_start message
+            # (_plaintext_fresh_start_message) is itself classified as a "support"
+            # message by _is_import_support_message (fresh_start is in
+            # _IMPORT_SUPPORT_SOURCES), so a plain "no support texts" check would
+            # misclassify a real fresh_start upload as "has content". Instead,
+            # match the sentinel source_family directly: fresh_start iff every
+            # message in msgs is the fresh_start marker (or there are no messages
+            # at all).
+            is_fresh_start = all(
+                history_import._import_source_family(
+                    str(m.get("source") or m.get("source_family") or "")
+                ) == history_import._FRESH_START_SOURCE
+                for m in msgs
+            )
+            if is_fresh_start:
+                pass  # truly empty upload -> nameless done is allowed
+            else:
+                # real content but couldn't derive/salvage an identity -> failed,
+                # let the user retry instead of silently completing nameless.
+                service.mark_failed(store, job_id, "onboarding_no_identity:provider_unstable")
+                return True
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
     persona_ref = ""
     persona_sha = ""
