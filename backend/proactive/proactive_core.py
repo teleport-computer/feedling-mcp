@@ -418,6 +418,12 @@ def job_status(store, job_id, payload: dict):
             job,
             status=str(patch.get("status") or payload.get("status") or ""),
         )
+    if capture_jobs.is_memory_migrate_job(job):
+        capture_scheduler.record_migrate_job_status(
+            store,
+            job,
+            status=str(patch.get("status") or payload.get("status") or ""),
+        )
     return {"job": job}, 200
 
 

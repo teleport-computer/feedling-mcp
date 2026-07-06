@@ -809,13 +809,18 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
                                      tz: str = "Asia/Shanghai") -> list[dict]:
     """Per-Beijing-day proactive-job aggregates for the ops trend view.
 
-    Answers "is the proactive success rate improving day over day", split into
-    the two runtime lanes (heartbeat vs screen-share). ``delivered`` = jobs that
-    reached posted/delivered; ``failed`` = failed/skipped. Success rate is
-    computed by the caller (delivered / non-pending)."""
+    Answers "is the proactive success rate improving day over day". 只有面向
+    用户的 wake lane 进成功率口径：``delivered``/``failed``/``skipped``/
+    ``pending`` 均不含 memory-maintenance（capture/dream/migrate）jobs——那些
+    永远不产生 delivered，坏一个用户的 key 就能无限灌 failed（2026-07-05
+    prod：40 用户的重试风暴把整体成功率打到 3%）。maintenance 单独成列。
+    ``failed`` 只含 status='failed'；gate 拒绝的 ``skipped``（用户关 ambient）
+    是产品行为不是失败，单独计数。成功率由调用方算
+    （delivered / (delivered+failed)）。"""
     day_limit = max(1, min(int(days or 30), 366))
     since = float(since_epoch or 0.0)
     screen_kinds = "('screen_watch','scene_change','screen_tick','broadcast_opened','heartbeat_broadcast_on')"
+    maintenance_kinds = "('memory_capture','memory_dream','memory_migrate')"
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -833,10 +838,19 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
                 )
                 SELECT day,
                        COUNT(*)::int AS jobs,
-                       (COUNT(*) FILTER (WHERE status IN ('posted','delivered','completed')))::int AS delivered,
-                       (COUNT(*) FILTER (WHERE status IN ('failed','skipped')))::int AS failed,
-                       (COUNT(*) FILTER (WHERE status = 'pending'))::int AS pending,
+                       (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
+                                          AND status IN ('posted','delivered')))::int AS delivered,
+                       (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
+                                          AND status = 'failed'))::int AS failed,
+                       (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
+                                          AND status = 'skipped'))::int AS skipped,
+                       (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
+                                          AND status = 'pending'))::int AS pending,
+                       (COUNT(*) FILTER (WHERE kind IN {maintenance_kinds}))::int AS maintenance,
+                       (COUNT(*) FILTER (WHERE kind IN {maintenance_kinds}
+                                          AND status IN ('failed','skipped')))::int AS maintenance_failed,
                        (COUNT(*) FILTER (WHERE kind IN {screen_kinds}))::int AS screen,
+                       -- 自发 tick：现网 kind 是 'presence'，heartbeat* 为历史 kind
                        (COUNT(*) FILTER (WHERE (kind = 'presence' OR kind LIKE 'heartbeat%%')
                                           AND kind NOT IN {screen_kinds}))::int AS heartbeat
                 FROM jobs
@@ -849,7 +863,8 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
         return [
             {
                 "day": r[0], "jobs": r[1], "delivered": r[2], "failed": r[3],
-                "pending": r[4], "screen": r[5], "heartbeat": r[6],
+                "skipped": r[4], "pending": r[5], "maintenance": r[6],
+                "maintenance_failed": r[7], "screen": r[8], "heartbeat": r[9],
             }
             for r in rows
         ]

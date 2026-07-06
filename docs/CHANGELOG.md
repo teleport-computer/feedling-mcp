@@ -47,6 +47,35 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-06
+
+### [DONE] Proactive 日报口径修复 + memory-maintenance 失败退避
+
+排查「日报成功率 3%」：真因不是投递管线坏，而是 memory-maintenance
+（capture/dream/migrate）jobs 在坏钥用户身上无退避重试（prod 实测 ~75s 一次、
+40 用户 2 天 7412 条 failed），灌满日报的 failed 分母；真实 wake lane 成功率
+~55%。爆发点 = 7/5 单 runner 接管 102 用户：此前这些用户的 job 静默积压在
+pending（1200-1400/天），切换后被消费、坏钥用户变成大声失败。
+
+- **日报口径**（`db.admin_data_track_proactive_daily` + `admin/data_track.py`）：
+  成功率只算 wake lane（delivered/(delivered+failed)），failed 只含
+  status='failed'；gate 拒绝的 skipped 单独计数；maintenance 单独成列
+  （表格新增 Skipped / 维护(失败) 列）；「心跳」列分类器补上现网 kind
+  `presence`（旧 SQL 只匹配 heartbeat*，恒 0）。
+- **失败退避**（`proactive/capture_jobs.py` 新增 `failure_backoff_sec`/
+  `in_failure_backoff`，capture/dream/migrate 三条 lane 接入）：terminal=failed
+  后同一窗口指数退避（base 600s × 2^(streak-1)，封顶 6h；
+  `FEEDLING_MAINTENANCE_FAIL_BACKOFF_{BASE,MAX}_SEC` 可调），completed 重置
+  streak，debug 面板 force 绕过；migrate 终态此前无人记录，补了
+  `record_migrate_job_status` + `proactive_core.job_status` 接线。
+- 测试：`tests/test_proactive_daily_report.py`（SQL lane 拆分/payload/分类器/
+  渲染）+ `tests/test_capture_failure_backoff.py`（三 lane 退避、翻倍、重置、
+  force 绕过、route 接线）。`test_memory_capture_trace.py::
+  test_enqueue_duplicate_capture_key_does_not_emit_queued_event` 在本改动前
+  已失败（pre-existing，与本次无关）。
+- 未做（后续方向）：坏钥用户的 provider 级熔断（连续 401/403/余额不足时
+  暂停 maintenance lane）。
+
 ## 2026-07-04
 
 ### [DONE] enclave Flask→FastAPI/asyncio 迁移，全仓 flask 依赖清零

@@ -97,6 +97,8 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         "last_dreamed_turn_count": max(0, _safe_int(doc.get("last_dreamed_turn_count"), 0)),
         "last_dream_signature": str(doc.get("last_dream_signature") or "")[:240],
         "pending_dream_key": str(doc.get("pending_dream_key") or "")[:240],
+        "dream_fail_streak": max(0, _safe_int(doc.get("dream_fail_streak"), 0)),
+        "last_dream_failed_at": _safe_float(doc.get("last_dream_failed_at"), 0.0),
         "updated_at": str(doc.get("updated_at") or "")[:80],
     }
 
@@ -225,6 +227,14 @@ def tick_memory_dream(store, *, now: float | None = None, force: bool = False) -
         state = save_dream_state(store, state, now=now_ts)
     if not force and night_only() and not _within_night_window(store, now=now_ts):
         return {"enqueued": False, "reason": "night_not_due", "state": state, "job": None, "snapshot": snapshot}
+    # 失败退避（同 capture）：min_interval 只看上次成功，对永远失败的 dream
+    # （坏 BYOK key）不生效，会退化成每 tick 重试。force 绕过。
+    if not force and capture_jobs.in_failure_backoff(
+        int(state.get("dream_fail_streak") or 0),
+        _safe_float(state.get("last_dream_failed_at"), 0.0),
+        now_ts,
+    ):
+        return {"enqueued": False, "reason": "failure_backoff", "state": state, "job": None, "snapshot": snapshot}
     last_count = max(0, int(state.get("last_dreamed_card_count") or 0))
     new_cards = max(0, card_count - last_count)
     turn_count = max(0, int(snapshot.get("turn_count") or 0))
@@ -306,4 +316,10 @@ def record_dream_job_status(store, job: Mapping[str, Any], *, status: str, now: 
         state["last_dreamed_turn_count"] = max(0, _safe_int(stats.get("turn_count"), 0))
         state["last_dream_signature"] = str(stats.get("signature") or until.get("signature") or "")[:240]
         state["last_dreamed_until"] = str(until.get("last_until") or "")[:240]
+        state["dream_fail_streak"] = 0
+        state["last_dream_failed_at"] = 0.0
+    elif status_text == "failed":
+        # skipped 是调度器主动暂缓、不算失败；只有真失败累计退避 streak。
+        state["dream_fail_streak"] = int(state.get("dream_fail_streak") or 0) + 1
+        state["last_dream_failed_at"] = now_ts
     return save_dream_state(store, state, now=now_ts)

@@ -83,6 +83,10 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         "last_captured_until_ts": _safe_float(doc.get("last_captured_until_ts"), 0.0),
         "pending_capture_key": str(doc.get("pending_capture_key") or "")[:240],
         "last_capture_completed_at": _safe_float(doc.get("last_capture_completed_at"), 0.0),
+        "capture_fail_streak": max(0, int(_safe_float(doc.get("capture_fail_streak"), 0.0))),
+        "last_capture_failed_at": _safe_float(doc.get("last_capture_failed_at"), 0.0),
+        "migrate_fail_streak": max(0, int(_safe_float(doc.get("migrate_fail_streak"), 0.0))),
+        "last_migrate_failed_at": _safe_float(doc.get("last_migrate_failed_at"), 0.0),
         "last_seen_message_id": str(doc.get("last_seen_message_id") or "")[:160],
         "last_seen_ts": _safe_float(doc.get("last_seen_ts"), 0.0),
         "turns_since_capture": max(0, int(_safe_float(doc.get("turns_since_capture"), 0.0))),
@@ -197,6 +201,14 @@ def _enqueue_window(store, *, trigger: str, now: float | None = None) -> dict[st
     last_completed = _safe_float(state.get("last_capture_completed_at"), 0.0)
     if last_completed and now_ts - last_completed < min_interval_sec():
         return {"enqueued": False, "reason": "min_interval", "state": state, "job": None}
+    # 失败退避：min_interval 只看上次成功，对「永远失败的窗口」（坏 BYOK key）
+    # 不生效，会退化成每 tick 重试。手动 force（debug 面板）不受限。
+    if trigger != "manual_force" and capture_jobs.in_failure_backoff(
+        int(state.get("capture_fail_streak") or 0),
+        _safe_float(state.get("last_capture_failed_at"), 0.0),
+        now_ts,
+    ):
+        return {"enqueued": False, "reason": "failure_backoff", "state": state, "job": None}
 
     key = capture_key_for_window(window)
     job, enqueued, reason = capture_jobs.enqueue_memory_capture_job(
@@ -311,6 +323,14 @@ def tick_quiet_migrate(store, *, now: float | None = None) -> dict[str, Any]:
     quiet_for = now_ts - _safe_float(state.get("last_seen_ts"), 0.0)
     if quiet_for < quiet_sec():
         return {"enqueued": False, "reason": "quiet_not_due", "quiet_for_sec": quiet_for, "job": None}
+    # 失败退避（同 _enqueue_window）：migrate 的每小时新 window key 不挡同 key
+    # 重试，坏钥用户会在窗口内每 tick 重建 job。
+    if capture_jobs.in_failure_backoff(
+        int(state.get("migrate_fail_streak") or 0),
+        _safe_float(state.get("last_migrate_failed_at"), 0.0),
+        now_ts,
+    ):
+        return {"enqueued": False, "reason": "failure_backoff", "job": None}
     mig_state = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
     if not memory_migration.should_enqueue(mig_state):
         # 'done' — but periodically re-scan once (a card may have reverted to old
@@ -339,6 +359,25 @@ def _capture_trace_card_titles(job: Mapping[str, Any]) -> str:
     return " | ".join(str(t) for t in titles if t)[:1000]
 
 
+def record_migrate_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
+    """migrate 终态只维护失败退避 streak——window 游标由 handler 自己重扫，
+    这里不像 capture 那样推进 last_captured_*。"""
+    if not capture_jobs.is_memory_migrate_job(job):
+        return load_capture_state(store)
+    status_text = str(status or job.get("status") or "").strip().lower()
+    now_ts = time.time() if now is None else float(now)
+    state = load_capture_state(store)
+    if status_text == "completed":
+        state["migrate_fail_streak"] = 0
+        state["last_migrate_failed_at"] = 0.0
+    elif status_text == "failed":
+        state["migrate_fail_streak"] = int(state.get("migrate_fail_streak") or 0) + 1
+        state["last_migrate_failed_at"] = now_ts
+    else:
+        return state
+    return save_capture_state(store, state, now=now_ts)
+
+
 def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
     if not capture_jobs.is_memory_capture_job(job):
         return load_capture_state(store)
@@ -361,6 +400,12 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
             state["last_captured_until_message_id"] = until_id
             state["last_captured_until_ts"] = until_ts
             state["last_capture_completed_at"] = now_ts
+        state["capture_fail_streak"] = 0
+        state["last_capture_failed_at"] = 0.0
+    elif status_text == "failed":
+        # skipped 是调度器主动暂缓、不算失败；只有真失败累计退避 streak。
+        state["capture_fail_streak"] = int(state.get("capture_fail_streak") or 0) + 1
+        state["last_capture_failed_at"] = now_ts
     state = save_capture_state(store, state, now=now_ts)
     result = refresh_capture_state_from_chat(store, now=now_ts)
 

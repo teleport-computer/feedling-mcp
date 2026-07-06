@@ -486,8 +486,9 @@ def _classify_proactive_kind(kind: str) -> str:
         return "other"
     if norm in _SCREEN_PROACTIVE_KINDS:
         return "screen"
-    # heartbeat, heartbeat_no_frame, heartbeat_unknown, heartbeat_broadcast_off …
-    if norm.startswith("heartbeat"):
+    # 现网自发 tick 的 kind 是 presence；heartbeat* 为历史 kind
+    # (heartbeat, heartbeat_no_frame, heartbeat_unknown, heartbeat_broadcast_off …)。
+    if norm == "presence" or norm.startswith("heartbeat"):
         return "heartbeat"
     return "other"
 
@@ -1609,6 +1610,8 @@ def _data_track_proactive_daily_payload() -> dict:
     tot_jobs = sum(int(r.get("jobs") or 0) for r in rows)
     tot_deliv = sum(int(r.get("delivered") or 0) for r in rows)
     tot_fail = sum(int(r.get("failed") or 0) for r in rows)
+    tot_maint = sum(int(r.get("maintenance") or 0) for r in rows)
+    tot_maint_fail = sum(int(r.get("maintenance_failed") or 0) for r in rows)
     tot_resolved = tot_deliv + tot_fail
     latest = out_rows[0] if out_rows else {}
     summary = {
@@ -1620,6 +1623,8 @@ def _data_track_proactive_daily_payload() -> dict:
         "total_jobs": tot_jobs,
         "total_delivered": tot_deliv,
         "total_failed": tot_fail,
+        "total_maintenance": tot_maint,
+        "total_maintenance_failed": tot_maint_fail,
         "overall_success_rate": (tot_deliv / tot_resolved) if tot_resolved else 0.0,
     }
     return {
@@ -1627,8 +1632,12 @@ def _data_track_proactive_daily_payload() -> dict:
         "filters": {"since": filters.get("since", ""), "days": days, "view": "proactive"},
         "rows": out_rows,
         "definition": {
-            "success_rate": "delivered / (delivered + failed); still-pending jobs excluded from the denominator.",
-            "lanes": "heartbeat = the main self-initiated tick; screen = screen-share / broadcast driven.",
+            "success_rate": "wake-lane only: delivered / (delivered + failed). "
+                            "memory-maintenance jobs, gate-skipped wakes and still-pending "
+                            "jobs are all excluded from the denominator.",
+            "lanes": "heartbeat = the main self-initiated tick (kind=presence); "
+                     "screen = screen-share / broadcast driven; "
+                     "maintenance = memory capture/dream/migrate (never user-facing).",
             "timezone": "Asia/Shanghai",
         },
     }
@@ -1977,19 +1986,22 @@ def _render_proactive_daily_page(payload: dict) -> str:
             f"<td>{int(row.get('jobs') or 0)}</td>"
             f"<td>{int(row.get('delivered') or 0)}</td>"
             f"<td>{int(row.get('failed') or 0)}</td>"
+            f"<td>{int(row.get('skipped') or 0)}</td>"
             f"<td>{int(row.get('pending') or 0)}</td>"
             f"<td><b class='{sr_cls}'>{sr*100:.0f}%</b>"
             f"<div class='fn-bar'><span class='{sr_cls}' style='width:{sr*100:.0f}%'></span></div></td>"
+            f"<td>{int(row.get('maintenance') or 0)}(f{int(row.get('maintenance_failed') or 0)})</td>"
             f"<td>{int(row.get('heartbeat') or 0)}</td>"
             f"<td>{int(row.get('screen') or 0)}</td>"
             "</tr>"
         )
     metrics = "".join([
-        _render_metric("整体成功率 (投递/已结)", f"{summary['overall_success_rate']*100:.0f}%"),
+        _render_metric("整体成功率 (wake 投递/已结)", f"{summary['overall_success_rate']*100:.0f}%"),
         _render_metric("最近一天成功率", f"{summary['latest_success_rate']*100:.0f}%"),
         _render_metric("最近一天", summary.get("latest_day") or "n/a"),
         _render_metric("总 jobs", summary["total_jobs"]),
         _render_metric("投递 / 失败", f"{summary['total_delivered']} / {summary['total_failed']}"),
+        _render_metric("维护 / 失败", f"{summary.get('total_maintenance', 0)} / {summary.get('total_maintenance_failed', 0)}"),
     ])
     return f"""<!doctype html>
 <html>
@@ -2026,12 +2038,12 @@ def _render_proactive_daily_page(payload: dict) -> str:
   <div class="muted">Generated {html.escape(summary["generated_at"])}. 时区 {html.escape(summary["timezone"])}. 最近 {html.escape(str(summary["days_returned"]))} 天。</div>
   {_render_data_track_view_nav("proactive")}
   <section class="metrics">{metrics}</section>
-  <h2>每日主动消息成功率(心跳 vs 屏幕)</h2>
+  <h2>每日主动消息成功率(仅 wake lane)</h2>
   <div class="muted">{html.escape(definition.get("success_rate") or "")} {html.escape(definition.get("lanes") or "")}</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>失败</th><th>Pending</th><th>成功率</th><th>心跳</th><th>屏幕</th></tr></thead>
-    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='8' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
+    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>失败</th><th>Skipped</th><th>Pending</th><th>成功率</th><th>维护(失败)</th><th>心跳</th><th>屏幕</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
   </table>
 </main>
 </body>

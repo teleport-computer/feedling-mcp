@@ -6,6 +6,7 @@ scheduled / delivery controls.
 """
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -29,6 +30,35 @@ CAPTURE_ACTIVE_STATUSES = frozenset({"pending", "claimed", "realizing"})
 # not successfully captured, so re-enqueuing the same window is correct (failed =
 # error; skipped = abnormal terminal — noop is reported as completed, not skipped).
 CAPTURE_RETRYABLE_TERMINAL = frozenset({"failed", "skipped"})
+
+
+def failure_backoff_sec(streak: int) -> float:
+    """连续失败 ``streak`` 次后，同一 maintenance 窗口多久内不得重新入队。
+
+    没有退避时，永远失败的窗口（典型：坏掉的 BYOK key，agent 调用必败）每个
+    调度 tick 都会重建 job——min_interval 只看「上次成功完成」，对纯失败流
+    不生效。指数退避 base × 2^(streak-1)，封顶 max；三条 lane
+    （capture/dream/migrate）共用。"""
+    n = int(streak or 0)
+    if n <= 0:
+        return 0.0
+    try:
+        base = float(os.environ.get("FEEDLING_MAINTENANCE_FAIL_BACKOFF_BASE_SEC") or 600.0)
+    except (TypeError, ValueError):
+        base = 600.0
+    try:
+        cap = float(os.environ.get("FEEDLING_MAINTENANCE_FAIL_BACKOFF_MAX_SEC") or 21600.0)
+    except (TypeError, ValueError):
+        cap = 21600.0
+    base = max(1.0, base)
+    cap = max(base, cap)
+    return min(base * (2 ** min(n - 1, 16)), cap)
+
+
+def in_failure_backoff(streak: int, last_failed_at: float, now_ts: float) -> bool:
+    streak = int(streak or 0)
+    last = float(last_failed_at or 0.0)
+    return streak > 0 and last > 0.0 and (now_ts - last) < failure_backoff_sec(streak)
 
 
 def is_memory_capture_job(job: Mapping[str, Any] | None) -> bool:
