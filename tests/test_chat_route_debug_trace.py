@@ -8,10 +8,12 @@ import pytest
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
 import debug_trace  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -22,12 +24,11 @@ def _b64(raw: bytes) -> str:
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     debug_trace._flag_cache.clear()
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    with make_client() as c:
         yield c
     debug_trace._flag_cache.clear()
 

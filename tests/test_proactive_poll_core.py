@@ -14,10 +14,12 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 from proactive import poll_core  # noqa: E402
+from proactive import service as proactive_service  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -27,11 +29,11 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def store(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    res = appmod.app.test_client().post(
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
     )
@@ -68,7 +70,7 @@ def test_intro_job_is_pollable_and_carries_runtime_profile(store):
     # gate. Each returned job carries the runtime profile.
     store.append_proactive_job({
         "job_id": "pj_intro",
-        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "source": proactive_service.PROACTIVE_JOB_SOURCE,
         "job_kind": "introduction",
         "ts": 1.0,
         "status": "pending",
@@ -85,7 +87,7 @@ def test_pollable_respects_limit(store):
     for i in range(5):
         store.append_proactive_job({
             "job_id": f"pj_intro_{i}",
-            "source": appmod.PROACTIVE_JOB_SOURCE,
+            "source": proactive_service.PROACTIVE_JOB_SOURCE,
             "job_kind": "introduction",
             "ts": 1.0,
             "status": "pending",
@@ -102,7 +104,7 @@ def test_reclaim_recovers_stale_resident_claim(store):
     now = 10_000.0
     store.append_proactive_job({
         "job_id": "pj_stale",
-        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "source": proactive_service.PROACTIVE_JOB_SOURCE,
         "ts": 1.0,
         "status": "claimed",
         "consumer_id": "resident-a",
@@ -118,7 +120,7 @@ def test_reclaim_leaves_fresh_and_hosted_claims_alone(store):
     now = 10_000.0
     store.append_proactive_job({
         "job_id": "pj_fresh",
-        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "source": proactive_service.PROACTIVE_JOB_SOURCE,
         "ts": 1.0,
         "status": "claimed",
         "consumer_id": "resident-a",
@@ -126,7 +128,7 @@ def test_reclaim_leaves_fresh_and_hosted_claims_alone(store):
     })
     store.append_proactive_job({
         "job_id": "pj_hosted",
-        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "source": proactive_service.PROACTIVE_JOB_SOURCE,
         "ts": 1.0,
         "status": "claimed",
         "consumer_id": "hosted_runtime",  # hosted consumers manage their own lease

@@ -31,8 +31,9 @@ from identity import service as identity_service
 
 
 
-# Injected by the assembly layer — these live with the hosted/onboarding
-# validation code that has not been extracted from app.py yet.
+# Injected by the assembly layer (asgi_app.py) — the real implementations live
+# in hosted/onboarding_validation.py; admin sits below hosted, so the stub is
+# declared here and assembly wires it.
 def _latest_history_import_job(store):
     return None
 
@@ -1598,21 +1599,25 @@ def _data_track_proactive_daily_payload() -> dict:
     for r in rows:
         jobs = int(r.get("jobs") or 0)
         delivered = int(r.get("delivered") or 0)
+        completed = int(r.get("completed") or 0)
         failed = int(r.get("failed") or 0)
         # success rate over RESOLVED jobs (exclude still-pending) — a fairer
-        # "did it work" denominator than raw jobs.
-        resolved = delivered + failed
+        # "did it work" denominator than raw jobs. completed（sleep/纯动作，
+        # 醒了但决定不说话）算成功：口径衡量「系统是否健康」。
+        ok = delivered + completed
+        resolved = ok + failed
         out_rows.append({
             **r,
-            "success_rate": (delivered / resolved) if resolved else 0.0,
+            "success_rate": (ok / resolved) if resolved else 0.0,
             "fail_rate": (failed / resolved) if resolved else 0.0,
         })
     tot_jobs = sum(int(r.get("jobs") or 0) for r in rows)
     tot_deliv = sum(int(r.get("delivered") or 0) for r in rows)
+    tot_completed = sum(int(r.get("completed") or 0) for r in rows)
     tot_fail = sum(int(r.get("failed") or 0) for r in rows)
     tot_maint = sum(int(r.get("maintenance") or 0) for r in rows)
     tot_maint_fail = sum(int(r.get("maintenance_failed") or 0) for r in rows)
-    tot_resolved = tot_deliv + tot_fail
+    tot_resolved = tot_deliv + tot_completed + tot_fail
     latest = out_rows[0] if out_rows else {}
     summary = {
         "generated_at": datetime.now().isoformat(),
@@ -1622,17 +1627,19 @@ def _data_track_proactive_daily_payload() -> dict:
         "latest_success_rate": latest.get("success_rate", 0.0),
         "total_jobs": tot_jobs,
         "total_delivered": tot_deliv,
+        "total_completed": tot_completed,
         "total_failed": tot_fail,
         "total_maintenance": tot_maint,
         "total_maintenance_failed": tot_maint_fail,
-        "overall_success_rate": (tot_deliv / tot_resolved) if tot_resolved else 0.0,
+        "overall_success_rate": ((tot_deliv + tot_completed) / tot_resolved) if tot_resolved else 0.0,
     }
     return {
         "summary": summary,
         "filters": {"since": filters.get("since", ""), "days": days, "view": "proactive"},
         "rows": out_rows,
         "definition": {
-            "success_rate": "wake-lane only: delivered / (delivered + failed). "
+            "success_rate": "wake-lane only: (delivered + completed) / (delivered + completed + failed). "
+                            "completed = woke, decided, just didn't post (sleep / action-only) — counts as success. "
                             "memory-maintenance jobs, gate-skipped wakes and still-pending "
                             "jobs are all excluded from the denominator.",
             "lanes": "heartbeat = the main self-initiated tick (kind=presence); "
@@ -1985,6 +1992,7 @@ def _render_proactive_daily_page(payload: dict) -> str:
             f"<td>{html.escape(str(row.get('day') or ''))}</td>"
             f"<td>{int(row.get('jobs') or 0)}</td>"
             f"<td>{int(row.get('delivered') or 0)}</td>"
+            f"<td>{int(row.get('completed') or 0)}</td>"
             f"<td>{int(row.get('failed') or 0)}</td>"
             f"<td>{int(row.get('skipped') or 0)}</td>"
             f"<td>{int(row.get('pending') or 0)}</td>"
@@ -1996,11 +2004,11 @@ def _render_proactive_daily_page(payload: dict) -> str:
             "</tr>"
         )
     metrics = "".join([
-        _render_metric("整体成功率 (wake 投递/已结)", f"{summary['overall_success_rate']*100:.0f}%"),
+        _render_metric("整体成功率 (wake 投递+完成/已结)", f"{summary['overall_success_rate']*100:.0f}%"),
         _render_metric("最近一天成功率", f"{summary['latest_success_rate']*100:.0f}%"),
         _render_metric("最近一天", summary.get("latest_day") or "n/a"),
         _render_metric("总 jobs", summary["total_jobs"]),
-        _render_metric("投递 / 失败", f"{summary['total_delivered']} / {summary['total_failed']}"),
+        _render_metric("投递+完成 / 失败", f"{summary['total_delivered']}+{summary.get('total_completed', 0)} / {summary['total_failed']}"),
         _render_metric("维护 / 失败", f"{summary.get('total_maintenance', 0)} / {summary.get('total_maintenance_failed', 0)}"),
     ])
     return f"""<!doctype html>
@@ -2042,8 +2050,8 @@ def _render_proactive_daily_page(payload: dict) -> str:
   <div class="muted">{html.escape(definition.get("success_rate") or "")} {html.escape(definition.get("lanes") or "")}</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>失败</th><th>Skipped</th><th>Pending</th><th>成功率</th><th>维护(失败)</th><th>心跳</th><th>屏幕</th></tr></thead>
-    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
+    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>完成</th><th>失败</th><th>Skipped</th><th>Pending</th><th>成功率</th><th>维护(失败)</th><th>心跳</th><th>屏幕</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='11' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
   </table>
 </main>
 </body>

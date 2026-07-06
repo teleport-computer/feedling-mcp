@@ -1,12 +1,10 @@
-"""Sync ASGI test client with Flask-``test_client`` API compatibility.
+"""Sync ASGI test client for the assembled backend (``asgi_app.app``).
 
-The Flask web layer was deleted in the ASGI migration (plan §13); the backend now
-serves exclusively through ``asgi_app``. The test suite, however, historically
-exercised the backend via ``app.app.test_client()`` (the old Flask oracle). Rather
-than rewrite ~900 call sites, ``app.app`` is now an :class:`_AsgiApp` whose
-``test_client()`` returns a **sync** client that speaks the subset of the Flask
-test-client API the tests use — backed by ``httpx.ASGITransport`` over the real
-assembled FastAPI app (``asgi_app.app``). No Flask is involved anywhere here.
+The test suite drives the backend through :func:`make_client`, which returns a
+**sync** client backed by ``httpx.ASGITransport`` over the real assembled
+FastAPI app. Its request/response surface descends from the old Flask
+test-client API (the suite was written against it pre-migration); no Flask is
+involved anywhere here.
 
 Supported surface (measured against the suite):
   - methods: ``get`` / ``post`` / ``put`` / ``delete`` / ``open``
@@ -22,9 +20,10 @@ Each request runs on its own ``asyncio.run`` loop (mirroring the existing
 ``test_asgi_*`` helpers). Cross-thread poll wakes still work: a parked waiter
 captures its own loop at registration and ``registry.wake`` reaches it via
 ``loop.call_soon_threadsafe`` — so a background-thread poll is woken by a
-main-thread write exactly as under gunicorn. ``test_client()`` wires the async
-wake hook (the one lifespan side effect the tests depend on; the lifespan itself
-is not run by ASGITransport, and no route reads the lifespan httpx clients).
+main-thread write exactly as under gunicorn. ``make_client()`` wires the async
+wake hook and the envelope pubkey lookup (the lifespan side effects the tests
+depend on; the lifespan itself is not run by ASGITransport, and no route reads
+the lifespan httpx clients).
 """
 
 from __future__ import annotations
@@ -152,26 +151,26 @@ class _AsgiTestClient:
         return False
 
 
-class _AsgiApp:
-    """Stand-in for the deleted Flask ``app`` object.
+def make_client() -> _AsgiTestClient:
+    """Sync test client over the real assembled FastAPI app (``asgi_app.app``).
 
-    Kept intentionally tiny: the only production entry point is ``asgi_app:app``;
-    this exists so the test suite keeps a working ``app.app`` handle. It exposes
-    the two Flask-app members the suite touches:
-      - ``test_client()`` — a sync ASGI-backed client (see :class:`_AsgiTestClient`);
-      - ``config`` — a plain dict (absorbs ``config.update(TESTING=True)`` etc.).
+    The canonical way for tests to drive the backend in-process (the ``client``
+    fixture in tests/conftest.py wraps this).
     """
+    import asgi_app  # lazy: only tests need the fully assembled app
 
-    def __init__(self):
-        self.config: dict = {}
+    # The lifespan side effects the tests rely on — ASGITransport does not run
+    # lifespan, so mirror them here (both idempotent):
+    #   - async poll-waiter wakes (lifespan step 3);
+    #   - core.envelope user-public-key lookup (lifespan step 4), without which
+    #     server-side shared-envelope builds 500 with "not wired by assembly".
+    from accounts import registry as accounts_registry
+    from core import envelope as core_envelope
+    from core import store as core_store
+    from runtime.waiters import registry
 
-    def test_client(self) -> _AsgiTestClient:
-        import asgi_app  # lazy: only tests need the fully assembled app
+    core_store.set_async_wake_hook(registry.wake)
+    core_envelope.get_user_public_key = accounts_registry._get_user_public_key
+    return _AsgiTestClient(asgi_app.app)
 
-        # The one lifespan side effect the tests rely on: async poll-waiter wakes.
-        # ASGITransport does not run lifespan, so wire the hook here (idempotent).
-        from core import store as core_store
-        from runtime.waiters import registry
 
-        core_store.set_async_wake_hook(registry.wake)
-        return _AsgiTestClient(asgi_app.app)

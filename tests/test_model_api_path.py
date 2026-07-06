@@ -1,25 +1,31 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
 import db  # noqa: E402
 from accounts import registry as accounts_registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
+from chat import service as chat_service  # noqa: E402
 from hosted import turn as hosted_turn  # noqa: E402
 import provider_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from core import store as core_store  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
+from hosted import history_import  # noqa: E402
+from identity import service as identity_service  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -29,10 +35,10 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
+    accounts_registry._users[:] = []
+    accounts_registry._key_to_user.clear()
+    core_store._stores.clear()
+    accounts_registry._save_users()
     monkeypatch.setattr(
         core_enclave,
         "_get_enclave_info",
@@ -42,8 +48,7 @@ def client(tmp_path, monkeypatch):
     # hosting runtime (these are full-path tests that route to the agent-runner).
     db.set_supervisor_heartbeat({"ts": time.time(), "owner": "test",
                                  "host_all": True, "gateway": True})
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    with make_client() as c:
         yield c
 
 
@@ -95,7 +100,7 @@ def _fake_shared_envelope_builder(captured: list | None = None):
         counter["n"] += 1
         if captured is not None:
             try:
-                captured.append(appmod.json.loads(plaintext.decode("utf-8")))
+                captured.append(json.loads(plaintext.decode("utf-8")))
             except Exception:
                 captured.append(plaintext.decode("utf-8"))
         return {
@@ -125,7 +130,7 @@ def test_chat_response_plaintext_reasoning_builds_thinking_extra(monkeypatch):
         _fake_shared_envelope_builder(captured_plaintexts),
     )
 
-    extra = appmod._chat_plaintext_thinking_extra_for_store(
+    extra = chat_service._chat_plaintext_thinking_extra_for_store(
         Store(),
         {
             "reasoning_text": "Checked the provider-native reasoning field.",
@@ -157,7 +162,7 @@ def test_chat_response_plaintext_reasoning_default_is_summary(monkeypatch):
         _fake_shared_envelope_builder(captured_plaintexts),
     )
 
-    extra = appmod._chat_plaintext_thinking_extra_for_store(
+    extra = chat_service._chat_plaintext_thinking_extra_for_store(
         Store(),
         {"reasoning_text": "A tagged or flattened reasoning block."},
     )
@@ -205,7 +210,7 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert get_res.status_code == 200
     assert "api_key_envelope" not in get_res.get_json()["config"]
 
-    config_text = appmod.json.dumps(appmod.db.get_blob(user_id, "model_api") or {})
+    config_text = json.dumps(db.get_blob(user_id, "model_api") or {})
     assert raw_provider_key not in config_text
     assert "api_key_envelope" in config_text
 
@@ -215,7 +220,7 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert body["route"] == "model_api"
     assert body["stage"] == "history_import"
     assert all(step["id"] != "resident_consumer" for step in body["steps"])
-    runtime = appmod.db.get_blob(user_id, "model_api_runtime")
+    runtime = db.get_blob(user_id, "model_api_runtime")
     assert runtime["runtime_mode"] == "hosted_resident"
     assert runtime["tool_action_enabled"] is True
     assert any(step["id"] == "hosted_runtime" and step["passing"] for step in body["steps"])
@@ -245,7 +250,7 @@ def test_model_api_setup_stores_responses_support_for_openai_compatible(client, 
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
     assert probed == ["https://relay.host/v1"]  # probed exactly the relay
-    stored = appmod.db.get_blob(user_id, "model_api")
+    stored = db.get_blob(user_id, "model_api")
     assert stored["supports_responses"] is True
 
 
@@ -266,55 +271,8 @@ def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatc
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
-    stored = appmod.db.get_blob(user_id, "model_api")
+    stored = db.get_blob(user_id, "model_api")
     assert stored.get("supports_responses", False) is False
-
-
-def test_model_api_memory_fallback_instruction_prioritizes_memory_over_conflicting_draft():
-    msg = appmod.hosted_chat_routes._memory_fallback_instruction_message(
-        "auto_readside",
-        [{"id": "mem_cat", "title": "猫叫武松", "description": "用户家猫叫武松。"}],
-        {"selected": [{"id": "mem_cat", "reason": "topic_supported_weak_generic_overlap"}]},
-    )
-
-    content = msg["content"]
-    assert "Safety/privacy boundaries >= the user's current explicit message or correction > directly relevant fallback memory > conflicting assistant draft from before this fallback" in content
-    assert "If fallback memory directly answers the latest user message, use it instead of any conflicting assistant draft" in content
-
-
-def test_model_api_memory_fallback_instruction_does_not_override_user_correction():
-    msg = appmod.hosted_chat_routes._memory_fallback_instruction_message(
-        "auto_readside",
-        [{"id": "mem_old", "title": "用户有一只猫", "description": "旧记忆：用户有一只猫。"}],
-        {},
-    )
-
-    content = msg["content"]
-    assert "Do not use fallback memory to argue against the user's current correction" in content
-    assert "If the user now corrects or updates a fact, follow the current user message" in content
-
-
-def test_model_api_memory_fallback_instruction_uses_content_not_weak_label():
-    msg = appmod.hosted_chat_routes._memory_fallback_instruction_message(
-        "index_selector",
-        [{"id": "mem_cat", "summary": "用户的橘猫叫武松。"}],
-        {"selected": [{"id": "mem_cat", "reason": "topic_supported_weak_generic_overlap"}]},
-    )
-
-    content = msg["content"]
-    assert "Judge fallback memories by whether their content directly answers the latest user message, not by weak/generic/approximate trace labels alone" in content
-
-
-def test_model_api_memory_fallback_instruction_avoids_hard_claims_for_tangential_memory():
-    msg = appmod.hosted_chat_routes._memory_fallback_instruction_message(
-        "auto_readside",
-        [{"id": "mem_bike", "title": "用户喜欢某辆自行车"}],
-        {"selected": [{"id": "mem_bike", "reason": "weak_generic_overlap"}]},
-    )
-
-    content = msg["content"]
-    assert "If fallback memory is only tangentially related, do not make a hard factual claim from it" in content
-    assert "say you are not sure rather than over-asserting" in content
 
 
 @pytest.mark.xfail(
@@ -350,7 +308,7 @@ def test_model_api_memory_repair_archives_noisy_cards_only_after_replacements(cl
         plain = memory_plaintexts.get(str(envelope.get("id") or ""))
         if plain is None:
             plain = {"title": "Unknown", "description": "Unknown memory.", "type": "fact"}
-        return appmod.json.dumps(plain).encode("utf-8")
+        return json.dumps(plain).encode("utf-8")
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder(captured_plaintexts))
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
@@ -358,7 +316,7 @@ def test_model_api_memory_repair_archives_noisy_cards_only_after_replacements(cl
 
     def fake_chat_completion(cfg, messages, **kwargs):
         return {
-            "reply": appmod.json.dumps({
+            "reply": json.dumps({
                 "candidates": [
                     {
                         "candidate_type": "preference",
@@ -398,7 +356,7 @@ def test_model_api_memory_repair_archives_noisy_cards_only_after_replacements(cl
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
 
-    appmod.db.memory_replace_all(user_id, [
+    db.memory_replace_all(user_id, [
         {
             "v": 1,
             "id": "bad_import",
@@ -465,7 +423,7 @@ def test_model_api_memory_repair_archives_noisy_cards_only_after_replacements(cl
     assert job["new_cards_created"] >= 1
     assert job["old_cards_archived"] == 1
 
-    saved = appmod.db.memory_load(user_id)
+    saved = db.memory_load(user_id)
     by_id = {row["id"]: row for row in saved}
     assert by_id["bad_import"]["is_archived"] is True
     assert by_id["bad_import"]["archive_reason"]
@@ -491,7 +449,7 @@ def test_model_api_setup_logs_provider_test_failure(client, monkeypatch, capsys)
     _, api_key = _register(client)
 
     def boom(cfg):
-        raise appmod.ProviderError(
+        raise provider_client.ProviderError(
             "provider_http_404: model: claude-3-5-haiku-latest", status_code=404
         )
 
@@ -553,23 +511,23 @@ def test_model_api_setup_can_reuse_saved_key_when_model_changes(client, monkeypa
 
 
 def test_history_import_relationship_date_accepts_flexible_user_input():
-    assert appmod._parse_iso_calendar_date("20260602") == appmod.date(2026, 6, 2)
-    assert appmod._parse_iso_calendar_date("2026/06/02") == appmod.date(2026, 6, 2)
-    assert appmod._parse_iso_calendar_date("2026年6月2日") == appmod.date(2026, 6, 2)
-    assert appmod._parse_iso_calendar_date("2026-02-31") is None
+    assert identity_service._parse_iso_calendar_date("20260602") == date(2026, 6, 2)
+    assert identity_service._parse_iso_calendar_date("2026/06/02") == date(2026, 6, 2)
+    assert identity_service._parse_iso_calendar_date("2026年6月2日") == date(2026, 6, 2)
+    assert identity_service._parse_iso_calendar_date("2026-02-31") is None
 
-    parsed, err = appmod._relationship_start_from_import(
+    parsed, err = history_import._relationship_start_from_import(
         {"relationship_started_at": "20260602"},
         [],
     )
-    assert parsed == appmod.date(2026, 6, 2)
+    assert parsed == date(2026, 6, 2)
     assert err == ""
 
-    fallback, err = appmod._relationship_start_from_import(
+    fallback, err = history_import._relationship_start_from_import(
         {"relationship_started_at": "not a date"},
         [],
     )
-    assert fallback == appmod.date.today()
+    assert fallback == date.today()
     assert err == ""
 
 
@@ -600,7 +558,7 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
                 "usage": {},
             }
         if "Derive a Feedling Identity Card" in joined:
-            return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
+            return {"reply": json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "I can answer from the imported history now.", "usage": {"total_tokens": 12}}
 
     monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
@@ -720,16 +678,16 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     )
     assert any(row["source"] == "model_api" and row["role"] == "user" for row in rows)
     assert all("body_ct" in row for row in rows if row["source"] == "model_api")
-    assert "sk-test-secret" not in appmod.json.dumps(appmod.db.get_blob(user_id, "model_api") or {})
+    assert "sk-test-secret" not in json.dumps(db.get_blob(user_id, "model_api") or {})
 
 def test_model_api_context_summary_parsing_drops_generic_runtime_fallback():
-    reply, summary = appmod._model_api_parse_turn_reply(
+    reply, summary = hosted_turn._model_api_parse_turn_reply(
         '{"reply":"好，我在。","thinking_summary":"参考了 8 条相关记忆。\\n对齐了当前 Identity 设定。"}'
     )
     assert reply == "好，我在。"
     assert summary == ""
 
-    reply, summary = appmod._model_api_parse_turn_reply(
+    reply, summary = hosted_turn._model_api_parse_turn_reply(
         '{"reply":"我先不删。","context_summary":"准备删除 Memory：烧卖和蒸饺设定，等待用户确认。"}'
     )
     assert reply == "我先不删。"
@@ -767,7 +725,7 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
                 "usage": {},
             }
         if "Derive a Feedling Identity Card" in joined:
-            return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
+            return {"reply": json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "Ready.", "usage": {}}
 
     monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
@@ -874,7 +832,7 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
                 "usage": {},
             }
         if "Derive a Feedling Identity Card" in joined:
-            return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
+            return {"reply": json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "ok", "usage": {}}
 
     monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
@@ -904,7 +862,7 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
         "/v1/history_import/upload",
         json={
             "format": "auto",
-            "content": appmod.json.dumps(chat_export),
+            "content": json.dumps(chat_export),
             "history_filename": "chat-export.json",
             "persona_content": "Long-term user profile: prefers durable setup context.",
             "persona_filename": "persona.md",
@@ -953,12 +911,12 @@ def test_wrapped_chat_history_json_parses_without_upload_artifacts():
     ]
     wrapped = (
         "===== BEGIN CHAT HISTORY FILE: conversations-011.json =====\n"
-        + appmod.json.dumps(chat_export, ensure_ascii=False)
+        + json.dumps(chat_export, ensure_ascii=False)
         + "\n===== END CHAT HISTORY FILE: conversations-011.json ====="
     )
     warnings = []
 
-    messages = appmod._parse_import_history_content(wrapped, "auto", warnings)
+    messages = history_import._parse_import_history_content(wrapped, "auto", warnings)
 
     assert warnings == []
     assert [m["role"] for m in messages] == ["user", "assistant"]
@@ -966,12 +924,12 @@ def test_wrapped_chat_history_json_parses_without_upload_artifacts():
     assert all("BEGIN CHAT HISTORY FILE" not in m["content"] for m in messages)
     assert all("conversation_id" not in m["content"] for m in messages)
 
-    cards = appmod._fallback_memory_cards(
+    cards = history_import._fallback_memory_cards(
         messages,
-        appmod.date(2026, 5, 31),
+        date(2026, 5, 31),
         story_needed=1,
         about_needed=1,
-        language=appmod._detect_import_language(messages),
+        language=history_import._detect_import_language(messages),
     )
     assert len(cards) == 2
     assert not cards[0]["title"].startswith("导入")
@@ -991,7 +949,7 @@ def test_large_history_sampling_keeps_middle_and_latest_messages():
     messages[90]["content"] = "MIDDLE_MARKER " + messages[90]["content"]
     messages[-1]["content"] = "LATEST_MARKER " + messages[-1]["content"]
 
-    sample = appmod._transcript_sample(messages, max_chars=5000)
+    sample = history_import._transcript_sample(messages, max_chars=5000)
 
     assert "EARLIEST_MARKER" in sample
     assert "MIDDLE_MARKER" in sample
@@ -1010,7 +968,7 @@ def test_large_history_extraction_windows_cover_full_timeline():
     messages[0]["content"] = "FIRST_WINDOW_MARKER " + messages[0]["content"]
     messages[-1]["content"] = "LAST_WINDOW_MARKER " + messages[-1]["content"]
 
-    windows = appmod._transcript_extraction_windows(messages, max_chars=5000, max_windows=5)
+    windows = history_import._transcript_extraction_windows(messages, max_chars=5000, max_windows=5)
     joined = "\n".join(windows)
 
     assert len(windows) > 1
@@ -1019,7 +977,7 @@ def test_large_history_extraction_windows_cover_full_timeline():
 
 
 def test_import_memory_targets_do_not_force_historical_floor_padding():
-    targets = appmod._import_memory_targets(
+    targets = history_import._import_memory_targets(
         {"story": 15, "about_me": 60, "ta_thinking": 12, "total": 87},
         [{"role": "user", "content": f"m{i}", "source": "history_import"} for i in range(120)],
         [],
@@ -1042,8 +1000,8 @@ def test_history_import_profile_marks_three_year_history_as_ultra():
         for idx in range(14)
     ]
 
-    profile = appmod._history_import_profile(messages, [], content_chars=80_000)
-    targets = appmod._import_memory_targets(
+    profile = history_import._history_import_profile(messages, [], content_chars=80_000)
+    targets = history_import._import_memory_targets(
         {"story": 15, "about_me": 60, "ta_thinking": 12, "total": 87},
         messages,
         [],
@@ -1057,7 +1015,7 @@ def test_history_import_profile_marks_three_year_history_as_ultra():
 
 
 def test_import_memory_filters_generic_import_cards_and_repetitive_low_value_content():
-    cards = appmod._dedupe_memory_cards([
+    cards = history_import._dedupe_memory_cards([
         {
             "type": "moment",
             "title": "导入片段 7",
@@ -1112,10 +1070,10 @@ def test_candidate_pipeline_renders_high_value_cards_without_generic_tasks():
         ]
     }
 
-    candidates = appmod._coerce_import_candidates(raw, appmod.date(2026, 6, 1), window_id="w1")
-    cards = appmod._render_candidates_to_memory_cards(
+    candidates = history_import._coerce_import_candidates(raw, date(2026, 6, 1), window_id="w1")
+    cards = history_import._render_candidates_to_memory_cards(
         candidates,
-        appmod.date(2026, 6, 1),
+        date(2026, 6, 1),
         {"story": 2, "about_me": 2, "ta_thinking": 0, "total": 4},
         language="en",
     )
@@ -1130,12 +1088,12 @@ def test_identity_import_keeps_unknown_agent_name_empty():
     payload = _identity_payload()
     payload["agent_name"] = "IO"
 
-    normalized = appmod._normalize_identity_payload(payload, [], 7, "zh-Hans")
+    normalized = history_import._normalize_identity_payload(payload, [], 7, "zh-Hans")
 
     assert normalized["agent_name"] == ""
 
     payload["agent_name"] = "小哆啦"
-    normalized = appmod._normalize_identity_payload(payload, [], 7, "zh-Hans")
+    normalized = history_import._normalize_identity_payload(payload, [], 7, "zh-Hans")
 
     assert normalized["agent_name"] == "小哆啦"
 
@@ -1181,10 +1139,10 @@ def test_candidate_render_merges_similar_cards_filters_sensitive_claims_and_sort
         ]
     }
 
-    candidates = appmod._coerce_import_candidates(raw, appmod.date(2026, 5, 1), window_id="w1")
-    cards = appmod._render_candidates_to_memory_cards(
+    candidates = history_import._coerce_import_candidates(raw, date(2026, 5, 1), window_id="w1")
+    cards = history_import._render_candidates_to_memory_cards(
         candidates,
-        appmod.date(2026, 5, 1),
+        date(2026, 5, 1),
         {"story": 2, "about_me": 4, "ta_thinking": 0, "total": 6},
         language="en",
     )
@@ -1202,7 +1160,7 @@ def test_candidate_extraction_repairs_malformed_provider_json(monkeypatch):
         calls.append(joined)
         if "previous model response was not valid json" in joined.lower():
             return {
-                "reply": appmod.json.dumps({
+                "reply": json.dumps({
                     "candidates": [{
                         "candidate_type": "preference",
                         "subject": "user",
@@ -1219,10 +1177,10 @@ def test_candidate_extraction_repairs_malformed_provider_json(monkeypatch):
 
     monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
-    candidates, warnings = appmod._extract_memory_candidates_with_provider(
-        appmod.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+    candidates, warnings = history_import._extract_memory_candidates_with_provider(
+        provider_client.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
         [{"id": "w1", "text": "2026-06-01 User: Please turn this into readable memory."}],
-        appmod.date(2026, 6, 1),
+        date(2026, 6, 1),
         per_window_target=3,
         language="en",
     )
@@ -1241,8 +1199,8 @@ def test_onboarding_greeting_for_unknown_name_asks_for_name(monkeypatch):
 
     monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
-    text, warnings = appmod._generate_model_api_onboarding_greeting(
-        appmod.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+    text, warnings = history_import._generate_model_api_onboarding_greeting(
+        provider_client.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
         [{"role": "user", "content": "这是之前的聊天。", "source": "history_import"}],
         [],
         {"agent_name": "", "self_introduction": ""},
@@ -1273,7 +1231,7 @@ def test_support_material_sections_split_character_and_personal_profile():
 """,
     }
 
-    support = appmod._persona_support_messages(payload)
+    support = history_import._persona_support_messages(payload)
 
     assert [m["source"] for m in support] == ["ai_persona_import", "ai_persona_import", "user_profile_import"]
     assert [m["source_detail"] for m in support] == ["ai_persona_import", "ai_persona_import", "user_profile_import"]
@@ -1294,7 +1252,7 @@ def test_support_materials_accept_explicit_agent_character_and_personal_profile_
         "personal_profile_filename": "profile.md",
     }
 
-    support = appmod._persona_support_messages(payload)
+    support = history_import._persona_support_messages(payload)
 
     assert [m["source"] for m in support] == ["ai_persona_import", "ai_persona_import", "user_profile_import"]
     assert [m["source_detail"] for m in support] == ["agent_prompt_import", "character_import", "user_profile_import"]
@@ -1316,7 +1274,7 @@ def test_support_materials_accept_memory_summary_as_first_class_source():
         "personal_profile_filename": "profile.txt",
     }
 
-    support = appmod._persona_support_messages(payload)
+    support = history_import._persona_support_messages(payload)
 
     assert [m["source"] for m in support] == [
         "ai_persona_import",
@@ -1333,13 +1291,13 @@ def test_history_import_windows_keep_memory_summary_separate_from_large_history(
         "ai_persona_content": "TA 叫小哆啦，语气稳定。",
         "memory_summary_content": "用户在五月反复提到需要稳定陪伴。\n他们约定重要提醒要直接说。",
     }
-    support = appmod._persona_support_messages(payload)
+    support = history_import._persona_support_messages(payload)
     history = [
         {"role": "user", "content": f"history line {idx}", "source": "history_import"}
         for idx in range(240)
     ]
 
-    windows = appmod._build_transcript_windows(
+    windows = history_import._build_transcript_windows(
         support + history,
         max_chars=2500,
         max_windows=4,
@@ -1352,15 +1310,15 @@ def test_history_import_windows_keep_memory_summary_separate_from_large_history(
 
 
 def test_memory_summary_fallback_splits_high_recall_cards_without_ai_persona_story_pollution():
-    messages = appmod._persona_support_messages({
+    messages = history_import._persona_support_messages({
         "ai_persona_content": "TA 叫小哆啦，温柔稳定。",
         "memory_summary_content": "1. 用户在五月反复提到需要稳定陪伴。\n2. 用户希望重要提醒要直接说。\n3. 他们在一次争执后约定先确认情绪。",
         "personal_profile_content": "用户喜欢直接反馈。",
     })
 
-    cards = appmod._fallback_memory_cards(
+    cards = history_import._fallback_memory_cards(
         messages,
-        appmod.date(2026, 5, 1),
+        date(2026, 5, 1),
         story_needed=2,
         about_needed=2,
         language="zh-Hans",
@@ -1375,7 +1333,7 @@ def test_memory_summary_fallback_splits_high_recall_cards_without_ai_persona_sto
 def test_identity_without_ai_source_does_not_use_user_profile_as_companion(monkeypatch):
     def fake_chat_completion(cfg, messages, **kwargs):
         return {
-            "reply": appmod.json.dumps({
+            "reply": json.dumps({
                 "agent_name": "Seven",
                 "self_introduction": "我是 Seven，我喜欢直接反馈，也在做 Feedling。",
                 "category": "用户画像",
@@ -1390,8 +1348,8 @@ def test_identity_without_ai_source_does_not_use_user_profile_as_companion(monke
 
     monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
-    identity, warnings = appmod._derive_identity_with_provider(
-        appmod.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+    identity, warnings = history_import._derive_identity_with_provider(
+        provider_client.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
         [{"role": "user", "content": "User profile:\n用户叫 Seven，喜欢直接反馈。", "source": "user_profile_import"}],
         [],
         3,
@@ -1406,7 +1364,7 @@ def test_identity_without_ai_source_does_not_use_user_profile_as_companion(monke
 def test_support_materials_extract_chatgpt_memories_json_without_raw_artifacts():
     payload = {
         "personal_profile_filename": "memories.json",
-        "personal_profile_content": appmod.json.dumps([
+        "personal_profile_content": json.dumps([
             {
                 "conversations_memory": "**工作上下文**\nSeven 正在做 Feedling MCP 和 API onboarding。",
                 "account_uuid": "user-secret-id",
@@ -1414,7 +1372,7 @@ def test_support_materials_extract_chatgpt_memories_json_without_raw_artifacts()
         ]),
     }
 
-    support = appmod._persona_support_messages(payload)
+    support = history_import._persona_support_messages(payload)
 
     assert len(support) == 1
     content = support[0]["content"]
@@ -1428,7 +1386,7 @@ def test_support_materials_extract_chatgpt_memories_json_without_raw_artifacts()
 def test_support_materials_ignore_account_metadata_json():
     payload = {
         "personal_profile_filename": "users.json",
-        "personal_profile_content": appmod.json.dumps([
+        "personal_profile_content": json.dumps([
             {
                 "uuid": "user-secret-id",
                 "email_address": "seven@example.com",
@@ -1438,14 +1396,14 @@ def test_support_materials_ignore_account_metadata_json():
         ]),
     }
 
-    assert appmod._persona_support_messages(payload) == []
+    assert history_import._persona_support_messages(payload) == []
 
 
 def test_import_language_prefers_user_archive_language(monkeypatch):
     monkeypatch.setattr(accounts_registry, "_get_user_archive_language", lambda user_id: "zh-Hans-US")
     store = type("Store", (), {"user_id": "usr_test"})()
 
-    language = appmod._import_language_for_store(
+    language = history_import._import_language_for_store(
         store,
         [{"role": "user", "content": "Work context and product strategy are written in English."}],
     )
@@ -1481,7 +1439,7 @@ def test_history_import_allows_confirmed_fresh_start_without_materials(client, m
                 "usage": {},
             }
         if "Derive a Feedling Identity Card" in joined:
-            return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
+            return {"reply": json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "ok", "usage": {}}
 
     monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)

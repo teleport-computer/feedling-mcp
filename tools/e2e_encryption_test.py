@@ -2,7 +2,7 @@
 """
 End-to-end Phase 2 encryption test.
 
-Spins up Flask backend + enclave service against the dstack simulator,
+Spins up the ASGI backend + enclave service against the dstack simulator,
 registers a user, generates a client-side content keypair, encrypts a
 message per docs/DESIGN_E2E.md §3.2 (double-wrap + AEAD aad binding),
 POSTs it via /v1/chat/message, then fetches it back through the enclave's
@@ -12,7 +12,7 @@ for shared rejected, local_only surfaces as placeholder.
 
 Prereqs:
   - phala simulator running (phala simulator start)
-  - Python deps: flask, nacl, dstack_sdk, httpx, requests
+  - Python deps: fastapi, nacl, dstack_sdk, httpx, requests
 
 Run:
   python3 tools/e2e_v2_encryption_test.py
@@ -214,7 +214,7 @@ def main():
 
     backend = Proc(
         "backend",
-        ["python3", "backend/app.py"],
+        ["python3", "backend/serve_dev.py"],
         {
             "FEEDLING_DATA_DIR": data_dir,
             "FEEDLING_WS_PORT": "29998",
@@ -342,7 +342,7 @@ def main():
         r = requests.post("http://127.0.0.1:5001/v1/chat/message",
                           headers={"X-API-Key": user2_key},
                           json={"envelope": env_spoof}, timeout=5)
-        check("spoofed envelope accepted by backend (Flask doesn't validate crypto)",
+        check("spoofed envelope accepted by backend (backend doesn't validate crypto)",
               r.status_code == 200)
         # Now the enclave should fail AEAD verification when user2 reads back.
         r = requests.get("http://127.0.0.1:5003/v1/chat/history",

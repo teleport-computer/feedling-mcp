@@ -15,12 +15,14 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
 import provider_client  # noqa: E402
+from accounts import registry as accounts_registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from core import store as core_store  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
 
@@ -32,10 +34,10 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
+    accounts_registry._users[:] = []
+    accounts_registry._key_to_user.clear()
+    core_store._stores.clear()
+    accounts_registry._save_users()
     monkeypatch.setattr(
         core_enclave,
         "_get_enclave_info",
@@ -44,8 +46,7 @@ def client(tmp_path, monkeypatch):
     # Default: a live supervisor so the wedge guard lets sends through. Tests that
     # exercise the guard's 503 path re-monkeypatch this to return not-live.
     monkeypatch.setattr(agent_runtime_cutover, "check_supervisor_live", lambda **kw: (True, ""))
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    with make_client() as c:
         yield c
 
 
@@ -121,7 +122,7 @@ def test_chat_response_marks_first_user_success_once_for_real_chat_sources(clien
         lambda store, allow_verify_reply=False: None,
     )
 
-    store = appmod.get_store(user_id)
+    store = core_store.get_store(user_id)
     assert store.proactive_activation_ready() is False
 
     bad_user = store.append_chat("user", source, _chat_envelope(user_id, f"{source}-bad-user-1"))
@@ -167,7 +168,7 @@ def test_chat_response_does_not_mark_first_chat_ok_for_verify_ping(client, monke
         lambda store, allow_verify_reply=False: None,
     )
 
-    store = appmod.get_store(user_id)
+    store = core_store.get_store(user_id)
     ping_user = store.append_chat("user", "verify_ping", _chat_envelope(user_id, "verify-ping-user-1"))
 
     reply = client.post(
@@ -324,7 +325,7 @@ def test_send_503_when_supervisor_not_live(client, monkeypatch):
     assert body["reason"].startswith("stale_supervisor_heartbeat")
     assert calls == [], "supervisor down 时不应路由到 handle_send"
     # 守卫早于 append_chat，store 里不应有任何用户消息（无孤儿 turn）
-    store = appmod._stores.get(user_id)
+    store = core_store._stores.get(user_id)
     if store:
         user_msgs = [m for m in store.chat_messages if m.get("role") == "user"]
         assert user_msgs == [], f"守卫触发后 store 不应有用户消息，实际: {user_msgs}"

@@ -209,18 +209,6 @@ def test_screen_caption_follows_env_baseline_and_explicit_override(monkeypatch):
     assert screen_flag_v2.screen_caption_enabled(store) is False  # explicit opt-out wins
 
 
-def test_hosted_chat_full_tool_loop_follows_env_baseline(monkeypatch):
-    from hosted import chat_routes
-
-    store = SimpleNamespace(user_id="u_hc")
-    monkeypatch.setattr(hosted_config_store, "_load_model_api_config", lambda s: {})
-    monkeypatch.setattr(hosted_config_store, "_ensure_model_api_runtime_profile", lambda s, c: {})
-    monkeypatch.setenv(ENV, "true")
-    assert chat_routes._hosted_chat_full_tool_loop_v2_enabled(store) is True
-    monkeypatch.delenv(ENV, raising=False)
-    assert chat_routes._hosted_chat_full_tool_loop_v2_enabled(store) is False
-
-
 def test_ensure_profile_preserves_explicit_perception_true(monkeypatch):
     store = SimpleNamespace(user_id="u_keep")
     monkeypatch.setattr(

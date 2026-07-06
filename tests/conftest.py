@@ -1,10 +1,10 @@
 """Shared pytest setup for the PostgreSQL-backed backend.
 
-The backend now persists to PostgreSQL (see backend/db.py) instead of files, so
-every test — whether it imports ``app`` in-process or spawns the backend as a
-subprocess — needs a ``DATABASE_URL``. This conftest provisions a throwaway
-test database once per session and points ``DATABASE_URL`` at it BEFORE any
-test module is collected (module-level ``import app`` then succeeds).
+The backend persists to PostgreSQL (see backend/db.py), so every test — whether
+it drives the app in-process (``asgi_test_client.make_client``) or spawns the
+backend as a subprocess (``backend/serve_dev.py``) — needs a ``DATABASE_URL``.
+This conftest provisions a throwaway test database once per session and points
+``DATABASE_URL`` at it BEFORE any test module is collected.
 
 Configure the Postgres server to use via ``FEEDLING_TEST_PG`` (a libpq URL
 whose database is the maintenance db, e.g. ``.../postgres``). If unset, it
@@ -74,15 +74,14 @@ except Exception as e:  # noqa: BLE001 — any failure means "no usable PG"
             pass
 
 # If we couldn't provision a test DB, do NOT collect the backend test modules.
-# Several of them import backend/app.py at module scope, which now calls
-# db.init_schema() and raises without a reachable Postgres — that would turn a
-# graceful skip into a hard collection error. ``collect_ignore_glob`` is honored
-# at collection time (before those modules are imported), so on a developer
-# machine with no Postgres `pytest` exits cleanly instead of erroring. CI always
+# Most of them hit the DB (directly or through the app); without a reachable
+# Postgres that would turn a graceful skip into a hard collection error.
+# ``collect_ignore`` is honored at collection time, so on a developer machine
+# with no Postgres `pytest` exits cleanly instead of erroring. CI always
 # provisions Postgres, so coverage there is unaffected.
 if not _provisioned:
-    # Pure-unit modules that neither import app nor touch the DB — keep them
-    # collectable so a no-Postgres dev machine still runs something useful.
+    # Pure-unit modules that don't touch the DB — keep them collectable so a
+    # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
         "test_object_storage.py",
         "test_wake_bus.py",
@@ -111,7 +110,7 @@ if not _provisioned:
         "test_hosted_agent_runtime_cutover.py",
         "test_worldbook_match.py",
         "test_worldbook_readside_core.py",
-        "test_asgi_app_import_guard.py",
+        "test_no_app_py_regression.py",
         "test_asgi_waiters.py",
     }
     collect_ignore = sorted(
@@ -175,3 +174,33 @@ def pytest_unconfigure(config):
         admin.close()
     except Exception:
         pass
+
+
+@pytest.fixture()
+def backend_env(tmp_path, monkeypatch):
+    """Fresh per-test backend state: FEEDLING_DIR → tmp_path, registry + store
+    caches reset.
+
+    Mutation is in-place on purpose (``_users[:] =`` / ``.clear()``): the list
+    and dict objects are shared by identity across modules (CONTRIBUTING §4);
+    rebinding them here would silently desync every other holder.
+    """
+    from accounts import registry
+    from core import config as core_config
+    from core import store as core_store
+
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    with registry._users_lock:
+        registry._users[:] = []
+        registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    yield
+
+
+@pytest.fixture()
+def client(backend_env):
+    """Sync HTTP client over the real assembled ASGI app, on fresh state."""
+    from asgi_test_client import make_client
+
+    return make_client()

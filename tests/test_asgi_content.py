@@ -37,13 +37,17 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle; import triggers db.init_schema)
 import db  # noqa: E402
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from content import routes_asgi as content_asgi  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
+from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
+from identity import service as identity_service  # noqa: E402
+from memory import service as memory_service  # noqa: E402
 
 
 _FAKE_ENCLAVE = {"content_pk_hex": ("22" * 32), "compose_hash": "test-compose"}
@@ -71,17 +75,16 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     # Deterministic enclave material for both backends (rewrap + export use it).
     monkeypatch.setattr(core_enclave, "_get_enclave_info", lambda: dict(_FAKE_ENCLAVE))
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
     yield
 
 
 def _register() -> tuple[str, str]:
     raw = next(_pk_counter).to_bytes(32, "big")
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(raw), "archive_language": "en"},
     )
@@ -92,7 +95,7 @@ def _register() -> tuple[str, str]:
 
 def _registered_pk(user_id: str) -> str:
     """The base64 content public key registration stored for this user."""
-    return appmod._get_user_public_key(user_id)
+    return registry._get_user_public_key(user_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -114,21 +117,21 @@ def _old_env(user_id: str, item_id: str) -> dict:
 
 
 def _seed_encrypted_content(user_id: str) -> None:
-    store = appmod.get_store(user_id)
+    store = core_store.get_store(user_id)
     # Fixed timestamps so two throwaway users seed byte-identical content (the
     # export parity compare would otherwise trip on ms-apart datetime.now()).
     now = "2026-07-04T00:00:00"
     identity = {**_old_env(user_id, "identity1"), "created_at": now, "updated_at": now,
                 "relationship_started_at": "2026-06-01"}
-    appmod._save_identity(store, identity)
+    identity_service._save_identity(store, identity)
     memory = {**_old_env(user_id, "memory1"), "type": "fact", "occurred_at": "2026-06-01",
               "created_at": now, "source": "test"}
-    appmod._save_moments(store, [memory])
+    memory_service._save_moments(store, [memory])
     chat = {**_old_env(user_id, "chat1"), "role": "openclaw", "source": "test",
             "ts": 1000.0, "content_type": "text"}
     with store.chat_lock:
         store.chat_messages = [chat]
-        appmod.db.chat_append(user_id, chat["id"], chat["ts"], chat, appmod.MAX_CHAT_MESSAGES)
+        db.chat_append(user_id, chat["id"], chat["ts"], chat, core_store.MAX_CHAT_MESSAGES)
 
 
 # --------------------------------------------------------------------------- #
@@ -140,13 +143,13 @@ def _key(api_key: str) -> dict:
 
 
 def _flask(method, path, *, headers=None, json_body=None):
-    c = appmod.app.test_client()
+    c = make_client()
     res = c.open(path, method=method, headers=headers or {}, json=json_body)
     return res.status_code, res.get_json(silent=True)
 
 
 def _flask_raw(method, path, *, headers=None):
-    res = appmod.app.test_client().open(path, method=method, headers=headers or {})
+    res = make_client().open(path, method=method, headers=headers or {})
     return res.status_code, res.data, res.headers.get("Content-Type"), res.headers.get("Content-Disposition")
 
 
@@ -324,7 +327,7 @@ def test_swap_chat_ok_parity(env):
     assert f[0] == 200
     assert f[1]["summary"] == {"ok": 1, "not_found": 0, "error": 0, "total": 1}
     # E2E: the swapped envelope's ciphertext was relocated verbatim, no decrypt.
-    store = appmod.get_store(fu)
+    store = core_store.get_store(fu)
     with store.chat_lock:
         stored = [m for m in store.chat_messages if m["id"] == "chat1"][0]
     assert stored["K_user"] == new_env["K_user"]
@@ -371,8 +374,8 @@ def test_rewrap_full_parity_and_credential_forwarding(env, monkeypatch):
     assert f[1]["status"] == "ok"
     # Both backends advanced the registered key and forwarded the caller's api key
     # to the (stubbed) enclave decrypt call — the enclave, not this process, decrypts.
-    assert appmod._get_user_public_key(fu) == new_pk
-    assert appmod._get_user_public_key(au) == new_pk
+    assert registry._get_user_public_key(fu) == new_pk
+    assert registry._get_user_public_key(au) == new_pk
     assert fk in seen_keys and ak in seen_keys
 
 
@@ -395,8 +398,8 @@ def test_rewrap_dry_run_parity(env, monkeypatch):
     assert f[1]["dry_run"] is a[1]["dry_run"] is True
     assert f[1]["summary"]["total_rewrapped"] == a[1]["summary"]["total_rewrapped"] == 3
     # dry_run must NOT advance the registered key on either backend.
-    assert appmod._get_user_public_key(fu) != new_pk
-    assert appmod._get_user_public_key(au) != new_pk
+    assert registry._get_user_public_key(fu) != new_pk
+    assert registry._get_user_public_key(au) != new_pk
 
 
 # =========================================================================== #

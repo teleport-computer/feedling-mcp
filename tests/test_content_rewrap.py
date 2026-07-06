@@ -3,15 +3,22 @@ from __future__ import annotations
 import base64
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
+import db  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
+from core import envelope as core_envelope  # noqa: E402
+from core import store as core_store  # noqa: E402
+from identity import service as identity_service  # noqa: E402
+from memory import service as memory_service  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -21,17 +28,16 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
     monkeypatch.setattr(
         core_enclave,
         "_get_enclave_info",
         lambda: {"content_pk_hex": ("22" * 32), "compose_hash": "test"},
     )
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    with make_client() as c:
         yield c
 
 
@@ -64,8 +70,8 @@ def _old_env(user_id: str, item_id: str) -> dict:
 
 
 def _seed_encrypted_content(user_id: str) -> dict[str, str]:
-    store = appmod.get_store(user_id)
-    now = appmod.datetime.now().isoformat()
+    store = core_store.get_store(user_id)
+    now = datetime.now().isoformat()
 
     identity = {
         **_old_env(user_id, "identity1"),
@@ -73,7 +79,7 @@ def _seed_encrypted_content(user_id: str) -> dict[str, str]:
         "updated_at": now,
         "relationship_started_at": "2026-06-01",
     }
-    appmod._save_identity(store, identity)
+    identity_service._save_identity(store, identity)
 
     memory = {
         **_old_env(user_id, "memory1"),
@@ -82,7 +88,7 @@ def _seed_encrypted_content(user_id: str) -> dict[str, str]:
         "created_at": now,
         "source": "test",
     }
-    appmod._save_moments(store, [memory])
+    memory_service._save_moments(store, [memory])
 
     chat = {
         **_old_env(user_id, "chat1"),
@@ -93,7 +99,7 @@ def _seed_encrypted_content(user_id: str) -> dict[str, str]:
     }
     with store.chat_lock:
         store.chat_messages = [chat]
-        appmod.db.chat_append(user_id, chat["id"], chat["ts"], chat, appmod.MAX_CHAT_MESSAGES)
+        db.chat_append(user_id, chat["id"], chat["ts"], chat, core_store.MAX_CHAT_MESSAGES)
     return {
         "identity_K_user": identity["K_user"],
         "memory_K_user": memory["K_user"],
@@ -116,7 +122,7 @@ def test_public_key_rotation_requires_rewrap_when_content_exists(client):
     assert body["error"] == "public_key_rotation_requires_rewrap"
     assert body["encrypted_content"] == {"identity": 1, "memory": 1, "chat": 1, "total": 3}
     assert body["recovery_endpoint"] == "/v1/content/rewrap-to-current-key"
-    assert appmod._get_user_public_key(user_id) == _b64(b"\x11" * 32)
+    assert registry._get_user_public_key(user_id) == _b64(b"\x11" * 32)
 
 
 def test_content_rewrap_to_current_key_rewraps_all_shared_content(client, monkeypatch):
@@ -137,7 +143,7 @@ def test_content_rewrap_to_current_key_rewraps_all_shared_content(client, monkey
     )
     assert dry.status_code == 200, dry.get_data(as_text=True)
     assert dry.get_json()["summary"]["total_rewrapped"] == 3
-    assert appmod._get_user_public_key(user_id) == _b64(b"\x11" * 32)
+    assert registry._get_user_public_key(user_id) == _b64(b"\x11" * 32)
 
     res = client.post(
         "/v1/content/rewrap-to-current-key",
@@ -148,11 +154,11 @@ def test_content_rewrap_to_current_key_rewraps_all_shared_content(client, monkey
     body = res.get_json()
     assert body["summary"]["total_rewrapped"] == 3
     assert body["summary"]["total_errors"] == 0
-    assert appmod._get_user_public_key(user_id) == new_public_key
+    assert registry._get_user_public_key(user_id) == new_public_key
 
-    store = appmod.get_store(user_id)
-    identity = appmod._load_identity(store)
-    moments = appmod._load_moments(store)
+    store = core_store.get_store(user_id)
+    identity = identity_service._load_identity(store)
+    moments = memory_service._load_moments(store)
     with store.chat_lock:
         chat = list(store.chat_messages)
 
@@ -190,16 +196,16 @@ def test_rewrap_partial_failure_persists_successes_and_reports_pending(client, m
     # pending 只含超时的 chat1
     assert [p["id"] for p in body["pending"]] == ["chat1"]
     # 成功条目已落盘(K_user 变了),失败条目保持旧值
-    store = appmod.get_store(user_id)
-    identity = appmod._load_identity(store)
-    moments = appmod._load_moments(store)
+    store = core_store.get_store(user_id)
+    identity = identity_service._load_identity(store)
+    moments = memory_service._load_moments(store)
     with store.chat_lock:
         chat = list(store.chat_messages)
     assert identity["K_user"] != old_keys["identity_K_user"]
     assert moments[0]["K_user"] != old_keys["memory_K_user"]
     assert chat[0]["K_user"] == old_keys["chat_K_user"]
     # 有进展 → 注册钥已推进到新钥
-    assert appmod._get_user_public_key(user_id) == new_public_key
+    assert registry._get_user_public_key(user_id) == new_public_key
 
 
 def test_rewrap_converges_on_retry(client, monkeypatch):
@@ -227,8 +233,8 @@ def test_rewrap_converges_on_retry(client, monkeypatch):
     assert r2.status_code == 200
     assert b2["status"] == "ok"
     assert b2["pending"] == []
-    assert appmod._get_user_public_key(user_id) == new_public_key
-    store = appmod.get_store(user_id)
+    assert registry._get_user_public_key(user_id) == new_public_key
+    store = core_store.get_store(user_id)
     with store.chat_lock:
         chat = list(store.chat_messages)
     assert "K_enclave" in chat[0]
@@ -238,7 +244,7 @@ def test_rewrap_no_progress_returns_failed_and_keeps_key(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_encrypted_content(user_id)
     new_public_key = _b64(b"\x33" * 32)
-    old_registered = appmod._get_user_public_key(user_id)
+    old_registered = registry._get_user_public_key(user_id)
 
     def fake_decrypt(envelope, key, purpose):
         raise RuntimeError("enclave_http_502:backend_error timed out")
@@ -253,7 +259,7 @@ def test_rewrap_no_progress_returns_failed_and_keeps_key(client, monkeypatch):
     assert body["summary"]["total_rewrapped"] == 0
     assert len(body["pending"]) == 3
     # 零进展 → 注册钥保持旧值
-    assert appmod._get_user_public_key(user_id) == old_registered
+    assert registry._get_user_public_key(user_id) == old_registered
 
 
 def test_rewrap_skips_already_current_items_on_second_pass(client, monkeypatch):
@@ -302,7 +308,7 @@ def test_client_swap_clears_stale_content_pk_fpr_no_false_skip(client, monkeypat
     assert r1.get_json()["status"] == "ok"
 
     # Client swaps chat1 in place: new K_user + a FORGED stamp matching key A.
-    fpr_a = appmod.core_envelope._content_public_key_fingerprint(base64.b64decode(key_a))
+    fpr_a = core_envelope._content_public_key_fingerprint(base64.b64decode(key_a))
     swap_env = _old_env(user_id, "chat1")
     swap_env["K_user"] = _b64(b"\x09" * 48)
     swap_env["content_pk_fpr"] = fpr_a
@@ -312,7 +318,7 @@ def test_client_swap_clears_stale_content_pk_fpr_no_false_skip(client, monkeypat
     assert sres.status_code == 200, sres.get_data(as_text=True)
 
     # Stored stamp must have been cleared (not the forged fpr_a).
-    store = appmod.get_store(user_id)
+    store = core_store.get_store(user_id)
     with store.chat_lock:
         chat = [m for m in store.chat_messages if m["id"] == "chat1"][0]
     assert chat.get("content_pk_fpr") != fpr_a

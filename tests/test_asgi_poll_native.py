@@ -28,10 +28,12 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
 import asgi_app  # noqa: E402
+from accounts import registry as accounts_registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from proactive import service as proactive_service  # noqa: E402
 from runtime.waiters import registry  # noqa: E402
 
 
@@ -42,11 +44,11 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    res = appmod.app.test_client().post(
+    accounts_registry._users[:] = []
+    accounts_registry._key_to_user.clear()
+    core_store._stores.clear()
+    accounts_registry._save_users()
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
     )
@@ -147,7 +149,7 @@ def test_proactive_poll_parks_then_write_wakes(user):
 
             store.append_proactive_job({
                 "job_id": "pj_wake",
-                "source": appmod.PROACTIVE_JOB_SOURCE,
+                "source": proactive_service.PROACTIVE_JOB_SOURCE,
                 "job_kind": "introduction",
                 "ts": 1.0,
                 "status": "pending",

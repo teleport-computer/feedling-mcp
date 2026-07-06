@@ -111,7 +111,7 @@ def backend():
     log_path = Path(tmp_data) / "backend.log"
     log = open(log_path, "w")
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(BACKEND_DIR / "app.py")],
+        [sys.executable, "-u", str(BACKEND_DIR / "serve_dev.py")],
         env=env,
         stdout=log,
         stderr=subprocess.STDOUT,

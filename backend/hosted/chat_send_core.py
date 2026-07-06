@@ -2,12 +2,11 @@
 
 The route logic — image parse, runtime-provider load, user-message envelope
 build, driver resolve, supervisor wedge guard, chat append + wake, debug traces,
-and the delegation to ``agent_runtime_cutover.handle_send`` — with **no**
-``flask.request`` and **no** framework response object. Both the Flask route
-(``hosted.chat_routes``) and the ASGI route (``hosted.chat_routes_asgi``) call
-this and wrap the returned ``(body, status)`` in their own response type, so the
+and the delegation to ``agent_runtime_cutover.handle_send`` — with no framework
+request/response object. The ASGI route (``hosted.chat_routes_asgi``) calls this
+and wraps the returned ``(body, status)`` in its response type, preserving the
 202 contract, every debug/action trace, the 402/409/503/400/413 error branches,
-and the single (non-double) append stay byte-identical across frameworks.
+and the single (non-double) append.
 
 Every collaborator is referenced via its module (``agent_runtime_cutover.X``,
 ``hosted_config_store.X``, ``core_envelope.X`` …) so the existing tests that

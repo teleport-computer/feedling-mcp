@@ -18,8 +18,9 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
 from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
+from core import store as core_store  # noqa: E402
 from core import wake_bus  # noqa: E402
 
 
@@ -31,15 +32,15 @@ def _b64(raw: bytes) -> str:
 def captured(monkeypatch):
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(wake_bus, "notify", lambda ch, uid="": calls.append((ch, uid)))
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()  # not broadcast: default
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()  # not broadcast: default
     return calls
 
 
 def _register(calls) -> str:
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(os.urandom(32)), "archive_language": "en"},
     )

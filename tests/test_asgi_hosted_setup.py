@@ -1,12 +1,12 @@
 """Native hosted-setup parity (ASGI-migration plan §5.3 / §9).
 
-Asserts the FastAPI routes (``hosted.setup_routes_asgi``) return the same
-status/body as the Flask oracle (``hosted.setup_routes``) for all 10 routes:
+Asserts the FastAPI routes (``hosted.setup_routes_asgi``) return the expected
+status/body for all 10 routes:
 model_api get/setup/driver/key_envelope/test/delete/runtime + memory/repair,
-state/receipts, memory/capture_jobs. Both sides call the same framework-neutral
+state/receipts, memory/capture_jobs. The routes call the framework-neutral
 ``hosted.setup_core``, so provider/enclave stubs are installed once on the shared
-module objects and cover both paths — keeping the test fully offline and the E2E
-envelope handling identical across frameworks (the server never decrypts).
+module objects — keeping the test fully offline and the E2E envelope handling
+untouched (the server never decrypts).
 
 These routes are gated on ``auth.require_user()`` only (no
 ``runtime_auth.authorize_scope``), so there is no scope-failure (403) case — the
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import sys
 from pathlib import Path
@@ -25,10 +26,12 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from hosted import setup_routes_asgi as setup_asgi  # noqa: E402
 from hosted import turn as hosted_turn  # noqa: E402
@@ -52,13 +55,13 @@ _ASGI = _build_asgi_app()
 @pytest.fixture()
 def make_user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
 
     def _make():
-        res = appmod.app.test_client().post(
+        res = make_client().post(
             "/v1/users/register",
             json={"public_key": _b64(os.urandom(32)), "archive_language": "en"},
         )
@@ -78,7 +81,7 @@ def _headers(api_key: str) -> dict[str, str]:
 # --------------------------------------------------------------------------- #
 
 def _flask(method: str, path: str, *, headers=None, json_body=None):
-    client = appmod.app.test_client()
+    client = make_client()
     kw: dict = {"headers": headers or {}}
     if json_body is not None:
         kw["json"] = json_body
@@ -287,7 +290,7 @@ def test_setup_happy_path_parity_sealed_envelope(make_user, monkeypatch):
     assert cfg["provider"] == "openai"
     assert cfg["model"] == "gpt-4.1-mini"
     # E2E: the raw provider key is never echoed back.
-    assert "sk-secret-123" not in appmod.json.dumps(fb[1])
+    assert "sk-secret-123" not in json.dumps(fb[1])
     assert "api_key_envelope" not in cfg
 
     # And GET reflects the stored config identically on both users.

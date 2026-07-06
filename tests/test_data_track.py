@@ -11,8 +11,14 @@ import pytest
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
+import db  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
+from memory import service as memory_service  # noqa: E402
+from proactive import service as proactive_service  # noqa: E402
+from tracking import tracking_core  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -23,12 +29,11 @@ def _b64(raw: bytes) -> str:
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "admin-test-token")
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    with make_client() as c:
         yield c
 
 
@@ -80,7 +85,7 @@ def _append_chat_at(user_id: str, msg_id: str, role: str, source: str, ts: float
         "source": source,
         "ts": ts,
     }
-    appmod.db.chat_append(user_id, msg_id, ts, doc, appmod.MAX_CHAT_MESSAGES)
+    db.chat_append(user_id, msg_id, ts, doc, core_store.MAX_CHAT_MESSAGES)
 
 
 def test_track_event_scrubs_sensitive_payload(client):
@@ -106,7 +111,7 @@ def test_track_event_scrubs_sensitive_payload(client):
     )
 
     assert res.status_code == 200, res.get_data(as_text=True)
-    events = appmod.get_store(user_id).list_tracking_events(limit=0)
+    events = core_store.get_store(user_id).list_tracking_events(limit=0)
     assert len(events) == 1
     payload = events[0]["payload"]
     assert payload["screen"] == "chat_empty"
@@ -134,13 +139,13 @@ def test_admin_data_track_requires_admin_token(client, monkeypatch):
 
 def test_admin_data_track_aggregates_counts_without_content(client):
     user_id, api_key = _register(client)
-    store = appmod.get_store(user_id)
+    store = core_store.get_store(user_id)
 
     store.append_chat("user", "chat", _env("msg_user_1", user_id))
     store.append_chat("openclaw", "chat", _env("msg_agent_1", user_id))
     store.append_chat(
         "openclaw",
-        appmod.PROACTIVE_JOB_SOURCE,
+        proactive_service.PROACTIVE_JOB_SOURCE,
         _env("msg_proactive_1", user_id),
         extra={
             "proactive_job_id": "pj_1",
@@ -149,19 +154,19 @@ def test_admin_data_track_aggregates_counts_without_content(client):
             "alert_preview": "private alert preview",
         },
     )
-    appmod._save_moments(
+    memory_service._save_moments(
         store,
         [
             {"id": "mem_1", "type": "moment", "source": "bootstrap", "created_at": "2026-06-01T01:00:00"},
             {"id": "mem_2", "type": "fact", "source": "chat", "created_at": "2026-06-01T02:00:00"},
         ],
     )
-    appmod.db.set_blob(store.user_id, "identity", {
+    db.set_blob(store.user_id, "identity", {
         "updated_at": "2026-06-01T03:00:00",
         "relationship_started_at": "2026-06-01",
         "relationship_anchor_evidence": "private evidence",
     })
-    store.append_tracking_event(appmod._make_tracking_event(
+    store.append_tracking_event(tracking_core._make_tracking_event(
         store,
         "onboarding_connection_copied",
         {"payload": {"screen": "chat_empty", "prompt": "private copied prompt"}},
@@ -202,13 +207,13 @@ def test_admin_data_track_dau_counts_user_activity_by_beijing_day(client):
     _append_chat_at(user_c, "dau_verify_ping", "user", "verify_ping", day2_chat_ts + 2)
     _append_chat_at(user_b, "dau_next_day_chat", "user", "chat", day3_chat_ts)
 
-    appmod.db.log_append(
+    db.log_append(
         user_a,
         "tracking_events",
         {"event_id": "trk_day2_a", "type": "app_open", "ts": day2_tracking_ts},
         ts=day2_tracking_ts,
     )
-    appmod.db.log_append(
+    db.log_append(
         user_b,
         "tracking_events",
         {"event_id": "trk_day2_b", "type": "onboarding_view", "ts": day2_tracking_ts + 10},
@@ -249,13 +254,13 @@ def test_admin_data_track_supports_since_filter_and_pagination(client):
     old_user, _ = _register(client)
     new_user, _ = _register(client)
 
-    with appmod._users_lock:
-        for entry in appmod._users:
+    with registry._users_lock:
+        for entry in registry._users:
             if entry["user_id"] == old_user:
                 entry["created_at"] = "2026-06-01T17:00:00+00:00"
             elif entry["user_id"] == new_user:
                 entry["created_at"] = "2026-06-01T19:00:00+00:00"
-        appmod._save_users()
+        registry._save_users()
 
     summary = client.get(
         "/v1/admin/data-track/summary?since=2026-06-01T18:00:00Z",
@@ -289,20 +294,20 @@ def test_admin_data_track_sorts_before_pagination(client):
     high_chat_low_memory, _ = _register(client)
 
     def add_chat(user_id: str, *, regular: int, proactive: int) -> None:
-        store = appmod.get_store(user_id)
+        store = core_store.get_store(user_id)
         for idx in range(regular):
             role = "user" if idx % 2 == 0 else "openclaw"
             store.append_chat(role, "chat", _env(f"{user_id}_chat_{idx}", user_id))
         for idx in range(proactive):
             store.append_chat(
                 "openclaw",
-                appmod.PROACTIVE_JOB_SOURCE,
+                proactive_service.PROACTIVE_JOB_SOURCE,
                 _env(f"{user_id}_proactive_{idx}", user_id),
             )
 
     def add_memories(user_id: str, count: int) -> None:
-        store = appmod.get_store(user_id)
-        appmod._save_moments(
+        store = core_store.get_store(user_id)
+        memory_service._save_moments(
             store,
             [
                 {

@@ -87,7 +87,7 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: "ci-smoke-secret"
         run: |
           mkdir -p "$FEEDLING_DATA_DIR"
-          python backend/app.py > /tmp/backend.log 2>&1 &
+          python backend/serve_dev.py > /tmp/backend.log 2>&1 &
           echo $! > /tmp/backend.pid
           # wait for /healthz
           for i in $(seq 1 30); do

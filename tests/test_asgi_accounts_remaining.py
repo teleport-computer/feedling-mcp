@@ -35,10 +35,12 @@ from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle)
 import asgi_app  # noqa: E402
+from accounts import recover as accounts_recover  # noqa: E402
 from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -49,17 +51,17 @@ def _b64(raw: bytes) -> str:
 def clean(tmp_path, monkeypatch):
     """Fresh, isolated registry/store state per test (shared by both backends)."""
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._recover_challenges.clear()
-    appmod._save_users()
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    accounts_recover._recover_challenges.clear()
+    registry._save_users()
     return tmp_path
 
 
 @pytest.fixture()
 def user(clean):
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
     )
@@ -95,7 +97,7 @@ def _asgi_post(path, json_body=None, headers=None):
 
 
 def _flask(method: str, path: str, json_body=None, headers: dict | None = None):
-    c = appmod.app.test_client()
+    c = make_client()
     res = c.open(path, method=method, json=json_body, headers=headers or {})
     return res.status_code, res.get_json()
 

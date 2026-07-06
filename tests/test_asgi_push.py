@@ -26,9 +26,11 @@ import pytest
 from fastapi import FastAPI
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle)
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 from core.store import UserStore  # noqa: E402
 from push import apns  # noqa: E402
 from push import routes_asgi as push_asgi  # noqa: E402
@@ -52,11 +54,11 @@ def asgi_app_obj():
 @pytest.fixture()
 def user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    res = appmod.app.test_client().post(
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
     )
@@ -96,12 +98,12 @@ def _asgi_post(app, path: str, json_body=None, headers: dict | None = None):
 
 
 def _flask_get(path: str, headers: dict | None = None):
-    res = appmod.app.test_client().get(path, headers=headers or {})
+    res = make_client().get(path, headers=headers or {})
     return res.status_code, res.get_json()
 
 
 def _flask_post(path: str, json_body=None, headers: dict | None = None):
-    res = appmod.app.test_client().post(path, json=json_body, headers=headers or {})
+    res = make_client().post(path, json=json_body, headers=headers or {})
     return res.status_code, res.get_json()
 
 

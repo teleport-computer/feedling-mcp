@@ -17,11 +17,13 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle)
 import asgi_app  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import runtime_token  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 
 def _normalize(body: dict) -> dict:
@@ -55,11 +57,11 @@ def user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     # Deterministic enclave material for both backends (whoami_core calls this).
     monkeypatch.setattr(core_enclave, "_get_enclave_info", lambda: dict(_FAKE_ENCLAVE))
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    res = appmod.app.test_client().post(
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
     )
@@ -79,7 +81,7 @@ def _asgi_get(path: str, headers: dict | None = None):
 
 
 def _flask_get(path: str, headers: dict | None = None):
-    res = appmod.app.test_client().get(path, headers=headers or {})
+    res = make_client().get(path, headers=headers or {})
     return res.status_code, res.get_json()
 
 

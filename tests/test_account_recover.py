@@ -22,20 +22,22 @@ from cryptography.hazmat.primitives import serialization
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
+from accounts import recover as accounts_recover  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._recover_challenges.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    accounts_recover._recover_challenges.clear()
+    registry._save_users()
+    with make_client() as c:
         yield c
 
 
@@ -73,7 +75,7 @@ def test_register_with_new_pubkey_succeeds(client):
     _, _, pub_b64 = _new_keypair()
     res = client.post("/v1/users/register", json={"public_key": pub_b64})
     assert res.status_code == 201
-    assert len(appmod._users) == 1
+    assert len(registry._users) == 1
 
 
 def test_register_refuses_duplicate_pubkey(client):
@@ -86,7 +88,7 @@ def test_register_refuses_duplicate_pubkey(client):
     assert first.status_code == 201
     second = client.post("/v1/users/register", json={"public_key": pub_b64})
     assert second.status_code == 409, second.get_data(as_text=True)
-    assert len(appmod._users) == 1  # no orphan minted
+    assert len(registry._users) == 1  # no orphan minted
 
 
 def test_register_without_pubkey_still_allowed(client):
@@ -96,7 +98,7 @@ def test_register_without_pubkey_still_allowed(client):
     two = client.post("/v1/users/register", json={"archive_language": "en"})
     assert one.status_code == 201
     assert two.status_code == 201
-    assert len(appmod._users) == 2
+    assert len(registry._users) == 2
 
 
 def test_recover_challenge_unknown_pubkey_returns_404(client):
@@ -130,7 +132,7 @@ def test_recover_full_flow_issues_working_key_for_same_user(client):
     assert who.get_json()["user_id"] == user_id
 
     # No new account was minted.
-    assert len(appmod._users) == 1
+    assert len(registry._users) == 1
 
 
 def test_recover_lands_on_newest_active_account_when_pubkey_shared(client):
@@ -140,10 +142,10 @@ def test_recover_lands_on_newest_active_account_when_pubkey_shared(client):
     priv, pub_bytes, pub_b64 = _new_keypair()
     # Pre-existing orphan lineage (minted before the dedup backstop existed):
     # build it directly, since the register endpoint now refuses duplicates.
-    appmod._register_user(public_key=pub_b64)
-    new_user = appmod._register_user(public_key=pub_b64)["user_id"]
-    appmod._save_users()
-    assert len(appmod._users) == 2
+    registry._register_user(public_key=pub_b64)
+    new_user = registry._register_user(public_key=pub_b64)["user_id"]
+    registry._save_users()
+    assert len(registry._users) == 2
 
     ch = client.post("/v1/account/recover/challenge", json={"public_key": pub_b64}).get_json()
     answer = _solve_challenge(ch["envelope"], priv, pub_bytes)

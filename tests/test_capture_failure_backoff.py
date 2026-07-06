@@ -17,7 +17,6 @@ CAPTURE_RETRYABLE_TERMINAL 会立即重新入队 → 每个调度 tick（现网 
 """
 from __future__ import annotations
 
-import importlib
 import os
 import sys
 import tempfile
@@ -27,18 +26,19 @@ _DATA_DIR = tempfile.mkdtemp(prefix="feedling-capture-backoff-test-")
 os.environ.setdefault("FEEDLING_DATA_DIR", _DATA_DIR)
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-appmod = importlib.import_module("app")
+import db  # noqa: E402
 from proactive import capture_scheduler  # noqa: E402
 from proactive import dream_scheduler  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
 
 
 def _store(tmp_path, monkeypatch, user_id: str):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._stores.clear()
-    store = appmod.UserStore(user_id)
+    core_store._stores.clear()
+    store = core_store.UserStore(user_id)
     seed_user(store.user_id)
     return store
 
@@ -135,7 +135,7 @@ def test_dream_failed_job_backs_off(tmp_path, monkeypatch):
     monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
     monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
     store = _store(tmp_path, monkeypatch, "usr_dream_backoff")
-    appmod.db.memory_replace_all(store.user_id, [{
+    db.memory_replace_all(store.user_id, [{
         "v": 1,
         "id": "mem_backoff",
         "type": "fact",
@@ -199,3 +199,32 @@ def test_job_status_route_records_migrate_failure(tmp_path, monkeypatch):
     state = capture_scheduler.load_capture_state(store)
     assert int(state.get("migrate_fail_streak") or 0) == 1
     assert float(state.get("last_migrate_failed_at") or 0.0) > 0.0
+
+
+def test_duplicate_failed_report_does_not_double_streak(tmp_path, monkeypatch):
+    """consumer 可能对同一 job 重复上报终态 failed（重试/幂等重放）——streak
+    只在状态真正转变为 failed 的那次推进，否则退避会被无故翻倍。"""
+    monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", "1")
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "10")
+    from proactive import proactive_core
+
+    # migrate lane（route 级）
+    store = _store(tmp_path, monkeypatch, "usr_migrate_dup_failed")
+    first = capture_scheduler.tick_quiet_migrate(store, now=4_000_000.0)
+    assert first["enqueued"] is True
+    job_id = first["job"]["job_id"]
+    proactive_core.job_status(store, job_id, {"status": "failed", "reason": "boom"})
+    proactive_core.job_status(store, job_id, {"status": "failed", "reason": "boom again"})
+    state = capture_scheduler.load_capture_state(store)
+    assert int(state.get("migrate_fail_streak") or 0) == 1
+
+    # capture lane（route 级）
+    store2 = _store(tmp_path, monkeypatch, "usr_capture_dup_failed")
+    t0 = _seed_chat(store2, "m1")
+    first2 = capture_scheduler.tick_quiet_capture(store2, now=t0 + 20)
+    assert first2["enqueued"] is True
+    job2_id = first2["job"]["job_id"]
+    proactive_core.job_status(store2, job2_id, {"status": "failed", "reason": "boom"})
+    proactive_core.job_status(store2, job2_id, {"status": "failed", "reason": "boom again"})
+    state2 = capture_scheduler.load_capture_state(store2)
+    assert int(state2.get("capture_fail_streak") or 0) == 1

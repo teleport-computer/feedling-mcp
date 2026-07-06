@@ -9,12 +9,16 @@ import pytest
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
+import db  # noqa: E402
 import provider_client  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from core import store as core_store  # noqa: E402
 from identity import actions as identity_actions_mod  # noqa: E402
+from identity import service as identity_service  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -24,12 +28,11 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    with make_client() as c:
         yield c
 
 
@@ -66,7 +69,7 @@ def _plain_identity() -> dict:
 
 
 def _seed_identity(user_id: str) -> None:
-    appmod.db.set_blob(user_id, "identity", {
+    db.set_blob(user_id, "identity", {
         "v": 1,
         "id": "identity_1",
         "body_ct": "old",
@@ -84,7 +87,7 @@ def _seed_identity(user_id: str) -> None:
 
 
 def _seed_memory(user_id: str, memory_id: str = "mom_1") -> None:
-    appmod.db.memory_replace_all(user_id, [{
+    db.memory_replace_all(user_id, [{
         "v": 1,
         "id": memory_id,
         "type": "fact",
@@ -160,7 +163,7 @@ def test_identity_profile_patch_reencrypts_existing_card(client, monkeypatch):
     assert body["effects"][0]["fields"] == ["agent_name"]
     assert captured_plaintexts[-1]["agent_name"] == "小秘"
     assert captured_plaintexts[-1]["self_introduction"] == _plain_identity()["self_introduction"]
-    saved = appmod.db.get_blob(user_id, "identity")
+    saved = db.get_blob(user_id, "identity")
     assert saved["id"] == "identity_1"
     assert saved["body_ct"] == "ct_1"
     assert saved["relationship_started_at"] == "2026-04-01"
@@ -169,7 +172,7 @@ def test_identity_profile_patch_reencrypts_existing_card(client, monkeypatch):
 def test_identity_profile_patch_passes_runtime_token_to_enclave(client, monkeypatch):
     user_id, _api_key = _register(client)
     _seed_identity(user_id)
-    store = appmod.get_store(user_id)
+    store = core_store.get_store(user_id)
     captured: dict = {}
     captured_plaintexts: list = []
 
@@ -316,9 +319,9 @@ def test_model_api_chat_background_runtime_updates_relationship_days(client, mon
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
     assert body["state"]["background_execution"]["status"] == "completed"
-    saved = appmod.db.get_blob(user_id, "identity")
+    saved = db.get_blob(user_id, "identity")
     assert saved["relationship_anchor_source"] == "user_calibrated"
-    assert appmod._live_days_with_user(saved, store=appmod.get_store(user_id)) == 68
+    assert identity_service._live_days_with_user(saved, store=core_store.get_store(user_id)) == 68
 
 
 @pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)
@@ -415,7 +418,7 @@ def test_memory_content_patch_reencrypts_existing_card(client, monkeypatch):
     assert body["effects"][0]["supersedes"] == "mom_1"
     assert captured_plaintexts[-1]["summary"] == "User moved to Tokyo in April."
     assert "User moved to Tokyo in April." in captured_plaintexts[-1]["content"]
-    saved = appmod.db.memory_load(user_id)
+    saved = db.memory_load(user_id)
     old_card = next(item for item in saved if item["id"] == "mom_1")
     new_card = next(item for item in saved if item["id"] != "mom_1")
     assert old_card["status"] == "superseded"
@@ -584,7 +587,7 @@ def test_model_api_chat_background_runtime_writes_general_correction_memory(clie
         and "烂梗王" in item.get("content", "")
         for item in captured_plaintexts
     )
-    saved = appmod.db.memory_load(user_id)
+    saved = db.memory_load(user_id)
     assert any(item.get("source") == "model_api_correction" for item in saved)
 
 
@@ -737,7 +740,7 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
     assert first_body["state"]["background_execution"]["status"] == "pending_confirmation"
     assert first_body["state"]["pending"]
     assert first_body["state"]["pending"][0]["target"] == "烧卖和蒸饺设定"
-    assert len(appmod.db.memory_load(user_id)) == 1
+    assert len(db.memory_load(user_id)) == 1
     assert any(
         isinstance(item, str) and "确认" in item and "烧卖和蒸饺设定" in item
         for item in captured_plaintexts
@@ -752,7 +755,7 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
     second_body = second.get_json()
     assert second_body["effects"] == []
     assert second_body["state"]["background_execution"]["status"] == "completed"
-    assert len(appmod.db.memory_load(user_id)) == 0
+    assert len(db.memory_load(user_id)) == 0
 
 
 @pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)
@@ -843,7 +846,7 @@ def test_proactive_settings_wake_directive_validation(client):
     # is whitelisted and clamped now that the tick loop contract carries it.
     # Unknown keys are still rejected. (DB-backed — CI.)
     user_id, _api_key = _register(client)
-    store = appmod.get_store(user_id)
+    store = core_store.get_store(user_id)
     saved = store.save_proactive_settings({
         "wake_directive": "x" * 2000,
         "wake_interval_sec": 100,

@@ -26,13 +26,15 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle)
 import asgi_app  # noqa: E402
 import debug_trace  # noqa: E402
 import provider_client  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from core import store as core_store  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
 from hosted import chat_routes_asgi  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
@@ -71,10 +73,10 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
     monkeypatch.setattr(
         core_enclave, "_get_enclave_info",
         lambda: {"content_pk_hex": ("22" * 32), "compose_hash": "test"},
@@ -88,7 +90,6 @@ def env(tmp_path, monkeypatch):
     )
     # Live supervisor by default; the wedge-guard test overrides this.
     monkeypatch.setattr(agent_runtime_cutover, "check_supervisor_live", lambda **kw: (True, ""))
-    appmod.app.config.update(TESTING=True)
     return monkeypatch
 
 
@@ -109,7 +110,7 @@ def _fake_envelope_builder():
 
 
 def _register() -> tuple[str, str]:
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
     )
@@ -123,7 +124,7 @@ def _setup_openrouter(api_key: str, monkeypatch) -> None:
         provider_client, "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
     )
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/model_api/setup",
         json={"provider": "openrouter", "model": "openai/gpt-4o-mini", "api_key": "sk-or-test"},
         headers={"X-API-Key": api_key},
@@ -132,7 +133,7 @@ def _setup_openrouter(api_key: str, monkeypatch) -> None:
 
 
 def _flask_post(path, payload, headers=None, *, raw=None, content_type=None):
-    c = appmod.app.test_client()
+    c = make_client()
     if raw is not None:
         res = c.post(path, data=raw, content_type=content_type, headers=headers or {})
     else:
@@ -161,7 +162,7 @@ def _asgi_post(path, payload, headers=None, *, raw=None, content_type=None):
 
 
 def _user_msg_count(user_id: str) -> int:
-    store = appmod._stores.get(user_id)
+    store = core_store._stores.get(user_id)
     if not store:
         return 0
     return len([m for m in store.chat_messages if m.get("role") == "user"])

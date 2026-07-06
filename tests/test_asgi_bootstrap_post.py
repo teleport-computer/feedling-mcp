@@ -21,10 +21,12 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle)
 import asgi_app  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 _FAKE_ENCLAVE = {"content_pk_hex": ("33" * 32), "compose_hash": "test-compose"}
 
@@ -37,10 +39,10 @@ def _b64(raw: bytes) -> str:
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(core_enclave, "_get_enclave_info", lambda: dict(_FAKE_ENCLAVE))
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
     yield
 
 
@@ -48,7 +50,7 @@ def _register(archive_language: str | None = None, pk_byte: bytes = b"\x11") -> 
     payload = {"public_key": _b64(pk_byte * 32)}
     if archive_language is not None:
         payload["archive_language"] = archive_language
-    res = appmod.app.test_client().post("/v1/users/register", json=payload)
+    res = make_client().post("/v1/users/register", json=payload)
     assert res.status_code == 201, res.get_data(as_text=True)
     body = res.get_json()
     return body["user_id"], body["api_key"]
@@ -65,7 +67,7 @@ def _asgi_post(path: str, headers: dict | None = None):
 
 
 def _flask_post(path: str, headers: dict | None = None):
-    res = appmod.app.test_client().post(path, headers=headers or {})
+    res = make_client().post(path, headers=headers or {})
     return res.status_code, res.get_json()
 
 

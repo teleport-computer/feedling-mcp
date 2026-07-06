@@ -27,9 +27,10 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (import triggers db.init_schema)
+from accounts import registry  # noqa: E402
 from admin import routes_asgi as admin_asgi  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
@@ -54,17 +55,16 @@ _ASGI = _build_asgi_app()
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", ADMIN_TOKEN)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
     yield
 
 
 def _register() -> tuple[str, str]:
     raw = next(_pk_counter).to_bytes(32, "big")
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": base64.b64encode(raw).decode("ascii"), "archive_language": "en"},
     )
@@ -78,12 +78,12 @@ def _register() -> tuple[str, str]:
 # --------------------------------------------------------------------------- #
 
 def _flask_get_json(path, headers=None):
-    res = appmod.app.test_client().get(path, headers=headers or {})
+    res = make_client().get(path, headers=headers or {})
     return res.status_code, res.get_json(silent=True)
 
 
 def _flask_get_raw(path, headers=None):
-    res = appmod.app.test_client().get(path, headers=headers or {})
+    res = make_client().get(path, headers=headers or {})
     return res.status_code, res.get_data(as_text=True), res.headers.get("Content-Type")
 
 
@@ -254,7 +254,7 @@ def test_user_detail_page_not_found_parity(env):
 # --------------------------------------------------------------------------- #
 
 def test_store_evict_missing_user_id_parity(env):
-    f = appmod.app.test_client().post("/v1/admin/store/evict", headers=_admin(), json={})
+    f = make_client().post("/v1/admin/store/evict", headers=_admin(), json={})
     a = _asgi_json("POST", "/v1/admin/store/evict", headers=_admin(), json={})
     assert (f.status_code, f.get_json(silent=True)) == a
     assert a == (400, {"error": "user_id required"})
@@ -263,7 +263,7 @@ def test_store_evict_missing_user_id_parity(env):
 def test_store_evict_uncached_parity(env):
     # A never-cached user id evicts to False on both sides (no state consumed).
     unique = f"evict-{uuid.uuid4().hex}"
-    f = appmod.app.test_client().post(
+    f = make_client().post(
         "/v1/admin/store/evict", headers=_admin(), json={"user_id": unique}
     )
     a = _asgi_json("POST", "/v1/admin/store/evict", headers=_admin(), json={"user_id": unique})
@@ -297,7 +297,7 @@ def test_store_evict_cached_true(env):
     ],
 )
 def test_no_token_is_401_parity(env, path, method):
-    f = appmod.app.test_client().open(path, method=method)
+    f = make_client().open(path, method=method)
     a = _asgi_json(method, path)
     assert (f.status_code, f.get_json(silent=True)) == a
     assert a == (401, {"error": "unauthorized"})

@@ -18,11 +18,13 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
+from accounts import registry as accounts_registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import store as core_store  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
+from hosted import config_store as hosted_config_store  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -32,17 +34,16 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
+    accounts_registry._users[:] = []
+    accounts_registry._key_to_user.clear()
+    core_store._stores.clear()
+    accounts_registry._save_users()
     monkeypatch.setattr(
         core_enclave,
         "_get_enclave_info",
         lambda: {"content_pk_hex": ("22" * 32), "compose_hash": "test"},
     )
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    with make_client() as c:
         yield c
 
 
@@ -73,7 +74,7 @@ def _seed_config(user_id: str, **extra) -> dict:
         "test_status": "ok",
         **extra,
     }
-    return appmod.hosted_config_store._save_model_api_config(store, config)
+    return hosted_config_store._save_model_api_config(store, config)
 
 
 # ---- POST /v1/model_api/driver ----
@@ -86,7 +87,7 @@ def test_enabling_hosting_derives_claude_for_anthropic(client):
     assert res.status_code == 200, res.get_data(as_text=True)
     assert res.get_json()["driver"] == "claude"  # derived from provider, not chosen
     store = core_store.get_store(user_id)
-    config = appmod.hosted_config_store._load_model_api_config(store)
+    config = hosted_config_store._load_model_api_config(store)
     assert agent_runtime_cutover.resolve_driver(config) == "claude"
 
 
@@ -134,7 +135,7 @@ def test_driver_endpoint_always_derives_from_provider(client):
     assert body["enabled"] is True        # always True now
     assert body["driver"] == "claude"     # derived from provider, not from enabled flag
     store = core_store.get_store(user_id)
-    config = appmod.hosted_config_store._load_model_api_config(store)
+    config = hosted_config_store._load_model_api_config(store)
     assert agent_runtime_cutover.resolve_driver(config) == "claude"
 
 

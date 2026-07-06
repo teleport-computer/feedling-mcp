@@ -30,10 +30,13 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle)
+import db  # noqa: E402
 import debug_trace  # noqa: E402
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 from core import runtime_token  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from genesis import plaintext as genesis_routes  # noqa: E402
@@ -61,11 +64,11 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    res = appmod.app.test_client().post(
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
     )
@@ -79,16 +82,16 @@ def user(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 def _reset_genesis(uid: str) -> None:
-    with appmod.db.get_pool().connection() as conn:
+    with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM genesis_import_chunks WHERE user_id = %s", (uid,))
         conn.execute("DELETE FROM genesis_import_jobs WHERE user_id = %s", (uid,))
     for blob in ("genesis_state", "genesis_persona", "genesis_voice"):
-        appmod.db.delete_blob(uid, blob)
+        db.delete_blob(uid, blob)
 
 
 def _create_job(uid: str, api_key: str, **payload) -> dict:
     body = {"job_id": payload.pop("job_id", "seedjob"), **payload}
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/genesis/imports", headers=_headers(api_key), json=body)
     assert res.status_code in (200, 201), res.get_data(as_text=True)
     return res.get_json()["job"]
@@ -96,14 +99,14 @@ def _create_job(uid: str, api_key: str, **payload) -> dict:
 
 def _seed_done_plaintext_job(uid: str, input_hash: str) -> None:
     genesis_service.create_import_job(
-        appmod.get_store(uid),
+        core_store.get_store(uid),
         {
             "job_id": "plaindone",
             "source_kind": "history_import",
             "metadata": {"ingest": "plaintext", "input_hash": input_hash, "mode": "onboarding"},
         },
     )
-    appmod.db.genesis_set_job_status(uid, "plaindone", status=genesis_service.DONE_JOB_STATUS)
+    db.genesis_set_job_status(uid, "plaindone", status=genesis_service.DONE_JOB_STATUS)
 
 
 # --------------------------------------------------------------------------- #
@@ -136,7 +139,7 @@ def _headers(api_key: str) -> dict[str, str]:
 
 
 def _flask(method: str, path: str, *, headers=None, json_body=None, data=None, extra_headers=None):
-    client = appmod.app.test_client()
+    client = make_client()
     hdr = dict(headers or {})
     if extra_headers:
         hdr.update(extra_headers)
@@ -507,12 +510,12 @@ def test_plaintext_enqueues_not_inline_parity(user, monkeypatch):
 
     f = _flask("POST", "/v1/genesis/imports/plaintext", headers=_headers(api_key), json_body=payload)
     flask_job_id = f[1]["job"]["job_id"]
-    assert appmod.db.genesis_get_job(uid, flask_job_id) is not None  # real job row enqueued
+    assert db.genesis_get_job(uid, flask_job_id) is not None  # real job row enqueued
     _reset_genesis(uid)
 
     a = _asgi("POST", "/v1/genesis/imports/plaintext", headers=_headers(api_key), json_body=payload)
     asgi_job_id = a[1]["job"]["job_id"]
-    assert appmod.db.genesis_get_job(uid, asgi_job_id) is not None
+    assert db.genesis_get_job(uid, asgi_job_id) is not None
 
     assert f[0] == a[0] == 202
     assert f[1]["status"] == a[1]["status"] == "processing"

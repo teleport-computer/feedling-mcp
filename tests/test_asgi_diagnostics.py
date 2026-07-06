@@ -23,9 +23,11 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (import triggers db.init_schema)
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 from diagnostics import routes_asgi as diag_asgi  # noqa: E402
 from diagnostics import storage as diag_storage  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
@@ -54,18 +56,17 @@ def env(tmp_path, monkeypatch):
     for var in ("R2_ENDPOINT", "R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID",
                 "R2_SECRET_ACCESS_KEY", "R2_USER_LOGS_BUCKET"):
         monkeypatch.delenv(var, raising=False)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
     yield
 
 
 def _register() -> tuple[str, str]:
     raw = next(_pk_counter).to_bytes(32, "big")
     import base64
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": base64.b64encode(raw).decode("ascii"), "archive_language": "en"},
     )
@@ -79,17 +80,17 @@ def _register() -> tuple[str, str]:
 # --------------------------------------------------------------------------- #
 
 def _flask_get(path, headers=None):
-    res = appmod.app.test_client().get(path, headers=headers or {})
+    res = make_client().get(path, headers=headers or {})
     return res.status_code, res.get_json(silent=True)
 
 
 def _flask_post_json(path, headers=None, json_body=None):
-    res = appmod.app.test_client().post(path, headers=headers or {}, json=json_body)
+    res = make_client().post(path, headers=headers or {}, json=json_body)
     return res.status_code, res.get_json(silent=True)
 
 
 def _flask_delete(path, headers=None):
-    res = appmod.app.test_client().delete(path, headers=headers or {})
+    res = make_client().delete(path, headers=headers or {})
     return res.status_code, res.get_json(silent=True)
 
 
@@ -97,7 +98,7 @@ def _flask_upload(api_key, content, meta=None):
     data = {"file": (io.BytesIO(content), "diagnostics.log")}
     if meta is not None:
         data["meta"] = json.dumps(meta)
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/diagnostics/logs",
         data=data,
         content_type="multipart/form-data",

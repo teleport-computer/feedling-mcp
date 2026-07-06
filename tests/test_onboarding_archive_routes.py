@@ -11,10 +11,12 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
 import db  # noqa: E402
 import object_storage  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 
 class _FakeS3:
@@ -33,12 +35,11 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "sk")
     monkeypatch.setenv("R2_USER_LOGS_BUCKET", "io-user-logs")
     monkeypatch.setattr(object_storage, "_client", lambda: _FakeS3())
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    with make_client() as c:
         yield c
 
 

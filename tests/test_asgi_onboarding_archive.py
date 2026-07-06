@@ -27,11 +27,13 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (import triggers db.init_schema)
 import db  # noqa: E402
 import object_storage  # noqa: E402
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from onboarding_archive import routes_asgi as arch_asgi  # noqa: E402
 
@@ -67,18 +69,17 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "sk")
     monkeypatch.setenv("R2_USER_LOGS_BUCKET", "io-user-logs")
     monkeypatch.setattr(object_storage, "_client", lambda: _FakeS3())
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
     yield
 
 
 def _register() -> tuple[str, str]:
     import base64
     raw = next(_pk_counter).to_bytes(32, "big")
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": base64.b64encode(raw).decode("ascii"), "archive_language": "en"},
     )
@@ -95,7 +96,7 @@ def _flask_archive(api_key, content, *, filename="chat.json", extra=None):
     data = {"file": (io.BytesIO(content), filename), "filename": filename}
     if extra:
         data.update(extra)
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/onboarding/archive",
         data=data,
         content_type="multipart/form-data",
@@ -197,7 +198,7 @@ def test_requires_auth_parity(env):
 def test_missing_file_parity(env):
     _uid, api_key = _register()
     # No file part on either side (still a valid multipart with just a text field).
-    fs = appmod.app.test_client().post(
+    fs = make_client().post(
         "/v1/onboarding/archive", data={"filename": "c.json"}, headers=_key(api_key)
     )
     f = (fs.status_code, fs.get_json(silent=True))

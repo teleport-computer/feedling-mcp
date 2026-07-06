@@ -17,10 +17,10 @@ import httpx
 from fastapi import FastAPI
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle)
 import asgi_app  # noqa: E402
 from accounts import auth_core  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 
 
 def _asgi_get(path: str):
@@ -34,7 +34,7 @@ def _asgi_get(path: str):
 
 
 def test_healthz_parity_with_flask_oracle():
-    flask_resp = appmod.app.test_client().get("/healthz")
+    flask_resp = make_client().get("/healthz")
     status, body = _asgi_get("/healthz")
     assert status == flask_resp.status_code == 200
     assert body == flask_resp.get_json() == {"ok": True, "mode": "multi_tenant"}

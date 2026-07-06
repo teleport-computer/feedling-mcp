@@ -26,12 +26,15 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle)
+import db  # noqa: E402
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import runtime_token  # noqa: E402
+from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from identity import routes_asgi as identity_asgi  # noqa: E402
 
@@ -55,11 +58,11 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    res = appmod.app.test_client().post(
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
     )
@@ -73,7 +76,7 @@ def user(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 def _seed_identity(uid: str) -> None:
-    appmod.db.set_blob(uid, "identity", {
+    db.set_blob(uid, "identity", {
         "v": 1,
         "id": "identity_1",
         "body_ct": "seed_ct",
@@ -92,8 +95,8 @@ def _seed_identity(uid: str) -> None:
 
 
 def _reset_identity(uid: str) -> None:
-    appmod.db.delete_blob(uid, "identity")
-    with appmod.db.get_pool().connection() as conn:
+    db.delete_blob(uid, "identity")
+    with db.get_pool().connection() as conn:
         conn.execute(
             "DELETE FROM user_logs WHERE user_id = %s AND stream = %s",
             (uid, "identity_changes"),
@@ -146,7 +149,7 @@ def _headers(api_key: str) -> dict[str, str]:
 
 
 def _flask(method: str, path: str, *, headers=None, json_body=None):
-    client = appmod.app.test_client()
+    client = make_client()
     res = client.open(path, method=method, headers=headers or {}, json=json_body)
     return res.status_code, res.get_json(silent=True)
 
@@ -278,8 +281,8 @@ def test_changes_invalid_limit_400_parity(user):
 def test_changes_seeded_parity(user):
     uid, api_key = user
     # Deterministic log rows (fixed id + ts) so both frameworks read identical data.
-    appmod.db.log_append(uid, "identity_changes", {"id": "c1", "ts": "2026-06-01T00:00:00", "action": "init", "reason": "first"})
-    appmod.db.log_append(uid, "identity_changes", {"id": "c2", "ts": "2026-06-02T00:00:00", "action": "replace", "reason": "second"})
+    db.log_append(uid, "identity_changes", {"id": "c1", "ts": "2026-06-01T00:00:00", "action": "init", "reason": "first"})
+    db.log_append(uid, "identity_changes", {"id": "c2", "ts": "2026-06-02T00:00:00", "action": "replace", "reason": "second"})
     f = _flask("GET", "/v1/identity/changes", headers=_headers(api_key))
     a = _asgi("GET", "/v1/identity/changes", headers=_headers(api_key))
     assert f == a

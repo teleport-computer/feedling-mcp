@@ -35,8 +35,9 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (import triggers db.init_schema)
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import runtime_token as rt_mod  # noqa: E402
 from core import store as core_store  # noqa: E402
@@ -74,11 +75,10 @@ def env(tmp_path, monkeypatch):
                 "R2_SECRET_ACCESS_KEY", "R2_FRAMES_BUCKET"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("FEEDLING_ENCLAVE_URL", raising=False)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
     yield
 
 
@@ -89,7 +89,7 @@ def _register() -> tuple[str, str]:
     global _pk
     _pk += 1
     raw = _pk.to_bytes(32, "big")
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": base64.b64encode(raw).decode("ascii"), "archive_language": "en"},
     )
@@ -137,12 +137,12 @@ def _key(api_key: str) -> dict:
 
 
 def _flask_get(path, headers=None):
-    res = appmod.app.test_client().get(path, headers=headers or {})
+    res = make_client().get(path, headers=headers or {})
     return res.status_code, res.get_json(silent=True)
 
 
 def _flask_get_raw(path, headers=None):
-    res = appmod.app.test_client().get(path, headers=headers or {})
+    res = make_client().get(path, headers=headers or {})
     # res.headers is a case-insensitive Werkzeug Headers object.
     return res.status_code, res.data, res.headers.get("Content-Type"), res.headers
 

@@ -141,7 +141,7 @@ def main() -> int:
 
     backend = Proc(
         "backend",
-        [sys.executable, "backend/app.py"],
+        [sys.executable, "backend/serve_dev.py"],
         {"FEEDLING_PORT": "5001", "FEEDLING_ENCLAVE_URL": ENCLAVE, "FEEDLING_WS_PORT": "29998"},
         f"{data_dir}/backend.log",
     )

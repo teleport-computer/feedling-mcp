@@ -26,9 +26,12 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle)
+import db  # noqa: E402
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from hosted import history_import as hi  # noqa: E402
 from hosted import history_import_asgi as hi_asgi  # noqa: E402
@@ -53,11 +56,11 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    res = appmod.app.test_client().post(
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(b"\x22" * 32), "archive_language": "en"},
     )
@@ -71,8 +74,8 @@ def user(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 def _reset_history(uid: str) -> None:
-    for job in appmod.db.list_blobs(uid, "history_import_job:"):
-        appmod.db.delete_blob(uid, hi._history_job_kind(job["job_id"]))
+    for job in db.list_blobs(uid, "history_import_job:"):
+        db.delete_blob(uid, hi._history_job_kind(job["job_id"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -106,7 +109,7 @@ def _headers(api_key: str) -> dict[str, str]:
 
 
 def _flask(method: str, path: str, *, headers=None, json_body=None):
-    client = appmod.app.test_client()
+    client = make_client()
     res = client.open(path, method=method, headers=dict(headers or {}), json=json_body)
     return res.status_code, res.get_json(silent=True)
 
@@ -172,12 +175,12 @@ def test_upload_enqueues_not_inline_parity(user, monkeypatch):
     f = _flask("POST", "/v1/history_import/upload", headers=_headers(api_key), json_body=payload)
     flask_job_id = f[1]["job"]["job_id"]
     # Real job blob row enqueued (not run inline).
-    assert appmod.db.get_blob(uid, hi._history_job_kind(flask_job_id)) is not None
+    assert db.get_blob(uid, hi._history_job_kind(flask_job_id)) is not None
     _reset_history(uid)
 
     a = _asgi("POST", "/v1/history_import/upload", headers=_headers(api_key), json_body=payload)
     asgi_job_id = a[1]["job"]["job_id"]
-    assert appmod.db.get_blob(uid, hi._history_job_kind(asgi_job_id)) is not None
+    assert db.get_blob(uid, hi._history_job_kind(asgi_job_id)) is not None
 
     assert f[0] == a[0] == 202
     assert f[1]["job"]["status"] == a[1]["job"]["status"] == "queued"
@@ -198,7 +201,7 @@ def test_upload_reuses_done_job_200_parity(user, monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not restart a done job")))
     payload = {"format": "plaintext", "content": "User: hi", "client_job_id": "done1"}
     input_hash = hi._history_import_payload_hash(payload)
-    store = appmod.get_store(uid)
+    store = core_store.get_store(uid)
     hi._save_history_job(store, {
         "job_id": "hi_donefixed",
         "status": "done",
@@ -222,7 +225,7 @@ def test_upload_restarts_queued_job_202_parity(user, monkeypatch):
         lambda store, key, job, payload: started.append(job.get("job_id")) or True)
     payload = {"format": "plaintext", "content": "User: yo", "client_job_id": "q1"}
     input_hash = hi._history_import_payload_hash(payload)
-    store = appmod.get_store(uid)
+    store = core_store.get_store(uid)
     hi._save_history_job(store, {
         "job_id": "hi_queuedfixed",
         "status": "queued",
@@ -253,7 +256,7 @@ def test_status_not_found_404_parity(user):
 
 def test_status_found_parity(user):
     uid, api_key = user
-    store = appmod.get_store(uid)
+    store = core_store.get_store(uid)
     hi._save_history_job(store, {
         "job_id": "hi_statfixed",
         "status": "processing",

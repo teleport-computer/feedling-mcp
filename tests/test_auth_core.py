@@ -16,9 +16,11 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
 from accounts import auth_core  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import runtime_token  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 _SECRET = "test-auth-core-secret"
 
@@ -34,12 +36,11 @@ def user(monkeypatch):
     Registration populates the in-process registry (``_users`` / ``_key_to_user``)
     that ``auth_core`` reads, so we can then call the core directly in-process.
     """
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    with make_client() as c:
         res = c.post(
             "/v1/users/register",
             json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},

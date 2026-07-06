@@ -14,9 +14,12 @@ import pytest
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
+import db  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 
 ANCHOR = "transcript: earliest chat dated 2026-05-08"
@@ -29,12 +32,11 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    with make_client() as c:
         yield c
 
 
@@ -111,7 +113,7 @@ def test_init_plaintext_server_builds_envelope(client, monkeypatch):
     # the server built the envelope from OUR plaintext identity
     assert captured[-1]["agent_name"] == "bro"
     assert captured[-1]["self_introduction"] == _plain_identity()["self_introduction"]
-    saved = appmod.db.get_blob(user_id, "identity")
+    saved = db.get_blob(user_id, "identity")
     assert saved["body_ct"] == "ct_1"
     assert saved["relationship_anchor_evidence"] == ANCHOR
 
@@ -124,7 +126,7 @@ def test_init_prebuilt_envelope_still_works(client):
         json={"envelope": _prebuilt_envelope(user_id), "days_with_user": 10, "relationship_anchor_evidence": ANCHOR},
     )
     assert res.status_code == 201, res.get_data(as_text=True)
-    saved = appmod.db.get_blob(user_id, "identity")
+    saved = db.get_blob(user_id, "identity")
     assert saved["body_ct"] == "client_ct"
 
 

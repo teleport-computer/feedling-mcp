@@ -85,19 +85,6 @@ def _bootstrap_state(store) -> dict:
     }
 
 
-def _gate_required_for_missing_tabs(state) -> str:
-    """DEPRECATED (A', 2026-06). Memory is no longer an onboarding gate, so
-    `missing_tabs` is always empty and this string is no longer surfaced on any
-    blocking path. Retained only because `app.py` re-exports it; returns an
-    informational, A'-aligned message instead of the old "pile memory floor"
-    instruction so no stale caller can revive the old flow.
-    """
-    return (
-        "Memory is no longer an onboarding gate. Write the identity card first; "
-        "the Memory Garden grows naturally afterwards — there are no per-tab floors."
-    )
-
-
 def _chat_loop_verified_by_server(store) -> bool:
     events = _load_bootstrap_events(store)
     if any(

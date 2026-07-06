@@ -4,24 +4,22 @@
 > 领域包（见 `docs/CHANGELOG.md` 当日条目）。这份文档的目的只有一个：
 > **别让它长回去。** 所有后端 PR 按此检查。
 >
-> **⚠️ ASGI 迁移已 cutover（2026-07-04）：后端 web 层从 Flask 全量切到
-> FastAPI/ASGI（入口 `asgi_app:app`，gunicorn `-k asgi.worker.FeedlingUvicornWorker`）。
-> 每个领域包的 Flask `routes.py`（+ 各包的 `bp`/`register(app)`）已删除，
-> 由 `routes_asgi.py`（FastAPI `APIRouter` + `register_asgi(app)`）取代；路由体委托
-> 给框架中立的 `*_core.py`（拿 store + 已解析参数，无 `flask.request`），Flask 与
-> ASGI 曾共用一份实现。`app.py` 不再是 Flask app：它是一个无 Flask 的符号 re-export
-> facade + 装配注入 + 一个 ASGI-backed test-client shim（`backend/asgi_test_client.py`，
-> 让老测试的 `app.app.test_client()` 照跑真实 ASGI app）。`flask` 依赖仅为
-> enclave 内独立服务 `enclave_app.py` 保留。下文凡提到「Flask 创建 / Blueprint /
-> routes.py / register(app)」均为迁移前语境；新路由请照 `routes_asgi.py` 三件套。**
+> **⚠️ ASGI 迁移已完结（cutover 2026-07-04，收尾 2026-07-06）：后端 web 层是
+> FastAPI/ASGI（入口 `asgi_app:app`，gunicorn `-k asgi.worker.FeedlingUvicornWorker`；
+> dev/子进程入口 `backend/serve_dev.py`）。路由在各领域包的 `routes_asgi.py`
+> （FastAPI `APIRouter` + `register_asgi(app)`），路由体委托给框架中立的
+> `*_core.py`（拿 store + 已解析参数）。迁移期的 Flask parity facade
+> `backend/app.py`（符号 re-export + test-client shim 门面）已于 2026-07-06 删除；
+> 测试经 `asgi_test_client.make_client()` 驱动真实 ASGI app，全仓零 flask
+> （守护：`tests/test_no_flask_anywhere.py`、`tests/test_no_app_py_regression.py`）。**
 
 ---
 
 ## 一句话版本
 
-**app.py 只做装配（现为无 Flask 的 facade + 注入），业务逻辑进领域包的
-`*_core.py`（框架中立）；新路由进对应包的 `routes_asgi.py`（FastAPI `APIRouter`，
-经 `run_db` 把阻塞调用移出事件循环）；依赖只能向下，向上要用注入。**
+**asgi_app.py 只做装配（lifespan、中间件、include 路由、注入接线），业务逻辑
+进领域包的 `*_core.py`（框架中立）；新路由进对应包的 `routes_asgi.py`（FastAPI
+`APIRouter`，经 `run_db` 把阻塞调用移出事件循环）；依赖只能向下，向上要用注入。**
 
 ---
 
@@ -29,7 +27,7 @@
 
 ```
 backend/
-├── app.py          ← 装配层：初始化顺序、Flask 创建、register(app)、注入接线。
+├── asgi_app.py     ← 装配层：lifespan、中间件、include 路由、注入接线。
 │                      ❌ 禁止在这里加路由、业务函数、常量
 ├── core/           ← 共享内核：config / util / enclave / envelope / store(UserStore)
 ├── accounts/       ← 账号：registry / auth / onboarding / access / recover / routes
@@ -41,7 +39,7 @@ backend/
 ├── agent/          ← resident agent 感知端点（routes-only，依赖 accounts/perception/proactive）
 ├── tracking/  admin/  content/  ← 埋点 ｜ data-track 后台 ｜ swap/rewrap/export
 ├── hosted/         ← Model API 托管条线（config_store / context / turn /
-│                      chat_routes / history_import / wake_consumer …）
+│                      chat_send_core+chat_routes_asgi / history_import …）
 ├── model_api_runtime/ ← Model API 线的 agent 运行时：prompts / tools /
 │                      memory_tools / wake（独立包，与 hosted/ 平级；
 │                      被 hosted·proactive·perception 复用）
@@ -64,7 +62,7 @@ backend/
 | 新增跨域共享的工具函数 | `core/util.py`（必须无业务依赖才算「共享」） |
 | 新增一个完整的新功能域 | 新建包，照抄 `perception/` 的形态：`__init__.py` 提供 `register(app)`，内部 `routes.py` + `service.py` 分层 |
 | 新增测试 | 仓库根的 `tests/`，**绝不放 backend/**（规则见 §6） |
-| 实在不知道放哪 | 问自己「这段代码服务于哪条用户线/哪个名词」，按名词归包；**答案永远不是 app.py** |
+| 实在不知道放哪 | 问自己「这段代码服务于哪条用户线/哪个名词」，按名词归包；**答案永远不是 asgi_app.py** |
 
 **单文件红线**：单个模块超过 **800 行**时，PR 里必须说明为什么不拆；
 超过 **1500 行**直接拆，不接受理由。
@@ -76,7 +74,7 @@ backend/
 依赖层级，**只允许从上往下 import**：
 
 ```
-app.py（装配，最高）
+asgi_app.py（装配，最高）
   ↑ hosted / agent
   ↑ tracking / admin / content
   ↑ chat
@@ -93,11 +91,12 @@ app.py（装配，最高）
 
 - `routes.py` 可以 import 平级或更低的任何 service；`service.py` 只准向下。
 - **需要「向上」调用时，用注入，不用 import。** 现有范例：
-  - `core/store.py` 的 `on_proactive_job_appended` 钩子（store 不能 import hosted，
-    由 app.py 装配段把 hosted 的 consumer 挂进去）
-  - `core/envelope.py` 的 `get_user_public_key`（core 不能 import accounts）
-  - `push/live_activity.py` 的 `load_identity`、`hosted/wake_consumer.py` 的 `flask_app`
-- 不确定会不会成环：新 import 后跑 `python -c "import app"` 能过、
+  - `core/store.py` 的 `on_proactive_job_appended` 钩子（store 不能 import hosted）
+  - `core/envelope.py` 的 `get_user_public_key`（core 不能 import accounts；
+    lifespan 接线，测试侧由 `make_client()` 镜像）
+  - `push/live_activity.py` 的 `load_identity`、`admin/data_track.py` 的
+    `_latest_history_import_job`（均由 `asgi_app.py` 末尾装配段接线）
+- 不确定会不会成环：新 import 后跑 `python -c "import asgi_app"` 能过、
   `pyflakes backend/<你的包>` 干净，基本就没问题。
 
 ---
@@ -131,33 +130,32 @@ result = chat_completion(runtime, messages)
 - 进程内单例（`_users`、`_stores`、各种 lock/缓存）**归属定义它的模块**，
   别处只通过模块属性访问，不复制引用。
 - 这些容器**只能就地变更**（`_users[:] = ...`、`d.clear()`），**禁止重绑**
-  （`_users = ...`）——app.py 的兼容 re-export 和测试都依赖对象身份，
+  （`_users = ...`）——测试与跨模块引用都依赖对象身份，
   重绑会静默分叉（历史教训：`_load_users` 重绑导致「注册后 whoami 401」）。
 - 模块 import 阶段**禁止读数据库/发网络**（pepper 已改 lazy 就是为此）；
-  需要启动期初始化的，提供显式 `start()`/`load_x()` 由 app.py 装配段调用
-  （范例：`screen/ws.start()`、`hosted/wake_consumer.start_tick()`）。
-- 后台线程不要直接引用 Flask 的 `app` 对象，走注入（`flask_app`）。
+  需要启动期初始化的，提供显式 `start()`/`load_x()` 由 lifespan
+  （`asgi/lifespan.py`）调用（范例：wake-bus、WS-leader 选举）。
 
 ---
 
-## 5. app.py 里的「COMPAT re-exports」段
+## 5. 兼容层（已终结）
 
-那是**拆分迁移期的兼容层，只减不增**：
+拆分迁移期的 `app.py` COMPAT re-export 门面已于 2026-07-06 随 `app.py` 一起
+删除（守护：`tests/test_no_app_py_regression.py`）：
 
-- ❌ 不准给新代码加 re-export；新代码直接 import 真正的模块。
-- ❌ 不准让新代码反过来 `import app` 取符号。
-- 删除计划见 `docs/OPTIMIZATION_BACKLOG.md` #6 的遗留项（白名单：
-  `app`、`get_store`、`UserStore`、`require_user`、`_users`、`_key_to_user`、
-  `_stores`、`_save_users`、`_register_user`、`db`）。
+- ❌ 不准再造任何全局符号 re-export 门面；新代码直接 import 真正的模块。
+- ❌ 不准新建 `backend/app.py`。
 
 ---
 
 ## 6. 测试规范
 
-- **monkeypatch 打在符号的定义模块上**，不是 `appmod`：
+- **monkeypatch 打在符号的定义模块上**：
   `monkeypatch.setattr(provider_client, "chat_completion", fake)`、
   `setattr(core_enclave, "_get_enclave_info", fake)`。
-  patch `appmod.X` 对已迁出的代码**不生效**（re-export 是独立绑定）。
+  patch 别处的独立绑定（裸函数引用/re-export）对调用方**不生效**。
+- 测试驱动后端一律 `from asgi_test_client import make_client`（或 conftest 的
+  `client`/`backend_env` fixture）；子进程集成用 `backend/serve_dev.py`。
 - **所有测试文件一律放 `tests/`，不要放 backend/ 或其它代码目录**
   （2026-06-12 已把 backend/ 下的 4 个测试迁走，别再放回去）。
   文件开头加一行 `sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))`
@@ -181,7 +179,8 @@ result = chat_completion(runtime, messages)
 
 ## 7. 不变量（动之前先到群里喊一声）
 
-- gunicorn 入口 `"app:app"` + `--chdir backend`。**已支持 `-w N`**（多 worker）：
+- gunicorn 入口 `"asgi_app:app"`（`-k asgi.worker.FeedlingUvicornWorker`）+
+  `--chdir backend`。**已支持 `-w N`**（多 worker）：
   :9998 WS ingest 由 advisory-lock 选主只在一个 worker 绑定（`core/leader.py`），
   长轮询 waiter + per-user 缓存靠 Postgres LISTEN/NOTIFY 唤醒总线跨 worker 保持
   一致（`core/wake_bus.py`）。hosted tick 每 worker 各跑、按持 key 用户 key-gate。
@@ -200,11 +199,11 @@ result = chat_completion(runtime, messages)
 ## 8. PR 自查清单
 
 ```
-[ ] app.py 的 diff 只有装配/注入/re-export 变化（理想情况是零 diff）
-[ ] 新路由在领域包 Blueprint 上，新逻辑在 service/actions 层
+[ ] asgi_app.py 的 diff 只有装配/注入变化（理想情况是零 diff）
+[ ] 新路由在领域包 routes_asgi.py（APIRouter）上，新逻辑在 service/actions/core 层
 [ ] 没有新增向上 import（需要时用了注入钩子）
 [ ] 跨模块调用是 module.func() 形式；模块别名不与局部变量撞名
-[ ] 没有给 COMPAT 段加新条目；没有新代码 import app
+[ ] 没有引用已删除的 app.py facade；没有新造全局 re-export 门面
 [ ] 全量 pytest 零新增失败；pyflakes 干净
 [ ] 动了 compose / 路由集 / 加密路径的，PR 描述里写明
 ```

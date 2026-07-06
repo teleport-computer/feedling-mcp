@@ -26,11 +26,14 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (Flask oracle; import triggers db.init_schema)
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from proactive import routes_asgi as proactive_asgi  # noqa: E402
+from proactive import service as proactive_service  # noqa: E402
 
 
 def _build_asgi_app() -> FastAPI:
@@ -58,16 +61,16 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
     yield
 
 
 def _register() -> tuple[str, str]:
     raw = next(_pk_counter).to_bytes(32, "big")
-    res = appmod.app.test_client().post(
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(raw), "archive_language": "en"},
     )
@@ -85,7 +88,7 @@ def _key(api_key: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _flask(method, path, *, headers=None, json_body=None, data=None):
-    c = appmod.app.test_client()
+    c = make_client()
     res = c.open(path, method=method, headers=headers or {}, json=json_body, data=data)
     return res.status_code, res.get_json(silent=True)
 
@@ -123,7 +126,7 @@ def _asgi_raw(method, path, *, headers=None, data=None):
 
 
 def _flask_raw(method, path, *, headers=None, data=None):
-    res = appmod.app.test_client().open(path, method=method, headers=headers or {}, data=data)
+    res = make_client().open(path, method=method, headers=headers or {}, data=data)
     return res.status_code, res.get_data(as_text=True), res.headers.get("Content-Type")
 
 
@@ -174,7 +177,7 @@ def test_no_auth_is_401_parity(env, method, path, body):
 
 def test_settings_get_parity(env):
     uid, key = _register()
-    appmod.get_store(uid).save_proactive_settings({"timezone": "Asia/Tokyo"})
+    core_store.get_store(uid).save_proactive_settings({"timezone": "Asia/Tokyo"})
     f = _flask("GET", "/v1/proactive/settings", headers=_key(key))
     a = _asgi("GET", "/v1/proactive/settings", headers=_key(key))
     assert f[0] == a[0] == 200
@@ -308,7 +311,7 @@ def test_proactive_tick_parity_forced_wake(env):
     a = _asgi("POST", "/v1/proactive/tick", headers=_key(ak), json_body=body)
     assert f[0] == a[0] == 200
     assert f[1]["enqueued"] is a[1]["enqueued"] is True
-    assert f[1]["job"]["source"] == a[1]["job"]["source"] == appmod.PROACTIVE_JOB_SOURCE
+    assert f[1]["job"]["source"] == a[1]["job"]["source"] == proactive_service.PROACTIVE_JOB_SOURCE
     assert _norm(f[1]) == _norm(a[1])
 
 
@@ -317,9 +320,9 @@ def test_proactive_tick_parity_forced_wake(env):
 # =========================================================================== #
 
 def _seed_pending_job(uid: str, job_id: str) -> dict:
-    return appmod.get_store(uid).append_proactive_job({
+    return core_store.get_store(uid).append_proactive_job({
         "job_id": job_id,
-        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "source": proactive_service.PROACTIVE_JOB_SOURCE,
         "ts": 1000.0,
         "status": "pending",
         "trigger": "heartbeat_broadcast_on",
@@ -372,7 +375,7 @@ def test_job_status_consumer_mismatch_409_parity(env):
     au, ak = _register()
     for uid in (fu, au):
         job = _seed_pending_job(uid, "pj_m")
-        appmod.get_store(uid).update_proactive_job(job["job_id"], {"consumer_id": "owner-x"})
+        core_store.get_store(uid).update_proactive_job(job["job_id"], {"consumer_id": "owner-x"})
     body = {"status": "posted", "consumer_id": "intruder"}
     f = _flask("POST", "/v1/proactive/jobs/pj_m/status", headers=_key(fk), json_body=body)
     a = _asgi("POST", "/v1/proactive/jobs/pj_m/status", headers=_key(ak), json_body=body)
@@ -447,7 +450,7 @@ def test_scheduled_fire_no_timers_parity(env, monkeypatch):
 # =========================================================================== #
 
 def _seed_decision(uid: str, decision_id: str) -> None:
-    appmod.get_store(uid).append_gate_decision({
+    core_store.get_store(uid).append_gate_decision({
         "decision_id": decision_id,
         "ts": 1000.0,
         "should_reach_out": True,
@@ -473,7 +476,7 @@ def test_decisions_get_parity_and_invalid(env):
 
 def test_reviews_get_parity(env):
     uid, key = _register()
-    appmod.get_store(uid).append_gate_review({
+    core_store.get_store(uid).append_gate_review({
         "review_id": "gr_1", "decision_id": "gd_1", "ts": 1000.0, "label": "good_presence"})
     f = _flask("GET", "/v1/proactive/reviews?since=0", headers=_key(key))
     a = _asgi("GET", "/v1/proactive/reviews?since=0", headers=_key(key))

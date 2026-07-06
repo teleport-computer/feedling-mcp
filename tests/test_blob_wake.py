@@ -16,7 +16,6 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
 from core import store as core_store  # noqa: E402
 from core import wake_bus  # noqa: E402
 

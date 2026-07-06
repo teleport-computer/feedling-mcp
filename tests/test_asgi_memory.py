@@ -21,11 +21,13 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
 import db  # noqa: E402
+from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import runtime_token  # noqa: E402
+from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from memory import actions as memory_actions_mod  # noqa: E402
 from memory import memory_core  # noqa: E402
@@ -53,11 +55,11 @@ _ASGI = _build_asgi_app()
 @pytest.fixture()
 def user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
-    res = appmod.app.test_client().post(
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    res = make_client().post(
         "/v1/users/register",
         json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
     )
@@ -75,7 +77,7 @@ def _headers(api_key: str) -> dict[str, str]:
 
 
 def _flask(method: str, path: str, *, headers=None, json_body=None):
-    client = appmod.app.test_client()
+    client = make_client()
     kw: dict = {"headers": headers or {}}
     if json_body is not None:
         kw["json"] = json_body

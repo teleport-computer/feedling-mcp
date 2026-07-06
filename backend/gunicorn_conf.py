@@ -1,19 +1,16 @@
-"""gunicorn server config — 生产启动钩子（WSGI Flask 与 ASGI FastAPI 共用）。
+"""gunicorn server config — 生产启动钩子（ASGI FastAPI，``asgi_app:app``）。
 
 ``on_starting`` 在 gunicorn master 进程启动时执行一次（worker fork 之前）。两件事：
 
 1. **fail-fast 托管校验**：gateway-only codex 用户依赖 in-CVM LiteLLM gateway，未开则
-   拒绝启动而非让请求在运行期 hang。放这里而非 app.py 模块 import 顶层——后者会让单测
-   ``import app`` 也触发校验。
+   拒绝启动而非让请求在运行期 hang（dev 入口 ``serve_dev.py`` 跑同一校验）。
 2. **DB migration 单点**（ASGI 迁移计划 §5.2/§8.1/§19.6）：``db.init_schema()``
-   （alembic ``upgrade head``）在 master、fork 之前跑一次。**ASGI 入口 ``asgi_app:app``
-   不 import app.py**，所以这是 FastAPI 下 schema 升级的唯一位置——漏掉 = 新镜像服务旧
-   schema（本计划最高危单点）。对 legacy Flask ``app:app`` 这一步幂等冗余（app.py import
-   时也跑），顺带消除"每 worker 各跑一次 alembic"的竞态。
+   （alembic ``upgrade head``）在 master、fork 之前跑一次。这是 schema 升级的唯一
+   位置——漏掉 = 新镜像服务旧 schema；放 master 也消除"每 worker 各跑一次 alembic"
+   的竞态。
 
-两种入口都用 ``--config gunicorn_conf.py``；``on_starting`` 是 master 钩子，与 worker
-class（sync 线程 / UvicornWorker）无关，换 worker class 后照样在 fork 前执行。enclave_app
-不路由 chat send、不加载本 config。"""
+``on_starting`` 是 master 钩子，与 worker class 无关。enclave_app 不路由 chat send、
+不加载本 config。"""
 
 import os
 

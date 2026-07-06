@@ -18,9 +18,9 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (import triggers db.init_schema → migration 0006)
 import db  # noqa: E402
 from asgi import middleware  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from copytext import routes_asgi as copytext_asgi  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 
@@ -62,7 +62,7 @@ _ASGI = _build_asgi_app()
 # --------------------------------------------------------------------------- #
 
 def _flask_get(path: str, headers: dict | None = None):
-    res = appmod.app.test_client().get(path, headers=headers or {})
+    res = make_client().get(path, headers=headers or {})
     return res.status_code, res.get_json(silent=True), res.headers.get("ETag")
 
 
@@ -88,7 +88,7 @@ def _flask_post(path: str, *, headers=None, json_body=None, data=None):
         kw["json"] = json_body
     if data is not None:
         kw["data"] = data
-    res = appmod.app.test_client().post(path, headers=headers or {}, **kw)
+    res = make_client().post(path, headers=headers or {}, **kw)
     return res.status_code, res.get_json(silent=True)
 
 

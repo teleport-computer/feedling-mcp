@@ -5,7 +5,6 @@ Modeled on tests/test_chat_route_debug_trace.py (trace enable/read) and
 tests/test_proactive_jobs.py (UserStore + seed_user backed by real PG)."""
 from __future__ import annotations
 
-import importlib
 import os
 import sys
 import tempfile
@@ -15,11 +14,11 @@ _DATA_DIR = tempfile.mkdtemp(prefix="feedling-capture-trace-test-")
 os.environ.setdefault("FEEDLING_DATA_DIR", _DATA_DIR)
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-appmod = importlib.import_module("app")
 import debug_trace  # noqa: E402
 from proactive import capture_jobs  # noqa: E402
 from proactive import capture_scheduler  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
 
@@ -27,7 +26,7 @@ from conftest import seed_user  # noqa: E402
 def _store(tmp_path, monkeypatch, user_id: str):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     debug_trace._flag_cache.clear()
-    store = appmod.UserStore(user_id)
+    store = core_store.UserStore(user_id)
     seed_user(store.user_id)
     debug_trace.set_enabled(store, True)
     return store

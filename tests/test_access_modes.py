@@ -9,9 +9,13 @@ import pytest
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
+import db  # noqa: E402
+from accounts import access as accounts_access  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -21,17 +25,16 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
     monkeypatch.setattr(
         core_enclave,
         "_get_enclave_info",
         lambda: {"content_pk_hex": ("22" * 32), "compose_hash": "test"},
     )
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    with make_client() as c:
         yield c
 
 
@@ -63,8 +66,8 @@ def test_whoami_does_not_rewrite_user_table_on_each_call(client, monkeypatch):
 
     save_all: list = []
     upserts: list = []
-    monkeypatch.setattr(appmod.db, "save_all_users", lambda users: save_all.append(1))
-    monkeypatch.setattr(appmod.db, "upsert_user", lambda entry: upserts.append(entry.get("user_id")))
+    monkeypatch.setattr(db, "save_all_users", lambda users: save_all.append(1))
+    monkeypatch.setattr(db, "upsert_user", lambda entry: upserts.append(entry.get("user_id")))
 
     # First whoami may legitimately persist once (binding flips to connected).
     assert client.get("/v1/users/whoami", headers=_headers(api_key)).status_code == 200
@@ -90,23 +93,23 @@ def test_access_modes_payload_rolls_back_binding_on_persist_failure(client, monk
     we drive the onboarding route to a mode the user has no key for.)
     """
     user_id, _principal_id, api_key = _register(client)
-    store = appmod.get_store(user_id)
+    store = core_store.get_store(user_id)
 
     # Route to a mode with no api_key → its binding is new and not reconstructed
     # from keys, so _access_modes_payload must persist it. Set the blob directly
     # so the route endpoint doesn't persist the binding for us.
     route = "resident"
-    appmod.db.set_blob(user_id, "onboarding_route", {"route": route})
+    db.set_blob(user_id, "onboarding_route", {"route": route})
 
     def has_connected(mode: str) -> bool:
-        with appmod._users_lock:
-            e = appmod._find_user_entry_locked(user_id)
+        with registry._users_lock:
+            e = registry._find_user_entry_locked(user_id)
             return any(
                 b.get("access_mode") == mode and b.get("status") == "connected"
                 for b in e.get("access_bindings") or []
             )
 
-    real_upsert = appmod.db.upsert_user
+    real_upsert = db.upsert_user
     fail = {"on": True}
     calls = {"n": 0}
 
@@ -116,17 +119,17 @@ def test_access_modes_payload_rolls_back_binding_on_persist_failure(client, monk
             raise RuntimeError("transient DB error")
         return real_upsert(entry)
 
-    monkeypatch.setattr(appmod.db, "upsert_user", flaky_upsert)
+    monkeypatch.setattr(db, "upsert_user", flaky_upsert)
 
     # Persist fails → the new binding must be rolled back (not left connected),
     # and the call must not raise.
-    appmod._access_modes_payload(store)
+    accounts_access._access_modes_payload(store)
     assert calls["n"] == 1
     assert not has_connected(route), "failed persist must roll back the new binding"
 
     # Persist succeeds → the retry writes it; the binding now sticks.
     fail["on"] = False
-    appmod._access_modes_payload(store)
+    accounts_access._access_modes_payload(store)
     assert calls["n"] == 2, "binding persist must be retried after a transient failure"
     assert has_connected(route)
 
@@ -208,7 +211,7 @@ def test_link_token_claim_issues_new_key_for_same_user(client):
     second_claim = client.post("/v1/access/claim-token", json={"token": token})
     assert second_claim.status_code == 409
 
-    users_json = appmod.db.load_all_users()
+    users_json = db.load_all_users()
     assert len(users_json) == 1
     assert len(users_json[0]["api_keys"]) == 2
 
@@ -216,15 +219,15 @@ def test_link_token_claim_issues_new_key_for_same_user(client):
 def test_legacy_user_record_backfills_principal_and_api_keys(client):
     raw_key = "legacy-test-key"
     user_id = "usr_abcdef1234567890"
-    appmod._users[:] = [{
+    registry._users[:] = [{
         "user_id": user_id,
-        "api_key_hash": appmod._hash_api_key(raw_key),
+        "api_key_hash": registry._hash_api_key(raw_key),
         "created_at": "2026-06-01T00:00:00",
     }]
-    appmod._save_users()
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._load_users()
+    registry._save_users()
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    registry.load_users()
 
     res = client.get("/v1/access/modes", headers=_headers(raw_key))
     assert res.status_code == 200

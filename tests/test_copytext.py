@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402  (import triggers db.init_schema → migration 0006)
 import db  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from copytext import service as copytext_service  # noqa: E402
 
 ADMIN_TOKEN = "test-admin-token"
@@ -30,8 +30,7 @@ def _reset_copytext():
 @pytest.fixture()
 def client(monkeypatch):
     monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", ADMIN_TOKEN)
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    with make_client() as c:
         yield c
 
 

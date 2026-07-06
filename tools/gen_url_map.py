@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Snapshot the ASGI (FastAPI) backend's route table for route accounting.
 
-Why this exists (see docs/superpowers/specs/2026-07-03-backend-asgi-migration-plan.md
-§6.1): the FastAPI cutover had **no runtime fallback**, so a route missed during
+Why this exists (ASGI 迁移计划 §6.1，计划稿已删，见 git 历史):
+the FastAPI cutover had **no runtime fallback**, so a route missed during
 migration would be a user-visible 404. Originally this snapshotted the Flask
 url_map as the migration baseline; post-cutover the Flask app is gone, so it now
 walks ``asgi_app.app.routes`` — the ground truth for "100% route accounting".
@@ -14,9 +14,9 @@ Output columns (tab-separated, stable-sorted by path then methods):
 
 - METHODS excludes the auto-added HEAD/OPTIONS (kept as a trailing note) so the
   diff tracks real handler surface, not framework bookkeeping.
-- OWNER is derived from the Flask endpoint's blueprint prefix (the part before
-  the first '.'), which maps 1:1 to the domain package that owns the route —
-  this is the migration unit (§3.1).
+- OWNER is derived from the endpoint name's blueprint-style prefix (the part
+  before the first '.'), which maps 1:1 to the domain package that owns the
+  route.
 
 Usage:
 
@@ -41,10 +41,10 @@ BACKEND = REPO_ROOT / "backend"
 
 
 def _ensure_env_and_db() -> None:
-    """Replicate tests/conftest.py's minimal boot env so `import app` succeeds.
+    """Replicate tests/conftest.py's minimal boot env so `import asgi_app` succeeds.
 
     The hosting-ready gate and a reachable DATABASE_URL are prerequisites for
-    importing app.py (it runs db.init_schema() at import time). We only
+    importing the backend (db.init_schema() runs at startup). We only
     provision a throwaway DB when DATABASE_URL is not already supplied.
     """
     os.environ.setdefault("FEEDLING_LITELLM_ENABLE", "1")
@@ -160,7 +160,7 @@ def main() -> int:
 
     lines = [
         "# ASGI (FastAPI) backend route snapshot — post-cutover route accounting (§6.1).",
-        "# Regenerate: python tools/gen_url_map.py docs/generated/backend-url-map-<date>.txt",
+        "# Regenerate: python tools/gen_url_map.py <out-file>  (or omit for stdout; snapshots are not checked in)",
         "# Columns: PATH\\tMETHODS\\tENDPOINT\\tOWNER  (auto HEAD/OPTIONS noted in trailing comment)",
         f"# Total routes: {len(rows)}",
         "",

@@ -14,7 +14,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-import app as appmod  # noqa: E402  (Flask app context for jsonify)
 from bootstrap import gates as boot_gates  # noqa: E402
 from chat import consumer as chat_consumer  # noqa: E402
 from accounts import onboarding as accounts_onboarding  # noqa: E402
