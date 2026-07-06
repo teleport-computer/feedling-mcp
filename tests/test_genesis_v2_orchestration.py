@@ -397,6 +397,80 @@ def test_v2_background_can_skip_fact_write_for_voice_persona_only(monkeypatch):
     assert calls["voice"] is True
 
 
+def test_v2_foreground_salvages_identity_from_support_card(monkeypatch):
+    # LLM derive fails/empty, but the upload includes a character-card support message
+    # with an explicit name -> the non-LLM lightweight fallback salvages it, and the
+    # salvaged identity flows through the normal identity-first write path (job DONE,
+    # never failed).
+    calls = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"memories": [{"summary": "x"}]})
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: ({"agent_name": "", "dimensions": []}, []))
+    monkeypatch.setattr(service, "apply_memory_outputs", lambda *a, **k: (1, []))
+    monkeypatch.setattr(history_import, "_store_identity_payload",
+                        lambda store, payload, **k: calls.update(payload=payload))
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting", lambda *a, **k: ("", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting", lambda *a, **k: None)
+    monkeypatch.setattr(db, "genesis_complete_job",
+                        lambda *a, **k: calls.update(completed=True) or {"job_id": "job1"})
+    monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment", lambda *a, **k: None)
+    monkeypatch.setattr(service, "mark_failed",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fail when salvage succeeds")))
+
+    support_card = {
+        "role": "user",
+        "content": "# 阿樟 · 角色卡\n- 名字：阿樟\n- 性格：温柔但毒舌",
+        "source": "ai_persona_import",
+        "source_family": "ai_persona_import",
+    }
+    assert history_import._is_import_support_message(support_card)  # sanity: classified as support
+
+    handled = plaintext._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 1},
+        analysis_messages=[support_card])
+
+    assert handled is True
+    assert calls["payload"]["agent_name"] == "阿樟"
+    assert calls.get("completed") is True
+
+
+def test_v2_foreground_fresh_start_allows_nameless_done(monkeypatch):
+    # truly-empty upload (the real fresh_start sentinel message) with no derivable
+    # identity must still complete nameless -> NOT a failure, unlike real content with
+    # no identity signal.
+    calls = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"memories": []})
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: ({"agent_name": "", "dimensions": []}, []))
+    monkeypatch.setattr(service, "mark_failed",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fresh_start must not fail")))
+    monkeypatch.setattr(service, "apply_reducer_output",
+                        lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting",
+                        lambda *a, **k: ("", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
+                        lambda store, text: calls.__setitem__("greeting", text))
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
+                        lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
+
+    plaintext._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 1},
+        analysis_messages=[plaintext._plaintext_fresh_start_message()])
+
+    assert calls.get("used_apply_reducer") is True               # nameless-done fallback
+    assert calls["greeting"] == "好久不见，很高兴又能和你聊天。"  # fallback branch still greets
+    assert calls["bg_write_identity"] is True                    # background fills identity
+
+
 def test_v2_foreground_provider_identity_failure_marks_job_failed(monkeypatch):
     calls = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
@@ -420,8 +494,7 @@ def test_v2_foreground_provider_identity_failure_marks_job_failed(monkeypatch):
 
     assert handled is True
     assert calls["job_id"] == "job1"
-    assert "provider_identity_failed" in calls["error"]
-    assert "402" in calls["error"]
+    assert calls["error"] == "onboarding_no_identity:provider_unstable"
 
 
 def test_v2_foreground_honors_explicit_relationship_date(monkeypatch):
@@ -454,10 +527,10 @@ def test_v2_foreground_honors_explicit_relationship_date(monkeypatch):
     assert calls["stored_days"] == 200
 
 
-def test_v2_foreground_falls_back_when_no_identity(monkeypatch):
-    # deriver yields nothing -> fall back to the current behavior (apply_reducer_output),
-    # append a fallback greeting, and the background is asked to write identity
-    # (write_identity=True).
+def test_v2_foreground_content_but_no_identity_signal_fails(monkeypatch):
+    # deriver yields nothing, no provider warnings, and there's no salvageable support
+    # text (just a plain user message) -> this is "real content but no identity signal",
+    # which the spec now routes to a hard failure instead of a silent nameless-done.
     calls = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
@@ -465,23 +538,21 @@ def test_v2_foreground_falls_back_when_no_identity(monkeypatch):
     monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
     monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
                         lambda **k: ({"agent_name": "", "dimensions": []}, []))
+    monkeypatch.setattr(service, "mark_failed",
+                        lambda store, job_id, error: calls.update(job_id=job_id, error=error) or
+                        {"job_id": job_id, "status": "failed", "error": error})
     monkeypatch.setattr(service, "apply_reducer_output",
                         lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
-    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting",
-                        lambda *a, **k: ("", []))
-    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
-                        lambda store, text: calls.__setitem__("greeting", text))
-    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
-                        lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
 
-    plaintext._run_plaintext_genesis_v2(
+    handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
         relationship_anchor={"days_with_user": 1},
         analysis_messages=[{"role": "user", "content": "hi"}])
 
-    assert calls.get("used_apply_reducer") is True               # empty-identity fallback
-    assert calls["greeting"] == "好久不见，很高兴又能和你聊天。"  # fallback branch still greets
-    assert calls["bg_write_identity"] is True                    # background fills identity
+    assert handled is True
+    assert calls["job_id"] == "job1"
+    assert calls["error"] == "onboarding_no_identity:provider_unstable"
+    assert "used_apply_reducer" not in calls           # must fail before the nameless-done path
 
 
 def test_merged_has_identity_rule():
