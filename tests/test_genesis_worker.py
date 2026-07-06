@@ -923,16 +923,18 @@ class _FakeLLM:
         return type("R", (), {"text": item, "usage": None})()
 
 
-def test_retry_empty_also_retries_transient_then_succeeds(monkeypatch):
-    # 1st call ReadTimeout (transient) -> 2nd call returns usable JSON.
+def test_retry_empty_raises_transient_immediately_no_outer_retry(monkeypatch):
+    # 1st call ReadTimeout (transient) -> raises immediately, no outer retry.
+    # The inner reliable_chat_completion already exhausted its own transient
+    # retries (3x with backoff); looping again here would just double the stall.
     llm = _FakeLLM([provider_client.ProviderError("provider network error: ReadTimeout"),
                     '{"fact_candidates":[{"about":"user","summary":"x"}]}'])
-    out = worker._complete_json_retry_empty(
-        llm, user_id="u", job_id="j", task_id="fact-map-0",
-        runtime=object(), messages=[{"role": "user", "content": "x"}],
-        max_tokens=100, idempotency_key="k", is_empty=worker._combined_map_empty, max_attempts=3)
-    assert out["fact_candidates"][0]["summary"] == "x"
-    assert llm.calls == 2
+    with pytest.raises(provider_client.ProviderError):
+        worker._complete_json_retry_empty(
+            llm, user_id="u", job_id="j", task_id="fact-map-0",
+            runtime=object(), messages=[{"role": "user", "content": "x"}],
+            max_tokens=100, idempotency_key="k", is_empty=worker._combined_map_empty, max_attempts=3)
+    assert llm.calls == 1
 
 
 def test_retry_empty_does_not_retry_provider_config(monkeypatch):
@@ -945,3 +947,16 @@ def test_retry_empty_does_not_retry_provider_config(monkeypatch):
             runtime=object(), messages=[{"role": "user", "content": "x"}],
             max_tokens=100, idempotency_key="k", is_empty=worker._combined_map_empty, max_attempts=3)
     assert llm.calls == 1
+
+
+def test_retry_empty_still_retries_empty_result(monkeypatch):
+    # 1st call returns empty-but-valid payload -> 2nd call returns usable JSON.
+    # The empty-reply retry is the outer loop's original purpose and must be preserved.
+    llm = _FakeLLM(['{"fact_candidates":[]}',
+                    '{"fact_candidates":[{"about":"user","summary":"x"}]}'])
+    out = worker._complete_json_retry_empty(
+        llm, user_id="u", job_id="j", task_id="fact-map-0",
+        runtime=object(), messages=[{"role": "user", "content": "x"}],
+        max_tokens=100, idempotency_key="k", is_empty=worker._combined_map_empty, max_attempts=3)
+    assert out["fact_candidates"][0]["summary"] == "x"
+    assert llm.calls == 2

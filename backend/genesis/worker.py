@@ -569,8 +569,13 @@ def _complete_json_retry_empty(
         except provider_client.ProviderError as e:
             if provider_client.classify_provider_error(e) == "provider_config":
                 raise  # hard error (402/401/403/quota/key) — never retry
-            last_exc = e
-            continue  # transient/unknown — try again next attempt
+            # Transient/unknown — do NOT retry here. The inner
+            # reliable_chat_completion already exhausted its own transient
+            # retries (3x with backoff, ~274s worst-case per call); looping
+            # again in this outer loop just doubles that stall per chunk.
+            # The caller (per-chunk foreground loop) catches this and skips
+            # the chunk instead.
+            raise
         except GenesisWorkerError as e:  # bad/invalid JSON — treat as transient
             last_exc = e
             continue
