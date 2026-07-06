@@ -1487,14 +1487,45 @@ def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None
 
 
 def chat_try_claim_reply(
-    user_id: str, msg_id: str, consumer_id: str, now: float, fields: dict
+    user_id: str, msg_id: str, consumer_id: str, now: float, fields: dict,
+    *, redelivery: bool = False,
 ) -> dict | None:
     """Atomically claim a chat reply for ``consumer_id`` — the cross-worker-safe
     replacement for read-cache-then-write. The claim succeeds iff the row is
     currently unclaimed, already ours, or the prior claim has expired (the SQL
     WHERE mirrors chat.service._chat_message_claimable). Returns the merged doc
     on success, or None if the row is missing or another consumer/worker holds
-    an unexpired claim — so two workers polling the same reply can't both win."""
+    an unexpired claim — so two workers polling the same reply can't both win.
+
+    ``redelivery=True`` (the lost-turn backstop, chat.service) hardens the CAS
+    against the caller's stale per-worker cache with two extra conditions the
+    fresh-delivery path must NOT have:
+    - rejects OUR OWN unexpired claim (no idempotent self-refresh): re-handing
+      an in-flight redelivered turn to its claimer would run a duplicate
+      provider turn. A fresh delivery keeps the self-refresh so a poll retry of
+      a just-claimed message doesn't error.
+    - rejects the claim when ANY newer visible user message is already replied
+      (the superseded-tail rule, decided HERE at claim time): the cache-side
+      _redelivery_floor pre-filter can miss it because parent reply_status
+      metadata updates are not broadcast across workers, and a late reply to a
+      conversation that already moved on would land out of order. Synthetic
+      verify_ping probes are not conversation and never supersede."""
+    same_consumer_sql = "" if redelivery else "OR doc->>'reply_claimed_by' = %s "
+    unanswered_tail_sql = (
+        "  AND NOT EXISTS ("
+        "    SELECT 1 FROM chat_messages n "
+        "    WHERE n.user_id = chat_messages.user_id "
+        "      AND n.ts > chat_messages.ts "
+        "      AND n.doc->>'role' = 'user' "
+        "      AND COALESCE(n.doc->>'source','') <> 'verify_ping' "
+        "      AND ((n.doc->>'reply_status') = 'replied' "
+        "           OR COALESCE(n.doc->>'reply_message_id','') <> '')"
+        "  ) "
+    ) if redelivery else ""
+    params: list = [Jsonb(fields), user_id, msg_id]
+    if not redelivery:
+        params.append(consumer_id)
+    params.append(now)
     try:
         with get_pool().connection() as conn:
             row = conn.execute(
@@ -1506,12 +1537,13 @@ def chat_try_claim_reply(
                 # this worker last refreshed. Mirrors _chat_message_claimable.
                 "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
                 "  AND COALESCE(doc->>'reply_message_id','') = '' "
+                f"{unanswered_tail_sql}"
                 "  AND ("
                 "    COALESCE(doc->>'reply_claimed_by','') = '' "
-                "    OR doc->>'reply_claimed_by' = %s "
+                f"    {same_consumer_sql}"
                 "    OR COALESCE(NULLIF(doc->>'reply_claim_expires_at','')::float8, 0) <= %s"
                 ") RETURNING doc",
-                (Jsonb(fields), user_id, msg_id, consumer_id, now),
+                tuple(params),
             ).fetchone()
         return row[0] if row is not None else None
     except Exception as e:

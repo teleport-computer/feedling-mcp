@@ -49,6 +49,7 @@
 
 ## 2026-07-04
 
+<<<<<<< Updated upstream
 ### [DONE] enclave Flask→FastAPI/asyncio 迁移，全仓 flask 依赖清零
 
 `backend/enclave_app.py`（2333 行 Flask 单文件，全仓最后一个 flask 使用方）
@@ -108,6 +109,40 @@
   `enclave-asgi-migration`，基于 test 分支），由用户在验收后提交。
 
 ### [DONE] 自定义陪伴频率 wake_interval_sec + 心跳激活门（三层，已 ship）
+=======
+### [DONE] 丢回合重投递兜底：consumer respawn 窗口不再永久丢用户消息（未 commit / 未部署）
+
+- **背景**：prod ASGI 切换当日全量巡检发现 3 条 model_api 用户消息永久无回复。根因不在
+  HTTP 层：supervisor 一检测到 config changed（model_api/setup、driver、preferences 写入都算）
+  就 signal 15 respawn consumer，而 consumer 重启后游标从 checkpoint/最新历史 ts 播种，
+  `since` 严格大于 ⇒ 重启前落库、未回复的消息被永久跳过——claim CAS 机制再也看不到它。
+- **修**（server 为主）：`chat/service._pending_chat_messages_for_poll` 加重投递兜底——
+  `ts <= since` 的 user 消息在同时满足「未回复 + claim 空/过期 + 在
+  `FEEDLING_CHAT_REDELIVERY_WINDOW_SEC`（默认 3600s，0=关）窗口内 + 在未回复尾巴上
+  （其后没有已回复的可见 user 消息，见 `_redelivery_floor`；verify_ping 不算对话也不重投）」
+  时仍可投递。**backstop claim 走 DB CAS 严格模式** `db.chat_try_claim_reply(redelivery=True)`——
+  两轮 Codex review 抓出的多 worker 缓存问题都封在这一条 SQL 里：① 拒绝**任何**未过期
+  claim（含自己的；不同于正常路径的幂等自刷新）——防止把进行中的重投回合再发给它的
+  claimer 跑重复回合；② `NOT EXISTS` 在 claim 时刻权威判定 supersede 尾巴——父消息
+  reply_status 元数据更新不跨 worker 广播，缓存侧 `_redelivery_floor` 可能漏掉「更新的
+  消息已被回复」，没有这条乱序迟到回复仍可能发生。缓存侧检查降级为快速预过滤
+  （prod 跑 4 worker，缓存不可信）。重试节奏 = claim TTL：`CHAT_POLL_CLAIM_TTL_SEC`
+  默认 120→600——重投递生效后 claim 过期意味着重复回合（双烧 provider，409 只挡双落库），
+  TTL 必须盖过最长正常回合。
+- **批量恢复走滚动**（第三轮 Codex review）：per-poll 重投预算
+  `FEEDLING_CHAT_REDELIVERY_BATCH_MAX`（默认 5）——consumer 逐条跑回合（30-90s/条），
+  不设预算的话大批 claim 的尾部会在处理到之前过期（重复回合）+ 超出解密拉取量；
+  超预算的消息**不 claim**、下次 poll 立即接上（滚动恢复，不是等 TTL）。预算只管
+  backstop，`ts > since` 的活对话永不受限。
+- **配套**（consumer 两处）：`tools/chat_resident_consumer.py` 解密窗口改
+  `_poll_decrypt_since(last_ts, poll_messages)`——重投的消息 ts 在游标之前，原
+  `since=last_ts` 取不到明文会走 wedge-skip 白烧 claim；现在窗口拉回到批次最旧消息之前，
+  且拉取量 `_poll_decrypt_limit` 按批次放大（2×批次+20，下限 50）保证整批可解密。
+- 测试：`tests/test_chat_poll_redelivery.py`（16 项，含 supersede/窗口/TTL/排序/陈旧缓存
+  ×2/预算滚动×2 语义）+ `tests/test_consumer_decrypt_since.py`（6 项）；全量回归通过。
+- 部署注意：backend 镜像 + runner 镜像都要更新（consumer 走自身 self-update 亦可）；
+  乱序回复不可能出现——重投只发生在「其后无任何已回复消息」的尾巴上。
+>>>>>>> Stashed changes
 
 两件事一起落地（Seven 主导）。**① 自定义陪伴频率**:用户在设置页选「陪伴频率」7 档
 (15min–12h,**默认 2h**),per-user `wake_interval_sec`(clamp `[900,43200]`),consumer 即时

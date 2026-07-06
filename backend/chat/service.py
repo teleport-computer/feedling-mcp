@@ -63,7 +63,24 @@ def _sanitize_provider_reasoning_text(text: str) -> str:
 
 
 CHAT_HISTORY_INLINE_BODY_CT_MAX = int(os.environ.get("FEEDLING_CHAT_HISTORY_INLINE_BODY_CT_MAX", "262144"))
-CHAT_POLL_CLAIM_TTL_SEC = int(os.environ.get("FEEDLING_CHAT_POLL_CLAIM_TTL_SEC", "120"))
+# With the lost-turn redelivery backstop live, an expired claim means a second
+# agent turn for the same message (double provider burn — the already-answered
+# 409 only blocks the double APPEND), so the TTL must sit above the longest
+# normal turn. It doubles as the redelivery retry cadence: a crashed turn is
+# retried one TTL later, not never.
+CHAT_POLL_CLAIM_TTL_SEC = int(os.environ.get("FEEDLING_CHAT_POLL_CLAIM_TTL_SEC", "600"))
+# Lost-turn redelivery backstop: how far back a poll may resurrect an
+# unanswered user message whose ts the consumer's cursor already passed
+# (respawn re-seed, checkpoint advanced before the reply landed, wedge skip).
+# 0 disables redelivery entirely. See _pending_chat_messages_for_poll.
+CHAT_REDELIVERY_WINDOW_SEC = int(os.environ.get("FEEDLING_CHAT_REDELIVERY_WINDOW_SEC", "3600"))
+# Max redelivered (backstop) messages per poll response. The consumer runs one
+# agent turn per message (30-90s each), so an uncapped recovery batch would let
+# the tail's claims expire before processing (duplicate turns) and outgrow the
+# consumer's decrypt fetch. Unclaimed leftovers roll into the NEXT poll
+# immediately — a rolling recovery, never a TTL stall. Sized so
+# batch × turn-time stays under CHAT_POLL_CLAIM_TTL_SEC.
+CHAT_REDELIVERY_BATCH_MAX = int(os.environ.get("FEEDLING_CHAT_REDELIVERY_BATCH_MAX", "5"))
 
 
 def _recent_user_chat_active(store: UserStore, now: float, window_sec: float = 600.0) -> bool:
@@ -330,6 +347,28 @@ def _chat_message_claimable(msg: dict, consumer_id: str, now: float) -> bool:
     return (not claimed_by) or claimed_by == consumer_id or expires_at <= now
 
 
+def _redelivery_floor(store: UserStore, now: float) -> float:
+    """Exclusive ts lower bound for redelivering messages behind the cursor.
+
+    A message with ts <= floor is never redelivered. The floor is the later of
+    the window edge (now - CHAT_REDELIVERY_WINDOW_SEC) and the newest REPLIED
+    visible user message: if the conversation already moved past an unanswered
+    message (the user re-asked and got an answer), a late reply to the old one
+    would land out of order — it is superseded, not lost. Synthetic
+    verify_ping rows are liveness probes, not conversation; their replies
+    don't supersede anything. Caller holds store.chat_lock.
+    """
+    if CHAT_REDELIVERY_WINDOW_SEC <= 0:
+        return float("inf")
+    floor = now - CHAT_REDELIVERY_WINDOW_SEC
+    for msg in store.chat_messages:
+        if msg.get("role") != "user" or msg.get("source") == "verify_ping":
+            continue
+        if msg.get("reply_status") == "replied" or msg.get("reply_message_id"):
+            floor = max(floor, _float_meta(msg.get("ts"), 0.0))
+    return floor
+
+
 def _pending_chat_messages_for_poll(
     store: UserStore,
     *,
@@ -339,10 +378,31 @@ def _pending_chat_messages_for_poll(
 ) -> list[dict]:
     now = time.time()
     claimed: list[dict] = []
+    redelivered = 0
     with store.chat_lock:
+        redelivery_floor = _redelivery_floor(store, now)
         for msg in store.chat_messages:
-            if _float_meta(msg.get("ts"), 0.0) <= since:
-                continue
+            ts = _float_meta(msg.get("ts"), 0.0)
+            if ts <= since:
+                if redelivered >= CHAT_REDELIVERY_BATCH_MAX:
+                    continue  # budget spent — leftovers roll into the next poll unclaimed
+                # Redelivery backstop: an unanswered turn the cursor already
+                # passed is still deliverable while it's inside the window and
+                # on the unanswered tail (see _redelivery_floor). verify_ping
+                # probes are excluded — verify_loop GC'd theirs long ago and a
+                # late reply would only 409. Unlike the fresh path below, a
+                # LIVE claim blocks redelivery even to its own consumer:
+                # re-handing the message to its claimer on every poll while
+                # the turn is still running would double-burn; retry waits for
+                # TTL expiry instead.
+                if ts <= redelivery_floor:
+                    continue
+                if msg.get("source") == "verify_ping":
+                    continue
+                claimed_by = str(msg.get("reply_claimed_by") or "").strip()
+                expires_at = _float_meta(msg.get("reply_claim_expires_at"), 0.0)
+                if claimed_by and expires_at > now:
+                    continue
             # Gate on role / already-replied / claimable from cache (these don't
             # race the way the claim itself does). For a claiming poll the
             # cache's claimed_by read is only an early filter — the authoritative
@@ -351,6 +411,8 @@ def _pending_chat_messages_for_poll(
                 continue
             if not claim:
                 claimed.append(dict(msg))  # read-only peek, no lock taken
+                if ts <= since:
+                    redelivered += 1
                 continue
             # The claim must be atomic in the DB, not decided from this worker's
             # cache — otherwise two workers polling the same reply would each read
@@ -364,9 +426,18 @@ def _pending_chat_messages_for_poll(
                 "reply_claimed_at": f"{now:.3f}",
                 "reply_claim_expires_at": f"{now + max(10, CHAT_POLL_CLAIM_TTL_SEC):.3f}",
             }
-            merged = db.chat_try_claim_reply(store.user_id, msg_id, consumer_id, now, fields)
+            # Backstop (ts <= since) claims are strict: the cache-side checks
+            # above (live claim, _redelivery_floor) may be stale on this
+            # worker, so the CAS itself re-decides both authoritatively — see
+            # chat_try_claim_reply's redelivery mode.
+            merged = db.chat_try_claim_reply(
+                store.user_id, msg_id, consumer_id, now, fields,
+                redelivery=ts <= since,
+            )
             if merged is None:
                 continue  # lost the claim to another consumer/worker — skip
             msg.update(fields)  # keep this worker's cache copy consistent
             claimed.append(dict(merged))
+            if ts <= since:
+                redelivered += 1
     return claimed

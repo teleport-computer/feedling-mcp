@@ -928,6 +928,45 @@ def _msg_key(msg: dict) -> str:
     return f"{ts}:{msg.get('role', '')}"
 
 
+_DECRYPT_SINCE_EPSILON = 0.001
+
+
+def _poll_decrypt_since(last_ts: float, poll_messages: list[dict]) -> float:
+    """Decrypt-history window for this poll batch.
+
+    Normally the cursor. But the server's lost-turn redelivery backstop can
+    hand back a message whose ts is BEHIND the cursor (its turn was lost to a
+    respawn); fetching plaintext with since=last_ts would never include it,
+    _filter_messages_to_poll_ids would come back empty, and the wedge-skip
+    path would burn the claim. Pull the window back to just before the oldest
+    message in the batch so every claimed message is fetchable.
+    """
+    since = last_ts
+    for m in poll_messages:
+        if not isinstance(m, dict):
+            continue
+        try:
+            pts = float(m.get("ts", m.get("timestamp", 0)) or 0)
+        except (TypeError, ValueError):
+            continue
+        if pts and pts - _DECRYPT_SINCE_EPSILON < since:
+            since = pts - _DECRYPT_SINCE_EPSILON
+    return since
+
+
+def _poll_decrypt_limit(decrypt_since: float, last_ts: float, poll_messages: list[dict]) -> int:
+    """Decrypt-history fetch size for this poll batch.
+
+    A pulled-back window (redelivered messages) spans more history than the
+    usual tail, and EVERY claimed message must fit in one fetch: a truncated
+    fetch drops claimed messages, and a redelivery claim can't be retried until
+    its TTL expires. Sized to the batch (interleaved openclaw replies roughly
+    double the row count) with a floor of 50."""
+    if decrypt_since >= last_ts:
+        return 20
+    return max(50, 2 * len(poll_messages) + 20)
+
+
 def _filter_messages_to_poll_ids(messages: list[dict], poll_messages: list[dict]) -> list[dict]:
     """Keep only decrypted rows that this poll cycle actually claimed.
 
@@ -6768,7 +6807,11 @@ def run() -> None:
             # poll is used only as a trigger — its content fields are "" for
             # v1 encrypted envelopes. Fetch actual plaintext from a decrypt source.
             if FEEDLING_ENCLAVE_URL:
-                decrypted = get_decrypted_history(since=last_ts, limit=20)
+                decrypt_since = _poll_decrypt_since(last_ts, poll_messages)
+                decrypted = get_decrypted_history(
+                    since=decrypt_since,
+                    limit=_poll_decrypt_limit(decrypt_since, last_ts, poll_messages),
+                )
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.
                     log.warning(
