@@ -536,6 +536,35 @@ def _add_memory_payload(text, filename, as_kind, client_job_id):
     return payload
 
 
+def _poll_genesis_job(api_url, auth, job_id, *, timeout, interval=2.0):
+    """Poll GET /v1/genesis/imports/{job_id} until done/failed/timeout.
+
+    Returns a plain dict for the caller to _emit(); pure w.r.t. _http_json so it
+    is unit-testable by monkeypatching that seam.
+    """
+    import time as _time
+    deadline = _time.monotonic() + max(0.0, timeout)
+    while True:
+        code, body = _http_json("GET", f"{api_url}/v1/genesis/imports/{job_id}", auth)
+        if code >= 400:
+            return {"ok": False, "status": "error", "job_id": job_id,
+                    "http_status": code, "error": body}
+        job = body.get("job") if isinstance(body, dict) else {}
+        job = job if isinstance(job, dict) else {}
+        state = body.get("state") if isinstance(body, dict) else {}
+        state = state if isinstance(state, dict) else {}
+        status = str(job.get("status") or state.get("status") or "").strip().lower()
+        if status == "done":
+            return {"ok": True, "status": "done", "job_id": job_id,
+                    "memories_created": int(job.get("memory_action_count") or 0)}
+        if status == "failed":
+            return {"ok": False, "status": "failed", "job_id": job_id,
+                    "error": job.get("error") or state.get("error") or "genesis job failed"}
+        if _time.monotonic() >= deadline:
+            return {"ok": True, "status": "pending", "job_id": job_id}
+        _time.sleep(interval)
+
+
 def cmd_identity_write(args):
     """Patch the agent's display identity card (self_introduction / signature).
 
