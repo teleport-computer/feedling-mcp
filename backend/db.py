@@ -858,6 +858,123 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
         return []
 
 
+# Route split for the event-health view: model_api → "API", everything else
+# (resident / official_import / unknown) folds to "VPS" on the caller side.
+_EVENTS_ROUTES_CTE = (
+    "WITH routes AS (SELECT user_id, "
+    "lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route "
+    "FROM user_blobs WHERE kind = 'onboarding_route')"
+)
+# EXTRACT epoch of (completed_at - created_at) from two JSONB iso strings, NULL-safe.
+_JOB_DUR_SEC = (
+    "CASE WHEN doc->>'completed_at' ~ '^[0-9]' AND doc->>'created_at' ~ '^[0-9]' "
+    "THEN EXTRACT(EPOCH FROM ((doc->>'completed_at')::timestamptz "
+    "- (doc->>'created_at')::timestamptz)) ELSE NULL END"
+)
+
+
+def admin_events_overview() -> dict:
+    """Fleet-wide event-health aggregates for the `view=events` board, split by
+    route (VPS/resident vs API/model_api). Each sub-query is independently
+    guarded so one failure degrades to an empty slice, not the whole board.
+
+    Returns {proactive:[...], capture:[...], genesis:[...], reply:[...]} where each
+    row carries route + the event dimension + counts + median duration (seconds)."""
+    out = {"proactive": [], "capture": [], "genesis": [], "reply": []}
+
+    def _run(key, sql):
+        try:
+            with get_pool().connection() as conn:
+                rows = conn.execute(sql).fetchall()
+            return rows
+        except Exception as e:  # noqa: BLE001
+            log.error("[db] admin_events_overview.%s failed: %s", key, e)
+            return []
+
+    # 1) Proactive lanes: 心跳 / 主动触发(感知+定时) / 屏幕 / 其他
+    rows = _run("proactive", f"""
+        {_EVENTS_ROUTES_CTE}
+        SELECT COALESCE(r.route,'resident') AS route, j.lane,
+               COUNT(*)::int AS total,
+               (COUNT(*) FILTER (WHERE j.status IN ('posted','delivered','completed')))::int AS success,
+               (COUNT(*) FILTER (WHERE j.status IN ('failed','skipped')))::int AS failed,
+               (COUNT(*) FILTER (WHERE j.status = 'pending'))::int AS pending,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY j.dur) AS median_dur
+        FROM (
+          SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur,
+            CASE
+              WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','heartbeat_broadcast_on') THEN 'screen'
+              WHEN k.kind IN ('perception_event','scene_change','photo_added','arrived_at_anchor','location','unlock_after_absence','scheduled_wake') THEN 'trigger'
+              WHEN left(k.kind, 9) = 'heartbeat' THEN 'heartbeat'
+              ELSE 'other'
+            END AS lane
+          FROM user_logs l,
+            LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),NULLIF(l.doc->>'wake_kind',''),NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+          WHERE l.stream = 'proactive_jobs'
+        ) j LEFT JOIN routes r ON r.user_id = j.user_id
+        GROUP BY route, j.lane
+    """)
+    out["proactive"] = [
+        {"route": r[0], "lane": r[1], "total": r[2], "success": r[3], "failed": r[4],
+         "pending": r[5], "median_dur": float(r[6]) if r[6] is not None else None}
+        for r in rows
+    ]
+
+    # 2) 主动记忆整理(category-level so the median is valid across dream+capture):
+    #    memory_dream(做梦) + memory_capture(自写) + memory_migrate 合一。
+    rows = _run("capture", f"""
+        {_EVENTS_ROUTES_CTE}
+        SELECT COALESCE(r.route,'resident') AS route,
+               COUNT(*)::int AS total,
+               (COUNT(*) FILTER (WHERE l.doc->>'status' = 'completed'))::int AS success,
+               (COUNT(*) FILTER (WHERE l.doc->>'status' IN ('failed','error','skipped')))::int AS failed,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY {_JOB_DUR_SEC.replace('doc','l.doc')}) AS median_dur
+        FROM user_logs l LEFT JOIN routes r ON r.user_id = l.user_id
+        WHERE l.stream = 'memory_capture_jobs'
+        GROUP BY route
+    """)
+    out["capture"] = [
+        {"route": r[0], "total": r[1], "success": r[2], "failed": r[3],
+         "median_dur": float(r[4]) if r[4] is not None else None}
+        for r in rows
+    ]
+
+    # 3) 蒸馏: genesis job — mode=onboarding → 一次(first); add_memory/update_identity → 二次(second)
+    rows = _run("genesis", f"""
+        {_EVENTS_ROUTES_CTE}
+        SELECT COALESCE(r.route,'resident') AS route,
+               CASE WHEN COALESCE(NULLIF(g.metadata->>'mode',''),'onboarding') = 'onboarding'
+                    THEN 'first' ELSE 'second' END AS distill,
+               COUNT(*)::int AS total,
+               (COUNT(*) FILTER (WHERE g.status IN ('done','completed')))::int AS success,
+               (COUNT(*) FILTER (WHERE g.status IN ('error','failed')))::int AS failed
+        FROM genesis_import_jobs g LEFT JOIN routes r ON r.user_id = g.user_id
+        GROUP BY route, distill
+    """)
+    out["genesis"] = [
+        {"route": r[0], "distill": r[1], "total": r[2], "success": r[3], "failed": r[4]}
+        for r in rows
+    ]
+
+    # 4) 回复消息: 真回复率 + 兜底率(foreground_fallback)
+    rows = _run("reply", f"""
+        {_EVENTS_ROUTES_CTE}
+        SELECT COALESCE(r.route,'resident') AS route,
+               (COUNT(*) FILTER (WHERE c.doc->>'role' = 'user'
+                    AND COALESCE(c.doc->>'source','') <> 'verify_ping'))::int AS user_msgs,
+               (COUNT(*) FILTER (WHERE c.doc->>'role' IN ('agent','openclaw')
+                    AND COALESCE(c.doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback')))::int AS real_replies,
+               (COUNT(*) FILTER (WHERE c.doc->>'source' = 'foreground_fallback'))::int AS fallback_replies
+        FROM chat_messages c LEFT JOIN routes r ON r.user_id = c.user_id
+        GROUP BY route
+    """)
+    out["reply"] = [
+        {"route": r[0], "user_msgs": r[1], "real_replies": r[2], "fallback_replies": r[3]}
+        for r in rows
+    ]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Per-user singleton blobs
 # ---------------------------------------------------------------------------

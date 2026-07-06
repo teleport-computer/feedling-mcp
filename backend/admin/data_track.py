@@ -981,7 +981,7 @@ def _data_track_request_filters() -> dict:
     if raw_dir not in {"asc", "desc"}:
         raw_dir = "desc"
     raw_view = (request.args.get("view") or "users").strip().lower()
-    if raw_view not in {"users", "dau", "proactive", "debug"}:
+    if raw_view not in {"users", "dau", "proactive", "debug", "events"}:
         raw_view = "users"
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -1677,6 +1677,7 @@ def _render_data_track_view_nav(active: str) -> str:
         f"{nav_item('users', 'Users')}"
         f"{nav_item('dau', 'DAU')}"
         f"{nav_item('proactive', 'Proactive 日报')}"
+        f"{nav_item('events', '事件健康度')}"
         f"{nav_item('debug', 'Debug')}"
         "</div>"
     )
@@ -2470,6 +2471,159 @@ def _render_data_track_debug_page(payload: dict) -> str:
 </script>
 </body>
 </html>"""
+
+
+def _events_route_bucket(route) -> str:
+    """VPS/API split: model_api → API; resident/official_import/other → VPS."""
+    return "api" if str(route or "") == "model_api" else "vps"
+
+
+# Ordered category catalog for the event-health board.
+_EVENT_CATEGORIES = [
+    ("onboarding", "Onboarding（漏斗）"),
+    ("distill_first", "一次蒸馏"),
+    ("distill_second", "二次蒸馏"),
+    ("memory_org", "主动记忆整理"),
+    ("reply", "回复消息"),
+    ("heartbeat", "心跳"),
+    ("trigger", "主动触发"),
+    ("screen", "屏幕共享"),
+    ("other", "其他"),
+]
+
+
+def _data_track_events_payload() -> dict:
+    raw = db.admin_events_overview()
+
+    def blank():
+        return {"vps": _blank_evt_stat(), "api": _blank_evt_stat()}
+
+    cats = {key: {"label": label, **blank()} for key, label in _EVENT_CATEGORIES}
+
+    def add(key, route, total=0, success=0, failed=0, pending=0, median=None):
+        b = cats[key][_events_route_bucket(route)]
+        b["total"] += int(total or 0)
+        b["success"] += int(success or 0)
+        b["failed"] += int(failed or 0)
+        b["pending"] += int(pending or 0)
+        if median is not None:
+            b["median_dur"] = median  # db already medians per (route, category)
+
+    lane_key = {"heartbeat": "heartbeat", "trigger": "trigger", "screen": "screen", "other": "other"}
+    for row in raw.get("proactive", []):
+        add(lane_key.get(row.get("lane"), "other"), row.get("route"),
+            row.get("total"), row.get("success"), row.get("failed"), row.get("pending"), row.get("median_dur"))
+    for row in raw.get("capture", []):
+        add("memory_org", row.get("route"), row.get("total"), row.get("success"), row.get("failed"), 0, row.get("median_dur"))
+    for row in raw.get("genesis", []):
+        key = "distill_first" if row.get("distill") == "first" else "distill_second"
+        add(key, row.get("route"), row.get("total"), row.get("success"), row.get("failed"))
+    # reply is special: success = real replies / user messages; fallback rate tracked apart
+    reply = {"vps": {"user_msgs": 0, "real_replies": 0, "fallback_replies": 0},
+             "api": {"user_msgs": 0, "real_replies": 0, "fallback_replies": 0}}
+    for row in raw.get("reply", []):
+        b = reply[_events_route_bucket(row.get("route"))]
+        b["user_msgs"] += int(row.get("user_msgs") or 0)
+        b["real_replies"] += int(row.get("real_replies") or 0)
+        b["fallback_replies"] += int(row.get("fallback_replies") or 0)
+    for bucket in ("vps", "api"):
+        rb = reply[bucket]
+        cats["reply"][bucket].update({
+            "total": rb["user_msgs"], "success": rb["real_replies"],
+            "failed": max(0, rb["user_msgs"] - rb["real_replies"]),
+            "fallback": rb["fallback_replies"],
+            "fallback_base": rb["real_replies"] + rb["fallback_replies"],
+        })
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "categories": [{"key": k, **cats[k]} for k, _ in _EVENT_CATEGORIES],
+        "note": "Onboarding 漏斗 + 回复延迟为下一阶段；本页先给 成功率/次数/中位耗时(job类)/兜底率，VPS·API 分列。",
+    }
+
+
+def _blank_evt_stat() -> dict:
+    return {"total": 0, "success": 0, "failed": 0, "pending": 0, "median_dur": None}
+
+
+def _evt_rate(b: dict) -> str:
+    resolved = int(b.get("success") or 0) + int(b.get("failed") or 0)
+    if resolved <= 0:
+        return "—"
+    return f"{(b['success'] / resolved) * 100:.0f}%"
+
+
+def _evt_dur(b: dict) -> str:
+    d = b.get("median_dur")
+    if d is None:
+        return "—"
+    d = float(d)
+    return f"{d:.1f}s" if d < 60 else f"{d/60:.1f}m"
+
+
+def _render_events_page(payload: dict) -> str:
+    cats = payload.get("categories", [])
+
+    def cell(b: dict, *, is_reply: bool) -> str:
+        total = int(b.get("total") or 0)
+        if total <= 0:
+            return "<td class='muted'>—</td>"
+        rate = _evt_rate(b)
+        rate_cls = ""
+        try:
+            rv = int(rate.rstrip("%"))
+            rate_cls = "ok" if rv >= 80 else ("warn" if rv >= 50 else "bad")
+        except ValueError:
+            rate_cls = ""
+        extra = ""
+        if is_reply:
+            fb = int(b.get("fallback") or 0)
+            base = int(b.get("fallback_base") or 0)
+            fb_pct = f"{(fb/base)*100:.0f}%" if base else "—"
+            extra = f"<br><span class='muted'>兜底 {fb_pct}</span>"
+        else:
+            extra = f"<br><span class='muted'>{_evt_dur(b)}</span>"
+        return (f"<td><b class='{rate_cls}'>{rate}</b> <span class='muted'>·{total}</span>{extra}</td>")
+
+    rows = []
+    for c in cats:
+        is_reply = c["key"] == "reply"
+        is_onb = c["key"] == "onboarding"
+        if is_onb:
+            rows.append(f"<tr><td>{html.escape(c['label'])}</td>"
+                        "<td class='muted' colspan='2'>漏斗视图下一阶段接入</td></tr>")
+            continue
+        rows.append(
+            f"<tr><td>{html.escape(c['label'])}</td>"
+            f"{cell(c['vps'], is_reply=is_reply)}{cell(c['api'], is_reply=is_reply)}</tr>"
+        )
+    body = "".join(rows)
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feedling 事件健康度 · Data Track</title>
+<style>
+  :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+  body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+  main {{ max-width:920px; margin:0 auto; padding:28px 24px 48px; }}
+  h1 {{ font-size:24px; margin:0 0 4px; }} h2 {{ font-size:15px; margin:24px 0 10px; }}
+  .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
+  .viewbar {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0 18px; }}
+  .sort-button {{ display:inline-flex; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
+  .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+  a {{ color:var(--accent); text-decoration:none; }}
+  table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
+  th,td {{ text-align:left; padding:11px 14px; border-bottom:1px solid var(--line); vertical-align:top; }}
+  th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; background:#f4ece5; }}
+  tr:last-child td {{ border-bottom:0; }} b {{ font-size:15px; }}
+</style></head><body><main>
+  <h1>事件健康度</h1>
+  <div class="muted">每格 = 成功率 · 次数 / 中位耗时(job类)或兜底率(回复)。VPS=resident 自托管,API=model_api 托管。Generated {html.escape(str(payload.get('generated_at') or ''))}.</div>
+  {_render_data_track_view_nav("events")}
+  <div class="muted">{html.escape(str(payload.get('note') or ''))}</div>
+  <table>
+    <thead><tr><th>事件</th><th>VPS(自托管)</th><th>API(托管)</th></tr></thead>
+    <tbody>{body}</tbody>
+  </table>
+</main></body></html>"""
 
 
 def _render_user_detail_page(user: dict) -> str:
