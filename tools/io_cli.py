@@ -507,6 +507,35 @@ def _identity_write_payload(self_introduction, signature):
     return {"action": {"type": "identity.profile_patch", "patch": patch}}
 
 
+def _add_memory_payload(text, filename, as_kind, client_job_id):
+    """Shape the plaintext-genesis body for a VPS-side re-distill (pure).
+
+    Mirrors iOS uploadGenesisPlaintext + backend/genesis/plaintext.py field names:
+    memory   -> mode=add_memory,      memory_summary_content
+    identity -> mode=update_identity, ai_persona_content + character_content
+    """
+    payload = {
+        "format": "auto",
+        "content": "",
+        "fresh_start": False,
+        "client_job_id": client_job_id,
+    }
+    name = (filename or "").strip()
+    if as_kind == "identity":
+        payload["mode"] = "update_identity"
+        payload["ai_persona_content"] = text
+        payload["character_content"] = text
+        if name:
+            payload["ai_persona_filename"] = name
+            payload["character_filename"] = name
+    else:  # memory (default)
+        payload["mode"] = "add_memory"
+        payload["memory_summary_content"] = text
+        if name:
+            payload["memory_summary_filename"] = name
+    return payload
+
+
 def cmd_identity_write(args):
     """Patch the agent's display identity card (self_introduction / signature).
 
