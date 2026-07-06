@@ -388,7 +388,7 @@ def test_fast_validation_genesis_user_is_complete_despite_empty_tabs():
     )
     assert v["passing"] is True
     assert v["stage"] == "complete"
-    mg = next(s for s in v["steps"] if s["id"] == "memory_garden")
+    mg = next(s for s in v["steps"] if s["id"] == "memory")
     assert mg["passing"] is True  # cards exist -> garden satisfied (bucket-agnostic)
 
 
@@ -404,5 +404,5 @@ def test_fast_validation_no_memories_still_blocks_memory_garden():
         bootstrap_events={"by_type": {}},
     )
     assert v["passing"] is False
-    mg = next(s for s in v["steps"] if s["id"] == "memory_garden")
+    mg = next(s for s in v["steps"] if s["id"] == "memory")
     assert mg["passing"] is False  # genuinely empty garden must still flag
