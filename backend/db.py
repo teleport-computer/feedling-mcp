@@ -815,8 +815,10 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
     永远不产生 delivered，坏一个用户的 key 就能无限灌 failed（2026-07-05
     prod：40 用户的重试风暴把整体成功率打到 3%）。maintenance 单独成列。
     ``failed`` 只含 status='failed'；gate 拒绝的 ``skipped``（用户关 ambient）
-    是产品行为不是失败，单独计数。成功率由调用方算
-    （delivered / (delivered+failed)）。"""
+    是产品行为不是失败，单独计数。``completed``（醒了、正常决策、只是没发
+    消息——sleep/纯动作）算成功：口径衡量「系统是否健康」，不是「醒了的里面
+    有多少真正送达」。成功率由调用方算
+    （(delivered+completed) / (delivered+completed+failed)）。"""
     day_limit = max(1, min(int(days or 30), 366))
     since = float(since_epoch or 0.0)
     screen_kinds = "('screen_watch','scene_change','screen_tick','broadcast_opened','heartbeat_broadcast_on')"
@@ -841,6 +843,8 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
                        (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
                                           AND status IN ('posted','delivered')))::int AS delivered,
                        (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
+                                          AND status = 'completed'))::int AS completed,
+                       (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
                                           AND status = 'failed'))::int AS failed,
                        (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
                                           AND status = 'skipped'))::int AS skipped,
@@ -862,9 +866,9 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
             ).fetchall()
         return [
             {
-                "day": r[0], "jobs": r[1], "delivered": r[2], "failed": r[3],
-                "skipped": r[4], "pending": r[5], "maintenance": r[6],
-                "maintenance_failed": r[7], "screen": r[8], "heartbeat": r[9],
+                "day": r[0], "jobs": r[1], "delivered": r[2], "completed": r[3],
+                "failed": r[4], "skipped": r[5], "pending": r[6], "maintenance": r[7],
+                "maintenance_failed": r[8], "screen": r[9], "heartbeat": r[10],
             }
             for r in rows
         ]
