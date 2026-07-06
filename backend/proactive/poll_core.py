@@ -122,6 +122,7 @@ def _resident_wake_control_decision_v2(store, job: dict):
         event = wake_event_v2_from_legacy_job(store.user_id, job)
         return evaluate_wake_control_v2(
             event.source,
+            trigger=event.trigger,
             manual=event.manual,
             settings=_settings_v2_for_store(store),
         )

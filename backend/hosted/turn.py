@@ -1467,6 +1467,8 @@ def _run_model_api_memory_repair_job(
 def _model_api_recap_due(store: UserStore, turn_count: int) -> tuple[bool, str]:
     if turn_count <= 0 or turn_count % MODEL_API_CONSOLIDATE_TURN_INTERVAL != 0:
         return False, f"cadence:{MODEL_API_CONSOLIDATE_TURN_INTERVAL}"
+    if not _model_api_capture_enabled(store):
+        return False, "capture_disabled"
     with _model_api_recap_active_lock:
         if store.user_id in _model_api_recap_active_users:
             return False, "recap_already_running"
@@ -1479,6 +1481,13 @@ def _model_api_recap_due(store: UserStore, turn_count: int) -> tuple[bool, str]:
         if elapsed < MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC:
             return False, f"min_interval:{MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC}"
     return True, "recap_due"
+
+
+def _model_api_capture_enabled(store: UserStore) -> bool:
+    try:
+        return bool(store.load_proactive_settings().get("capture_enabled", True))
+    except Exception:
+        return True
 
 
 def _model_api_patch_recap_job(store: UserStore, job_id: str, patch: dict, *, only_if_status: str | None = None) -> dict | None:
@@ -1680,6 +1689,13 @@ def _model_api_maybe_run_memory_capture(
     run_sync: bool = False,
 ) -> dict:
     turn_count = _model_api_turn_count(store)
+    if not _model_api_capture_enabled(store):
+        return {
+            "status": "skipped",
+            "reason": "capture_disabled",
+            "turn_count": turn_count,
+            "actions_written": 0,
+        }
     has_state_write = any(
         str(effect.get("action") or "").startswith(("identity.", "memory."))
         or str(effect.get("type") or "").startswith(("identity_", "memory_"))

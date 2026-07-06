@@ -258,9 +258,18 @@ def handle_device_event(store, event: Mapping[str, Any]) -> dict[str, Any]:
     return _enqueue_window(store, trigger=trigger, now=_safe_float(event.get("ts"), time.time()))
 
 
+def _capture_enabled(store) -> bool:
+    try:
+        return bool(store.load_proactive_settings().get("capture_enabled", True))
+    except Exception:
+        return True
+
+
 def tick_quiet_capture(store, *, now: float | None = None) -> dict[str, Any]:
     now_ts = time.time() if now is None else float(now)
     state = refresh_capture_state_from_chat(store, now=now_ts)
+    if not _capture_enabled(store):
+        return {"enqueued": False, "reason": "capture_disabled", "state": state, "job": None}
     until_id = str(state.get("last_seen_message_id") or "")
     if not until_id or int(state.get("message_count") or 0) <= 0:
         return {"enqueued": False, "reason": "no_new_messages", "state": state, "job": None}

@@ -199,9 +199,18 @@ def dream_key_for_snapshot(state: Mapping[str, Any], snapshot: Mapping[str, Any]
     return "dream:" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
+def _dream_enabled(store) -> bool:
+    try:
+        return bool(store.load_proactive_settings().get("dream_enabled", True))
+    except Exception:
+        return True
+
+
 def tick_memory_dream(store, *, now: float | None = None, force: bool = False) -> dict[str, Any]:
     now_ts = time.time() if now is None else float(now)
     state = load_dream_state(store)
+    if not _dream_enabled(store):
+        return {"enqueued": False, "reason": "dream_disabled", "state": state, "job": None, "snapshot": {}}
     snapshot = _dream_snapshot(store)
     card_count = int(snapshot.get("card_count") or 0)
     if card_count <= 0:

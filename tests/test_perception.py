@@ -757,13 +757,13 @@ def test_app_settings_failure_does_not_block_wake(env, monkeypatch):
     assert len(wakes) == 1
 
 
-def test_photo_suppressed_when_ambient_disabled(env, monkeypatch):
-    """Ambient off blocks self-initiated photo wakes; Delivery/DND does not."""
+def test_photo_suppressed_when_photo_wake_disabled(env, monkeypatch):
+    """Photo wake off blocks self-initiated photo wakes; ambient no longer does."""
     fake, wakes = env
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
                         lambda user_or_store: True)
     monkeypatch.setattr(service, "_settings_v2_for_user",
-                        lambda uid: {"switches": {"ambient": False}})
+                        lambda uid: {"switches": {"photo_wake_enabled": False}})
     uid = "u_photo_dnd"
     out, code = service.photo_evaluate(
         uid, {"scene_hint": "food"}, {"id": "p_dnd", "body_ct": "cipher"})
@@ -773,7 +773,7 @@ def test_photo_suppressed_when_ambient_disabled(env, monkeypatch):
     suppressed = [e for e in events
                   if e.get("cap") == "runtime_v2" and e.get("type") == "suppressed"]
     assert len(suppressed) == 1
-    assert suppressed[0]["reason"] == "ambient_disabled"
+    assert suppressed[0]["reason"] == "photo_wake_disabled"
     assert suppressed[0]["origin_refs"] == ["photo:p_dnd"]
     assert not any(e.get("cap") == "runtime_v2" and e.get("type") == "wake"
                    for e in events)

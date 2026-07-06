@@ -21,6 +21,7 @@ from proactive import resident_runtime_v2 as proactive_resident_runtime_v2  # no
 from perception import service as perception_service  # noqa: E402
 from proactive import poll_core as proactive_poll_core  # noqa: E402
 from push import apns as push_apns  # noqa: E402
+from hosted import turn as hosted_turn  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import reqctx  # noqa: E402
 
@@ -29,6 +30,32 @@ from conftest import seed_user  # noqa: E402
 
 def _mark_proactive_activated(user_id: str) -> None:
     appmod.get_store(user_id).mark_first_chat_ok(at_iso="2026-07-03T00:00:00")
+
+
+AUTONOMY_SWITCH_FIELDS = (
+    "dream_enabled",
+    "capture_enabled",
+    "screen_watch_enabled",
+    "photo_wake_enabled",
+    "arrival_wake_enabled",
+    "unlock_wake_enabled",
+)
+
+
+def _v2_switches(**overrides):
+    doc = {
+        "ambient": True,
+        "scheduled": True,
+        "reminders_delivery": True,
+        "dream_enabled": True,
+        "capture_enabled": True,
+        "screen_watch_enabled": True,
+        "photo_wake_enabled": True,
+        "arrival_wake_enabled": True,
+        "unlock_wake_enabled": True,
+    }
+    doc.update(overrides)
+    return doc
 
 
 def _patch_resident_scheduled_route_dependencies(monkeypatch):
@@ -497,15 +524,58 @@ def test_proactive_state_three_switch_contract_drives_v2_scheduled_gate(tmp_path
     assert settings["dnd"] is True
 
     resolved = resolve_settings_v2(settings)
-    assert resolved.switches() == {
-        "ambient": False,
-        "scheduled": False,
-        "reminders_delivery": False,
-    }
+    assert resolved.switches() == _v2_switches(
+        ambient=False,
+        scheduled=False,
+        reminders_delivery=False,
+    )
     decision = evaluate_wake_control_v2("scheduled_wake", settings=resolved)
     assert decision.accepted is False
     assert decision.reason == "scheduled_disabled"
     assert decision.transparency_required is True
+
+
+def test_proactive_state_autonomy_switches_default_patch_and_legacy_true(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_autonomy_switch_key"
+    user_id = "usr_endpoint_proactive_autonomy_switch"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    default_state = client.get("/v1/proactive/state", headers=headers)
+    assert default_state.status_code == 200
+    body = default_state.get_json()
+    for key in AUTONOMY_SWITCH_FIELDS:
+        assert body[key] is True
+        assert appmod.get_store(user_id).load_proactive_settings()[key] is True
+
+    off_payload = {key: False for key in AUTONOMY_SWITCH_FIELDS}
+    off = client.post("/v1/proactive/state", headers=headers, json=off_payload)
+    assert off.status_code == 200
+    off_body = off.get_json()
+    settings = appmod.get_store(user_id).load_proactive_settings()
+    for key in AUTONOMY_SWITCH_FIELDS:
+        assert off_body[key] is False
+        assert settings[key] is False
+
+    on_payload = {key: True for key in AUTONOMY_SWITCH_FIELDS}
+    on = client.post("/v1/proactive/state", headers=headers, json=on_payload)
+    assert on.status_code == 200
+    for key in AUTONOMY_SWITCH_FIELDS:
+        assert on.get_json()[key] is True
+
+    appmod.db.set_blob(user_id, "proactive_settings", {"enabled": False})
+    legacy = client.get("/v1/proactive/state", headers=headers)
+    assert legacy.status_code == 200
+    legacy_body = legacy.get_json()
+    assert legacy_body["ambient"] is False
+    for key in AUTONOMY_SWITCH_FIELDS:
+        assert legacy_body[key] is True
 
 
 def test_proactive_tick_response_includes_wake_interval_sec(tmp_path, monkeypatch):
@@ -1137,6 +1207,7 @@ def test_resident_poll_applies_v2_wake_controls_to_legacy_jobs(tmp_path, monkeyp
         "ambient": False,
         "scheduled": False,
         "reminders_delivery": False,
+        "photo_wake_enabled": False,
     })
     store.append_proactive_job({
         "job_id": "pj_photo",
@@ -1169,7 +1240,7 @@ def test_resident_poll_applies_v2_wake_controls_to_legacy_jobs(tmp_path, monkeyp
     assert [job["job_id"] for job in body["jobs"]] == ["pj_manual"]
     rows = {row["job_id"]: row for row in store.list_proactive_jobs(since_epoch=0, limit=0)}
     assert rows["pj_photo"]["status"] == "skipped"
-    assert rows["pj_photo"]["status_reason"] == "ambient_disabled"
+    assert rows["pj_photo"]["status_reason"] == "photo_wake_disabled"
     assert rows["pj_scheduled"]["status"] == "skipped"
     assert rows["pj_scheduled"]["status_reason"] == "scheduled_disabled"
     assert rows["pj_manual"]["status"] == "pending"
@@ -1585,6 +1656,30 @@ def test_dream_tick_threshold_single_flight_and_ambient_off_poll(tmp_path, monke
     assert poll.get_json()["jobs"][0]["source"] == "memory_dream"
 
 
+def test_dream_tick_respects_dream_enabled_switch(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    user_id = "usr_dream_enabled_switch"
+    seed_user(user_id)
+    store = appmod.UserStore(user_id)
+    appmod.db.memory_replace_all(user_id, [_dream_test_memory(user_id, "mem_switch")])
+
+    store.save_proactive_settings({"dream_enabled": False})
+    disabled = proactive_dream_scheduler.tick_memory_dream(store, now=1000.0)
+    assert disabled["enqueued"] is False
+    assert disabled["reason"] == "dream_disabled"
+    assert _memory_dream_jobs(store) == []
+
+    store.save_proactive_settings({"dream_enabled": True})
+    enabled = proactive_dream_scheduler.tick_memory_dream(store, now=1001.0)
+    assert enabled["enqueued"] is True
+    assert enabled["job"]["job_kind"] == "memory_dream"
+
+
 def test_dream_enqueue_idempotent_by_key_and_single_flight(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_dream_idempotent")
@@ -1766,6 +1861,65 @@ def test_capture_turn_backstop_enqueues_only_when_due(tmp_path, monkeypatch):
     assert jobs[0]["trigger"] == "turn_backstop"
     assert jobs[0]["window"]["until_message_id"] == "msg_turn_2"
     assert jobs[0]["window"]["message_count"] == 2
+
+
+def test_quiet_capture_respects_capture_enabled_switch(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "0")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    user_id = "usr_capture_enabled_switch"
+    seed_user(user_id)
+    store = appmod.UserStore(user_id)
+    msg = store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_capture_switch"))
+
+    store.save_proactive_settings({"capture_enabled": False})
+    disabled = proactive_capture_scheduler.tick_quiet_capture(store, now=float(msg["ts"]) + 1.0)
+    assert disabled["enqueued"] is False
+    assert disabled["reason"] == "capture_disabled"
+    assert _memory_capture_jobs(store) == []
+
+    store.save_proactive_settings({"capture_enabled": True})
+    enabled = proactive_capture_scheduler.tick_quiet_capture(store, now=float(msg["ts"]) + 2.0)
+    assert enabled["enqueued"] is True
+    assert enabled["job"]["job_kind"] == "memory_capture"
+
+
+def test_model_api_capture_and_recap_respect_capture_enabled_switch(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    user_id = "usr_model_api_capture_enabled_switch"
+    seed_user(user_id)
+    store = appmod.UserStore(user_id)
+    store.save_proactive_settings({"capture_enabled": False})
+    monkeypatch.setattr(
+        hosted_turn,
+        "_model_api_turn_count",
+        lambda _store: hosted_turn.MODEL_API_CAPTURE_TURN_INTERVAL,
+    )
+
+    capture = hosted_turn._model_api_maybe_run_memory_capture(
+        store,
+        api_key=None,
+        runtime=None,
+        user_message="hello",
+        assistant_reply="hi",
+        user_message_id="msg_user",
+        assistant_message_id="msg_assistant",
+        context_payload={},
+        effects=[],
+    )
+    recap_due, recap_reason = hosted_turn._model_api_recap_due(
+        store,
+        hosted_turn.MODEL_API_CONSOLIDATE_TURN_INTERVAL,
+    )
+
+    assert capture["status"] == "skipped"
+    assert capture["reason"] == "capture_disabled"
+    assert recap_due is False
+    assert recap_reason == "capture_disabled"
 
 
 def test_capture_device_boundary_ignores_proactive_switches(tmp_path, monkeypatch):

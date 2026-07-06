@@ -26,6 +26,22 @@ from proactive.runtime_v2 import (
 from proactive.tool_catalog_v2 import FAST, SLOW, default_tool_catalog_v2
 
 
+def _switches(**overrides):
+    doc = {
+        "ambient": True,
+        "scheduled": True,
+        "reminders_delivery": True,
+        "dream_enabled": True,
+        "capture_enabled": True,
+        "screen_watch_enabled": True,
+        "photo_wake_enabled": True,
+        "arrival_wake_enabled": True,
+        "unlock_wake_enabled": True,
+    }
+    doc.update(overrides)
+    return doc
+
+
 def test_wake_inbox_merges_nearby_wakes_and_dedupes_same_trigger():
     spine = RuntimeSpineV2(merge_window_sec=2.0)
     spine.submit(WakeEventV2(user_id="u1", source="heartbeat", trigger="heartbeat", created_at=100.0))
@@ -89,11 +105,7 @@ def test_background_result_is_context_not_direct_chat_write():
     assert turn_context["background_payloads"] == [
         {"tool": "perception.calendar", "result": {"events": 2}}
     ]
-    assert turn_context["switches"] == {
-        "ambient": True,
-        "scheduled": True,
-        "reminders_delivery": True,
-    }
+    assert turn_context["switches"] == _switches()
 
 
 def test_v2_settings_compatibility_maps_old_fields_without_resurrecting_old_gates():
@@ -104,11 +116,7 @@ def test_v2_settings_compatibility_maps_old_fields_without_resurrecting_old_gate
         "ai_state": "waiting",
     })
 
-    assert settings.switches() == {
-        "ambient": False,
-        "scheduled": True,
-        "reminders_delivery": False,
-    }
+    assert settings.switches() == _switches(ambient=False, reminders_delivery=False)
     doc = settings_v2_to_doc(settings)
     assert doc["switches"] == settings.switches()
     assert "enabled" not in doc
@@ -117,16 +125,44 @@ def test_v2_settings_compatibility_maps_old_fields_without_resurrecting_old_gate
     assert "ai_state" not in doc
 
 
-def test_ambient_off_blocks_only_self_initiated_wake_sources():
+def test_ambient_off_blocks_only_heartbeat_wake_sources():
     settings = resolve_settings_v2({"switches": {"ambient": False}})
-    for source in ("heartbeat", "perception_event", "scene_change"):
-        decision = evaluate_wake_control_v2(source, settings=settings)
-        assert decision.accepted is False
-        assert decision.reason == "ambient_disabled"
+    decision = evaluate_wake_control_v2("heartbeat", trigger="heartbeat_broadcast_off", settings=settings)
+    assert decision.accepted is False
+    assert decision.reason == "ambient_disabled"
 
-    for source in ("user_message", "scheduled_wake", "background_result"):
-        decision = evaluate_wake_control_v2(source, settings=settings)
+    for source, trigger in (
+        ("perception_event", "photo_added"),
+        ("perception_event", "arrived_at_anchor"),
+        ("perception_event", "unlock_after_absence"),
+        ("scene_change", "screen_watch"),
+        ("user_message", "user_message"),
+        ("scheduled_wake", "scheduled_wake"),
+        ("background_result", "background_result"),
+    ):
+        decision = evaluate_wake_control_v2(source, trigger=trigger, settings=settings)
         assert decision.accepted is True
+
+
+def test_event_wake_switches_gate_only_matching_trigger_and_manual_bypasses():
+    cases = [
+        ("photo_wake_enabled", "perception_event", "photo_added", "photo_wake_disabled"),
+        ("arrival_wake_enabled", "perception_event", "arrived_at_anchor", "arrival_wake_disabled"),
+        ("unlock_wake_enabled", "perception_event", "unlock_after_absence", "unlock_wake_disabled"),
+        ("screen_watch_enabled", "scene_change", "screen_watch", "screen_watch_disabled"),
+        ("screen_watch_enabled", "scene_change", "scene_change", "screen_watch_disabled"),
+    ]
+    for switch, source, trigger, reason in cases:
+        settings = resolve_settings_v2({"switches": {switch: False}})
+        blocked = evaluate_wake_control_v2(source, trigger=trigger, settings=settings)
+        manual = evaluate_wake_control_v2(source, trigger=trigger, manual=True, settings=settings)
+        heartbeat = evaluate_wake_control_v2("heartbeat", trigger="heartbeat_broadcast_off", settings=settings)
+
+        assert blocked.accepted is False, switch
+        assert blocked.reason == reason
+        assert manual.accepted is True
+        assert manual.reason == "manual_bypass"
+        assert heartbeat.accepted is True
 
 
 def test_runtime_submit_applies_ambient_gate_without_suppressing_scheduled_or_background():
@@ -145,11 +181,7 @@ def test_runtime_submit_applies_ambient_gate_without_suppressing_scheduled_or_ba
     assert ctx is not None
     assert ctx.trigger == "scheduled_wake"
     assert ctx.merged_triggers == ("background_result",)
-    assert ctx.switches == {
-        "ambient": False,
-        "scheduled": True,
-        "reminders_delivery": True,
-    }
+    assert ctx.switches == _switches(ambient=False)
 
 
 def test_runtime_settings_resolver_failure_falls_back_to_default_switches():
@@ -163,11 +195,7 @@ def test_runtime_settings_resolver_failure_falls_back_to_default_switches():
 
     assert submit.accepted is True
     assert ctx is not None
-    assert ctx.switches == {
-        "ambient": True,
-        "scheduled": True,
-        "reminders_delivery": True,
-    }
+    assert ctx.switches == _switches()
 
 
 def test_runtime_submit_carries_settings_timezone_into_merged_context():

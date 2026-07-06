@@ -445,7 +445,12 @@ class RuntimeSpineV2:
 
     def submit(self, event: WakeEventV2) -> WakeControlDecisionV2:
         settings = self._settings_for_event(event)
-        decision = evaluate_wake_control_v2(event.source, manual=event.manual, settings=settings)
+        decision = evaluate_wake_control_v2(
+            event.source,
+            trigger=event.trigger,
+            manual=event.manual,
+            settings=settings,
+        )
         record_metric_v2(
             self.metrics_sink,
             user_id=event.user_id,

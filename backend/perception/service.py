@@ -626,7 +626,12 @@ def _submit_wake_event_v2_compat(event) -> None:
     from proactive.controls_v2 import evaluate_wake_control_v2  # lazy
 
     settings = _settings_v2_for_user(event.user_id)
-    decision = evaluate_wake_control_v2(event.source, manual=event.manual, settings=settings)
+    decision = evaluate_wake_control_v2(
+        event.source,
+        trigger=event.trigger,
+        manual=event.manual,
+        settings=settings,
+    )
     now = float(event.created_at or _now())
     if not event.manual and not _proactive_activation_ready(event.user_id):
         store.append_event(event.user_id, {

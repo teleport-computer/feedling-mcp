@@ -51,6 +51,12 @@ def _proactive_state_doc(settings: dict) -> dict:
         "wake_interval_sec": core_store.normalize_proactive_wake_interval_sec(
             settings.get("wake_interval_sec")
         ),
+        "dream_enabled": bool(settings.get("dream_enabled", True)),
+        "capture_enabled": bool(settings.get("capture_enabled", True)),
+        "screen_watch_enabled": bool(settings.get("screen_watch_enabled", True)),
+        "photo_wake_enabled": bool(settings.get("photo_wake_enabled", True)),
+        "arrival_wake_enabled": bool(settings.get("arrival_wake_enabled", True)),
+        "unlock_wake_enabled": bool(settings.get("unlock_wake_enabled", True)),
         "updated_at": settings.get("updated_at", ""),
     }
 
@@ -81,6 +87,12 @@ def state_save(store, payload: dict) -> dict:
             "scheduled",
             "reminders_delivery",
             "wake_interval_sec",
+            "dream_enabled",
+            "capture_enabled",
+            "screen_watch_enabled",
+            "photo_wake_enabled",
+            "arrival_wake_enabled",
+            "unlock_wake_enabled",
         )
         if key in payload
     })

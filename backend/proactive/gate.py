@@ -189,6 +189,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         wake_source = source_for_legacy_trigger_v2(trigger, manual=manual)
         wake_control = evaluate_wake_control_v2(
             wake_source,
+            trigger=trigger,
             manual=manual,
             settings=resolve_settings_v2(settings),
         )

@@ -201,7 +201,10 @@ def test_state_get_parity(env):
     assert _norm(f[1]) == _norm(a[1])
     assert set(f[1]) == {"version", "enabled", "dnd", "ambient", "scheduled",
                          "reminders_delivery", "user_state", "manual_user_state",
-                         "ai_state", "broadcast_state", "wake_interval_sec", "updated_at"}
+                         "ai_state", "broadcast_state", "wake_interval_sec",
+                         "dream_enabled", "capture_enabled", "screen_watch_enabled",
+                         "photo_wake_enabled", "arrival_wake_enabled",
+                         "unlock_wake_enabled", "updated_at"}
 
 
 def test_state_post_three_switch_parity(env):

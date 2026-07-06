@@ -554,6 +554,12 @@ class UserStore:
             # preference.
             "wake_directive": "",
             "wake_interval_sec": PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC,
+            "dream_enabled": True,
+            "capture_enabled": True,
+            "screen_watch_enabled": True,
+            "photo_wake_enabled": True,
+            "arrival_wake_enabled": True,
+            "unlock_wake_enabled": True,
             "first_chat_ok_at": "",
             "updated_at": datetime.now().isoformat(),
         }
@@ -576,6 +582,15 @@ class UserStore:
                 merged["wake_interval_sec"] = normalize_proactive_wake_interval_sec(
                     merged.get("wake_interval_sec")
                 )
+                for key in (
+                    "dream_enabled",
+                    "capture_enabled",
+                    "screen_watch_enabled",
+                    "photo_wake_enabled",
+                    "arrival_wake_enabled",
+                    "unlock_wake_enabled",
+                ):
+                    merged[key] = bool(merged.get(key, True))
                 return merged
         except Exception as e:
             print(f"[{self.user_id}/proactive] settings load failed: {e}")
@@ -596,6 +611,12 @@ class UserStore:
             "broadcast_state",
             "wake_directive",
             "wake_interval_sec",
+            "dream_enabled",
+            "capture_enabled",
+            "screen_watch_enabled",
+            "photo_wake_enabled",
+            "arrival_wake_enabled",
+            "unlock_wake_enabled",
         }
         patch_doc = dict(patch or {})
         if "ambient" in patch_doc:
@@ -606,7 +627,17 @@ class UserStore:
         for key, value in patch_doc.items():
             if key not in allowed:
                 continue
-            if key in {"enabled", "dnd", "scheduled"}:
+            if key in {
+                "enabled",
+                "dnd",
+                "scheduled",
+                "dream_enabled",
+                "capture_enabled",
+                "screen_watch_enabled",
+                "photo_wake_enabled",
+                "arrival_wake_enabled",
+                "unlock_wake_enabled",
+            }:
                 cur[key] = bool(value)
             elif key == "ambient":
                 cur["enabled"] = bool(value)

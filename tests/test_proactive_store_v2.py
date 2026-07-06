@@ -35,6 +35,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _switches(**overrides):
+    doc = {
+        "ambient": True,
+        "scheduled": True,
+        "reminders_delivery": True,
+        "dream_enabled": True,
+        "capture_enabled": True,
+        "screen_watch_enabled": True,
+        "photo_wake_enabled": True,
+        "arrival_wake_enabled": True,
+        "unlock_wake_enabled": True,
+    }
+    doc.update(overrides)
+    return doc
+
+
 def _uid() -> str:
     return "usr_v2_" + uuid.uuid4().hex[:12]
 
@@ -274,16 +290,8 @@ def test_db_settings_store_uses_v2_shape_with_legacy_fallback():
     saved = settings_store.save(uid, {"switches": {"ambient": True, "scheduled": False}})
     doc = db.get_blob(uid, SETTINGS_KIND_V2)
 
-    assert fallback.switches() == {
-        "ambient": False,
-        "scheduled": True,
-        "reminders_delivery": False,
-    }
-    assert saved.switches() == {
-        "ambient": True,
-        "scheduled": False,
-        "reminders_delivery": False,
-    }
+    assert fallback.switches() == _switches(ambient=False, reminders_delivery=False)
+    assert saved.switches() == _switches(scheduled=False, reminders_delivery=False)
     assert doc["kind"] == SETTINGS_KIND_V2
     assert doc["switches"] == saved.switches()
     assert "enabled" not in doc

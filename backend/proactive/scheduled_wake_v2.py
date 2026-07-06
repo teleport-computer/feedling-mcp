@@ -662,7 +662,7 @@ class ScheduledWakeServiceV2:
             if claimed is None:
                 continue
             event = self._wake_event_from_record(claimed, now=now)
-            decision = evaluate_wake_control_v2(event.source, settings=resolved)
+            decision = evaluate_wake_control_v2(event.source, trigger=event.trigger, settings=resolved)
             if decision.accepted:
                 submitted = submit_wake(event)
                 if getattr(submitted, "accepted", True):
