@@ -867,3 +867,16 @@ def test_update_identity_plaintext_requires_existing_identity(monkeypatch):
 
     assert resp.status_code == 409
     assert resp.get_json()["error"] == "identity_not_initialized"
+
+
+def test_foreground_history_chunks_capped_support_untouched(monkeypatch):
+    monkeypatch.setenv("FEEDLING_GENESIS_FG_HISTORY_CAP", "8")
+    groups = [
+        {"source_family": "history", "chunk_texts": [f"h{i}" for i in range(27)]},
+        {"source_family": "ai_persona", "chunk_texts": ["persona-card"]},
+    ]
+    capped = plaintext._cap_foreground_history_chunks(groups)
+    hist = next(g for g in capped if g["source_family"] == "history")
+    persona = next(g for g in capped if g["source_family"] == "ai_persona")
+    assert len(hist["chunk_texts"]) == 8          # history 采样到 8
+    assert len(persona["chunk_texts"]) == 1        # 小桶不动

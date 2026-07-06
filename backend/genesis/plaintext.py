@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -149,6 +150,29 @@ def _plaintext_source_groups(analysis_messages: list[dict], *, window_limit: int
             "message_count": len(messages),
         })
     return groups
+
+
+def _foreground_history_cap() -> int:
+    try:
+        return max(1, int(os.environ.get("FEEDLING_GENESIS_FG_HISTORY_CAP", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _cap_foreground_history_chunks(source_groups: list[dict]) -> list[dict]:
+    """前台用:只对 history 桶采样到 cap(_select_evenly);其它桶(人物卡/档案/长期记忆)全读。
+    被砍的 history 块由后台补全,不影响身份(名字来自人物卡,全读)。"""
+    cap = _foreground_history_cap()
+    out: list[dict] = []
+    for g in source_groups:
+        if str(g.get("source_family") or "") == "history":
+            chunks = list(g.get("chunk_texts") or [])
+            if len(chunks) > cap:
+                chunks = history_import._select_evenly(chunks, cap)
+            out.append({**g, "chunk_texts": chunks})
+        else:
+            out.append(g)
+    return out
 
 
 def _plaintext_timeline_span_days(messages: list[dict]) -> int:
@@ -597,12 +621,19 @@ def _run_plaintext_genesis_v2(
     Returns True when it handled the job. Returns False only when there's nothing to work
     with (no core), so the caller runs the v1 full path instead.
     """
+    # Foreground only: cap the history bucket to a small, evenly-sampled window so large
+    # imports stay fast (support buckets — ai_persona/user_profile/memory_summary — are
+    # never sampled here, since identity/name lives in the character card). `source_groups`
+    # itself is left untouched — background enrichment below still consumes the full,
+    # un-sampled groups so the dropped history chunks get fully processed there.
+    fg_source_groups = _cap_foreground_history_chunks(source_groups)
+
     # primary group: prefer the real chat history (best greeting signal), else the first
     fg_group = next(
-        (g for g in source_groups if str(g.get("source_family") or "") == "history"),
-        source_groups[0],
+        (g for g in fg_source_groups if str(g.get("source_family") or "") == "history"),
+        fg_source_groups[0],
     )
-    fg_idx = source_groups.index(fg_group) + 1
+    fg_idx = fg_source_groups.index(fg_group) + 1
     fg_kind = str(fg_group.get("source_kind") or history_import._HISTORY_SOURCE)
     fg_family = str(fg_group.get("source_family") or worker._source_family(fg_kind))
 
@@ -615,7 +646,7 @@ def _run_plaintext_genesis_v2(
     primary_reduce: dict | None = None
     voice_candidates: list[dict] = []
     persona_material_parts: list[str] = []
-    for idx, group in enumerate(source_groups, start=1):
+    for idx, group in enumerate(fg_source_groups, start=1):
         group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
         group_family = str(group.get("source_family") or worker._source_family(group_kind))
         group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
