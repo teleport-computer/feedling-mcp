@@ -49,7 +49,6 @@
 
 ## 2026-07-04
 
-<<<<<<< Updated upstream
 ### [DONE] enclave Flask→FastAPI/asyncio 迁移，全仓 flask 依赖清零
 
 `backend/enclave_app.py`（2333 行 Flask 单文件，全仓最后一个 flask 使用方）
@@ -108,8 +107,6 @@
   是本次设计的 spec 源文档。本条目工作树未 commit（worktree
   `enclave-asgi-migration`，基于 test 分支），由用户在验收后提交。
 
-### [DONE] 自定义陪伴频率 wake_interval_sec + 心跳激活门（三层，已 ship）
-=======
 ### [DONE] 丢回合重投递兜底：consumer respawn 窗口不再永久丢用户消息（未 commit / 未部署）
 
 - **背景**：prod ASGI 切换当日全量巡检发现 3 条 model_api 用户消息永久无回复。根因不在
@@ -140,9 +137,14 @@
   且拉取量 `_poll_decrypt_limit` 按批次放大（2×批次+20，下限 50）保证整批可解密。
 - 测试：`tests/test_chat_poll_redelivery.py`（16 项，含 supersede/窗口/TTL/排序/陈旧缓存
   ×2/预算滚动×2 语义）+ `tests/test_consumer_decrypt_since.py`（6 项）；全量回归通过。
+- CI 适配：`tests/test_api.py` 长轮询超时用例原本留着未回复的用户消息（第 3/5/6 节的
+  openclaw 回复不带 `reply_to_message_id`）——兜底生效后这些消息被立即重投、poll 不再
+  park（CI #687 三红）。改为真实 consumer 行为（回复都挂 reply_to），本地按 CI 同款
+  方式起服务全量验证通过。
 - 部署注意：backend 镜像 + runner 镜像都要更新（consumer 走自身 self-update 亦可）；
   乱序回复不可能出现——重投只发生在「其后无任何已回复消息」的尾巴上。
->>>>>>> Stashed changes
+
+### [DONE] 自定义陪伴频率 wake_interval_sec + 心跳激活门（三层，已 ship）
 
 两件事一起落地（Seven 主导）。**① 自定义陪伴频率**:用户在设置页选「陪伴频率」7 档
 (15min–12h,**默认 2h**),per-user `wake_interval_sec`(clamp `[900,43200]`),consumer 即时

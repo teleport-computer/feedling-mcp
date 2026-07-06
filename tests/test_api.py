@@ -362,7 +362,11 @@ r = requests.post(f"{BASE_URL}/v1/chat/response",
 check("POST plaintext /v1/chat/response → 400", r.status_code == 400)
 
 reply_env = make_envelope(USER_ID)
-r = requests.post(f"{BASE_URL}/v1/chat/response", json={"envelope": reply_env}, timeout=5)
+# Reply WITH reply_to_message_id, like a real consumer: it marks the section-2
+# user message replied. Leaving it unanswered would trip the lost-turn
+# redelivery backstop and make section 4's timeout poll return it instantly.
+r = requests.post(f"{BASE_URL}/v1/chat/response",
+                  json={"envelope": reply_env, "reply_to_message_id": msg_id}, timeout=5)
 check("POST v1 envelope /v1/chat/response → 200", r.status_code == 200)
 reply_id = r.json().get("id") if r.status_code == 200 else None
 check("envelope response has id", bool(reply_id))
@@ -439,6 +443,14 @@ else:
     check("wake envelope is in poll response",
           any(m.get("id") == wake_id for m in msgs))
 
+# Answer the wake message so it doesn't linger unanswered: the redelivery
+# backstop would hand it straight to section 6's poll, short-circuiting the
+# wake it means to test.
+if wake_id:
+    requests.post(f"{BASE_URL}/v1/chat/response",
+                  json={"envelope": make_envelope(USER_ID), "reply_to_message_id": wake_id},
+                  timeout=5)
+
 # ---------------------------------------------------------------------------
 # 6. Full round-trip: user envelope → poll wakes → openclaw envelope → history
 # ---------------------------------------------------------------------------
@@ -461,7 +473,12 @@ def poll_and_reply():
         else:
             poll_rt["err"] = f"HTTP {r.status_code}: {r.text[:80]}"
             return
-        rr = requests.post(f"{BASE_URL}/v1/chat/response", json={"envelope": oc_env}, timeout=5)
+        # Reply to the polled message like a real consumer (marks it replied,
+        # keeping the transcript free of unanswered turns the redelivery
+        # backstop would resurrect in later polls).
+        polled = (poll_rt["poll_body"].get("messages") or [{}])[0].get("id")
+        rr = requests.post(f"{BASE_URL}/v1/chat/response",
+                           json={"envelope": oc_env, "reply_to_message_id": polled}, timeout=5)
         poll_rt["reply_status"] = rr.status_code
         if rr.status_code == 200:
             poll_rt["reply_id"] = rr.json().get("id")
