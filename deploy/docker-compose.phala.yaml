@@ -166,11 +166,11 @@ services:
       FEEDLING_WS_PORT: "9998"
       # ASGI backend: start the per-worker background services (the :9998 WS
       # ingest server, bound by ONE leader-elected worker via core/leader.py, +
-      # the cross-worker wake bus). Default is OFF (asgi/settings.py) so the dev
-      # A/B parallel instance (:5005) does not contend for WS leadership; a REAL
-      # deploy MUST turn it on or the iOS broadcast-extension frame ingest on
-      # :9998 never binds (pre-ASGI app.py started it unconditionally). Changing
-      # this literal alters compose_hash → re-publish on-chain. See asgi/lifespan.py.
+      # the cross-worker wake bus). Default is OFF (asgi/settings.py) so ad-hoc
+      # dev instances never contend for WS leadership; a REAL deploy MUST turn
+      # it on or the iOS broadcast-extension frame ingest on :9998 never binds.
+      # Changing this literal alters compose_hash → re-publish on-chain.
+      # See asgi/lifespan.py.
       FEEDLING_ASGI_BACKGROUND: "true"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       # External Postgres holding all (E2E-encrypted) user data + plaintext

@@ -4,7 +4,6 @@ websockets>=12.0
 httpx[http2]>=0.27.0
 PyJWT>=2.8.0
 cryptography>=42.0.0
-Pillow>=10.0.0
 
 # Production server (process manager) for both the backend and the enclave.
 # The dev server in app.run() (Werkzeug) is single-process and stalls on large

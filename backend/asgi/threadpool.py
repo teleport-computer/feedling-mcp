@@ -1,7 +1,7 @@
 """Bounded sync->thread bridge (ASGI-migration plan §5.2 / §7.2).
 
 `async def` routes must never call blocking sync code (sync `db.py`, boto3,
-Pillow, sync provider SDKs) directly — that pins the event loop. They hand it to
+sync provider SDKs) directly — that pins the event loop. They hand it to
 a bounded threadpool instead. anyio's default global thread limiter is only
 **40** tokens, well under the legacy 128-thread gunicorn worker, so a heavy
 route would be silently throttled; `configure_thread_limiter()` raises it in the

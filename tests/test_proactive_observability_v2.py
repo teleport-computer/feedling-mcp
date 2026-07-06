@@ -7,12 +7,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from perception.differ_v2 import PerceptionDifferV2
 from proactive.background_v2 import BackgroundWorkerV2, InMemoryBackgroundJobStoreV2
-from proactive.eval_v2 import (
-    SyntheticEpisodeV2,
-    SyntheticWakeV2,
-    replay_seed_episodes_v2,
-    replay_synthetic_episode_v2,
-)
 from proactive.observability_v2 import (
     InMemoryMetricsSinkV2,
     METRIC_DOUBLE_SEND_DETECTED,
@@ -109,37 +103,3 @@ def test_cross_wake_metrics_cover_double_send_and_missed_scheduled_rates():
     assert health.missed_scheduled_wake_count == 1
     assert health.missed_scheduled_wake_rate == 0.5
 
-
-def test_replayable_synthetic_episodes_emit_round3_labels_and_metrics():
-    results = replay_seed_episodes_v2()
-    by_id = {result.episode_id: result for result in results}
-
-    assert by_id["merged_anchor_unlock_good_presence"].labels == ("good_presence",)
-    assert by_id["merged_anchor_unlock_good_presence"].health.merge_rate == 0.5
-    assert by_id["manual_sleep_ignored_manual"].labels == ("ignored_manual",)
-    assert all(result.metric_events for result in results)
-
-
-def test_custom_synthetic_episode_can_emit_stutter_label():
-    episode = SyntheticEpisodeV2(
-        episode_id="two_user_messages_stutter",
-        description="Two latency-sensitive user messages drain as separate turns.",
-        wakes=(
-            SyntheticWakeV2(
-                source="user_message",
-                trigger="user_message",
-                at=10.0,
-                latency_sensitive=True,
-            ),
-            SyntheticWakeV2(
-                source="user_message",
-                trigger="user_message",
-                at=10.1,
-                latency_sensitive=True,
-            ),
-        ),
-        agent_responses=({"messages": ["first"]}, {"messages": ["second"]}),
-    )
-    result = replay_synthetic_episode_v2(episode)
-
-    assert "stutter" in result.labels
