@@ -1421,8 +1421,14 @@ def _data_track_debug_payload() -> dict:
     status_filter = (request.args.get("status") or "").strip().lower()
     trace_filter = (request.args.get("trace_id") or "").strip()
     reveal_key = (request.args.get("reveal") or "").strip()
-    mode = (request.args.get("mode") or "flat").strip().lower()
-    if mode not in {"flat", "timeline"}:
+    # Default to the readable per-turn timeline when drilling into one user (or a
+    # single trace); the flat event table stays the default for the firehose view.
+    raw_mode = (request.args.get("mode") or "").strip().lower()
+    if raw_mode in {"flat", "timeline"}:
+        mode = raw_mode
+    elif user_filter or trace_filter:
+        mode = "timeline"
+    else:
         mode = "flat"
     q = str(filters.get("q") or "").strip().lower()
     since_epoch = float(filters.get("since_epoch") or 0)
@@ -2053,6 +2059,46 @@ def _debug_time(ts) -> str:
     return datetime.fromtimestamp(value).strftime("%H:%M:%S") if value else "—"
 
 
+# type → (icon, 友好中文步骤名). Makes a turn read as a narrative instead of
+# raw event-type strings. Unknown types fall back to a subsystem-based label.
+_DEBUG_STEP_LABELS = {
+    "route.decided": ("🧭", "路由决策"),
+    "context.build": ("📎", "组装上下文"),
+    "agent.model.call.start": ("🧠", "调用模型 · 开始"),
+    "agent.model.call.done": ("🧠", "调用模型 · 完成"),
+    "agent.tool.call": ("🔧", "调用工具"),
+    "agent.reasoning": ("💭", "思考 / reasoning"),
+    "agent.reply": ("💬", "AI 回复"),
+    "chat.response": ("📤", "写入回复"),
+    "chat.poll.delivered": ("✅", "投递到客户端"),
+    "enclave.call.start": ("🔐", "飞地调用 · 开始"),
+    "enclave.call.done": ("🔐", "飞地调用 · 完成"),
+    "memory.capture.queued": ("🧩", "记忆抓取 · 入队"),
+    "memory.capture.done": ("🧩", "记忆抓取 · 完成"),
+}
+_DEBUG_SUBSYSTEM_FALLBACK = {
+    "route": ("🧭", "路由"), "context": ("📎", "上下文"), "agent": ("🤖", "Agent"),
+    "memory": ("🧩", "记忆"), "genesis": ("🌱", "入驻蒸馏"), "enclave": ("🔐", "飞地"),
+    "chat": ("💬", "聊天"), "debug_trace": ("🔎", "trace"),
+}
+
+
+def _debug_friendly_step(ev: dict) -> tuple[str, str]:
+    typ = str(ev.get("type") or "")
+    # tool-call carries the tool name in detail.tool → surface it (before the map,
+    # which only has the generic "调用工具" label).
+    if typ == "agent.tool.call":
+        tool = str((ev.get("detail") or {}).get("tool") or "")
+        return ("🔧", f"调用工具 · {tool}" if tool else "调用工具")
+    if typ in _DEBUG_STEP_LABELS:
+        return _DEBUG_STEP_LABELS[typ]
+    icon, base = _DEBUG_SUBSYSTEM_FALLBACK.get(str(ev.get("subsystem") or ""), ("•", ""))
+    # for an unknown type, show the last dotted segment as a hint, e.g. foo.bar.baz→baz
+    tail = typ.split(".")[-1] if typ else ""
+    label = f"{base} · {tail}" if base and tail else (base or tail or "事件")
+    return (icon, label)
+
+
 def _render_data_track_debug_page(payload: dict) -> str:
     summary = payload["summary"]
     filters = payload.get("filters", {})
@@ -2192,14 +2238,16 @@ def _render_data_track_debug_page(payload: dict) -> str:
         for ev in turn.get("rows") or []:
             ev_status = str(ev.get("status") or "")
             ev_cls = "bad" if ev_status in {"error", "failed"} else ("warn" if ev_status == "blocked" else "ok")
+            icon, step_label = _debug_friendly_step(ev)
             rows_html.append(
                 f"<div class='event-row' id='{html.escape(event_anchor(ev), quote=True)}'>"
-                f"<div class='event-meta'><span class='mono'>{html.escape(_debug_time(ev.get('ts')))}</span>"
-                f"{module_badge(str(ev.get('subsystem') or ''))}"
-                f"<span class='mono'>{html.escape(str(ev.get('type') or ''))}</span>"
+                f"<div class='step-head'><span class='step-icon'>{icon}</span>"
+                f"<span class='step-label'>{html.escape(step_label)}</span>"
                 f"<span class='pill {ev_cls}'>{html.escape(ev_status or 'ok')}</span>"
-                f"<span class='muted'>{html.escape(_debug_ms(ev.get('dur_ms')))}</span></div>"
-                f"<div>{html.escape(str(ev.get('explain') or ev.get('summary') or ''))}</div>"
+                f"<span class='muted mono step-time'>{html.escape(_debug_time(ev.get('ts')))}</span>"
+                f"<span class='muted'>{html.escape(_debug_ms(ev.get('dur_ms')))}</span>"
+                f"<span class='muted mono step-rawtype'>{html.escape(str(ev.get('type') or ''))}</span></div>"
+                f"<div class='step-explain'>{html.escape(str(ev.get('explain') or ev.get('summary') or ''))}</div>"
                 f"{event_actions(ev, include_open_turn=False)}"
                 f"{event_detail_block(ev)}"
                 "</div>"
@@ -2331,6 +2379,12 @@ def _render_data_track_debug_page(payload: dict) -> str:
     .mini-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:5px; padding:3px 7px; background:#fffdfa; color:var(--fg); font-size:12px; margin:4px 5px 0 0; cursor:pointer; }}
     .reveal-button {{ border-color:#d9b28c; color:#8a4a00; background:#fff8ed; }}
     .actions {{ display:flex; flex-wrap:wrap; gap:0; margin-top:5px; }}
+    .event-row {{ border-left:3px solid var(--line); padding:8px 0 8px 12px; margin:2px 0; }}
+    .step-head {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+    .step-icon {{ font-size:15px; }}
+    .step-label {{ font-weight:600; font-size:14px; }}
+    .step-time {{ font-size:12px; }} .step-rawtype {{ font-size:11px; color:#b5aaa2; }}
+    .step-explain {{ color:var(--ink); margin:3px 0 0; font-size:13px; }}
     .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
     input,select {{ border:1px solid var(--line); border-radius:6px; padding:8px 9px; background:white; color:var(--fg); }}
     .field {{ display:flex; flex-direction:column; gap:4px; min-width:150px; }} .field label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
