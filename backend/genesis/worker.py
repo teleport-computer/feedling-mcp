@@ -550,23 +550,40 @@ def _complete_json_retry_empty(
 ) -> dict:
     attempts = max(1, int(max_attempts))
     last: dict = {}
+    last_exc: BaseException | None = None
     for attempt in range(attempts):
         suffix = "" if attempt == 0 else f"-empty-retry-{attempt}"
         key_suffix = "" if attempt == 0 else f":empty_retry:{attempt}"
-        last = _complete_json(
-            llm,
-            user_id=user_id,
-            job_id=job_id,
-            task_id=f"{task_id}{suffix}",
-            runtime=runtime,
-            messages=messages,
-            max_tokens=max_tokens,
-            idempotency_key=f"{idempotency_key}{key_suffix}",
-            temperature=temperature,
-        )
+        try:
+            last = _complete_json(
+                llm,
+                user_id=user_id,
+                job_id=job_id,
+                task_id=f"{task_id}{suffix}",
+                runtime=runtime,
+                messages=messages,
+                max_tokens=max_tokens,
+                idempotency_key=f"{idempotency_key}{key_suffix}",
+                temperature=temperature,
+            )
+        except provider_client.ProviderError as e:
+            if provider_client.classify_provider_error(e) == "provider_config":
+                raise  # hard error (402/401/403/quota/key) — never retry
+            # Transient/unknown — do NOT retry here. The inner
+            # reliable_chat_completion already exhausted its own transient
+            # retries (3x with backoff, ~274s worst-case per call); looping
+            # again in this outer loop just doubles that stall per chunk.
+            # The caller (per-chunk foreground loop) catches this and skips
+            # the chunk instead.
+            raise
+        except GenesisWorkerError as e:  # bad/invalid JSON — treat as transient
+            last_exc = e
+            continue
         if not is_empty(last):
-            return last
-    return last
+            return last  # got usable content — success
+    if last_exc is not None and not last:
+        raise last_exc  # every attempt errored, nothing usable — surface the last error
+    return last  # got a result at some point (possibly empty) — let caller handle it
 
 
 def _combined_map_empty(output: dict) -> bool:
@@ -575,6 +592,11 @@ def _combined_map_empty(output: dict) -> bool:
     notes = voice.get("behavior_notes_candidates") if isinstance(voice.get("behavior_notes_candidates"), list) else []
     exemplars = voice.get("exemplar_candidates") if isinstance(voice.get("exemplar_candidates"), list) else []
     return not facts and not notes and not exemplars
+
+
+def _fact_map_output_empty(output: dict) -> bool:
+    facts = output.get("fact_candidates") if isinstance(output.get("fact_candidates"), list) else []
+    return not facts
 
 
 def _fact_write_output_empty(output: dict) -> bool:
@@ -1199,31 +1221,48 @@ def build_foreground_output_from_texts(
 
     fact_candidates: list[dict] = []
     voice_candidates: list[dict] = []
+    history_windows_total = 0
+    history_windows_failed = 0
     for idx, text in enumerate(chunk_texts):
-        if include_voice_candidates and source_family == "history" and genesis_combined_map_enabled():
-            facts = _complete_json_retry_empty(
-                llm,
-                user_id=user_id,
-                job_id=job_id,
-                task_id=f"combined-map-{idx}",
-                runtime=runtime,
-                messages=prompts.combined_map_messages(text),
-                max_tokens=2400,
-                idempotency_key=f"{shared_prefix}:combined_map:{idx}",
-                is_empty=_combined_map_empty,
-            )
-            voice_candidates.append(_voice_candidate_from_combined_map(facts))
-        else:
-            facts = _complete_json(
-                llm,
-                user_id=user_id,
-                job_id=job_id,
-                task_id=f"fact-map-{idx}",
-                runtime=runtime,
-                messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
-                max_tokens=1800,
-                idempotency_key=f"{shared_prefix}:fact_map:{idx}",   # SAME key as background -> cache shared
-            )
+        is_history = source_family == "history"
+        if is_history:
+            history_windows_total += 1
+        try:
+            if include_voice_candidates and is_history and genesis_combined_map_enabled():
+                facts = _complete_json_retry_empty(
+                    llm,
+                    user_id=user_id,
+                    job_id=job_id,
+                    task_id=f"combined-map-{idx}",
+                    runtime=runtime,
+                    messages=prompts.combined_map_messages(text),
+                    max_tokens=2400,
+                    idempotency_key=f"{shared_prefix}:combined_map:{idx}",
+                    is_empty=_combined_map_empty,
+                )
+                voice_candidates.append(_voice_candidate_from_combined_map(facts))
+            else:
+                facts = _complete_json_retry_empty(
+                    llm,
+                    user_id=user_id,
+                    job_id=job_id,
+                    task_id=f"fact-map-{idx}",
+                    runtime=runtime,
+                    messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
+                    max_tokens=1800,
+                    idempotency_key=f"{shared_prefix}:fact_map:{idx}",   # SAME key as background -> cache shared
+                    is_empty=_fact_map_output_empty,
+                )
+        except provider_client.ProviderError as e:
+            if provider_client.classify_provider_error(e) == "provider_config":
+                raise  # hard error (402/401/403/quota/key) -> caller aborts
+            if is_history:
+                history_windows_failed += 1  # transient exhausted -> skip this chunk, keep going
+            continue
+        except GenesisWorkerError:
+            if is_history:
+                history_windows_failed += 1
+            continue
         if isinstance(facts.get("fact_candidates"), list):
             fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
 
@@ -1246,6 +1285,8 @@ def build_foreground_output_from_texts(
         "all_fact_candidates": fact_candidates,
         "core_fact_candidates": core,
         "voice_candidates": voice_candidates,
+        "history_windows_total": history_windows_total,
+        "history_windows_failed": history_windows_failed,
     }
 
 

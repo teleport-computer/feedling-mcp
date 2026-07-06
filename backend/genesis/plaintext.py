@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -19,7 +20,7 @@ import db
 import debug_trace
 from accounts import runtime_auth
 from core import enclave as core_enclave
-from genesis import dedup, foreground, foreground_identity, genesis_core, service, worker
+from genesis import dedup, foreground, foreground_identity, genesis_core, lightweight_identity, service, worker
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
@@ -149,6 +150,29 @@ def _plaintext_source_groups(analysis_messages: list[dict], *, window_limit: int
             "message_count": len(messages),
         })
     return groups
+
+
+def _foreground_history_cap() -> int:
+    try:
+        return max(1, int(os.environ.get("FEEDLING_GENESIS_FG_HISTORY_CAP", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _cap_foreground_history_chunks(source_groups: list[dict]) -> list[dict]:
+    """前台用:只对 history 桶采样到 cap(_select_evenly);其它桶(人物卡/档案/长期记忆)全读。
+    被砍的 history 块由后台补全,不影响身份(名字来自人物卡,全读)。"""
+    cap = _foreground_history_cap()
+    out: list[dict] = []
+    for g in source_groups:
+        if str(g.get("source_family") or "") == "history":
+            chunks = list(g.get("chunk_texts") or [])
+            if len(chunks) > cap:
+                chunks = history_import._select_evenly(chunks, cap)
+            out.append({**g, "chunk_texts": chunks})
+        else:
+            out.append(g)
+    return out
 
 
 def _plaintext_timeline_span_days(messages: list[dict]) -> int:
@@ -597,12 +621,19 @@ def _run_plaintext_genesis_v2(
     Returns True when it handled the job. Returns False only when there's nothing to work
     with (no core), so the caller runs the v1 full path instead.
     """
+    # Foreground only: cap the history bucket to a small, evenly-sampled window so large
+    # imports stay fast (support buckets — ai_persona/user_profile/memory_summary — are
+    # never sampled here, since identity/name lives in the character card). `source_groups`
+    # itself is left untouched — background enrichment below still consumes the full,
+    # un-sampled groups so the dropped history chunks get fully processed there.
+    fg_source_groups = _cap_foreground_history_chunks(source_groups)
+
     # primary group: prefer the real chat history (best greeting signal), else the first
     fg_group = next(
-        (g for g in source_groups if str(g.get("source_family") or "") == "history"),
-        source_groups[0],
+        (g for g in fg_source_groups if str(g.get("source_family") or "") == "history"),
+        fg_source_groups[0],
     )
-    fg_idx = source_groups.index(fg_group) + 1
+    fg_idx = fg_source_groups.index(fg_group) + 1
     fg_kind = str(fg_group.get("source_kind") or history_import._HISTORY_SOURCE)
     fg_family = str(fg_group.get("source_family") or worker._source_family(fg_kind))
 
@@ -615,7 +646,7 @@ def _run_plaintext_genesis_v2(
     primary_reduce: dict | None = None
     voice_candidates: list[dict] = []
     persona_material_parts: list[str] = []
-    for idx, group in enumerate(source_groups, start=1):
+    for idx, group in enumerate(fg_source_groups, start=1):
         group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
         group_family = str(group.get("source_family") or worker._source_family(group_kind))
         group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
@@ -638,6 +669,8 @@ def _run_plaintext_genesis_v2(
     if not foreground_reduces:
         return False
     primary_reduce = primary_reduce or foreground_reduces[0]
+    hw_total = int(primary_reduce.get("history_windows_total") or 0)
+    hw_failed = int(primary_reduce.get("history_windows_failed") or 0)
     all_fact_candidates: list[dict] = []
     for reduce in foreground_reduces:
         candidates = reduce.get("all_fact_candidates") or reduce.get("core_fact_candidates") or []
@@ -689,9 +722,38 @@ def _run_plaintext_genesis_v2(
         days_with_user=days, language=language,
     )
     provider_failure = _provider_identity_failure(id_warnings)
-    if provider_failure:
-        service.mark_failed(store, job_id, f"foreground_identity_failed:{provider_failure}")
-        return True
+    if provider_failure or not foreground_identity.has_identity_signal(identity_payload):
+        # Non-LLM lightweight fallback: try to salvage a name from the uploaded
+        # character card / profile text (never calls the LLM). Covers the common
+        # real failure mode (provider hiccup) that used to hard-fail the job.
+        support_texts = [str(m.get("content") or "") for m in msgs
+                         if history_import._is_import_support_message(m)]
+        lite = lightweight_identity.derive_from_support(
+            support_texts, days_with_user=days, language=language)
+        if lightweight_identity.has_signal(lite):
+            identity_payload = lite
+        else:
+            # fresh_start detection: the synthetic fresh_start message
+            # (_plaintext_fresh_start_message) is itself classified as a "support"
+            # message by _is_import_support_message (fresh_start is in
+            # _IMPORT_SUPPORT_SOURCES), so a plain "no support texts" check would
+            # misclassify a real fresh_start upload as "has content". Instead,
+            # match the sentinel source_family directly: fresh_start iff every
+            # message in msgs is the fresh_start marker (or there are no messages
+            # at all).
+            is_fresh_start = all(
+                history_import._import_source_family(
+                    str(m.get("source") or m.get("source_family") or "")
+                ) == history_import._FRESH_START_SOURCE
+                for m in msgs
+            )
+            if is_fresh_start:
+                pass  # truly empty upload -> nameless done is allowed
+            else:
+                # real content but couldn't derive/salvage an identity -> failed,
+                # let the user retry instead of silently completing nameless.
+                service.mark_failed(store, job_id, "onboarding_no_identity:provider_unstable")
+                return True
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
     persona_ref = ""
     persona_sha = ""
@@ -718,7 +780,12 @@ def _run_plaintext_genesis_v2(
             language=language,
         )
         completed = db.genesis_complete_job(
-            store.user_id, job_id, output={"stage": "genesis_v2_foreground_ready"},
+            store.user_id, job_id,
+            output={
+                "stage": "genesis_v2_foreground_ready",
+                "history_windows_total": hw_total,
+                "history_windows_failed": hw_failed,
+            },
             memory_action_count=mem_count, identity_status="initialized",
             persona_ref=persona_ref, persona_sha256=persona_sha,
         )

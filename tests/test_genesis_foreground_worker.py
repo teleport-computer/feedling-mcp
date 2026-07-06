@@ -130,6 +130,30 @@ def _full_reduce_fake():
     return fake, seen
 
 
+def test_foreground_skips_failed_history_chunk_and_counts(monkeypatch):
+    monkeypatch.setattr(db, "genesis_upsert_output", lambda *a, **k: None)
+    calls = {"n": 0}
+
+    def fake_retry(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:                          # 2nd chunk persistently fails
+            raise pc.ProviderError("provider network error: ReadTimeout")
+        return {"fact_candidates": [{"about": "user", "summary": f"m{calls['n']}"}]}
+
+    monkeypatch.setattr(worker, "_complete_json_retry_empty", fake_retry)
+    monkeypatch.setattr(worker, "_complete_json", fake_retry)
+    llm = GenesisLLMClient(completion_fn=lambda *a, **k: {"reply": "{}", "usage": {}, "stop_reason": "stop"})
+    out = worker.build_foreground_output_from_texts(
+        user_id="u", job_id="j", key_prefix="k", runtime=_RUNTIME,
+        chunk_texts=["a", "b", "c"], source_kind="history", llm=llm,
+    )
+    assert out["history_windows_total"] == 3
+    assert out["history_windows_failed"] == 1        # chunk 2 skipped
+    # the other chunks' candidates survive
+    assert any(c.get("summary") for c in out["all_fact_candidates"])
+    assert len(out["all_fact_candidates"]) == 2
+
+
 def test_background_reduce_skips_foreground_core(monkeypatch):
     # foreground picks core -> derive skip set -> background full reduce must NOT
     # fact_write any of those core facts again (structural dedup, Codex #1).

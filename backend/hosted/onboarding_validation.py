@@ -209,6 +209,8 @@ def _model_api_steps_with_genesis(
     # greeting again, this mis-lights hosted_chat — keep that invariant.
     live_memory = done or int(bootstrap_st.get("memory_count") or 0) > 0
     hosted_chat_ok = done or _model_api_hosted_chat_verified(store)
+    history_windows_total = _int_value(metadata.get("history_windows_total") or output.get("history_windows_total") or 0)
+    history_windows_failed = _int_value(metadata.get("history_windows_failed") or output.get("history_windows_failed") or 0)
 
     history_step = {
         "id": "history_import",
@@ -241,6 +243,10 @@ def _model_api_steps_with_genesis(
         "memory_action_count": memory_action_count,
         "identity_status": identity_status,
         "persona_ref": persona_ref,
+        "history_windows_total": history_windows_total,
+        "history_windows_failed": history_windows_failed,
+        "degraded": bool(history_windows_failed > 0),
+        "support_inputs_present": bool(_int_value(metadata.get("support_count")) > 0),
         "required": (
             "Genesis import failed. Start onboarding again with the latest app build."
             if failed else (
@@ -374,6 +380,10 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "background_status": (latest_job or {}).get("background_status", ""),
             "background_windows_done": (latest_job or {}).get("background_windows_done", 0),
             "background_windows_total": (latest_job or {}).get("background_windows_total", 0),
+            "history_windows_total": _int_value((latest_job or {}).get("history_windows_total")),
+            "history_windows_failed": _int_value((latest_job or {}).get("history_windows_failed")),
+            "degraded": bool(_int_value((latest_job or {}).get("history_windows_failed")) > 0),
+            "support_inputs_present": bool(_int_value((latest_job or {}).get("support_materials")) > 0),
             "required": (
                 "Start onboarding with AI persona materials, user profile, memory summary, chat history, or confirmed fresh start."
                 if not history_ok else ""
