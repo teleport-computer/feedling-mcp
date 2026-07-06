@@ -669,6 +669,8 @@ def _run_plaintext_genesis_v2(
     if not foreground_reduces:
         return False
     primary_reduce = primary_reduce or foreground_reduces[0]
+    hw_total = int(primary_reduce.get("history_windows_total") or 0)
+    hw_failed = int(primary_reduce.get("history_windows_failed") or 0)
     all_fact_candidates: list[dict] = []
     for reduce in foreground_reduces:
         candidates = reduce.get("all_fact_candidates") or reduce.get("core_fact_candidates") or []
@@ -778,7 +780,12 @@ def _run_plaintext_genesis_v2(
             language=language,
         )
         completed = db.genesis_complete_job(
-            store.user_id, job_id, output={"stage": "genesis_v2_foreground_ready"},
+            store.user_id, job_id,
+            output={
+                "stage": "genesis_v2_foreground_ready",
+                "history_windows_total": hw_total,
+                "history_windows_failed": hw_failed,
+            },
             memory_action_count=mem_count, identity_status="initialized",
             persona_ref=persona_ref, persona_sha256=persona_sha,
         )

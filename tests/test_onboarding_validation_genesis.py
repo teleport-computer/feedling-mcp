@@ -243,3 +243,26 @@ def test_genesis_stage_mapped_to_legacy_phase_for_old_ios(monkeypatch):
     steps = {s["id"]: s for s in validation._model_api_onboarding_validation_payload(_store())["steps"]}
     # the history_import step's phase is the mapped legacy phase, NOT the raw v2 stage
     assert steps["history_import"]["phase"] == "chat_history_importing"
+
+
+def test_validate_surfaces_history_windows_failed_degraded(monkeypatch):
+    # Task 2 already computes history_windows_total/history_windows_failed during
+    # extraction; this test asserts they're surfaced through to onboarding validate's
+    # history_import step, along with a derived `degraded` flag and
+    # `support_inputs_present`. The genesis job (not the legacy history_import job,
+    # which the harness stubs to None) is the source of truth here.
+    _install_model_api_harness(monkeypatch, genesis_jobs=[{
+        "job_id": "g1", "status": "done", "source_kind": "history_import",
+        "identity_status": "initialized", "memory_action_count": 20,
+        "output": {"stage": "genesis_v2_done",
+                   "history_windows_total": 8, "history_windows_failed": 3},
+        "metadata": {"ingest": "plaintext", "history_count": 68, "timeline_span_days": 1,
+                     "history_windows_total": 8, "history_windows_failed": 3,
+                     "support_count": 2},
+    }])
+    body = validation._model_api_onboarding_validation_payload(_store())
+    step = next(s for s in body["steps"] if s["id"] == "history_import")
+    assert step["history_windows_total"] == 8
+    assert step["history_windows_failed"] == 3
+    assert step["degraded"] is True
+    assert step["support_inputs_present"] is True
