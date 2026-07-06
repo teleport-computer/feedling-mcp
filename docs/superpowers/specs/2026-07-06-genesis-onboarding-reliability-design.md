@@ -96,11 +96,13 @@ CC 复现:openrouter/sonnet-4.5(prod 同款)+ 同 4 份文件,test 上 4 次 acc
 ### 4.1 后端记录
 job / validate 带上:`windows_total`、`windows_failed`、`memories_created`、`degraded`(bool)。
 
+> ⚠️ **时机**:`windows_failed` 只统计**重试全部用尽后仍失败**的块。临时抖一下、重试即恢复的**不计入、不提示**。下面所有提示都是"尽力重试后的真实残余",不会因单次抖动误报。
+
 ### 4.2 iOS 提示(要改 iOS)
-1. **降级完成态(面板)**:onboarding 完成页读 `windows_failed` / `memories_created` →
-   - `已导入 26 条记忆（3 段未成功抽取，可重新上传补全）`
-   - **「重新上传补全」按钮 → 打开现有「加记忆」(GardenMaterialSheet / add_memory)**,把没抽到的记忆补进花园。
-2. **硬错误友好文案**(pollGenesisImport 失败分支,Round3 已显示 job.error,现在映射成人话):
+1. **降级完成态(面板,引导文案,不加按钮)**:onboarding 完成页读 `windows_failed` / `memories_created` →
+   - 若 `windows_failed>0`,显示**引导文案**:`有 3 段记忆没抽全，你可以到记忆花园重新上传聊天记录来补充。`
+   - **不新建"补全"按钮**——记忆花园(GardenMaterialSheet)本就有"上传聊天记录/长期记忆"入口,文案引导用户去那里即可(那条路走 add_memory,把记忆补进花园)。
+2. **硬错误友好文案**(pollGenesisImport 失败分支,Round3 已显示 job.error,现在映射成人话;这些都是重试也救不了才报):
    - 402/额度 → `AI 服务额度不足，请检查配置后重试`
    - enclave/infra → `服务暂时不可用，请稍后重试`
    - "有内容全失败" → `没能处理你上传的材料（服务临时不可用），请重试`
