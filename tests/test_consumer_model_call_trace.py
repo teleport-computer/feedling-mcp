@@ -89,6 +89,31 @@ def test_call_agent_cli_emits_start_then_done(monkeypatch):
     assert done["content_excerpt"]["stderr_head"] == ""
 
 
+def test_call_agent_cli_sets_trace_id_env_for_io_cli(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+
+    result = subprocess.CompletedProcess(
+        args=["mycli", "ask", "hi"], returncode=0,
+        stdout='{"type":"result","duration_ms":10}', stderr="",
+    )
+    seen = {}
+
+    def _fake_run(*a, **kw):
+        seen["env"] = kw.get("env")
+        return result
+
+    monkeypatch.setattr(crc.subprocess, "run", _fake_run)
+    calls, fake_emit = _recorder()
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+
+    crc.call_agent_cli("hi", trace_id="trace-env")
+
+    assert seen["env"]["FEEDLING_TRACE_ID"] == "trace-env"
+    assert seen["env"]["FEEDLING_DEBUG_TRACE_ID"] == "trace-env"
+    assert calls[0]["trace_id"] == "trace-env"
+
+
 def test_call_agent_cli_emits_error_on_nonzero_rc(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])

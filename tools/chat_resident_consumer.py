@@ -3197,8 +3197,15 @@ def call_agent_cli(
                       summary="cli turn start",
                       explain="模型调用发起（" + ("codex" if _is_codex_cmd(cmd) else "claude") + "）",
                       content_excerpt={"prompt_head": (message or "")[:1000]})
+    child_env = os.environ.copy()
+    if trace_id:
+        child_env["FEEDLING_TRACE_ID"] = trace_id
+        child_env["FEEDLING_DEBUG_TRACE_ID"] = trace_id
+    else:
+        child_env.pop("FEEDLING_TRACE_ID", None)
+        child_env.pop("FEEDLING_DEBUG_TRACE_ID", None)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=child_env)
     except subprocess.TimeoutExpired:
         _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
                           dur_ms=(time.monotonic() - _turn_t0) * 1000,

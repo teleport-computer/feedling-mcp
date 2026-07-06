@@ -29,6 +29,7 @@ import os
 import re
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,6 +51,7 @@ PHASE2_VERBS = ("send", "wait-for-wake")
 
 def _emit(obj, code=0):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
     sys.exit(code)
 
 
@@ -94,6 +96,10 @@ def _env(name):
     return os.environ.get(name, "").strip()
 
 
+def _trace_id():
+    return _env("FEEDLING_TRACE_ID") or _env("FEEDLING_DEBUG_TRACE_ID")
+
+
 def _auth_headers():
     """Auth header for backend/enclave calls. Prefer ``FEEDLING_API_KEY``; in
     zero-roster host-all mode it is absent, so fall back to the Stage-D runtime
@@ -116,6 +122,9 @@ def _auth_headers():
 def _http_json(method, url, auth, *, payload=None, insecure=False, timeout=30):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {**auth, "Accept": "application/json"}
+    trace_id = _trace_id()
+    if trace_id:
+        headers["X-Feedling-Trace-Id"] = trace_id
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
@@ -135,6 +144,89 @@ def _http_json(method, url, auth, *, payload=None, insecure=False, timeout=30):
         return e.code, detail
     except Exception as e:  # noqa: BLE001 — return a JSON error, never crash the agent
         return -1, {"error": f"{type(e).__name__}: {e}"}
+
+
+_REDACTED_ARG_KEYS = {"query", "self_introduction", "signature", "reason"}
+
+
+def _clip_arg(s, limit=80):
+    s = str(s or "")
+    return s if len(s) <= limit else s[:limit] + "...(truncated)"
+
+
+def _summarize_arg_value(key, value):
+    if callable(value):
+        return None
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value if value else None
+    if isinstance(value, (int, float)):
+        return value
+    if key in _REDACTED_ARG_KEYS:
+        if isinstance(value, (list, tuple)):
+            chars = sum(len(str(v)) for v in value)
+            return f"<redacted items={len(value)} chars={chars}>"
+        text = str(value)
+        return f"<redacted chars={len(text)}>" if text else None
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        sample = ", ".join(_clip_arg(v, 24) for v in list(value)[:3])
+        suffix = ", ..." if len(value) > 3 else ""
+        return f"{len(value)} item(s): {sample}{suffix}"
+    text = str(value)
+    return _clip_arg(text) if text else None
+
+
+def _redacted_tool_args(args):
+    out = {}
+    for key, value in vars(args).items():
+        if key in {"func", "verb"}:
+            continue
+        summary = _summarize_arg_value(key, value)
+        if summary is not None:
+            out[key] = summary
+    return out
+
+
+def _emit_tool_trace(args, exit_code, dur_ms):
+    """Best-effort per-tool trace. Never let observability affect tool output."""
+    try:
+        trace_id = _trace_id()
+        api_url = _env("FEEDLING_API_URL")
+        auth = _auth_headers()
+        if not trace_id or not api_url or not auth:
+            return
+        tool = str(getattr(args, "verb", "") or "")
+        result_status = "ok" if int(exit_code or 0) == 0 else "err"
+        rounded_ms = round(float(dur_ms), 1)
+        detail = {
+            "tool": tool,
+            "args": _redacted_tool_args(args),
+            "result_status": result_status,
+            "dur_ms": rounded_ms,
+        }
+        _http_json(
+            "POST",
+            f"{api_url.rstrip('/')}/v1/debug/trace/event",
+            auth,
+            payload={"event": {
+                "subsystem": "agent",
+                "type": "agent.tool.call",
+                "status": "ok" if result_status == "ok" else "error",
+                "summary": f"io_cli {tool} {result_status}",
+                "explain": f"io_cli tool {tool} finished {result_status} in {int(rounded_ms)}ms",
+                "detail": detail,
+                "trace_id": trace_id,
+                "turn_id": trace_id,
+                "actor": "vps_resident",
+                "dur_ms": rounded_ms,
+            }},
+            timeout=1.0,
+        )
+    except Exception:
+        pass
 
 
 def cmd_perception(args):
@@ -533,7 +625,18 @@ def main():
         sp.set_defaults(func=cmd_phase2)
 
     args = p.parse_args()
-    args.func(args)
+    started = time.monotonic()
+    exit_code = 0
+    try:
+        args.func(args)
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        raise
+    except Exception:
+        exit_code = 1
+        raise
+    finally:
+        _emit_tool_trace(args, exit_code, (time.monotonic() - started) * 1000)
 
 
 if __name__ == "__main__":
