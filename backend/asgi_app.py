@@ -1,20 +1,15 @@
 """FastAPI backend assembly (ASGI-migration plan §5.3).
 
-The ASGI counterpart of ``app.py`` — **assembly only**, no business logic
-(inherits CONTRIBUTING §1's app.py discipline). It wires the lifespan, the
-access-log middleware, the fixed-body exception handlers, and includes the
-native routers.
+The backend's single assembly layer — **assembly only**, no business logic
+(CONTRIBUTING §1). It wires the lifespan, the access-log middleware, the
+fixed-body exception handlers, includes the native routers, and injects the
+cross-package seams at the bottom of this file. The old Flask parity facade
+``app.py`` was deleted post-cutover (migration §13); tests drive this app via
+``asgi_test_client.make_client()``.
 
-HARD RULE: this module (and anything it imports) must **never** ``import app``.
-``app.py`` is the Flask parity oracle; importing it would re-trigger all of its
-import-time side effects (db.init_schema, wake_bus listener, WS leader bind) and
-smuggle the old startup chain back in. A CI guard test asserts ``app`` is not in
-``sys.modules`` after ``import asgi_app``.
-
-Until every route is migrated, an unmigrated path is simply a 404 here — the
-expected behavior when validating the parallel :5005 instance, and the reason
-the url_map ledger (docs/BACKEND_ASGI_ROUTE_MATRIX.md) must hit 100% before
-cutover.
+Cutover completed 2026-07-04 with 100% route accounting (the migration-era
+url_map ledger BACKEND_ASGI_ROUTE_MATRIX is deleted; see git history). Use
+``tools/gen_url_map.py`` to snapshot/diff the live route surface.
 
 Start command (plan §5.2):
     gunicorn --chdir backend --config backend/gunicorn_conf.py \\
@@ -84,3 +79,17 @@ middleware.register_exception_handlers(app)
 app.include_router(health.router)
 for _mod_name in _ASGI_PACKAGES:
     importlib.import_module(_mod_name).register_asgi(app)
+
+# Assembly wiring (dependency direction: identity sits above push, hosted above
+# admin — the lower module declares a stub, assembly injects the real impl).
+# Moved here from app.py at its deletion; the ASGI cutover had left these three
+# unwired, so Live Activity identity and admin data-track import/validation
+# stats were silently empty in production.
+from admin import data_track as _admin_data_track  # noqa: E402
+from hosted import onboarding_validation as _hosted_onboarding_validation  # noqa: E402
+from identity import service as _identity_service  # noqa: E402
+from push import live_activity as _push_live_activity  # noqa: E402
+
+_push_live_activity.load_identity = _identity_service._load_identity
+_admin_data_track._latest_history_import_job = _hosted_onboarding_validation._latest_history_import_job
+_admin_data_track._onboarding_validation_payload = _hosted_onboarding_validation._onboarding_validation_payload
