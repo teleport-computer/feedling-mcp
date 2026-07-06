@@ -1730,7 +1730,14 @@ def _visible_reply_fragment_from_text(text: str) -> Any:
     if not starts:
         return None
     fragment = stripped[min(starts):].strip().rstrip(",")
-    parsed = _safe_json_loads("{" + fragment + "}")
+    candidates = ["{" + fragment + "}"]
+    if fragment.endswith("}"):
+        candidates.append("{" + fragment)
+    parsed = None
+    for candidate in candidates:
+        parsed = _safe_json_loads(candidate)
+        if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
+            break
     if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
         return parsed
     return None

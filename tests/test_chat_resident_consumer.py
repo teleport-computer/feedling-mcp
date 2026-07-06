@@ -3237,6 +3237,27 @@ def test_agent_turn_extracts_bare_visible_thinking_summary_fragment():
     assert "messages" not in turn.messages[0]
 
 
+def test_agent_turn_extracts_bare_visible_thinking_summary_fragment_with_trailing_brace():
+    raw = (
+        '"thinking_summary": "注意到57秒前关于模型身份的回答有误，决定简短纠正",\n'
+        '"messages": [\n'
+        '"啧，刚才说错了。",\n'
+        '"我是 anthropic/claude-sonnet-4.5，不是 gpt 那个。"\n'
+        ']\n'
+        '}'
+    )
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == [
+        "啧，刚才说错了。",
+        "我是 anthropic/claude-sonnet-4.5，不是 gpt 那个。",
+    ]
+    assert turn.thinking_summary == "注意到57秒前关于模型身份的回答有误，决定简短纠正"
+    assert all("thinking_summary" not in message for message in turn.messages)
+    assert all('"messages"' not in message for message in turn.messages)
+
+
 def test_agent_turn_extracts_visible_thinking_summary_from_text_block():
     raw = {
         "choices": [
