@@ -77,6 +77,19 @@ def test_poll_http_error(monkeypatch):
     assert out["http_status"] == 500
 
 
+def test_poll_network_error_is_error_not_pending(monkeypatch):
+    # _http_json returns code=-1 on DNS/TLS/connection failures. That must NOT be
+    # swallowed into a timeout "pending" — the agent would think the job is still
+    # running when the request never landed.
+    def fake_http(method, url, auth, **kw):
+        return -1, {"error": "URLError: [Errno 8] nodename nor servname provided"}
+    monkeypatch.setattr(io_cli, "_http_json", fake_http)
+    out = io_cli._poll_genesis_job("http://x", {}, "job-net", timeout=1.0, interval=0.0)
+    assert out["ok"] is False
+    assert out["status"] == "error"
+    assert out["http_status"] == -1
+
+
 import json as _json  # noqa: E402
 import subprocess  # noqa: E402
 

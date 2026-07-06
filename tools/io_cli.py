@@ -547,7 +547,9 @@ def _poll_genesis_job(api_url, auth, job_id, *, timeout, interval=2.0):
     deadline = _time.monotonic() + max(0.0, timeout)
     while True:
         code, body = _http_json("GET", f"{api_url}/v1/genesis/imports/{job_id}", auth)
-        if code >= 400:
+        if code < 0 or code >= 400:
+            # code < 0 == transport failure (DNS/TLS/refused) from _http_json; must
+            # be an error, not swallowed into a timeout "pending".
             return {"ok": False, "status": "error", "job_id": job_id,
                     "http_status": code, "error": body}
         job = body.get("job") if isinstance(body, dict) else {}
@@ -594,7 +596,7 @@ def cmd_add_memory(args):
     client_job_id = f"{prefix}-{uuid.uuid4()}"
     payload = _add_memory_payload(text, filename, as_kind, client_job_id)
     code, body = _http_json("POST", f"{api_url}/v1/genesis/imports/plaintext", auth, payload=payload)
-    if code >= 400:
+    if code < 0 or code >= 400:
         _emit({"ok": False, "status": "error", "http_status": code, "error": body}, 1)
     job = body.get("job") if isinstance(body, dict) else {}
     job_id = (job.get("job_id") if isinstance(job, dict) else None) or (
