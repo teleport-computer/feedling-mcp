@@ -228,7 +228,17 @@ def _pi_models_json(*, base_url: str, model: str) -> str:
     the consumer process env and never lands on disk. The compat flags mirror
     what the LiteLLM bridge effectively sent (plain ``system`` role, no
     ``reasoning_effort``) — relay OpenAI-compat is the weak point, so default
-    to the most conservative wire."""
+    to the most conservative wire.
+
+    ``input: ["text", "image"]`` declares the model's accepted modalities: pi
+    only sends attached images as real vision content when the model's ``input``
+    includes ``"image"`` (``toChatMessages(..., model.input.includes("image"))``);
+    otherwise it silently OMITS the image and injects "(image omitted: model does
+    not support images)", so the agent replies that it cannot see the picture even
+    though the file was delivered. A user model entry defaults to text-only, so we
+    must opt image in explicitly. Chat relays front vision-capable models (gpt-4o,
+    gpt-5.x, gemini, claude); a rare text-only relay will error an image turn
+    rather than silently drop it — the honest failure."""
     doc = {
         "providers": {
             _PI_PROVIDER_ID: {
@@ -240,7 +250,10 @@ def _pi_models_json(*, base_url: str, model: str) -> str:
                     "supportsDeveloperRole": False,
                     "supportsReasoningEffort": False,
                 },
-                "models": [{"id": (model or "").strip() or "default"}],
+                "models": [{
+                    "id": (model or "").strip() or "default",
+                    "input": ["text", "image"],
+                }],
             }
         }
     }

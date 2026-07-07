@@ -843,7 +843,8 @@ def test_agent_home_files_pi_seeds_models_json_with_relay_provider():
     assert prov["apiKey"] == "$PI_PROVIDER_API_KEY"         # $ENV 插值，key 不落盘
     assert prov["compat"] == {"supportsDeveloperRole": False,
                               "supportsReasoningEffort": False}
-    assert prov["models"] == [{"id": "qwen-max"}]
+    # input 声明 image 模态，否则 pi 会把附带图片丢弃（模型看不到图）
+    assert prov["models"] == [{"id": "qwen-max", "input": ["text", "image"]}]
     # 工具 how-to 照常 seed；不写 claude/codex 的 home 文件
     assert "/h/agent-tools-prompt.md" in files
     assert "/h/claude-home/settings.json" not in files

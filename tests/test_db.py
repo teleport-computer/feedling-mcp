@@ -342,6 +342,19 @@ def test_supervisor_instance_heartbeat_roundtrip():
     assert isinstance(r["ts"], float) and r["ts"] > 0
 
 
+def test_supervisor_instance_heartbeat_surfaces_pi_from_payload():
+    # ``pi`` has no typed column — it rides in the JSONB payload. The send-gate's
+    # require_pi check reads hb["pi"], so the read MUST surface it; omitting it
+    # 503s pi-driven openai_compatible sends even while the runner runs pi.
+    on, off = _owner(), _owner()
+    db.set_supervisor_instance_heartbeat(on, _hb_payload(on, pi=True))
+    db.set_supervisor_instance_heartbeat(off, _hb_payload(off))  # no pi key (old runner)
+    rows = {r["owner"]: r for r in db.list_supervisor_instance_heartbeats()}
+    assert rows[on]["pi"] is True
+    # Missing pi → False (the safe pi-off direction, never a truthy accident).
+    assert rows[off]["pi"] is False
+
+
 def test_supervisor_instance_heartbeats_do_not_clobber_across_owners():
     a, b = _owner(), _owner()
     db.set_supervisor_instance_heartbeat(a, _hb_payload(a, host="A", active_children=1))

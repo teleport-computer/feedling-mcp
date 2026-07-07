@@ -278,6 +278,7 @@ def list_supervisor_instance_heartbeats() -> list[dict]:
         rows = conn.execute(
             "SELECT owner, host, shard_index, shard_count, max_children, "
             "       active_children, host_all, gateway, version, "
+            "       (payload->>'pi')::boolean AS pi, "
             "       extract(epoch FROM updated_at) AS ts "
             "FROM agent_runtime_supervisor_heartbeats"
         ).fetchall()
@@ -286,8 +287,14 @@ def list_supervisor_instance_heartbeats() -> list[dict]:
         out.append({
             "owner": r[0], "host": r[1], "shard_index": r[2], "shard_count": r[3],
             "max_children": r[4], "active_children": r[5],
+            # ``pi`` has no typed column — it lives only in the JSONB ``payload``.
+            # The send-gate's require_pi check reads hb["pi"], so surface it here
+            # (missing/old-runner → NULL → False, the safe pi-off direction). Omit
+            # this and pi-driven openai_compatible sends 503 supervisor_pi_disabled
+            # even though the runner IS running pi.
             "host_all": bool(r[6]), "gateway": bool(r[7]), "version": r[8],
-            "ts": float(r[9]),
+            "pi": bool(r[9]),
+            "ts": float(r[10]),
         })
     return out
 
