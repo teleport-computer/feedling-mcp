@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, test]
+    branches: [main, test, pre]
   pull_request:
-    branches: [main, test]
+    branches: [main, test, pre]
   workflow_dispatch:
 
 # Cancel in-progress runs on the same ref — latest push wins.
@@ -269,6 +269,32 @@ jobs:
               - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.test.yaml'
               - 'deploy/docker-compose.phala.runner.yaml'
+              - 'deploy/publish-compose-hash.sh'
+              - '.github/workflows/ci.yml'
+
+  detect-cvm-changes-pre:
+    name: detect CVM changes (pre)
+    if: github.ref == 'refs/heads/pre' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    outputs:
+      cvm: ${{ steps.filter.outputs.cvm }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            cvm:
+              - 'backend/**'
+              - 'tools/chat_resident_consumer.py'
+              - 'tools/deploy_canary.py'
+              - 'deploy/attestation-gate.sh'
+              - 'deploy/Dockerfile'
+              - 'deploy/Dockerfile.agent-runner'
+              - 'deploy/docker-compose.phala.pre.yaml'
+              - 'deploy/docker-compose.phala.pre.runner.yaml'
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
 
@@ -990,6 +1016,394 @@ jobs:
           FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
           PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.runner.yaml
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+          publish_status=1
+          for attempt in 1 2 3; do
+            if ./deploy/publish-compose-hash.sh eth_sepolia; then
+              publish_status=0
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::runner compose_hash publish failed (attempt $attempt/3); retrying in 20s"
+              sleep 20
+            fi
+          done
+          exit "$publish_status"
+
+  deploy-pre-cvm:
+    name: deploy CVM (pre)
+    needs: [forge-test, python-tests, docker-build, lint, dcap-python, detect-cvm-changes-pre]
+    if: |
+      github.ref == 'refs/heads/pre' &&
+      github.event_name == 'push' &&
+      needs.detect-cvm-changes-pre.outputs.cvm == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: read
+    concurrency:
+      group: deploy-pre-cvm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Wait for ghcr.io image :<sha>
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
+          echo "waiting for ${IMAGE}:$SHA_SHORT"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          for i in $(seq 1 60); do
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1 \
+               && docker manifest inspect "${IMAGE}-agent-runner:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "images :$SHA_SHORT available (backend + agent-runner)"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::image :$SHA_SHORT (backend or agent-runner) did not appear in 10 min — docker-publish.yml likely failed"
+          exit 1
+
+      - name: Pin image tag in deploy/docker-compose.phala.pre.yaml
+        id: pin
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          git fetch origin pre
+          git reset --hard origin/pre
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
+          # Pin the backend image, then the sibling agent-runner image (see prod job).
+          sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.pre.yaml
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}-agent-runner:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.pre.yaml
+          if git diff --quiet -- deploy/docker-compose.phala.pre.yaml; then
+            echo "tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
+          else
+            git config user.name  'feedling-ci'
+            git config user.email 'ci@feedling.app'
+            git add deploy/docker-compose.phala.pre.yaml
+            git commit -m "deploy(pre): bump CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
+            git push origin HEAD:pre
+          fi
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: 1.7.1   # pin a concrete version: 'stable' makes foundryup hit the rate-limited GitHub API (403 in CI)
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install phala CLI
+        run: npm install -g phala@1.1.19  # pinned (§8 supply-chain); bump deliberately
+
+      - name: Resolve CVM_ID
+        id: cvmid
+        run: |
+          CVM_ID=$(tr -d '[:space:]' < deploy/pre-cvm-id.txt)
+          if [ -z "$CVM_ID" ]; then
+            echo "::error::deploy/pre-cvm-id.txt is empty — cannot target a CVM"
+            exit 1
+          fi
+          echo "cvm_id=$CVM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy CVM via phala
+        env:
+          # Pre env lives on the SAME Phala account as test (amiller-user) and
+          # deliberately reuses its API key; only DB/contract/URLs are pre-specific.
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          CF_ZONE_ID:          ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN:        ${{ secrets.CF_API_TOKEN }}
+          APNS_KEY_P8_B64:     ${{ secrets.APNS_KEY_P8_B64 }}
+          APNS_KEY_ID:         ${{ secrets.APNS_KEY_ID }}
+          APNS_TEAM_ID:        ${{ secrets.APNS_TEAM_ID }}
+          OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          DATABASE_URL:        ${{ secrets.PRE_DATABASE_URL }}
+          CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
+          # agent-runner (4th service) knobs — encrypted env channel, NOT baked
+          # into compose_hash (see prod deploy step). Default empty = idle + gateway
+          # off; flip on later with no on-chain re-auth. TEST_-prefixed where a
+          # separate test value is wanted; falls back to the shared secret/var.
+          AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
+          FEEDLING_LITELLM_ENABLE:      ${{ vars.TEST_FEEDLING_LITELLM_ENABLE }}
+          FEEDLING_LITELLM_API_KEY:     ${{ secrets.TEST_FEEDLING_LITELLM_API_KEY }}
+          # Host-all: agent-runner hosts every configured user (zero-roster, via
+          # runtime token) + backend routes their sends to it. Needs the token
+          # secret above. Empty = off. Both services read it from the encrypted env.
+          FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
+          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
+          # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
+          # Encrypted env channel, NOT baked into compose_hash — flip without
+          # on-chain re-auth. Gate: the deployed image must contain the leader-
+          # election patch (core/leader.py) or N>1 double-binds :9998.
+          FEEDLING_BACKEND_WORKERS:     ${{ vars.TEST_FEEDLING_BACKEND_WORKERS }}
+          # R2 frame-ciphertext offload — TEST_-prefixed secrets, un-prefixed
+          # container env. Empty = feature off; token MUST be scoped to the
+          # frames bucket. See deploy/DEPLOYMENTS.md.
+          R2_ENDPOINT:                  ${{ secrets.TEST_R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID:             ${{ secrets.TEST_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:         ${{ secrets.TEST_R2_SECRET_ACCESS_KEY }}
+          R2_FRAMES_BUCKET:             ${{ secrets.TEST_R2_FRAMES_BUCKET }}
+        run: |
+          echo ">>> deploy-pre-cvm target: $CVM_ID"
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::PRE_DATABASE_URL secret is not set — backend has no datastore"
+            exit 1
+          fi
+          phala deploy \
+            --api-token "$PHALA_CLOUD_API_KEY" \
+            --cvm-id "$CVM_ID" \
+            -c deploy/docker-compose.phala.pre.yaml \
+            -e "R2_ENDPOINT=$R2_ENDPOINT" \
+            -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+            -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+            -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
+            -e "CF_ZONE_ID=$CF_ZONE_ID" \
+            -e "CF_API_TOKEN=$CF_API_TOKEN" \
+            -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \
+            -e "APNS_KEY_ID=$APNS_KEY_ID" \
+            -e "APNS_TEAM_ID=$APNS_TEAM_ID" \
+            -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
+            -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
+            -e "DATABASE_URL=$DATABASE_URL" \
+            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "AGENT_TICK_INTERVAL_SEC=$AGENT_TICK_INTERVAL_SEC" \
+            -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
+            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
+            --wait
+
+      - name: Publish live compose_hash on Sepolia (pre contract)
+        env:
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.PRE_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
+          # Separate test account key (see deploy step above) — reads the live
+          # CVM's compose_hash; publish itself is signed by ETH_DEPLOYER_KEY.
+          PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.pre.yaml
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+          publish_status=1
+          for attempt in 1 2 3; do
+            if ./deploy/publish-compose-hash.sh eth_sepolia; then
+              publish_status=0
+              break
+            fi
+            # Do NOT capture `publish_status=$?` here: a failed `if cmd; then …; fi`
+            # with no else makes the whole `if` statement exit 0, so $? reads 0 and
+            # the step false-greens even when the publish reverted. Leave
+            # publish_status=1 until an attempt actually succeeds above.
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::compose_hash publish failed (attempt $attempt/3); retrying in 20s"
+              sleep 20
+            fi
+          done
+          exit "$publish_status"
+
+      # §2 attestation gate (pre). Inert until BOTH repo vars are set:
+      #   PRE_MAIN_ENCLAVE_URL            = https://<pre-app-id>-5003s.dstack-pha-prod9.phala.network
+      #   PRE_ENCLAVE_CONTENT_PK_BASELINE = <pre enclave content pk, from a manual /attestation read>
+      - name: Post-deploy attestation gate (pre)
+        env:
+          ATTEST_BASE:  ${{ vars.PRE_MAIN_ENCLAVE_URL }}
+          BASELINE_PK:  ${{ vars.PRE_ENCLAVE_CONTENT_PK_BASELINE }}
+        run: ./deploy/attestation-gate.sh pre attestation-pre.json
+
+      - name: Upload attestation snapshot (pre)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: attestation-pre-${{ github.sha }}
+          path: attestation-pre.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # §3 post-deploy canary (pre). Inert until PRE_MAIN_ENCLAVE_URL is set.
+      - name: Post-deploy canary round-trip (pre)
+        if: ${{ vars.PRE_MAIN_ENCLAVE_URL != '' }}
+        env:
+          FEEDLING_API_URL:     ${{ vars.PRE_API_URL || 'https://pre-api.feedling.app' }}
+          FEEDLING_ENCLAVE_URL: ${{ vars.PRE_MAIN_ENCLAVE_URL }}
+        run: |
+          python3 -m pip install --quiet cryptography
+          python3 tools/deploy_canary.py
+
+  # =========================================================================
+  # DEPLOY — standalone runner CVM (pre, multi-node Form B)
+  #
+  # Deploys deploy/docker-compose.phala.pre.runner.yaml to a SEPARATE Phala CVM that
+  # runs only agent-runner supervisors (see deploy/DEPLOYMENTS.md “横向扩展”). It
+  # reuses the same feedling-agent-runner:<sha> image, shares the main CVM's
+  # Postgres + token secret, and reaches the main CVM's backend/enclave over their
+  # public ingress + gateway-passthrough URLs.
+  #
+  # DORMANT BY DEFAULT: skipped unless the repo var DEPLOY_PRE_RUNNER_CVM == 'true'
+  # AND deploy/pre-runner-cvm-id.txt names a provisioned runner CVM. So merging
+  # this is a no-op until you (1) provision the runner dstack app, (2) put its CVM
+  # id in that file, (3) set the runner secrets/vars below, (4) flip the var. Runs
+  # AFTER deploy-pre-cvm (serialized: shares the branch push + the main CVM must
+  # be up for the runner to reach it).
+  # =========================================================================
+  deploy-pre-runner-cvm:
+    name: deploy runner CVM (pre)
+    needs: [deploy-pre-cvm, detect-cvm-changes-pre]
+    if: |
+      github.ref == 'refs/heads/pre' &&
+      github.event_name == 'push' &&
+      needs.detect-cvm-changes-pre.outputs.cvm == 'true' &&
+      vars.DEPLOY_PRE_RUNNER_CVM == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: read
+    concurrency:
+      group: deploy-pre-runner-cvm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Wait for ghcr.io agent-runner image :<sha>
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          for i in $(seq 1 60); do
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "agent-runner image :$SHA_SHORT available"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::agent-runner image :$SHA_SHORT did not appear in 10 min"
+          exit 1
+
+      - name: Pin image tag in deploy/docker-compose.phala.pre.runner.yaml
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          # deploy-pre-cvm already pushed the main pre bump; sync to it so this
+          # push fast-forwards (no race — the two deploy jobs are serialized).
+          git fetch origin pre
+          git reset --hard origin/pre
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.pre.runner.yaml
+          if git diff --quiet -- deploy/docker-compose.phala.pre.runner.yaml; then
+            echo "runner tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
+          else
+            git config user.name  'feedling-ci'
+            git config user.email 'ci@feedling.app'
+            git add deploy/docker-compose.phala.pre.runner.yaml
+            git commit -m "deploy(pre): bump runner CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
+            git push origin HEAD:pre
+          fi
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: 1.7.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install phala CLI
+        run: npm install -g phala@1.1.19  # pinned (§8 supply-chain); bump deliberately
+
+      - name: Resolve runner CVM_ID
+        id: cvmid
+        run: |
+          CVM_ID=$(tr -d '[:space:]' < deploy/pre-runner-cvm-id.txt)
+          if [ -z "$CVM_ID" ]; then
+            echo "::error::deploy/pre-runner-cvm-id.txt is empty — provision the runner CVM first"
+            exit 1
+          fi
+          echo "cvm_id=$CVM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy runner CVM via phala
+        env:
+          PHALA_CLOUD_API_KEY:          ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          CVM_ID:                       ${{ steps.cvmid.outputs.cvm_id }}
+          # Cross-CVM reach to the main CVM (repo vars — public URLs, not secrets):
+          #   PRE_MAIN_API_URL     = https://pre-api.feedling.app
+          #   PRE_MAIN_ENCLAVE_URL = https://<main-app-id>-5003s.dstack-pha-prod9.phala.network
+          FEEDLING_API_URL:             ${{ vars.PRE_MAIN_API_URL }}
+          FEEDLING_ENCLAVE_URL:         ${{ vars.PRE_MAIN_ENCLAVE_URL }}
+          AGENT_MAX_CHILDREN:           ${{ vars.TEST_AGENT_MAX_CHILDREN }}
+          # Shared with the main pre CVM — MUST match (esp. the token secret).
+          DATABASE_URL:                 ${{ secrets.PRE_DATABASE_URL }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
+          AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
+          FEEDLING_LITELLM_ENABLE:      ${{ vars.TEST_FEEDLING_LITELLM_ENABLE }}
+          FEEDLING_LITELLM_API_KEY:     ${{ secrets.TEST_FEEDLING_LITELLM_API_KEY }}
+          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
+        run: |
+          echo ">>> deploy-runner-cvm target: $CVM_ID"
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::PRE_DATABASE_URL not set — runner has no lease store"
+            exit 1
+          fi
+          if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
+            echo "::error::PRE_MAIN_API_URL / PRE_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"
+            exit 1
+          fi
+          phala deploy \
+            --api-token "$PHALA_CLOUD_API_KEY" \
+            --cvm-id "$CVM_ID" \
+            -c deploy/docker-compose.phala.pre.runner.yaml \
+            -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
+            -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
+            -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
+            -e "DATABASE_URL=$DATABASE_URL" \
+            -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
+            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
+            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            --wait
+
+      - name: Publish live runner compose_hash on Sepolia (pre contract)
+        env:
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          # The runner is a distinct dstack app → distinct compose_hash. Reuses the
+          # same FeedlingAppAuth contract by default (addComposeHash is onlyOwner +
+          # per-hash; the iOS audit card only checks the MAIN app's hashes, so the
+          # runner hash is harmless there). Override with PRE_RUNNER_FEEDLING_APP_AUTH_CONTRACT.
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.PRE_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.PRE_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
+          PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.pre.runner.yaml
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install pyyaml
