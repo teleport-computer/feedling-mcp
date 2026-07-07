@@ -73,6 +73,11 @@ x-agent-runner-env: &agent-runner-env
   FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
   FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
   FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
+  # pi driver: openai_compatible relays are served by the pi CLI directly (no
+  # LiteLLM). MUST match the backend's FEEDLING_PI_DRIVER_ENABLE (published in the
+  # supervisor heartbeat's pi capability) — drift → send 503 / stuck processing.
+  # Empty = off.
+  FEEDLING_PI_DRIVER_ENABLE: "${FEEDLING_PI_DRIVER_ENABLE:-}"
   # Genesis import worker: this runner is the only place genesis import jobs get
   # drained (the main CVM no longer runs an agent-runner). Claim is FOR UPDATE
   # SKIP LOCKED, so it stays correct if more runners are ever added back.

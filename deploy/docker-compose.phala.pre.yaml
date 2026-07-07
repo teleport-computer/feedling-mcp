@@ -221,6 +221,11 @@ services:
       # (inline) until the in-CVM LiteLLM gateway is actually on. Encrypted env,
       # NOT baked into compose_hash; default empty = off.
       FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      # pi driver: openai_compatible relays route to the pi CLI directly (no
+      # gateway) instead of codex+LiteLLM. The backend mirrors the runner's flag
+      # so driver_for_provider / send-gating agree — drift (backend on, runner
+      # off, or vice-versa) → require_pi 503. Empty = off.
+      FEEDLING_PI_DRIVER_ENABLE: "${FEEDLING_PI_DRIVER_ENABLE:-}"
       # Host-all: every configured user is served by the agent-runner (the send
       # routing must agree with the supervisor's host_all discovery). Empty = off
       # (per-user flag still required). Mirror the agent-runner's value.
