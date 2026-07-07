@@ -2,7 +2,7 @@ name: Publish container image
 
 on:
   push:
-    branches: [main, test]
+    branches: [main, test, pre]
     tags: ["v*"]
   workflow_dispatch:
 

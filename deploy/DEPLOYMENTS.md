@@ -108,6 +108,45 @@ and the Form B section below for the design.
 
 ### agent-runner (hosted agent-runtime) — 4th CVM service
 
+### Pre CVM (prod9, `pre` branch)
+
+Third environment, a mirror of test: `pre` branch → `deploy-pre-cvm` CI job →
+this CVM. Shares the test Phala account/key, R2 buckets, runtime-token secret
+and feature-flag vars (all `TEST_*` references in the CI job are deliberate);
+only DB, AppAuth contract, domain and CVM are pre-specific.
+
+| | |
+|---|---|
+| Provider | Phala Cloud dstack on prod9 (node id `18`), account `amiller-user` — same account + `TEST_PHALA_CLOUD_API_KEY` as test |
+| CVM ID | `82485d6f-9c23-48f1-9bdd-5a0d38531c3e` (also in `deploy/pre-cvm-id.txt`) |
+| App ID | `7d18a1f234a0d90e5f643cac8283b6048451b8f7` |
+| Created | 2026-07-07 as `feedling-io-pre`, `tdx.small`, **Phala KMS** (prod9). Provisioned locally via `phala deploy` (no `--cvm-id` ⇒ new app) without secrets, to mint the app_id; the healthy secret-bearing deploy is the CI `deploy-pre-cvm` job. |
+| Compose | `deploy/docker-compose.phala.pre.yaml` — same 3 services as test (`ingress`/`backend`/`enclave`), with `pre-api.feedling.app` + `_pre` volumes. `FEEDLING_IO_ONBOARDING_BRANCH` stays `test` (io-onboarding has no pre branch). |
+| Public API | `https://pre-api.feedling.app` (dstack-ingress auto-creates the CF DNS records once CI injects `CF_*`) |
+| Attestation | `https://7d18a1f234a0d90e5f643cac8283b6048451b8f7-5003s.dstack-pha-prod9.phala.network/attestation` (repo var `PRE_MAIN_ENCLAVE_URL`) |
+| Database | Dedicated pre RDS, injected via `PRE_DATABASE_URL` — fully isolated from test/prod (pre's enclave content key differs from test's, so sharing a DB would mix mutually-undecryptable ciphertext + double-schedule proactive jobs). |
+| On-chain | **Separate** Sepolia FeedlingAppAuth `0x65844Dd69eba4Aa4a784e089dA9D9308F430F794` (owner = the `ETH_DEPLOYER_KEY` address, deployed 2026-07-07 via `deploy-test-contract.yml` dispatch), repo var `PRE_FEEDLING_APP_AUTH_CONTRACT`. Kept apart from test's contract because a shared AppAuth + a newly created CVM is the exact combination that flipped the main enclave key in the 2026-07-05 prod-runner incident. |
+| Deploy path | CI `deploy-pre-cvm` job (in `ci.yml`) on push to the `pre` branch. Clone of `deploy-test-cvm` with pre compose / CVM / DB / contract, branch-gated to `refs/heads/pre`. |
+| Baseline | Set repo var `PRE_ENCLAVE_CONTENT_PK_BASELINE` from a manual `/attestation` read after the first healthy deploy (the attestation gate is inert until then). |
+
+### Runner CVM (pre, `feedling-io-agents-pre`)
+
+Mirror of the test runner CVM for the pre environment.
+
+| | |
+|---|---|
+| Provider | Phala Cloud dstack on prod9 (node id `18`), account `amiller-user` |
+| CVM ID | `d83aa64f-b0d9-40a1-91dd-c66307bd2c08` (also in `deploy/pre-runner-cvm-id.txt`) |
+| App ID | `cd73962001b190ce1be1e438422aeb46e95f5a79` |
+| Created | 2026-07-07 as `feedling-io-agents-pre`, `tdx.small`, **Phala KMS** (prod9). Provisioned locally with only the non-secret cross-CVM env (`FEEDLING_API_URL` / `FEEDLING_ENCLAVE_URL` / `AGENT_MAX_CHILDREN=16`). |
+| Compose | `deploy/docker-compose.phala.pre.runner.yaml` (`feedling-pre-runner`, volume `feedling_agent_runtime_pre_runner`) |
+| Shares w/ main pre CVM | pre RDS (`PRE_DATABASE_URL`), `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` (same secret as test — reuse is deliberate), Sepolia FeedlingAppAuth `0x6584…` (runner publishes its own compose_hash there) |
+| Cross-CVM reach | `FEEDLING_API_URL=https://pre-api.feedling.app` (`PRE_MAIN_API_URL`); `FEEDLING_ENCLAVE_URL=https://7d18a1f2…-5003s.dstack-pha-prod9.phala.network` (`PRE_MAIN_ENCLAVE_URL`) |
+| Deploy path | CI `deploy-pre-runner-cvm` job — DORMANT until repo var `DEPLOY_PRE_RUNNER_CVM=true`. |
+| Status | Provisioned 2026-07-07, idle shell (no DB env yet). Flip `DEPLOY_PRE_RUNNER_CVM=true` + push `pre` → CI does the first real deploy. |
+
+### agent-runner (hosted agent-runtime) — 4th CVM service
+
 The `agent-runner` service runs `backend/agent_runtime/supervisor.py`: a
 multi-tenant supervisor that hosts the resident consumer
 (`tools/chat_resident_consumer.py`) one process per user, driving `claude` /
