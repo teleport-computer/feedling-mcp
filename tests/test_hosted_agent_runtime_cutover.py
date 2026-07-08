@@ -25,11 +25,12 @@ class FakeStore:
 # ---- flag resolution ----
 
 def test_driver_for_provider_is_derived_not_chosen():
-    # Claude Code (Anthropic-wire) handles ONLY anthropic + deepseek; Codex is
-    # openai-native only; pi is the catch-all for the rest, unconditionally.
+    # Claude Code (Anthropic-wire) handles ONLY anthropic; Codex is
+    # openai-native only; pi is the catch-all for the rest (incl. deepseek),
+    # unconditionally.
     assert cutover.driver_for_provider("anthropic") == "claude"
     assert cutover.driver_for_provider("claude") == "claude"      # alias → anthropic
-    assert cutover.driver_for_provider("deepseek") == "claude"    # via its /anthropic endpoint
+    assert cutover.driver_for_provider("deepseek") == "pi"        # direct relay, no gateway
     assert cutover.driver_for_provider("openai") == "codex"
     # gemini/openrouter/openai_compatible → pi, unconditionally (no gateway hop)
     for p in ("gemini", "openrouter", "openai_compatible"):
@@ -37,6 +38,12 @@ def test_driver_for_provider_is_derived_not_chosen():
     # no provider configured → no hosted agent
     for p in ("", "bogus"):
         assert cutover.driver_for_provider(p) == "legacy"
+
+
+def test_deepseek_derives_to_pi_anthropic_stays_claude():
+    assert cutover.driver_for_provider("deepseek") == "pi"
+    assert cutover.driver_for_provider("anthropic") == "claude"
+    assert cutover.driver_for_provider("openai") == "codex"
 
 
 def test_codex_transport_native_only_for_openai():
@@ -56,7 +63,7 @@ def test_gemini_and_openrouter_derive_to_pi_unconditionally(monkeypatch):
     assert cutover.driver_for_provider("openai_compatible") == "pi"
     assert cutover.driver_for_provider("openai") == "codex"
     assert cutover.driver_for_provider("anthropic") == "claude"
-    assert cutover.driver_for_provider("deepseek") == "claude"
+    assert cutover.driver_for_provider("deepseek") == "pi"
 
 
 def test_codex_transport_only_native_or_empty():
@@ -78,7 +85,7 @@ def test_resolve_driver_raises_when_no_provider():
 def test_resolve_driver_derives_agent_from_provider():
     # Provider alone determines the driver — no per-user flag needed
     assert cutover.resolve_driver({"provider": "anthropic"}) == "claude"
-    assert cutover.resolve_driver({"provider": "deepseek"}) == "claude"
+    assert cutover.resolve_driver({"provider": "deepseek"}) == "pi"
     assert cutover.resolve_driver({"provider": "openai"}) == "codex"
 
 
@@ -398,13 +405,13 @@ def test_check_supervisor_live_instance_read_error_falls_back_to_legacy(monkeypa
 # ---- pi driver derivation (unconditional — FEEDLING_PI_DRIVER_ENABLE retired) ----
 
 def test_driver_for_provider_pi_is_unconditional(monkeypatch):
-    # No flag gates pi anymore: openai_compatible/gemini/openrouter always → pi.
+    # No flag gates pi anymore: openai_compatible/gemini/openrouter/deepseek always → pi.
     monkeypatch.delenv("FEEDLING_PI_DRIVER_ENABLE", raising=False)
     assert cutover.driver_for_provider("openai_compatible") == "pi"
     assert cutover.driver_for_provider("gemini") == "pi"
     assert cutover.driver_for_provider("openrouter") == "pi"
     assert cutover.driver_for_provider("anthropic") == "claude"
-    assert cutover.driver_for_provider("deepseek") == "claude"
+    assert cutover.driver_for_provider("deepseek") == "pi"
     assert cutover.driver_for_provider("openai") == "codex"
     # Setting the retired flag must not change anything.
     monkeypatch.setenv("FEEDLING_PI_DRIVER_ENABLE", "1")

@@ -14,10 +14,11 @@ consumer per API-key user inside the CVM, driven in `cli` mode against
 `claude` / `codex exec` / `pi --mode json`.
 
 Drivers are auto-derived from the user's provider (never user-chosen):
-- `claude` ← anthropic, deepseek (Anthropic wire, direct)
+- `claude` ← anthropic (Anthropic wire, direct)
 - `codex` ← openai (native OpenAI Responses, direct)
-- `pi` ← openai_compatible, gemini, openrouter (pi native adapters, direct —
-  no LiteLLM gateway)
+- `pi` ← openai_compatible, gemini, openrouter, **deepseek** (pi native
+  adapters, direct — no LiteLLM gateway; deepseek goes through pi's
+  `anthropic-messages` adapter at `<base>/anthropic`, text-only)
 
 pi resumes sessions with `--session-id` (create-if-missing) — the only driver
 that natively closes codex's missing-resume gap.

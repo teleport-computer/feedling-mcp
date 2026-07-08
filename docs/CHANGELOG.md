@@ -79,6 +79,21 @@
 
 ## 2026-07-08
 
+### [DONE] deepseek 从 claude driver 改投 pi driver（同一 anthropic-messages adapter）
+
+上一条 LiteLLM 网关退休时，deepseek 暂时留在了 `claude` driver 下（直接
+`ANTHROPIC_BASE_URL` 指向 `api.deepseek.com/anthropic`）。本次把 deepseek 也
+挪进 `pi` driver，走 pi 原生 `anthropic-messages` adapter，命中同一个
+`api.deepseek.com/anthropic` endpoint（text-only，deepseek 模型不接受图片
+content）——只是搬了驱动归属，端点和协议都没变。
+
+- **最终 driver 归属**：`anthropic` → `claude`；`openai` → `codex`；
+  `gemini`/`deepseek`/`openrouter`/`openai_compatible` → `pi`。
+- `backend/agent_runtime/spawners.py` 的 `_claude_anthropic_base_url` 现在
+  恒返回 `""`（deepseek 不再是 claude-wire 第三方）；调用点保留只是防未来
+  某个 claude-wire 第三方复用这条路径，本次改动是纯注释更新，不动逻辑。
+- 文档同步：`backend/agent_runtime/README.md` driver 表。
+
 ### [DONE] 退休 in-CVM LiteLLM 网关：gemini/openrouter 改走 pi driver 原生直连
 
 `agent-runner` 里的 in-CVM LiteLLM 网关（codex 非 openai provider 的转译层）整体退休。

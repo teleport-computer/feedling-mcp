@@ -1269,9 +1269,9 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     per-user ``agent_runtime_driver`` switch, no gateway/pi flags (the in-CVM
     LiteLLM gateway is retired; kill switch is deleting the config or flipping
     test_status). Driver is derived per provider (kept in sync with the CASE
-    here and hosted.agent_runtime_cutover.driver_for_provider): anthropic/
-    deepseek → claude; openai → codex (native OpenAI Responses); gemini/
-    openrouter/openai_compatible → pi (direct relay, no gateway hop).
+    here and hosted.agent_runtime_cutover.driver_for_provider): anthropic →
+    claude; openai → codex (native OpenAI Responses); gemini/openrouter/
+    openai_compatible/deepseek → pi (direct relay, no gateway hop).
     Returns [{"user_id","driver","provider","model","base_url","supports_responses",
     "reasoning_effort","thinking_fallback"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
@@ -1286,7 +1286,6 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                   CASE LOWER(COALESCE(doc->>'provider', ''))
                     WHEN 'anthropic' THEN 'claude'
                     WHEN 'claude'    THEN 'claude'
-                    WHEN 'deepseek'  THEN 'claude'
                     WHEN 'openai'    THEN 'codex'
                     ELSE 'pi'
                   END AS driver,

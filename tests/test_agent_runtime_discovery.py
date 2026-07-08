@@ -87,7 +87,7 @@ def _seed_model_api(user_id: str, *, provider: str, test_status: str,
 
 def _seed_all(_clean_blobs):
     _seed_model_api("anthropic_on", provider="anthropic", test_status="ok", enabled=True)
-    _seed_model_api("deepseek_on", provider="deepseek", test_status="ok", enabled=True)
+    _seed_model_api("deepseek_on", provider="deepseek", test_status="ok", enabled=True)  # pi, direct
     _seed_model_api("openai_on", provider="openai", test_status="ok", enabled=True)
     _seed_model_api("gemini_on", provider="gemini", test_status="ok", enabled=True, model="gemini-2.0-flash")  # pi, direct
     _seed_model_api("openrouter_on", provider="openrouter", test_status="ok", enabled=True,
@@ -113,7 +113,7 @@ def test_list_enabled_users_discovers_all_fit_providers_unconditionally(_clean_b
     assert {uid: r["driver"] for uid, r in rows.items()} == {
         "anthropic_on": "claude",
         "anthropic_off": "claude",   # legacy flag no longer gates discovery
-        "deepseek_on": "claude",
+        "deepseek_on": "pi",
         "openai_on": "codex",
         "gemini_on": "pi",
         "openrouter_on": "pi",
@@ -185,6 +185,13 @@ def test_gemini_openrouter_discovered_as_pi(_clean_blobs):
     rows = {r["user_id"]: r for r in db.list_agent_runtime_enabled_users()}
     assert rows["gem_u"]["driver"] == "pi"
     assert rows["or_u"]["driver"] == "pi"
+
+
+def test_deepseek_discovered_as_pi(_clean_blobs):
+    # deepseek moved off the claude driver onto pi (direct relay, no gateway).
+    _seed_model_api("ds_u", provider="deepseek", test_status="ok")
+    rows = {r["user_id"]: r for r in db.list_agent_runtime_enabled_users()}
+    assert rows["ds_u"]["driver"] == "pi"
 
 
 def test_list_agent_runtime_enabled_users_takes_no_flag_params():

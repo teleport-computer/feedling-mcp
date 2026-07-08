@@ -74,37 +74,6 @@ def test_consumer_env_sets_tz_from_user_first_class_timezone(monkeypatch):
     assert env["TZ"] == "America/New_York"
 
 
-def test_consumer_env_uses_stream_json_for_deepseek_claude_thinking():
-    env = spawners.consumer_env(
-        {"PATH": "/bin"},
-        {
-            "api_key": "fk",
-            "provider": "deepseek",
-            "provider_key": "sk-ds",
-            "driver": "claude",
-            "model": "deepseek-v4-pro",
-        },
-        user_id="u_1",
-        home="/agent-data/users/u_1",
-    )
-
-    cmd = env["AGENT_CLI_CMD"]
-    assert "--output-format stream-json" in cmd
-    assert "--include-partial-messages" in cmd
-    assert "--effort high" in cmd
-    assert "--permission-mode acceptEdits" in cmd  # non-interactive image Read
-    # the thinking-claude command must ALSO grant Read on the image temp dir, or a
-    # thinking model (deepseek/sonnet-4) can't open chat images (Read denied under -p).
-    # DOUBLE leading slash: a single slash anchors at the settings source (cwd /app),
-    # so Read(/agent-data/...) resolves to /app/agent-data/... and never matches.
-    assert "Read(//agent-data/users/u_1/images/**)" in cmd
-    # --add-dir puts the out-of-cwd image dir inside claude's trusted workspace, so
-    # the Read is permitted even under the headless workspace-trust boundary.
-    assert "--add-dir /agent-data/users/u_1/images" in cmd
-    assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
-    assert env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
-
-
 def test_consumer_env_uses_stream_json_for_native_anthropic_sonnet_thinking():
     env = spawners.consumer_env(
         {"PATH": "/bin"},
@@ -476,21 +445,21 @@ def test_openclaw_feedling_plugin_declares_native_memory_screen_tools_with_costs
     assert "[fast caption, slow image] Read the decrypted caption/ocr" in text
 
 
-def test_consumer_env_claude_deepseek_points_at_anthropic_compat_endpoint():
-    # deepseek runs on the claude (Anthropic-wire) driver but is NOT anthropic:
-    # the CLI must be pointed at deepseek's /anthropic-compatible endpoint + its
-    # own model, else it hits api.anthropic.com with a foreign key → exit 1.
+def test_consumer_env_claude_deepseek_no_longer_overrides_anthropic_endpoint():
+    # deepseek moved to the pi driver (anthropic-messages, see
+    # test_models_json_deepseek_uses_anthropic_messages_text_only); the claude
+    # driver's old /anthropic-compatible base-URL override for it is retired,
+    # so even an (unreachable in production) driver=claude+provider=deepseek
+    # entry now behaves like any other claude entry — no override.
     env = spawners.consumer_env(
         {}, {"driver": "claude", "provider": "deepseek", "model": "deepseek-v4-flash",
              "base_url": "https://api.deepseek.com", "provider_key": "sk-ds"},
         user_id="u_1", home="/h",
     )
-    assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    assert "ANTHROPIC_BASE_URL" not in env
     assert env["ANTHROPIC_API_KEY"] == "sk-ds"
     assert env["ANTHROPIC_MODEL"] == "deepseek-v4-flash"
-    # claude Code's background "small/fast" calls must use the deepseek model too,
-    # not a claude-* default the endpoint doesn't serve.
-    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == "deepseek-v4-flash"
+    assert "ANTHROPIC_SMALL_FAST_MODEL" not in env
 
 
 def test_consumer_env_claude_native_anthropic_keeps_default_endpoint():
@@ -838,3 +807,22 @@ def test_models_json_openai_compatible_unchanged():
     assert p["api"] == "openai-completions"
     assert p["baseUrl"] == "https://api.gemai.cc/v1"
     assert p["models"][0]["input"] == ["text", "image"]
+
+
+def test_models_json_deepseek_uses_anthropic_messages_text_only():
+    p = _prov("deepseek", model="deepseek-reasoner", base_url="")
+    assert p["api"] == "anthropic-messages"
+    assert p["baseUrl"] == "https://api.deepseek.com/anthropic"
+    assert "compat" not in p
+    assert p["models"] == [{"id": "deepseek-reasoner", "input": ["text"]}]
+
+
+def test_models_json_deepseek_honors_custom_base_url():
+    p = _prov("deepseek", model="deepseek-chat", base_url="https://ds.example.com/")
+    assert p["baseUrl"] == "https://ds.example.com/anthropic"
+
+
+def test_claude_anthropic_base_url_empty_for_all_providers_now():
+    assert spawners._claude_anthropic_base_url({"provider": "anthropic"}) == ""
+    assert spawners._claude_anthropic_base_url(
+        {"provider": "deepseek", "base_url": "https://api.deepseek.com"}) == ""
