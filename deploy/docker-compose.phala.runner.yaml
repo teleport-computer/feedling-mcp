@@ -46,8 +46,6 @@
 #     FEEDLING_API_URL              main CVM public ingress URL
 #     FEEDLING_ENCLAVE_URL          main CVM enclave gateway-passthrough URL
 #     FEEDLING_HOST_ALL=1           mirror the backend
-#     FEEDLING_LITELLM_ENABLE=1     if hosting gemini/openrouter/openai_compatible
-#     FEEDLING_LITELLM_API_KEY      gateway bearer (per-runner LiteLLM child)
 #     AGENT_MAX_CHILDREN            per-runner capacity ceiling (must cover the user
 #                                   count or some users go unserved)
 
@@ -68,11 +66,6 @@ x-agent-runner-env: &agent-runner-env
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
   FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
   FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-  # in-CVM LiteLLM gateway — a runner that hosts non-openai codex users runs its
-  # OWN proxy child on 127.0.0.1:<port>; codex on that runner connects locally.
-  FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
-  FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
-  FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
   # Genesis import worker: this runner is the only place genesis import jobs get
   # drained (the main CVM no longer runs an agent-runner). Claim is FOR UPDATE
   # SKIP LOCKED, so it stays correct if more runners are ever added back.

@@ -90,59 +90,21 @@ def write_runtime_token(home: str, token: str) -> None:
         pass
 
 
-# Codex speaks the OpenAI Responses wire only. It reaches OpenAI DIRECTLY
-# ("native"); every other codex-driven provider (gemini/openrouter/
-# openai_compatible) is bridged through the in-CVM LiteLLM gateway, which
-# exposes a Responses endpoint and fans out to the real provider. Keep this set
-# in sync with hosted/agent_runtime_cutover._CODEX_NATIVE_PROVIDERS.
-_CODEX_NATIVE_PROVIDERS = {"openai"}
-# The codex provider id for the gateway (referenced in config.toml + cli).
-_GATEWAY_PROVIDER_ID = "feedling_gateway"
+# Codex speaks the OpenAI Responses wire only, reaching OpenAI DIRECTLY
+# ("native"). It is the only codex-driven provider left — the in-CVM LiteLLM
+# gateway that used to bridge gemini/openrouter/openai_compatible through
+# codex's Responses wire is retired; those providers now go straight to their
+# native wire via the pi driver instead. Keep in sync with
+# hosted/agent_runtime_cutover._CODEX_PROVIDERS.
 
 
 def _codex_transport(entry: dict) -> str:
-    """For a codex entry, how it reaches the provider: ``native`` (direct OpenAI
-    Responses) or ``gateway`` (via the in-CVM LiteLLM Responses endpoint). Empty
-    for non-codex entries. A missing/unknown provider defaults to ``native`` so a
-    dev roster carrying only an OpenAI ``provider_key`` keeps working."""
+    """For a codex entry, how it reaches the provider: always ``native`` (direct
+    OpenAI Responses) — openai is codex's only driven provider now that the
+    in-CVM LiteLLM gateway is retired. Empty for non-codex entries."""
     if (entry.get("driver") or "").strip().lower() != "codex":
         return ""
-    prov = (entry.get("provider") or "").strip().lower()
-    if not prov or prov in _CODEX_NATIVE_PROVIDERS:
-        return "native"
-    return "gateway"
-
-
-def _codex_gateway_config(*, base_url: str, model: str) -> str:
-    """codex ``config.toml`` routing it through the in-CVM LiteLLM gateway: codex
-    talks OpenAI Responses to ``base_url`` (the gateway), authenticating with the
-    gateway key in ``CODEX_API_KEY``; the gateway holds the upstream provider key
-    and translates to the real provider."""
-    lines = []
-    if model:
-        lines.append(f'model = "{model}"')
-    lines += [
-        f'model_provider = "{_GATEWAY_PROVIDER_ID}"',
-        "",
-        f"[model_providers.{_GATEWAY_PROVIDER_ID}]",
-        'name = "feedling-litellm"',
-        f'base_url = "{base_url}"',
-        'wire_api = "responses"',
-        'env_key = "CODEX_API_KEY"',
-        "",
-        # codex >=0.142 declares its multi-agent tools as a
-        # `{"type": "namespace"}` tool group on EVERY Responses request — an
-        # OpenAI-only wire extension. Non-OpenAI upstreams reject the whole
-        # request on the unknown tool type (xAI via openrouter: 422 "unknown
-        # variant 'namespace', expected one of 'function', 'web_search'"), so
-        # every turn dies before the model runs. Disable multi-agent for gateway
-        # users; the remaining tools are plain `function` + `web_search`,
-        # which the gateway upstreams parse. (Verified on codex-cli 0.142.5:
-        # with `multi_agent = false` the namespace group is gone from the wire.)
-        "[features]",
-        "multi_agent = false",
-    ]
-    return "\n".join(lines) + "\n"
+    return "native"
 
 
 def _io_cli_allow_rules(io_cli: str = _IO_CLI) -> list[str]:
@@ -217,18 +179,32 @@ _CLAUDE_COMPAT_BASE_URLS = {"deepseek": "https://api.deepseek.com"}
 # pi 自定义 provider id（models.json 与 --model feedling/<id> 引用同一名字）。
 _PI_PROVIDER_ID = "feedling"
 
+# openrouter is a fixed public endpoint, not a user-supplied base_url.
+_PI_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
-def _pi_models_json(*, base_url: str, model: str) -> str:
+
+def _pi_models_json(*, base_url: str, model: str, provider: str) -> str:
     """pi ``models.json`` registering the user's relay as a custom provider.
 
-    ``api: openai-completions`` — relays only accept /chat/completions (the
-    LiteLLM chat-bridge lesson, 2026-06); pi speaks that wire natively so no
-    bridge/gateway hop is needed. ``apiKey: $PI_PROVIDER_API_KEY`` — pi resolves
-    ``$ENV`` at runtime (resolve-config-value), so the real relay key stays in
-    the consumer process env and never lands on disk. The compat flags mirror
-    what the LiteLLM bridge effectively sent (plain ``system`` role, no
-    ``reasoning_effort``) — relay OpenAI-compat is the weak point, so default
-    to the most conservative wire.
+    api/baseUrl/headers vary per ``provider`` (the LiteLLM-gateway retirement:
+    gemini/openrouter now go straight to their native wire instead of through
+    an in-CVM chat-bridge):
+
+    - ``gemini`` → pi's native ``google-generative-ai`` api; no ``baseUrl``/
+      ``compat`` (those are openai-completions-specific).
+    - ``openrouter`` → openrouter's fixed public endpoint + the
+      ``HTTP-Referer``/``X-Title`` headers openrouter asks callers to send.
+    - ``openai_compatible`` (and any other/empty provider — legacy default) →
+      ``api: openai-completions`` against the user-supplied relay
+      ``base_url``; relays only accept /chat/completions (the LiteLLM
+      chat-bridge lesson, 2026-06) and pi speaks that wire natively.
+
+    ``apiKey: $PI_PROVIDER_API_KEY`` — pi resolves ``$ENV`` at runtime
+    (resolve-config-value), so the real relay key stays in the consumer
+    process env and never lands on disk, for every branch. The compat flags
+    (openai-completions branches only) mirror what the LiteLLM bridge
+    effectively sent (plain ``system`` role, no ``reasoning_effort``) — relay
+    OpenAI-compat is the weak point, so default to the most conservative wire.
 
     ``input: ["text", "image"]`` declares the model's accepted modalities: pi
     only sends attached images as real vision content when the model's ``input``
@@ -239,24 +215,45 @@ def _pi_models_json(*, base_url: str, model: str) -> str:
     must opt image in explicitly. Chat relays front vision-capable models (gpt-4o,
     gpt-5.x, gemini, claude); a rare text-only relay will error an image turn
     rather than silently drop it — the honest failure."""
-    doc = {
-        "providers": {
-            _PI_PROVIDER_ID: {
-                "name": "Feedling relay",
-                "baseUrl": (base_url or "").strip().rstrip("/"),
-                "api": "openai-completions",
-                "apiKey": "$PI_PROVIDER_API_KEY",
-                "compat": {
-                    "supportsDeveloperRole": False,
-                    "supportsReasoningEffort": False,
-                },
-                "models": [{
-                    "id": (model or "").strip() or "default",
-                    "input": ["text", "image"],
-                }],
-            }
-        }
+    p = (provider or "").strip().lower()
+    model_entry = {
+        "id": (model or "").strip() or "default",
+        "input": ["text", "image"],
     }
+    compat = {
+        "supportsDeveloperRole": False,
+        "supportsReasoningEffort": False,
+    }
+    if p == "gemini":
+        prov = {
+            "name": "Feedling relay",
+            "api": "google-generative-ai",
+            "apiKey": "$PI_PROVIDER_API_KEY",
+            "models": [model_entry],
+        }
+    elif p == "openrouter":
+        prov = {
+            "name": "Feedling relay",
+            "baseUrl": _PI_OPENROUTER_BASE,
+            "api": "openai-completions",
+            "apiKey": "$PI_PROVIDER_API_KEY",
+            "headers": {
+                "HTTP-Referer": "https://feedling.app",
+                "X-Title": "Feedling",
+            },
+            "compat": compat,
+            "models": [model_entry],
+        }
+    else:  # openai_compatible (and empty/unknown) — legacy behaviour
+        prov = {
+            "name": "Feedling relay",
+            "baseUrl": (base_url or "").strip().rstrip("/"),
+            "api": "openai-completions",
+            "apiKey": "$PI_PROVIDER_API_KEY",
+            "compat": compat,
+            "models": [model_entry],
+        }
+    doc = {"providers": {_PI_PROVIDER_ID: prov}}
     return json.dumps(doc, indent=2) + "\n"
 
 
@@ -446,8 +443,6 @@ def agent_home_files(
     *,
     driver: str,
     io_cli: str = _IO_CLI,
-    codex_transport: str = "native",
-    gateway_base_url: str = "",
     model: str = "",
     base_url: str = "",
     persona_content: str = "",
@@ -472,8 +467,7 @@ def agent_home_files(
 
     For claude it also writes a ``settings.json`` under ``CLAUDE_CONFIG_DIR`` whose
     ``permissions.allow`` pre-authorizes the io_cli command (defense-in-depth alongside
-    the CLI flag). For a codex user on the LiteLLM gateway (non-openai provider) it
-    also writes a ``config.toml`` pointing codex at the gateway's Responses endpoint.
+    the CLI flag).
     """
     # The prompt template ships literal ``<io_cli>`` placeholders in every usage
     # example (``python <io_cli> perception …``). Substitute the real path here, or
@@ -485,22 +479,19 @@ def agent_home_files(
     persona = (persona_content or "").strip()
     if persona:
         system_append = f"{persona}\n\n---\n\n{system_append}"
-    # 身份块置顶，最高显著性。gateway codex 用户的 ``model`` 已被改写成内部 ``gw-<uid>``
-    # 别名（喂 LiteLLM 路由），身份自称须用真实上游模型 ``identity_model``（缺省回退 model）。
+    # 身份块置顶，最高显著性。``identity_model`` 目前恒为空（LiteLLM 网关已退役，不再有
+    # gw-<uid> 别名改写 model），字段/参数保留只是防未来复用；缺省回退用 ``model``。
     identity = _identity_override_block(provider, identity_model or model, base_url)
     if identity:
         system_append = f"{identity}\n\n---\n\n{system_append}"
     files = {f"{home}/{_AGENT_PROMPT_BASENAME}": system_append}
     if driver == "codex":
         files[f"{home}/codex-home/AGENTS.md"] = system_append
-        if codex_transport == "gateway":
-            files[f"{home}/codex-home/config.toml"] = _codex_gateway_config(
-                base_url=gateway_base_url, model=model)
     elif driver == "pi":
         # pi reads the tools how-to via --append-system-prompt (same mechanism as
         # claude); the relay is registered as a custom provider in models.json.
         files[f"{home}/pi-home/agent/models.json"] = _pi_models_json(
-            base_url=base_url, model=model)
+            base_url=base_url, model=model, provider=provider)
     else:
         # defaultMode acceptEdits is REQUIRED, not cosmetic: a settings.json that
         # carries `permissions.allow` but no defaultMode makes `claude -p` (esp. in
@@ -519,24 +510,19 @@ def agent_home_files(
     return files
 
 
-def stale_home_files(home: str, *, driver: str, codex_transport: str = "native") -> list[str]:
+def stale_home_files(home: str, *, driver: str) -> list[str]:
     """Per-user home paths a (re)spawn must PRUNE — files ``agent_home_files`` does
-    not write for the current driver/transport but a PERSISTENT home may still carry
-    from a prior config. Absolute paths.
+    not write for the current driver but a PERSISTENT home may still carry from a
+    prior config. Absolute paths.
 
-    The motivating case: a codex user who switched from a gateway provider
-    (gemini/openrouter/openai_compatible) to native openai — or to the claude
-    driver — leaves a ``codex-home/config.toml`` pointing at the in-CVM LiteLLM
-    gateway (``127.0.0.1:4000``). ``agent_home_files`` writes that file only for
-    ``gateway`` transport, so on the native/claude path the stale file survives and
-    codex keeps routing every turn to a port the supervisor only opens when gateway
-    users exist → ``error sending request`` → user-visible fallback. Listing it here
-    lets the spawner delete it so native codex falls back to api.openai.com as
-    designed. ``gateway`` transport returns [] — it WRITES that config this spawn and
-    must never prune it."""
-    stale: list[str] = []
-    if codex_transport != "gateway":
-        stale.append(f"{home}/codex-home/config.toml")
+    The motivating case (historical): a codex user who used to be bridged through
+    the in-CVM LiteLLM gateway (now retired) — or who switches to the claude
+    driver — may still carry a ``codex-home/config.toml`` pointing at the
+    (now-dead) gateway on a PERSISTENT home; ``agent_home_files`` never writes
+    that file any more (codex is native-only), so it must always be pruned here
+    or a stale config would keep routing codex at a port nothing listens on
+    anymore → ``error sending request`` → user-visible fallback."""
+    stale: list[str] = [f"{home}/codex-home/config.toml"]
     if driver != "pi":
         # A user who switched off the pi driver leaves a models.json pointing at
         # the old relay; prune it so a future switch-back always reseeds fresh
@@ -550,8 +536,6 @@ def materialize_home(
     *,
     driver: str,
     io_cli: str = _IO_CLI,
-    codex_transport: str = "native",
-    gateway_base_url: str = "",
     model: str = "",
     base_url: str = "",
     persona_content: str = "",
@@ -561,20 +545,19 @@ def materialize_home(
     """Write the per-user home files for a spawn AND prune stale ones a persistent
     home may carry (see ``stale_home_files``). Idempotent — safe before every
     (re)spawn. A path written this spawn is never pruned (the prune list excludes the
-    current transport's files, and a final guard skips anything just written).
+    current driver's files, and a final guard skips anything just written).
 
     ``provider``/``base_url`` drive the identity-override block in the appended
     system prompt (see ``agent_home_files``) — a non-official model reseeds with a
     prompt stating its real underlying model."""
     files = agent_home_files(
-        home, driver=driver, io_cli=io_cli, codex_transport=codex_transport,
-        gateway_base_url=gateway_base_url, model=model, persona_content=persona_content,
+        home, driver=driver, io_cli=io_cli, model=model, persona_content=persona_content,
         base_url=base_url, provider=provider, identity_model=identity_model)
     for path, content in files.items():
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
-    for path in stale_home_files(home, driver=driver, codex_transport=codex_transport):
+    for path in stale_home_files(home, driver=driver):
         if path not in files:
             Path(path).unlink(missing_ok=True)
     # Pre-create the decrypted-image dir (IMAGE_TEMP_DIR = {home}/images). The claude
@@ -694,15 +677,10 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     env["FEEDLING_RUNTIME_TOKEN_FILE"] = runtime_token_path(home)
     if driver == "codex":
         env["CODEX_HOME"] = f"{home}/codex-home"
-        if _codex_transport(entry) == "gateway":
-            # Codex authenticates to the in-CVM LiteLLM gateway with the GATEWAY
-            # key; the upstream provider key never enters the consumer process
-            # (it lives in the gateway's own config). base_env carries the
-            # gateway creds (supervisor environment).
-            gw_key = base_env.get("FEEDLING_LITELLM_API_KEY", "")
-            if gw_key:
-                env["CODEX_API_KEY"] = gw_key
-        elif entry.get("provider_key"):
+        # LiteLLM gateway retired: codex is native-only now (openai), so the
+        # upstream provider key goes straight to CODEX_API_KEY — no gateway
+        # key indirection.
+        if entry.get("provider_key"):
             env["CODEX_API_KEY"] = entry["provider_key"]
     elif driver == "pi":
         # 每用户 pi 配置隔离（models.json/sessions 都落在 agent dir 下，pi 从
@@ -796,8 +774,6 @@ class ProcessSpawner:
         driver = (entry.get("driver") or "claude").strip().lower()
         materialize_home(
             home, driver=driver,
-            codex_transport=_codex_transport(entry),
-            gateway_base_url=os.environ.get("FEEDLING_LITELLM_BASE_URL", ""),
             model=str(entry.get("model") or ""),
             base_url=str(entry.get("base_url") or ""),
             provider=str(entry.get("provider") or ""),
@@ -840,7 +816,6 @@ _CONSUMER_ENV_KEYS = (
     "AGENT_MODE", "AGENT_CLI_CMD", "CHECKPOINT_FILE", "AGENT_SESSION_FILE",
     "IMAGE_TEMP_DIR", "FILE_TEMP_DIR", "CONSUMER_ID", "FEEDLING_RUNTIME_TOKEN_FILE",
     "ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
-    "FEEDLING_LITELLM_BASE_URL", "FEEDLING_LITELLM_API_KEY",
     # Per-user ambient timezone so the containerized agent's clock isn't the
     # container's default UTC (the process-spawn path sets it in consumer_env;
     # without this the container strategy would silently drop it).

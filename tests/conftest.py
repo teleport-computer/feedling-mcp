@@ -26,7 +26,6 @@ import pytest
 # Let hosting-ready check pass in tests by default. Tests that specifically
 # test the assert_hosting_ready() raise path (test_hosted_agent_runtime_cutover.py)
 # use monkeypatch.delenv to explicitly unset these, overriding setdefault.
-os.environ.setdefault("FEEDLING_LITELLM_ENABLE", "1")
 os.environ.setdefault("FEEDLING_HOST_ALL", "1")
 os.environ.setdefault("FEEDLING_RUNTIME_TOKEN_SECRET", "test-runtime-token-secret")
 

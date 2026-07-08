@@ -505,31 +505,18 @@ def test_consumer_env_claude_native_anthropic_keeps_default_endpoint():
     assert env["ANTHROPIC_API_KEY"] == "sk-ant"
 
 
-# ---- codex → LiteLLM gateway (non-openai providers) ----
+# ---- codex: native-only (LiteLLM gateway retired) ----
 
 
 def test_codex_native_for_openai_uses_provider_key_directly():
-    # openai is codex's native wire: the OpenAI key goes straight to CODEX_API_KEY
-    # and there is no gateway override.
+    # openai is codex's only driven provider now (native OpenAI Responses): the
+    # OpenAI key goes straight to CODEX_API_KEY — no gateway indirection left.
     env = spawners.consumer_env(
-        {"FEEDLING_LITELLM_API_KEY": "gw-key"},
+        {},
         {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex", "provider": "openai"},
         user_id="u", home="/h",
     )
     assert env["CODEX_API_KEY"] == "sk-oai"
-
-
-def test_codex_gateway_for_non_openai_presents_gateway_key_not_upstream():
-    # gemini/openrouter/openai_compatible reach codex only through the in-CVM
-    # LiteLLM gateway: codex presents the GATEWAY key, never the upstream provider
-    # key (which stays inside the gateway's own config — minimize key exposure).
-    env = spawners.consumer_env(
-        {"FEEDLING_LITELLM_API_KEY": "gw-key", "FEEDLING_LITELLM_BASE_URL": "http://127.0.0.1:4000/v1"},
-        {"api_key": "fk", "provider_key": "sk-upstream", "driver": "codex", "provider": "gemini"},
-        user_id="u", home="/h",
-    )
-    assert env["CODEX_API_KEY"] == "gw-key"
-    assert "sk-upstream" not in env.values()
 
 
 def test_agent_home_files_prepends_genesis_persona_when_present():
@@ -580,82 +567,33 @@ def test_agent_home_files_blank_persona_is_tools_only():
     assert append.startswith("# Feedling context tools")  # tools how-to header, no prefix
 
 
-def test_agent_home_files_codex_gateway_writes_responses_config():
-    # 明确指定为非官方 provider，会注入身份块。测试检查 gateway config 仍被创建
-    files = spawners.agent_home_files(
-        "/h", driver="codex", provider="gemini", codex_transport="gateway",
-        gateway_base_url="http://127.0.0.1:4000/v1", model="gw-gemini",
-    )
-    cfg = files["/h/codex-home/config.toml"]
-    # codex speaks OpenAI Responses to the gateway, which fans out to the provider
-    assert 'wire_api = "responses"' in cfg
-    assert "http://127.0.0.1:4000/v1" in cfg
-    assert "gw-gemini" in cfg
-    # AGENTS.md still seeded
-    assert "/h/codex-home/AGENTS.md" in files
-
-
-def test_agent_home_files_codex_gateway_disables_multi_agent_tools():
-    # codex 0.142 declares its multi-agent tools as a `{"type": "namespace"}` tool
-    # group on EVERY Responses request — an OpenAI-only wire extension. Non-OpenAI
-    # upstreams behind the gateway reject the whole request on it (xAI: 422
-    # "unknown variant 'namespace', expected one of 'function', 'web_search'"),
-    # so every turn dies before the model runs. Gateway config must turn the
-    # multi-agent feature off; native OpenAI keeps it (no config.toml written there).
-    files = spawners.agent_home_files(
-        "/h", driver="codex", provider="openrouter", codex_transport="gateway",
-        gateway_base_url="http://127.0.0.1:4000/v1", model="gw-x",
-    )
-    cfg = files["/h/codex-home/config.toml"]
-    assert "[features]" in cfg
-    assert "multi_agent = false" in cfg
-    assert "collab = false" not in cfg
-
-
-def test_agent_home_files_codex_native_omits_gateway_config():
-    # 明确指定为官方 openai provider，native codex 不会创建 gateway config
-    files = spawners.agent_home_files("/h", driver="codex", provider="openai", codex_transport="native")
+def test_agent_home_files_codex_never_writes_config_toml():
+    # LiteLLM gateway retired: codex is native-only now, and native codex never
+    # gets a config.toml (the CLI default api.openai.com is correct as-is).
+    files = spawners.agent_home_files("/h", driver="codex", provider="openai")
     assert "/h/codex-home/config.toml" not in files
 
 
-def test_stale_home_files_native_codex_prunes_gateway_config():
-    # A user who switched from a gateway provider (gemini/openrouter/...) to native
-    # openai leaves a codex-home/config.toml pointing at the in-CVM gateway on the
-    # PERSISTENT home. agent_home_files writes nothing for native, so the stale file
-    # would survive and keep routing codex at the (now-dead) :4000 — list it to prune.
-    stale = spawners.stale_home_files("/h", driver="codex", codex_transport="native")
+def test_stale_home_files_codex_always_prunes_config_toml():
+    # Historical case: a user who used to be bridged through the in-CVM LiteLLM
+    # gateway (now retired) may still carry a codex-home/config.toml pointing at
+    # the (now-dead) gateway on the PERSISTENT home. agent_home_files never
+    # writes that file any more, so it must always be pruned here.
+    stale = spawners.stale_home_files("/h", driver="codex")
     assert "/h/codex-home/config.toml" in stale
 
 
-def test_stale_home_files_gateway_codex_keeps_config():
-    # Gateway transport WRITES config.toml this spawn — it must never be pruned.
-    stale = spawners.stale_home_files("/h", driver="codex", codex_transport="gateway")
-    assert "/h/codex-home/config.toml" not in stale
-
-
-def test_materialize_home_prunes_stale_gateway_config_on_native(tmp_path):
+def test_materialize_home_prunes_stale_gateway_config_on_codex(tmp_path):
     home = str(tmp_path / "u")
     cfg = tmp_path / "u" / "codex-home" / "config.toml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text('model_provider = "feedling_gateway"\nbase_url = "http://127.0.0.1:4000/v1"\n')
     # 明确指定为官方 provider，所以不会注入身份块
-    spawners.materialize_home(home, driver="codex", provider="openai", codex_transport="native")
+    spawners.materialize_home(home, driver="codex", provider="openai")
     # the stale gateway config is gone → codex falls back to native (api.openai.com)
     assert not cfg.exists()
     # AGENTS.md still seeded
     assert (tmp_path / "u" / "codex-home" / "AGENTS.md").exists()
-
-
-def test_materialize_home_writes_and_keeps_gateway_config(tmp_path):
-    home = str(tmp_path / "u")
-    # 明确指定为非官方 provider，会注入身份块。测试检查 gateway config 仍被创建
-    spawners.materialize_home(
-        home, driver="codex", provider="gemini", codex_transport="gateway",
-        gateway_base_url="http://127.0.0.1:4000/v1", model="gw-gemini",
-    )
-    cfg = tmp_path / "u" / "codex-home" / "config.toml"
-    assert cfg.exists()
-    assert "http://127.0.0.1:4000/v1" in cfg.read_text()
 
 
 def test_materialize_home_creates_image_dir_for_claude(tmp_path):
@@ -775,17 +713,15 @@ def test_agent_home_files_official_provider_with_default_base_url_no_block():
     assert "你的真实身份" not in files["/h/agent-tools-prompt.md"]
 
 
-def test_agent_home_files_identity_block_uses_identity_model_over_gateway_alias():
-    # gateway codex：model 已改写成内部 gw-<uid> 别名，身份自称须用真实上游模型（Codex P2）
+def test_agent_home_files_identity_block_uses_identity_model_over_model():
+    # identity_model 目前恒为空（LiteLLM 网关已退役，不再有 gw-<uid> 别名改写 model），
+    # 字段/参数保留只是防未来复用——但当调用方显式传入时，身份块仍须优先用它。
     files = spawners.agent_home_files(
-        "/h", driver="codex", provider="gemini", codex_transport="gateway",
-        gateway_base_url="http://127.0.0.1:4000/v1",
-        model="gw-u123", identity_model="gemini-2.0-flash")
+        "/h", driver="codex", provider="gemini",
+        model="internal-alias", identity_model="gemini-2.0-flash")
     agents_md = files["/h/codex-home/AGENTS.md"]
-    assert "gemini-2.0-flash" in agents_md   # 身份块用真实模型
-    assert "gw-u123" not in agents_md          # 不暴露内部别名
-    # gateway config.toml 仍用 gw-<uid> 别名做 LiteLLM 路由
-    assert 'model = "gw-u123"' in files["/h/codex-home/config.toml"]
+    assert "gemini-2.0-flash" in agents_md   # 身份块用 identity_model
+    assert "internal-alias" not in agents_md
 
 
 def test_agent_home_files_identity_block_reaches_codex_and_pi():
@@ -833,9 +769,28 @@ def test_consumer_env_uses_pi_cli_and_home_for_pi_driver():
     assert "CLAUDE_CONFIG_DIR" not in env
 
 
+def test_consumer_env_pi_gemini_sets_provider_key_no_litellm():
+    # LiteLLM gateway retirement: gemini (like every pi-driven provider) sets
+    # PI_PROVIDER_API_KEY directly — no gateway indirection (see
+    # test_consumer_env_keys_have_no_litellm for the general no-litellm-key guard).
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider_key": "sk-gemini", "driver": "pi",
+             "provider": "gemini", "model": "gemini-2.5-pro"},
+        user_id="u_1", home="/h",
+    )
+    assert env["PI_PROVIDER_API_KEY"] == "sk-gemini"
+    assert env["PI_CODING_AGENT_DIR"] == "/h/pi-home/agent"
+    assert env["PI_OFFLINE"] == "1"
+
+
+def test_consumer_env_keys_have_no_litellm():
+    assert not any("LITELLM" in k for k in spawners._CONSUMER_ENV_KEYS)
+
+
 def test_agent_home_files_pi_seeds_models_json_with_relay_provider():
     files = spawners.agent_home_files(
-        "/h", driver="pi", model="qwen-max", base_url="https://my.host/v1/")
+        "/h", driver="pi", model="qwen-max", base_url="https://my.host/v1/",
+        provider="openai_compatible")
     doc = json.loads(files["/h/pi-home/agent/models.json"])
     prov = doc["providers"]["feedling"]
     assert prov["baseUrl"] == "https://my.host/v1"          # 尾斜杠被剥掉
@@ -852,7 +807,34 @@ def test_agent_home_files_pi_seeds_models_json_with_relay_provider():
 
 
 def test_stale_home_files_prunes_pi_models_json_when_not_pi():
-    stale = spawners.stale_home_files("/h", driver="codex", codex_transport="native")
+    stale = spawners.stale_home_files("/h", driver="codex")
     assert "/h/pi-home/agent/models.json" in stale
     stale_pi = spawners.stale_home_files("/h", driver="pi")
     assert "/h/pi-home/agent/models.json" not in stale_pi
+
+
+def _prov(provider, **kw):
+    files = spawners.agent_home_files("/h", driver="pi", provider=provider, **kw)
+    return json.loads(files["/h/pi-home/agent/models.json"])["providers"]["feedling"]
+
+
+def test_models_json_openrouter_uses_openai_completions_and_base():
+    p = _prov("openrouter", model="x-ai/grok-2", base_url="")
+    assert p["api"] == "openai-completions"
+    assert p["baseUrl"] == "https://openrouter.ai/api/v1"
+    assert p["headers"]["X-Title"] == "Feedling"
+    assert p["models"] == [{"id": "x-ai/grok-2", "input": ["text", "image"]}]
+
+
+def test_models_json_gemini_uses_google_generative_ai():
+    p = _prov("gemini", model="gemini-2.5-flash", base_url="")
+    assert p["api"] == "google-generative-ai"
+    assert "compat" not in p
+    assert p["models"] == [{"id": "gemini-2.5-flash", "input": ["text", "image"]}]
+
+
+def test_models_json_openai_compatible_unchanged():
+    p = _prov("openai_compatible", model="gpt-5.4-mini", base_url="https://api.gemai.cc/v1/")
+    assert p["api"] == "openai-completions"
+    assert p["baseUrl"] == "https://api.gemai.cc/v1"
+    assert p["models"][0]["input"] == ["text", "image"]

@@ -1089,13 +1089,13 @@ def chat_completion(
 def probe_responses_support(config: ProviderConfig) -> bool:
     """Does this relay implement the OpenAI Responses API (POST /v1/responses)?
 
-    codex speaks the Responses wire; the in-CVM LiteLLM gateway either passes that
-    straight through to a relay that implements /v1/responses (preserving codex's
-    tool loop) or, for a chat-only relay, forces the responses→chat-completions
-    bridge (which mangles the tool loop). We pick per relay by probing once at
-    setup. Returns True ONLY on a clear 2xx; a 4xx/5xx ("not implemented") or any
-    network error → False, i.e. fall back to the bridge — the safe default that
-    keeps chat-only relays working. Never raises."""
+    codex is native-openai-only now (the in-CVM LiteLLM gateway that used to
+    bridge this probe result into codex's Responses transport for
+    gemini/openrouter/openai_compatible is retired); those relays instead route
+    through the pi driver, which always speaks chat-completions directly
+    regardless of this probe. Probed once at setup and persisted as roster
+    metadata. Returns True ONLY on a clear 2xx; a 4xx/5xx ("not implemented") or
+    any network error → False. Never raises."""
     base_url = (config.base_url or default_base_url(config.provider)).rstrip("/")
     if not base_url:
         return False

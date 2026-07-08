@@ -5044,7 +5044,7 @@ def test_call_agent_cli_pi_folds_thinking_and_prefers_command_sid(monkeypatch, t
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id} {message}")
     monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
     monkeypatch.setattr(crc, "_prepare_cli_command",
-                        lambda message, image_paths=None: ["pi", "--mode", "json",
+                        lambda message, image_paths=None, lane="background": ["pi", "--mode", "json",
                                                            "--session-id", "sid-cmd-1", message])
     monkeypatch.setattr(crc.subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
@@ -5100,7 +5100,7 @@ def test_call_agent_cli_pi_error_turn_does_not_echo_user_message(monkeypatch, tm
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id} {message}")
     monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
     monkeypatch.setattr(crc, "_prepare_cli_command",
-                        lambda message, image_paths=None: ["pi", "--mode", "json",
+                        lambda message, image_paths=None, lane="background": ["pi", "--mode", "json",
                                                            "--session-id", "smoke-1", message])
     monkeypatch.setattr(crc.subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))

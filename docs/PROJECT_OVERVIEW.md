@@ -182,7 +182,7 @@ fallback；观察窗口健康后再逐条删除旧执行体，而不是长期并
 | `provider_client.py` | 模型 API 路由的 LLM provider 客户端（key 校验、chat completion） |
 | `hosted_runtime.py` | 托管运行时的后台执行合约（工具调用、待确认动作）。**现仅剩 fallback**：托管主路已是 agent-runner（`backend/agent_runtime/`），待 Stage F 退役，见 `docs/HOSTED_MODEL_API_RETIREMENT_ROADMAP.zh.md` |
 | `model_api_runtime/` | 托管聊天的 prompt 构建与工具（web search 等）。同上，仅剩 fallback |
-| `agent_runtime/` | agent-runner：托管用户的主运行时（每用户一个 claude/codex CLI agent 进程，supervisor + spawner + litellm gateway） |
+| `agent_runtime/` | agent-runner：托管用户的主运行时（每用户一个 claude/codex/pi CLI agent 进程，supervisor + spawner；in-CVM LiteLLM gateway 已退役） |
 | `context_memory_selection.py` | 记忆检索与相关性打分，组上下文窗口 |
 | `perception/` | 扩展感知：信号目录、权限、快照、wake 触发 |
 | `dstack_tls.py` | dstack-KMS 密钥派生 + 确定性 TLS 证书生成 |

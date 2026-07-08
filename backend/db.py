@@ -1264,29 +1264,20 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
 
 
-def list_agent_runtime_enabled_users(include_gateway: bool = False,
-                                     include_pi: bool = False) -> list[dict]:
-    """配了能 fit 的 provider 且 test_status='ok' 的用户都纳入托管（与
-    hosted/agent_runtime_cutover.resolve_driver 一致——不再有 per-user
-    ``agent_runtime_driver`` 开关；kill switch 改用删 config 或改 test_status）。
-    driver 由 provider 派生（保持 CASE 与 cutover.driver_for_provider 同步）：
-    anthropic/deepseek → claude；openai → codex (native)；openai_compatible →
-    pi（``include_pi``，直连中转站、不依赖 gateway）否则 codex via gateway。
-    gateway-only provider (gemini/openrouter[/openai_compatible 当 pi 关]) 仅当
-    ``include_gateway`` 时返回（gateway 关时不发现，避免 spawn 到不存在的 proxy）。
+def list_agent_runtime_enabled_users() -> list[dict]:
+    """Every user with a fit-able provider + test_status='ok' is hosted — no
+    per-user ``agent_runtime_driver`` switch, no gateway/pi flags (the in-CVM
+    LiteLLM gateway is retired; kill switch is deleting the config or flipping
+    test_status). Driver is derived per provider (kept in sync with the CASE
+    here and hosted.agent_runtime_cutover.driver_for_provider): anthropic/
+    deepseek → claude; openai → codex (native OpenAI Responses); gemini/
+    openrouter/openai_compatible → pi (direct relay, no gateway hop).
     Returns [{"user_id","driver","provider","model","base_url","supports_responses",
     "reasoning_effort","thinking_fallback"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
-    /v1/responses capability, set at setup; selects native passthrough vs the
-    LiteLLM chat-completions bridge)。"""
-    providers = ["anthropic", "claude", "deepseek", "openai"]
-    if include_gateway:
-        providers += ["gemini", "openrouter"]
-    if include_gateway and not include_pi:
-        providers.append("openai_compatible")
-    if include_pi:
-        providers.append("openai_compatible")
-    oc_driver = "pi" if include_pi else "codex"
+    /v1/responses capability, set at setup)."""
+    providers = ["anthropic", "claude", "deepseek", "openai",
+                 "gemini", "openrouter", "openai_compatible"]
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -1296,8 +1287,8 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False,
                     WHEN 'anthropic' THEN 'claude'
                     WHEN 'claude'    THEN 'claude'
                     WHEN 'deepseek'  THEN 'claude'
-                    WHEN 'openai_compatible' THEN %s
-                    ELSE 'codex'
+                    WHEN 'openai'    THEN 'codex'
+                    ELSE 'pi'
                   END AS driver,
                   LOWER(COALESCE(doc->>'provider', '')) AS provider,
                   COALESCE(doc->>'model', '') AS model,
@@ -1311,7 +1302,7 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False,
                   AND LOWER(COALESCE(doc->>'provider', '')) = ANY(%s)
                 ORDER BY user_id
                 """,
-                (oc_driver, providers),
+                (providers,),
             ).fetchall()
         return [{"user_id": uid, "driver": driver, "provider": provider,
                  "model": model, "base_url": base_url,

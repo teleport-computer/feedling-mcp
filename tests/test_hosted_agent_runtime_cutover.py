@@ -26,27 +26,42 @@ class FakeStore:
 
 def test_driver_for_provider_is_derived_not_chosen():
     # Claude Code (Anthropic-wire) handles ONLY anthropic + deepseek; Codex is
-    # the catch-all for everything else (openai direct, the rest via LiteLLM).
+    # openai-native only; pi is the catch-all for the rest, unconditionally.
     assert cutover.driver_for_provider("anthropic") == "claude"
     assert cutover.driver_for_provider("claude") == "claude"      # alias → anthropic
     assert cutover.driver_for_provider("deepseek") == "claude"    # via its /anthropic endpoint
     assert cutover.driver_for_provider("openai") == "codex"
-    # everything non-claude falls back to Codex (gateway-bridged where needed)
+    # gemini/openrouter/openai_compatible → pi, unconditionally (no gateway hop)
     for p in ("gemini", "openrouter", "openai_compatible"):
-        assert cutover.driver_for_provider(p) == "codex"
+        assert cutover.driver_for_provider(p) == "pi"
     # no provider configured → no hosted agent
     for p in ("", "bogus"):
         assert cutover.driver_for_provider(p) == "legacy"
 
 
 def test_codex_transport_native_only_for_openai():
-    # Codex speaks OpenAI Responses; it reaches OpenAI directly ("native") but
-    # any other codex-driven provider must go through the in-CVM LiteLLM gateway.
+    # Codex speaks OpenAI Responses natively; it is the ONLY codex-driven
+    # provider left (the LiteLLM gateway is retired). Everything else — pi-driven
+    # or claude-driven or unconfigured — has no codex transport.
     assert cutover.codex_transport("openai") == "native"
-    for p in ("gemini", "openrouter", "openai_compatible"):
-        assert cutover.codex_transport(p) == "gateway"
-    # claude-driven or unconfigured providers are not codex → no transport
-    for p in ("anthropic", "claude", "deepseek", "", "bogus"):
+    for p in ("gemini", "openrouter", "openai_compatible", "anthropic", "claude",
+              "deepseek", "", "bogus"):
+        assert cutover.codex_transport(p) == ""
+
+
+def test_gemini_and_openrouter_derive_to_pi_unconditionally(monkeypatch):
+    monkeypatch.delenv("FEEDLING_PI_DRIVER_ENABLE", raising=False)  # flag retired
+    assert cutover.driver_for_provider("gemini") == "pi"
+    assert cutover.driver_for_provider("openrouter") == "pi"
+    assert cutover.driver_for_provider("openai_compatible") == "pi"
+    assert cutover.driver_for_provider("openai") == "codex"
+    assert cutover.driver_for_provider("anthropic") == "claude"
+    assert cutover.driver_for_provider("deepseek") == "claude"
+
+
+def test_codex_transport_only_native_or_empty():
+    assert cutover.codex_transport("openai") == "native"
+    for p in ("gemini", "openrouter", "openai_compatible", "anthropic"):
         assert cutover.codex_transport(p) == ""
 
 
@@ -67,11 +82,10 @@ def test_resolve_driver_derives_agent_from_provider():
     assert cutover.resolve_driver({"provider": "openai"}) == "codex"
 
 
-def test_resolve_driver_routes_all_codex_providers_regardless_of_gateway(monkeypatch):
-    # Gateway check removed: gemini/openrouter/openai_compatible always → codex
-    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
+def test_resolve_driver_routes_all_pi_providers_regardless_of_gateway():
+    # Gateway check removed: gemini/openrouter/openai_compatible always → pi
     for p in ("gemini", "openrouter", "openai_compatible"):
-        assert cutover.resolve_driver({"provider": p}) == "codex"
+        assert cutover.resolve_driver({"provider": p}) == "pi"
     # openai is native (unaffected)
     assert cutover.resolve_driver({"provider": "openai"}) == "codex"
 
@@ -182,31 +196,16 @@ def test_handle_send_returns_processing_when_slow():
 
 # ---- assert_hosting_ready ----
 
-def test_assert_hosting_ready_raises_when_litellm_disabled(monkeypatch):
-    # pi off → openai_compatible still needs the gateway, so LiteLLM is required.
+def test_assert_hosting_ready_no_longer_requires_litellm(monkeypatch):
+    # LiteLLM gateway retired: assert_hosting_ready must not require it at all,
+    # regardless of the (now-retired) pi flag.
     monkeypatch.delenv("FEEDLING_PI_DRIVER_ENABLE", raising=False)
     monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
-    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
-    with pytest.raises(RuntimeError) as exc_info:
-        cutover.assert_hosting_ready()
-    assert "FEEDLING_LITELLM_ENABLE" in str(exc_info.value)
-
-
-def test_assert_hosting_ready_allows_pi_only_without_litellm(monkeypatch):
-    # pi-only 部署：openai_compatible 用户走 pi 直连中转站、不需要 gateway，所以缺
-    # FEEDLING_LITELLM_ENABLE 不该阻止启动。gateway-only provider (gemini/openrouter)
-    # 在 gateway 关时不被发现，且发送侧 check_supervisor_live(require_gateway=True)
-    # 会给清晰 503，不会卡 processing。
-    monkeypatch.setenv("FEEDLING_PI_DRIVER_ENABLE", "1")
-    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
-    monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
-    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
-    cutover.assert_hosting_ready()   # 不抛
+    cutover.assert_hosting_ready()  # must not raise
 
 
 def test_assert_hosting_ready_raises_when_host_all_disabled(monkeypatch):
-    monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
     monkeypatch.delenv("FEEDLING_HOST_ALL", raising=False)
     with pytest.raises(RuntimeError) as exc_info:
@@ -215,7 +214,6 @@ def test_assert_hosting_ready_raises_when_host_all_disabled(monkeypatch):
 
 
 def test_assert_hosting_ready_raises_when_token_secret_missing(monkeypatch):
-    monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
     monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
     monkeypatch.delenv("FEEDLING_RUNTIME_TOKEN_SECRET", raising=False)
     with pytest.raises(RuntimeError) as exc_info:
@@ -224,7 +222,6 @@ def test_assert_hosting_ready_raises_when_token_secret_missing(monkeypatch):
 
 
 def test_assert_hosting_ready_passes_when_all_set(monkeypatch):
-    monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
     monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
     cutover.assert_hosting_ready()  # 不抛
@@ -258,30 +255,11 @@ def test_evaluate_heartbeat_host_all_off_is_not_live():
     assert ok is False and reason == "supervisor_host_all_inactive"
 
 
-def test_evaluate_heartbeat_gateway_off_is_not_live():
+def test_evaluate_heartbeat_gateway_flag_is_ignored():
+    """gateway 概念已退休：hb 里的 gateway=False 不再影响判定（只剩 host_all + pi）。"""
     hb = {"ts": 1000.0, "host_all": True, "gateway": False}
     ok, reason = cutover.evaluate_supervisor_heartbeat(hb, now=1010.0, max_age=90)
-    assert ok is False and reason == "supervisor_gateway_disabled"
-
-
-def test_evaluate_heartbeat_gateway_off_require_gateway_false_is_live():
-    """gateway=False + require_gateway=False → live。
-    anthropic/openai-native 用户不经 gateway，不应被 supervisor_gateway_disabled 误阻断。"""
-    hb = {"ts": 1000.0, "host_all": True, "gateway": False}
-    ok, reason = cutover.evaluate_supervisor_heartbeat(
-        hb, now=1010.0, max_age=90, require_gateway=False
-    )
     assert ok is True and reason == ""
-
-
-def test_evaluate_heartbeat_gateway_off_require_gateway_true_is_not_live():
-    """gateway=False + require_gateway=True（默认）→ not-live。
-    openrouter/gemini 等 gateway-transport 用户应被阻断。"""
-    hb = {"ts": 1000.0, "host_all": True, "gateway": False}
-    ok, reason = cutover.evaluate_supervisor_heartbeat(
-        hb, now=1010.0, max_age=90, require_gateway=True
-    )
-    assert ok is False and reason == "supervisor_gateway_disabled"
 
 
 def test_evaluate_heartbeat_missing_ts_is_not_live():
@@ -348,30 +326,19 @@ def test_evaluate_instances_all_stale_is_not_live():
 
 def test_evaluate_instances_reason_from_freshest_when_none_live():
     # No instance is live; the reported reason comes from the freshest row so the
-    # operator sees the most current cluster state.
+    # operator sees the most current cluster state. gateway is no longer checked,
+    # so both rows here are only distinguished by host_all.
     insts = [
-        {"ts": 1000.0, "owner": "h:1", "host_all": True, "gateway": False},  # gateway off
-        {"ts": 1005.0, "owner": "h:2", "host_all": False, "gateway": True},  # host_all off (freshest)
+        {"ts": 1000.0, "owner": "h:1", "host_all": False, "gateway": True},
+        {"ts": 1005.0, "owner": "h:2", "host_all": False, "gateway": True},  # freshest
     ]
-    ok, reason = cutover.evaluate_supervisor_instances(
-        insts, now=1010.0, max_age=90, require_gateway=True)
+    ok, reason = cutover.evaluate_supervisor_instances(insts, now=1010.0, max_age=90)
     assert ok is False and reason == "supervisor_host_all_inactive"
 
 
-def test_evaluate_instances_require_gateway_false_ignores_gateway_off():
+def test_evaluate_instances_gateway_flag_is_ignored():
     insts = [{"ts": 1000.0, "owner": "h:1", "host_all": True, "gateway": False}]
-    assert cutover.evaluate_supervisor_instances(
-        insts, now=1010.0, max_age=90, require_gateway=False) == (True, "")
-
-
-def test_evaluate_instances_require_gateway_true_all_gateway_off_is_not_live():
-    insts = [
-        {"ts": 1000.0, "owner": "h:1", "host_all": True, "gateway": False},
-        {"ts": 1001.0, "owner": "h:2", "host_all": True, "gateway": False},
-    ]
-    ok, reason = cutover.evaluate_supervisor_instances(
-        insts, now=1010.0, max_age=90, require_gateway=True)
-    assert ok is False and reason == "supervisor_gateway_disabled"
+    assert cutover.evaluate_supervisor_instances(insts, now=1010.0, max_age=90) == (True, "")
 
 
 def test_check_supervisor_live_prefers_multi_instance(monkeypatch):
@@ -428,63 +395,75 @@ def test_check_supervisor_live_instance_read_error_falls_back_to_legacy(monkeypa
     assert cutover.check_supervisor_live(now=1000.0) == (True, "")
 
 
-# ---- pi driver derivation (FEEDLING_PI_DRIVER_ENABLE) ----
+# ---- pi driver derivation (unconditional — FEEDLING_PI_DRIVER_ENABLE retired) ----
 
-def test_driver_for_provider_pi_flag(monkeypatch):
-    # 开关关（默认）：openai_compatible 维持 codex（回滚路径零变化）
+def test_driver_for_provider_pi_is_unconditional(monkeypatch):
+    # No flag gates pi anymore: openai_compatible/gemini/openrouter always → pi.
     monkeypatch.delenv("FEEDLING_PI_DRIVER_ENABLE", raising=False)
-    assert cutover.driver_for_provider("openai_compatible") == "codex"
-    # 开关开：openai_compatible → pi；其余 provider 不受影响
-    monkeypatch.setenv("FEEDLING_PI_DRIVER_ENABLE", "1")
     assert cutover.driver_for_provider("openai_compatible") == "pi"
+    assert cutover.driver_for_provider("gemini") == "pi"
+    assert cutover.driver_for_provider("openrouter") == "pi"
     assert cutover.driver_for_provider("anthropic") == "claude"
     assert cutover.driver_for_provider("deepseek") == "claude"
     assert cutover.driver_for_provider("openai") == "codex"
-    assert cutover.driver_for_provider("gemini") == "codex"
-    assert cutover.driver_for_provider("openrouter") == "codex"
-
-
-def test_codex_transport_empty_when_pi_takes_openai_compatible(monkeypatch):
-    # pi 接管后 openai_compatible 不再是 codex-driven，也就不再依赖 gateway
-    # （chat_routes 的 require_gateway 推导靠这个返回 ""）。
+    # Setting the retired flag must not change anything.
     monkeypatch.setenv("FEEDLING_PI_DRIVER_ENABLE", "1")
+    assert cutover.driver_for_provider("openai_compatible") == "pi"
+
+
+def test_codex_transport_empty_for_pi_providers():
+    # pi-driven providers are never codex-driven, so no gateway/native transport.
     assert cutover.codex_transport("openai_compatible") == ""
-    assert cutover.codex_transport("gemini") == "gateway"
+    assert cutover.codex_transport("gemini") == ""
+    assert cutover.codex_transport("openrouter") == ""
     assert cutover.codex_transport("openai") == "native"
-    monkeypatch.delenv("FEEDLING_PI_DRIVER_ENABLE", raising=False)
-    assert cutover.codex_transport("openai_compatible") == "gateway"
 
 
-def test_resolve_driver_accepts_pi(monkeypatch):
-    monkeypatch.setenv("FEEDLING_PI_DRIVER_ENABLE", "1")
+def test_resolve_driver_accepts_pi():
     assert cutover.resolve_driver({"provider": "openai_compatible"}) == "pi"
+    assert cutover.resolve_driver({"provider": "gemini"}) == "pi"
+    assert cutover.resolve_driver({"provider": "openrouter"}) == "pi"
 
 
 # ---- pi capability in heartbeat (cross-service flag-drift guard) ----
 
 def test_evaluate_heartbeat_require_pi_gates_on_pi_flag():
     now = 1000.0
-    # pi 用户: require_gateway=False + require_pi=True。runner 报 pi=True → live。
+    # pi 用户: require_pi=True。runner 报 pi=True → live（gateway 字段已退休，不看）。
     fresh = {"ts": 999.0, "host_all": True, "gateway": False, "pi": True}
     assert cutover.evaluate_supervisor_heartbeat(
-        fresh, now=now, max_age=90, require_gateway=False, require_pi=True) == (True, "")
+        fresh, now=now, max_age=90, require_pi=True) == (True, "")
     # runner pi 关 → 判不 live（防 backend-pi-on/runner-pi-off 卡 processing）。
     no_pi = {"ts": 999.0, "host_all": True, "gateway": True, "pi": False}
     live, reason = cutover.evaluate_supervisor_heartbeat(
-        no_pi, now=now, max_age=90, require_gateway=False, require_pi=True)
+        no_pi, now=now, max_age=90, require_pi=True)
     assert live is False and reason == "supervisor_pi_disabled"
     # 老 runner 心跳无 pi 字段 → 保守判不 live（安全方向，宁可 503 不卡死）。
     old = {"ts": 999.0, "host_all": True, "gateway": True}
     assert cutover.evaluate_supervisor_heartbeat(
-        old, now=now, max_age=90, require_gateway=False, require_pi=True)[0] is False
+        old, now=now, max_age=90, require_pi=True)[0] is False
     # 非 pi 用户(require_pi=False): pi 字段缺失不受影响。
     assert cutover.evaluate_supervisor_heartbeat(
-        old, now=now, max_age=90, require_gateway=True, require_pi=False) == (True, "")
+        old, now=now, max_age=90, require_pi=False) == (True, "")
 
 
 def test_check_supervisor_live_threads_require_pi(monkeypatch):
     monkeypatch.setattr(cutover.db, "list_supervisor_instance_heartbeats",
                         lambda: [{"ts": 999.0, "owner": "h:1", "host_all": True,
                                   "gateway": True, "pi": False}], raising=False)
-    ok, reason = cutover.check_supervisor_live(require_gateway=False, require_pi=True, now=1000.0)
+    ok, reason = cutover.check_supervisor_live(require_pi=True, now=1000.0)
     assert ok is False and reason == "supervisor_pi_disabled"
+
+
+def test_send_gate_has_no_require_gateway_param():
+    import inspect
+    sig = inspect.signature(cutover.check_supervisor_live)
+    assert "require_gateway" not in sig.parameters
+    assert "require_pi" in sig.parameters
+
+
+def test_pi_heartbeat_gate_ignores_gateway_flag():
+    hb = {"ts": 1_000_000.0, "host_all": True, "gateway": False, "pi": True}
+    live, reason = cutover.evaluate_supervisor_heartbeat(
+        hb, now=1_000_001.0, max_age=90, require_pi=True)
+    assert live is True and reason == ""

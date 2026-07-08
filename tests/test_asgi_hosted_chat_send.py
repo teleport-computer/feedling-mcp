@@ -206,7 +206,7 @@ def test_processing_202_parity(env):
     assert f_status == a_status == 202
     assert _norm(a_body) == _norm(f_body)
     assert f_body["status"] == "processing" and f_body["reply_ready"] is False
-    assert f_body["runtime"]["driver"] == "codex"
+    assert f_body["runtime"]["driver"] == "pi"
     # debug_trace: route.decided / agent_runtime fired on BOTH backends.
     for tr in (flask_traces, asgi_traces):
         decided = [t for t in tr if t.get("type") == "route.decided"]

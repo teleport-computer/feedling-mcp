@@ -79,6 +79,33 @@
 
 ## 2026-07-08
 
+### [DONE] 退休 in-CVM LiteLLM 网关：gemini/openrouter 改走 pi driver 原生直连
+
+`agent-runner` 里的 in-CVM LiteLLM 网关（codex 非 openai provider 的转译层）整体退休。
+收口后三个驱动各自原生直连自己的 provider，没有任何 provider 再需要网关中转：
+
+- **driver 归属**：`claude` ← anthropic/deepseek（Anthropic wire，直连）；
+  `codex` ← openai（原生 OpenAI Responses，直连）；`pi` ← openai_compatible/
+  gemini/openrouter（pi 原生 adapter，直连，无网关跳转）。
+- **pi 无条件接管** gemini/openrouter/openai_compatible：`FEEDLING_PI_DRIVER_ENABLE`
+  开关整体删除（`hosted.agent_runtime_cutover.driver_for_provider`、
+  `db.list_agent_runtime_enabled_users`、supervisor 发现/心跳均不再读这个 flag）。
+- **per-provider pi `models.json`**：`_pi_models_json` 按 provider 分叉——
+  gemini 走 pi 原生 `google-generative-ai` api（无 baseUrl/openai 桥）；
+  openrouter/openai_compatible 走 `openai-completions` wire（openrouter 固定
+  `https://openrouter.ai/api/v1`，openai_compatible 用用户自填 baseUrl）。
+- **runner 镜像瘦身**：`deploy/Dockerfile.agent-runner` 删除整个 LiteLLM venv
+  安装步骤（`/opt/litellm-venv` + `litellm[proxy]==1.89.4`，未 hash-lock 的
+  依赖树），`FEEDLING_LITELLM_PYTHON`/`FEEDLING_LITELLM_ENABLE`/
+  `FEEDLING_LITELLM_API_KEY` 全线（backend、agent-runner、ci.yml 各 job、
+  compose 文件）移除。`backend/agent_runtime/litellm_gateway.py` 与
+  `tests/test_litellm_gateway.py` 删除，新增 `tests/test_no_litellm_anywhere.py`
+  守护回归。
+- 文档同步：`backend/agent_runtime/README.md` driver 表、`deploy/DEPLOYMENTS.md`
+  的网关部署前置/环境变量表（三件套→两件套 `FEEDLING_HOST_ALL` +
+  `FEEDLING_RUNTIME_TOKEN_SECRET`）、`agent_runtime_cutover.py` 的启动校验注释。
+- 计划先在 pre 环境验证通过，再上 prod。
+
 ### [DONE] 通知设施 Phase C（四个生产者接入 + consumer 分类器扩容）
 
 - **C1 genesis**：`backend/genesis/service.py::mark_failed`（蒸馏 job 整体
