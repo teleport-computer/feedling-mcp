@@ -40,11 +40,14 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import provider_client
 from capabilities import registry as cap_registry
 from core import envelope as core_envelope
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from model_api_runtime.v2 import coalesce as v2_coalesce
+from model_api_runtime.v2 import compaction as v2_compaction
+from model_api_runtime.v2 import context
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import invalidation as v2_inval
 from model_api_runtime.v2 import jobs_store
@@ -61,6 +64,15 @@ MAX_WORKERS = int(os.environ.get("FEEDLING_V2_MAX_WORKERS", "4"))
 MAX_READ_ACTION_PARALLELISM = int(os.environ.get("FEEDLING_V2_MAX_READ_PARALLELISM", "4"))
 # 跨所有 job 共享的 enclave 并发闸（provider-key 解密 + chat 解密 + capability 调用都过它）。治 R3。
 ENCLAVE_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")))
+
+# D1（full-conversation context）：responder 现在吃 summary+tail 而不是"仅未回复的 user
+# 消息"。tail 超过 _TAIL_BUDGET 条（双角色计数）时，chat turn 顺手（best-effort，不阻塞
+# 回复）入队一个 maintenance lane 的 compaction job，把最旧的一批折进摘要，只留
+# _TAIL_KEEP 条最近消息逐字保留。_TAIL_HARD_CAP 是 chat turn 读 tail 时的硬上限（喂
+# responder 用，不是压缩用——压缩自己读到 watermark 之后的全部，见 `_run_compaction`）。
+_TAIL_BUDGET = int(os.environ.get("FEEDLING_V2_TAIL_BUDGET_MSGS", "20"))
+_TAIL_KEEP = int(os.environ.get("FEEDLING_V2_TAIL_KEEP_MSGS", "10"))
+_TAIL_HARD_CAP = int(os.environ.get("FEEDLING_V2_TAIL_HARD_CAP", "60"))
 
 
 @dataclass
@@ -83,6 +95,21 @@ class TurnDeps:
     # hosted/setup_core.py:265）。默认 None：worker.py 自身不 import hosted，测试/其他调用方
     # 不必提供；生产装配见 serve_worker.build_production_deps。
     record_terminal_error: Callable[[str, str], None] | None = None
+    # (user_id, after_ts, limit) -> [{"id","ts","role","content"}]：最近窗口，BOTH
+    # roles，ts>after_ts，enclave 解密明文（D1：让 turn 能看见真实对话上下文，不再局限于
+    # "上次回复之后的 user 消息"那一批）。默认 None：worker.py 自身不 import hosted，
+    # 测试/其他调用方不必提供；生产装配见 serve_worker.build_production_deps。
+    read_tail: Callable[[str, float, int], list[dict]] | None = None
+    # user_id -> (summary_plaintext, watermark_ts, version)：读取该用户当前会话摘要（enclave
+    # 解密明文）；从未压缩过时 ("", 0.0, 0)（D1：turn 看 摘要+尾巴 而不是全量重放）。默认
+    # None：worker.py 自身不 import hosted，测试/其他调用方不必提供；生产装配见
+    # serve_worker.build_production_deps。
+    read_summary: Callable[[str], tuple[str, float, int]] | None = None
+    # (user_id, summary, watermark_ts, expected_version) -> True if CAS landed：本地加密
+    # （core_envelope，非 enclave 往返）+ CAS 写回 v2_conversation_summary（Task 2 storage）。
+    # expected_version 不匹配（别的回合已推进过摘要）时返回 False，调用方按丢弃本次压缩处理，
+    # 不重试、不报错——下一回合会用新版本重新压缩。默认 None：同上。
+    write_summary: Callable[[str, str, float, int], bool] | None = None
 
 
 async def _cap_data(store, action_type, *, api_key, runtime_token, params=None, enclave_sem=None) -> dict:
@@ -170,6 +197,48 @@ def _surface_terminal_error(deps: TurnDeps, user_id: str, job_id, message: str) 
             log.warning("[v2.worker] job %s record_terminal_error callback failed: %s", job_id, e)
 
 
+async def _run_compaction(
+    job_id, user_id: str, deps: TurnDeps, provider_config: Any, enclave_sem: "asyncio.Semaphore"
+) -> str:
+    """maintenance-lane 压缩：把超预算 tail 的最旧一批折进加密 summary（append-and-merge，
+    CAS 原子写，见 `model_api_runtime.v2.compaction.compact` + `jobs_store.upsert_summary_row_cas`）。
+    用户 BYOK key（provider_config 已由 `_run_turn` 单次解密并传入，压缩本身不再多解密一次）。
+
+    自成一体、自己的 try/except：这是后台维护 job，绝不写聊天气泡、失败绝不给用户弹
+    error chip（不调 `_surface_terminal_error`，不落 "error"-kind status 事件）——只是
+    静默 `mark_failed`，跟 chat turn 的用户可见失败路径彻底分开。
+    """
+    try:
+        async with enclave_sem:
+            summary, watermark, version = await asyncio.to_thread(deps.read_summary, user_id)
+            tail = await asyncio.to_thread(deps.read_tail, user_id, watermark, 10_000)  # 读到 watermark 之后的全部
+        if len(tail) <= _TAIL_KEEP:
+            await asyncio.to_thread(jobs_store.mark_completed, job_id)  # 没到该折的量
+            return "completed"
+        old = tail[: len(tail) - _TAIL_KEEP]  # 折最旧的一批；最近 _TAIL_KEEP 条继续逐字保留
+        new_watermark = old[-1]["ts"]
+        new_summary = await v2_compaction.compact(
+            provider_config=provider_config, current_summary=summary, old_messages=old,
+            llm=provider_client.reliable_chat_completion_async)
+        if new_summary.strip() == summary.strip():  # 空/no-op 折叠 → 不推进 watermark/version
+            await asyncio.to_thread(jobs_store.mark_completed, job_id)
+            return "completed"
+        # write_summary 是本地加密（core_envelope，非 enclave 往返）+ CAS 写库，不占用
+        # 稀缺的 enclave_sem——只有解密才走 enclave HTTP（见 _read_summary/_read_tail）。
+        ok = await asyncio.to_thread(deps.write_summary, user_id, new_summary, new_watermark, version)
+        if ok:
+            await asyncio.to_thread(jobs_store.mark_completed, job_id)
+            return "completed"
+        # CAS 没落地：别的写手已经推进过版本，本次压缩视为丢弃，不重试、不报错。
+        await asyncio.to_thread(jobs_store.mark_failed, job_id, "summary_cas_lost")
+        return "failed"
+    except Exception as e:  # noqa: BLE001 — 后台 job：静默 mark_failed，绝不弹用户可见 error/写气泡
+        log.warning("[v2.worker] compaction job %s failed: %s", job_id, e)
+        await asyncio.to_thread(
+            jobs_store.mark_failed, job_id, f"compaction_failed: {type(e).__name__}: {str(e)[:160]}")
+        return "failed"
+
+
 async def process_job(
     job: dict,
     deps: TurnDeps,
@@ -202,6 +271,11 @@ async def process_job(
 
     await asyncio.to_thread(jobs_store.mark_running, job_id)
     try:
+        if lane == "maintenance":
+            # 自成一体的压缩路径：自己的 try/except（见 `_run_compaction`），绝不落到本
+            # 函数下面那个 chat-turn 的 `except`——那个分支会 emit 用户可见的 error status
+            # + record_terminal_error（iOS 错误 chip），压缩失败是后台维护事，不该弹给用户。
+            return await _run_compaction(job_id, user_id, deps, provider_config, enclave_sem)
         store = core_store.get_store(user_id)
         runtime_state = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
         await asyncio.to_thread(_emit_status, user_id, job_id, "processing")
@@ -265,15 +339,30 @@ async def process_job(
         wants_reply = any(s["type"] == "final_response" for s in steps)
         if wants_reply:
             await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
-            merged_state = {**runtime_state, "action_digest": action_state["action_digest"]}
+            # D1：responder 现在吃 summary（早前对话摘要）+ tail（双角色逐字近期窗口），
+            # 不再是"仅合并的未回复 user 消息"。deps.read_summary/read_tail 为 None 时
+            # （既有单测不装配这两样、只打桩 v2_responder.respond）退化成空摘要+空 tail——
+            # 不影响那些测试的断言（它们看的是 respond 被打桩后的返回值/调用与否）。
+            if deps.read_summary is not None and deps.read_tail is not None:
+                async with enclave_sem:
+                    summary, watermark, _ver = await asyncio.to_thread(deps.read_summary, user_id)
+                    tail = await asyncio.to_thread(deps.read_tail, user_id, watermark, _TAIL_HARD_CAP)
+            else:
+                summary, tail = "", []
             # responder 走 BYOK provider_config；ResponderError（空回复/provider 错）交给下面
             # 统一的 except 兜底 mark_failed——no-filler 铁律：绝不写占位气泡。v2_responder.respond
             # 现在原生 async，直接 await，不再经 to_thread 桥线程池（同上，治并发天花板）。
             reply = await v2_responder.respond(
-                provider_config=provider_config,
-                coalesced_messages=coalesced, runtime_state=merged_state,
+                provider_config=provider_config, summary=summary, tail=tail,
                 action_results=action_state["action_results"])
             await asyncio.to_thread(_write_encrypted_reply, store, reply)
+            # 超预算 → best-effort 入队一个 maintenance lane 的压缩 job（不阻塞、不拖垮
+            # 本回合——enqueue_job 本身命中 single-flight 会 coalesce，失败只记日志）。
+            if tail and context.needs_compaction(tail, budget=_TAIL_BUDGET):
+                try:
+                    await asyncio.to_thread(jobs_store.enqueue_job, user_id, "maintenance", reason="compaction")
+                except Exception as e:  # noqa: BLE001 — 压缩入队失败绝不能拖垮已经写成的这条回复
+                    log.warning("[v2.worker] enqueue compaction failed for %s: %s", user_id, e)
 
         # last_replied_ts 单调前进：cursor==0.0（本轮没折入新消息，如纯 sleep 的 heartbeat）
         # 时绝不回退已有游标——否则下一回合会把早就答过的旧消息重新折入。
@@ -307,7 +396,12 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
         err = str((meta or {}).get("error") or "provider_unavailable")
         await asyncio.to_thread(jobs_store.mark_running, job_id)
         await asyncio.to_thread(jobs_store.mark_failed, job_id, err)
-        await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, err)
+        # maintenance（后台压缩）job 跑在 enqueue 之后、异步执行；此刻 provider 解析失败
+        # （key 轮换 / enclave 瞬时解密失败，正是 R3 要防的）是后台维护事，绝不该给用户弹
+        # error chip。只有用户可见的 chat 回合才走 _surface_terminal_error（iOS 错误 chip）；
+        # maintenance 静默 mark_failed 即可——与 _run_compaction 内部失败的隔离口径一致。
+        if str(job.get("lane") or "chat") != "maintenance":
+            await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, err)
         return "failed"
     is_official = deps.is_official(provider_config)
     runtime_token = await asyncio.to_thread(deps.mint_enclave_token, user_id)

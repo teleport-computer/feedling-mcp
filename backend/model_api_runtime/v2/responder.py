@@ -1,15 +1,16 @@
-"""model-authored responder（子项目 B 起步，C §7.5 扩展）。
+"""model-authored responder（子项目 B 起步，C §7.5 扩展，D1 改用 summary+tail）。
 
 用**用户自己的 BYOK** ProviderConfig 出最终回复（spec §7.3 不变量：无平台 key 兜底）。
-B 阶段无 planner——直接把合并的用户消息交给 provider，取 model-authored 文本。
+D1：不再只喂"合并的未回复用户消息"——改为消费一个 `summary`（早前对话摘要字符串）+
+`tail`（双角色逐条消息列表），组装委托给纯函数 `context.build_turn_messages`，让模型
+看到整段对话（摘要 + 双角色逐字尾巴），而不只是待回复的用户轮次。
 C 阶段扩展：executor 产出的 `action_results`（capability 输出，如记忆卡片/感知摘要）折进
-context，让回复吃得到 fetch 回来的东西；对外签名新增一个可选 kwarg：
-`respond(*, provider_config, coalesced_messages, runtime_state, action_results=None) -> str`。
-默认 `None` 保持 B 阶段调用方 / 既有测试行为不变——no-filler、BYOK-only、空回复报错三条
-不变量全部照旧，`action_results` 只是额外折进 prompt 的 grounding context。
+context，让回复吃得到 fetch 回来的东西——`action_results=None` 时行为与不带该 kwarg 完全
+一致，no-filler、BYOK-only、空回复报错三条不变量全部照旧。
 
-依赖方向：本模块只 import provider_client（底层），不 import hosted.*（在其上层）。
-provider-key 的单次解密由 worker 的注入式 resolve_provider 完成（见 worker.py / serve_worker.py）。
+依赖方向：本模块只 import provider_client（底层）+ 同层的 v2.context（纯组装，无 I/O），
+不 import hosted.*（在其上层）。provider-key 的单次解密由 worker 的注入式 resolve_provider
+完成（见 worker.py / serve_worker.py）。
 """
 from __future__ import annotations
 
@@ -17,6 +18,8 @@ import json
 from typing import Any
 
 import provider_client
+
+from model_api_runtime.v2 import context
 
 # 最小系统提示：no-filler 铁律——回复即 model-authored 聊天气泡内容，无占位、无“正在处理”。
 _SYSTEM_PROMPT = (
@@ -58,51 +61,50 @@ def _fold_action_results(action_results: dict[str, Any] | None) -> dict[str, Any
     return ctx
 
 
-def _build_messages(
-    coalesced_messages: list[dict],
-    runtime_state: dict,
-    action_results: dict[str, Any] | None = None,
-) -> list[dict]:
-    user_turns = [
-        {"role": "user", "content": str(m.get("content") or "")}
-        for m in coalesced_messages
-        if str(m.get("role") or "") == "user" and str(m.get("content") or "").strip()
-    ]
-    if not user_turns:
-        raise ResponderError("no_user_messages")
-    messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
-    action_context = _fold_action_results(action_results)
-    if action_context:
-        messages.append({
-            "role": "system",
-            "content": (
-                "Grounding context fetched for this turn (memory cards, perception, "
-                "etc.) — use it if relevant, do not narrate that it was fetched:\n"
-                + json.dumps(action_context, ensure_ascii=False)[:_ACTION_CONTEXT_CHAR_CAP]
-            ),
-        })
-    messages.extend(user_turns)
-    return messages
+def _action_context_str(action_results: dict[str, Any] | None) -> str:
+    """把 `_fold_action_results` 折出的 grounding dict 渲染成 context.build_turn_messages
+    要的纯字符串（截断保护，见 `_ACTION_CONTEXT_CHAR_CAP`）；无可折内容时返回空串。"""
+    folded = _fold_action_results(action_results)
+    if not folded:
+        return ""
+    return (
+        "Grounding context fetched for this turn (memory cards, perception, "
+        "etc.) — use it if relevant, do not narrate that it was fetched:\n"
+        + json.dumps(folded, ensure_ascii=False)[:_ACTION_CONTEXT_CHAR_CAP]
+    )
 
 
 async def respond(
     *,
     provider_config: Any,
-    coalesced_messages: list[dict],
-    runtime_state: dict,
+    summary: str,
+    tail: list[dict],
     action_results: dict[str, Any] | None = None,
 ) -> str:
     """出一条 model-authored 回复文本。空回复 / provider 错 → ResponderError（调用方据此
     把 job 标 failed，绝不写占位气泡——no-filler 铁律）。
 
+    D1：`summary`（早前对话摘要字符串，可为空）+ `tail`（双角色逐条消息列表）交给纯
+    `context.build_turn_messages` 组装，让模型看到整段对话，而不只是待回复的用户消息。
+
     `action_results`（§7.5，可选）：executor 产出的 capability 结果，折进 context 让回复
-    吃得到 fetch 回来的记忆/感知等 grounding 数据；省略/None 时行为与 B 阶段完全一致。
+    吃得到 fetch 回来的记忆/感知等 grounding 数据；省略/None 时行为不变。
 
     原生 async（hosted-runtime-v2 并发修复）：worker 的回合协程直接 await 本函数，不再
     经 `asyncio.to_thread` 桥线程池——那条桥会把并发悄悄封顶在线程池大小（~32），让
     worker 池自己的并发闸形同虚设。
     """
-    messages = _build_messages(coalesced_messages, runtime_state, action_results)
+    action_context = _action_context_str(action_results)
+    messages = context.build_turn_messages(
+        system_prompt=_SYSTEM_PROMPT,
+        summary=summary,
+        tail=tail,
+        action_context=action_context,
+    )
+    # 除了 system 块（system prompt / summary / action context）没有任何 tail 轮次
+    # 折进来——保留原有"无用户消息报错"不变量，现在是对 tail 判的。
+    if not any(m["role"] != "system" for m in messages):
+        raise ResponderError("no_user_messages")
     try:
         result = await provider_client.reliable_chat_completion_async(
             provider_config,

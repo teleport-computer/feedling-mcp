@@ -233,3 +233,166 @@ def test_on_v2_job_notify_is_a_noop_without_context():
     window and direct-call test paths that don't go through serve_worker)."""
     worker.set_job_wake_context(None, None)
     worker.on_v2_job_notify("some-user")  # must not raise
+
+
+# ------------------------------------------------------------------
+# Task 3 (D1): _read_tail — both-roles windowed read (mirrors _read_messages
+# but doesn't slice at last-assistant and doesn't skip non-user rows).
+# ------------------------------------------------------------------
+
+class _FakeStore:
+    def __init__(self, chat_messages):
+        self.chat_messages = chat_messages
+
+
+def _fake_decrypt(envelope, key, *, purpose, runtime_token=""):
+    return f"plain-{envelope['id']}".encode()
+
+
+def _interleaved_rows():
+    return [
+        {"id": "m1", "ts": 1.0, "role": "user", "content_type": "text",
+         "body_ct": "ct1", "K_enclave": "k1"},
+        {"id": "m2", "ts": 2.0, "role": "openclaw", "content_type": "text",
+         "body_ct": "ct2", "K_enclave": "k2"},
+        {"id": "m3", "ts": 3.0, "role": "user", "content_type": "text",
+         "body_ct": "ct3", "K_enclave": "k3"},
+    ]
+
+
+def test_read_tail_returns_both_roles_in_order(monkeypatch):
+    from core import enclave as core_enclave
+    from core import store as core_store
+
+    fake_store = _FakeStore(_interleaved_rows())
+    monkeypatch.setattr(core_store, "get_store", lambda uid: fake_store)
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _fake_decrypt)
+
+    out = serve_worker._read_tail("u_tail_test", 0.0, 10)
+    assert [r["role"] for r in out] == ["user", "assistant", "user"]
+    assert [r["content"] for r in out] == ["plain-m1", "plain-m2", "plain-m3"]
+    assert [r["ts"] for r in out] == [1.0, 2.0, 3.0]
+    assert [r["id"] for r in out] == ["m1", "m2", "m3"]
+
+
+def test_read_tail_filters_after_ts(monkeypatch):
+    from core import enclave as core_enclave
+    from core import store as core_store
+
+    fake_store = _FakeStore(_interleaved_rows())
+    monkeypatch.setattr(core_store, "get_store", lambda uid: fake_store)
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _fake_decrypt)
+
+    out = serve_worker._read_tail("u_tail_test", 1.5, 10)
+    assert [r["id"] for r in out] == ["m2", "m3"]
+    assert [r["role"] for r in out] == ["assistant", "user"]
+
+
+def test_read_tail_caps_to_limit(monkeypatch):
+    from core import enclave as core_enclave
+    from core import store as core_store
+
+    rows = [
+        {"id": f"m{i}", "ts": float(i), "role": "user", "content_type": "text",
+         "body_ct": f"ct{i}", "K_enclave": f"k{i}"}
+        for i in range(1, 6)
+    ]
+    fake_store = _FakeStore(rows)
+    monkeypatch.setattr(core_store, "get_store", lambda uid: fake_store)
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _fake_decrypt)
+
+    out = serve_worker._read_tail("u_tail_test", 0.0, 2)
+    assert [r["id"] for r in out] == ["m4", "m5"]
+
+
+# ------------------------------------------------------------------
+# Task 4: _read_summary / _write_summary — decrypt-on-read (enclave) +
+# encrypt-on-write (local) + CAS against v2_conversation_summary.
+# ------------------------------------------------------------------
+
+def test_read_summary_missing_returns_empty(monkeypatch):
+    """No row yet for this user (never compressed) -> ("", 0.0, 0), no enclave
+    round trip attempted."""
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(v2_jobs_store, "get_summary_row", lambda uid: None)
+
+    out = serve_worker._read_summary("u_summary_test")
+    assert out == ("", 0.0, 0)
+
+
+def test_read_summary_decrypts_present_row(monkeypatch):
+    from core import enclave as core_enclave
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(
+        v2_jobs_store, "get_summary_row",
+        lambda uid: {"summary_envelope": {"body_ct": "x"}, "watermark_ts": 7.0, "version": 3})
+    monkeypatch.setattr(
+        core_enclave, "_decrypt_envelope_via_enclave",
+        lambda envelope, key, *, purpose, runtime_token="": b"- prior chat")
+
+    out = serve_worker._read_summary("u_summary_test")
+    assert out == ("- prior chat", 7.0, 3)
+
+
+def test_read_summary_empty_envelope(monkeypatch):
+    """summary_envelope is None (row exists but nothing compressed into it yet,
+    e.g. Task 2's first-write path) -> plaintext "" without touching the
+    enclave at all."""
+    from core import enclave as core_enclave
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(
+        v2_jobs_store, "get_summary_row",
+        lambda uid: {"summary_envelope": None, "watermark_ts": 4.0, "version": 1})
+
+    def _boom(*a, **k):
+        raise AssertionError("must not decrypt when summary_envelope is empty")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
+
+    out = serve_worker._read_summary("u_summary_test")
+    assert out == ("", 4.0, 1)
+
+
+def test_write_summary_builds_envelope_and_cas(monkeypatch):
+    from core import envelope as core_envelope
+    from core import store as core_store
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(core_store, "get_store", lambda uid: object())
+    monkeypatch.setattr(
+        core_envelope, "_build_shared_envelope_for_store",
+        lambda store, plaintext: ({"body_ct": "e"}, ""))
+
+    calls = {}
+
+    def _fake_cas(uid, *, summary_envelope, watermark_ts, expected_version):
+        calls["args"] = (uid, summary_envelope, watermark_ts, expected_version)
+        return True
+
+    monkeypatch.setattr(v2_jobs_store, "upsert_summary_row_cas", _fake_cas)
+
+    ok = serve_worker._write_summary("u", "- s", 9.0, 2)
+    assert ok is True
+    assert calls["args"] == ("u", {"body_ct": "e"}, 9.0, 2)
+
+
+def test_write_summary_envelope_build_failure_returns_false(monkeypatch):
+    from core import envelope as core_envelope
+    from core import store as core_store
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(core_store, "get_store", lambda uid: object())
+    monkeypatch.setattr(
+        core_envelope, "_build_shared_envelope_for_store",
+        lambda store, plaintext: (None, "boom"))
+
+    def _must_not_call(*a, **k):
+        raise AssertionError("CAS must not be called when envelope build fails")
+
+    monkeypatch.setattr(v2_jobs_store, "upsert_summary_row_cas", _must_not_call)
+
+    ok = serve_worker._write_summary("u", "- s", 9.0, 2)
+    assert ok is False

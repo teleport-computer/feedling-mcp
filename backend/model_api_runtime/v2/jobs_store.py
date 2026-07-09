@@ -331,6 +331,58 @@ def workers_alive(*, within_sec: int = 30) -> bool:
             return bool(cur.fetchone()[0])
 
 
+def get_summary_row(user_id) -> dict | None:
+    """读取该用户当前的会话摘要行（若存在）。返回
+    {"summary_envelope": dict|None, "watermark_ts": float, "version": int}，
+    无行返回 None（该用户从未压缩过）。"""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT summary_envelope, watermark_ts, version "
+                "FROM v2_conversation_summary WHERE user_id=%s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "summary_envelope": dict(row["summary_envelope"]) if row["summary_envelope"] is not None else None,
+        "watermark_ts": float(row["watermark_ts"]),
+        "version": int(row["version"]),
+    }
+
+
+def upsert_summary_row_cas(
+    user_id, *, summary_envelope: dict, watermark_ts: float, expected_version: int
+) -> bool:
+    """compare-and-swap 写入该用户的会话摘要行。expected_version==0 走首建
+    （INSERT ... ON CONFLICT DO NOTHING，若行已存在说明输了竞态，返回 False）；
+    否则走 UPDATE ... WHERE version=expected_version（不匹配说明摘要在别处已被
+    推进，本次写入是过期/丢失的 CAS，返回 False）。成功返回 True。"""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            if int(expected_version) == 0:
+                cur.execute(
+                    "INSERT INTO v2_conversation_summary "
+                    "(user_id, summary_envelope, watermark_ts, version) "
+                    "VALUES (%s, %s, %s, 1) ON CONFLICT (user_id) DO NOTHING",
+                    (user_id, Jsonb(dict(summary_envelope or {})), float(watermark_ts)),
+                )
+            else:
+                cur.execute(
+                    "UPDATE v2_conversation_summary "
+                    "SET summary_envelope=%s, watermark_ts=%s, version=version+1, updated_at=now() "
+                    "WHERE user_id=%s AND version=%s",
+                    (
+                        Jsonb(dict(summary_envelope or {})),
+                        float(watermark_ts),
+                        user_id,
+                        int(expected_version),
+                    ),
+                )
+            return cur.rowcount == 1
+
+
 def upsert_runtime_state(user_id, patch: dict) -> dict:
     """浅合并 patch 进 state_json（JSONB || 合并），返回合并后的 state。"""
     with _pool().connection() as conn:
