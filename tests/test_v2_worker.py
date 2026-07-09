@@ -25,6 +25,7 @@ import db
 import provider_client
 from capabilities import registry as cap_registry
 from core import store as core_store
+from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import invalidation as v2_inval
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import planner as v2_planner
@@ -480,6 +481,37 @@ def test_run_turn_provider_resolve_failure_emits_error_status_and_callback(monke
     assert "model_api_key_decrypt_failed" in rec_msg
 
 
+def test_run_turn_maintenance_resolve_failure_is_silent_no_user_error(monkeypatch):
+    """A maintenance-lane (compaction) job whose provider can't be resolved must
+    fail SILENTLY — no user-facing error chip. The provider-resolve failure lives
+    in _run_turn, one level above the lane fork in process_job; without a lane
+    gate it would inherit the chat lane's _surface_terminal_error and pop a
+    spurious error chip for a background job the user never triggered."""
+    uid = "u_w_maint_resolve_fail"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "maintenance", reason="compaction")
+    job = jobs_store.claim_next_job("w")
+
+    def _boom(*a, **k):
+        raise AssertionError("must not run past provider resolution failure")
+
+    recorded = []
+    deps = worker.TurnDeps(
+        read_messages=_boom,
+        resolve_provider=lambda uid_: (None, {"error": "model_api_key_decrypt_failed"}),
+        is_official=_boom,
+        mint_enclave_token=_boom,
+        record_terminal_error=lambda user_id, message: recorded.append((user_id, message)),
+    )
+    status = asyncio.run(worker._run_turn(job, deps))
+
+    assert status == "failed"
+    # SILENT: no "error"-kind status event, no record_terminal_error callback.
+    assert [e for e in _status_events(uid) if e["kind"] == "error"] == []
+    assert recorded == []
+
+
 # ------------------------------------------------------------------
 # _run_turn: single BYOK decrypt/turn + is_official/mint wiring
 # ------------------------------------------------------------------
@@ -682,3 +714,254 @@ def test_bounded_gates_exist():
     assert isinstance(worker.MAX_WORKERS, int) and worker.MAX_WORKERS >= 1
     assert isinstance(worker.MAX_READ_ACTION_PARALLELISM, int)
     assert isinstance(worker.ENCLAVE_SEMAPHORE, asyncio.Semaphore)
+
+
+# ------------------------------------------------------------------
+# Task 7: worker dispatch by lane — chat reads summary+tail via deps and
+# enqueues a maintenance compaction job when over budget; maintenance lane
+# runs the self-contained compaction path.
+# ------------------------------------------------------------------
+
+def test_process_job_reply_uses_deps_summary_and_tail_and_enqueues_compaction_when_over_budget(monkeypatch):
+    """D1 responder call site: the reply must be produced from `deps.read_summary`/
+    `deps.read_tail` (not the coalesced/runtime_state shape the old call site used).
+    When the tail returned by `deps.read_tail` is over `_TAIL_BUDGET`, the turn must
+    best-effort enqueue a maintenance-lane compaction job — without blocking or
+    failing the reply that was already written."""
+    uid = "u_w_compact_enqueue"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    big_tail = [
+        {"id": f"m{i}", "ts": float(i), "role": "user" if i % 2 == 0 else "openclaw", "content": f"msg {i}"}
+        for i in range(worker._TAIL_BUDGET + 5)
+    ]
+    respond_calls = []
+
+    async def _spy_respond(*, provider_config, summary, tail, action_results=None):
+        respond_calls.append({"summary": summary, "tail": tail})
+        return "REPLY"
+
+    monkeypatch.setattr(v2_responder, "respond", _spy_respond)
+
+    enqueue_calls = []
+    orig_enqueue = jobs_store.enqueue_job
+
+    def _spy_enqueue(user_id_, lane, *, reason=None, **k):
+        enqueue_calls.append((user_id_, lane, reason))
+        return orig_enqueue(user_id_, lane, reason=reason, **k)
+
+    monkeypatch.setattr(jobs_store, "enqueue_job", _spy_enqueue)
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        read_tail=lambda uid_, after_ts, limit: big_tail,
+        read_summary=lambda uid_: ("prior summary", 0.0, 3),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert len(respond_calls) == 1
+    assert respond_calls[0]["summary"] == "prior summary"
+    assert respond_calls[0]["tail"] == big_tail
+    assert (uid, "maintenance", "compaction") in enqueue_calls
+
+
+def test_process_job_reply_skips_compaction_enqueue_when_under_budget(monkeypatch):
+    """Symmetric negative case: a short tail (under `_TAIL_BUDGET`) must NOT
+    trigger a maintenance enqueue."""
+    uid = "u_w_compact_skip"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    async def _spy_respond(*, provider_config, summary, tail, action_results=None):
+        return "REPLY"
+
+    monkeypatch.setattr(v2_responder, "respond", _spy_respond)
+
+    enqueue_calls = []
+    orig_enqueue = jobs_store.enqueue_job
+
+    def _spy_enqueue(user_id_, lane, *, reason=None, **k):
+        enqueue_calls.append((user_id_, lane, reason))
+        return orig_enqueue(user_id_, lane, reason=reason, **k)
+
+    monkeypatch.setattr(jobs_store, "enqueue_job", _spy_enqueue)
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        read_tail=lambda uid_, after_ts, limit: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+        read_summary=lambda uid_: ("", 0.0, 0),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert enqueue_calls == []
+
+
+def test_run_compaction_folds_oldest_batch_and_advances_watermark(monkeypatch):
+    """maintenance lane, happy path: the oldest batch (everything but the last
+    `_TAIL_KEEP` messages) is folded via `v2_compaction.compact` and CAS-written
+    with `expected_version` from `read_summary` and a watermark equal to the
+    folded batch's last ts. No chat bubble is ever written and no user-facing
+    error surface fires for a background compaction job."""
+    uid = "u_w_maintenance"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
+    job = jobs_store.claim_next_job("w")
+
+    tail = [
+        {"id": f"m{i}", "ts": float(i), "role": "user", "content": f"msg {i}"}
+        for i in range(worker._TAIL_KEEP + 6)
+    ]
+
+    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+        return current_summary + "\n- new"
+
+    monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
+
+    write_calls = []
+
+    def _write_summary(uid_, summary, watermark_ts, expected_version):
+        write_calls.append((uid_, summary, watermark_ts, expected_version))
+        return True
+
+    write_bubble_called = {"n": 0}
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply",
+        lambda store, text: write_bubble_called.update(n=write_bubble_called["n"] + 1) or {"id": "r"})
+
+    surface_called = {"n": 0}
+    monkeypatch.setattr(
+        worker, "_surface_terminal_error",
+        lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        read_tail=lambda uid_, after_ts, limit: tail,
+        read_summary=lambda uid_: ("- old", 0.0, 2),
+        write_summary=_write_summary,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert write_bubble_called["n"] == 0
+    assert surface_called["n"] == 0
+    assert len(write_calls) == 1
+    _wuid, wsummary, wwatermark, wversion = write_calls[0]
+    assert wversion == 2  # expected_version came straight from read_summary's version
+    old_count = len(tail) - worker._TAIL_KEEP
+    assert wwatermark == tail[old_count - 1]["ts"]
+    assert wsummary == "- old\n- new"
+    assert _job_status(job_id)[0] == "completed"
+
+
+def test_run_compaction_failure_marks_failed_without_surfacing_user_error(monkeypatch):
+    """A background compaction failure (e.g. summary decrypt blows up) must be a
+    silent `mark_failed` — NEVER a chat bubble, NEVER an "error"-kind status
+    event, NEVER a `_surface_terminal_error` call. That machinery is for
+    user-initiated chat turns; maintenance is a background job."""
+    uid = "u_w_maintenance_fail"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
+    job = jobs_store.claim_next_job("w")
+
+    def _boom_read_summary(uid_):
+        raise RuntimeError("summary decrypt exploded")
+
+    write_bubble_called = {"n": 0}
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply",
+        lambda store, text: write_bubble_called.update(n=write_bubble_called["n"] + 1) or {"id": "r"})
+
+    surface_called = {"n": 0}
+    monkeypatch.setattr(
+        worker, "_surface_terminal_error",
+        lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        read_tail=lambda uid_, after_ts, limit: [],
+        read_summary=_boom_read_summary,
+        write_summary=lambda *a, **k: True,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert write_bubble_called["n"] == 0
+    assert surface_called["n"] == 0
+    row = _job_status(job_id)
+    assert row[0] == "failed"
+    assert "compaction_failed" in (row[1] or "")
+    events = _status_events(uid)
+    assert not any(e["kind"] == "error" for e in events)
+
+
+def test_run_compaction_under_keep_threshold_completes_as_noop(monkeypatch):
+    """A tail no longer than `_TAIL_KEEP` has nothing worth folding yet — the
+    maintenance job should cleanly complete without calling compact/write_summary."""
+    uid = "u_w_maintenance_noop"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
+    job = jobs_store.claim_next_job("w")
+
+    compact_calls = {"n": 0}
+
+    async def _counting_compact(*a, **k):
+        compact_calls["n"] += 1
+        return "should not be called"
+
+    monkeypatch.setattr(v2_compaction, "compact", _counting_compact)
+    write_calls = {"n": 0}
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        read_tail=lambda uid_, after_ts, limit: [
+            {"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+        read_summary=lambda uid_: ("", 0.0, 0),
+        write_summary=lambda *a, **k: write_calls.update(n=write_calls["n"] + 1) or True,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert compact_calls["n"] == 0
+    assert write_calls["n"] == 0
+    assert _job_status(job_id)[0] == "completed"

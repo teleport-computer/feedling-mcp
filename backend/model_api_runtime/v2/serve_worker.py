@@ -142,6 +142,78 @@ def _read_messages(user_id: str) -> list[dict]:
     return out
 
 
+def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
+    """读该用户最近一个窗口内的消息（BOTH roles），逐条经 enclave 解密取明文（D1）。
+
+    镜像 `_read_messages` 的解密/过滤规则，但服务于不同目的：`_read_messages` 只回放
+    "自上一条 assistant 回复之后"的未答 user 消息（喂 coalesce/planner 判断本回合要不要
+    起新 job）；`_read_tail` 给 turn 看一段**真实的、双角色的**近期对话尾巴（喂 responder
+    的上下文窗口），所以：
+    - 不按 last_assistant 下标切片、不跳过非 user 行；
+    - 只保留 ts > after_ts 的行；
+    - assistant 角色（`_ASSISTANT_ROLES`：openclaw/assistant/agent）规整为 "assistant"，
+      其余规整为 "user"；
+    - 过滤后只留最近 limit 条（`result[-limit:]`），保持时间序。
+
+    Skip 规则与 `_read_messages` 一致：无 `body_ct` 或 `K_enclave is None` 的合成/
+    本地-only 行跳过；`content_type == "image"` 走 "[image]" 简写，不经 enclave。"""
+    store = core_store.get_store(user_id)
+    rows = list(getattr(store, "chat_messages", []) or [])
+    rows = sorted(rows, key=lambda m: m.get("ts") or 0.0)
+    token = _mint_runtime_token(user_id)
+    out: list[dict] = []
+    for m in rows:
+        ts = m.get("ts")
+        if ts is None or not (ts > after_ts):
+            continue
+        mid = m.get("id")
+        role = "assistant" if str(m.get("role") or "") in _ASSISTANT_ROLES else "user"
+        if m.get("content_type") == "image":
+            out.append({"id": mid, "ts": ts, "role": role, "content": "[image]"})
+            continue
+        if not m.get("body_ct") or m.get("K_enclave") is None:
+            continue  # 无 enclave 钥的合成/本地-only 消息跳过
+        plaintext = core_enclave._decrypt_envelope_via_enclave(
+            m, None, purpose="v2_chat_read", runtime_token=token
+        ).decode("utf-8")
+        if plaintext.strip():
+            out.append({"id": mid, "ts": ts, "role": role, "content": plaintext})
+    if limit <= 0:
+        return []
+    return out[-limit:]
+
+
+def _read_summary(user_id: str) -> tuple[str, float, int]:
+    """读取该用户当前的会话摘要（Task 2 storage：v2_conversation_summary），逐条走 enclave
+    解密取明文（服务器永不本地解密）。从未压缩过（无行）时返回 ("", 0.0, 0)；行存在但
+    summary_envelope 为空（Task 2 首建行、尚未真正压缩过一次）时返回 ("", watermark_ts,
+    version)，不触发 enclave 往返——没有密文可解。"""
+    row = jobs_store.get_summary_row(user_id)
+    if row is None:
+        return "", 0.0, 0
+    env = row["summary_envelope"]
+    if not env:
+        return "", row["watermark_ts"], row["version"]
+    token = _mint_runtime_token(user_id)
+    plaintext = core_enclave._decrypt_envelope_via_enclave(
+        env, None, purpose="v2_summary_read", runtime_token=token
+    ).decode("utf-8")
+    return plaintext, row["watermark_ts"], row["version"]
+
+
+def _write_summary(user_id: str, summary: str, watermark_ts: float, expected_version: int) -> bool:
+    """把新压缩出的摘要**本地**加密（core_envelope，非 enclave 往返——跟 worker._write_encrypted_reply
+    同一套写法）后 CAS 写回 v2_conversation_summary。信封构建失败（用户从未 onboard 过加密
+    身份）时直接返回 False、不调用 CAS——调用方应当把本次压缩当作丢弃处理，不重试。"""
+    store = core_store.get_store(user_id)
+    env, err = core_envelope._build_shared_envelope_for_store(store, summary.encode("utf-8"))
+    if env is None:
+        log.warning("[v2.serve_worker] _write_summary build envelope failed for %s: %s", user_id, err)
+        return False
+    return jobs_store.upsert_summary_row_cas(
+        user_id, summary_envelope=env, watermark_ts=watermark_ts, expected_version=expected_version)
+
+
 def _is_official(provider_config) -> bool:
     """包一层 `agent_runtime.spawners._is_official_identity`——worker.py 不能自己 import
     agent_runtime（hosted-adjacent），所以这个判定只能在装配层做好、经 TurnDeps 注入。
@@ -169,6 +241,9 @@ def build_production_deps() -> v2_worker.TurnDeps:
         is_official=_is_official,
         mint_enclave_token=_mint_runtime_token,
         record_terminal_error=_record_terminal_error,
+        read_tail=_read_tail,
+        read_summary=_read_summary,
+        write_summary=_write_summary,
     )
 
 
