@@ -117,6 +117,14 @@ if not _provisioned:
         "test_chat_resident_consumer_file.py",
         "test_user_mcp_probe.py",
         "test_user_mcp_materialize.py",
+        "test_v2_coalesce.py",
+        "test_v2_invalidation.py",
+        "test_v2_status_stream.py",
+        "test_v2_planner_rule.py",
+        "test_v2_planner_official.py",
+        "test_v2_executor.py",
+        "test_v2_responder.py",
+        "test_v2_dependency_direction.py",
     }
     collect_ignore = sorted(
         f
@@ -185,6 +193,34 @@ def configure_model_api_route(user_id: str, *, provider: str = "anthropic",
         db.model_api_route_activate(user_id, route_id)
     return credential_id, route_id
 
+
+def seed_api_key(user_id: str) -> str:
+    """Test-only: mint a real (hashed) api key for an already-``seed_user``-ed
+    user and register it in ``accounts.registry`` the same way
+    ``/v1/users/register`` does, so ``require_auth``/``_resolve_user`` — which
+    hash-looks-up ``api_key_hash`` — accept it. Returns the plaintext key for
+    the ``Authorization: Bearer <key>`` header. Idempotent-ish: appends a new
+    key entry each call (fine for tests, which mint once per user)."""
+    import secrets
+
+    from accounts import registry
+
+    api_key = secrets.token_hex(32)
+    api_key_hash = registry._hash_api_key(api_key)
+    with registry._users_lock:
+        for u in registry._users:
+            if u.get("user_id") == user_id:
+                u["api_key_hash"] = api_key_hash
+                u.setdefault("api_keys", []).append({
+                    "key_id": f"key_test_{api_key_hash[:8]}",
+                    "api_key_hash": api_key_hash,
+                    "access_mode": "official_import",
+                    "label": "Test",
+                    "created_at": "",
+                    "revoked_at": "",
+                })
+        registry._key_to_user[api_key_hash] = user_id
+    return api_key
 
 def pytest_report_header(config):
     """Surface WHY the DB-backed suite was skipped (collect_ignore is silent)."""

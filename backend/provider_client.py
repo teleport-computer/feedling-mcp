@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 import threading
 import time
@@ -1244,3 +1245,51 @@ async def chat_completion_async(
 
     return _parse_openai_compat_body(
         resp, provider=provider, model=request_model, require_reply=require_reply)
+
+
+# --- Hosted runtime V2: natively async reliable wrapper ---------------------
+# `reliable_chat_completion` (above) bridges `chat_completion` off the request
+# path via blocking `time.sleep` — fine for the genesis CVM worker, but the V2
+# hosted runtime's worker calls it from inside an asyncio event loop via
+# `asyncio.to_thread`, which silently caps concurrency at the thread pool size
+# (~32 workers) no matter how high the worker pool's own dial is set. This is a
+# straight async mirror of the SAME retry loop (identical classification/
+# backoff/terminal-labelling semantics via the shared `classify_provider_error`/
+# `_retry_after_seconds` helpers) — it just `await`s `chat_completion_async`
+# and sleeps via `asyncio.sleep` instead of blocking the thread, so the turn
+# coroutine yields the event loop during backoff instead of parking a thread.
+async def reliable_chat_completion_async(
+    *args: Any,
+    max_attempts: int = 3,
+    base_delay_sec: float = 1.0,
+    max_delay_sec: float = 30.0,
+    **kwargs: Any,
+) -> Any:
+    """`chat_completion_async` + bounded retry on *transient* failures only.
+
+    Same semantics as `reliable_chat_completion`: exponential backoff (base·3^n)
+    + jitter, capped; honours 429 Retry-After when present. NEVER retries
+    `provider_config` failures. On final failure the raised exception carries
+    `.feedling_error_class` ("transient_exhausted" | "provider_config") so the
+    caller can label the job/turn.
+    """
+    attempts = max(1, int(max_attempts))
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await chat_completion_async(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
+            cls = classify_provider_error(exc)
+            last_exc = exc
+            if cls == "provider_config" or attempt >= attempts:
+                exc.feedling_error_class = (
+                    "provider_config" if cls == "provider_config" else "transient_exhausted"
+                )
+                raise
+            delay = min(base_delay_sec * (3 ** (attempt - 1)), max_delay_sec)
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None:
+                delay = min(max(delay, retry_after), max_delay_sec)
+            await asyncio.sleep(delay + random.uniform(0.0, 0.5 * delay))
+    assert last_exc is not None  # loop always sets it before this point
+    raise last_exc

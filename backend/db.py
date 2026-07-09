@@ -3100,3 +3100,20 @@ def delete_user_chat_files(user_id: str) -> None:
     CASCADE already dropped the pointer rows). Mirrors delete_user_frames."""
     if object_storage.chat_files_enabled():
         object_storage.delete_user_chat_files(user_id)
+
+
+def list_agent_status_events(user_id: str, *, after_id: int = 0, limit: int = 50) -> list[dict]:
+    """托管运行时 v2（子项目 B/C 共用的单一读源）：按 id 升序返回该用户 after_id 之后
+    的 agent_status_events 行。Plan C 的 chat/poll_core 长轮询游标读、jobs_store.
+    list_status_events 都委托到这个原语——避免两处 SQL 各写一份、日后走形。"""
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT id, job_id, user_id, kind, label, detail_json, seq, "
+            "       extract(epoch FROM created_at)::float8 AS created_at "
+            "FROM agent_status_events "
+            "WHERE user_id = %s AND id > %s ORDER BY id ASC LIMIT %s",
+            (user_id, int(after_id), int(limit)),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in rows]
