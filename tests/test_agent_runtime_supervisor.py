@@ -868,13 +868,17 @@ def test_autoverify_triggers_once_then_marks_done():
         calls.append(headers)
         return True   # passing
 
-    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
-                                     state=state, post_verify=post_verify, now=lambda: 100.0)
-    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
-                                     state=state, post_verify=post_verify, now=lambda: 100.0)
+    passed = supervisor_mod._maybe_autoverify(
+        "u1", mint_token=lambda u: "t", api_url="a",
+        state=state, post_verify=post_verify, now=lambda: 100.0)
+    skipped = supervisor_mod._maybe_autoverify(
+        "u1", mint_token=lambda u: "t", api_url="a",
+        state=state, post_verify=post_verify, now=lambda: 100.0)
     assert len(calls) == 1                          # second call skipped (done)
     assert calls[0] == {"X-Feedling-Runtime-Token": "t"}
     assert state["u1"]["done"] is True
+    assert passed is True
+    assert skipped is False
 
 
 def test_autoverify_backs_off_after_failure():
@@ -889,12 +893,16 @@ def test_autoverify_backs_off_after_failure():
         return False   # never passes
 
     now = lambda: clock["t"]
-    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
-                                     state=state, post_verify=post_verify, now=now)
+    passed = supervisor_mod._maybe_autoverify(
+        "u1", mint_token=lambda u: "t", api_url="a",
+        state=state, post_verify=post_verify, now=now)
     assert len(calls) == 1                          # first probe at t=0
-    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
-                                     state=state, post_verify=post_verify, now=now)
+    skipped = supervisor_mod._maybe_autoverify(
+        "u1", mint_token=lambda u: "t", api_url="a",
+        state=state, post_verify=post_verify, now=now)
     assert len(calls) == 1                          # immediate retry suppressed (backoff)
+    assert passed is False
+    assert skipped is False
     clock["t"] = 10_000.0
     supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
                                      state=state, post_verify=post_verify, now=now)

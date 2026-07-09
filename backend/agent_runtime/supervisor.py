@@ -854,23 +854,24 @@ _AUTOVERIFY_BACKOFF = [0.0, 30.0, 120.0, 600.0, 1800.0]
 
 
 def _maybe_autoverify(user_id: str, *, mint_token, api_url: str, state: dict,
-                      post_verify=_post_verify_loop, now=time.time) -> None:
+                      post_verify=_post_verify_loop, now=time.time) -> bool:
     """Open the bootstrap gate for a freshly-hosted user by running verify_loop.
     ``state`` (user_id -> {"done", "fails", "next"}) makes it idempotent AND backed
     off: a passed user is marked ``done`` and never re-probed; a failed attempt
     schedules the next try with increasing backoff instead of every tick."""
     s = state.get(user_id)
     if s is not None and s.get("done"):
-        return
+        return False
     t = now()
     if s is not None and t < s.get("next", 0.0):
-        return                                  # within the backoff window
+        return False                            # within the backoff window
     if post_verify(api_url, _auth_headers(runtime_token=mint_token(user_id))):
         state[user_id] = {"done": True}
-        return
+        return True
     fails = (s.get("fails", 0) if s else 0) + 1
     delay = _AUTOVERIFY_BACKOFF[min(fails, len(_AUTOVERIFY_BACKOFF) - 1)]
     state[user_id] = {"done": False, "fails": fails, "next": t + delay}
+    return False
 
 
 # A host user is blocked from spawning only while an import genesis is actively
@@ -1452,8 +1453,19 @@ def main() -> int:
 
                         def _autoverify(uid=uid):
                             try:
-                                _maybe_autoverify(uid, mint_token=mint_token, api_url=api_url,
-                                                  state=autoverify_state)
+                                passed = _maybe_autoverify(
+                                    uid, mint_token=mint_token, api_url=api_url,
+                                    state=autoverify_state)
+                                if passed:
+                                    with sup._lock:
+                                        child = sup.children.get(uid)
+                                        entry = dict(child["entry"]) if child else None
+                                    if entry is not None:
+                                        # Spawn-time introduction can be skipped before
+                                        # verify_loop marks first_chat_ok_at. Retry once
+                                        # right after the gate opens, using a fresh token.
+                                        entry["runtime_token"] = mint_token(uid)
+                                        sup._enqueue_introduction(uid, entry)
                             finally:
                                 autoverify_inflight.discard(uid)
 
