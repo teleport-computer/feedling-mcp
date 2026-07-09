@@ -19,6 +19,7 @@ import base64
 import time
 
 from core import envelope as core_envelope
+from core import wake_bus as core_wake_bus
 
 import debug_trace
 from chat import service as chat_service
@@ -26,6 +27,7 @@ from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
 from hosted import context as hosted_context
 from hosted import turn as hosted_turn
+from model_api_runtime.v2 import jobs_store
 
 
 def model_api_chat_send_core(
@@ -100,6 +102,29 @@ def model_api_chat_send_core(
     except agent_runtime_cutover.UnsupportedProviderError:
         return {"error": "provider_not_configured"}, 409
 
+    # Hosted Runtime V2 灰度：db_action_v2 用户由独立 worker 池应答，不依赖 resident
+    # supervisor，故跳过下面的 resident wedge guard（否则会被 resident 心跳错误 503）。
+    _v2_mode = hosted_config_store.get_hosted_runtime_mode(store) == "db_action_v2"
+
+    # V2 liveness guard: skipping the resident wedge guard above left db_action_v2
+    # users with NO replacement — if every serve_worker process is dead (crashed,
+    # not yet deployed, scaled to zero), enqueue_job below would still succeed
+    # and the message would queue in agent_jobs forever with no error, no reply,
+    # no visible failure. jobs_store.workers_alive() checks the v2_worker_heartbeats
+    # table each live serve_worker process UPSERTs into every ~10s. Distinct
+    # code/summary ("workers_unavailable") from the resident wedge guard's
+    # "hosting_runtime_unavailable"/"supervisor_unavailable" — the two failure
+    # modes are unrelated (dead worker pool vs. dead resident supervisor) and
+    # must stay distinguishable to callers/on-call. Placed BEFORE append_chat so
+    # nothing is persisted on refusal (same principle as the wedge guard above).
+    if _v2_mode and not jobs_store.workers_alive():
+        debug_trace.trace_event(
+            store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+            status="gated", summary="workers_unavailable",
+            detail={"mode": "blocked", "reason": "workers_unavailable"},
+        )
+        return {"error": "workers_unavailable", "reason": "no_live_v2_worker_heartbeat"}, 503
+
     # Wedge guard: routing to the agent-runner only works if a supervisor is
     # actually hosting. assert_hosting_ready validated THIS process's env at
     # startup, but the consumer lives in a separate service — if its heartbeat is
@@ -113,7 +138,7 @@ def model_api_chat_send_core(
     _provider = str((config or {}).get("provider") or "")
     _require_pi = agent_runtime_cutover.driver_for_provider(_provider) == "pi"
     live, reason = agent_runtime_cutover.check_supervisor_live(require_pi=_require_pi)
-    if not live:
+    if not _v2_mode and not live:
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             status="gated", summary="supervisor_unavailable",
@@ -172,5 +197,16 @@ def model_api_chat_send_core(
         turn_id=_turn_id, summary="agent_runtime",
         detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
     )
+    if _v2_mode:
+        # 落加密用户消息已完成（上方 append_chat）；入队/合并 chat job，唤醒 worker 池，
+        # 快速返回 202 processing（不写 filler；客户端经 chat poll 取加密回复）。
+        jobs_store.enqueue_job(
+            store.user_id, "chat", reason="chat_send",
+            trace_id=str(user_row.get("id") or "") if isinstance(user_row, dict) else None,
+        )
+        core_wake_bus.notify("v2_jobs", store.user_id)
+        body, status = agent_runtime_cutover.build_processing_response(user_row, driver=driver)
+        return body, status
+
     body, status = agent_runtime_cutover.handle_send(store, user_row, driver)
     return body, status

@@ -86,8 +86,10 @@ def test_build_response_contract(store):
     resp = chat_poll_core.build_response(
         messages=[{"id": "m"}], context=ctx, consumer_id="c-A", claim=True, timed_out=False
     )
+    # §9 status-wire additions: agent_status_events + status_cursor are always present.
     assert set(resp) == {
         "messages", "runtime_v2", "client_release", "user_mcp", "timed_out", "consumer_id", "claimed",
+        "agent_status_events", "status_cursor",
     }
     assert resp["messages"] == [{"id": "m"}]
     assert resp["consumer_id"] == "c-A"

@@ -313,6 +313,17 @@ def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
     return record
 
 
+def set_last_runtime_error(store: UserStore, message: str) -> None:
+    """Public direct lever to surface a terminal runtime failure to iOS's error
+    chip (`hosted/setup_core.py:265` reads `last_runtime_error` off this same
+    profile blob). The private action-trace helpers above already set this
+    field as a side-effect of a traced action; this is for callers — namely
+    the v2 worker's terminal-failure path via serve_worker's injected
+    TurnDeps.record_terminal_error callback — that have no action-trace entry
+    to patch, just a plain failure message and a store."""
+    _patch_model_api_runtime_profile(store, {"last_runtime_error": str(message)[:300]})
+
+
 def _patch_model_api_action_trace(store: UserStore, trace_id: str, patch: dict) -> dict | None:
     merged = dict(patch)
     if patch.get("status") in {"completed", "failed", "skipped"}:
@@ -389,3 +400,33 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runt
         return _provider_config_from_plain(route, provider_key)
     except provider_client.ProviderError as e:
         return None, {"error": "model_api_config_invalid", "detail": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# hosted_runtime_mode —— per-user 灰度开关（Hosted Runtime V2 子项目 B）
+# resident_cli：现有常驻 CLI consumer 路径（默认，原样不动）。
+# db_action_v2：chat/send 入队 agent_jobs，由独立 V2 worker 池处理（spec §10）。
+# 存进既有 model_api_runtime profile blob，两条路径并存。
+# ---------------------------------------------------------------------------
+
+HOSTED_RUNTIME_MODE_RESIDENT = "resident_cli"
+HOSTED_RUNTIME_MODE_DB_ACTION_V2 = "db_action_v2"
+_HOSTED_RUNTIME_MODES = {HOSTED_RUNTIME_MODE_RESIDENT, HOSTED_RUNTIME_MODE_DB_ACTION_V2}
+
+
+def get_hosted_runtime_mode(store: UserStore) -> str:
+    """该用户的 hosted 运行时模式；未设或非法值一律回退默认 resident_cli。"""
+    profile = _load_model_api_runtime_profile(store) or {}
+    mode = str(profile.get("hosted_runtime_mode") or "")
+    return mode if mode in _HOSTED_RUNTIME_MODES else HOSTED_RUNTIME_MODE_RESIDENT
+
+
+def set_hosted_runtime_mode(store: UserStore, mode: str) -> str:
+    """切换该用户的 hosted 运行时模式。非法值、或用户尚无 model_api config
+    导致无法落地时，抛 ValueError（绝不返回假成功）。返回真正落地后的 mode。"""
+    if mode not in _HOSTED_RUNTIME_MODES:
+        raise ValueError(f"unknown hosted_runtime_mode: {mode!r}")
+    persisted = _patch_model_api_runtime_profile(store, {"hosted_runtime_mode": mode})
+    if persisted is None:
+        raise ValueError("cannot set hosted_runtime_mode: user has no model_api config")
+    return mode
