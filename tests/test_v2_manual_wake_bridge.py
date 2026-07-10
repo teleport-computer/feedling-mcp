@@ -20,15 +20,14 @@ from hosted import config_store as hosted_config_store
 from model_api_runtime.v2 import jobs_store
 from proactive import gate, proactive_core
 
-from conftest import seed_user
+from conftest import seed_user, configure_model_api_route
 
 
 def _seed_v2(uid):
     seed_user(uid)
-    db.set_blob(uid, "model_api", {
-        "route": "model_api", "provider": "anthropic", "model": "m",
-        "test_status": "ok", "api_key_envelope": {"body_ct": "x", "nonce": "n", "K_user": "k"},
-    })
+    configure_model_api_route(
+        uid, provider="anthropic", model="m", test_status="ok",
+        envelope={"body_ct": "x", "nonce": "n", "K_user": "k"})
 
 
 @pytest.fixture(autouse=True)

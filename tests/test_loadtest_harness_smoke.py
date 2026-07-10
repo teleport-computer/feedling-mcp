@@ -101,9 +101,11 @@ def test_seed_synthetic_users_wires_db_action_v2_and_activation():
     assert hosted_config_store.get_hosted_runtime_mode(store) == "db_action_v2"
     settings = store.load_proactive_settings()
     assert str(settings.get("first_chat_ok_at") or "").strip() != ""
-    config = db.get_blob(uid, "model_api")
-    assert config["route"] == "model_api"
-    assert config["base_url"] == expected_base_url
+    # Provider config now lives in model_api_routes/credentials (model-api-multi-
+    # profile), not a 'model_api' blob. Verify the active route points at the mock.
+    config = hosted_config_store._load_model_api_config(store)
+    assert config is not None
+    assert config.get("base_url") == expected_base_url
 
 
 def test_run_orchestrates_seed_enqueue_drain_collect_at_n5():

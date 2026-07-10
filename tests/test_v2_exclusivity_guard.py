@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
 
-from conftest import seed_user
+from conftest import seed_user, configure_model_api_route
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="requires DATABASE_URL / postgres"
@@ -26,16 +26,17 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture()
 def _clean_blobs():
+    # hosted_runtime_mode lives in user_blobs ('model_api_runtime'); provider config
+    # moved to model_api_routes/credentials (model-api-multi-profile). Clean both so
+    # the discovery query sees only this test's users.
     with db.get_pool().connection() as conn:
-        conn.execute("TRUNCATE user_blobs")
+        conn.execute("TRUNCATE user_blobs, model_api_routes, model_api_credentials")
     yield
 
 
 def _seed_enabled(user_id: str, *, provider: str = "anthropic", test_status: str = "ok"):
     seed_user(user_id)
-    db.set_blob(user_id, "model_api", {
-        "provider": provider, "model": "x", "test_status": test_status, "base_url": "",
-    })
+    configure_model_api_route(user_id, provider=provider, model="x", test_status=test_status)
 
 
 def test_db_action_v2_user_excluded_resident_cli_user_included(_clean_blobs):
