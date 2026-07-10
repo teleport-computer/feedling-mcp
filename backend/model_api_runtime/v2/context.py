@@ -19,6 +19,32 @@ def _norm_role(role: Any) -> str:
     return "assistant" if str(role or "") in _ASSISTANT_ROLES else "user"
 
 
+def text_of(content: Any) -> str:
+    """Extract the human-readable text from a tail row's ``content``.
+
+    ``content`` is either a plain string, or an OpenAI-style content-block list
+    (``[{"type":"text","text":...}, {"type":"image_url", ...}]``) once the worker
+    has injected images. Mirrors ``provider_client._content_text`` but is
+    replicated here to keep this module stdlib-only (dependency direction).
+    """
+    if isinstance(content, list):
+        parts = [
+            str(p.get("text") or "").strip()
+            for p in content
+            if isinstance(p, dict) and str(p.get("text") or "").strip()
+        ]
+        return "\n".join(parts).strip()
+    return str(content or "").strip()
+
+
+def _has_payload(content: Any) -> bool:
+    """True when the row carries anything worth sending: text, or any block at all
+    (an image-only turn has no text but IS the user's entire message)."""
+    if isinstance(content, list):
+        return bool(content)
+    return bool(str(content or "").strip())
+
+
 def build_turn_messages(
     *,
     system_prompt: str,
@@ -32,10 +58,10 @@ def build_turn_messages(
         messages.append({"role": "system", "content": _SUMMARY_HEADER + summary})
 
     for m in tail:
-        content = str(m.get("content") or "").strip()
-        if not content:
+        content = m.get("content")
+        if not _has_payload(content):
             continue
-        messages.append({"role": _norm_role(m.get("role")), "content": m["content"]})
+        messages.append({"role": _norm_role(m.get("role")), "content": content})
 
     if action_context.strip():
         messages.append({"role": "system", "content": action_context})
@@ -44,5 +70,5 @@ def build_turn_messages(
 
 
 def needs_compaction(tail: list[dict], *, budget: int) -> bool:
-    count = sum(1 for m in tail if str(m.get("content") or "").strip())
+    count = sum(1 for m in tail if _has_payload(m.get("content")))
     return count > budget

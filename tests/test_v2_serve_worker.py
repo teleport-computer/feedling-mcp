@@ -130,7 +130,14 @@ def test_read_messages_carries_id_and_ts_for_coalesce(client, backend_env):
 
     deps = serve_worker.build_production_deps()
     messages = deps.read_messages(user_id)
-    assert messages == [{"id": "m_synthetic_1", "ts": 12345.0, "role": "user", "content": "[image]"}]
+    # Multimodal round: image rows additionally carry non-sensitive `has_image`/`image_mime`
+    # markers so worker._inject_tail_images can find them. `content` stays TEXT here (no
+    # caption envelope on this synthetic row -> the "[image]" placeholder); bytes never
+    # enter this read path, because compaction shares it.
+    assert messages == [{
+        "id": "m_synthetic_1", "ts": 12345.0, "role": "user", "content": "[image]",
+        "has_image": True, "image_mime": "image/jpeg",
+    }]
 
 
 # ------------------------------------------------------------------

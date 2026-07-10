@@ -90,6 +90,12 @@ _TAIL_BUDGET = int(os.environ.get("FEEDLING_V2_TAIL_BUDGET_MSGS", "20"))
 _TAIL_KEEP = int(os.environ.get("FEEDLING_V2_TAIL_KEEP_MSGS", "10"))
 _TAIL_HARD_CAP = int(os.environ.get("FEEDLING_V2_TAIL_HARD_CAP", "60"))
 
+# 每回合最多注入最近 N 张图。enclave 单线程（每张图一次往返），且无 prompt caching ——
+# tail 里的图片每个回合都要重发，token 成本随图片数线性上升。
+_TAIL_IMAGE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2"))
+# 单张图 b64 上限；超限跳过注入、退化成文本标记（不引入图像缩放依赖）。
+_IMAGE_MAX_B64_CHARS = int(os.environ.get("FEEDLING_V2_IMAGE_MAX_B64_CHARS", "2000000"))
+
 # 工具循环轮数上限（spec §6）。撞上限 → 停止取工具，用手上的结果强制收口回复。
 _LOOP_MAX_ROUNDS = int(os.environ.get("FEEDLING_V2_LOOP_MAX_ROUNDS", "3"))
 # 一个回合内**跨两层循环**（外层消息驱动 replan × 内层模型驱动 tool loop）的 LLM 调用硬闸。
@@ -167,6 +173,11 @@ class TurnDeps:
     # expected_version 不匹配（别的回合已推进过摘要）时返回 False，调用方按丢弃本次压缩处理，
     # 不重试、不报错——下一回合会用新版本重新压缩。默认 None：同上。
     write_summary: Callable[[str, str, float, int], bool] | None = None
+    # (user_id, message_ids) -> {message_id: {"image_mime": str, "image_b64": str}}：只对
+    # 指定的图片消息做 enclave 解密。**不能**并进 read_tail —— compaction 用 limit=10_000 调
+    # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
+    # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
+    read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
 
 
 async def _cap_data(store, action_type, *, api_key, runtime_token, params=None, enclave_sem=None) -> dict:
@@ -332,6 +343,8 @@ async def _run_wake(
                 tail = await asyncio.to_thread(deps.read_tail, user_id, watermark, _TAIL_BUDGET)
             else:
                 tail = []
+            tail = await asyncio.to_thread(
+                _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images)
         wake_tail = list(tail) + [{"role": "user", "content": _WAKE_NUDGE}]
         try:
             reply = await v2_responder.respond(
@@ -360,6 +373,48 @@ async def _run_wake(
         await asyncio.to_thread(
             jobs_store.mark_failed, job_id, f"wake_failed: {type(e).__name__}: {str(e)[:160]}")
         return "failed"
+
+
+def _inject_tail_images(tail: list[dict], *, user_id: str, read_images) -> list[dict]:
+    """把 tail 里最近 `_TAIL_IMAGE_LIMIT` 个图片行的 content 换成 OpenAI 风格 content block
+    列表（caption 文本块在前、图片块在后）。返回**新列表**，绝不原地改输入行——compaction
+    共用 read_tail 产出的那些 dict。
+
+    任何失败（无 reader / 解密抛错 / 超尺寸 / 缺字段）都静默降级成原来的文本行：用户拿到
+    一条看不见图的回复，好过拿到 error chip（no-filler 铁律）。
+    """
+    if read_images is None:
+        return tail
+    targets = [r for r in tail if r.get("has_image") and r.get("id")]
+    if not targets:
+        return tail
+    wanted = [str(r["id"]) for r in targets[-_TAIL_IMAGE_LIMIT:]]
+    try:
+        fetched = read_images(user_id, wanted) or {}
+    except Exception as e:  # noqa: BLE001
+        log.warning("[v2.worker] read_images failed for %s: %s", user_id, e)
+        return tail
+
+    out: list[dict] = []
+    for row in tail:
+        got = fetched.get(str(row.get("id"))) if row.get("has_image") else None
+        b64 = str((got or {}).get("image_b64") or "")
+        if not b64 or len(b64) > _IMAGE_MAX_B64_CHARS:
+            if got and b64:
+                log.warning("[v2.worker] image too large, sending text only (msg=%s, %d chars)",
+                            row.get("id"), len(b64))
+            out.append(row)
+            continue
+        mime = str(got.get("image_mime") or "image/jpeg")
+        blocks: list[dict] = []
+        caption = context.text_of(row.get("content"))
+        # `[image]` 是我们自己塞的占位符，不是用户写的字——别当成用户的话发给模型。
+        if caption and caption != "[image]":
+            blocks.append({"type": "text", "text": caption})
+        blocks.append({"type": "image_url",
+                       "image_url": {"url": f"data:{mime};base64,{b64}"}})
+        out.append({**row, "content": blocks})
+    return out
 
 
 async def process_job(
@@ -497,6 +552,8 @@ async def process_job(
                 async with enclave_sem:
                     summary, watermark, _ver = await asyncio.to_thread(deps.read_summary, user_id)
                     tail = await asyncio.to_thread(deps.read_tail, user_id, watermark, _TAIL_HARD_CAP)
+                    tail = await asyncio.to_thread(
+                        _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images)
             else:
                 summary, tail = "", []
             # responder 走 BYOK provider_config；ResponderError（空回复/provider 错）交给下面

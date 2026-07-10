@@ -55,6 +55,7 @@ if str(_BACKEND_DIR) not in sys.path:
 
 from accounts import registry as accounts_registry  # noqa: E402
 from agent_runtime import spawners as agent_spawners
+from capabilities import registry as cap_registry
 from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import runtime_token
@@ -77,6 +78,53 @@ _ASSISTANT_ROLES = ("openclaw", "assistant", "agent")
 # only verifies signature+expiry+user_id, not scope — see enclave/auth.py
 # local_user_id_from_token) doesn't silently start rejecting this worker.
 _RUNTIME_TOKEN_SCOPE = ["envelope_decrypt"]
+
+_IMAGE_MARKER = "[image]"
+# 只为最近 N 个图片行解 caption。compaction 用 limit=10_000 调 _read_tail，没有这个上限
+# 它会把该用户历史上每一张图的 caption 都发起一次 enclave 往返（enclave 是单线程瓶颈）。
+_CAPTION_DECRYPT_LIMIT = 8
+
+
+def _caption_envelope(m: dict) -> dict | None:
+    """从 `caption_*` 前缀字段重建 caption 信封；无密文时 None。
+
+    镜像 `enclave/routes/chat.py:79-92`。**必须**用 `caption_id`（不是消息自己的 id）——
+    enclave 的 AEAD additional-data 是 `owner_user_id||v||id`，用错 id 会 AEAD 校验失败。
+    """
+    ct = str(m.get("caption_body_ct") or "").strip()
+    if not ct:
+        return None
+    v = m.get("caption_v", m.get("v", 1))
+    return {
+        "id": m.get("caption_id") or m.get("id"),
+        "v": int(v or 1),
+        "body_ct": ct,
+        "nonce": m.get("caption_nonce"),
+        "K_enclave": m.get("caption_K_enclave"),
+        "owner_user_id": m.get("caption_owner_user_id") or m.get("owner_user_id"),
+    }
+
+
+def _image_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
+    """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。
+
+    `caption_budget` 是一个单元素列表（可变计数器）：预算耗尽后不再解 caption，退化成
+    `_IMAGE_MARKER`。caption 解密失败同样静默退化——看不到那句话，好过整个回合失败。
+    """
+    text = _IMAGE_MARKER
+    cap_env = _caption_envelope(m)
+    if cap_env is not None and caption_budget[0] > 0:
+        caption_budget[0] -= 1
+        try:
+            caption = core_enclave._decrypt_envelope_via_enclave(
+                cap_env, None, purpose="v2_caption_read", runtime_token=token
+            ).decode("utf-8", errors="replace").strip()
+            if caption:
+                text = caption
+        except Exception as e:  # noqa: BLE001 — 静默降级，绝不拖垮回合
+            log.warning("[v2.serve_worker] caption decrypt failed msg=%s: %s", mid, e)
+    return {"id": mid, "ts": ts, "role": role, "content": text,
+            "has_image": True, "image_mime": m.get("image_mime") or "image/jpeg"}
 
 
 def _mint_runtime_token(user_id: str) -> str:
@@ -141,12 +189,14 @@ def _read_messages(user_id: str) -> list[dict]:
     pending = rows[last_assistant + 1:]
     token = _mint_runtime_token(user_id)
     out: list[dict] = []
+    caption_budget = [_CAPTION_DECRYPT_LIMIT]
     for m in pending:
         if str(m.get("role") or "") != "user":
             continue
         mid, ts = m.get("id"), m.get("ts")
         if m.get("content_type") == "image":
-            out.append({"id": mid, "ts": ts, "role": "user", "content": "[image]"})
+            out.append(_image_row(m, mid=mid, ts=ts, role="user",
+                                   token=token, caption_budget=caption_budget))
             continue
         if not m.get("body_ct") or m.get("K_enclave") is None:
             continue  # 无 enclave 钥的合成/本地-only 消息跳过
@@ -178,6 +228,7 @@ def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
     rows = sorted(rows, key=lambda m: m.get("ts") or 0.0)
     token = _mint_runtime_token(user_id)
     out: list[dict] = []
+    caption_budget = [_CAPTION_DECRYPT_LIMIT]
     for m in rows:
         ts = m.get("ts")
         if ts is None or not (ts > after_ts):
@@ -185,7 +236,8 @@ def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
         mid = m.get("id")
         role = "assistant" if str(m.get("role") or "") in _ASSISTANT_ROLES else "user"
         if m.get("content_type") == "image":
-            out.append({"id": mid, "ts": ts, "role": role, "content": "[image]"})
+            out.append(_image_row(m, mid=mid, ts=ts, role=role,
+                                   token=token, caption_budget=caption_budget))
             continue
         if not m.get("body_ct") or m.get("K_enclave") is None:
             continue  # 无 enclave 钥的合成/本地-only 消息跳过
@@ -265,6 +317,32 @@ def _record_terminal_error(user_id: str, message: str) -> None:
     hosted_config_store.set_last_runtime_error(core_store.get_store(user_id), message)
 
 
+def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
+    """按 id 取图片字节。复用**仍然注册、但 planner 词表够不到**的 chat_image_read
+    capability（见 multimodal spec §4.0）—— 能力还在，只是不再由模型选择、不再流经
+    responder 的文本 grounding context（那是 BUG-1 的成因）。
+
+    单条失败只跳过那一条，绝不抛——调用方 `worker._inject_tail_images` 会把缺失的图片
+    行原样留成文本。
+    """
+    store = core_store.get_store(user_id)
+    token = _mint_runtime_token(user_id)
+    out: dict[str, dict] = {}
+    for mid in message_ids:
+        try:
+            res = cap_registry.run_capability(
+                "chat_image_read", store, api_key=None, runtime_token=token,
+                params={"message_id": mid})
+            data = (res.to_dict() or {}).get("data") or {}
+        except Exception as e:  # noqa: BLE001
+            log.warning("[v2.serve_worker] image read failed msg=%s: %s", mid, e)
+            continue
+        if data.get("image_b64"):
+            out[str(mid)] = {"image_mime": data.get("image_mime") or "image/jpeg",
+                             "image_b64": data["image_b64"]}
+    return out
+
+
 def build_production_deps() -> v2_worker.TurnDeps:
     return v2_worker.TurnDeps(
         read_messages=_read_messages,
@@ -276,6 +354,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_tail=_read_tail,
         read_summary=_read_summary,
         write_summary=_write_summary,
+        read_images=_read_images,
     )
 
 
