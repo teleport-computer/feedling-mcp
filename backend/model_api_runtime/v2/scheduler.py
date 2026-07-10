@@ -35,24 +35,45 @@ def run_scheduler_tick(deps, *, now: float) -> dict:
 
     Returns {"considered": N, "enqueued": E, "skipped": S}.
     """
+    eligible_source = getattr(deps, "eligible_users", None)
+    eligible_users = set(eligible_source()) if eligible_source is not None else None
+    runtime_mode_enabled = getattr(deps, "runtime_mode_enabled", None)
+
+    def _still_v2(user_id):
+        return runtime_mode_enabled is None or bool(runtime_mode_enabled(user_id))
+
+    def _eligible(user_ids):
+        if eligible_users is None:
+            return list(user_ids)
+        return [user_id for user_id in user_ids if user_id in eligible_users]
+
     considered = 0
     enqueued = 0
     skipped = 0
 
-    for user_id in deps.due_users():
+    for user_id in _eligible(deps.due_users()):
         considered += 1
         try:
             decision = deps.wake_decision(user_id)
+            # A rollback discovered by the decision adapter is not an ordinary
+            # weak-wake block: do not mutate a resident user's V2 schedule.
+            if str(decision.get("block_reason") or "") == "runtime_mode":
+                skipped += 1
+                continue
             interval = int(decision.get("wake_interval_sec") or _DEFAULT_WAKE_INTERVAL_SEC)
             next_at = now + interval
 
             if decision.get("should_wake"):
+                if not _still_v2(user_id):
+                    skipped += 1
+                    continue
                 deps.enqueue_heartbeat(user_id)
                 enqueued += 1
             else:
                 skipped += 1
 
-            deps.advance_heartbeat(user_id, next_at)
+            if _still_v2(user_id):
+                deps.advance_heartbeat(user_id, next_at)
         except Exception:
             skipped += 1
             logger.exception("scheduler: error processing wake tick for user %s", user_id)
@@ -64,7 +85,7 @@ def run_scheduler_tick(deps, *, now: float) -> dict:
     fire_scheduled = getattr(deps, "fire_scheduled", None)
     scheduled_fired = 0
     if due_scheduled is not None and fire_scheduled is not None:
-        for user_id in due_scheduled():
+        for user_id in _eligible(due_scheduled()):
             try:
                 scheduled_fired += int(fire_scheduled(user_id) or 0)
             except Exception:  # noqa: BLE001 — 单用户失败不能中断整轮扫描
@@ -78,7 +99,7 @@ def run_scheduler_tick(deps, *, now: float) -> dict:
     tick_extraction = getattr(deps, "tick_extraction", None)
     extraction_enqueued = 0
     if extraction_users is not None and tick_extraction is not None:
-        for user_id in extraction_users():
+        for user_id in _eligible(extraction_users()):
             try:
                 extraction_enqueued += int(tick_extraction(user_id) or 0)
             except Exception:  # noqa: BLE001 — 单用户失败不能中断整轮扫描
@@ -92,7 +113,7 @@ def run_scheduler_tick(deps, *, now: float) -> dict:
     tick_screen_watch = getattr(deps, "tick_screen_watch", None)
     screen_watch_enqueued = 0
     if screen_watch_users is not None and tick_screen_watch is not None:
-        for user_id in screen_watch_users():
+        for user_id in _eligible(screen_watch_users()):
             try:
                 screen_watch_enqueued += int(tick_screen_watch(user_id) or 0)
             except Exception:  # noqa: BLE001 — 单用户失败不能中断整轮扫描

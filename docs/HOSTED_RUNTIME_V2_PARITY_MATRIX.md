@@ -1,5 +1,15 @@
 # Hosted Runtime V2 — Parity Matrix
 
+> **STATUS: HISTORICAL / SUPERSEDED FOR GO-NO-GO.** This matrix records useful
+> capability archaeology, but its “shipped,” “bucket empty,” and resident-deletion
+> conclusions are no longer authoritative. Use
+> `docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md` for current acceptance.
+> In particular, capture/dream producers are default-off and lack a durable
+> lifecycle; the provider-native unified tool loop is not implemented; full
+> conversation coverage, transactional effects, hard wedged-turn recovery, and
+> safe resident cutover remain blockers. Do not delete resident or enroll users
+> based on this file alone.
+
 > **This is walkthrough §8 gate 0**, built late (2026-07-10). The gate said: *"Table of every resident capability → V2 action. Gate: every later acceptance test traces to a row."* We skipped it and started at gate 1, so capability gaps have been discovered by accident (three real bugs below were found while building this table, not by tests). Every future V2 acceptance test should cite a row here.
 >
 > **Scope:** what the legacy per-user resident consumer (`tools/chat_resident_consumer.py` + `backend/agent_runtime/supervisor.py`) can do, versus what the V2 worker pool (`backend/model_api_runtime/v2/*` + `backend/capabilities/*`) can do.
@@ -50,8 +60,8 @@ The resident agent's tools are the `io_cli` subcommands it can shell out to (`to
 | heartbeat | ✅ `PROACTIVE_TICK_ENABLED` (`:228`), POST `/v1/proactive/tick` | ✅ D3 scheduler (`scheduler.py` + `serve_worker._scheduler_loop`) | ✅ `_run_wake` (`worker.py:392`) | aligned |
 | manual_wake | ✅ manual/force payload on `/v1/proactive/tick` | ✅ D3 bridge (`proactive_core.proactive_tick`) | ✅ `_run_wake` | aligned |
 | `scheduled` | ✅ `fire_scheduled_wakes` → `/v1/proactive/scheduled/fire`, timers in `proactive_scheduled_wakes_v2` | ✅ D3 scheduler `serve_worker._fire_scheduled_for_user` drains due timers → `enqueue_job(uid, "scheduled")`; `schedule_wake` capability (§A) persists them | ✅ in `_WAKE_LANES` (`worker.py:100`) | aligned |
-| `capture` | ✅ `fire_capture_tick()` (`:3844`) → `/v1/capture/tick` | ✅ `serve_worker._tick_capture_for_user` via the new `capture_scheduler.tick_quiet_capture(submit=…)` seam | ✅ `worker._run_extraction` | aligned |
-| `dream` | ✅ proactive job kind (`_is_memory_dream_job` `:4782`) | ✅ `serve_worker._tick_dream_for_user` via `dream_scheduler.tick_memory_dream(submit=…)` | ✅ `worker._run_extraction` (same handler) | aligned |
+| `capture` | ✅ `fire_capture_tick()` (`:3844`) → `/v1/capture/tick` | ⚠️ producer code exists but is default-off | ✅ `worker._run_extraction` | **not parity-complete**: durable input/watermark/backoff/idempotency lifecycle is missing |
+| `dream` | ✅ proactive job kind (`_is_memory_dream_job` `:4782`) | ⚠️ producer code exists but is default-off | ✅ `worker._run_extraction` (same handler) | **not parity-complete**: durable lifecycle and failure replay are missing |
 | screen-watch | ✅ `SCREEN_WATCH_ENABLED` / `SCREEN_WATCH_INTERVAL_SEC=120` (`:246-250`) | ✅ D3 scheduler `serve_worker._tick_screen_watch_for_user` — pure gate `v2/screen_watch.py` (fresh→changed→chatting, no enclave), then read-only oracle `_wake_decision_for_user`, then `enqueue_job(uid, "screen_watch")`; state in `v2_wake_schedule` (`next_screen_watch_at` / `last_screen_watch_frame_id`) | ✅ `_run_wake` (`worker.py:396`, `screen_watch` ∈ `_WAKE_LANES`) | aligned |
 | maintenance (compaction) | ❌ n/a (resident has no summary compaction) | ✅ `worker.py:363` | ✅ `_run_compaction` (`worker.py:387`) | V2-only |
 
@@ -94,7 +104,7 @@ Four real defects, none caught by the 2637-test suite — because no test traced
 **Bonus defect found while fixing it:** the image **caption** (the text a user sends *with* a picture, encrypted separately into `extra.caption_*` by `chat/service.py:115`) was read by **no V2 code path at all**. A user sending a screenshot plus "what's wrong with this?" gave the model the five characters `[image]` and nothing else. Fixed by `serve_worker._caption_envelope` + `_image_row`.
 
 **🟡 BUG-2 — a `capture`-lane job falls through to the chat path.** *(safety fix landed; full handler still pending)*
-`enqueue_job(uid, "capture")` is accepted (`capture` ∈ `LANES`, `jobs_store.py:16`), but `process_job` dispatches only `maintenance` and `_WAKE_LANES`; everything else used to take the chat path. The chat path's early-return guard is `if not coalesced and lane == "chat"`, so a capture job did **not** bail — it ran planner → executor → responder and **wrote a chat bubble**, and on failure emitted a user-visible error chip. **Safety fix:** `process_job` now has an explicit `if lane != "chat"` guard (`worker.py:463-474`) that logs and `mark_failed`s any unhandled lane **silently** (no bubble, no error chip) before the chat path is reached. This closes the "background job writes a chat bubble" hazard. That guard remains as defence in depth. `capture` and `dream` subsequently got a real producer (`serve_worker._tick_capture_for_user` / `_tick_dream_for_user`, via the new `submit=` seam in their gates) and a real handler (`worker._run_extraction`), and `screen_watch` got a producer + `_run_wake`. All three lanes are now aligned in §B; nothing reaches the unhandled-lane guard in normal operation.
+`enqueue_job(uid, "capture")` is accepted (`capture` ∈ `LANES`, `jobs_store.py:16`), but `process_job` dispatches only `maintenance` and `_WAKE_LANES`; everything else used to take the chat path. The chat path's early-return guard is `if not coalesced and lane == "chat"`, so a capture job did **not** bail — it ran planner → executor → responder and **wrote a chat bubble**, and on failure emitted a user-visible error chip. **Safety fix:** `process_job` now has an explicit `if lane != "chat"` guard (`worker.py:463-474`) that logs and `mark_failed`s any unhandled lane **silently** (no bubble, no error chip) before the chat path is reached. This closes the "background job writes a chat bubble" hazard. That guard remains as defence in depth. `capture` and `dream` subsequently got producer/handler code and `screen_watch` got a producer plus `_run_wake`; however capture/dream remain default-off and are not parity-complete until their durable lifecycle lands.
 
 **✅ BUG-3 — RESOLVED. `scheduled` lane now has a producer AND a way to create timers.**
 Was: handler with no producer; agent-scheduled wakes silently never fired for `db_action_v2` users (see §B). Fixed in two parts: (1) the D3 scheduler (`serve_worker._fire_scheduled_for_user`) drains due timers via `ScheduledWakeServiceV2.fire_due_timers` and `enqueue_job(uid, "scheduled")` — the one and only producer; (2) the agent can now **create/cancel** those timers through the `schedule_wake` / `cancel_wake` WRITE capabilities (`capabilities/wake.py`, §A), which persist the timer without enqueuing and let the scheduler pick it up within one tick.
@@ -117,8 +127,16 @@ This is the deepest reason the one-shot shape is wrong: **"the planner didn't as
 
 ## F. Triage
 
-**1. Must build (V2 cannot replace resident without these)** — ✅ **bucket empty; every item landed.**
-- ~~Agent loop (see §C and the loop spec) — the one-shot planner cannot chain or recover from a tool miss. **Also fixes BUG-4.**~~ ✅ **DONE** — `v2/agent_loop.py`; `worker.py:682` now forces a reply on the chat lane (`wants_reply = lane == "chat" or …`), closing BUG-4 by construction.
+**1. Must build (V2 cannot replace resident without these)** — **bucket is not empty.**
+- Provider-native unified tool loop; `agent_loop.py` is orchestration scaffolding,
+  while official/rule planning and the separate responder remain.
+- Durable capture/dream lifecycle and failure replay; current producers stay off.
+- See the current audit handoff for cutover, transactional effects, liveness,
+  full-history, security, telemetry, and kill-switch blockers.
+- ⚠️ **PARTIAL** — `v2/agent_loop.py` adds bounded orchestration and the chat
+  path forces a reply, closing BUG-4. The provider-native unified tool loop,
+  per-round message folding, reply-as-tool, and removal of the official/rule
+  split remain open.
 - ~~Multimodal: give `provider_client` a real image content block; stop feeding b64 through the text context (fully fixes BUG-1; the loop round only stops the bleeding).~~ ✅ **DONE** — images route in-band through the conversation tail as real content blocks (§A "chat image" = aligned, BUG-1 RESOLVED in §E).
 - ~~`schedule_wake` / `cancel_wake` capability + planner vocabulary, and a producer for the `scheduled` lane (fixes BUG-3).~~ ✅ **DONE** — see §A, §B `scheduled`, and BUG-3.
 - ~~`screen_watch` lane.~~ ✅ **DONE** — producer `serve_worker._tick_screen_watch_for_user` (pure gate `v2/screen_watch.py`, state in `v2_wake_schedule`), handler `_run_wake`; see §B `screen-watch`. **Deliberate divergence from the resident:** a frame suppressed by active chat is **not** consumed (`last_screen_watch_frame_id` is written only on a real wake, never on a suppressed tick) — the resident writes it as soon as `fresh and changed`, permanently losing frames it then suppresses.
@@ -126,14 +144,17 @@ This is the deepest reason the one-shot shape is wrong: **"the planner didn't as
 **2. Decide: drop or port**
 - Local file read / bash. Resident has it only because codex runs with the sandbox bypassed. Probably not an intended product capability.
 
-**3. V2 is already ahead — no work**
-- `memory_search`, `memory_write`, `identity_get`/`identity_patch`, summary compaction.
+**3. V2 has additional primitives, but they still need rollout proof**
+- `memory_search`, `memory_write`, `identity_get`/`identity_patch`, and summary
+  compaction exist; bounded search pagination and summary-coverage/retention
+  invariants remain open.
 
 **4. Infrastructure rehome (not capability work)** — ✅ **BUCKET EMPTY**
 - ~~Move the genesis import worker out of the agent-runner container.~~ ✅ **DONE 2026-07-10** — extracted to `backend/genesis/daemon.py`, hosted by `serve_worker` on a dedicated thread, with a `kind='genesis'` heartbeat so its death stops being silent. `supervisor.py` no longer starts it at all.
 - ~~Confirm gateway providers need no in-CVM LiteLLM under V2, then drop the child.~~ ✅ **DONE** — confirmed (§G Q2); the child self-stops on an empty roster, so there is nothing to drop by hand.
 
-Nothing further blocks deleting the `agent-runner` container.
+Do **not** delete the `agent-runner` container yet; the current audit handoff's
+parity, cutover, soak, and rollback gates remain open.
 
 ---
 
@@ -155,7 +176,9 @@ Nothing further blocks deleting the `agent-runner` container.
    `GatewayManager.reconcile([])` calls `_stop()` (`litellm_gateway.py:362-365`). Once every user is
    migrated the child stops itself — no separate step, nothing to delete by hand.
 3. **Resident web access** — confirm it comes from the CLI's built-in web tool and not something we haven't found. If a user's provider is a relay whose CLI has no web tool, does the resident agent have web at all today? (Affects whether V2's DuckDuckGo facade is parity, a regression, or an upgrade.)
-4. ~~**dream / screen_watch** — still wanted as products, or candidates for §2?~~ ✅ **Resolved: both kept as products and shipped.** `dream` → §B `dream` (aligned). `screen_watch` → §B `screen-watch` (aligned): producer `serve_worker._tick_screen_watch_for_user`, pure gate `v2/screen_watch.py`, state in `v2_wake_schedule`, handler `_run_wake`.
+4. **dream / screen_watch** — both remain desired products. Screen-watch has a
+   producer and handler; dream has code paths but is default-off and is not
+   shipped until its durable lifecycle and failure replay gates pass.
 5. **Dead column: `v2_wake_schedule.next_capture_at`.** The capture lane is driven by `capture_scheduler.tick_quiet_capture`'s own quiet-window bookkeeping (§B `capture`), **not** by a `next_capture_at` poll — so `upsert_wake_schedule(next_capture_at=…)` / `get_wake_schedule()["next_capture_at"]` have **no production writer or reader**. The column is inert (mirrors `next_heartbeat_at` / `next_screen_watch_at` for symmetry but was never wired to a producer). Safe to drop in a future migration, or wire if capture ever moves to a due-time poll.
 
 ---

@@ -120,7 +120,33 @@ def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane)
     assert written == {}                       # no chat bubble
     assert emitted == []                       # no user-visible status/error chip
     row = _job_row(job_id)
-    assert row[0] == "failed" and "provider_call_failed" in (row[1] or "")
+    assert row == ("failed", "extraction_failed:runtimeerror")
+
+
+def test_extraction_rollback_during_llm_blocks_memory_write(monkeypatch):
+    uid = "u_x_rollback"
+    conftest.seed_user(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(*, provider_config, prompt, parse, **kw):
+        return ([{"action": "add", "summary": "s", "content": "c"}], None)
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    mode_checks = iter([True, False])
+    applied = {"n": 0}
+    deps = _deps(
+        runtime_mode_enabled=lambda uid_: next(mode_checks),
+        apply_memory_actions=lambda uid_, actions: applied.update(n=len(actions)) or {},
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=True,
+        api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert applied["n"] == 0
+    assert _job_row(job_id)[0] == "failed"
 
 
 def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):

@@ -4,9 +4,46 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from model_api_runtime.v2 import jobs_store, serve_worker, worker
+from model_api_runtime.v2 import jobs_store, reaper as v2_reaper, serve_worker, worker
+
+
+def test_provider_thread_limiter_scales_with_worker_slots(monkeypatch):
+    import anyio.to_thread
+
+    async def _run():
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = 40
+        monkeypatch.delenv("FEEDLING_V2_PROVIDER_THREAD_LIMIT", raising=False)
+        assert serve_worker._configure_provider_thread_limiter(64) == 64
+
+        limiter.total_tokens = 40
+        monkeypatch.setenv("FEEDLING_V2_PROVIDER_THREAD_LIMIT", "96")
+        assert serve_worker._configure_provider_thread_limiter(64) == 96
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "nope"])
+def test_positive_loop_intervals_fail_closed(monkeypatch, raw):
+    monkeypatch.setenv("TEST_V2_INTERVAL", raw)
+    with pytest.raises(RuntimeError, match="finite and > 0"):
+        serve_worker._positive_float_env("TEST_V2_INTERVAL", "1")
+
+
+def test_default_worker_id_is_unique_across_same_pid_replica_calls(monkeypatch):
+    monkeypatch.setattr(serve_worker.socket, "gethostname", lambda: "pod")
+    monkeypatch.setattr(serve_worker.os, "getpid", lambda: 1)
+
+    first = serve_worker._default_worker_id()
+    second = serve_worker._default_worker_id()
+
+    assert first.startswith("v2-worker-pod-1-")
+    assert second.startswith("v2-worker-pod-1-")
+    assert first != second
 
 
 def test_build_production_deps_returns_turndeps():
@@ -76,6 +113,86 @@ def test_read_messages_returns_list_for_user_with_no_messages():
     assert messages == []
 
 
+def test_read_messages_uses_cursor_not_latest_assistant_position(monkeypatch):
+    class _Store:
+        chat_messages = [
+            {"id": "A", "ts": 10.0, "role": "user", "body_ct": "a", "K_enclave": "k"},
+            # B arrived during A's responder; R was appended after B.
+            {"id": "B", "ts": 20.0, "role": "user", "body_ct": "b", "K_enclave": "k"},
+            {"id": "R", "ts": 30.0, "role": "openclaw", "body_ct": "r", "K_enclave": "k"},
+        ]
+
+        def reload(self):
+            return None
+
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: _Store())
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda row, *args, **kwargs: f"text-{row['id']}".encode(),
+    )
+
+    assert serve_worker._read_messages("u", after_ts=10.0) == [
+        {"id": "B", "ts": 20.0, "role": "user", "content": "text-B"}
+    ]
+
+
+def test_read_messages_propagates_strict_database_reload_failure(monkeypatch):
+    class _Store:
+        chat_messages = [{"id": "cached", "ts": 1.0, "role": "user"}]
+
+        def reload_chat_strict(self):
+            raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: _Store())
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        serve_worker._read_messages("u", after_ts=0.0)
+
+
+def test_compaction_reader_is_oldest_first_while_context_reader_is_newest(monkeypatch):
+    class _Store:
+        chat_messages = [
+            {"id": f"m{i}", "ts": float(i), "role": "user", "body_ct": "x", "K_enclave": "k"}
+            for i in range(1, 6)
+        ]
+
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: _Store())
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda row, *args, **kwargs: row["id"].encode(),
+    )
+
+    newest = serve_worker._read_tail("u", 0.0, 2)
+    oldest = serve_worker._read_compaction_tail("u", 0.0, 2)
+    assert [row["id"] for row in newest] == ["m4", "m5"]
+    assert [row["id"] for row in oldest] == ["m1", "m2"]
+
+
+def test_tail_reader_selects_window_before_enclave_decrypt(monkeypatch):
+    class _Store:
+        chat_messages = [
+            {"id": f"m{i}", "ts": float(i), "role": "user", "body_ct": "x", "K_enclave": "k"}
+            for i in range(1, 501)
+        ]
+
+    calls = []
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: _Store())
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda row, *args, **kwargs: calls.append(row["id"]) or row["id"].encode(),
+    )
+
+    out = serve_worker._read_tail("u", 0.0, 2)
+    assert [row["id"] for row in out] == ["m499", "m500"]
+    assert calls == ["m499", "m500"]
+
+
 def test_main_module_has_entrypoint_guard():
     import inspect
 
@@ -108,7 +225,24 @@ def test_is_official_wraps_spawners_and_defaults_true_for_none():
     assert serve_worker._is_official(None) is True
 
 
-def test_read_messages_carries_id_and_ts_for_coalesce(client, backend_env):
+def test_resident_mode_is_final_fence_for_scheduled_and_screen_watch(monkeypatch):
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: object())
+    monkeypatch.setattr(
+        serve_worker.hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda store: serve_worker.hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT,
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue")),
+    )
+
+    assert serve_worker._fire_scheduled_for_user("resident") == 0
+    assert serve_worker._tick_screen_watch_for_user("resident") == 0
+
+
+def test_read_messages_carries_id_and_ts_for_coalesce(client, backend_env, monkeypatch):
     """Task 8: model_api_runtime.v2.coalesce.coalesce_pending filters by ts and
     dedupes by id, so _read_messages (feeding TurnDeps.read_messages) must forward
     both — Plan B's {"role","content"}-only shape predates the v2 pipeline."""
@@ -119,6 +253,7 @@ def test_read_messages_carries_id_and_ts_for_coalesce(client, backend_env):
     user_id = "u_serve_worker_idts"
     conftest.seed_user(user_id)
     store = core_store.get_store(user_id)
+    monkeypatch.setattr(store, "reload_chat_strict", lambda: list(store.chat_messages))
     store.chat_messages.append({
         "id": "m_synthetic_1", "ts": 12345.0, "role": "user",
         "content_type": "text", "body_ct": None, "K_enclave": None,
@@ -153,11 +288,11 @@ def test_reaper_loop_calls_reap_stuck_jobs_and_exits_promptly_on_stop_event(monk
     block stop_event from taking effect promptly."""
     calls = {"n": 0}
 
-    def _fake_reap(now=None):
+    def _fake_reap(**kwargs):
         calls["n"] += 1
         return 0
 
-    monkeypatch.setattr(jobs_store, "reap_stuck_jobs", _fake_reap)
+    monkeypatch.setattr(v2_reaper, "reap_once", _fake_reap)
     stop_event = asyncio.Event()
 
     async def _driver():
@@ -180,13 +315,13 @@ def test_reaper_loop_transient_db_error_does_not_kill_the_loop(monkeypatch):
     process if gathered with run_worker_loop in _serve)."""
     calls = {"n": 0}
 
-    def _flaky_reap(now=None):
+    def _flaky_reap(**kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("transient db outage")
         return 0
 
-    monkeypatch.setattr(jobs_store, "reap_stuck_jobs", _flaky_reap)
+    monkeypatch.setattr(v2_reaper, "reap_once", _flaky_reap)
     stop_event = asyncio.Event()
 
     async def _driver():
@@ -200,6 +335,31 @@ def test_reaper_loop_transient_db_error_does_not_kill_the_loop(monkeypatch):
 
     asyncio.run(_driver())
     assert calls["n"] >= 2  # survived the first raise and ticked again
+
+
+def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
+    calls = []
+    monkeypatch.setattr(worker, "MAX_WORKERS", 12)
+    monkeypatch.setattr(
+        jobs_store,
+        "record_worker_heartbeat",
+        lambda worker_id, **kwargs: calls.append((worker_id, kwargs)),
+    )
+    stop_event = asyncio.Event()
+
+    async def _driver():
+        task = asyncio.create_task(
+            serve_worker._heartbeat_loop("worker-a", stop_event, interval=0.02))
+        for _ in range(50):
+            if calls:
+                break
+            await asyncio.sleep(0.01)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(_driver())
+    assert calls[0] == ("worker-a", {"capacity": 12})
+    assert calls[-1] == ("worker-a", {"capacity": 0})
 
 
 # ------------------------------------------------------------------
@@ -414,6 +574,11 @@ def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, bac
     serve_worker.wire_assembly()
     uid = "u_sw_fire_scheduled"
     conftest.seed_user(uid)
+    monkeypatch.setattr(
+        serve_worker.hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda _store: serve_worker.hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+    )
 
     calls = []
     monkeypatch.setattr(jobs_store, "enqueue_job",

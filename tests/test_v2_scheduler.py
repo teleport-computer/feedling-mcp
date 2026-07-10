@@ -62,6 +62,41 @@ def test_zero_burn_blocked_does_not_enqueue_but_still_advances():
                       "screen_watch_enqueued": 0}
 
 
+def test_runtime_mode_block_does_not_mutate_v2_schedule():
+    deps = FakeDeps(
+        users=["rolled-back"],
+        decisions={"rolled-back": {
+            "should_wake": False,
+            "wake_interval_sec": 7200,
+            "block_reason": "runtime_mode",
+        }},
+    )
+
+    result = scheduler.run_scheduler_tick(deps, now=2000.0)
+
+    assert deps.enqueued == []
+    assert deps.advanced == []
+    assert result["skipped"] == 1
+
+
+def test_final_runtime_mode_fence_blocks_enqueue_after_decision():
+    deps = FakeDeps(
+        users=["raced"],
+        decisions={"raced": {
+            "should_wake": True,
+            "wake_interval_sec": 60,
+            "block_reason": "",
+        }},
+    )
+    deps.runtime_mode_enabled = lambda _uid: False
+
+    result = scheduler.run_scheduler_tick(deps, now=2000.0)
+
+    assert deps.enqueued == []
+    assert deps.advanced == []
+    assert result["skipped"] == 1
+
+
 def test_mixed_batch_two_wake_one_blocked():
     deps = FakeDeps(
         users=["a", "b", "c"],
@@ -199,3 +234,36 @@ def test_tick_sweeps_screen_watch_users_and_isolates_failures():
 def test_tick_skips_screen_watch_sweep_when_deps_absent():
     out = scheduler.run_scheduler_tick(_SchedFakeDeps(), now=100.0)
     assert out["screen_watch_enqueued"] == 0
+
+
+def test_one_eligible_snapshot_filters_every_scheduler_lane():
+    seen = {"eligible_calls": 0, "heartbeat": [], "scheduled": [], "extract": [], "screen": []}
+    deps = _SchedFakeDeps(
+        due_scheduled=["resident", "v2"],
+        fire=lambda uid: seen["scheduled"].append(uid) or 1,
+    )
+    deps.due_users = lambda: ["resident", "v2"]
+    deps.wake_decision = lambda uid: {
+        "should_wake": True, "wake_interval_sec": 60, "block_reason": "",
+    }
+    deps.enqueue_heartbeat = lambda uid: seen["heartbeat"].append(uid)
+    deps.advance_heartbeat = lambda uid, ts: None
+    deps.extraction_users = lambda: ["resident", "v2"]
+    deps.tick_extraction = lambda uid: seen["extract"].append(uid) or 1
+    deps.screen_watch_users = lambda: ["resident", "v2"]
+    deps.tick_screen_watch = lambda uid: seen["screen"].append(uid) or 1
+
+    def _eligible():
+        seen["eligible_calls"] += 1
+        return ["v2"]
+
+    deps.eligible_users = _eligible
+    scheduler.run_scheduler_tick(deps, now=100.0)
+
+    assert seen == {
+        "eligible_calls": 1,
+        "heartbeat": ["v2"],
+        "scheduled": ["v2"],
+        "extract": ["v2"],
+        "screen": ["v2"],
+    }

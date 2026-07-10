@@ -15,11 +15,12 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
-import socket
 import ssl
 from urllib.parse import urlparse
 
 import httpx
+
+from core import net_safety
 
 _CONNECT_TIMEOUT = 10.0
 _TOTAL_TIMEOUT = 30.0
@@ -34,8 +35,7 @@ class ProbeError(Exception):
 
 
 def _resolve_ips(host: str) -> list[str]:
-    infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    return sorted({info[4][0] for info in infos})
+    return net_safety.resolve_ips(host)
 
 
 def blocked_url_kind(url: str) -> str | None:

@@ -264,7 +264,7 @@ def dream_tick(store, payload: dict):
 
 
 def proactive_tick(store, payload: dict, *, api_key) -> dict:
-    if hosted_config_store.get_hosted_runtime_mode(store) == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+    if hosted_config_store.get_hosted_runtime_mode_strict(store) == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
         # db_action_v2 users have no resident consumer (D0 exclusivity guard). A MANUAL
         # wake becomes a V2 manual_wake job; non-manual (heartbeat) ticks are owned by the
         # V2 scheduler, so we create NO resident proactive_job (it would never be claimed).

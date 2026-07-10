@@ -21,6 +21,23 @@ def test_new_visible_message_after_cursor_triggers_replan():
     assert decision == v2_inval.REPLAN
 
 
+def test_encrypted_message_metadata_triggers_without_plaintext_content():
+    """Production rows have ciphertext, not the plaintext test-only content key."""
+    messages = [
+        {"id": "m1", "role": "user", "ts": 101.0, "body_ct": "ciphertext"},
+        {"id": "m2", "role": "user", "ts": 105.0, "body_ct": "ciphertext"},
+    ]
+    assert v2_inval.new_visible_message_since(messages, cursor_ts=102.0) is True
+
+
+def test_non_user_or_invalid_timestamp_does_not_trigger():
+    messages = [
+        {"role": "openclaw", "ts": 200.0, "body_ct": "ciphertext"},
+        {"role": "user", "ts": "not-a-number", "body_ct": "ciphertext"},
+    ]
+    assert v2_inval.new_visible_message_since(messages, cursor_ts=102.0) is False
+
+
 def test_no_new_message_continues():
     messages = [_u("m1", 101.0), _u("m2", 102.0)]
     decision = v2_inval.evaluate(messages, safe_point="before_write", coalesced_cursor_ts=102.0)

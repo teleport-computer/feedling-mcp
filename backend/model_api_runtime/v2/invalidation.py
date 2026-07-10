@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import jobs_store
 
 # 三个允许重规划的安全点（§8）。在别处重规划会撕裂半应用的写。
@@ -27,9 +26,25 @@ DEFAULT_REPLAN_BUDGET = 2
 
 
 def new_visible_message_since(messages: list[dict[str, Any]], *, cursor_ts: float) -> bool:
-    """cursor_ts（当前 plan 折入的最大用户 ts）之后是否又来了新用户可见消息？= invalidation 触发条件。"""
-    _, new_cursor = v2_coalesce.coalesce_pending(messages, since_ts=cursor_ts)
-    return new_cursor > cursor_ts
+    """Return whether a newer user row exists using metadata only.
+
+    Production ``store.chat_messages`` rows contain encrypted ``body_ct`` and
+    deliberately do not expose plaintext ``content``. Reusing
+    ``coalesce_pending`` here therefore made the safe point work only for the
+    plaintext fixtures used by tests: every real encrypted row was discarded as
+    empty. Invalidation needs only role and timestamp, both non-sensitive
+    metadata, so it must not depend on decryption or message text.
+    """
+    for message in messages:
+        if str(message.get("role") or "") not in {"user", "human"}:
+            continue
+        try:
+            message_ts = float(message.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if message_ts > cursor_ts:
+            return True
+    return False
 
 
 def evaluate(

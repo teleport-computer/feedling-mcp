@@ -7,11 +7,18 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))  # noqa: E402
 
 from model_api_runtime import tools  # noqa: E402
 from capabilities import web as cap_web  # noqa: E402
 from capabilities import registry as cap_registry  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _public_dns(monkeypatch):
+    monkeypatch.setattr(cap_web, "_resolve_ips", lambda host: ["93.184.216.34"])
 
 
 # ---------------------------------------------------------------------------
@@ -101,20 +108,31 @@ def test_search_caps_oversized_result_list(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class _FakeResponse:
-    def __init__(self, *, status_code=200, text=""):
+    def __init__(self, *, status_code=200, text="", headers=None):
         self.status_code = status_code
         self.text = text
+        self.headers = dict(headers or {})
+        self.encoding = "utf-8"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def iter_bytes(self):
+        yield self.text.encode(self.encoding)
 
 
 def test_fetch_happy_path_strips_html_and_caps_size(monkeypatch):
     html_body = "<html><head><style>.x{}</style></head><body><p>Hello  World</p></body></html>"
 
     def fake_get(url, *, timeout, follow_redirects, headers):
-        assert follow_redirects is True
+        assert follow_redirects is False
         assert "User-Agent" in headers
         return _FakeResponse(status_code=200, text=html_body)
 
-    monkeypatch.setattr(cap_web.httpx, "get", fake_get)
+    monkeypatch.setattr(cap_web, "_stream_get", fake_get)
     r = cap_web.fetch("STORE", params={"url": "https://example.com/page"})
     assert r.ok is True
     assert r.data["url"] == "https://example.com/page"
@@ -134,8 +152,57 @@ def test_fetch_invalid_url_scheme_is_invalid():
     assert r.error["code"] == "capability_invalid_input"
 
 
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1/admin",
+    "http://10.0.0.1/",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://[::1]/",
+])
+def test_fetch_blocks_non_global_literal_addresses(url, monkeypatch):
+    called = {"n": 0}
+    monkeypatch.setattr(cap_web, "_stream_get", lambda *a, **k: called.update(n=1))
+    r = cap_web.fetch("STORE", params={"url": url})
+    assert r.ok is False
+    assert r.error["code"] == "capability_invalid_input"
+    assert called["n"] == 0
+
+
+def test_fetch_blocks_mixed_public_private_dns(monkeypatch):
+    monkeypatch.setattr(
+        cap_web, "_resolve_ips", lambda host: ["93.184.216.34", "10.0.0.8"]
+    )
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/"})
+    assert r.ok is False
+    assert r.error["code"] == "capability_invalid_input"
+
+
+def test_fetch_revalidates_public_to_private_redirect(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return _FakeResponse(status_code=302, headers={"location": "http://127.0.0.1/admin"})
+
+    monkeypatch.setattr(cap_web, "_stream_get", fake_get)
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/start"})
+    assert r.ok is False
+    assert r.error["code"] == "capability_invalid_input"
+    assert calls == ["https://example.com/start"]
+
+
+def test_fetch_caps_redirect_count(monkeypatch):
+    monkeypatch.setattr(
+        cap_web,
+        "_stream_get",
+        lambda url, **kwargs: _FakeResponse(status_code=302, headers={"location": "/again"}),
+    )
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/start"})
+    assert r.ok is False
+    assert "redirect" in r.error["message"]
+
+
 def test_fetch_non_2xx_status_is_err(monkeypatch):
-    monkeypatch.setattr(cap_web.httpx, "get",
+    monkeypatch.setattr(cap_web, "_stream_get",
                         lambda *a, **k: _FakeResponse(status_code=404, text="nope"))
     r = cap_web.fetch("STORE", params={"url": "https://example.com/missing"})
     assert r.ok is False
@@ -143,7 +210,7 @@ def test_fetch_non_2xx_status_is_err(monkeypatch):
 
 
 def test_fetch_5xx_status_is_retryable(monkeypatch):
-    monkeypatch.setattr(cap_web.httpx, "get",
+    monkeypatch.setattr(cap_web, "_stream_get",
                         lambda *a, **k: _FakeResponse(status_code=503, text="down"))
     r = cap_web.fetch("STORE", params={"url": "https://example.com/down"})
     assert r.ok is False
@@ -154,7 +221,7 @@ def test_fetch_exception_maps_to_retryable_err(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("dns failure")
 
-    monkeypatch.setattr(cap_web.httpx, "get", boom)
+    monkeypatch.setattr(cap_web, "_stream_get", boom)
     r = cap_web.fetch("STORE", params={"url": "https://example.com/"})
     assert r.ok is False
     assert r.error["retryable"] is True
@@ -162,12 +229,23 @@ def test_fetch_exception_maps_to_retryable_err(monkeypatch):
 
 def test_fetch_caps_response_body_before_stripping(monkeypatch):
     huge = "<p>" + ("a" * 200_000) + "</p>"
-    monkeypatch.setattr(cap_web.httpx, "get",
+    monkeypatch.setattr(cap_web, "_stream_get",
                         lambda *a, **k: _FakeResponse(status_code=200, text=huge))
     r = cap_web.fetch("STORE", params={"url": "https://example.com/huge"})
-    assert r.ok is True
-    # errors.cap_text further caps to MAX_TEXT (2000) — either way, nowhere near 200k.
-    assert len(r.data["text"]) < 3000
+    assert r.ok is False
+    assert "size limit" in r.error["message"]
+
+
+def test_fetch_rejects_content_length_before_reading(monkeypatch):
+    response = _FakeResponse(
+        status_code=200,
+        text="must not matter",
+        headers={"content-length": str(cap_web._FETCH_MAX_BODY_BYTES + 1)},
+    )
+    monkeypatch.setattr(cap_web, "_stream_get", lambda *a, **k: response)
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/huge"})
+    assert r.ok is False
+    assert "size limit" in r.error["message"]
 
 
 # ---------------------------------------------------------------------------

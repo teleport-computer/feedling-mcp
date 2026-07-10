@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -41,8 +42,10 @@ if str(_repo_root) not in sys.path:
 import provider_client  # noqa: E402
 from model_api_runtime.v2 import planner as v2_planner  # noqa: E402
 from model_api_runtime.v2 import responder as v2_responder  # noqa: E402
+from model_api_runtime.v2 import agent_loop as v2_agent_loop  # noqa: E402
 
 from scripts.loadtest.mock_provider import MockProvider  # noqa: E402
+from scripts.loadtest.fixtures import v2_turn_fixtures  # noqa: E402
 
 DEFAULT_THRESHOLD = 0.10
 
@@ -50,20 +53,7 @@ DEFAULT_THRESHOLD = 0.10
 # short, plausible conversation turns. Real gate runs should pass a richer,
 # representative fixture set (this module's ``measure_v2_tokens_per_turn``
 # accepts any ``fixtures`` list, so callers are free to swap these out).
-_DEFAULT_FIXTURES: list[dict[str, Any]] = [
-    {
-        "summary": "",
-        "tail": [{"role": "user", "content": "hey, how's it going?"}],
-    },
-    {
-        "summary": "- user mentioned they're prepping for a trip",
-        "tail": [
-            {"role": "user", "content": "packed everything for the trip yet?"},
-            {"role": "openclaw", "content": "almost, just the charger left"},
-            {"role": "user", "content": "nice, don't forget it this time"},
-        ],
-    },
-]
+_DEFAULT_FIXTURES: list[dict[str, Any]] = v2_turn_fixtures()
 
 
 def compare_tokens_per_turn(
@@ -76,21 +66,15 @@ def compare_tokens_per_turn(
     ROLLBACK condition: if this comes back True near cutover, the rollout
     must not proceed / must be rolled back to resident.
 
-    ``resident_baseline <= 0`` is guarded (a zero/negative baseline makes the
-    ratio meaningless, e.g. a caller passing an unset/placeholder value) —
-    returns ``regression=False`` (never claims a spurious pass OR fail) with
-    ``delta_ratio=None`` and a ``"reason"`` key explaining why no comparison
-    was made.
+    Invalid baselines/thresholds raise. A rollout gate must fail closed rather
+    than convert a skipped comparison into exit code zero.
     """
-    if resident_baseline <= 0:
-        return {
-            "v2_mean": v2_mean,
-            "resident_baseline": resident_baseline,
-            "delta_ratio": None,
-            "threshold": threshold,
-            "regression": False,
-            "reason": "resident_baseline must be > 0 to compute a delta_ratio; comparison skipped",
-        }
+    if not math.isfinite(resident_baseline) or resident_baseline <= 0:
+        raise ValueError("resident_baseline must be > 0")
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError("threshold must be >= 0")
+    if not math.isfinite(v2_mean) or v2_mean < 0:
+        raise ValueError("v2_mean must be finite and >= 0")
     delta_ratio = (v2_mean - resident_baseline) / resident_baseline
     return {
         "v2_mean": v2_mean,
@@ -154,7 +138,7 @@ def measure_v2_tokens_per_turn(
     return sum(totals) / len(totals)
 
 
-async def _drive_turn_async(provider_config, fixture: dict[str, Any]) -> None:
+async def _drive_turn_async(provider_config, fixture: dict[str, Any], *, provider) -> None:
     """跑一个**完整回合**的 LLM 调用序列：planner（可能多轮）+ responder。
 
     这是 token 门唯一正确的观测口径。老的 `measure_v2_tokens_per_turn` 只跑 responder，
@@ -164,14 +148,47 @@ async def _drive_turn_async(provider_config, fixture: dict[str, Any]) -> None:
     """
     tail = list(fixture.get("tail") or [])
     coalesced = [m for m in tail if m.get("role") == "user"]
-    await v2_planner.plan(
-        None,
-        provider_config=provider_config, is_official=True,
-        coalesced_messages=coalesced,
-        digest={"messages": [{"content": str(m.get("content") or "")[:400]} for m in coalesced[-6:]]},
-        memory_index={}, perception_summary={}, runtime_state={},
-        lane="chat", reason="loadtest",
+    scripted = list(fixture.get("planner_replies") or [])
+
+    async def _decide(round_idx: int, prior: dict) -> v2_agent_loop.Decision:
+        if scripted:
+            provider.reply = scripted[min(round_idx, len(scripted) - 1)]
+        steps = await v2_planner.plan(
+            None,
+            provider_config=provider_config, is_official=True,
+            coalesced_messages=coalesced,
+            digest={"messages": [{"content": str(m.get("content") or "")[:400]} for m in coalesced[-6:]]},
+            memory_index={}, perception_summary={}, runtime_state={},
+            lane="chat", reason="loadtest", prior_action_results=prior or None,
+        )
+        return v2_agent_loop.Decision(
+            actions=[step for step in steps if step["type"] != "final_response"],
+            wants_reply=any(step["type"] == "final_response" for step in steps),
+        )
+
+    async def _run_tools(actions: list[dict]) -> dict:
+        # Token measurement needs the loop shape, not live capabilities. Return a
+        # deterministic observation so the next planner round receives results.
+        results = {
+            str(action.get("type") or "unknown"): [
+                {"ok": True, "data": {"count": 1}}
+            ]
+            for action in actions
+        }
+        return {
+            "action_results": results,
+            "action_digest": {
+                action_type: {"ok": len(runs), "count": len(runs)}
+                for action_type, runs in results.items()
+            },
+        }
+
+    await v2_agent_loop.run_turn(
+        decide=_decide,
+        run_tools=_run_tools,
+        max_rounds=int(fixture.get("max_rounds") or 3),
     )
+    provider.reply = str(fixture.get("response_reply") or "Measured final response.")
     await v2_responder.respond(
         provider_config=provider_config,
         summary=str(fixture.get("summary") or ""),
@@ -194,7 +211,7 @@ def measure_turn_tokens(fixtures: list[dict[str, Any]], *, provider) -> dict[str
 
     async def _run() -> None:
         for fixture in fixtures:
-            await _drive_turn_async(provider_config, fixture)
+            await _drive_turn_async(provider_config, fixture, provider=provider)
 
     asyncio.run(_run())
     turns = float(len(fixtures))
@@ -229,13 +246,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    with MockProvider() as provider:
-        v2_mean = measure_v2_tokens_per_turn(
-            _DEFAULT_FIXTURES, mock_base_url=provider.base_url
-        )
+    if (
+        not math.isfinite(args.resident_baseline)
+        or args.resident_baseline <= 0
+        or not math.isfinite(args.threshold)
+        or args.threshold < 0
+    ):
+        print(json.dumps({
+            "error": "invalid_gate_input",
+            "resident_baseline": args.resident_baseline,
+            "threshold": args.threshold,
+        }, indent=2))
+        return 2
+    one_shot = '{"plan":[{"type":"final_response","payload":{}}]}'
+    with MockProvider(reply=one_shot, estimate_tokens=True) as provider:
+        report = measure_turn_tokens(_DEFAULT_FIXTURES, provider=provider)
     result = compare_tokens_per_turn(
-        v2_mean, args.resident_baseline, threshold=args.threshold
+        report["tokens_per_turn"], args.resident_baseline, threshold=args.threshold
     )
+    result["llm_calls_per_turn"] = report["llm_calls_per_turn"]
     print(json.dumps(result, indent=2))
     return 1 if result["regression"] else 0
 

@@ -120,6 +120,46 @@ class _CountingSemaphore(asyncio.Semaphore):
         return await super().acquire()
 
 
+def test_write_encrypted_reply_uses_strict_persistence(monkeypatch):
+    calls = []
+
+    class _Store:
+        def append_chat(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return {"id": "reply-1"}
+
+        def notify_chat_waiters(self):
+            calls.append(("notify", {}))
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, _raw: ({"id": "reply-1"}, None),
+    )
+
+    assert worker._write_encrypted_reply(_Store(), "hello") == {"id": "reply-1"}
+    assert calls[0][1] == {"strict": True}
+    assert calls[1] == ("notify", {})
+
+
+def test_write_encrypted_reply_propagates_strict_database_failure(monkeypatch):
+    class _Store:
+        def append_chat(self, *_args, **_kwargs):
+            raise RuntimeError("database unavailable")
+
+        def notify_chat_waiters(self):
+            raise AssertionError("must not notify after a failed persistence")
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, _raw: ({"id": "reply-2"}, None),
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        worker._write_encrypted_reply(_Store(), "hello")
+
+
 # ------------------------------------------------------------------
 # process_job: the full turn body
 # ------------------------------------------------------------------
@@ -152,6 +192,63 @@ def test_process_job_end_to_end_writes_reply_and_completes(monkeypatch):
     state = jobs_store.get_runtime_state(uid)
     assert state.get("last_replied_ts") == 10.0
     assert "action_digest" in state  # non-sensitive digest only; no capability data leaked here
+
+
+def test_message_coalesced_during_responder_creates_successor(monkeypatch):
+    uid = "u_w_late_successor"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-late")
+
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda action_type, store, **kwargs: _FakeCapResult({}),
+    )
+
+    async def _respond(**kwargs):
+        same_id, coalesced = jobs_store.enqueue_job(uid, "chat", reason="late-B")
+        assert (same_id, coalesced) == (job_id, True)
+        return "reply to A"
+
+    monkeypatch.setattr(v2_responder, "respond", _respond)
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+    deps = _deps(messages=[{"id": "A", "ts": 10.0, "role": "user", "content": "first"}])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False,
+        api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT id,status,reason FROM agent_jobs WHERE user_id=%s ORDER BY id", (uid,)
+        ).fetchall()
+    assert rows[0][:2] == (job_id, "completed")
+    assert rows[1][1:] == ("pending", "coalesced_followup")
+
+
+def test_reply_envelope_failure_is_terminal_not_success(monkeypatch):
+    uid = "u_w_reply_envelope_failure"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-envelope")
+
+    _patch_cheap_boundaries(monkeypatch, reply="model reply")
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: None)
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False,
+        api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    row = _job_status(job_id)
+    assert row[0] == "failed"
+    assert row[1] == "turn_failed:runtimeerror"
+    assert "reply_encryption_failed" not in row[1]
 
 
 def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(monkeypatch):
@@ -247,7 +344,7 @@ def test_process_job_responder_error_marks_failed_no_filler(monkeypatch):
     assert write_called["n"] == 0
     row = _job_status(job_id)
     assert row[0] == "failed"
-    assert "ResponderError" in (row[1] or "") and "empty_reply" in (row[1] or "")
+    assert row[1] == "turn_failed:empty_reply"
 
 
 def test_process_job_no_pending_messages_chat_lane_completes_without_planning(monkeypatch):
@@ -267,6 +364,14 @@ def test_process_job_no_pending_messages_chat_lane_completes_without_planning(mo
         return []
 
     monkeypatch.setattr(v2_planner, "plan", _counting_empty_plan)
+    emitted = []
+    wakes = []
+    monkeypatch.setattr(worker, "_emit_status", lambda user_id, jid, kind: emitted.append(kind))
+    monkeypatch.setattr(
+        worker.core_wake_bus,
+        "notify",
+        lambda channel, user_id: wakes.append((channel, user_id)),
+    )
     deps = _deps(messages=[])  # nothing pending -> coalesce_pending returns ([], 0.0)
 
     status = asyncio.run(worker.process_job(
@@ -275,6 +380,8 @@ def test_process_job_no_pending_messages_chat_lane_completes_without_planning(mo
     assert status == "completed"
     assert plan_calls["n"] == 0
     assert _job_status(job_id)[0] == "completed"
+    assert emitted == ["processing", "done"]
+    assert ("chat", uid) in wakes
 
 
 def test_process_job_replans_on_concurrent_new_message_within_budget(monkeypatch):
@@ -391,7 +498,9 @@ def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monk
     assert len(recorded) == 1
     rec_uid, rec_msg = recorded[0]
     assert rec_uid == uid
-    assert "RuntimeError" in rec_msg and "planner blew up" in rec_msg
+    assert rec_msg == "turn_failed:runtimeerror"
+    assert row[1] == rec_msg
+    assert "planner blew up" not in rec_msg
 
 
 def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
@@ -447,7 +556,8 @@ def test_run_turn_provider_resolve_failure_emits_error_status_and_callback(monke
     assert len(recorded) == 1
     rec_uid, rec_msg = recorded[0]
     assert rec_uid == uid
-    assert "model_api_key_decrypt_failed" in rec_msg
+    assert rec_msg == "provider_unavailable"
+    assert "model_api_key_decrypt_failed" not in rec_msg
 
 
 def test_run_turn_maintenance_resolve_failure_is_silent_no_user_error(monkeypatch):
@@ -583,7 +693,7 @@ def test_run_turn_fails_when_provider_unresolved_and_never_enters_process_job(mo
     assert status == "failed"
     row = _job_status(job_id)
     assert row[0] == "failed"
-    assert "model_api_key_decrypt_failed" in (row[1] or "")
+    assert row[1] == "provider_unavailable"
 
 
 # ------------------------------------------------------------------
@@ -710,10 +820,63 @@ def test_slot_exception_path_backs_off_on_persistent_failure(monkeypatch):
     assert calls["n"] <= 4, f"Too many attempts ({calls['n']}) suggests hot-loop without backoff"
 
 
+def test_slot_recovery_failure_does_not_kill_slot(monkeypatch):
+    stop = asyncio.Event()
+    claim_calls = {"n": 0}
+
+    def _claim(worker_id, lanes=None):
+        claim_calls["n"] += 1
+        if claim_calls["n"] == 1:
+            return {"id": "job-1", "user_id": "u", "lane": "chat",
+                    "claimed_by": worker_id}
+        stop.set()
+        return None
+
+    async def _explode(_job, _deps):
+        raise RuntimeError("turn exploded")
+
+    monkeypatch.setattr(jobs_store, "claim_next_job", _claim)
+    monkeypatch.setattr(jobs_store, "mark_failed", lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("db still down")))
+    monkeypatch.setattr(worker, "_run_turn", _explode)
+
+    asyncio.run(worker._slot_loop(
+        "w-recovery", poll_interval=0.001, stop_event=stop, deps=_ok_deps({})))
+
+    assert claim_calls["n"] >= 2
+
+
+def test_run_worker_loop_propagates_unexpected_slot_exit(monkeypatch):
+    async def _broken_slot(worker_id, **kwargs):
+        raise AssertionError(f"broken {worker_id}")
+
+    monkeypatch.setattr(worker, "_slot_loop", _broken_slot)
+    stop = asyncio.Event()
+
+    with pytest.raises(AssertionError, match="broken w-supervise#0"):
+        asyncio.run(worker.run_worker_loop(
+            "w-supervise", max_workers=1, poll_interval=0.01,
+            stop_event=stop, deps=_ok_deps({})))
+
+    assert stop.is_set()
+
+
 def test_bounded_gates_exist():
     assert isinstance(worker.MAX_WORKERS, int) and worker.MAX_WORKERS >= 1
     assert isinstance(worker.MAX_READ_ACTION_PARALLELISM, int)
     assert isinstance(worker.ENCLAVE_SEMAPHORE, asyncio.Semaphore)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "nope"])
+def test_positive_worker_integer_settings_fail_closed(monkeypatch, raw):
+    monkeypatch.setenv("TEST_V2_POSITIVE_INT", raw)
+    with pytest.raises(RuntimeError, match="positive integer"):
+        worker._positive_int_env("TEST_V2_POSITIVE_INT", "1")
+
+
+def test_positive_worker_integer_setting_accepts_value(monkeypatch):
+    monkeypatch.setenv("TEST_V2_POSITIVE_INT", "3")
+    assert worker._positive_int_env("TEST_V2_POSITIVE_INT", "1") == 3
 
 
 # ------------------------------------------------------------------
@@ -732,13 +895,13 @@ def test_reserved_lane_slots_default_is_half_rounded_down():
     assert result == [{"chat", "manual_wake"}, {"chat", "manual_wake"}, None, None]
 
 
-def test_reserved_lane_slots_single_worker_defaults_to_fully_reserved():
-    assert worker._reserved_lane_slots(1, None) == [{"chat", "manual_wake"}]
+def test_reserved_lane_slots_single_worker_stays_unrestricted():
+    assert worker._reserved_lane_slots(1, None) == [None]
 
 
-def test_reserved_lane_slots_reserved_clamped_to_max_workers():
+def test_reserved_lane_slots_reserved_clamped_to_leave_generic_worker():
     assert worker._reserved_lane_slots(3, 99) == [
-        {"chat", "manual_wake"}, {"chat", "manual_wake"}, {"chat", "manual_wake"},
+        {"chat", "manual_wake"}, {"chat", "manual_wake"}, None,
     ]
 
 
@@ -957,6 +1120,43 @@ def test_run_compaction_failure_marks_failed_without_surfacing_user_error(monkey
     assert "compaction_failed" in (row[1] or "")
     events = _status_events(uid)
     assert not any(e["kind"] == "error" for e in events)
+
+
+def test_compaction_rollback_during_llm_blocks_summary_write(monkeypatch):
+    uid = "u_w_maintenance_rollback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
+    job = jobs_store.claim_next_job("w")
+    tail = [
+        {"id": f"m{i}", "ts": float(i), "role": "user", "content": f"msg {i}"}
+        for i in range(worker._TAIL_KEEP + 1)
+    ]
+
+    async def _compact(**kwargs):
+        return "- compacted"
+
+    monkeypatch.setattr(v2_compaction, "compact", _compact)
+    mode_checks = iter([True, False])
+    writes = {"n": 0}
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        runtime_mode_enabled=lambda uid_: next(mode_checks),
+        read_tail=lambda uid_, after_ts, limit: tail,
+        read_summary=lambda uid_: ("", 0.0, 0),
+        write_summary=lambda *a, **k: writes.update(n=writes["n"] + 1) or True,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False,
+        api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert writes["n"] == 0
+    assert _job_status(job_id)[0] == "failed"
 
 
 # ------------------------------------------------------------------

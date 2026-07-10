@@ -53,3 +53,47 @@ def test_wake_decision_is_the_task3_adapter_not_a_reimplementation():
     deps = serve_worker._build_scheduler_deps()
 
     assert deps.wake_decision is serve_worker._wake_decision_for_user
+
+
+def test_runtime_mode_fence_uses_strict_control_plane_read(monkeypatch):
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: object())
+    monkeypatch.setattr(
+        serve_worker.hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda store: "db_action_v2",
+    )
+
+    assert serve_worker._build_scheduler_deps().runtime_mode_enabled("u1") is True
+
+
+def test_extraction_producer_is_quarantined_by_default(monkeypatch):
+    monkeypatch.setattr(serve_worker, "_EXTRACTION_ENABLED", False)
+    monkeypatch.setattr(
+        serve_worker.admin_core,
+        "list_runtime_modes",
+        lambda: {"db_action_v2": ["u1"]},
+    )
+    deps = serve_worker._build_scheduler_deps()
+    assert deps.extraction_users() == []
+
+
+def test_existing_v2_schedule_backfill_is_idempotent(monkeypatch):
+    monkeypatch.setattr(
+        serve_worker.admin_core,
+        "list_runtime_modes",
+        lambda: {"db_action_v2": ["new", "existing"]},
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "get_wake_schedule",
+        lambda uid: {"user_id": uid} if uid == "existing" else None,
+    )
+    writes = []
+    monkeypatch.setattr(
+        jobs_store,
+        "upsert_wake_schedule",
+        lambda uid, **kwargs: writes.append((uid, kwargs)),
+    )
+
+    assert serve_worker._seed_existing_v2_wake_schedules(now=123.0) == 1
+    assert writes == [("new", {"next_heartbeat_at": 123.0})]

@@ -11,10 +11,11 @@ external content.
 """
 from __future__ import annotations
 
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from core import net_safety
 from model_api_runtime import tools
 
 from capabilities import errors
@@ -27,6 +28,41 @@ _SEARCH_TIMEOUT_SEC = 8.0
 _FETCH_TIMEOUT_SEC = 8.0
 _FETCH_MAX_BODY_BYTES = 40_000  # cap raw HTML before stripping — untrusted external body
 _FETCH_USER_AGENT = "Mozilla/5.0 (compatible; FeedlingIO/1.0; +https://feedling.app)"
+_FETCH_MAX_REDIRECTS = 5
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+
+
+def _resolve_ips(host: str) -> list[str]:
+    return net_safety.resolve_ips(host)
+
+
+def _blocked_url_kind(url: str) -> str | None:
+    return net_safety.blocked_url_kind(url, resolve=_resolve_ips)
+
+
+def _stream_get(url: str, *, timeout: float, follow_redirects: bool, headers: dict):
+    return httpx.stream(
+        "GET", url, timeout=timeout, follow_redirects=follow_redirects, headers=headers)
+
+
+def _read_capped_body(resp) -> str | None:
+    """Read at most the configured raw-body cap; ``None`` means oversized."""
+    raw_length = str(resp.headers.get("content-length") or "").strip()
+    if raw_length:
+        try:
+            if int(raw_length) > _FETCH_MAX_BODY_BYTES:
+                return None
+        except ValueError:
+            pass
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in resp.iter_bytes():
+        total += len(chunk)
+        if total > _FETCH_MAX_BODY_BYTES:
+            return None
+        chunks.append(chunk)
+    encoding = getattr(resp, "encoding", None) or "utf-8"
+    return b"".join(chunks).decode(encoding, errors="replace")
 
 
 def search(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
@@ -74,20 +110,42 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return err(errors.INVALID, "url must be an absolute http(s) url", retryable=False)
 
-    try:
-        resp = httpx.get(url, timeout=_FETCH_TIMEOUT_SEC, follow_redirects=True,
-                         headers={"User-Agent": _FETCH_USER_AGENT})
-    except Exception as e:
-        return err(errors.UPSTREAM,
-                   f"web fetch failed: {type(e).__name__}: {e}", retryable=True)
+    current_url = url
+    status_code = 0
+    response_headers: dict = {}
+    body: str | None = ""
+    for redirect_count in range(_FETCH_MAX_REDIRECTS + 1):
+        blocked = _blocked_url_kind(current_url)
+        if blocked == "blocked_url":
+            return err(errors.INVALID, "url is not permitted", retryable=False)
+        if blocked == "dns":
+            return err(errors.UPSTREAM, "url host could not be resolved", retryable=True)
+        try:
+            with _stream_get(
+                current_url, timeout=_FETCH_TIMEOUT_SEC, follow_redirects=False,
+                headers={"User-Agent": _FETCH_USER_AGENT},
+            ) as resp:
+                status_code = resp.status_code
+                response_headers = dict(resp.headers)
+                body = _read_capped_body(resp) if 200 <= status_code < 300 else ""
+        except Exception as e:
+            return err(errors.UPSTREAM,
+                       f"web fetch failed: {type(e).__name__}: {e}", retryable=True)
+        if status_code not in _REDIRECT_STATUSES:
+            break
+        if redirect_count >= _FETCH_MAX_REDIRECTS:
+            return err(errors.UPSTREAM, "web fetch exceeded redirect limit", retryable=False)
+        location = str(response_headers.get("location") or "").strip()
+        if not location:
+            return err(errors.UPSTREAM, "web fetch redirect missing location", retryable=False)
+        current_url = urljoin(current_url, location)
 
-    if not (200 <= resp.status_code < 300):
-        return err(errors.code_for_status(resp.status_code),
-                   f"fetch failed with status {resp.status_code}",
-                   retryable=errors.retryable_for_status(resp.status_code))
+    if not (200 <= status_code < 300):
+        return err(errors.code_for_status(status_code),
+                   f"fetch failed with status {status_code}",
+                   retryable=errors.retryable_for_status(status_code))
+    if body is None:
+        return err(errors.UPSTREAM, "web fetch body exceeded size limit", retryable=False)
 
-    # Cap the raw body BEFORE stripping — untrusted external content, bound the work
-    # regex-based _strip_html_text does and the size that ever reaches the responder.
-    body = (resp.text or "")[:_FETCH_MAX_BODY_BYTES]
     text = tools._strip_html_text(body)
-    return ok(data={"url": url, "text": errors.cap_text(text)})
+    return ok(data={"url": current_url, "text": errors.cap_text(text)})

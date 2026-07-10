@@ -74,6 +74,62 @@ def test_index_decrypts_and_flags_unavailable(client, _authed, monkeypatch):
     assert body["unavailable_ids"] == ["m2"]
 
 
+def test_index_query_matches_private_content_without_exposing_it(client, _authed, monkeypatch):
+    private = json.dumps({
+        "summary": "ordinary summary",
+        "content": "the exact hidden phrase is blue-orchid-47",
+        "bucket": "notes",
+        "threads": [],
+    }).encode()
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: private)
+
+    r = client.post(
+        "/v1/memory/index",
+        json={"moments": [{"id": "m1", "K_enclave": "x"}], "query": "BLUE-ORCHID-47"},
+        headers={"X-API-Key": "k"},
+    )
+
+    assert r.status_code == 200
+    item = r.get_json()["items"][0]
+    assert item["id"] == "m1"
+    assert "content" not in item
+    assert "_search_content" not in item
+
+
+def test_index_query_filters_full_candidate_window_before_result_limit(
+    client, _authed, monkeypatch
+):
+    plaintext_by_id = {
+        "m1": json.dumps({
+            "summary": "high-ranked non-match", "content": "ordinary",
+            "bucket": "notes", "threads": [],
+        }).encode(),
+        "m2": json.dumps({
+            "summary": "low-ranked match", "content": "blue-orchid-47",
+            "bucket": "notes", "threads": [],
+        }).encode(),
+    }
+    monkeypatch.setattr(
+        envmod,
+        "decrypt_envelope",
+        lambda envelope, _user, _sk: plaintext_by_id[envelope["id"]],
+    )
+
+    r = client.post(
+        "/v1/memory/index",
+        json={
+            "moments": [{"id": "m1", "K_enclave": "x"},
+                        {"id": "m2", "K_enclave": "x"}],
+            "query": "BLUE-ORCHID-47",
+            "limit": 1,
+        },
+        headers={"X-API-Key": "k"},
+    )
+
+    assert r.status_code == 200
+    assert [item["id"] for item in r.get_json()["items"]] == ["m2"]
+
+
 def test_fetch_blocks_sensitive_by_default(client, _authed, monkeypatch):
     sensitive = json.dumps({"summary": "s", "content": "c", "bucket": "b",
                             "threads": [], "is_sensitive": True}).encode()

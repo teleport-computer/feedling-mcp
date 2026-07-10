@@ -1,4 +1,8 @@
-# Hosted Runtime V2 — tokens/turn baseline (pre-agent-loop)
+# Hosted Runtime V2 — tokens/turn measurements
+
+> Current rollout-gate result (2026-07-11, shared fixtures): **574.0
+> tokens/turn, 2.3333 LLM calls/turn**. The 545.3/2.0 values below are retained
+> as the historical pre-loop measurement, not as the current go/no-go number.
 
 Taken on 2026-07-10, at commit `3bfb7f2`, BEFORE `agent_loop.py` existed.
 Purpose: give D4's rollback gate (`scripts/loadtest/compare_tokens.py`) a reference point,
@@ -21,6 +25,9 @@ and a long-summary turn. Exact fixture bodies are in this plan, Task 3 Step 5.
 |---|---|
 | `tokens_per_turn` | 545.3333333333334 |
 | `llm_calls_per_turn` | 2.0 |
+
+This is a historical pre-loop reference. Do not paste it into the current
+runbook gate.
 
 ## How to re-measure after the loop lands
 
@@ -122,16 +129,17 @@ and is essentially independent of what the user said. It is the whole story.
 
 ## The gate, finally runnable
 
-```
-                          tokens/turn    vs resident    regression (>+10%)?
-resident (codex)               9303.0         —              —
-V2 single round                 545.3       -94.1%          no
-V2 3-round tool loop           1336.0       -85.6%          no
-V2 worst case (hard gate)      2066.0       -77.8%          no
+```text
+                                      tokens/turn   calls/turn   vs resident
+resident (codex, shared prompts)          9303.0        1.0000         —
+V2 current shared-fixture gate             574.0        2.3333      -93.83%
 ```
 
-**V2 is 17× cheaper per turn than the runtime it replaces**, and even its `_TURN_MAX_LLM_CALLS`
-worst case is 4.5× cheaper. The rollback gate passes with enormous margin.
+The separately forced small-context stress fixtures remain useful bounds but
+are not the same workload: a three-round loop measured 1336 tokens and the
+six-call hard-gate case measured 2066. The current shared-fixture V2 result is
+about **16.2× lower** than the measured resident baseline. This large offline
+margin does not replace production whole-turn telemetry or CVM load evidence.
 
 ## Honest caveats
 
