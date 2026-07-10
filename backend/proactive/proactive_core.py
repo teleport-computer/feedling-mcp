@@ -24,6 +24,9 @@ from datetime import datetime
 from core import reqctx
 from core import store as core_store
 from core import util
+from core import wake_bus as core_wake_bus
+from hosted import config_store as hosted_config_store
+from model_api_runtime.v2 import jobs_store
 from proactive import capture_jobs, capture_scheduler, dashboard, dream_scheduler, gate, service
 from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
 
@@ -249,6 +252,21 @@ def dream_tick(store, payload: dict):
 
 
 def proactive_tick(store, payload: dict, *, api_key) -> dict:
+    if hosted_config_store.get_hosted_runtime_mode(store) == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        # db_action_v2 users have no resident consumer (D0 exclusivity guard). A MANUAL
+        # wake becomes a V2 manual_wake job; non-manual (heartbeat) ticks are owned by the
+        # V2 scheduler, so we create NO resident proactive_job (it would never be claimed).
+        is_manual = (
+            service._proactive_bool(payload, "force", "force_response")
+            or service._proactive_bool(payload, "manual", "manual_wake", "user_initiated")
+            or bool(str(payload.get("context_hint") or "").strip())
+        )
+        if is_manual:
+            job_id, coalesced = jobs_store.enqueue_job(store.user_id, "manual_wake", reason="manual_tick")
+            core_wake_bus.notify("v2_jobs", store.user_id)
+            return {"decision": None, "job": {"id": job_id, "lane": "manual_wake"}, "enqueued": not coalesced, "v2": True}
+        return {"decision": None, "job": None, "enqueued": False, "v2": True}
+
     decision = gate._build_proactive_v2_wake_decision(store, payload, api_key=api_key)
     store.append_gate_decision(decision)
 

@@ -79,6 +79,10 @@ x-agent-runner-env: &agent-runner-env
   FEEDLING_GENESIS_WORKER_ENABLED: "1"
   FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "${FEEDLING_GENESIS_WORKER_INTERVAL_SEC:-10}"
   FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "${FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC:-7200}"
+  # Hosted Runtime V2 worker pool sizing (subproject D). N in-process asyncio job
+  # slots share the agent_jobs queue via FOR UPDATE SKIP LOCKED. Rides the encrypted
+  # env channel → tuning it needs no on-chain re-auth (unlike adding the service).
+  FEEDLING_V2_MAX_WORKERS: "${FEEDLING_V2_MAX_WORKERS:-4}"
 
 services:
   # Single runner per CVM (mirrors prod). One data volume → a user's per-user home
@@ -94,6 +98,25 @@ services:
       AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-16}"
     volumes:
       - feedling_agent_runtime_runner:/agent-data
+
+  # Hosted Runtime V2 worker pool (subproject D). Sibling to the resident
+  # supervisor: SAME image + SAME env, but runs the serve_worker entrypoint and
+  # holds NO data volume — all V2 state lives in Postgres (agent_jobs queue,
+  # v2_worker_heartbeats, v2_turn_metrics, v2_conversation_summary). Turns are
+  # pure async HTTP provider calls (no per-user home, no codex subprocess), so it
+  # needs neither /agent-data nor the LiteLLM child. Claims chat/maintenance (and,
+  # after D3, wake) jobs via FOR UPDATE SKIP LOCKED. Coexists with the resident
+  # supervisor — the D0 exclusivity guard keeps each user on exactly one path.
+  # Adding this service changes compose_hash → on-chain addComposeHash() re-auth
+  # (see deploy/DEPLOYMENTS.md); until deployed, chat_send_core 503s
+  # workers_unavailable for db_action_v2 users.
+  serve-worker:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:f140eb4   # CI pins the sha (same image as agent-runner)
+    container_name: serve-worker
+    command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
+    restart: unless-stopped
+    environment:
+      <<: *agent-runner-env
 
 volumes:
   # Fresh volume name (was feedling_agent_runtime_r0/r1). A new name gives the

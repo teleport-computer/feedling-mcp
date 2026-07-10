@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -65,6 +66,20 @@ MAX_READ_ACTION_PARALLELISM = int(os.environ.get("FEEDLING_V2_MAX_READ_PARALLELI
 # 跨所有 job 共享的 enclave 并发闸（provider-key 解密 + chat 解密 + capability 调用都过它）。治 R3。
 ENCLAVE_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")))
 
+
+def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
+    """Per-slot lane allowlist（D3 Task 5：把 Task 2 的 claim lane-reservation 接进池编排）。
+
+    前 `reserved` 个 slot 只允许抢 {"chat","manual_wake"}（一次 heartbeat/capture 唤醒风暴
+    绝不会饿死聊天回复）；其余 slot 不设限（None＝任意 lane，含 heartbeat/capture/
+    maintenance）。reserved 未显式传时默认 max(1, max_workers // 2)——至少留一个专用槽，
+    但不会把整个池都锁死成 chat-only（scheduler 产出的 heartbeat job 仍需要有 slot 能抢）。
+    reserved 会被夹到 [0, max_workers] 区间内，防御越界配置。"""
+    n = max(1, int(max_workers))
+    r = reserved if reserved is not None else max(1, n // 2)
+    r = max(0, min(r, n))
+    return [{"chat", "manual_wake"} if i < r else None for i in range(n)]
+
 # D1（full-conversation context）：responder 现在吃 summary+tail 而不是"仅未回复的 user
 # 消息"。tail 超过 _TAIL_BUDGET 条（双角色计数）时，chat turn 顺手（best-effort，不阻塞
 # 回复）入队一个 maintenance lane 的 compaction job，把最旧的一批折进摘要，只留
@@ -73,6 +88,31 @@ ENCLAVE_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("FEEDLING_V2_ENCLAVE_CO
 _TAIL_BUDGET = int(os.environ.get("FEEDLING_V2_TAIL_BUDGET_MSGS", "20"))
 _TAIL_KEEP = int(os.environ.get("FEEDLING_V2_TAIL_KEEP_MSGS", "10"))
 _TAIL_HARD_CAP = int(os.environ.get("FEEDLING_V2_TAIL_HARD_CAP", "60"))
+
+# D3 Task 6 (proactive/wake lanes): the scheduler (Task 4/9) enqueues jobs in
+# these three lanes when it decides the companion should reach out without the
+# user having spoken first. "capture" is intentionally NOT in this set — it's
+# a different capability shape (memory extraction, not a model-authored reply)
+# and is scoped to a follow-up task; a capture-lane job falling through to the
+# default chat path below would be wrong (no coalesced pending messages ->
+# it would just complete as a no-op), so it's left alone here rather than
+# silently mishandled by this task's scope.
+_WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake"})
+_WAKE_SYSTEM_PROMPT = (
+    "You are the user's companion. This is a PROACTIVE moment — the user has not "
+    "just spoken. Look at the conversation so far. If there is something genuine, "
+    "specific, and worth saying right now — a follow-up, a thought, a check-in — say "
+    "it naturally in your own voice. If there is nothing worth saying, reply with an "
+    "empty message; staying silent is correct and expected."
+)
+_WAKE_NUDGE = "(A quiet moment has passed. Reach out only if something is genuinely worth saying right now.)"
+# D3 Task 7 (BYOK payment cooldown): a "provider_config" wake failure (402 out-of-credits,
+# 401/403 bad key) means the user's BYOK key is dead/broke — retrying it every heartbeat
+# interval is a retry storm against a key that cannot succeed until the user fixes it
+# (mirrors the original resident runtime's 600s payment cooldown). We write
+# `payment_cooldown_until` on the wake schedule; `jobs_store.due_heartbeat_users` already
+# excludes cooled-down users (Task 1), so no further wakes fire until it lapses.
+_WAKE_COOLDOWN_SEC = float(os.environ.get("FEEDLING_V2_WAKE_COOLDOWN_SEC", "600"))
 
 
 @dataclass
@@ -95,6 +135,13 @@ class TurnDeps:
     # hosted/setup_core.py:265）。默认 None：worker.py 自身不 import hosted，测试/其他调用方
     # 不必提供；生产装配见 serve_worker.build_production_deps。
     record_terminal_error: Callable[[str, str], None] | None = None
+    # (job_id, user_id, lane, prompt_tokens, completion_tokens, latency_ms) -> None
+    # （kwargs-only，见 jobs_store.record_turn_metric）：D4 load-testing 消费的每回合
+    # provider token usage + 延迟。只在 responder.respond 成功返回后（chat lane）由
+    # worker 调用——responder 自己不落库/不知道 job_id/lane（见 responder.respond 的
+    # usage_out 出参文档）。默认 None：worker.py 自身不 import jobs_store 的落库细节
+    # 之外的东西，测试/其他调用方不必提供；生产装配见 serve_worker.build_production_deps。
+    record_turn_metric: Callable[..., None] | None = None
     # (user_id, after_ts, limit) -> [{"id","ts","role","content"}]：最近窗口，BOTH
     # roles，ts>after_ts，enclave 解密明文（D1：让 turn 能看见真实对话上下文，不再局限于
     # "上次回复之后的 user 消息"那一批）。默认 None：worker.py 自身不 import hosted，
@@ -239,6 +286,72 @@ async def _run_compaction(
         return "failed"
 
 
+async def _run_wake(
+    job_id, user_id: str, lane: str, deps: TurnDeps, provider_config: Any,
+    enclave_sem: "asyncio.Semaphore",
+) -> str:
+    """wake-lane（heartbeat/scheduled/manual_wake）turn：让伴侣主动开口，而不是回答用户
+    刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
+    一体、自己的 try/except：这是后台/主动发起的 job，provider 解析失败或任何未预期异常
+    都静默 `mark_failed`，绝不 `_surface_terminal_error`、绝不写占位气泡。
+
+    跟 `_run_compaction` 的关键区别：压缩从不产出用户可见内容，wake 恰恰相反——目的就是
+    让模型主动写一条聊天气泡。区分两种"没写成"：
+    - "weak wake sleeps"（弱唤醒睡回去）：`v2_responder.respond` 抛
+      `ResponderError("empty_reply")`（模型选择保持沉默）或
+      `ResponderError("no_user_messages")`（tail+nudge 退化到没有非 system 轮次，理论上
+      不会发生——nudge 本身就是一条 user 消息——但同样按"无话可说"处理，保险）。这两种
+      都不是失败：`mark_completed`，零气泡，不弹 error。
+    - 真 provider 错误（其他任何 `ResponderError`，如 402/enclave 瞬时故障）：真失败，
+      `mark_failed`，同样静默（不弹用户可见 error chip——背景 job，同 maintenance 的
+      隔离口径）。
+
+    prompt 组装：读 summary+tail（同 chat 路径的 D1 读法），追加一条固定的
+    `_WAKE_NUDGE`（as a user-role turn，让 `context.build_turn_messages`/
+    `responder.respond` 的"至少一条非 system 消息"不变量恒真，即使 tail 本身是空的）。
+    `system_prompt=_WAKE_SYSTEM_PROMPT` 覆盖聊天默认提示，明确告诉模型这是主动时刻。
+    """
+    try:
+        store = core_store.get_store(user_id)
+        async with enclave_sem:
+            if deps.read_summary is not None:
+                summary, watermark, _ver = await asyncio.to_thread(deps.read_summary, user_id)
+            else:
+                summary, watermark, _ver = ("", 0.0, 0)
+            if deps.read_tail is not None:
+                tail = await asyncio.to_thread(deps.read_tail, user_id, watermark, _TAIL_BUDGET)
+            else:
+                tail = []
+        wake_tail = list(tail) + [{"role": "user", "content": _WAKE_NUDGE}]
+        try:
+            reply = await v2_responder.respond(
+                provider_config=provider_config, summary=summary, tail=wake_tail,
+                system_prompt=_WAKE_SYSTEM_PROMPT)
+        except v2_responder.ResponderError as e:
+            if "empty_reply" in str(e) or "no_user_messages" in str(e):
+                # Weak wake sleeps: the model (or a degenerate prompt) chose silence —
+                # this is a SUCCESSFUL wake, not a failure. No bubble, no error surface.
+                await asyncio.to_thread(jobs_store.mark_completed, job_id)
+                return "completed"
+            if e.kind == "provider_config":
+                # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
+                # BEFORE the silent mark_failed below, so the scheduler stops hammering
+                # this key every heartbeat interval (Task 1's due_heartbeat_users query
+                # already excludes users still in cooldown).
+                await asyncio.to_thread(
+                    jobs_store.upsert_wake_schedule, user_id,
+                    payment_cooldown_until=time.time() + _WAKE_COOLDOWN_SEC)
+            raise
+        await asyncio.to_thread(_write_encrypted_reply, store, reply)
+        await asyncio.to_thread(jobs_store.mark_completed, job_id)
+        return "completed"
+    except Exception as e:  # noqa: BLE001 — wake job: silent mark_failed, never surface/bubble
+        log.warning("[v2.worker] wake job %s (lane=%s) failed: %s", job_id, lane, e)
+        await asyncio.to_thread(
+            jobs_store.mark_failed, job_id, f"wake_failed: {type(e).__name__}: {str(e)[:160]}")
+        return "failed"
+
+
 async def process_job(
     job: dict,
     deps: TurnDeps,
@@ -276,6 +389,12 @@ async def process_job(
             # 函数下面那个 chat-turn 的 `except`——那个分支会 emit 用户可见的 error status
             # + record_terminal_error（iOS 错误 chip），压缩失败是后台维护事，不该弹给用户。
             return await _run_compaction(job_id, user_id, deps, provider_config, enclave_sem)
+        if lane in _WAKE_LANES:
+            # Self-contained wake path (D3 Task 6): proactive turn, not a reply to a
+            # just-sent user message. Own try/except inside `_run_wake` — never falls
+            # into the chat-turn `except` below (that branch emits a user-visible
+            # error status + record_terminal_error, which wake failures must not do).
+            return await _run_wake(job_id, user_id, lane, deps, provider_config, enclave_sem)
         store = core_store.get_store(user_id)
         runtime_state = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
         await asyncio.to_thread(_emit_status, user_id, job_id, "processing")
@@ -352,9 +471,23 @@ async def process_job(
             # responder 走 BYOK provider_config；ResponderError（空回复/provider 错）交给下面
             # 统一的 except 兜底 mark_failed——no-filler 铁律：绝不写占位气泡。v2_responder.respond
             # 现在原生 async，直接 await，不再经 to_thread 桥线程池（同上，治并发天花板）。
+            # Task 4：usage_out 是纯出参（responder 保持 hosted-free/无 job 上下文），成功
+            # 返回后由 worker（有 job_id/user_id/lane）记 v2_turn_metrics，喂 D4 load-test。
+            _usage: dict = {}
+            _t0 = time.monotonic()
             reply = await v2_responder.respond(
                 provider_config=provider_config, summary=summary, tail=tail,
-                action_results=action_state["action_results"])
+                action_results=action_state["action_results"], usage_out=_usage)
+            if deps.record_turn_metric is not None:
+                try:
+                    deps.record_turn_metric(
+                        job_id=job_id, user_id=user_id, lane=lane,
+                        prompt_tokens=_usage.get("prompt_tokens"),
+                        completion_tokens=_usage.get("completion_tokens"),
+                        latency_ms=int((time.monotonic() - _t0) * 1000),
+                    )
+                except Exception as e:  # noqa: BLE001 — 记指标失败绝不能拖垮已经产出的回复
+                    log.warning("[v2.worker] record_turn_metric failed job=%s: %s", job_id, e)
             await asyncio.to_thread(_write_encrypted_reply, store, reply)
             # 超预算 → best-effort 入队一个 maintenance lane 的压缩 job（不阻塞、不拖垮
             # 本回合——enqueue_job 本身命中 single-flight 会 coalesce，失败只记日志）。
@@ -396,11 +529,13 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
         err = str((meta or {}).get("error") or "provider_unavailable")
         await asyncio.to_thread(jobs_store.mark_running, job_id)
         await asyncio.to_thread(jobs_store.mark_failed, job_id, err)
-        # maintenance（后台压缩）job 跑在 enqueue 之后、异步执行；此刻 provider 解析失败
-        # （key 轮换 / enclave 瞬时解密失败，正是 R3 要防的）是后台维护事，绝不该给用户弹
-        # error chip。只有用户可见的 chat 回合才走 _surface_terminal_error（iOS 错误 chip）；
-        # maintenance 静默 mark_failed 即可——与 _run_compaction 内部失败的隔离口径一致。
-        if str(job.get("lane") or "chat") != "maintenance":
+        # maintenance（后台压缩）/ wake（heartbeat/scheduled/manual_wake，D3 Task 6）job
+        # 跑在 enqueue 之后、异步执行，甚至压根不是用户此刻发消息触发的；此刻 provider
+        # 解析失败（key 轮换 / enclave 瞬时解密失败，正是 R3 要防的）都不该给用户弹
+        # error chip。只有用户可见的 chat 回合才走 _surface_terminal_error（iOS 错误
+        # chip）；maintenance/wake 静默 mark_failed 即可——与 _run_compaction/_run_wake
+        # 内部失败的隔离口径一致。
+        if str(job.get("lane") or "chat") == "chat":
             await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, err)
         return "failed"
     is_official = deps.is_official(provider_config)
@@ -472,18 +607,22 @@ async def _wait_for_job_or_stop(
 
 async def _slot_loop(
     worker_id: str, *, poll_interval: float, stop_event: asyncio.Event, deps: TurnDeps,
-    wake_event: "asyncio.Event | None" = None,
+    wake_event: "asyncio.Event | None" = None, lanes: "set | None" = None,
 ) -> None:
     """一个 job-slot：抢一个 job 就跑一回合，抢不到就等待（poll_interval 兜底，
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
     跑完手上的即退出（优雅 drain）。
+
+    lanes（可选）：转给 `jobs_store.claim_next_job` 的 lane 白名单（Task 2）。None＝不限制
+    （行为与改动前完全一致）；非 None 时这个 slot 只抢白名单里的 lane——`run_worker_loop`
+    用它给部分 slot 划专用车道（见 `_reserved_lane_slots`）。
 
     per-iteration 的抢活 + 跑回合整段包 try/except：单个 slot 上的瞬时故障（例如 claim/
     mark_running 撞到一次性 DB 错误）绝不允许冒出这个协程、拖垮 run_worker_loop 里其他
     仍然健康的 slot——记日志后 continue，下一轮再抢。"""
     while not stop_event.is_set():
         try:
-            job = await asyncio.to_thread(jobs_store.claim_next_job, worker_id)
+            job = await asyncio.to_thread(jobs_store.claim_next_job, worker_id, lanes=lanes)
             if job is None:
                 await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
                 continue
@@ -502,13 +641,22 @@ async def run_worker_loop(
     stop_event 置位 → 所有 slot 跑完手上 job 后退出（SIGTERM 优雅 drain 的落点）。
     wake_event（可选）由 serve_worker._serve 传入，桥 "v2_jobs" 即时唤醒（FIX 3）——
     未传（None）时所有 slot 退化为纯 poll，向后兼容既有调用方/测试。
+
+    lane 预留（D3 Task 5）：前几个 slot 只抢 {"chat","manual_wake"}（见 `_reserved_lane_slots`），
+    保证 scheduler（Task 4）产出的 heartbeat 唤醒风暴抢不走全部 slot、饿死聊天回复。
+    `FEEDLING_V2_CHAT_RESERVED_SLOTS` 显式设置时覆盖默认的 max(1, max_workers // 2)；
+    留空/未设置时用默认值。
+
     return_exceptions=True 是防御性纵深：_slot_loop 本身已经不放跑异常，这里再兜一层，
     确保万一某个 slot 协程仍然意外死亡，也不会通过 gather 传播出去、抛弃其余仍在跑的 slot。"""
+    _reserved_env = os.environ.get("FEEDLING_V2_CHAT_RESERVED_SLOTS", "").strip()
+    reserved = int(_reserved_env) if _reserved_env else None
+    assignments = _reserved_lane_slots(max_workers, reserved)
     slots = [
         asyncio.create_task(
             _slot_loop(f"{worker_id}#{i}", poll_interval=poll_interval, stop_event=stop_event,
-                       deps=deps, wake_event=wake_event)
+                       deps=deps, wake_event=wake_event, lanes=assignments[i])
         )
-        for i in range(max(1, int(max_workers)))
+        for i in range(len(assignments))
     ]
     await asyncio.gather(*slots, return_exceptions=True)

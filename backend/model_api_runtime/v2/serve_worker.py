@@ -38,6 +38,8 @@ import asyncio
 import logging
 import os
 import signal
+import time
+import types
 
 from accounts import registry as accounts_registry
 from agent_runtime import spawners as agent_spawners
@@ -48,7 +50,9 @@ from core import store as core_store
 from core import wake_bus as core_wake_bus
 from hosted import config_store as hosted_config_store
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import worker as v2_worker
+from proactive import gate as proactive_gate
 import db
 
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
@@ -214,6 +218,21 @@ def _write_summary(user_id: str, summary: str, watermark_ts: float, expected_ver
         user_id, summary_envelope=env, watermark_ts=watermark_ts, expected_version=expected_version)
 
 
+def _wake_decision_for_user(user_id: str) -> dict:
+    """Read-only heartbeat wake decision via the real proactive gate (assembly
+    layer — reuses gate._build_proactive_v2_wake_decision so activation gate /
+    broadcast suppression / all landmines hold with zero drift). No enqueue here;
+    the scheduler decides what to do with should_wake."""
+    store = core_store.get_store(user_id)
+    payload = {"trigger": "heartbeat"}
+    d = proactive_gate._build_proactive_v2_wake_decision(store, payload)
+    return {
+        "should_wake": bool(d.get("should_wake_agent")),
+        "wake_interval_sec": int(d.get("wake_interval_sec") or 7200),
+        "block_reason": str(d.get("reason") or ""),
+    }
+
+
 def _is_official(provider_config) -> bool:
     """包一层 `agent_runtime.spawners._is_official_identity`——worker.py 不能自己 import
     agent_runtime（hosted-adjacent），所以这个判定只能在装配层做好、经 TurnDeps 注入。
@@ -241,9 +260,31 @@ def build_production_deps() -> v2_worker.TurnDeps:
         is_official=_is_official,
         mint_enclave_token=_mint_runtime_token,
         record_terminal_error=_record_terminal_error,
+        record_turn_metric=jobs_store.record_turn_metric,
         read_tail=_read_tail,
         read_summary=_read_summary,
         write_summary=_write_summary,
+    )
+
+
+def _build_scheduler_deps():
+    """装配 `model_api_runtime.v2.scheduler.run_scheduler_tick` 要的 deps（D3 Task 5）。
+    scheduler.py 是纯模块（不 import hosted/agent_runtime/proactive）——这里把它接到真实
+    实现：due_heartbeat_users（Task 2 落的 v2_wake_schedule 表）、_wake_decision_for_user
+    （Task 3 适配器，包一层 proactive_gate，读专用，本身不 enqueue）、enqueue_job("heartbeat")
+    /upsert_wake_schedule(next_heartbeat_at=...)。
+
+    leader-election 有意跳过（见 D3 plan Task 5 说明）：`enqueue_job` 走
+    ux_agent_jobs_singleflight 分区唯一索引，多个 serve_worker 进程的 scheduler tick
+    并发对同一用户各自判定 should_wake 也只会各自 INSERT 一次、第二个撞唯一索引 coalesce
+    成同一行——重复调度天然无害。prod 只跑一个 serve-worker 容器，这条不变量目前甚至用
+    不上，但即使将来横向扩容也不需要另起一套选主。"""
+    return types.SimpleNamespace(
+        due_users=lambda: jobs_store.due_heartbeat_users(),
+        wake_decision=_wake_decision_for_user,
+        enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(uid, "heartbeat"),
+        advance_heartbeat=lambda uid, next_at: jobs_store.upsert_wake_schedule(
+            uid, next_heartbeat_at=next_at),
     )
 
 
@@ -331,6 +372,45 @@ async def _heartbeat_loop(
             pass
 
 
+_SCHEDULER_INTERVAL_SEC = float(os.environ.get("FEEDLING_V2_SCHEDULER_INTERVAL_SEC", "30"))
+
+
+async def _scheduler_loop(stop_event: asyncio.Event, *, interval: float = _SCHEDULER_INTERVAL_SEC) -> None:
+    """周期性跑一遍纯调度器（D3 Task 4 `scheduler.run_scheduler_tick`，Task 5 接线）：
+    对每个到期用户判定是否唤醒 heartbeat（经 `_wake_decision_for_user` 复用真实
+    proactive gate），should_wake 就 enqueue_job("heartbeat")（single-flight 去重、
+    走 Task 2 的 lane 优先级），无论如何都 advance_heartbeat 推进下次到期时间——
+    不会同一批用户每个 tick 都重新判一遍。
+
+    镜像 `_reaper_loop`/`_heartbeat_loop` 的结构：interruptible 的
+    `wait_for(stop_event.wait(), timeout=interval)`（stop_event 置位立刻醒，drain 不被
+    卡满一个周期）；单次异常只记日志，绝不允许冒出去杀掉这个循环或拖垮跟它并发跑的
+    run_worker_loop/reaper/heartbeat（scheduler.run_scheduler_tick 本身逐用户已经吞异常，
+    这里再兜一层，防的是 deps 装配/DB 连接层面的意外）。
+
+    leader-election 有意跳过——见 `_build_scheduler_deps` 的说明：single-flight 唯一索引
+    让重复调度天然无害，prod 只跑一个 serve-worker 容器，不需要另起选主。
+
+    `run_scheduler_tick` 是同步函数（内部只做 dict/list 操作 + 通过 deps 调用同步 DB
+    函数），过 `asyncio.to_thread` 挪出 event loop，跟其它 loop 里所有同步 jobs_store
+    调用的桥法一致。`now=time.time()`：装配层读墙钟，scheduler.py 自己不摸时钟（保持
+    纯/可测）。"""
+    while not stop_event.is_set():
+        try:
+            deps = _build_scheduler_deps()
+            result = await asyncio.to_thread(scheduler.run_scheduler_tick, deps, now=time.time())
+            if result.get("considered"):
+                log.info(
+                    "[v2.serve_worker] scheduler tick considered=%s enqueued=%s skipped=%s",
+                    result.get("considered"), result.get("enqueued"), result.get("skipped"))
+        except Exception as e:  # noqa: BLE001 — 瞬时故障绝不能杀掉 scheduler/worker 进程
+            log.warning("[v2.serve_worker] scheduler tick failed: %s", e)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _serve(worker_id: str, *, poll_interval: float) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -353,7 +433,8 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         ),
         _reaper_loop(stop_event),
         _heartbeat_loop(worker_id, stop_event),
-        # 防御性纵深（对齐 run_worker_loop 内层 gather）：三个协程内部都已吞尽异常，
+        _scheduler_loop(stop_event),
+        # 防御性纵深（对齐 run_worker_loop 内层 gather）：四个协程内部都已吞尽异常，
         # 但万一某个漏网抛出，return_exceptions 保证不牵连拖垮另一个 loop。
         return_exceptions=True,
     )

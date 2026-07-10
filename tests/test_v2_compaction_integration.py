@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import conftest
 import db
 import provider_client
+import pytest
 from capabilities import registry as cap_registry
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import responder as v2_responder
@@ -40,6 +41,18 @@ _BYOK = provider_client.ProviderConfig(
 class _FakeCapResult:
     def to_dict(self):
         return {"ok": True, "data": {}, "error": None, "trace": {}, "warnings": []}
+
+
+@pytest.fixture(autouse=True)
+def _clean_agent_jobs_table():
+    # claim_next_job is a GLOBAL claim (no user_id filter, by design). A pending
+    # job left behind by another test file (e.g. the D3 claim-reservation / wake
+    # tests enqueue jobs for other users) would pollute this test's global claim
+    # ordering and get picked up instead of this test's own chat job. Truncate the
+    # whole table before each test here (mirrors tests/test_v2_jobs_store.py).
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs")
+    yield
 
 
 def _reset(uid):
@@ -110,7 +123,7 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
 
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult())
 
-    async def _fake_respond(*, provider_config, summary, tail, action_results=None):
+    async def _fake_respond(*, provider_config, summary, tail, action_results=None, usage_out=None):
         return "model reply"
 
     monkeypatch.setattr(v2_responder, "respond", _fake_respond)

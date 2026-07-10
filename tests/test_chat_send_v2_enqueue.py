@@ -185,3 +185,143 @@ def test_db_action_v2_with_no_live_workers_refuses_before_persist(monkeypatch):
         ).fetchone()[0]
     assert after == before  # nothing persisted on refusal
     assert jobs_after == 0
+
+
+def test_db_action_v2_over_sla_admission_rejects_before_persist(monkeypatch):
+    """§6 admission ceiling: the resident wedge guard is skipped for db_action_v2
+    (Task 9) and the dead-pool liveness guard above only catches a fully dead
+    worker pool (Task 2) — it says nothing about a *live but overloaded* pool.
+    If estimated queue wait exceeds the SLA, send must refuse with a distinct
+    "busy"/"queue_over_sla" 503 BEFORE persisting anything (same
+    persist-nothing-on-refusal principle as the two guards above)."""
+    _seed("u_send_v2_over_sla")
+    store = core_store.get_store("u_send_v2_over_sla")
+    hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+
+    monkeypatch.setattr(
+        chat_send_core.core_envelope, "_build_shared_envelope_for_store",
+        lambda s, pt, **kw: ({"id": "u-msg-1", "body_ct": "c", "nonce": "n", "K_user": "k"}, ""),
+    )
+    monkeypatch.setattr(
+        core_enclave, "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose, **kw: b"sk-or-test",
+    )
+    monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
+    monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
+    # 1 worker, 999 in-flight, no history (falls back to the 20s default
+    # service time) → est_wait = ceil(999/1)*20 = 19980s, far over the 60s SLA.
+    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_count", lambda **kw: 1)
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 999)
+    monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
+
+    enqueue_called = {"n": 0}
+    monkeypatch.setattr(
+        chat_send_core.jobs_store, "enqueue_job",
+        lambda *a, **k: enqueue_called.update(n=enqueue_called["n"] + 1) or (0, False),
+    )
+    append_chat_calls = {"n": 0}
+
+    def _append_chat_spy(*a, **k):
+        append_chat_calls["n"] += 1
+        raise AssertionError("append_chat must not be called on admission refusal")
+
+    monkeypatch.setattr(store, "append_chat", _append_chat_spy)
+
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key="key", runtime_tok="", payload={"message": "hi"},
+    )
+
+    assert status == 503
+    assert body["error"] == "busy"
+    assert body["reason"] == "queue_over_sla"
+    assert body["est_wait_sec"] == 19980
+    assert append_chat_calls["n"] == 0
+    assert enqueue_called["n"] == 0
+
+
+def test_db_action_v2_admission_check_fails_open_on_exception(monkeypatch):
+    """§6 admission ceiling must never itself become a failure source: if the
+    est-wait computation blows up (DB hiccup, unexpected None, etc.), send must
+    still proceed normally instead of the user silently losing their turn."""
+    _seed("u_send_v2_admission_failopen")
+    store = core_store.get_store("u_send_v2_admission_failopen")
+    hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+
+    monkeypatch.setattr(
+        chat_send_core.core_envelope, "_build_shared_envelope_for_store",
+        lambda s, pt, **kw: ({"id": "u-msg-1", "body_ct": "c", "nonce": "n", "K_user": "k"}, ""),
+    )
+    monkeypatch.setattr(
+        core_enclave, "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose, **kw: b"sk-or-test",
+    )
+    monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
+    monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
+    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_count", lambda **kw: 1)
+
+    def _boom():
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", _boom)
+
+    enq = {}
+    monkeypatch.setattr(
+        chat_send_core.jobs_store, "enqueue_job",
+        lambda uid, lane, **kw: enq.update(uid=uid, lane=lane, kw=kw) or (123, False),
+    )
+    notified = {}
+    monkeypatch.setattr(
+        chat_send_core.core_wake_bus, "notify",
+        lambda channel, user_id="": notified.update(channel=channel, user_id=user_id),
+    )
+
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key="key", runtime_tok="", payload={"message": "hi"},
+    )
+
+    assert status == 202
+    assert body["status"] == "processing"
+    assert enq == {"uid": "u_send_v2_admission_failopen", "lane": "chat", "kw": enq["kw"]}
+    assert notified["channel"] == "v2_jobs"
+
+
+def test_db_action_v2_admission_admits_under_sla(monkeypatch):
+    """Normal case: live worker pool with no queue backlog admits as usual —
+    the admission ceiling is a no-op when the estimated wait is under SLA."""
+    _seed("u_send_v2_admission_ok")
+    store = core_store.get_store("u_send_v2_admission_ok")
+    hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+
+    monkeypatch.setattr(
+        chat_send_core.core_envelope, "_build_shared_envelope_for_store",
+        lambda s, pt, **kw: ({"id": "u-msg-1", "body_ct": "c", "nonce": "n", "K_user": "k"}, ""),
+    )
+    monkeypatch.setattr(
+        core_enclave, "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose, **kw: b"sk-or-test",
+    )
+    monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
+    monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
+    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_count", lambda **kw: 1)
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
+    monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
+
+    enq = {}
+    monkeypatch.setattr(
+        chat_send_core.jobs_store, "enqueue_job",
+        lambda uid, lane, **kw: enq.update(uid=uid, lane=lane, kw=kw) or (123, False),
+    )
+    notified = {}
+    monkeypatch.setattr(
+        chat_send_core.core_wake_bus, "notify",
+        lambda channel, user_id="": notified.update(channel=channel, user_id=user_id),
+    )
+
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key="key", runtime_tok="", payload={"message": "hi"},
+    )
+
+    assert status == 202
+    assert body["status"] == "processing"
+    assert enq == {"uid": "u_send_v2_admission_ok", "lane": "chat", "kw": enq["kw"]}
+    assert notified["channel"] == "v2_jobs"

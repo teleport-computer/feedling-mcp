@@ -90,6 +90,35 @@ services:
     volumes:
       - feedling_agent_runtime_prod_runner:/agent-data
 
+  # Hosted Runtime V2 worker pool (subproject D). Sibling to the resident
+  # supervisor: SAME image, runs the serve_worker entrypoint, holds NO data volume
+  # (all V2 state in Postgres: agent_jobs / v2_worker_heartbeats / v2_turn_metrics /
+  # v2_conversation_summary). Turns are pure async HTTP provider calls (no per-user
+  # home, no codex subprocess, no genesis worker). Coexists with the resident
+  # supervisor — the D0 exclusivity guard keeps each user on exactly one path.
+  # Adding this service changes compose_hash → on-chain addComposeHash() re-auth on
+  # the prod FeedlingAppAuth (see deploy/DEPLOYMENTS.md). Until deployed,
+  # chat_send_core 503s workers_unavailable for db_action_v2 users.
+  serve-worker:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:164c64b   # CI pins the sha (same image as agent-runner)
+    command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
+    restart: unless-stopped
+    environment:
+      FEEDLING_API_URL: "${FEEDLING_API_URL:-}"          # main prod ingress URL
+      FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"  # main prod enclave passthrough URL
+      DATABASE_URL: "${DATABASE_URL:-}"
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      # in-CVM LiteLLM gateway — needed if hosting gemini/openrouter/openai_compatible
+      # (codex-gateway providers); harmless when off.
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
+      FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
+      # V2 worker pool sizing. N in-process asyncio job slots share the agent_jobs
+      # queue via FOR UPDATE SKIP LOCKED. Rides the encrypted env channel → tuning
+      # needs no on-chain re-auth (unlike adding the service).
+      FEEDLING_V2_MAX_WORKERS: "${FEEDLING_V2_MAX_WORKERS:-4}"
+
 volumes:
   feedling_agent_runtime_prod_runner:
     name: feedling_agent_runtime_prod_runner

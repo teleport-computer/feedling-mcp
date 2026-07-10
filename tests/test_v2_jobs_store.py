@@ -309,3 +309,55 @@ def test_invalidate_pending_actions_marks_them_and_stamps_job():
         ).fetchone()[0]
     assert st == "invalidated"
     assert job == 999
+
+
+# --- §6 admission ceiling: 三个纯读查询 (live_worker_count / inflight_job_count /
+# recent_mean_service_sec) ---------------------------------------------------
+
+
+def test_live_worker_count_counts_only_recent():
+    jobs_store.record_worker_heartbeat("w-fresh-1")
+    jobs_store.record_worker_heartbeat("w-fresh-2")
+    # 塞一个陈旧心跳（beat_at 在窗口外）
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_worker_heartbeats (worker_id, beat_at) "
+            "VALUES (%s, now() - make_interval(secs => %s)) "
+            "ON CONFLICT (worker_id) DO UPDATE SET beat_at = EXCLUDED.beat_at",
+            ("w-stale", 120),
+        )
+    assert jobs_store.live_worker_count(within_sec=30) >= 2
+    # 陈旧的不计入
+    n_wide = jobs_store.live_worker_count(within_sec=300)
+    n_narrow = jobs_store.live_worker_count(within_sec=30)
+    assert n_wide > n_narrow
+
+
+def test_inflight_job_count_counts_active_states():
+    seed_user("u_js_11"); _reset("u_js_11")
+    before = jobs_store.inflight_job_count()
+    jobs_store.enqueue_job("u_js_11", "chat", reason="t")
+    assert jobs_store.inflight_job_count() == before + 1
+
+
+def test_recent_mean_service_sec_none_without_history():
+    # 全新 lane，无 completed job
+    assert jobs_store.recent_mean_service_sec(lane="no-such-lane") is None
+
+
+def test_recent_mean_service_sec_averages_completed():
+    seed_user("u_js_12")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO agent_jobs (user_id, lane, status, started_at, finished_at) "
+            "VALUES (%s,'svc-test','completed', now() - make_interval(secs=>10), now())",
+            ("u_js_12",),
+        )
+        conn.execute(
+            "INSERT INTO agent_jobs (user_id, lane, status, started_at, finished_at) "
+            "VALUES (%s,'svc-test','completed', now() - make_interval(secs=>20), now())",
+            ("u_js_12",),
+        )
+    mean = jobs_store.recent_mean_service_sec(lane="svc-test", limit=50)
+    assert mean is not None
+    assert 14.0 <= mean <= 16.0  # (10+20)/2 = 15

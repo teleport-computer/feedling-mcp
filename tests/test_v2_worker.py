@@ -224,13 +224,21 @@ def test_coalesce_inputs_and_cap_data_tolerate_enclave_sem_none(monkeypatch):
 
 
 def test_process_job_sleep_plan_no_responder_no_bubble(monkeypatch):
-    """A plan without final_response (sleep — e.g. a heartbeat wake with nothing
-    visible to react to) must never call the responder and must never write a
-    reply bubble, yet still cleanly completes the job."""
+    """A plan without final_response (sleep — e.g. a wake with nothing visible to
+    react to) must never call the responder and must never write a reply bubble,
+    yet still cleanly completes the job.
+
+    Lane: "capture" (not "heartbeat") — D3 Task 6 gave heartbeat/scheduled/
+    manual_wake their own dedicated `_run_wake` dispatch in `process_job`
+    (before this generic chat-turn/rule_plan path is ever reached); capture is
+    explicitly deferred/out of scope for that task (different semantics —
+    memory extraction, not a reply) and still falls through to this generic
+    path, so it's the lane that continues to exercise rule_plan's sleep-plan
+    degradation exactly as this test intends."""
     uid = "u_w_sleep"
     conftest.seed_user(uid)
     _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    job_id, _ = jobs_store.enqueue_job(uid, "capture")
     job = jobs_store.claim_next_job("w")
 
     responder_called = {"n": 0}
@@ -243,7 +251,7 @@ def test_process_job_sleep_plan_no_responder_no_bubble(monkeypatch):
         worker, "_write_encrypted_reply",
         lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
 
-    # heartbeat lane, no coalesced messages -> has_user_text=False and lane != "chat"
+    # capture lane, no coalesced messages -> has_user_text=False and lane != "chat"
     # -> real rule_plan degrades to [{"type": "sleep", ...}] (no final_response).
     deps = _deps(messages=[])
     status = asyncio.run(worker.process_job(
@@ -512,6 +520,37 @@ def test_run_turn_maintenance_resolve_failure_is_silent_no_user_error(monkeypatc
     assert recorded == []
 
 
+def test_run_turn_heartbeat_resolve_failure_is_silent_no_user_error(monkeypatch):
+    """D3 Task 6: the same silence extends to wake lanes (heartbeat/scheduled/
+    manual_wake) — a heartbeat job whose provider can't be resolved must fail
+    SILENTLY, mirroring test_run_turn_maintenance_resolve_failure_is_silent_no_user_error
+    above. The _run_turn gate change (`lane == "chat"`, was `lane != "maintenance"`)
+    means only the chat lane still surfaces a user-visible error chip."""
+    uid = "u_w_heartbeat_resolve_fail"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+
+    def _boom(*a, **k):
+        raise AssertionError("must not run past provider resolution failure")
+
+    recorded = []
+    deps = worker.TurnDeps(
+        read_messages=_boom,
+        resolve_provider=lambda uid_: (None, {"error": "model_api_key_decrypt_failed"}),
+        is_official=_boom,
+        mint_enclave_token=_boom,
+        record_terminal_error=lambda user_id, message: recorded.append((user_id, message)),
+    )
+    status = asyncio.run(worker._run_turn(job, deps))
+
+    assert status == "failed"
+    # SILENT: no "error"-kind status event, no record_terminal_error callback.
+    assert [e for e in _status_events(uid) if e["kind"] == "error"] == []
+    assert recorded == []
+
+
 # ------------------------------------------------------------------
 # _run_turn: single BYOK decrypt/turn + is_official/mint wiring
 # ------------------------------------------------------------------
@@ -652,11 +691,11 @@ def test_run_worker_loop_survives_transient_claim_error(monkeypatch):
     calls = {"n": 0}
     orig_claim = jobs_store.claim_next_job
 
-    def _flaky_claim(worker_id):
+    def _flaky_claim(worker_id, lanes=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("transient db error")
-        return orig_claim(worker_id)
+        return orig_claim(worker_id, lanes=lanes)
 
     monkeypatch.setattr(jobs_store, "claim_next_job", _flaky_claim)
 
@@ -688,7 +727,7 @@ def test_slot_exception_path_backs_off_on_persistent_failure(monkeypatch):
     stop = asyncio.Event()
     calls = {"n": 0}
 
-    def _always_fail(worker_id):
+    def _always_fail(worker_id, lanes=None):
         calls["n"] += 1
         raise RuntimeError("persistent db outage")
 
@@ -714,6 +753,36 @@ def test_bounded_gates_exist():
     assert isinstance(worker.MAX_WORKERS, int) and worker.MAX_WORKERS >= 1
     assert isinstance(worker.MAX_READ_ACTION_PARALLELISM, int)
     assert isinstance(worker.ENCLAVE_SEMAPHORE, asyncio.Semaphore)
+
+
+# ------------------------------------------------------------------
+# D3 Task 5: lane reservation wiring — _reserved_lane_slots() picks the
+# per-slot lane allowlist that run_worker_loop hands to each _slot_loop.
+# ------------------------------------------------------------------
+
+def test_reserved_lane_slots_explicit_reserved_count():
+    assert worker._reserved_lane_slots(4, 2) == [
+        {"chat", "manual_wake"}, {"chat", "manual_wake"}, None, None,
+    ]
+
+
+def test_reserved_lane_slots_default_is_half_rounded_down():
+    result = worker._reserved_lane_slots(4, None)
+    assert result == [{"chat", "manual_wake"}, {"chat", "manual_wake"}, None, None]
+
+
+def test_reserved_lane_slots_single_worker_defaults_to_fully_reserved():
+    assert worker._reserved_lane_slots(1, None) == [{"chat", "manual_wake"}]
+
+
+def test_reserved_lane_slots_reserved_clamped_to_max_workers():
+    assert worker._reserved_lane_slots(3, 99) == [
+        {"chat", "manual_wake"}, {"chat", "manual_wake"}, {"chat", "manual_wake"},
+    ]
+
+
+def test_reserved_lane_slots_reserved_zero_means_all_unrestricted():
+    assert worker._reserved_lane_slots(3, 0) == [None, None, None]
 
 
 # ------------------------------------------------------------------
@@ -743,7 +812,7 @@ def test_process_job_reply_uses_deps_summary_and_tail_and_enqueues_compaction_wh
     ]
     respond_calls = []
 
-    async def _spy_respond(*, provider_config, summary, tail, action_results=None):
+    async def _spy_respond(*, provider_config, summary, tail, action_results=None, usage_out=None):
         respond_calls.append({"summary": summary, "tail": tail})
         return "REPLY"
 
@@ -789,7 +858,7 @@ def test_process_job_reply_skips_compaction_enqueue_when_under_budget(monkeypatc
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
-    async def _spy_respond(*, provider_config, summary, tail, action_results=None):
+    async def _spy_respond(*, provider_config, summary, tail, action_results=None, usage_out=None):
         return "REPLY"
 
     monkeypatch.setattr(v2_responder, "respond", _spy_respond)
@@ -927,6 +996,108 @@ def test_run_compaction_failure_marks_failed_without_surfacing_user_error(monkey
     assert "compaction_failed" in (row[1] or "")
     events = _status_events(uid)
     assert not any(e["kind"] == "error" for e in events)
+
+
+# ------------------------------------------------------------------
+# Task 4: TurnDeps.record_turn_metric — worker records per-turn provider token
+# usage + latency after a SUCCESSFUL respond() call (chat lane only; the
+# metric records at the worker call site, not inside responder, to keep
+# responder.respond hosted-free/job-context-free — see D0 rollout plan Task 4
+# note and responder.py's usage_out docstring).
+# ------------------------------------------------------------------
+
+def test_process_job_records_turn_metric_after_successful_respond(monkeypatch):
+    uid = "u_w_turnmetric"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    async def _spy_respond(*, provider_config, summary, tail, action_results=None, usage_out=None):
+        if usage_out is not None:
+            usage_out["prompt_tokens"] = 42
+            usage_out["completion_tokens"] = 8
+        return "REPLY"
+
+    monkeypatch.setattr(v2_responder, "respond", _spy_respond)
+
+    metric_calls = []
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        record_turn_metric=lambda **kwargs: metric_calls.append(kwargs),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert len(metric_calls) == 1
+    call = metric_calls[0]
+    assert call["job_id"] == job_id
+    assert call["user_id"] == uid
+    assert call["lane"] == "chat"
+    assert call["prompt_tokens"] == 42
+    assert call["completion_tokens"] == 8
+    assert isinstance(call["latency_ms"], int) and call["latency_ms"] >= 0
+
+
+def test_process_job_does_not_record_turn_metric_on_responder_error(monkeypatch):
+    """No-filler-adjacent invariant for metrics: a failed turn (ResponderError)
+    never happened as a "turn" from D4's perspective — only successful respond()
+    calls get metered."""
+    uid = "u_w_turnmetric_err"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+
+    async def _raise_respond(*, provider_config, summary, tail, action_results=None, usage_out=None):
+        raise v2_responder.ResponderError("empty_reply")
+
+    monkeypatch.setattr(v2_responder, "respond", _raise_respond)
+
+    metric_calls = []
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        record_turn_metric=lambda **kwargs: metric_calls.append(kwargs),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert metric_calls == []
+
+
+def test_process_job_tolerates_missing_record_turn_metric_callback(monkeypatch):
+    """record_turn_metric defaults to None like the other optional TurnDeps
+    callbacks — the happy path must not crash when it's absent."""
+    uid = "u_w_turnmetric_none"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    _patch_cheap_boundaries(monkeypatch, reply="R")
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+    deps = _deps(messages=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
+    assert deps.record_turn_metric is None
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
 
 
 def test_run_compaction_under_keep_threshold_completes_as_noop(monkeypatch):

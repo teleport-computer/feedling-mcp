@@ -34,7 +34,15 @@ _ACTION_CONTEXT_CHAR_CAP = 8000
 
 
 class ResponderError(Exception):
-    """responder 无法产出 model-authored 文本（无用户消息 / provider 空回复 / provider 错）。"""
+    """responder 无法产出 model-authored 文本（无用户消息 / provider 空回复 / provider 错）。
+
+    `.kind`（D3 Task 7，类级默认 `""` —— 无需 `getattr` 兜底）：仅 provider 调用失败这一支
+    会被填成 `provider_client.classify_provider_error(exc)` 的结果（"transient" /
+    "provider_config" / "unknown"），让调用方（`worker._run_wake`）不必重新解析错误消息
+    字符串就能判断是否要写支付冷却。empty_reply / no_user_messages 两支保持 `""`（它们
+    根本不是 provider 错误，不适用该分类）。"""
+
+    kind: str = ""
 
 
 def _fold_action_results(action_results: dict[str, Any] | None) -> dict[str, Any]:
@@ -80,6 +88,8 @@ async def respond(
     summary: str,
     tail: list[dict],
     action_results: dict[str, Any] | None = None,
+    usage_out: dict | None = None,
+    system_prompt: str | None = None,
 ) -> str:
     """出一条 model-authored 回复文本。空回复 / provider 错 → ResponderError（调用方据此
     把 job 标 failed，绝不写占位气泡——no-filler 铁律）。
@@ -90,13 +100,24 @@ async def respond(
     `action_results`（§7.5，可选）：executor 产出的 capability 结果，折进 context 让回复
     吃得到 fetch 回来的记忆/感知等 grounding 数据；省略/None 时行为不变。
 
+    `usage_out`（Task 4，可选纯出参）：调用方（worker）传一个空 dict 进来，respond 在
+    provider 调用成功后原地写入 `prompt_tokens`/`completion_tokens`（provider 未回
+    usage 时两者为 None）。这是保持 responder 纯度的选择——responder 不落库、不知道
+    job_id/lane，只把 usage 作为副返回值交给有 job 上下文的 worker 去记
+    `jobs_store.record_turn_metric`（二选一：见 D0 rollout 计划 Task 4 note）。
+    `-> str` 返回类型和 `text` 本身完全不变，D1 既有调用点/测试不受影响。
+
     原生 async（hosted-runtime-v2 并发修复）：worker 的回合协程直接 await 本函数，不再
     经 `asyncio.to_thread` 桥线程池——那条桥会把并发悄悄封顶在线程池大小（~32），让
     worker 池自己的并发闸形同虚设。
+
+    `system_prompt`（D3 Task 6，可选）：省略/None 时用聊天默认的 `_SYSTEM_PROMPT`（既有
+    调用点不受影响）；wake-lane 调用方（`worker._run_wake`）传入不同的 proactive 框架
+    提示，让模型知道这是主动打招呼的时刻而不是在回答用户消息。
     """
     action_context = _action_context_str(action_results)
     messages = context.build_turn_messages(
-        system_prompt=_SYSTEM_PROMPT,
+        system_prompt=system_prompt if system_prompt is not None else _SYSTEM_PROMPT,
         summary=summary,
         tail=tail,
         action_context=action_context,
@@ -114,7 +135,14 @@ async def respond(
             timeout=_TIMEOUT_SEC,
         )
     except Exception as e:  # noqa: BLE001 — 归一成 ResponderError 交给 worker 落 last_error
-        raise ResponderError(f"provider_call_failed: {type(e).__name__}: {str(e)[:200]}") from e
+        err = ResponderError(f"provider_call_failed: {type(e).__name__}: {str(e)[:200]}")
+        err.kind = provider_client.classify_provider_error(e)
+        raise err from e
+    if usage_out is not None:
+        # 防御性双路抽取：provider 回包形状不一，取不到就是 None，绝不因缺 usage 抛错。
+        u = (result or {}).get("usage") or {}
+        usage_out["prompt_tokens"] = u.get("prompt_tokens")
+        usage_out["completion_tokens"] = u.get("completion_tokens")
     text = str((result or {}).get("reply") or "").strip()
     if not text:
         raise ResponderError("empty_reply")
