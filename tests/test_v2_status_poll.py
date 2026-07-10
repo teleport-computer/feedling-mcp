@@ -18,7 +18,7 @@ from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 def test_build_response_carries_status_cursor():
     resp = chat_poll_core.build_response(
-        messages=[], context={"runtime_v2": {}, "client_release": {}},
+        messages=[], context={"runtime_v2": {}, "client_release": {}, "user_mcp": {}},
         consumer_id="c1", claim=True, timed_out=True,
         status_events=[{"id": 5, "kind": "reading_memory", "label": "读取上下文", "detail": {}}],
         status_cursor=5)
@@ -31,7 +31,7 @@ def test_build_response_defaults_are_empty_and_backward_compatible():
     and gets an empty status list / zero cursor — the additive fields never
     surprise a caller that doesn't know about them."""
     resp = chat_poll_core.build_response(
-        messages=[{"id": 1}], context={"runtime_v2": {}, "client_release": {}},
+        messages=[{"id": 1}], context={"runtime_v2": {}, "client_release": {}, "user_mcp": {}},
         consumer_id="c1", claim=True, timed_out=False,
     )
     assert resp["messages"] == [{"id": 1}]
@@ -39,7 +39,7 @@ def test_build_response_defaults_are_empty_and_backward_compatible():
     assert resp["status_cursor"] == 0
     # exact legacy field set + the two additive fields, nothing else snuck in.
     assert set(resp.keys()) == {
-        "messages", "runtime_v2", "client_release", "timed_out",
+        "messages", "runtime_v2", "client_release", "user_mcp", "timed_out",
         "consumer_id", "claimed", "agent_status_events", "status_cursor",
     }
 
