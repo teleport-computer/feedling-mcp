@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 from admin import routes_asgi as admin_asgi  # noqa: E402
 from asgi import middleware  # noqa: E402
-from conftest import seed_user  # noqa: E402
+from conftest import seed_user, configure_model_api_route  # noqa: E402
 from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from hosted import config_store  # noqa: E402
@@ -57,9 +57,7 @@ def _uid(prefix: str) -> str:
 
 def _seed_model_api_user(user_id: str) -> None:
     seed_user(user_id)
-    db.set_blob(user_id, "model_api", {
-        "provider": "anthropic", "model": "x", "test_status": "ok", "base_url": "",
-    })
+    configure_model_api_route(user_id, provider="anthropic", model="x", test_status="ok")
 
 
 def _admin(token=ADMIN_TOKEN):

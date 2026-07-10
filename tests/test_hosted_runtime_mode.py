@@ -10,6 +10,8 @@ import db
 from core import store as core_store
 from hosted import config_store as hosted_config_store
 
+from conftest import configure_model_api_route
+
 
 def _seed_model_api_user(uid):
     with db.get_pool().connection() as conn:
@@ -19,7 +21,8 @@ def _seed_model_api_user(uid):
             (uid,),
         )
     # 需要一个 model_api 配置，_patch_model_api_runtime_profile 才能建 runtime profile。
-    db.set_blob(uid, "model_api", {"route": "model_api", "provider": "anthropic", "model": "m"})
+    # provider config 现在落在 model_api_routes/credentials（model-api-multi-profile）。
+    configure_model_api_route(uid, provider="anthropic", model="m")
 
 
 def test_default_mode_is_resident_cli():

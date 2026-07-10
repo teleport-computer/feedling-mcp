@@ -110,14 +110,16 @@ def seed_synthetic_users(n: int, *, mock_base_url: str) -> list[str]:
     for _ in range(n):
         uid = f"loadtest_{uuid.uuid4().hex[:12]}"
         _seed_user_row(uid)
-        db.set_blob(uid, "model_api", {
-            "route": "model_api",
-            "provider": "anthropic",
-            "model": "loadtest-mock",
-            "base_url": mock_base_url,
-            "test_status": "ok",
-            "api_key_envelope": {"body_ct": "x", "nonce": "n", "K_user": "k"},
-        })
+        # Provider config lives in model_api_routes/credentials (model-api-multi-
+        # profile), not a 'model_api' blob. Seed an active, test_status='ok' route so
+        # list_agent_runtime_enabled_users / _load_model_api_config see the user.
+        credential_id = db.model_api_credential_create(
+            uid, provider="anthropic", base_url=mock_base_url, label="Loadtest",
+            api_key_envelope={"body_ct": "x", "nonce": "n", "K_user": "k"},
+            api_key_hint="sk-...load", supports_responses=False)
+        route_id = db.model_api_route_upsert(uid, credential_id, "loadtest-mock", None)
+        db.model_api_route_mark_test(uid, route_id, status="ok")
+        db.model_api_route_activate(uid, route_id)
         store = core_store.get_store(uid)
         hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
         store.mark_first_chat_ok()

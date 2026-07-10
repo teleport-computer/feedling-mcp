@@ -12,6 +12,8 @@ from hosted import agent_runtime_cutover
 from model_api_runtime.v2 import jobs_store
 from core import wake_bus as core_wake_bus
 
+from conftest import configure_model_api_route
+
 
 def _seed(uid):
     with db.get_pool().connection() as conn:
@@ -20,10 +22,9 @@ def _seed(uid):
             "ON CONFLICT (user_id) DO NOTHING",
             (uid,),
         )
-    db.set_blob(uid, "model_api", {
-        "route": "model_api", "provider": "anthropic", "model": "m",
-        "test_status": "ok", "api_key_envelope": {"body_ct": "x", "nonce": "n", "K_user": "k"},
-    })
+    configure_model_api_route(
+        uid, provider="anthropic", model="m", test_status="ok",
+        envelope={"body_ct": "x", "nonce": "n", "K_user": "k"})
 
 
 def test_db_action_v2_enqueues_job_and_skips_resident(monkeypatch):

@@ -9,7 +9,11 @@ Revision ID: 0014_hosted_runtime_v2
 from alembic import op
 
 revision = "0014_hosted_runtime_v2"
-down_revision = "0013_genesis_resident_claim"
+# Re-parented onto test's 0014_model_api_profiles during the 2026-07-11 rebase:
+# both migrations originally branched from 0013_genesis_resident_claim (two heads).
+# The V2 chain (0014_hosted_runtime_v2 → 0020) now stacks after the model-api
+# multi-profile migration, giving a single linear head.
+down_revision = "0014_model_api_profiles"
 branch_labels = None
 depends_on = None
 
