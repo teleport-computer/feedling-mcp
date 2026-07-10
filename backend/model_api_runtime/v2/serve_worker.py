@@ -38,10 +38,22 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 import time
 import types
+from pathlib import Path
 
-from accounts import registry as accounts_registry
+# Put the backend dir on sys.path BEFORE importing backend modules. When this is
+# run as a script (`python backend/model_api_runtime/v2/serve_worker.py` — how the
+# runner compose starts it), sys.path[0] is the script's own dir (…/v2), NOT
+# backend/ — so `from accounts import …` below would ImportError. Mirrors the same
+# bootstrap in agent_runtime/supervisor.py. Importing this module normally (tests,
+# which already put backend/ on the path) is unaffected: the insert is a no-op.
+_BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
+from accounts import registry as accounts_registry  # noqa: E402
 from agent_runtime import spawners as agent_spawners
 from core import enclave as core_enclave
 from core import envelope as core_envelope

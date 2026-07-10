@@ -74,50 +74,28 @@ def model_api_chat_send_core(
     if len(message) > 12000:
         return {"error": "message too long", "max_chars": 12000}, 413
 
-    runtime = hosted_config_store._load_runtime_provider_config(store, api_key, runtime_token=runtime_tok)
-    if isinstance(runtime, tuple):
-        _, err = runtime
-        hosted_config_store._append_model_api_action_trace(store, {
-            "status": "failed",
-            "error": err.get("error", "runtime_load_failed"),
-            "context": {"stage": "load_runtime"},
-            "duration_ms": int((time.time() - trace_start) * 1000),
-        })
-        return err, 400
-    hosted_config_store._ensure_model_api_runtime_profile(store, hosted_config_store._load_model_api_config(store), touch=True)
-
-    if has_image:
-        user_plaintext = image_bytes
-    elif has_file:
-        user_plaintext = file_parse["bytes"]
-    else:
-        user_plaintext = message.encode("utf-8")
-    user_env, env_err = core_envelope._build_shared_envelope_for_store(store, user_plaintext)
-    if user_env is None:
-        return {"error": "user_message_envelope_failed", "detail": env_err}, 409
-    # 收口：配了 fit provider 即托管到 agent-runner，否则 409。
-    # 先校验 driver 再入 store，避免未配置时写入孤儿用户消息。
-    config = hosted_config_store._load_model_api_config(store)
-    try:
-        driver = agent_runtime_cutover.resolve_driver(config)
-    except agent_runtime_cutover.UnsupportedProviderError:
-        return {"error": "provider_not_configured"}, 409
-
-    # Hosted Runtime V2 灰度：db_action_v2 用户由独立 worker 池应答，不依赖 resident
-    # supervisor，故跳过下面的 resident wedge guard（否则会被 resident 心跳错误 503）。
+    # ---- Hosted Runtime V2 gates: BEFORE the enclave round-trip below ----------
+    # `_load_runtime_provider_config` (next) does a per-request, uncached enclave
+    # call to unwrap the user's BYOK key, and the enclave is the single-threaded
+    # bottleneck this whole subproject exists to stop overloading. So both V2 gates
+    # run FIRST: they need only a cheap blob read (`get_hosted_runtime_mode`) plus
+    # two indexed counts, and they are exactly the two cases where we want to shed
+    # load without touching the enclave at all. Keeping them behind the decrypt
+    # meant (a) every refused send still burned an enclave round-trip precisely
+    # when the system was overloaded, and (b) a dead worker pool was masked by a
+    # 400 decrypt error whenever the enclave itself was down. Both gates still
+    # refuse BEFORE anything is persisted (nothing below has written yet).
     _v2_mode = hosted_config_store.get_hosted_runtime_mode(store) == "db_action_v2"
 
-    # V2 liveness guard: skipping the resident wedge guard above left db_action_v2
-    # users with NO replacement — if every serve_worker process is dead (crashed,
-    # not yet deployed, scaled to zero), enqueue_job below would still succeed
-    # and the message would queue in agent_jobs forever with no error, no reply,
-    # no visible failure. jobs_store.workers_alive() checks the v2_worker_heartbeats
-    # table each live serve_worker process UPSERTs into every ~10s. Distinct
-    # code/summary ("workers_unavailable") from the resident wedge guard's
-    # "hosting_runtime_unavailable"/"supervisor_unavailable" — the two failure
-    # modes are unrelated (dead worker pool vs. dead resident supervisor) and
-    # must stay distinguishable to callers/on-call. Placed BEFORE append_chat so
-    # nothing is persisted on refusal (same principle as the wedge guard above).
+    # V2 liveness guard: db_action_v2 users skip the resident wedge guard further
+    # down, and without this they'd have NO replacement — if every serve_worker
+    # process is dead (crashed, not yet deployed, scaled to zero), enqueue_job
+    # would still succeed and the message would queue in agent_jobs forever with
+    # no error, no reply, no visible failure. jobs_store.workers_alive() reads the
+    # v2_worker_heartbeats table each live serve_worker UPSERTs every ~10s.
+    # Distinct code/summary ("workers_unavailable") from the resident wedge guard's
+    # "hosting_runtime_unavailable"/"supervisor_unavailable" — dead worker pool vs.
+    # dead resident supervisor are unrelated and must stay distinguishable.
     if _v2_mode and not jobs_store.workers_alive():
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
@@ -156,6 +134,36 @@ def model_api_chat_send_core(
                         "est_wait_sec": int(_est), "inflight": _inflight, "workers": _workers},
             )
             return {"error": "busy", "reason": "queue_over_sla", "est_wait_sec": int(_est)}, 503
+    # ---- end V2 gates ---------------------------------------------------------
+
+    runtime = hosted_config_store._load_runtime_provider_config(store, api_key, runtime_token=runtime_tok)
+    if isinstance(runtime, tuple):
+        _, err = runtime
+        hosted_config_store._append_model_api_action_trace(store, {
+            "status": "failed",
+            "error": err.get("error", "runtime_load_failed"),
+            "context": {"stage": "load_runtime"},
+            "duration_ms": int((time.time() - trace_start) * 1000),
+        })
+        return err, 400
+    hosted_config_store._ensure_model_api_runtime_profile(store, hosted_config_store._load_model_api_config(store), touch=True)
+
+    if has_image:
+        user_plaintext = image_bytes
+    elif has_file:
+        user_plaintext = file_parse["bytes"]
+    else:
+        user_plaintext = message.encode("utf-8")
+    user_env, env_err = core_envelope._build_shared_envelope_for_store(store, user_plaintext)
+    if user_env is None:
+        return {"error": "user_message_envelope_failed", "detail": env_err}, 409
+    # 收口：配了 fit provider 即托管到 agent-runner，否则 409。
+    # 先校验 driver 再入 store，避免未配置时写入孤儿用户消息。
+    config = hosted_config_store._load_model_api_config(store)
+    try:
+        driver = agent_runtime_cutover.resolve_driver(config)
+    except agent_runtime_cutover.UnsupportedProviderError:
+        return {"error": "provider_not_configured"}, 409
 
     # Wedge guard: routing to the agent-runner only works if a supervisor is
     # actually hosting. assert_hosting_ready validated THIS process's env at
