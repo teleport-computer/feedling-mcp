@@ -361,3 +361,43 @@ def test_recent_mean_service_sec_averages_completed():
     mean = jobs_store.recent_mean_service_sec(lane="svc-test", limit=50)
     assert mean is not None
     assert 14.0 <= mean <= 16.0  # (10+20)/2 = 15
+
+
+# --- kind discriminator: genesis heartbeats must be invisible to the chat/send
+# admission gate (workers_alive / live_worker_count read only kind='turn') ---
+
+
+def _clear_heartbeats():
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_worker_heartbeats")
+
+
+def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
+    """A genesis heartbeat row must be invisible to the chat/send admission gate.
+
+    live_worker_count() feeds admission.estimate_wait_sec(workers=...); counting a
+    genesis row as a turn worker would halve the estimated queue wait for a
+    single-process pool and over-admit onto turn slots that do not exist.
+    """
+    _clear_heartbeats()
+    jobs_store.record_worker_heartbeat("w1")                      # default kind='turn'
+    jobs_store.record_worker_heartbeat("w1:genesis", kind="genesis")
+
+    assert jobs_store.live_worker_count() == 1
+    assert jobs_store.workers_alive() is True
+    assert jobs_store.genesis_worker_alive() is True
+
+
+def test_genesis_heartbeat_alone_does_not_open_the_send_gate():
+    """Genesis alive but every turn worker dead => send must still 503."""
+    _clear_heartbeats()
+    jobs_store.record_worker_heartbeat("only:genesis", kind="genesis")
+
+    assert jobs_store.workers_alive() is False
+    assert jobs_store.live_worker_count() == 0
+    assert jobs_store.genesis_worker_alive() is True
+
+
+def test_genesis_worker_alive_false_when_nothing_beats():
+    _clear_heartbeats()
+    assert jobs_store.genesis_worker_alive() is False

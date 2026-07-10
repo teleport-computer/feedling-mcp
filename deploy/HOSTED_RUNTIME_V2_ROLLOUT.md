@@ -18,6 +18,7 @@ RAM and process count become a function of the worker-pool size, not the user co
 2. Build `feedling-agent-runner:<sha>`, bump the compose tag, `phala deploy --cvm-id <runner>`, `deploy/publish-compose-hash.sh`.
 3. Env (encrypted channel, no re-auth): `FEEDLING_V2_MAX_WORKERS` (default 4), `FEEDLING_V2_CHAT_RESERVED_SLOTS` (default `max(1, MAX_WORKERS//2)`), `FEEDLING_V2_SCHEDULER_INTERVAL_SEC` (default 30).
 4. **Verify**: `v2_worker_heartbeats` has fresh rows (`jobs_store.workers_alive()` True); `GET /v1/admin/v2-metrics` returns live_workers ≥ 1.
+5. **Verify genesis rehome** (2026-07-10): the genesis import worker now runs inside `serve-worker`, not `agent-runner` — `genesis_import_jobs` has exactly one drain in the codebase, so if this container is unhealthy, every new user's onboarding distillation stalls silently. Confirm `GET /v1/admin/v2-metrics` returns `genesis_alive: true`, then drive **one real genesis import end-to-end** and confirm it decrypts (the runner CVM reaches the main enclave over the passthrough URL with `verify=False`; `deploy/DEPLOYMENTS.md` has always flagged this as a post-cutover check). A `genesis_alive: false` with `live_workers ≥ 1` means the genesis thread died while the turn loops kept beating — check the serve-worker logs for `[genesis:daemon]`.
 
 ## Step 1 — Load test (LOCAL, before flipping real users)
 
@@ -51,4 +52,4 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 
 - **Default flip** (changing the `resident_cli` fallback default) — a separate one-line change once the fleet is stable and fully migrated; easy to revert.
 - **Authoritative 4c/8GB load run** — rerun Step 1 on CVM-class hardware if the local indicative numbers are borderline.
-- **capture lane** wake execution (D3 scoped to heartbeat/scheduled/manual_wake; capture = memory-extraction, follow-up).
+- **Promoting genesis to its own container.** It is now a dedicated thread inside `serve-worker` rather than inside `agent-runner` — better, but still a thread in someone else's process. Its own service would give it a restart policy and a real crash domain. Costs one more `addComposeHash()`, so it was not bundled here.

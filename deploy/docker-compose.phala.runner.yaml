@@ -69,6 +69,14 @@ x-agent-runner-env: &agent-runner-env
   # Genesis import worker: this runner is the only place genesis import jobs get
   # drained (the main CVM no longer runs an agent-runner). Claim is FOR UPDATE
   # SKIP LOCKED, so it stays correct if more runners are ever added back.
+  #
+  # 2026-07-10: rehomed from agent-runner into serve-worker. These keys live in a
+  # shared anchor consumed by BOTH containers, so nothing moves here — supervisor.py
+  # simply no longer reads them, and serve_worker.py now does. (In the prod compose
+  # the two services have separate env blocks, so there the keys did move.) Genesis
+  # never depended on the resident CLI runtime; it was a daemon thread in supervisor
+  # only because supervisor was the CVM's one long-running process. Liveness is now
+  # v2_worker_heartbeats kind='genesis' → `genesis_alive` on /v1/admin/v2-metrics.
   FEEDLING_GENESIS_WORKER_ENABLED: "1"
   FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "${FEEDLING_GENESIS_WORKER_INTERVAL_SEC:-10}"
   FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "${FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC:-7200}"

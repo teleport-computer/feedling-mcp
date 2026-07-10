@@ -1295,34 +1295,6 @@ def main() -> int:
     for _uid, _detail in base_roster_key_decrypt_failures:
         sup._emit_runner_notice(_uid, "runner_key_decrypt_failed", _detail)
 
-    # Genesis CVM worker — runs in its own daemon thread (never inline in the tick
-    # loop). Default OFF; activates only when FEEDLING_GENESIS_WORKER_ENABLED is set
-    # AND a runtime-token secret + enclave URL are present (else dormant + warn).
-    genesis_enabled = os.environ.get("FEEDLING_GENESIS_WORKER_ENABLED", "")
-    genesis_stop = threading.Event()
-    if _genesis_worker_should_start(enabled=genesis_enabled, secret=secret_raw, enclave_url=enclave_url):
-        g_secret = secret_raw.encode("utf-8")
-        genesis_ttl = float(os.environ.get(
-            "FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC", str(_GENESIS_TOKEN_TTL_DEFAULT_SEC)))
-        g_interval = float(os.environ.get(
-            "FEEDLING_GENESIS_WORKER_INTERVAL_SEC", str(_GENESIS_TICK_DEFAULT_SEC)))
-
-        def mint_genesis(user_id, scopes=None):
-            return runtime_token.mint(
-                g_secret, user_id=user_id, runtime_instance_id=owner,
-                scope=list(scopes or ["envelope_decrypt", "genesis"]), ttl=genesis_ttl)
-
-        threading.Thread(
-            target=_genesis_worker_loop, daemon=True,
-            kwargs={"api_url": api_url, "enclave_url": enclave_url,
-                    "mint_genesis": mint_genesis, "interval": g_interval,
-                    "stop_event": genesis_stop},
-        ).start()
-        log.info("genesis worker enabled — interval=%.0fs token_ttl=%.0fs", g_interval, genesis_ttl)
-    elif _truthy(genesis_enabled):
-        log.warning("FEEDLING_GENESIS_WORKER_ENABLED set but prerequisites missing "
-                    "(need FEEDLING_RUNTIME_TOKEN_SECRET + FEEDLING_ENCLAVE_URL) — genesis worker dormant")
-
     # Heartbeat from a dedicated thread, decoupled from the (potentially slow)
     # discover→resolve→spawn loop below: a multi-minute cold-start pass must not
     # stall the wedge-guard heartbeat (else the backend 503s every send). Capped
@@ -1444,7 +1416,6 @@ def main() -> int:
     finally:
         hb_stop.set()
         renew_stop.set()
-        genesis_stop.set()
         sup.shutdown()
 
 

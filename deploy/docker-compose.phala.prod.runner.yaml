@@ -89,7 +89,8 @@ services:
   # supervisor: SAME image, runs the serve_worker entrypoint, holds NO data volume
   # (all V2 state in Postgres: agent_jobs / v2_worker_heartbeats / v2_turn_metrics /
   # v2_conversation_summary). Turns are pure async HTTP provider calls (no per-user
-  # home, no codex subprocess, no genesis worker). Coexists with the resident
+  # home, no codex subprocess). Also hosts the genesis import worker on a dedicated
+  # thread — see its env block below. Coexists with the resident
   # supervisor — the D0 exclusivity guard keeps each user on exactly one path.
   # Adding this service changes compose_hash → on-chain addComposeHash() re-auth on
   # the prod FeedlingAppAuth (see deploy/DEPLOYMENTS.md). Until deployed,
@@ -113,6 +114,24 @@ services:
       # queue via FOR UPDATE SKIP LOCKED. Rides the encrypted env channel → tuning
       # needs no on-chain re-auth (unlike adding the service).
       FEEDLING_V2_MAX_WORKERS: "${FEEDLING_V2_MAX_WORKERS:-4}"
+      # Genesis import worker — rehomed here from agent-runner 2026-07-10. It lived
+      # there for one accidental reason: supervisor was the only long-running process
+      # in the CVM, so it was the only place with a `while True` to hang a poller on.
+      # It has no dependency on the resident CLI runtime — it needs an enclave URL
+      # (to decrypt E2E chunk envelopes), a token secret, and a loop.
+      # `genesis_import_jobs` has exactly ONE drain in the codebase
+      # (genesis/worker.py → db.genesis_claim_uploaded_jobs), so retiring
+      # agent-runner while genesis lived inside it would have silently stalled every
+      # new user's onboarding distillation. Runs on a DEDICATED thread, not the
+      # asyncio default executor: a tick blocks for the whole LLM reduce (minutes)
+      # and would starve the turn coroutines' sync DB bridges.
+      # Claim is FOR UPDATE SKIP LOCKED → safe on N replicas.
+      # Liveness: v2_worker_heartbeats kind='genesis' — invisible to the chat/send
+      # admission gate (which reads kind='turn'), surfaced as `genesis_alive` on
+      # GET /v1/admin/v2-metrics.
+      FEEDLING_GENESIS_WORKER_ENABLED: "1"
+      FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "${FEEDLING_GENESIS_WORKER_INTERVAL_SEC:-10}"
+      FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "${FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC:-7200}"
 
 volumes:
   feedling_agent_runtime_prod_runner:

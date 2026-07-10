@@ -342,41 +342,68 @@ def invalidate_pending_actions(job_id, *, by_job_id: int) -> int:
     return affected
 
 
-def record_worker_heartbeat(worker_id: str) -> None:
-    """UPSERT this process's liveness row (called every ~10s by
-    serve_worker._heartbeat_loop). Backs workers_alive() — the chat/send guard
-    that refuses db_action_v2 sends when no worker pool process is alive."""
+def record_worker_heartbeat(worker_id: str, *, kind: str = "turn") -> None:
+    """UPSERT this process's liveness row (turn loops every ~10s via
+    serve_worker._heartbeat_loop; the genesis thread every tick with
+    kind='genesis').
+
+    ``kind`` is load-bearing, not a label: workers_alive()/live_worker_count()
+    read ONLY kind='turn' because they gate chat/send admission. A genesis row
+    counted as a turn worker would halve the estimated queue wait.
+    """
     with _pool().connection() as conn:
         conn.execute(
-            "INSERT INTO v2_worker_heartbeats (worker_id, beat_at) VALUES (%s, now()) "
-            "ON CONFLICT (worker_id) DO UPDATE SET beat_at = now()",
-            (str(worker_id),),
+            "INSERT INTO v2_worker_heartbeats (worker_id, beat_at, kind) "
+            "VALUES (%s, now(), %s) "
+            "ON CONFLICT (worker_id) DO UPDATE SET beat_at = now(), kind = EXCLUDED.kind",
+            (str(worker_id), str(kind)),
         )
 
 
 def workers_alive(*, within_sec: int = 30) -> bool:
-    """True iff at least one serve_worker has recorded a heartbeat within the
-    last ``within_sec`` seconds. Used by the chat/send v2 liveness guard."""
+    """True iff at least one serve_worker TURN process has recorded a heartbeat
+    within the last ``within_sec`` seconds. Used by the chat/send v2 liveness
+    guard. Genesis heartbeats are deliberately invisible here — a live genesis
+    thread says nothing about whether any turn slot exists to drain the job."""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT EXISTS(SELECT 1 FROM v2_worker_heartbeats "
-                "WHERE beat_at > now() - make_interval(secs => %s))",
+                "WHERE kind = 'turn' AND beat_at > now() - make_interval(secs => %s))",
                 (int(within_sec),),
             )
             return bool(cur.fetchone()[0])
 
 
 def live_worker_count(*, within_sec: int = 30) -> int:
-    """窗口内有心跳的 serve_worker 数（workers_alive 的计数版，喂 admission ceiling）。"""
+    """窗口内有心跳的 serve_worker TURN 进程数（workers_alive 的计数版，喂 admission
+    ceiling）。genesis 心跳不计入——它不占 turn 槽位。"""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT count(*) FROM v2_worker_heartbeats "
-                "WHERE beat_at > now() - make_interval(secs => %s)",
+                "WHERE kind = 'turn' AND beat_at > now() - make_interval(secs => %s)",
                 (int(within_sec),),
             )
             return int(cur.fetchone()[0])
+
+
+def genesis_worker_alive(*, within_sec: int = 60) -> bool:
+    """True iff the genesis import worker thread has beaten recently.
+
+    Window defaults to 60s (not 30s): a genesis tick holds the thread for the
+    whole LLM reduce, and the heartbeat is written once per tick, so the gap
+    between beats is the tick interval (default 10s) PLUS the last job's
+    duration. Purely observational — nothing gates on this.
+    """
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT EXISTS(SELECT 1 FROM v2_worker_heartbeats "
+                "WHERE kind = 'genesis' AND beat_at > now() - make_interval(secs => %s))",
+                (int(within_sec),),
+            )
+            return bool(cur.fetchone()[0])
 
 
 def inflight_job_count() -> int:

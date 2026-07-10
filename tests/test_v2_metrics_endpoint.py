@@ -46,6 +46,7 @@ def env(monkeypatch):
     monkeypatch.setattr(jobs_store, "live_worker_count", lambda **kw: 2)
     monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: 4.5)
     monkeypatch.setattr(jobs_store, "recent_mean_tokens_per_turn", lambda **kw: 123.0)
+    monkeypatch.setattr(jobs_store, "genesis_worker_alive", lambda **kw: True)
     monkeypatch.setattr(
         jobs_store,
         "wake_success_stats",
@@ -84,7 +85,7 @@ def _asgi_json(method, path, headers=None, **kw):
     return resp.status_code, body
 
 
-def test_v2_metrics_returns_the_five_fields(env):
+def test_v2_metrics_returns_every_field(env):
     status, body = _asgi_json("GET", "/v1/admin/v2-metrics", headers=_admin())
 
     assert status == 200
@@ -101,7 +102,23 @@ def test_v2_metrics_returns_the_five_fields(env):
             "success_rate": 0.8,
             "by_lane": {"heartbeat": {"completed": 4}, "scheduled": {"failed": 1}},
         },
+        "genesis_alive": True,
     }
+
+
+def test_v2_metrics_surfaces_a_dead_genesis_thread(env, monkeypatch):
+    """A dead genesis thread must be visible even when every turn worker is healthy.
+
+    `live_workers` counts kind='turn' rows only, so a genesis thread that died to a
+    lazy-import error inside `run_loop` leaves no other trace anywhere.
+    """
+    monkeypatch.setattr(jobs_store, "genesis_worker_alive", lambda **kw: False)
+
+    status, body = _asgi_json("GET", "/v1/admin/v2-metrics", headers=_admin())
+
+    assert status == 200
+    assert body["genesis_alive"] is False
+    assert body["live_workers"] == 2
 
 
 def test_v2_metrics_no_token_is_401(env):

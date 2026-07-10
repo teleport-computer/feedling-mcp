@@ -40,6 +40,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -63,6 +64,7 @@ from core import envelope as core_envelope
 from core import runtime_token
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
 from identity import identity_core
 from memory import memory_core
@@ -86,6 +88,20 @@ _ASSISTANT_ROLES = ("openclaw", "assistant", "agent")
 # only verifies signature+expiry+user_id, not scope — see enclave/auth.py
 # local_user_id_from_token) doesn't silently start rejecting this worker.
 _RUNTIME_TOKEN_SCOPE = ["envelope_decrypt"]
+
+# Genesis mints its own token: a wider scope (it decrypts chunk envelopes AND calls
+# the genesis apply route) and a much longer TTL — a history import routinely
+# outlives the 900s chat token. Deliberately NOT folded into _RUNTIME_TOKEN_SCOPE:
+# the per-turn chat path must keep the narrower scope.
+#
+# TTL and the poll interval are deliberately NOT hoisted into module-level
+# constants (unlike _REAP_INTERVAL_SEC etc. below) — both are read from os.environ
+# at CALL time, inside `_mint_genesis_token`/`_start_genesis_thread`. Those two
+# functions are invoked lazily (once per process, well after import), and tests
+# drive them via `monkeypatch.setenv` right before calling in; a module-level
+# constant would freeze the value at import time and the monkeypatch would
+# silently do nothing.
+_GENESIS_TOKEN_SCOPE = ["envelope_decrypt", "genesis"]
 
 # 本 V2 worker 触发 self-wake timer 时用的 owner_id。**必须**与 proactive_core 的
 # RESIDENT_RUNTIME_OWNER_ID_V2（"resident_runtime_v2"）不同 —— fire_due_timers 的
@@ -181,6 +197,26 @@ def _mint_runtime_token(user_id: str) -> str:
         runtime_instance_id="v2-worker",
         scope=_RUNTIME_TOKEN_SCOPE,
         ttl=900.0,
+    )
+
+
+def _mint_genesis_token(user_id: str, scopes: list[str] | None = None) -> str:
+    """Genesis-scoped runtime token: wider scope + longer TTL than
+    ``_mint_runtime_token`` (see ``_GENESIS_TOKEN_SCOPE`` docstring above).
+
+    ``runtime_instance_id="v2-genesis"`` is a free-form label — `core.runtime_token
+    .authorize` checks only `user_id` + `scope`, never `sub` — this mirrors
+    `_mint_runtime_token`'s made-up `"v2-worker"` above.
+    """
+    secret = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip().encode("utf-8")
+    if not secret:
+        raise RuntimeError("FEEDLING_RUNTIME_TOKEN_SECRET not set")
+    return runtime_token.mint(
+        secret,
+        user_id=user_id,
+        runtime_instance_id="v2-genesis",
+        scope=list(scopes or _GENESIS_TOKEN_SCOPE),
+        ttl=float(os.environ.get("FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC", "7200")),
     )
 
 
@@ -834,6 +870,59 @@ async def _scheduler_loop(stop_event: asyncio.Event, *, interval: float = _SCHED
             pass
 
 
+def _start_genesis_thread(worker_id: str):
+    """Start the genesis import worker on a DEDICATED thread, or return None if dormant.
+
+    Rehomed here from `agent_runtime.supervisor` (2026-07-10): genesis never depended
+    on the resident CLI runtime — it needed an enclave URL, a token secret, and a
+    long-running loop, and supervisor merely happened to be the only process in the
+    CVM that had one. Deleting agent-runner would have silently stopped draining
+    `genesis_import_jobs`, stalling every new user's onboarding distillation with no
+    error surfaced anywhere.
+
+    NOT `asyncio.to_thread`: a tick blocks for the whole LLM reduce (minutes), and
+    `to_thread` would park that in the loop's default executor — `min(32, cpu+4)`, i.e.
+    6 threads on a 2-core CVM — which every turn coroutine's sync DB call also bridges
+    through. Its own thread cannot starve them.
+
+    The heartbeat (kind='genesis', invisible to `workers_alive`/`live_worker_count`)
+    exists because this thread can die while the process lives on: `run_loop` imports
+    `genesis.worker` lazily, so an ImportError kills only the thread and the turn loops
+    keep beating happily. Today that failure is completely silent.
+    """
+    enabled = os.environ.get("FEEDLING_GENESIS_WORKER_ENABLED", "")
+    secret = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip()
+    enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").strip()
+    api_url = os.environ.get("FEEDLING_API_URL", "").strip()
+
+    if not genesis_daemon.should_start(enabled=enabled, secret=secret, enclave_url=enclave_url):
+        if enabled:
+            log.warning("[v2.serve_worker] FEEDLING_GENESIS_WORKER_ENABLED set but "
+                        "prerequisites missing (need FEEDLING_RUNTIME_TOKEN_SECRET + "
+                        "FEEDLING_ENCLAVE_URL) — genesis worker dormant")
+        return None
+
+    genesis_worker_id = f"{worker_id}:genesis"
+    stop_event = threading.Event()
+    # Read at CALL time (not a module-level constant) — see the comment beside
+    # _GENESIS_TOKEN_SCOPE above for why.
+    interval = float(os.environ.get("FEEDLING_GENESIS_WORKER_INTERVAL_SEC", "10"))
+
+    def _beat() -> None:
+        jobs_store.record_worker_heartbeat(genesis_worker_id, kind="genesis")
+
+    thread = threading.Thread(
+        target=genesis_daemon.run_loop, daemon=True, name="v2-genesis",
+        kwargs={"api_url": api_url, "enclave_url": enclave_url,
+                "mint_genesis": _mint_genesis_token, "interval": interval,
+                "stop_event": stop_event, "on_beat": _beat},
+    )
+    thread.start()
+    log.info("[v2.serve_worker] genesis worker enabled — interval=%.0fs worker_id=%s",
+             interval, genesis_worker_id)
+    return thread, stop_event
+
+
 async def _serve(worker_id: str, *, poll_interval: float) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -845,6 +934,10 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     wake_event = asyncio.Event()
     v2_worker.set_job_wake_context(loop, wake_event)
     log.info("[v2.serve_worker] starting worker=%s max_workers=%s", worker_id, v2_worker.MAX_WORKERS)
+    # Genesis runs on its own dedicated thread (NOT part of this asyncio.gather —
+    # see _start_genesis_thread docstring for why it can't share the to_thread
+    # executor with the turn/reaper/heartbeat/scheduler coroutines below).
+    genesis = _start_genesis_thread(worker_id)
     await asyncio.gather(
         v2_worker.run_worker_loop(
             worker_id,
@@ -861,6 +954,12 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         # 但万一某个漏网抛出，return_exceptions 保证不牵连拖垮另一个 loop。
         return_exceptions=True,
     )
+    if genesis is not None:
+        genesis_thread, genesis_stop = genesis
+        genesis_stop.set()
+        # Bounded: a tick in flight finishes its current LLM call. daemon=True means
+        # a wedged tick can never block process exit.
+        await asyncio.to_thread(genesis_thread.join, 10.0)
     log.info("[v2.serve_worker] drained; exiting worker=%s", worker_id)
 
 

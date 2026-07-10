@@ -32,13 +32,13 @@ def test_allows_fresh_start_done_failed_and_malformed():
     assert supervisor._genesis_status_blocks_spawn({"status": "failed"}) is False
     assert supervisor._genesis_status_blocks_spawn("not-a-dict") is False
 
-
-def test_genesis_worker_should_start_requires_enable_secret_and_enclave():
-    # Default OFF: the activation hook must not run genesis unless explicitly enabled
-    # AND both prerequisites (runtime-token secret + enclave URL) are present.
-    assert supervisor._genesis_worker_should_start(enabled="", secret="s", enclave_url="u") is False
-    assert supervisor._genesis_worker_should_start(enabled="1", secret="", enclave_url="u") is False
-    assert supervisor._genesis_worker_should_start(enabled="1", secret="s", enclave_url="") is False
-    assert supervisor._genesis_worker_should_start(enabled="true", secret="s", enclave_url="u") is True
-    assert supervisor._genesis_worker_should_start(enabled="on", secret="s", enclave_url="u") is True
-    assert supervisor._genesis_worker_should_start(enabled="false", secret="s", enclave_url="u") is False
+# NOTE (2026-07-10): this file used to also cover
+# supervisor._genesis_worker_should_start (the genesis worker activation gate).
+# That function — and the daemon thread it gated — has been extracted out of
+# supervisor.py entirely into backend/genesis/daemon.py (see
+# docs/superpowers/plans/2026-07-10-genesis-worker-rehome.md, Task 2). Its
+# coverage now lives in tests/test_genesis_daemon.py::test_should_start
+# (parametrized over the same enabled/secret/enclave_url cases). This file
+# keeps only the _genesis_status_blocks_spawn tests above, which cover an
+# unrelated function (whether to spawn a resident CLI process for a host user)
+# that was never moved and still lives in supervisor.py.
