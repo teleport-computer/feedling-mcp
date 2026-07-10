@@ -28,14 +28,16 @@
 # backend/model_api_runtime/v2/agent_loop.py —— 纯：无 DB / 无 hosted / 无 provider import
 @dataclass
 class Decision:
-    actions: list[dict]          # 本轮要跑的 [{type, payload}]；空 = 不再要工具
+    actions: list[dict]          # 本轮要跑的 [{type, payload}]
+    wants_reply: bool = False    # plan 里有 final_response 哨兵 = 收手去回复（见 §13）
     final_text: str | None = None  # 原生后端在收手时自带回复；JSON-planner 恒为 None
 
 async def run_turn(*, decide, run_tools, max_rounds: int) -> tuple[dict, str | None]:
     """decide(round_idx, prior_results) -> Decision
        run_tools(actions)              -> dict  (action_type -> [result,...])
     返回 (累积的 action_results, final_text|None)。
-    停止条件：decide 不再要工具 / 撞 max_rounds / 无进展。"""
+    停止条件：wants_reply / 撞 max_rounds / 无进展 / 无 actions。
+    撞上限或无进展时**强制收口去回复**（chat lane 不存在「无回复正常完成」终态，见 §13）。"""
 ```
 
 `worker.process_job` 负责接线：
@@ -135,8 +137,27 @@ LLM 调用数 ≤ replan_budget × max_rounds + 1(responder)
 - prompt caching（`cache_control`）——它是 `native_tools` 的前置，不是本轮的
 - capability 的 JSON schema——同上
 
-## 12. 待你拍板
+## 12. 已定决策（2026-07-10）
 
-1. `_LOOP_MAX_ROUNDS` 默认 **3**？`_TURN_MAX_LLM_CALLS` 默认 **6**？
-2. BUG-1 走 **(推荐) 先做多模态**，还是 **先摘掉 `chat_image_read` 止血**、多模态另立一轮？
-3. 上线前是否**必须**先量出单轮 tokens/turn 基线（我认为是，否则 D4 的回滚门没有参照物）？
+1. **`_LOOP_MAX_ROUNDS = 3`，`_TURN_MAX_LLM_CALLS = 6`。**
+   注意 §6.1 的上界是 `replan_budget(2) × max_rounds(3) + 1 = 7 > 6`——**这不是笔误，硬闸就是要真的咬住**。撞到 6 时强制收口（见下条 BUG-4 处理）。若两个上限相等，硬闸永远不触发，等于没有。
+
+2. **BUG-1 走「先止血」，不是 spec 原推荐的「先做多模态」。** 我推翻了自己的推荐，理由：
+   - 止血（把 `chat_image_read` 从 `_READ_ACTIONS` + `_PLANNER_SYSTEM` 词表摘掉）之后，planner **根本发不出**这个 action，BUG-1 不可达——"循环会让它更糟"这个耦合当场消失。原推荐是为了避免带病上循环，止血同样达成，且**小得多**。
+   - 多模态是 **per-provider wire 改动**（anthropic image block ≠ openai image_url ≠ 各家中转的支持度），有自己独立的风险面。把它和循环这个**控制流**改动捆在一轮，两者的回归会互相掩盖。
+   - 终态相同，每轮爆炸半径更小。多模态紧接着独立立一轮，届时把 `chat_image_read` 加回词表。
+   - 同时把 `_fold_action_results` 改成**丢 blob 键 + 每 action 独立字符上限**，作为纵深防御——即使将来某个 capability 又开始返回大 blob，也毒不掉 context。
+
+3. **上线前必须先量出单轮 tokens/turn 基线。** 作为实现计划的 Task 2（在循环落地之前），用 D4 的 `scripts/loadtest/` + mock provider 量，结果落文件。否则 D4 runbook 的 `compare_tokens.py --resident-baseline` 回滚门没有参照物，循环上线后无法判断 token 均值抬高是预期内还是失控。
+
+## 13. 循环顺带修掉 BUG-4（矩阵 §E）
+
+写本文时未意识到：`validate_plan` **不强制** `final_response`，而 `worker.py:458` 把"plan 里没有 final_response"直接当成"这回合不用回复"——于是可信模型漏写 `final_response` 时，用户消息被静默吞掉，零气泡。
+
+**"planner 没要求回复" 和 "planner 想先多查点东西" 今天是同一个信号**，worker 猜了前者。循环里这个信号的正确含义恰恰是后者：
+
+- plan 含 `final_response` → 停止取工具，交 responder。
+- plan 不含 `final_response` 且轮数/预算未尽 → **再来一轮**（把上轮结果喂回 planner）。
+- 撞 `_LOOP_MAX_ROUNDS` 或 `_TURN_MAX_LLM_CALLS` → **强制** `final_response`，用手上的结果收口。
+
+所以 chat lane 在循环下**不存在"无回复正常完成"这个终态**，BUG-4 由构造消失，不需要单独补丁。这也让 §3 的停止条件从"decide 返回空 actions"改成**复用既有的 `final_response` 哨兵**——不新增协议。

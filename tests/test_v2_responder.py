@@ -349,3 +349,32 @@ def test_respond_action_results_never_reaches_platform_key_either(monkeypatch):
     ))
     assert len(calls) == 1
     assert calls[0] is sentinel_cfg
+
+
+# --- Task 1 (D-round): BUG-1 defence-in-depth in `_fold_action_results` ---
+
+
+def test_fold_action_results_drops_image_blob():
+    from model_api_runtime.v2 import responder
+    action_results = {
+        "chat_image_read": [{"ok": True, "data": {
+            "message_id": "m1", "image_mime": "image/jpeg", "image_b64": "A" * 50000}}],
+    }
+    folded = responder._fold_action_results(action_results)
+    assert folded["chat_image_read"]["message_id"] == "m1"
+    assert folded["chat_image_read"]["image_mime"] == "image/jpeg"
+    assert "image_b64" not in folded["chat_image_read"]
+
+
+def test_fold_action_results_caps_a_single_oversized_action():
+    from model_api_runtime.v2 import responder
+    action_results = {
+        "memory_fetch": [{"ok": True, "data": {"body": "B" * 50000}}],
+        "perception_snapshot": [{"ok": True, "data": {"mood": "calm"}}],
+    }
+    folded = responder._fold_action_results(action_results)
+    assert folded["memory_fetch"]["_truncated"] is True
+    assert len(folded["memory_fetch"]["preview"]) <= responder._PER_ACTION_CHAR_CAP
+    # The small action must survive intact — the point of the cap is that one
+    # fat capability cannot evict the others from the 8000-char context budget.
+    assert folded["perception_snapshot"] == {"mood": "calm"}

@@ -127,3 +127,50 @@ def test_drain_times_out_when_processor_never_finishes():
     result = run_loadtest.drain(processor=lambda: None, timeout_sec=0.3)
     assert result["drained"] is False
     assert result["elapsed_sec"] >= 0.3
+
+
+def test_mock_provider_estimates_tokens_from_request_and_accumulates():
+    import json
+    import urllib.request
+    from scripts.loadtest.mock_provider import MockProvider, estimate_tokens_from_text
+
+    long_prompt = "x" * 4000
+    with MockProvider(reply="ok", estimate_tokens=True) as p:
+        def _post(content: str) -> dict:
+            req = urllib.request.Request(
+                f"{p.base_url}/chat/completions",
+                data=json.dumps({"messages": [{"role": "user", "content": content}]}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req) as r:
+                return json.loads(r.read())
+
+        small = _post("hi")
+        large = _post(long_prompt)
+
+        # A bigger prompt MUST cost more prompt_tokens — the whole point of the gate.
+        assert large["usage"]["prompt_tokens"] > small["usage"]["prompt_tokens"]
+        assert large["usage"]["prompt_tokens"] == estimate_tokens_from_text(long_prompt)
+        assert small["usage"]["completion_tokens"] == estimate_tokens_from_text("ok")
+
+        # Server-side accumulators see EVERY call, whoever made it.
+        assert p.request_count == 2
+        assert p.total_prompt_tokens == (
+            small["usage"]["prompt_tokens"] + large["usage"]["prompt_tokens"])
+
+
+def test_mock_provider_fixed_tokens_remains_the_default():
+    import json
+    import urllib.request
+    from scripts.loadtest.mock_provider import MockProvider
+
+    with MockProvider(reply="ok", prompt_tokens=100, completion_tokens=20) as p:
+        req = urllib.request.Request(
+            f"{p.base_url}/chat/completions",
+            data=json.dumps({"messages": [{"role": "user", "content": "x" * 4000}]}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as r:
+            body = json.loads(r.read())
+    assert body["usage"]["prompt_tokens"] == 100
+    assert body["usage"]["completion_tokens"] == 20

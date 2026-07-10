@@ -13,17 +13,40 @@ import provider_client
 
 # 封闭动作词表（§4.3，NO recent_chat_digest——它不是 capability，digest 在 worker 确定性构建）。
 # 词表外一律丢弃。final_response 是唯一可见/作者 action。
+#
+# chat_image_read 被**故意移出**词表（BUG-1，见 docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md §E）：
+# 它返回原始 image_b64，会经 responder 的文本 grounding context 挤掉记忆卡/感知。多模态那一轮
+# 会给 provider_client 真正的 image content block，届时把它加回来。
 _READ_ACTIONS = frozenset({
     "identity_get", "memory_index", "memory_fetch", "memory_search",
     "perception_snapshot", "perception_trend", "perception_history",
     "screen_recent", "screen_read", "photo_recent", "photo_read",
-    "chat_image_read", "web_search", "web_fetch",
+    "web_search", "web_fetch",
 })
 _WRITE_ACTIONS = frozenset({
     "memory_write", "identity_patch",
 })
 
 MAX_PLAN_ACTIONS = 5
+
+# 喂回 planner 的上轮结果预览上限。别喂原始 data——那会把 planner 的 prompt 撑成
+# responder 的 grounding context，两轮就爆。planner 只需要知道「查到了什么量级的东西」
+# 来决定还要不要再查。
+_PRIOR_PREVIEW_CHARS = 600
+
+
+def _compact_prior(prior_action_results: dict[str, Any] | None) -> dict[str, Any]:
+    """把上一轮的 action 结果压成 planner 可读的极简摘要：成败计数 + 截断预览。"""
+    out: dict[str, Any] = {}
+    for action_type, runs in (prior_action_results or {}).items():
+        if not isinstance(runs, list):
+            continue
+        ok = [r for r in runs if isinstance(r, dict) and r.get("ok")]
+        fail = [r for r in runs if isinstance(r, dict) and not r.get("ok")]
+        first_data = ok[0].get("data") if ok else None
+        preview = json.dumps(first_data, ensure_ascii=False)[:_PRIOR_PREVIEW_CHARS] if first_data else ""
+        out[action_type] = {"ok_count": len(ok), "fail_count": len(fail), "preview": preview}
+    return out
 
 
 def validate_plan(raw: Any) -> list[dict[str, Any]]:
@@ -93,6 +116,7 @@ async def plan(
     runtime_state: dict,
     lane: str,
     reason: str,
+    prior_action_results: dict | None = None,
 ) -> list[dict[str, Any]]:
     """回合 planner。is_official=False → 确定性规则（零 LLM）；True → 用户 BYOK provider_config 结构化 JSON planner。
 
@@ -102,6 +126,10 @@ async def plan(
     原生 async（hosted-runtime-v2 并发修复）：official_plan 内部 await 用户 BYOK 的
     provider 调用，不再经 `asyncio.to_thread` 桥线程池；rule_plan 零 LLM，本就是纯函数，
     直接同步跑完即可（不必也不应该为它单开一个协程调度点）。
+
+    prior_action_results（agent_loop 累积的本回合已完成 action 结果，形如
+    {action_type: [{"ok": bool, "data": ...}, ...]}）只喂给 official_plan——rule_plan
+    是确定性规则，不从工具结果里学习，忽略此参数（弱/杂牌模型用户实质上仍是单轮）。
     """
     if not is_official:
         return rule_plan(coalesced_messages=coalesced_messages, memory_index=memory_index, lane=lane)
@@ -109,7 +137,7 @@ async def plan(
         provider_config=provider_config,
         coalesced_messages=coalesced_messages, digest=digest, memory_index=memory_index,
         perception_summary=perception_summary, runtime_state=runtime_state,
-        lane=lane, reason=reason,
+        lane=lane, reason=reason, prior_action_results=prior_action_results,
     )
 
 
@@ -119,21 +147,25 @@ _PLANNER_SYSTEM = (
     "Choose 1-5 short actions from this EXACT vocabulary: "
     "identity_get, memory_index, memory_fetch, memory_search, perception_snapshot, "
     "perception_trend, perception_history, screen_recent, screen_read, photo_recent, "
-    "photo_read, chat_image_read, web_search, web_fetch, memory_write, identity_patch, "
+    "photo_read, web_search, web_fetch, memory_write, identity_patch, "
     "final_response. memory_search is keyword/grep search over memory cards (needs a "
     "payload.query string) — prefer it over memory_index when the user asks to find/recall "
     "something specific. "
     "Rules: prefer the SHORTEST plan; non-response actions must not produce visible text; "
     "do not mutate state without a strong reason; a reply is always warranted here, so "
     "include final_response LAST. "
+    "If `prior_action_results` is present, it holds what THIS turn's earlier tool rounds "
+    "already returned: request more actions only if they are still missing something, "
+    "otherwise include final_response now. You get at most 3 rounds. "
     "Never wrap the JSON in Markdown."
 )
 
 
 def _planner_user_payload(
-    *, coalesced_messages, digest, memory_index, perception_summary, runtime_state, lane, reason
+    *, coalesced_messages, digest, memory_index, perception_summary, runtime_state, lane, reason,
+    prior_action_results=None,
 ) -> dict:
-    return {
+    payload = {
         "lane": lane,
         "reason": reason,
         "messages": [{"content": str(m.get("content") or "")[:2000]} for m in coalesced_messages[-8:]],
@@ -142,6 +174,10 @@ def _planner_user_payload(
         "perception_summary": perception_summary,
         "runtime_state": runtime_state or {},   # 只含非敏感 digest（无 provider 三元组、无 key）
     }
+    compact = _compact_prior(prior_action_results)
+    if compact:
+        payload["prior_action_results"] = compact
+    return payload
 
 
 def _parse_plan_json(reply: str) -> Any:
@@ -174,6 +210,7 @@ async def official_plan(
     runtime_state: dict,
     lane: str,
     reason: str,
+    prior_action_results: dict | None = None,
 ) -> list[dict[str, Any]]:
     """轻量结构化 JSON planner，跑用户自己的 **BYOK provider_config**（§7.2/7.3）。
 
@@ -186,6 +223,7 @@ async def official_plan(
         coalesced_messages=coalesced_messages, digest=digest,
         memory_index=memory_index, perception_summary=perception_summary,
         runtime_state=runtime_state, lane=lane, reason=reason,
+        prior_action_results=prior_action_results,
     )
     messages = [
         {"role": "system", "content": _PLANNER_SYSTEM},

@@ -32,6 +32,21 @@ _TEMPERATURE = 0.7
 _TIMEOUT_SEC = 60.0
 _ACTION_CONTEXT_CHAR_CAP = 8000
 
+# 单个 action 的 grounding 上限。没有它，一个返回大 blob 的 capability 能把整个
+# _ACTION_CONTEXT_CHAR_CAP 吃光，把同回合 fetch 到的记忆卡/感知全挤出 context（BUG-1 的
+# 一般形式）。BLOB 键则直接丢——它们对文本 responder 永远没有意义。
+_PER_ACTION_CHAR_CAP = 2000
+_BLOB_KEYS = frozenset({"image_b64"})
+
+
+def _strip_blobs(value: Any) -> Any:
+    """递归剥掉 `_BLOB_KEYS`。dict/list 之外的值原样返回。"""
+    if isinstance(value, dict):
+        return {k: _strip_blobs(v) for k, v in value.items() if k not in _BLOB_KEYS}
+    if isinstance(value, list):
+        return [_strip_blobs(v) for v in value]
+    return value
+
 
 class ResponderError(Exception):
     """responder 无法产出 model-authored 文本（无用户消息 / provider 空回复 / provider 错）。
@@ -52,6 +67,10 @@ def _fold_action_results(action_results: dict[str, Any] | None) -> dict[str, Any
     `.to_dict()`（`{"ok", "data", ...}`）。只取 ok=True 且有 data 的那些 —— data 已由
     A 层 capability 做过截断/脱敏，对模型可见是安全的（模型本就能看用户自己的记忆/感知）。
     None/空/畸形输入一律静默忽略，绝不抛错——这是 minimal 路径（无 action）必须继续可用。
+
+    BUG-1 defence-in-depth（parity matrix §E）：blob 键（`_BLOB_KEYS`，如 image_b64）一律
+    剥掉；任一 action 序列化后超过 `_PER_ACTION_CHAR_CAP` 就整体替换成一个截断预览，
+    这样单个肥 capability 就永远不能把同回合的其它 action 挤出 8000 字符的 context 预算。
     """
     ctx: dict[str, Any] = {}
     if not action_results:
@@ -60,12 +79,17 @@ def _fold_action_results(action_results: dict[str, Any] | None) -> dict[str, Any
         if not isinstance(runs, list):
             continue
         payloads = [
-            r.get("data")
+            _strip_blobs(r.get("data"))
             for r in runs
             if isinstance(r, dict) and r.get("ok") and r.get("data")
         ]
-        if payloads:
-            ctx[action_type] = payloads if len(payloads) > 1 else payloads[0]
+        if not payloads:
+            continue
+        folded = payloads if len(payloads) > 1 else payloads[0]
+        rendered = json.dumps(folded, ensure_ascii=False)
+        if len(rendered) > _PER_ACTION_CHAR_CAP:
+            folded = {"_truncated": True, "preview": rendered[:_PER_ACTION_CHAR_CAP]}
+        ctx[action_type] = folded
     return ctx
 
 

@@ -39,6 +39,7 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 import provider_client  # noqa: E402
+from model_api_runtime.v2 import planner as v2_planner  # noqa: E402
 from model_api_runtime.v2 import responder as v2_responder  # noqa: E402
 
 from scripts.loadtest.mock_provider import MockProvider  # noqa: E402
@@ -151,6 +152,57 @@ def measure_v2_tokens_per_turn(
         _measure_v2_tokens_per_turn_async(fixtures, mock_base_url=mock_base_url)
     )
     return sum(totals) / len(totals)
+
+
+async def _drive_turn_async(provider_config, fixture: dict[str, Any]) -> None:
+    """跑一个**完整回合**的 LLM 调用序列：planner（可能多轮）+ responder。
+
+    这是 token 门唯一正确的观测口径。老的 `measure_v2_tokens_per_turn` 只跑 responder，
+    因此对"循环让 planner 多跑几轮"这件事完全失明——而那恰恰是本次改动的全部风险。
+    token 计数不在这里做：由 MockProvider 的服务端累加器统计，它看得见每一次调用，
+    无论调用方是谁、调了几次。
+    """
+    tail = list(fixture.get("tail") or [])
+    coalesced = [m for m in tail if m.get("role") == "user"]
+    await v2_planner.plan(
+        None,
+        provider_config=provider_config, is_official=True,
+        coalesced_messages=coalesced,
+        digest={"messages": [{"content": str(m.get("content") or "")[:400]} for m in coalesced[-6:]]},
+        memory_index={}, perception_summary={}, runtime_state={},
+        lane="chat", reason="loadtest",
+    )
+    await v2_responder.respond(
+        provider_config=provider_config,
+        summary=str(fixture.get("summary") or ""),
+        tail=tail,
+    )
+
+
+def measure_turn_tokens(fixtures: list[dict[str, Any]], *, provider) -> dict[str, Any]:
+    """把每个 fixture 当成一个完整回合跑过 planner+responder，返回每回合的 token 与
+    LLM 调用次数均值。`provider` 是一个已启动的 `MockProvider(estimate_tokens=True)`。
+
+    fixtures 为空 → 抛（均值无定义）。
+    """
+    if not fixtures:
+        raise ValueError("measure_turn_tokens requires at least one fixture")
+    provider_config = provider_client.ProviderConfig(
+        provider="openai_compatible", model="loadtest-mock",
+        api_key="mock-key", base_url=provider.base_url,
+    )
+
+    async def _run() -> None:
+        for fixture in fixtures:
+            await _drive_turn_async(provider_config, fixture)
+
+    asyncio.run(_run())
+    turns = float(len(fixtures))
+    total = provider.total_prompt_tokens + provider.total_completion_tokens
+    return {
+        "tokens_per_turn": total / turns,
+        "llm_calls_per_turn": provider.request_count / turns,
+    }
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
