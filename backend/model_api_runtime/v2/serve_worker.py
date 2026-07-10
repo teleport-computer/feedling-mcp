@@ -119,26 +119,56 @@ def _caption_envelope(m: dict) -> dict | None:
     }
 
 
-def _image_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
-    """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。
+def _caption_text(m, *, mid, token, caption_budget: list[int], fallback: str) -> str:
+    """附件行（image / file）的可见文本：随附件发的那句话，取不到就退化成 `fallback`。
 
-    `caption_budget` 是一个单元素列表（可变计数器）：预算耗尽后不再解 caption，退化成
-    `_IMAGE_MARKER`。caption 解密失败同样静默退化——看不到那句话，好过整个回合失败。
+    `caption_budget` 是一个单元素列表（可变计数器）：预算耗尽后不再解 caption。
+    caption 解密失败同样静默退化——看不到那句话，好过整个回合失败。
     """
-    text = _IMAGE_MARKER
     cap_env = _caption_envelope(m)
-    if cap_env is not None and caption_budget[0] > 0:
-        caption_budget[0] -= 1
-        try:
-            caption = core_enclave._decrypt_envelope_via_enclave(
-                cap_env, None, purpose="v2_caption_read", runtime_token=token
-            ).decode("utf-8", errors="replace").strip()
-            if caption:
-                text = caption
-        except Exception as e:  # noqa: BLE001 — 静默降级，绝不拖垮回合
-            log.warning("[v2.serve_worker] caption decrypt failed msg=%s: %s", mid, e)
+    if cap_env is None or caption_budget[0] <= 0:
+        return fallback
+    caption_budget[0] -= 1
+    try:
+        caption = core_enclave._decrypt_envelope_via_enclave(
+            cap_env, None, purpose="v2_caption_read", runtime_token=token
+        ).decode("utf-8", errors="replace").strip()
+        return caption or fallback
+    except Exception as e:  # noqa: BLE001 — 静默降级，绝不拖垮回合
+        log.warning("[v2.serve_worker] caption decrypt failed msg=%s: %s", mid, e)
+        return fallback
+
+
+def _image_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
+    """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。"""
+    text = _caption_text(m, mid=mid, token=token, caption_budget=caption_budget,
+                         fallback=_IMAGE_MARKER)
     return {"id": mid, "ts": ts, "role": role, "content": text,
             "has_image": True, "image_mime": m.get("image_mime") or "image/jpeg"}
+
+
+def _file_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
+    """文件行 -> **纯文本** tail 行。**绝不解密 body_ct。**
+
+    文件消息的明文是**原始文件字节**（`chat_send_core`: `user_plaintext = file_parse["bytes"]`，
+    `content_type="file"`）。没有这个分支，这一行会掉进下面通用的
+    `_decrypt_envelope_via_enclave(...).decode("utf-8")`，一个 PDF 立刻 `UnicodeDecodeError`
+    —— 而它会**抛出整个 `_read_tail`**，连带打死该用户的 chat / wake / extraction /
+    compaction 四条路径（compaction 用 limit=10_000 调同一个函数）。
+
+    这个洞是两个各自正确的特性撞出来的：上游加文件上传时 V2 还不存在，V2 写这条读路径时
+    `content_type == "file"` 还不存在。两边的测试都覆盖不到。
+
+    `file_name` / `file_mime` 是**明文** extra 字段（`core/store.py:406-407`），所以渲染
+    这一行连 enclave 都不用打——只有 caption 需要（和图片同一套 `caption_*` 信封，见
+    `enclave/routes/chat.py:104-112`）。
+    """
+    name = str(m.get("file_name") or "file")
+    text = _caption_text(m, mid=mid, token=token, caption_budget=caption_budget,
+                         fallback=f"[file: {name}]")
+    return {"id": mid, "ts": ts, "role": role, "content": text,
+            "has_file": True, "file_name": name,
+            "file_mime": m.get("file_mime") or "application/octet-stream"}
 
 
 def _mint_runtime_token(user_id: str) -> str:
@@ -212,6 +242,10 @@ def _read_messages(user_id: str) -> list[dict]:
             out.append(_image_row(m, mid=mid, ts=ts, role="user",
                                    token=token, caption_budget=caption_budget))
             continue
+        if m.get("content_type") == "file":
+            out.append(_file_row(m, mid=mid, ts=ts, role="user",
+                                  token=token, caption_budget=caption_budget))
+            continue
         if not m.get("body_ct") or m.get("K_enclave") is None:
             continue  # 无 enclave 钥的合成/本地-only 消息跳过
         plaintext = core_enclave._decrypt_envelope_via_enclave(
@@ -252,6 +286,10 @@ def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
         if m.get("content_type") == "image":
             out.append(_image_row(m, mid=mid, ts=ts, role=role,
                                    token=token, caption_budget=caption_budget))
+            continue
+        if m.get("content_type") == "file":
+            out.append(_file_row(m, mid=mid, ts=ts, role=role,
+                                  token=token, caption_budget=caption_budget))
             continue
         if not m.get("body_ct") or m.get("K_enclave") is None:
             continue  # 无 enclave 钥的合成/本地-only 消息跳过
