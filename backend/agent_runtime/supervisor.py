@@ -1132,41 +1132,6 @@ def _effective_roster(base_roster: list[dict], *, autodiscover: bool,
     return _wire_gateway_models(roster)
 
 
-_GENESIS_TICK_DEFAULT_SEC = 30
-_GENESIS_TOKEN_TTL_DEFAULT_SEC = 7200  # a large import can spend >15min in LLM calls
-
-
-def _truthy(value: str) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _genesis_worker_should_start(*, enabled: str, secret: str, enclave_url: str) -> bool:
-    """Activate the in-CVM genesis worker only when explicitly enabled AND its
-    prerequisites are present (runtime-token secret to mint scoped tokens, enclave
-    URL to decrypt chunks). Default OFF — landing the hook must not run genesis
-    until the env opts in; missing prereqs stay dormant rather than fail jobs."""
-    if not _truthy(enabled):
-        return False
-    return bool(str(secret or "").strip()) and bool(str(enclave_url or "").strip())
-
-
-def _genesis_worker_loop(*, api_url, enclave_url, mint_genesis, interval, stop_event):
-    """Background daemon: poll genesis.worker.tick. Separate from sup.tick so a
-    long genesis run never blocks chat-consumer supervision. Worker claim is
-    FOR UPDATE SKIP LOCKED, so multiple supervisors/threads are safe."""
-    from genesis import worker as genesis_worker
-    while not stop_event.is_set():
-        try:
-            # Reap imports wedged in 'processing' (worker/daemon died mid-run)
-            # before claiming new work, so a crashed job can't block spawn forever.
-            genesis_worker.reap_stale_processing_jobs()
-            genesis_worker.tick(api_url=api_url, enclave_url=enclave_url,
-                                mint_runtime_token=mint_genesis, max_jobs=1)
-        except Exception as e:  # noqa: BLE001
-            log.exception("genesis worker tick failed: %s", e)
-        stop_event.wait(interval)
-
-
 def _supervisor_heartbeat_payload(owner: str, *, host_all: bool, gateway: bool, ts: float) -> dict:
     """Global heartbeat the backend's wedge guard reads. ``host_all``/``gateway``
     let the backend detect the cross-service config divergence (supervisor up but
@@ -1346,34 +1311,6 @@ def main() -> int:
     for _uid, _detail in base_roster_key_decrypt_failures:
         sup._emit_runner_notice(_uid, "runner_key_decrypt_failed", _detail)
 
-    # Genesis CVM worker — runs in its own daemon thread (never inline in the tick
-    # loop). Default OFF; activates only when FEEDLING_GENESIS_WORKER_ENABLED is set
-    # AND a runtime-token secret + enclave URL are present (else dormant + warn).
-    genesis_enabled = os.environ.get("FEEDLING_GENESIS_WORKER_ENABLED", "")
-    genesis_stop = threading.Event()
-    if _genesis_worker_should_start(enabled=genesis_enabled, secret=secret_raw, enclave_url=enclave_url):
-        g_secret = secret_raw.encode("utf-8")
-        genesis_ttl = float(os.environ.get(
-            "FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC", str(_GENESIS_TOKEN_TTL_DEFAULT_SEC)))
-        g_interval = float(os.environ.get(
-            "FEEDLING_GENESIS_WORKER_INTERVAL_SEC", str(_GENESIS_TICK_DEFAULT_SEC)))
-
-        def mint_genesis(user_id, scopes=None):
-            return runtime_token.mint(
-                g_secret, user_id=user_id, runtime_instance_id=owner,
-                scope=list(scopes or ["envelope_decrypt", "genesis"]), ttl=genesis_ttl)
-
-        threading.Thread(
-            target=_genesis_worker_loop, daemon=True,
-            kwargs={"api_url": api_url, "enclave_url": enclave_url,
-                    "mint_genesis": mint_genesis, "interval": g_interval,
-                    "stop_event": genesis_stop},
-        ).start()
-        log.info("genesis worker enabled — interval=%.0fs token_ttl=%.0fs", g_interval, genesis_ttl)
-    elif _truthy(genesis_enabled):
-        log.warning("FEEDLING_GENESIS_WORKER_ENABLED set but prerequisites missing "
-                    "(need FEEDLING_RUNTIME_TOKEN_SECRET + FEEDLING_ENCLAVE_URL) — genesis worker dormant")
-
     # Heartbeat from a dedicated thread, decoupled from the (potentially slow)
     # discover→resolve→spawn loop below: a multi-minute cold-start pass must not
     # stall the wedge-guard heartbeat (else the backend 503s every send). Capped
@@ -1501,7 +1438,6 @@ def main() -> int:
     finally:
         hb_stop.set()
         renew_stop.set()
-        genesis_stop.set()
         sup.shutdown()
         if gateway_mgr is not None:
             gateway_mgr.shutdown()

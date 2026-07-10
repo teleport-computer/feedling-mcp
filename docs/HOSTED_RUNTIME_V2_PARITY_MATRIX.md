@@ -76,8 +76,8 @@ These block "delete agent-runner" but are a rehome, not a rewrite.
 
 | Thing | Where | Note |
 |---|---|---|
-| genesis import worker | `FEEDLING_GENESIS_WORKER_ENABLED: "1"` in `deploy/docker-compose.phala.prod.runner.yaml:87`; `supervisor._genesis_worker_should_start` (`:979`) | prod compose comment: the runner CVMs are the **only** place genesis import jobs get drained |
-| in-CVM LiteLLM gateway child | `supervisor.py:60` imports `litellm_gateway`; spawned for gateway providers (gemini / openrouter / openai_compatible) | 🔎 **Unverified**: V2's `responder` calls `provider_client` over plain HTTP and never spawns codex, so it *probably* needs no gateway. **Must be confirmed before the gateway child is removed.** |
+| genesis import worker | ~~`supervisor._genesis_worker_should_start`~~ → `backend/genesis/daemon.py`; started by `serve_worker._start_genesis_thread` | ✅ **Rehomed 2026-07-10.** It was a daemon thread in `agent-runner`'s supervisor only because supervisor was the CVM's one long-running process — zero coupling to the resident CLI runtime. `genesis_import_jobs` has exactly ONE drain (`db.genesis_claim_uploaded_jobs`), so retiring agent-runner would have silently stalled all onboarding distillation. Now a dedicated thread in `serve-worker` (not `asyncio.to_thread` — a tick blocks minutes on the LLM reduce). Liveness: `v2_worker_heartbeats.kind='genesis'` → `genesis_alive` on `/v1/admin/v2-metrics`. |
+| in-CVM LiteLLM gateway child | `supervisor.py:60` imports `litellm_gateway`; spawned for gateway providers (gemini / openrouter / openai_compatible) | ✅ **Verified independent of V2** (§G Q2). It is a codex-CLI bridge. V2 calls the user's upstream directly. `GatewayManager.reconcile([])` self-stops once the roster empties, so kill-resident retires it automatically. Guarded by `tests/test_v2_no_gateway_dependency.py`. |
 | per-user leases + heartbeats | `agent_runtime/leases.py`, `agent_runtime_instances` | V2 uses `agent_jobs` single-flight + `v2_worker_heartbeats` instead |
 
 ---
@@ -129,16 +129,31 @@ This is the deepest reason the one-shot shape is wrong: **"the planner didn't as
 **3. V2 is already ahead — no work**
 - `memory_search`, `memory_write`, `identity_get`/`identity_patch`, summary compaction.
 
-**4. Infrastructure rehome (not capability work)**
-- Move the genesis import worker out of the agent-runner container.
-- Confirm gateway providers need no in-CVM LiteLLM under V2, then drop the child.
+**4. Infrastructure rehome (not capability work)** — ✅ **BUCKET EMPTY**
+- ~~Move the genesis import worker out of the agent-runner container.~~ ✅ **DONE 2026-07-10** — extracted to `backend/genesis/daemon.py`, hosted by `serve_worker` on a dedicated thread, with a `kind='genesis'` heartbeat so its death stops being silent. `supervisor.py` no longer starts it at all.
+- ~~Confirm gateway providers need no in-CVM LiteLLM under V2, then drop the child.~~ ✅ **DONE** — confirmed (§G Q2); the child self-stops on an empty roster, so there is nothing to drop by hand.
+
+Nothing further blocks deleting the `agent-runner` container.
 
 ---
 
 ## G. Open questions
 
 1. **Local file read / bash** — port, or declare it a sandbox accident and drop it?
-2. **Gateway + LiteLLM** — does V2 truly bypass it? (Blocks removing the supervisor's LiteLLM child.)
+2. ~~**Gateway + LiteLLM** — does V2 truly bypass it?~~ ✅ **ANSWERED: yes, completely (2026-07-10).**
+   The in-CVM LiteLLM proxy is a **codex-CLI bridge**: codex speaks the OpenAI Responses wire and cannot
+   reach gemini/openrouter directly, so the resident runtime ran a per-CVM proxy and pointed codex at it.
+   V2 never spawns codex — `responder`/`planner`/`extraction` call `provider_client` over plain HTTP, and
+   `provider_client` speaks all three providers natively. Verified three ways: (a) zero references to
+   `litellm`/`FEEDLING_LITELLM`/`:4000` anywhere in `model_api_runtime/v2/*` or `capabilities/*`;
+   (b) the only readers of `FEEDLING_LITELLM_BASE_URL` are `agent_runtime/spawners.py` and
+   `agent_runtime/supervisor.py` (the codex spawn path); (c) **behavioural** — poison the gateway endpoint
+   and drive the real `responder.respond` for gemini/openrouter/openai_compatible: every outbound request
+   lands on the user's own upstream. Pinned by `tests/test_v2_no_gateway_dependency.py`.
+   **Teardown is automatic**: the D0 exclusivity guard drops `db_action_v2` users from
+   `db.list_agent_runtime_enabled_users`, so `_gateway_entries(roster)` yields `[]`, and
+   `GatewayManager.reconcile([])` calls `_stop()` (`litellm_gateway.py:362-365`). Once every user is
+   migrated the child stops itself — no separate step, nothing to delete by hand.
 3. **Resident web access** — confirm it comes from the CLI's built-in web tool and not something we haven't found. If a user's provider is a relay whose CLI has no web tool, does the resident agent have web at all today? (Affects whether V2's DuckDuckGo facade is parity, a regression, or an upgrade.)
 4. ~~**dream / screen_watch** — still wanted as products, or candidates for §2?~~ ✅ **Resolved: both kept as products and shipped.** `dream` → §B `dream` (aligned). `screen_watch` → §B `screen-watch` (aligned): producer `serve_worker._tick_screen_watch_for_user`, pure gate `v2/screen_watch.py`, state in `v2_wake_schedule`, handler `_run_wake`.
 5. **Dead column: `v2_wake_schedule.next_capture_at`.** The capture lane is driven by `capture_scheduler.tick_quiet_capture`'s own quiet-window bookkeeping (§B `capture`), **not** by a `next_capture_at` poll — so `upsert_wake_schedule(next_capture_at=…)` / `get_wake_schedule()["next_capture_at"]` have **no production writer or reader**. The column is inert (mirrors `next_heartbeat_at` / `next_screen_watch_at` for symmetry but was never wired to a producer). Safe to drop in a future migration, or wire if capture ever moves to a due-time poll.
