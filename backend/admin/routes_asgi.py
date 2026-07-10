@@ -258,5 +258,41 @@ async def tee_replication_status(request: Request):
     return JSONResponse(payload)
 
 
+@router.post("/v1/admin/hosted-runtime-mode")
+async def hosted_runtime_mode_set(request: Request):
+    _require_admin(request)
+    payload = (await read_json_silent(request)) or {}
+    user_id = str(payload.get("user_id") or "").strip()
+    mode = str(payload.get("mode") or "").strip()
+    if not user_id or not mode:
+        return JSONResponse({"error": "user_id and mode required"}, status_code=400)
+    body, status = await threadpool.run_db(admin_core.set_runtime_mode, user_id, mode)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/admin/hosted-runtime-mode")
+async def hosted_runtime_mode_get(request: Request):
+    _require_admin(request)
+    user_id = (request.query_params.get("user_id") or "").strip()
+    if not user_id:
+        return JSONResponse({"error": "user_id required"}, status_code=400)
+    body, status = await threadpool.run_db(admin_core.get_runtime_mode, user_id)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/admin/hosted-runtime-modes")
+async def hosted_runtime_modes_list(request: Request):
+    _require_admin(request)
+    payload = await threadpool.run_db(admin_core.list_runtime_modes)
+    return JSONResponse(payload)
+
+
+@router.get("/v1/admin/v2-metrics")
+async def v2_metrics(request: Request):
+    _require_admin(request)
+    payload = await threadpool.run_db(admin_core.v2_metrics)
+    return JSONResponse(payload)
+
+
 def register_asgi(app) -> None:
     app.include_router(router)

@@ -14,6 +14,18 @@ import db
 from core import wake_bus
 
 LANES = {"chat", "manual_wake", "heartbeat", "scheduled", "capture", "maintenance"}
+
+# 默认（lane 派生）优先级：预留槽位场景下 chat/manual_wake 必须能在一堆 heartbeat/
+# capture 前面被抢到，防止后台唤醒风暴饿死聊天回复。enqueue_job 未显式传 priority
+# 时按 lane 落这个值；调用方显式传 priority=<int> 仍原样生效（不被这里覆盖）。
+LANE_PRIORITY = {
+    "chat": 100,
+    "manual_wake": 100,
+    "heartbeat": 50,
+    "scheduled": 50,
+    "capture": 10,
+    "maintenance": 10,
+}
 # mark_running 时若 job 无 deadline_at，补一个（now + 该秒数），供 reaper 兜底回收
 # 卡死的 claimed/running job。chat lane 的 enqueue 不带 deadline，全靠这个兜底。
 #
@@ -37,7 +49,7 @@ def _pool():
 
 
 def enqueue_job(
-    user_id, lane, *, reason=None, trace_id=None, priority=0, deadline_at=None
+    user_id, lane, *, reason=None, trace_id=None, priority=None, deadline_at=None
 ) -> tuple[int, bool]:
     """入队一个 job。命中 per-user/lane single-flight（已有 active job）则合并到现有
     pending，返回 (existing_id, True)；否则新建，返回 (new_id, False)。
@@ -45,9 +57,15 @@ def enqueue_job(
     实现：事务内先 SELECT ... FOR UPDATE 现有 active job；无则 INSERT。两个并发 enqueue
     可能都读不到现有行而各自 INSERT → 第二个撞 ux_agent_jobs_singleflight 唯一索引抛
     UniqueViolation → 重试一轮即读到赢家并 coalesce。唯一索引是最终防线。
+
+    priority：未显式传（None）时按 LANE_PRIORITY 从 lane 派生（chat/manual_wake=100，
+    heartbeat/scheduled=50，capture/maintenance=10）；调用方显式传一个 int 则原样
+    使用，不被 lane 派生值覆盖。
     """
     if lane not in LANES:
         raise ValueError(f"unknown lane: {lane!r}")
+    if priority is None:
+        priority = LANE_PRIORITY.get(lane, 0)
     for _ in range(3):
         try:
             with _pool().connection() as conn:
@@ -85,19 +103,33 @@ def enqueue_job(
     return int(row["id"]), True
 
 
-def claim_next_job(worker_id: str) -> dict | None:
+def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | None:
     """抢下一个 pending job（priority DESC, created_at）。用 FOR UPDATE SKIP LOCKED 让
     多进程/多 slot 无争用地各抢各的。pending → claimed，落 claimed_by/claimed_at。
-    返回整行 dict（含 id/user_id/lane/trace_id/...），无活可抢返回 None。"""
+    返回整行 dict（含 id/user_id/lane/trace_id/...），无活可抢返回 None。
+
+    lanes：可选 lane 白名单（预留槽位场景，如某个 slot 只允许抢 {"chat",
+    "manual_wake"}，保证聊天回复不被 heartbeat/capture 之类的后台唤醒风暴饿死）。
+    None（默认）＝不限制 lane，行为与改动前完全一致。"""
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    "SELECT id FROM agent_jobs "
-                    "WHERE status='pending' AND (deadline_at IS NULL OR deadline_at > now()) "
-                    "ORDER BY priority DESC, created_at "
-                    "FOR UPDATE SKIP LOCKED LIMIT 1"
-                )
+                if lanes is None:
+                    cur.execute(
+                        "SELECT id FROM agent_jobs "
+                        "WHERE status='pending' AND (deadline_at IS NULL OR deadline_at > now()) "
+                        "ORDER BY priority DESC, created_at "
+                        "FOR UPDATE SKIP LOCKED LIMIT 1"
+                    )
+                else:
+                    cur.execute(
+                        "SELECT id FROM agent_jobs "
+                        "WHERE status='pending' AND (deadline_at IS NULL OR deadline_at > now()) "
+                        "AND lane = ANY(%s) "
+                        "ORDER BY priority DESC, created_at "
+                        "FOR UPDATE SKIP LOCKED LIMIT 1",
+                        (list(lanes),),
+                    )
                 head = cur.fetchone()
                 if head is None:
                     return None
@@ -331,6 +363,142 @@ def workers_alive(*, within_sec: int = 30) -> bool:
             return bool(cur.fetchone()[0])
 
 
+def live_worker_count(*, within_sec: int = 30) -> int:
+    """窗口内有心跳的 serve_worker 数（workers_alive 的计数版，喂 admission ceiling）。"""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM v2_worker_heartbeats "
+                "WHERE beat_at > now() - make_interval(secs => %s)",
+                (int(within_sec),),
+            )
+            return int(cur.fetchone()[0])
+
+
+def inflight_job_count() -> int:
+    """在飞 job 数（pending/claimed/running）。单飞唯一索引 → 约等活跃用户数。"""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM agent_jobs "
+                "WHERE status IN ('pending','claimed','running')"
+            )
+            return int(cur.fetchone()[0])
+
+
+def recent_mean_service_sec(*, lane: str = "chat", limit: int = 50) -> float | None:
+    """最近 limit 条 completed job 的均服务时长（finished_at−started_at，秒）。
+    无历史 → None（调用方用默认常量）。"""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT avg(EXTRACT(EPOCH FROM (finished_at - started_at))) "
+                "FROM (SELECT finished_at, started_at FROM agent_jobs "
+                "      WHERE status='completed' AND lane=%s "
+                "      AND finished_at IS NOT NULL AND started_at IS NOT NULL "
+                "      ORDER BY finished_at DESC LIMIT %s) recent",
+                (str(lane), int(limit)),
+            )
+            row = cur.fetchone()
+            return None if row is None or row[0] is None else float(row[0])
+
+
+def record_turn_metric(
+    *,
+    job_id: int | None,
+    user_id: str,
+    lane: str,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    latency_ms: int | None,
+) -> None:
+    """插一行到 v2_turn_metrics（append-only，无 FK）。由 responder/worker 在一轮
+    turn 结束后调用；provider 未回 usage 时 prompt/completion_tokens 传 None，
+    该行仍落地（latency 仍可信），只是不参与 recent_mean_tokens_per_turn 的均值。"""
+    with _pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(job_id, user_id, lane, prompt_tokens, completion_tokens, latency_ms) "
+            "VALUES (%s,%s,%s,%s,%s,%s)",
+            (job_id, str(user_id), str(lane), prompt_tokens, completion_tokens, latency_ms),
+        )
+
+
+def recent_mean_tokens_per_turn(*, lane: str = "chat", limit: int = 50) -> float | None:
+    """最近 limit 条该 lane 的 v2_turn_metrics 行中，prompt_tokens+completion_tokens
+    的均值——只看两列都非 NULL 的行（provider 未回 usage 的行被自然排除）。
+    无这样的历史 → None（调用方用默认常量，同 recent_mean_service_sec 的约定）。"""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT avg(prompt_tokens + completion_tokens) "
+                "FROM (SELECT prompt_tokens, completion_tokens FROM v2_turn_metrics "
+                "      WHERE lane=%s AND prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL "
+                "      ORDER BY created_at DESC LIMIT %s) recent",
+                (str(lane), int(limit)),
+            )
+            row = cur.fetchone()
+            return None if row is None or row[0] is None else float(row[0])
+
+
+WAKE_LANES = ("heartbeat", "scheduled", "manual_wake")
+
+
+def wake_success_stats(*, within_hours: int = 24) -> dict:
+    """V2 唤醒（proactive wake）成功率——独立于 legacy `proactive_jobs` 流。V2 的
+    heartbeat/scheduled/manual_wake 唤醒全走 agent_jobs，从不写那张旧表，所以这是
+    一条全新的、只读 agent_jobs 的口径，不是去修 legacy daily-report 那条查询。
+
+    地雷1（legacy daily-report 曾踩过的坑，此处照抄同一原则）：wake job 的
+    `completed` 终态本身就是成功——即使这一轮唤醒判断"这次不用发消息"（silence 是
+    D3 设计里的合法结果），也照样落 status='completed'，必须计入成功，不能因为没发
+    消息就当失败去拉低成功率。只有 `failed`（真错误：provider 异常/校验失败）和
+    `expired`（reaper 判定卡死回收）计入失败侧的分母。
+
+    返回 {"completed": int, "failed": int, "expired": int,
+          "success_rate": float in [0,1] | None（三者之和为 0 时，无历史可算）,
+          "by_lane": {lane: {status: count}}}（by_lane 只含窗口内出现过的 lane/status
+    组合，无活动的 lane 不会出现空条目）。"""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT lane, status, count(*) FROM agent_jobs "
+                "WHERE lane IN ('heartbeat','scheduled','manual_wake') "
+                "AND finished_at IS NOT NULL "
+                "AND finished_at > now() - make_interval(hours => %s) "
+                "GROUP BY lane, status",
+                (int(within_hours),),
+            )
+            rows = cur.fetchall()
+    completed = failed = expired = 0
+    by_lane: dict[str, dict[str, int]] = {}
+    for lane, status, count in rows:
+        count = int(count)
+        by_lane.setdefault(lane, {})[status] = count
+        if status == "completed":
+            completed += count
+        elif status == "failed":
+            failed += count
+        elif status == "expired":
+            expired += count
+    denom = completed + failed + expired
+    return {
+        "completed": completed,
+        "failed": failed,
+        "expired": expired,
+        "success_rate": (completed / denom) if denom else None,
+        "by_lane": by_lane,
+    }
+
+
+def pending_job_count() -> int:
+    """当前排队中（status='pending'，尚未被任何 worker claim）的 job 数。"""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM agent_jobs WHERE status='pending'")
+            return int(cur.fetchone()[0])
+
+
 def get_summary_row(user_id) -> dict | None:
     """读取该用户当前的会话摘要行（若存在）。返回
     {"summary_envelope": dict|None, "watermark_ts": float, "version": int}，
@@ -381,6 +549,71 @@ def upsert_summary_row_cas(
                     ),
                 )
             return cur.rowcount == 1
+
+
+def get_wake_schedule(user_id) -> dict | None:
+    """读取该用户的 v2_wake_schedule 行（proactive 唤醒调度：下次心跳/采集到期时间
+    + BYOK 支付冷却截止），无行返回 None（该用户尚未被调度器接管过）。"""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT user_id, next_heartbeat_at, next_capture_at, "
+                "payment_cooldown_until, updated_at "
+                "FROM v2_wake_schedule WHERE user_id=%s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+def upsert_wake_schedule(
+    user_id,
+    *,
+    next_heartbeat_at: float | None = None,
+    next_capture_at: float | None = None,
+    payment_cooldown_until: float | None = None,
+) -> None:
+    """UPSERT 该用户的唤醒调度行。三个时间列各自是可选的 epoch 浮点数；传 None 表示
+    「本次不动这一列」（COALESCE(EXCLUDED.col, 现有值) 保留旧值），不会把已有到期时间
+    清空——这些列只会被推进到未来的时间戳，从不被置空，调用方总是「只更新我刚算出来的
+    那一列」。updated_at 每次调用都刷新。"""
+    with _pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_wake_schedule "
+            "(user_id, next_heartbeat_at, next_capture_at, payment_cooldown_until, updated_at) "
+            "VALUES (%s, to_timestamp(%s), to_timestamp(%s), to_timestamp(%s), now()) "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "next_heartbeat_at = COALESCE(EXCLUDED.next_heartbeat_at, v2_wake_schedule.next_heartbeat_at), "
+            "next_capture_at = COALESCE(EXCLUDED.next_capture_at, v2_wake_schedule.next_capture_at), "
+            "payment_cooldown_until = COALESCE(EXCLUDED.payment_cooldown_until, v2_wake_schedule.payment_cooldown_until), "
+            "updated_at = now()",
+            (
+                user_id,
+                float(next_heartbeat_at) if next_heartbeat_at is not None else None,
+                float(next_capture_at) if next_capture_at is not None else None,
+                float(payment_cooldown_until) if payment_cooldown_until is not None else None,
+            ),
+        )
+
+
+def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[str]:
+    """到期需要心跳唤醒的 user_id 列表（next_heartbeat_at 已到且不在 BYOK 支付冷却
+    窗口内），按 next_heartbeat_at 升序（最该醒的排前面），供 D3 调度器 poll 后逐个
+    enqueue_job(..., 'heartbeat')。now 可注入 epoch 浮点数用于确定性测试；
+    None → 用 DB now()（镜像 reap_stuck_jobs 的 to_timestamp(%s) 约定）。"""
+    ts = float(now) if now is not None else None
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id FROM v2_wake_schedule "
+                "WHERE next_heartbeat_at IS NOT NULL "
+                "AND next_heartbeat_at <= COALESCE(to_timestamp(%s), now()) "
+                "AND (payment_cooldown_until IS NULL "
+                "     OR payment_cooldown_until <= COALESCE(to_timestamp(%s), now())) "
+                "ORDER BY next_heartbeat_at LIMIT %s",
+                (ts, ts, int(limit)),
+            )
+            return [row[0] for row in cur.fetchall()]
 
 
 def upsert_runtime_state(user_id, patch: dict) -> dict:

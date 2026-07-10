@@ -27,6 +27,7 @@ from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
 from hosted import context as hosted_context
 from hosted import turn as hosted_turn
+from model_api_runtime.v2 import admission
 from model_api_runtime.v2 import jobs_store
 
 
@@ -124,6 +125,37 @@ def model_api_chat_send_core(
             detail={"mode": "blocked", "reason": "workers_unavailable"},
         )
         return {"error": "workers_unavailable", "reason": "no_live_v2_worker_heartbeat"}, 503
+
+    # §6 admission ceiling：存活闸已保证 ≥1 活 worker；再估排队等待，超 SLA 就在
+    # persist 之前回独立 busy（区别于 workers_unavailable=供给死）。任何计算异常
+    # fail-open（放行）——此闸绝不能自身变成故障源。
+    if _v2_mode:
+        _inflight = _workers = 0
+        try:
+            _workers = jobs_store.live_worker_count(within_sec=30)
+            _inflight = jobs_store.inflight_job_count()
+            _mean = jobs_store.recent_mean_service_sec(lane="chat", limit=admission.SERVICE_SAMPLE_N)
+            _est = admission.estimate_wait_sec(
+                inflight=_inflight, workers=_workers,
+                mean_service_sec=_mean, default_service_sec=admission.DEFAULT_SERVICE_SEC,
+            )
+            _admit = admission.should_admit(_est, sla_sec=admission.SLA_SEC)
+        except Exception as exc:  # fail-open
+            debug_trace.trace_event(
+                store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+                status="ok", summary="admission_failopen",
+                detail={"mode": "admit", "error": str(exc)[:120]},
+            )
+            _admit = True
+            _est = 0.0
+        if not _admit:
+            debug_trace.trace_event(
+                store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+                status="gated", summary="admission_over_sla",
+                detail={"mode": "blocked", "reason": "queue_over_sla",
+                        "est_wait_sec": int(_est), "inflight": _inflight, "workers": _workers},
+            )
+            return {"error": "busy", "reason": "queue_over_sla", "est_wait_sec": int(_est)}, 503
 
     # Wedge guard: routing to the agent-runner only works if a supervisor is
     # actually hosting. assert_hosting_ready validated THIS process's env at

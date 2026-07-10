@@ -189,6 +189,147 @@ def test_respond_action_results_none_is_the_same_as_omitted(monkeypatch):
     assert out == "ok"
 
 
+# --- Task 4: usage_out out-param (D4 load-testing needs per-turn token usage) ---
+
+
+def test_respond_populates_usage_out_when_provider_returns_usage(monkeypatch):
+    """`usage_out` is a pure out-param: respond() still returns the stripped text
+    unchanged (str, D1 contract preserved), and additionally writes prompt/
+    completion token counts into the caller-supplied dict."""
+    async def fake_reliable(config, messages, **kwargs):
+        return {"reply": "hi", "usage": {"prompt_tokens": 11, "completion_tokens": 7}}
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", fake_reliable)
+    cfg = provider_client.ProviderConfig(provider="anthropic", model="m", api_key="k")
+    usage_out: dict = {}
+    out = asyncio.run(responder.respond(
+        provider_config=cfg,
+        summary="",
+        tail=[{"id": "1", "ts": 1.0, "role": "user", "content": "hi"}],
+        usage_out=usage_out,
+    ))
+    assert out == "hi"
+    assert usage_out == {"prompt_tokens": 11, "completion_tokens": 7}
+
+
+def test_respond_usage_out_is_none_values_when_provider_omits_usage(monkeypatch):
+    """Providers differ in whether/how they report usage — no usage key at all
+    must not crash respond() and must leave usage_out's values as None."""
+    async def fake_reliable(config, messages, **kw):
+        return {"reply": "hi"}
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", fake_reliable)
+    cfg = provider_client.ProviderConfig(provider="anthropic", model="m", api_key="k")
+    usage_out: dict = {}
+    out = asyncio.run(responder.respond(
+        provider_config=cfg,
+        summary="",
+        tail=[{"id": "1", "ts": 1.0, "role": "user", "content": "hi"}],
+        usage_out=usage_out,
+    ))
+    assert out == "hi"
+    assert usage_out == {"prompt_tokens": None, "completion_tokens": None}
+
+
+def test_respond_usage_out_none_default_is_untouched(monkeypatch):
+    """When usage_out isn't passed at all (the default), respond() must not try
+    to write anywhere — the D1 call sites that predate this kwarg keep working."""
+    async def fake_reliable(config, messages, **kw):
+        return {"reply": "hi", "usage": {"prompt_tokens": 1, "completion_tokens": 2}}
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", fake_reliable)
+    cfg = provider_client.ProviderConfig(provider="anthropic", model="m", api_key="k")
+    out = asyncio.run(responder.respond(
+        provider_config=cfg,
+        summary="",
+        tail=[{"id": "1", "ts": 1.0, "role": "user", "content": "hi"}],
+    ))
+    assert out == "hi"
+
+
+def test_respond_accepts_system_prompt_override(monkeypatch):
+    """D3 Task 6 (wake lanes): the wake handler needs a different system prompt
+    (proactive framing) than the chat default. `system_prompt` is an optional
+    kwarg — passing it must make the FIRST system message carry the override
+    verbatim instead of `responder._SYSTEM_PROMPT`."""
+    seen = {}
+
+    async def fake_reliable(config, messages, **kwargs):
+        seen["messages"] = messages
+        return {"reply": "ok"}
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", fake_reliable)
+    cfg = provider_client.ProviderConfig(provider="anthropic", model="m", api_key="k")
+    asyncio.run(responder.respond(
+        provider_config=cfg,
+        summary="",
+        tail=[{"id": "1", "ts": 1.0, "role": "user", "content": "hi"}],
+        system_prompt="CUSTOM WAKE PROMPT",
+    ))
+    messages = seen["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"] == "CUSTOM WAKE PROMPT"
+    assert responder._SYSTEM_PROMPT not in messages[0]["content"]
+
+
+# --- D3 Task 7: ResponderError carries `.kind` (provider_client.classify_provider_error)
+# so the wake worker can decide to write a BYOK payment cooldown WITHOUT re-parsing the
+# error message string. ---
+
+
+def test_respond_provider_config_error_sets_kind_provider_config(monkeypatch):
+    """A 402-out-of-credits-shaped provider failure must classify as
+    "provider_config" (see provider_client.classify_provider_error /
+    _PROVIDER_CONFIG_STATUS) and be attached to the raised ResponderError as `.kind`."""
+    async def fake_reliable(config, messages, **kw):
+        raise provider_client.ProviderError("insufficient credits", status_code=402)
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", fake_reliable)
+    cfg = provider_client.ProviderConfig(provider="anthropic", model="m", api_key="k")
+    with pytest.raises(responder.ResponderError) as excinfo:
+        asyncio.run(responder.respond(
+            provider_config=cfg,
+            summary="",
+            tail=[{"id": "1", "ts": 1.0, "role": "user", "content": "hi"}],
+        ))
+    assert excinfo.value.kind == "provider_config"
+
+
+def test_respond_transient_error_sets_kind_transient(monkeypatch):
+    """A retryable-shaped failure (e.g. 503) must classify as "transient", NOT
+    "provider_config" — the wake worker must not cooldown a key that's just
+    having a temporary blip."""
+    async def fake_reliable(config, messages, **kw):
+        raise provider_client.ProviderError("upstream hiccup", status_code=503)
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", fake_reliable)
+    cfg = provider_client.ProviderConfig(provider="anthropic", model="m", api_key="k")
+    with pytest.raises(responder.ResponderError) as excinfo:
+        asyncio.run(responder.respond(
+            provider_config=cfg,
+            summary="",
+            tail=[{"id": "1", "ts": 1.0, "role": "user", "content": "hi"}],
+        ))
+    assert excinfo.value.kind == "transient"
+
+
+def test_respond_empty_reply_kind_is_default_empty_string(monkeypatch):
+    """empty_reply/no_user_messages aren't provider errors at all — `.kind` must
+    stay at the class-level default ("") rather than some misleading classification."""
+    async def fake_reliable(config, messages, **kw):
+        return {"reply": "   "}
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", fake_reliable)
+    cfg = provider_client.ProviderConfig(provider="anthropic", model="m", api_key="k")
+    with pytest.raises(responder.ResponderError) as excinfo:
+        asyncio.run(responder.respond(
+            provider_config=cfg,
+            summary="",
+            tail=[{"id": "1", "ts": 1.0, "role": "user", "content": "hi"}],
+        ))
+    assert excinfo.value.kind == ""
+
+
 def test_respond_action_results_never_reaches_platform_key_either(monkeypatch):
     """BYOK-only (§7.3) must hold even when action_results is populated: still exactly
     the injected provider_config, no substitution."""

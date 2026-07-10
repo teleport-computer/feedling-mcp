@@ -855,6 +855,43 @@ def cmd_doctor(args):
     _emit(out, 0 if out["ok"] else 1)
 
 
+def _require_admin():
+    """Resolve (api_url, auth_headers) for the ops-only hosted_runtime_mode
+    endpoints. These are gated by FEEDLING_ADMIN_TOKEN (X-Admin-Token) on the
+    backend (backend/admin/routes_asgi.py's _require_admin) — deliberately NOT
+    the caller's own per-user FEEDLING_API_KEY / runtime token from
+    _auth_headers(), since this flips another user's runtime mode and must not
+    be reachable with just that user's own credentials."""
+    api_url = _env("FEEDLING_API_URL")
+    token = _env("FEEDLING_ADMIN_TOKEN")
+    if not api_url or not token:
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_ADMIN_TOKEN in env"}, 2)
+    return api_url.rstrip("/"), {"X-Admin-Token": token}
+
+
+def cmd_set_runtime_mode(args):
+    """[ops] Flip a user's hosted_runtime_mode. POST /v1/admin/hosted-runtime-mode."""
+    api_url, auth = _require_admin()
+    status, body = _http_json(
+        "POST", f"{api_url}/v1/admin/hosted-runtime-mode", auth,
+        payload={"user_id": args.user_id, "mode": args.mode},
+    )
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_list_runtime_mode(args):
+    """[ops] List user_ids grouped by hosted_runtime_mode. GET /v1/admin/hosted-runtime-modes."""
+    api_url, auth = _require_admin()
+    status, body = _http_json("GET", f"{api_url}/v1/admin/hosted-runtime-modes", auth)
+    if status == 200:
+        if args.mode:
+            _emit({"ok": True, "mode": args.mode, "user_ids": body.get(args.mode, [])})
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def cmd_phase2(args):
     # send / sleep / schedule-wake / cancel-wake are NOT pull tools in the native
     # model — the agent emits them as output actions (JSON messages/actions) which
@@ -1013,6 +1050,21 @@ def main():
     dr = sub.add_parser("doctor",
                         help="Five-probe environment health check (api/enclave/identity/memory/chat, read-only).")
     dr.set_defaults(func=cmd_doctor)
+
+    srm = sub.add_parser(
+        "set-runtime-mode",
+        help="[ops] Flip a user's hosted_runtime_mode (resident_cli|db_action_v2). Requires FEEDLING_ADMIN_TOKEN.",
+    )
+    srm.add_argument("user_id")
+    srm.add_argument("mode", choices=["resident_cli", "db_action_v2"])
+    srm.set_defaults(func=cmd_set_runtime_mode)
+
+    lrm = sub.add_parser(
+        "list-runtime-mode",
+        help="[ops] List user_ids grouped by hosted_runtime_mode. Requires FEEDLING_ADMIN_TOKEN.",
+    )
+    lrm.add_argument("--mode", default="", choices=["", "resident_cli", "db_action_v2"], help="filter to one mode")
+    lrm.set_defaults(func=cmd_list_runtime_mode)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")

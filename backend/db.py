@@ -1827,6 +1827,18 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                 WHERE r.is_active
                   AND r.test_status = 'ok'
                   AND LOWER(c.provider) = ANY(%s)
+                  -- D0 exclusivity guard (Hosted Runtime V2): a user flipped to
+                  -- db_action_v2 runs on the V2 worker pool, so drop them from the
+                  -- resident roster to prevent a double-run. hosted_runtime_mode
+                  -- still lives in the user_blobs 'model_api_runtime' profile even
+                  -- after the model-api-multi-profile migration moved provider
+                  -- config into model_api_routes/credentials.
+                  AND NOT EXISTS (
+                    SELECT 1 FROM user_blobs mrt
+                    WHERE mrt.user_id = r.user_id
+                      AND mrt.kind = 'model_api_runtime'
+                      AND COALESCE(mrt.doc->>'hosted_runtime_mode', '') = 'db_action_v2'
+                  )
                 ORDER BY r.user_id
                 """,
                 (providers,),

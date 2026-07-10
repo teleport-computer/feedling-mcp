@@ -14,10 +14,13 @@ via ``asgi.threadpool.run_db`` from the async routes.
 
 from __future__ import annotations
 
+import db
 from accounts import registry
 from admin import data_track
 from core import store as core_store
 from core.reqctx import bind, request
+from hosted import config_store
+from model_api_runtime.v2 import jobs_store
 
 
 def summary_payload(query_string: str) -> dict:
@@ -93,3 +96,68 @@ def store_evict(user_id: str) -> dict:
     evicted = core_store._evict_store(user_id)
     print(f"[admin:store/evict] user_id={user_id} evicted={evicted}")
     return {"evicted": evicted, "user_id": user_id}
+
+
+# --------------------------------------------------------------------------- #
+# hosted_runtime_mode control plane (Hosted Runtime V2 D0 rollout — gated flip
+# between resident_cli and db_action_v2 without a direct DB write).
+# --------------------------------------------------------------------------- #
+
+def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
+    store = core_store.get_store(user_id)
+    try:
+        persisted_mode = config_store.set_hosted_runtime_mode(store, mode)
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    return {"user_id": user_id, "hosted_runtime_mode": persisted_mode}, 200
+
+
+def get_runtime_mode(user_id: str) -> tuple[dict, int]:
+    store = core_store.get_store(user_id)
+    return {
+        "user_id": user_id,
+        "hosted_runtime_mode": config_store.get_hosted_runtime_mode(store),
+    }, 200
+
+
+def list_runtime_modes() -> dict:
+    # Group user_ids by their persisted hosted_runtime_mode; absent/unknown
+    # values fall back to resident_cli (mirrors config_store.get_hosted_runtime_mode's
+    # default-on-missing-or-invalid behavior).
+    result: dict = {
+        config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2: [],
+        config_store.HOSTED_RUNTIME_MODE_RESIDENT: [],
+    }
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, doc->>'hosted_runtime_mode' AS mode
+            FROM user_blobs
+            WHERE kind = 'model_api_runtime'
+            """
+        ).fetchall()
+    for row in rows:
+        user_id = row[0] if not isinstance(row, dict) else row["user_id"]
+        mode = row[1] if not isinstance(row, dict) else row["mode"]
+        if mode == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+            result[config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2].append(user_id)
+        else:
+            result[config_store.HOSTED_RUNTIME_MODE_RESIDENT].append(user_id)
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# v2 turn metrics (Task 4 — D4 load-testing consumes these via
+# GET /v1/admin/v2-metrics; queue depth/worker liveness/service time/token
+# throughput, all sourced from jobs_store's existing DB-backed counters).
+# --------------------------------------------------------------------------- #
+
+def v2_metrics() -> dict:
+    return {
+        "inflight": jobs_store.inflight_job_count(),
+        "pending": jobs_store.pending_job_count(),
+        "live_workers": jobs_store.live_worker_count(),
+        "mean_service_sec": jobs_store.recent_mean_service_sec(lane="chat"),
+        "recent_mean_tokens_per_turn": jobs_store.recent_mean_tokens_per_turn(lane="chat"),
+        "wake": jobs_store.wake_success_stats(),
+    }
