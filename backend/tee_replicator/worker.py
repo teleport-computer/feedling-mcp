@@ -123,8 +123,17 @@ def _chat_unpack(r: tuple) -> tuple:
     and copies everything else through untouched, so ``_replicator_seq`` survives
     decryption intact; chat_messages' upsert_args below pops it back out before
     the row is written, so it never lands in the stored plaintext ``doc`` JSONB.
+
+    R2-offloaded file rows（content_type="file"，doc 只带 ``body_key`` 指针、无
+    ``body_ct``，见 db.chat_append 的 offload）在这里水合回 body_ct 再交给
+    transform——否则 plaintext_chat_doc 送 enclave 解密一个没有 body_ct 的信封，
+    失败按传输错误处理会把游标永久冻在这行上。水合失败（R2 瞬时故障）时 doc 原样
+    返回、transform 照常失败 → freeze → 下个 pass 重试，与其余瞬时错误同策略。
+    unpack 同时服务 run_table 游标环和 _consume_requeue，两条路径一并覆盖。
     """
     uid, msg_id, ts, doc, seq = r
+    if db._is_chat_file_pointer(doc):
+        doc = db.hydrate_chat_file_body(uid, doc)
     return (uid, msg_id, ts, {**doc, _SEQ_KEY: seq})
 
 

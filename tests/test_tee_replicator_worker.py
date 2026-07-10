@@ -298,3 +298,79 @@ def test_decrypt_failure_freezes_cursor_before_failed_row(backend_env, monkeypat
     assert cur[0][0] == "a"
     # the later good row "c" was still processed this batch
     assert _tee("SELECT count(*) FROM chat_messages WHERE user_id=%s AND msg_id='c'", (uid,))[0][0] == 1
+
+
+def _insert_chat_file_pointer(uid, msg_id, ts):
+    """R2-offloaded file row: envelope metadata + body_key pointer, NO body_ct
+    (the shape db.chat_append leaves behind after a successful offload)."""
+    doc = _chat_doc(uid, msg_id, "IGNORED")
+    del doc["body_ct"]
+    doc["content_type"] = "file"
+    doc["body_key"] = f"chatfiles/{uid}/{msg_id}"
+    doc["body_ct_len"] = 7
+    doc["ts"] = ts
+    with db.get_pool().connection() as c:
+        c.execute("INSERT INTO chat_messages (user_id, msg_id, ts, doc) VALUES (%s,%s,%s,%s)",
+                  (uid, msg_id, ts, Jsonb(doc)))
+
+
+def test_offloaded_file_row_hydrated_from_r2_then_replicated(backend_env, monkeypatch):
+    """chat-file R2 offload (R2_CHAT_FILES_BUCKET) leaves pointer rows with no
+    body_ct; _chat_unpack must hydrate them back before the enclave transform,
+    or the row freezes the chat cursor forever."""
+    import object_storage
+
+    _reset_cursor("chat_messages")
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    _insert_chat(uid, "a", 10.0, "AAA")
+    _insert_chat_file_pointer(uid, "filemsg", 20.0)
+
+    monkeypatch.setattr(object_storage, "chat_files_enabled", lambda: True)
+    monkeypatch.setattr(object_storage, "get_chat_file_body",
+                        lambda u, m: "FILECT" if (u, m) == (uid, "filemsg") else None)
+
+    report = worker.run_table("chat_messages", qps=1000)
+
+    assert report["copied"] == 2 and report["errors"] == 0
+    body = _tee("SELECT doc->>'body' FROM chat_messages WHERE user_id=%s AND msg_id='filemsg'", (uid,))
+    assert body[0][0] == "PT:FILECT"
+    # pointer keys never land in the TEE plaintext doc's crypto fields; the body
+    # arrives decrypted inline (body_key survives as an inert metadata field)
+    leak = _tee("SELECT count(*) FROM chat_messages WHERE user_id=%s AND doc ? 'body_ct'", (uid,))
+    assert leak[0][0] == 0
+    cur = _tee("SELECT watermark_id FROM tee_replication_cursors WHERE table_name='chat_messages'")
+    assert cur[0][0] == "filemsg"
+
+
+def test_offloaded_file_row_hydration_failure_freezes_cursor(backend_env, monkeypatch):
+    """R2 fetch failure → doc stays a pointer → transform fails → freeze (same
+    retry-next-pass policy as any transient error), later rows still copy."""
+    import object_storage
+
+    _reset_cursor("chat_messages")
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    _insert_chat(uid, "a", 10.0, "AAA")
+    _insert_chat_file_pointer(uid, "filemsg", 20.0)
+    _insert_chat(uid, "c", 30.0, "CCC")
+
+    monkeypatch.setattr(object_storage, "chat_files_enabled", lambda: True)
+    monkeypatch.setattr(object_storage, "get_chat_file_body", lambda u, m: None)
+
+    def _strict(_user_id):
+        def decrypt(envelope, purpose):
+            if "body_ct" not in envelope:
+                raise RuntimeError("enclave_http_400:missing body_ct")
+            return b"PT:" + envelope["body_ct"].encode()
+        return decrypt
+
+    monkeypatch.setattr(worker, "_make_decrypt", _strict)
+    worker._decrypt_cache.clear()
+
+    report = worker.run_table("chat_messages", qps=1000)
+
+    assert report["errors"] == 1
+    cur = _tee("SELECT watermark_id FROM tee_replication_cursors WHERE table_name='chat_messages'")
+    assert cur[0][0] == "a"
+    assert _tee("SELECT count(*) FROM chat_messages WHERE user_id=%s AND msg_id='c'", (uid,))[0][0] == 1
