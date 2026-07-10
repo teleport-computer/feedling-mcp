@@ -24,7 +24,7 @@ _READ_ACTIONS = frozenset({
     "web_search", "web_fetch",
 })
 _WRITE_ACTIONS = frozenset({
-    "memory_write", "identity_patch",
+    "memory_write", "identity_patch", "schedule_wake", "cancel_wake",
 })
 
 MAX_PLAN_ACTIONS = 5
@@ -148,6 +148,7 @@ _PLANNER_SYSTEM = (
     "identity_get, memory_index, memory_fetch, memory_search, perception_snapshot, "
     "perception_trend, perception_history, screen_recent, screen_read, photo_recent, "
     "photo_read, web_search, web_fetch, memory_write, identity_patch, "
+    "schedule_wake, cancel_wake, "
     "final_response. memory_search is keyword/grep search over memory cards (needs a "
     "payload.query string) — prefer it over memory_index when the user asks to find/recall "
     "something specific. "
@@ -157,6 +158,9 @@ _PLANNER_SYSTEM = (
     "If `prior_action_results` is present, it holds what THIS turn's earlier tool rounds "
     "already returned: request more actions only if they are still missing something, "
     "otherwise include final_response now. You get at most 3 rounds. "
+    "schedule_wake takes payload.at (ISO time or a relative spec like '2h') and optional "
+    "tz/reason; cancel_wake takes payload.wake_id. Use them only when the user actually "
+    "asks to be reminded or checked on later. "
     "Never wrap the JSON in Markdown."
 )
 

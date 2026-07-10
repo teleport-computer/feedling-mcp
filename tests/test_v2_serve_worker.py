@@ -403,3 +403,30 @@ def test_write_summary_envelope_build_failure_returns_false(monkeypatch):
 
     ok = serve_worker._write_summary("u", "- s", 9.0, 2)
     assert ok is False
+
+
+def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, backend_env):
+    """BUG-3: the timer machinery existed but submitted into the dead legacy proactive_jobs
+    stream. It must now produce an agent_jobs `scheduled` job."""
+    import conftest
+    from model_api_runtime.v2 import jobs_store
+
+    serve_worker.wire_assembly()
+    uid = "u_sw_fire_scheduled"
+    conftest.seed_user(uid)
+
+    calls = []
+    monkeypatch.setattr(jobs_store, "enqueue_job",
+                        lambda u, lane, **kw: calls.append((u, lane)) or ("job1", False))
+
+    class _FakeService:
+        def __init__(self, *a, **kw):
+            pass
+
+        def fire_due_timers(self, user_id, *, settings, submit_wake, owner_id):
+            submit_wake(object())
+            return ()
+
+    monkeypatch.setattr("proactive.scheduled_wake_v2.ScheduledWakeServiceV2", _FakeService)
+    assert serve_worker._fire_scheduled_for_user(uid) == 1
+    assert calls == [(uid, "scheduled")]

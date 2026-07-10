@@ -51,11 +51,16 @@ from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
 from model_api_runtime.v2 import executor as v2_executor
+from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import invalidation as v2_inval
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import planner as v2_planner
 from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import status_stream
+# 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
+# （extraction.py 同样只 import 这两个 + provider_client）。
+from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
+from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
 
 log = logging.getLogger("feedling.runtime_v2.worker")
 
@@ -114,6 +119,9 @@ _TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "6"))
 # it would just complete as a no-op), so it's left alone here rather than
 # silently mishandled by this task's scope.
 _WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake"})
+# 记忆抽取 lane（capture=一窗对话→记忆卡，dream=现有卡片→合并）。同形：
+# build prompt → BYOK 抽取 → parse → memory actions。永不写气泡、永不弹 error chip。
+_EXTRACTION_LANES = frozenset({"capture", "dream"})
 _WAKE_SYSTEM_PROMPT = (
     "You are the user's companion. This is a PROACTIVE moment — the user has not "
     "just spoken. Look at the conversation so far. If there is something genuine, "
@@ -178,6 +186,21 @@ class TurnDeps:
     # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
     # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
     read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
+    # —— capture/dream 记忆抽取 lane 的三个注入回调（Task 3）——
+    # 全部默认 None：worker.py 不 import `hosted`/`memory_core`/`core.envelope`-for-memory
+    # （否则违反 CONTRIBUTING §2 的依赖方向），所以记忆上下文读取、信封加密、落库都作为
+    # 可调用对象由 serve_worker.build_production_deps 注入；测试注入假实现直接跑。
+    # user_id -> {"ai_name","user_name","buckets","threads","identity","cards"}（均为字符串，
+    # 任意一项可为 ""）：capture/dream prompt 需要的记忆上下文（enclave 解密明文）。取数失败
+    # → 降级为空上下文，不失败 job（spec §3.5）。
+    read_memory_context: Callable[[str], dict] | None = None
+    # (user_id, actions) -> result dict：把抽取产出的 memory.add/memory.supersede action 落库
+    # （走既有 /v1/memory/actions 同路径的服务端实现）。None 时跳过持久化、仍干净 mark_completed
+    # （让 handler 无 DB/enclave 也可单测）。
+    apply_memory_actions: Callable[[str, list[dict]], dict] | None = None
+    # (user_id, inner) -> envelope：把一张卡的明文草稿封成客户端加密信封（E2E）。传给
+    # extraction.cards_to_actions/consolidations_to_actions 的 build_envelope。None 时同上跳过持久化。
+    build_memory_envelope: Callable[[str, dict], dict] | None = None
 
 
 async def _cap_data(store, action_type, *, api_key, runtime_token, params=None, enclave_sem=None) -> dict:
@@ -375,6 +398,70 @@ async def _run_wake(
         return "failed"
 
 
+async def _run_extraction(job_id, user_id: str, lane: str, deps: TurnDeps,
+                          provider_config: Any, enclave_sem: "asyncio.Semaphore") -> str:
+    """capture / dream：后台记忆抽取。自成一体的 try/except —— 绝不落进 process_job 那个
+    chat-turn 的 except（那条会 emit 用户可见的 error status + record_terminal_error）。
+
+    空结果（0 张卡 / 0 条合并）是**成功**：mark_completed，不写任何东西。与 wake lane 的
+    「弱唤醒睡回去」同口径 —— 模型选择什么都不做，不是失败。
+    """
+    try:
+        ctx = {}
+        # 两次读都是 enclave-bound（read_memory_context 内部 buckets/threads/index 各走一次
+        # post_enclave 往返；read_tail 逐条解密），所以**必须同在 enclave_sem 闸内**——enclave
+        # 是单线程瓶颈，正是整个子项目要保护的东西（spec §4）。
+        async with enclave_sem:
+            if deps.read_memory_context is not None:
+                try:
+                    ctx = await asyncio.to_thread(deps.read_memory_context, user_id) or {}
+                except Exception as e:  # noqa: BLE001 — 上下文取数失败 → 降级，不失败（spec §3.5）
+                    log.warning("[v2.worker] memory context unavailable for %s: %s", user_id, e)
+            tail = await asyncio.to_thread(deps.read_tail, user_id, 0.0, _TAIL_HARD_CAP) \
+                if deps.read_tail is not None else []
+        window = "\n".join(
+            f"- {m.get('role')}: {context.text_of(m.get('content'))}" for m in tail).strip()
+        source_ids = [str(m.get("id")) for m in tail if m.get("id")]
+
+        if lane == "capture":
+            prompt = build_capture_prompt(
+                ai_name=ctx.get("ai_name", ""), user_name=ctx.get("user_name", ""),
+                buckets=ctx.get("buckets", ""), threads=ctx.get("threads", ""),
+                identity=ctx.get("identity", ""), window=window)
+            parse, to_actions = parse_capture_cards, v2_extraction.cards_to_actions
+        else:
+            prompt = build_dream_prompt(
+                ai_name=ctx.get("ai_name", ""), user_name=ctx.get("user_name", ""),
+                cards=ctx.get("cards", ""), recent_conversations=window)
+            # parse_dream_consolidations 返回 (consolidations, questions, err)。
+            # questions 属于「主动提问」= wake 语义，本轮明确丢弃（spec §5.3）。
+            parse, to_actions = parse_dream_consolidations, v2_extraction.consolidations_to_actions
+
+        items, reason = await v2_extraction.extract(
+            provider_config=provider_config, prompt=prompt, parse=parse)
+        if reason:
+            raise RuntimeError(reason)
+        if not items:
+            await asyncio.to_thread(jobs_store.mark_completed, job_id)
+            return "completed"
+
+        if deps.build_memory_envelope is None or deps.apply_memory_actions is None:
+            await asyncio.to_thread(jobs_store.mark_completed, job_id)
+            return "completed"
+
+        actions, _added, _superseded = to_actions(
+            items, occurred_at="", source_ids=source_ids,
+            build_envelope=lambda inner: deps.build_memory_envelope(user_id, inner))
+        await asyncio.to_thread(deps.apply_memory_actions, user_id, actions)
+        await asyncio.to_thread(jobs_store.mark_completed, job_id)
+        return "completed"
+    except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
+        log.warning("[v2.worker] extraction job %s (lane=%s) failed: %s", job_id, lane, e)
+        await asyncio.to_thread(
+            jobs_store.mark_failed, job_id, f"extraction_failed: {str(e)[:160]}")
+        return "failed"
+
+
 def _inject_tail_images(tail: list[dict], *, user_id: str, read_images) -> list[dict]:
     """把 tail 里最近 `_TAIL_IMAGE_LIMIT` 个图片行的 content 换成 OpenAI 风格 content block
     列表（caption 文本块在前、图片块在后）。返回**新列表**，绝不原地改输入行——compaction
@@ -460,6 +547,23 @@ async def process_job(
             # into the chat-turn `except` below (that branch emits a user-visible
             # error status + record_terminal_error, which wake failures must not do).
             return await _run_wake(job_id, user_id, lane, deps, provider_config, enclave_sem)
+        if lane in _EXTRACTION_LANES:
+            # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
+            # parse → memory actions。同 _run_compaction/_run_wake 一样有自己的 try/except，
+            # 绝不落进下面 chat-turn 的 except（那条会 emit 用户可见 error status +
+            # record_terminal_error）——后台 job 永不写气泡、永不弹 error chip。
+            return await _run_extraction(job_id, user_id, lane, deps, provider_config, enclave_sem)
+        if lane != "chat":
+            # 真·未注册 lane 的兜底：maintenance/wake（heartbeat/scheduled/manual_wake）/
+            # capture/dream 都已在上面各自的 handler 里分派完；能落到这里的只剩既不是 chat、
+            # 又没有对应 handler 的 lane（配置错误 / 未来新增但未接线的 lane）。若放它掉进下面
+            # 的 chat 回合，planner 一旦要求回复就会写出用户可见的聊天气泡、失败还弹 error chip。
+            #
+            # 显式失败，静默（背景 job 的既有口径：不写气泡、不 _surface_terminal_error）——
+            # 落到这里就是「明确失败」而不是「偷偷写气泡」。
+            log.warning("[v2.worker] job %s has unhandled lane=%s", job_id, lane)
+            await asyncio.to_thread(jobs_store.mark_failed, job_id, f"unhandled_lane:{lane}")
+            return "failed"
         store = core_store.get_store(user_id)
         runtime_state = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
         await asyncio.to_thread(_emit_status, user_id, job_id, "processing")

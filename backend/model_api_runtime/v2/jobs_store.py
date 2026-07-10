@@ -6,6 +6,8 @@ CONTRIBUTING §2：新表存取逻辑全部收进本模块（jobs_store）。连
 """
 from __future__ import annotations
 
+import time
+
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -13,7 +15,7 @@ from psycopg.types.json import Jsonb
 import db
 from core import wake_bus
 
-LANES = {"chat", "manual_wake", "heartbeat", "scheduled", "capture", "maintenance"}
+LANES = {"chat", "manual_wake", "heartbeat", "scheduled", "capture", "maintenance", "dream"}
 
 # 默认（lane 派生）优先级：预留槽位场景下 chat/manual_wake 必须能在一堆 heartbeat/
 # capture 前面被抢到，防止后台唤醒风暴饿死聊天回复。enqueue_job 未显式传 priority
@@ -25,6 +27,7 @@ LANE_PRIORITY = {
     "scheduled": 50,
     "capture": 10,
     "maintenance": 10,
+    "dream": 10,
 }
 # mark_running 时若 job 无 deadline_at，补一个（now + 该秒数），供 reaper 兜底回收
 # 卡死的 claimed/running job。chat lane 的 enqueue 不带 deadline，全靠这个兜底。
@@ -614,6 +617,38 @@ def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[s
                 (ts, ts, int(limit)),
             )
             return [row[0] for row in cur.fetchall()]
+
+
+SCHEDULED_WAKE_STREAM = "proactive_scheduled_wakes_v2"
+
+
+def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[str]:
+    """有到期 self-wake timer 的用户（跨用户）。
+
+    `user_logs` 是 append-only：一个 timer 会有 created→claimed→fired 多行。必须用
+    `DISTINCT ON (user_id, item_key) ... ORDER BY seq DESC` 只取每个 timer 的**最新一版**，
+    否则早已 fire 的 timer 会被当成 pending 反复唤醒。
+
+    到期 = pending，或 claimed 但 claim 租约已过期（持有者死了）。触发的原子性由
+    `ScheduledWakeServiceV2.fire_due_timers` 内部的 claim_due CAS 保证——本函数只是个
+    廉价的候选人筛子，允许假阳性（多个 scheduler 抢同一个 timer 是安全的）。"""
+    ts = time.time() if now is None else float(now)
+    if limit <= 0:
+        return []
+    sql = (
+        "SELECT DISTINCT user_id FROM ("
+        "  SELECT DISTINCT ON (user_id, item_key) user_id, doc"
+        "  FROM user_logs WHERE stream = %s"
+        "  ORDER BY user_id, item_key, seq DESC"
+        ") latest "
+        "WHERE COALESCE(NULLIF(doc->>'due_at','')::float8, 0) <= %s "
+        "  AND (doc->>'status' = 'pending' OR (doc->>'status' = 'claimed' "
+        "       AND COALESCE(NULLIF(doc->>'claim_expires_at','')::float8, 0) <= %s)) "
+        "LIMIT %s"
+    )
+    with _pool().connection() as conn:
+        rows = conn.execute(sql, (SCHEDULED_WAKE_STREAM, ts, ts, limit)).fetchall()
+    return [str(r[0]) for r in rows]
 
 
 def upsert_runtime_state(user_id, patch: dict) -> dict:
