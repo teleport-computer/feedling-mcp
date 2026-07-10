@@ -115,3 +115,57 @@ def test_regression_result_is_the_nonzero_exit_signal():
     ok = compare_tokens_per_turn(101.0, 100.0)
     assert regressed["regression"] is True
     assert ok["regression"] is False
+
+
+# --- measure_turn_tokens (drives planner + responder, whole-turn baseline) --
+
+
+def test_measure_turn_tokens_counts_planner_and_responder():
+    from scripts.loadtest.compare_tokens import measure_turn_tokens
+    from scripts.loadtest.mock_provider import MockProvider
+
+    # The mock must answer the planner with parseable JSON; responder gets the
+    # same string back, which is fine — we are counting tokens, not reading prose.
+    plan_json = '{"plan":[{"type":"final_response","payload":{}}],"reason":"t"}'
+    fixtures = [{"summary": "", "tail": [{"role": "user", "content": "hello"}]}]
+
+    with MockProvider(reply=plan_json, estimate_tokens=True) as p:
+        report = measure_turn_tokens(fixtures, provider=p)
+
+    # One planner call + one responder call per turn, today (pre-loop).
+    assert report["llm_calls_per_turn"] == 2.0
+    assert report["tokens_per_turn"] > 0
+    assert report["tokens_per_turn"] == (
+        p.total_prompt_tokens + p.total_completion_tokens) / len(fixtures)
+
+
+def test_measure_turn_tokens_grows_with_prompt_size():
+    from scripts.loadtest.compare_tokens import measure_turn_tokens
+    from scripts.loadtest.mock_provider import MockProvider
+
+    plan_json = '{"plan":[{"type":"final_response","payload":{}}],"reason":"t"}'
+    small = [{"summary": "", "tail": [{"role": "user", "content": "hi"}]}]
+    large = [{"summary": "S" * 8000, "tail": [{"role": "user", "content": "hi"}]}]
+
+    with MockProvider(reply=plan_json, estimate_tokens=True) as p:
+        small_report = measure_turn_tokens(small, provider=p)
+    with MockProvider(reply=plan_json, estimate_tokens=True) as p:
+        large_report = measure_turn_tokens(large, provider=p)
+
+    assert large_report["tokens_per_turn"] > small_report["tokens_per_turn"]
+
+
+def test_multi_round_turn_costs_more_llm_calls_than_single_round():
+    """The loop's cost is real and the instrument must see it. If this passes trivially
+    (equal call counts), the mock is not driving the loop and the gate is blind."""
+    from scripts.loadtest.compare_tokens import measure_turn_tokens
+    from scripts.loadtest.mock_provider import MockProvider
+
+    one_shot = '{"plan":[{"type":"final_response","payload":{}}],"reason":"t"}'
+    fixtures = [{"summary": "", "tail": [{"role": "user", "content": "hello"}]}]
+
+    with MockProvider(reply=one_shot, estimate_tokens=True) as p:
+        single = measure_turn_tokens(fixtures, provider=p)
+
+    assert single["llm_calls_per_turn"] == 2.0            # planner + responder
+    assert single["tokens_per_turn"] > 0

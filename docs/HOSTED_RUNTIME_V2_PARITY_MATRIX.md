@@ -84,7 +84,7 @@ These block "delete agent-runner" but are a rehome, not a rewrite.
 
 ## E. Bugs found while building this matrix
 
-Three real defects, none caught by the 2637-test suite — because no test traced to a parity row.
+Four real defects, none caught by the 2637-test suite — because no test traced to a parity row.
 
 **🔴 BUG-1 — `chat_image_read` poisons the turn's grounding context (live, reachable today).**
 `chat_image_read` is in the planner's vocabulary (`planner.py:21`), so the planner *can* pick it when a user sends an image. It returns `{"message_id","image_mime","image_b64"}` (`capabilities/chat.py:50-52`). `_fold_action_results` copies `data` **verbatim, no key whitelist** (`responder.py`), then `_action_context_str` does `json.dumps(folded)[:8000]`. A base64 JPEG blows past 8000 chars, so the model receives ~8000 characters of truncated base64 **instead of** the memory cards / perception it also fetched. Not "V2 is image-blind" — V2 actively corrupts the turn when it tries to look at an image.
@@ -95,13 +95,27 @@ Three real defects, none caught by the 2637-test suite — because no test trace
 **🔴 BUG-3 — `scheduled` lane is a handler with no producer.**
 See §B. Agent-scheduled wakes silently never fire for `db_action_v2` users.
 
+**🔴 BUG-4 — a chat turn whose plan omits `final_response` silently produces no reply (live, hits *trusted* models only).**
+`validate_plan` appends `final_response` only when the model asked for it (`planner.py:54-58`); it never forces one. `worker.py:458` computes `wants_reply = any(s["type"] == "final_response" for s in steps)`, and when it's False the responder is skipped entirely — the job goes `mark_completed` + `_emit_status "done"` with **no chat bubble**. The user's message is swallowed, and the client's long-poll sees a completed turn with nothing in it.
+
+Reproduced:
+```
+>>> planner.validate_plan({"plan":[{"type":"memory_search","payload":{"query":"x"}}]})
+[{'type': 'memory_search', 'payload': {'query': 'x'}}]     # no final_response
+>>> wants_reply
+False                                                       # → responder never runs
+```
+`rule_plan` always appends `final_response` (`planner.py:75`), so weak/relay models are immune. Only `official_plan` — the *trusted* models we route our best users to — can drop it. `_PLANNER_SYSTEM` says "include final_response LAST", which is a prompt-level hope, not an invariant.
+
+This is the deepest reason the one-shot shape is wrong: **"the planner didn't ask to reply" and "the planner wants more tools first" are the same wire signal today**, and the worker guesses the first. Under the agent loop the same signal means "loop again", with a forced `final_response` at the round cap — so the loop **fixes BUG-4 by construction** rather than needing a separate patch.
+
 ---
 
 ## F. Triage
 
 **1. Must build (V2 cannot replace resident without these)**
-- Agent loop (see §C and the loop spec) — the one-shot planner cannot chain or recover from a tool miss.
-- Multimodal: give `provider_client` a real image content block; stop feeding b64 through the text context (fixes BUG-1).
+- Agent loop (see §C and the loop spec) — the one-shot planner cannot chain or recover from a tool miss. **Also fixes BUG-4.**
+- Multimodal: give `provider_client` a real image content block; stop feeding b64 through the text context (fully fixes BUG-1; the loop round only stops the bleeding).
 - `schedule_wake` / `cancel_wake` capability + planner vocabulary, and a producer for the `scheduled` lane (fixes BUG-3).
 - `capture` lane: producer + handler (fixes BUG-2).
 - `dream` lane.

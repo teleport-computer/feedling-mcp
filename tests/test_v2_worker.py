@@ -25,6 +25,7 @@ import db
 import provider_client
 from capabilities import registry as cap_registry
 from core import store as core_store
+from model_api_runtime.v2 import agent_loop as v2_agent_loop
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import invalidation as v2_inval
 from model_api_runtime.v2 import jobs_store
@@ -1136,3 +1137,155 @@ def test_run_compaction_under_keep_threshold_completes_as_noop(monkeypatch):
     assert compact_calls["n"] == 0
     assert write_calls["n"] == 0
     assert _job_status(job_id)[0] == "completed"
+
+
+# ------------------------------------------------------------------
+# Task 6: wire the agent loop into process_job (and fix BUG-4). The
+# message-driven replan loop is the OUTER loop; agent_loop.run_turn is the
+# INNER model-driven tool loop; one _TURN_MAX_LLM_CALLS counter spans both.
+# ------------------------------------------------------------------
+
+def test_chat_turn_always_replies_even_when_plan_omits_final_response(monkeypatch):
+    """BUG-4: a trusted model's plan without final_response must NOT silently swallow the turn.
+    Pre-loop, `wants_reply` was False and the responder never ran — the user got nothing."""
+    uid = "u_w_loop_bug4"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    _patch_cheap_boundaries(monkeypatch, reply="MODEL REPLY")
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}],
+                 is_official=True)
+    written = {}
+    monkeypatch.setattr(worker, "_write_encrypted_reply",
+                        lambda store, text: written.update(text=text) or {"id": "r1"})
+
+    # Each round asks for a DIFFERENT action; an identical plan would trip the loop's
+    # `no_progress` guard and we would never reach the max_rounds path this test is about.
+    plans = [
+        [{"type": "memory_index", "payload": {}}],                # round 0: no final_response
+        [{"type": "memory_search", "payload": {"query": "a"}}],   # round 1: still none
+        [{"type": "memory_fetch", "payload": {"ids": ["a"]}}],    # round 2: still none -> max_rounds
+    ]
+    calls = {"plan": 0}
+
+    async def fake_plan(store, **kw):
+        i = calls["plan"]; calls["plan"] += 1
+        return [dict(s) for s in plans[min(i, len(plans) - 1)]]
+
+    monkeypatch.setattr(v2_planner, "plan", fake_plan)
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert calls["plan"] == worker._LOOP_MAX_ROUNDS   # looped; did not stop after round 0
+    assert written.get("text") == "MODEL REPLY"       # forced reply at the cap — no silent swallow
+
+
+def test_planner_second_round_receives_first_round_results(monkeypatch):
+    uid = "u_w_loop_prior"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    _patch_cheap_boundaries(monkeypatch, reply="R")
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}],
+                 is_official=True)
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    seen_prior = []
+
+    async def fake_plan(store, **kw):
+        seen_prior.append(kw.get("prior_action_results"))
+        if len(seen_prior) == 1:
+            return [{"type": "memory_index", "payload": {}}]
+        return [{"type": "final_response", "payload": {}}]
+
+    monkeypatch.setattr(v2_planner, "plan", fake_plan)
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert seen_prior[0] in (None, {})               # round 0: nothing observed yet
+    assert "memory_index" in (seen_prior[1] or {})   # round 1: the observation was fed back
+
+
+def test_turn_llm_call_budget_binds_across_replan_and_rounds(monkeypatch):
+    """replan_budget(2) x _LOOP_MAX_ROUNDS(3) + 1 = 7 > _TURN_MAX_LLM_CALLS(6). It must bite."""
+    uid = "u_w_loop_budget"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    _patch_cheap_boundaries(monkeypatch, reply="R")
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}],
+                 is_official=True)
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    calls = {"plan": 0, "respond": 0}
+
+    async def fake_plan(store, **kw):
+        calls["plan"] += 1
+        # Payload varies per call so `no_progress` never fires — this test is about the
+        # LLM-call budget, and a no-progress stop would mask it.
+        return [{"type": "memory_index", "payload": {"n": calls["plan"]}}]   # never asks to reply
+
+    async def fake_respond(**kw):
+        calls["respond"] += 1
+        return "reply"
+
+    monkeypatch.setattr(v2_planner, "plan", fake_plan)
+    monkeypatch.setattr(v2_responder, "respond", fake_respond)
+    monkeypatch.setattr(v2_inval, "evaluate", lambda *a, **k: v2_inval.REPLAN)
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    # Walk it: outer iter 1 burns rounds 0,1,2 (llm_calls=3) -> max_rounds. evaluate=REPLAN and
+    # 3 < 5, so replan. Outer iter 2: rounds 0,1 plan (llm_calls=5); round 2 sees the budget
+    # exhausted and returns wants_reply with no actions. evaluate=REPLAN but 5 < 5 is False ->
+    # break. The responder takes the reserved 6th slot.
+    assert calls["plan"] == 5
+    assert calls["respond"] == 1   # the reserved responder slot is never eaten by the planner
+    assert calls["plan"] + calls["respond"] == worker._TURN_MAX_LLM_CALLS
+
+
+def test_final_text_from_decide_short_circuits_the_responder(monkeypatch):
+    """Native-tools seam: if `decide` authored the reply, do not pay for a responder call."""
+    uid = "u_w_loop_finaltext"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    _patch_cheap_boundaries(monkeypatch, reply="SHOULD NOT BE USED")
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}],
+                 is_official=True)
+    written = {}
+    monkeypatch.setattr(worker, "_write_encrypted_reply",
+                        lambda store, text: written.update(text=text) or {"id": "r"})
+
+    called = {"respond": 0}
+
+    async def fake_run_turn(*, decide, run_tools, max_rounds):
+        return v2_agent_loop.LoopResult({}, {}, "authored inline", 1, v2_agent_loop.WANTS_REPLY)
+
+    async def fake_respond(**kw):
+        called["respond"] += 1
+        return "should not happen"
+
+    monkeypatch.setattr(v2_agent_loop, "run_turn", fake_run_turn)
+    monkeypatch.setattr(v2_responder, "respond", fake_respond)
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert called["respond"] == 0
+    assert written.get("text") == "authored inline"

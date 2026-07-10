@@ -46,6 +46,7 @@ from capabilities import registry as cap_registry
 from core import envelope as core_envelope
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from model_api_runtime.v2 import agent_loop as v2_agent_loop
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
@@ -88,6 +89,15 @@ def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
 _TAIL_BUDGET = int(os.environ.get("FEEDLING_V2_TAIL_BUDGET_MSGS", "20"))
 _TAIL_KEEP = int(os.environ.get("FEEDLING_V2_TAIL_KEEP_MSGS", "10"))
 _TAIL_HARD_CAP = int(os.environ.get("FEEDLING_V2_TAIL_HARD_CAP", "60"))
+
+# 工具循环轮数上限（spec §6）。撞上限 → 停止取工具，用手上的结果强制收口回复。
+_LOOP_MAX_ROUNDS = int(os.environ.get("FEEDLING_V2_LOOP_MAX_ROUNDS", "3"))
+# 一个回合内**跨两层循环**（外层消息驱动 replan × 内层模型驱动 tool loop）的 LLM 调用硬闸。
+# 上界是 replan_budget(2) × _LOOP_MAX_ROUNDS(3) + 1(responder) = 7 —— 故意让 6 咬住它。
+# 两层语义不同（外层"用户又说话了"、内层"我还想再查"）不能合并，但必须共用一个预算，
+# 否则一个话痨用户 + 一个爱查东西的 planner 能把用户的 BYOK key 烧穿。
+# 恒留 1 个名额给 responder：no-filler 铁律要求 chat lane 一定产出 model-authored 文本。
+_TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "6"))
 
 # D3 Task 6 (proactive/wake lanes): the scheduler (Task 4/9) enqueues jobs in
 # these three lanes when it decides the companion should reach out without the
@@ -407,8 +417,10 @@ async def process_job(
             return "completed"
 
         replan_count = 0
-        steps: list[dict] = []
-        action_state: dict = {"action_results": {}, "action_digest": {}}
+        # 跨两层循环共享的 LLM 调用计数（见 _TURN_MAX_LLM_CALLS）。外层 replan 不重置它。
+        llm_calls = 0
+        loop_res = v2_agent_loop.LoopResult({}, {}, None, 0, v2_agent_loop.NO_ACTIONS)
+
         while True:
             # 便宜预取（无 LLM，enclave-auth 凭证）：memory index + 感知摘要；确定性 digest（无 LLM，§7.2）。
             memory_index = await _cap_data(
@@ -419,27 +431,40 @@ async def process_job(
                 enclave_sem=enclave_sem)
             digest = {"messages": [{"content": m["content"][:400]} for m in coalesced[-6:]]}
 
-            # planner 走 BYOK provider_config；v2_planner.plan 现在原生 async（official_plan
-            # 内部 await reliable_chat_completion_async），直接 await，不再经 to_thread 桥
-            # 线程池——那条桥会把并发悄悄封顶在线程池大小（~32），worker 池自己的并发闸形同虚设。
-            steps = await v2_planner.plan(
-                store,
-                provider_config=provider_config, is_official=is_official,
-                coalesced_messages=coalesced, digest=digest, memory_index=memory_index,
-                perception_summary=perception_summary, runtime_state=runtime_state,
-                lane=lane, reason=str(job.get("reason") or ""))
+            async def _decide(round_idx: int, prior: dict) -> v2_agent_loop.Decision:
+                """json_planner 后端（spec §5 默认）：跑用户 BYOK 的结构化 JSON planner。
 
-            executable = [s for s in steps if s["type"] != "final_response"]
-            action_ids = await asyncio.to_thread(
-                jobs_store.add_actions, job_id, user_id,
-                [{"type": s["type"], "payload": s["payload"]} for s in executable])
-            for s, aid in zip(executable, action_ids):
-                s["_action_id"] = aid
+                预算耗尽 → 立刻收手（wants_reply=True），把最后一个名额留给 responder。
+                `final_text` 恒为 None —— 散文由 responder 写（spec §4）。
+                """
+                nonlocal llm_calls
+                if llm_calls >= _TURN_MAX_LLM_CALLS - 1:
+                    return v2_agent_loop.Decision(actions=[], wants_reply=True)
+                llm_calls += 1
+                steps = await v2_planner.plan(
+                    store,
+                    provider_config=provider_config, is_official=is_official,
+                    coalesced_messages=coalesced, digest=digest, memory_index=memory_index,
+                    perception_summary=perception_summary, runtime_state=runtime_state,
+                    lane=lane, reason=str(job.get("reason") or ""),
+                    prior_action_results=prior or None)
+                return v2_agent_loop.Decision(
+                    actions=[s for s in steps if s["type"] != "final_response"],
+                    wants_reply=any(s["type"] == "final_response" for s in steps))
 
-            # executor 用 enclave-auth 凭证（与 BYOK 独立的两套）；已经是 async，无需 to_thread。
-            action_state = await v2_executor.execute_plan(
-                store, job_id, api_key=api_key, runtime_token=runtime_token,
-                plan=steps, read_parallelism=read_parallelism, enclave_sem=enclave_sem)
+            async def _run_tools(actions: list[dict]) -> dict:
+                """executor 桥：DB 记账 + 排空。executor 的并行读/串行写/ENCLAVE_SEMAPHORE 原样复用。"""
+                action_ids = await asyncio.to_thread(
+                    jobs_store.add_actions, job_id, user_id,
+                    [{"type": s["type"], "payload": s["payload"]} for s in actions])
+                for s, aid in zip(actions, action_ids):
+                    s["_action_id"] = aid
+                return await v2_executor.execute_plan(
+                    store, job_id, api_key=api_key, runtime_token=runtime_token,
+                    plan=actions, read_parallelism=read_parallelism, enclave_sem=enclave_sem)
+
+            loop_res = await v2_agent_loop.run_turn(
+                decide=_decide, run_tools=_run_tools, max_rounds=_LOOP_MAX_ROUNDS)
 
             # 安全点（before_final_response）：跨进程/跨 worker 写入的新消息只活在 DB 里，
             # 本进程内存态的 store.chat_messages 未必看得到——先 reload 再判定，避免漏判。
@@ -448,14 +473,20 @@ async def process_job(
             decision = v2_inval.evaluate(
                 store.chat_messages, safe_point="before_final_response",
                 coalesced_cursor_ts=cursor, replan_count=replan_count, replan_budget=replan_budget)
-            if decision == v2_inval.REPLAN:
+            if decision == v2_inval.REPLAN and llm_calls < _TURN_MAX_LLM_CALLS - 1:
                 await asyncio.to_thread(v2_inval.invalidate, job_id, replan_job_id=job_id)
                 replan_count += 1
                 coalesced, cursor = await _coalesce_inputs(deps, user_id, since, enclave_sem=enclave_sem)
                 continue
             break
 
-        wants_reply = any(s["type"] == "final_response" for s in steps)
+        action_state = {"action_results": loop_res.action_results,
+                        "action_digest": loop_res.action_digest}
+        # BUG-4（矩阵 §E）：chat lane **恒**回复。「planner 没要 final_response」在单轮形状下
+        # 被 worker 误读成「这回合不用回复」，可信模型漏写时用户消息被静默吞掉、零气泡。
+        # 循环下同一个信号的含义是「想再查一轮」；轮数/预算用尽就用手上的结果强制收口。
+        # 这不是占位气泡——responder 仍然产出真正的 model-authored 文本（no-filler 不变量）。
+        wants_reply = lane == "chat" or loop_res.stop_reason == v2_agent_loop.WANTS_REPLY
         if wants_reply:
             await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
             # D1：responder 现在吃 summary（早前对话摘要）+ tail（双角色逐字近期窗口），
@@ -473,21 +504,27 @@ async def process_job(
             # 现在原生 async，直接 await，不再经 to_thread 桥线程池（同上，治并发天花板）。
             # Task 4：usage_out 是纯出参（responder 保持 hosted-free/无 job 上下文），成功
             # 返回后由 worker（有 job_id/user_id/lane）记 v2_turn_metrics，喂 D4 load-test。
-            _usage: dict = {}
-            _t0 = time.monotonic()
-            reply = await v2_responder.respond(
-                provider_config=provider_config, summary=summary, tail=tail,
-                action_results=action_state["action_results"], usage_out=_usage)
-            if deps.record_turn_metric is not None:
-                try:
-                    deps.record_turn_metric(
-                        job_id=job_id, user_id=user_id, lane=lane,
-                        prompt_tokens=_usage.get("prompt_tokens"),
-                        completion_tokens=_usage.get("completion_tokens"),
-                        latency_ms=int((time.monotonic() - _t0) * 1000),
-                    )
-                except Exception as e:  # noqa: BLE001 — 记指标失败绝不能拖垮已经产出的回复
-                    log.warning("[v2.worker] record_turn_metric failed job=%s: %s", job_id, e)
+            if loop_res.final_text:
+                # 原生 tool-calling 后端在收手时自带回复（spec §3.1）。默认的 json_planner
+                # 后端恒为 None，所以今天这条分支不会走到——留着，是为了别在接原生后端时
+                # 白丢一次已经生成好的文本、再花一次 token 让 responder 重写。
+                reply = loop_res.final_text
+            else:
+                _usage: dict = {}
+                _t0 = time.monotonic()
+                reply = await v2_responder.respond(
+                    provider_config=provider_config, summary=summary, tail=tail,
+                    action_results=action_state["action_results"], usage_out=_usage)
+                if deps.record_turn_metric is not None:
+                    try:
+                        deps.record_turn_metric(
+                            job_id=job_id, user_id=user_id, lane=lane,
+                            prompt_tokens=_usage.get("prompt_tokens"),
+                            completion_tokens=_usage.get("completion_tokens"),
+                            latency_ms=int((time.monotonic() - _t0) * 1000),
+                        )
+                    except Exception as e:  # noqa: BLE001 — 记指标失败绝不能拖垮已经产出的回复
+                        log.warning("[v2.worker] record_turn_metric failed job=%s: %s", job_id, e)
             await asyncio.to_thread(_write_encrypted_reply, store, reply)
             # 超预算 → best-effort 入队一个 maintenance lane 的压缩 job（不阻塞、不拖垮
             # 本回合——enqueue_job 本身命中 single-flight 会 coalesce，失败只记日志）。

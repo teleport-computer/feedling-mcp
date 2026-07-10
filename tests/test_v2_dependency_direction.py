@@ -5,10 +5,16 @@ import ast
 import pathlib
 
 _V2 = pathlib.Path(__file__).parent.parent / "backend" / "model_api_runtime" / "v2"
-_CORE_MODULES = [
-    "worker.py", "coalesce.py", "planner.py", "executor.py",
-    "invalidation.py", "responder.py", "jobs_store.py", "status_stream.py",
-]
+
+# serve_worker.py is the assembly/entrypoint layer and is ALLOWED to import hosted/
+# agent_runtime — it is the one place the injection happens. Everything else in v2/ is core.
+_EXEMPT = {"serve_worker.py", "__init__.py"}
+
+# Derived, not hand-listed. A hardcoded roster silently exempts every module added after it
+# was written: admission.py, scheduler.py, context.py, compaction.py and agent_loop.py had
+# all escaped this guard that way. Deriving from the directory means a new v2 module is
+# guarded the moment it exists, which is the only version of this rule that stays true.
+_CORE_MODULES = sorted(p.name for p in _V2.glob("*.py") if p.name not in _EXEMPT)
 _FORBIDDEN = ("hosted", "agent_runtime")
 
 

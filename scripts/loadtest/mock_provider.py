@@ -33,6 +33,24 @@ DEFAULT_PROMPT_TOKENS = 100
 DEFAULT_COMPLETION_TOKENS = 20
 DEFAULT_LATENCY_MS = 0
 
+# 4 chars/token 是所有主流 BPE 分词器在混合中英文本上的常用粗估。我们只需要一个对
+# prompt 长度**单调**的量：token 门比较的是"循环前 vs 循环后"的比值，不是绝对 token 数。
+_CHARS_PER_TOKEN = 4
+
+
+def estimate_tokens_from_text(text: str) -> int:
+    """粗估 token 数。对长度单调、恒 >= 1（空串也算一个 token 的开销）。"""
+    return max(1, len(text) // _CHARS_PER_TOKEN)
+
+
+def _estimate_prompt_tokens(payload: dict) -> int:
+    parts = [
+        str(m.get("content") or "")
+        for m in (payload.get("messages") or [])
+        if isinstance(m, dict)
+    ]
+    return estimate_tokens_from_text("".join(parts))
+
 
 def _make_handler(provider: "MockProvider") -> type:
     class Handler(BaseHTTPRequestHandler):
@@ -43,14 +61,28 @@ def _make_handler(provider: "MockProvider") -> type:
 
         def do_POST(self) -> None:  # noqa: N802 (stdlib naming convention)
             length = int(self.headers.get("Content-Length", 0) or 0)
-            if length:
-                self.rfile.read(length)  # drain the request body; content is not inspected
+            raw_body = self.rfile.read(length) if length else b""
 
             if provider.latency_ms:
                 time.sleep(provider.latency_ms / 1000.0)
 
-            prompt_tokens = provider.prompt_tokens
-            completion_tokens = provider.completion_tokens
+            if provider.estimate_tokens:
+                try:
+                    payload = json.loads(raw_body) if raw_body else {}
+                except json.JSONDecodeError:
+                    payload = {}
+                prompt_tokens = _estimate_prompt_tokens(payload)
+                completion_tokens = estimate_tokens_from_text(provider.reply)
+            else:
+                prompt_tokens = provider.prompt_tokens
+                completion_tokens = provider.completion_tokens
+            # 服务端累加器：无论调用方是 planner 的第 N 轮还是 responder，每一次
+            # provider 调用都被计入。这是"整回合 token"唯一可靠的观测点——它不依赖
+            # 调用方自报 usage，也不需要知道一个回合内到底发生了几次 LLM 调用。
+            with provider._lock:
+                provider.total_prompt_tokens += prompt_tokens
+                provider.total_completion_tokens += completion_tokens
+                provider.request_count += 1
             body = {
                 "id": "mock-chatcmpl-0",
                 "object": "chat.completion",
@@ -97,6 +129,7 @@ class MockProvider:
         prompt_tokens: int = DEFAULT_PROMPT_TOKENS,
         completion_tokens: int = DEFAULT_COMPLETION_TOKENS,
         latency_ms: int = DEFAULT_LATENCY_MS,
+        estimate_tokens: bool = False,
         host: str = "127.0.0.1",
         port: int = 0,
     ) -> None:
@@ -104,10 +137,15 @@ class MockProvider:
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.latency_ms = latency_ms
+        self.estimate_tokens = estimate_tokens
         self._host = host
         self._requested_port = port
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.request_count = 0
 
     def start(self) -> None:
         if self._server is not None:
