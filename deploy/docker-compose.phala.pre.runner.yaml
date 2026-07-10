@@ -76,6 +76,14 @@ x-agent-runner-env: &agent-runner-env
   # Genesis import worker: this runner is the only place genesis import jobs get
   # drained (the main CVM no longer runs an agent-runner). Claim is FOR UPDATE
   # SKIP LOCKED, so it stays correct if more runners are ever added back.
+  #
+  # 2026-07-10: rehomed from agent-runner into serve-worker. These keys live in a
+  # shared anchor consumed by BOTH containers, so nothing moves here — supervisor.py
+  # simply no longer reads them, and serve_worker.py now does. (In the prod compose
+  # the two services have separate env blocks, so there the keys did move.) Genesis
+  # never depended on the resident CLI runtime; it was a daemon thread in supervisor
+  # only because supervisor was the CVM's one long-running process. Liveness is now
+  # v2_worker_heartbeats kind='genesis' → `genesis_alive` on /v1/admin/v2-metrics.
   FEEDLING_GENESIS_WORKER_ENABLED: "1"
   FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "${FEEDLING_GENESIS_WORKER_INTERVAL_SEC:-10}"
   FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "${FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC:-7200}"
@@ -94,6 +102,27 @@ services:
       AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-16}"
     volumes:
       - feedling_agent_runtime_pre_runner:/agent-data
+
+  # Hosted Runtime V2 worker pool (subproject D). Sibling to the resident
+  # supervisor: SAME image, runs the serve_worker entrypoint, holds NO data volume
+  # (all V2 state in Postgres: agent_jobs / v2_worker_heartbeats / v2_turn_metrics /
+  # v2_conversation_summary). Turns are pure async HTTP provider calls (no per-user
+  # home, no codex subprocess). Also hosts the genesis import worker on a dedicated
+  # thread (see the shared anchor's genesis env above). Adding this service changes
+  # compose_hash → on-chain addComposeHash() re-auth on the pre FeedlingAppAuth (see
+  # deploy/DEPLOYMENTS.md). Until deployed, chat_send_core 503s workers_unavailable
+  # for db_action_v2 users.
+  serve-worker:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:ac147f0   # CI pins the sha (same image as agent-runner)
+    container_name: serve-worker
+    command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
+    restart: unless-stopped
+    environment:
+      <<: *agent-runner-env
+      # V2 worker pool sizing. N in-process asyncio job slots share the agent_jobs
+      # queue via FOR UPDATE SKIP LOCKED. Encrypted env channel → tuning needs no
+      # on-chain re-auth (unlike adding the service).
+      FEEDLING_V2_MAX_WORKERS: "${FEEDLING_V2_MAX_WORKERS:-4}"
 
 volumes:
   # Fresh volume name (was feedling_agent_runtime_r0/r1). A new name gives the
