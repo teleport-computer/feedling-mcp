@@ -43,7 +43,8 @@ def test_should_wake_true_enqueues_and_advances():
     assert deps.enqueued == ["u1"]
     assert deps.advanced == [("u1", now + 900)]
     assert result == {"considered": 1, "enqueued": 1, "skipped": 0,
-                      "scheduled_fired": 0, "extraction_enqueued": 0}
+                      "scheduled_fired": 0, "extraction_enqueued": 0,
+                      "screen_watch_enqueued": 0}
 
 
 def test_zero_burn_blocked_does_not_enqueue_but_still_advances():
@@ -57,7 +58,8 @@ def test_zero_burn_blocked_does_not_enqueue_but_still_advances():
     assert deps.enqueued == []  # zero-burn: no job, no model call
     assert deps.advanced == [("u2", now + 1800)]
     assert result == {"considered": 1, "enqueued": 0, "skipped": 1,
-                      "scheduled_fired": 0, "extraction_enqueued": 0}
+                      "scheduled_fired": 0, "extraction_enqueued": 0,
+                      "screen_watch_enqueued": 0}
 
 
 def test_mixed_batch_two_wake_one_blocked():
@@ -75,7 +77,8 @@ def test_mixed_batch_two_wake_one_blocked():
     assert sorted(deps.enqueued) == ["a", "c"]
     assert set(deps.advanced) == {("a", now + 600), ("b", now + 7200), ("c", now + 300)}
     assert result == {"considered": 3, "enqueued": 2, "skipped": 1,
-                      "scheduled_fired": 0, "extraction_enqueued": 0}
+                      "scheduled_fired": 0, "extraction_enqueued": 0,
+                      "screen_watch_enqueued": 0}
 
 
 def test_per_user_error_isolation_does_not_abort_tick():
@@ -97,7 +100,8 @@ def test_per_user_error_isolation_does_not_abort_tick():
     assert ("bad", now + 60) not in deps.advanced
     assert set(deps.advanced) == {("good1", now + 60), ("good2", now + 60)}
     assert result == {"considered": 3, "enqueued": 2, "skipped": 1,
-                      "scheduled_fired": 0, "extraction_enqueued": 0}
+                      "scheduled_fired": 0, "extraction_enqueued": 0,
+                      "screen_watch_enqueued": 0}
 
 
 def test_empty_due_users_all_zero():
@@ -107,7 +111,8 @@ def test_empty_due_users_all_zero():
     assert deps.enqueued == []
     assert deps.advanced == []
     assert result == {"considered": 0, "enqueued": 0, "skipped": 0,
-                      "scheduled_fired": 0, "extraction_enqueued": 0}
+                      "scheduled_fired": 0, "extraction_enqueued": 0,
+                      "screen_watch_enqueued": 0}
 
 
 def test_module_does_not_import_forbidden_packages():
@@ -176,3 +181,21 @@ def test_tick_sweeps_extraction_users_and_isolates_failures():
 def test_tick_skips_extraction_sweep_when_deps_absent():
     out = scheduler.run_scheduler_tick(_SchedFakeDeps(), now=100.0)
     assert out["extraction_enqueued"] == 0
+
+
+def test_tick_sweeps_screen_watch_users_and_isolates_failures():
+    def _tick(uid):
+        if uid == "bad":
+            raise RuntimeError("boom")
+        return 1
+
+    deps = _SchedFakeDeps()                     # the duck-typed helper
+    deps.screen_watch_users = lambda: ["bad", "good"]
+    deps.tick_screen_watch = _tick
+    out = scheduler.run_scheduler_tick(deps, now=100.0)
+    assert out["screen_watch_enqueued"] == 1
+
+
+def test_tick_skips_screen_watch_sweep_when_deps_absent():
+    out = scheduler.run_scheduler_tick(_SchedFakeDeps(), now=100.0)
+    assert out["screen_watch_enqueued"] == 0

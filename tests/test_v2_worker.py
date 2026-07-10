@@ -1255,15 +1255,16 @@ def test_unhandled_lane_never_writes_a_bubble_and_fails_loudly_in_the_db(monkeyp
     """An unhandled lane must NOT take the chat path (no chat bubble, no user-visible error
     chip) and must fail loudly in the DB with `unhandled_lane:<lane>`.
 
-    Task 3 note: this test used to enqueue `capture`, but `capture` is now a real handled
-    lane (memory extraction via `_run_extraction`). To keep exercising the genuine unhandled
-    branch we use a lane that is NOT in `jobs_store.LANES`. `enqueue_job` validates against
-    LANES, so we INSERT the bogus-lane row directly (chosen over monkeypatching LANES, so the
-    Python-side guard stays real for every other test)."""
+    Task 3 note: this test used to enqueue `capture`, then `screen_watch` — both are now
+    real handled lanes (memory extraction via `_run_extraction`; screen_watch wake via
+    `_run_wake`). To keep exercising the genuine unhandled branch we use a lane that is NOT
+    in `jobs_store.LANES`. `enqueue_job` validates against LANES, so we INSERT the bogus-lane
+    row directly (chosen over monkeypatching LANES, so the Python-side guard stays real for
+    every other test)."""
     uid = "u_w_unhandled_lane"
     conftest.seed_user(uid)
     _reset(uid)
-    bogus_lane = "screen_watch"  # not in jobs_store.LANES → genuinely unregistered
+    bogus_lane = "bogus_lane"  # not in jobs_store.LANES → genuinely unregistered
     assert bogus_lane not in jobs_store.LANES
     with db.get_pool().connection() as conn:
         job_id = conn.execute(

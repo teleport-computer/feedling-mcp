@@ -68,6 +68,7 @@ from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import scheduler
+from model_api_runtime.v2 import screen_watch
 from model_api_runtime.v2 import worker as v2_worker
 from proactive import capture_scheduler
 from proactive import dream_scheduler
@@ -527,6 +528,92 @@ def _tick_extraction_for_user(user_id: str) -> int:
     return _tick_capture_for_user(user_id) + _tick_dream_for_user(user_id)
 
 
+def _latest_frame_meta(user_id: str) -> tuple[str, float]:
+    """该用户最新一帧的 (frame_id, ts) —— 纯读 `db.frame_list_meta`（id/ts/app，绝不解密）。
+
+    `frame_list_meta` 按 ts 升序返回（newest last，见 screen/caption.py:73/135），所以取
+    `meta[-1]`。frame_id 从 `filename`（"<frame_id>.env.json"）派生，退回 `id`——与
+    `screen/caption.py:_frame_id_from_entry` 同一套推导，但**内联复制**以免让本模块耦合
+    进 screen 包的私有函数（且 screen/* 在本任务里是只读的）。无帧时返回 ("", 0.0)。"""
+    meta = db.frame_list_meta(user_id)
+    if not meta:
+        return "", 0.0
+    entry = meta[-1]
+    filename = str(entry.get("filename") or "")
+    if filename:
+        # frame_id 是无点十六进制串，split(".")[0] 安全（镜像 _frame_id_from_entry）。
+        frame_id = filename.removesuffix(".env.json").split(".")[0]
+    else:
+        frame_id = str(entry.get("id") or "")
+    ts = entry.get("ts")
+    return frame_id, float(ts) if ts is not None else 0.0
+
+
+def _last_user_msg_ts(user_id: str) -> float | None:
+    """该用户最后一条 `role == "user"` 消息的 ts —— 直接读 `store.chat_messages` 的明文
+    `role`/`ts` 列（**绝不 enclave**：只有 `body_ct` 是密文，role/ts 是明文）。没有任何
+    user 行时返回 None（gate 视作「未在对话」，不触发 chatting 让路）。"""
+    store = core_store.get_store(user_id)
+    rows = getattr(store, "chat_messages", []) or []
+    last_ts: float | None = None
+    for m in rows:
+        if str(m.get("role") or "") == "user":
+            ts = m.get("ts")
+            if ts is not None:
+                last_ts = float(ts)
+    return last_ts
+
+
+def _tick_screen_watch_for_user(user_id: str) -> int:
+    """屏幕监看生产者（D-screen_watch Task 4）：替掉 resident 的 per-user 120s 循环。
+
+    每 scheduler tick 对一个到期用户跑一遍**纯** gate `screen_watch.should_watch`，命中才
+    再问只读 proactive oracle `_wake_decision_for_user`（未激活/Ambient-off/免打扰闸 + 零
+    预激活烧钱不变量）。两关都过才 enqueue 一个 `screen_watch` lane 的 background job。
+
+    两个 gate 输入都在服务端明文可得，**绝不碰 enclave**（这条每 120s 对每个 db_action_v2
+    用户跑一次，一次 enclave 往返会锤死本子项目要保护的单线程瓶颈）：最新帧 id/ts 走
+    `db.frame_list_meta`（不解密），last_screen_watch_frame_id 走 `get_wake_schedule`，
+    last-user-msg ts 直接读 `store.chat_messages` 的明文 role/ts。
+
+    **无论结果如何都推进** `next_screen_watch_at = now + INTERVAL_SEC`——否则一个被 gate
+    挡下的用户会在每个 30s scheduler tick 都被重新考量。
+
+    **只有真的 enqueue 时才落 `last_screen_watch_frame_id`**——这是**相对 resident 有意的
+    修正**：resident 一旦 `fresh and changed` 就把 frame id 写进内存，即便这一 tick 随后被
+    `chatting` 抑制，那一帧也永久被「消费」掉、用户停手后再也看不到。我们只在真醒时消费它。
+
+    enqueue 了返回 1，否则 0。"""
+    now = time.time()
+    latest_frame_id, latest_ts = _latest_frame_meta(user_id)
+    sched = jobs_store.get_wake_schedule(user_id) or {}
+    last_frame_id = str(sched.get("last_screen_watch_frame_id") or "")
+    last_user_msg_ts = _last_user_msg_ts(user_id)
+
+    next_at = now + screen_watch.INTERVAL_SEC
+    should, _reason = screen_watch.should_watch(
+        latest_frame_id=latest_frame_id,
+        latest_ts=latest_ts,
+        last_frame_id=last_frame_id,
+        last_user_msg_ts=last_user_msg_ts,
+        now=now,
+    )
+
+    if should and bool(_wake_decision_for_user(user_id).get("should_wake")):
+        jobs_store.enqueue_job(user_id, "screen_watch", reason="screen_watch")
+        core_wake_bus.notify("v2_jobs", user_id)
+        # 真醒：推进到期时间 **且** 消费这一帧（记 last_screen_watch_frame_id）。
+        jobs_store.upsert_wake_schedule(
+            user_id, next_screen_watch_at=next_at,
+            last_screen_watch_frame_id=latest_frame_id)
+        return 1
+
+    # 被 gate（未 fresh/未变/chatting）或 oracle（未激活/免打扰）挡下：只推进到期时间，
+    # **不**动 last_screen_watch_frame_id——那一帧仍是「新」的，用户停手后仍能被看到。
+    jobs_store.upsert_wake_schedule(user_id, next_screen_watch_at=next_at)
+    return 0
+
+
 def build_production_deps() -> v2_worker.TurnDeps:
     return v2_worker.TurnDeps(
         read_messages=_read_messages,
@@ -576,6 +663,13 @@ def _build_scheduler_deps():
         extraction_users=lambda: admin_core.list_runtime_modes().get(
             hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []),
         tick_extraction=_tick_extraction_for_user,
+        # screen_watch lane 生产者（D-screen_watch Task 4）：screen_watch_users 列出
+        # next_screen_watch_at 已到期的用户（Task 2 的 due_screen_watch_users，与
+        # heartbeat/scheduled 同套 payment-cooldown 排除）；_tick_screen_watch_for_user
+        # 逐用户跑纯 gate + 只读 oracle，命中才 enqueue 一个 screen_watch job。
+        # scheduler.py 同样用 getattr 探测这两个属性（缺一即整段跳过，既有 FakeDeps 零改动）。
+        screen_watch_users=lambda: jobs_store.due_screen_watch_users(),
+        tick_screen_watch=_tick_screen_watch_for_user,
     )
 
 

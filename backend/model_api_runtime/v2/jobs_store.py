@@ -15,7 +15,7 @@ from psycopg.types.json import Jsonb
 import db
 from core import wake_bus
 
-LANES = {"chat", "manual_wake", "heartbeat", "scheduled", "capture", "maintenance", "dream"}
+LANES = {"chat", "manual_wake", "heartbeat", "scheduled", "capture", "maintenance", "dream", "screen_watch"}
 
 # 默认（lane 派生）优先级：预留槽位场景下 chat/manual_wake 必须能在一堆 heartbeat/
 # capture 前面被抢到，防止后台唤醒风暴饿死聊天回复。enqueue_job 未显式传 priority
@@ -25,6 +25,7 @@ LANE_PRIORITY = {
     "manual_wake": 100,
     "heartbeat": 50,
     "scheduled": 50,
+    "screen_watch": 50,
     "capture": 10,
     "maintenance": 10,
     "dream": 10,
@@ -555,18 +556,35 @@ def upsert_summary_row_cas(
 
 
 def get_wake_schedule(user_id) -> dict | None:
-    """读取该用户的 v2_wake_schedule 行（proactive 唤醒调度：下次心跳/采集到期时间
-    + BYOK 支付冷却截止），无行返回 None（该用户尚未被调度器接管过）。"""
+    """读取该用户的 v2_wake_schedule 行（proactive 唤醒调度：下次心跳/采集/屏幕监看到期
+    时间 + BYOK 支付冷却截止 + screen_watch 的跨-tick 状态 last_screen_watch_frame_id），
+    无行返回 None（该用户尚未被调度器接管过）。
+
+    **四个时间列一律以 epoch 浮点数返回**（`EXTRACT(EPOCH FROM ...)`），与
+    `upsert_wake_schedule` 收的 epoch float 对称，调用方可以直接做算术比较。
+    曾经只有 `next_screen_watch_at` 是 float、其余三列是 `datetime` —— 同一个 dict 里四个
+    同类字段两种类型是个地雷（谁会记得只有第四个能做减法？）。本函数没有生产调用方，
+    只有测试，所以统一成 float 的代价是零。`updated_at` 保持 datetime：它是审计字段，
+    没人拿它做算术。"""
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT user_id, next_heartbeat_at, next_capture_at, "
-                "payment_cooldown_until, updated_at "
+                "SELECT user_id, "
+                "EXTRACT(EPOCH FROM next_heartbeat_at) AS next_heartbeat_at, "
+                "EXTRACT(EPOCH FROM next_capture_at) AS next_capture_at, "
+                "EXTRACT(EPOCH FROM payment_cooldown_until) AS payment_cooldown_until, "
+                "EXTRACT(EPOCH FROM next_screen_watch_at) AS next_screen_watch_at, "
+                "last_screen_watch_frame_id, updated_at "
                 "FROM v2_wake_schedule WHERE user_id=%s",
                 (user_id,),
             )
             row = cur.fetchone()
-    return dict(row) if row is not None else None
+    if row is None:
+        return None
+    result = dict(row)
+    if result["next_screen_watch_at"] is not None:
+        result["next_screen_watch_at"] = float(result["next_screen_watch_at"])
+    return result
 
 
 def upsert_wake_schedule(
@@ -575,26 +593,39 @@ def upsert_wake_schedule(
     next_heartbeat_at: float | None = None,
     next_capture_at: float | None = None,
     payment_cooldown_until: float | None = None,
+    next_screen_watch_at: float | None = None,
+    last_screen_watch_frame_id: str | None = None,
 ) -> None:
-    """UPSERT 该用户的唤醒调度行。三个时间列各自是可选的 epoch 浮点数；传 None 表示
+    """UPSERT 该用户的唤醒调度行。时间列各自是可选的 epoch 浮点数；传 None 表示
     「本次不动这一列」（COALESCE(EXCLUDED.col, 现有值) 保留旧值），不会把已有到期时间
     清空——这些列只会被推进到未来的时间戳，从不被置空，调用方总是「只更新我刚算出来的
-    那一列」。updated_at 每次调用都刷新。"""
+    那一列」。updated_at 每次调用都刷新。
+
+    last_screen_watch_frame_id 同一套「None=不动」语义：resident 把这个值放进程内存，
+    V2 没有 per-user 常驻进程，不落库每个 scheduler tick 都会把同一帧当成新内容，变成
+    唤醒风暴——所以推进 next_screen_watch_at 的调用（不带 frame id）绝不能把已记的
+    frame id 冲掉。"""
     with _pool().connection() as conn:
         conn.execute(
             "INSERT INTO v2_wake_schedule "
-            "(user_id, next_heartbeat_at, next_capture_at, payment_cooldown_until, updated_at) "
-            "VALUES (%s, to_timestamp(%s), to_timestamp(%s), to_timestamp(%s), now()) "
+            "(user_id, next_heartbeat_at, next_capture_at, payment_cooldown_until, "
+            "next_screen_watch_at, last_screen_watch_frame_id, updated_at) "
+            "VALUES (%s, to_timestamp(%s), to_timestamp(%s), to_timestamp(%s), "
+            "to_timestamp(%s), %s, now()) "
             "ON CONFLICT (user_id) DO UPDATE SET "
             "next_heartbeat_at = COALESCE(EXCLUDED.next_heartbeat_at, v2_wake_schedule.next_heartbeat_at), "
             "next_capture_at = COALESCE(EXCLUDED.next_capture_at, v2_wake_schedule.next_capture_at), "
             "payment_cooldown_until = COALESCE(EXCLUDED.payment_cooldown_until, v2_wake_schedule.payment_cooldown_until), "
+            "next_screen_watch_at = COALESCE(EXCLUDED.next_screen_watch_at, v2_wake_schedule.next_screen_watch_at), "
+            "last_screen_watch_frame_id = COALESCE(EXCLUDED.last_screen_watch_frame_id, v2_wake_schedule.last_screen_watch_frame_id), "
             "updated_at = now()",
             (
                 user_id,
                 float(next_heartbeat_at) if next_heartbeat_at is not None else None,
                 float(next_capture_at) if next_capture_at is not None else None,
                 float(payment_cooldown_until) if payment_cooldown_until is not None else None,
+                float(next_screen_watch_at) if next_screen_watch_at is not None else None,
+                str(last_screen_watch_frame_id) if last_screen_watch_frame_id is not None else None,
             ),
         )
 
@@ -614,6 +645,27 @@ def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[s
                 "AND (payment_cooldown_until IS NULL "
                 "     OR payment_cooldown_until <= COALESCE(to_timestamp(%s), now())) "
                 "ORDER BY next_heartbeat_at LIMIT %s",
+                (ts, ts, int(limit)),
+            )
+            return [row[0] for row in cur.fetchall()]
+
+
+def due_screen_watch_users(*, now: float | None = None, limit: int = 500) -> list[str]:
+    """到期需要屏幕监看唤醒的 user_id 列表（next_screen_watch_at 已到且不在 BYOK 支付
+    冷却窗口内），按 next_screen_watch_at 升序，供 D3 调度器 poll 后逐个
+    enqueue_job(..., 'screen_watch')。镜像 due_heartbeat_users 的每一处语义（NULL 不
+    算到期；now 可注入 epoch 浮点数用于确定性测试；payment_cooldown_until 排除——
+    一个已死的 BYOK key 不该被屏幕轮询器持续锤）。"""
+    ts = float(now) if now is not None else None
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id FROM v2_wake_schedule "
+                "WHERE next_screen_watch_at IS NOT NULL "
+                "AND next_screen_watch_at <= COALESCE(to_timestamp(%s), now()) "
+                "AND (payment_cooldown_until IS NULL "
+                "     OR payment_cooldown_until <= COALESCE(to_timestamp(%s), now())) "
+                "ORDER BY next_screen_watch_at LIMIT %s",
                 (ts, ts, int(limit)),
             )
             return [row[0] for row in cur.fetchall()]

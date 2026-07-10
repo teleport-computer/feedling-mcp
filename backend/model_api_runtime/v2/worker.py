@@ -118,7 +118,7 @@ _TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "6"))
 # default chat path below would be wrong (no coalesced pending messages ->
 # it would just complete as a no-op), so it's left alone here rather than
 # silently mishandled by this task's scope.
-_WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake"})
+_WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake", "screen_watch"})
 # 记忆抽取 lane（capture=一窗对话→记忆卡，dream=现有卡片→合并）。同形：
 # build prompt → BYOK 抽取 → parse → memory actions。永不写气泡、永不弹 error chip。
 _EXTRACTION_LANES = frozenset({"capture", "dream"})
@@ -130,6 +130,18 @@ _WAKE_SYSTEM_PROMPT = (
     "empty message; staying silent is correct and expected."
 )
 _WAKE_NUDGE = "(A quiet moment has passed. Reach out only if something is genuinely worth saying right now.)"
+# screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
+# than a perception snapshot. Its own system prompt sits beside _WAKE_SYSTEM_PROMPT;
+# _run_wake selects it only for lane=="screen_watch". Silence is still the correct
+# answer most ticks (inherits the "weak wake sleeps" empty_reply path).
+_SCREEN_WATCH_SYSTEM_PROMPT = (
+    "You are the user's personal companion, quietly watching the screen they are sharing. "
+    "Recent frames (with captions) are provided as grounding context. "
+    "Speak ONLY if you have something genuinely useful or warm to say about what changed on "
+    "screen right now. If nothing is worth saying, reply with an empty message — silence is "
+    "the correct answer most of the time. Never narrate that you are watching or that you "
+    "looked at frames."
+)
 # D3 Task 7 (BYOK payment cooldown): a "provider_config" wake failure (402 out-of-credits,
 # 401/403 bad key) means the user's BYOK key is dead/broke — retrying it every heartbeat
 # interval is a retry storm against a key that cannot succeed until the user fixes it
@@ -369,10 +381,32 @@ async def _run_wake(
             tail = await asyncio.to_thread(
                 _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images)
         wake_tail = list(tail) + [{"role": "user", "content": _WAKE_NUDGE}]
+        # screen_watch lane grounds on recent shared-screen frames (Task 3). Fetch
+        # ONLY screen_recent — NOT perception_snapshot: the resident explicitly sets
+        # perception_digest=None for screen-watch jobs (chat_resident_consumer.py:6611).
+        #
+        # This _cap_data call sits DELIBERATELY OUTSIDE the `async with enclave_sem`
+        # block above: `_cap_data` acquires enclave_sem ITSELF (see its body), and
+        # asyncio.Semaphore is NOT reentrant. Nesting it inside another
+        # `async with enclave_sem` deadlocks whenever the semaphore value is 1
+        # (FEEDLING_V2_ENCLAVE_CONCURRENCY defaults to 2, so a naive test would pass
+        # while production wedges wherever the value is 1). The gate still bounds the
+        # call — _cap_data holds the semaphore for its own turn.
+        screen_results = None
+        if lane == "screen_watch":
+            token = deps.mint_enclave_token(user_id)
+            data = await _cap_data(
+                store, "screen_recent", api_key=None, runtime_token=token,
+                enclave_sem=enclave_sem)
+            # _fold_action_results caps each action at _PER_ACTION_CHAR_CAP=2000 chars
+            # (the multimodal round's anti-poisoning cap); captions fit.
+            screen_results = {"screen_recent": [{"ok": True, "data": data}]}
         try:
             reply = await v2_responder.respond(
                 provider_config=provider_config, summary=summary, tail=wake_tail,
-                system_prompt=_WAKE_SYSTEM_PROMPT)
+                action_results=screen_results,
+                system_prompt=(_SCREEN_WATCH_SYSTEM_PROMPT if lane == "screen_watch"
+                               else _WAKE_SYSTEM_PROMPT))
         except v2_responder.ResponderError as e:
             if "empty_reply" in str(e) or "no_user_messages" in str(e):
                 # Weak wake sleeps: the model (or a degenerate prompt) chose silence —
