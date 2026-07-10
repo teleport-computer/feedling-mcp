@@ -82,3 +82,73 @@ The typical turn is **unchanged**. A planner that emits `final_response` on roun
 is what the prompt tells it to do, and what every `rule_plan` (weak/relay model) turn does
 unconditionally — costs exactly 2 calls, exactly as before the loop. Only turns where the
 model genuinely asks for more context pay more. That is the feature, and it is bounded.
+
+---
+
+# The RESIDENT baseline — measured 2026-07-10, and it unblocks the D4 gate
+
+`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md` Step 1.3 gates the rollout on
+`compare_tokens.py --resident-baseline <N>`. **Nobody had ever measured N**, so that gate
+was un-runnable and the +10% rollback condition had no reference point. Now it does.
+
+## Method
+
+`scripts/loadtest/measure_resident.py` points the resident's actual agent CLI (`codex-cli
+0.142.5`) at `MockProvider(estimate_tokens=True)` and reads the mock's server-side
+accumulators. Same three user messages as the V2 fixtures above, so the numbers compare.
+
+**This has to spawn the real CLI.** The resident never calls the provider itself — it shells
+out to codex, which injects its OWN system prompt and tool catalog into every request.
+Estimating that from our prompt text would understate it by more than 10×, and a fabricated
+baseline is worse than none: it green-lights a real regression.
+
+Two things the harness had to learn, both the hard way:
+- **codex speaks the OpenAI Responses wire** (`POST /v1/responses`), not `/chat/completions`.
+  `MockProvider` now serves both; the Responses route counts `instructions` + `input` + `tools`.
+- **`codex exec` reads stdin when it is a pipe.** Without `stdin=DEVNULL` it hangs forever and
+  the mock sees zero requests. The first probe lost 45 seconds to exactly this.
+
+## Result
+
+| metric | value |
+|---|---|
+| `tokens_per_turn` | **9303.0** |
+| `llm_calls_per_turn` | 1.0 |
+| prompt / completion split | 27906 / 3 over 3 turns |
+
+For one trivial `"say ok"` turn, codex's request body is ~38 KB: `instructions` alone is
+**20,771 characters**, plus **9 tool definitions**. That overhead is re-sent every single turn
+and is essentially independent of what the user said. It is the whole story.
+
+## The gate, finally runnable
+
+```
+                          tokens/turn    vs resident    regression (>+10%)?
+resident (codex)               9303.0         —              —
+V2 single round                 545.3       -94.1%          no
+V2 3-round tool loop           1336.0       -85.6%          no
+V2 worst case (hard gate)      2066.0       -77.8%          no
+```
+
+**V2 is 17× cheaper per turn than the runtime it replaces**, and even its `_TURN_MAX_LLM_CALLS`
+worst case is 4.5× cheaper. The rollback gate passes with enormous margin.
+
+## Honest caveats
+
+1. **`llm_calls_per_turn = 1.0` is a floor, not the truth.** A `"say ok"` prompt makes codex
+   answer in one shot. A real chat turn where the model uses tools costs several round-trips,
+   each re-sending the full ~9.3k-token overhead. So the true resident number is **higher**
+   than 9303 — which only widens V2's margin. Do not read 9303 as an upper bound.
+2. The harness runs codex in an **empty temp workdir on purpose**. codex folds any `AGENTS.md`
+   it finds into `instructions`; running inside this repo would inflate the baseline with our
+   own docs and make the number unreproducible elsewhere.
+3. Token counts are the same 4-chars-per-token estimate used for the V2 numbers. The gate
+   compares ratios, so the estimator cancels out.
+4. This measures the **codex** driver. The `claude` driver (anthropic wire) has its own
+   overhead and was not measured; `resolve_driver` picks per provider.
+
+## Re-measure
+
+```bash
+python scripts/loadtest/measure_resident.py
+```

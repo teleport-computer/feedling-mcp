@@ -174,3 +174,61 @@ def test_mock_provider_fixed_tokens_remains_the_default():
             body = json.loads(r.read())
     assert body["usage"]["prompt_tokens"] == 100
     assert body["usage"]["completion_tokens"] == 20
+
+
+def test_mock_provider_serves_the_openai_responses_wire_with_sse():
+    """codex speaks Responses (`POST /v1/responses`), not `/chat/completions`. Without this
+    route the resident-baseline harness receives zero requests."""
+    import json
+    import urllib.request
+    from scripts.loadtest.mock_provider import MockProvider
+
+    with MockProvider(reply="ok", estimate_tokens=True) as p:
+        req = urllib.request.Request(
+            f"{p.base_url}/v1/responses",
+            data=json.dumps({
+                "instructions": "S" * 4000,           # codex's own system prompt
+                "input": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "name": "shell"}],
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as r:
+            assert r.headers.get("Content-Type") == "text/event-stream"
+            body = r.read().decode()
+
+    assert "event: response.completed" in body
+    assert "output_text" in body
+    # instructions + input + tools all counted: 4000 chars of instructions alone is 1000 tokens.
+    assert p.total_prompt_tokens > 1000
+    assert p.request_count == 1
+
+
+def test_responses_token_count_includes_instructions_and_tools():
+    """Counting only the user's message understates the resident by >10x — the whole point."""
+    from scripts.loadtest.mock_provider import _estimate_responses_prompt_tokens
+
+    user_only = _estimate_responses_prompt_tokens({"input": [{"role": "user", "content": "hi"}]})
+    with_overhead = _estimate_responses_prompt_tokens({
+        "instructions": "S" * 20000,
+        "input": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "name": f"t{i}"} for i in range(9)],
+    })
+    assert with_overhead > user_only * 50
+
+
+def test_chat_completions_route_is_unaffected_by_the_responses_branch():
+    import json
+    import urllib.request
+    from scripts.loadtest.mock_provider import MockProvider
+
+    with MockProvider(reply="ok", prompt_tokens=100, completion_tokens=20) as p:
+        req = urllib.request.Request(
+            f"{p.base_url}/chat/completions",
+            data=json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as r:
+            body = json.loads(r.read())
+    assert body["usage"]["prompt_tokens"] == 100
+    assert body["object"] == "chat.completion"

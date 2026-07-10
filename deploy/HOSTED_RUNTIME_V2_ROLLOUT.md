@@ -25,7 +25,7 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 
 1. Start the mock provider: `python scripts/loadtest/mock_provider.py --port 8099 --prompt-tokens 100 --completion-tokens 20 --latency-ms 200`.
 2. Drive load: `python scripts/loadtest/run_loadtest.py --users 100 --workers 16` (for the real run, point the driver's processor at a live `serve_worker` pool configured against the mock; the in-CI smoke uses the simulated drain). Collect: queue-wait P95, turn latency, tokens/turn, stuck jobs, RSS.
-3. **tokens/turn vs resident (rollback gate)**: `python scripts/loadtest/compare_tokens.py --resident-baseline <tokens/turn measured on the resident runtime for the same fixtures> --threshold 0.10`. Exit code 1 = regression > +10% = **do not roll out** (investigate prompt-shape/caching drift first).
+3. **tokens/turn vs resident (rollback gate)**: the resident baseline is **measured, not assumed** — `python scripts/loadtest/measure_resident.py` (spawns the real `codex` CLI against MockProvider; see `docs/HOSTED_RUNTIME_V2_TOKEN_BASELINE.md`). As of 2026-07-10 it is **9303.0 tokens/turn**. Then: `python scripts/loadtest/compare_tokens.py --resident-baseline 9303.0 --threshold 0.10`. Exit code 1 = regression > +10% = **do not roll out**. Current standing: V2 single-round 545.3 (-94.1%), 3-round loop 1336.0 (-85.6%), worst case 2066.0 (-77.8%) — all pass. Re-measure the baseline if the agent CLI version changes; codex's own system prompt + tool catalog (~9.3k tokens/turn) is the dominant term, not our prompt.
 4. Sanity vs the capacity model: 100 users, 16 workers × ~20 s/turn ≈ 50 turns/min → the everyone-at-once spike clears in ~2 min; queue-wait P95 should not contradict this.
 
 ## Step 2 — Gated rollout (evidence-first)

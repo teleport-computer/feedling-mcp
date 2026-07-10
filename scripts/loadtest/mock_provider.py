@@ -52,6 +52,21 @@ def _estimate_prompt_tokens(payload: dict) -> int:
     return estimate_tokens_from_text("".join(parts))
 
 
+def _estimate_responses_prompt_tokens(payload: dict) -> int:
+    """OpenAI Responses 请求体的 prompt 规模。
+
+    `instructions` + `input` + `tools` 三项都算。codex 的 `instructions` 单独就有 ~20k
+    字符、`tools` 有 9 个函数定义，而且**每回合原样重发** —— 只数用户那句话会把 resident
+    的真实 tokens/turn 低估一个数量级以上。
+    """
+    parts = [str(payload.get("instructions") or "")]
+    for key in ("input", "tools"):
+        value = payload.get(key)
+        if value:
+            parts.append(json.dumps(value, ensure_ascii=False))
+    return estimate_tokens_from_text("".join(parts))
+
+
 def _make_handler(provider: "MockProvider") -> type:
     class Handler(BaseHTTPRequestHandler):
         # Silence default stderr access logging; load tests can generate a
@@ -65,6 +80,12 @@ def _make_handler(provider: "MockProvider") -> type:
 
             if provider.latency_ms:
                 time.sleep(provider.latency_ms / 1000.0)
+
+            # codex 只说 OpenAI Responses（`/responses`），不说 `/chat/completions`。
+            # 量 resident 基线时必须服务这条路由，否则一个请求都收不到。
+            if self.path.rstrip("/").endswith("/responses"):
+                self._serve_responses(raw_body)
+                return
 
             if provider.estimate_tokens:
                 try:
@@ -105,6 +126,52 @@ def _make_handler(provider: "MockProvider") -> type:
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+
+        def _serve_responses(self, raw_body: bytes) -> None:
+            """OpenAI Responses wire (`POST /v1/responses`), SSE — what codex speaks.
+
+            Token accounting covers the WHOLE request, not just the user's message:
+            `instructions` (codex's own ~20k-char system prompt) + `input` + `tools`.
+            That overhead is re-sent on every single turn and is the dominant term in
+            the resident runtime's tokens/turn — measuring only the user's message
+            would understate it by more than an order of magnitude.
+            """
+            try:
+                payload = json.loads(raw_body) if raw_body else {}
+            except json.JSONDecodeError:
+                payload = {}
+
+            if provider.estimate_tokens:
+                prompt_tokens = _estimate_responses_prompt_tokens(payload)
+                completion_tokens = estimate_tokens_from_text(provider.reply)
+            else:
+                prompt_tokens = provider.prompt_tokens
+                completion_tokens = provider.completion_tokens
+            with provider._lock:
+                provider.total_prompt_tokens += prompt_tokens
+                provider.total_completion_tokens += completion_tokens
+                provider.request_count += 1
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+
+            def _event(kind: str, data: dict) -> None:
+                self.wfile.write(f"event: {kind}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+
+            _event("response.created",
+                   {"type": "response.created", "response": {"id": "resp_mock", "status": "in_progress"}})
+            _event("response.output_item.done",
+                   {"type": "response.output_item.done",
+                    "item": {"type": "message", "role": "assistant", "id": "msg_mock",
+                             "content": [{"type": "output_text", "text": provider.reply}]}})
+            _event("response.completed",
+                   {"type": "response.completed",
+                    "response": {"id": "resp_mock", "status": "completed",
+                                 "usage": {"input_tokens": prompt_tokens,
+                                           "output_tokens": completion_tokens,
+                                           "total_tokens": prompt_tokens + completion_tokens}}})
 
         # Accept GET too (e.g. health checks) with a trivial 200, in case a
         # harness pings the provider before driving real traffic.
