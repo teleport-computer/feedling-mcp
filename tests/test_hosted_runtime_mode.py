@@ -39,6 +39,57 @@ def test_set_and_get_db_action_v2():
     assert hosted_config_store.get_hosted_runtime_mode(store) == "db_action_v2"
 
 
+def test_strict_mode_read_propagates_control_plane_failure(monkeypatch):
+    _seed_model_api_user("u_mode_strict_read")
+    store = core_store.get_store("u_mode_strict_read")
+    monkeypatch.setattr(
+        db, "get_blob_strict",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        hosted_config_store.get_hosted_runtime_mode_strict(store)
+
+
+def test_mode_write_propagates_persistence_failure(monkeypatch):
+    _seed_model_api_user("u_mode_strict_write")
+    store = core_store.get_store("u_mode_strict_write")
+    hosted_config_store.set_hosted_runtime_mode(store, "resident_cli")
+    monkeypatch.setattr(
+        db, "patch_blob_strict",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+
+
+def test_concurrent_mode_flip_and_error_patch_preserve_both_fields():
+    import concurrent.futures
+    import threading
+
+    uid = "u_mode_concurrent_patch"
+    _seed_model_api_user(uid)
+    store = core_store.get_store(uid)
+    hosted_config_store.set_hosted_runtime_mode(store, "resident_cli")
+    barrier = threading.Barrier(2)
+
+    def _flip():
+        barrier.wait()
+        return hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+
+    def _error():
+        barrier.wait()
+        hosted_config_store.set_last_runtime_error(store, "turn_failed:provider_unknown")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_flip), pool.submit(_error)]
+        for future in futures:
+            future.result(timeout=5)
+
+    profile = db.get_blob_strict(uid, hosted_config_store.MODEL_API_RUNTIME_BLOB)
+    assert profile["hosted_runtime_mode"] == "db_action_v2"
+    assert profile["last_runtime_error"] == "turn_failed:provider_unknown"
+
+
 def test_set_rejects_unknown_mode():
     _seed_model_api_user("u_mode_3")
     store = core_store.get_store("u_mode_3")
@@ -65,6 +116,18 @@ def test_set_without_model_api_config_raises_and_stays_default():
     assert hosted_config_store.get_hosted_runtime_mode(store) == "resident_cli"
 
 
+def test_set_rejects_stale_runtime_blob_without_active_model_route():
+    uid = "u_mode_stale_blob"
+    _seed_bare_user(uid)
+    db.set_blob_strict(uid, hosted_config_store.MODEL_API_RUNTIME_BLOB, {
+        "hosted_runtime_mode": "resident_cli",
+    })
+    store = core_store.get_store(uid)
+
+    with pytest.raises(ValueError, match="no model_api config"):
+        hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+
+
 # ------------------------------------------------------------------
 # set_last_runtime_error (Task 3: v2 worker terminal-failure error surface).
 # Public direct lever wrapping _patch_model_api_runtime_profile — the v2 worker
@@ -78,6 +141,13 @@ def test_set_last_runtime_error_writes_profile_field():
     hosted_config_store.set_last_runtime_error(store, "boom")
     profile = hosted_config_store._load_model_api_runtime_profile(store)
     assert profile.get("last_runtime_error") == "boom"
+    with db.get_pool().connection() as conn:
+        route_error = conn.execute(
+            "SELECT last_runtime_error FROM model_api_routes "
+            "WHERE user_id=%s AND is_active",
+            (store.user_id,),
+        ).fetchone()[0]
+    assert route_error == "boom"
 
 
 def test_set_last_runtime_error_truncates_at_300_chars():
@@ -88,3 +158,10 @@ def test_set_last_runtime_error_truncates_at_300_chars():
     profile = hosted_config_store._load_model_api_runtime_profile(store)
     assert profile.get("last_runtime_error") == "x" * 300
     assert len(profile.get("last_runtime_error")) == 300
+    with db.get_pool().connection() as conn:
+        route_error = conn.execute(
+            "SELECT last_runtime_error FROM model_api_routes "
+            "WHERE user_id=%s AND is_active",
+            (store.user_id,),
+        ).fetchone()[0]
+    assert route_error == "x" * 300

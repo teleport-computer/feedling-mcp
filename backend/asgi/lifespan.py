@@ -26,6 +26,8 @@ process). See asgi.settings.
 
 from __future__ import annotations
 
+import asyncio
+import os
 from contextlib import asynccontextmanager
 
 import httpx
@@ -114,6 +116,25 @@ async def lifespan(app):
     if settings.start_background:
         _start_ws_leader()
 
+    # (7) Independent V2 timeout watchdog. The worker process also runs this
+    # loop, but pending jobs must still expire visibly when the whole worker
+    # fleet is dead. Concurrent passes are safe: the UPDATE returns each row to
+    # exactly one winner.
+    from hosted import config_store as hosted_config_store
+    from model_api_runtime.v2 import reaper as v2_reaper
+
+    def _record_v2_timeout(user_id: str, message: str) -> None:
+        hosted_config_store.set_last_runtime_error(core_store.get_store(user_id), message)
+
+    reaper_stop = asyncio.Event()
+    reaper_task = asyncio.create_task(
+        v2_reaper.run_loop(
+            reaper_stop,
+            interval=float(os.environ.get("FEEDLING_V2_REAP_INTERVAL_SEC", "30")),
+            record_terminal_error=_record_v2_timeout,
+        )
+    )
+
     print(
         f"[asgi] startup ready: threadpool={settings.db_threads} "
         f"http_max={settings.http_max_connections} poller_max={settings.poller_max_active} "
@@ -128,5 +149,7 @@ async def lifespan(app):
         # hook, then close the async clients.
         registry.wake_all()
         core_store.set_async_wake_hook(None)
+        reaper_stop.set()
+        await reaper_task
         await app.state.internal_http.aclose()
         await app.state.provider_http.aclose()

@@ -294,6 +294,19 @@ def build_memory_index_item(envelope: dict, inner: dict) -> dict:
     }
 
 
+def build_memory_search_item(envelope: dict, inner: dict) -> dict:
+    """Build an index-shaped item with enclave-private search text.
+
+    ``content`` must never appear in the memory-index response, but exact search
+    still needs to match it while plaintext exists inside the enclave. The route
+    strips ``_search_content`` before serialization.
+    """
+    adapted = memory_inner_to_v1(inner, envelope)
+    item = build_memory_index_item(envelope, inner)
+    item["_search_content"] = adapted.get("content", "")
+    return item
+
+
 def build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
     adapted = memory_inner_to_v1(inner, envelope)
     return {
@@ -317,12 +330,26 @@ def build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
 def memory_index_filter_items(items: list[dict], payload: dict) -> list[dict]:
     bucket = memory_readside_text(payload.get("bucket"), 120)
     thread = memory_readside_text(payload.get("thread"), 120)
+    query = memory_readside_text(payload.get("query"), 500).casefold().strip()
     filtered = []
     for item in items:
         if bucket and item.get("bucket") != bucket:
             continue
         if thread and thread not in (item.get("threads") or []):
             continue
+        if query:
+            haystack = "\n".join(
+                [
+                    str(item.get("content") or ""),
+                    str(item.get("summary") or ""),
+                    str(item.get("_search_content") or ""),
+                    str(item.get("bucket") or ""),
+                    str(item.get("source") or ""),
+                    *[str(value) for value in (item.get("threads") or [])],
+                ]
+            ).casefold()
+            if query not in haystack:
+                continue
         filtered.append(item)
     return filtered
 

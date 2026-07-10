@@ -2,6 +2,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
@@ -77,6 +79,62 @@ def test_db_action_v2_enqueues_job_and_skips_resident(monkeypatch):
     assert enq == {"uid": "u_send_v2", "lane": "chat", "kw": enq["kw"]}
     assert notified["channel"] == "v2_jobs" and notified["user_id"] == "u_send_v2"
     assert called["handle_send"] is False
+
+
+def test_runtime_mode_read_failure_refuses_before_persistence(monkeypatch):
+    _seed("u_send_mode_db_failure")
+    store = core_store.get_store("u_send_mode_db_failure")
+    monkeypatch.setattr(
+        hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda _store: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+    monkeypatch.setattr(
+        store,
+        "append_chat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not persist")),
+    )
+
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key="key", runtime_tok="", payload={"message": "hi"},
+    )
+
+    assert status == 503
+    assert body == {"error": "runtime_control_unavailable"}
+
+
+def test_db_action_v2_input_write_failure_never_enqueues(monkeypatch):
+    _seed("u_send_v2_strict_failure")
+    store = core_store.get_store("u_send_v2_strict_failure")
+    hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+    monkeypatch.setattr(
+        chat_send_core.core_envelope, "_build_shared_envelope_for_store",
+        lambda s, pt, **kw: ({"id": "u-msg-strict", "body_ct": "c", "nonce": "n", "K_user": "k"}, ""),
+    )
+    monkeypatch.setattr(
+        core_enclave, "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose, **kw: b"sk-or-test",
+    )
+    monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
+    monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
+    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
+    monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
+
+    def _fail_append(*args, **kwargs):
+        assert kwargs.get("strict") is True
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(store, "append_chat", _fail_append)
+    monkeypatch.setattr(
+        chat_send_core.jobs_store, "enqueue_job",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue")),
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        chat_send_core.model_api_chat_send_core(
+            store, api_key="key", runtime_tok="", payload={"message": "hi"},
+        )
 
 
 def test_resident_cli_default_still_routes_old_way_and_skips_enqueue(monkeypatch):
@@ -211,7 +269,7 @@ def test_db_action_v2_over_sla_admission_rejects_before_persist(monkeypatch):
     monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
     # 1 worker, 999 in-flight, no history (falls back to the 20s default
     # service time) → est_wait = ceil(999/1)*20 = 19980s, far over the 60s SLA.
-    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_count", lambda **kw: 1)
+    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
     monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 999)
     monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
 
@@ -258,7 +316,7 @@ def test_db_action_v2_admission_check_fails_open_on_exception(monkeypatch):
     )
     monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
     monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
-    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_count", lambda **kw: 1)
+    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
 
     def _boom():
         raise RuntimeError("db hiccup")
@@ -303,7 +361,7 @@ def test_db_action_v2_admission_admits_under_sla(monkeypatch):
     )
     monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
     monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
-    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_count", lambda **kw: 1)
+    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
     monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
     monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
 

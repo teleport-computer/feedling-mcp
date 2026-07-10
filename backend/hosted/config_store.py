@@ -147,15 +147,30 @@ def _load_model_api_runtime_profile(store: UserStore) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _save_model_api_runtime_profile(store: UserStore, profile: dict) -> dict:
+def _save_model_api_runtime_profile(
+    store: UserStore, profile: dict, *, strict: bool = False,
+) -> dict:
     data = dict(profile)
     data["runtime_mode"] = MODEL_API_RUNTIME_MODE
     data["runtime_version"] = MODEL_API_RUNTIME_VERSION
     data["updated_at"] = core_util._now_iso()
     if not data.get("created_at"):
         data["created_at"] = data["updated_at"]
-    db.set_blob(store.user_id, MODEL_API_RUNTIME_BLOB, data)
-    return data
+    # hosted_runtime_mode is an independent control-plane key.  Normalization
+    # of the broader runtime profile must never overwrite a concurrent flip.
+    data.pop("hosted_runtime_mode", None)
+    scrubbed = set(data.get(V2_AUTOSEED_SCRUBBED_FLAGS) or [])
+    remove_keys = [
+        key for key in (*AUTOSEED_SCRUB_FLAGS, PERCEPTION_V2_AUTOSEED_SCRUBBED)
+        if key not in data and (key in scrubbed or key == PERCEPTION_V2_AUTOSEED_SCRUBBED)
+    ]
+    if strict:
+        persisted = db.patch_blob_strict(
+            store.user_id, MODEL_API_RUNTIME_BLOB, data, remove_keys=remove_keys)
+    else:
+        persisted = db.patch_blob(
+            store.user_id, MODEL_API_RUNTIME_BLOB, data, remove_keys=remove_keys)
+    return persisted if isinstance(persisted, dict) else data
 
 
 def _ensure_model_api_runtime_profile(
@@ -228,9 +243,18 @@ def _patch_model_api_runtime_profile(store: UserStore, patch: dict) -> dict | No
     profile = _ensure_model_api_runtime_profile(store) or {}
     if not profile:
         return None
+    values = {k: v for k, v in patch.items() if v is not None}
+    values.update({
+        "runtime_mode": MODEL_API_RUNTIME_MODE,
+        "runtime_version": MODEL_API_RUNTIME_VERSION,
+        "updated_at": core_util._now_iso(),
+    })
+    persisted = db.patch_blob(store.user_id, MODEL_API_RUNTIME_BLOB, values)
+    if isinstance(persisted, dict):
+        return persisted
     merged = dict(profile)
-    merged.update({k: v for k, v in patch.items() if v is not None})
-    return _save_model_api_runtime_profile(store, merged)
+    merged.update(values)
+    return merged
 
 
 def record_runtime_error(store: UserStore, *, error: str, error_class: str = "") -> tuple[dict, int]:
@@ -315,13 +339,13 @@ def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
 
 def set_last_runtime_error(store: UserStore, message: str) -> None:
     """Public direct lever to surface a terminal runtime failure to iOS's error
-    chip (`hosted/setup_core.py:265` reads `last_runtime_error` off this same
-    profile blob). The private action-trace helpers above already set this
-    field as a side-effect of a traced action; this is for callers — namely
-    the v2 worker's terminal-failure path via serve_worker's injected
-    TurnDeps.record_terminal_error callback — that have no action-trace entry
-    to patch, just a plain failure message and a store."""
-    _patch_model_api_runtime_profile(store, {"last_runtime_error": str(message)[:300]})
+    chip. The active route is the current read-side truth; the legacy runtime
+    profile remains a rollback/debug mirror. This is for callers — namely the
+    V2 worker and independent reaper — that have no action-trace entry."""
+    value = str(message)[:300]
+    _patch_model_api_runtime_profile(store, {"last_runtime_error": value})
+    db.model_api_route_mark_runtime_error(
+        store.user_id, error=value, error_class=None)
 
 
 def _patch_model_api_action_trace(store: UserStore, trace_id: str, patch: dict) -> dict | None:
@@ -421,12 +445,42 @@ def get_hosted_runtime_mode(store: UserStore) -> str:
     return mode if mode in _HOSTED_RUNTIME_MODES else HOSTED_RUNTIME_MODE_RESIDENT
 
 
+def get_hosted_runtime_mode_strict(store: UserStore) -> str:
+    """Control-plane read that distinguishes a DB error from an absent flag."""
+    profile = db.get_blob_strict(store.user_id, MODEL_API_RUNTIME_BLOB)
+    profile = profile if isinstance(profile, dict) else {}
+    mode = str(profile.get("hosted_runtime_mode") or "")
+    return mode if mode in _HOSTED_RUNTIME_MODES else HOSTED_RUNTIME_MODE_RESIDENT
+
+
 def set_hosted_runtime_mode(store: UserStore, mode: str) -> str:
     """切换该用户的 hosted 运行时模式。非法值、或用户尚无 model_api config
     导致无法落地时，抛 ValueError（绝不返回假成功）。返回真正落地后的 mode。"""
     if mode not in _HOSTED_RUNTIME_MODES:
         raise ValueError(f"unknown hosted_runtime_mode: {mode!r}")
-    persisted = _patch_model_api_runtime_profile(store, {"hosted_runtime_mode": mode})
+    config = _load_model_api_config(store)
+    if not config:
+        raise ValueError("cannot set hosted_runtime_mode: user has no model_api config")
+    # Read control state fail-loud. A missing profile is a real state (seed it
+    # for configured users); a DB failure must never be mistaken for that state.
+    existing = db.get_blob_strict(store.user_id, MODEL_API_RUNTIME_BLOB)
+    if isinstance(existing, dict):
+        persisted = dict(existing)
+    else:
+        persisted = _ensure_model_api_runtime_profile(store, config)
     if persisted is None:
         raise ValueError("cannot set hosted_runtime_mode: user has no model_api config")
+    db.patch_blob_strict(
+        store.user_id,
+        MODEL_API_RUNTIME_BLOB,
+        {
+            "hosted_runtime_mode": mode,
+            "runtime_mode": MODEL_API_RUNTIME_MODE,
+            "runtime_version": MODEL_API_RUNTIME_VERSION,
+            "updated_at": core_util._now_iso(),
+        },
+    )
+    readback = db.get_blob_strict(store.user_id, MODEL_API_RUNTIME_BLOB)
+    if not isinstance(readback, dict) or readback.get("hosted_runtime_mode") != mode:
+        raise RuntimeError("hosted_runtime_mode persistence verification failed")
     return mode

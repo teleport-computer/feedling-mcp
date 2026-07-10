@@ -87,15 +87,13 @@ async def _run_one(store, step, *, api_key, runtime_token, enclave_sem) -> tuple
         if data.get("ok"):
             await asyncio.to_thread(jobs_store.mark_action_done, action_id, data)
         else:
-            # jobs_store.mark_action_failed(action_id, error: str) — 传人可读的
-            # "code: message"，不要 str(dict)（那是 repr，形如
-            # "{'code': 'boom', 'message': 'nope', 'retryable': False}"，
-            # 不是干净文案）。error 字典本就只含 code/message/retryable（已脱敏），
-            # 这里只是格式化，不是新增敏感面。
+            # Only the stable error code is durable. Provider/capability messages
+            # can echo a query, URL, or decrypted value; the full result remains
+            # available in memory to the responder for this turn.
             err = data.get("error") or {}
             await asyncio.to_thread(
                 jobs_store.mark_action_failed, action_id,
-                f"{err.get('code', 'error')}: {err.get('message', '')}")
+                str(err.get("code") or "error")[:120])
     return t, data
 
 
@@ -118,6 +116,7 @@ async def execute_plan(
     plan: list[dict],
     read_parallelism: int,
     enclave_sem: "asyncio.Semaphore",
+    before_write=None,
 ) -> dict[str, Any]:
     """排空 plan：读并行（read_parallelism 闸）、写严格串行；非 capability 的控制/未知
     action（final_response/preliminary_response/sleep/capture_memory/schedule_followup/
@@ -161,6 +160,8 @@ async def execute_plan(
 
     # 写严格串行：逐条跑完再跑下一条，每条自己一行 status（不合并，写的可见性更重要）。
     for step in writes:
+        if before_write is not None:
+            await before_write()
         t_hint = str(step.get("type") or "")
         await asyncio.to_thread(
             _emit, limiter, job_id, store.user_id,

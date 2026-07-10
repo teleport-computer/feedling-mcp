@@ -12,9 +12,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from conftest import seed_user  # noqa: E402
+import db  # noqa: E402
 from core import store as core_store  # noqa: E402
+from hosted import config_store as hosted_config_store  # noqa: E402
 from proactive import gate as proactive_gate  # noqa: E402
 from model_api_runtime.v2.serve_worker import _wake_decision_for_user  # noqa: E402
+
+
+def _enable_v2(uid: str) -> None:
+    db.patch_blob_strict(uid, hosted_config_store.MODEL_API_RUNTIME_BLOB, {
+        "hosted_runtime_mode": hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+    })
 
 
 def test_wake_decision_blocks_unactivated_user():
@@ -22,6 +30,7 @@ def test_wake_decision_blocks_unactivated_user():
     should_wake=False，block_reason 是 gate 的 ACTIVATION_PENDING_REASON。"""
     uid = "usr_wake_decision_unactivated"
     seed_user(uid)
+    _enable_v2(uid)
     # 不设置 first_chat_ok_at：新鲜 proactive settings 保持未激活。
 
     decision = _wake_decision_for_user(uid)
@@ -35,6 +44,7 @@ def test_wake_decision_activated_user_wakes():
     broadcast_state 默认 "unknown" 非 off/paused）——heartbeat 应当放行。"""
     uid = "usr_wake_decision_activated"
     seed_user(uid)
+    _enable_v2(uid)
     store = core_store.get_store(uid)
     # first_chat_ok_at is NOT settable via save_proactive_settings (it's not in
     # its `allowed` key whitelist — core/store.py:604) — the only writer is the

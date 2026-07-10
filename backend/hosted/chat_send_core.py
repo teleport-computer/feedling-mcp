@@ -85,7 +85,12 @@ def model_api_chat_send_core(
     # when the system was overloaded, and (b) a dead worker pool was masked by a
     # 400 decrypt error whenever the enclave itself was down. Both gates still
     # refuse BEFORE anything is persisted (nothing below has written yet).
-    _v2_mode = hosted_config_store.get_hosted_runtime_mode(store) == "db_action_v2"
+    try:
+        _v2_mode = (
+            hosted_config_store.get_hosted_runtime_mode_strict(store) == "db_action_v2"
+        )
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
 
     # V2 liveness guard: db_action_v2 users skip the resident wedge guard further
     # down, and without this they'd have NO replacement — if every serve_worker
@@ -110,7 +115,7 @@ def model_api_chat_send_core(
     if _v2_mode:
         _inflight = _workers = 0
         try:
-            _workers = jobs_store.live_worker_count(within_sec=30)
+            _workers = jobs_store.live_worker_capacity(within_sec=30)
             _inflight = jobs_store.inflight_job_count()
             _mean = jobs_store.recent_mean_service_sec(lane="chat", limit=admission.SERVICE_SAMPLE_N)
             _est = admission.estimate_wait_sec(
@@ -227,6 +232,7 @@ def model_api_chat_send_core(
         user_env,
         content_type="image" if has_image else ("file" if has_file else "text"),
         extra=extra or None,
+        strict=_v2_mode,
     )
     store.notify_chat_waiters()
 

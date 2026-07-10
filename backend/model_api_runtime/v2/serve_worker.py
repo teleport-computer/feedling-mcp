@@ -1,11 +1,10 @@
 """V2 worker 进程入口 + 生产依赖装配（子项目 B，Task 8 扩到全流程）。
 
-部署目标（已钉死，见 spec §2.1 与 merge-conditions-backlog 条件 5）：这是**同一 backend/
-镜像的兄弟入口**，运行在 **runner CVM（agent-runner supervisor）** 内，与常驻 consumer、
-genesis import worker 并肩——**不是**独立 HTTP 服务、**不是**独立 repo、**不**贴着主 app
-CVM 的 FastAPI backend 跑。HTTP 化会把 backend→enclave→backend 的 reentrant 502 根因请回来；
-贴主 app 跑则与 backend 争 CPU/内存。实际进程启动（manifest/compose）属子项目 D 的 rollout，
-本文件只钉死「跑在哪」这一决定。
+部署目标（已钉死，见 spec §2.1）：这是**同一 backend 镜像的兄弟入口**，运行在独立
+runner CVM 的 `serve-worker` service；它与 resident `agent-runner` service 并列，而不是
+由 supervisor 托管。Genesis 已在 2026-07-10 rehome 到本进程的 dedicated thread。
+它**不是**独立 repo，也**不**贴着主 app CVM 的 FastAPI backend 跑。HTTP 化会把
+backend→enclave→backend 的 reentrant 502 根因请回来；贴主 app 跑则与 backend 争 CPU/内存。
 
 装配层：这里（且只有这里）可同时 import hosted/agent_runtime/core/model_api_runtime，把
 需要上层的实现注入进 worker.TurnDeps，令 worker.py 保持不逆依赖（CONTRIBUTING §2）。
@@ -24,8 +23,9 @@ worker.py 明确不 import `hosted` 或 `agent_runtime.spawners`——official/�
 - mint_enclave_token：签发 enclave-auth runtime_token（scope=envelope_decrypt）。只是 HMAC
   签名，不是解密，回合内可按需多签（executor 的 capability 调用 + read_messages 的逐条
   chat 解密都要用它）。
-- read_messages：读该用户 chat_messages 中自上一条 assistant 之后的 user 行，逐条经 enclave
-  解密取明文（服务器永不本地解密）；带上 id/ts 供 v2.coalesce 按 since_ts 过滤/去重。enclave-bound。
+- read_messages：按 durable `last_replied_ts` cursor 读取其后的 user 行，逐条经 enclave
+  解密取明文（服务器永不本地解密）；绝不以“最后一条 assistant”切片，因为回复与并发
+  follow-up 交错时会吞消息。带上 id/ts 供 v2.coalesce 去重。enclave-bound。
 
 respond/append_reply 不再是 TurnDeps 的字段：worker.process_job 现在直接调用同层的
 `model_api_runtime.v2.responder.respond`（本就 hosted-free）和自己的
@@ -37,12 +37,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
+import socket
 import sys
 import threading
 import time
 import types
+import uuid
 from pathlib import Path
 
 # Put the backend dir on sys.path BEFORE importing backend modules. When this is
@@ -69,6 +72,7 @@ from hosted import config_store as hosted_config_store
 from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import screen_watch
 from model_api_runtime.v2 import worker as v2_worker
@@ -80,7 +84,48 @@ import memory_readside_core
 
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
 
+
+def _positive_float_env(name: str, default: str) -> float:
+    raw = os.environ.get(name, default)
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be finite and > 0") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"{name} must be finite and > 0")
+    return value
+
+
+def _default_worker_id() -> str:
+    """Replica-unique identity even when every container runs as PID 1."""
+    return f"v2-worker-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
 _ASSISTANT_ROLES = ("openclaw", "assistant", "agent")
+_EXTRACTION_ENABLED = os.environ.get(
+    "FEEDLING_V2_EXTRACTION_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _configure_provider_thread_limiter(max_workers: int) -> int:
+    """Ensure sync provider bridges can occupy every configured turn slot.
+
+    Anthropic, Gemini, and OpenAI Responses currently use
+    ``anyio.to_thread.run_sync``. A standalone worker has no ASGI lifespan, so
+    AnyIO otherwise retains its silent default of roughly forty threads even if
+    ``FEEDLING_V2_MAX_WORKERS`` is larger. Never lower an existing process-wide
+    limit; an explicit override can reserve extra headroom.
+    """
+    import anyio.to_thread
+
+    raw = os.environ.get("FEEDLING_V2_PROVIDER_THREAD_LIMIT", "").strip()
+    try:
+        requested = int(raw) if raw else int(max_workers)
+    except ValueError:
+        log.warning("invalid FEEDLING_V2_PROVIDER_THREAD_LIMIT=%r; using max_workers", raw)
+        requested = int(max_workers)
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = max(int(limiter.total_tokens), max(1, requested), int(max_workers))
+    return int(limiter.total_tokens)
 
 # Scope name matches the existing host-all/genesis-worker convention
 # (agent_runtime/supervisor.py mints "envelope_decrypt", not a colon-form) so a
@@ -243,8 +288,14 @@ def _resolve_provider(user_id: str):
     return runtime, {}
 
 
-def _read_messages(user_id: str) -> list[dict]:
-    """读该用户自上一条 assistant 之后的 user 消息，逐条经 enclave 解密成明文文本。
+def _read_messages(user_id: str, after_ts: float = 0.0) -> list[dict]:
+    """Read user messages after the durable reply cursor and decrypt them.
+
+    Never infer unanswered state from the latest assistant position. A user
+    message can arrive while a responder is running and be stored immediately
+    before that responder's assistant row; assistant slicing would then hide it
+    forever. ``runtime_state.last_replied_ts`` is the source of truth.
+
     服务器永不本地解密——每条信封走 enclave /v1/envelope/decrypt。
 
     The full stored message dict is forwarded to ``_decrypt_envelope_via_enclave``
@@ -260,18 +311,24 @@ def _read_messages(user_id: str) -> list[dict]:
     coalesce/planner/executor pipeline and didn't need either field.
     """
     store = core_store.get_store(user_id)
-    rows = list(getattr(store, "chat_messages", []) or [])
-    # 找到最后一条 assistant 回复的下标；只回放其后的 user 消息（未答的那批）。
-    last_assistant = -1
-    for idx, m in enumerate(rows):
-        if str(m.get("role") or "") in _ASSISTANT_ROLES:
-            last_assistant = idx
-    pending = rows[last_assistant + 1:]
+    reload_chat = getattr(store, "reload_chat_strict", None)
+    if callable(reload_chat):
+        rows = reload_chat()
+    else:  # lightweight test doubles retain the older reload seam
+        reload_store = getattr(store, "reload", None)
+        if callable(reload_store):
+            reload_store()
+        rows = list(getattr(store, "chat_messages", []) or [])
     token = _mint_runtime_token(user_id)
     out: list[dict] = []
     caption_budget = [_CAPTION_DECRYPT_LIMIT]
-    for m in pending:
+    for m in rows:
         if str(m.get("role") or "") != "user":
+            continue
+        try:
+            if float(m.get("ts") or 0.0) <= float(after_ts):
+                continue
+        except (TypeError, ValueError):
             continue
         mid, ts = m.get("id"), m.get("ts")
         if m.get("content_type") == "image":
@@ -292,7 +349,9 @@ def _read_messages(user_id: str) -> list[dict]:
     return out
 
 
-def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
+def _read_tail_window(
+    user_id: str, after_ts: float, limit: int, *, oldest_first: bool
+) -> list[dict]:
     """读该用户最近一个窗口内的消息（BOTH roles），逐条经 enclave 解密取明文（D1）。
 
     镜像 `_read_messages` 的解密/过滤规则，但服务于不同目的：`_read_messages` 只回放
@@ -308,15 +367,29 @@ def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
     Skip 规则与 `_read_messages` 一致：无 `body_ct` 或 `K_enclave is None` 的合成/
     本地-only 行跳过；`content_type == "image"` 走 "[image]" 简写，不经 enclave。"""
     store = core_store.get_store(user_id)
-    rows = list(getattr(store, "chat_messages", []) or [])
+    reload_chat = getattr(store, "reload_chat_strict", None)
+    if callable(reload_chat):
+        rows = reload_chat()
+    else:  # lightweight test doubles retain the older reload seam
+        reload_store = getattr(store, "reload", None)
+        if callable(reload_store):
+            reload_store()
+        rows = list(getattr(store, "chat_messages", []) or [])
     rows = sorted(rows, key=lambda m: m.get("ts") or 0.0)
+    if limit <= 0:
+        return []
+    candidates = [
+        m for m in rows
+        if m.get("ts") is not None and m.get("ts") > after_ts
+    ]
+    # Bound enclave work before decrypting. This also allocates the caption
+    # budget to the messages that will actually reach the prompt.
+    rows = candidates[:limit] if oldest_first else candidates[-limit:]
     token = _mint_runtime_token(user_id)
     out: list[dict] = []
     caption_budget = [_CAPTION_DECRYPT_LIMIT]
     for m in rows:
         ts = m.get("ts")
-        if ts is None or not (ts > after_ts):
-            continue
         mid = m.get("id")
         role = "assistant" if str(m.get("role") or "") in _ASSISTANT_ROLES else "user"
         if m.get("content_type") == "image":
@@ -334,9 +407,17 @@ def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
         ).decode("utf-8")
         if plaintext.strip():
             out.append({"id": mid, "ts": ts, "role": role, "content": plaintext})
-    if limit <= 0:
-        return []
-    return out[-limit:]
+    return out
+
+
+def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
+    """Newest bounded verbatim window for responder/wake context."""
+    return _read_tail_window(user_id, after_ts, limit, oldest_first=False)
+
+
+def _read_compaction_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
+    """Oldest contiguous batch so summary watermarks never skip backlog rows."""
+    return _read_tail_window(user_id, after_ts, limit, oldest_first=True)
 
 
 def _read_summary(user_id: str) -> tuple[str, float, int]:
@@ -376,6 +457,10 @@ def _wake_decision_for_user(user_id: str) -> dict:
     broadcast suppression / all landmines hold with zero drift). No enqueue here;
     the scheduler decides what to do with should_wake."""
     store = core_store.get_store(user_id)
+    if hosted_config_store.get_hosted_runtime_mode_strict(store) != (
+        hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    ):
+        return {"should_wake": False, "wake_interval_sec": 7200, "block_reason": "runtime_mode"}
     payload = {"trigger": "heartbeat"}
     d = proactive_gate._build_proactive_v2_wake_decision(store, payload)
     return {
@@ -394,6 +479,11 @@ def _fire_scheduled_for_user(user_id: str) -> int:
     scheduler 实例并发跑也不会重复触发。gate（未激活/免打扰）原样复用，零漂移。
     镜像 `proactive_core.scheduled_fire` 的 settings/service 构造，只换 owner_id 与
     submit_wake 的落点。"""
+    if hosted_config_store.get_hosted_runtime_mode_strict(core_store.get_store(user_id)) != (
+        hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    ):
+        return 0
+
     from proactive.controls_v2 import WakeControlDecisionV2
     from proactive.scheduled_wake_v2 import DBScheduledWakeStoreV2, ScheduledWakeServiceV2
     from proactive.store_v2 import DBProactiveSettingsStoreV2
@@ -658,6 +748,10 @@ def _tick_screen_watch_for_user(user_id: str) -> int:
     `chatting` 抑制，那一帧也永久被「消费」掉、用户停手后再也看不到。我们只在真醒时消费它。
 
     enqueue 了返回 1，否则 0。"""
+    if hosted_config_store.get_hosted_runtime_mode_strict(core_store.get_store(user_id)) != (
+        hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    ):
+        return 0
     now = time.time()
     latest_frame_id, latest_ts = _latest_frame_meta(user_id)
     sched = jobs_store.get_wake_schedule(user_id) or {}
@@ -691,12 +785,18 @@ def _tick_screen_watch_for_user(user_id: str) -> int:
 def build_production_deps() -> v2_worker.TurnDeps:
     return v2_worker.TurnDeps(
         read_messages=_read_messages,
+        read_messages_since=_read_messages,
+        runtime_mode_enabled=lambda user_id: (
+            hosted_config_store.get_hosted_runtime_mode_strict(core_store.get_store(user_id))
+            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+        ),
         resolve_provider=_resolve_provider,
         is_official=_is_official,
         mint_enclave_token=_mint_runtime_token,
         record_terminal_error=_record_terminal_error,
         record_turn_metric=jobs_store.record_turn_metric,
         read_tail=_read_tail,
+        read_compaction_tail=_read_compaction_tail,
         read_summary=_read_summary,
         write_summary=_write_summary,
         read_images=_read_images,
@@ -719,6 +819,12 @@ def _build_scheduler_deps():
     成同一行——重复调度天然无害。prod 只跑一个 serve-worker 容器，这条不变量目前甚至用
     不上，但即使将来横向扩容也不需要另起一套选主。"""
     return types.SimpleNamespace(
+        eligible_users=lambda: admin_core.list_runtime_modes().get(
+            hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []),
+        runtime_mode_enabled=lambda uid: (
+            hosted_config_store.get_hosted_runtime_mode_strict(core_store.get_store(uid))
+            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+        ),
         due_users=lambda: jobs_store.due_heartbeat_users(),
         wake_decision=_wake_decision_for_user,
         enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(uid, "heartbeat"),
@@ -734,8 +840,11 @@ def _build_scheduler_deps():
         # list_agent_runtime_enabled_users 的反集，无需另起一条查询）；_tick_extraction_for_user
         # 逐用户跑 capture+dream 触发闸，各自命中安静窗口/夜间阈值时 enqueue 一个抽取 job。
         # scheduler.py 同样用 getattr 探测这两个属性（缺一即整段跳过，既有 FakeDeps 零改动）。
-        extraction_users=lambda: admin_core.list_runtime_modes().get(
-            hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []),
+        extraction_users=lambda: (
+            admin_core.list_runtime_modes().get(
+                hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, [])
+            if _EXTRACTION_ENABLED else []
+        ),
         tick_extraction=_tick_extraction_for_user,
         # screen_watch lane 生产者（D-screen_watch Task 4）：screen_watch_users 列出
         # next_screen_watch_at 已到期的用户（Task 2 的 due_screen_watch_users，与
@@ -745,6 +854,20 @@ def _build_scheduler_deps():
         screen_watch_users=lambda: jobs_store.due_screen_watch_users(),
         tick_screen_watch=_tick_screen_watch_for_user,
     )
+
+
+def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
+    """Idempotent startup backfill for users flipped before seeding existed."""
+    due_at = time.time() if now is None else float(now)
+    users = admin_core.list_runtime_modes().get(
+        hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, [])
+    seeded = 0
+    for user_id in users:
+        if jobs_store.get_wake_schedule(user_id) is not None:
+            continue
+        jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=due_at)
+        seeded += 1
+    return seeded
 
 
 def wire_assembly() -> None:
@@ -775,33 +898,25 @@ def build_health_app():
     return app
 
 
-_REAP_INTERVAL_SEC = float(os.environ.get("FEEDLING_V2_REAP_INTERVAL_SEC", "30"))
+_REAP_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_REAP_INTERVAL_SEC", "30")
 
 
 async def _reaper_loop(stop_event: asyncio.Event, *, interval: float = _REAP_INTERVAL_SEC) -> None:
-    """周期性回收卡死的 claimed/running job（FIX 1）：若某个 worker 在 claim_next_job 和
-    终态 mark_* 之间死掉（进程崩溃/被杀），该 job 会永远卡在 claimed/running——single-flight
-    的 partial unique index 会让这个用户之后所有 chat/send 都合并进这个死 job，用户从此
-    再也收不到回复、也没有自愈路径。`jobs_store.reap_stuck_jobs()` 早就实现好且有测试
-    覆盖，只是没人调用它——这里把它接成一个跟 run_worker_loop 并发跑的周期任务。
+    """Mirror the backend watchdog inside the worker process.
+
+    It expires both queue-deadline and execution-lease timeouts. The ASGI
+    lifespan runs the same DB-atomic reaper, so accepted pending rows still
+    terminate visibly when the entire worker fleet is down; this copy reduces
+    detection latency while a worker is healthy.
 
     每 ~interval 秒跑一次，interruptible（stop_event 置位时不必等满这个周期就退出，
     drain 更快）；单次 DB 错误只记日志、不杀进程——reaper 本身故障绝不能拖垮整个 worker
     进程（那样反而制造更多卡死 job）。"""
-    while not stop_event.is_set():
-        try:
-            reaped = await asyncio.to_thread(jobs_store.reap_stuck_jobs)
-            if reaped:
-                log.info("[v2.serve_worker] reaper expired %d stuck job(s)", reaped)
-        except Exception as e:  # noqa: BLE001 — 瞬时 DB 错误绝不能杀掉 reaper/worker 进程
-            log.warning("[v2.serve_worker] reap_stuck_jobs failed: %s", e)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            pass
+    await v2_reaper.run_loop(
+        stop_event, interval=interval, record_terminal_error=_record_terminal_error)
 
 
-_HEARTBEAT_INTERVAL_SEC = float(os.environ.get("FEEDLING_V2_HEARTBEAT_INTERVAL_SEC", "10"))
+_HEARTBEAT_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_HEARTBEAT_INTERVAL_SEC", "10")
 
 
 async def _heartbeat_loop(
@@ -820,18 +935,34 @@ async def _heartbeat_loop(
     instead of waiting out the rest of the interval — shutdown must not be
     delayed by a stale/soon-to-expire heartbeat row.
     """
-    while not stop_event.is_set():
+    try:
+        while not stop_event.is_set():
+            try:
+                await asyncio.to_thread(
+                    jobs_store.record_worker_heartbeat,
+                    worker_id,
+                    capacity=v2_worker.MAX_WORKERS,
+                )
+            except Exception as e:  # noqa: BLE001 — a heartbeat write failure must not kill the worker
+                log.warning("[v2.serve_worker] record_worker_heartbeat failed: %s", e)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        # Do not leave a fresh full-capacity row behind during graceful drain.
+        # A crash still ages out through the normal heartbeat TTL.
         try:
-            await asyncio.to_thread(jobs_store.record_worker_heartbeat, worker_id)
-        except Exception as e:  # noqa: BLE001 — a heartbeat write failure must not kill the worker
-            log.warning("[v2.serve_worker] record_worker_heartbeat failed: %s", e)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            pass
+            await asyncio.to_thread(
+                jobs_store.record_worker_heartbeat,
+                worker_id,
+                capacity=0,
+            )
+        except Exception as e:  # noqa: BLE001 — shutdown must remain bounded
+            log.warning("[v2.serve_worker] clear worker capacity failed: %s", e)
 
 
-_SCHEDULER_INTERVAL_SEC = float(os.environ.get("FEEDLING_V2_SCHEDULER_INTERVAL_SEC", "30"))
+_SCHEDULER_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_SCHEDULER_INTERVAL_SEC", "30")
 
 
 async def _scheduler_loop(stop_event: asyncio.Event, *, interval: float = _SCHEDULER_INTERVAL_SEC) -> None:
@@ -906,10 +1037,10 @@ def _start_genesis_thread(worker_id: str):
     stop_event = threading.Event()
     # Read at CALL time (not a module-level constant) — see the comment beside
     # _GENESIS_TOKEN_SCOPE above for why.
-    interval = float(os.environ.get("FEEDLING_GENESIS_WORKER_INTERVAL_SEC", "10"))
+    interval = _positive_float_env("FEEDLING_GENESIS_WORKER_INTERVAL_SEC", "10")
 
     def _beat() -> None:
-        jobs_store.record_worker_heartbeat(genesis_worker_id, kind="genesis")
+        jobs_store.record_worker_heartbeat(genesis_worker_id, kind="genesis", capacity=0)
 
     thread = threading.Thread(
         target=genesis_daemon.run_loop, daemon=True, name="v2-genesis",
@@ -926,40 +1057,55 @@ def _start_genesis_thread(worker_id: str):
 async def _serve(worker_id: str, *, poll_interval: float) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+    provider_threads = _configure_provider_thread_limiter(v2_worker.MAX_WORKERS)
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)
     deps = build_production_deps()
+    seeded = await asyncio.to_thread(_seed_existing_v2_wake_schedules)
+    if seeded:
+        log.info("[v2.serve_worker] seeded %d existing V2 wake schedule(s)", seeded)
     # "v2_jobs" 即时唤醒（FIX 3）：event 必须在 running loop 里创建/绑定——wire_assembly
     # 本身在 asyncio.run 之前跑，那时还没有 loop 可绑。
     wake_event = asyncio.Event()
     v2_worker.set_job_wake_context(loop, wake_event)
-    log.info("[v2.serve_worker] starting worker=%s max_workers=%s", worker_id, v2_worker.MAX_WORKERS)
+    log.info(
+        "[v2.serve_worker] starting worker=%s max_workers=%s provider_threads=%s",
+        worker_id, v2_worker.MAX_WORKERS, provider_threads,
+    )
     # Genesis runs on its own dedicated thread (NOT part of this asyncio.gather —
     # see _start_genesis_thread docstring for why it can't share the to_thread
     # executor with the turn/reaper/heartbeat/scheduler coroutines below).
     genesis = _start_genesis_thread(worker_id)
-    await asyncio.gather(
-        v2_worker.run_worker_loop(
+    tasks = [
+        asyncio.create_task(v2_worker.run_worker_loop(
             worker_id,
             max_workers=v2_worker.MAX_WORKERS,
             poll_interval=poll_interval,
             stop_event=stop_event,
             deps=deps,
             wake_event=wake_event,
-        ),
-        _reaper_loop(stop_event),
-        _heartbeat_loop(worker_id, stop_event),
-        _scheduler_loop(stop_event),
-        # 防御性纵深（对齐 run_worker_loop 内层 gather）：四个协程内部都已吞尽异常，
-        # 但万一某个漏网抛出，return_exceptions 保证不牵连拖垮另一个 loop。
-        return_exceptions=True,
-    )
-    if genesis is not None:
-        genesis_thread, genesis_stop = genesis
-        genesis_stop.set()
-        # Bounded: a tick in flight finishes its current LLM call. daemon=True means
-        # a wedged tick can never block process exit.
-        await asyncio.to_thread(genesis_thread.join, 10.0)
+        )),
+        asyncio.create_task(_reaper_loop(stop_event)),
+        asyncio.create_task(_heartbeat_loop(worker_id, stop_event)),
+        asyncio.create_task(_scheduler_loop(stop_event)),
+    ]
+    try:
+        # Each loop handles recoverable iteration failures internally.  An
+        # escaping exception means the worker is degraded; propagate it so the
+        # container restarts instead of leaving a live heartbeat with dead work.
+        await asyncio.gather(*tasks)
+    finally:
+        stop_event.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if genesis is not None:
+            genesis_thread, genesis_stop = genesis
+            genesis_stop.set()
+            # Bounded: a tick in flight finishes its current LLM call. daemon=True means
+            # a wedged tick can never block process exit.
+            await asyncio.to_thread(genesis_thread.join, 10.0)
     log.info("[v2.serve_worker] drained; exiting worker=%s", worker_id)
 
 
@@ -972,8 +1118,8 @@ def main() -> None:
     # not assume the schema is already at head.
     db.init_schema()
     wire_assembly()
-    worker_id = os.environ.get("FEEDLING_V2_WORKER_ID", f"v2-worker-{os.getpid()}")
-    poll_interval = float(os.environ.get("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0"))
+    worker_id = os.environ.get("FEEDLING_V2_WORKER_ID", "").strip() or _default_worker_id()
+    poll_interval = _positive_float_env("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0")
     asyncio.run(_serve(worker_id, poll_interval=poll_interval))
 
 

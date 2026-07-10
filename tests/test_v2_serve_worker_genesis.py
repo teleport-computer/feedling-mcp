@@ -22,7 +22,7 @@ def test_genesis_thread_starts_and_stops(monkeypatch):
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "s3cret")
     monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://enclave")
     monkeypatch.setenv("FEEDLING_API_URL", "https://api")
-    monkeypatch.setenv("FEEDLING_GENESIS_WORKER_INTERVAL_SEC", "0")
+    monkeypatch.setenv("FEEDLING_GENESIS_WORKER_INTERVAL_SEC", "0.01")
 
     ran = threading.Event()
     beats: list[tuple] = []

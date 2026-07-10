@@ -27,6 +27,7 @@ from conftest import seed_user, configure_model_api_route  # noqa: E402
 from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from hosted import config_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="requires DATABASE_URL / postgres"
@@ -100,6 +101,27 @@ def test_post_valid_mode_sets_and_reflects_in_config_store(env):
     assert status == 200
     assert body == {"user_id": uid, "hosted_runtime_mode": "db_action_v2"}
     assert config_store.get_hosted_runtime_mode(core_store.get_store(uid)) == "db_action_v2"
+    schedule = jobs_store.get_wake_schedule(uid)
+    assert schedule is not None
+    assert schedule["next_heartbeat_at"] is not None
+
+
+def test_post_control_plane_write_failure_returns_503(env, monkeypatch):
+    uid = _uid("rtmode_dbfail")
+    _seed_model_api_user(uid)
+    monkeypatch.setattr(
+        config_store,
+        "set_hosted_runtime_mode",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    status, body = _asgi_json(
+        "POST", "/v1/admin/hosted-runtime-mode", headers=_admin(),
+        json={"user_id": uid, "mode": "resident_cli"},
+    )
+
+    assert status == 503
+    assert body == {"error": "runtime_control_unavailable"}
 
 
 def test_post_invalid_mode_returns_400(env):

@@ -1231,30 +1231,81 @@ def admin_api_key_stats() -> dict:
 # ---------------------------------------------------------------------------
 
 
+def get_blob_strict(user_id: str, kind: str):
+    """Return a blob or ``None`` for a genuine miss; propagate DB failures."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT doc FROM user_blobs WHERE user_id = %s AND kind = %s",
+            (user_id, kind),
+        ).fetchone()
+    return row[0] if row is not None else None
+
+
 def get_blob(user_id: str, kind: str):
-    """Return the stored JSON doc (dict or list) for (user_id, kind), or None."""
+    """Legacy best-effort wrapper around :func:`get_blob_strict`."""
     try:
-        with get_pool().connection() as conn:
-            row = conn.execute(
-                "SELECT doc FROM user_blobs WHERE user_id = %s AND kind = %s",
-                (user_id, kind),
-            ).fetchone()
-        return row[0] if row is not None else None
+        return get_blob_strict(user_id, kind)
     except Exception as e:
         log.error("[db] get_blob(%s,%s) failed: %s", user_id, kind, e)
         return None
 
 
+def set_blob_strict(user_id: str, kind: str, doc) -> None:
+    """Persist a blob or raise."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
+            (user_id, kind, Jsonb(doc)),
+        )
+
+
 def set_blob(user_id: str, kind: str, doc) -> None:
     try:
-        with get_pool().connection() as conn:
-            conn.execute(
-                "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
-                "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
-                (user_id, kind, Jsonb(doc)),
-            )
+        set_blob_strict(user_id, kind, doc)
     except Exception as e:
         log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
+
+
+def patch_blob_strict(
+    user_id: str,
+    kind: str,
+    patch: dict,
+    *,
+    remove_keys: tuple[str, ...] | list[str] = (),
+):
+    """Atomically merge top-level blob keys and optionally remove keys.
+
+    Unlike a Python read/modify/full-write, the merge happens in one UPSERT, so
+    independent control-plane writers cannot resurrect stale sibling fields.
+    Returns the persisted document and propagates DB failures.
+    """
+    clean_patch = dict(patch or {})
+    keys = [str(key) for key in remove_keys if str(key)]
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, kind) DO UPDATE SET "
+            "doc = (user_blobs.doc - %s::text[]) || EXCLUDED.doc "
+            "RETURNING doc",
+            (user_id, kind, Jsonb(clean_patch), keys),
+        ).fetchone()
+    return row[0]
+
+
+def patch_blob(
+    user_id: str,
+    kind: str,
+    patch: dict,
+    *,
+    remove_keys: tuple[str, ...] | list[str] = (),
+):
+    """Legacy best-effort wrapper around :func:`patch_blob_strict`."""
+    try:
+        return patch_blob_strict(user_id, kind, patch, remove_keys=remove_keys)
+    except Exception as e:
+        log.error("[db] patch_blob(%s,%s) failed: %s", user_id, kind, e)
+        return None
 
 
 def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict]:
@@ -1952,20 +2003,25 @@ def genesis_complete_job(
 # ---------------------------------------------------------------------------
 
 
-def chat_load(user_id: str) -> list[dict]:
+def chat_load_strict(user_id: str) -> list[dict]:
     """Load the user's chat ring. R2-offloaded file rows are returned as SLIM
     POINTERS (``body_key`` + ``body_ct_len``, no ``body_ct``) — the heavy
     ciphertext is fetched lazily only at the read exits that actually deliver a
     body (``hydrate_chat_file_body``), so a bulk/metadata-only load never
     downloads every historical file. Mirrors how large image bodies are omitted
     from the visible feed and lazily re-fetched per message."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT doc FROM chat_messages WHERE user_id = %s ORDER BY seq ASC",
+            (user_id,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def chat_load(user_id: str) -> list[dict]:
+    """Legacy best-effort wrapper; V2 correctness paths use chat_load_strict."""
     try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                "SELECT doc FROM chat_messages WHERE user_id = %s ORDER BY seq ASC",
-                (user_id,),
-            ).fetchall()
-        return [r[0] for r in rows]
+        return chat_load_strict(user_id)
     except Exception as e:
         log.error("[db] chat_load(%s) failed: %s", user_id, e)
         return []
@@ -1996,7 +2052,9 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
     return out
 
 
-def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int) -> None:
+def _chat_append_impl(
+    user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
+) -> None:
     """Insert one chat message then trim to the newest ``max_messages`` rows,
     mirroring the in-memory ring buffer. Idempotent on msg_id.
 
@@ -2015,56 +2073,73 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
         and doc.get("body_ct") is not None
     )
     trimmed_docs: list = []
-    try:
-        with get_pool().connection() as conn:
-            with conn.transaction():
-                # 1) inline first — message readable, references no R2 object yet.
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            # 1) inline first — message readable, references no R2 object yet.
+            conn.execute(
+                "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (user_id, msg_id) DO UPDATE SET ts = EXCLUDED.ts, doc = EXCLUDED.doc",
+                (user_id, msg_id, ts, Jsonb(doc)),
+            )
+            if max_messages and max_messages > 0:
+                rows = conn.execute(
+                    "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
+                    "  SELECT MIN(seq) FROM ("
+                    "    SELECT seq FROM chat_messages WHERE user_id = %s "
+                    "    ORDER BY seq DESC LIMIT %s"
+                    "  ) t"
+                    ") RETURNING doc",
+                    (user_id, user_id, max_messages),
+                ).fetchall()
+                trimmed_docs = [r[0] for r in rows]
+    if offload:
+        # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
+        try:
+            body_ct_len = len(doc["body_ct"])
+            object_storage.put_chat_file_body(user_id, msg_id, doc["body_ct"])
+            # 3) object exists → flip the row to the pointer shape as the last
+            #    durable step. ATOMIC on the CURRENT row (not a stale snapshot):
+            #    drop only body_ct and add the pointer keys, so any reply/claim
+            #    metadata another worker merged into `doc` during the upload is
+            #    preserved. The `? 'body_ct'` guard makes it a no-op if the row
+            #    was already flipped (idempotent, avoids a double-flip race).
+            pointer = {
+                "body_key": object_storage.chat_file_key(user_id, msg_id),
+                "body_ct_len": body_ct_len,
+            }
+            with get_pool().connection() as conn:
                 conn.execute(
-                    "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
-                    "VALUES (%s, %s, %s, %s) "
-                    "ON CONFLICT (user_id, msg_id) DO UPDATE SET ts = EXCLUDED.ts, doc = EXCLUDED.doc",
-                    (user_id, msg_id, ts, Jsonb(doc)),
+                    "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
+                    "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
+                    (Jsonb(pointer), user_id, msg_id),
                 )
-                if max_messages and max_messages > 0:
-                    rows = conn.execute(
-                        "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
-                        "  SELECT MIN(seq) FROM ("
-                        "    SELECT seq FROM chat_messages WHERE user_id = %s "
-                        "    ORDER BY seq DESC LIMIT %s"
-                        "  ) t"
-                        ") RETURNING doc",
-                        (user_id, user_id, max_messages),
-                    ).fetchall()
-                    trimmed_docs = [r[0] for r in rows]
-        if offload:
-            # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
-            try:
-                body_ct_len = len(doc["body_ct"])
-                object_storage.put_chat_file_body(user_id, msg_id, doc["body_ct"])
-                # 3) object exists → flip the row to the pointer shape as the last
-                #    durable step. ATOMIC on the CURRENT row (not a stale snapshot):
-                #    drop only body_ct and add the pointer keys, so any reply/claim
-                #    metadata another worker merged into `doc` during the upload is
-                #    preserved. The `? 'body_ct'` guard makes it a no-op if the row
-                #    was already flipped (idempotent, avoids a double-flip race).
-                pointer = {
-                    "body_key": object_storage.chat_file_key(user_id, msg_id),
-                    "body_ct_len": body_ct_len,
-                }
-                with get_pool().connection() as conn:
-                    conn.execute(
-                        "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
-                        "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
-                        (Jsonb(pointer), user_id, msg_id),
-                    )
-            except Exception as e:  # noqa: BLE001
-                log.error("[db] chat_append(%s,%s) R2 offload failed, left inline: %s",
-                          user_id, msg_id, e)
-        # Best-effort: drop R2 objects for any offloaded file rows just trimmed.
-        if trimmed_docs and object_storage.chat_files_enabled():
-            for d in trimmed_docs:
-                if isinstance(d, dict) and d.get("body_key") and d.get("content_type") == "file":
-                    object_storage.delete_chat_file_body(user_id, str(d.get("id") or ""))
+        except Exception as e:  # noqa: BLE001
+            log.error("[db] chat_append(%s,%s) R2 offload failed, left inline: %s",
+                      user_id, msg_id, e)
+    # Best-effort: drop R2 objects for any offloaded file rows just trimmed.
+    if trimmed_docs and object_storage.chat_files_enabled():
+        for d in trimmed_docs:
+            if isinstance(d, dict) and d.get("body_key") and d.get("content_type") == "file":
+                object_storage.delete_chat_file_body(user_id, str(d.get("id") or ""))
+
+
+def chat_append_strict(
+    user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
+) -> None:
+    """Persist one chat message or raise on the primary database write.
+
+    V2 uses this path for model replies so a database failure cannot be mistaken
+    for delivery. Optional R2 offload remains best-effort: the inline row is
+    already durable before an upload is attempted.
+    """
+    _chat_append_impl(user_id, msg_id, ts, doc, max_messages)
+
+
+def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int) -> None:
+    """Best-effort legacy wrapper around :func:`chat_append_strict`."""
+    try:
+        chat_append_strict(user_id, msg_id, ts, doc, max_messages)
     except Exception as e:
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
 

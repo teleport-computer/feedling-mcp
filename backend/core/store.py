@@ -295,6 +295,13 @@ class UserStore:
     def _load_chat(self):
         self.chat_messages = db.chat_load(self.user_id)
 
+    def reload_chat_strict(self) -> list[dict]:
+        """Refresh chat state without converting a DB failure into emptiness."""
+        with self.chat_lock:
+            rows = db.chat_load_strict(self.user_id)
+            self.chat_messages = rows
+            return list(rows)
+
     def reload(self):
         """Re-read this store's cached state from PostgreSQL IN PLACE, keeping
         the same object identity (and the same waiter lists). Used by the cache
@@ -338,6 +345,8 @@ class UserStore:
         envelope: dict,
         content_type: str = "text",
         extra: dict | None = None,
+        *,
+        strict: bool = False,
     ) -> dict:
         """Append a v1 ciphertext chat message. `envelope` holds the AEAD
         payload. See docs/DESIGN_E2E.md §3.2 for field definitions. Server
@@ -442,10 +451,18 @@ class UserStore:
                     msg[key] = value
 
         with self.chat_lock:
+            # The legacy route is deliberately best-effort for compatibility.
+            # V2 terminal replies opt into strict ordering: commit first, then
+            # expose the row in the process cache.  A failed DB write therefore
+            # cannot leave a phantom reply that makes the job look successful.
+            if strict:
+                db.chat_append_strict(
+                    self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
             self.chat_messages.append(msg)
             if len(self.chat_messages) > MAX_CHAT_MESSAGES:
                 self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
-            db.chat_append(self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
+            if not strict:
+                db.chat_append(self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
         # Cross-worker wake: other workers' pollers for this user park on their
         # own threading.Events, which our notify_chat_waiters can't reach. The
         # local fast path (the caller's notify_chat_waiters) stays; this only

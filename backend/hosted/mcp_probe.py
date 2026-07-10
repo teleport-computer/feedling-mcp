@@ -13,12 +13,12 @@ documented residual risk — spec §6); redirects are disabled outright.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
-import socket
 from urllib.parse import urlparse
 
 import httpx
+
+from core import net_safety
 
 _CONNECT_TIMEOUT = 10.0
 _TOTAL_TIMEOUT = 30.0
@@ -33,29 +33,13 @@ class ProbeError(Exception):
 
 
 def _resolve_ips(host: str) -> list[str]:
-    infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    return sorted({info[4][0] for info in infos})
+    return net_safety.resolve_ips(host)
 
 
 def blocked_url_kind(url: str) -> str | None:
     """"blocked_url" when the host resolves to any non-global address,
     "dns" when it doesn't resolve, None when clean."""
-    host = urlparse(url).hostname or ""
-    if not host:
-        return "blocked_url"
-    try:
-        ip = ipaddress.ip_address(host)
-        return None if ip.is_global else "blocked_url"
-    except ValueError:
-        pass  # hostname, not a literal IP
-    try:
-        ips = _resolve_ips(host)
-    except OSError:
-        return "dns"
-    for raw in ips:
-        if not ipaddress.ip_address(raw).is_global:
-            return "blocked_url"
-    return None
+    return net_safety.blocked_url_kind(url, resolve=_resolve_ips)
 
 
 def _classify_http(status: int) -> str:

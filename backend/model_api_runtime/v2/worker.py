@@ -27,10 +27,11 @@ hosted-adjacent 的东西；因此它被挪到 TurnDeps.is_official（生产实�
 只含标签 + 粗计数，绝无原文。
 
 并发：asyncio 事件循环 + asyncio.to_thread 把同步 jobs_store/enclave 调用移出 loop。
-provider 调用（planner/responder 的 reliable_chat_completion_async）原生 async，直接
-await——不经 to_thread 桥线程池，那条桥会把并发悄悄封顶在线程池大小（~32），worker 池
-自己的并发闸形同虚设。ENCLAVE_SEMAPHORE 框住 turn 里所有 enclave-bound 调用（provider-key
-解密 + 逐条 chat 解密 + capability 调用），治 spec R3（enclave 单线程瓶颈，多 worker 齐打会放大 502）。
+provider 调用统一 await async facade；OpenAI-compatible chat 已是原生 async，仍需同步
+bridge 的 provider 路径由 serve-worker 把 AnyIO limiter 至少扩到 turn-slot 数，避免默认
+线程上限悄悄小于配置的并发。最终目标仍是所有 provider HTTP 原生 async。
+ENCLAVE_SEMAPHORE 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
++ capability 调用），治 spec R3（enclave 单线程瓶颈，多 worker 齐打会放大 502）。
 """
 from __future__ import annotations
 
@@ -64,13 +65,25 @@ from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidation
 
 log = logging.getLogger("feedling.runtime_v2.worker")
 
+
+def _positive_int_env(name: str, default: str) -> int:
+    raw = os.environ.get(name, default)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive integer")
+    return value
+
 # —— 三个有界闸 ——（spec §6）
 # 每进程并发 job 数（= 并发回合数）。线上多进程 × CVM 共抢同一张 agent_jobs → 线性扩容。
-MAX_WORKERS = int(os.environ.get("FEEDLING_V2_MAX_WORKERS", "4"))
+MAX_WORKERS = _positive_int_env("FEEDLING_V2_MAX_WORKERS", "4")
 # 单 job 内 executor 并行读上限。
-MAX_READ_ACTION_PARALLELISM = int(os.environ.get("FEEDLING_V2_MAX_READ_PARALLELISM", "4"))
+MAX_READ_ACTION_PARALLELISM = _positive_int_env("FEEDLING_V2_MAX_READ_PARALLELISM", "4")
 # 跨所有 job 共享的 enclave 并发闸（provider-key 解密 + chat 解密 + capability 调用都过它）。治 R3。
-ENCLAVE_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")))
+ENCLAVE_CONCURRENCY = _positive_int_env("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")
+ENCLAVE_SEMAPHORE = asyncio.Semaphore(ENCLAVE_CONCURRENCY)
 
 
 def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
@@ -78,12 +91,13 @@ def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
 
     前 `reserved` 个 slot 只允许抢 {"chat","manual_wake"}（一次 heartbeat/capture 唤醒风暴
     绝不会饿死聊天回复）；其余 slot 不设限（None＝任意 lane，含 heartbeat/capture/
-    maintenance）。reserved 未显式传时默认 max(1, max_workers // 2)——至少留一个专用槽，
-    但不会把整个池都锁死成 chat-only（scheduler 产出的 heartbeat job 仍需要有 slot 能抢）。
-    reserved 会被夹到 [0, max_workers] 区间内，防御越界配置。"""
+    maintenance）。reserved 未显式传时默认 max(1, max_workers // 2)，但始终至少保留
+    一个 unrestricted slot；单-worker 部署因此不能做 lane reservation。否则 scheduled/
+    maintenance/capture 等非 chat job 会在一个健康进程里永久 pending。reserved 会被夹到
+    [0, max_workers - 1] 区间内，防御越界配置。"""
     n = max(1, int(max_workers))
     r = reserved if reserved is not None else max(1, n // 2)
-    r = max(0, min(r, n))
+    r = max(0, min(r, n - 1))
     return [{"chat", "manual_wake"} if i < r else None for i in range(n)]
 
 # D1（full-conversation context）：responder 现在吃 summary+tail 而不是"仅未回复的 user
@@ -94,6 +108,7 @@ def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
 _TAIL_BUDGET = int(os.environ.get("FEEDLING_V2_TAIL_BUDGET_MSGS", "20"))
 _TAIL_KEEP = int(os.environ.get("FEEDLING_V2_TAIL_KEEP_MSGS", "10"))
 _TAIL_HARD_CAP = int(os.environ.get("FEEDLING_V2_TAIL_HARD_CAP", "60"))
+_COMPACTION_BATCH = int(os.environ.get("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200"))
 
 # 每回合最多注入最近 N 张图。enclave 单线程（每张图一次往返），且无 prompt caching ——
 # tail 里的图片每个回合都要重发，token 成本随图片数线性上升。
@@ -151,6 +166,29 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
 _WAKE_COOLDOWN_SEC = float(os.environ.get("FEEDLING_V2_WAKE_COOLDOWN_SEC", "600"))
 
 
+class LostJobLease(RuntimeError):
+    """The reaper or another lifecycle transition fenced this worker out."""
+
+
+class RuntimeModeChanged(RuntimeError):
+    """The user rolled back while this V2 job was queued or running."""
+
+
+def _safe_failure_code(scope: str, exc: BaseException) -> str:
+    """Stable plaintext error code that never embeds exception messages."""
+    if isinstance(exc, v2_responder.ResponderError):
+        raw = str(exc)
+        if raw in {"empty_reply", "no_user_messages"}:
+            kind = raw
+        elif exc.kind in {"transient", "provider_config", "unknown"}:
+            kind = f"provider_{exc.kind}"
+        else:
+            kind = "responder_error"
+    else:
+        kind = type(exc).__name__.lower() or "error"
+    return f"{scope}:{kind}"[:120]
+
+
 @dataclass
 class TurnDeps:
     """turn 执行体的注入式依赖（生产实现见 serve_worker.build_production_deps）。
@@ -171,6 +209,10 @@ class TurnDeps:
     # hosted/setup_core.py:265）。默认 None：worker.py 自身不 import hosted，测试/其他调用方
     # 不必提供；生产装配见 serve_worker.build_production_deps。
     record_terminal_error: Callable[[str, str], None] | None = None
+    # Production cursor-aware reader. Keeping this optional preserves the many
+    # pure tests that inject the older one-argument reader.
+    read_messages_since: Callable[[str, float], list[dict]] | None = None
+    runtime_mode_enabled: Callable[[str], bool] | None = None
     # (job_id, user_id, lane, prompt_tokens, completion_tokens, latency_ms) -> None
     # （kwargs-only，见 jobs_store.record_turn_metric）：D4 load-testing 消费的每回合
     # provider token usage + 延迟。只在 responder.respond 成功返回后（chat lane）由
@@ -183,6 +225,7 @@ class TurnDeps:
     # "上次回复之后的 user 消息"那一批）。默认 None：worker.py 自身不 import hosted，
     # 测试/其他调用方不必提供；生产装配见 serve_worker.build_production_deps。
     read_tail: Callable[[str, float, int], list[dict]] | None = None
+    read_compaction_tail: Callable[[str, float, int], list[dict]] | None = None
     # user_id -> (summary_plaintext, watermark_ts, version)：读取该用户当前会话摘要（enclave
     # 解密明文）；从未压缩过时 ("", 0.0, 0)（D1：turn 看 摘要+尾巴 而不是全量重放）。默认
     # None：worker.py 自身不 import hosted，测试/其他调用方不必提供；生产装配见
@@ -251,6 +294,8 @@ async def _coalesce_inputs(
     直调）时不设闸。返回 (coalesced, cursor)。cursor==0.0 表示本次没有新消息被折入（调用方
     不应据此回退 last_replied_ts——见 process_job 里的单调前进处理）。"""
     async def _read():
+        if deps.read_messages_since is not None:
+            return await asyncio.to_thread(deps.read_messages_since, user_id, since_ts)
         return await asyncio.to_thread(deps.read_messages, user_id)
 
     if enclave_sem is not None:
@@ -270,7 +315,10 @@ def _write_encrypted_reply(store, text: str) -> dict | None:
     env, err = core_envelope._build_shared_envelope_for_store(store, text.encode("utf-8"))
     if env is None:
         return None
-    row = store.append_chat("openclaw", "model_api", env)
+    # Strict persistence is required for a terminal V2 reply.  The legacy
+    # append API swallows DB failures after mutating its in-process cache, which
+    # could otherwise let this job complete with no durable reply.
+    row = store.append_chat("openclaw", "model_api", env, strict=True)
     store.notify_chat_waiters()
     return row
 
@@ -301,7 +349,8 @@ def _surface_terminal_error(deps: TurnDeps, user_id: str, job_id, message: str) 
 
 
 async def _run_compaction(
-    job_id, user_id: str, deps: TurnDeps, provider_config: Any, enclave_sem: "asyncio.Semaphore"
+    job_id, user_id: str, deps: TurnDeps, provider_config: Any,
+    enclave_sem: "asyncio.Semaphore", claimed_by: str | None = None,
 ) -> str:
     """maintenance-lane 压缩：把超预算 tail 的最旧一批折进加密 summary（append-and-merge，
     CAS 原子写，见 `model_api_runtime.v2.compaction.compact` + `jobs_store.upsert_summary_row_cas`）。
@@ -314,37 +363,58 @@ async def _run_compaction(
     try:
         async with enclave_sem:
             summary, watermark, version = await asyncio.to_thread(deps.read_summary, user_id)
-            tail = await asyncio.to_thread(deps.read_tail, user_id, watermark, 10_000)  # 读到 watermark 之后的全部
+            reader = deps.read_compaction_tail or deps.read_tail
+            tail = await asyncio.to_thread(
+                reader, user_id, watermark, _COMPACTION_BATCH + _TAIL_KEEP)
         if len(tail) <= _TAIL_KEEP:
-            await asyncio.to_thread(jobs_store.mark_completed, job_id)  # 没到该折的量
+            await asyncio.to_thread(
+                jobs_store.mark_completed, job_id, claimed_by=claimed_by)
             return "completed"
-        old = tail[: len(tail) - _TAIL_KEEP]  # 折最旧的一批；最近 _TAIL_KEEP 条继续逐字保留
+        old = tail[: min(_COMPACTION_BATCH, len(tail) - _TAIL_KEEP)]
         new_watermark = old[-1]["ts"]
         new_summary = await v2_compaction.compact(
             provider_config=provider_config, current_summary=summary, old_messages=old,
             llm=provider_client.reliable_chat_completion_async)
         if new_summary.strip() == summary.strip():  # 空/no-op 折叠 → 不推进 watermark/version
-            await asyncio.to_thread(jobs_store.mark_completed, job_id)
+            await asyncio.to_thread(
+                jobs_store.mark_completed, job_id, claimed_by=claimed_by)
             return "completed"
+        if claimed_by and not await asyncio.to_thread(
+            jobs_store.renew_job_lease, job_id, claimed_by,
+            ttl_sec=jobs_store.RUNNING_TTL_SEC,
+        ):
+            raise LostJobLease("compaction lease lost before summary write")
+        if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
+            deps.runtime_mode_enabled, user_id
+        ):
+            raise RuntimeModeChanged("user rolled back before summary write")
         # write_summary 是本地加密（core_envelope，非 enclave 往返）+ CAS 写库，不占用
         # 稀缺的 enclave_sem——只有解密才走 enclave HTTP（见 _read_summary/_read_tail）。
         ok = await asyncio.to_thread(deps.write_summary, user_id, new_summary, new_watermark, version)
         if ok:
-            await asyncio.to_thread(jobs_store.mark_completed, job_id)
+            completed = await asyncio.to_thread(
+                jobs_store.mark_completed, job_id, claimed_by=claimed_by)
+            if completed and len(tail) >= _COMPACTION_BATCH + _TAIL_KEEP:
+                await asyncio.to_thread(
+                    jobs_store.enqueue_job, user_id, "maintenance", reason="compaction_catchup")
+                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
             return "completed"
         # CAS 没落地：别的写手已经推进过版本，本次压缩视为丢弃，不重试、不报错。
-        await asyncio.to_thread(jobs_store.mark_failed, job_id, "summary_cas_lost")
+        await asyncio.to_thread(
+            jobs_store.mark_failed, job_id, "summary_cas_lost", claimed_by=claimed_by)
         return "failed"
     except Exception as e:  # noqa: BLE001 — 后台 job：静默 mark_failed，绝不弹用户可见 error/写气泡
-        log.warning("[v2.worker] compaction job %s failed: %s", job_id, e)
+        code = _safe_failure_code("compaction_failed", e)
+        log.warning("[v2.worker] compaction job %s failed code=%s", job_id, code)
         await asyncio.to_thread(
-            jobs_store.mark_failed, job_id, f"compaction_failed: {type(e).__name__}: {str(e)[:160]}")
+            jobs_store.mark_failed, job_id, code,
+            claimed_by=claimed_by)
         return "failed"
 
 
 async def _run_wake(
     job_id, user_id: str, lane: str, deps: TurnDeps, provider_config: Any,
-    enclave_sem: "asyncio.Semaphore",
+    enclave_sem: "asyncio.Semaphore", claimed_by: str,
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake）turn：让伴侣主动开口，而不是回答用户
     刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
@@ -369,6 +439,20 @@ async def _run_wake(
     """
     try:
         store = core_store.get_store(user_id)
+
+        async def _fence_wake_effect(effect: str) -> None:
+            if not await asyncio.to_thread(
+                jobs_store.renew_job_lease,
+                job_id,
+                claimed_by,
+                ttl_sec=jobs_store.RUNNING_TTL_SEC,
+            ):
+                raise LostJobLease(f"wake lease lost before {effect}")
+            if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
+                deps.runtime_mode_enabled, user_id
+            ):
+                raise RuntimeModeChanged(f"user rolled back before {effect}")
+
         async with enclave_sem:
             if deps.read_summary is not None:
                 summary, watermark, _ver = await asyncio.to_thread(deps.read_summary, user_id)
@@ -411,29 +495,37 @@ async def _run_wake(
             if "empty_reply" in str(e) or "no_user_messages" in str(e):
                 # Weak wake sleeps: the model (or a degenerate prompt) chose silence —
                 # this is a SUCCESSFUL wake, not a failure. No bubble, no error surface.
-                await asyncio.to_thread(jobs_store.mark_completed, job_id)
+                await asyncio.to_thread(
+                    jobs_store.mark_completed, job_id, claimed_by=claimed_by)
                 return "completed"
             if e.kind == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
                 # BEFORE the silent mark_failed below, so the scheduler stops hammering
                 # this key every heartbeat interval (Task 1's due_heartbeat_users query
                 # already excludes users still in cooldown).
+                await _fence_wake_effect("payment cooldown")
                 await asyncio.to_thread(
                     jobs_store.upsert_wake_schedule, user_id,
                     payment_cooldown_until=time.time() + _WAKE_COOLDOWN_SEC)
             raise
-        await asyncio.to_thread(_write_encrypted_reply, store, reply)
-        await asyncio.to_thread(jobs_store.mark_completed, job_id)
+        await _fence_wake_effect("wake reply")
+        row = await asyncio.to_thread(_write_encrypted_reply, store, reply)
+        if row is None:
+            raise RuntimeError("reply_encryption_failed")
+        await asyncio.to_thread(
+            jobs_store.mark_completed, job_id, claimed_by=claimed_by)
         return "completed"
     except Exception as e:  # noqa: BLE001 — wake job: silent mark_failed, never surface/bubble
-        log.warning("[v2.worker] wake job %s (lane=%s) failed: %s", job_id, lane, e)
+        code = _safe_failure_code("wake_failed", e)
+        log.warning("[v2.worker] wake job %s lane=%s failed code=%s", job_id, lane, code)
         await asyncio.to_thread(
-            jobs_store.mark_failed, job_id, f"wake_failed: {type(e).__name__}: {str(e)[:160]}")
+            jobs_store.mark_failed, job_id, code, claimed_by=claimed_by)
         return "failed"
 
 
 async def _run_extraction(job_id, user_id: str, lane: str, deps: TurnDeps,
-                          provider_config: Any, enclave_sem: "asyncio.Semaphore") -> str:
+                          provider_config: Any, enclave_sem: "asyncio.Semaphore",
+                          claimed_by: str | None = None) -> str:
     """capture / dream：后台记忆抽取。自成一体的 try/except —— 绝不落进 process_job 那个
     chat-turn 的 except（那条会 emit 用户可见的 error status + record_terminal_error）。
 
@@ -476,23 +568,37 @@ async def _run_extraction(job_id, user_id: str, lane: str, deps: TurnDeps,
         if reason:
             raise RuntimeError(reason)
         if not items:
-            await asyncio.to_thread(jobs_store.mark_completed, job_id)
+            await asyncio.to_thread(
+                jobs_store.mark_completed, job_id, claimed_by=claimed_by)
             return "completed"
 
         if deps.build_memory_envelope is None or deps.apply_memory_actions is None:
-            await asyncio.to_thread(jobs_store.mark_completed, job_id)
+            await asyncio.to_thread(
+                jobs_store.mark_completed, job_id, claimed_by=claimed_by)
             return "completed"
 
         actions, _added, _superseded = to_actions(
             items, occurred_at="", source_ids=source_ids,
             build_envelope=lambda inner: deps.build_memory_envelope(user_id, inner))
+        if claimed_by and not await asyncio.to_thread(
+            jobs_store.renew_job_lease, job_id, claimed_by,
+            ttl_sec=jobs_store.RUNNING_TTL_SEC,
+        ):
+            raise LostJobLease("extraction lease lost before memory write")
+        if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
+            deps.runtime_mode_enabled, user_id
+        ):
+            raise RuntimeModeChanged("user rolled back before memory write")
         await asyncio.to_thread(deps.apply_memory_actions, user_id, actions)
-        await asyncio.to_thread(jobs_store.mark_completed, job_id)
+        await asyncio.to_thread(
+            jobs_store.mark_completed, job_id, claimed_by=claimed_by)
         return "completed"
     except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
-        log.warning("[v2.worker] extraction job %s (lane=%s) failed: %s", job_id, lane, e)
+        code = _safe_failure_code("extraction_failed", e)
+        log.warning("[v2.worker] extraction job %s lane=%s failed code=%s", job_id, lane, code)
         await asyncio.to_thread(
-            jobs_store.mark_failed, job_id, f"extraction_failed: {str(e)[:160]}")
+            jobs_store.mark_failed, job_id, code,
+            claimed_by=claimed_by)
         return "failed"
 
 
@@ -567,26 +673,59 @@ async def process_job(
     job_id = job["id"]
     user_id = str(job["user_id"])
     lane = job.get("lane") or "chat"
+    claimed_by = str(job.get("claimed_by") or "")
+    observed_generation = int(job.get("input_generation") or 0)
 
-    await asyncio.to_thread(jobs_store.mark_running, job_id)
     try:
+        if not claimed_by or not await asyncio.to_thread(
+            jobs_store.mark_running, job_id, claimed_by=claimed_by
+        ):
+            raise LostJobLease("job ownership lost before start")
+
+        async def _renew_lease() -> None:
+            if not await asyncio.to_thread(
+                jobs_store.renew_job_lease,
+                job_id,
+                claimed_by,
+                ttl_sec=jobs_store.RUNNING_TTL_SEC,
+            ):
+                raise LostJobLease("job lease expired or ownership changed")
+
+        async def _ensure_runtime_mode() -> None:
+            if deps.runtime_mode_enabled is None or await asyncio.to_thread(
+                deps.runtime_mode_enabled, user_id
+            ):
+                return
+            await asyncio.to_thread(
+                jobs_store.mark_failed,
+                job_id,
+                "runtime_mode_changed",
+                claimed_by=claimed_by,
+            )
+            raise RuntimeModeChanged("user is no longer assigned to V2")
+
+        await _ensure_runtime_mode()
+
         if lane == "maintenance":
             # 自成一体的压缩路径：自己的 try/except（见 `_run_compaction`），绝不落到本
             # 函数下面那个 chat-turn 的 `except`——那个分支会 emit 用户可见的 error status
             # + record_terminal_error（iOS 错误 chip），压缩失败是后台维护事，不该弹给用户。
-            return await _run_compaction(job_id, user_id, deps, provider_config, enclave_sem)
+            return await _run_compaction(
+                job_id, user_id, deps, provider_config, enclave_sem, claimed_by)
         if lane in _WAKE_LANES:
             # Self-contained wake path (D3 Task 6): proactive turn, not a reply to a
             # just-sent user message. Own try/except inside `_run_wake` — never falls
             # into the chat-turn `except` below (that branch emits a user-visible
             # error status + record_terminal_error, which wake failures must not do).
-            return await _run_wake(job_id, user_id, lane, deps, provider_config, enclave_sem)
+            return await _run_wake(
+                job_id, user_id, lane, deps, provider_config, enclave_sem, claimed_by)
         if lane in _EXTRACTION_LANES:
             # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
             # parse → memory actions。同 _run_compaction/_run_wake 一样有自己的 try/except，
             # 绝不落进下面 chat-turn 的 except（那条会 emit 用户可见 error status +
             # record_terminal_error）——后台 job 永不写气泡、永不弹 error chip。
-            return await _run_extraction(job_id, user_id, lane, deps, provider_config, enclave_sem)
+            return await _run_extraction(
+                job_id, user_id, lane, deps, provider_config, enclave_sem, claimed_by)
         if lane != "chat":
             # 真·未注册 lane 的兜底：maintenance/wake（heartbeat/scheduled/manual_wake）/
             # capture/dream 都已在上面各自的 handler 里分派完；能落到这里的只剩既不是 chat、
@@ -596,17 +735,35 @@ async def process_job(
             # 显式失败，静默（背景 job 的既有口径：不写气泡、不 _surface_terminal_error）——
             # 落到这里就是「明确失败」而不是「偷偷写气泡」。
             log.warning("[v2.worker] job %s has unhandled lane=%s", job_id, lane)
-            await asyncio.to_thread(jobs_store.mark_failed, job_id, f"unhandled_lane:{lane}")
+            await asyncio.to_thread(
+                jobs_store.mark_failed, job_id, f"unhandled_lane:{lane}",
+                claimed_by=claimed_by)
             return "failed"
         store = core_store.get_store(user_id)
         runtime_state = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
         await asyncio.to_thread(_emit_status, user_id, job_id, "processing")
 
         since = float(runtime_state.get("last_replied_ts") or 0)
+        generation = await asyncio.to_thread(
+            jobs_store.get_input_generation, job_id, claimed_by=claimed_by)
+        if generation is None:
+            raise LostJobLease("job ownership lost before input read")
+        observed_generation = generation
         coalesced, cursor = await _coalesce_inputs(deps, user_id, since, enclave_sem=enclave_sem)
         if not coalesced and lane == "chat":
             # 无未回复消息（已被别的回合吃掉，或是竞态下的重复 claim）——干净收尾，不落 filler。
-            await asyncio.to_thread(jobs_store.mark_completed, job_id)
+            completed, successor_id = await asyncio.to_thread(
+                jobs_store.finish_chat_job,
+                job_id,
+                claimed_by=claimed_by,
+                observed_generation=observed_generation,
+            )
+            if not completed:
+                raise LostJobLease("job ownership lost during empty finalization")
+            if successor_id is not None:
+                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            await asyncio.to_thread(_emit_status, user_id, job_id, "done")
+            await asyncio.to_thread(core_wake_bus.notify, "chat", user_id)
             return "completed"
 
         replan_count = 0
@@ -631,6 +788,7 @@ async def process_job(
                 `final_text` 恒为 None —— 散文由 responder 写（spec §4）。
                 """
                 nonlocal llm_calls
+                await _renew_lease()
                 if llm_calls >= _TURN_MAX_LLM_CALLS - 1:
                     return v2_agent_loop.Decision(actions=[], wants_reply=True)
                 llm_calls += 1
@@ -646,15 +804,26 @@ async def process_job(
                     wants_reply=any(s["type"] == "final_response" for s in steps))
 
             async def _run_tools(actions: list[dict]) -> dict:
-                """executor 桥：DB 记账 + 排空。executor 的并行读/串行写/ENCLAVE_SEMAPHORE 原样复用。"""
+                """Persist trajectory shape, fence ownership, then drain tools."""
+                # A planner call happens between the preceding renewal and this
+                # side-effect boundary. Fence again before any capability executes,
+                # especially the serialized write actions.
+                await _ensure_runtime_mode()
+                await _renew_lease()
                 action_ids = await asyncio.to_thread(
                     jobs_store.add_actions, job_id, user_id,
                     [{"type": s["type"], "payload": s["payload"]} for s in actions])
                 for s, aid in zip(actions, action_ids):
                     s["_action_id"] = aid
+
+                async def _before_write() -> None:
+                    await _ensure_runtime_mode()
+                    await _renew_lease()
+
                 return await v2_executor.execute_plan(
                     store, job_id, api_key=api_key, runtime_token=runtime_token,
-                    plan=actions, read_parallelism=read_parallelism, enclave_sem=enclave_sem)
+                    plan=actions, read_parallelism=read_parallelism,
+                    enclave_sem=enclave_sem, before_write=_before_write)
 
             loop_res = await v2_agent_loop.run_turn(
                 decide=_decide, run_tools=_run_tools, max_rounds=_LOOP_MAX_ROUNDS)
@@ -662,13 +831,21 @@ async def process_job(
             # 安全点（before_final_response）：跨进程/跨 worker 写入的新消息只活在 DB 里，
             # 本进程内存态的 store.chat_messages 未必看得到——先 reload 再判定，避免漏判。
             # evaluate 只看 role/ts（密文行本身不含明文，无需解密即可判定「有没有新用户消息」）。
-            await asyncio.to_thread(store.reload)
+            refresh_chat = getattr(store, "reload_chat_strict", None)
+            if not callable(refresh_chat):
+                refresh_chat = store.reload
+            await asyncio.to_thread(refresh_chat)
             decision = v2_inval.evaluate(
                 store.chat_messages, safe_point="before_final_response",
                 coalesced_cursor_ts=cursor, replan_count=replan_count, replan_budget=replan_budget)
             if decision == v2_inval.REPLAN and llm_calls < _TURN_MAX_LLM_CALLS - 1:
                 await asyncio.to_thread(v2_inval.invalidate, job_id, replan_job_id=job_id)
                 replan_count += 1
+                generation = await asyncio.to_thread(
+                    jobs_store.get_input_generation, job_id, claimed_by=claimed_by)
+                if generation is None:
+                    raise LostJobLease("job ownership lost before replan read")
+                observed_generation = generation
                 coalesced, cursor = await _coalesce_inputs(deps, user_id, since, enclave_sem=enclave_sem)
                 continue
             break
@@ -681,6 +858,8 @@ async def process_job(
         # 这不是占位气泡——responder 仍然产出真正的 model-authored 文本（no-filler 不变量）。
         wants_reply = lane == "chat" or loop_res.stop_reason == v2_agent_loop.WANTS_REPLY
         if wants_reply:
+            await _ensure_runtime_mode()
+            await _renew_lease()
             await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
             # D1：responder 现在吃 summary（早前对话摘要）+ tail（双角色逐字近期窗口），
             # 不再是"仅合并的未回复 user 消息"。deps.read_summary/read_tail 为 None 时
@@ -712,7 +891,8 @@ async def process_job(
                     action_results=action_state["action_results"], usage_out=_usage)
                 if deps.record_turn_metric is not None:
                     try:
-                        deps.record_turn_metric(
+                        await asyncio.to_thread(
+                            deps.record_turn_metric,
                             job_id=job_id, user_id=user_id, lane=lane,
                             prompt_tokens=_usage.get("prompt_tokens"),
                             completion_tokens=_usage.get("completion_tokens"),
@@ -720,7 +900,11 @@ async def process_job(
                         )
                     except Exception as e:  # noqa: BLE001 — 记指标失败绝不能拖垮已经产出的回复
                         log.warning("[v2.worker] record_turn_metric failed job=%s: %s", job_id, e)
-            await asyncio.to_thread(_write_encrypted_reply, store, reply)
+            await _ensure_runtime_mode()
+            await _renew_lease()
+            reply_row = await asyncio.to_thread(_write_encrypted_reply, store, reply)
+            if reply_row is None:
+                raise RuntimeError("reply_encryption_failed")
             # 超预算 → best-effort 入队一个 maintenance lane 的压缩 job（不阻塞、不拖垮
             # 本回合——enqueue_job 本身命中 single-flight 会 coalesce，失败只记日志）。
             if tail and context.needs_compaction(tail, budget=_TAIL_BUDGET):
@@ -735,16 +919,41 @@ async def process_job(
         await asyncio.to_thread(
             jobs_store.upsert_runtime_state, user_id,
             {"last_replied_ts": new_last_replied, "action_digest": action_state["action_digest"]})
+        await _ensure_runtime_mode()
+        completed, successor_id = await asyncio.to_thread(
+            jobs_store.finish_chat_job,
+            job_id,
+            claimed_by=claimed_by,
+            observed_generation=observed_generation,
+        )
+        if not completed:
+            raise LostJobLease("job ownership lost during finalization")
+        if deps.record_terminal_error is not None:
+            try:
+                await asyncio.to_thread(deps.record_terminal_error, user_id, "")
+            except Exception as e:  # noqa: BLE001 — reply/job are already durable
+                log.warning("[v2.worker] clear terminal error failed job=%s: %s", job_id, e)
         await asyncio.to_thread(_emit_status, user_id, job_id, "done")
         # 跨进程唤醒 web 层 parked 的 chat long-poll（worker 与 web 是不同进程/CVM，origin 不同）。
         await asyncio.to_thread(core_wake_bus.notify, "chat", user_id)
-        await asyncio.to_thread(jobs_store.mark_completed, job_id)
+        if successor_id is not None:
+            await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
         return "completed"
+    except LostJobLease as e:
+        # The winning lifecycle transition (normally the reaper) owns terminal
+        # visibility. A stale worker must not overwrite it or emit a duplicate error.
+        log.warning("[v2.worker] job %s fenced out: %s", job_id, e)
+        return "failed"
+    except RuntimeModeChanged as e:
+        log.info("[v2.worker] job %s stopped at rollout fence: %s", job_id, e)
+        return "failed"
     except Exception as e:  # noqa: BLE001 — 任何失败落 last_error，绝不写占位气泡
-        log.warning("[v2.worker] job %s failed: %s", job_id, e)
-        message = f"{type(e).__name__}: {str(e)[:200]}"
-        await asyncio.to_thread(jobs_store.mark_failed, job_id, message)
-        await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, message)
+        message = _safe_failure_code("turn_failed", e)
+        log.warning("[v2.worker] job %s failed code=%s", job_id, message)
+        owned = await asyncio.to_thread(
+            jobs_store.mark_failed, job_id, message, claimed_by=claimed_by)
+        if owned:
+            await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, message)
         return "failed"
 
 
@@ -755,28 +964,35 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
     不进入全流程（没有可用 provider，planner/responder 都跑不了）。"""
     job_id = job["id"]
     user_id = str(job["user_id"])
-    async with ENCLAVE_SEMAPHORE:
-        provider_config, meta = await asyncio.to_thread(deps.resolve_provider, user_id)
-    if provider_config is None:
-        err = str((meta or {}).get("error") or "provider_unavailable")
-        await asyncio.to_thread(jobs_store.mark_running, job_id)
-        await asyncio.to_thread(jobs_store.mark_failed, job_id, err)
-        # maintenance（后台压缩）/ wake（heartbeat/scheduled/manual_wake，D3 Task 6）job
-        # 跑在 enqueue 之后、异步执行，甚至压根不是用户此刻发消息触发的；此刻 provider
-        # 解析失败（key 轮换 / enclave 瞬时解密失败，正是 R3 要防的）都不该给用户弹
-        # error chip。只有用户可见的 chat 回合才走 _surface_terminal_error（iOS 错误
-        # chip）；maintenance/wake 静默 mark_failed 即可——与 _run_compaction/_run_wake
-        # 内部失败的隔离口径一致。
-        if str(job.get("lane") or "chat") == "chat":
-            await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, err)
+    claimed_by = str(job.get("claimed_by") or "")
+    lane = str(job.get("lane") or "chat")
+    try:
+        async with ENCLAVE_SEMAPHORE:
+            provider_config, meta = await asyncio.to_thread(deps.resolve_provider, user_id)
+        if provider_config is None:
+            err = "provider_unavailable"
+            owned = await asyncio.to_thread(
+                jobs_store.mark_failed, job_id, err, claimed_by=claimed_by)
+            if owned and lane == "chat":
+                await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, err)
+            return "failed"
+        is_official = deps.is_official(provider_config)
+        runtime_token = await asyncio.to_thread(deps.mint_enclave_token, user_id)
+        return await process_job(
+            job, deps,
+            provider_config=provider_config, is_official=is_official,
+            api_key=None, runtime_token=runtime_token,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 — claimed work must always terminalize visibly
+        message = _safe_failure_code("turn_setup_failed", e)
+        log.warning("[v2.worker] job %s outer turn failure code=%s", job_id, message)
+        owned = await asyncio.to_thread(
+            jobs_store.mark_failed, job_id, message, claimed_by=claimed_by)
+        if owned and lane == "chat":
+            await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, message)
         return "failed"
-    is_official = deps.is_official(provider_config)
-    runtime_token = await asyncio.to_thread(deps.mint_enclave_token, user_id)
-    return await process_job(
-        job, deps,
-        provider_config=provider_config, is_official=is_official,
-        api_key=None, runtime_token=runtime_token,
-    )
 
 
 # —— "v2_jobs" 即时唤醒（FIX 3）——
@@ -853,6 +1069,7 @@ async def _slot_loop(
     mark_running 撞到一次性 DB 错误）绝不允许冒出这个协程、拖垮 run_worker_loop 里其他
     仍然健康的 slot——记日志后 continue，下一轮再抢。"""
     while not stop_event.is_set():
+        job = None
         try:
             job = await asyncio.to_thread(jobs_store.claim_next_job, worker_id, lanes=lanes)
             if job is None:
@@ -861,6 +1078,29 @@ async def _slot_loop(
             await _run_turn(job, deps)
         except Exception as e:  # noqa: BLE001 — 单 slot 故障绝不冒出去拖垮其他 slot
             log.warning("[v2.worker] slot %s iteration failed: %s", worker_id, e)
+            if job is not None:
+                try:
+                    user_id = str(job.get("user_id") or "")
+                    message = f"slot_failure:{type(e).__name__.lower()}"
+                    owned = await asyncio.to_thread(
+                        jobs_store.mark_failed,
+                        job["id"],
+                        message,
+                        claimed_by=str(job.get("claimed_by") or worker_id),
+                    )
+                    if owned and str(job.get("lane") or "chat") == "chat":
+                        await asyncio.to_thread(
+                            _surface_terminal_error, deps, user_id, job["id"], message)
+                except Exception as recovery_error:  # noqa: BLE001
+                    # Recovery is best-effort: the independent lease reaper is
+                    # the final owner of terminalization.  A second DB/error-
+                    # surface failure must never kill this slot and leave the
+                    # process advertising capacity it no longer has.
+                    log.error(
+                        "[v2.worker] slot %s recovery failed code=%s",
+                        worker_id,
+                        _safe_failure_code("slot_recovery_failed", recovery_error),
+                    )
             await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
             continue
 
@@ -875,12 +1115,15 @@ async def run_worker_loop(
     未传（None）时所有 slot 退化为纯 poll，向后兼容既有调用方/测试。
 
     lane 预留（D3 Task 5）：前几个 slot 只抢 {"chat","manual_wake"}（见 `_reserved_lane_slots`），
-    保证 scheduler（Task 4）产出的 heartbeat 唤醒风暴抢不走全部 slot、饿死聊天回复。
+    保证 scheduler（Task 4）产出的 heartbeat 唤醒风暴抢不走全部 slot、饿死聊天回复，
+    同时始终留一个 unrestricted slot，避免后台 lane 永久 pending。
     `FEEDLING_V2_CHAT_RESERVED_SLOTS` 显式设置时覆盖默认的 max(1, max_workers // 2)；
     留空/未设置时用默认值。
 
-    return_exceptions=True 是防御性纵深：_slot_loop 本身已经不放跑异常，这里再兜一层，
-    确保万一某个 slot 协程仍然意外死亡，也不会通过 gather 传播出去、抛弃其余仍在跑的 slot。"""
+    `_slot_loop` catches recoverable per-job failures.  Any exception that still
+    escapes is therefore a broken slot invariant: cancel the siblings and let
+    the process supervisor restart the worker instead of silently running with
+    fewer (possibly zero) slots while its heartbeat advertises full capacity."""
     _reserved_env = os.environ.get("FEEDLING_V2_CHAT_RESERVED_SLOTS", "").strip()
     reserved = int(_reserved_env) if _reserved_env else None
     assignments = _reserved_lane_slots(max_workers, reserved)
@@ -891,4 +1134,12 @@ async def run_worker_loop(
         )
         for i in range(len(assignments))
     ]
-    await asyncio.gather(*slots, return_exceptions=True)
+    try:
+        await asyncio.gather(*slots)
+    except BaseException:
+        stop_event.set()
+        for slot in slots:
+            if not slot.done():
+                slot.cancel()
+        await asyncio.gather(*slots, return_exceptions=True)
+        raise

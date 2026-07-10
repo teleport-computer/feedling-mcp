@@ -44,14 +44,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from scripts.loadtest.mock_provider import MockProvider
+from scripts.loadtest.fixtures import resident_prompts
 
 # The same user messages the V2 single-round baseline used, so the two numbers
 # are comparable (see docs/HOSTED_RUNTIME_V2_TOKEN_BASELINE.md).
-DEFAULT_FIXTURES = [
-    "今天过得怎么样",
-    "我还是有点焦虑，面试没过",
-    "帮我回忆一下上周说的那个计划",
-]
+DEFAULT_FIXTURES = resident_prompts()
 
 _CONFIG_TOML = """\
 model = "gpt-5"
@@ -117,6 +114,8 @@ def measure(fixtures: list[str]) -> dict:
             "completion_tokens_total": provider.total_completion_tokens,
             "turns": int(turns),
             "codex_failures": failures,
+            "request_count": provider.request_count,
+            "expected_min_requests": len(fixtures),
         }
 
 
@@ -133,11 +132,17 @@ def main(argv: list[str] | None = None) -> int:
         print("\nFeed this into the D4 rollback gate:")
         print(f"  python scripts/loadtest/compare_tokens.py "
               f"--resident-baseline {report['tokens_per_turn']:.1f}")
-    if report["codex_failures"]:
-        print(f"WARNING: {report['codex_failures']} codex turn(s) exited non-zero; "
-              f"tokens still counted, but investigate before trusting the number.",
-              file=sys.stderr)
-    return 0
+    invalid = (
+        bool(report["codex_failures"])
+        or int(report["request_count"]) < int(report["expected_min_requests"])
+    )
+    if invalid:
+        print(
+            "ERROR: resident baseline incomplete; every fixture must exit zero "
+            "and reach the mock provider.",
+            file=sys.stderr,
+        )
+    return 2 if invalid else 0
 
 
 if __name__ == "__main__":

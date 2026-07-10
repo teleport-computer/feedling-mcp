@@ -267,10 +267,17 @@ def memory_index_core(
         except (TypeError, ValueError):
             raise ValueError("invalid ambient_top_n")
     limit = effective_readside_limit(payload.get("limit"))
+    query = str(payload.get("query") or "")[:500]
+    # ``limit`` is the caller's requested *result* count.  A private-content
+    # query can only be evaluated after enclave decryption, so applying that
+    # limit to the ciphertext candidates first creates deterministic false
+    # negatives (a matching low-score card after the first N is never seen).
+    # Search the bounded full window; the enclave filters and slices results.
+    candidate_limit = readside_hard_max() if query.strip() else limit
     candidates, user_card_count = readside_candidates(
         memory_service._load_moments(store),
         store.user_id,
-        limit=limit,
+        limit=candidate_limit,
         ambient=ambient,
         ambient_top_n=ambient_top_n,
     )
@@ -284,7 +291,7 @@ def memory_index_core(
             "thread": str(payload.get("thread") or "")[:120],
             "include_sensitive": bool(payload.get("include_sensitive", False)),
             "limit": limit,
-            "query": str(payload.get("query") or "")[:500],
+            "query": query,
         },
     )
     items = response.get("items") if isinstance(response.get("items"), list) else []

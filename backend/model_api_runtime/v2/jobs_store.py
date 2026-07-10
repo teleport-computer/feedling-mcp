@@ -6,6 +6,8 @@ CONTRIBUTING §2：新表存取逻辑全部收进本模块（jobs_store）。连
 """
 from __future__ import annotations
 
+import math
+import os
 import time
 
 import psycopg
@@ -16,6 +18,17 @@ import db
 from core import wake_bus
 
 LANES = {"chat", "manual_wake", "heartbeat", "scheduled", "capture", "maintenance", "dream", "screen_watch"}
+
+
+def _positive_float_env(name: str, default: str) -> float:
+    raw = os.environ.get(name, default)
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be finite and > 0") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"{name} must be finite and > 0")
+    return value
 
 # 默认（lane 派生）优先级：预留槽位场景下 chat/manual_wake 必须能在一堆 heartbeat/
 # capture 前面被抢到，防止后台唤醒风暴饿死聊天回复。enqueue_job 未显式传 priority
@@ -30,20 +43,13 @@ LANE_PRIORITY = {
     "maintenance": 10,
     "dream": 10,
 }
-# mark_running 时若 job 无 deadline_at，补一个（now + 该秒数），供 reaper 兜底回收
-# 卡死的 claimed/running job。chat lane 的 enqueue 不带 deadline，全靠这个兜底。
-#
-# 300s（非最初的 120s）：一旦 serve_worker 接上周期性 reap_stuck_jobs()（FIX 1），一个
-# replan 密集的官方 turn 有可能撑到 120s 以上（planner ≤30s ×≤3 + responder ≤60s +
-# 开销），若 TTL 仍是 120s，reaper 可能在 turn 仍存活时就把它 expire 掉——single-flight
-# 槽位一放开，第二个 worker 就可能抢到同一 user 的新 job 并发跑同一轮对话，双写回复，
-# 违反 §16「无双回复」。300s 留足这个最坏情况的余量，reaper 只回收真正卡死（进程崩溃/
-# 崩在 claim 和 mark_running 之间）的 job。
-# TODO(more-robust follow-up): mark_completed/mark_failed 在写终态前应该先确认这行仍是
-# 'claimed'/'running' 且仍归本 worker 所有（ownership check），这样即使 TTL 判断失误
-# （reaper 提前收了一个仍存活的 job），旧 worker 收尾时也会因为状态已经是 'expired' 而
-# 自然短路，不会覆盖新 worker 的结果——比单纯拉长 TTL 更彻底，但改动面更大，留到下一轮。
-RUNNING_TTL_SEC = 300.0
+# Chat admission and execution use separate columns and clocks. Pending rows
+# have a short queue deadline so an admitted turn cannot wait forever when the
+# fleet dies. Claim starts a distinct owner-fenced execution lease. Workers
+# renew only at explicit progress boundaries; a provider call that is itself
+# wedged therefore cannot keep a blind heartbeat alive forever.
+PENDING_CHAT_TTL_SEC = _positive_float_env("FEEDLING_V2_CHAT_PENDING_TTL_SEC", "120")
+RUNNING_TTL_SEC = _positive_float_env("FEEDLING_V2_LEASE_TTL_SEC", "300")
 
 _ACTIVE_STATUSES = ("pending", "claimed", "running")
 
@@ -70,41 +76,72 @@ def enqueue_job(
         raise ValueError(f"unknown lane: {lane!r}")
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
+
+    def _coalesce_or_insert(cur) -> tuple[int, bool]:
+        cur.execute(
+            "SELECT id,status,CASE "
+            "WHEN status='pending' THEN "
+            "  COALESCE(queue_deadline_at, deadline_at, "
+            "    CASE WHEN lane='chat' THEN "
+            "      created_at + make_interval(secs => %s) END) <= now() "
+            "ELSE COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+            "  AND COALESCE(lease_expires_at, deadline_at) <= now() "
+            "END AS stale "
+            "FROM agent_jobs "
+            "WHERE user_id=%s AND lane=%s "
+            "AND status IN ('pending','claimed','running') "
+            "ORDER BY id LIMIT 1 FOR UPDATE",
+            (float(PENDING_CHAT_TTL_SEC), user_id, lane),
+        )
+        existing = cur.fetchone()
+        if existing is not None and not bool(existing["stale"]):
+            cur.execute(
+                "UPDATE agent_jobs SET input_generation=input_generation+1 "
+                "WHERE id=%s RETURNING id",
+                (existing["id"],),
+            )
+            return int(cur.fetchone()["id"]), True
+        if existing is not None:
+            # Reclaim the single-flight key inside the same transaction.  The
+            # fresh chat job will re-read every message after the durable cursor,
+            # so input attached to the expired row is not lost or stranded.
+            cur.execute(
+                "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+                "attempt_count=attempt_count+1, "
+                "last_error=CASE WHEN status='pending' "
+                "THEN 'queue_timeout' ELSE 'lease_timeout' END "
+                "WHERE id=%s",
+                (existing["id"],),
+            )
+        cur.execute(
+            "INSERT INTO agent_jobs "
+            "(user_id, lane, status, reason, trace_id, priority, queue_deadline_at) "
+            "VALUES (%s,%s,'pending',%s,%s,%s,"
+            "CASE WHEN %s::timestamptz IS NOT NULL THEN %s::timestamptz "
+            "     WHEN %s='chat' THEN now() + make_interval(secs => %s) "
+            "     ELSE NULL END) RETURNING id",
+            (
+                user_id, lane, reason, trace_id, int(priority),
+                deadline_at, deadline_at, lane, float(PENDING_CHAT_TTL_SEC),
+            ),
+        )
+        return int(cur.fetchone()["id"]), False
+
     for _ in range(3):
         try:
             with _pool().connection() as conn:
                 with conn.transaction():
                     with conn.cursor(row_factory=dict_row) as cur:
-                        cur.execute(
-                            "SELECT id FROM agent_jobs "
-                            "WHERE user_id=%s AND lane=%s AND status IN ('pending','claimed','running') "
-                            "ORDER BY id LIMIT 1 FOR UPDATE",
-                            (user_id, lane),
-                        )
-                        existing = cur.fetchone()
-                        if existing is not None:
-                            return int(existing["id"]), True
-                        cur.execute(
-                            "INSERT INTO agent_jobs "
-                            "(user_id, lane, status, reason, trace_id, priority, deadline_at) "
-                            "VALUES (%s,%s,'pending',%s,%s,%s,%s) RETURNING id",
-                            (user_id, lane, reason, trace_id, int(priority), deadline_at),
-                        )
-                        return int(cur.fetchone()["id"]), False
+                        return _coalesce_or_insert(cur)
         except psycopg.errors.UniqueViolation:
             continue  # 并发 racer 抢先建了 active job；重读并 coalesce
+    # A very busy terminal/enqueue race can exhaust the optimistic retries.
+    # The fallback must still record that new input arrived; merely returning
+    # the row id would let finalization miss the follow-up generation.
     with _pool().connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "SELECT id FROM agent_jobs "
-                "WHERE user_id=%s AND lane=%s AND status IN ('pending','claimed','running') "
-                "ORDER BY id LIMIT 1",
-                (user_id, lane),
-            )
-            row = cur.fetchone()
-    if row is None:
-        raise RuntimeError("enqueue_job: coalesce read found no active job after conflict")
-    return int(row["id"]), True
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                return _coalesce_or_insert(cur)
 
 
 def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | None:
@@ -120,57 +157,102 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
             with conn.cursor(row_factory=dict_row) as cur:
                 if lanes is None:
                     cur.execute(
-                        "SELECT id FROM agent_jobs "
-                        "WHERE status='pending' AND (deadline_at IS NULL OR deadline_at > now()) "
-                        "ORDER BY priority DESC, created_at "
-                        "FOR UPDATE SKIP LOCKED LIMIT 1"
+                        "SELECT j.id FROM agent_jobs j "
+                        "JOIN users u ON u.user_id=j.user_id "
+                        "WHERE j.status='pending' "
+                        "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
+                        "CASE WHEN j.lane='chat' THEN "
+                        "j.created_at + make_interval(secs => %s) END) IS NULL OR "
+                        "COALESCE(j.queue_deadline_at, j.deadline_at, "
+                        "CASE WHEN j.lane='chat' THEN "
+                        "j.created_at + make_interval(secs => %s) END) > now()) "
+                        "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
+                        "WHERE active.user_id=j.user_id "
+                        "AND active.status IN ('claimed','running')) "
+                        "ORDER BY j.priority DESC, j.created_at "
+                        "FOR UPDATE OF j,u SKIP LOCKED LIMIT 1",
+                        (float(PENDING_CHAT_TTL_SEC), float(PENDING_CHAT_TTL_SEC)),
                     )
                 else:
                     cur.execute(
-                        "SELECT id FROM agent_jobs "
-                        "WHERE status='pending' AND (deadline_at IS NULL OR deadline_at > now()) "
-                        "AND lane = ANY(%s) "
-                        "ORDER BY priority DESC, created_at "
-                        "FOR UPDATE SKIP LOCKED LIMIT 1",
-                        (list(lanes),),
+                        "SELECT j.id FROM agent_jobs j "
+                        "JOIN users u ON u.user_id=j.user_id "
+                        "WHERE j.status='pending' "
+                        "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
+                        "CASE WHEN j.lane='chat' THEN "
+                        "j.created_at + make_interval(secs => %s) END) IS NULL OR "
+                        "COALESCE(j.queue_deadline_at, j.deadline_at, "
+                        "CASE WHEN j.lane='chat' THEN "
+                        "j.created_at + make_interval(secs => %s) END) > now()) "
+                        "AND j.lane = ANY(%s) "
+                        "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
+                        "WHERE active.user_id=j.user_id "
+                        "AND active.status IN ('claimed','running')) "
+                        "ORDER BY j.priority DESC, j.created_at "
+                        "FOR UPDATE OF j,u SKIP LOCKED LIMIT 1",
+                        (float(PENDING_CHAT_TTL_SEC), float(PENDING_CHAT_TTL_SEC), list(lanes)),
                     )
                 head = cur.fetchone()
                 if head is None:
                     return None
                 cur.execute(
                     "UPDATE agent_jobs SET status='claimed', claimed_by=%s, claimed_at=now(), "
-                    "deadline_at = COALESCE(deadline_at, now() + make_interval(secs => %s)) "
+                    "lease_expires_at = now() + make_interval(secs => %s), "
+                    "deadline_at = now() + make_interval(secs => %s) "
                     "WHERE id=%s RETURNING *",
-                    (worker_id, float(RUNNING_TTL_SEC), head["id"]),
+                    (worker_id, float(RUNNING_TTL_SEC), float(RUNNING_TTL_SEC), head["id"]),
                 )
                 return cur.fetchone()
 
 
-def mark_running(job_id) -> None:
+def mark_running(job_id, *, claimed_by: str) -> bool:
     with _pool().connection() as conn:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE agent_jobs SET status='running', started_at=now(), "
-            "deadline_at = COALESCE(deadline_at, now() + make_interval(secs => %s)) "
-            "WHERE id=%s",
-            (float(RUNNING_TTL_SEC), job_id),
+            "lease_expires_at = now() + make_interval(secs => %s), "
+            "deadline_at = now() + make_interval(secs => %s) "
+            "WHERE id=%s AND status='claimed' "
+            "AND (lease_expires_at IS NULL OR lease_expires_at > now()) "
+            "AND claimed_by=%s",
+            (float(RUNNING_TTL_SEC), float(RUNNING_TTL_SEC), job_id, str(claimed_by)),
         )
+        return cur.rowcount == 1
 
 
-def mark_completed(job_id) -> None:
+def renew_job_lease(job_id, claimed_by: str, *, ttl_sec: float = RUNNING_TTL_SEC) -> bool:
     with _pool().connection() as conn:
-        conn.execute(
-            "UPDATE agent_jobs SET status='completed', finished_at=now() WHERE id=%s",
-            (job_id,),
+        cur = conn.execute(
+            "UPDATE agent_jobs SET "
+            "lease_expires_at=now() + make_interval(secs => %s), "
+            "deadline_at=now() + make_interval(secs => %s) "
+            "WHERE id=%s AND claimed_by=%s AND status IN ('claimed','running') "
+            "AND lease_expires_at > now()",
+            (float(ttl_sec), float(ttl_sec), job_id, str(claimed_by)),
         )
+        return cur.rowcount == 1
 
 
-def mark_failed(job_id, error: str) -> None:
+def mark_completed(job_id, *, claimed_by: str) -> bool:
     with _pool().connection() as conn:
-        conn.execute(
+        cur = conn.execute(
+            "UPDATE agent_jobs SET status='completed', finished_at=now() "
+            "WHERE id=%s AND status IN ('claimed','running') "
+            "AND claimed_by=%s AND lease_expires_at > now()",
+            (job_id, str(claimed_by)),
+        )
+        return cur.rowcount == 1
+
+
+def mark_failed(job_id, error: str, *, claimed_by: str) -> bool:
+    with _pool().connection() as conn:
+        cur = conn.execute(
             "UPDATE agent_jobs SET status='failed', finished_at=now(), "
-            "last_error=%s, attempt_count=attempt_count+1 WHERE id=%s",
-            (str(error)[:500], job_id),
+            "last_error=%s, attempt_count=attempt_count+1 "
+            "WHERE id=%s AND status IN ('claimed','running') "
+            "AND claimed_by=%s AND lease_expires_at > now()",
+            (str(error)[:500], job_id, str(claimed_by)),
         )
+        return cur.rowcount == 1
 
 
 def mark_expired(job_id) -> None:
@@ -181,23 +263,93 @@ def mark_expired(job_id) -> None:
         )
 
 
-def reap_stuck_jobs(now=None) -> int:
-    """把 claimed/running 且已过 deadline_at 的 job 置为 expired（终态，释放 single-flight
-    槽位，下一条 chat/send 可重新入队）。now 可注入用于确定性测试（不必真等超时）；
-    None → 用 DB now()。返回被回收的行数。重试（re-pending）留给 C 的 replan。"""
+def reap_stuck_job_rows(now=None) -> list[dict]:
+    """Expire overdue pending admissions and claimed/running execution leases.
+
+    The terminal transition releases the single-flight slot. ``now`` is an
+    injectable epoch for deterministic tests; ``None`` uses database time.
+    Returned rows let the independent watchdog surface chat timeouts.
+    """
     ts = float(now) if now is not None else None
     with _pool().connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "UPDATE agent_jobs SET status='expired', finished_at=now(), "
                 "attempt_count=attempt_count+1, "
-                "last_error=COALESCE(last_error,'stuck_timeout') "
-                "WHERE status IN ('claimed','running') "
-                "AND deadline_at IS NOT NULL "
-                "AND deadline_at <= COALESCE(to_timestamp(%s), now())",
-                (ts,),
+                "last_error=CASE WHEN status='pending' THEN 'queue_timeout' ELSE 'lease_timeout' END "
+                "WHERE (status='pending' "
+                "       AND COALESCE(queue_deadline_at, deadline_at, "
+                "           CASE WHEN lane='chat' THEN "
+                "             created_at + make_interval(secs => %s) END) "
+                "           <= COALESCE(to_timestamp(%s), now())) "
+                "   OR (status IN ('claimed','running') "
+                "       AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+                "       AND COALESCE(lease_expires_at, deadline_at) "
+                "           <= COALESCE(to_timestamp(%s), now())) "
+                "RETURNING id,user_id,lane,last_error,claimed_by",
+                (float(PENDING_CHAT_TTL_SEC), ts, ts),
             )
-            return cur.rowcount
+            return [dict(row) for row in cur.fetchall()]
+
+
+def reap_stuck_jobs(now=None) -> int:
+    """Compatibility count wrapper over :func:`reap_stuck_job_rows`."""
+    return len(reap_stuck_job_rows(now=now))
+
+
+def get_input_generation(job_id, *, claimed_by: str) -> int | None:
+    """Snapshot chat input generation before reading messages."""
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "SELECT input_generation FROM agent_jobs "
+            "WHERE id=%s AND claimed_by=%s AND status IN ('claimed','running') "
+            "AND lease_expires_at > now()",
+            (job_id, str(claimed_by)),
+        ).fetchone()
+    return int(row[0]) if row is not None else None
+
+
+def finish_chat_job(
+    job_id,
+    *,
+    claimed_by: str,
+    observed_generation: int,
+) -> tuple[bool, int | None]:
+    """Complete an owned chat job and atomically create one late-input successor.
+
+    Sends coalesced after ``observed_generation`` increment the active row under
+    the same row lock. If they won the race, this transaction terminates the old
+    row and inserts exactly one new pending chat job before releasing the lock.
+    If finalization wins first, a concurrent enqueue sees the successor or creates
+    a fresh job after the old row is terminal. Either ordering preserves input.
+    """
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT user_id,lane,input_generation,priority FROM agent_jobs "
+                    "WHERE id=%s AND claimed_by=%s AND status='running' "
+                    "AND lease_expires_at > now() FOR UPDATE",
+                    (job_id, str(claimed_by)),
+                )
+                row = cur.fetchone()
+                if row is None or str(row["lane"]) != "chat":
+                    return False, None
+                cur.execute(
+                    "UPDATE agent_jobs SET status='completed',finished_at=now() WHERE id=%s",
+                    (job_id,),
+                )
+                successor_id = None
+                if int(row["input_generation"] or 0) > int(observed_generation):
+                    cur.execute(
+                        "INSERT INTO agent_jobs "
+                        "(user_id,lane,status,reason,priority,queue_deadline_at) "
+                        "VALUES (%s,'chat','pending','coalesced_followup',%s,"
+                        "now() + make_interval(secs => %s)) RETURNING id",
+                        (row["user_id"], int(row["priority"]), float(PENDING_CHAT_TTL_SEC)),
+                    )
+                    successor_id = int(cur.fetchone()["id"])
+                return True, successor_id
 
 
 def append_status_event(
@@ -269,7 +421,12 @@ def add_actions(job_id, user_id, actions: list[dict]) -> list[int]:
                             user_id,
                             start + offset,
                             str(action["type"]),
-                            Jsonb(dict(action.get("payload") or {})),
+                            # Planner payloads can contain decrypted memory text,
+                            # search terms, URLs, or identity patches. Execution
+                            # uses the in-memory plan; no production consumer
+                            # reloads payload_json. Persist trajectory shape, not
+                            # conversation data, until encrypted trajectories land.
+                            Jsonb({}),
                             bool(action.get("visible", False)),
                             bool(action.get("requires_model_authorship", False)),
                         ),
@@ -302,7 +459,10 @@ def mark_action_done(action_id, result: dict) -> None:
         conn.execute(
             "UPDATE agent_action_queue SET status='completed', finished_at=now(), "
             "result_json=%s WHERE id=%s",
-            (Jsonb(dict(result or {})), action_id),
+            # Capability data remains in memory for the responder. Persist only
+            # the non-sensitive outcome bit; full result bodies may contain
+            # decrypted cards, perception, or fetched web content.
+            (Jsonb({"ok": bool((result or {}).get("ok", True))}), action_id),
         )
 
 
@@ -342,7 +502,9 @@ def invalidate_pending_actions(job_id, *, by_job_id: int) -> int:
     return affected
 
 
-def record_worker_heartbeat(worker_id: str, *, kind: str = "turn") -> None:
+def record_worker_heartbeat(
+    worker_id: str, *, kind: str = "turn", capacity: int = 1
+) -> None:
     """UPSERT this process's liveness row (turn loops every ~10s via
     serve_worker._heartbeat_loop; the genesis thread every tick with
     kind='genesis').
@@ -353,10 +515,11 @@ def record_worker_heartbeat(worker_id: str, *, kind: str = "turn") -> None:
     """
     with _pool().connection() as conn:
         conn.execute(
-            "INSERT INTO v2_worker_heartbeats (worker_id, beat_at, kind) "
-            "VALUES (%s, now(), %s) "
-            "ON CONFLICT (worker_id) DO UPDATE SET beat_at = now(), kind = EXCLUDED.kind",
-            (str(worker_id), str(kind)),
+            "INSERT INTO v2_worker_heartbeats (worker_id, beat_at, kind, capacity) "
+            "VALUES (%s, now(), %s, %s) "
+            "ON CONFLICT (worker_id) DO UPDATE SET beat_at = now(), "
+            "kind = EXCLUDED.kind, capacity = EXCLUDED.capacity",
+            (str(worker_id), str(kind), max(0, int(capacity))),
         )
 
 
@@ -369,7 +532,8 @@ def workers_alive(*, within_sec: int = 30) -> bool:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT EXISTS(SELECT 1 FROM v2_worker_heartbeats "
-                "WHERE kind = 'turn' AND beat_at > now() - make_interval(secs => %s))",
+                "WHERE kind = 'turn' AND capacity > 0 "
+                "AND beat_at > now() - make_interval(secs => %s))",
                 (int(within_sec),),
             )
             return bool(cur.fetchone()[0])
@@ -382,7 +546,20 @@ def live_worker_count(*, within_sec: int = 30) -> int:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT count(*) FROM v2_worker_heartbeats "
-                "WHERE kind = 'turn' AND beat_at > now() - make_interval(secs => %s)",
+                "WHERE kind = 'turn' AND capacity > 0 "
+                "AND beat_at > now() - make_interval(secs => %s)",
+                (int(within_sec),),
+            )
+            return int(cur.fetchone()[0])
+
+
+def live_worker_capacity(*, within_sec: int = 30) -> int:
+    """Sum executable turn slots, not heartbeat processes."""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(sum(capacity),0) FROM v2_worker_heartbeats "
+                "WHERE kind='turn' AND beat_at > now() - make_interval(secs => %s)",
                 (int(within_sec),),
             )
             return int(cur.fetchone()[0])

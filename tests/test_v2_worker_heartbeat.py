@@ -46,3 +46,13 @@ def test_record_worker_heartbeat_upserts_same_worker_id():
         rows = conn.execute("SELECT worker_id FROM v2_worker_heartbeats").fetchall()
     assert [r[0] for r in rows] == ["w1"]
     _clear()
+
+
+def test_live_worker_capacity_sums_turn_slots_and_ignores_genesis():
+    _clear()
+    jobs_store.record_worker_heartbeat("turn-a", capacity=4)
+    jobs_store.record_worker_heartbeat("turn-b", capacity=8)
+    jobs_store.record_worker_heartbeat("genesis", kind="genesis", capacity=0)
+    assert jobs_store.live_worker_count() == 2
+    assert jobs_store.live_worker_capacity() == 12
+    _clear()

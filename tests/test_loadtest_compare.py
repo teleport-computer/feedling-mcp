@@ -13,6 +13,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -56,18 +58,36 @@ def test_default_threshold_is_ten_percent():
 
 
 def test_zero_resident_baseline_guarded():
-    result = compare_tokens_per_turn(100.0, 0.0)
-    assert result["regression"] is False
-    assert result["delta_ratio"] is None
-    assert "reason" in result
-    assert result["resident_baseline"] == 0.0
+    with pytest.raises(ValueError, match="resident_baseline"):
+        compare_tokens_per_turn(100.0, 0.0)
 
 
 def test_negative_resident_baseline_guarded():
-    result = compare_tokens_per_turn(100.0, -5.0)
-    assert result["regression"] is False
-    assert result["delta_ratio"] is None
-    assert "reason" in result
+    with pytest.raises(ValueError, match="resident_baseline"):
+        compare_tokens_per_turn(100.0, -5.0)
+
+
+def test_negative_threshold_is_rejected():
+    with pytest.raises(ValueError, match="threshold"):
+        compare_tokens_per_turn(100.0, 100.0, threshold=-0.01)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_resident_baseline_is_rejected(value):
+    with pytest.raises(ValueError, match="resident_baseline"):
+        compare_tokens_per_turn(100.0, value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_threshold_is_rejected(value):
+    with pytest.raises(ValueError, match="threshold"):
+        compare_tokens_per_turn(100.0, 100.0, threshold=value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_v2_mean_is_rejected(value):
+    with pytest.raises(ValueError, match="v2_mean"):
+        compare_tokens_per_turn(value, 100.0)
 
 
 # --- measure_v2_tokens_per_turn (against MockProvider, real responder) ---
@@ -169,3 +189,56 @@ def test_multi_round_turn_costs_more_llm_calls_than_single_round():
 
     assert single["llm_calls_per_turn"] == 2.0            # planner + responder
     assert single["tokens_per_turn"] > 0
+
+    two_round = [{
+        "summary": "",
+        "tail": [{"role": "user", "content": "hello"}],
+        "planner_replies": [
+            '{"plan":[{"type":"memory_search","payload":{"query":"hello"}}]}',
+            one_shot,
+        ],
+    }]
+    with MockProvider(reply=one_shot, estimate_tokens=True) as p:
+        multi = measure_turn_tokens(two_round, provider=p)
+
+    assert multi["llm_calls_per_turn"] == 3.0  # two planner rounds + responder
+    assert multi["tokens_per_turn"] > single["tokens_per_turn"]
+
+
+def test_main_uses_whole_turn_measurement_and_reports_call_count(capsys):
+    from scripts.loadtest import compare_tokens
+
+    exit_code = compare_tokens.main(["--resident-baseline", "1000000"])
+    report = __import__("json").loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert report["llm_calls_per_turn"] > 2.0
+    assert report["v2_mean"] > 0
+
+
+def test_main_fails_closed_on_invalid_baseline(capsys):
+    from scripts.loadtest import compare_tokens
+
+    assert compare_tokens.main(["--resident-baseline", "0"]) == 2
+    assert __import__("json").loads(capsys.readouterr().out)["error"] == "invalid_gate_input"
+
+
+@pytest.mark.parametrize("argv", [
+    ["--resident-baseline", "nan"],
+    ["--resident-baseline", "inf"],
+    ["--resident-baseline", "100", "--threshold", "nan"],
+    ["--resident-baseline", "100", "--threshold", "inf"],
+])
+def test_main_fails_closed_on_nonfinite_inputs(capsys, argv):
+    from scripts.loadtest import compare_tokens
+
+    assert compare_tokens.main(argv) == 2
+    assert __import__("json").loads(capsys.readouterr().out)["error"] == "invalid_gate_input"
+
+
+def test_resident_and_v2_gate_use_same_prompts():
+    from scripts.loadtest.fixtures import resident_prompts, v2_turn_fixtures
+
+    assert resident_prompts() == [
+        fixture["tail"][-1]["content"] for fixture in v2_turn_fixtures()
+    ]

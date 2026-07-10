@@ -69,6 +69,12 @@ def _status_events(uid):
     return jobs_store.list_status_events(uid, after_id=0, limit=100)
 
 
+def _claim(job_id: int) -> str:
+    job = jobs_store.claim_next_job("wake-test")
+    assert job is not None and job["id"] == job_id
+    return str(job["claimed_by"])
+
+
 def _wake_deps(*, summary="", tail=None):
     return worker.TurnDeps(
         read_messages=lambda uid: [],
@@ -89,6 +95,7 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
 
     async def _respond(*, provider_config, summary, tail, system_prompt=None, **k):
         assert system_prompt == worker._WAKE_SYSTEM_PROMPT
@@ -101,7 +108,8 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
         lambda store, text: written.update(text=text, user_id=store.user_id) or {"id": "r1"})
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
-    status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE))
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "completed"
     assert written == {"text": "hey, how did that go?", "user_id": uid}
@@ -115,6 +123,7 @@ def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
 
     async def _respond(*, provider_config, summary, tail, system_prompt=None, **k):
         raise v2_responder.ResponderError("empty_reply")
@@ -130,7 +139,8 @@ def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):
         lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
-    status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE))
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "completed"
     assert write_called["n"] == 0
@@ -146,6 +156,7 @@ def test_run_wake_no_user_messages_also_sleeps_silently(monkeypatch):
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
 
     async def _respond(*, provider_config, summary, tail, system_prompt=None, **k):
         raise v2_responder.ResponderError("no_user_messages")
@@ -157,7 +168,8 @@ def test_run_wake_no_user_messages_also_sleeps_silently(monkeypatch):
         lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
 
     deps = _wake_deps(tail=[])
-    status = asyncio.run(worker._run_wake(job_id, uid, "scheduled", deps, _BYOK, worker.ENCLAVE_SEMAPHORE))
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "scheduled", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "completed"
     assert write_called["n"] == 0
@@ -172,6 +184,7 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    claimed_by = _claim(job_id)
 
     async def _respond(*, provider_config, summary, tail, system_prompt=None, **k):
         raise v2_responder.ResponderError("provider_call_failed: RuntimeError: boom")
@@ -187,14 +200,15 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
         lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
-    status = asyncio.run(worker._run_wake(job_id, uid, "manual_wake", deps, _BYOK, worker.ENCLAVE_SEMAPHORE))
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "manual_wake", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "failed"
     assert write_called["n"] == 0
     assert surface_called["n"] == 0
     row = _job_status(job_id)
     assert row[0] == "failed"
-    assert "provider_call_failed" in (row[1] or "") or "ResponderError" in (row[1] or "")
+    assert row[1] == "wake_failed:responder_error"
     assert not any(e["kind"] == "error" for e in _status_events(uid))
 
 
@@ -206,6 +220,7 @@ def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
 
     def _boom_read_tail(uid_, after_ts, limit):
         raise RuntimeError("tail read exploded")
@@ -223,7 +238,8 @@ def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
         worker, "_surface_terminal_error",
         lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
 
-    status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE))
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "failed"
     assert surface_called["n"] == 0
@@ -240,6 +256,7 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
 
     seen = {}
 
@@ -258,7 +275,8 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
         # read_tail/read_summary left at their TurnDeps default of None.
     )
 
-    status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE))
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "completed"
     assert seen["summary"] == ""
@@ -280,6 +298,7 @@ def test_run_wake_provider_config_error_sets_payment_cooldown(monkeypatch):
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
 
     async def _respond(*, provider_config, summary, tail, system_prompt=None, **k):
         err = v2_responder.ResponderError("provider_call_failed: ProviderError: out of credits")
@@ -307,7 +326,8 @@ def test_run_wake_provider_config_error_sets_payment_cooldown(monkeypatch):
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     before = time.time()
-    status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE))
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
     after = time.time()
 
     assert status == "failed"
@@ -328,11 +348,71 @@ def test_run_wake_provider_config_error_sets_payment_cooldown(monkeypatch):
     assert schedule["payment_cooldown_until"] is not None
 
 
+def test_run_wake_rollback_blocks_provider_cooldown_write(monkeypatch):
+    uid = "u_wake_provider_rollback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+
+    async def _respond(**kwargs):
+        err = v2_responder.ResponderError("provider_call_failed: ProviderError: credits")
+        err.kind = "provider_config"
+        raise err
+
+    monkeypatch.setattr(v2_responder, "respond", _respond)
+    mode_checks = iter([False])
+    cooldown_calls = []
+    monkeypatch.setattr(
+        jobs_store,
+        "upsert_wake_schedule",
+        lambda *a, **k: cooldown_calls.append((a, k)),
+    )
+    deps = _wake_deps(tail=[])
+    deps.runtime_mode_enabled = lambda _uid: next(mode_checks)
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status == "failed"
+    assert cooldown_calls == []
+
+
+def test_run_wake_lost_lease_blocks_provider_cooldown_write(monkeypatch):
+    uid = "u_wake_provider_lost_lease"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+
+    async def _respond(**kwargs):
+        err = v2_responder.ResponderError("provider_call_failed: ProviderError: credits")
+        err.kind = "provider_config"
+        raise err
+
+    monkeypatch.setattr(v2_responder, "respond", _respond)
+    monkeypatch.setattr(jobs_store, "renew_job_lease", lambda *a, **k: False)
+    cooldown_calls = []
+    monkeypatch.setattr(
+        jobs_store,
+        "upsert_wake_schedule",
+        lambda *a, **k: cooldown_calls.append((a, k)),
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", _wake_deps(tail=[]), _BYOK,
+        worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status == "failed"
+    assert cooldown_calls == []
+
+
 def test_run_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
     uid = "u_wake_transient"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
 
     async def _respond(*, provider_config, summary, tail, system_prompt=None, **k):
         err = v2_responder.ResponderError("provider_call_failed: TimeoutException: timed out")
@@ -351,7 +431,8 @@ def test_run_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
     monkeypatch.setattr(jobs_store, "upsert_wake_schedule", _spy_upsert)
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
-    status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE))
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "failed"
     assert _job_status(job_id)[0] == "failed"

@@ -44,6 +44,7 @@ def env(monkeypatch):
     monkeypatch.setattr(jobs_store, "inflight_job_count", lambda: 3)
     monkeypatch.setattr(jobs_store, "pending_job_count", lambda: 1)
     monkeypatch.setattr(jobs_store, "live_worker_count", lambda **kw: 2)
+    monkeypatch.setattr(jobs_store, "live_worker_capacity", lambda **kw: 8)
     monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: 4.5)
     monkeypatch.setattr(jobs_store, "recent_mean_tokens_per_turn", lambda **kw: 123.0)
     monkeypatch.setattr(jobs_store, "genesis_worker_alive", lambda **kw: True)
@@ -93,6 +94,7 @@ def test_v2_metrics_returns_every_field(env):
         "inflight": 3,
         "pending": 1,
         "live_workers": 2,
+        "live_worker_capacity": 8,
         "mean_service_sec": 4.5,
         "recent_mean_tokens_per_turn": 123.0,
         "wake": {

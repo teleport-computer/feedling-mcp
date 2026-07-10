@@ -140,7 +140,7 @@ def test_failed_action_marks_failed_and_digest_reflects_it(monkeypatch):
     assert len(marked["failed"]) == 1
     failed_action_id, failed_error = marked["failed"][0]
     assert failed_action_id == 42
-    assert isinstance(failed_error, str)  # jobs_store.mark_action_failed(action_id, error: str)
+    assert failed_error == "boom"
     assert out["action_digest"]["memory_fetch"] == {"ok": 0, "count": 1}
 
 

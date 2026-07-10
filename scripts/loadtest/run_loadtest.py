@@ -157,13 +157,13 @@ def build_simulated_processor(
         if job is None:
             return False
         job_id = job["id"]
-        jobs_store.mark_running(job_id)
+        jobs_store.mark_running(job_id, claimed_by=str(job["claimed_by"]))
         jobs_store.record_turn_metric(
             job_id=job_id, user_id=job["user_id"], lane=job.get("lane") or "chat",
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
             latency_ms=latency_ms,
         )
-        jobs_store.mark_completed(job_id)
+        jobs_store.mark_completed(job_id, claimed_by=str(job["claimed_by"]))
         return True
 
     return _tick

@@ -20,6 +20,11 @@ def _wire(monkeypatch, *, frames, last_frame_id, chat_msgs, should_wake):
     """把 _tick_screen_watch_for_user 的四个明文输入 + oracle + 落库副作用全部替身化。
     返回 (enqueue_calls, notify_calls, upsert_calls)。"""
     monkeypatch.setattr(serve_worker.time, "time", lambda: _NOW)
+    monkeypatch.setattr(
+        serve_worker.hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda store: serve_worker.hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+    )
     monkeypatch.setattr(serve_worker.db, "frame_list_meta", lambda uid: list(frames))
     monkeypatch.setattr(
         jobs_store, "get_wake_schedule",
