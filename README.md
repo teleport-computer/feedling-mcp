@@ -604,6 +604,7 @@ outside a user directory.
 | Verify the running enclave yourself | `docs/AUDIT.md` |
 | Redeploy the CVM or rotate `compose_hash` | `deploy/DEPLOYMENTS.md` |
 | See landmark diffs by session (current state lives here too) | `docs/CHANGELOG.md` |
+| Review Hosted Runtime V2 readiness, blockers, and engineer handoff | [`docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md`](docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md) · [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](deploy/HOSTED_RUNTIME_V2_ROLLOUT.md) |
 | Work on visuals / UI | `DESIGN.md` |
 | Run your own backend on your VPS | `deploy/SELF_HOSTING.md` |
 | Set up a resident chat consumer for a non-MCP agent backend | `tools/README.md` |
