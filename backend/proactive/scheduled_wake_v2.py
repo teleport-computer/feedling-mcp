@@ -412,6 +412,10 @@ class DBScheduledWakeStoreV2:
         )
         with db.get_pool().connection() as conn:
             row = conn.execute(sql, tuple(params)).fetchone()
+        if row is not None:
+            # 只在 primary 真抢到 claim 时才镜像（与 db.chat_try_claim_reply 同规）。
+            from tee_shadow import mirror
+            mirror.execute(sql, tuple(params))
         return scheduled_record_from_doc_v2(row[0]) if row is not None else None
 
     def mark_fired(self, user_id: str, timer_id: str, claim_id: str, *, wake_id: str, now: float) -> ScheduledWakeRecordV2 | None:
@@ -480,6 +484,12 @@ class DBScheduledWakeStoreV2:
         )
         with db.get_pool().connection() as conn:
             row = conn.execute(sql, tuple(params)).fetchone()
+        if row is not None:
+            # 只在 primary 真命中守卫（状态/claim_id 匹配）时才镜像，与
+            # claim_due 同规：被拒绝/无操作的守卫更新不是真实状态迁移，不应
+            # 回放到 TEE；真实漏写由 reconciler 收敛。
+            from tee_shadow import mirror
+            mirror.execute(sql, tuple(params))
         return row[0] if row is not None else None
 
 

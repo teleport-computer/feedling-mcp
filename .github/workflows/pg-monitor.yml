@@ -1,0 +1,60 @@
+# .github/workflows/pg-monitor.yml — 没有监控 = 没有备份（spec §3）
+name: PG backup monitor
+on:
+  schedule: [{ cron: '*/30 * * * *' }]
+  workflow_dispatch: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install psql 17 (direct TLS 需要 libpq>=17)
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17
+      - name: Archiver freshness + WAL 堆积（monitoring 角色，pg_monitor-only）
+        env:
+          MON_DSN: ${{ secrets.TEST_PG_MONITORING_DSN }}   # host=<app-id>-5432s... port=443 user=monitoring ... sslnegotiation=direct sslmode=require
+        run: |
+          PSQL=/usr/lib/postgresql/17/bin/psql
+          AGE=$($PSQL "$MON_DSN" -tAc "SELECT COALESCE(EXTRACT(EPOCH FROM now()-last_archived_time)::int, 999999) FROM pg_stat_archiver;")
+          echo "archiver age: ${AGE}s"
+          test "$AGE" -lt 3600 || { echo "::error::archiver stale ${AGE}s (>1h) — 归档死了"; exit 1; }
+          WAL_MB=$($PSQL "$MON_DSN" -tAc "SELECT COALESCE(sum(size)/1024/1024,0)::int FROM pg_ls_waldir();")
+          echo "pg_wal size: ${WAL_MB}MB"
+          test "$WAL_MB" -lt 4096 || { echo "::error::WAL 堆积 ${WAL_MB}MB (>4GB) — 先修归档，绝不手删 pg_wal/"; exit 1; }
+      - name: R2 bucket freshness
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
+          # GitHub runner has no default AWS region; `aws s3api` still demands
+          # one even with --endpoint-url pointed at R2 (which ignores the
+          # value but the CLI errors out client-side without it).
+          AWS_DEFAULT_REGION: auto
+          AWS_REGION: auto
+          ENDPOINT: ${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}
+        run: |
+          newest() { aws s3api list-objects-v2 --endpoint-url "$ENDPOINT" \
+            --bucket feedling-pg-backups --prefix "$1" \
+            --query 'sort_by(Contents,&LastModified)[-1].LastModified' --output text; }
+          WAL_TS=$(newest "wal-g/wal_005/")
+          BASE_TS=$(newest "wal-g/basebackups_005/")
+          echo "newest wal: $WAL_TS | newest base sentinel: $BASE_TS"
+
+          check_age() {
+            # $1=label $2=timestamp $3=max_age_seconds $4=empty_error_message
+            local label="$1" ts="$2" max="$3" empty_msg="$4"
+            local age rc
+            # && rc=0 || rc=$? 防 GHA 默认 bash -e 在赋值失败时直接终止、吞掉下面的诊断分支
+            age=$(python3 -c "import sys, datetime as dt; s = sys.argv[1].strip(); sys.exit(3) if (not s or s == 'None') else None; s = s[:-1] + '+00:00' if s.endswith('Z') else s; d = dt.datetime.fromisoformat(s); d = d.replace(tzinfo=dt.timezone.utc) if d.tzinfo is None else d; print(int((dt.datetime.now(dt.timezone.utc) - d).total_seconds()))" "$ts") && rc=0 || rc=$?
+            case $rc in
+              3) echo "::error::${label} prefix EMPTY — ${empty_msg}"; exit 1 ;;
+              0) : ;;
+              *) echo "::error::${label} timestamp parse failed: '${ts}'"; exit 1 ;;
+            esac
+            echo "${label} age: ${age}s"
+            test "$age" -lt "$max" || { echo "::error::${label} stale ${age}s (>${max}s)"; exit 1; }
+          }
+
+          check_age "WAL" "$WAL_TS" 3600 "wal_005 无最新 WAL — 归档未同步到 R2"
+          check_age "BASE" "$BASE_TS" 93600 "WAL 无 base backup 不可恢复"

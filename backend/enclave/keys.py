@@ -15,10 +15,18 @@ from typing import Any
 import anyio.to_thread
 import nacl.public
 import nacl.signing
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from dstack_sdk import DstackClient
 
 CONTENT_KEY_PATH = "feedling-content-v1"
 SIGNING_KEY_PATH = "feedling-signing-v1"
+# Storage-at-rest key family (D4): a per-version symmetric key HKDF-derived from
+# a KMS seed on a dedicated path — same derivation family as content/signing, so
+# it inherits the (compose_hash, app_id, path) determinism. ``version`` tags the
+# path AND the HKDF info for domain separation, so "v1" and a future "v2" never
+# collide.
+FRAME_STORAGE_KEY_PREFIX = "feedling-frame-storage"
 # TLS_KEY_PATH is imported from dstack_tls so enclave_app
 # derive from the same KMS-bound path.
 
@@ -105,6 +113,56 @@ def get_or_derive_content_sk() -> nacl.public.PrivateKey:
 
 _cached_content_sk: nacl.public.PrivateKey | None = None
 _content_sk_lock = threading.Lock()
+
+# Per-version cache for the AES-256 storage keys. Derivation is deterministic,
+# so concurrent first callers at worst repeat it (same bytes either way); the
+# lock keeps the dstack round-trip to once per version.
+_storage_keys: dict[str, bytes] = {}
+_storage_key_lock = threading.Lock()
+
+
+def _storage_key_path(version: str) -> str:
+    return f"{FRAME_STORAGE_KEY_PREFIX}-{version}"
+
+
+def _derive_storage_key(version: str) -> bytes:
+    """32-byte AES-256 storage key for ``version``, HKDF'd from a KMS seed.
+
+    Mirrors derive_keys: dev seed in sandboxes/tests (FEEDLING_DEV_DSTACK_SEED),
+    dstack KMS in production. HKDF domain-separates by the versioned path so the
+    stored ciphertext is bound to its key_version tag."""
+    path = _storage_key_path(version)
+    dev_seed = os.environ.get("FEEDLING_DEV_DSTACK_SEED", "").strip()
+    if dev_seed:
+        seed = _dev_seed_bytes(path)
+    else:
+        resp = DstackClient().get_key(path, "")
+        raw = bytes.fromhex(resp.key) if isinstance(resp.key, str) else resp.key
+        seed = raw[:32]
+    return HKDF(algorithm=SHA256(), length=32, salt=None,
+                info=path.encode("utf-8")).derive(seed)
+
+
+def get_or_derive_storage_key(version: str = "v1") -> bytes:
+    """Return the process-lifetime AES-256 storage key for ``version``."""
+    hit = _storage_keys.get(version)
+    if hit is not None:
+        return hit
+    with _storage_key_lock:
+        hit = _storage_keys.get(version)
+        if hit is not None:
+            return hit
+        key = _derive_storage_key(version)
+        _storage_keys[version] = key
+    return key
+
+
+async def get_storage_key(version: str = "v1") -> bytes:
+    """async accessor for the storage key (dstack socket I/O off the loop)."""
+    hit = _storage_keys.get(version)
+    if hit is not None:
+        return hit
+    return await anyio.to_thread.run_sync(get_or_derive_storage_key, version)
 
 
 def set_cached_content_sk(sk: nacl.public.PrivateKey) -> None:

@@ -1,0 +1,3 @@
+# feedling-pg-test 的 CVM uuid——首次开通后填入（一行、无注释前缀）。
+# 首次开通流程见 deploy/DEPLOYMENTS.md「TEE Postgres (feedling-pg) — 待开通」；
+# 本文件为空时 pg-deploy workflow 会 fail-closed（绝不静默新建 CVM）。

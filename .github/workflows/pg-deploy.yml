@@ -1,0 +1,110 @@
+# .github/workflows/pg-deploy.yml — pg CVM 手动部署（绝不并入 merge 自动部署）
+name: Deploy Postgres CVM
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [test]        # prod 待 Phase 8 加
+        required: true
+      confirm:
+        description: '输入 DEPLOY-PG 确认（防误触）'
+        required: true
+permissions:
+  contents: read
+  packages: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency: pg-deploy-${{ github.event.inputs.environment }}   # 与 app 部署不同组
+    steps:
+      - name: Typo guard
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: test "$CONFIRM" = "DEPLOY-PG" || { echo "confirm mismatch"; exit 1; }
+      - uses: actions/checkout@v4
+        with: { ref: test }
+      - name: Required secrets pre-check   # 本仓 compose 用 ${VAR:-}，无法 grep :?，用显式清单
+        env:
+          PG_OWNER_PASSWORD: ${{ secrets.TEST_PG_OWNER_PASSWORD }}
+          APP_DB_PASSWORD: ${{ secrets.TEST_APP_DB_PASSWORD }}
+          REPLICATOR_DB_PASSWORD: ${{ secrets.TEST_REPLICATOR_DB_PASSWORD }}
+          MONITORING_DB_PASSWORD: ${{ secrets.TEST_MONITORING_DB_PASSWORD }}
+          PG_SERVER_CERT_B64: ${{ secrets.TEST_PG_SERVER_CERT_B64 }}
+          PG_SERVER_KEY_B64: ${{ secrets.TEST_PG_SERVER_KEY_B64 }}
+          WALG_S3_PREFIX: ${{ secrets.TEST_WALG_S3_PREFIX }}
+          WALG_LIBSODIUM_KEY: ${{ secrets.TEST_WALG_LIBSODIUM_KEY }}
+          PG_BACKUP_R2_ENDPOINT: ${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}
+          PG_BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}
+          PG_BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
+        run: |
+          missing=0
+          for v in PG_OWNER_PASSWORD APP_DB_PASSWORD REPLICATOR_DB_PASSWORD \
+                   MONITORING_DB_PASSWORD PG_SERVER_CERT_B64 PG_SERVER_KEY_B64 \
+                   WALG_S3_PREFIX WALG_LIBSODIUM_KEY PG_BACKUP_R2_ENDPOINT \
+                   PG_BACKUP_R2_ACCESS_KEY_ID PG_BACKUP_R2_SECRET_ACCESS_KEY; do
+            [ -n "${!v}" ] || { echo "MISSING secret: $v"; missing=1; }
+          done
+          exit $missing
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Derive lowercase owner   # ghcr rejects mixed-case image paths (see docker-publish.yml)
+        id: owner
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - name: Build & push pg image
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy
+          file: deploy/postgres/Dockerfile
+          push: true
+          tags: ghcr.io/${{ steps.owner.outputs.owner }}/feedling-postgres:${{ github.sha }}
+      - name: Pin image sha into compose
+        run: |
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-postgres:[A-Za-z0-9_]+|ghcr.io/${{ steps.owner.outputs.owner }}/feedling-postgres:${{ github.sha }}|" \
+            deploy/docker-compose.phala.postgres.yaml
+      - name: Deploy (update in place; 名字查不到就失败，绝不静默新建)
+        env: { PHALA_CLOUD_API_KEY: '${{ secrets.TEST_PHALA_CLOUD_API_KEY }}' }
+        run: |
+          npm install -g phala@1.1.19
+          # GH Actions runs `run:` steps as `bash -eo pipefail` — a pure-comment
+          # cvm-id.txt makes `grep -v '^#'` exit 1 (no matching lines); under
+          # pipefail that non-zero propagates as the pipeline's exit status
+          # even though `head -1` itself exits 0, so `set -e` would abort right
+          # here with a bare, unexplained non-zero exit — never reaching the
+          # intended fail-closed message below. `|| true` absorbs grep's
+          # no-match exit so CVM_ID legitimately ends up empty and the explicit
+          # check on the next line is what actually fires.
+          CVM_ID=$(grep -v '^#' deploy/test-pg-cvm-id.txt | head -1 || true)
+          test -n "$CVM_ID" || { echo "test-pg-cvm-id.txt empty — 首次开通走 DEPLOYMENTS.md runbook，不走本 workflow"; exit 1; }
+          phala deploy --api-token "$PHALA_CLOUD_API_KEY" --cvm-id "$CVM_ID" \
+            -c deploy/docker-compose.phala.postgres.yaml \
+            -e "PG_OWNER_PASSWORD=${{ secrets.TEST_PG_OWNER_PASSWORD }}" \
+            -e "APP_DB_PASSWORD=${{ secrets.TEST_APP_DB_PASSWORD }}" \
+            -e "REPLICATOR_DB_PASSWORD=${{ secrets.TEST_REPLICATOR_DB_PASSWORD }}" \
+            -e "MONITORING_DB_PASSWORD=${{ secrets.TEST_MONITORING_DB_PASSWORD }}" \
+            -e "PG_SERVER_CERT_B64=${{ secrets.TEST_PG_SERVER_CERT_B64 }}" \
+            -e "PG_SERVER_KEY_B64=${{ secrets.TEST_PG_SERVER_KEY_B64 }}" \
+            -e "WALG_S3_PREFIX=${{ secrets.TEST_WALG_S3_PREFIX }}" \
+            -e "WALG_LIBSODIUM_KEY=${{ secrets.TEST_WALG_LIBSODIUM_KEY }}" \
+            -e "PG_BACKUP_R2_ENDPOINT=${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}" \
+            -e "PG_BACKUP_R2_ACCESS_KEY_ID=${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}" \
+            -e "PG_BACKUP_R2_SECRET_ACCESS_KEY=${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}" \
+            --wait
+      - name: Publish compose hash (independent AppAuth)
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          PRIVATE_KEY: ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL: ${{ secrets.ETH_SEPOLIA_RPC_URL }}
+          FEEDLING_APP_AUTH_CONTRACT: ${{ secrets.TEST_PG_APP_AUTH_CONTRACT }}
+          FEEDLING_COMPOSE_FILE: deploy/docker-compose.phala.postgres.yaml
+        run: |
+          # Same pipefail guard as the Deploy step above (this step only runs
+          # after Deploy already validated a non-empty CVM_ID, but keep the
+          # same defensive `|| true` so this line can never abort the script
+          # on its own with an unexplained exit).
+          export FEEDLING_CVM_ID=$(grep -v '^#' deploy/test-pg-cvm-id.txt | head -1 || true)
+          ./deploy/publish-compose-hash.sh eth_sepolia

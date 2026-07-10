@@ -1,0 +1,78 @@
+# deploy/docker-compose.phala.postgres.yaml — feedling-pg-{test,prod} CVM
+#
+# 部署（首次开通见 DEPLOYMENTS.md runbook；日常用 pg-deploy workflow）：
+#   phala deploy --cvm-id <id> -c deploy/docker-compose.phala.postgres.yaml -e KEY=VAL ... --wait
+#
+# 约定（与本仓其它 phala compose 一致）：
+#  - 所有机密走 "${VAR:-}"（加密 env 注入，不烧 compose_hash）；必填校验在
+#    entrypoint fail-closed（deploy/postgres/entrypoint-wrapper.sh）。
+#  - 独立 AppAuth 合约；不进 merge 自动部署。
+name: feedling-pg
+services:
+  db:
+    image: ghcr.io/teleport-computer/feedling-postgres:REPLACE_SHA
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - listen_addresses=*
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/pgtls/server.crt
+      - -c
+      - ssl_key_file=/etc/pgtls/server.key
+      # --- 修正 1：归档配置走服务器旗标，每次 boot 生效（不用 initdb 脚本） ---
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=wal-g wal-push %p
+      - -c
+      - archive_timeout=60
+      - -c
+      - wal_level=replica
+      # --- 容量（spec §3【补充】）：3 CVM × (4 workers × pool 10) + wake bus
+      #     每 worker 1 条 + replicator + monitoring + 余量 ≈ 160，取 200。
+      #     实施 Plan 2 时按 db.py 实际池参数复核。 ---
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+    environment:
+      POSTGRES_DB: feedling
+      POSTGRES_USER: feedling_owner
+      POSTGRES_PASSWORD: "${PG_OWNER_PASSWORD:-}"
+      APP_DB_PASSWORD: "${APP_DB_PASSWORD:-}"
+      REPLICATOR_DB_PASSWORD: "${REPLICATOR_DB_PASSWORD:-}"
+      MONITORING_DB_PASSWORD: "${MONITORING_DB_PASSWORD:-}"
+      PG_SERVER_CERT_B64: "${PG_SERVER_CERT_B64:-}"
+      PG_SERVER_KEY_B64: "${PG_SERVER_KEY_B64:-}"
+      WALG_S3_PREFIX: "${WALG_S3_PREFIX:-}"
+      WALG_LIBSODIUM_KEY: "${WALG_LIBSODIUM_KEY:-}"
+      AWS_ENDPOINT: "${PG_BACKUP_R2_ENDPOINT:-}"
+      AWS_ACCESS_KEY_ID: "${PG_BACKUP_R2_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${PG_BACKUP_R2_SECRET_ACCESS_KEY:-}"
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      AWS_REGION: "auto"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # sentinel 语义：/var/run/postgresql/feedling-roles-ok 只在
+      # ensure-roles.sh（角色/密码对齐，见 entrypoint-wrapper.sh 后台任务）
+      # 全部步骤成功后才 install；任一步骤失败就不写它，健康检查因此保持
+      # unhealthy，而不是像纯 pg_isready 那样在角色/密码没对齐时也报健康。
+      # roles 脚本要等 PG ready 后才跑完 → 放宽到 60s 量级余量。
+      test: ["CMD-SHELL", "test -f /var/run/postgresql/feedling-roles-ok && pg_isready -U feedling_owner -d feedling"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      # 首次开通是唯一真跑 initdb 的冷启动（30-60s 量级），start_period 内的
+      # 失败探测不消耗 retries 预算；热启动（卷已存在）~15s 不受影响。
+      start_period: 90s
+
+volumes:
+  pgdata:

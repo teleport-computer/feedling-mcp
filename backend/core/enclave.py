@@ -130,6 +130,40 @@ def _get_enclave_info() -> dict | None:
         return None
 
 
+def _reencrypt_frame_via_enclave(envelope: dict, api_key: str | None, *,
+                                 key_version: str = "v1",
+                                 runtime_token: str = "") -> dict:
+    """Storage-layer re-encryption (D4): hand a frame's v1 envelope (incl.
+    ``body_ct``) to the enclave, which opens it, seals the PLAINTEXT under its
+    KMS-derived storage key, and returns ``{body_ct_storage, key_version,
+    sha256, size}`` — the plaintext never leaves the enclave. Auth mirrors
+    _decrypt_envelope_via_enclave (api_key or runtime token). Raises
+    RuntimeError on any transport/HTTP/shape failure (the tee_replicator maps
+    HTTP-401/403-shaped errors to a token re-mint)."""
+    enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
+    if not enclave_url:
+        raise RuntimeError("enclave_unavailable")
+    if not api_key and not runtime_token:
+        raise RuntimeError("api_key_unavailable")
+    headers = {"X-Feedling-Runtime-Token": runtime_token} if runtime_token else {"X-API-Key": api_key}
+    path = "/v1/storage/reencrypt-frame"
+    try:
+        with httpx.Client(timeout=30, verify=False) as client:
+            resp = client.post(
+                f"{enclave_url}{path}",
+                headers=headers,
+                json={"envelope": envelope, "key_version": key_version},
+            )
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
+    if resp.status_code >= 400:
+        raise RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")
+    body = resp.json()
+    if not isinstance(body, dict) or not isinstance(body.get("body_ct_storage"), str):
+        raise RuntimeError("enclave_invalid_reencrypt_response")
+    return body
+
+
 def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpose: str,
                                   runtime_token: str = "") -> bytes:
     """Decrypt an envelope via the enclave. Auth = api_key (``X-API-Key``) or a

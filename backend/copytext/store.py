@@ -63,6 +63,14 @@ def apply_edits(
     now = time.time()
     upserted = 0
     deleted = 0
+    mirror_group: list[tuple[str, tuple]] = []
+
+    upsert_sql = ("INSERT INTO copytext_strings (key, lang, value, updated_at) "
+                  "VALUES (%s, %s, %s, %s) "
+                  "ON CONFLICT (key, lang) DO UPDATE "
+                  "SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at")
+    delete_sql = "DELETE FROM copytext_strings WHERE key = %s"
+    bump_sql = "UPDATE copytext_meta SET revision = revision + 1 WHERE id = TRUE RETURNING revision"
 
     # One explicit transaction (the pool is autocommit by default, so open a
     # transaction block to keep writes + revision bump atomic).
@@ -70,24 +78,18 @@ def apply_edits(
         with conn.transaction():
             for key, by_lang in strings.items():
                 for lang, value in by_lang.items():
-                    conn.execute(
-                        "INSERT INTO copytext_strings (key, lang, value, updated_at) "
-                        "VALUES (%s, %s, %s, %s) "
-                        "ON CONFLICT (key, lang) DO UPDATE "
-                        "SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at",
-                        (key, lang, value, now),
-                    )
+                    conn.execute(upsert_sql, (key, lang, value, now))
+                    mirror_group.append((upsert_sql, (key, lang, value, now)))
                     upserted += 1
             for key in delete:
-                cur = conn.execute(
-                    "DELETE FROM copytext_strings WHERE key = %s", (key,)
-                )
+                cur = conn.execute(delete_sql, (key,))
+                mirror_group.append((delete_sql, (key,)))
                 # Count keys removed (not rows): a key spans up to len(LANGS) rows.
                 if (cur.rowcount or 0) > 0:
                     deleted += 1
-            row = conn.execute(
-                "UPDATE copytext_meta SET revision = revision + 1 "
-                "WHERE id = TRUE RETURNING revision"
-            ).fetchone()
+            row = conn.execute(bump_sql).fetchone()
+            mirror_group.append((bump_sql, ()))
     new_rev = int(row[0]) if row else get_revision()
+    from tee_shadow import mirror
+    mirror.execute_many(mirror_group)
     return new_rev, upserted, deleted

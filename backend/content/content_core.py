@@ -138,6 +138,29 @@ def _swap_summary(results: list) -> dict:
     return summary
 
 
+def _propagate_swap_to_tee(user_id: str, table_name: str, item_id: str,
+                           visibility: str, tee_delete_sql: str) -> None:
+    """Plaintext-safe propagation of a /v1/content/swap (or rewrap) in-place
+    envelope replace to the TEE shadow.
+
+    chat/memory rows are ciphertext→plaintext REPLICATED (not dual-written), and
+    a swap keeps the same PK, so the append-only cursor never revisits them:
+      - → local_only: the item is now private; DELETE the TEE plaintext row and
+        drop a terminal ``visibility_local_only`` pending marker (keeps verify's
+        ``rds == tee + pending`` balanced — the RDS row still exists).
+      - → shared: enqueue the requeue lane so the next worker pass re-derives the
+        TEE plaintext from the new ciphertext.
+    Best-effort (shadow phase): mirror swallows failures. ``table_name`` matches
+    the tee_replicator.worker._TABLES key so the requeue consume step picks it up.
+    """
+    from tee_shadow import mirror
+    if visibility == "local_only":
+        mirror.execute(tee_delete_sql, (user_id, item_id))
+        mirror.mark_pending(user_id, table_name, item_id, "visibility_local_only")
+    else:  # "shared" — validated by the caller
+        mirror.mark_pending(user_id, table_name, item_id, "requeue_visibility_shared")
+
+
 def _swap_chat(
     store: "UserStore",
     msg_id: str,
@@ -170,6 +193,12 @@ def _swap_chat(
             # Full-row replace: the K_enclave key may have been removed, which a
             # JSONB shallow-merge can't express, so we overwrite the whole doc.
             db.chat_append(store.user_id, msg_id, msg["ts"], msg, core_store.MAX_CHAT_MESSAGES)
+            # env=None（仅子信封 rewrap）时 visibility 不变，取行内现值——行的
+            # 密文仍被原地改写了，TEE 明文照样需要传播（游标不会回头）。
+            _propagate_swap_to_tee(
+                store.user_id, "chat_messages", msg_id,
+                env["visibility"] if env is not None else str(msg.get("visibility") or "shared"),
+                "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s")
             return "ok"
     return "not_found"
 
@@ -494,6 +523,16 @@ def swap(store: UserStore, payload: dict) -> tuple[dict, int]:
             for swap_id, swap_env in memory_swaps:
                 _swap_memory_inplace(fresh, swap_id, swap_env)
             memory_service._save_moments(store, fresh)
+        # Propagate each accepted memory swap to the TEE shadow AFTER the persist.
+        # _save_moments → db.memory_replace_all already requeues all survivors, but
+        # a → local_only swap additionally needs the TEE plaintext row DELETED +
+        # a terminal marker, which requeue-all can't express — so wire it here
+        # explicitly (last-writer-wins on the pending reason). See
+        # _propagate_swap_to_tee.
+        for swap_id, swap_env in memory_swaps:
+            _propagate_swap_to_tee(
+                store.user_id, "memory_moments", swap_id, swap_env["visibility"],
+                "DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s")
 
     return {"results": results, "summary": _swap_summary(results)}, 200
 

@@ -165,7 +165,6 @@ def _patch_log_item_guarded(
     try:
         with db.get_pool().connection() as conn:
             row = conn.execute(sql, tuple(params)).fetchone()
-        return row[0] if row is not None else None
     except Exception as e:
         import logging
 
@@ -173,6 +172,15 @@ def _patch_log_item_guarded(
             "patch_log_item_guarded(%s,%s,%s) failed: %s", user_id, stream, item_key, e
         )
         return None
+    if row is not None:
+        # Only mirror when the primary's guard actually matched a row (same
+        # convention as db.chat_try_claim_reply / scheduled_wake claim_due):
+        # a rejected guarded update is not a state transition and must not be
+        # replayed against TEE. Missed real updates are caught by the
+        # reconciler.
+        from tee_shadow import mirror
+        mirror.execute(sql, tuple(params))
+    return row[0] if row is not None else None
 
 
 class DBWakeInboxV2:
@@ -261,6 +269,7 @@ class DBLeaseRegistryV2:
         )
         try:
             with db.get_pool().connection() as conn:
+                # tee-mirror: 有意不镜像（TTL lease，reconciler 收敛）
                 row = conn.execute(
                     "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
                     "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc "

@@ -1,0 +1,72 @@
+# .github/workflows/tee-replicate.yml — TEE 复制手动遥控器（spec §5 执行防护）
+#
+# 复制/收敛本身在 CVM enclave 内跑（backend/admin/tee_replication.py 同步执行
+# tee_shadow.reconciler / tee_replicator.worker / tee_shadow.verify）；本
+# workflow 只手动 dispatch，curl 打 admin 端点当遥控器，绝不在 CI runner 里跑
+# 复制逻辑。默认 dry_run=true；非 dry_run 的 reconcile/replicate 服务端强制
+# confirm 字面等于 MIGRATE（400 confirm_required）——这里只透传，不做客户端
+# typo-guard（拼错直接被服务端拒绝，等价效果）。
+name: TEE replicate
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        # 前瞻性输入：目前只有 test；Phase 8 上 prod 后用它选择对应的
+        # secrets 组（PROD_ADMIN_BASE_URL / PROD_ADMIN_KEY）。
+        description: 目标环境
+        type: choice
+        options: [test]
+        required: true
+      action:
+        description: reconcile=全表收敛 / replicate=游标增量复制 / verify=只读抽样核对
+        type: choice
+        options: [reconcile, replicate, verify]
+        required: true
+      table:
+        description: 表名（replicate 必填；reconcile 留空=全表；verify 忽略）
+        required: false
+      dry_run:
+        description: 演练（不落写）——关掉需要下面 confirm 填字面 MIGRATE
+        type: boolean
+        default: true
+      confirm:
+        description: 非 dry_run 的 reconcile/replicate 必须填字面 MIGRATE（服务端校验）
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # 静态组名——job 级 concurrency 拿不到 inputs 上下文，只能写死；与
+    # pg-deploy-*/应用部署的 concurrency 组分离，纯粹防止两次复制/收敛并发。
+    concurrency: tee-replication
+    steps:
+      - name: Trigger admin tee-replication endpoint
+        env:
+          BASE_URL: ${{ secrets.TEST_ADMIN_BASE_URL }}
+          ADMIN_KEY: ${{ secrets.TEST_ADMIN_KEY }}
+          ACTION: ${{ inputs.action }}
+          TABLE_IN: ${{ inputs.table }}
+          DRY_RUN_IN: ${{ inputs.dry_run }}
+          CONFIRM_IN: ${{ inputs.confirm }}
+        run: |
+          table_json=$([ -n "$TABLE_IN" ] && printf '%s' "$TABLE_IN" | jq -R . || echo null)
+          confirm_json=$([ -n "$CONFIRM_IN" ] && printf '%s' "$CONFIRM_IN" | jq -R . || echo null)
+          dry_run_json=$(printf '%s' "$DRY_RUN_IN" | tr '[:upper:]' '[:lower:]')
+          body=$(jq -n --arg action "$ACTION" --argjson table "$table_json" \
+            --argjson dry_run "$dry_run_json" --argjson confirm "$confirm_json" \
+            '{action: $action, table: $table, dry_run: $dry_run, confirm: $confirm}')
+          echo "request body: $body"
+          # 不用 curl -f：非 2xx 也要把响应体（{"error": ...}）打给操作者看，
+          # 再用 HTTP 状态码决定 job 成败。
+          HTTP_CODE=$(curl -s -o resp.json -w '%{http_code}' \
+            -X POST "$BASE_URL/v1/admin/tee-replication/run" \
+            -H "content-type: application/json" \
+            -H "X-Admin-Token: $ADMIN_KEY" \
+            -d "$body")
+          echo "HTTP $HTTP_CODE"
+          jq . resp.json || cat resp.json
+          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300

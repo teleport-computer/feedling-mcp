@@ -685,3 +685,30 @@ forge script script/DeployFeedlingAppAuth.s.sol \
 
 After deploy, run `cast send` with `addComposeHash()` for your compose_hash.
 Record the new address + first-tx info in the table above.
+
+## TEE Postgres (feedling-pg) — 待开通
+
+影子迁移的代码侧构件已就绪并合入分支：`backend/alembic_tee/`、双写镜像
+(`tee_shadow/`)、cursor 复制器 (`tee_replicator/`)、一致性 verify、admin 触发端点，
+以及 pg 镜像全家桶 / compose / CI workflow（P1–P2 全部 Task）。**但 feedling-pg
+CVM 本身尚未开通** —— 下列 runbook 项必须在开通前逐条补齐（对应
+`docs/superpowers/plans/2026-07-07-tee-pg-phase0-1-infra.md` 的 Task 编号）：
+
+- **首次 create + AppAuth**：为 feedling-pg 建独立 CVM 与独立 AppAuth 合约
+  （切勿复用主 app 合约，见「新建 runner CVM 换钥」教训），授权其 compose_hash
+  （Phase 0 / P1T3–T4）。
+- **R2 桶 + 双钥托管**：建 WAL-G 备份桶并把两把加密钥（内容钥 + 备份钥）按托管
+  流程分存（Phase 1 / P1T4）。
+- **证书重签**：用 `deploy/postgres/gen-certs.sh` 重签 server/client TLS 证书，
+  把 `TEE_DATABASE_URL` 的 sslmode/根证书接进后端 secrets（P1T1）。
+- **restore 演练**：开通前跑一次 WAL-G 全量 restore + PITR 演练，确认备份可用
+  （Phase 1 验收）。
+- **Phase 1 验收清单**：走一遍 reconcile → replicate → verify（`ok==true`）
+  的三段收敛，作为停 RDS gate 的硬条件（P2T7 / plan Phase 1 验收 Task）。
+  verify 作为该 gate 前，先跑一遍 `python -m backend.tee_replicator run
+  --table <t>`（对全部密文表）把 requeue 清空——verify 报告每张密文表的
+  `requeue_backlog` 应读 0（非零只代表正常积压未收敛，不是 verify 的 bug，
+  见 `tee_shadow/verify.py` 的 `_split_pending`）。
+
+密码一律用 `openssl rand -hex`（十六进制无特殊字符）——引号 / `$` / 反引号等字符会
+破坏 ensure-roles 的 SQL 与 compose 环境注入。

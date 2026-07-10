@@ -53,30 +53,31 @@ def _merge_blob(user_id: str, kind: str, patch: dict) -> dict:
     Inserts the row if absent. Returns the merged doc."""
     if not patch:
         return _get_blob(user_id, kind)
+    sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+           "ON CONFLICT (user_id, kind) DO UPDATE "
+           "SET doc = user_blobs.doc || EXCLUDED.doc RETURNING doc")
     try:
         with get_pool().connection() as conn:
-            row = conn.execute(
-                "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
-                "ON CONFLICT (user_id, kind) DO UPDATE "
-                "SET doc = user_blobs.doc || EXCLUDED.doc RETURNING doc",
-                (user_id, kind, Jsonb(patch)),
-            ).fetchone()
-        return row[0] if row else patch
+            row = conn.execute(sql, (user_id, kind, Jsonb(patch))).fetchone()
     except Exception as e:
         log.error("merge_blob(%s,%s) failed: %s", user_id, kind, e)
         return _get_blob(user_id, kind)
+    from tee_shadow import mirror
+    mirror.execute(sql, (user_id, kind, Jsonb(patch)))
+    return row[0] if row else patch
 
 
 def _set_blob(user_id: str, kind: str, doc: dict) -> None:
+    sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+           "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc")
     try:
         with get_pool().connection() as conn:
-            conn.execute(
-                "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
-                "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
-                (user_id, kind, Jsonb(doc)),
-            )
+            conn.execute(sql, (user_id, kind, Jsonb(doc)))
     except Exception as e:
         log.error("set_blob(%s,%s) failed: %s", user_id, kind, e)
+        return
+    from tee_shadow import mirror
+    mirror.execute(sql, (user_id, kind, Jsonb(doc)))
 
 
 def _delete_state_keys(user_id: str, keys: list[str]) -> None:
@@ -84,16 +85,17 @@ def _delete_state_keys(user_id: str, keys: list[str]) -> None:
     capability is turned off — its fields must vanish from the snapshot)."""
     if not keys:
         return
+    sql = ("UPDATE user_blobs SET doc = doc - %s::text[] "
+           "WHERE user_id = %s AND kind = %s")
     try:
         with get_pool().connection() as conn:
             # doc - ARRAY[...]  removes each key from the JSONB object
-            conn.execute(
-                "UPDATE user_blobs SET doc = doc - %s::text[] "
-                "WHERE user_id = %s AND kind = %s",
-                (list(keys), user_id, STATE),
-            )
+            conn.execute(sql, (list(keys), user_id, STATE))
     except Exception as e:
         log.error("delete_state_keys(%s) failed: %s", user_id, e)
+        return
+    from tee_shadow import mirror
+    mirror.execute(sql, (list(keys), user_id, STATE))
 
 
 # typed accessors
@@ -116,16 +118,15 @@ def merge_state_guarded(user_id: str, patch: dict) -> set:
     if not patch:
         return set()
     written: set = set()
+    insert_sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, '{}'::jsonb) "
+                  "ON CONFLICT (user_id, kind) DO NOTHING")
+    update_sql = "UPDATE user_blobs SET doc = %s WHERE user_id = %s AND kind = %s"
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
                 # Ensure the row exists, then lock it (FOR UPDATE serializes
                 # concurrent writers on this user's state row).
-                conn.execute(
-                    "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, '{}'::jsonb) "
-                    "ON CONFLICT (user_id, kind) DO NOTHING",
-                    (user_id, STATE),
-                )
+                conn.execute(insert_sql, (user_id, STATE))
                 row = conn.execute(
                     "SELECT doc FROM user_blobs WHERE user_id = %s AND kind = %s FOR UPDATE",
                     (user_id, STATE),
@@ -138,14 +139,16 @@ def merge_state_guarded(user_id: str, patch: dict) -> set:
                     if old_ts is None or new_ts is None or float(new_ts) >= float(old_ts):
                         merged[field] = cell
                         written.add(field)
-                conn.execute(
-                    "UPDATE user_blobs SET doc = %s WHERE user_id = %s AND kind = %s",
-                    (Jsonb(merged), user_id, STATE),
-                )
-        return written
+                conn.execute(update_sql, (Jsonb(merged), user_id, STATE))
     except Exception as e:
         log.error("merge_state_guarded(%s) failed: %s", user_id, e)
         return set()
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (insert_sql, (user_id, STATE)),
+        (update_sql, (Jsonb(merged), user_id, STATE)),
+    ])
+    return written
 
 
 def clear_state_fields(user_id: str, fields: list[str]) -> None:
@@ -174,14 +177,14 @@ def set_manual_user_state_guarded(user_id: str, value: str, ts: float) -> dict:
     user_state doc (whether or not this write won). Mirrors merge_state_guarded's
     locked compare-and-write so a late/concurrent older report can't clobber a
     newer manual value — the read-check-write is one serialized transaction."""
+    insert_sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, '{}'::jsonb) "
+                  "ON CONFLICT (user_id, kind) DO NOTHING")
+    update_sql = "UPDATE user_blobs SET doc = %s WHERE user_id = %s AND kind = %s"
+    won = False
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                conn.execute(
-                    "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, '{}'::jsonb) "
-                    "ON CONFLICT (user_id, kind) DO NOTHING",
-                    (user_id, USER_STATE),
-                )
+                conn.execute(insert_sql, (user_id, USER_STATE))
                 row = conn.execute(
                     "SELECT doc FROM user_blobs WHERE user_id = %s AND kind = %s FOR UPDATE",
                     (user_id, USER_STATE),
@@ -191,14 +194,21 @@ def set_manual_user_state_guarded(user_id: str, value: str, ts: float) -> dict:
                 if prev_ts is None or float(ts) >= float(prev_ts):
                     doc["manual"] = str(value or "default")
                     doc["manual_ts"] = float(ts)
-                    conn.execute(
-                        "UPDATE user_blobs SET doc = %s WHERE user_id = %s AND kind = %s",
-                        (Jsonb(doc), user_id, USER_STATE),
-                    )
-                return doc
+                    conn.execute(update_sql, (Jsonb(doc), user_id, USER_STATE))
+                    won = True
     except Exception as e:
         log.error("set_manual_user_state_guarded(%s) failed: %s", user_id, e)
         return _get_blob(user_id, USER_STATE)
+    if won:
+        # Mirror the final computed doc directly (not the guarded read-check-
+        # write), avoiding any TOCTOU divergence from re-deriving the guard
+        # against TEE's own (possibly lagging) copy of the row.
+        from tee_shadow import mirror
+        mirror.execute_many([
+            (insert_sql, (user_id, USER_STATE)),
+            (update_sql, (Jsonb(doc), user_id, USER_STATE)),
+        ])
+    return doc
 
 
 # ---------------------------------------------------------------------------
@@ -207,17 +217,18 @@ def set_manual_user_state_guarded(user_id: str, value: str, ts: float) -> dict:
 
 def item_upsert(user_id: str, kind: str, item_id: str, ts: float,
                 doc: dict, expires_at: float | None = None) -> None:
+    sql = ("INSERT INTO perception_items (user_id, kind, item_id, ts, expires_at, doc) "
+           "VALUES (%s, %s, %s, %s, %s, %s) "
+           "ON CONFLICT (user_id, kind, item_id) DO UPDATE "
+           "SET ts = EXCLUDED.ts, expires_at = EXCLUDED.expires_at, doc = EXCLUDED.doc")
     try:
         with get_pool().connection() as conn:
-            conn.execute(
-                "INSERT INTO perception_items (user_id, kind, item_id, ts, expires_at, doc) "
-                "VALUES (%s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (user_id, kind, item_id) DO UPDATE "
-                "SET ts = EXCLUDED.ts, expires_at = EXCLUDED.expires_at, doc = EXCLUDED.doc",
-                (user_id, kind, item_id, ts, expires_at, Jsonb(doc)),
-            )
+            conn.execute(sql, (user_id, kind, item_id, ts, expires_at, Jsonb(doc)))
     except Exception as e:
         log.error("item_upsert(%s,%s,%s) failed: %s", user_id, kind, item_id, e)
+        return
+    from tee_shadow import mirror
+    mirror.execute(sql, (user_id, kind, item_id, ts, expires_at, Jsonb(doc)))
 
 
 def item_get(user_id: str, kind: str, item_id: str, now: float | None = None) -> dict | None:
@@ -265,51 +276,50 @@ def item_patch(user_id: str, kind: str, item_id: str, patch: dict,
                expires_at: float | None = "__keep__") -> dict | None:
     """Shallow-merge `patch` into an item's doc. Optionally also set expires_at
     (pass None to clear the TTL / promote a staged item; omit to keep current)."""
+    if expires_at == "__keep__":
+        sql = ("UPDATE perception_items SET doc = doc || %s "
+               "WHERE user_id = %s AND kind = %s AND item_id = %s RETURNING doc")
+        params = (Jsonb(patch), user_id, kind, item_id)
+    else:
+        sql = ("UPDATE perception_items SET doc = doc || %s, expires_at = %s "
+               "WHERE user_id = %s AND kind = %s AND item_id = %s RETURNING doc")
+        params = (Jsonb(patch), expires_at, user_id, kind, item_id)
     try:
         with get_pool().connection() as conn:
-            if expires_at == "__keep__":
-                row = conn.execute(
-                    "UPDATE perception_items SET doc = doc || %s "
-                    "WHERE user_id = %s AND kind = %s AND item_id = %s RETURNING doc",
-                    (Jsonb(patch), user_id, kind, item_id),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    "UPDATE perception_items SET doc = doc || %s, expires_at = %s "
-                    "WHERE user_id = %s AND kind = %s AND item_id = %s RETURNING doc",
-                    (Jsonb(patch), expires_at, user_id, kind, item_id),
-                ).fetchone()
-        return row[0] if row else None
+            row = conn.execute(sql, params).fetchone()
     except Exception as e:
         log.error("item_patch(%s,%s,%s) failed: %s", user_id, kind, item_id, e)
         return None
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+    return row[0] if row else None
 
 
 def item_delete(user_id: str, kind: str, item_id: str) -> bool:
+    sql = "DELETE FROM perception_items WHERE user_id = %s AND kind = %s AND item_id = %s"
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                "DELETE FROM perception_items WHERE user_id = %s AND kind = %s AND item_id = %s",
-                (user_id, kind, item_id),
-            )
-        return cur.rowcount > 0
+            cur = conn.execute(sql, (user_id, kind, item_id))
     except Exception as e:
         log.error("item_delete(%s,%s,%s) failed: %s", user_id, kind, item_id, e)
         return False
+    from tee_shadow import mirror
+    mirror.execute(sql, (user_id, kind, item_id))
+    return cur.rowcount > 0
 
 
 def prune_expired(now: float) -> int:
     """Delete all expired items across users (lazy GC; safe to call anytime)."""
+    sql = "DELETE FROM perception_items WHERE expires_at IS NOT NULL AND expires_at <= %s"
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                "DELETE FROM perception_items WHERE expires_at IS NOT NULL AND expires_at <= %s",
-                (now,),
-            )
-        return cur.rowcount or 0
+            cur = conn.execute(sql, (now,))
     except Exception as e:
         log.error("prune_expired failed: %s", e)
         return 0
+    from tee_shadow import mirror
+    mirror.execute(sql, (now,))
+    return cur.rowcount or 0
 
 
 def latest_ts(user_id: str, kind: str) -> float | None:
@@ -385,15 +395,15 @@ def merge_perception_daily(user_id: str, date: str, signal: str, merge_fn, ts: f
     field-agnostic incremental aggregator), and persist. The lock serializes the
     30s/5min report churn so concurrent reports can't lose increments.
     Returns the new doc (or {} on failure)."""
+    insert_sql = ("INSERT INTO perception_daily (user_id, date, signal, doc, updated_at) "
+                  "VALUES (%s, %s, %s, '{}'::jsonb, %s) "
+                  "ON CONFLICT (user_id, date, signal) DO NOTHING")
+    update_sql = ("UPDATE perception_daily SET doc = %s, updated_at = %s "
+                  "WHERE user_id = %s AND date = %s AND signal = %s")
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                conn.execute(
-                    "INSERT INTO perception_daily (user_id, date, signal, doc, updated_at) "
-                    "VALUES (%s, %s, %s, '{}'::jsonb, %s) "
-                    "ON CONFLICT (user_id, date, signal) DO NOTHING",
-                    (user_id, date, signal, ts),
-                )
+                conn.execute(insert_sql, (user_id, date, signal, ts))
                 row = conn.execute(
                     "SELECT doc FROM perception_daily "
                     "WHERE user_id = %s AND date = %s AND signal = %s FOR UPDATE",
@@ -401,15 +411,19 @@ def merge_perception_daily(user_id: str, date: str, signal: str, merge_fn, ts: f
                 ).fetchone()
                 prev = row[0] if row and isinstance(row[0], dict) else {}
                 new_doc = merge_fn(prev) or {}
-                conn.execute(
-                    "UPDATE perception_daily SET doc = %s, updated_at = %s "
-                    "WHERE user_id = %s AND date = %s AND signal = %s",
-                    (Jsonb(new_doc), ts, user_id, date, signal),
-                )
-        return new_doc
+                conn.execute(update_sql, (Jsonb(new_doc), ts, user_id, date, signal))
     except Exception as e:
         log.error("merge_perception_daily(%s,%s,%s) failed: %s", user_id, date, signal, e)
         return {}
+    # Mirror the final computed doc directly (same rationale as
+    # merge_state_guarded) rather than re-deriving merge_fn's incremental
+    # aggregation against TEE's own (possibly lagging) prior doc.
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (insert_sql, (user_id, date, signal, ts)),
+        (update_sql, (Jsonb(new_doc), ts, user_id, date, signal)),
+    ])
+    return new_doc
 
 
 def list_perception_daily(user_id: str, signal: str, days: int = 30) -> list[dict]:

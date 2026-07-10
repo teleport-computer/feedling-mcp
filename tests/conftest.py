@@ -32,6 +32,7 @@ os.environ.setdefault("FEEDLING_RUNTIME_TOKEN_SECRET", "test-runtime-token-secre
 
 _ADMIN_URL = os.environ.get("FEEDLING_TEST_PG", "postgresql://postgres:test@127.0.0.1:55432/postgres")
 _TEST_DB = f"feedling_test_{uuid.uuid4().hex[:12]}"
+_TEE_DB = f"feedling_tee_test_{uuid.uuid4().hex[:12]}"
 
 
 def _admin_url_for(dbname: str) -> str:
@@ -43,6 +44,7 @@ def _admin_url_for(dbname: str) -> str:
 _provisioned = False
 _PROVISION_ERROR = None
 _created_test_db = False
+_created_tee_db = False
 try:
     import psycopg
 
@@ -51,11 +53,23 @@ try:
     _admin.close()
     _created_test_db = True
     os.environ["DATABASE_URL"] = _admin_url_for(_TEST_DB)
+
+    with psycopg.connect(_ADMIN_URL, autocommit=True) as _c:
+        _c.execute(f'CREATE DATABASE "{_TEE_DB}"')
+    _created_tee_db = True
+    os.environ["TEE_DATABASE_URL"] = _admin_url_for(_TEE_DB)
+    os.environ["TEE_MIGRATION_DATABASE_URL"] = os.environ["TEE_DATABASE_URL"]
+
     backend_dir = Path(__file__).parent.parent / "backend"
     sys.path.insert(0, str(backend_dir))
     import db
 
     db.init_schema()
+
+    from alembic_tee import upgrade_head
+
+    upgrade_head()
+
     _provisioned = True
 except Exception as e:  # noqa: BLE001 — any failure means "no usable PG"
     _PROVISION_ERROR = e
@@ -69,6 +83,19 @@ except Exception as e:  # noqa: BLE001 — any failure means "no usable PG"
                 (_TEST_DB,),
             )
             admin.execute(f'DROP DATABASE IF EXISTS "{_TEST_DB}"')
+            admin.close()
+        except Exception:
+            pass
+    if _created_tee_db:
+        try:
+            import psycopg
+
+            admin = psycopg.connect(_ADMIN_URL, autocommit=True)
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+                (_TEE_DB,),
+            )
+            admin.execute(f'DROP DATABASE IF EXISTS "{_TEE_DB}"')
             admin.close()
         except Exception:
             pass
@@ -199,7 +226,7 @@ def pytest_report_header(config):
 
 
 def pytest_unconfigure(config):
-    """Drop the throwaway database at the end of the session."""
+    """Drop the throwaway database(s) at the end of the session."""
     if not _provisioned:
         return
     try:
@@ -207,11 +234,12 @@ def pytest_unconfigure(config):
 
         admin = psycopg.connect(_ADMIN_URL, autocommit=True)
         # Terminate stragglers (subprocess backends may not have exited yet).
-        admin.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
-            (_TEST_DB,),
-        )
-        admin.execute(f'DROP DATABASE IF EXISTS "{_TEST_DB}"')
+        for _dbname in (_TEST_DB, _TEE_DB):
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+                (_dbname,),
+            )
+            admin.execute(f'DROP DATABASE IF EXISTS "{_dbname}"')
         admin.close()
     except Exception:
         pass

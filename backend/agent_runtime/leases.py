@@ -44,6 +44,9 @@ def acquire(
     """
     clock = _now(now)
     expires = clock + ttl
+    # tee-mirror: 本文件所有写点有意不镜像（TTL lease/心跳，与 proactive
+    # store_v2 的 user_blobs lease 同规则：ephemeral 锁，TEE 侧 supervisor
+    # 自行重建，reconciler 收敛残留行）。
     sql = """
         INSERT INTO agent_runtime_instances
             (user_id, driver, status, pid, lease_owner, lease_expires_at,

@@ -125,3 +125,77 @@ def test_delete_user_frames_removes_only_that_prefix(fake):
     assert object_storage.get_frame_body("u1", "f1") is None
     assert object_storage.get_frame_body("u1", "f2") is None
     assert object_storage.get_frame_body("u2", "f1") is not None
+
+
+def test_delete_user_frames_also_reaps_tee_prefix(fake):
+    """Account reset must delete BOTH frames/<u>/ and frames-tee/<u>/ — the TEE
+    storage-layer mirror is user data too. Other users' tee objects survive."""
+    ct = base64.b64encode(b"a").decode()
+    object_storage.put_frame_body("u1", "f1", ct)
+    object_storage.put_frame_tee_body("u1", "f1", ct)
+    object_storage.put_frame_tee_body("u2", "f1", ct)
+    object_storage.delete_user_frames("u1")
+    assert ("io-image-frames", "frames-tee/u1/f1") not in fake.store
+    assert ("io-image-frames", "frames/u1/f1") not in fake.store
+    assert ("io-image-frames", "frames-tee/u2/f1") in fake.store
+
+
+def test_frame_tee_key_format():
+    assert object_storage.frame_tee_key("u1", "abc") == "frames-tee/u1/abc"
+
+
+def test_put_frame_tee_body_stores_raw_bytes(fake):
+    ct = base64.b64encode(b"\x00sealed\xff").decode()
+    key = object_storage.put_frame_tee_body("u1", "f1", ct)
+    assert key == "frames-tee/u1/f1"
+    assert fake.store[("io-image-frames", key)] == base64.b64decode(ct)
+
+
+def test_delete_frame_tee_body(fake):
+    ct = base64.b64encode(b"sealed").decode()
+    object_storage.put_frame_tee_body("u1", "f1", ct)
+    assert ("io-image-frames", "frames-tee/u1/f1") in fake.store
+    object_storage.delete_frame_tee_body("u1", "f1")
+    assert ("io-image-frames", "frames-tee/u1/f1") not in fake.store
+
+
+def test_get_frame_body_strict_none_only_on_404(fake):
+    """strict: definitive NoSuchKey → None (orphan); any other error raises
+    (transient — the tee_replicator must freeze-and-retry, not skip)."""
+    assert object_storage.get_frame_body_strict("u1", "ghost") is None
+
+    ct = base64.b64encode(b"x").decode()
+    object_storage.put_frame_body("u1", "f1", ct)
+    assert object_storage.get_frame_body_strict("u1", "f1") == ct
+
+    def _transient(Bucket, Key, **kw):
+        raise _ClientError("SlowDown")  # throttling — not a 404
+
+    fake.get_object = _transient
+    with pytest.raises(Exception):
+        object_storage.get_frame_body_strict("u1", "f1")
+    # the lenient variant still swallows the same error
+    assert object_storage.get_frame_body("u1", "f1") is None
+
+
+def test_get_frame_body_strict_nosuchbucket_raises_not_none(fake):
+    """Round 4 Fix 2 (P2): NoSuchBucket must NOT be treated as an orphaned
+    object. A misconfigured/unavailable bucket is a deployment fault, not
+    proof that this specific object was deleted — the strict variant must
+    raise (freeze-and-retry) so the tee_replicator doesn't mass-mark every
+    R2-backed frame as pending, which would not self-heal even after the
+    bucket config is fixed (the cursor would already have advanced past
+    them). Only NoSuchKey/404 (object-level) may return None."""
+    def _no_bucket(Bucket, Key, **kw):
+        raise _ClientError("NoSuchBucket")
+
+    fake.get_object = _no_bucket
+    with pytest.raises(Exception):
+        object_storage.get_frame_body_strict("u1", "f1")
+
+
+def test_is_missing_object_excludes_nosuchbucket():
+    assert object_storage._is_missing_object(_ClientError("NoSuchKey")) is True
+    assert object_storage._is_missing_object(_ClientError("404")) is True
+    assert object_storage._is_missing_object(_ClientError("NoSuchBucket")) is False
+    assert object_storage._is_missing_object(_ClientError("SlowDown")) is False

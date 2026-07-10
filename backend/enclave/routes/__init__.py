@@ -13,7 +13,8 @@ from enclave.routes.gzip import ContentTypeGZipMiddleware
 from enclave.routes.head import HeadBodyStripMiddleware
 
 # 每个路由任务落地时把模块名加进来（Task 9-13）。
-_ROUTE_MODULES = ("health", "envelope", "memory", "worldbook", "chat", "identity", "frames")
+_ROUTE_MODULES = ("health", "envelope", "memory", "worldbook", "chat", "identity",
+                  "frames", "storage")
 
 
 @asynccontextmanager

@@ -35,6 +35,10 @@ import threading
 log = logging.getLogger(__name__)
 
 _KEY_PREFIX = "frames"
+# TEE storage-layer re-encrypted bodies live under a distinct prefix in the SAME
+# bucket (D4). The ciphertext here is sealed with the enclave's storage key, not
+# the E2E content key — it is never the raw ``body_ct`` under _KEY_PREFIX.
+_TEE_KEY_PREFIX = "frames-tee"
 _client_lock = threading.Lock()
 _cached_client = None
 
@@ -125,6 +129,49 @@ def put_frame_body(user_id: str, frame_id: str, body_ct_b64: str) -> str:
     return key
 
 
+def frame_tee_key(user_id: str, frame_id: str) -> str:
+    return f"{_TEE_KEY_PREFIX}/{user_id}/{frame_id}"
+
+
+def put_frame_tee_body(user_id: str, frame_id: str, body_ct_b64: str) -> str:
+    """Upload the storage-layer ciphertext (D4) under the frames-tee/ prefix;
+    return the R2 object key. Deterministic key → overwrite-safe, so a replay
+    of the tee_replicator converges without orphaning objects. Raises on
+    failure so the replicator freezes the cursor rather than persist a pointer
+    to a missing object."""
+    key = frame_tee_key(user_id, frame_id)
+    raw = base64.b64decode(body_ct_b64)
+    _client().put_object(
+        Bucket=_bucket(),
+        Key=key,
+        Body=raw,
+        ContentType="application/octet-stream",
+    )
+    return key
+
+
+def get_frame_body_strict(user_id: str, frame_id: str) -> str | None:
+    """Like ``get_frame_body`` but distinguishes definitive not-found from
+    transient failure: returns None ONLY on an *object-level* 404/NoSuchKey
+    (the object is truly gone — an orphaned ``body_key``); any other failure
+    raises, INCLUDING NoSuchBucket. A misconfigured/unavailable bucket is not
+    the same fact as "this one object is missing" — treating NoSuchBucket as
+    an orphan would mass-mark every R2-backed frame as pending on a bucket
+    misconfig, and fixing the config afterward would not self-heal (the
+    cursor already advanced past them). The tee_replicator needs the
+    distinction — an orphan is skipped as pending, while a transient/config
+    R2 error must freeze the cursor and be retried."""
+    key = frame_key(user_id, frame_id)
+    try:
+        resp = _client().get_object(Bucket=_bucket(), Key=key)
+    except Exception as e:  # noqa: BLE001
+        if _is_missing_object(e):
+            return None
+        raise
+    raw = resp["Body"].read()
+    return base64.b64encode(raw).decode("ascii")
+
+
 def get_frame_body(user_id: str, frame_id: str) -> str | None:
     """Fetch the object and re-encode to the original base64 ``body_ct``.
 
@@ -150,24 +197,38 @@ def delete_frame_body(user_id: str, frame_id: str) -> None:
         log.error("[r2] delete_frame_body(%s) failed: %s", key, e)
 
 
+def delete_frame_tee_body(user_id: str, frame_id: str) -> None:
+    """Delete the TEE storage-layer re-encrypted body (``frames-tee/`` prefix,
+    D4) for one frame. A single-frame RDS delete/prune must reap this too, else
+    the replicator's re-encrypted object is orphaned in R2 (``delete_user_frames``
+    already covers the whole-account reset case for both prefixes)."""
+    key = frame_tee_key(user_id, frame_id)
+    try:
+        _client().delete_object(Bucket=_bucket(), Key=key)
+    except Exception as e:  # noqa: BLE001
+        log.error("[r2] delete_frame_tee_body(%s) failed: %s", key, e)
+
+
 def delete_user_frames(user_id: str) -> None:
-    """Delete every object under ``frames/<user_id>/`` (account reset)."""
-    prefix = f"{_KEY_PREFIX}/{user_id}/"
+    """Delete every object under ``frames/<user_id>/`` AND the TEE storage-layer
+    mirror ``frames-tee/<user_id>/`` (account reset must reap both prefixes)."""
     try:
         client = _client()
         bucket = _bucket()
-        token = None
-        while True:
-            kwargs = {"Bucket": bucket, "Prefix": prefix}
-            if token:
-                kwargs["ContinuationToken"] = token
-            resp = client.list_objects_v2(**kwargs)
-            objs = [{"Key": c["Key"]} for c in resp.get("Contents", [])]
-            if objs:
-                client.delete_objects(Bucket=bucket, Delete={"Objects": objs})
-            if not resp.get("IsTruncated"):
-                break
-            token = resp.get("NextContinuationToken")
+        for key_prefix in (_KEY_PREFIX, _TEE_KEY_PREFIX):
+            prefix = f"{key_prefix}/{user_id}/"
+            token = None
+            while True:
+                kwargs = {"Bucket": bucket, "Prefix": prefix}
+                if token:
+                    kwargs["ContinuationToken"] = token
+                resp = client.list_objects_v2(**kwargs)
+                objs = [{"Key": c["Key"]} for c in resp.get("Contents", [])]
+                if objs:
+                    client.delete_objects(Bucket=bucket, Delete={"Objects": objs})
+                if not resp.get("IsTruncated"):
+                    break
+                token = resp.get("NextContinuationToken")
     except Exception as e:  # noqa: BLE001
         log.error("[r2] delete_user_frames(%s) failed: %s", user_id, e)
 
@@ -270,3 +331,16 @@ def delete_user_chat_files(user_id: str) -> None:
             token = resp.get("NextContinuationToken")
     except Exception as e:  # noqa: BLE001
         log.error("[r2] delete_user_chat_files(%s) failed: %s", user_id, e)
+
+
+def _is_missing_object(e) -> bool:
+    """Object-level "definitely gone" only — NoSuchKey / HTTP 404. Deliberately
+    EXCLUDES NoSuchBucket: a missing/misconfigured bucket is a deployment fault,
+    not proof any given object was deleted, and must not be treated as an
+    orphan (see ``get_frame_body_strict``)."""
+    resp = getattr(e, "response", None)
+    if isinstance(resp, dict):
+        code = resp.get("Error", {}).get("Code")
+        if code in ("NoSuchKey", "404"):
+            return True
+    return e.__class__.__name__ in ("NoSuchKey", "404")

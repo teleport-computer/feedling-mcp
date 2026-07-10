@@ -248,6 +248,40 @@ def test_prune_removes_r2_objects(monkeypatch):
     assert ("io-image-frames", "frames/%s/f2" % uid) in fake.store
 
 
+def test_delete_reaps_both_prefixes(monkeypatch):
+    """A single-frame delete must reap BOTH frames/<u>/<f> and the TEE
+    storage-layer mirror frames-tee/<u>/<f>, else the re-encrypted body orphans."""
+    fake = _FakeS3()
+    _enable_r2(monkeypatch, fake)
+    uid = _uid()
+    seed_user(uid)
+    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
+    # Simulate the replicator having written the TEE storage-layer body.
+    object_storage.put_frame_tee_body(uid, "f1", base64.b64encode(b"sealed").decode())
+    assert ("io-image-frames", "frames-tee/%s/f1" % uid) in fake.store
+
+    db.frame_delete(uid, "f1")
+    assert ("io-image-frames", "frames/%s/f1" % uid) not in fake.store
+    assert ("io-image-frames", "frames-tee/%s/f1" % uid) not in fake.store
+
+
+def test_prune_reaps_both_prefixes(monkeypatch):
+    fake = _FakeS3()
+    _enable_r2(monkeypatch, fake)
+    uid = _uid()
+    seed_user(uid)
+    for i in range(4):
+        db.frame_upsert(uid, f"f{i}", float(i), _env(uid, f"f{i}"))
+        object_storage.put_frame_tee_body(uid, f"f{i}", base64.b64encode(b"s").decode())
+    evicted = db.frame_prune_to(uid, 2)  # evict f0, f1
+    assert set(evicted) == {"f0", "f1"}
+    for f in ("f0", "f1"):
+        assert ("io-image-frames", "frames/%s/%s" % (uid, f)) not in fake.store
+        assert ("io-image-frames", "frames-tee/%s/%s" % (uid, f)) not in fake.store
+    # Survivors' tee bodies untouched.
+    assert ("io-image-frames", "frames-tee/%s/f2" % uid) in fake.store
+
+
 def test_delete_user_data_does_not_touch_r2(monkeypatch):
     """delete_user_data is now a DB-only belt (0011 CASCADE does the real
     deletion); R2 cleanup is the caller's job via delete_user_frames, kept

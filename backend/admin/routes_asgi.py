@@ -25,6 +25,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from admin import admin_core
+from admin import tee_replication as admin_tee_replication
 from asgi import threadpool
 from asgi.http import read_json_silent
 
@@ -114,6 +115,44 @@ async def store_evict(request: Request):
         return JSONResponse({"error": "user_id required"}, status_code=400)
     result = await threadpool.run_db(admin_core.store_evict, user_id)
     return JSONResponse(result)
+
+
+@router.post("/v1/admin/tee-replication/run")
+async def tee_replication_run(request: Request):
+    # Deliberately synchronous: a real (non-dry-run) replicate/reconcile pass
+    # occupies one anyio worker thread — and holds the module-level run lock —
+    # for its whole duration (minutes at the default qps=2). Acceptable at the
+    # current tiny prod scale; revisit (background job + status polling) if
+    # the user count grows enough for a pass to outlive the HTTP timeout.
+    _require_admin(request)
+    payload = (await read_json_silent(request)) or {}
+    try:
+        result = await threadpool.run_db(
+            admin_tee_replication.run_action,
+            action=payload.get("action"),
+            table=payload.get("table"),
+            dry_run=payload.get("dry_run", True),
+            confirm=payload.get("confirm"),
+            qps=payload.get("qps"),
+            sample_rate=payload.get("sample_rate"),
+        )
+    except admin_tee_replication.BadRequest as exc:
+        return JSONResponse({"error": exc.error}, status_code=400)
+    except admin_tee_replication.AlreadyRunning:
+        return JSONResponse({"error": "already_running"}, status_code=409)
+    except admin_tee_replication.Unconfigured:
+        return JSONResponse({"error": "tee_database_unconfigured"}, status_code=503)
+    return JSONResponse(result)
+
+
+@router.get("/v1/admin/tee-replication/status")
+async def tee_replication_status(request: Request):
+    _require_admin(request)
+    try:
+        payload = await threadpool.run_db(admin_tee_replication.status_payload)
+    except admin_tee_replication.Unconfigured:
+        return JSONResponse({"error": "tee_database_unconfigured"}, status_code=503)
+    return JSONResponse(payload)
 
 
 def register_asgi(app) -> None:
