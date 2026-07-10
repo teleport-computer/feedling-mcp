@@ -1,0 +1,199 @@
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+import pytest
+
+import conftest
+import db
+import provider_client
+from model_api_runtime.v2 import extraction, jobs_store, worker
+
+_BYOK = provider_client.ProviderConfig(
+    provider="anthropic", model="claude-x", api_key="sk-user", base_url="")
+
+
+@pytest.fixture(autouse=True)
+def _clean():
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs")
+    yield
+
+
+def _job_row(job_id):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT status, last_error FROM agent_jobs WHERE id=%s", (job_id,)).fetchone()
+
+
+def _deps(**over):
+    base = dict(
+        read_messages=lambda uid: [],
+        resolve_provider=lambda uid: (_BYOK, {}),
+        is_official=lambda cfg: True,
+        mint_enclave_token=lambda uid: "rt",
+        read_tail=lambda uid, after, limit: [
+            {"id": "m1", "ts": 1.0, "role": "user", "content": "我换工作了"}],
+        read_memory_context=lambda uid: {
+            "ai_name": "小克", "user_name": "Z", "buckets": "B",
+            "threads": "T", "identity": "I", "cards": "C"},
+        build_memory_envelope=lambda uid, inner: {"body_ct": "CT", "_inner": inner},
+        apply_memory_actions=lambda uid, actions: {"applied": len(actions)},
+    )
+    base.update(over)
+    return worker.TurnDeps(**base)
+
+
+def test_dream_is_a_lane_with_background_priority():
+    assert "dream" in jobs_store.LANES
+    assert jobs_store.LANE_PRIORITY["dream"] == jobs_store.LANE_PRIORITY["capture"]
+
+
+@pytest.mark.parametrize("lane", ["capture", "dream"])
+def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
+    uid = f"u_x_{lane}"
+    conftest.seed_user(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(*, provider_config, prompt, parse, **kw):
+        assert provider_config is _BYOK          # BYOK-only
+        return ([{"action": "add", "summary": "s", "content": "c"}], None)
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    applied = {}
+    deps = _deps(apply_memory_actions=lambda uid_, actions: applied.update(n=len(actions)) or {})
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert applied == {"n": 1}
+    assert _job_row(job_id)[0] == "completed"
+
+
+@pytest.mark.parametrize("lane", ["capture", "dream"])
+def test_zero_results_completes_without_applying_anything(monkeypatch, lane):
+    """`nothing_worth_keeping` is SUCCESS — mirrors the wake lane's weak-wake-sleeps."""
+    uid = f"u_x_empty_{lane}"
+    conftest.seed_user(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+
+    async def _empty(*, provider_config, prompt, parse, **kw):
+        return ([], None)
+
+    monkeypatch.setattr(extraction, "extract", _empty)
+    applied = {"n": 0}
+    deps = _deps(apply_memory_actions=lambda uid_, a: applied.update(n=applied["n"] + 1) or {})
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+    assert status == "completed"
+    assert applied["n"] == 0
+    assert _job_row(job_id)[0] == "completed"
+
+
+@pytest.mark.parametrize("lane", ["capture", "dream"])
+def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane):
+    uid = f"u_x_fail_{lane}"
+    conftest.seed_user(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+
+    async def _err(*, provider_config, prompt, parse, **kw):
+        return (None, "provider_call_failed:RuntimeError")
+
+    monkeypatch.setattr(extraction, "extract", _err)
+    written = {}
+    monkeypatch.setattr(worker, "_write_encrypted_reply",
+                        lambda store, text: written.update(t=text) or {"id": "r"})
+    emitted = []
+    monkeypatch.setattr(worker, "_emit_status", lambda *a, **k: emitted.append(a))
+
+    status = asyncio.run(worker.process_job(
+        job, _deps(), provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert written == {}                       # no chat bubble
+    assert emitted == []                       # no user-visible status/error chip
+    row = _job_row(job_id)
+    assert row[0] == "failed" and "provider_call_failed" in (row[1] or "")
+
+
+def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
+    """Context fetch failure must degrade, not fail the job (spec §3.5)."""
+    uid = "u_x_nocontext"
+    conftest.seed_user(uid)
+    jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+
+    seen = {}
+
+    async def _cap(*, provider_config, prompt, parse, **kw):
+        seen["prompt"] = prompt
+        return ([], None)
+
+    monkeypatch.setattr(extraction, "extract", _cap)
+    status = asyncio.run(worker.process_job(
+        job, _deps(read_memory_context=None), provider_config=_BYOK,
+        is_official=True, api_key=None, runtime_token="rt"))
+    assert status == "completed"
+    assert "（暂无）" in seen["prompt"]          # prompt builder's own fallback kicked in
+
+
+def test_extraction_reads_go_through_the_enclave_semaphore(monkeypatch):
+    """spec §4: read_memory_context (3 post_enclave round-trips) and read_tail (per-message
+    decrypt) are BOTH enclave-bound. The enclave is single-threaded — the whole point of this
+    subproject — so both must sit inside the turn's enclave_sem. A background lane that
+    bypasses the gate can starve the interactive chat path."""
+    import asyncio as _asyncio
+
+    class _CountingSemaphore(_asyncio.Semaphore):
+        def __init__(self, value=2):
+            super().__init__(value)
+            self.held = 0
+            self.acquire_count = 0
+
+        async def acquire(self):
+            self.acquire_count += 1
+            got = await super().acquire()
+            self.held += 1
+            return got
+
+        def release(self):
+            self.held -= 1
+            super().release()
+
+    uid = "u_x_sem"
+    conftest.seed_user(uid)
+    jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+
+    sem = _CountingSemaphore(2)
+    inside = {"ctx": None, "tail": None}
+
+    def _ctx(uid_):
+        inside["ctx"] = sem.held          # must be >0 -> we are inside the gate
+        return {"buckets": "B"}
+
+    def _tail(uid_, after, limit):
+        inside["tail"] = sem.held
+        return [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+
+    async def _empty(*, provider_config, prompt, parse, **kw):
+        return ([], None)
+
+    monkeypatch.setattr(extraction, "extract", _empty)
+    deps = _deps(read_memory_context=_ctx, read_tail=_tail)
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=True, api_key=None,
+        runtime_token="rt", enclave_sem=sem))
+
+    assert status == "completed"
+    assert inside["ctx"] == 1, "read_memory_context ran OUTSIDE enclave_sem"
+    assert inside["tail"] == 1, "read_tail ran OUTSIDE enclave_sem"
+    assert sem.acquire_count >= 1

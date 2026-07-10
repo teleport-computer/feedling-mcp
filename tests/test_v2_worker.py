@@ -224,46 +224,6 @@ def test_coalesce_inputs_and_cap_data_tolerate_enclave_sem_none(monkeypatch):
     assert data == {"x": 1}
 
 
-def test_process_job_sleep_plan_no_responder_no_bubble(monkeypatch):
-    """A plan without final_response (sleep — e.g. a wake with nothing visible to
-    react to) must never call the responder and must never write a reply bubble,
-    yet still cleanly completes the job.
-
-    Lane: "capture" (not "heartbeat") — D3 Task 6 gave heartbeat/scheduled/
-    manual_wake their own dedicated `_run_wake` dispatch in `process_job`
-    (before this generic chat-turn/rule_plan path is ever reached); capture is
-    explicitly deferred/out of scope for that task (different semantics —
-    memory extraction, not a reply) and still falls through to this generic
-    path, so it's the lane that continues to exercise rule_plan's sleep-plan
-    degradation exactly as this test intends."""
-    uid = "u_w_sleep"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "capture")
-    job = jobs_store.claim_next_job("w")
-
-    responder_called = {"n": 0}
-    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
-    monkeypatch.setattr(
-        v2_responder, "respond",
-        lambda *a, **k: responder_called.update(n=responder_called["n"] + 1) or "SHOULD NOT BE CALLED")
-    write_called = {"n": 0}
-    monkeypatch.setattr(
-        worker, "_write_encrypted_reply",
-        lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
-
-    # capture lane, no coalesced messages -> has_user_text=False and lane != "chat"
-    # -> real rule_plan degrades to [{"type": "sleep", ...}] (no final_response).
-    deps = _deps(messages=[])
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
-
-    assert status == "completed"
-    assert responder_called["n"] == 0
-    assert write_called["n"] == 0
-    assert _job_status(job_id)[0] == "completed"
-
-
 def test_process_job_responder_error_marks_failed_no_filler(monkeypatch):
     """ResponderError (empty model reply / provider failure) must mark the job
     failed and must NEVER write a placeholder bubble — the no-filler invariant."""
@@ -1289,3 +1249,85 @@ def test_final_text_from_decide_short_circuits_the_responder(monkeypatch):
     assert status == "completed"
     assert called["respond"] == 0
     assert written.get("text") == "authored inline"
+
+
+def test_unhandled_lane_never_writes_a_bubble_and_fails_loudly_in_the_db(monkeypatch):
+    """An unhandled lane must NOT take the chat path (no chat bubble, no user-visible error
+    chip) and must fail loudly in the DB with `unhandled_lane:<lane>`.
+
+    Task 3 note: this test used to enqueue `capture`, but `capture` is now a real handled
+    lane (memory extraction via `_run_extraction`). To keep exercising the genuine unhandled
+    branch we use a lane that is NOT in `jobs_store.LANES`. `enqueue_job` validates against
+    LANES, so we INSERT the bogus-lane row directly (chosen over monkeypatching LANES, so the
+    Python-side guard stays real for every other test)."""
+    uid = "u_w_unhandled_lane"
+    conftest.seed_user(uid)
+    _reset(uid)
+    bogus_lane = "screen_watch"  # not in jobs_store.LANES → genuinely unregistered
+    assert bogus_lane not in jobs_store.LANES
+    with db.get_pool().connection() as conn:
+        job_id = conn.execute(
+            "INSERT INTO agent_jobs (user_id, lane, status, priority) "
+            "VALUES (%s, %s, 'pending', 0) RETURNING id", (uid, bogus_lane)).fetchone()[0]
+    job = jobs_store.claim_next_job("w")
+
+    _patch_cheap_boundaries(monkeypatch, reply="SHOULD NOT BE WRITTEN")
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    written = {}
+    monkeypatch.setattr(worker, "_write_encrypted_reply",
+                        lambda store, text: written.update(text=text) or {"id": "r"})
+    emitted = []
+    monkeypatch.setattr(worker, "_emit_status",
+                        lambda uid_, jid, status, **kw: emitted.append(status))
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert written == {}                       # no chat bubble
+    assert "error" not in emitted              # no user-visible error chip
+    row = _job_status(job_id)
+    assert row[0] == "failed"
+    assert row[1].startswith("unhandled_lane:")
+
+
+def test_chat_still_works_and_takes_the_chat_path(monkeypatch):
+    """Guard against the dispatch fix accidentally starving the real chat turn."""
+    uid = "u_w_chat_still_works"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    _patch_cheap_boundaries(monkeypatch, reply="REPLY")
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    written = {}
+    monkeypatch.setattr(worker, "_write_encrypted_reply",
+                        lambda store, text: written.update(text=text) or {"id": "r"})
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+    assert status == "completed"
+    assert written == {"text": "REPLY"}
+
+
+def test_chat_lane_still_takes_the_chat_path(monkeypatch):
+    """Regression guard for the BUG-2 dispatch fix: the `lane != "chat"` bail-out must not
+    starve the real interactive chat turn. Pairs with
+    test_unhandled_lane_never_writes_a_bubble_and_fails_loudly_in_the_db."""
+    uid = "u_w_chat_still_works"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    _patch_cheap_boundaries(monkeypatch, reply="REPLY")
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    written = {}
+    monkeypatch.setattr(worker, "_write_encrypted_reply",
+                        lambda store, text: written.update(text=text) or {"id": "r"})
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+    assert status == "completed"
+    assert written == {"text": "REPLY"}

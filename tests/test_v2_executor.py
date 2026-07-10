@@ -173,7 +173,7 @@ def test_two_credentials_passed_no_byok(monkeypatch):
 
 
 def test_control_actions_are_skipped_not_run_or_failed(monkeypatch):
-    """sleep/schedule_wake/final_response (and any non-capability type) must never reach
+    """sleep/capture_memory/final_response (and any non-capability type) must never reach
     run_capability, never be mark_action_failed'd, and must not appear in action_results
     or action_digest — they are control/deferred actions the worker/responder interprets,
     not executor failures. Actions carrying an _action_id get mark_action_skipped instead."""
@@ -200,7 +200,7 @@ def test_control_actions_are_skipped_not_run_or_failed(monkeypatch):
     plan = [
         {"type": "memory_index", "payload": {}, "_action_id": 100},
         {"type": "sleep", "payload": {}, "_action_id": 101},
-        {"type": "schedule_wake", "payload": {}, "_action_id": 102},
+        {"type": "capture_memory", "payload": {}, "_action_id": 102},
         {"type": "final_response", "payload": {}},  # no _action_id — just dropped
     ]
     out = asyncio.run(v2_executor.execute_plan(

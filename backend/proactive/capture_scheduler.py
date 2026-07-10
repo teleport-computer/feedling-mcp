@@ -10,7 +10,7 @@ import hashlib
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import db
 from proactive import capture_jobs
@@ -277,7 +277,10 @@ def _capture_enabled(store) -> bool:
         return True
 
 
-def tick_quiet_capture(store, *, now: float | None = None) -> dict[str, Any]:
+def tick_quiet_capture(
+    store, *, now: float | None = None,
+    submit: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     now_ts = time.time() if now is None else float(now)
     state = refresh_capture_state_from_chat(store, now=now_ts)
     if not _capture_enabled(store):
@@ -290,12 +293,20 @@ def tick_quiet_capture(store, *, now: float | None = None) -> dict[str, Any]:
     quiet_for = now_ts - _safe_float(state.get("last_seen_ts"), 0.0)
     if quiet_for < quiet_sec():
         return {"enqueued": False, "reason": "quiet_not_due", "quiet_for_sec": quiet_for, "state": state, "job": None}
-    result = _enqueue_window(store, trigger="quiet_timeout", now=now_ts)
+    # V2 seam（spec §3.1）：默认 None = 今天的行为（append 进 legacy proactive_jobs 流）。
+    # V2 的 scheduler 传入一个把 job 塞进 agent_jobs 的 submitter —— 这样 gate 的五道早退
+    # （capture_disabled / no_new_messages / already_captured / quiet_not_due / min_interval）
+    # 和失败退避全部原样复用，零漂移。镜像 ScheduledWakeServiceV2.fire_due_timers(submit_wake=)。
+    _enqueue = submit if submit is not None else _enqueue_window
+    result = _enqueue(store, trigger="quiet_timeout", now=now_ts)
     result["quiet_for_sec"] = quiet_for
     return result
 
 
-def force_capture(store, *, now: float | None = None) -> dict[str, Any]:
+def force_capture(
+    store, *, now: float | None = None,
+    submit: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Debug: enqueue a capture job for the current window NOW, skipping the quiet
     window (still needs new messages since the last capture). For the test panel's
     'capture now' button so you don't wait 20 min."""
@@ -306,7 +317,9 @@ def force_capture(store, *, now: float | None = None) -> dict[str, Any]:
         return {"enqueued": False, "reason": "no_new_messages", "state": state, "job": None}
     if until_id == str(state.get("last_captured_until_message_id") or ""):
         return {"enqueued": False, "reason": "already_captured", "state": state, "job": None}
-    return _enqueue_window(store, trigger="manual_force", now=now_ts)
+    # Same V2 seam as tick_quiet_capture — see comment there.
+    _enqueue = submit if submit is not None else _enqueue_window
+    return _enqueue(store, trigger="manual_force", now=now_ts)
 
 
 def tick_quiet_migrate(store, *, now: float | None = None) -> dict[str, Any]:

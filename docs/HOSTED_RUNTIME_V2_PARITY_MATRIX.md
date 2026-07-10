@@ -35,7 +35,7 @@ The resident agent's tools are the `io_cli` subcommands it can shell out to (`to
 | `identity_get` / `identity_patch` | ❌ `io_cli identity-write` is `(phase 2 — not implemented yet)` | ✅ `registry.py:12-13` | **V2 stronger** |
 | web search / fetch | 🔎 via codex/claude CLI built-in — **no** `web` subcommand exists in `io_cli` or the consumer | ✅ `web_search` / `web_fetch` `registry.py:26-27` (DuckDuckGo facade) | roughly aligned, different impl |
 | **chat image** | ✅ `io_cli chat-image`; **codex attaches images natively** (`chat_resident_consumer.py:2768`); non-native drivers get a local file path (`:371-379`) | ✅ **in-band**: `serve_worker._read_images` → `worker._inject_tail_images` → OpenAI content blocks → `provider_client` (openai-compat verbatim / anthropic / gemini wires). Capped at `_TAIL_IMAGE_LIMIT=2` per turn. Image **caption** now decrypted (`_caption_envelope`) — it had been silently dropped since V2 began. | aligned |
-| **`schedule_wake` / `cancel_wake`** | ✅ `io_cli schedule-wake` / `cancel-wake` | ❌ not in planner vocabulary (`planner.py:17-23`); executor lists them as control actions and **SKIPs** them (`executor.py:28-31`) — unemittable and uninterpreted | **🔴 GAP** |
+| **`schedule_wake` / `cancel_wake`** | ✅ `io_cli schedule-wake` / `cancel-wake` | ✅ **WRITE capabilities** `registry.py` (`schedule_wake`/`cancel_wake` → `capabilities/wake.py`, facade over `ScheduledWakeServiceV2.apply_turn_actions`); in planner vocabulary + `planner._WRITE_ACTIONS`; executor runs them serially (no longer in `_CONTROL_ACTIONS`). Capability persists the timer and does **not** enqueue — the D3 scheduler fires it within one tick (≤30 s). | aligned |
 | local file read / bash | ✅ codex runs sandbox-bypassed (`--dangerously-bypass-…`), so it reads local files | ❌ | **decide: drop or port** — this may be an accident of the sandbox flag, not a product capability |
 
 ---
@@ -49,9 +49,9 @@ The resident agent's tools are the `io_cli` subcommands it can shell out to (`to
 | chat | ✅ chat poll loop | ✅ `chat_send_core` → `enqueue_job` | ✅ chat path (`worker.py:395+`) | aligned |
 | heartbeat | ✅ `PROACTIVE_TICK_ENABLED` (`:228`), POST `/v1/proactive/tick` | ✅ D3 scheduler (`scheduler.py` + `serve_worker._scheduler_loop`) | ✅ `_run_wake` (`worker.py:392`) | aligned |
 | manual_wake | ✅ manual/force payload on `/v1/proactive/tick` | ✅ D3 bridge (`proactive_core.proactive_tick`) | ✅ `_run_wake` | aligned |
-| `scheduled` | ✅ `fire_scheduled_wakes` → `/v1/proactive/scheduled/fire`, timers in `proactive_scheduled_wakes_v2` | ❌ **none** | ✅ in `_WAKE_LANES` (`worker.py:100`) | **🔴 dead lane** — handler with no producer; agent-scheduled timers never fire under V2. Compounded by the missing `schedule_wake` capability (§A). |
-| `capture` | ✅ `fire_capture_tick()` (`:3844`) → `/v1/capture/tick` | ❌ none | ❌ **none** | **🔴 GAP + BUG-2** |
-| dream / memory consolidation | ✅ proactive job kind (`_is_memory_dream_job` `:4782`; `build_dream_prompt` `:125`) | ❌ | ❌ | **🔴 GAP** |
+| `scheduled` | ✅ `fire_scheduled_wakes` → `/v1/proactive/scheduled/fire`, timers in `proactive_scheduled_wakes_v2` | ✅ D3 scheduler `serve_worker._fire_scheduled_for_user` drains due timers → `enqueue_job(uid, "scheduled")`; `schedule_wake` capability (§A) persists them | ✅ in `_WAKE_LANES` (`worker.py:100`) | aligned |
+| `capture` | ✅ `fire_capture_tick()` (`:3844`) → `/v1/capture/tick` | ✅ `serve_worker._tick_capture_for_user` via the new `capture_scheduler.tick_quiet_capture(submit=…)` seam | ✅ `worker._run_extraction` | aligned |
+| `dream` | ✅ proactive job kind (`_is_memory_dream_job` `:4782`) | ✅ `serve_worker._tick_dream_for_user` via `dream_scheduler.tick_memory_dream(submit=…)` | ✅ `worker._run_extraction` (same handler) | aligned |
 | screen-watch | ✅ `SCREEN_WATCH_ENABLED` / `SCREEN_WATCH_INTERVAL_SEC=120` (`:246-250`) | ❌ | ❌ | **🔴 GAP** |
 | maintenance (compaction) | ❌ n/a (resident has no summary compaction) | ✅ `worker.py:363` | ✅ `_run_compaction` (`worker.py:387`) | V2-only |
 
@@ -93,11 +93,11 @@ Four real defects, none caught by the 2637-test suite — because no test traced
 
 **Bonus defect found while fixing it:** the image **caption** (the text a user sends *with* a picture, encrypted separately into `extra.caption_*` by `chat/service.py:115`) was read by **no V2 code path at all**. A user sending a screenshot plus "what's wrong with this?" gave the model the five characters `[image]` and nothing else. Fixed by `serve_worker._caption_envelope` + `_image_row`.
 
-**🔴 BUG-2 — a `capture`-lane job falls through to the chat path.**
-`enqueue_job(uid, "capture")` is accepted (`capture` ∈ `LANES`, `jobs_store.py:16`), but `process_job` dispatches only `maintenance` (`worker.py:387`) and `_WAKE_LANES` (`:392`); everything else takes the chat path. The chat path's early-return guard is `if not coalesced and lane == "chat"` (`worker.py:404`), so a capture job does **not** bail — it runs planner → executor → responder and **writes a chat bubble**, and on failure emits a user-visible error chip. Latent only because nothing enqueues `capture` today.
+**🟡 BUG-2 — a `capture`-lane job falls through to the chat path.** *(safety fix landed; full handler still pending)*
+`enqueue_job(uid, "capture")` is accepted (`capture` ∈ `LANES`, `jobs_store.py:16`), but `process_job` dispatches only `maintenance` and `_WAKE_LANES`; everything else used to take the chat path. The chat path's early-return guard is `if not coalesced and lane == "chat"`, so a capture job did **not** bail — it ran planner → executor → responder and **wrote a chat bubble**, and on failure emitted a user-visible error chip. **Safety fix:** `process_job` now has an explicit `if lane != "chat"` guard (`worker.py:463-474`) that logs and `mark_failed`s any unhandled lane **silently** (no bubble, no error chip) before the chat path is reached. This closes the "background job writes a chat bubble" hazard. It is a safety fix only — `capture` still has **no** producer or real handler; giving `capture`/`dream`/`screen_watch` a proper background-turn handler is a separate task.
 
-**🔴 BUG-3 — `scheduled` lane is a handler with no producer.**
-See §B. Agent-scheduled wakes silently never fire for `db_action_v2` users.
+**✅ BUG-3 — RESOLVED. `scheduled` lane now has a producer AND a way to create timers.**
+Was: handler with no producer; agent-scheduled wakes silently never fired for `db_action_v2` users (see §B). Fixed in two parts: (1) the D3 scheduler (`serve_worker._fire_scheduled_for_user`) drains due timers via `ScheduledWakeServiceV2.fire_due_timers` and `enqueue_job(uid, "scheduled")` — the one and only producer; (2) the agent can now **create/cancel** those timers through the `schedule_wake` / `cancel_wake` WRITE capabilities (`capabilities/wake.py`, §A), which persist the timer without enqueuing and let the scheduler pick it up within one tick.
 
 **🔴 BUG-4 — a chat turn whose plan omits `final_response` silently produces no reply (live, hits *trusted* models only).**
 `validate_plan` appends `final_response` only when the model asked for it (`planner.py:54-58`); it never forces one. `worker.py:458` computes `wants_reply = any(s["type"] == "final_response" for s in steps)`, and when it's False the responder is skipped entirely — the job goes `mark_completed` + `_emit_status "done"` with **no chat bubble**. The user's message is swallowed, and the client's long-poll sees a completed turn with nothing in it.
@@ -120,9 +120,7 @@ This is the deepest reason the one-shot shape is wrong: **"the planner didn't as
 **1. Must build (V2 cannot replace resident without these)**
 - Agent loop (see §C and the loop spec) — the one-shot planner cannot chain or recover from a tool miss. **Also fixes BUG-4.**
 - Multimodal: give `provider_client` a real image content block; stop feeding b64 through the text context (fully fixes BUG-1; the loop round only stops the bleeding).
-- `schedule_wake` / `cancel_wake` capability + planner vocabulary, and a producer for the `scheduled` lane (fixes BUG-3).
-- `capture` lane: producer + handler (fixes BUG-2).
-- `dream` lane.
+- ~~`schedule_wake` / `cancel_wake` capability + planner vocabulary, and a producer for the `scheduled` lane (fixes BUG-3).~~ ✅ **DONE** — see §A, §B `scheduled`, and BUG-3.
 - `screen_watch` lane.
 
 **2. Decide: drop or port**

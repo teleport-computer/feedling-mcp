@@ -13,9 +13,11 @@ def test_all_action_types_registered():
         "perception_snapshot", "perception_trend", "perception_history",
         "screen_recent", "screen_read", "photo_recent", "photo_read", "chat_image_read",
         "web_search", "web_fetch",
+        "schedule_wake", "cancel_wake",
     }
     assert set(registry.CAPABILITIES) == expected
-    assert registry.WRITE_ACTIONS == frozenset({"memory_write", "identity_patch"})
+    assert registry.WRITE_ACTIONS == frozenset({
+        "memory_write", "identity_patch", "schedule_wake", "cancel_wake"})
     assert "memory_index" in registry.READ_ACTIONS
 
 
@@ -32,13 +34,14 @@ def test_run_capability_unknown():
 
 
 def test_capabilities_is_a_real_populated_dict():
-    assert len(registry.CAPABILITIES) == 16
+    assert len(registry.CAPABILITIES) == 18
     assert set(registry.CAPABILITIES.keys()) == {
         "identity_get", "identity_patch", "memory_index", "memory_fetch", "memory_write",
         "memory_search",
         "perception_snapshot", "perception_trend", "perception_history",
         "screen_recent", "screen_read", "photo_recent", "photo_read", "chat_image_read",
         "web_search", "web_fetch",
+        "schedule_wake", "cancel_wake",
     }
-    assert len(list(registry.CAPABILITIES.items())) == 16
+    assert len(list(registry.CAPABILITIES.items())) == 18
     assert bool(registry.CAPABILITIES) is True

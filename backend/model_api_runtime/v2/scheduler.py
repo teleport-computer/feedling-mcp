@@ -57,4 +57,32 @@ def run_scheduler_tick(deps, *, now: float) -> dict:
             skipped += 1
             logger.exception("scheduler: error processing wake tick for user %s", user_id)
 
-    return {"considered": considered, "enqueued": enqueued, "skipped": skipped}
+    # `deps` 是鸭子类型（测试里的 FakeDeps / 生产的 SimpleNamespace），不是 dataclass。
+    # 必须 getattr 探测：老的 FakeDeps 根本没有这两个属性，直接取会 AttributeError。
+    # 两者缺一即整个 scheduled 扫描跳过 —— 既有 scheduler 逻辑因此零改动。
+    due_scheduled = getattr(deps, "due_scheduled_users", None)
+    fire_scheduled = getattr(deps, "fire_scheduled", None)
+    scheduled_fired = 0
+    if due_scheduled is not None and fire_scheduled is not None:
+        for user_id in due_scheduled():
+            try:
+                scheduled_fired += int(fire_scheduled(user_id) or 0)
+            except Exception:  # noqa: BLE001 — 单用户失败不能中断整轮扫描
+                logger.exception("scheduler: fire_scheduled failed for user %s", user_id)
+
+    # capture/dream 抽取扫描（Task 4）—— 与上面的 scheduled 扫描同构：两个新 dep 同样
+    # getattr 探测（既有 FakeDeps 没有这两个属性，直接取会 AttributeError），缺一即整段跳过；
+    # 每用户 try/except（logger.exception），单用户失败绝不中断整轮扫描（与 heartbeat/
+    # scheduled 的隔离口径一致）。
+    extraction_users = getattr(deps, "extraction_users", None)
+    tick_extraction = getattr(deps, "tick_extraction", None)
+    extraction_enqueued = 0
+    if extraction_users is not None and tick_extraction is not None:
+        for user_id in extraction_users():
+            try:
+                extraction_enqueued += int(tick_extraction(user_id) or 0)
+            except Exception:  # noqa: BLE001 — 单用户失败不能中断整轮扫描
+                logger.exception("scheduler: tick_extraction failed for user %s", user_id)
+
+    return {"considered": considered, "enqueued": enqueued, "skipped": skipped,
+            "scheduled_fired": scheduled_fired, "extraction_enqueued": extraction_enqueued}

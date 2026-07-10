@@ -35,6 +35,7 @@ respond/append_reply 不再是 TurnDeps 的字段：worker.process_job 现在直
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -54,6 +55,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from accounts import registry as accounts_registry  # noqa: E402
+from admin import admin_core
 from agent_runtime import spawners as agent_spawners
 from capabilities import registry as cap_registry
 from core import enclave as core_enclave
@@ -62,11 +64,16 @@ from core import runtime_token
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from hosted import config_store as hosted_config_store
+from identity import identity_core
+from memory import memory_core
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import worker as v2_worker
+from proactive import capture_scheduler
+from proactive import dream_scheduler
 from proactive import gate as proactive_gate
 import db
+import memory_readside_core
 
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
 
@@ -78,6 +85,12 @@ _ASSISTANT_ROLES = ("openclaw", "assistant", "agent")
 # only verifies signature+expiry+user_id, not scope — see enclave/auth.py
 # local_user_id_from_token) doesn't silently start rejecting this worker.
 _RUNTIME_TOKEN_SCOPE = ["envelope_decrypt"]
+
+# 本 V2 worker 触发 self-wake timer 时用的 owner_id。**必须**与 proactive_core 的
+# RESIDENT_RUNTIME_OWNER_ID_V2（"resident_runtime_v2"）不同 —— fire_due_timers 的
+# claim_due CAS 用 owner_id 标记谁抢到了 timer，若两者同名，一个 V2 worker 的 claim
+# 会与常驻 runtime 的 claim 相互混淆/相互认作对方。
+_V2_WAKE_OWNER_ID = "hosted_runtime_v2"
 
 _IMAGE_MARKER = "[image]"
 # 只为最近 N 个图片行解 caption。compaction 用 limit=10_000 调 _read_tail，没有这个上限
@@ -297,6 +310,35 @@ def _wake_decision_for_user(user_id: str) -> dict:
     }
 
 
+def _fire_scheduled_for_user(user_id: str) -> int:
+    """触发该用户所有到期的 self-wake timer，每个转成一个 `scheduled` lane 的 agent_job。
+
+    复用 `ScheduledWakeServiceV2.fire_due_timers` 的注入缝：把 legacy 的
+    `submit_wake`（塞进 proactive_jobs 流，V2 下无人排空 = BUG-3）换成 enqueue_job。
+    claim/mark_fired 的原子性由 fire_due_timers 内部的 claim_due CAS 保证，多个
+    scheduler 实例并发跑也不会重复触发。gate（未激活/免打扰）原样复用，零漂移。
+    镜像 `proactive_core.scheduled_fire` 的 settings/service 构造，只换 owner_id 与
+    submit_wake 的落点。"""
+    from proactive.controls_v2 import WakeControlDecisionV2
+    from proactive.scheduled_wake_v2 import DBScheduledWakeStoreV2, ScheduledWakeServiceV2
+    from proactive.store_v2 import DBProactiveSettingsStoreV2
+
+    settings = DBProactiveSettingsStoreV2().load(user_id)
+    service = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id=_V2_WAKE_OWNER_ID)
+    fired = 0
+
+    def _submit(event):
+        nonlocal fired
+        jobs_store.enqueue_job(user_id, "scheduled", reason="scheduled_wake")
+        core_wake_bus.notify("v2_jobs", user_id)
+        fired += 1
+        return WakeControlDecisionV2(True, "queued_v2", settings)
+
+    service.fire_due_timers(user_id, settings=settings, submit_wake=_submit,
+                            owner_id=_V2_WAKE_OWNER_ID)
+    return fired
+
+
 def _is_official(provider_config) -> bool:
     """包一层 `agent_runtime.spawners._is_official_identity`——worker.py 不能自己 import
     agent_runtime（hosted-adjacent），所以这个判定只能在装配层做好、经 TurnDeps 注入。
@@ -343,6 +385,148 @@ def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
     return out
 
 
+# 记忆抽取上下文一次拉多少张卡喂 dream prompt。dream 只需要一份粗粒度的现有卡片清单
+# 供模型判断哪些能合并；不是全量导出，控制 prompt 体积 + 一次 enclave 往返的候选数。
+_MEMORY_CARDS_LIMIT = int(os.environ.get("FEEDLING_V2_MEMORY_CARDS_LIMIT", "60"))
+
+
+def _render_card_line(item: dict) -> str:
+    """一张记忆卡渲染成一行（title/summary/content 里第一个非空的），仅供 dream prompt 参考。
+    卡内容经 enclave readside 解出明文（见 memory_index_core），服务器本地不再解密。"""
+    if not isinstance(item, dict):
+        return ""
+    text = str(item.get("title") or item.get("summary") or item.get("content") or "").strip()
+    mid = str(item.get("id") or "").strip()
+    if not text:
+        return ""
+    return f"- [{mid}] {text}" if mid else f"- {text}"
+
+
+def _read_memory_context(user_id: str) -> dict:
+    """capture/dream prompt 要的记忆上下文（buckets/threads/identity/cards 明文串）。
+
+    **每一项独立 try/except 降级为 ""**（spec §3.5）：任一子取数失败绝不清空其它项、绝不
+    抛——两个 prompt builder 对空串都会 fallback 到 "（暂无）"。buckets/threads/cards 走
+    enclave readside（用 runtime token 认证，服务器不本地解密）；runtime token 铸造失败
+    也只让这三项降级（token=""，post_enclave 会 raise 被各自 try 吞掉），不影响 identity。
+
+    identity 是 E2E 信封，服务器侧拿不到明文人格文本 —— 只取 get_identity 暴露的顶层
+    非敏感明文（如有），否则降级为 ""。ai_name/user_name 同样无服务器侧明文来源，保持 ""，
+    由 prompt builder fallback（"我"/"TA"）。"""
+    store = core_store.get_store(user_id)
+    try:
+        token = _mint_runtime_token(user_id)
+    except Exception as e:  # noqa: BLE001 — token 铸造失败只让读侧降级，不抛
+        log.warning("[v2.serve_worker] memory context token mint failed for %s: %s", user_id, e)
+        token = ""
+
+    def _post(api_key, candidates, *, operation, payload=None):
+        return memory_readside_core.post_enclave_readside(
+            api_key, candidates, operation=operation, payload=payload, runtime_token=token)
+
+    ctx = {"ai_name": "", "user_name": "", "buckets": "", "threads": "",
+           "identity": "", "cards": ""}
+    try:
+        body, status = memory_core.buckets(store, None, post_enclave=_post)
+        if status == 200:
+            ctx["buckets"] = ", ".join(str(b) for b in (body.get("buckets") or []))
+    except Exception as e:  # noqa: BLE001 — 单项降级
+        log.warning("[v2.serve_worker] memory buckets unavailable for %s: %s", user_id, e)
+    try:
+        body, status = memory_core.threads(store, None, post_enclave=_post)
+        if status == 200:
+            ctx["threads"] = ", ".join(str(t) for t in (body.get("threads") or []))
+    except Exception as e:  # noqa: BLE001 — 单项降级
+        log.warning("[v2.serve_worker] memory threads unavailable for %s: %s", user_id, e)
+    try:
+        body, status = memory_core.index(store, None, {"limit": _MEMORY_CARDS_LIMIT}, post_enclave=_post)
+        if status == 200:
+            lines = [_render_card_line(it) for it in (body.get("items") or [])]
+            ctx["cards"] = "\n".join(ln for ln in lines if ln)
+    except Exception as e:  # noqa: BLE001 — 单项降级
+        log.warning("[v2.serve_worker] memory index unavailable for %s: %s", user_id, e)
+    try:
+        body, status = identity_core.get_identity(store)
+        ident = body.get("identity") if isinstance(body, dict) else None
+        if status == 200 and isinstance(ident, dict):
+            # E2E 信封：服务器侧只有顶层非敏感明文（summary/title 若曾以明文写入），否则 ""。
+            ctx["identity"] = str(ident.get("summary") or ident.get("title") or "").strip()
+    except Exception as e:  # noqa: BLE001 — 单项降级
+        log.warning("[v2.serve_worker] identity unavailable for %s: %s", user_id, e)
+    return ctx
+
+
+def _apply_memory_actions(user_id: str, actions: list[dict]) -> dict:
+    """把抽取产出的 memory.add / memory.supersede action 落库（复用 /v1/memory/actions 的
+    服务端实现 memory_core.actions）。api_key=None：capture/dream 产出的 action 都自带完整
+    E2E 信封（extraction._to_actions 的 build_envelope），memory.add 走 _memory_add_action、
+    memory.supersede 走 envelope 分支（memory/actions.py:698），两条都不需要服务器解密旧卡，
+    因此 memory_core.actions 也无 runtime_token 形参（其签名只有 store/api_key/payload）。
+
+    顶层 status>=400（整批被拒）时抛 —— 让 worker._run_extraction 的自有 try/except 把它
+    转成静默 mark_failed（背景 job：不写气泡、不弹 error chip），而不是把一次失败的持久化
+    伪装成成功。"""
+    store = core_store.get_store(user_id)
+    body, status = memory_core.actions(store, None, {"actions": actions})
+    if status >= 400:
+        raise RuntimeError(f"memory_actions_failed: status={status} body={str(body)[:160]}")
+    return body
+
+
+def _build_memory_envelope(user_id: str, inner: dict) -> dict:
+    """把一张记忆卡的明文草稿 inner 封成 shared 客户端加密信封（E2E，本地加密，非 enclave
+    往返 —— 同 worker._write_encrypted_reply / _write_summary 的写法）。
+
+    **失败必抛**（不返回 None）：一张我们加密不了的记忆卡绝不能被静默丢弃。
+    extraction._to_actions 在 build_envelope 抛出时会把整批 to_actions 一并冒出去，交给
+    worker._run_extraction 的 try/except mark_failed —— 这正是我们要的：宁可整批失败重来，
+    也不要把半张卡/无信封的卡塞进 memory.actions。"""
+    store = core_store.get_store(user_id)
+    payload = json.dumps(inner, ensure_ascii=False).encode("utf-8")
+    env, err = core_envelope._build_shared_envelope_for_store(store, payload)
+    if env is None:
+        raise RuntimeError(f"memory_envelope_build_failed: {err}")
+    return env
+
+
+def _tick_capture_for_user(user_id: str) -> int:
+    """跑一遍 capture 触发闸（`capture_scheduler.tick_quiet_capture`），注入把 job 塞进
+    agent_jobs 的 submitter —— gate 的五道早退（capture_disabled/no_new_messages/
+    already_captured/quiet_not_due/min_interval）原样复用，零漂移（spec §3.1）。enqueue 了
+    返回 1，否则 0。"""
+    store = core_store.get_store(user_id)
+
+    def _submit(store, *, trigger, now):
+        job_id, _coalesced = jobs_store.enqueue_job(user_id, "capture", reason=trigger)
+        core_wake_bus.notify("v2_jobs", user_id)
+        return {"enqueued": True, "reason": "v2", "job": {"id": job_id}}
+
+    result = capture_scheduler.tick_quiet_capture(store, submit=_submit) or {}
+    return 1 if result.get("enqueued") else 0
+
+
+def _tick_dream_for_user(user_id: str) -> int:
+    """跑一遍 dream 触发闸（`dream_scheduler.tick_memory_dream`），注入把 job 塞进 agent_jobs
+    的 submitter —— gate 的全部早退（dream_disabled/no_memory_cards/dream_already_pending/
+    night_not_due/failure_backoff/already_dreamed/min_interval/not_enough_new_cards）原样复用，
+    零漂移。enqueue 了返回 1，否则 0。"""
+    store = core_store.get_store(user_id)
+
+    def _submit(store, *, trigger, now):
+        job_id, _coalesced = jobs_store.enqueue_job(user_id, "dream", reason=trigger)
+        core_wake_bus.notify("v2_jobs", user_id)
+        return {"enqueued": True, "reason": "v2", "job": {"id": job_id}}
+
+    result = dream_scheduler.tick_memory_dream(store, submit=_submit) or {}
+    return 1 if result.get("enqueued") else 0
+
+
+def _tick_extraction_for_user(user_id: str) -> int:
+    """一个 scheduler dep 驱动两条抽取 lane：先 capture 再 dream，返回两者 enqueue 计数之和。
+    两个触发闸各自独立（capture 看安静窗口，dream 看夜间+新卡阈值），互不影响。"""
+    return _tick_capture_for_user(user_id) + _tick_dream_for_user(user_id)
+
+
 def build_production_deps() -> v2_worker.TurnDeps:
     return v2_worker.TurnDeps(
         read_messages=_read_messages,
@@ -355,6 +539,9 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_summary=_read_summary,
         write_summary=_write_summary,
         read_images=_read_images,
+        read_memory_context=_read_memory_context,
+        apply_memory_actions=_apply_memory_actions,
+        build_memory_envelope=_build_memory_envelope,
     )
 
 
@@ -376,6 +563,19 @@ def _build_scheduler_deps():
         enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(uid, "heartbeat"),
         advance_heartbeat=lambda uid, next_at: jobs_store.upsert_wake_schedule(
             uid, next_heartbeat_at=next_at),
+        # scheduled lane 生产者（BUG-3）：due_scheduled_users（Task 2）列出到期 self-wake
+        # timer 的用户，_fire_scheduled_for_user 逐用户走 fire_due_timers 把每个到期 timer
+        # 转成一个 `scheduled` lane 的 agent_job。scheduler.py 用 getattr 探测这两个属性。
+        due_scheduled_users=lambda: jobs_store.due_scheduled_users(),
+        fire_scheduled=_fire_scheduled_for_user,
+        # capture/dream 抽取 lane 生产者（Task 4）：extraction_users 列出当前处于 db_action_v2
+        # 模式的用户（admin_core.list_runtime_modes 已按模式分组，取 db_action_v2 那组即
+        # list_agent_runtime_enabled_users 的反集，无需另起一条查询）；_tick_extraction_for_user
+        # 逐用户跑 capture+dream 触发闸，各自命中安静窗口/夜间阈值时 enqueue 一个抽取 job。
+        # scheduler.py 同样用 getattr 探测这两个属性（缺一即整段跳过，既有 FakeDeps 零改动）。
+        extraction_users=lambda: admin_core.list_runtime_modes().get(
+            hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []),
+        tick_extraction=_tick_extraction_for_user,
     )
 
 

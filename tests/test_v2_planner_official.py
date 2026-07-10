@@ -21,10 +21,14 @@ import provider_client  # noqa: E402
 from capabilities import registry as cap_registry  # noqa: E402
 from model_api_runtime.v2 import planner as v2_planner  # noqa: E402
 
-# Task 4 vocab reconcile: these 5 verbs must never survive validate_plan/rule fallback
-# for the foreground chat path — scheduling/capture/sleep belong to subproject D.
+# Vocab reconcile: these control verbs must never survive validate_plan/rule fallback
+# for the foreground chat path — capture/dream/sleep belong to subproject D.
+# NB: schedule_wake / cancel_wake were retired here originally, but the scheduled-lane
+# round promoted them to real WRITE capabilities (registry.WRITE_ACTIONS); they are now
+# a legitimate part of the planner vocabulary and MUST survive validate_plan, so they
+# are no longer in this retired set.
 _REMOVED_CONTROL_VERBS = frozenset({
-    "capture_memory", "schedule_followup", "schedule_wake", "cancel_wake", "sleep",
+    "capture_memory", "schedule_followup", "sleep",
 })
 
 _USER_KEY = "sk-user-byok-real"
@@ -89,7 +93,7 @@ def test_official_planner_falls_back_to_rule_on_provider_error(monkeypatch):
 
 def test_official_planner_drops_removed_control_verbs_and_falls_back(monkeypatch):
     """A stray/unknown-model reply that still tries to speak the retired vocabulary
-    (schedule_wake/capture_memory/sleep/...) must never reach the executor as a
+    (capture_memory/schedule_followup/sleep/...) must never reach the executor as a
     'promised' action — validate_plan drops them, the plan goes empty, and
     official_plan falls back to the deterministic rule planner (chat lane here),
     which itself only emits registry-clean actions."""
@@ -97,7 +101,7 @@ def test_official_planner_drops_removed_control_verbs_and_falls_back(monkeypatch
     async def _probe(config, messages, **kw):
         return {"reply": json.dumps({
             "plan": [
-                {"type": "schedule_wake", "payload": {"at": "later"}},
+                {"type": "schedule_followup", "payload": {}},
                 {"type": "capture_memory", "payload": {}},
                 {"type": "sleep", "payload": {}},
                 {"type": "not_a_real_action", "payload": {}},

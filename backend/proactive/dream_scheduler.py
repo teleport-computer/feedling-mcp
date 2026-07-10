@@ -10,7 +10,7 @@ import hashlib
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 import db
@@ -208,7 +208,10 @@ def _dream_enabled(store) -> bool:
         return True
 
 
-def tick_memory_dream(store, *, now: float | None = None, force: bool = False) -> dict[str, Any]:
+def tick_memory_dream(
+    store, *, now: float | None = None, force: bool = False,
+    submit: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     now_ts = time.time() if now is None else float(now)
     state = load_dream_state(store)
     if not _dream_enabled(store):
@@ -259,26 +262,39 @@ def tick_memory_dream(store, *, now: float | None = None, force: bool = False) -
         }
 
     key = dream_key_for_snapshot(state, snapshot)
-    stats = {
-        "card_count": card_count,
-        "new_cards": new_cards,
-        "new_turns": new_turns,
-        "last_dreamed_card_count": last_count,
-        "last_dreamed_turn_count": last_turn_count,
-        "turn_count": turn_count,
-        "signature": snapshot.get("signature") or "",
-    }
-    job, enqueued, reason = capture_jobs.enqueue_memory_dream_job(
-        store,
-        trigger="force_dream" if force else "nightly_dream",
-        dream_key=key,
-        dream_until={
+    trigger = "force_dream" if force else "nightly_dream"
+    # V2 seam（同 capture_scheduler.tick_quiet_capture）：默认 None = 今天的行为
+    # （append 进 legacy proactive_jobs 流）。V2 的 scheduler 传入一个把 job 塞进
+    # agent_jobs 的 submitter —— 上面的所有早退（disabled / no_memory_cards /
+    # dream_already_pending / night_not_due / failure_backoff / already_dreamed /
+    # min_interval / not_enough_new_cards）原样复用，零漂移。submit 的返回值
+    # 直接就是这个函数的 enqueue 结果，形状与 legacy 分支一致。
+    if submit is not None:
+        submitted = submit(store, trigger=trigger, now=now_ts)
+        job = submitted.get("job")
+        enqueued = bool(submitted.get("enqueued"))
+        reason = submitted.get("reason")
+    else:
+        stats = {
+            "card_count": card_count,
+            "new_cards": new_cards,
+            "new_turns": new_turns,
+            "last_dreamed_card_count": last_count,
+            "last_dreamed_turn_count": last_turn_count,
+            "turn_count": turn_count,
             "signature": snapshot.get("signature") or "",
-            "last_until": snapshot.get("last_until") or "",
-        },
-        dream_stats=stats,
-        now=now_ts,
-    )
+        }
+        job, enqueued, reason = capture_jobs.enqueue_memory_dream_job(
+            store,
+            trigger=trigger,
+            dream_key=key,
+            dream_until={
+                "signature": snapshot.get("signature") or "",
+                "last_until": snapshot.get("last_until") or "",
+            },
+            dream_stats=stats,
+            now=now_ts,
+        )
     # Only arm pending for a genuinely in-flight job (mirror capture fix): arming on
     # a terminal duplicate is what caused the permanent dream_already_pending lock.
     if job is not None and (enqueued or capture_jobs._active_dream_job(job)):

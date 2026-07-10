@@ -21,13 +21,15 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import status_stream
 
 # 非 capability 的 planner 控制/延迟 action（final_response/preliminary_response 由
-# responder 作者；sleep/capture_memory/schedule_followup/schedule_wake/cancel_wake 是
-# worker/别的子系统解读的控制动作）。executor 只排空已注册 capability，其余（含这些
-# 已知控制类型和任何未知 type）一律 SKIP —— 不跑、不算失败、不进 action_results/digest。
+# responder 作者；sleep/capture_memory/schedule_followup 是 worker/别的子系统解读的控制
+# 动作）。executor 只排空已注册 capability，其余（含这些已知控制类型和任何未知 type）一律
+# SKIP —— 不跑、不算失败、不进 action_results/digest。
 # 这个 frozenset 只用来在文档/日志里点名常见控制类型；真正判定看 _split_plan。
+# 注意：schedule_wake/cancel_wake 曾在此列——Task 4 起它们是真正的 WRITE capability
+# （registry.WRITE_ACTIONS），由 executor 串行跑，不再是控制动作。
 _CONTROL_ACTIONS = frozenset({
     "final_response", "preliminary_response", "sleep", "capture_memory",
-    "schedule_followup", "schedule_wake", "cancel_wake",
+    "schedule_followup",
 })
 
 
@@ -37,8 +39,9 @@ def _split_plan(plan: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
     只有 type ∈ cap_registry.CAPABILITIES（即 READ_ACTIONS ∪ WRITE_ACTIONS）的 action
     才会真的跑：读入 reads（读并行闸），写入 writes（严格串行）。其余一律进 skipped——
     包括 final_response/preliminary_response（responder 的活）、sleep/capture_memory/
-    schedule_followup/schedule_wake/cancel_wake（worker 或别的子系统解读的控制 action）、
-    以及任何未知 type。skipped 不跑 run_capability、不算 FAILURE、不进 action_results/
+    schedule_followup（worker 或别的子系统解读的控制 action）、以及任何未知 type。
+    （schedule_wake/cancel_wake 现在是 WRITE capability，走 writes 桶，不再 skip。）
+    skipped 不跑 run_capability、不算 FAILURE、不进 action_results/
     action_digest——它们不是本轮 executor 的职责，误跑/误标失败会把「正常的控制流」
     喂成假失败塞回 runtime_state，污染下一轮 planner 的输入。
     """
@@ -118,7 +121,7 @@ async def execute_plan(
 ) -> dict[str, Any]:
     """排空 plan：读并行（read_parallelism 闸）、写严格串行；非 capability 的控制/未知
     action（final_response/preliminary_response/sleep/capture_memory/schedule_followup/
-    schedule_wake/cancel_wake/任何未知 type）一律 SKIP——不跑、不算失败。
+    任何未知 type）一律 SKIP——不跑、不算失败。
 
     返回 {"action_results": {action_type: [result_dict,...]}, "action_digest": {action_type:
     {"ok","count"}}}。action_results 含敏感 data，只在内存传给 responder；action_digest
