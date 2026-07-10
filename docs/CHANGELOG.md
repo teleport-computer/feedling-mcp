@@ -47,6 +47,30 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-11
+
+### [DONE] Hosted Runtime V2 安全审计跟进进入 draft PR；用户切换仍 HOLD
+
+- 以 `feat/hosted-runtime-v2` 的 `bfc8862` 为审计基线，提交 bounded follow-up
+  `20c4b0b`，并开出以该 feature branch 为 base 的
+  [draft PR #70](https://github.com/teleport-computer/feedling-mcp/pull/70)；没有合进
+  `main`、没有部署、没有切任何用户。
+- 关闭本轮三个直接 blocker：chat 入队即有 queue deadline，pending/active 由独立
+  reaper 终态化并显示错误；Anthropic/Gemini 的 AnyIO limiter 按 worker slots 扩容
+  （native async 仍是后续）；rollout CLI 改用包含 planner rounds + responder 的
+  loop-aware tokens/turn 口径。
+- 同批补齐 mixed-version queue/lease 兼容、per-user 跨 lane 串行、late-input successor、
+  strict chat durability、runtime/effect fences、worker identity/slot supervision、迁移图修复、
+  隐私 scrub、SSRF/redirect/body cap 与 enclave-private memory search。验证：focused
+  **385 passed**，Alembic 单 head `0024_v2_worker_capacity`，真实 PostgreSQL
+  `0020→0024` 升级通过；共享 fixture gate 为 **574.0 tokens/turn、2.3333 calls/turn**。
+- **仍是 NO-GO**：resident→V2 稳定 cursor/generation、transactional outbox + 幂等 effects、
+  永久 hung call 的硬恢复、effect commit 原子 generation fence、tool-output prompt-injection
+  trust boundary、summary coverage/retention invariant、保留 Genesis 的 live pool kill switch
+  未完成。完整验收合同与工程师交接见
+  [Hosted Runtime V2 audit handoff](HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md)，运维顺序见
+  [rollout runbook](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)。
+
 ## 2026-07-09
 
 ### [DONE] 用户 MCP 服务器（user_mcp）—— 配置分发模型
