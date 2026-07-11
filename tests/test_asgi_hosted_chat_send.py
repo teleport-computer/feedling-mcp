@@ -27,6 +27,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import asgi_app  # noqa: E402
+import db  # noqa: E402
 import debug_trace  # noqa: E402
 import provider_client  # noqa: E402
 from accounts import registry  # noqa: E402
@@ -116,7 +117,13 @@ def _register() -> tuple[str, str]:
     )
     assert res.status_code == 201, res.get_data(as_text=True)
     body = res.get_json()
-    return body["user_id"], body["api_key"]
+    uid = body["user_id"]
+    # This whole file exercises the legacy resident chat-send path
+    # (agent_runtime_cutover.handle_send / wait_for_reply parity between
+    # Flask and ASGI). db_action_v2 is now the global default, so opt this
+    # user explicitly back into resident_cli.
+    db.set_blob(uid, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
+    return uid, body["api_key"]
 
 
 def _setup_openrouter(api_key: str, monkeypatch) -> None:
