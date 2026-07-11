@@ -77,15 +77,18 @@ def _openrouter_reasoning_request(effort: str) -> dict:
 
     codex only ever speaks the OpenAI Responses wire, and OpenRouter serves it
     NATIVELY (OpenRouterResponsesAPIConfig, litellm 1.89.4) — not via the
-    responses->chat bridge. The Responses ``reasoning`` object only accepts
+    responses->chat bridge. The Responses ``reasoning`` object accepts
     {effort, summary}; a chat-wire {max_tokens} budget is silently dropped there
     (probed 2026-07-11 against /responses: effort -> 17 reasoning_tokens with a
     real chain, max_tokens -> 0). So emit effort for ALL OpenRouter families,
     Anthropic included. low/medium/high are the valid Responses effort values;
     anything else (incl. legacy numeric budgets) falls back to medium.
+    ``summary:auto`` makes OpenRouter Anthropic return visible reasoning summary
+    text; without it the response may only include encrypted_content that counts
+    tokens but cannot be shown (zhihao probe 2026-07-11 §3/§6.3).
     """
     normalized = effort if effort in _OPENROUTER_REASONING_EFFORTS else "medium"
-    return {"effort": normalized}
+    return {"effort": normalized, "summary": "auto"}
 
 
 def gateway_model_id(user_id: str) -> str:
