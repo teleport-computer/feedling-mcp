@@ -80,6 +80,9 @@ def _mint(user_id: str) -> str:
 
 def test_runtime_token_turn_decrypts_provider_key_and_routes(client, monkeypatch):
     user_id, api_key = _register(client)
+    # Exercises the legacy resident-cli chat-send path (agent_runtime_cutover
+    # monkeypatches below); db_action_v2 is now the global default, so opt out.
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
 
     # 1) Configure + test the provider with the user's real api_key (works today).
     monkeypatch.setattr(

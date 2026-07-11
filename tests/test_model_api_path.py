@@ -298,6 +298,9 @@ def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_budget(clien
     route = db.model_api_active_route(user_id)
     assert route["reasoning_effort"] == "medium"
 
+    # Resident discovery (list_agent_runtime_enabled_users) now only admits
+    # explicit resident_cli opt-outs; db_action_v2 is the global default.
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
     row = rows[user_id]
     assert row["reasoning_effort"] == "medium"
@@ -700,6 +703,9 @@ def test_history_import_relationship_date_accepts_flexible_user_input():
 
 def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypatch):
     user_id, api_key = _register(client)
+    # Exercises the legacy resident-cli chat-send path (agent_runtime_cutover
+    # monkeypatches below); db_action_v2 is now the global default, so opt out.
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
 
     monkeypatch.setattr(
         provider_client,
@@ -928,7 +934,10 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
 
 
 def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
-    _, api_key = _register(client)
+    user_id, api_key = _register(client)
+    # Exercises the legacy resident-cli chat-send path (agent_runtime_cutover
+    # monkeypatches below); db_action_v2 is now the global default, so opt out.
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
 
     monkeypatch.setattr(
         provider_client,

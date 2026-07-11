@@ -25,10 +25,12 @@ def _seed_model_api_user(uid):
     configure_model_api_route(uid, provider="anthropic", model="m")
 
 
-def test_default_mode_is_resident_cli():
+def test_default_mode_is_db_action_v2():
+    # Full cutover 2026-07-11: db_action_v2 is the global default. A user who has
+    # never had hosted_runtime_mode set runs on the V2 pool.
     _seed_model_api_user("u_mode_1")
     store = core_store.get_store("u_mode_1")
-    assert hosted_config_store.get_hosted_runtime_mode(store) == "resident_cli"
+    assert hosted_config_store.get_hosted_runtime_mode(store) == "db_action_v2"
 
 
 def test_set_and_get_db_action_v2():
@@ -57,12 +59,12 @@ def _seed_bare_user(uid):
 
 def test_set_without_model_api_config_raises_and_stays_default():
     # 用户没有 model_api config → set 无法落地，必须抛错（不能返回假成功），
-    # 且 get 仍回退默认 resident_cli（什么都没写进去）。
+    # 且 get 仍回退默认（全量翻转后为 db_action_v2，什么都没写进去）。
     _seed_bare_user("u_mode_4")
     store = core_store.get_store("u_mode_4")
     with pytest.raises(ValueError):
         hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
-    assert hosted_config_store.get_hosted_runtime_mode(store) == "resident_cli"
+    assert hosted_config_store.get_hosted_runtime_mode(store) == "db_action_v2"
 
 
 # ------------------------------------------------------------------
