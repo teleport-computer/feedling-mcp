@@ -135,9 +135,8 @@ def test_post_invalid_mode_returns_400(env):
 
     assert status == 400
     assert "error" in body
-    # Never silently coerced to a valid mode — nothing written, so get returns the
-    # global default (db_action_v2 after the 2026-07-11 cutover).
-    assert config_store.get_hosted_runtime_mode(core_store.get_store(uid)) == "db_action_v2"
+    # Never silently coerced to a valid mode.
+    assert config_store.get_hosted_runtime_mode(core_store.get_store(uid)) == "resident_cli"
 
 
 def test_post_user_with_no_model_api_config_returns_400(env):
@@ -184,8 +183,7 @@ def test_get_returns_current_mode(env):
     assert body == {"user_id": uid, "hosted_runtime_mode": "db_action_v2"}
 
 
-def test_get_defaults_to_db_action_v2_when_unset(env):
-    # Full cutover 2026-07-11: an unset user reports the global default db_action_v2.
+def test_get_defaults_to_resident_cli_when_unset(env):
     uid = _uid("rtmode_default")
     _seed_model_api_user(uid)
 
@@ -194,7 +192,7 @@ def test_get_defaults_to_db_action_v2_when_unset(env):
     )
 
     assert status == 200
-    assert body == {"user_id": uid, "hosted_runtime_mode": "db_action_v2"}
+    assert body == {"user_id": uid, "hosted_runtime_mode": "resident_cli"}
 
 
 # --------------------------------------------------------------------------- #

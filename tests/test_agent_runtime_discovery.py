@@ -89,12 +89,6 @@ def _seed_model_api(user_id: str, *, provider: str, test_status: str,
     if test_status:
         db.model_api_route_mark_test(user_id, rid, status=test_status)
     db.model_api_route_activate(user_id, rid)
-    # Full cutover 2026-07-11: db_action_v2 is the global default, so the resident
-    # discovery query (list_agent_runtime_enabled_users) now admits ONLY users who
-    # explicitly opted back to resident_cli. These tests exercise that resident
-    # roster, so mark every seeded user resident_cli — otherwise they default to V2
-    # and the roster comes back empty.
-    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
 
 
 def _seed_all(_clean_blobs):
