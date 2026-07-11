@@ -315,9 +315,6 @@ def test_roster_only_returns_active_ok_routes(backend_env):
     db.model_api_route_mark_test(uid, r_sonnet, status="ok")
     db.model_api_route_mark_test(uid, r_haiku, status="ok")
     db.model_api_route_activate(uid, r_sonnet)
-    # Resident discovery now only admits explicit resident_cli opt-outs;
-    # db_action_v2 is the global default.
-    db.set_blob(uid, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
 
     roster = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
     assert len(roster) == 1
@@ -447,9 +444,6 @@ def test_roster_supports_responses_bool_conversion_from_real_column(backend_env)
     r = db.model_api_route_upsert(uid, cid, "gpt-5", None)
     db.model_api_route_mark_test(uid, r, status="ok")
     db.model_api_route_activate(uid, r)
-    # Resident discovery now only admits explicit resident_cli opt-outs;
-    # db_action_v2 is the global default.
-    db.set_blob(uid, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
 
     rows = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
     assert len(rows) == 1

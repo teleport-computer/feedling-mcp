@@ -690,9 +690,6 @@ def test_history_import_relationship_date_accepts_flexible_user_input():
 
 def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypatch):
     user_id, api_key = _register(client)
-    # Exercises the legacy resident-cli chat-send path (agent_runtime_cutover
-    # monkeypatches below); db_action_v2 is now the global default, so opt out.
-    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
 
     monkeypatch.setattr(
         provider_client,
@@ -921,10 +918,7 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
 
 
 def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
-    user_id, api_key = _register(client)
-    # Exercises the legacy resident-cli chat-send path (agent_runtime_cutover
-    # monkeypatches below); db_action_v2 is now the global default, so opt out.
-    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
+    _, api_key = _register(client)
 
     monkeypatch.setattr(
         provider_client,

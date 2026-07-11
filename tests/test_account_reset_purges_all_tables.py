@@ -206,7 +206,6 @@ def test_reset_stops_hosted_agent(client):
     rid = _db.model_api_route_upsert(uid, cid, "claude-x", None)
     _db.model_api_route_mark_test(uid, rid, status="ok")
     _db.model_api_route_activate(uid, rid)
-    _db.set_blob(uid, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     with _db.get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO agent_runtime_instances (user_id, driver, status, runtime_home) "
