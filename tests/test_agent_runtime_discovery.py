@@ -154,6 +154,19 @@ def test_list_enabled_users_empty_when_no_tested_config(_clean_blobs):
     assert db.list_agent_runtime_enabled_users() == []
 
 
+def test_list_enabled_users_propagates_database_failure(monkeypatch):
+    # This query is destructive desired-state input for the resident supervisor:
+    # [] means "stop every child", so a DB outage must not be coerced to empty.
+    monkeypatch.setattr(
+        db,
+        "get_pool",
+        lambda: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        db.list_agent_runtime_enabled_users()
+
+
 
 # ---- new semantics: test_ok + fit provider → discovered, no per-user flag ----
 

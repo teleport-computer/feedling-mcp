@@ -109,6 +109,13 @@
   `20c4b0b`，并开出以该 feature branch 为 base 的
   [draft PR #70](https://github.com/teleport-computer/feedling-mcp/pull/70)；没有合进
   `main`、没有部署、没有切任何用户。
+- 工程师随后把 feature branch 推到 `0333bc4`，用“缺失/非法 mode = V2”做隐式全量
+  切换。child branch 保留该提交历史并以 `f08fe5a` 显式 revert：只有明确
+  `db_action_v2` 才进 V2；缺失/非法仍走 resident，mode 读取失败拒绝路由；resident
+  discovery 的 DB 失败不再伪装成空 roster 而误杀全 fleet，admin/scheduler 列表也会
+  枚举没有 runtime blob 的 active-route 用户。该 reconciliation slice **109 passed**；
+  broader changed-surface 为 **680 passed / 1 xfailed / 3 个已在 engineer tree 复现的
+  baseline failures**。
 - 关闭本轮三个直接 blocker：chat 入队即有 queue deadline，pending/active 由独立
   reaper 终态化并显示错误；Anthropic/Gemini 的 AnyIO limiter 按 worker slots 扩容
   （native async 仍是后续）；rollout CLI 改用包含 planner rounds + responder 的
@@ -124,6 +131,9 @@
   未完成。完整验收合同与工程师交接见
   [Hosted Runtime V2 audit handoff](HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md)，运维顺序见
   [rollout runbook](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)。
+- 存储词汇校正：conversation summary/trajectory 的产品要求是 storage-agnostic；当前外部
+  RDS adapter 用 envelope encryption，目标 pg CVM 则在 LUKS2 FDE 盘上存 plaintext 并
+  删除 envelope/decrypt/rewrap 层。模型在两种拓扑中都只在授权 CVM 内看到 plaintext。
 
 ## 2026-07-09
 

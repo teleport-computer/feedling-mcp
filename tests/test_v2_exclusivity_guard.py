@@ -61,3 +61,16 @@ def test_resident_cli_mode_or_absent_still_included(_clean_blobs):
 
     assert "usr_explicit_resident" in rows
     assert "usr_no_runtime_blob" in rows
+
+
+def test_invalid_runtime_mode_remains_in_resident_roster(_clean_blobs):
+    _seed_enabled("usr_invalid_runtime_mode")
+    db.set_blob(
+        "usr_invalid_runtime_mode",
+        "model_api_runtime",
+        {"hosted_runtime_mode": "not-a-mode"},
+    )
+
+    rows = {u["user_id"] for u in db.list_agent_runtime_enabled_users()}
+
+    assert "usr_invalid_runtime_mode" in rows

@@ -913,6 +913,17 @@ def test_discover_enabled_calls_db_with_no_args(monkeypatch):
     assert captured["called"] is True
 
 
+def test_discover_enabled_propagates_database_failure(monkeypatch):
+    monkeypatch.setattr(
+        supervisor_mod.db,
+        "list_agent_runtime_enabled_users",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        supervisor_mod._discover_enabled()
+
+
 # ---- Codex P2: preserve a cached provider key across transient credential failures ----
 
 

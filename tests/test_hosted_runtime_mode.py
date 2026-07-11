@@ -31,6 +31,18 @@ def test_default_mode_is_resident_cli():
     assert hosted_config_store.get_hosted_runtime_mode(store) == "resident_cli"
 
 
+def test_invalid_persisted_mode_falls_back_to_resident_cli():
+    uid = "u_mode_invalid_persisted"
+    _seed_model_api_user(uid)
+    db.set_blob(uid, hosted_config_store.MODEL_API_RUNTIME_BLOB, {
+        "hosted_runtime_mode": "not-a-mode",
+    })
+    store = core_store.get_store(uid)
+
+    assert hosted_config_store.get_hosted_runtime_mode(store) == "resident_cli"
+    assert hosted_config_store.get_hosted_runtime_mode_strict(store) == "resident_cli"
+
+
 def test_set_and_get_db_action_v2():
     _seed_model_api_user("u_mode_2")
     store = core_store.get_store("u_mode_2")
