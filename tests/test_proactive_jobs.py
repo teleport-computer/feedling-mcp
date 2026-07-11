@@ -596,6 +596,9 @@ def test_proactive_tick_response_includes_wake_interval_sec(tmp_path, monkeypatc
     user_id = "usr_endpoint_proactive_tick_wake_interval"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    # Resident proactive-tick gate (proactive_gate) is the resident_cli path;
+    # db_action_v2 is now the global default, so opt back out for parity.
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
 
     client = make_client()
     headers = {"X-API-Key": api_key}
@@ -628,6 +631,7 @@ def test_proactive_activation_gate_blocks_self_initiated_wakes_until_first_chat_
     user_id = "usr_endpoint_proactive_activation_gate"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     store = core_store.get_store(user_id)
 
     blocked_payloads = [
@@ -721,6 +725,7 @@ def test_proactive_tick_delivery_off_still_allows_presence_wake(tmp_path, monkey
     user_id = "usr_endpoint_proactive_delivery_off_wake"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     _mark_proactive_activated(user_id)
 
     client = make_client()
@@ -755,6 +760,7 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     user_id = "usr_endpoint_proactive"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
 
     client = make_client()
     headers = {"X-API-Key": api_key}
@@ -815,6 +821,7 @@ def test_screen_watch_tick_preserves_job_kind_and_trigger(tmp_path, monkeypatch)
     user_id = "usr_screen_watch"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     _mark_proactive_activated(user_id)
 
     client = make_client()
@@ -863,6 +870,7 @@ def test_screen_watch_tick_does_not_sample_recent_frames_implicitly(tmp_path, mo
     user_id = "usr_screen_watch_no_sample"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     _mark_proactive_activated(user_id)
 
     client = make_client()
@@ -896,6 +904,7 @@ def test_auto_proactive_v2_wake_samples_frames_without_gate_llm(tmp_path, monkey
     user_id = "usr_endpoint_proactive_auto"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     _mark_proactive_activated(user_id)
     store = core_store.get_store(user_id)
     store.frames_meta.append({
@@ -933,6 +942,7 @@ def test_auto_proactive_v2_wake_does_not_block_after_recent_user_chat(tmp_path, 
     user_id = "usr_endpoint_proactive_recent_chat"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     _mark_proactive_activated(user_id)
     store = core_store.get_store(user_id)
     store.append_chat("user", "ios", {
@@ -971,6 +981,7 @@ def test_auto_proactive_v2_wake_does_not_require_gate_model(tmp_path, monkeypatc
     user_id = "usr_endpoint_proactive_auto_no_model"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     _mark_proactive_activated(user_id)
     store = core_store.get_store(user_id)
     store.frames_meta.append({
@@ -1000,6 +1011,7 @@ def test_auto_proactive_v2_wake_suppresses_job_without_frames(tmp_path, monkeypa
     user_id = "usr_endpoint_proactive_auto_false"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     _mark_proactive_activated(user_id)
 
     client = make_client()
@@ -1025,6 +1037,7 @@ def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(t
     user_id = "usr_endpoint_proactive_auto_schedule"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     _mark_proactive_activated(user_id)
 
     client = make_client()
@@ -1150,6 +1163,7 @@ def test_auto_proactive_v2_away_state_does_not_resurrect_legacy_wake_gate(tmp_pa
     user_id = "usr_endpoint_proactive_away"
     registry._key_to_user[registry._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    db.set_blob(user_id, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     _mark_proactive_activated(user_id)
 
     client = make_client()

@@ -427,10 +427,17 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runt
 
 
 # ---------------------------------------------------------------------------
-# hosted_runtime_mode —— per-user 灰度开关（Hosted Runtime V2 子项目 B）
-# resident_cli：现有常驻 CLI consumer 路径（默认，原样不动）。
+# hosted_runtime_mode —— per-user 运行时选择（Hosted Runtime V2 子项目 B/D）
+# resident_cli：旧的常驻 CLI consumer 路径。现在是显式 opt-OUT——用户必须把 blob
+#   明确写成 'resident_cli' 才留在旧路径。
 # db_action_v2：chat/send 入队 agent_jobs，由独立 V2 worker 池处理（spec §10）。
+#   **这是全局默认**（2026-07-11 全量翻转）：未设 / 非法值的用户一律走 V2。
 # 存进既有 model_api_runtime profile blob，两条路径并存。
+#
+# ⚠️ 默认值与 db.list_agent_runtime_enabled_users 的 D0 排他闸必须保持一致：
+# 闸只把**显式 resident_cli** 的用户收进常驻 roster；未设/db_action_v2 的用户被排除
+# → 走 V2。若两处的默认判定不一致，一个未设 blob 的用户会同时被 V2 和常驻 consumer
+# 接管（双跑）。改这里的默认时，务必同步改那个闸。
 # ---------------------------------------------------------------------------
 
 HOSTED_RUNTIME_MODE_RESIDENT = "resident_cli"
@@ -439,10 +446,11 @@ _HOSTED_RUNTIME_MODES = {HOSTED_RUNTIME_MODE_RESIDENT, HOSTED_RUNTIME_MODE_DB_AC
 
 
 def get_hosted_runtime_mode(store: UserStore) -> str:
-    """该用户的 hosted 运行时模式；未设或非法值一律回退默认 resident_cli。"""
+    """该用户的 hosted 运行时模式；未设或非法值一律回退默认 **db_action_v2**（全量
+    翻转 2026-07-11）。用户只有把 blob 明确写成 'resident_cli' 才留在旧常驻路径。"""
     profile = _load_model_api_runtime_profile(store) or {}
     mode = str(profile.get("hosted_runtime_mode") or "")
-    return mode if mode in _HOSTED_RUNTIME_MODES else HOSTED_RUNTIME_MODE_RESIDENT
+    return mode if mode in _HOSTED_RUNTIME_MODES else HOSTED_RUNTIME_MODE_DB_ACTION_V2
 
 
 def get_hosted_runtime_mode_strict(store: UserStore) -> str:

@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+import db  # noqa: E402
 import provider_client  # noqa: E402
 from accounts import registry as accounts_registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
@@ -57,7 +58,12 @@ def _register(client) -> tuple[str, str]:
     )
     assert res.status_code == 201, res.get_data(as_text=True)
     body = res.get_json()
-    return body["user_id"], body["api_key"]
+    uid = body["user_id"]
+    # This file exercises the legacy resident-cli chat-send routing path
+    # (agent_runtime_cutover.handle_send / check_supervisor_live parity).
+    # db_action_v2 is now the global default, so opt back into resident_cli.
+    db.set_blob(uid, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
+    return uid, body["api_key"]
 
 
 def _headers(api_key: str) -> dict[str, str]:
