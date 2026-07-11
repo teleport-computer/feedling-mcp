@@ -709,6 +709,29 @@ def test_effective_roster_empty_is_tolerated_not_fatal(monkeypatch):
     assert roster == [] and gateways == []
 
 
+def test_discovery_failure_stops_before_live_child_reconciliation(monkeypatch):
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    base = _roster("u_1")
+    sup.tick(base)
+    pid = sup.children["u_1"]["pid"]
+    monkeypatch.setattr(
+        supervisor_mod,
+        "_discover_enabled",
+        lambda include_gateway: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        roster, _gateways = supervisor_mod._effective_roster(
+            base, autodiscover=True, gateway_enabled=False,
+        )
+        sup.tick(roster)
+
+    assert procs.killed == []
+    assert sup.children["u_1"]["pid"] == pid
+    assert leases.get("u_1")["lease_owner"] == "sup_A"
+
+
 def test_wire_gateway_models_swaps_requested_model_to_gw_id():
     roster = [
         {"user_id": "c", "driver": "codex", "provider": "gemini", "model": "gemini-2.0-flash", "provider_key": "kc"},
@@ -855,7 +878,7 @@ def test_effective_roster_host_all_base_roster_overrides_by_user_id():
 
 
 def test_discover_enabled_threads_include_gateway_to_db(monkeypatch):
-    # host_all parameter removed; _discover_enabled now only passes include_gateway
+    # host_all parameter removed; _discover_enabled now only passes include_gateway.
     captured = {}
 
     def fake_list(include_gateway=False):
@@ -865,6 +888,17 @@ def test_discover_enabled_threads_include_gateway_to_db(monkeypatch):
     monkeypatch.setattr(supervisor_mod.db, "list_agent_runtime_enabled_users", fake_list)
     supervisor_mod._discover_enabled(include_gateway=True)
     assert captured == {"include_gateway": True}
+
+
+def test_discover_enabled_propagates_database_failure(monkeypatch):
+    monkeypatch.setattr(
+        supervisor_mod.db,
+        "list_agent_runtime_enabled_users",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        supervisor_mod._discover_enabled()
 
 
 # ---- Codex P2: preserve a cached provider key across transient credential failures ----

@@ -130,9 +130,11 @@ def get_runtime_mode(user_id: str) -> tuple[dict, int]:
 
 
 def list_runtime_modes() -> dict:
-    # Group user_ids by their persisted hosted_runtime_mode; absent/unknown
-    # values fall back to resident_cli (mirrors config_store.get_hosted_runtime_mode's
-    # default-on-missing-or-invalid behavior).
+    # Enumerate every user with an active provider route, not only users who
+    # already have a runtime-profile blob. Otherwise an unset (effective
+    # resident) user disappears from the admin view and from V2 scheduler
+    # eligibility calculations. The shared normalizer keeps missing/invalid
+    # semantics identical to chat routing and the per-user control endpoint.
     result: dict = {
         config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2: [],
         config_store.HOSTED_RUNTIME_MODE_RESIDENT: [],
@@ -140,18 +142,20 @@ def list_runtime_modes() -> dict:
     with db.get_pool().connection() as conn:
         rows = conn.execute(
             """
-            SELECT user_id, doc->>'hosted_runtime_mode' AS mode
-            FROM user_blobs
-            WHERE kind = 'model_api_runtime'
+            SELECT DISTINCT r.user_id, mrt.doc->>'hosted_runtime_mode' AS mode
+            FROM model_api_routes r
+            LEFT JOIN user_blobs mrt
+              ON mrt.user_id = r.user_id
+             AND mrt.kind = 'model_api_runtime'
+            WHERE r.is_active
+            ORDER BY r.user_id
             """
         ).fetchall()
     for row in rows:
         user_id = row[0] if not isinstance(row, dict) else row["user_id"]
         mode = row[1] if not isinstance(row, dict) else row["mode"]
-        if mode == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
-            result[config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2].append(user_id)
-        else:
-            result[config_store.HOSTED_RUNTIME_MODE_RESIDENT].append(user_id)
+        effective_mode = config_store.effective_hosted_runtime_mode(mode)
+        result[effective_mode].append(user_id)
     return result
 
 

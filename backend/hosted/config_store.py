@@ -438,19 +438,28 @@ HOSTED_RUNTIME_MODE_DB_ACTION_V2 = "db_action_v2"
 _HOSTED_RUNTIME_MODES = {HOSTED_RUNTIME_MODE_RESIDENT, HOSTED_RUNTIME_MODE_DB_ACTION_V2}
 
 
+def effective_hosted_runtime_mode(value: object) -> str:
+    """Return the rollout-safe effective mode for a persisted value.
+
+    V2 remains explicit opt-in until the fleet cutover gates are complete.
+    Missing, malformed, and unknown values therefore stay resident. Strict
+    callers surface database read failures before reaching this normalizer.
+    """
+    mode = str(value or "")
+    return mode if mode in _HOSTED_RUNTIME_MODES else HOSTED_RUNTIME_MODE_RESIDENT
+
+
 def get_hosted_runtime_mode(store: UserStore) -> str:
     """该用户的 hosted 运行时模式；未设或非法值一律回退默认 resident_cli。"""
     profile = _load_model_api_runtime_profile(store) or {}
-    mode = str(profile.get("hosted_runtime_mode") or "")
-    return mode if mode in _HOSTED_RUNTIME_MODES else HOSTED_RUNTIME_MODE_RESIDENT
+    return effective_hosted_runtime_mode(profile.get("hosted_runtime_mode"))
 
 
 def get_hosted_runtime_mode_strict(store: UserStore) -> str:
     """Control-plane read that distinguishes a DB error from an absent flag."""
     profile = db.get_blob_strict(store.user_id, MODEL_API_RUNTIME_BLOB)
     profile = profile if isinstance(profile, dict) else {}
-    mode = str(profile.get("hosted_runtime_mode") or "")
-    return mode if mode in _HOSTED_RUNTIME_MODES else HOSTED_RUNTIME_MODE_RESIDENT
+    return effective_hosted_runtime_mode(profile.get("hosted_runtime_mode"))
 
 
 def set_hosted_runtime_mode(store: UserStore, mode: str) -> str:

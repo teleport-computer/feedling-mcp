@@ -1,17 +1,19 @@
 # Hosted Runtime V2 audit and engineer handoff — 2026-07-11
 
 > Audited upstream: `feat/hosted-runtime-v2` at
-> `bfc88629cf8e81b267266581cfa466af5760e305`
+> `0333bc4f8a251d99570a6e0df57cafee751d99b7`
 > Follow-up branch: `codex/hosted-runtime-v2-p0-followup`
 > Intended PR base: `feat/hosted-runtime-v2`, not `main`
 
 ## Executive verdict
 
-The engineer did push new work during this audit. The feature-branch tip was
-force-rewritten from the earlier `de9e111` history and now ends at `bfc8862`
-(`feat: Update model API configuration handling and migration dependencies`).
-That update adds multi-profile model API storage and R2-backed chat-file handling.
-The follow-up was replayed and reconciled on that new tip.
+The engineer did push new work during this audit. After the earlier `bfc8862`
+multi-profile/R2 update, the feature branch advanced to `0333bc4`
+(`feat: Update hosted runtime mode handling and exclusivity logic for V2 cutover`).
+That commit made an absent or invalid runtime-mode value mean V2 globally, before
+the rollout gates below were satisfied. The follow-up branch merges that commit
+to preserve shared history and then explicitly reverts its implicit fleet cutover.
+V2 remains per-user explicit opt-in; no user was flipped or deployed here.
 
 Recommendation:
 
@@ -41,6 +43,27 @@ private memory search, response-size caps, and plaintext error scrubbing.
 It still does not satisfy the full product vision. The largest remaining work is
 architectural rather than a safe follow-up patch.
 
+The reconciliation also closes the hazards exposed by `0333bc4`: missing or
+invalid mode values remain resident; strict routing reads fail with 503 instead
+of guessing; resident discovery propagates database failures so the supervisor
+does not tear down a live fleet on an outage; and the grouped admin/scheduler
+view now includes active-route users whose runtime flag is absent.
+
+## Storage boundary — current adapter versus target architecture
+
+Encryption is not an extra conversation-compaction requirement. Today the
+external RDS adapter stores user conversation content and the V2 summary as
+envelopes; the runner/enclave path decrypts that content before it reaches the
+model. The target architecture in the walkthrough is different: Postgres moves
+inside its own CVM and stores plaintext on a LUKS2 full-disk-encrypted volume,
+with encrypted backups, while the envelope/decrypt/rewrap layer is deleted.
+
+Therefore the durable requirement is **storage-agnostic summary and trajectory
+persistence**. The current RDS implementation must encrypt content at its
+adapter boundary; the future pg-CVM adapter must not preserve application-level
+envelopes just for historical compatibility. In both designs the model receives
+plaintext conversation context inside the authorized CVM trust boundary.
+
 ## Vision scorecard
 
 **Overall: 1 PASS / 2 PARTIAL / 3 FAIL.**
@@ -48,11 +71,11 @@ architectural rather than a safe follow-up patch.
 | # | Vision requirement | Verdict | Current state |
 |---|---|---|---|
 | 1 | No silent hangs, visible deadlines/errors, outer fences, scalable provider concurrency | **PARTIAL** | Pending and active deadlines, independent reaping, safe terminal codes, owner fences, cross-lane serialization, slot supervision, capacity heartbeats, unique worker IDs, and a sized AnyIO limiter are present. Permanently hung calls can still consume every slot while static heartbeat capacity remains positive; native async and a hard watchdog/dynamic capacity remain open. |
-| 2 | Entire conversation, not a fixed-count window; encrypted append-only itemized summary and automatic compaction | **FAIL** | Encrypted summary storage, append-and-merge compaction, CAS, oldest-first catch-up, and a verbatim tail exist. Prompt assembly still uses hard message caps, and the base store deletes rows/R2 objects beyond 5,000 without proving summary coverage. |
+| 2 | Entire conversation, not a fixed-count window; storage-agnostic append-only itemized summary and automatic compaction | **FAIL** | Append-and-merge compaction, CAS, oldest-first catch-up, and a verbatim tail exist. The current RDS adapter envelope-encrypts the summary; the target pg-CVM adapter should store it as plaintext on LUKS2 FDE. Prompt assembly still uses hard message caps, and the base store deletes rows/R2 objects beyond 5,000 without proving summary coverage. |
 | 3 | One native tool-calling loop for every model; no official/rule tier; parallel tool batches; reply in loop; immediate message folding | **FAIL** | `agent_loop.py` provides bounded inner-round orchestration, but `planner.py` still branches on `is_official`, emits JSON plans, and calls a separate responder. New user input is reloaded only after the entire inner loop returns, not at every round boundary. Provider-native `tools=`, reply-as-tool, mid-turn acknowledgements, and observed-behavior fallback are absent. |
 | 4 | Planner/executor vocabulary parity, including schedule, web, and exact memory search | **PARTIAL** | Schedule, web search/fetch, and enclave-private memory search exist. Web fetch now has SSRF, redirect, and body-size controls. Memory matching is exact only inside the configured hard candidate cap (default 1,000); pagination/indexing and a single generated capability schema remain open. |
 | 5 | One deployment topology | **PASS** | Executable configuration places `serve-worker` in the runner CVM as a sibling entrypoint. It is not hosted in the main FastAPI process. Genesis is a dedicated thread in `serve-worker`. |
-| 6 | Prompt caching, real whole-turn load metrics, admission proof, typing prewarm, encrypted trajectories/dream review, resident retirement | **FAIL** | Slot-aware admission and a loop-aware offline comparator exist. Production whole-turn metrics, prompt caching, typing prewarm, encrypted trajectories, dream-lane failure replay, a real kill switch, and the final resident-retirement proof do not. |
+| 6 | Prompt caching, real whole-turn load metrics, admission proof, typing prewarm, durable trajectories/dream review, resident retirement | **FAIL** | Slot-aware admission and a loop-aware offline comparator exist. Production whole-turn metrics, prompt caching, typing prewarm, durable storage-adapted trajectories, dream-lane failure replay, a real kill switch, and the final resident-retirement proof do not. |
 
 ## What this child branch changes
 
@@ -180,7 +203,7 @@ tests.
    so prompt injection in fetched content cannot authorize memory/schedule or
    other durable writes.
 6. **Summary-coverage and retention invariant.** No prompt may omit a message
-   unless it is below the committed encrypted-summary watermark. Replace
+   unless it is below the committed summary-coverage watermark. Replace
    fixed-count context truncation, use a stable ordered cursor, and stop deleting
    DB/R2 chat history merely because it exceeds 5,000 rows.
 7. **Live turn-pool kill switch.** It must stop new admissions and claims,
@@ -217,11 +240,13 @@ tests.
 
 ### Full-history compaction and D-lane completion
 
-- Keep the encrypted summary itemized and append/merge only; never wholesale
+- Keep the summary itemized and append/merge only; never wholesale
   rewrite conversation meaning.
 - Use token budget plus summary coverage rather than a fixed message count.
 - Make CAS loss requeue/retry without advancing the losing watermark.
-- Persist encrypted trajectory/effect records with redacted observability.
+- Persist durable trajectory/effect records behind the same storage adapter:
+  envelope-encrypted on current external RDS, plaintext on the target LUKS2-FDE
+  pg CVM, with redacted observability in either topology.
 - Give capture/dream immutable input identity, durable pending/backoff state,
   idempotent memory effects, and failure replay into a dream/regression lane.
 - Add typing-signal prewarm and complete resident shutdown only after parity,
@@ -234,6 +259,13 @@ tests.
   model profiles and representative privacy scrubs.
 - Focused regression suite: **385 passed, 1 deprecation warning**.
 - Additional focused control/liveness slice: **211 passed**.
+- Post-`0333bc4` reconciliation slice: **109 passed**, covering missing,
+  invalid, unreadable, explicit-resident, and explicit-V2 modes plus discovery
+  outage preservation of a live resident child.
+- Broader changed-surface run: **680 passed, 1 expected xfail, 3 known baseline
+  failures**; the same registration-key fixture failure and two stale
+  `is_verify_reply` monkeypatch signatures were reproduced on the untouched
+  engineer tree.
 - Loop-aware token command: **574.0 tokens/turn**, **2.3333 calls/turn**, exit 0
   against the measured 9303.0 resident baseline and +10% threshold.
 
@@ -267,12 +299,16 @@ redesign into this already-large safety PR.
 
 ```text
 Please continue Hosted Runtime V2 from upstream
-bfc88629cf8e81b267266581cfa466af5760e305 and review the child branch
+0333bc4f8a251d99570a6e0df57cafee751d99b7 and review the child branch
 codex/hosted-runtime-v2-p0-followup. The child PR must target
 feat/hosted-runtime-v2, not main.
 
-The child already addresses the three immediate audit blockers and the bounded
-follow-on defects: pending queue deadlines plus independent visible reaping;
+The child preserves 0333bc4 in history but explicitly reverts its implicit
+default-to-V2 fleet cutover. Missing/invalid mode values remain resident, control
+read failures fail closed, resident discovery outages no longer look like an
+empty fleet, and the admin/scheduler mode view includes unset active-route users.
+It also addresses the three immediate audit blockers and the bounded follow-on
+defects: pending queue deadlines plus independent visible reaping;
 separate queue/lease clocks with old/new worker fallbacks; owner-fenced and
 per-user cross-lane execution; late-input successor jobs; strict chat reads and
 writes; active-route runtime errors; unique worker IDs and slot supervision;
@@ -293,9 +329,14 @@ Do not flip an internal user yet. Close these P0s first:
 
 Then finish the vision work: one provider-native tool loop for every model with
 no official/rule tier split; native async Anthropic/Gemini/OpenAI Responses;
-whole-turn production metrics; prompt caching; encrypted trajectories;
+whole-turn production metrics; prompt caching; durable storage-adapted trajectories;
 capture/dream lifecycle and failure replay; typing prewarm; and resident
 retirement only after fault injection, rollback, load, and soak gates pass.
+
+Storage terminology is deliberate: current external RDS uses envelope-encrypted
+content, while the target pg CVM stores plaintext on LUKS2 FDE and deletes the
+application envelope/decrypt layer. Do not turn encryption into a permanent
+compaction or trajectory requirement.
 
 Use docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md as the acceptance
 contract and attach evidence for every rollout gate. Treat 574.0 tokens/turn and

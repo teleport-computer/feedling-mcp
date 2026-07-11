@@ -35,7 +35,7 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 
 1. **Current state: HOLD.** The audit verdict is NO-GO for user flips until the prerequisites above and the handoff's P0 gates are closed. Once they pass, start with one explicitly consented internal user: `io_cli set-runtime-mode <internal_uid> db_action_v2`. Watch `/v1/admin/v2-metrics` (inflight/pending/wake success and current responder-only token samples) + error chips + subjective chat quality for 24–48 h. Treat production token metrics as non-authoritative until whole-turn aggregation lands.
 2. **Ramp cohorts**: 5 → 20 → 50 → all. `io_cli list-runtime-mode` to track who's on what. Each batch: confirm tokens/turn not regressed, queue-wait P95 within SLA, `wake.success_rate` healthy, `stuck_jobs ≈ 0`.
-3. **Mixed-fleet safety**: the D0 exclusivity guard keeps each user on exactly ONE path — a flipped user runs on V2 and their resident consumer is reaped (~15 s, next supervisor tick); an un-flipped user stays resident. No double-run.
+3. **Mixed-fleet safety**: the D0 exclusivity guard keeps each user on exactly ONE path — only an explicit `db_action_v2` value enrolls V2; missing/invalid values remain resident. A flipped user runs on V2 and their resident consumer is reaped (~15 s, next supervisor tick); an un-flipped user stays resident. A runtime-control read failure must refuse routing, and a resident-discovery query failure must skip reconciliation rather than look like an empty roster. No double-run and no outage-driven fleet teardown.
 
 ## Step 3 — Kill resident (the actual cost win)
 
@@ -53,6 +53,6 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 
 ## Deferred (explicit, out of this round)
 
-- **Default flip** (changing the `resident_cli` fallback default) — a separate one-line change once the fleet is stable and fully migrated; easy to revert.
+- **Default flip** — do not infer fleet membership from a missing blob. After every gate is complete, backfill existing users to an explicit mode and make onboarding persist its intended mode transactionally; only then consider changing new-user policy. A missing/invalid value remains a safety fallback, not a cutover signal.
 - **Authoritative 4c/8GB load run** — rerun Step 1 on CVM-class hardware if the local indicative numbers are borderline.
 - **Promoting genesis to its own container.** It is now a dedicated thread inside `serve-worker` rather than inside `agent-runner` — better, but still a thread in someone else's process. Its own service would give it a restart policy and a real crash domain. Costs one more `addComposeHash()`, so it was not bundled here.

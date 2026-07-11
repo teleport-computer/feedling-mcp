@@ -211,6 +211,20 @@ def test_list_runtime_modes_groups_by_mode(env):
     assert status == 200
     assert uid_v2 in body["db_action_v2"]
     assert uid_v2 not in body.get("resident_cli", [])
+    assert uid_resident in body["resident_cli"]
+    assert uid_resident not in body.get("db_action_v2", [])
+
+
+def test_list_runtime_modes_treats_invalid_value_as_resident(env):
+    uid = _uid("rtmode_list_invalid")
+    _seed_model_api_user(uid)
+    db.set_blob(uid, "model_api_runtime", {"hosted_runtime_mode": "not-a-mode"})
+
+    status, body = _asgi_json("GET", "/v1/admin/hosted-runtime-modes", headers=_admin())
+
+    assert status == 200
+    assert uid in body["resident_cli"]
+    assert uid not in body["db_action_v2"]
 
 
 # --------------------------------------------------------------------------- #

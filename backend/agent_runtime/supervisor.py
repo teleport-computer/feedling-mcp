@@ -692,7 +692,9 @@ def _discover_enabled(include_gateway: bool = False) -> dict[str, dict]:
     No per-user flag required — aligned with hosted/agent_runtime_cutover.resolve_driver.
     ``include_gateway`` mirrors whether the LiteLLM gateway is running — when off,
     gateway-only providers are excluded so they aren't spawned against a proxy that
-    isn't there."""
+    isn't there. The DB query is intentionally fail-loud: this result is destructive
+    desired state, and the main loop must skip reconciliation rather than mistake a
+    read outage for an empty resident fleet."""
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
                            "model": u.get("model", ""), "base_url": u.get("base_url", ""),
                            "supports_responses": bool(u.get("supports_responses", False)),
