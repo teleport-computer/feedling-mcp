@@ -569,6 +569,13 @@ class UserStore:
             "arrival_wake_enabled": True,
             "unlock_wake_enabled": True,
             "first_chat_ok_at": "",
+            # Durable "agent has done its first proactive self-introduction"
+            # marker, INDEPENDENT of the identity card (identity-card-never-gates,
+            # 2026-07). A no-card / empty-card user has no `self_introduction`
+            # field to write, so the intro's one-shot dedup can't live in the card
+            # — it lives here. Set once the introduction job is enqueued; see
+            # agent_runtime.supervisor._enqueue_introduction_job_if_needed.
+            "introduced_at": "",
             "updated_at": datetime.now().isoformat(),
         }
         try:
@@ -705,6 +712,27 @@ class UserStore:
             if str(cur.get("first_chat_ok_at") or "").strip():
                 return cur
             cur["first_chat_ok_at"] = str(at_iso or datetime.now().isoformat())
+            cur["version"] = 2
+            cur["updated_at"] = datetime.now().isoformat()
+            db.set_blob(self.user_id, "proactive_settings", cur)
+        return cur
+
+    def introduced_at(self) -> str:
+        settings = self.load_proactive_settings()
+        return str(settings.get("introduced_at") or "").strip()
+
+    def introduction_done(self) -> bool:
+        """True once the agent's first proactive self-introduction has been
+        enqueued for this user. Card-independent (see `introduced_at` default)
+        so no-card / empty-card users get exactly one introduction."""
+        return bool(self.introduced_at())
+
+    def mark_introduced(self, *, at_iso: str | None = None) -> dict:
+        with self.proactive_lock:
+            cur = self.load_proactive_settings()
+            if str(cur.get("introduced_at") or "").strip():
+                return cur
+            cur["introduced_at"] = str(at_iso or datetime.now().isoformat())
             cur["version"] = 2
             cur["updated_at"] = datetime.now().isoformat()
             db.set_blob(self.user_id, "proactive_settings", cur)

@@ -190,7 +190,7 @@ def test_model_api_validate_marks_genesis_done_steps_complete(monkeypatch):
     assert steps["hosted_chat"]["passing"] is True
 
 
-def test_model_api_validate_rejects_done_genesis_with_empty_identity_card(monkeypatch):
+def test_model_api_validate_accepts_done_genesis_with_empty_identity_card(monkeypatch):
     _install_model_api_harness(
         monkeypatch,
         identity={
@@ -214,11 +214,18 @@ def test_model_api_validate_rejects_done_genesis_with_empty_identity_card(monkey
     body = validation._model_api_onboarding_validation_payload(_store())
     steps = {step["id"]: step for step in body["steps"]}
 
-    assert body["passing"] is False
-    assert body["stage"] == "identity_card"
+    assert body["passing"] is True
+    assert body["stage"] == "complete"
     assert steps["identity_card"]["written"] is True
-    assert steps["identity_card"]["complete"] is False
-    assert steps["identity_card"]["passing"] is False
+    assert steps["identity_card"]["complete"] is True
+    assert steps["identity_card"]["passing"] is True
+    assert steps["identity_card"]["required"] == ""
+
+
+def test_identity_card_complete_accepts_written_empty_or_done_without_card():
+    assert validation._identity_card_complete({}) is True
+    assert validation._identity_card_complete(None, {"status": "done"}) is True
+    assert validation._identity_card_complete(None, {"status": "processing"}) is False
 
 
 def test_genesis_stage_mapped_to_legacy_phase_for_old_ios(monkeypatch):

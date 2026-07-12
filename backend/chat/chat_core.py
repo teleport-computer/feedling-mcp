@@ -376,7 +376,7 @@ def trace_response_gated(store: UserStore, payload: dict, allow_verify_reply: bo
     )
 
 
-def gate_response_dict(store: UserStore, allow_verify_reply: bool, is_verify_reply: bool = False):
+def gate_response_dict(store: UserStore, allow_verify_reply: bool):
     """Bridge to the shared bootstrap gate.
 
     ``boot_gates._gate_bootstrap_for_chat`` returns a framework-neutral
@@ -384,12 +384,11 @@ def gate_response_dict(store: UserStore, allow_verify_reply: bool, is_verify_rep
     application context is needed. Looked up on ``boot_gates`` at call time so test
     monkeypatches of ``_gate_bootstrap_for_chat`` are honored.
 
-    ``is_verify_reply`` (the current POST carries source="verify_ping") keeps the
-    hidden liveness probe on the forcing path even after the user has spoken —
-    only genuine user-facing replies bypass the needs_identity gate (A'').
+    Identity Card presence/content is not part of this gate. The remaining VPS
+    checks prove that a resident consumer and live chat loop are available.
     """
     gated = boot_gates._gate_bootstrap_for_chat(
-        store, allow_verify_reply=allow_verify_reply, is_verify_reply=is_verify_reply
+        store, allow_verify_reply=allow_verify_reply
     )
     if gated is None:
         return None

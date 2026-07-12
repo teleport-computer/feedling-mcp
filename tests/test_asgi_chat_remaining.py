@@ -226,16 +226,16 @@ def test_history_clear_success(user):
 
 
 # --------------------------------------------------------------------------- #
-# POST /v1/chat/response: bootstrap-gate parity (fresh user has no identity)
+# POST /v1/chat/response: bootstrap-gate parity
 # --------------------------------------------------------------------------- #
 
-def test_response_gate_parity_needs_identity(user):
+def test_response_gate_parity_needs_resident_consumer(user):
     _uid, api_key = user
     a_status, a_body = _asgi("POST", "/v1/chat/response", headers=_hk(api_key), json={})
     f = _flask_client().post("/v1/chat/response", headers=_hk(api_key), json={})
     assert a_status == f.status_code == 409
     assert a_body == f.get_json()
-    assert a_body["stage"] == "needs_identity"
+    assert a_body["stage"] == "needs_resident_consumer"
     assert a_body["error"] == "bootstrap_incomplete"
 
 

@@ -152,13 +152,8 @@ async def chat_response(request: Request, auth: AuthResult = Depends(require_aut
     allow_verify_reply = await threadpool.run_db(
         _allow_verify_reply_with_fresh_pending_check, store
     )
-    # is_verify_reply: this POST is the hidden liveness probe (source="verify_ping"),
-    # not a user-facing reply. Keeps verify pings on the needs_identity forcing
-    # path even after the user has spoken (A'' softening applies to visible replies
-    # only).
-    is_verify_reply = str(payload.get("source") or "") == "verify_ping"
     gated = await threadpool.run_db(
-        chat_core.gate_response_dict, store, allow_verify_reply, is_verify_reply
+        chat_core.gate_response_dict, store, allow_verify_reply
     )
     if gated is not None:
         await threadpool.run_db(chat_core.trace_response_gated, store, payload, allow_verify_reply)

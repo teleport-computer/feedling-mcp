@@ -38,7 +38,7 @@ _SKILL_URL = core_util.io_onboarding_skill_url("skill.md")
 
 def _bootstrap_state(store) -> dict:
     """Snapshot of bootstrap completion for `store`. Read-only; safe to call
-    on every write path. Source of truth: on-disk identity + memory files.
+    on every write path. Identity and memory state are informational only.
 
     Returns:
         {
@@ -47,32 +47,22 @@ def _bootstrap_state(store) -> dict:
           counts: {story, about_me, ta_thinking, total},
           floors: {story, about_me, ta_thinking, total},
           identity_written: bool,
-          stage: str ∈ {"needs_identity", "main_loop"},
+          stage: "main_loop",
           missing_tabs: []                  # always empty (memory no longer gates)
         }
 
-    Gate semantics (A', 2026-06):
-      - Memory is NOT an onboarding gate. Identity is the minimum baseline.
-        stage is "needs_identity" until the identity card is written, then
-        "main_loop". counts / floors / missing_tabs are informational only —
-        the Memory Garden grows naturally and never blocks onboarding.
+    Gate semantics (2026-07): neither Memory Garden nor Identity Card content
+    gates whether the agent may speak. ``identity_written`` remains available
+    to status/diagnostic consumers, but never drives ``stage``.
     """
     moments = memory_service._load_moments(store)
     counts = memory_service._count_by_tab(moments)
     identity_written = identity_service._load_identity(store) is not None
     floors = memory_service._per_tab_floors_for_days(identity_service._relationship_age_days(store))
 
-    # A' (2026-06): memory is no longer an onboarding gate. Identity is the
-    # minimum baseline; the Memory Garden grows naturally afterwards. counts /
-    # floors stay for informational display only — they no longer drive
-    # `stage`, and `missing_tabs` is always empty (kept for response-shape
-    # back-compat; never blocks).
+    # Memory and identity stay visible for status display only. Neither drives
+    # ``stage``; ``missing_tabs`` is retained for response-shape compatibility.
     missing_tabs: list[str] = []
-
-    if not identity_written:
-        stage = "needs_identity"
-    else:
-        stage = "main_loop"
 
     return {
         "memory_count": counts["total"],
@@ -80,7 +70,7 @@ def _bootstrap_state(store) -> dict:
         "counts": counts,
         "floors": floors,
         "identity_written": identity_written,
-        "stage": stage,
+        "stage": "main_loop",
         "missing_tabs": missing_tabs,
     }
 
@@ -150,30 +140,7 @@ def _reply_is_for_pending_verify_ping(store) -> bool:
     return pending
 
 
-def _user_has_spoken(store) -> bool:
-    """True once the user has sent at least one genuine (non-synthetic) message.
-
-    A'' (2026-07): used to relax the ``needs_identity`` gate. A user who is
-    already talking has effectively skipped / ignored onboarding and is waiting
-    on a reply — hard-blocking it just yields an endless "typing…" with no
-    output (the worst UX). The synthetic verify-ping row (``source ==
-    "verify_ping"``) does not count, matching the genuine-user test in
-    ``_chat_loop_verified_by_server``. Inbound user messages are stored as
-    ``append_chat("user", "chat", …)`` (see chat_core.write_message).
-    """
-    with store.chat_lock:
-        chat_msgs = list(store.chat_messages)
-    for m in chat_msgs:
-        if (
-            isinstance(m, dict)
-            and m.get("role") == "user"
-            and m.get("source") != "verify_ping"
-        ):
-            return True
-    return False
-
-
-def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False, is_verify_reply: bool = False):
+def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
     """Refuse /v1/chat/response when bootstrap is incomplete.
 
     Returns a (response, status) tuple to be returned by the caller, or None
@@ -235,40 +202,7 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False, is_verify_
                 "skill_url": _SKILL_URL,
             }), 409
         return None
-    # A' (2026-06): memory no longer gates chat. The only remaining
-    # pre-main_loop stage is "needs_identity" (identity is the baseline that
-    # must exist before the agent speaks, so day-1 isn't ungrounded).
-    #
-    # A'' (2026-07): but never hard-block a user who is ALREADY talking. Once a
-    # genuine user message exists, the user has effectively skipped onboarding
-    # and is waiting on a reply — swallowing it produces an endless "typing…"
-    # with no output (the worst UX; see prod usr_e326d5cc). Deliver the reply;
-    # the chat UI already surfaces an "identity not written" reminder. The
-    # forcing function is preserved for the UNPROMPTED path: an agent greeting
-    # first (no user message yet) or a verify ping (is_verify_reply — the hidden
-    # liveness probe of feedling_chat_verify_loop) still hits this gate and is
-    # pushed to write identity before speaking. Only a genuine user-facing reply
-    # to a user who is already talking is let through.
-    if _user_has_spoken(store) and not is_verify_reply:
-        return None
-    required = (
-        "Call feedling_identity_init with the derived identity card "
-        "(7 dimensions + days_with_user) BEFORE you can post chat."
-    )
-    print(f"[gate:{store.user_id}] chat_response blocked stage={state['stage']} "
-          f"missing={state['missing_tabs']} id={state['identity_written']}")
-    return ({
-        "error": "bootstrap_incomplete",
-        "stage": state["stage"],
-        "memory_count": state["memory_count"],
-        "memory_floor": state["memory_floor"],
-        "counts": state["counts"],
-        "floors": state["floors"],
-        "missing_tabs": state["missing_tabs"],
-        "identity_written": state["identity_written"],
-        "required": required,
-        "skill_url": _SKILL_URL,
-    }), 409
+    return None
 
 
 def _gate_bootstrap_for_identity_init(store):

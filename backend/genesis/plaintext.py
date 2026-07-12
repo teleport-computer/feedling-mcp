@@ -746,11 +746,10 @@ def _run_plaintext_genesis_v2(
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
 
-    # Foreground-ready contract, restored from the legacy chat_ready: the user only
-    # enters once the Identity Card is REAL. Derive it with the EXISTING hosted deriver
-    # (orchestration only — no new prompt/logic), then write identity + relationship
-    # anchor + a greeting BEFORE completing. So the home is never blank and validate's
-    # identity_card passes at entry. Heavy voice/persona/full-memory stay in background.
+    # Foreground-ready contract: derive identity when the material contains a real
+    # signal, but never invent one or make its absence a speaking gate. Greeting and
+    # Genesis completion still happen before entry; heavy voice/persona/full-memory
+    # stay in background.
     identity_payload, id_warnings = foreground_identity.derive_foreground_identity(
         runtime=runtime, analysis_messages=msgs, core_memories=full_memories,
         days_with_user=days, language=language,
@@ -767,25 +766,10 @@ def _run_plaintext_genesis_v2(
         if lightweight_identity.has_signal(lite):
             identity_payload = lite
         else:
-            # fresh_start detection: the synthetic fresh_start message
-            # (_plaintext_fresh_start_message) is itself classified as a "support"
-            # message by _is_import_support_message (fresh_start is in
-            # _IMPORT_SUPPORT_SOURCES), so a plain "no support texts" check would
-            # misclassify a real fresh_start upload as "has content". Instead,
-            # match the sentinel source_family directly: fresh_start iff every
-            # message in msgs is the fresh_start marker (or there are no messages
-            # at all).
-            is_fresh_start = all(
-                history_import._import_source_family(
-                    str(m.get("source") or m.get("source_family") or "")
-                ) == history_import._FRESH_START_SOURCE
-                for m in msgs
-            )
-            if is_fresh_start:
-                pass  # truly empty upload -> nameless done is allowed
-            else:
-                # real content but couldn't derive/salvage an identity -> failed,
-                # let the user retry instead of silently completing nameless.
+            # Only an explicit provider failure is retryable. Material that simply
+            # contains no identity signal is a valid nameless onboarding result and
+            # follows the same greeting + done path as fresh_start.
+            if provider_failure:
                 service.mark_failed(store, job_id, "onboarding_no_identity:provider_unstable")
                 return True
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
@@ -830,9 +814,8 @@ def _run_plaintext_genesis_v2(
             # here too so a prior failure notice doesn't linger past a successful retry.
             notices_core.resolve(store, "genesis:")
     else:
-        # edge: foreground couldn't derive an identity -> current backstop (complete on
-        # core + let the background fill identity via init_identity/persona baseline).
-        # Rare, never worse than before; the iOS minimal-seed page is the real fix.
+        # No foreground identity signal: complete nameless after greeting/core, then
+        # let background enrichment add an identity later if the full material supports it.
         _append_plaintext_onboarding_greeting(
             store,
             runtime=runtime,
@@ -939,9 +922,8 @@ def _run_plaintext_background_enrichment(
     if include_memory:
         service.apply_memory_outputs(store, api_key, merged)
     # Identity is normally written by the FOREGROUND now (identity-first contract), so the
-    # background skips it (write_identity=False). Only the edge fallback (foreground could
-    # not derive an identity) asks the background to fill it — from the full reduce, or a
-    # persona-derived baseline so onboarding never wedges on an empty identity_card.
+    # background skips it (write_identity=False). When foreground had no signal,
+    # background may still derive one from the full reduce or persona; absence remains valid.
     if write_identity:
         if not _merged_has_identity(merged) and isinstance(merged.get("persona"), dict):
             persona_content = str(merged["persona"].get("content") or "").strip()

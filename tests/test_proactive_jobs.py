@@ -669,6 +669,31 @@ def test_proactive_activation_gate_blocks_self_initiated_wakes_until_first_chat_
     assert activated["gate_input"]["activation_pending"] is False
 
 
+def test_introduction_marker_persists_and_first_write_wins(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    core_store._stores.clear()
+
+    user_id = "usr_introduction_marker_persistence"
+    seed_user(user_id)
+    store = core_store.get_store(user_id)
+
+    assert store.introduced_at() == ""
+    assert store.introduction_done() is False
+
+    first_at = "2026-07-12T15:00:00"
+    store.mark_introduced(at_iso=first_at)
+    assert store.introduced_at() == first_at
+    assert store.introduction_done() is True
+
+    store.mark_introduced(at_iso="2026-07-12T16:00:00")
+    assert store.introduced_at() == first_at
+
+    core_store._stores.clear()
+    reloaded = core_store.get_store(user_id)
+    assert reloaded.introduced_at() == first_at
+    assert reloaded.introduction_done() is True
+
+
 def test_perception_direct_wake_respects_proactive_activation_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     core_store._stores.clear()

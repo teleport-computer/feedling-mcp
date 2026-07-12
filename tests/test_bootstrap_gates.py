@@ -10,13 +10,10 @@ Covers two failure modes that hit prod 2026-05-13..15:
    backend/bootstrap/status_core.py (accept both roles). Tested below
    in test_bootstrap_status_counts_openclaw_role.
 
-2. Agent runtimes (OpenClaw specifically) skipping Pass 1-3 + Step 5
-   and going straight to chat_post — server would happily accept the
-   writes even though the agent had hallucinated bootstrap completion.
-   Fixed in the original app.py (since deleted); the gates now live in
-   backend/bootstrap/gates.py: /v1/identity/init and /v1/chat/response
-   return 409 bootstrap_incomplete unless prerequisites are satisfied.
-   Tested below.
+2. Agent runtimes (OpenClaw specifically) need a live resident consumer and
+   verified loop before visible replies are accepted. Identity and memory
+   content are informational and no longer gate speech. The remaining checks
+   live in backend/bootstrap/gates.py and are tested below.
 
 The fixture spawns a fresh ASGI backend (serve_dev.py) in a subprocess against a temp
 data dir, identical to test_multi_tenant_isolation.py. Hermetic — does
@@ -429,83 +426,52 @@ def _establish_live_connection(base_url: str, user_id: str, api_key: str) -> dic
 # writes when prerequisites aren't satisfied.
 # ---------------------------------------------------------------------------
 
-def test_chat_response_blocked_when_no_identity(backend):
-    """A' (2026-06): fresh user — chat_response 409s with stage=needs_identity.
-    Memory no longer gates; identity is the baseline that must exist first."""
+def test_chat_response_without_identity_only_hits_resident_gate(backend):
+    """Identity absence never gates speech; a fresh VPS user is blocked only
+    because no resident consumer is polling yet."""
     user_id, api_key = _register(backend["base_url"])
     r = _chat_response(backend["base_url"], user_id, api_key)
     assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
     body = r.json()
     assert body["error"] == "bootstrap_incomplete"
-    assert body["stage"] == "needs_identity"
+    assert body["stage"] == "needs_resident_consumer"
     assert body["identity_written"] is False
     assert body["missing_tabs"] == []
-    assert "feedling_identity_init" in body["required"]
+    assert "resident" in body["required"].lower()
     assert "skill_url" in body
 
 
-def test_chat_response_blocked_when_memory_ok_but_no_identity(backend):
-    """User wrote enough memories (Story + About me floor met) but never
-    initialized identity — chat still 409s with stage=needs_identity."""
+def test_chat_response_with_memory_but_no_identity_only_hits_resident_gate(backend):
+    """Memory counts and identity presence are both informational; liveness is
+    still required for the resident route."""
     user_id, api_key = _register(backend["base_url"])
     _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
     r = _chat_response(backend["base_url"], user_id, api_key)
     assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
     body = r.json()
     assert body["error"] == "bootstrap_incomplete"
-    assert body["stage"] == "needs_identity"
+    assert body["stage"] == "needs_resident_consumer"
     assert body["memory_count"] >= 2
     assert body["identity_written"] is False
 
 
-def test_chat_response_allowed_when_user_has_spoken_without_identity(backend):
-    """A'' (2026-07): a user who is ALREADY talking must not be hard-blocked
-    just because the agent hasn't written the identity card yet. Once a genuine
-    user message exists, /v1/chat/response is delivered (200) even at
-    stage=needs_identity — this is the endless "typing…" bug from prod
-    usr_e326d5cc. The UNPROMPTED path (no user message yet) still 409s: see
-    test_chat_response_blocked_when_no_identity, which stays green."""
+def test_chat_response_allowed_after_live_connection_without_identity(backend):
+    """Once the resident/live-loop gates pass, a nameless user can chat from
+    the first turn without initializing an Identity Card."""
     user_id, api_key = _register(backend["base_url"])
-    # User reaches out first (append_chat stamps role="user" source="chat"),
-    # skipping / ignoring onboarding.
-    env = _stub_envelope(user_id, "user-said-hi-before-identity")
-    msg = requests.post(
-        f"{backend['base_url']}/v1/chat/message",
-        json={"envelope": env},
-        headers={"X-API-Key": api_key},
-        timeout=TIMEOUT,
-    )
-    assert msg.status_code == 200, msg.text
-    # The agent's reply now flows despite no identity card being written.
-    r = _chat_response(backend["base_url"], user_id, api_key)
+    _establish_live_connection(backend["base_url"], user_id, api_key)
+    r = _chat_response(
+        backend["base_url"], user_id, api_key, consumer_headers=True)
     assert r.status_code == 200, f"reply should be delivered, got {r.status_code}: {r.text}"
     assert "id" in r.json()
 
 
-def test_chat_response_verify_ping_stays_gated_pre_identity(backend):
-    """A'' tightening: the softening is for genuine user-facing replies only. A
-    verify-ping reply (source="verify_ping", the hidden liveness probe of
-    feedling_chat_verify_loop) still 409s pre-identity even after the user has
-    spoken — so the forcing function to write identity before the loop is
-    'verified' survives."""
+def test_verify_loop_can_open_without_identity(backend):
+    """The hidden liveness probe proves the resident loop independently of
+    Identity Card presence."""
     user_id, api_key = _register(backend["base_url"])
-    env = _stub_envelope(user_id, "user-said-hi")
-    msg = requests.post(
-        f"{backend['base_url']}/v1/chat/message",
-        json={"envelope": env},
-        headers={"X-API-Key": api_key},
-        timeout=TIMEOUT,
-    )
-    assert msg.status_code == 200, msg.text
-    reply = _stub_envelope(user_id, "verify-reply")
-    r = requests.post(
-        f"{backend['base_url']}/v1/chat/response",
-        json={"envelope": reply, "source": "verify_ping", "alert_body": "hi"},
-        headers={"X-API-Key": api_key},
-        timeout=TIMEOUT,
-    )
-    assert r.status_code == 409, f"verify reply should stay gated, got {r.status_code}: {r.text}"
-    assert r.json()["stage"] == "needs_identity"
+    body = _establish_live_connection(backend["base_url"], user_id, api_key)
+    assert body["passing"] is True
 
 
 def test_chat_response_allowed_after_full_bootstrap_and_live_connection(backend):

@@ -441,8 +441,7 @@ def test_v2_foreground_salvages_identity_from_support_card(monkeypatch):
 
 def test_v2_foreground_fresh_start_allows_nameless_done(monkeypatch):
     # truly-empty upload (the real fresh_start sentinel message) with no derivable
-    # identity must still complete nameless -> NOT a failure, unlike real content with
-    # no identity signal.
+    # identity must still complete nameless.
     calls = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
@@ -527,10 +526,9 @@ def test_v2_foreground_honors_explicit_relationship_date(monkeypatch):
     assert calls["stored_days"] == 200
 
 
-def test_v2_foreground_content_but_no_identity_signal_fails(monkeypatch):
-    # deriver yields nothing, no provider warnings, and there's no salvageable support
-    # text (just a plain user message) -> this is "real content but no identity signal",
-    # which the spec now routes to a hard failure instead of a silent nameless-done.
+def test_v2_foreground_content_without_identity_signal_completes_nameless(monkeypatch):
+    # A real upload may contain memories but no identity signal. With no provider
+    # failure warning this is a valid nameless result, not a retryable failure.
     calls = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
@@ -539,10 +537,15 @@ def test_v2_foreground_content_but_no_identity_signal_fails(monkeypatch):
     monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
                         lambda **k: ({"agent_name": "", "dimensions": []}, []))
     monkeypatch.setattr(service, "mark_failed",
-                        lambda store, job_id, error: calls.update(job_id=job_id, error=error) or
-                        {"job_id": job_id, "status": "failed", "error": error})
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("valid nameless import must not fail")))
     monkeypatch.setattr(service, "apply_reducer_output",
                         lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting",
+                        lambda *a, **k: ("", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
+                        lambda store, text: calls.__setitem__("greeting", text))
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
+                        lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
 
     handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
@@ -550,9 +553,9 @@ def test_v2_foreground_content_but_no_identity_signal_fails(monkeypatch):
         analysis_messages=[{"role": "user", "content": "hi"}])
 
     assert handled is True
-    assert calls["job_id"] == "job1"
-    assert calls["error"] == "onboarding_no_identity:provider_unstable"
-    assert "used_apply_reducer" not in calls           # must fail before the nameless-done path
+    assert calls.get("used_apply_reducer") is True
+    assert calls["greeting"] == "好久不见，很高兴又能和你聊天。"
+    assert calls["bg_write_identity"] is True
 
 
 def test_merged_has_identity_rule():

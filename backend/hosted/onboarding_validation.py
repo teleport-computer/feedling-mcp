@@ -156,22 +156,16 @@ def _int_value(value: Any, default: int = 0) -> int:
         return default
 
 
-def _identity_card_complete(identity: dict | None) -> bool:
-    if not isinstance(identity, dict):
-        return False
-    if str(identity.get("agent_name") or "").strip():
-        return True
-    dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
-    if any(isinstance(dim, dict) for dim in dims):
-        return True
-    if bool(identity.get("identity_agent_name_present")):
-        return True
-    if _int_value(identity.get("identity_dimension_count")) > 0:
-        return True
-    # Legacy non-genesis identities predate the completion metadata. Keep them
-    # passing unless the card was written by Genesis, where old empty cards are
-    # exactly the regression this validator must catch.
-    return str(identity.get("relationship_anchor_source") or "") != "genesis_import"
+def _identity_card_complete(identity: dict | None, genesis_job: dict | None = None) -> bool:
+    """Identity content is never an onboarding completion gate.
+
+    A written card counts even when nameless/empty. A completed Genesis job also
+    counts when no card was written because the supplied material contained no
+    identity signal. The overall history step still anchors onboarding on the
+    Genesis ``done`` status.
+    """
+    genesis_done = str((genesis_job or {}).get("status") or "").strip().lower() == "done"
+    return isinstance(identity, dict) or genesis_done
 
 
 def _model_api_steps_with_genesis(
@@ -195,7 +189,7 @@ def _model_api_steps_with_genesis(
     memory_action_count = _int_value(genesis_job.get("memory_action_count"))
     identity_status = str(genesis_job.get("identity_status") or "")
     persona_ref = str(genesis_job.get("persona_ref") or "")
-    identity_complete = _identity_card_complete(identity)
+    identity_complete = _identity_card_complete(identity, genesis_job)
     # Per-artifact live signals so the checklist ticks INCREMENTALLY (each step passes as
     # its own artifact lands), matching the base/legacy steps — instead of every step
     # being gated on the single job `done`, which made them all flip at once. The
@@ -205,10 +199,10 @@ def _model_api_steps_with_genesis(
     # Keep this aligned with the base model_api/resident/official validators so the
     # iOS checklist does not briefly show Memory Garden as done and then regress to
     # waiting when the genesis overlay refreshes.
-    # NOTE (Codex): hosted_chat leaning on `done` is only sound because the foreground-ready
-    # contract writes the greeting BEFORE done (genesis v2 _run_plaintext_genesis_v2:
-    # identity + greeting + core, THEN genesis_complete_job). If `done` ever fires without a
-    # greeting again, this mis-lights hosted_chat — keep that invariant.
+    # NOTE (Codex): hosted_chat leaning on `done` is only sound because the
+    # foreground-ready contract writes the greeting BEFORE done (identity may
+    # legitimately remain absent). If `done` ever fires without a greeting again,
+    # this mis-lights hosted_chat — keep that invariant.
     hosted_chat_ok = done or _model_api_hosted_chat_verified(store)
     history_windows_total = _int_value(metadata.get("history_windows_total") or output.get("history_windows_total") or 0)
     history_windows_failed = _int_value(metadata.get("history_windows_failed") or output.get("history_windows_failed") or 0)
@@ -277,7 +271,7 @@ def _model_api_steps_with_genesis(
         "complete": identity_complete,
         "genesis": True,
         "identity_status": identity_status,
-        "required": "" if identity_complete else "Wait for Genesis to write a non-empty Identity Card.",
+        "required": "" if identity_complete else "Wait for Genesis to finish onboarding.",
     }
     relationship_step = {
         "id": "relationship_anchor",
@@ -312,7 +306,8 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
     bootstrap_st = boot_gates._bootstrap_state(store)
     identity = identity_service._load_identity(store)
     identity_written = identity is not None
-    identity_complete = _identity_card_complete(identity)
+    genesis_job = _latest_onboarding_genesis_job(store)
+    identity_complete = _identity_card_complete(identity, genesis_job)
     relationship_anchored = bool(identity and identity.get("relationship_started_at"))
     relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
     relationship_ok = relationship_anchored and bool(relationship_evidence)
@@ -328,8 +323,6 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
     chat_ready = bool(latest_job and latest_job.get("chat_ready"))
     history_ok = bool(latest_job and (latest_job.get("status") == "completed" or chat_ready))
     hosted_chat_ok = _model_api_hosted_chat_verified(store)
-    genesis_job = _latest_onboarding_genesis_job(store)
-
     steps = [
         {
             "id": "model_api_config",
@@ -409,7 +402,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "passing": identity_complete,
             "written": identity_written,
             "complete": identity_complete,
-            "required": "History import must derive and write a non-empty Identity Card." if not identity_complete else "",
+            "required": "Wait for onboarding to finish." if not identity_complete else "",
         },
         {
             "id": "relationship_anchor",
@@ -455,7 +448,8 @@ def _official_import_onboarding_validation_payload(store: UserStore) -> dict:
     bootstrap_st = boot_gates._bootstrap_state(store)
     identity = identity_service._load_identity(store)
     identity_written = identity is not None
-    identity_complete = _identity_card_complete(identity)
+    genesis_job = _latest_onboarding_genesis_job(store)
+    identity_complete = _identity_card_complete(identity, genesis_job)
     relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
     relationship_ok = bool(identity and identity.get("relationship_started_at") and relationship_evidence)
     steps = [
@@ -477,7 +471,7 @@ def _official_import_onboarding_validation_payload(store: UserStore) -> dict:
             "passing": identity_complete,
             "written": identity_written,
             "complete": identity_complete,
-            "required": "Use the official app/tool client to import a non-empty identity." if not identity_complete else "",
+            "required": "Wait for onboarding to finish." if not identity_complete else "",
         },
         {
             "id": "relationship_anchor",
@@ -510,7 +504,8 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
     bootstrap_st = boot_gates._bootstrap_state(store)
     identity = identity_service._load_identity(store)
     identity_written = identity is not None
-    identity_complete = _identity_card_complete(identity)
+    genesis_job = _latest_onboarding_genesis_job(store)
+    identity_complete = _identity_card_complete(identity, genesis_job)
     relationship_anchored = bool(identity and identity.get("relationship_started_at"))
     relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
     relationship_ok = relationship_anchored and bool(relationship_evidence)
@@ -539,12 +534,7 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
             "passing": identity_complete,
             "written": identity_written,
             "complete": identity_complete,
-            "required": (
-                "Write the identity card first (feedling_identity_init) — it no "
-                "longer depends on memory floor. The Memory Garden grows naturally "
-                "afterwards."
-                if not identity_complete else ""
-            ),
+            "required": "Wait for onboarding to finish." if not identity_complete else "",
         },
         {
             "id": "relationship_anchor",

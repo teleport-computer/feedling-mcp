@@ -169,83 +169,194 @@ def test_tick_enqueues_introduction_after_spawn(monkeypatch):
     assert enqueued[0][2]["enclave_url"] is not None
 
 
+class _IntroStore:
+    """Fake store for the introduction enqueue path. Tracks the card-independent
+    ``introduced_at`` marker (identity-card-never-gates, 2026-07)."""
+
+    user_id = "u_1"
+
+    def __init__(self, activated=False):
+        self.jobs = []
+        self.activated = activated
+        self._introduced_at = ""
+
+    def proactive_activation_ready(self):
+        return self.activated
+
+    def introduction_done(self):
+        return bool(self._introduced_at)
+
+    def mark_introduced(self, *, at_iso=None):
+        if not self._introduced_at:
+            self._introduced_at = at_iso or "2026-07-12T00:00:00"
+        return {"introduced_at": self._introduced_at}
+
+    def list_proactive_jobs(self, since_epoch=0, limit=0):
+        return list(self.jobs)
+
+    def append_proactive_job(self, job):
+        self.jobs.append(job)
+        return job
+
+
+def _enqueue_intro(store, *, now):
+    return supervisor_mod._enqueue_introduction_job_if_needed(
+        "u_1",
+        {"api_key": "k"},
+        api_url="http://backend",
+        enclave_url="https://enclave",
+        now=now,
+        get_store_fn=lambda _uid: store,
+    )
+
+
 def test_enqueue_introduction_job_when_profile_fields_empty(monkeypatch):
-    class IntroStore:
-        user_id = "u_1"
-
-        def __init__(self):
-            self.jobs = []
-            self.activated = False
-
-        def proactive_activation_ready(self):
-            return self.activated
-
-        def list_proactive_jobs(self, since_epoch=0, limit=0):
-            return list(self.jobs)
-
-        def append_proactive_job(self, job):
-            self.jobs.append(job)
-            return job
-
-    store = IntroStore()
+    store = _IntroStore(activated=False)
     monkeypatch.setattr(
         supervisor_mod,
         "_fetch_identity_plain_for_intro",
         lambda entry, **kwargs: ({"decrypt_status": "ok", "self_introduction": "", "signature": []}, ""),
     )
 
-    pending = supervisor_mod._enqueue_introduction_job_if_needed(
-        "u_1",
-        {"api_key": "k"},
-        api_url="http://backend",
-        enclave_url="https://enclave",
-        now=lambda: T0 - 1,
-        get_store_fn=lambda _uid: store,
-    )
-    store.activated = True
-    job = supervisor_mod._enqueue_introduction_job_if_needed(
-        "u_1",
-        {"api_key": "k"},
-        api_url="http://backend",
-        enclave_url="https://enclave",
-        now=lambda: T0,
-        get_store_fn=lambda _uid: store,
-    )
-    duplicate = supervisor_mod._enqueue_introduction_job_if_needed(
-        "u_1",
-        {"api_key": "k"},
-        api_url="http://backend",
-        enclave_url="https://enclave",
-        now=lambda: T0 + 1,
-        get_store_fn=lambda _uid: store,
-    )
-
+    # Not activated -> gated on the unified signal, nothing enqueued or marked.
+    pending = _enqueue_intro(store, now=lambda: T0 - 1)
     assert pending is None
+    assert store.jobs == []
+    assert store.introduction_done() is False
+
+    store.activated = True
+    job = _enqueue_intro(store, now=lambda: T0)
+    duplicate = _enqueue_intro(store, now=lambda: T0 + 1)
+
     assert store.jobs == [job]
     assert job["job_kind"] == "introduction"
     assert job["trigger"] == "post_spawn_genesis"
     assert job["source"] == "agent_initiated_proactive"
     assert job["status"] == "pending"
+    # Marked at enqueue -> the duplicate short-circuits on introduction_done.
+    assert store.introduction_done() is True
     assert duplicate is None
     assert len(store.jobs) == 1
 
 
-def test_enqueue_introduction_skips_existing_profile(monkeypatch):
+def test_enqueue_introduction_no_card_still_introduces_once(monkeypatch):
+    # The core new behavior: a user with NO identity card (identity_not_found)
+    # still gets exactly one introduction — the card is no longer a precondition.
+    store = _IntroStore(activated=True)
     monkeypatch.setattr(
         supervisor_mod,
         "_fetch_identity_plain_for_intro",
-        lambda entry, **kwargs: ({"decrypt_status": "ok", "self_introduction": "I am here.", "signature": []}, ""),
+        lambda entry, **kwargs: (None, "identity_not_found"),
     )
 
-    job = supervisor_mod._enqueue_introduction_job_if_needed(
-        "u_1",
-        {"api_key": "k"},
-        api_url="http://backend",
-        enclave_url="https://enclave",
-        get_store_fn=lambda _uid: (_ for _ in ()).throw(AssertionError("store should not be read")),
+    job = _enqueue_intro(store, now=lambda: T0)
+    duplicate = _enqueue_intro(store, now=lambda: T0 + 1)
+
+    assert job is not None
+    assert job["job_kind"] == "introduction"
+    assert store.introduction_done() is True
+    assert duplicate is None
+    assert len(store.jobs) == 1
+
+
+def test_enqueue_introduction_defers_on_transient_fetch_failure(monkeypatch):
+    # identity is None but the reason is a TRANSIENT enclave/HTTP failure, NOT a
+    # genuine no-card. Must defer (no job, no marker) so a later spawn can read a
+    # real profile — never permanently mis-intro on a one-off hiccup.
+    store = _IntroStore(activated=True)
+    fetch_result = {"value": (None, "identity_fetch_failed:ReadTimeout")}
+    monkeypatch.setattr(
+        supervisor_mod,
+        "_fetch_identity_plain_for_intro",
+        lambda entry, **kwargs: fetch_result["value"],
     )
 
+    deferred = _enqueue_intro(store, now=lambda: T0)
+    assert deferred is None
+    assert store.jobs == []
+    assert store.introduction_done() is False
+
+    # enclave recovers, card genuinely absent -> now proceed to intro.
+    fetch_result["value"] = (None, "identity_not_found")
+    job = _enqueue_intro(store, now=lambda: T0 + 1)
+    assert job is not None
+    assert store.introduction_done() is True
+    assert len(store.jobs) == 1
+
+
+def test_enqueue_introduction_defers_on_config_failure(monkeypatch):
+    # enclave_url_missing / auth_missing are config failures, also deferred.
+    store = _IntroStore(activated=True)
+    monkeypatch.setattr(
+        supervisor_mod,
+        "_fetch_identity_plain_for_intro",
+        lambda entry, **kwargs: (None, "enclave_url_missing"),
+    )
+    assert _enqueue_intro(store, now=lambda: T0) is None
+    assert store.jobs == []
+    assert store.introduction_done() is False
+
+
+def test_enqueue_introduction_defers_on_transient_decrypt_failure(monkeypatch):
+    # A decrypt failure is transient — it must NOT be marked introduced (that
+    # would suppress a real intro forever). It retries once the card decrypts.
+    store = _IntroStore(activated=True)
+    fetch_result = {"value": ({"decrypt_status": "failed"}, "")}
+    monkeypatch.setattr(
+        supervisor_mod,
+        "_fetch_identity_plain_for_intro",
+        lambda entry, **kwargs: fetch_result["value"],
+    )
+
+    deferred = _enqueue_intro(store, now=lambda: T0)
+    assert deferred is None
+    assert store.jobs == []
+    assert store.introduction_done() is False
+
+    # Card now decrypts with empty profile -> enqueue proceeds.
+    fetch_result["value"] = ({"decrypt_status": "ok", "self_introduction": "", "signature": []}, "")
+    job = _enqueue_intro(store, now=lambda: T0 + 1)
+    assert job is not None
+    assert store.introduction_done() is True
+    assert len(store.jobs) == 1
+
+
+def test_enqueue_introduction_skips_existing_profile(monkeypatch):
+    # A legacy card that already carries a self_introduction: no new job, but the
+    # durable marker IS recorded so future spawns skip without an enclave fetch.
+    store = _IntroStore(activated=True)
+    fetch_calls = {"n": 0}
+
+    def _fetch(entry, **kwargs):
+        fetch_calls["n"] += 1
+        return ({"decrypt_status": "ok", "self_introduction": "I am here.", "signature": []}, "")
+
+    monkeypatch.setattr(supervisor_mod, "_fetch_identity_plain_for_intro", _fetch)
+
+    job = _enqueue_intro(store, now=lambda: T0)
     assert job is None
+    assert store.jobs == []
+    assert store.introduction_done() is True
+    assert fetch_calls["n"] == 1
+
+    # Second spawn: short-circuits on introduction_done, no further enclave read.
+    again = _enqueue_intro(store, now=lambda: T0 + 1)
+    assert again is None
+    assert fetch_calls["n"] == 1
+
+
+def test_enqueue_introduction_not_ready_never_fetches_identity(monkeypatch):
+    # Store read happens first now; an un-activated user must not trigger an
+    # enclave identity fetch at all.
+    store = _IntroStore(activated=False)
+
+    def _fetch(entry, **kwargs):
+        raise AssertionError("identity should not be fetched before activation")
+
+    monkeypatch.setattr(supervisor_mod, "_fetch_identity_plain_for_intro", _fetch)
+
+    assert _enqueue_intro(store, now=lambda: T0) is None
+    assert store.introduction_done() is False
 
 
 def test_tick_is_idempotent_for_live_children():
@@ -932,7 +1043,7 @@ def test_autoverify_triggers_once_then_marks_done():
 
 
 def test_autoverify_backs_off_after_failure():
-    # A user that can't pass yet (e.g. still at needs_identity) must NOT be re-probed
+    # A user that cannot pass the current bootstrap gate must NOT be re-probed
     # every tick — back off so we don't generate avoidable verify traffic.
     calls = []
     state = {}

@@ -75,6 +75,13 @@ INTRODUCTION_JOB_KIND = "introduction"
 INTRODUCTION_TRIGGER = "post_spawn_genesis"
 INTRODUCTION_INTENT_LABEL = "post_respawn_introduction"
 _INTRODUCTION_ACTIVE_STATUSES = {"pending", "claimed", "realizing"}
+# `_fetch_identity_plain_for_intro` returns identity=None for several reasons.
+# Only these two mean the card GENUINELY does not exist yet (a fresh / no-card
+# user) -> safe to introduce without a card. The rest (enclave_url_missing,
+# auth_missing, identity_fetch_failed:*) are transient/config failures: defer,
+# do NOT mark introduced, and retry on a later spawn so an existing profile can
+# still be read and correctly skipped/introduced. (identity-card-never-gates)
+_NO_CARD_INTRO_REASONS = frozenset({"identity_not_found", "identity_not_initialized"})
 
 
 def parse_roster(raw) -> list[dict]:
@@ -613,21 +620,63 @@ def _enqueue_introduction_job_if_needed(
     now=time.time,
     get_store_fn=None,
 ) -> dict | None:
-    identity, reason = _fetch_identity_plain_for_intro(entry, api_url=api_url, enclave_url=enclave_url)
-    if not _needs_introduction_identity(identity):
-        if reason:
-            log.debug("introduction skipped for %s: %s", user_id, reason)
-        return None
+    """Enqueue the agent's one-shot post-spawn self-introduction.
+
+    identity-card-never-gates (2026-07): the introduction is gated ONLY on the
+    unified activation signal (``proactive_activation_ready`` == the user reached
+    the app / first chat ok). The identity card's existence or content is NOT a
+    precondition — a no-card / empty-card / fresh-start user still gets one
+    introduction. Dedup is durable via ``store.introduction_done()`` (card-
+    independent) plus the in-flight ``_has_active_introduction_job`` guard.
+    """
     if get_store_fn is None:
         from core.store import get_store
         get_store_fn = get_store
     store = get_store_fn(user_id)
+    # Unified signal — the ONLY precondition. No identity dependency.
     if not store.proactive_activation_ready():
+        return None
+    # Already introduced (durable marker) or one already in flight.
+    if store.introduction_done():
         return None
     if _has_active_introduction_job(store):
         return None
+    # Back-compat: a legacy card may already carry a ``self_introduction`` written
+    # before this marker existed. Only when the card is READABLE and already
+    # introduced do we record the marker and skip — a transient decrypt failure
+    # must not be mistaken for "already introduced" (it would suppress a real
+    # intro forever).
+    identity, reason = _fetch_identity_plain_for_intro(entry, api_url=api_url, enclave_url=enclave_url)
+    if isinstance(identity, dict):
+        status = str(identity.get("decrypt_status") or "").strip()
+        decrypt_ok = (not status) or status == "ok"
+        if not decrypt_ok:
+            # transient decrypt failure -> retry on a later spawn, don't mark
+            log.debug("introduction deferred for %s: identity decrypt %s", user_id, status)
+            return None
+        if not _needs_introduction_identity(identity):
+            # card present and already self-introduced -> record + skip fast next time
+            store.mark_introduced()
+            return None
+        # readable card, not yet introduced -> fall through to enqueue
+    elif reason not in _NO_CARD_INTRO_REASONS:
+        # identity is None for a TRANSIENT/config reason (enclave_url_missing,
+        # auth_missing, identity_fetch_failed:*) — NOT a genuine no-card user.
+        # Defer without marking so we can read a real profile next spawn; treating
+        # a one-off enclave/HTTP hiccup as "no card" would permanently mis-intro.
+        log.debug("introduction deferred for %s: identity fetch %s", user_id, reason)
+        return None
+    # Reachable when: (a) readable card that still needs an intro, or (b) identity
+    # is None for a genuine no-card reason. Both enqueue exactly one introduction.
     clock = now() if callable(now) else float(now)
-    return store.append_proactive_job(_build_introduction_job(now=clock))
+    job = store.append_proactive_job(_build_introduction_job(now=clock))
+    if job:
+        # Optimistic one-shot: mark at enqueue. The intro is best-effort; if the
+        # job later fails to realize, the user still gets ongoing proactive
+        # messages (the gate no longer blocks them). Re-introducing on every
+        # spawn would be worse than a rare missed first-touch.
+        store.mark_introduced()
+    return job
 
 
 def _fetch_key_envelope(api_url: str, api_key: str = "", *, runtime_token: str = "") -> dict | None:
@@ -867,10 +916,10 @@ def _post_verify_loop(api_url: str, headers: dict) -> bool:
 
 
 # Backoff (seconds) between verify_loop attempts, indexed by consecutive failure
-# count (capped at the last entry). A user that cannot pass yet — e.g. still at
-# `needs_identity`, where the verify reply is gate-rejected — must NOT be re-probed
-# every tick; this spaces retries out so a genuinely-advancing user still gets
-# verified soon while a stuck one generates little traffic.
+# count (capped at the last entry). A user that cannot pass yet — e.g. a resident
+# whose consumer isn't live so the verify reply hits the `needs_live_connection`
+# gate — must NOT be re-probed every tick; this spaces retries out so a genuinely-
+# advancing user still gets verified soon while a stuck one generates little traffic.
 _AUTOVERIFY_BACKOFF = [0.0, 30.0, 120.0, 600.0, 1800.0]
 
 
