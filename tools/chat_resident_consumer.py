@@ -392,7 +392,7 @@ AgentErrorNotice = namedtuple("AgentErrorNotice", "error_class blame user_text d
 _ERROR_CLASS_RULES = (
     # 次序即优先级：quota 必须先于 auth/rate（403+「额度」语义是余额不是权限）
     ("quota_insufficient", "user_provider",
-     "你的 API 服务额度不足，充值后再发消息即可恢复。",
+     "模型服务额度不足，充值后再发消息即可恢复。",
      re.compile(r"余额|额度|insufficient_quota|credit balance|requires more credits"
                 r"|payment required|\b402\b|quota", re.I)),
     ("auth_invalid", "user_provider",
@@ -413,7 +413,7 @@ _ERROR_CLASS_RULES = (
      "这次回复被模型的内容策略拦下了，换个说法再试。",
      re.compile(r"content_filter|content policy|safety|blocked by", re.I)),
     ("rate_limited", "provider_transient",
-     "你的 API 服务限流了，稍等几分钟再试。",
+     "模型服务限流了，稍等几分钟再试。",
      re.compile(r"\b429\b|too many requests|rate.?limit", re.I)),
     ("upstream_unavailable", "provider_transient",
      "你的模型服务暂时不可用，稍后会自动恢复。",
@@ -457,9 +457,16 @@ def _system_notice_body(notice: AgentErrorNotice) -> str:
     return f"⚠️ {notice.user_text}\n详情: {notice.detail}"
 
 
-# system 通知去抖：前台必发；后台同 error_class 每 SYSTEM_NOTICE_DEBOUNCE_SEC 一条，
-# 任一成功回合清零（恢复后再坏要重新提醒）。进程内存态即可——respawn 顶多多发一条。
-SYSTEM_NOTICE_DEBOUNCE_SEC = float(os.environ.get("SYSTEM_NOTICE_DEBOUNCE_SEC", "21600"))
+# 聊天流失败横幅节流（Seven 定稿 2026-07-11）：
+# - 后台车道（心跳/主动/capture/dream）一律不进聊天流——用户无法据此行动，天天聊天
+#   的人会被自己根本看不见的后台车道刷屏；可观测性走设置页/admin 腿
+#   （_report_runtime_error）+ debug 日志。
+# - 前台（用户刚发的消息最终没拿到真实回复）才弹，且限流：可行动类
+#   （blame=user_provider，如额度/key/模型名）按 error_class 各一个窗口；瞬时/系统类
+#   合并进同一个 "_transient" 桶——同一波上游抖动打出多个 error_class 也只弹第一条。
+# - 固定窗口（默认 3h），不因成功回合清零——否则上游一抖一恢复（fail→ok→fail）时
+#   每次"恢复后再坏"都重新弹，越抖越刷屏。进程内存态即可——respawn 顶多多发一条。
+FOREGROUND_NOTICE_WINDOW_SEC = float(os.environ.get("FOREGROUND_NOTICE_WINDOW_SEC", "10800"))
 _system_notice_last_sent: dict[str, float] = {}
 # 每进程首个成功回合无条件清一次设置页错误（代价一次 HTTP），覆盖 respawn 前留下的滞留错误：
 # respawn 后新进程从 False 起步则永远不会触发清空，导致用户修好配置后 last_runtime_error 仍滞留。
@@ -507,31 +514,37 @@ def _report_runtime_error(error: str, error_class: str = "") -> bool:
 
 
 def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
-    """腿①+②：分类 → 上报设置页 → （前台必发/后台去抖）聊天 system 通知。
+    """腿①+②：分类 → 上报设置页/admin；仅前台失败（限流后）才发聊天 system 横幅。
 
-    永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
+    后台车道失败不进聊天流（Seven 2026-07-11）——观测走 _report_runtime_error
+    + debug 日志。永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
     try:
         notice = classify_agent_error(exc)
         _report_runtime_error(notice.detail, notice.error_class)
-        last = _system_notice_last_sent.get(notice.error_class)
-        if not foreground and last is not None and (time.monotonic() - last) < SYSTEM_NOTICE_DEBOUNCE_SEC:
+        if not foreground:
+            return
+        # 可行动类按 error_class 分桶；瞬时/系统类共享一个桶（同波合并）。
+        key = notice.error_class if notice.blame == "user_provider" else "_transient"
+        last = _system_notice_last_sent.get(key)
+        if last is not None and (time.monotonic() - last) < FOREGROUND_NOTICE_WINDOW_SEC:
             return
         post_reply(
             _system_notice_body(notice),
             role="system", notice_kind="upstream_error", suppress_push=True,
         )
-        _system_notice_last_sent[notice.error_class] = time.monotonic()
+        _system_notice_last_sent[key] = time.monotonic()
     except Exception:
         log.exception("system notice emit failed (non-fatal)")
 
 
 def _note_agent_turn_success() -> None:
-    """成功回合：重置去抖 + 清空设置页错误（仅当本进程报过错，省一次 HTTP）。
+    """成功回合：清空设置页错误（仅当本进程报过错，省一次 HTTP）。
 
+    不再清横幅限流窗口——固定窗口（见 FOREGROUND_NOTICE_WINDOW_SEC）：上游
+    一抖一恢复时若每次成功都清零，每次"恢复后再坏"都会重新弹横幅。
     标记翻转在 _report_runtime_error 内部、且仅在清空真正送达时发生——
     这里不再无条件翻 False（Codex P2：清空 POST 失败会让过期错误滞留且
     永不重试）。清空失败 → 标记保留 → 下个成功回合自动重试。"""
-    _reset_system_notice_state()
     if _runtime_error_reported:
         _report_runtime_error("", "")
 

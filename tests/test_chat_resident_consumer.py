@@ -961,14 +961,16 @@ def test_agent_failure_reported_even_with_fallback_disabled(monkeypatch):
     assert len(reported) == 1
 
 
-def test_agent_failure_fallback_is_not_cooldown_suppressed(monkeypatch):
-    """Each failed user turn receives visible feedback instead of a silent cooldown
-    drop, and (new behavior) each also gets its own system notice — foreground
-    notices bypass the background debounce, so two failed turns yield two of
-    each kind of post_reply call, not one."""
+def test_agent_failure_fallback_posts_every_turn_banner_windowed(monkeypatch):
+    """Each failed user turn still receives its visible in-chat fallback (never a
+    silent drop), but the system error banner is rate-limited (Seven 2026-07-11):
+    same-class foreground failures inside FOREGROUND_NOTICE_WINDOW_SEC post only
+    ONE banner — a user chatting through a bad patch must not get a banner per
+    message. So two failed turns = two fallbacks + one banner."""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    crc._reset_system_notice_state()
 
     with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
          patch.object(crc, "post_reply") as mock_post:
@@ -982,13 +984,13 @@ def test_agent_failure_fallback_is_not_cooldown_suppressed(monkeypatch):
 
     assert [c.args[0] for c in fallback_calls] == [crc.FALLBACK_REPLY, crc.FALLBACK_REPLY]
 
-    assert len(notice_calls) == 2
-    for c in notice_calls:
-        assert c.kwargs["notice_kind"] == "upstream_error"
-        assert c.kwargs["suppress_push"] is True
-        assert "agent down" in c.args[0]
+    assert len(notice_calls) == 1
+    c = notice_calls[0]
+    assert c.kwargs["notice_kind"] == "upstream_error"
+    assert c.kwargs["suppress_push"] is True
+    assert "agent down" in c.args[0]
 
-    assert mock_post.call_count == 4
+    assert mock_post.call_count == 3
 
 
 def test_sanitize_reply_text_strips_leaks_and_duplicates():

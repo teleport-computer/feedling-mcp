@@ -116,41 +116,82 @@ def test_notice_body_has_marker_and_detail_truncated():
     assert len(n.detail) <= 200
 
 
-def test_debounce_foreground_always_background_once(monkeypatch):
+def test_background_failures_never_banner(monkeypatch):
+    # Seven 2026-07-11：后台车道失败一律不进聊天流（用户无法据此行动，会被自己
+    # 看不见的车道刷屏）。观测走 _report_runtime_error（设置页/admin）——它必须照发。
+    sent, reported = [], []
+    monkeypatch.setattr(crc, "post_reply", lambda text, **kw: sent.append((text, kw)) or {})
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: reported.append(a))
+    crc._reset_system_notice_state()
+    crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 429"), foreground=False)
+    crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 余额不足"), foreground=False)
+    assert sent == []          # 聊天流零横幅
+    assert len(reported) == 2  # 设置页/admin 腿照发
+
+
+def test_foreground_transient_wave_merges_to_one_banner(monkeypatch):
+    # 同一波抖动打出两个瞬时/系统类（429 + unknown）→ 只弹第一条；
+    # 同类在窗口内再失败 → 也不再弹。
     sent = []
     monkeypatch.setattr(crc, "post_reply", lambda text, **kw: sent.append((text, kw)) or {})
     monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: None)
     crc._reset_system_notice_state()
-    e = RuntimeError("cli agent exited 1: unexpected status 403: 额度不足")
-
-    crc._notify_agent_turn_failure(e, foreground=False)
-    crc._notify_agent_turn_failure(e, foreground=False)  # 同类去抖
+    crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 429"), foreground=True)
+    crc._notify_agent_turn_failure(RuntimeError("totally opaque failure"), foreground=True)  # unknown
+    crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 429"), foreground=True)
     assert len(sent) == 1
 
-    crc._notify_agent_turn_failure(e, foreground=True)   # 前台绕过去抖
+
+def test_foreground_actionable_classes_bucketed_per_class(monkeypatch):
+    # 可行动类（user_provider）各自一个窗口：额度 + key 失效都值得用户知道，
+    # 但同类重复在窗口内只弹一次。
+    sent = []
+    monkeypatch.setattr(crc, "post_reply", lambda text, **kw: sent.append((text, kw)) or {})
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: None)
+    crc._reset_system_notice_state()
+    quota = RuntimeError("cli agent exited 1: unexpected status 403: 额度不足")
+    auth = RuntimeError("cli agent exited 1: invalid api key")
+    crc._notify_agent_turn_failure(quota, foreground=True)
+    crc._notify_agent_turn_failure(auth, foreground=True)   # 不被 quota 的窗口挡住
+    crc._notify_agent_turn_failure(quota, foreground=True)  # 同类窗口内抑制
+    assert len(sent) == 2
+
+
+def test_foreground_window_not_reset_by_success(monkeypatch):
+    # 固定窗口：成功回合不清零，flapping（fail→ok→fail）不重复弹。
+    sent = []
+    monkeypatch.setattr(crc, "post_reply", lambda text, **kw: sent.append((text, kw)) or {})
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: None)
+    crc._reset_system_notice_state()
+    e = RuntimeError("cli agent exited 1: 429")
     crc._notify_agent_turn_failure(e, foreground=True)
-    assert len(sent) == 3
-
-    # 不同 error_class 互不影响
-    crc._notify_agent_turn_failure(
-        RuntimeError("cli agent exited 1: exceeded retry limit, last status: 429"),
-        foreground=False)
-    assert len(sent) == 4
-
-    # 成功重置后同类再发
     crc._note_agent_turn_success()
-    crc._notify_agent_turn_failure(e, foreground=False)
-    assert len(sent) == 5
+    crc._notify_agent_turn_failure(e, foreground=True)
+    assert len(sent) == 1
 
 
-def test_debounce_first_notice_not_suppressed_at_low_uptime(monkeypatch):
-    # monotonic 从 0 起步（模拟刚开机的 CVM）：首个后台通知不得被 0.0 默认值假抑制
+def test_foreground_banner_returns_after_window_elapses(monkeypatch):
+    sent = []
+    now = {"t": 1000.0}
+    monkeypatch.setattr(crc, "post_reply", lambda text, **kw: sent.append(text) or {})
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: None)
+    monkeypatch.setattr(crc.time, "monotonic", lambda: now["t"])
+    crc._reset_system_notice_state()
+    e = RuntimeError("cli agent exited 1: 429")
+    crc._notify_agent_turn_failure(e, foreground=True)
+    now["t"] += crc.FOREGROUND_NOTICE_WINDOW_SEC + 1
+    crc._notify_agent_turn_failure(e, foreground=True)
+    assert len(sent) == 2
+
+
+def test_foreground_first_notice_not_suppressed_at_low_uptime(monkeypatch):
+    # monotonic 从 0 起步（模拟刚开机的 CVM）：首个前台横幅不得被 0.0 默认值假抑制
     calls = []
     monkeypatch.setattr(crc, "post_reply", lambda text, **kw: calls.append(kw) or {})
     monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: None)
-    monkeypatch.setattr(crc.time, "monotonic", lambda: 100.0)  # uptime 100s < 21600s
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 100.0)  # uptime 100s < 10800s
     crc._reset_system_notice_state()
-    crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 429"), foreground=False)
+    crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 429"), foreground=True)
     assert len(calls) == 1
 
 

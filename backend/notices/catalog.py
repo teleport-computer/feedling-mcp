@@ -51,7 +51,7 @@ ERROR_CLASSES = frozenset({
 # error_class -> (blame, user_text)
 _CATALOG: dict[str, tuple[str, str]] = {
     "quota_insufficient": (
-        "user_provider", "你的 API 服务额度不足，充值后再发消息即可恢复。"),
+        "user_provider", "模型服务额度不足，充值后再发消息即可恢复。"),
     "auth_invalid": (
         "user_provider", "API Key 无效或已过期，请到设置里重新保存。"),
     "model_not_found": (
@@ -63,7 +63,7 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "content_filtered": (
         "provider_transient", "这次回复被模型的内容策略拦下了，换个说法再试。"),
     "rate_limited": (
-        "provider_transient", "你的 API 服务限流了，稍等几分钟再试。"),
+        "provider_transient", "模型服务限流了，稍等几分钟再试。"),
     "upstream_unavailable": (
         "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。"),
     "turn_timeout": (
