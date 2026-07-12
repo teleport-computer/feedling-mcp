@@ -429,9 +429,6 @@ def test_route_test_active_route_failure_takes_over_to_other_ok_route(
     assert r1_row["is_active"] is False
     assert db.model_api_active_route(uid)["id"] == r2
 
-    # Resident discovery now only admits explicit resident_cli opt-outs;
-    # db_action_v2 is the global default.
-    db.set_blob(uid, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     roster = {u["user_id"] for u in db.list_agent_runtime_enabled_users()}
     assert uid in roster
 

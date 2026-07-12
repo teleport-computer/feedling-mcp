@@ -129,11 +129,8 @@ def test_resident_cli_manual_tick_still_uses_resident_path(monkeypatch):
     """Regression: a hosted user with no hosted_runtime_mode set (default
     resident_cli) must hit the exact same resident gate-decision path as
     before Task 9 — the v2 bridge must be a no-op for them."""
-    _seed_v2("u_manual_resident")
+    seed_user("u_manual_resident")
     store = core_store.get_store("u_manual_resident")
-    # Full cutover 2026-07-11: db_action_v2 is the default, so the resident path is
-    # reached only by an explicit resident_cli opt-out.
-    hosted_config_store.set_hosted_runtime_mode(store, "resident_cli")
     assert hosted_config_store.get_hosted_runtime_mode(store) == "resident_cli"
 
     fake_decision = {"should_wake_agent": True, "decision_id": "d1"}

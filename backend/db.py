@@ -1295,22 +1295,17 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
                 WHERE r.is_active
                   AND r.test_status = 'ok'
                   AND LOWER(c.provider) = ANY(%s)
-                  -- D0 exclusivity guard (Hosted Runtime V2, full cutover 2026-07-11):
-                  -- db_action_v2 is now the GLOBAL DEFAULT, so the resident roster
-                  -- admits ONLY users who explicitly opted back to resident_cli. A
-                  -- user with no model_api_runtime blob (or db_action_v2, or an
-                  -- invalid value) runs on the V2 pool and MUST be excluded here, or
-                  -- both runtimes answer their turns (double-run). This mirrors
-                  -- config_store.get_hosted_runtime_mode's flipped default exactly:
-                  -- resident iff the blob's hosted_runtime_mode == 'resident_cli'.
-                  -- hosted_runtime_mode still lives in the user_blobs
-                  -- 'model_api_runtime' profile after the model-api-multi-profile
-                  -- migration moved provider config into routes/credentials.
-                  AND EXISTS (
+                  -- D0 exclusivity guard (Hosted Runtime V2): a user flipped to
+                  -- db_action_v2 runs on the V2 worker pool, so drop them from the
+                  -- resident roster to prevent a double-run. hosted_runtime_mode
+                  -- still lives in the user_blobs 'model_api_runtime' profile even
+                  -- after the model-api-multi-profile migration moved provider
+                  -- config into model_api_routes/credentials.
+                  AND NOT EXISTS (
                     SELECT 1 FROM user_blobs mrt
                     WHERE mrt.user_id = r.user_id
                       AND mrt.kind = 'model_api_runtime'
-                      AND mrt.doc->>'hosted_runtime_mode' = 'resident_cli'
+                      AND COALESCE(mrt.doc->>'hosted_runtime_mode', '') = 'db_action_v2'
                   )
                 ORDER BY r.user_id
                 """,

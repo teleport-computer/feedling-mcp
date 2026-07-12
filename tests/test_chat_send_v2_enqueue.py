@@ -87,10 +87,8 @@ def test_resident_cli_default_still_routes_old_way_and_skips_enqueue(monkeypatch
     delegation) still runs."""
     _seed("u_send_resident")
     store = core_store.get_store("u_send_resident")
-    # Full cutover 2026-07-11: db_action_v2 is the default, so a user must EXPLICITLY
-    # opt back to resident_cli to hit the old resident dispatch. This asserts that
-    # opt-out still routes exactly as before (v2 gate a no-op for them).
-    hosted_config_store.set_hosted_runtime_mode(store, "resident_cli")
+    # Deliberately NOT calling set_hosted_runtime_mode — proves the untouched
+    # default (resident_cli) path, matching existing hosted users today.
     assert hosted_config_store.get_hosted_runtime_mode(store) == "resident_cli"
 
     monkeypatch.setattr(

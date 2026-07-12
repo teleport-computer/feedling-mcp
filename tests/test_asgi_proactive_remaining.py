@@ -29,7 +29,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
-import db  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
@@ -307,11 +306,6 @@ def test_dream_tick_invalid_now_parity(env):
 def test_proactive_tick_parity_forced_wake(env):
     _fu, fk = _register()
     _au, ak = _register()
-    # Resident proactive-job shape (job.source) is only produced on the
-    # resident_cli path; db_action_v2 (now the global default) enqueues a
-    # V2 manual_wake job instead with a different response shape.
-    db.set_blob(_fu, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
-    db.set_blob(_au, "model_api_runtime", {"hosted_runtime_mode": "resident_cli"})
     body = {"force": True, "context_hint": "a research screen", "intent_label": "research_pause"}
     f = _flask("POST", "/v1/proactive/tick", headers=_key(fk), json_body=body)
     a = _asgi("POST", "/v1/proactive/tick", headers=_key(ak), json_body=body)
