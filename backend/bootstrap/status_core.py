@@ -44,7 +44,21 @@ def bootstrap_status_payload(store: UserStore) -> dict:
     # lock so we don't race with /v1/chat/response writes.
     with store.chat_lock:
         chat_msgs = list(store.chat_messages)
-    agent_msgs = [m for m in chat_msgs if isinstance(m, dict) and m.get("role") in _AGENT_ROLES]
+    # Exclude synthetic verify-loop liveness replies (source="verify_ping",
+    # role=agent/openclaw). /v1/chat/history hides these rows from the visible
+    # transcript (_hide_verify_ping_from_feed), so counting them here as real
+    # agent messages made bootstrap_status report agent_messages_count>=1 while
+    # /chat/history returned total=0 — the App showed a "new message" bubble that
+    # opened onto an empty chat. Every other real-message count in the codebase
+    # (gates.py / chat.service / db.py) already excludes source=="verify_ping";
+    # this line was the outlier. See test_bootstrap_status_ignores_verify_ping.
+    agent_msgs = [
+        m
+        for m in chat_msgs
+        if isinstance(m, dict)
+        and m.get("role") in _AGENT_ROLES
+        and m.get("source") != "verify_ping"
+    ]
     agent_msg_count = len(agent_msgs)
     last_agent_msg_ts = ""
     if agent_msg_count > 0:
