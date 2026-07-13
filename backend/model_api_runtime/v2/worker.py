@@ -65,6 +65,7 @@ from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import kill_switch
 from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
@@ -247,11 +248,14 @@ class TurnDeps:
     # None：worker.py 自身不 import hosted，测试/其他调用方不必提供；生产装配见
     # serve_worker.build_production_deps。
     read_summary: Callable[[str], tuple[str, float, int]] | None = None
-    # (user_id, summary, watermark_ts, expected_version) -> True if CAS landed：本地加密
-    # （core_envelope，非 enclave 往返）+ CAS 写回 v2_conversation_summary（Task 2 storage）。
-    # expected_version 不匹配（别的回合已推进过摘要）时返回 False，调用方按丢弃本次压缩处理，
-    # 不重试、不报错——下一回合会用新版本重新压缩。默认 None：同上。
-    write_summary: Callable[[str, str, float, int], bool] | None = None
+    # (user_id, summary, watermark_ts, expected_version[, watermark_seq]) -> True if CAS
+    # landed：本地加密（core_envelope，非 enclave 往返）+ CAS 写回 v2_conversation_summary
+    # （Task 2 storage）。expected_version 不匹配（别的回合已推进过摘要）时返回 False，
+    # 调用方按丢弃本次压缩处理，不重试、不报错——下一回合会用新版本重新压缩。默认 None：同上。
+    # watermark_seq（D5/Task 9）是可选的第 5 个位置参数——_run_compaction 只有在能拿到折叠
+    # 批次最后一行的精确 seq 时才会传它（生产路径总是能拿到；某些窄签名的测试 fake 只接 4
+    # 个参数，_run_compaction 会退化成旧的 4 参调用，两边都不破）。
+    write_summary: Callable[..., bool] | None = None
     # (user_id, message_ids) -> {message_id: {"image_mime": str, "image_b64": str}}：只对
     # 指定的图片消息做 enclave 解密。**不能**并进 read_tail —— compaction 用 limit=10_000 调
     # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
@@ -642,6 +646,20 @@ async def _run_compaction(
             return "completed"
         old = tail[: min(_COMPACTION_BATCH, len(tail) - _TAIL_KEEP)]
         new_watermark = old[-1]["ts"]
+        # D5/Task 9: also advance the seq watermark, atomically, in the same CAS
+        # write as new_watermark below. The tail row dict itself may already carry
+        # "seq" (a seq-aware reader); if not (e.g. today's ts-windowed
+        # _read_compaction_tail, or a narrow test double), fall back to an exact
+        # by-id lookup — never a ts-range estimate, which would be ambiguous
+        # under same-ts ties (see db.chat_seq_for_msg_id's docstring). A tail row
+        # with no "id" at all (only synthetic test doubles) leaves the seq
+        # watermark unadvanced this round rather than guessing.
+        new_watermark_seq = old[-1].get("seq")
+        if new_watermark_seq is None:
+            last_id = old[-1].get("id")
+            if last_id is not None:
+                new_watermark_seq = await asyncio.to_thread(
+                    db.chat_seq_for_msg_id, user_id, last_id)
         new_summary = await v2_compaction.compact(
             provider_config=provider_config, current_summary=summary, old_messages=old,
             llm=provider_client.reliable_chat_completion_async)
@@ -666,7 +684,14 @@ async def _run_compaction(
             raise RuntimeModeChanged("user rolled back before summary write")
         # write_summary 是本地加密（core_envelope，非 enclave 往返）+ CAS 写库，不占用
         # 稀缺的 enclave_sem——只有解密才走 enclave HTTP（见 _read_summary/_read_tail）。
-        ok = await asyncio.to_thread(deps.write_summary, user_id, new_summary, new_watermark, version)
+        # watermark_seq 只在算出来时才多传一个位置参数（见上）——narrow-signature 的旧
+        # fake（不接这个参数）走的正是这条 4 参分支，不受影响。
+        if new_watermark_seq is not None:
+            ok = await asyncio.to_thread(
+                deps.write_summary, user_id, new_summary, new_watermark, version, new_watermark_seq)
+        else:
+            ok = await asyncio.to_thread(
+                deps.write_summary, user_id, new_summary, new_watermark, version)
         if ok:
             completed = await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by)
@@ -677,9 +702,18 @@ async def _run_compaction(
             if tm is not None:
                 tm.flush(failed=False, status="ok")
             return "completed"
-        # CAS 没落地：别的写手已经推进过版本，本次压缩视为丢弃，不重试、不报错。
+        # CAS 没落地：别的写手已经推进过版本，本次压缩的 batch 作废——但 tail 是否
+        # 仍然超预算跟这次 CAS 输赢无关，绝不能静默放弃，否则超预算 tail 永久堆积、
+        # 加密开销/上下文预算一路涨上去没人再折。跟成功路径 (:674-677) 同一个
+        # "maintenance" lane + enqueue_job 的 per-user 单飞 coalesce（本来就防
+        # 重试风暴），reason 换成 cas_lost_retry 便于跟正常的 catch-up 区分。下一次
+        # 尝试会重新从（未被本次推进的）watermark 读 summary/tail，不复用这次算出
+        # 的、已经作废的 batch。
         await asyncio.to_thread(
             jobs_store.mark_failed, job_id, "summary_cas_lost", claimed_by=claimed_by)
+        await asyncio.to_thread(
+            jobs_store.enqueue_job, user_id, "maintenance", reason="cas_lost_retry")
+        await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
         if tm is not None:
             tm.flush(failed=True, status="summary_cas_lost")
         return "failed"
@@ -692,6 +726,230 @@ async def _run_compaction(
         if tm is not None:
             tm.flush(failed=True, status=code)
         return "failed"
+
+
+def _gap_from_count(unsummarized_count: int, tail_limit: int) -> bool:
+    """Pure/no-I/O core of D6 gap detection: True when THIS USER has more
+    unsummarized messages (``seq > watermark_seq``) than the bounded tail
+    window can hold. The tail keeps only the newest ``tail_limit`` of them
+    (``serve_worker._read_tail_window``'s ``candidates[-limit:]`` slice) —
+    anything beyond that count is neither folded into the summary nor inside
+    the tail: D6's silent-drop hole.
+
+    COUNT-based, NOT seq-arithmetic. ``chat_messages.seq`` is a TABLE-WIDE
+    ``BIGINT GENERATED ALWAYS AS IDENTITY`` counter shared by every user (see
+    migration 0001_baseline.py) — in production, other users' concurrent
+    inserts interleave with this user's, so the raw seq SPAN since the
+    watermark (``max_seq - watermark_seq``, the OLD buggy test — ``max_seq``
+    being the GLOBAL max across all users) has no fixed relationship to how
+    many of THIS user's own messages actually sit in that span: it can be
+    huge (mostly other users' rows) even when this user has only a handful
+    unsummarized. That produced a FALSE gap on ~every multi-user turn — every
+    turn ran a needless synchronous BYOK catch-up compaction, collapsing the
+    verbatim tail to empty and occasionally failing the turn outright
+    (``prompt_coverage_incomplete`` after 3 no-op-fold retries). The fix:
+    compare THIS USER's own row count (``db.count_messages_after_seq``,
+    scoped by ``user_id``) against ``tail_limit`` directly — ``max_seq <= 0``
+    no longer needs a special case, since a user with zero rows past the
+    watermark has ``unsummarized_count == 0 <= tail_limit`` naturally."""
+    return unsummarized_count > tail_limit
+
+
+async def _unsummarized_count(user_id: str, watermark_seq: int) -> int:
+    """THIS USER's own ``chat_messages`` row count with ``seq > watermark_seq``
+    — one cheap indexed ``COUNT(*)`` (see ``db.count_messages_after_seq``),
+    scoped by ``user_id``. Replaces the old ``max_seq - watermark_seq``
+    global-seq-span estimate — see ``_gap_from_count``'s docstring for why
+    that was wrong."""
+    return await asyncio.to_thread(db.count_messages_after_seq, user_id, watermark_seq)
+
+
+async def _prompt_coverage_gap(user_id: str, *, watermark_seq: int, tail_limit: int) -> bool:
+    """D6 gap check: fetch THIS USER's own unsummarized row count and run it
+    through the pure ``_gap_from_count`` core. One indexed COUNT query on the
+    fast (overwhelmingly common) no-gap path — no enclave/decrypt work, no
+    LLM call, no compaction."""
+    count = await _unsummarized_count(user_id, watermark_seq)
+    return _gap_from_count(count, tail_limit)
+
+
+async def _assert_prompt_covers_seq(user_id: str, *, watermark_seq: int, tail_limit: int) -> None:
+    """D6 hard invariant, count-based (see ``_prompt_coverage_gap``): raises
+    ``v2_responder.ResponderError`` if a coverage hole would remain — see
+    ``_assert_prompt_covers`` (the wrapper actually wired into the two call
+    sites, which additionally re-derives ``watermark_seq`` fresh) for why
+    raising, not truncating/ignoring, is the deliberate choice here."""
+    if await _prompt_coverage_gap(user_id, watermark_seq=watermark_seq, tail_limit=tail_limit):
+        raise v2_responder.ResponderError("prompt_coverage_incomplete")
+
+
+async def _assert_prompt_covers(user_id: str, tail_limit: int) -> None:
+    """Post-assembly hard assertion (D6/Task 10): every message with
+    ``seq > watermark_seq`` must be inside the tail window this turn is about
+    to hand the model. Re-derives ``watermark_seq`` fresh from the DB
+    (``jobs_store.get_summary_row``) rather than reusing
+    ``_ensure_prompt_coverage``'s return value — this is deliberately an
+    INDEPENDENT re-check, not a cache read, so it still catches a future
+    wiring bug (e.g. the tail read moved ahead of the coverage call, or the
+    coverage call got dropped from a call site entirely) instead of silently
+    trusting whatever the earlier call computed. One extra cheap indexed
+    COUNT read per turn (see ``_prompt_coverage_gap``) — negligible next to
+    the LLM/enclave work already in the same turn.
+
+    Raising here (rather than truncating the tail or proceeding) is
+    deliberate: reaching a real gap at THIS point means
+    ``_ensure_prompt_coverage`` either wasn't called before this, or its
+    catch-up didn't actually land — a bug, not a recoverable runtime
+    condition — so the turn must fail loudly (``mark_failed``, requeue-able)
+    instead of silently shipping a prompt with a known coverage hole, which
+    is exactly the silent-drop bug this task exists to close."""
+    summary_row = await asyncio.to_thread(jobs_store.get_summary_row, user_id)
+    watermark_seq = int(summary_row["watermark_seq"]) if summary_row else 0
+    await _assert_prompt_covers_seq(user_id, watermark_seq=watermark_seq, tail_limit=tail_limit)
+
+
+async def _ensure_prompt_coverage(
+    user_id: str,
+    deps: TurnDeps,
+    *,
+    provider_config: Any,
+    enclave_sem: "asyncio.Semaphore",
+    tail_limit: int,
+    max_retries: int = 3,
+) -> tuple[int, int]:
+    """D6 (Task 10): close a compaction backlog gap BEFORE assembling a turn's
+    prompt. Today's bug: ``_read_tail`` only ever returns the newest
+    ``tail_limit`` messages after the summary watermark (``result[-limit:]``,
+    see ``serve_worker._read_tail_window``) — if compaction has fallen more
+    than ``tail_limit`` messages behind, the messages strictly between the
+    watermark and the tail's start seq are SILENTLY DROPPED: not summarized
+    (compaction hasn't reached them yet) and not in the tail (the
+    newest-``tail_limit`` slice excludes them). This closes that hole with a
+    SYNCHRONOUS catch-up compaction run inline, before the caller reads the
+    actual prompt content — unlike the existing best-effort background
+    maintenance enqueue (``process_job``'s ``needs_compaction`` check), which
+    only fires AFTER a reply has already gone out on a tail that had the hole.
+
+    Gap math (COUNT-based on THIS USER's own rows — see ``_gap_from_count``/
+    ``_prompt_coverage_gap``, no enclave/decrypt work on the fast path):
+    ``watermark_seq`` comes from ``jobs_store.get_summary_row`` (already
+    performs the D5/Task 9 ts->seq back-compat translation for pre-migration
+    rows — that function's own docstring names this exact call site).
+    ``unsummarized_count`` is ``db.count_messages_after_seq(user_id,
+    watermark_seq)`` — deliberately NOT ``db.chat_max_seq`` seq-arithmetic
+    (``chat_messages.seq`` is a table-wide identity counter shared by every
+    user; other users' interleaved inserts make a global-seq span meaningless
+    as a per-user count — see ``_gap_from_count``'s docstring for the full
+    writeup of the bug this replaced). No gap is the overwhelmingly common
+    case and costs exactly two cheap indexed reads (summary row + COUNT) — no
+    tail decrypt, no LLM call, no compaction.
+
+    Gap found: run ONE inline catch-up compaction covering the ENTIRE gap
+    (``unsummarized_count`` messages — THIS USER's own oldest unsummarized
+    rows, oldest-first from the watermark — reuses
+    ``deps.read_compaction_tail``/``_read_compaction_tail``'s
+    oldest-first-from-watermark contract, exactly like ``_run_compaction``'s
+    periodic fold) via ``v2_compaction.compact``, then CAS-writes the
+    advanced summary via ``deps.write_summary`` (watermark_ts AND
+    watermark_seq advance atomically in the same CAS row, per Task 9), then
+    loops to re-check from a fresh read. Looping (rather than assuming the
+    CAS landed) handles two real races: (a) CAS loss — a concurrently running
+    periodic maintenance job or another turn for this user advanced the
+    summary first; re-reading at the top of the next iteration picks up
+    whatever version won, which may already close the gap with zero extra
+    compaction work; (b) a genuine no-op fold (``compact`` returns unchanged
+    text, e.g. an empty/failed LLM reply) never advances the watermark and
+    must not spin forever — hence ``max_retries`` (default 3, matching the
+    plan's "bounded number of times").
+
+    Bounded-retry exhaustion is NOT a silent pass-through: raises
+    ``v2_responder.ResponderError("prompt_coverage_incomplete")`` so the turn
+    fails visibly (``mark_failed``, requeue-able) rather than shipping a
+    prompt with a known coverage hole. ``deps.read_summary``/
+    ``deps.read_compaction_tail``-or-``deps.read_tail``/``deps.write_summary``
+    being unwired (``None`` — older/minimal test deps) is likewise NOT
+    treated as "can't happen here": it raises the same way on the first gap
+    found, since without those readers this function has no way to close it.
+
+    Returns ``(watermark_seq, max_seq)`` as of the last (successful, no-gap)
+    check purely for callers that want it cheaply (``max_seq`` is
+    ``db.chat_max_seq`` — a GLOBAL anchor, informational only, no longer part
+    of the gap math itself); the actual hard invariant enforcement after the
+    real tail read is ``_assert_prompt_covers``, which re-derives its own
+    fresh state rather than trusting this return value.
+    """
+    attempt = 0
+    while True:
+        summary_row = await asyncio.to_thread(jobs_store.get_summary_row, user_id)
+        watermark_seq = int(summary_row["watermark_seq"]) if summary_row else 0
+        unsummarized_count = await _unsummarized_count(user_id, watermark_seq)
+        if not _gap_from_count(unsummarized_count, tail_limit):
+            max_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
+            return watermark_seq, max_seq  # no gap — the common fast path
+        if (attempt >= max_retries or deps.read_summary is None or deps.write_summary is None
+                or (deps.read_compaction_tail is None and deps.read_tail is None)):
+            raise v2_responder.ResponderError("prompt_coverage_incomplete")
+        attempt += 1
+        reader = deps.read_compaction_tail or deps.read_tail
+
+        async def _read_gap():
+            summary_ = await asyncio.to_thread(deps.read_summary, user_id)
+            # Cover the WHOLE current gap in one fold — not just the periodic
+            # `_COMPACTION_BATCH` slice `_run_compaction` uses for its steady-
+            # state maintenance cadence. This call exists specifically to make
+            # the hole disappear before the prompt is assembled, not to pace
+            # background token spend. Sized by THIS USER's actual unsummarized
+            # row count (`unsummarized_count`, just computed above from
+            # `db.count_messages_after_seq`) — NOT `max_seq - watermark_seq`
+            # (a GLOBAL seq span that includes every other user's interleaved
+            # inserts too; see `_gap_from_count`'s docstring for why that was
+            # the D6 regression this rework closes).
+            old_ = await asyncio.to_thread(reader, user_id, summary_[1], unsummarized_count)
+            return summary_, old_
+
+        # enclave_sem may be None in tests that call this helper directly
+        # (mirrors `_coalesce_inputs`/`_cap_data`'s own `enclave_sem is None`
+        # no-gate tolerance) — production callers always pass the shared gate.
+        if enclave_sem is not None:
+            async with enclave_sem:
+                (summary, watermark_ts, version), old = await _read_gap()
+        else:
+            (summary, watermark_ts, version), old = await _read_gap()
+        if not old:
+            # The count says a gap exists but the reader returned nothing
+            # (e.g. a ts-windowed fake/reader whose window doesn't line up
+            # with the real seq boundary) — looping again would just burn
+            # retry budget for no benefit. Fail now rather than spin.
+            raise v2_responder.ResponderError("prompt_coverage_incomplete")
+        new_summary = await v2_compaction.compact(
+            provider_config=provider_config, current_summary=summary, old_messages=old,
+            llm=provider_client.reliable_chat_completion_async)
+        if new_summary.strip() == summary.strip():
+            # Genuine no-op fold (empty/failed LLM reply — mirrors
+            # `_run_compaction`'s identical guard). Do NOT advance the
+            # watermark: these messages were NOT actually folded into the
+            # summary text, so pretending they were covered would satisfy the
+            # seq arithmetic while silently losing their content — exactly
+            # the bug this task exists to close, just moved one layer down.
+            # Leave the gap in place; the `while` loop's own retry-budget
+            # check (top of next iteration) is what eventually raises.
+            continue
+        new_watermark_ts = old[-1]["ts"]
+        new_watermark_seq = old[-1].get("seq")
+        if new_watermark_seq is None:
+            last_id = old[-1].get("id")
+            if last_id is not None:
+                new_watermark_seq = await asyncio.to_thread(
+                    db.chat_seq_for_msg_id, user_id, last_id)
+        if new_watermark_seq is not None:
+            await asyncio.to_thread(
+                deps.write_summary, user_id, new_summary, new_watermark_ts, version, new_watermark_seq)
+        else:
+            await asyncio.to_thread(
+                deps.write_summary, user_id, new_summary, new_watermark_ts, version)
+        # Loop: the top of `while` re-reads and re-checks against whatever
+        # watermark actually landed (this write's, a concurrent writer's, or
+        # unchanged on CAS loss/no-op fold).
 
 
 async def _run_wake(
@@ -741,11 +999,26 @@ async def _run_wake(
                 ttl_sec=jobs_store.RUNNING_TTL_SEC,
             ):
                 raise LostJobLease(f"wake lease lost before {effect}")
+            # D4 live kill switch: same RuntimeModeChanged fence as the runtime-mode
+            # check below — _run_wake's outer `except Exception` mark_faileds/flushes
+            # it silently (no user-visible error chip for a background wake job),
+            # exactly like every other raise in this closure.
+            if await asyncio.to_thread(kill_switch.turns_halted):
+                raise RuntimeModeChanged(f"v2 turns halted before {effect}")
             if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
                 deps.runtime_mode_enabled, user_id
             ):
                 raise RuntimeModeChanged(f"user rolled back before {effect}")
 
+        # D6/Task 10: close a compaction backlog gap BEFORE reading the actual
+        # prompt content — see `_ensure_prompt_coverage`'s docstring. Only run
+        # when BOTH readers are wired (mirrors the joint `read_summary is not
+        # None and read_tail is not None` gate `process_job` uses below); a
+        # coverage check is meaningless without a real tail reader to bound.
+        if deps.read_summary is not None and deps.read_tail is not None:
+            await _ensure_prompt_coverage(
+                user_id, deps, provider_config=provider_config,
+                enclave_sem=enclave_sem, tail_limit=_TAIL_BUDGET)
         async with enclave_sem:
             if deps.read_summary is not None:
                 summary, watermark, _ver = await asyncio.to_thread(deps.read_summary, user_id)
@@ -757,6 +1030,11 @@ async def _run_wake(
                 tail = []
             tail = await asyncio.to_thread(
                 _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images)
+        if deps.read_summary is not None and deps.read_tail is not None:
+            # Post-assembly hard assertion (D6): independent re-derivation,
+            # not a reuse of `_ensure_prompt_coverage`'s return — see
+            # `_assert_prompt_covers`'s docstring for why.
+            await _assert_prompt_covers(user_id, _TAIL_BUDGET)
         wake_tail = list(tail) + [{"role": "user", "content": _WAKE_NUDGE}]
 
         # Minted ONCE, unconditionally: cheap HMAC signing (not a decrypt — see
@@ -1081,6 +1359,20 @@ async def process_job(
                 raise LostJobLease("job lease expired or ownership changed")
 
         async def _ensure_runtime_mode() -> None:
+            # D4 live kill switch: checked first, same fence as runtime-mode-disabled
+            # below (mark_failed + tm.flush + raise RuntimeModeChanged) — this closure
+            # is what _before_write/_dispatch_tools/the turn-start check all call, so
+            # gating here fences every active write and tool-dispatch round while
+            # halted without a second bare-raise path that would skip the bookkeeping.
+            if await asyncio.to_thread(kill_switch.turns_halted):
+                await asyncio.to_thread(
+                    jobs_store.mark_failed,
+                    job_id,
+                    "turns_halted",
+                    claimed_by=claimed_by,
+                )
+                tm.flush(failed=True, status="turns_halted")
+                raise RuntimeModeChanged("v2 turns halted")
             if deps.runtime_mode_enabled is None or await asyncio.to_thread(
                 deps.runtime_mode_enabled, user_id
             ):
@@ -1183,11 +1475,22 @@ async def process_job(
         # read_tail being None (older/minimal test deps) degrades to empty
         # summary/tail, exactly as before.
         if deps.read_summary is not None and deps.read_tail is not None:
+            # D6/Task 10: close a compaction backlog gap BEFORE reading the
+            # actual prompt content — see `_ensure_prompt_coverage`'s
+            # docstring. Common case (no gap) costs two cheap indexed reads
+            # and returns immediately without touching the enclave/LLM.
+            await _ensure_prompt_coverage(
+                user_id, deps, provider_config=provider_config,
+                enclave_sem=enclave_sem, tail_limit=_TAIL_HARD_CAP)
             async with enclave_sem:
                 summary, watermark, _ver = await asyncio.to_thread(deps.read_summary, user_id)
                 tail = await asyncio.to_thread(deps.read_tail, user_id, watermark, _TAIL_HARD_CAP)
                 tail = await asyncio.to_thread(
                     _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images)
+            # Post-assembly hard assertion (D6): independent re-derivation,
+            # not a reuse of `_ensure_prompt_coverage`'s return — see
+            # `_assert_prompt_covers`'s docstring for why.
+            await _assert_prompt_covers(user_id, _TAIL_HARD_CAP)
         else:
             summary, tail = "", []
 
@@ -1202,6 +1505,9 @@ async def process_job(
         async def _before_write() -> None:
             # Same runtime-mode/lease fence execute_plan's before_write used —
             # called before each serialized write inside dispatch_tool_calls.
+            # D4 live kill switch check lives in _ensure_runtime_mode itself (see
+            # below) so it gets the same mark_failed+flush bookkeeping as the
+            # runtime-mode-disabled case, not a bare raise that would skip it.
             await _ensure_runtime_mode()
             await _renew_lease()
 
@@ -1452,6 +1758,7 @@ async def _wait_for_job_or_stop(
 async def _slot_loop(
     worker_id: str, *, poll_interval: float, stop_event: asyncio.Event, deps: TurnDeps,
     wake_event: "asyncio.Event | None" = None, lanes: "set | None" = None,
+    slot_id: int = 0, progress_cb: "Callable[[int, float | None], None] | None" = None,
 ) -> None:
     """一个 job-slot：抢一个 job 就跑一回合，抢不到就等待（poll_interval 兜底，
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
@@ -1461,17 +1768,64 @@ async def _slot_loop(
     （行为与改动前完全一致）；非 None 时这个 slot 只抢白名单里的 lane——`run_worker_loop`
     用它给部分 slot 划专用车道（见 `_reserved_lane_slots`）。
 
+    progress_cb（可选，PR D Task 2 + hard-timeout fix）：`progress_cb(slot_id, turn_start)`
+    在真实 slot 活动的天然边界调用——claim 到一个 job 之后（即将进入 `_run_turn`）、
+    `_run_turn` 跑完之后、以及每次空转 poll 醒来之后（哪怕没抢到活）。三个点合起来才能让
+    Task 3 的 watchdog 分清"事件循环整体健康只是没活干"和"全部 slot 卡死在一个永不返回的
+    await 上"——后者不会触发这三个点里的任何一个，进度会变陈旧。`slot_id` 就是这个 slot
+    在 `run_worker_loop` 里的下标（不是 `worker_id` 那个 `"{worker_id}#{i}"` 复合标签）。
+
+    `turn_start`（hard-timeout fix）：这个 slot 当前正在跑的 turn 的开始时刻
+    （`time.monotonic()`），空转/回合已完成时为 `None`。这是让 `ChildSupervisor.
+    poll_liveness()` 能报告"最老一个仍在跑的 turn 已经跑了多久"（`current_turn_age_sec`，
+    见 `child_supervisor.py`）的唯一信号来源——一个卡在单个 turn 里永不返回的 slot 会
+    STOP SENDING（它既不会再 claim，也不会跑完，也不会空转唤醒），但它发出的最后一条
+    `turn_start` 会一直被父进程记着，父进程用挂钟时间减去它，年龄跟着挂钟时间持续增长，
+    即使这个 slot 一条消息都不再发。若只报告"距上次收到消息多久"（旧的
+    `last_progress_age_sec`），这个卡住的 turn 永远不会单独被抓到——其它 slot 仍在正常
+    工作时，`last_progress_age_sec` 整体仍然新鲜，clause (b) 不会触发。
+
+    `progress_cb` 必须便宜、且绝不能把异常炸进这个循环——调用点自己包 try/except，记
+    日志后吞掉，不影响抢活/跑回合的主路径。默认 None：向后兼容既有调用方/测试，不传就是
+    纯 no-op。
+
     per-iteration 的抢活 + 跑回合整段包 try/except：单个 slot 上的瞬时故障（例如 claim/
     mark_running 撞到一次性 DB 错误）绝不允许冒出这个协程、拖垮 run_worker_loop 里其他
     仍然健康的 slot——记日志后 continue，下一轮再抢。"""
+
+    def _signal_progress(turn_start: float | None = None) -> None:
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(slot_id, turn_start)
+        except Exception as e:  # noqa: BLE001 — 心跳信号故障绝不能拖垮 slot 主循环
+            log.debug("[v2.worker] slot %s progress_cb failed: %s", worker_id, e)
+
     while not stop_event.is_set():
         job = None
         try:
+            # D4 live kill switch: while halted, claim nothing this iteration — idle
+            # and re-check on the next poll/wake (fail-open here on a control-plane
+            # read error: admission already fail-closes new work at the front door;
+            # a slot that's already running must not treat a transient DB blip on
+            # THIS read as a reason to stop draining jobs it may already own).
+            if await asyncio.to_thread(kill_switch.turns_halted):
+                await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
+                _signal_progress()
+                continue
             job = await asyncio.to_thread(jobs_store.claim_next_job, worker_id, lanes=lanes)
             if job is None:
                 await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
+                _signal_progress()
                 continue
+            # (a) claimed a job, about to enter _run_turn — record the turn's start
+            # time and report it so a wedge INSIDE _run_turn (the slot never reaches
+            # (b) below) still shows up as a climbing current_turn_age_sec even
+            # though this slot never sends another message.
+            turn_start = time.monotonic()
+            _signal_progress(turn_start)
             await _run_turn(job, deps)
+            _signal_progress(None)  # (b) turn completed — back to idle
         except Exception as e:  # noqa: BLE001 — 单 slot 故障绝不冒出去拖垮其他 slot
             log.warning("[v2.worker] slot %s iteration failed: %s", worker_id, e)
             if job is not None:
@@ -1515,12 +1869,14 @@ async def _slot_loop(
                         _safe_failure_code("slot_recovery_failed", recovery_error),
                     )
             await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
+            _signal_progress()  # (c) idle/error poll wake — slot is alive, just cycling
             continue
 
 
 async def run_worker_loop(
     worker_id: str, *, max_workers: int, poll_interval: float, stop_event: asyncio.Event, deps: TurnDeps,
     wake_event: "asyncio.Event | None" = None,
+    progress_cb: "Callable[[int, float | None], None] | None" = None,
 ) -> None:
     """起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
     stop_event 置位 → 所有 slot 跑完手上 job 后退出（SIGTERM 优雅 drain 的落点）。
@@ -1533,6 +1889,10 @@ async def run_worker_loop(
     `FEEDLING_V2_CHAT_RESERVED_SLOTS` 显式设置时覆盖默认的 max(1, max_workers // 2)；
     留空/未设置时用默认值。
 
+    progress_cb（可选，PR D Task 2）：原样转给每个 `_slot_loop`，附带该 slot 在
+    `assignments` 里的下标作为 `slot_id`——见 `_slot_loop` 自己的 docstring。默认 None：
+    向后兼容既有调用方/测试。
+
     `_slot_loop` catches recoverable per-job failures.  Any exception that still
     escapes is therefore a broken slot invariant: cancel the siblings and let
     the process supervisor restart the worker instead of silently running with
@@ -1543,7 +1903,8 @@ async def run_worker_loop(
     slots = [
         asyncio.create_task(
             _slot_loop(f"{worker_id}#{i}", poll_interval=poll_interval, stop_event=stop_event,
-                       deps=deps, wake_event=wake_event, lanes=assignments[i])
+                       deps=deps, wake_event=wake_event, lanes=assignments[i],
+                       slot_id=i, progress_cb=progress_cb)
         )
         for i in range(len(assignments))
     ]

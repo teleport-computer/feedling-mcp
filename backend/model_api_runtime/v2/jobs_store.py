@@ -797,49 +797,78 @@ def pending_job_count() -> int:
 
 def get_summary_row(user_id) -> dict | None:
     """读取该用户当前的会话摘要行（若存在）。返回
-    {"summary_envelope": dict|None, "watermark_ts": float, "version": int}，
-    无行返回 None（该用户从未压缩过）。"""
+    {"summary_envelope": dict|None, "watermark_ts": float, "version": int,
+    "watermark_seq": int}，无行返回 None（该用户从未压缩过）。
+
+    ``watermark_seq``（D5/Task 9，migration 0031）与 ``watermark_ts`` 同一行
+    并存：新压缩写入的行两者都是真值（见 ``upsert_summary_row_cas``）；但
+    0031 之前就存在的行只有 ``watermark_ts``、``watermark_seq`` 落着迁移
+    默认值 0。这里做一次性懒翻译——``watermark_seq==0`` 但
+    ``watermark_ts>0`` 时，用 ``db.seq_for_watermark_ts``（保守、
+    strictly-less）现算一个替身返回，不回写库（下一次真正压缩发生时才会
+    落一个精确值）。选在读侧做而不是把翻译推给每个调用方，是因为
+    ``get_summary_row`` 只有一个实现、调用方（当前的 ``_read_summary``、
+    未来 Task 10 的 prompt-invariant 边界读取）都自动拿到一致语义，不用人人
+    记得先查有没有 watermark_seq 再翻译一次。"""
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT summary_envelope, watermark_ts, version "
+                "SELECT summary_envelope, watermark_ts, version, watermark_seq "
                 "FROM v2_conversation_summary WHERE user_id=%s",
                 (user_id,),
             )
             row = cur.fetchone()
     if row is None:
         return None
+    watermark_ts = float(row["watermark_ts"])
+    watermark_seq = int(row["watermark_seq"] or 0)
+    if watermark_seq == 0 and watermark_ts > 0:
+        watermark_seq = db.seq_for_watermark_ts(user_id, watermark_ts)
     return {
         "summary_envelope": dict(row["summary_envelope"]) if row["summary_envelope"] is not None else None,
-        "watermark_ts": float(row["watermark_ts"]),
+        "watermark_ts": watermark_ts,
         "version": int(row["version"]),
+        "watermark_seq": watermark_seq,
     }
 
 
 def upsert_summary_row_cas(
-    user_id, *, summary_envelope: dict, watermark_ts: float, expected_version: int
+    user_id, *, summary_envelope: dict, watermark_ts: float, expected_version: int,
+    watermark_seq: int | None = None,
 ) -> bool:
     """compare-and-swap 写入该用户的会话摘要行。expected_version==0 走首建
     （INSERT ... ON CONFLICT DO NOTHING，若行已存在说明输了竞态，返回 False）；
     否则走 UPDATE ... WHERE version=expected_version（不匹配说明摘要在别处已被
-    推进，本次写入是过期/丢失的 CAS，返回 False）。成功返回 True。"""
+    推进，本次写入是过期/丢失的 CAS，返回 False）。成功返回 True。
+
+    ``watermark_seq``（D5/Task 9）与 ``watermark_ts`` 在同一次 CAS 写入里
+    原子推进——同一行、同一个 UPDATE 语句，不是两次写。``None``（默认，
+    向后兼容旧调用方/旧测试 fixture 未传这个参数的场景）在 UPDATE 分支用
+    ``COALESCE`` 保留该行原有的 watermark_seq（不清零、不误伤未真正推进
+    seq 的调用方）；INSERT 分支没有旧值可留，落 0（与迁移 0031 的列默认值
+    一致）。"""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             if int(expected_version) == 0:
                 cur.execute(
                     "INSERT INTO v2_conversation_summary "
-                    "(user_id, summary_envelope, watermark_ts, version) "
-                    "VALUES (%s, %s, %s, 1) ON CONFLICT (user_id) DO NOTHING",
-                    (user_id, Jsonb(dict(summary_envelope or {})), float(watermark_ts)),
+                    "(user_id, summary_envelope, watermark_ts, version, watermark_seq) "
+                    "VALUES (%s, %s, %s, 1, %s) ON CONFLICT (user_id) DO NOTHING",
+                    (
+                        user_id, Jsonb(dict(summary_envelope or {})), float(watermark_ts),
+                        int(watermark_seq or 0),
+                    ),
                 )
             else:
                 cur.execute(
                     "UPDATE v2_conversation_summary "
-                    "SET summary_envelope=%s, watermark_ts=%s, version=version+1, updated_at=now() "
+                    "SET summary_envelope=%s, watermark_ts=%s, version=version+1, "
+                    "watermark_seq=COALESCE(%s, watermark_seq), updated_at=now() "
                     "WHERE user_id=%s AND version=%s",
                     (
                         Jsonb(dict(summary_envelope or {})),
                         float(watermark_ts),
+                        int(watermark_seq) if watermark_seq is not None else None,
                         user_id,
                         int(expected_version),
                     ),

@@ -337,6 +337,14 @@ def test_reaper_loop_transient_db_error_does_not_kill_the_loop(monkeypatch):
     assert calls["n"] >= 2  # survived the first raise and ticked again
 
 
+class _HealthySupervisor:
+    """D3 (Task 4): `_heartbeat_loop` now derives capacity from
+    `supervisor.poll_liveness()` — a fresh/alive child advertises full capacity."""
+
+    def poll_liveness(self) -> dict:
+        return {"alive": True, "last_progress_age_sec": 1.0}
+
+
 def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
     calls = []
     monkeypatch.setattr(worker, "MAX_WORKERS", 12)
@@ -349,7 +357,8 @@ def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
 
     async def _driver():
         task = asyncio.create_task(
-            serve_worker._heartbeat_loop("worker-a", stop_event, interval=0.02))
+            serve_worker._heartbeat_loop(
+                "worker-a", stop_event, supervisor=_HealthySupervisor(), interval=0.02))
         for _ in range(50):
             if calls:
                 break
@@ -358,8 +367,8 @@ def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
         await asyncio.wait_for(task, timeout=1.0)
 
     asyncio.run(_driver())
-    assert calls[0] == ("worker-a", {"capacity": 12})
-    assert calls[-1] == ("worker-a", {"capacity": 0})
+    assert calls[0] == ("worker-a", {"capacity": 12, "kind": "turn"})
+    assert calls[-1] == ("worker-a", {"capacity": 0, "kind": "turn"})
 
 
 # ------------------------------------------------------------------

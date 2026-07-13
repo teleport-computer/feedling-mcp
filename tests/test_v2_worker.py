@@ -1720,6 +1720,142 @@ def test_chat_still_works_and_takes_the_chat_path(monkeypatch):
     assert written == {"text": "REPLY"}
 
 
+# ------------------------------------------------------------------
+# Hosted Runtime V2 PR D Task 2: slot-driven progress_cb. Replaces the old
+# free-running progress ticker (turn_child._progress_ticker) with a signal
+# tied to REAL slot activity — claim, turn completion, and idle-poll wake —
+# so the Task 3 watchdog can tell "event loop healthy, nothing to claim"
+# apart from "all slots wedged mid-turn, event loop still spinning". Fully
+# mocked (no real DB claim/turn), mirroring test_slot_recovery_failure_does_
+# not_kill_slot's direct-_slot_loop style.
+# ------------------------------------------------------------------
+
+def test_slot_loop_progress_cb_called_on_claim_and_turn_completion(monkeypatch):
+    stop = asyncio.Event()
+    claim_calls = {"n": 0}
+    turn_calls = {"n": 0}
+
+    def _claim(worker_id, lanes=None):
+        claim_calls["n"] += 1
+        if claim_calls["n"] == 1:
+            return {"id": "job-1", "user_id": "u", "lane": "chat", "claimed_by": worker_id}
+        stop.set()
+        return None
+
+    async def _run_turn_stub(_job, _deps):
+        turn_calls["n"] += 1
+
+    monkeypatch.setattr(jobs_store, "claim_next_job", _claim)
+    monkeypatch.setattr(worker, "_run_turn", _run_turn_stub)
+
+    events = []
+
+    asyncio.run(worker._slot_loop(
+        "w-progress", poll_interval=0.001, stop_event=stop, deps=_ok_deps({}),
+        slot_id=7, progress_cb=lambda slot_id, turn_start=None: events.append((slot_id, turn_start))))
+
+    assert claim_calls["n"] >= 2
+    assert turn_calls["n"] == 1
+    # (a) claim + (b) turn-completion signals, both tagged with this slot's id —
+    # plus (c) an idle-poll signal once claim_next_job starts returning None.
+    assert len(events) >= 2
+    assert all(slot_id == 7 for slot_id, _turn_start in events)
+    # (a) the claim signal must carry a non-None turn_start (hard-timeout fix);
+    # (b)/(c) idle signals must carry None.
+    claim_events = [ts for sid, ts in events if ts is not None]
+    idle_events = [ts for sid, ts in events if ts is None]
+    assert len(claim_events) == 1, "exactly one turn was claimed and started"
+    assert isinstance(claim_events[0], float) and claim_events[0] > 0
+    assert len(idle_events) >= 1, "turn-completion and/or idle-poll signals report turn_start=None"
+
+
+def test_slot_loop_progress_cb_exception_does_not_crash_loop(monkeypatch):
+    """progress_cb must be cheap and never allowed to blow up the slot loop —
+    a broken telemetry hook can't be allowed to take down job processing."""
+    stop = asyncio.Event()
+    calls = {"n": 0}
+
+    def _claim(worker_id, lanes=None):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            stop.set()
+        return None
+
+    monkeypatch.setattr(jobs_store, "claim_next_job", _claim)
+
+    def _boom(slot_id, turn_start=None):
+        raise RuntimeError("boom")
+
+    # Must not raise despite progress_cb always raising.
+    asyncio.run(worker._slot_loop(
+        "w-progress-boom", poll_interval=0.001, stop_event=stop, deps=_ok_deps({}),
+        slot_id=0, progress_cb=_boom))
+
+    assert calls["n"] >= 3
+
+
+def test_run_worker_loop_threads_progress_cb_with_slot_index(monkeypatch):
+    """run_worker_loop must hand each _slot_loop its own index (slot_id) plus
+    the same progress_cb — this is the wiring the turn_child progress pipe
+    (and the eventual Task 3 watchdog) relies on to attribute a heartbeat to a
+    specific slot."""
+    stop = asyncio.Event()
+
+    async def _fake_slot_loop(worker_id, *, poll_interval, stop_event, deps,
+                               wake_event=None, lanes=None, slot_id=0, progress_cb=None):
+        if progress_cb is not None:
+            progress_cb(slot_id, None)
+        stop_event.set()
+
+    monkeypatch.setattr(worker, "_slot_loop", _fake_slot_loop)
+    events = []
+    asyncio.run(worker.run_worker_loop(
+        "w-thread", max_workers=2, poll_interval=0.01, stop_event=stop, deps=_ok_deps({}),
+        progress_cb=lambda slot_id, turn_start=None: events.append(slot_id)))
+    assert sorted(events) == [0, 1]
+
+
+def test_slot_loop_progress_cb_reports_turn_start_at_claim_and_none_after_completion(monkeypatch):
+    """Hard-timeout fix: `progress_cb`'s second positional arg must be a real
+    (non-None) `time.monotonic()` value at the moment a job is claimed and the
+    slot is about to enter `_run_turn` — that's the only signal
+    `ChildSupervisor.poll_liveness()` has for `current_turn_age_sec`, the field
+    that makes D2 watchdog clause (c) (per-turn hard timeout) live instead of
+    dead code. Must go back to None immediately after the turn completes."""
+    stop = asyncio.Event()
+    claim_calls = {"n": 0}
+
+    def _claim(worker_id, lanes=None):
+        claim_calls["n"] += 1
+        if claim_calls["n"] == 1:
+            return {"id": "job-1", "user_id": "u", "lane": "chat", "claimed_by": worker_id}
+        stop.set()
+        return None
+
+    async def _run_turn_stub(_job, _deps):
+        pass
+
+    monkeypatch.setattr(jobs_store, "claim_next_job", _claim)
+    monkeypatch.setattr(worker, "_run_turn", _run_turn_stub)
+
+    calls = []  # list of (slot_id, turn_start)
+
+    asyncio.run(worker._slot_loop(
+        "w-turnstart", poll_interval=0.001, stop_event=stop, deps=_ok_deps({}),
+        slot_id=3, progress_cb=lambda slot_id, turn_start=None: calls.append((slot_id, turn_start))))
+
+    # First call: claim just happened, about to run the turn -> non-None turn_start.
+    first_slot_id, first_turn_start = calls[0]
+    assert first_slot_id == 3
+    assert first_turn_start is not None
+    assert isinstance(first_turn_start, float) and first_turn_start > 0
+
+    # Second call: the turn just completed -> back to idle (turn_start=None).
+    second_slot_id, second_turn_start = calls[1]
+    assert second_slot_id == 3
+    assert second_turn_start is None
+
+
 def test_chat_lane_still_takes_the_chat_path(monkeypatch):
     """Regression guard for the BUG-2 dispatch fix: the `lane != "chat"` bail-out must not
     starve the real interactive chat turn. Pairs with

@@ -30,6 +30,7 @@ from hosted import context as hosted_context
 from hosted import turn as hosted_turn
 from model_api_runtime.v2 import admission
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import kill_switch
 
 
 def model_api_chat_send_core(
@@ -109,6 +110,20 @@ def model_api_chat_send_core(
             detail={"mode": "blocked", "reason": "workers_unavailable"},
         )
         return {"error": "workers_unavailable", "reason": "no_live_v2_worker_heartbeat"}, 503
+
+    # D4 live kill switch: fail-CLOSED (default_on_error=True) — unlike workers_alive
+    # above (which answers "is anyone home"), this answers "has an operator asked the
+    # pool to stop", and a control-plane read failure must NOT be treated as "no, keep
+    # admitting" into a pool that may in fact be halted. Live-flippable without redeploy
+    # via kill_switch.set_turns_halted; Genesis is a separate table/thread and never
+    # consults this gate.
+    if _v2_mode and kill_switch.turns_halted(default_on_error=True):
+        debug_trace.trace_event(
+            store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+            status="gated", summary="turns_halted",
+            detail={"mode": "blocked", "reason": "turns_halted"},
+        )
+        return {"error": "turns_halted"}, 503
 
     # §6 admission ceiling：存活闸已保证 ≥1 活 worker；再估排队等待，超 SLA 就在
     # persist 之前回独立 busy（区别于 workers_unavailable=供给死）。任何计算异常

@@ -2831,6 +2831,65 @@ def chat_messages_after_seq(user_id: str, after_seq: int, *, limit: int) -> list
     return [{**r[1], "seq": int(r[0])} for r in rows]
 
 
+def count_messages_after_seq(user_id: str, after_seq: int) -> int:
+    """COUNT of THIS USER's own ``chat_messages`` rows with ``seq > after_seq``
+    — scoped by ``user_id``, unlike a bare ``chat_max_seq(...) - after_seq``
+    seq-arithmetic estimate. ``chat_messages.seq`` is a TABLE-WIDE ``BIGINT
+    GENERATED ALWAYS AS IDENTITY`` counter shared by every user (see
+    :func:`chat_max_seq` / migration 0001_baseline.py): once other users'
+    inserts interleave with this user's, the raw seq SPAN since a watermark
+    (``max_seq - after_seq``) has no fixed relationship to how many of this
+    user's OWN rows actually fall in that span — it can vastly overcount
+    (mostly other users' rows) while the true per-user count stays small.
+    Used by V2 worker's D6 prompt-coverage gap detection
+    (``worker._prompt_coverage_gap``), which must compare against
+    ``tail_limit`` using a real per-user count, not a global-seq guess — a
+    one-shot ``COUNT(*)`` on the existing ``(user_id, seq)`` index, exactly
+    as cheap as :func:`chat_max_seq`."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE user_id = %s AND seq > %s",
+            (user_id, after_seq),
+        ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def chat_seq_for_msg_id(user_id: str, msg_id: str) -> int | None:
+    """Exact ``seq`` for one message (its real primary-key identity), or
+    ``None`` if the user has no such row. Used by V2 compaction (worker.py
+    ``_run_compaction``) to attach the precise seq of the last-folded tail
+    row to the summary's new watermark — a direct-by-id lookup rather than a
+    ts-range query so it is exact even under same-``ts`` ties (see
+    :func:`chat_max_seq`)."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT seq FROM chat_messages WHERE user_id = %s AND msg_id = %s",
+            (user_id, msg_id),
+        ).fetchone()
+    return int(row[0]) if row is not None else None
+
+
+def seq_for_watermark_ts(user_id: str, watermark_ts: float) -> int:
+    """Conservative one-time ts->seq translation for a LEGACY summary
+    watermark that only carries ``watermark_ts`` (``v2_conversation_summary
+    .watermark_seq`` still at its migration default of 0 — see migration
+    0031). Strictly-less (``ts < watermark_ts``), never ``<=``: a summary's
+    ``watermark_ts`` marks how far compaction has folded, but with only a
+    ts we cannot tell whether a row exactly AT that ts was itself folded in
+    (same-ts ties — see :func:`chat_max_seq`), so this under-approximates
+    the covered seq range on purpose. That is the same conservative
+    direction the GC coverage gate/retention boundary already takes (never
+    treat a possibly-uncovered row as covered). Returns 0 (covers nothing)
+    when there is no row strictly before ``watermark_ts``."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM chat_messages "
+            "WHERE user_id = %s AND ts < %s",
+            (user_id, watermark_ts),
+        ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def _is_chat_file_pointer(doc) -> bool:
     return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
 
@@ -2863,6 +2922,7 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
 def _chat_insert_on_cursor(
     cur, user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
     *, trimmed_docs_out: list | None = None, trimmed_ids_out: list | None = None,
+    coverage_gated: bool = False,
 ) -> int:
     """INSERT one chat message (ON CONFLICT upsert) + trim to the newest
     ``max_messages`` rows, on the CALLER's cursor/transaction. Returns the
@@ -2883,6 +2943,19 @@ def _chat_insert_on_cursor(
     two callers need different projections (R2 cleanup needs the doc; the mirror
     needs the id).
 
+    ``coverage_gated``: selects which trim policy runs. ``False`` (the
+    default) is the plain ring-buffer trim — delete everything but the
+    newest ``max_messages`` rows, unconditionally. This is shared with the
+    LEGACY (pre-V2) best-effort write path (``db.chat_append`` ←
+    ``core/store.py`` / ``content/content_core.py``), which never writes a
+    ``v2_conversation_summary`` row, so gating on summary coverage there
+    would silently disable trimming forever (unbounded ``chat_messages``
+    growth — this bit us once, see the regression this flag fixes).
+    ``True`` applies the GC/retention coverage gate (D7) below, and must
+    only be requested by V2 write paths (``db.chat_append_strict`` and
+    ``db.chat_append_and_enqueue``), which DO maintain the summary
+    watermark.
+
     Row-factory agnostic: works whether ``cur`` is the default tuple cursor
     or a ``dict_row`` cursor (see :func:`chat_append_and_enqueue`, which opens
     a separate ``dict_row`` cursor on the same connection/transaction for the
@@ -2896,15 +2969,45 @@ def _chat_insert_on_cursor(
     row = cur.fetchone()
     seq = row["seq"] if isinstance(row, dict) else row[0]
     if max_messages and max_messages > 0:
-        cur.execute(
-            "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
-            "  SELECT MIN(seq) FROM ("
-            "    SELECT seq FROM chat_messages WHERE user_id = %s "
-            "    ORDER BY seq DESC LIMIT %s"
-            "  ) t"
-            ") RETURNING msg_id, doc",
-            (user_id, user_id, max_messages),
-        )
+        if coverage_gated:
+            # GC/retention gate (D7): never delete a row the summary hasn't
+            # covered yet. A row is "covered" only if its ts is STRICTLY less
+            # than the user's v2_conversation_summary.watermark_ts — same-ts
+            # boundary rows may not have made it into the compacted batch, so
+            # we err on keeping them. The watermark is read via a correlated
+            # subquery in the SAME DELETE (same cursor/transaction, single
+            # round-trip): no row for the user (never compacted), or a
+            # watermark_ts of 0/NULL, makes the subquery return NULL — and
+            # `ts < NULL` is never true in SQL — so the DELETE naturally
+            # deletes nothing at all (fail-safe: never trim uncovered
+            # history). This means the row count can exceed max_messages
+            # until compaction advances the watermark past these rows; that
+            # is intended, not a bug. ONLY for V2 writes (see docstring) —
+            # legacy never writes a summary row and would trim nothing.
+            cur.execute(
+                "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
+                "  SELECT MIN(seq) FROM ("
+                "    SELECT seq FROM chat_messages WHERE user_id = %s "
+                "    ORDER BY seq DESC LIMIT %s"
+                "  ) t"
+                ") AND ts < ("
+                "  SELECT watermark_ts FROM v2_conversation_summary WHERE user_id = %s"
+                ") RETURNING msg_id, doc",
+                (user_id, user_id, max_messages, user_id),
+            )
+        else:
+            # Plain ring-buffer trim (legacy/pre-V2 behavior): delete
+            # everything but the newest ``max_messages`` rows, no coverage
+            # clause.
+            cur.execute(
+                "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
+                "  SELECT MIN(seq) FROM ("
+                "    SELECT seq FROM chat_messages WHERE user_id = %s "
+                "    ORDER BY seq DESC LIMIT %s"
+                "  ) t"
+                ") RETURNING msg_id, doc",
+                (user_id, user_id, max_messages),
+            )
         rows = cur.fetchall()
         if trimmed_docs_out is not None:
             trimmed_docs_out.extend(r["doc"] if isinstance(r, dict) else r[1] for r in rows)
@@ -2915,11 +3018,15 @@ def _chat_insert_on_cursor(
 
 def _chat_append_impl(
     user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
+    *, coverage_gated: bool = False,
 ) -> None:
     """Insert one chat message then trim to the newest ``max_messages`` rows,
     mirroring the in-memory ring buffer. Idempotent on msg_id. Raises on the
     primary database write (``chat_append_strict`` relies on this so a DB failure
     cannot be mistaken for delivery); R2 offload stays best-effort.
+
+    ``coverage_gated`` is forwarded to :func:`_chat_insert_on_cursor` — see
+    that function's docstring. Must be ``True`` only for V2 write paths.
 
     A heavy body_ct (``_R2_OFFLOAD_CONTENT_TYPES``: file, image) is offloaded to
     R2 when configured (``object_storage.chat_files_enabled()``); the row then
@@ -2944,6 +3051,7 @@ def _chat_append_impl(
                 _chat_insert_on_cursor(
                     cur, user_id, msg_id, ts, doc, max_messages,
                     trimmed_docs_out=trimmed_docs, trimmed_ids_out=trimmed_ids,
+                    coverage_gated=coverage_gated,
                 )
     if offload:
         # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
@@ -3003,14 +3111,22 @@ def chat_append_strict(
     V2 uses this path for model replies so a database failure cannot be mistaken
     for delivery. Optional R2 offload remains best-effort: the inline row is
     already durable before an upload is attempted.
+
+    V2-only: this is one of the two write paths (the other being
+    :func:`chat_append_and_enqueue`) that maintains the
+    ``v2_conversation_summary`` watermark, so it is safe to request the
+    coverage-gated trim here.
     """
-    _chat_append_impl(user_id, msg_id, ts, doc, max_messages)
+    _chat_append_impl(user_id, msg_id, ts, doc, max_messages, coverage_gated=True)
 
 
 def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int) -> None:
-    """Best-effort legacy wrapper around :func:`chat_append_strict`."""
+    """Best-effort legacy (pre-V2) chat write. Plain ring-buffer trim — this
+    path never writes a ``v2_conversation_summary`` row, so it must NOT
+    request the coverage-gated trim (that would silently disable trimming
+    forever for legacy users)."""
     try:
-        chat_append_strict(user_id, msg_id, ts, doc, max_messages)
+        _chat_append_impl(user_id, msg_id, ts, doc, max_messages, coverage_gated=False)
     except Exception as e:
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
 
@@ -3057,7 +3173,9 @@ def chat_append_and_enqueue(
         with get_pool().connection() as conn:
             with conn.transaction():
                 with conn.cursor() as mc:
-                    seq = _chat_insert_on_cursor(mc, user_id, msg_id, ts, doc, max_messages)
+                    seq = _chat_insert_on_cursor(
+                        mc, user_id, msg_id, ts, doc, max_messages, coverage_gated=True,
+                    )
                 with conn.cursor(row_factory=dict_row) as jc:
                     job_id, _coalesced = jobs_store.coalesce_or_insert_on_cursor(
                         jc, user_id, lane, reason=reason, trace_id=trace_id,

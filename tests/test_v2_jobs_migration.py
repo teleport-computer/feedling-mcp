@@ -61,10 +61,13 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     # generation, 0026 job expected_generation, 0027 effect outbox, 0028 effect
     # sink-applied dedup guard, chained after 0024_v2_worker_capacity. PR B's
     # B5 (idempotent whole-turn metric) chains 0029 after that: v2_turn_metrics
-    # gains model_calls/retries/failed/status + UNIQUE(job_id). The
-    # deployed-history + profiles-merge invariants above are unchanged; only
-    # the single-head tip moved.
-    assert script.get_current_head() == "0029_v2_turn_metrics_whole_turn"
+    # gains model_calls/retries/failed/status + UNIQUE(job_id). PR D's D4 (live
+    # kill switch) chains 0030 after that: single-row v2_runtime_control table.
+    # D5 (seq-cursor migration, Task 9) chains 0031 after that:
+    # v2_conversation_summary gains a watermark_seq column alongside the
+    # existing watermark_ts. The deployed-history + profiles-merge invariants
+    # above are unchanged; only the single-head tip moved.
+    assert script.get_current_head() == "0031_v2_summary_watermark_seq"
 
 
 def test_singleflight_unique_index_enforced():

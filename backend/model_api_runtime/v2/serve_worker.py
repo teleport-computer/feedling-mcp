@@ -77,12 +77,20 @@ from hosted import config_store as hosted_config_store
 from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import cursor as v2_cursor
+from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import screen_watch
+from model_api_runtime.v2 import watchdog as v2_watchdog
 from model_api_runtime.v2 import worker as v2_worker
+# `turn_child` is NOT imported at module scope here: turn_child.py imports THIS module
+# (to reuse wire_assembly/build_production_deps — see turn_child.py's docstring for why
+# that's the correct direction of reuse) at ITS top level. If serve_worker also imported
+# turn_child at top level, whichever module loads first would hand the other a
+# still-initializing (partial) module object. `_serve` imports it lazily, by which point
+# this module has long finished loading — see the import inside `_serve` below.
 from proactive import capture_scheduler
 from proactive import dream_scheduler
 from proactive import gate as proactive_gate
@@ -445,15 +453,30 @@ def _read_summary(user_id: str) -> tuple[str, float, int]:
     return plaintext, row["watermark_ts"], row["version"]
 
 
-def _write_summary(user_id: str, summary: str, watermark_ts: float, expected_version: int) -> bool:
+def _write_summary(
+    user_id: str, summary: str, watermark_ts: float, expected_version: int,
+    watermark_seq: int | None = None,
+) -> bool:
     """把新压缩出的摘要**本地**加密（core_envelope，非 enclave 往返——跟 worker._write_encrypted_reply
     同一套写法）后 CAS 写回 v2_conversation_summary。信封构建失败（用户从未 onboard 过加密
-    身份）时直接返回 False、不调用 CAS——调用方应当把本次压缩当作丢弃处理，不重试。"""
+    身份）时直接返回 False、不调用 CAS——调用方应当把本次压缩当作丢弃处理，不重试。
+
+    ``watermark_seq``（D5/Task 9，可选第 5 参）跟 ``watermark_ts`` 在同一次 CAS 里原子
+    推进——见 ``jobs_store.upsert_summary_row_cas``。``worker._run_compaction`` 算不出精确
+    seq 时（罕见：折叠批次最后一行连 id 都没有）省略这个参数，CAS 只推进 ts，watermark_seq
+    保持不变（COALESCE 在 jobs_store 那一层兜底，不在这里假造一个值）。"""
     store = core_store.get_store(user_id)
     env, err = core_envelope._build_shared_envelope_for_store(store, summary.encode("utf-8"))
     if env is None:
         log.warning("[v2.serve_worker] _write_summary build envelope failed for %s: %s", user_id, err)
         return False
+    # Only pass watermark_seq through when the caller actually has one — keeps
+    # the call shape identical to pre-D5 callers (incl. narrow-signature test
+    # doubles) when it's omitted, rather than always sending an extra kwarg.
+    if watermark_seq is not None:
+        return jobs_store.upsert_summary_row_cas(
+            user_id, summary_envelope=env, watermark_ts=watermark_ts,
+            expected_version=expected_version, watermark_seq=watermark_seq)
     return jobs_store.upsert_summary_row_cas(
         user_id, summary_envelope=env, watermark_ts=watermark_ts, expected_version=expected_version)
 
@@ -1182,15 +1205,40 @@ async def _reaper_loop(stop_event: asyncio.Event, *, interval: float = _REAP_INT
 
 _HEARTBEAT_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_HEARTBEAT_INTERVAL_SEC", "10")
 
+# D3 (Task 4, PR-D plan): capacity must reflect the turn-child's ACTUAL health, not
+# the constant `v2_worker.MAX_WORKERS` — otherwise a heartbeat tick ~10s after the
+# watchdog (Task 3) writes capacity=0 on a kill would silently re-advertise full
+# capacity for a child that is mid-SIGKILL/respawn, letting admission race new turns
+# onto a pool slot that is not there yet. Independently env-configured (own var, own
+# default) rather than importing `_CHILD_LIVENESS_TIMEOUT_SEC` (defined further below,
+# next to `_watchdog_loop`) — the two constants intentionally share the same literal
+# default ("45") so a heartbeat tick and a watchdog tick agree on "stuck" out of the
+# box; an operator who deliberately diverges them via env var is doing so on purpose.
+_CAPACITY_STALE_SEC = _positive_float_env("FEEDLING_V2_CAPACITY_STALE_SEC", "45")
+
 
 async def _heartbeat_loop(
-    worker_id: str, stop_event: asyncio.Event, *, interval: float = _HEARTBEAT_INTERVAL_SEC
+    worker_id: str,
+    stop_event: asyncio.Event,
+    *,
+    supervisor: v2_child_supervisor.ChildSupervisor,
+    interval: float = _HEARTBEAT_INTERVAL_SEC,
+    capacity_stale_sec: float = _CAPACITY_STALE_SEC,
 ) -> None:
     """UPSERT this process's liveness row every ~interval seconds (Task 2: the
     db_action_v2 chat/send guard needs something to check — without this, a
     pool where every serve_worker process has died would queue jobs forever
     with no error). Reuses the same ``worker_id`` this process passes to
     ``claim_next_job``/``run_worker_loop`` — one row per live process.
+
+    D3 (Task 4): ``capacity`` is DERIVED from ``supervisor.poll_liveness()`` each
+    tick, not the constant ``v2_worker.MAX_WORKERS`` — 0 if the turn-child is dead
+    OR its progress is older than ``capacity_stale_sec``, else ``MAX_WORKERS``. This
+    is deliberately the same shape as (and agrees with) the watchdog's own kill
+    threshold: whichever of the two loops ticks next while the child is down keeps
+    writing capacity=0, so they reinforce rather than race each other back to a
+    stale "full capacity" row (see the watchdog module docstring's "capacity=0 must
+    be written before kill_and_respawn" note for the other half of this contract).
 
     Emits one heartbeat immediately on startup (before the first sleep) so a
     just-started pool is visible right away rather than only after the first
@@ -1202,10 +1250,18 @@ async def _heartbeat_loop(
     try:
         while not stop_event.is_set():
             try:
+                liveness = supervisor.poll_liveness()
+                age = liveness.get("last_progress_age_sec", math.inf)
+                capacity = (
+                    0
+                    if (not liveness.get("alive", False) or age > capacity_stale_sec)
+                    else v2_worker.MAX_WORKERS
+                )
                 await asyncio.to_thread(
                     jobs_store.record_worker_heartbeat,
                     worker_id,
-                    capacity=v2_worker.MAX_WORKERS,
+                    capacity=capacity,
+                    kind="turn",
                 )
             except Exception as e:  # noqa: BLE001 — a heartbeat write failure must not kill the worker
                 log.warning("[v2.serve_worker] record_worker_heartbeat failed: %s", e)
@@ -1221,12 +1277,66 @@ async def _heartbeat_loop(
                 jobs_store.record_worker_heartbeat,
                 worker_id,
                 capacity=0,
+                kind="turn",
             )
         except Exception as e:  # noqa: BLE001 — shutdown must remain bounded
             log.warning("[v2.serve_worker] clear worker capacity failed: %s", e)
 
 
 _SCHEDULER_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_SCHEDULER_INTERVAL_SEC", "30")
+
+# D2 (Task 3, watchdog.py) is the module that actually ACTS on this — comparing it
+# against `child_supervisor.ChildSupervisor.poll_liveness()["last_progress_age_sec"]`
+# to decide `should_kill`. It's defined here (not in watchdog.py) because the
+# ChildSupervisor this constant configures is constructed in `_serve`, and this same
+# value is threaded through to `_watchdog_loop`'s `child_liveness_timeout_sec` below
+# so the supervisor's own liveness_timeout_sec and the watchdog's kill threshold never
+# drift apart under a single env var.
+_CHILD_LIVENESS_TIMEOUT_SEC = _positive_float_env("FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC", "45")
+
+# D2 hard-timeout (Task 3): watchdog.should_kill's optional clause (c) — a single
+# turn wedged past this many seconds kills+respawns the child even if `should_kill`'s
+# liveness-staleness clause (b) hasn't independently tripped yet. `ChildSupervisor.
+# poll_liveness()` today only reports process-level fields (no `current_turn_age_sec`),
+# so clause (c) is a no-op until/unless a future supervisor reports per-turn age —
+# kept here (not hidden inside watchdog.py) so ops can tune it without reading the
+# pure-function module.
+_TURN_HARD_TIMEOUT_SEC = _positive_float_env("FEEDLING_V2_TURN_HARD_TIMEOUT_SEC", "180")
+
+_WATCHDOG_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_WATCHDOG_INTERVAL_SEC", "10")
+
+
+def _jobs_claimable() -> bool:
+    """Watchdog's "is there work waiting" predicate (`watchdog.should_kill`'s
+    `jobs_claimable` guard) — `pending_job_count()` counts only rows still
+    `status='pending'` (queued, not yet claimed by ANY worker slot), which is
+    exactly "all slots stuck while work waits": a wedged child claims nothing, so
+    genuinely queued work sits at `pending` instead of draining into `claimed`/
+    `running`. Deliberately NOT `inflight_job_count()` (pending+claimed+running) —
+    that would stay truthy even while a healthy child is mid-turn on already-claimed
+    work, which is not the "stuck and unable to make progress" signal this gates."""
+    return jobs_store.pending_job_count() > 0
+
+
+async def _watchdog_loop(
+    supervisor: v2_child_supervisor.ChildSupervisor,
+    worker_id: str,
+    stop_event: asyncio.Event,
+    *,
+    interval: float = _WATCHDOG_INTERVAL_SEC,
+) -> None:
+    """Thin wrapper around `watchdog._watchdog_loop` (mirrors `_reaper_loop`'s
+    delegation to `v2_reaper.run_loop`) — supplies the production
+    `jobs_claimable_fn` + the two env-configured timeouts. Runs in the PARENT
+    process/event loop (never the turn-child): it is the one piece of code with
+    both a handle on `supervisor` and the authority to SIGKILL it."""
+    await v2_watchdog._watchdog_loop(
+        supervisor, worker_id, stop_event,
+        jobs_claimable_fn=_jobs_claimable,
+        interval=interval,
+        turn_hard_timeout_sec=_TURN_HARD_TIMEOUT_SEC,
+        child_liveness_timeout_sec=_CHILD_LIVENESS_TIMEOUT_SEC,
+    )
 
 
 async def _scheduler_loop(stop_event: asyncio.Event, *, interval: float = _SCHEDULER_INTERVAL_SEC) -> None:
@@ -1259,6 +1369,45 @@ async def _scheduler_loop(stop_event: asyncio.Event, *, interval: float = _SCHED
                     result.get("considered"), result.get("enqueued"), result.get("skipped"))
         except Exception as e:  # noqa: BLE001 — 瞬时故障绝不能杀掉 scheduler/worker 进程
             log.warning("[v2.serve_worker] scheduler tick failed: %s", e)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+_RECONCILE_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_RECONCILE_INTERVAL_SEC", "60")
+
+
+async def _reconcile_loop(stop_event: asyncio.Event, *, interval: float = _RECONCILE_INTERVAL_SEC) -> None:
+    """D9 (Task 7, PR-D plan): periodic wiring for `db.reconcile_unenqueued_v2_messages`
+    — the A7 orphan-message sweeper that was built but never invoked anywhere (its own
+    docstring deferred the periodic call to "PR D's sweeper"). Without this loop, a
+    `db_action_v2` user whose newest chat message never got a matching `agent_jobs`
+    row (a bug, a manual data fix, or a message written before A7 existed) stays
+    silently unanswered forever — nothing else in the pool re-derives "has an
+    unanswered message" from `chat_messages` state; everything else keys off jobs
+    that already exist.
+
+    Runs in the PARENT process/event loop (never the turn-child) — sibling to
+    `_reaper_loop`/`_heartbeat_loop`/`_scheduler_loop` in `_serve`'s task list, so a
+    turn-child kill (watchdog SIGKILL, crash, respawn) never interrupts it; it must
+    keep sweeping across turn-child churn.
+
+    镜像 `_reaper_loop`/`_heartbeat_loop`/`_scheduler_loop` 的结构：interruptible 的
+    `wait_for(stop_event.wait(), timeout=interval)`（stop_event 置位立刻醒，drain 不被
+    卡满一个周期）；单次异常只记日志、绝不允许冒出去杀掉这个循环或拖垮跟它并发跑的
+    其它 parent loop——sweeper 本身故障绝不能拖垮整个 worker 进程。
+
+    `db.reconcile_unenqueued_v2_messages` is synchronous (plain psycopg calls), so it
+    is bridged via `asyncio.to_thread` — same pattern as every other sync DB call in
+    these parent loops."""
+    while not stop_event.is_set():
+        try:
+            enqueued = await asyncio.to_thread(db.reconcile_unenqueued_v2_messages)
+            if enqueued:
+                log.info("[v2.serve_worker] reconcile sweeper enqueued %d catch-up job(s)", enqueued)
+        except Exception as e:  # noqa: BLE001 — 瞬时故障绝不能杀掉 sweeper/worker 进程
+            log.warning("[v2.serve_worker] reconcile sweep failed: %s", e)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
@@ -1319,39 +1468,57 @@ def _start_genesis_thread(worker_id: str):
 
 
 async def _serve(worker_id: str, *, poll_interval: float) -> None:
+    """PARENT process loop (D1 结构拆分后，见
+    `docs/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md`
+    Task 2). turn slot 不再是这里的 `asyncio.create_task`——它们跑在一个由
+    `child_supervisor.ChildSupervisor` spawn/监督的独立子进程里（`turn_child.main`）,
+    这样一个 slot 里卡死的同步调用不会拖死本进程的事件循环，本进程才能保住
+    SIGKILL 那个子进程的权力。`_reaper_loop`/`_heartbeat_loop`/`_scheduler_loop`/
+    Genesis 线程未改动，仍在本（父）进程里跑。
+
+    D2（Task 3）在 `tasks` 里加了 `_watchdog_loop`，读 `supervisor.poll_liveness()` 判定
+    卡死并调 `supervisor.kill_and_respawn()`——子进程崩溃/卡死不会让 `asyncio.gather(*tasks)`
+    跟着报错退出（父进程能在没有存活子进程的情况下继续跑并把它救回来，这正是 Task 2 要求的
+    "子进程崩溃不能带崩父进程"，Task 3 在此基础上补上"卡死了要主动救"）。
+    """
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
-    provider_threads = _configure_provider_thread_limiter(v2_worker.MAX_WORKERS)
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)
-    deps = build_production_deps()
     seeded = await asyncio.to_thread(_seed_existing_v2_wake_schedules)
     if seeded:
         log.info("[v2.serve_worker] seeded %d existing V2 wake schedule(s)", seeded)
-    # "v2_jobs" 即时唤醒（FIX 3）：event 必须在 running loop 里创建/绑定——wire_assembly
-    # 本身在 asyncio.run 之前跑，那时还没有 loop 可绑。
-    wake_event = asyncio.Event()
-    v2_worker.set_job_wake_context(loop, wake_event)
-    log.info(
-        "[v2.serve_worker] starting worker=%s max_workers=%s provider_threads=%s",
-        worker_id, v2_worker.MAX_WORKERS, provider_threads,
-    )
+    log.info("[v2.serve_worker] starting worker=%s max_workers=%s", worker_id, v2_worker.MAX_WORKERS)
+
+    # Local import — see the comment beside the module-level import block for why
+    # `turn_child` cannot be imported at this module's top level (circular import:
+    # turn_child.py imports `serve_worker` at ITS top level to reuse wire_assembly/
+    # build_production_deps).
+    from model_api_runtime.v2 import turn_child
+
     # Genesis runs on its own dedicated thread (NOT part of this asyncio.gather —
     # see _start_genesis_thread docstring for why it can't share the to_thread
-    # executor with the turn/reaper/heartbeat/scheduler coroutines below).
+    # executor with the reaper/heartbeat/scheduler coroutines below). Unaffected by
+    # the turn-child split: it never lived in the turn slots' event loop.
     genesis = _start_genesis_thread(worker_id)
+
+    supervisor = v2_child_supervisor.ChildSupervisor(
+        turn_child.main,
+        liveness_timeout_sec=_CHILD_LIVENESS_TIMEOUT_SEC,
+        spawn_args=(worker_id, poll_interval),
+    )
+    # Synchronous: spawns the child process + starts the parent-side progress-pipe
+    # reader thread. Not an asyncio task — the child runs in its own OS process, so
+    # there is nothing here for `asyncio.gather` to await; its liveness is polled
+    # (Task 3) rather than joined.
+    await asyncio.to_thread(supervisor.start)
+
     tasks = [
-        asyncio.create_task(v2_worker.run_worker_loop(
-            worker_id,
-            max_workers=v2_worker.MAX_WORKERS,
-            poll_interval=poll_interval,
-            stop_event=stop_event,
-            deps=deps,
-            wake_event=wake_event,
-        )),
         asyncio.create_task(_reaper_loop(stop_event)),
-        asyncio.create_task(_heartbeat_loop(worker_id, stop_event)),
+        asyncio.create_task(_heartbeat_loop(worker_id, stop_event, supervisor=supervisor)),
         asyncio.create_task(_scheduler_loop(stop_event)),
+        asyncio.create_task(_watchdog_loop(supervisor, worker_id, stop_event)),
+        asyncio.create_task(_reconcile_loop(stop_event)),
     ]
     try:
         # Each loop handles recoverable iteration failures internally.  An
@@ -1364,6 +1531,9 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # SIGTERM the child + join (falls back to SIGKILL past the drain timeout);
+        # mirrors the graceful-drain contract the parent's own loops follow above.
+        await asyncio.to_thread(supervisor.stop)
         if genesis is not None:
             genesis_thread, genesis_stop = genesis
             genesis_stop.set()
