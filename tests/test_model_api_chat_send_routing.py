@@ -186,7 +186,8 @@ def test_chat_response_does_not_mark_first_chat_ok_for_verify_ping(client, monke
 
 def test_send_configured_routes_to_agent_runner(client, monkeypatch):
     """配了 openrouter 的用户，send 应托管到 agent-runner，返回 202，
-    且 handle_send 收到 driver=='codex'。"""
+    且 handle_send 收到 driver=='pi'（openrouter 现在无条件走 pi driver，LiteLLM
+    gateway 已退休）。"""
     user_id, api_key = _register(client)
 
     # 假 envelope 用于 setup（加密 api_key）和 chat/send（加密用户消息）
@@ -216,7 +217,7 @@ def test_send_configured_routes_to_agent_runner(client, monkeypatch):
     assert res.status_code == 202, res.get_data(as_text=True)
     body = res.get_json()
     assert body["status"] == "processing"
-    assert calls == ["codex"], f"expected driver='codex', got {calls}"
+    assert calls == ["pi"], f"expected driver='pi', got {calls}"
 
 
 def test_send_image_turn_also_routes(client, monkeypatch):
@@ -432,9 +433,10 @@ def _setup_anthropic(client, api_key: str, monkeypatch) -> None:
     assert res.status_code == 200, res.get_data(as_text=True)
 
 
-def test_gateway_off_does_not_block_anthropic_user(client, monkeypatch):
-    """supervisor 心跳 gateway=False，但用户是 anthropic（非 gateway-transport）时，
-    chat/send **不** 被 503——anthropic 走 claude driver，不经 LiteLLM gateway。"""
+def test_pi_runner_off_does_not_block_anthropic_user(client, monkeypatch):
+    """LiteLLM gateway 已退休，唯一剩下的按-provider 送达门是 require_pi（防
+    backend-pi-on/runner-pi-off 漂移）。anthropic 走 claude driver，require_pi
+    应为 False，不受 runner 的 pi 状态影响——runner pi 关时 chat/send **不** 被 503。"""
     user_id, api_key = _register(client)
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
@@ -443,12 +445,12 @@ def test_gateway_off_does_not_block_anthropic_user(client, monkeypatch):
         core_enclave, "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-ant-test",
     )
-    # 模拟 "heartbeat 存在但 gateway=False" 的情形：
-    # check_supervisor_live 收到 require_gateway=False → live；require_gateway=True → not-live。
+    # 模拟 "heartbeat 存在但 runner pi 关" 的情形：
+    # check_supervisor_live 收到 require_pi=False → live；require_pi=True → not-live。
     monkeypatch.setattr(
         agent_runtime_cutover, "check_supervisor_live",
-        lambda *, require_gateway=True, **kw: (
-            (True, "") if not require_gateway else (False, "supervisor_gateway_disabled")
+        lambda *, require_pi=False, **kw: (
+            (True, "") if not require_pi else (False, "supervisor_pi_disabled")
         ),
     )
     calls: list[str] = []
@@ -465,14 +467,14 @@ def test_gateway_off_does_not_block_anthropic_user(client, monkeypatch):
         headers=_headers(api_key),
     )
     assert res.status_code == 202, (
-        f"anthropic 用户在 gateway=False 时不应 503，实际: {res.status_code} {res.get_data(as_text=True)}"
+        f"anthropic 用户在 runner pi 关时不应 503，实际: {res.status_code} {res.get_data(as_text=True)}"
     )
     assert calls == ["claude"], f"anthropic 用户应路由到 claude driver，实际 calls={calls}"
 
 
-def test_gateway_off_blocks_openrouter_user(client, monkeypatch):
-    """supervisor 心跳 gateway=False，用户是 openrouter（gateway-transport）时，
-    chat/send 必须返回 503 supervisor_gateway_disabled。"""
+def test_pi_runner_off_blocks_openrouter_user(client, monkeypatch):
+    """openrouter 现在无条件走 pi driver（require_pi=True）。supervisor 心跳存在
+    但 runner 未跑 pi 时，chat/send 必须返回 503 supervisor_pi_disabled。"""
     user_id, api_key = _register(client)
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
@@ -481,11 +483,11 @@ def test_gateway_off_blocks_openrouter_user(client, monkeypatch):
         core_enclave, "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-or-test",
     )
-    # 模拟 "heartbeat 存在但 gateway=False"：require_gateway=True → not-live。
+    # 模拟 "heartbeat 存在但 runner pi 关"：require_pi=True → not-live。
     monkeypatch.setattr(
         agent_runtime_cutover, "check_supervisor_live",
-        lambda *, require_gateway=True, **kw: (
-            (True, "") if not require_gateway else (False, "supervisor_gateway_disabled")
+        lambda *, require_pi=False, **kw: (
+            (True, "") if not require_pi else (False, "supervisor_pi_disabled")
         ),
     )
     calls: list[str] = []
@@ -500,9 +502,9 @@ def test_gateway_off_blocks_openrouter_user(client, monkeypatch):
         headers=_headers(api_key),
     )
     assert res.status_code == 503, (
-        f"openrouter 用户在 gateway=False 时应 503，实际: {res.status_code} {res.get_data(as_text=True)}"
+        f"openrouter 用户在 runner pi 关时应 503，实际: {res.status_code} {res.get_data(as_text=True)}"
     )
     body = res.get_json()
     assert body["error"] == "hosting_runtime_unavailable"
-    assert body["reason"] == "supervisor_gateway_disabled"
-    assert calls == [], "gateway 阻断时不应路由到 handle_send"
+    assert body["reason"] == "supervisor_pi_disabled"
+    assert calls == [], "pi 阻断时不应路由到 handle_send"

@@ -139,13 +139,10 @@ compose_hash — flipping them on later needs **no on-chain re-auth**.
 | `AGENT_RUNTIME_USERS` | roster JSON `[{"api_key":"…"}]` — who to host (carries per-user keys) | empty → idle |
 | `AGENT_RUNTIME_AUTODISCOVER` | also pull hosted-enabled users from the DB (intersected with the roster's creds) | off |
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Stage-D: mint short-lived per-user runtime tokens (consumer drops the long-term api key) | off → consumer uses api key |
-| `FEEDLING_LITELLM_ENABLE` | run the in-CVM LiteLLM gateway (codex non-openai providers). **Must match the backend's same var** (the cutover routing decision is backend-side) | off |
-| `FEEDLING_LITELLM_API_KEY` | gateway bearer codex presents | — |
 | `FEEDLING_HOST_ALL` | **zero-touch hosting**: every configured user (tested-ok provider, not opted out) is hosted with NO `AGENT_RUNTIME_USERS` roster — the supervisor mints a runtime token per DB-discovered user and resolves the provider key with it; the backend routes their sends to the agent-runner; a freshly-hosted user's chat gate is auto-opened via verify_loop. **Requires `FEEDLING_RUNTIME_TOKEN_SECRET` set on BOTH services** (backend verifies, agent-runner mints) — inert without it. **Must match the backend's same var.** Per-user opt-out: set that user's `agent_runtime_driver="legacy"`. | off → per-user flag still required |
 
 CI secrets/vars (test job; `TEST_`-prefixed): `secrets.TEST_AGENT_RUNTIME_USERS`,
 `vars.TEST_AGENT_RUNTIME_AUTODISCOVER`, `secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET`,
-`vars.TEST_FEEDLING_LITELLM_ENABLE`, `secrets.TEST_FEEDLING_LITELLM_API_KEY`,
 `vars.TEST_FEEDLING_HOST_ALL`. Prod job uses the un-prefixed names.
 
 **Zero-touch host-all rollout order (`FEEDLING_HOST_ALL`):**
@@ -164,15 +161,15 @@ CI secrets/vars (test job; `TEST_`-prefixed): `secrets.TEST_AGENT_RUNTIME_USERS`
 routes EVERY fit-provider send to the agent-runner, so a turn wedges in
 `processing` forever if no consumer is hosting. Two layers prevent silent wedges:
 - **Startup** (`assert_hosting_ready`): the backend refuses to boot unless its own
-  `FEEDLING_LITELLM_ENABLE` + `FEEDLING_HOST_ALL` + `FEEDLING_RUNTIME_TOKEN_SECRET`
-  are set (validated in `__main__` and via `gunicorn_conf.py`'s `on_starting`).
+  `FEEDLING_HOST_ALL` + `FEEDLING_RUNTIME_TOKEN_SECRET` are set (validated in
+  `__main__` and via `gunicorn_conf.py`'s `on_starting`).
 - **Per request** (`check_supervisor_live`): the supervisor writes a global
-  heartbeat to `server_config` each tick (`ts` + `host_all` + `gateway`); before
+  heartbeat to `server_config` each tick (`ts` + `host_all`); before
   routing a send the backend reads it and returns **503 `hosting_runtime_unavailable`**
   (with a `reason`) instead of parking the turn — when the heartbeat is missing,
-  stale, or its `host_all`/`gateway` flags are off. This is what catches the case
+  stale, or its `host_all` flag is off. This is what catches the case
   the startup check can't see: the **agent-runner service** crashed, or has the
-  three vars set on the backend but NOT on itself. **So set all three vars on BOTH
+  two vars set on the backend but NOT on itself. **So set both vars on BOTH
   services** — a backend-only config still 503s every send (loudly) rather than
   hanging. Staleness window: `FEEDLING_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC` (default
   90s ≈ 6 ticks); a DB read error fails **open** (routes anyway) so the guard never
@@ -182,27 +179,24 @@ routes EVERY fit-provider send to the agent-runner, so a turn wedges in
 1. Deploy as-is (agent-runner idle). Confirms the 4th service builds + boots
    without disturbing existing users.
 2. Set `TEST_AGENT_RUNTIME_USERS` to a roster with **one** test user whose
-   provider is **anthropic** (→ claude, native, no gateway), leave
-   `TEST_FEEDLING_LITELLM_ENABLE` off. Re-deploy `test`. Validate A0:
+   provider is **anthropic** (→ claude, native). Re-deploy `test`. Validate A0:
    onboarding/verify_loop green, chat works.
 3. Add an **openai** user (→ codex native).
-4. **Last**, after an offline `codex→LiteLLM→gemini/openrouter` tool-loop eval:
-   set `TEST_FEEDLING_LITELLM_ENABLE=1` (it auto-includes the gateway providers in
-   discovery + starts the proxy) and a gemini/openrouter test user.
+4. Add a **gemini/openrouter/openai_compatible** test user (→ pi driver, direct
+   relay — the LiteLLM gateway is retired, no proxy to start).
 
-**Hosted-cutover deployment prerequisites (三件套，缺一不可):**
+**Hosted-cutover deployment prerequisites (两件套，缺一不可):**
 
 收口后，backend cutover 无条件把配了合适 provider 且 `test_ok` 的用户路由到
-agent-runner。以下三个变量必须同时设置；缺任何一个会导致全员 hang 或后端启动失败：
+agent-runner。以下两个变量必须同时设置；缺任何一个会导致全员 hang 或后端启动失败：
 
 | 变量 | 若缺失 |
 |---|---|
-| `FEEDLING_LITELLM_ENABLE` | 后端 `on_starting` **启动失败 fail-fast**（`gunicorn_conf.py` 的 `assert_hosting_ready` 检查此变量）。**纯 native 部署（无 codex/gemini）也必须设**，否则后端拒绝启动。 |
 | `FEEDLING_HOST_ALL` | 后端 `on_starting` **启动失败 fail-fast**；且 supervisor 不 spawn consumer，用户请求被 backend 路由到 agent-runner 但无 consumer 处理。 |
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | 后端 `on_starting` **启动失败 fail-fast**；且 supervisor 无法为 DB 发现的用户 mint runtime token，host-all 发现静默失败。须在 backend 和 agent-runner 两侧同时设置相同的值。 |
 
 部署顺序：先设 `FEEDLING_RUNTIME_TOKEN_SECRET`（backend + agent-runner 共享同一 secret），
-确认 token 鉴权通过、行为不变；再同步开启 `FEEDLING_HOST_ALL` 和 `FEEDLING_LITELLM_ENABLE`。
+确认 token 鉴权通过、行为不变；再开启 `FEEDLING_HOST_ALL`。
 
 ### 横向扩展 — 多节点 agent-runner
 
@@ -245,7 +239,7 @@ Cross-CVM reachability (the only real wiring):
   existing exposure, not a new one. Confirm `/v1/envelope/decrypt` accepts the
   runtime token over this path before rollout.
 - `DATABASE_URL` + `FEEDLING_RUNTIME_TOKEN_SECRET` (MUST equal the main backend's)
-  + `FEEDLING_LITELLM_API_KEY` via encrypted env.
+  via encrypted env.
 
 Rollout: provision the runner CVM (own dstack app) → build/pin
 `feedling-agent-runner:<sha>` → set the encrypted env above → boot with
@@ -278,8 +272,8 @@ secrets needed — all confirmed present 2026-07-01):
 | secret `TEST_PHALA_CLOUD_API_KEY` | test account (amiller-user) — reused |
 | secret `TEST_DATABASE_URL` | same test RDS as main CVM — reused |
 | secret `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` | **MUST equal** main backend's — reused |
-| secret `TEST_FEEDLING_LITELLM_API_KEY`, `TEST_AGENT_RUNTIME_USERS` | reused |
-| var `TEST_AGENT_RUNTIME_AUTODISCOVER`, `TEST_FEEDLING_HOST_ALL`, `TEST_FEEDLING_LITELLM_ENABLE`, `TEST_FEEDLING_MIGRATE_ENABLE` | reused |
+| secret `TEST_AGENT_RUNTIME_USERS` | reused |
+| var `TEST_AGENT_RUNTIME_AUTODISCOVER`, `TEST_FEEDLING_HOST_ALL`, `TEST_FEEDLING_MIGRATE_ENABLE` | reused |
 | var `TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT` (optional) | falls back to `TEST_FEEDLING_APP_AUTH_CONTRACT` if unset — the runner's compose_hash on the shared test contract is harmless (iOS audit card only checks the MAIN app's hashes) |
 
 #### First-time provisioning (one-shot, needs the Phala test account)
@@ -310,8 +304,6 @@ phala deploy \
   -e "AGENT_RUNTIME_USERS=<same as TEST_AGENT_RUNTIME_USERS, or empty to idle>" \
   -e "AGENT_RUNTIME_AUTODISCOVER=1" \
   -e "FEEDLING_HOST_ALL=1" \
-  -e "FEEDLING_LITELLM_ENABLE=1" \
-  -e "FEEDLING_LITELLM_API_KEY=<same as TEST_FEEDLING_LITELLM_API_KEY>" \
   -e "FEEDLING_MIGRATE_ENABLE=" \
   --wait
 
@@ -374,7 +366,7 @@ Repo vars already set (dormant): `PROD_MAIN_API_URL=https://api.feedling.app`,
 `PROD_MAIN_ENCLAVE_URL=https://9798850e…-5003s.dstack-pha-prod9.phala.network`,
 `PROD_AGENT_MAX_CHILDREN=120`, `DEPLOY_PROD_RUNNER_CVM=false`. Secrets are **reused**
 from the main prod CVM (no new ones): `PHALA_CLOUD_API_KEY` (prod/sxysun account),
-`DATABASE_URL`, `FEEDLING_RUNTIME_TOKEN_SECRET` (MUST match), `FEEDLING_LITELLM_API_KEY`,
+`DATABASE_URL`, `FEEDLING_RUNTIME_TOKEN_SECRET` (MUST match),
 `AGENT_RUNTIME_USERS`, `ETH_DEPLOYER_KEY`, contract `FEEDLING_APP_AUTH_CONTRACT`.
 
 **Sizing (`AGENT_MAX_CHILDREN=120`, ≈15GB CVMs):** 120 is deliberately ≥ all ~99

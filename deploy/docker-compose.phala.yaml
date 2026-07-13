@@ -238,17 +238,6 @@ services:
       # background. Validated on test; flip to "false" to revert to the v1
       # one-shot path. Read in worker.genesis_v2_enabled().
       FEEDLING_GENESIS_V2_ENABLED: "true"
-      # Mirrors the agent-runner's FEEDLING_LITELLM_ENABLE (see
-      # docker-compose.agent-runner.yaml). The hosted cutover decision lives in
-      # the backend, so it needs the same flag: gateway-only providers (gemini/
-      # openrouter/openai_compatible) stay on the legacy inline path until the
-      # in-CVM LiteLLM gateway is actually running — otherwise their sends wedge
-      # in `processing` (no consumer is spawned). Keep this in sync with the
-      # Defaults to "true": the cutover boot gate (assert_hosting_ready) refuses
-      # to start the backend without it, even for pure-native fleets. Still
-      # interpolation-driven so a GitHub var can override; unset/empty → true.
-      # Mirror the agent-runner's value.
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-true}"
       # Host-all: every configured user is served by the agent-runner. The send
       # routing here must agree with the supervisor's host_all discovery. Defaults
       # to "true": the cutover routes all fit-provider users to agent-runner with
@@ -287,8 +276,8 @@ services:
   # runtime now runs on a DEDICATED runner CVM
   # (deploy/docker-compose.phala.prod.runner.yaml). This CVM runs only ingress +
   # enclave + backend. The backend env above intentionally still mirrors the
-  # runner's FEEDLING_HOST_ALL / FEEDLING_LITELLM_ENABLE / FEEDLING_RUNTIME_TOKEN_
-  # SECRET so the hosted-cutover gate stays satisfied and the runner CVM shares
+  # runner's FEEDLING_HOST_ALL / FEEDLING_RUNTIME_TOKEN_SECRET so the
+  # hosted-cutover gate stays satisfied and the runner CVM shares
   # the same token auth. Scale hosting by adding runner CVMs, not by re-adding
   # this service (that would put key-bearing hosting back on the enclave CVM).
 

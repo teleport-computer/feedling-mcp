@@ -9,6 +9,7 @@ import importlib
 import base64
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -4332,6 +4333,102 @@ def test_call_agent_cli_codex_raw_text_lane_returns_literal_reply(monkeypatch):
 
     out = crc.call_agent_cli("hi", raw_text=True)
     assert out == cards_json
+
+
+# ---------------------------------------------------------------------------
+# pi driver: `pi --mode json` JSONL event stream parse / thinking / errors.
+# pi separates thinking from text at the event level (each completed assistant
+# message is its own `message_end`) and, unlike codex/claude, exits 0 EVEN ON
+# API ERRORS — the error rides the final message_end's stopReason/errorMessage
+# and pi echoes the user prompt as its own message_start/message_end. So
+# `_pi_turn_from_stream` is pi's ONLY valid reply source.
+# ---------------------------------------------------------------------------
+
+
+def _pi_stream_lines(*events) -> str:
+    return "\n".join(json.dumps(e) for e in events)
+
+
+_PI_HEADER = {"type": "session", "version": 3, "id": "abc123", "cwd": "/h"}
+
+
+def test_call_agent_cli_pi_folds_thinking_and_prefers_command_sid(monkeypatch, tmp_path):
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "内部推理"},
+            {"type": "text", "text": "答复正文"}]}},
+    )
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id} {message}")
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_prepare_cli_command",
+                        lambda message, image_paths=None, lane="background": ["pi", "--mode", "json",
+                                                           "--session-id", "sid-cmd-1", message])
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    out = crc.call_agent_cli("hi")
+    payload = json.loads(out)
+    assert payload["messages"] == ["答复正文"]
+    assert payload["provider_reasoning"] == "内部推理"
+    assert payload["reasoning_source"] == "pi_thinking"
+    assert payload["reasoning_native"] is True
+    # session ownership follows the command line (pi's event stream carries no
+    # extractable session_id field to scrape).
+    assert crc._load_agent_session_id() == "sid-cmd-1"
+
+
+def test_call_agent_cli_pi_error_turn_does_not_echo_user_message(monkeypatch, tmp_path):
+    # Real pi 0.80.3 behaviour: on an API error pi exits 0, rides the error on the
+    # final assistant message_end, AND echoes the user prompt as its own
+    # message_start/message_end. The pi branch must surface the error, NOT fall
+    # through to the generic extractor (which would return the echoed "say hi").
+    raw = _pi_stream_lines(
+        {"type": "session", "version": 3, "id": "smoke-1"},
+        {"type": "message_end", "message": {"role": "user",
+            "content": [{"type": "text", "text": "say hi"}]}},
+        {"type": "message_end", "message": {"role": "assistant", "content": [],
+            "stopReason": "error", "errorMessage": "401: Incorrect API key provided"}},
+        {"type": "agent_end", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "say hi"}]},
+            {"role": "assistant", "content": [], "stopReason": "error",
+             "errorMessage": "401: Incorrect API key provided"}]},
+    )
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id} {message}")
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_prepare_cli_command",
+                        lambda message, image_paths=None, lane="background": ["pi", "--mode", "json",
+                                                           "--session-id", "smoke-1", message])
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    with pytest.raises(RuntimeError) as ei:
+        crc.call_agent_cli("say hi")
+    assert "401" in str(ei.value)          # surfaced the real error
+    assert "say hi" not in str(ei.value).replace("produced no reply", "")  # not the echo
+
+
+def test_cli_failure_surfaces_pi_error_message():
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {"type": "message_end", "message": {"role": "assistant", "content": [],
+                                            "stopReason": "error",
+                                            "errorMessage": "401 invalid key"}},
+    )
+    assert "401 invalid key" in crc._cli_error_detail(raw, "")
+
+
+def test_pi_intermediate_events_are_non_final():
+    for etype in ("message_start", "message_update", "turn_start", "turn_end",
+                  "agent_start", "agent_end", "session",
+                  "tool_execution_start", "tool_execution_update", "tool_execution_end",
+                  "thinking_start", "thinking_delta", "thinking_end",
+                  "text_start", "text_delta", "text_end",
+                  "queue_update", "compaction_start", "compaction_end",
+                  "auto_retry_start", "auto_retry_end", "extension_error"):
+        assert etype in crc._JSON_NON_FINAL_EVENTS
 
 
 def test_agent_turn_skips_codex_reasoning_event_as_non_final():

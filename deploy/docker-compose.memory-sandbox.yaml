@@ -43,8 +43,7 @@ services:
       FEEDLING_ENCLAVE_URL: "http://enclave:5003"
       DATABASE_URL: "postgresql://feedling:feedling@postgres:5432/feedling?sslmode=disable"
       FEEDLING_PUBLIC_BASE_URL: "http://127.0.0.1:5001"
-      # --- 托管三件套（缺一即启动失败 fail-fast）---
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      # --- 托管两件套（缺一即启动失败 fail-fast）---
       FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
     ports:

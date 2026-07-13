@@ -222,11 +222,6 @@ services:
       # worker.genesis_combined_map_enabled(). Flip off to revert to the exact old
       # split-map path (hard rollback). On test for real-device quality comparison.
       FEEDLING_GENESIS_COMBINED_MAP: "true"
-      # Mirrors the agent-runner's flag: the hosted cutover decision lives in the
-      # backend, so it needs the same value — gateway-only providers stay legacy
-      # (inline) until the in-CVM LiteLLM gateway is actually on. Encrypted env,
-      # NOT baked into compose_hash; default empty = off.
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
       # Host-all: every configured user is served by the agent-runner (the send
       # routing must agree with the supervisor's host_all discovery). Empty = off
       # (per-user flag still required). Mirror the agent-runner's value.

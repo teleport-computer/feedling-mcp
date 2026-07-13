@@ -340,19 +340,16 @@ def test_roster_excludes_untested_active_route(backend_env):
     assert [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid] == []
 
 
-def test_roster_gateway_providers_gated_by_flag(backend_env):
+def test_roster_gemini_discovered_as_pi_unconditionally(backend_env):
     uid = _uid()
     seed_user(uid)
     cid = _cred(uid, provider="gemini")
     r = db.model_api_route_upsert(uid, cid, "gemini-2.5-flash", None)
     db.model_api_route_mark_test(uid, r, status="ok")
     db.model_api_route_activate(uid, r)
-
-    assert [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid] == []
-    gated = [e for e in db.list_agent_runtime_enabled_users(include_gateway=True)
-             if e["user_id"] == uid]
-    assert len(gated) == 1
-    assert gated[0]["driver"] == "codex"
+    rows = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
+    assert len(rows) == 1
+    assert rows[0]["driver"] == "pi"
 
 
 def test_account_deletion_clears_credentials_and_routes(backend_env):
@@ -448,7 +445,6 @@ def test_roster_supports_responses_bool_conversion_from_real_column(backend_env)
     db.model_api_route_mark_test(uid, r, status="ok")
     db.model_api_route_activate(uid, r)
 
-    gated = [e for e in db.list_agent_runtime_enabled_users(include_gateway=True)
-             if e["user_id"] == uid]
-    assert len(gated) == 1
-    assert gated[0]["supports_responses"] is True
+    rows = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
+    assert len(rows) == 1
+    assert rows[0]["supports_responses"] is True

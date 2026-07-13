@@ -26,7 +26,6 @@ from core import store as core_store  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
 from hosted import history_import  # noqa: E402
 from identity import service as identity_service  # noqa: E402
-from agent_runtime import litellm_gateway  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -53,10 +52,13 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
-def _register(client) -> tuple[str, str]:
+def _register(client, seed: int = 0x11) -> tuple[str, str]:
+    # ``seed`` fills the 32-byte content public key; callers that register more
+    # than one account in a single test must pass distinct seeds (the key is the
+    # account identity — a repeat 409s as account_exists_for_key).
     res = client.post(
         "/v1/users/register",
-        json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
+        json={"public_key": _b64(bytes([seed]) * 32), "archive_language": "en"},
     )
     assert res.status_code == 201, res.get_data(as_text=True)
     body = res.get_json()
@@ -278,7 +280,10 @@ def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatc
     assert route["supports_responses"] is False
 
 
-def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_effort(client, monkeypatch):
+def test_model_api_setup_persists_reasoning_effort(client, monkeypatch):
+    # LiteLLM gateway retired: reasoning_effort is still persisted at setup and
+    # surfaced through discovery (the pi driver consumes it); the old gateway
+    # budget translation (build_model_entry) is gone.
     user_id, api_key = _register(client)
     monkeypatch.setattr(provider_client, "test_provider_key",
                         lambda cfg: {"reply": "ok", "usage": {}})
@@ -298,19 +303,13 @@ def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_effort(clien
     route = db.model_api_active_route(user_id)
     assert route["reasoning_effort"] == "medium"
 
-    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
-    row = rows[user_id]
-    assert row["reasoning_effort"] == "medium"
-    entry = litellm_gateway.build_model_entry(
-        user_id=user_id, provider=row["provider"], model=row["model"],
-        reasoning_effort=row["reasoning_effort"],
-    )
-    assert entry["litellm_params"]["extra_body"]["reasoning"] == {"effort": "medium"}
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users()}
+    assert rows[user_id]["reasoning_effort"] == "medium"
 
 
-def test_model_api_setup_reasoning_effort_off_and_default_disable_gateway_reasoning(client, monkeypatch):
-    user_off, key_off = _register(client)
-    user_default, key_default = _register(client)
+def test_model_api_setup_reasoning_effort_off_and_default(client, monkeypatch):
+    user_off, key_off = _register(client, seed=0x21)
+    user_default, key_default = _register(client, seed=0x22)
     monkeypatch.setattr(provider_client, "test_provider_key",
                         lambda cfg: {"reply": "ok", "usage": {}})
 
@@ -336,19 +335,10 @@ def test_model_api_setup_reasoning_effort_off_and_default_disable_gateway_reason
     )
     assert default.status_code == 200, default.get_data(as_text=True)
 
-    stored_off = db.get_blob(user_off, "model_api")
-    stored_default = db.get_blob(user_default, "model_api")
-    assert stored_off["reasoning_effort"] == "off"
-    assert "reasoning_effort" not in stored_default
-
-    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
-    for uid in (user_off, user_default):
-        row = rows[uid]
-        entry = litellm_gateway.build_model_entry(
-            user_id=uid, provider=row["provider"], model=row["model"],
-            reasoning_effort=row["reasoning_effort"],
-        )
-        assert "extra_body" not in entry["litellm_params"]
+    route_off = db.model_api_active_route(user_off)
+    route_default = db.model_api_active_route(user_default)
+    assert route_off["reasoning_effort"] == "off"
+    assert not route_default.get("reasoning_effort")
 
 
 def test_model_api_setup_rejects_invalid_reasoning_effort(client, monkeypatch):

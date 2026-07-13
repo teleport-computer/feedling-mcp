@@ -103,16 +103,16 @@ def model_api_chat_send_core(
     # Wedge guard: routing to the agent-runner only works if a supervisor is
     # actually hosting. assert_hosting_ready validated THIS process's env at
     # startup, but the consumer lives in a separate service — if its heartbeat is
-    # missing/stale or its host-all/gateway flags are off, this turn would park in
+    # missing/stale or its host-all/pi flags are off, this turn would park in
     # "processing" forever. Surface a clear 503 instead, BEFORE writing the user
     # message (so no orphan turn is left unanswered). Fail-open on a DB hiccup.
     #
-    # Only gate on gateway if this provider actually routes through the in-CVM
-    # LiteLLM gateway. anthropic/deepseek (claude driver) and openai (codex-native)
-    # bypass the gateway entirely and must not be blocked by a gateway-off heartbeat.
+    # Only gate on pi if this provider actually routes through the pi driver
+    # (the in-CVM LiteLLM gateway is retired). anthropic (claude driver) and
+    # openai (codex-native) must not be blocked by a pi-off heartbeat.
     _provider = str((config or {}).get("provider") or "")
-    _require_gateway = agent_runtime_cutover.codex_transport(_provider) == "gateway"
-    live, reason = agent_runtime_cutover.check_supervisor_live(require_gateway=_require_gateway)
+    _require_pi = agent_runtime_cutover.driver_for_provider(_provider) == "pi"
+    live, reason = agent_runtime_cutover.check_supervisor_live(require_pi=_require_pi)
     if not live:
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",

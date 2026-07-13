@@ -43,15 +43,6 @@ services:
       # Encrypted env channel — carries per-user keys, never baked into the hash.
       AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
       AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
-      # in-CVM LiteLLM gateway — bridges codex to non-openai providers
-      # (gemini/openrouter/openai_compatible). Off by default; when "1" the
-      # supervisor runs `python -m litellm` as a child on 127.0.0.1:<port>, holding
-      # each gateway user's upstream key in the proxy's env (never on disk). The
-      # master key codex presents as its bearer is FEEDLING_LITELLM_API_KEY
-      # (encrypted env channel — a secret, never baked into the hash).
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
-      FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
-      FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
     volumes:
       - feedling_agent_runtime:/agent-data
     depends_on:

@@ -59,7 +59,7 @@ import db
 from core import runtime_token
 from core import wake_bus
 from core.store import get_store
-from agent_runtime import leases, litellm_gateway, spawners
+from agent_runtime import leases, spawners
 from notices import core as notices
 from notices import catalog
 
@@ -240,9 +240,9 @@ class Supervisor:
 
         ``pre_spawn(new_user_ids)`` (optional) is invoked ONCE after all of this
         tick's new leases are acquired but BEFORE any new consumer is spawned, so a
-        side-channel a consumer needs at startup (e.g. its LiteLLM ``gw-<uid>``
-        gateway route) can be configured first. It is best-effort — a failure logs
-        and the spawns still proceed."""
+        side-channel a consumer needs at startup (the in-CVM LiteLLM gateway route
+        this used to configure is retired) can be configured first. It is
+        best-effort — a failure logs and the spawns still proceed."""
         # Reap children whose user is no longer in the (re-derived) roster — e.g.
         # a user who disabled hosting. Kill + release so disable takes effect this
         # tick rather than lingering until lease expiry.
@@ -370,16 +370,16 @@ class Supervisor:
                                   runtime_home=home, lease_owner=self.owner,
                                   ttl=self.lease_ttl, now=self._now()):
                 continue  # another supervisor holds a live lease
-            # Acquired — defer the spawn so the gateway route can be configured for
-            # the whole batch first (route-before-spawn; avoids a queued first turn
-            # hitting a missing gw-<uid> route).
+            # Acquired — defer the spawn so any pre-spawn side-channel can be
+            # configured for the whole batch first (the in-CVM LiteLLM gateway
+            # route this used to serve is retired).
             spawned_this_tick += 1
             newly_acquired.append((user_id, entry, home))
 
-        # Configure any side-channel the new consumers need at startup (gateway
-        # routes) for the now-owned batch BEFORE starting them. Lease-scoped: only
-        # users we just acquired this tick. Best-effort — a blip must not strand
-        # the spawn; the post-tick reconcile still converges.
+        # Configure any side-channel the new consumers need at startup for the
+        # now-owned batch BEFORE starting them. Lease-scoped: only users we just
+        # acquired this tick. Best-effort — a blip must not strand the spawn; the
+        # post-tick reconcile still converges.
         if newly_acquired and pre_spawn is not None:
             try:
                 pre_spawn([uid for uid, _, _ in newly_acquired])
@@ -735,18 +735,18 @@ def _resolve_roster(roster: list[dict],
     return resolved
 
 
-def _discover_enabled(include_gateway: bool = False) -> dict[str, dict]:
+def _discover_enabled() -> dict[str, dict]:
     """Map ``user_id -> {"driver", "provider", "model", "base_url"}`` for users
     whose ``model_api`` config is test_ok and uses a fit provider (Stage C+).
     No per-user flag required — aligned with hosted/agent_runtime_cutover.resolve_driver.
-    ``include_gateway`` mirrors whether the LiteLLM gateway is running — when off,
-    gateway-only providers are excluded so they aren't spawned against a proxy that
-    isn't there."""
+    Unconditional: the LiteLLM gateway is retired, so every fit provider (including
+    gemini/openrouter/openai_compatible, discovered as the pi driver) is discovered
+    every time — no include_gateway/include_pi flags."""
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
                            "model": u.get("model", ""), "base_url": u.get("base_url", ""),
                            "supports_responses": bool(u.get("supports_responses", False)),
                            "reasoning_effort": u.get("reasoning_effort", "")}
-            for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway)}
+            for u in db.list_agent_runtime_enabled_users()}
 
 
 def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]:
@@ -1056,13 +1056,14 @@ def _run_lazy_persona_backfill(roster: list[dict], *, secret_raw: str, owner: st
 def _spawn_identity(entry: dict) -> tuple:
     """The spawn-determining fields of a roster entry — when any changes, the
     running consumer's env/home is stale and it must be respawned. Mirrors what
-    ``spawners.consumer_env`` / ``agent_home_files`` consume. The upstream
-    ``provider_key`` is EXCLUDED for gateway users (it goes to LiteLLM, not the
-    consumer env), so rotating it doesn't bounce the consumer. ``persona_version``
+    ``spawners.consumer_env`` / ``agent_home_files`` consume. ``persona_version``
     (genesis_persona digest) IS included so a voice backfill/Dream re-seeds the
-    persona prompt via a natural respawn (gate 4 C)."""
+    persona prompt via a natural respawn (gate 4 C). ``base_url`` and
+    ``reasoning_effort`` ARE included: both reach the consumer ONLY via a
+    spawn-time home file (pi ``models.json``, or claude's ANTHROPIC_BASE_URL), so
+    changing either with everything else unchanged must respawn — else the
+    consumer keeps hitting the old endpoint / stale reasoning setting."""
     driver = (entry.get("driver") or "claude").strip().lower()
-    gateway = spawners._codex_transport(entry) == "gateway"
     return (
         entry.get("api_key") or "",
         driver,
@@ -1070,96 +1071,25 @@ def _spawn_identity(entry: dict) -> tuple:
         entry.get("provider") or "",
         entry.get("model") or "",
         entry.get("base_url") or "",
-        # gateway 用户 ``model`` 是稳定的 gw-<uid> 别名；真实上游模型放在 identity_model，
-        # 纳入签名使切换上游模型时 respawn 并重新落盘身份块。
+        entry.get("reasoning_effort") or "",
+        # LiteLLM gateway 已退役：``model`` 现在原生透传，不再有 gw-<uid> 别名/网关
+        # 间接层。``identity_model`` 目前恒为空，但保留字段/签名位以防未来复用。
         entry.get("identity_model") or "",
-        "" if gateway else (entry.get("provider_key") or ""),
+        entry.get("provider_key") or "",
         entry.get("persona_version") or "",
     )
 
 
-def _gateway_entries(roster: list[dict]) -> list[dict]:
-    """Codex users that must be bridged through the in-CVM LiteLLM gateway
-    (gemini/openrouter/openai_compatible). Each carries the REAL upstream
-    provider/model/key for building the per-user LiteLLM routing."""
-    out = []
-    for e in roster:
-        if spawners._codex_transport(e) == "gateway":
-            out.append({
-                "user_id": e["user_id"],
-                "provider": e.get("provider", ""),
-                "model": e.get("model") or "",
-                "base_url": e.get("base_url") or "",
-                "supports_responses": bool(e.get("supports_responses", False)),
-                "reasoning_effort": e.get("reasoning_effort") or "",
-                "provider_key": e.get("provider_key") or "",
-            })
-    return out
-
-
-def _owned_gateway_entries(gateway_entries: list[dict], owned) -> list[dict]:
-    """Scope the gateway routing entries to ONLY users this runner currently holds
-    a lease/child for, so a user owned by another runner never enters this runner's
-    LiteLLM config (multi-node: provider keys don't fan out to every runner).
-
-    ``owned`` is the set of owned user_ids (or the children mapping, whose keys are
-    those ids). Callers should pass a SNAPSHOT taken under ``Supervisor._lock`` —
-    the renew thread mutates the live children dict concurrently.
-
-    Each entry's key is taken AS-IS from ``gateway_entries`` (built from the freshly
-    resolved roster this tick), NOT from the stored child entry — so an upstream
-    key rotation reaches LiteLLM on the next tick even though it deliberately does
-    not respawn the consumer (``_spawn_identity`` excludes the gateway key)."""
-    owned_ids = set(owned)
-    return [g for g in gateway_entries if g.get("user_id") in owned_ids]
-
-
-def _drop_gateway_users(roster: list[dict]) -> list[dict]:
-    """Remove codex users that would need the LiteLLM gateway — used when the
-    gateway is DISABLED. Without a running proxy, spawning them as gateway codex
-    yields a config pointing at nothing (and usually no gateway key), so they must
-    be dropped rather than half-spawned. Native (openai) + claude users stay."""
-    kept = [e for e in roster if spawners._codex_transport(e) != "gateway"]
-    dropped = [e.get("user_id") for e in roster if spawners._codex_transport(e) == "gateway"]
-    if dropped:
-        log.warning("litellm gateway disabled — dropping %d gateway codex user(s): %s",
-                    len(dropped), dropped)
-    return kept
-
-
-def _wire_gateway_models(roster: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Return (roster, gateway_entries). Gateway codex entries are rewritten so
-    codex REQUESTS the ``gw-<uid>`` model (which LiteLLM maps to the real upstream
-    model+key); the returned gateway_entries retain the real model for building
-    the LiteLLM config. Non-gateway entries pass through unchanged."""
-    gateways = _gateway_entries(roster)
-    if not gateways:
-        return roster, []
-    gateway_uids = {g["user_id"] for g in gateways}
-    # ``model`` becomes the internal ``gw-<uid>`` alias codex requests; ``identity_model``
-    # keeps the REAL upstream model so the identity-honesty prompt names it, not the alias.
-    wired = [
-        {**e, "model": litellm_gateway.gateway_model_id(e["user_id"]),
-         "identity_model": e.get("model") or ""}
-        if e.get("user_id") in gateway_uids and spawners._codex_transport(e) == "gateway"
-        else e
-        for e in roster
-    ]
-    return wired, gateways
-
-
 def _effective_roster(base_roster: list[dict], *, autodiscover: bool,
-                      gateway_enabled: bool,
-                      host_all_discovered: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
-    """Compute the roster to actually run this tick + the gateway routing entries.
+                      host_all_discovered: list[dict] | None = None) -> list[dict]:
+    """Compute the roster to actually run this tick.
 
-    ``base_roster`` carries credentials (resolved once at boot). Each tick we:
+    ``base_roster`` carries credentials (resolved once at boot). Each tick we
     optionally intersect it with the backend-enabled set (autodiscover — the
-    gradual-migration control plane); drop gateway-only codex users when the
-    gateway is off (no proxy to reach); and when the gateway is on, rewrite those
-    users' requested model to ``gw-<uid>`` (returning the real models as gateway
-    entries for the LiteLLM config). An empty result is fine — the supervisor
-    idles rather than exiting.
+    gradual-migration control plane). The LiteLLM gateway is retired, so there is
+    no gateway filtering or requested-model rewrite — every entry keeps its real
+    provider/model as-is. An empty result is fine — the supervisor idles rather
+    than exiting.
 
     ``host_all_discovered`` (Stage D host-all) supplies pre-credentialed entries
     resolved from the DB via runtime token — they BECOME the roster (no api_key
@@ -1170,15 +1100,11 @@ def _effective_roster(base_roster: list[dict], *, autodiscover: bool,
         for e in base_roster:
             if e.get("user_id"):
                 by_uid[e["user_id"]] = e        # dev override wins
-        roster = list(by_uid.values())
-    elif autodiscover:
-        enabled = _discover_enabled(include_gateway=gateway_enabled)
-        roster = _apply_discovery(base_roster, enabled)
-    else:
-        roster = base_roster
-    if not gateway_enabled:
-        return _drop_gateway_users(roster), []
-    return _wire_gateway_models(roster)
+        return list(by_uid.values())
+    if autodiscover:
+        enabled = _discover_enabled()
+        return _apply_discovery(base_roster, enabled)
+    return base_roster
 
 
 _GENESIS_TICK_DEFAULT_SEC = 30
@@ -1216,30 +1142,34 @@ def _genesis_worker_loop(*, api_url, enclave_url, mint_genesis, interval, stop_e
         stop_event.wait(interval)
 
 
-def _supervisor_heartbeat_payload(owner: str, *, host_all: bool, gateway: bool, ts: float) -> dict:
-    """Global heartbeat the backend's wedge guard reads. ``host_all``/``gateway``
-    let the backend detect the cross-service config divergence (supervisor up but
-    not actually hosting / gateway off) that its own startup check can't see."""
+def _supervisor_heartbeat_payload(owner: str, *, host_all: bool,
+                                  pi: bool, ts: float) -> dict:
+    """Global heartbeat the backend's wedge guard reads. ``host_all``/``pi`` let
+    the backend detect the cross-service config divergence (supervisor up but
+    not actually hosting / pi driver off) that its own startup check can't see —
+    the backend requires ``pi`` before routing a pi-driven send, else a
+    runner-pi-off config would park those sends in ``processing`` forever. The
+    in-CVM LiteLLM gateway is retired — no ``gateway`` key anymore."""
     return {"ts": float(ts), "owner": str(owner),
-            "host_all": bool(host_all), "gateway": bool(gateway)}
+            "host_all": bool(host_all), "pi": bool(pi)}
 
 
 def _supervisor_instance_payload(owner: str, *, host: str | None, host_all: bool,
-                                 gateway: bool, active_children: int, max_children: int,
+                                 pi: bool, active_children: int, max_children: int,
                                  shard_index: int, shard_count: int, version: str | None,
                                  ts: float) -> dict:
     """Rich per-owner heartbeat row (migration 0009). Beyond the legacy payload's
-    host_all/gateway, it carries this runner's live capacity (active vs max
-    children) and shard config, so multiple runners report independently and the
-    backend can aggregate without one clobbering another."""
+    host_all/pi, it carries this runner's live capacity (active vs max children)
+    and shard config, so multiple runners report independently and the backend
+    can aggregate without one clobbering another."""
     return {"ts": float(ts), "owner": str(owner), "host": host,
-            "host_all": bool(host_all), "gateway": bool(gateway),
+            "host_all": bool(host_all), "pi": bool(pi),
             "active_children": int(active_children), "max_children": int(max_children),
             "shard_index": int(shard_index), "shard_count": int(shard_count),
             "version": version}
 
 
-def _heartbeat_loop(*, owner: str, host_all: bool, gateway: bool,
+def _heartbeat_loop(*, owner: str, host_all: bool, pi: bool,
                     interval: float, stop_event, instance_payload_fn=None,
                     prune_max_age_sec: float | None = None) -> None:
     """Write the supervisor heartbeat on a fixed cadence from a dedicated thread,
@@ -1271,7 +1201,7 @@ def _heartbeat_loop(*, owner: str, host_all: bool, gateway: bool,
                     log.warning("supervisor instance heartbeat prune failed: %s", e)
         try:
             db.set_supervisor_heartbeat(_supervisor_heartbeat_payload(
-                owner, host_all=host_all, gateway=gateway, ts=ts))
+                owner, host_all=host_all, pi=pi, ts=ts))
         except Exception as e:  # noqa: BLE001
             log.warning("supervisor heartbeat write failed: %s", e)
         stop_event.wait(interval)
@@ -1319,7 +1249,14 @@ def main() -> int:
     data_root = os.environ.get("AGENT_DATA_ROOT", "/agent-data")
     isolation = os.environ.get("AGENT_RUNTIME_ISOLATION", "process").strip().lower()
 
-    gateway_enabled = os.environ.get("FEEDLING_LITELLM_ENABLE", "").strip().lower() in ("1", "true", "yes")
+    # The pi driver (gemini/openrouter/openai_compatible, direct relay, no
+    # gateway) is unconditional now — FEEDLING_PI_DRIVER_ENABLE no longer gates
+    # discovery/roster (hosted.agent_runtime_cutover.driver_for_provider derives
+    # pi unconditionally; db.list_agent_runtime_enabled_users takes no flag).
+    # This constant still feeds the heartbeat's ``pi`` capability bit for
+    # require_pi cross-service drift checks (chat_send_core / evaluate_
+    # supervisor_heartbeat).
+    pi_enabled = True
     autodiscover = os.environ.get("AGENT_RUNTIME_AUTODISCOVER", "").strip().lower() in ("1", "true", "yes")
     # Stage D host-all: every configured user is hosted with NO api_key roster —
     # the supervisor mints a runtime token per DB-discovered user and resolves the
@@ -1330,8 +1267,8 @@ def main() -> int:
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "")
 
     # Credentials resolved once (whoami + envelope decrypt are network calls). The
-    # backend-enabled intersection + gateway wiring re-run each tick off this base,
-    # so enabling/disabling a user (or the gateway) takes effect without a redeploy.
+    # backend-enabled intersection re-runs each tick off this base, so
+    # enabling/disabling a user takes effect without a redeploy.
     # This runs before ``sup`` exists, so decrypt failures are collected here and
     # emitted as runner_key_decrypt_failed notices once the Supervisor is built below.
     base_roster_key_decrypt_failures: list[tuple[str, str]] = []
@@ -1364,18 +1301,6 @@ def main() -> int:
 
         token_writer = _mint_and_write
 
-    # in-CVM LiteLLM gateway (codex non-openai providers). Off by default: only
-    # when FEEDLING_LITELLM_ENABLE is set do we run a LiteLLM proxy that holds the
-    # gateway users' upstream keys (in the proxy's env, never on disk) and rewrite
-    # those users to the gw-<uid> model. Codex reaches it at 127.0.0.1:<port>.
-    gateway_mgr = None
-    if gateway_enabled:
-        port = int(os.environ.get("FEEDLING_LITELLM_PORT", "4000"))
-        cfg_path = os.environ.get("FEEDLING_LITELLM_CONFIG", f"{data_root}/litellm.yaml")
-        os.environ.setdefault("FEEDLING_LITELLM_BASE_URL", f"http://127.0.0.1:{port}/v1")
-        gateway_mgr = litellm_gateway.GatewayManager(config_path=cfg_path, port=port)
-        log.info("litellm gateway enabled — config=%s port=%d", cfg_path, port)
-
     if host_all and mint_token is None:
         log.warning("FEEDLING_HOST_ALL set but FEEDLING_RUNTIME_TOKEN_SECRET is not — "
                     "host-all is inert (no token to authenticate zero-roster users)")
@@ -1390,8 +1315,8 @@ def main() -> int:
         token_writer=token_writer, max_spawns_per_tick=max_spawns_per_tick,
         max_children=max_children,
     )
-    log.info("supervisor up — owner=%s base_users=%d autodiscover=%s host_all=%s gateway=%s ttl=%.0fs max_children=%d",
-             owner, len(base_roster), autodiscover, host_all_active, gateway_enabled, lease_ttl, max_children)
+    log.info("supervisor up — owner=%s base_users=%d autodiscover=%s host_all=%s ttl=%.0fs max_children=%d",
+             owner, len(base_roster), autodiscover, host_all_active, lease_ttl, max_children)
     for _uid, _detail in base_roster_key_decrypt_failures:
         sup._emit_runner_notice(_uid, "runner_key_decrypt_failed", _detail)
 
@@ -1436,14 +1361,15 @@ def main() -> int:
             active = len(sup.children)
         return _supervisor_instance_payload(
             owner, host=socket.gethostname(), host_all=host_all_active,
-            gateway=gateway_enabled, active_children=active,
+            pi=pi_enabled, active_children=active,
             max_children=sup.max_children, shard_index=0, shard_count=1,
             version=None, ts=ts)
 
     threading.Thread(
         target=_heartbeat_loop, daemon=True,
         kwargs={"owner": owner, "host_all": host_all_active,
-                "gateway": gateway_enabled, "interval": min(interval, 15.0),
+                "pi": pi_enabled,
+                "interval": min(interval, 15.0),
                 "stop_event": hb_stop, "instance_payload_fn": _instance_payload,
                 # Drop rows from dead runners (each restart is a new hostname:pid
                 # owner). Generous so a briefly-paused runner isn't pruned mid-life.
@@ -1464,17 +1390,21 @@ def main() -> int:
         while True:
             try:
                 # Re-derive the live roster each tick so enabling/disabling a user
-                # (or the gateway) takes effect without restarting the supervisor.
+                # takes effect without restarting the supervisor.
                 discovered = None
                 if host_all_active:
-                    enabled = _discover_enabled(include_gateway=gateway_enabled)
+                    enabled = _discover_enabled()
                     discovered = _resolve_discovered(
                         enabled, mint_token=mint_token, api_url=api_url,
                         enclave_url=enclave_url, cache=cred_cache,
                         notify=lambda uid, detail: sup._emit_runner_notice(
                             uid, "runner_key_decrypt_failed", detail))
-                roster, gateways = _effective_roster(
-                    base_roster, autodiscover=autodiscover, gateway_enabled=gateway_enabled,
+                # The in-CVM LiteLLM gateway is retired, so there is no gateway
+                # filtering left — every fit-provider entry (autodiscovered or
+                # dev roster) is spawned as-is (see
+                # hosted.agent_runtime_cutover.driver_for_provider).
+                roster = _effective_roster(
+                    base_roster, autodiscover=autodiscover,
                     host_all_discovered=discovered)
                 # Tag each entry with the genesis_persona digest (unified point: covers
                 # base + discovered). _spawn_identity includes it, so when a voice
@@ -1483,26 +1413,7 @@ def main() -> int:
                 # gate 4 C. No kill, no in-place prompt rewrite.
                 for _entry in roster:
                     _entry["persona_version"] = _persona_version(_entry.get("user_id", ""))
-                # Lease-scoped gateway, race-free across spawn: configure the
-                # gw-<uid> routes for users acquired THIS tick BEFORE their consumers
-                # start (pre_spawn), then converge AFTER tick to drop routes for
-                # users that left/were reaped. Both passes only ever include users
-                # this runner owns, so another runner's key never enters our config
-                # (multi-node key isolation). ``gateways`` carries this tick's
-                # freshly-resolved upstream keys, so a key rotation still reaches
-                # LiteLLM even though it deliberately doesn't respawn the consumer.
-                # owned ids are snapshotted under the lock — the renew thread mutates
-                # sup.children concurrently (iterating it live could raise
-                # "dictionary changed size during iteration" and abort the tick).
-                def _reconcile_gateway(extra_ids=()):
-                    if gateway_mgr is None:
-                        return
-                    with sup._lock:
-                        owned_ids = set(sup.children) | set(extra_ids)
-                    gateway_mgr.reconcile(_owned_gateway_entries(gateways, owned_ids))
-
-                sup.tick(roster, pre_spawn=_reconcile_gateway)
-                _reconcile_gateway()
+                sup.tick(roster)
                 # Gate 4 B-3: after the spawn reconcile, top up voice for no-blob users
                 # (bounded + cooldown'd so it never blocks the tick). Off by default.
                 if _lazy_persona_backfill_enabled():
@@ -1552,8 +1463,6 @@ def main() -> int:
         renew_stop.set()
         genesis_stop.set()
         sup.shutdown()
-        if gateway_mgr is not None:
-            gateway_mgr.shutdown()
 
 
 if __name__ == "__main__":

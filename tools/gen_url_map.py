@@ -47,7 +47,6 @@ def _ensure_env_and_db() -> None:
     importing the backend (db.init_schema() runs at startup). We only
     provision a throwaway DB when DATABASE_URL is not already supplied.
     """
-    os.environ.setdefault("FEEDLING_LITELLM_ENABLE", "1")
     os.environ.setdefault("FEEDLING_HOST_ALL", "1")
     os.environ.setdefault("FEEDLING_RUNTIME_TOKEN_SECRET", "url-map-snapshot-secret")
 

@@ -95,21 +95,21 @@ def _seed_all(_clean_blobs):
     _seed_model_api("anthropic_on", provider="anthropic", test_status="ok", enabled=True)
     _seed_model_api("deepseek_on", provider="deepseek", test_status="ok", enabled=True)
     _seed_model_api("openai_on", provider="openai", test_status="ok", enabled=True)
-    _seed_model_api("gemini_on", provider="gemini", test_status="ok", enabled=True, model="gemini-2.0-flash")  # codex via gateway
+    _seed_model_api("gemini_on", provider="gemini", test_status="ok", enabled=True, model="gemini-2.0-flash")  # pi driver
     _seed_model_api("openrouter_on", provider="openrouter", test_status="ok", enabled=True,
-                    reasoning_effort="medium")  # codex via gateway
+                    reasoning_effort="medium")  # pi driver
     _seed_model_api("compat_on", provider="openai_compatible", test_status="ok", enabled=True,
-                    base_url="https://my.host/v1")  # codex via gateway
+                    base_url="https://my.host/v1")  # pi driver
     _seed_model_api("anthropic_off", provider="anthropic", test_status="ok", enabled=False)  # not enabled
     _seed_model_api("openai_failed", provider="openai", test_status="failed", enabled=True)  # key not ok
     seed_user("noisy")
     db.set_blob("noisy", "identity", {"foo": "bar"})                                    # unrelated kind
 
 
-def test_list_enabled_users_native_only_by_default(_clean_blobs):
-    # With the LiteLLM gateway OFF (default), gateway-only providers must NOT be
-    # discovered — else they'd be spawned with gateway transport into a proxy that
-    # isn't running. Only the native-fit providers (claude/openai) come back.
+def test_list_enabled_users_unconditional_all_fit_providers(_clean_blobs):
+    # Discovery is unconditional now — no gateway proxy to avoid, so every fit
+    # provider (native claude/codex plus pi-driven deepseek/gemini/openrouter/
+    # openai_compatible) is discovered in one pass, no include_gateway switch.
     # Flag (agent_runtime_driver) is no longer a gate — test_ok + fit provider suffices;
     # anthropic_off (agent_runtime_driver='legacy') is now included.
     _seed_all(_clean_blobs)
@@ -117,31 +117,34 @@ def test_list_enabled_users_native_only_by_default(_clean_blobs):
     assert {uid: r["driver"] for uid, r in rows.items()} == {
         "anthropic_on": "claude",
         "anthropic_off": "claude",   # legacy flag no longer gates discovery
-        "deepseek_on": "claude",
+        "deepseek_on": "pi",
         "openai_on": "codex",
+        "gemini_on": "pi",
+        "openrouter_on": "pi",
+        "compat_on": "pi",
     }
-
-
-def test_list_enabled_users_includes_gateway_when_enabled(_clean_blobs):
-    _seed_all(_clean_blobs)
-    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
-    assert {uid: r["driver"] for uid, r in rows.items()} == {
-        "anthropic_on": "claude",
-        "anthropic_off": "claude",   # legacy flag no longer gates discovery
-        "deepseek_on": "claude",
-        "openai_on": "codex",
-        "gemini_on": "codex",
-        "openrouter_on": "codex",
-        "compat_on": "codex",
-    }
-    # provider + model + base_url are carried so the supervisor can wire codex
-    # native vs gateway (and build the per-user LiteLLM routing for gateway users)
+    # provider + model + base_url are carried so the supervisor can wire the
+    # right transport (native codex vs. the pi driver's direct relay)
     assert rows["gemini_on"]["provider"] == "gemini"
     assert rows["gemini_on"]["model"] == "gemini-2.0-flash"
     assert rows["openai_on"]["provider"] == "openai"
     assert rows["openrouter_on"]["reasoning_effort"] == "medium"
-    # openai_compatible's custom endpoint must survive into LiteLLM's api_base
+    # openai_compatible's custom endpoint must survive into the pi driver's api_base
     assert rows["compat_on"]["base_url"] == "https://my.host/v1"
+
+
+def test_discovery_pi_providers(_clean_blobs):
+    for p in ("gemini", "openrouter", "openai_compatible", "deepseek"):
+        _seed_model_api(f"{p}_u", provider=p, test_status="ok",
+                        base_url="https://relay/v1" if p == "openai_compatible" else "")
+    rows = {r["user_id"]: r for r in db.list_agent_runtime_enabled_users()}
+    for p in ("gemini", "openrouter", "openai_compatible", "deepseek"):
+        assert rows[f"{p}_u"]["driver"] == "pi"
+
+
+def test_discovery_unconditional_no_include_gateway(_clean_blobs):
+    import inspect
+    assert "include_gateway" not in inspect.signature(db.list_agent_runtime_enabled_users).parameters
 
 
 def test_list_enabled_users_empty_when_no_tested_config(_clean_blobs):

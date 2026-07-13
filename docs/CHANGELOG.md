@@ -47,6 +47,17 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-13
+
+### [DONE] pi driver consolidation on the multi-profile schema
+
+- Re-homed pi driver consolidation onto test's `model_api_routes`/`model_api_credentials` schema (pi was greenfield on test).
+- Final driver map: `anthropic`→`claude` (native Anthropic wire), `openai`→`codex` (native OpenAI Responses), `gemini`/`openrouter`/`openai_compatible`/`deepseek`→`pi` (native direct relay; deepseek via pi anthropic-messages @ `/anthropic` endpoint, text-only).
+- Retired the in-CVM LiteLLM gateway entirely (module + env + venv install deleted); every provider now direct-native relay.
+- Reasoning effort forwarded **natively** by pi (openrouter etc.), no gateway intermediary. **NOTE:** the `_PI_MODEL_REASONING_KEY` models.json field is a **PLACEHOLDER** pending a pre-spike on `pre` branch (verify openrouter reasoning returns a real chain with no litellm process).
+- Discovery `list_agent_runtime_enabled_users()` derives pi via the `model_api_routes`/`model_api_credentials` JOIN with CASE fallback (ELSE→`pi`), unconditional (no `include_gateway` flag).
+- Status: implemented on branch `feat/pi-on-multiprofile`, **NOT committed/deployed**; pre-spike on `pre` is the pre-prod validation gate before test deployment.
+
 ## 2026-07-09
 
 ### [DONE] 用户 MCP 服务器（user_mcp）—— 配置分发模型

@@ -80,9 +80,8 @@ jobs:
           FEEDLING_DATA_DIR: /tmp/feedling-data-ci
           FEEDLING_WS_PORT: "19998"
           DATABASE_URL: "postgresql://postgres:postgres@127.0.0.1:5432/feedling_ci"
-          # 收口后 backend 启动会校验托管前置三件套（assert_hosting_ready）。
-          # CI smoke 用占位值满足校验，让 backend 起得来——不连真 gateway/supervisor。
-          FEEDLING_LITELLM_ENABLE: "1"
+          # 收口后 backend 启动会校验托管前置两件套（assert_hosting_ready）。
+          # CI smoke 用占位值满足校验，让 backend 起得来——不连真 supervisor。
           FEEDLING_HOST_ALL: "1"
           FEEDLING_RUNTIME_TOKEN_SECRET: "ci-smoke-secret"
         run: |
@@ -490,8 +489,6 @@ jobs:
           # consumer. Encrypted env, NOT in compose_hash — override via repo var.
           AGENT_TICK_INTERVAL_SEC:      ${{ vars.AGENT_TICK_INTERVAL_SEC || '5' }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
-          FEEDLING_LITELLM_ENABLE:      ${{ vars.FEEDLING_LITELLM_ENABLE }}
-          FEEDLING_LITELLM_API_KEY:     ${{ secrets.FEEDLING_LITELLM_API_KEY }}
           # Host-all: agent-runner hosts every configured user (zero-roster, via
           # runtime token) + backend routes their sends to it. Needs the token
           # secret above. Empty = off. Both services read it from the encrypted env.
@@ -537,8 +534,6 @@ jobs:
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
             -e "AGENT_TICK_INTERVAL_SEC=$AGENT_TICK_INTERVAL_SEC" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
-            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
@@ -725,8 +720,6 @@ jobs:
           AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
-          FEEDLING_LITELLM_ENABLE:      ${{ vars.TEST_FEEDLING_LITELLM_ENABLE }}
-          FEEDLING_LITELLM_API_KEY:     ${{ secrets.TEST_FEEDLING_LITELLM_API_KEY }}
           # Host-all: agent-runner hosts every configured user (zero-roster, via
           # runtime token) + backend routes their sends to it. Needs the token
           # secret above. Empty = off. Both services read it from the encrypted env.
@@ -770,8 +763,6 @@ jobs:
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
             -e "AGENT_TICK_INTERVAL_SEC=$AGENT_TICK_INTERVAL_SEC" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
-            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
@@ -948,8 +939,6 @@ jobs:
           AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
-          FEEDLING_LITELLM_ENABLE:      ${{ vars.TEST_FEEDLING_LITELLM_ENABLE }}
-          FEEDLING_LITELLM_API_KEY:     ${{ secrets.TEST_FEEDLING_LITELLM_API_KEY }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
@@ -973,8 +962,6 @@ jobs:
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
-            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             --wait
 
@@ -1019,7 +1006,7 @@ jobs:
   # a no-op until you (1) provision N runner dstack apps on the PROD phala account,
   # (2) put their ids in that file, (3) set PROD_MAIN_* vars, (4) flip the var. The
   # runner secrets reuse the main prod CVM's (DATABASE_URL / FEEDLING_RUNTIME_TOKEN_
-  # SECRET — MUST match — / FEEDLING_LITELLM_API_KEY / AGENT_RUNTIME_USERS).
+  # SECRET — MUST match — / AGENT_RUNTIME_USERS).
   deploy-prod-runner-cvm:
     name: deploy runner CVM (prod)
     needs: [deploy-cvm, detect-cvm-changes]
@@ -1121,8 +1108,6 @@ jobs:
           AGENT_RUNTIME_USERS:           ${{ secrets.AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:    ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_HOST_ALL:             ${{ vars.FEEDLING_HOST_ALL }}
-          FEEDLING_LITELLM_ENABLE:       ${{ vars.FEEDLING_LITELLM_ENABLE }}
-          FEEDLING_LITELLM_API_KEY:      ${{ secrets.FEEDLING_LITELLM_API_KEY }}
           FEEDLING_MIGRATE_ENABLE:       ${{ vars.FEEDLING_MIGRATE_ENABLE }}
         run: |
           if [ -z "$DATABASE_URL" ]; then
@@ -1146,8 +1131,6 @@ jobs:
               -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
               -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
               -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-              -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
-              -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
               -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
               --wait
           done

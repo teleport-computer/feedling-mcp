@@ -7,8 +7,7 @@
 #
 # Supply-chain pinning (matches the backend image): base pinned by digest below,
 # npm CLIs pinned to exact versions, Python deps hash-locked via the backend's
-# requirements.lock. Remaining gap: the LiteLLM venv deps are not yet hash-locked
-# (see the TODO at that step). To refresh the base digest see deploy/BUILD.md
+# requirements.lock. To refresh the base digest see deploy/BUILD.md
 # (`docker buildx imagetools inspect python:3.11-slim-bookworm`).
 
 # Pinned by multi-arch index digest. Kept at 3.11 (the backend image is 3.12) to
@@ -43,19 +42,6 @@ RUN npm install -g @anthropic-ai/claude-code@2.1.195 @openai/codex@0.142.4
 # (httpx, psycopg) all resolve.
 COPY backend/requirements.lock ./requirements.lock
 RUN pip install --require-hashes -r requirements.lock
-
-# in-CVM LiteLLM proxy — bridges codex (OpenAI Responses wire) to non-openai
-# providers (gemini/openrouter/openai_compatible). The supervisor launches it as
-# a child ONLY when FEEDLING_LITELLM_ENABLE is set, with a per-user config + the
-# upstream keys injected into the proxy's env (never on disk). Installed in its
-# OWN venv so LiteLLM's large dependency tree never perturbs the hash-locked
-# backend env (the supervisor invokes it via FEEDLING_LITELLM_PYTHON below).
-# Pinned to the empirically-validated version.
-# Hardening TODO (match the rest of the image before prod): hash-lock this venv's
-# deps too (separate lockfile) instead of an unpinned-resolver install.
-RUN python -m venv /opt/litellm-venv \
- && /opt/litellm-venv/bin/pip install --no-cache-dir 'litellm[proxy]==1.89.4'
-ENV FEEDLING_LITELLM_PYTHON=/opt/litellm-venv/bin/python
 
 # Ship the backend (content_encryption / db / proactive imported by the resident
 # consumer) AND tools/ (the resident consumer itself, spawned per user).

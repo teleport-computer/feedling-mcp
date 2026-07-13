@@ -1996,26 +1996,48 @@ _JSON_RUNTIME_DEBUG_FIELDS = {
 }
 
 _JSON_NON_FINAL_EVENTS = {
+    "agent_end",       # pi: carries the FULL message history — must never be
     "agent_message_delta",
     "agent_reasoning",
     "agent_reasoning_delta",
     "agent_reasoning_section_break",
+    "agent_start",
+    "auto_retry_end",
+    "auto_retry_start",
+    "compaction_end",
+    "compaction_start",
     "debug",
     "delta",
+    "extension_error",
     "log",
+    "message_start",   # pi: NOT message_end — that's pi's final event, parsed
+    "message_update",  #   by _pi_turn_from_stream.
     "progress",
+    "queue_update",
     "reasoning",
     "reasoning_delta",
+    "session",         # pi session header (first line)
     "status",
     "stderr",
     "stdout",
     "system",
+    "text_delta",
+    "text_end",
+    "text_start",
     "thinking",
+    "thinking_delta",
+    "thinking_end",
+    "thinking_start",
     "thought",
     "tool",
     "tool_call",
+    "tool_execution_end",
+    "tool_execution_start",
+    "tool_execution_update",
     "tool_result",
     "trace",
+    "turn_end",
+    "turn_start",
 }
 
 
@@ -2648,8 +2670,9 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
     warning: claude ``--output-format json`` emits a result object
     (``is_error`` + ``result`` text + ``api_error_status``); codex ``--json`` emits
     ``error`` events (``message``), ``turn.failed.error.message``, or nested
-    error items. Surface that so ``cli agent exited`` is actionable instead of
-    blank. Falls back to stderr, then a stdout snippet.
+    error items; pi reports it on the final ``message_end`` (``stopReason=error``
+    + ``errorMessage``). Surface that so ``cli agent exited`` is actionable
+    instead of blank. Falls back to stderr, then a stdout snippet.
     """
     def _codex_error_message(obj: Any) -> tuple[int, str]:
         if not isinstance(obj, dict):
@@ -2677,6 +2700,7 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
     claude_err = ""
     codex_err = ""
     codex_err_priority = 0
+    pi_err = ""
     for obj in _json_objects_from_cli_output(stdout or ""):
         if not isinstance(obj, dict):
             continue
@@ -2687,7 +2711,13 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
         if msg and priority >= codex_err_priority:
             codex_err = msg   # keep the last error event (the final one)
             codex_err_priority = priority
-    detail = claude_err or codex_err
+        # pi surfaces API errors on the final message_end: stopReason=error + errorMessage.
+        if obj.get("type") == "message_end":
+            msg = obj.get("message")
+            if (isinstance(msg, dict) and msg.get("stopReason") == "error"
+                    and isinstance(msg.get("errorMessage"), str) and msg["errorMessage"].strip()):
+                pi_err = msg["errorMessage"].strip()   # keep the last error turn
+    detail = claude_err or codex_err or pi_err
     if detail:
         return detail[:300]
     if (stderr or "").strip():
@@ -2862,6 +2892,77 @@ def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
         kind="provider_reasoning_summary",
         native=True,
     )
+
+
+def _pi_turn_from_stream(raw: str) -> tuple[str, str]:
+    """Split a ``pi --mode json`` JSONL event stream into (reply, thinking).
+
+    pi separates thinking from text at the event level: each completed assistant
+    message arrives as ``{"type":"message_end","message":{"role":"assistant",
+    "content":[{"type":"text",...}|{"type":"thinking",...}|toolCall]}}``. The
+    reply is the LAST assistant message carrying text (intermediate messages are
+    tool-call steps); thinking blocks are collected across the whole turn and
+    returned SEPARATELY so the caller folds them into the collapsible disclosure
+    — never a chat bubble. Both empty means an error/handshake-only turn so the
+    caller can fall back without leaking.
+    """
+    reply = ""
+    thinking: list[str] = []
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or str(obj.get("type") or "").strip() != "message_end":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict) or str(msg.get("role") or "") != "assistant":
+            continue
+        texts: list[str] = []
+        for block in msg.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text.strip())
+            elif block.get("type") == "thinking":
+                thought = block.get("thinking")
+                if isinstance(thought, str) and thought.strip():
+                    thinking.append(thought.strip())
+        if texts:
+            reply = "\n\n".join(texts)   # keep the LAST text-bearing message
+    return reply, "\n\n".join(thinking)
+
+
+def _pi_turn_metrics(raw: str) -> dict:
+    """Best-effort {steps, input_tokens, output_tokens, cost_usd} from a pi JSONL
+    stream. Every completed assistant message carries ``usage`` (input/output
+    token counts) and ``usage.cost.total`` (USD) — summed across the turn's
+    messages. Never raises."""
+    steps = 0
+    in_tok = out_tok = 0
+    cost = 0.0
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or str(obj.get("type") or "") != "message_end":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict) or str(msg.get("role") or "") != "assistant":
+            continue
+        steps += 1
+        usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+        for key in ("input", "output"):
+            try:
+                val = int(usage.get(key) or 0)
+            except (TypeError, ValueError):
+                val = 0
+            if key == "input":
+                in_tok += val
+            else:
+                out_tok += val
+        cost_obj = usage.get("cost") if isinstance(usage.get("cost"), dict) else {}
+        try:
+            cost += float(cost_obj.get("total") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    return {"steps": steps, "input_tokens": in_tok, "output_tokens": out_tok,
+            "cost_usd": round(cost, 6)}
 
 
 def _extract_text_from_cli_output(raw: str) -> str:
@@ -3359,6 +3460,10 @@ def _is_codex_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "codex"
 
 
+def _is_pi_cmd(cmd: list[str]) -> bool:
+    return bool(cmd) and Path(cmd[0]).name == "pi"
+
+
 def _cli_cmd_tokens() -> list[str]:
     """Tokenize the raw AGENT_CLI_CMD template for driver detection.
 
@@ -3752,12 +3857,16 @@ def _cli_turn_metrics(cmd: list[str], result: "subprocess.CompletedProcess", wal
     ``driver, rc, wall_ms, agent_ms, api_ms, num_turns, steps, input_tokens,
     output_tokens, out_chars``. Fields the driver doesn't report stay ``None``.
     """
-    m = {"driver": "codex" if _is_codex_cmd(cmd) else "claude", "rc": result.returncode,
+    m = {"driver": "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
+         "rc": result.returncode,
          "wall_ms": wall_ms, "agent_ms": None, "api_ms": None, "num_turns": None,
-         "steps": None, "input_tokens": None, "output_tokens": None,
+         "steps": None, "input_tokens": None, "output_tokens": None, "cost_usd": None,
          "out_chars": len(result.stdout or "")}
     try:
-        if m["driver"] == "codex":
+        if m["driver"] == "pi":
+            # pi carries per-message usage + USD cost — richer than codex's estimate.
+            m.update(_pi_turn_metrics(result.stdout or ""))
+        elif m["driver"] == "codex":
             m.update(_codex_turn_metrics(result.stdout or ""))
         else:
             for obj in _json_objects_from_cli_output(result.stdout or ""):
@@ -3789,6 +3898,15 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
     logged so blank fields aren't mistaken for missing claude data.
     """
     m = _cli_turn_metrics(cmd, result, wall_ms)
+
+    if m["driver"] == "pi":
+        log.info(
+            "[turn-timing] driver=pi rc=%s wall_ms=%d steps=%s in_tokens=%s "
+            "out_tokens=%s cost_usd=%s out_chars=%d",
+            m["rc"], m["wall_ms"], m.get("steps"), m.get("input_tokens"),
+            m.get("output_tokens"), m.get("cost_usd"), m["out_chars"],
+        )
+        return
 
     if m["driver"] == "codex":
         log.info(
@@ -3829,7 +3947,7 @@ def call_agent_cli(
     _turn_t0 = time.monotonic()
     _emit_debug_trace("agent", "agent.model.call.start", trace_id=trace_id,
                       summary="cli turn start",
-                      explain="模型调用发起（" + ("codex" if _is_codex_cmd(cmd) else "claude") + "）",
+                      explain="模型调用发起（" + ("pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude")) + "）",
                       content_excerpt={"prompt_head": (message or "")[:1000]})
     child_env = os.environ.copy()
     if trace_id:
@@ -3846,7 +3964,7 @@ def call_agent_cli(
                           summary="cli turn timeout", explain="模型调用超时（120s 上限）— 卡在模型这一步")
         log.warning(
             "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit 120s subprocess cap)",
-            "codex" if _is_codex_cmd(cmd) else "claude",
+            "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
             int((time.monotonic() - _turn_t0) * 1000),
         )
         raise
@@ -3904,7 +4022,13 @@ def call_agent_cli(
     )
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
-    observed_sid = _extract_session_id(raw_transport) or command_sid
+    if _is_pi_cmd(cmd):
+        # pi's session id is resident-owned (--session-id, created on first use);
+        # pi events carry no session_id field to scrape, and stream scraping could
+        # latch a wrong value from tool output — trust the command.
+        observed_sid = command_sid or _extract_session_id(raw_transport)
+    else:
+        observed_sid = _extract_session_id(raw_transport) or command_sid
     if observed_sid:
         _save_agent_session_id(observed_sid)
         _record_agent_session_turn(
@@ -3916,6 +4040,36 @@ def call_agent_cli(
     if result.returncode != 0:
         raise RuntimeError(
             f"cli agent exited {result.returncode}: "
+            f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
+        )
+
+    # pi `--mode json` streams JSONL events; the assistant's text and its
+    # thinking blocks live in dedicated `message_end` events, NOT in any field
+    # the generic extractor recognizes. Pull both from the stream before falling
+    # through (else the consumer would leak pi's internal handshake noise).
+    if _is_pi_cmd(cmd):
+        pi_reply, pi_thinking = _pi_turn_from_stream(result.stdout)
+        if pi_reply:
+            # Same lane discipline as codex: background memory lanes (raw_text)
+            # get the bare reply; only foreground chat folds thinking into the
+            # collapsible disclosure (pi separates thinking at the event layer,
+            # so there is no codex-0.142-style leak risk here).
+            if pi_thinking and not raw_text:
+                return _attach_provider_reasoning(
+                    pi_reply, pi_thinking,
+                    source="pi_thinking",
+                    kind="provider_reasoning_summary",
+                    native=True,
+                )
+            return pi_reply
+        # No assistant text: pi exits 0 EVEN ON API ERRORS (the error rides on the
+        # final message_end's stopReason/errorMessage), and pi ECHOES the user
+        # prompt as its own message_start/message_end. So _pi_turn_from_stream is
+        # pi's ONLY valid reply source — falling through to the generic extractor
+        # would return the user's own echoed message as the reply. Surface the
+        # error instead (verified against real pi 0.80.3 output, 2026-07-02).
+        raise RuntimeError(
+            "pi agent produced no reply: "
             f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
         )
 

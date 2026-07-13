@@ -61,6 +61,22 @@ without sharing session/home/logs. A second supervisor can't steal a live lease;
 a crashed/exited consumer's lease expires and is taken over (and `poll()` reaps
 the child so it isn't mistaken for alive).
 
+## Provider / driver routing
+
+| Provider | Driver | Agent | Transport |
+|---|---|---|---|
+| `anthropic` | `claude` | claude CLI native | Anthropic Messages wire (V1) |
+| `openai` | `codex` | codex exec native | OpenAI Responses wire |
+| `gemini` | `pi` | pi native relay | `google-generative-ai` @ OpenAI-compatible shim |
+| `openrouter` | `pi` | pi native relay | `openai-completions` @ `https://openrouter.ai/api/v1` |
+| `openai_compatible` | `pi` | pi native relay | `openai-completions` @ user's `base_url` |
+| `deepseek` | `pi` | pi native relay | `anthropic-messages` @ `{base_url}/anthropic` (text-only) |
+
+**Reasoning effort:** forwarded natively by the pi relay (no gateway intermediary). Provider support:
+- `anthropic` (claude): native
+- `openai` (codex): native Responses wire
+- `gemini`, `openrouter`, `openai_compatible`, `deepseek` (pi): native relay forward (placeholder `_PI_MODEL_REASONING_KEY` awaits pre-spike on `pre`)
+
 ## Tests
 
 ```bash

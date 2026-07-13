@@ -56,37 +56,6 @@ def test_consumer_env_sets_tz_from_user_first_class_timezone(monkeypatch):
     assert env["TZ"] == "America/New_York"
 
 
-def test_consumer_env_uses_stream_json_for_deepseek_claude_thinking():
-    env = spawners.consumer_env(
-        {"PATH": "/bin"},
-        {
-            "api_key": "fk",
-            "provider": "deepseek",
-            "provider_key": "sk-ds",
-            "driver": "claude",
-            "model": "deepseek-v4-pro",
-        },
-        user_id="u_1",
-        home="/agent-data/users/u_1",
-    )
-
-    cmd = env["AGENT_CLI_CMD"]
-    assert "--output-format stream-json" in cmd
-    assert "--include-partial-messages" in cmd
-    assert "--effort high" in cmd
-    assert "--permission-mode acceptEdits" in cmd  # non-interactive image Read
-    # the thinking-claude command must ALSO grant Read on the image temp dir, or a
-    # thinking model (deepseek/sonnet-4) can't open chat images (Read denied under -p).
-    # DOUBLE leading slash: a single slash anchors at the settings source (cwd /app),
-    # so Read(/agent-data/...) resolves to /app/agent-data/... and never matches.
-    assert "Read(//agent-data/users/u_1/images/**)" in cmd
-    # --add-dir puts the out-of-cwd image dir inside claude's trusted workspace, so
-    # the Read is permitted even under the headless workspace-trust boundary.
-    assert "--add-dir /agent-data/users/u_1/images" in cmd
-    assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
-    assert env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
-
-
 def test_consumer_env_uses_stream_json_for_native_anthropic_sonnet_thinking():
     env = spawners.consumer_env(
         {"PATH": "/bin"},
@@ -459,21 +428,20 @@ def test_openclaw_feedling_plugin_declares_native_memory_screen_tools_with_costs
     assert "[fast caption, slow image] Read the decrypted caption/ocr" in text
 
 
-def test_consumer_env_claude_deepseek_points_at_anthropic_compat_endpoint():
-    # deepseek runs on the claude (Anthropic-wire) driver but is NOT anthropic:
-    # the CLI must be pointed at deepseek's /anthropic-compatible endpoint + its
-    # own model, else it hits api.anthropic.com with a foreign key → exit 1.
+def test_consumer_env_claude_deepseek_no_longer_overrides_anthropic_endpoint():
+    # deepseek moved to the pi driver (anthropic-messages); the claude driver's
+    # old /anthropic-compatible base-URL override for it is retired, so even an
+    # (unreachable in production) driver=claude+provider=deepseek entry now
+    # behaves like any other claude entry — no override.
     env = spawners.consumer_env(
         {}, {"driver": "claude", "provider": "deepseek", "model": "deepseek-v4-flash",
              "base_url": "https://api.deepseek.com", "provider_key": "sk-ds"},
         user_id="u_1", home="/h",
     )
-    assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    assert "ANTHROPIC_BASE_URL" not in env
     assert env["ANTHROPIC_API_KEY"] == "sk-ds"
     assert env["ANTHROPIC_MODEL"] == "deepseek-v4-flash"
-    # claude Code's background "small/fast" calls must use the deepseek model too,
-    # not a claude-* default the endpoint doesn't serve.
-    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == "deepseek-v4-flash"
+    assert "ANTHROPIC_SMALL_FAST_MODEL" not in env
 
 
 def test_consumer_env_claude_native_anthropic_keeps_default_endpoint():
@@ -488,31 +456,18 @@ def test_consumer_env_claude_native_anthropic_keeps_default_endpoint():
     assert env["ANTHROPIC_API_KEY"] == "sk-ant"
 
 
-# ---- codex → LiteLLM gateway (non-openai providers) ----
+# ---- codex: native-only (LiteLLM gateway retired) ----
 
 
 def test_codex_native_for_openai_uses_provider_key_directly():
-    # openai is codex's native wire: the OpenAI key goes straight to CODEX_API_KEY
-    # and there is no gateway override.
+    # openai is codex's only driven provider now (native OpenAI Responses): the
+    # OpenAI key goes straight to CODEX_API_KEY — no gateway indirection left.
     env = spawners.consumer_env(
-        {"FEEDLING_LITELLM_API_KEY": "gw-key"},
+        {},
         {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex", "provider": "openai"},
         user_id="u", home="/h",
     )
     assert env["CODEX_API_KEY"] == "sk-oai"
-
-
-def test_codex_gateway_for_non_openai_presents_gateway_key_not_upstream():
-    # gemini/openrouter/openai_compatible reach codex only through the in-CVM
-    # LiteLLM gateway: codex presents the GATEWAY key, never the upstream provider
-    # key (which stays inside the gateway's own config — minimize key exposure).
-    env = spawners.consumer_env(
-        {"FEEDLING_LITELLM_API_KEY": "gw-key", "FEEDLING_LITELLM_BASE_URL": "http://127.0.0.1:4000/v1"},
-        {"api_key": "fk", "provider_key": "sk-upstream", "driver": "codex", "provider": "gemini"},
-        user_id="u", home="/h",
-    )
-    assert env["CODEX_API_KEY"] == "gw-key"
-    assert "sk-upstream" not in env.values()
 
 
 def test_agent_home_files_prepends_genesis_persona_when_present():
@@ -563,82 +518,39 @@ def test_agent_home_files_blank_persona_is_tools_only():
     assert append.startswith("# Feedling context tools")  # tools how-to header, no prefix
 
 
-def test_agent_home_files_codex_gateway_writes_responses_config():
-    # 明确指定为非官方 provider，会注入身份块。测试检查 gateway config 仍被创建
-    files = spawners.agent_home_files(
-        "/h", driver="codex", provider="gemini", codex_transport="gateway",
-        gateway_base_url="http://127.0.0.1:4000/v1", model="gw-gemini",
-    )
-    cfg = files["/h/codex-home/config.toml"]
-    # codex speaks OpenAI Responses to the gateway, which fans out to the provider
-    assert 'wire_api = "responses"' in cfg
-    assert "http://127.0.0.1:4000/v1" in cfg
-    assert "gw-gemini" in cfg
-    # AGENTS.md still seeded
-    assert "/h/codex-home/AGENTS.md" in files
-
-
-def test_agent_home_files_codex_gateway_disables_multi_agent_tools():
-    # codex 0.142 declares its multi-agent tools as a `{"type": "namespace"}` tool
-    # group on EVERY Responses request — an OpenAI-only wire extension. Non-OpenAI
-    # upstreams behind the gateway reject the whole request on it (xAI: 422
-    # "unknown variant 'namespace', expected one of 'function', 'web_search'"),
-    # so every turn dies before the model runs. Gateway config must turn the
-    # multi-agent feature off; native OpenAI keeps it (no config.toml written there).
-    files = spawners.agent_home_files(
-        "/h", driver="codex", provider="openrouter", codex_transport="gateway",
-        gateway_base_url="http://127.0.0.1:4000/v1", model="gw-x",
-    )
-    cfg = files["/h/codex-home/config.toml"]
-    assert "[features]" in cfg
-    assert "multi_agent = false" in cfg
-    assert "collab = false" not in cfg
-
-
-def test_agent_home_files_codex_native_omits_gateway_config():
-    # 明确指定为官方 openai provider，native codex 不会创建 gateway config
-    files = spawners.agent_home_files("/h", driver="codex", provider="openai", codex_transport="native")
+def test_agent_home_files_codex_never_writes_config_toml():
+    # LiteLLM gateway retired: codex is native-only now, and native codex never
+    # gets a config.toml (the CLI default api.openai.com is correct as-is).
+    files = spawners.agent_home_files("/h", driver="codex", provider="openai")
     assert "/h/codex-home/config.toml" not in files
 
 
-def test_stale_home_files_native_codex_prunes_gateway_config():
-    # A user who switched from a gateway provider (gemini/openrouter/...) to native
-    # openai leaves a codex-home/config.toml pointing at the in-CVM gateway on the
-    # PERSISTENT home. agent_home_files writes nothing for native, so the stale file
-    # would survive and keep routing codex at the (now-dead) :4000 — list it to prune.
-    stale = spawners.stale_home_files("/h", driver="codex", codex_transport="native")
+def test_codex_native_never_writes_config_toml():
+    # Brief Step-1 guard: codex is native-only — no codex-home/config.toml.
+    files = spawners.agent_home_files("/h", driver="codex", provider="openai")
+    assert "/h/codex-home/config.toml" not in files
+
+
+def test_stale_home_files_codex_always_prunes_config_toml():
+    # Historical case: a user who used to be bridged through the in-CVM LiteLLM
+    # gateway (now retired) may still carry a codex-home/config.toml pointing at
+    # the (now-dead) gateway on the PERSISTENT home. agent_home_files never
+    # writes that file any more, so it must always be pruned here.
+    stale = spawners.stale_home_files("/h", driver="codex")
     assert "/h/codex-home/config.toml" in stale
 
 
-def test_stale_home_files_gateway_codex_keeps_config():
-    # Gateway transport WRITES config.toml this spawn — it must never be pruned.
-    stale = spawners.stale_home_files("/h", driver="codex", codex_transport="gateway")
-    assert "/h/codex-home/config.toml" not in stale
-
-
-def test_materialize_home_prunes_stale_gateway_config_on_native(tmp_path):
+def test_materialize_home_prunes_stale_gateway_config_on_codex(tmp_path):
     home = str(tmp_path / "u")
     cfg = tmp_path / "u" / "codex-home" / "config.toml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text('model_provider = "feedling_gateway"\nbase_url = "http://127.0.0.1:4000/v1"\n')
     # 明确指定为官方 provider，所以不会注入身份块
-    spawners.materialize_home(home, driver="codex", provider="openai", codex_transport="native")
+    spawners.materialize_home(home, driver="codex", provider="openai")
     # the stale gateway config is gone → codex falls back to native (api.openai.com)
     assert not cfg.exists()
     # AGENTS.md still seeded
     assert (tmp_path / "u" / "codex-home" / "AGENTS.md").exists()
-
-
-def test_materialize_home_writes_and_keeps_gateway_config(tmp_path):
-    home = str(tmp_path / "u")
-    # 明确指定为非官方 provider，会注入身份块。测试检查 gateway config 仍被创建
-    spawners.materialize_home(
-        home, driver="codex", provider="gemini", codex_transport="gateway",
-        gateway_base_url="http://127.0.0.1:4000/v1", model="gw-gemini",
-    )
-    cfg = tmp_path / "u" / "codex-home" / "config.toml"
-    assert cfg.exists()
-    assert "http://127.0.0.1:4000/v1" in cfg.read_text()
 
 
 def test_materialize_home_creates_image_dir_for_claude(tmp_path):
@@ -758,17 +670,15 @@ def test_agent_home_files_official_provider_with_default_base_url_no_block():
     assert "你的真实身份" not in files["/h/agent-tools-prompt.md"]
 
 
-def test_agent_home_files_identity_block_uses_identity_model_over_gateway_alias():
-    # gateway codex：model 已改写成内部 gw-<uid> 别名，身份自称须用真实上游模型（Codex P2）
+def test_agent_home_files_identity_block_uses_identity_model_over_model():
+    # identity_model 目前恒为空（LiteLLM 网关已退役，不再有 gw-<uid> 别名改写 model），
+    # 字段/参数保留只是防未来复用——但当调用方显式传入时，身份块仍须优先用它。
     files = spawners.agent_home_files(
-        "/h", driver="codex", provider="gemini", codex_transport="gateway",
-        gateway_base_url="http://127.0.0.1:4000/v1",
-        model="gw-u123", identity_model="gemini-2.0-flash")
+        "/h", driver="codex", provider="gemini",
+        model="internal-alias", identity_model="gemini-2.0-flash")
     agents_md = files["/h/codex-home/AGENTS.md"]
-    assert "gemini-2.0-flash" in agents_md   # 身份块用真实模型
-    assert "gw-u123" not in agents_md          # 不暴露内部别名
-    # gateway config.toml 仍用 gw-<uid> 别名做 LiteLLM 路由
-    assert 'model = "gw-u123"' in files["/h/codex-home/config.toml"]
+    assert "gemini-2.0-flash" in agents_md   # 身份块用 identity_model
+    assert "internal-alias" not in agents_md
 
 
 def test_agent_home_files_identity_block_reaches_codex_and_pi():
@@ -788,3 +698,152 @@ def test_agent_home_files_identity_block_sits_above_persona():
         persona_content="You are Kai.")
     append = files["/h/agent-tools-prompt.md"]
     assert append.index("你的真实身份") < append.index("You are Kai.")
+
+
+# ---- pi driver wiring (Task 4): cli template, models.json seed, env, stale prune ----
+
+
+def test_pi_default_cli_cmd():
+    cmd = spawners._default_cli_cmd("pi", "/h", model="x")
+    assert "pi --mode json" in cmd and "-t bash" in cmd
+    assert "--model feedling/x" in cmd and "--session-id {session_id}" in cmd
+    assert "{message}" not in cmd   # message via STDIN, never argv
+
+
+def test_pi_default_cli_cmd_omits_model_when_unset():
+    cmd = spawners._default_cli_cmd("pi", "/h", model="")
+    assert "--model" not in cmd
+    assert cmd.rstrip().endswith("--session-id {session_id}")
+
+
+def test_pi_home_writes_models_json():
+    files = spawners.agent_home_files("/h", driver="pi", provider="openrouter",
+                                      model="x", reasoning_effort="high")
+    assert "/h/pi-home/agent/models.json" in files
+    doc = json.loads(files["/h/pi-home/agent/models.json"])
+    prov = doc["providers"]["feedling"]
+    assert prov["api"] == "openai-completions"
+    assert prov["compat"]["supportsReasoningEffort"] is True   # reasoning threaded through
+    # pi gets no claude/codex home files
+    assert "/h/claude-home/settings.json" not in files
+    assert "/h/codex-home/AGENTS.md" not in files
+
+
+def test_pi_consumer_env_sets_provider_key():
+    env = spawners.consumer_env({}, {"provider_key": "sk-or", "driver": "pi",
+                                     "provider": "openrouter", "model": "x"},
+                                user_id="u", home="/h")
+    assert env["PI_PROVIDER_API_KEY"] == "sk-or"
+    assert env["PI_CODING_AGENT_DIR"] == "/h/pi-home/agent"
+    assert env["PI_OFFLINE"] == "1"
+    # pi must not inherit any other driver's env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "CODEX_API_KEY" not in env
+    assert "CLAUDE_CONFIG_DIR" not in env
+
+
+def test_consumer_env_uses_pi_cli_and_home_for_pi_driver():
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider_key": "sk-relay", "driver": "pi",
+             "provider": "openai_compatible", "model": "qwen-max",
+             "base_url": "https://my.host/v1"},
+        user_id="u_1", home="/h",
+    )
+    cmd = env["AGENT_CLI_CMD"]
+    assert cmd.startswith("pi --mode json -t bash ")
+    assert "--append-system-prompt /h/agent-tools-prompt.md" in cmd
+    assert "--model feedling/qwen-max" in cmd
+    assert "--session-id {session_id}" in cmd
+    assert "{message}" not in cmd
+    assert cmd.rstrip().endswith("--session-id {session_id}")
+
+
+def test_consumer_env_keys_have_no_litellm():
+    assert not any("LITELLM" in k for k in spawners._CONSUMER_ENV_KEYS)
+
+
+def test_stale_home_files_prunes_pi_models_json_when_not_pi():
+    stale = spawners.stale_home_files("/h", driver="codex")
+    assert "/h/pi-home/agent/models.json" in stale
+    stale_pi = spawners.stale_home_files("/h", driver="pi")
+    assert "/h/pi-home/agent/models.json" not in stale_pi
+
+
+# ---- pi models.json generator (Task 3, pure) ----
+
+
+def _prov(provider, *, model, base_url, reasoning_effort=""):
+    """Build the pi provider dict directly from ``_pi_models_json`` (pure — the
+    generator is exercised on its own here; the ``agent_home_files`` pi wiring is
+    covered in the pi-driver wiring section above)."""
+    doc = json.loads(spawners._pi_models_json(
+        base_url=base_url, model=model, provider=provider,
+        reasoning_effort=reasoning_effort,
+    ))
+    return doc["providers"][spawners._PI_PROVIDER_ID]
+
+
+def _model_reasoning_effort(p):
+    return p["models"][0].get(spawners._PI_MODEL_REASONING_KEY, "")
+
+
+def test_pi_models_gemini():
+    p = _prov("gemini", model="gemini-2.0-flash", base_url="")
+    assert p["api"] == "google-generative-ai" and "compat" not in p
+    assert p["models"][0]["input"] == ["text", "image"]
+
+
+def test_pi_models_openrouter_headers_and_base():
+    p = _prov("openrouter", model="x", base_url="")
+    assert p["api"] == "openai-completions"
+    assert p["baseUrl"] == "https://openrouter.ai/api/v1"
+    assert p["headers"]["HTTP-Referer"] and p["headers"]["X-Title"]
+
+
+def test_pi_models_openai_compatible_uses_user_base():
+    p = _prov("openai_compatible", model="qwen", base_url="https://my/v1/")
+    assert p["api"] == "openai-completions" and p["baseUrl"] == "https://my/v1"
+
+
+def test_pi_models_deepseek_anthropic_messages_text_only():
+    p = _prov("deepseek", model="deepseek-reasoner", base_url="")
+    assert p["api"] == "anthropic-messages"
+    assert p["baseUrl"] == "https://api.deepseek.com/anthropic"
+    assert "compat" not in p and p["models"][0]["input"] == ["text"]
+
+
+def test_pi_models_deepseek_custom_base():
+    p = _prov("deepseek", model="deepseek-chat", base_url="https://ds.example.com/")
+    assert p["baseUrl"] == "https://ds.example.com/anthropic"
+
+
+# NATIVE REASONING (no gateway):
+
+
+def test_pi_openrouter_forwards_reasoning_effort():
+    p = _prov("openrouter", model="x", base_url="", reasoning_effort="high")
+    assert p["compat"]["supportsReasoningEffort"] is True
+    assert _model_reasoning_effort(p) == "high"
+
+
+def test_pi_openrouter_off_omits_reasoning():
+    p = _prov("openrouter", model="x", base_url="", reasoning_effort="off")
+    assert p["compat"]["supportsReasoningEffort"] is False
+    assert _model_reasoning_effort(p) == ""
+
+
+def test_pi_openrouter_bad_effort_normalized_to_medium():
+    p = _prov("openrouter", model="x", base_url="", reasoning_effort="ultra")
+    assert _model_reasoning_effort(p) == "medium"
+
+
+def test_pi_openai_compatible_reasoning_only_when_set():
+    assert _prov("openai_compatible", model="q", base_url="https://m/v1")["compat"]["supportsReasoningEffort"] is False
+    p = _prov("openai_compatible", model="q", base_url="https://m/v1", reasoning_effort="low")
+    assert p["compat"]["supportsReasoningEffort"] is True and _model_reasoning_effort(p) == "low"
+
+
+def test_claude_anthropic_base_url_empty_for_all():
+    assert spawners._claude_anthropic_base_url({"provider": "anthropic"}) == ""
+    assert spawners._claude_anthropic_base_url(
+        {"provider": "deepseek", "base_url": "https://api.deepseek.com"}) == ""

@@ -29,10 +29,9 @@ services:
       # sslmode=disable: the DB is on the trusted compose network in CI, not
       # an external endpoint, so TLS isn't required for this smoke test.
       DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/feedling?sslmode=disable"
-      # 收口后 backend 启动会校验托管前置三件套（assert_hosting_ready）。生产 compose
+      # 收口后 backend 启动会校验托管前置两件套（assert_hosting_ready）。生产 compose
       # 从宿主透传这些（CI 宿主未设 → 空），这里用占位值覆盖，让 smoke test 的 backend
-      # 起得来——不连真 gateway/supervisor，仅验证容器能启动。
-      FEEDLING_LITELLM_ENABLE: "1"
+      # 起得来——不连真 supervisor，仅验证容器能启动。
       FEEDLING_HOST_ALL: "1"
       FEEDLING_RUNTIME_TOKEN_SECRET: "ci-smoke-secret"
     depends_on:

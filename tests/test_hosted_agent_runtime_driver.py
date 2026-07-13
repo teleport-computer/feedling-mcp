@@ -111,24 +111,14 @@ def test_enabling_hosting_derives_codex_for_openai(client):
     assert res.get_json()["driver"] == "codex"
 
 
-def test_gateway_provider_derives_codex_regardless_of_gateway_flag(client, monkeypatch):
-    # Gateway check removed: gemini → codex unconditionally (consumer handles it)
-    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
+def test_pi_provider_derives_pi_unconditionally(client, monkeypatch):
+    # LiteLLM gateway retired: gemini/openrouter/openai_compatible/deepseek now
+    # derive the pi driver unconditionally (direct relay, no gateway flag).
     user_id, api_key = _register(client)
     _seed_config(user_id, provider="gemini")
     res = client.post("/v1/model_api/driver", json={}, headers=_headers(api_key))
     assert res.status_code == 200
-    assert res.get_json()["driver"] == "codex"
-
-
-def test_gateway_provider_derives_codex_when_gateway_enabled(client, monkeypatch):
-    monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
-    user_id, api_key = _register(client)
-    _seed_config(user_id, provider="gemini")
-    res = client.post("/v1/model_api/driver", json={}, headers=_headers(api_key))
-    assert res.status_code == 200
-    # gemini/openrouter/openai_compatible → codex (LiteLLM-bridged)
-    assert res.get_json()["driver"] == "codex"
+    assert res.get_json()["driver"] == "pi"
 
 
 def test_set_driver_requires_configured_model_api(client):
@@ -182,8 +172,8 @@ def test_get_key_envelope_requires_auth(client):
 import pytest
 from hosted import agent_runtime_cutover as arc
 
-def test_resolve_driver_returns_codex_for_openrouter():
-    assert arc.resolve_driver({"provider": "openrouter"}) == "codex"
+def test_resolve_driver_returns_pi_for_openrouter():
+    assert arc.resolve_driver({"provider": "openrouter"}) == "pi"
 
 def test_resolve_driver_returns_claude_for_anthropic():
     assert arc.resolve_driver({"provider": "anthropic"}) == "claude"
@@ -197,6 +187,5 @@ def test_resolve_driver_raises_for_unknown_provider():
         arc.resolve_driver({"provider": "weird"})
 
 def test_resolve_driver_ignores_per_user_flag_and_gateway(monkeypatch):
-    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
     monkeypatch.delenv("FEEDLING_HOST_ALL", raising=False)
-    assert arc.resolve_driver({"provider": "openrouter", "agent_runtime_driver": "legacy"}) == "codex"
+    assert arc.resolve_driver({"provider": "openrouter", "agent_runtime_driver": "legacy"}) == "pi"

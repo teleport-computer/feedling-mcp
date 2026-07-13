@@ -1257,23 +1257,22 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
 
 
-def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict]:
+def list_agent_runtime_enabled_users() -> list[dict]:
     """有 active route 且该 route test_status='ok'、其 credential 的 provider 能
     fit 的用户都纳入托管（与 hosted/agent_runtime_cutover.resolve_driver 一致——
     不再有 per-user ``agent_runtime_driver`` 开关；kill switch 改用删/换 active
-    route 或改 test_status）。
+    route 或改 test_status）。发现无条件进行——没有 gateway proxy 要避让，所有
+    fit provider 都直连（pi 走 openai-completions wire，不经 LiteLLM 网关）。
     AGENT 由 provider 派生（保持 CASE 与 cutover.driver_for_provider 同步）：
-    anthropic/deepseek → claude；openai → codex (native)。gateway-only provider
-    (gemini/openrouter/openai_compatible → codex via LiteLLM gateway) 仅当
-    ``include_gateway`` 时返回（gateway 关时不发现，避免 spawn 到不存在的 proxy）。
+    anthropic → claude；openai → codex (native)；其余 fit provider
+    （deepseek/gemini/openrouter/openai_compatible）→ pi。
     Returns [{"user_id","driver","provider","model","base_url","supports_responses",
     "reasoning_effort"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
     /v1/responses capability, set at setup; selects native passthrough vs the
     LiteLLM chat-completions bridge)。"""
-    providers = ["anthropic", "claude", "deepseek", "openai"]
-    if include_gateway:
-        providers += ["gemini", "openrouter", "openai_compatible"]
+    providers = ["anthropic", "claude", "deepseek", "openai",
+                 "gemini", "openrouter", "openai_compatible"]
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -1282,8 +1281,8 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
                   CASE LOWER(c.provider)
                     WHEN 'anthropic' THEN 'claude'
                     WHEN 'claude'    THEN 'claude'
-                    WHEN 'deepseek'  THEN 'claude'
-                    ELSE 'codex'
+                    WHEN 'openai'    THEN 'codex'
+                    ELSE 'pi'
                   END AS driver,
                   LOWER(c.provider) AS provider,
                   r.model AS model,

@@ -40,7 +40,7 @@
 #   on the prod FeedlingAppAuth 0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F). All
 #   secrets flow via the ENCRYPTED env channel (phala deploy -e …) — never baked.
 #   Reuses the main prod CVM's secrets (DATABASE_URL / FEEDLING_RUNTIME_TOKEN_SECRET
-#   — MUST match — / FEEDLING_LITELLM_API_KEY / AGENT_RUNTIME_USERS). Provision +
+#   — MUST match — / AGENT_RUNTIME_USERS). Provision +
 #   activation: see deploy/DEPLOYMENTS.md “prod Form B”. DORMANT until the CI job's
 #   repo var DEPLOY_PROD_RUNNER_CVM=true AND prod-runner-cvm-ids.txt is non-empty.
 
@@ -74,11 +74,6 @@ services:
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-      # in-CVM LiteLLM gateway (codex non-openai providers) — each runner runs its
-      # own proxy child on 127.0.0.1:<port>; codex on this runner connects locally.
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
-      FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
-      FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
       # Genesis import worker: ON here because once the main prod CVM's inline
       # agent-runner is removed, the runner CVMs are the ONLY place genesis import
       # jobs get drained. Safe on multiple runner CVMs — claim is FOR UPDATE SKIP
