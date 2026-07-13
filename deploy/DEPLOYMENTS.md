@@ -712,3 +712,34 @@ CVM 本身尚未开通** —— 下列 runbook 项必须在开通前逐条补齐
 
 密码一律用 `openssl rand -hex`（十六进制无特殊字符）——引号 / `$` / 反引号等字符会
 破坏 ensure-roles 的 SQL 与 compose 环境注入。
+
+### 磁盘 sizing 依据（实测 2026-07-13，prod RDS）
+
+CVM 磁盘创建时定死、事后扩容麻烦，故按「未来可能指向 prod / 长期不扩容」一次留够。
+
+**关键：TEE 影子库 ≠ prod 逻辑大小。** prod RDS 当时 1.28 GB，但迁进 TEE PG 的
+实际数据只有约 **650–700 MB**，因为最大的两块要么搬去 R2、要么明文化后缩水：
+
+| 表 | prod RDS | 进 TEE PG | 说明 |
+|---|---|---|---|
+| `frame_envelopes` | 491 MB | **~10 MB** | 485 MB 内联帧体（TOAST）在 TEE 侧重加密进 R2（`frames-tee/`），PG 只留指针 |
+| `chat_messages` | 291 MB | **~200 MB** | 252 MB base64 密文（TOAST）解密成明文约 ×0.75 缩水 |
+| `user_logs` | 376 MB | **~376 MB** | 本就明文，逐字双写原样 |
+| memory/blobs/perception/genesis 等 | ~60 MB | **~60 MB** | 明文化后量级不变 |
+| `genesis_import_chunks` / `bak_*` / `model_api_*` | — | **不复制** | staging / 临时备份表 / 非 baseline 表 |
+
+- **额外落 R2**（不占 PG 磁盘）：~485 MB 重加密帧体 + chat 文件体；WAL-G 全量备份
+  也在同一套 R2 凭证下（不同前缀）。R2 用量 ≈ 帧体 + 备份历史。
+- **增长率**：`user_logs`（append-only 最大明文表）实测 ~8.8 MB/天 ≈ 270 MB/月；
+  连同 chat/memory，prod 级总数据增长约 350–400 MB/月（当时用户量）。
+
+**磁盘建议**：
+- 纯 test 用途（影子 test 的 ~115 MB，帧体走 R2 后更小）：**20 GB** 足够
+  （数据 <100 MB，但要算 OS + postgres 镜像 ~1.5 GB + WAL + 初次批量 replicate
+  临时文件 + autovacuum 前 MVCC 膨胀）。
+- 想让该 CVM 未来也扛 prod 规模 / 长期不扩容：**30 GB**（prod 数据 ~700 MB、
+  月增 ~400 MB、帧体在 R2 不占 PG → 约 5 年跑道，含 WAL/膨胀/OS）。**推荐 30 GB**。
+- WAL：`archive_timeout=60s`，初次批量 replicate 会短时冲高 WAL，30 GB 完全吸收得住。
+
+（RDS 实例分配磁盘无法从本地 aws cli 查——RDS 在另一 AWS 账号下，当前 IAM 用户
+无权 describe。sizing 以上述实测逻辑数据量为准，不依赖 RDS 分配值。）

@@ -717,6 +717,11 @@ jobs:
           OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
           FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           DATABASE_URL:        ${{ secrets.TEST_DATABASE_URL }}
+          # TEE 明文影子库双写（feedling-io-db-test 独立 pg CVM）。best-effort
+          # 镜像，mirror 永不 raise。两个都空 = OFF。app 角色 DSN、sslmode=require。
+          # 加密 env 通道，不烧 compose_hash（同 DATABASE_URL）。
+          TEE_DATABASE_URL:        ${{ secrets.TEST_TEE_DATABASE_URL }}
+          FEEDLING_TEE_DUAL_WRITE: ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           # agent-runner (4th service) knobs — encrypted env channel, NOT baked
           # into compose_hash (see prod deploy step). Default empty = idle + gateway
@@ -766,6 +771,8 @@ jobs:
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
+            -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
             -e "AGENT_TICK_INTERVAL_SEC=$AGENT_TICK_INTERVAL_SEC" \

@@ -40,6 +40,12 @@ if [ -n "${WALG_S3_PREFIX:-}" ]; then
       echo "PGHOST=/var/run/postgresql"
       echo "PGUSER=${POSTGRES_USER}"
       echo "PGPASSWORD=${POSTGRES_PASSWORD}"
+      # PGDATABASE 必填：wal-g backup-push 连库跑 pg_backup_start/stop，缺它时
+      # libpq 把库名默认成用户名（feedling_owner），该库不存在 → base backup
+      # FATAL "database feedling_owner does not exist"。WAL wal-push 只传 S3 不
+      # 连库故不受影响，但没有 base backup 整条备份链不可恢复。cron backup-push
+      # 经 BASH_ENV source 同一文件，一并修好。
+      echo "PGDATABASE=${POSTGRES_DB}"
     } >> /etc/environment.walg
     sed -i '1i BASH_ENV=/etc/environment.walg' /etc/cron.d/walg-backup
     cron
