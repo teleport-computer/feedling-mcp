@@ -53,6 +53,15 @@ def _start_ws_leader() -> None:
     core_leader.run_singleton("ws", screen_ws.start)
 
 
+def _start_tee_sync_leader() -> None:
+    """In-process TEE 影子库自动同步单例（advisory-lock 选主，只一个 worker 跑）。
+    仅在双写已接（mirror.enabled）时选举 —— TEE 未配置时不空占 advisory 锁。"""
+    from admin import tee_sync_scheduler
+    from core import leader as core_leader
+
+    core_leader.run_singleton("tee-sync", tee_sync_scheduler.start)
+
+
 @asynccontextmanager
 async def lifespan(app):
     # (1) Threadpool limiter — off anyio's 40-token default (§5.2).
@@ -113,6 +122,11 @@ async def lifespan(app):
     # (6) :9998 WS-leader election — gated (see module docstring).
     if settings.start_background:
         _start_ws_leader()
+        # (6b) TEE 影子库自动同步单例 — 仅在双写已接时选举（env 决定，接=重部署）。
+        from tee_shadow import mirror as _tee_mirror
+
+        if _tee_mirror.enabled():
+            _start_tee_sync_leader()
 
     print(
         f"[asgi] startup ready: threadpool={settings.db_threads} "
