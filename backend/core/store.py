@@ -347,6 +347,7 @@ class UserStore:
         extra: dict | None = None,
         *,
         strict: bool = False,
+        enqueue: dict | None = None,
     ) -> dict:
         """Append a v1 ciphertext chat message. `envelope` holds the AEAD
         payload. See docs/DESIGN_E2E.md §3.2 for field definitions. Server
@@ -361,6 +362,18 @@ class UserStore:
         correctly — the envelope itself only carries opaque bytes; the type
         tag tells the renderer to show a string, decode JPEG, or offer a
         file download (with `file_name`/`file_mime` extras, see below).
+
+        `enqueue` (v2 send path only, requires `strict=True`): when provided,
+        the message INSERT and its V2 job enqueue/coalesce happen in ONE DB
+        transaction via `db.chat_append_and_enqueue` (spec A7) instead of
+        `db.chat_append_strict` — closing the crash window where the message
+        persists but the process dies before the job is queued, orphaning it.
+        Shape: `{"lane": str, "reason": str | None, "trace_id": str | None,
+        "expected_generation": int | None}`. `None` (the default) preserves
+        today's `chat_append_strict`/`chat_append` behavior byte-for-byte —
+        the in-memory cache append, trim, `wake_bus.notify`, and
+        `capture_scheduler.record_chat_append` side effects are unaffected
+        either way.
         """
         msg_id = envelope.get("id") if isinstance(envelope.get("id"), str) and envelope["id"] else uuid.uuid4().hex
         ct = content_type if content_type in ("text", "image", "file") else "text"
@@ -455,7 +468,17 @@ class UserStore:
             # V2 terminal replies opt into strict ordering: commit first, then
             # expose the row in the process cache.  A failed DB write therefore
             # cannot leave a phantom reply that makes the job look successful.
-            if strict:
+            if strict and enqueue is not None:
+                # A7: message persist + job enqueue/coalesce in one transaction
+                # so a crash between them can never orphan the message.
+                _seq, _job_id = db.chat_append_and_enqueue(
+                    self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES,
+                    enqueue["lane"],
+                    reason=enqueue.get("reason"),
+                    trace_id=enqueue.get("trace_id"),
+                    expected_generation=enqueue.get("expected_generation"),
+                )
+            elif strict:
                 db.chat_append_strict(
                     self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
             self.chat_messages.append(msg)

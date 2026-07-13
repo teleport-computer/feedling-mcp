@@ -256,6 +256,18 @@ class TurnDeps:
     # (user_id, inner) -> envelope：把一张卡的明文草稿封成客户端加密信封（E2E）。传给
     # extraction.cards_to_actions/consolidations_to_actions 的 build_envelope。None 时同上跳过持久化。
     build_memory_envelope: Callable[[str, dict], dict] | None = None
+    # user_id -> {"applied": int, "discarded": int}（Task 6 / spec A6）：run the
+    # generation-fenced effect-outbox applier (`effect_outbox.apply_pending_effects`)
+    # with this turn's real dispatch sinks at end-of-turn. worker.py itself never
+    # imports `model_api_runtime.v2.effect_outbox`'s dispatch-side wiring (the 7
+    # sinks live in serve_worker.py, the assembly tier, since several of them
+    # touch hosted-adjacent writers) — it only calls this injected callable.
+    # None (the default for every pre-existing test/caller that doesn't wire it)
+    # skips the step entirely: no effects have been enqueued into the outbox by
+    # any producer yet (that lands in PR C), so calling it today is a no-op read
+    # of an empty pending set; the field exists so the call site is already wired
+    # ahead of the producer landing.
+    apply_pending_effects: Callable[[str], dict] | None = None
 
 
 async def _cap_data(store, action_type, *, api_key, runtime_token, params=None, enclave_sem=None) -> dict:
@@ -938,6 +950,16 @@ async def process_job(
         await asyncio.to_thread(core_wake_bus.notify, "chat", user_id)
         if successor_id is not None:
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+        # End-of-turn effect-outbox drain (Task 6 / spec A6): apply any pending
+        # generation-fenced effects for this user with the real dispatch sinks.
+        # Best-effort — the turn's own reply/runtime-state/job transition above
+        # are already durable by this point, so a failure here must not turn a
+        # completed turn into a failed one.
+        if deps.apply_pending_effects is not None:
+            try:
+                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+            except Exception as e:  # noqa: BLE001 — see comment above
+                log.warning("[v2.worker] apply_pending_effects failed user=%s: %s", user_id, e)
         return "completed"
     except LostJobLease as e:
         # The winning lifecycle transition (normally the reaper) owns terminal

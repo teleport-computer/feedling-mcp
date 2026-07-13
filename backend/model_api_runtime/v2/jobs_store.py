@@ -58,8 +58,83 @@ def _pool():
     return db.get_pool()
 
 
+def coalesce_or_insert_on_cursor(
+    cur,
+    user_id,
+    lane,
+    *,
+    reason=None,
+    trace_id=None,
+    priority,
+    deadline_at=None,
+    expected_generation: int | None = None,
+) -> tuple[int, bool]:
+    """核心 coalesce-or-insert 逻辑，运行在调用方已开的事务/游标上（必须是
+    ``dict_row`` 游标——SQL 用 ``existing["stale"]``/``existing["id"]``）。抽成
+    模块级函数，好让 db.chat_append_and_enqueue（A7 原子发送+入队）在自己的
+    事务里复用同一段逻辑，而不是重开一个连接。语义与原 enqueue_job 内嵌闭包
+    完全一致，见该函数 docstring。"""
+    cur.execute(
+        "SELECT id,status,CASE "
+        "WHEN status='pending' THEN "
+        "  COALESCE(queue_deadline_at, deadline_at, "
+        "    CASE WHEN lane='chat' THEN "
+        "      created_at + make_interval(secs => %s) END) <= now() "
+        "ELSE COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+        "  AND COALESCE(lease_expires_at, deadline_at) <= now() "
+        "END AS stale "
+        "FROM agent_jobs "
+        "WHERE user_id=%s AND lane=%s "
+        "AND status IN ('pending','claimed','running') "
+        "ORDER BY id LIMIT 1 FOR UPDATE",
+        (float(PENDING_CHAT_TTL_SEC), user_id, lane),
+    )
+    existing = cur.fetchone()
+    if existing is not None and not bool(existing["stale"]):
+        cur.execute(
+            "UPDATE agent_jobs SET input_generation=input_generation+1 "
+            "WHERE id=%s RETURNING id",
+            (existing["id"],),
+        )
+        return int(cur.fetchone()["id"]), True
+    if existing is not None:
+        # Reclaim the single-flight key inside the same transaction.  The
+        # fresh chat job will re-read every message after the durable cursor,
+        # so input attached to the expired row is not lost or stranded.
+        cur.execute(
+            "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+            "attempt_count=attempt_count+1, "
+            "last_error=CASE WHEN status='pending' "
+            "THEN 'queue_timeout' ELSE 'lease_timeout' END "
+            "WHERE id=%s",
+            (existing["id"],),
+        )
+    cur.execute(
+        "INSERT INTO agent_jobs "
+        "(user_id, lane, status, reason, trace_id, priority, queue_deadline_at, "
+        "expected_runtime_generation) "
+        "VALUES (%s,%s,'pending',%s,%s,%s,"
+        "CASE WHEN %s::timestamptz IS NOT NULL THEN %s::timestamptz "
+        "     WHEN %s='chat' THEN now() + make_interval(secs => %s) "
+        "     ELSE NULL END, %s) RETURNING id",
+        (
+            user_id, lane, reason, trace_id, int(priority),
+            deadline_at, deadline_at, lane, float(PENDING_CHAT_TTL_SEC),
+            expected_generation,
+        ),
+    )
+    return int(cur.fetchone()["id"]), False
+
+
 def enqueue_job(
-    user_id, lane, *, reason=None, trace_id=None, priority=None, deadline_at=None
+    user_id,
+    lane,
+    *,
+    reason=None,
+    trace_id=None,
+    priority=None,
+    deadline_at=None,
+    expected_generation: int | None = None,
 ) -> tuple[int, bool]:
     """入队一个 job。命中 per-user/lane single-flight（已有 active job）则合并到现有
     pending，返回 (existing_id, True)；否则新建，返回 (new_id, False)。
@@ -71,68 +146,28 @@ def enqueue_job(
     priority：未显式传（None）时按 LANE_PRIORITY 从 lane 派生（chat/manual_wake=100，
     heartbeat/scheduled=50，capture/maintenance=10）；调用方显式传一个 int 则原样
     使用，不被 lane 派生值覆盖。
+
+    expected_generation：入队方（通常是 send/wake 入口，已经读过
+    db.get_runtime_generation(user_id)）观测到的运行时代数，原样落到新建行的
+    expected_runtime_generation 列（None 表示调用方未接入 cutover 代数校验，
+    该行永不因代数过期被判 superseded）。只影响新建分支——coalesce 到既有 pending
+    行时沿用那一行已经落库的代数，不覆盖。
     """
     if lane not in LANES:
         raise ValueError(f"unknown lane: {lane!r}")
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
 
-    def _coalesce_or_insert(cur) -> tuple[int, bool]:
-        cur.execute(
-            "SELECT id,status,CASE "
-            "WHEN status='pending' THEN "
-            "  COALESCE(queue_deadline_at, deadline_at, "
-            "    CASE WHEN lane='chat' THEN "
-            "      created_at + make_interval(secs => %s) END) <= now() "
-            "ELSE COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
-            "  AND COALESCE(lease_expires_at, deadline_at) <= now() "
-            "END AS stale "
-            "FROM agent_jobs "
-            "WHERE user_id=%s AND lane=%s "
-            "AND status IN ('pending','claimed','running') "
-            "ORDER BY id LIMIT 1 FOR UPDATE",
-            (float(PENDING_CHAT_TTL_SEC), user_id, lane),
-        )
-        existing = cur.fetchone()
-        if existing is not None and not bool(existing["stale"]):
-            cur.execute(
-                "UPDATE agent_jobs SET input_generation=input_generation+1 "
-                "WHERE id=%s RETURNING id",
-                (existing["id"],),
-            )
-            return int(cur.fetchone()["id"]), True
-        if existing is not None:
-            # Reclaim the single-flight key inside the same transaction.  The
-            # fresh chat job will re-read every message after the durable cursor,
-            # so input attached to the expired row is not lost or stranded.
-            cur.execute(
-                "UPDATE agent_jobs SET status='expired',finished_at=now(), "
-                "attempt_count=attempt_count+1, "
-                "last_error=CASE WHEN status='pending' "
-                "THEN 'queue_timeout' ELSE 'lease_timeout' END "
-                "WHERE id=%s",
-                (existing["id"],),
-            )
-        cur.execute(
-            "INSERT INTO agent_jobs "
-            "(user_id, lane, status, reason, trace_id, priority, queue_deadline_at) "
-            "VALUES (%s,%s,'pending',%s,%s,%s,"
-            "CASE WHEN %s::timestamptz IS NOT NULL THEN %s::timestamptz "
-            "     WHEN %s='chat' THEN now() + make_interval(secs => %s) "
-            "     ELSE NULL END) RETURNING id",
-            (
-                user_id, lane, reason, trace_id, int(priority),
-                deadline_at, deadline_at, lane, float(PENDING_CHAT_TTL_SEC),
-            ),
-        )
-        return int(cur.fetchone()["id"]), False
-
     for _ in range(3):
         try:
             with _pool().connection() as conn:
                 with conn.transaction():
                     with conn.cursor(row_factory=dict_row) as cur:
-                        return _coalesce_or_insert(cur)
+                        return coalesce_or_insert_on_cursor(
+                            cur, user_id, lane, reason=reason, trace_id=trace_id,
+                            priority=priority, deadline_at=deadline_at,
+                            expected_generation=expected_generation,
+                        )
         except psycopg.errors.UniqueViolation:
             continue  # 并发 racer 抢先建了 active job；重读并 coalesce
     # A very busy terminal/enqueue race can exhaust the optimistic retries.
@@ -141,68 +176,96 @@ def enqueue_job(
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
-                return _coalesce_or_insert(cur)
+                return coalesce_or_insert_on_cursor(
+                    cur, user_id, lane, reason=reason, trace_id=trace_id,
+                    priority=priority, deadline_at=deadline_at,
+                    expected_generation=expected_generation,
+                )
 
 
 def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | None:
     """抢下一个 pending job（priority DESC, created_at）。用 FOR UPDATE SKIP LOCKED 让
     多进程/多 slot 无争用地各抢各的。pending → claimed，落 claimed_by/claimed_at。
-    返回整行 dict（含 id/user_id/lane/trace_id/...），无活可抢返回 None。
+    返回整行 dict（含 id/user_id/lane/trace_id/expected_runtime_generation/...），
+    无活可抢返回 None。
 
     lanes：可选 lane 白名单（预留槽位场景，如某个 slot 只允许抢 {"chat",
     "manual_wake"}，保证聊天回复不被 heartbeat/capture 之类的后台唤醒风暴饿死）。
-    None（默认）＝不限制 lane，行为与改动前完全一致。"""
+    None（默认）＝不限制 lane，行为与改动前完全一致。
+
+    代过期早退（PR A / spec A3）：候选行的 expected_runtime_generation 若非空且
+    小于该用户当前 db.get_runtime_generation(user_id)（意味着入队之后发生过一次
+    resident<->v2 cutover，这一行是为旧运行时排的队，新运行时不认它），本次
+    claim 不把它交给任何 worker 过一轮——同一事务内直接把它判终态 'superseded'，
+    然后继续看下一个候选，直到拿到一个非过期的可抢行或彻底抢空。必须在同一个
+    claim 事务里做，否则两个并发 worker 可能都读到这个陈旧代的行、一个刚判
+    superseded、另一个已经把它当活的 claimed 出去。"""
+    if lanes is None:
+        select_sql = (
+            "SELECT j.id, j.user_id, j.expected_runtime_generation, "
+            "COALESCE(rs.runtime_generation, 1) AS current_generation FROM agent_jobs j "
+            "JOIN users u ON u.user_id=j.user_id "
+            "LEFT JOIN v2_runtime_state rs ON rs.user_id=j.user_id "
+            "WHERE j.status='pending' "
+            "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
+            "CASE WHEN j.lane='chat' THEN "
+            "j.created_at + make_interval(secs => %s) END) IS NULL OR "
+            "COALESCE(j.queue_deadline_at, j.deadline_at, "
+            "CASE WHEN j.lane='chat' THEN "
+            "j.created_at + make_interval(secs => %s) END) > now()) "
+            "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
+            "WHERE active.user_id=j.user_id "
+            "AND active.status IN ('claimed','running')) "
+            "ORDER BY j.priority DESC, j.created_at "
+            "FOR UPDATE OF j,u SKIP LOCKED LIMIT 1"
+        )
+        select_args = (float(PENDING_CHAT_TTL_SEC), float(PENDING_CHAT_TTL_SEC))
+    else:
+        select_sql = (
+            "SELECT j.id, j.user_id, j.expected_runtime_generation, "
+            "COALESCE(rs.runtime_generation, 1) AS current_generation FROM agent_jobs j "
+            "JOIN users u ON u.user_id=j.user_id "
+            "LEFT JOIN v2_runtime_state rs ON rs.user_id=j.user_id "
+            "WHERE j.status='pending' "
+            "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
+            "CASE WHEN j.lane='chat' THEN "
+            "j.created_at + make_interval(secs => %s) END) IS NULL OR "
+            "COALESCE(j.queue_deadline_at, j.deadline_at, "
+            "CASE WHEN j.lane='chat' THEN "
+            "j.created_at + make_interval(secs => %s) END) > now()) "
+            "AND j.lane = ANY(%s) "
+            "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
+            "WHERE active.user_id=j.user_id "
+            "AND active.status IN ('claimed','running')) "
+            "ORDER BY j.priority DESC, j.created_at "
+            "FOR UPDATE OF j,u SKIP LOCKED LIMIT 1"
+        )
+        select_args = (float(PENDING_CHAT_TTL_SEC), float(PENDING_CHAT_TTL_SEC), list(lanes))
+
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
-                if lanes is None:
+                while True:
+                    cur.execute(select_sql, select_args)
+                    head = cur.fetchone()
+                    if head is None:
+                        return None
+                    expected_gen = head["expected_runtime_generation"]
+                    if expected_gen is not None and int(expected_gen) < int(head["current_generation"]):
+                        cur.execute(
+                            "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
+                            "last_error='stale_runtime_generation' WHERE id=%s",
+                            (head["id"],),
+                        )
+                        continue
                     cur.execute(
-                        "SELECT j.id FROM agent_jobs j "
-                        "JOIN users u ON u.user_id=j.user_id "
-                        "WHERE j.status='pending' "
-                        "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
-                        "CASE WHEN j.lane='chat' THEN "
-                        "j.created_at + make_interval(secs => %s) END) IS NULL OR "
-                        "COALESCE(j.queue_deadline_at, j.deadline_at, "
-                        "CASE WHEN j.lane='chat' THEN "
-                        "j.created_at + make_interval(secs => %s) END) > now()) "
-                        "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
-                        "WHERE active.user_id=j.user_id "
-                        "AND active.status IN ('claimed','running')) "
-                        "ORDER BY j.priority DESC, j.created_at "
-                        "FOR UPDATE OF j,u SKIP LOCKED LIMIT 1",
-                        (float(PENDING_CHAT_TTL_SEC), float(PENDING_CHAT_TTL_SEC)),
+                        "UPDATE agent_jobs SET status='claimed', claimed_by=%s, claimed_at=now(), "
+                        "lease_expires_at = now() + make_interval(secs => %s), "
+                        "deadline_at = now() + make_interval(secs => %s) "
+                        "WHERE id=%s RETURNING *",
+                        (worker_id, float(RUNNING_TTL_SEC), float(RUNNING_TTL_SEC), head["id"]),
                     )
-                else:
-                    cur.execute(
-                        "SELECT j.id FROM agent_jobs j "
-                        "JOIN users u ON u.user_id=j.user_id "
-                        "WHERE j.status='pending' "
-                        "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
-                        "CASE WHEN j.lane='chat' THEN "
-                        "j.created_at + make_interval(secs => %s) END) IS NULL OR "
-                        "COALESCE(j.queue_deadline_at, j.deadline_at, "
-                        "CASE WHEN j.lane='chat' THEN "
-                        "j.created_at + make_interval(secs => %s) END) > now()) "
-                        "AND j.lane = ANY(%s) "
-                        "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
-                        "WHERE active.user_id=j.user_id "
-                        "AND active.status IN ('claimed','running')) "
-                        "ORDER BY j.priority DESC, j.created_at "
-                        "FOR UPDATE OF j,u SKIP LOCKED LIMIT 1",
-                        (float(PENDING_CHAT_TTL_SEC), float(PENDING_CHAT_TTL_SEC), list(lanes)),
-                    )
-                head = cur.fetchone()
-                if head is None:
-                    return None
-                cur.execute(
-                    "UPDATE agent_jobs SET status='claimed', claimed_by=%s, claimed_at=now(), "
-                    "lease_expires_at = now() + make_interval(secs => %s), "
-                    "deadline_at = now() + make_interval(secs => %s) "
-                    "WHERE id=%s RETURNING *",
-                    (worker_id, float(RUNNING_TTL_SEC), float(RUNNING_TTL_SEC), head["id"]),
-                )
-                return cur.fetchone()
+                    return cur.fetchone()
 
 
 def mark_running(job_id, *, claimed_by: str) -> bool:

@@ -21,6 +21,7 @@ import time
 from core import envelope as core_envelope
 from core import wake_bus as core_wake_bus
 
+import db
 import debug_trace
 from chat import service as chat_service
 from hosted import agent_runtime_cutover
@@ -226,6 +227,17 @@ def model_api_chat_send_core(
     ]
     if quoted_memory_ids:
         extra["quoted_memory_ids"] = ",".join(quoted_memory_ids[:8])
+    # A7: for the v2 send path, the message INSERT and its chat-job
+    # enqueue/coalesce must land in ONE DB transaction, so a crash between
+    # them can never orphan a persisted-but-never-enqueued message. The
+    # generation is read ONCE, before the append, and the trace_id is derived
+    # from the envelope's own id (the same value append_chat will use as the
+    # stored message's msg_id) — both must be known before the call since the
+    # enqueue now happens INSIDE store.append_chat via db.chat_append_and_enqueue,
+    # not as a separate call afterward.
+    _generation = db.get_runtime_generation(store.user_id) if _v2_mode else None
+    _envelope_id = user_env.get("id")
+    _trace_id = str(_envelope_id) if isinstance(_envelope_id, str) and _envelope_id else None
     user_row = store.append_chat(
         "user",
         "model_api",
@@ -233,6 +245,15 @@ def model_api_chat_send_core(
         content_type="image" if has_image else ("file" if has_file else "text"),
         extra=extra or None,
         strict=_v2_mode,
+        enqueue=(
+            {
+                "lane": "chat",
+                "reason": "chat_send",
+                "trace_id": _trace_id,
+                "expected_generation": _generation,
+            }
+            if _v2_mode else None
+        ),
     )
     store.notify_chat_waiters()
 
@@ -244,12 +265,9 @@ def model_api_chat_send_core(
         detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
     )
     if _v2_mode:
-        # 落加密用户消息已完成（上方 append_chat）；入队/合并 chat job，唤醒 worker 池，
-        # 快速返回 202 processing（不写 filler；客户端经 chat poll 取加密回复）。
-        jobs_store.enqueue_job(
-            store.user_id, "chat", reason="chat_send",
-            trace_id=str(user_row.get("id") or "") if isinstance(user_row, dict) else None,
-        )
+        # 落加密用户消息 + 入队/合并 chat job 已经在上方 append_chat 内一个事务里原子
+        # 完成（db.chat_append_and_enqueue，spec A7）；这里只需唤醒 worker 池，快速
+        # 返回 202 processing（不写 filler；客户端经 chat poll 取加密回复）。
         core_wake_bus.notify("v2_jobs", store.user_id)
         body, status = agent_runtime_cutover.build_processing_response(user_row, driver=driver)
         return body, status

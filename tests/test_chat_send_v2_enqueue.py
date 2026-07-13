@@ -53,11 +53,6 @@ def test_db_action_v2_enqueues_job_and_skips_resident(monkeypatch):
     # exercising enqueue behavior, not the (separately tested) dead-pool guard.
     monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
 
-    enq = {}
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "enqueue_job",
-        lambda uid, lane, **kw: enq.update(uid=uid, lane=lane, kw=kw) or (123, False),
-    )
     notified = {}
     monkeypatch.setattr(
         chat_send_core.core_wake_bus, "notify",
@@ -76,9 +71,23 @@ def test_db_action_v2_enqueues_job_and_skips_resident(monkeypatch):
 
     assert status == 202
     assert body["status"] == "processing"
-    assert enq == {"uid": "u_send_v2", "lane": "chat", "kw": enq["kw"]}
     assert notified["channel"] == "v2_jobs" and notified["user_id"] == "u_send_v2"
     assert called["handle_send"] is False
+    # A7: the enqueue no longer rides a separate jobs_store.enqueue_job call —
+    # it happens atomically inside store.append_chat via db.chat_append_and_enqueue.
+    # Verify the real effect: exactly one pending chat job row for this user,
+    # carrying the send's reason and the envelope id as trace_id.
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT lane, status, reason, trace_id FROM agent_jobs WHERE user_id=%s",
+            ("u_send_v2",),
+        ).fetchall()
+    assert len(rows) == 1
+    lane, job_status, reason, trace_id = rows[0]
+    assert lane == "chat"
+    assert job_status == "pending"
+    assert reason == "chat_send"
+    assert trace_id == "u-msg-1"
 
 
 def test_runtime_mode_read_failure_refuses_before_persistence(monkeypatch):
@@ -323,11 +332,6 @@ def test_db_action_v2_admission_check_fails_open_on_exception(monkeypatch):
 
     monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", _boom)
 
-    enq = {}
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "enqueue_job",
-        lambda uid, lane, **kw: enq.update(uid=uid, lane=lane, kw=kw) or (123, False),
-    )
     notified = {}
     monkeypatch.setattr(
         chat_send_core.core_wake_bus, "notify",
@@ -340,8 +344,15 @@ def test_db_action_v2_admission_check_fails_open_on_exception(monkeypatch):
 
     assert status == 202
     assert body["status"] == "processing"
-    assert enq == {"uid": "u_send_v2_admission_failopen", "lane": "chat", "kw": enq["kw"]}
     assert notified["channel"] == "v2_jobs"
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT lane, status, reason FROM agent_jobs WHERE user_id=%s",
+            ("u_send_v2_admission_failopen",),
+        ).fetchall()
+    assert len(rows) == 1
+    lane, job_status, reason = rows[0]
+    assert (lane, job_status, reason) == ("chat", "pending", "chat_send")
 
 
 def test_db_action_v2_admission_admits_under_sla(monkeypatch):
@@ -365,11 +376,6 @@ def test_db_action_v2_admission_admits_under_sla(monkeypatch):
     monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
     monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
 
-    enq = {}
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "enqueue_job",
-        lambda uid, lane, **kw: enq.update(uid=uid, lane=lane, kw=kw) or (123, False),
-    )
     notified = {}
     monkeypatch.setattr(
         chat_send_core.core_wake_bus, "notify",
@@ -382,5 +388,12 @@ def test_db_action_v2_admission_admits_under_sla(monkeypatch):
 
     assert status == 202
     assert body["status"] == "processing"
-    assert enq == {"uid": "u_send_v2_admission_ok", "lane": "chat", "kw": enq["kw"]}
     assert notified["channel"] == "v2_jobs"
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT lane, status, reason FROM agent_jobs WHERE user_id=%s",
+            ("u_send_v2_admission_ok",),
+        ).fetchall()
+    assert len(rows) == 1
+    lane, job_status, reason = rows[0]
+    assert (lane, job_status, reason) == ("chat", "pending", "chat_send")

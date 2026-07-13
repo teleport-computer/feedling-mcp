@@ -46,7 +46,9 @@ import threading
 import time
 import types
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 # Put the backend dir on sys.path BEFORE importing backend modules. When this is
 # run as a script (`python backend/model_api_runtime/v2/serve_worker.py` — how the
@@ -71,6 +73,8 @@ from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
 from identity import identity_core
 from memory import memory_core
+from model_api_runtime.v2 import cursor as v2_cursor
+from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import scheduler
@@ -782,6 +786,226 @@ def _tick_screen_watch_for_user(user_id: str) -> int:
     return 0
 
 
+@dataclass
+class EffectSinkDeps:
+    """Injectable sink callables for `build_effect_dispatch` — one per outbox
+    `effect_type` (spec A6). Each callable takes the payload dict (already
+    annotated with `effect_id` by `effect_outbox.apply_pending_effects` — see
+    that module) and performs the real durable write, or no-ops on replay.
+
+    Deliberately `Callable[[dict], None]`, NOT `Callable[[str, dict], None]`:
+    `effect_outbox.apply_pending_effects` calls `dispatch(effect_type, payload)`
+    with no separate `user_id` argument (the outbox row's `user_id` never
+    reaches the payload — see `db.effect_pending`'s SELECT). Production sinks
+    that need `user_id` (all of them) get it from a closure built once per
+    turn by `build_production_effect_dispatch(user_id)` below; tests just pass
+    plain `lambda p: ...` fakes."""
+    reply: Callable[[dict], None]
+    status: Callable[[dict], None]
+    cursor: Callable[[dict], None]
+    job: Callable[[dict], None]
+    memory: Callable[[dict], None]
+    identity: Callable[[dict], None]
+    schedule: Callable[[dict], None]
+
+
+def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], None]:
+    """Pure router (spec A6): `dispatch(effect_type, payload) -> None`. Side-
+    effect-free at construction — building the dispatch closure touches no DB;
+    effects happen only when `dispatch(...)` is actually called. Unknown
+    `effect_type` raises `ValueError` — a new effect kind shipping without a
+    wired sink must fail loudly, not silently drop the effect."""
+    routes: dict[str, Callable[[dict], None]] = {
+        "reply": deps.reply,
+        "status": deps.status,
+        "cursor": deps.cursor,
+        "job": deps.job,
+        "memory": deps.memory,
+        "identity": deps.identity,
+        "schedule": deps.schedule,
+    }
+
+    def dispatch(effect_type: str, payload: dict) -> None:
+        sink = routes.get(effect_type)
+        if sink is None:
+            raise ValueError(f"unknown effect_type: {effect_type!r}")
+        sink(payload)
+
+    return dispatch
+
+
+def _sink_reply(user_id: str, payload: dict) -> None:
+    """`reply` sink. Payload keys: ``{"text": str}``. Reuses
+    `v2_worker._write_encrypted_reply` (the same shared-envelope local-
+    encryption writer the chat-turn success path already uses) — does not
+    reimplement reply persistence."""
+    eid = payload["effect_id"]
+    if not db.effect_sink_claim(eid):
+        return  # replay after a crash between sink-write and status=applied -> no-op
+    try:
+        store = core_store.get_store(user_id)
+        v2_worker._write_encrypted_reply(store, str(payload.get("text") or ""))
+    except Exception:
+        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        raise
+
+
+def _sink_status(user_id: str, payload: dict) -> None:
+    """`status` sink. Payload keys: ``{"kind": str, "job_id"?: any, "label"?: str,
+    "detail"?: dict}``. Reuses `jobs_store.append_status_event` — the same
+    writer `worker._emit_status` calls."""
+    eid = payload["effect_id"]
+    if not db.effect_sink_claim(eid):
+        return
+    try:
+        jobs_store.append_status_event(
+            user_id, str(payload.get("kind") or ""),
+            job_id=payload.get("job_id"), label=payload.get("label"),
+            detail=payload.get("detail"))
+    except Exception:
+        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        raise
+
+
+def _sink_cursor(user_id: str, payload: dict) -> None:
+    """`cursor` sink. Payload keys: ``{"new_seq": int}`` (see
+    `model_api_runtime.v2.cursor.advance_effect`). Merges
+    `cursor.CURSOR_KEY` into the `model_api_runtime` profile blob via
+    `db.patch_blob_strict` — an atomic per-key merge, never a blind overwrite:
+    that blob also carries rollout flags / `hosted_runtime_mode` / other
+    sibling keys `cursor.load_seq` doesn't own. Uses the RAISING `_strict`
+    writer (not the best-effort `db.patch_blob`, which swallows failures and
+    returns None) so a write error propagates into the claim-release wrapper
+    below instead of silently no-oping."""
+    eid = payload["effect_id"]
+    if not db.effect_sink_claim(eid):
+        return
+    try:
+        db.patch_blob_strict(user_id, "model_api_runtime", {v2_cursor.CURSOR_KEY: int(payload["new_seq"])})
+    except Exception:
+        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        raise
+
+
+def _sink_job(user_id: str, payload: dict) -> None:
+    """`job` sink — generation-fenced follow-up enqueue. Payload keys:
+    ``{"lane": str, "reason"?: str, "expected_generation"?: int}``.
+
+    Defence in depth (A6 table note "fenced: only if generation still
+    current"): `effect_outbox.apply_pending_effects` already fenced
+    *application* of this effect under the row's `FOR UPDATE` lock before
+    ever calling dispatch; this is a second, independent check specifically
+    for the enqueue side-effect. Missing `expected_generation` (no fence data
+    supplied) defaults to reading the CURRENT generation as "expected" — i.e.
+    no additional fence beyond what the outbox already did.
+
+    NOTE on claim-release: the generation-fence early-return below is NOT a
+    write failure -- it means the effect is intentionally skipped, having
+    legitimately consumed its claim, and must NOT be re-driven on replay. The
+    claim is released only when the actual enqueue write raises."""
+    eid = payload["effect_id"]
+    if not db.effect_sink_claim(eid):
+        return
+    expected_generation = payload.get("expected_generation")
+    if expected_generation is None:
+        expected_generation = db.get_runtime_generation(user_id)
+    current = db.get_runtime_generation(user_id)
+    if int(expected_generation) != int(current):
+        log.debug(
+            "[v2.serve_worker] job effect skipped: generation advanced user=%s "
+            "expected=%s current=%s", user_id, expected_generation, current)
+        return  # intentional fence skip -> claim stands, NOT a write failure
+    try:
+        jobs_store.enqueue_job(user_id, str(payload.get("lane") or "chat"), reason=payload.get("reason"))
+    except Exception:
+        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        raise
+
+
+def _sink_memory(user_id: str, payload: dict) -> None:
+    """`memory` sink. Payload keys: ``{"actions": list[dict]}`` (memory.add /
+    memory.supersede action dicts — see `_apply_memory_actions` docstring
+    above). Reuses `_apply_memory_actions`, the same writer capture/dream
+    extraction already calls."""
+    eid = payload["effect_id"]
+    if not db.effect_sink_claim(eid):
+        return
+    try:
+        _apply_memory_actions(user_id, list(payload.get("actions") or []))
+    except Exception:
+        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        raise
+
+
+def _sink_identity(user_id: str, payload: dict) -> None:
+    """`identity` sink. Payload keys: ``{"patch": dict}`` OR top-level
+    ``self_introduction``/``signature`` keys — mirrors
+    `capabilities.identity.patch`'s own `params` contract exactly. No
+    assembly-tier identity writer exists yet, so (per the brief) this calls
+    the capability directly — a thin adapter, not a reimplementation."""
+    eid = payload["effect_id"]
+    if not db.effect_sink_claim(eid):
+        return
+    try:
+        store = core_store.get_store(user_id)
+        params = {k: v for k, v in payload.items() if k != "effect_id"}
+        cap_registry.run_capability("identity_patch", store, api_key=None, params=params)
+    except Exception:
+        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        raise
+
+
+_SCHEDULE_PAYLOAD_KEYS = (
+    "next_heartbeat_at", "next_capture_at", "payment_cooldown_until",
+    "next_screen_watch_at", "last_screen_watch_frame_id",
+)
+
+
+def _sink_schedule(user_id: str, payload: dict) -> None:
+    """`schedule` sink. Payload keys: any subset of
+    `jobs_store.upsert_wake_schedule`'s kwargs (`next_heartbeat_at` /
+    `next_capture_at` / `payment_cooldown_until` / `next_screen_watch_at` /
+    `last_screen_watch_frame_id`). Reuses `upsert_wake_schedule` — the same
+    writer `_fire_scheduled_for_user`/`_tick_screen_watch_for_user` call;
+    does not duplicate the wake-schedule upsert logic."""
+    eid = payload["effect_id"]
+    if not db.effect_sink_claim(eid):
+        return
+    try:
+        kwargs = {k: v for k, v in payload.items() if k in _SCHEDULE_PAYLOAD_KEYS}
+        jobs_store.upsert_wake_schedule(user_id, **kwargs)
+    except Exception:
+        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        raise
+
+
+def build_production_effect_dispatch(user_id: str) -> Callable[[str, dict], None]:
+    """Wire the 7 real sinks bound to a single user (see `EffectSinkDeps`
+    docstring for why the binding happens here and not inside
+    `build_effect_dispatch`). Called once per `apply_pending_effects(user_id,
+    ...)` at end-of-turn (see `build_production_deps`'s `apply_pending_effects`
+    field and its call site in `worker.process_job`)."""
+    deps = EffectSinkDeps(
+        reply=lambda p: _sink_reply(user_id, p),
+        status=lambda p: _sink_status(user_id, p),
+        cursor=lambda p: _sink_cursor(user_id, p),
+        job=lambda p: _sink_job(user_id, p),
+        memory=lambda p: _sink_memory(user_id, p),
+        identity=lambda p: _sink_identity(user_id, p),
+        schedule=lambda p: _sink_schedule(user_id, p),
+    )
+    return build_effect_dispatch(deps)
+
+
+def _apply_pending_effects_for_user(user_id: str) -> dict:
+    """`TurnDeps.apply_pending_effects` production wiring: run the generation-
+    fenced outbox applier (spec A4) with this turn's real sinks (spec A6) at
+    end-of-turn. Returns `{"applied": n, "discarded": m}` (see
+    `effect_outbox.apply_pending_effects`)."""
+    return v2_effect_outbox.apply_pending_effects(
+        user_id, dispatch=build_production_effect_dispatch(user_id))
+
+
 def build_production_deps() -> v2_worker.TurnDeps:
     return v2_worker.TurnDeps(
         read_messages=_read_messages,
@@ -803,6 +1027,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_memory_context=_read_memory_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
+        apply_pending_effects=_apply_pending_effects_for_user,
     )
 
 

@@ -2803,6 +2803,34 @@ def chat_insert_onboarding_greeting_once(
 _R2_OFFLOAD_CONTENT_TYPES = ("file", "image")
 
 
+def chat_max_seq(user_id: str) -> int:
+    """Highest ``chat_messages.seq`` for the user, or 0 if the user has no
+    messages. Anchors the stable per-user reply cursor (spec A1): ``seq`` is a
+    real monotonic identity-column counter, unlike wall-clock ``ts`` — two
+    messages appended in the same instant (common under concurrent workers)
+    can share an identical ``ts``, which would make a ts-based cursor
+    non-monotonic and risk silently skipping or reprocessing a message."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT MAX(seq) FROM chat_messages WHERE user_id = %s", (user_id,),
+        ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def chat_messages_after_seq(user_id: str, after_seq: int, *, limit: int) -> list[dict]:
+    """Messages strictly newer than ``after_seq``, in ``seq`` order (never
+    ``ts`` order — see :func:`chat_max_seq`). Each returned dict is the stored
+    doc with ``seq`` merged in, so a caller can persist exactly how far it has
+    read and resume from there without re-deriving position from timestamps."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq, doc FROM chat_messages WHERE user_id = %s AND seq > %s "
+            "ORDER BY seq ASC LIMIT %s",
+            (user_id, after_seq, limit),
+        ).fetchall()
+    return [{**r[1], "seq": int(r[0])} for r in rows]
+
+
 def _is_chat_file_pointer(doc) -> bool:
     return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
 
@@ -2832,6 +2860,59 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
     return out
 
 
+def _chat_insert_on_cursor(
+    cur, user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
+    *, trimmed_docs_out: list | None = None, trimmed_ids_out: list | None = None,
+) -> int:
+    """INSERT one chat message (ON CONFLICT upsert) + trim to the newest
+    ``max_messages`` rows, on the CALLER's cursor/transaction. Returns the
+    row's ``seq``. Does NOT do R2 offload — the caller handles that
+    post-commit, same as ``_chat_append_impl`` does today.
+
+    ``trimmed_docs_out``: optional list the caller pre-allocates; any row docs
+    deleted by the trim are appended to it so the caller can best-effort clean
+    up R2 objects for offloaded files just trimmed (mirrors the pre-refactor
+    ``_chat_append_impl`` behavior). ``None`` (the default, used by the new
+    atomic send+enqueue path) skips collecting them — R2 offload/cleanup is
+    intentionally out of that path.
+
+    ``trimmed_ids_out``: optional list the caller pre-allocates; the ``msg_id``
+    of every trimmed row is appended so the caller can pin the TEE-shadow mirror
+    DELETE to the EXACT rows evicted from RDS (tee_shadow.mirror, see
+    ``_chat_append_impl``). Kept separate from ``trimmed_docs_out`` because the
+    two callers need different projections (R2 cleanup needs the doc; the mirror
+    needs the id).
+
+    Row-factory agnostic: works whether ``cur`` is the default tuple cursor
+    or a ``dict_row`` cursor (see :func:`chat_append_and_enqueue`, which opens
+    a separate ``dict_row`` cursor on the same connection/transaction for the
+    coalesce-or-insert job op)."""
+    cur.execute(
+        "INSERT INTO chat_messages (user_id, msg_id, ts, doc) VALUES (%s,%s,%s,%s) "
+        "ON CONFLICT (user_id, msg_id) DO UPDATE SET ts=EXCLUDED.ts, doc=EXCLUDED.doc "
+        "RETURNING seq",
+        (user_id, msg_id, ts, Jsonb(doc)),
+    )
+    row = cur.fetchone()
+    seq = row["seq"] if isinstance(row, dict) else row[0]
+    if max_messages and max_messages > 0:
+        cur.execute(
+            "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
+            "  SELECT MIN(seq) FROM ("
+            "    SELECT seq FROM chat_messages WHERE user_id = %s "
+            "    ORDER BY seq DESC LIMIT %s"
+            "  ) t"
+            ") RETURNING msg_id, doc",
+            (user_id, user_id, max_messages),
+        )
+        rows = cur.fetchall()
+        if trimmed_docs_out is not None:
+            trimmed_docs_out.extend(r["doc"] if isinstance(r, dict) else r[1] for r in rows)
+        if trimmed_ids_out is not None:
+            trimmed_ids_out.extend(r["msg_id"] if isinstance(r, dict) else r[0] for r in rows)
+    return int(seq)
+
+
 def _chat_append_impl(
     user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
 ) -> None:
@@ -2859,24 +2940,11 @@ def _chat_append_impl(
     with get_pool().connection() as conn:
         with conn.transaction():
             # 1) inline first — message readable, references no R2 object yet.
-            conn.execute(
-                "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
-                "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT (user_id, msg_id) DO UPDATE SET ts = EXCLUDED.ts, doc = EXCLUDED.doc",
-                (user_id, msg_id, ts, Jsonb(doc)),
-            )
-            if max_messages and max_messages > 0:
-                rows = conn.execute(
-                    "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
-                    "  SELECT MIN(seq) FROM ("
-                    "    SELECT seq FROM chat_messages WHERE user_id = %s "
-                    "    ORDER BY seq DESC LIMIT %s"
-                    "  ) t"
-                    ") RETURNING msg_id, doc",
-                    (user_id, user_id, max_messages),
-                ).fetchall()
-                trimmed_ids = [r[0] for r in rows]
-                trimmed_docs = [r[1] for r in rows]
+            with conn.cursor() as cur:
+                _chat_insert_on_cursor(
+                    cur, user_id, msg_id, ts, doc, max_messages,
+                    trimmed_docs_out=trimmed_docs, trimmed_ids_out=trimmed_ids,
+                )
     if offload:
         # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
         try:
@@ -2945,6 +3013,113 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
         chat_append_strict(user_id, msg_id, ts, doc, max_messages)
     except Exception as e:
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
+
+
+def chat_append_and_enqueue(
+    user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int, lane: str,
+    *, reason=None, trace_id=None, expected_generation: int | None = None,
+) -> tuple[int, int]:
+    """Atomically persist one chat message AND enqueue/coalesce its job in ONE
+    transaction. Either both commit or neither does — closes the orphan-message
+    gap where the message persisted but the process died before the job insert
+    (spec A7). Returns ``(seq, job_id)``.
+
+    R2 offload of heavy file bodies is intentionally out of this atomic path
+    (rare on the send path; ``_chat_append_impl`` still owns the offload for
+    the legacy route) — trimmed offloaded-file cleanup is likewise skipped
+    here (best-effort, and rare enough on the send path not to matter).
+
+    One pool connection, one transaction, two cursors (a default cursor for
+    the message INSERT, a ``dict_row`` cursor for the job coalesce-or-insert)
+    — never two pool connections; that would break the atomicity this
+    function exists to provide.
+
+    Retry-on-``UniqueViolation``, mirroring ``jobs_store.enqueue_job``: two
+    concurrent same-user/same-lane sends with no active job yet can both pass
+    the coalesce's "no active job" ``SELECT ... FOR UPDATE`` check and both
+    attempt the ``agent_jobs`` INSERT; the loser hits the single-flight unique
+    index and would otherwise roll back — losing the message half too, since
+    both writes share one transaction. Up to 3 retries re-run the WHOLE
+    transaction (message INSERT + coalesce); the message INSERT is an
+    idempotent upsert (``ON CONFLICT (user_id, msg_id) DO UPDATE``), so
+    re-running it is a no-op and the retry's coalesce now sees the racer's
+    committed job and coalesces instead of colliding. A final unguarded
+    attempt is allowed to raise, same as ``enqueue_job``.
+    """
+    from model_api_runtime.v2 import jobs_store  # lazy — precedent db.py cutover import
+    from psycopg.rows import dict_row
+
+    if lane not in jobs_store.LANES:
+        raise ValueError(f"unknown lane: {lane!r}")
+    priority = jobs_store.LANE_PRIORITY.get(lane, 0)
+
+    def _attempt() -> tuple[int, int]:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as mc:
+                    seq = _chat_insert_on_cursor(mc, user_id, msg_id, ts, doc, max_messages)
+                with conn.cursor(row_factory=dict_row) as jc:
+                    job_id, _coalesced = jobs_store.coalesce_or_insert_on_cursor(
+                        jc, user_id, lane, reason=reason, trace_id=trace_id,
+                        priority=priority, deadline_at=None,
+                        expected_generation=expected_generation,
+                    )
+        return seq, job_id
+
+    for _ in range(3):
+        try:
+            return _attempt()
+        except psycopg.errors.UniqueViolation:
+            continue  # 并发 racer 抢先建了 active job；重跑整个事务并 coalesce
+    return _attempt()
+
+
+def reconcile_unenqueued_v2_messages() -> int:
+    """Belt to :func:`chat_append_and_enqueue`'s braces (spec A7): find
+    ``db_action_v2`` users whose newest chat message is an UNANSWERED user
+    message (``doc->>'role' = 'user'``) with NO active (pending/claimed/running)
+    ``chat`` lane job, and single-flight enqueue a catch-up chat job for each.
+
+    "Orphan" here means: the user's chat_messages row with the highest ``seq``
+    has ``doc->>'role' = 'user'`` (nothing has replied to it yet) AND there is
+    no ``agent_jobs`` row for that user with ``lane='chat'`` and status in
+    ('pending','claimed','running') that could still pick it up. That is
+    exactly the gap a crash between the message INSERT and the job INSERT
+    could leave behind if ``chat_append_and_enqueue`` were ever bypassed or
+    partially applied outside its own transaction (e.g. a bug, a manual data
+    fix, or a pre-A7 message written before this function existed).
+
+    Idempotent via ``enqueue_job``'s single-flight coalescing — calling this
+    repeatedly against the same orphan will not create duplicate jobs. Returns
+    the count of catch-up jobs enqueued. Periodic wiring (a scheduler calling
+    this on an interval) is deferred to PR D's sweeper; this function is not
+    invoked anywhere in this PR.
+    """
+    from model_api_runtime.v2 import jobs_store  # lazy — precedent db.py cutover import
+
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT ON (cm.user_id) cm.user_id, cm.doc->>'role' AS role "
+            "FROM chat_messages cm "
+            "JOIN user_blobs mrt ON mrt.user_id = cm.user_id AND mrt.kind = 'model_api_runtime' "
+            "WHERE mrt.doc->>'hosted_runtime_mode' = 'db_action_v2' "
+            "ORDER BY cm.user_id, cm.seq DESC"
+        ).fetchall()
+        candidate_user_ids = [r[0] for r in rows if r[1] == "user"]
+        if not candidate_user_ids:
+            return 0
+        active_rows = conn.execute(
+            "SELECT DISTINCT user_id FROM agent_jobs "
+            "WHERE lane='chat' AND status IN ('pending','claimed','running') "
+            "AND user_id = ANY(%s)",
+            (candidate_user_ids,),
+        ).fetchall()
+        active_user_ids = {r[0] for r in active_rows}
+
+    orphan_user_ids = [uid for uid in candidate_user_ids if uid not in active_user_ids]
+    for uid in orphan_user_ids:
+        jobs_store.enqueue_job(uid, "chat", reason="reconcile")
+    return len(orphan_user_ids)
 
 
 def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None:
@@ -4172,3 +4347,154 @@ def list_agent_status_events(user_id: str, *, after_id: int = 0, limit: int = 50
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
     return [dict(zip(cols, row)) for row in rows]
+
+
+def get_runtime_generation(user_id: str) -> int:
+    """Current monotonic runtime generation for the user. Lazily initializes the
+    row at (resident, 1) on first read for a known user; returns 0 for an unknown
+    user (no users row)."""
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO v2_runtime_state (user_id) "
+                "SELECT %s WHERE EXISTS (SELECT 1 FROM users u WHERE u.user_id = %s) "
+                "ON CONFLICT (user_id) DO NOTHING",
+                (user_id, user_id),
+            )
+            cur.execute(
+                "SELECT runtime_generation FROM v2_runtime_state WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+def advance_runtime_state(user_id: str, *, from_state: str, to_state: str) -> int | None:
+    """CAS the cutover state resident<->draining<->v2 and bump generation by 1,
+    atomically, only if the row is still in from_state. Returns the NEW generation,
+    or None if the from_state no longer holds (lost race) — callers must treat None
+    as 'someone else moved the machine; re-read', never as success. Also refuses an
+    illegal transition (returns None without touching the row)."""
+    from model_api_runtime.v2 import cutover
+    if not cutover.is_valid_transition(from_state, to_state):
+        return None
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            # Lazy-init the row at the default (resident, generation 1) so the very
+            # FIRST cutover for a user works — without this the CAS below matches no
+            # row and the transition silently no-ops (a user could never leave
+            # resident). The from_state guard on the UPDATE still enforces legality,
+            # so initializing to resident never lets an illegal start-state through.
+            cur.execute(
+                "INSERT INTO v2_runtime_state (user_id) "
+                "SELECT %s WHERE EXISTS (SELECT 1 FROM users u WHERE u.user_id = %s) "
+                "ON CONFLICT (user_id) DO NOTHING",
+                (user_id, user_id),
+            )
+            cur.execute(
+                "UPDATE v2_runtime_state "
+                "SET hosted_runtime_state = %s, "
+                "    runtime_generation = runtime_generation + 1, "
+                "    updated_at = now() "
+                "WHERE user_id = %s AND hosted_runtime_state = %s "
+                "RETURNING runtime_generation",
+                (to_state, user_id, from_state),
+            )
+            row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def effect_enqueue(effect_id, user_id, job_id, effect_type, expected_generation, payload) -> bool:
+    """Insert one row into the generation-fenced effect outbox (spec A4). The
+    ON CONFLICT (effect_id) DO NOTHING is the idempotency guarantee: re-enqueuing
+    the same logical effect (same job_id/effect_type/ordinal, or same
+    generation/effect_type/key for control-plane effects) is a no-op. Returns
+    True if this call actually inserted the row, False if it already existed."""
+    import json
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO v2_effect_outbox "
+                "(effect_id, user_id, job_id, effect_type, expected_generation, payload) "
+                "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (effect_id) DO NOTHING",
+                (effect_id, user_id, job_id, effect_type, int(expected_generation),
+                 json.dumps(payload)),
+            )
+            inserted = cur.rowcount == 1
+    return inserted
+
+
+def effect_pending(user_id) -> list[dict]:
+    """All still-pending effects for a user, oldest first. Backed by the
+    partial index on (user_id, created_at) WHERE status='pending'."""
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT effect_id, job_id, effect_type, expected_generation, payload "
+                "FROM v2_effect_outbox WHERE user_id=%s AND status='pending' "
+                "ORDER BY created_at ASC",
+                (user_id,),
+            )
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return rows
+
+
+def effect_mark(effect_id, status, *, error="") -> None:
+    """Flip an outbox row's terminal status (applied|discarded). `error` is
+    recorded on failure paths; callers that don't have one pass the default."""
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            if status == "applied":
+                cur.execute(
+                    "UPDATE v2_effect_outbox SET status=%s, applied_at=now(), "
+                    "last_error=%s WHERE effect_id=%s",
+                    (status, error, effect_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE v2_effect_outbox SET status=%s, last_error=%s "
+                    "WHERE effect_id=%s",
+                    (status, error, effect_id),
+                )
+
+
+def effect_sink_claim(effect_id: str) -> bool:
+    """Universal sink-level exactly-once guard (spec A6): the FIRST caller for a
+    given effect_id claims it (returns True) and should proceed to perform the
+    real durable write; every replay after that (the outbox applier re-running
+    a row that is still 'pending' because a crash landed between the sink
+    write and the status='applied' flip) gets False and must no-op. One shared
+    table backs ALL 7 effect types, so no sink needs its own per-table
+    effect_id column.
+
+    This claim commits on its own connection BEFORE the sink's durable write
+    runs. Every sink therefore follows claim -> try write -> except: release +
+    re-raise (see `effect_sink_release`) so a write failure un-claims and lets
+    a replay redo the write instead of silently skipping a never-completed
+    effect. The one residual gap this does NOT cover: a HARD process crash in
+    the microsecond window between the claim commit and the write starting —
+    no exception is raised to trigger a release, so the claim is left
+    orphaned and a replay would no-op a never-performed write. That narrow
+    window is closed by a PR D effect-sweeper (releases claims whose outbox
+    row is still 'pending'); claim-release-on-failure here fully covers the
+    realistic write-ERROR fault."""
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO v2_effect_sink_applied (effect_id) VALUES (%s) "
+                "ON CONFLICT (effect_id) DO NOTHING",
+                (effect_id,),
+            )
+            claimed = cur.rowcount == 1
+    return claimed
+
+
+def effect_sink_release(effect_id: str) -> None:
+    """Undo a claim taken by effect_sink_claim when the sink's durable write then FAILED, so a
+    replay re-claims and re-writes instead of silently skipping a never-completed effect. Paired
+    with the claim in each sink: claim -> try write -> except: release + re-raise. This restores
+    exactly-once under a write-error fault (the applier's transaction rolls back on the re-raised
+    exception, leaving the outbox row 'pending' for a clean re-drive)."""
+    with get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_effect_sink_applied WHERE effect_id=%s", (effect_id,))

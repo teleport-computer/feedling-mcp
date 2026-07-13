@@ -35,9 +35,16 @@ def _clean_agent_jobs_table():
     it) pollutes `ORDER BY priority DESC, created_at` for every later test in
     this module and gets claimed instead of the row the test just created.
     Truncate the whole table before each test so claim tests only ever see
-    the row(s) they set up themselves."""
+    the row(s) they set up themselves.
+
+    Also clears `v2_runtime_state` (Task 2's per-user cutover generation row):
+    generation tests advance a user's generation via `db.advance_runtime_state`,
+    and a leftover row from an earlier test would let a later test's
+    `db.get_runtime_generation("u_...")` lazy-init see a stale generation
+    instead of starting fresh at 1."""
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
+        conn.execute("DELETE FROM v2_runtime_state")
     yield
 
 
@@ -567,3 +574,23 @@ def test_genesis_heartbeat_alone_does_not_open_the_send_gate():
 def test_genesis_worker_alive_false_when_nothing_beats():
     _clear_heartbeats()
     assert jobs_store.genesis_worker_alive() is False
+
+
+def test_enqueue_stamps_expected_generation():
+    seed_user("u_jobgen")
+    gen = db.get_runtime_generation("u_jobgen")  # 1
+    jid, _created = jobs_store.enqueue_job("u_jobgen", "chat", expected_generation=gen)
+    row = jobs_store.claim_next_job("w1")
+    assert row["id"] == jid
+    assert row["expected_runtime_generation"] == gen
+
+
+def test_stale_generation_job_superseded_at_claim():
+    seed_user("u_jobstale")
+    jobs_store.enqueue_job("u_jobstale", "chat", expected_generation=1)
+    # user cut over: generation moves to 3
+    db.advance_runtime_state("u_jobstale", from_state="resident", to_state="draining")
+    db.advance_runtime_state("u_jobstale", from_state="draining", to_state="v2")
+    claimed = jobs_store.claim_next_job("w1")
+    # stale job is not handed out for a turn; it is terminal 'superseded'
+    assert claimed is None or claimed["status"] == "superseded"
