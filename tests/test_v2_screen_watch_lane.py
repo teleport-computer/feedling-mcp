@@ -3,20 +3,28 @@ a chat bubble — so it joins `worker._WAKE_LANES` and reuses `_run_wake`, but w
 its own system prompt (`_SCREEN_WATCH_SYSTEM_PROMPT`) and grounded on recent
 screen frames (`screen_recent` capability) instead of a perception snapshot.
 
+PR C Task 8 (spec C8): `_run_wake` (and therefore `screen_watch`) now runs on
+the unified `tool_loop.run_tool_loop` — the LLM wire boundary is
+`provider_client.chat_completion_async`, not `v2_responder.respond`. The
+`screen_recent` prefetch flows in as a STATIC `extra_context` string (rendered
+via `responder._action_context_str`, resolved once before the loop starts —
+see `_make_build_messages_fn`'s `extra_context` parameter) rather than as the
+old `action_results=` kwarg to `respond()`.
+
 Contract (from the task brief):
 - `"screen_watch" in worker._WAKE_LANES`.
 - The turn fetches ONLY `screen_recent` — NEVER `perception_snapshot` (the
   resident sets `perception_digest=None` for screen-watch jobs,
-  chat_resident_consumer.py:6611), and hands the frames to
-  `v2_responder.respond(..., action_results={"screen_recent": [...]}, ...)`
-  under `_SCREEN_WATCH_SYSTEM_PROMPT`.
-- Silence is SUCCESS: a `ResponderError("empty_reply")` completes the job with
-  zero bubbles (weak wake sleeps) — inherited from `_run_wake`, not a new path.
+  chat_resident_consumer.py:6611), and hands the frames to the loop's system
+  prompt/context under `_SCREEN_WATCH_SYSTEM_PROMPT`.
+- Silence is SUCCESS: an empty terminal reply completes the job with zero
+  bubbles (weak wake sleeps) — inherited from `_run_wake`, not a new path.
 
 Style mirrors test_v2_wake_worker.py: real jobs_store/core_store (real DB
-claim/mark_*) + stubbed `worker._cap_data` (the enclave/DB capability boundary),
-stubbed `v2_responder.respond` (the LLM boundary), stubbed
-`worker._write_encrypted_reply` (spy, no real envelope/enclave round-trip)."""
+claim/mark_*) + stubbed `worker._cap_data` (the enclave/DB capability
+boundary), stubbed `provider_client.chat_completion_async` (the LLM wire
+boundary), stubbed `worker._write_encrypted_reply` (spy, reached through a
+real PR A effect-outbox drain, no real envelope/enclave round-trip)."""
 from __future__ import annotations
 
 import asyncio
@@ -30,10 +38,10 @@ import pytest
 import conftest
 import db
 import provider_client
+from core import store as core_store
+from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import planner as v2_planner
-from model_api_runtime.v2 import coalesce as v2_coalesce
-from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import worker
 
 
@@ -52,6 +60,7 @@ def _reset(uid):
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
+        conn.execute("DELETE FROM v2_effect_outbox WHERE user_id=%s", (uid,))
 
 
 _BYOK = provider_client.ProviderConfig(
@@ -68,6 +77,19 @@ def _status_events(uid):
     return jobs_store.list_status_events(uid, after_id=0, limit=100)
 
 
+def _reply_effect_dispatch(user_id):
+    """Test-local production-shaped `reply` sink — mirrors
+    `serve_worker._sink_reply` without pulling in hosted-adjacent wiring."""
+    def dispatch(effect_type, payload):
+        if effect_type == "reply":
+            worker._write_encrypted_reply(core_store.get_store(user_id), str(payload.get("text") or ""))
+    return dispatch
+
+
+def _apply_effects(user_id):
+    return v2_effect_outbox.apply_pending_effects(user_id, dispatch=_reply_effect_dispatch(user_id))
+
+
 def _wake_deps(*, summary="", tail=None):
     return worker.TurnDeps(
         read_messages=lambda uid: [],
@@ -76,7 +98,13 @@ def _wake_deps(*, summary="", tail=None):
         mint_enclave_token=lambda uid: "rt",
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
         read_summary=lambda uid: (summary, 0.0, 0),
+        apply_pending_effects=_apply_effects,
     )
+
+
+def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
+    return {"reply": text, "tool_calls": [],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
 
 
 # ------------------------------------------------------------------
@@ -102,13 +130,11 @@ def test_screen_watch_turn_passes_screen_context_and_its_own_prompt(monkeypatch)
 
     seen = {}
 
-    async def _fake_respond(*, provider_config, summary, tail, system_prompt=None,
-                            action_results=None, **kw):
-        seen["system_prompt"] = system_prompt
-        seen["action_results"] = action_results
-        return "你在看这个报错？"
+    async def _fake(config, messages, *, tools=None):
+        seen["messages"] = messages
+        return _text_round("你在看这个报错？")
 
-    monkeypatch.setattr(v2_responder, "respond", _fake_respond)
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
     caps = []
 
@@ -134,12 +160,12 @@ def test_screen_watch_turn_passes_screen_context_and_its_own_prompt(monkeypatch)
         job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert seen["system_prompt"] is worker._SCREEN_WATCH_SYSTEM_PROMPT
-    assert "screen_recent" in (seen["action_results"] or {})
-    # frames flow through as a single ok run: {"screen_recent": [{"ok": True, "data": ...}]}
-    runs = seen["action_results"]["screen_recent"]
-    assert runs == [{"ok": True, "data": {"frames": [{"frame_id": "f1", "caption": "a stack trace"}]}}]
-    assert "perception_snapshot" not in caps          # resident sets perception_digest=None
+    system_msg = next(m for m in seen["messages"] if m["role"] == "system")
+    assert system_msg["content"] is not None
+    assert "watching the screen" in system_msg["content"]  # _SCREEN_WATCH_SYSTEM_PROMPT, not _WAKE_SYSTEM_PROMPT
+    joined = " ".join(str(m.get("content", "")) for m in seen["messages"])
+    assert "a stack trace" in joined                        # screen_recent frame caption flowed through
+    assert "perception_snapshot" not in caps                # resident sets perception_digest=None
     assert caps == ["screen_recent"]
     assert written["text"] == "你在看这个报错？"
     assert _job_status(job_id)[0] == "completed"
@@ -150,19 +176,21 @@ def test_screen_watch_turn_passes_screen_context_and_its_own_prompt(monkeypatch)
 # ------------------------------------------------------------------
 
 def test_screen_watch_silence_completes_without_a_bubble(monkeypatch):
-    """Most ticks produce nothing. empty_reply is SUCCESS (weak wake sleeps),
-    never a chip and never a bubble."""
+    """Most ticks produce nothing. An empty terminal reply is SUCCESS (weak
+    wake sleeps), never a chip and never a bubble."""
     uid = "u_sw_silence"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "screen_watch")
     job = jobs_store.claim_next_job("w")
 
-    async def _fake_respond(*, provider_config, summary, tail, system_prompt=None,
-                            action_results=None, **kw):
-        raise v2_responder.ResponderError("empty_reply")
+    _script_calls = []
 
-    monkeypatch.setattr(v2_responder, "respond", _fake_respond)
+    async def _fake(config, messages, *, tools=None):
+        _script_calls.append(messages)
+        return _text_round("")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
     async def _fake_cap_data(store, action_type, **kw):
         return {"frames": [{"frame_id": "f1", "caption": "idle desktop"}]}
@@ -219,11 +247,10 @@ def test_screen_watch_does_not_deadlock_when_cap_data_reacquires_enclave_sem(mon
     monkeypatch.setattr(
         cap_registry, "run_capability", lambda action_type, store, **k: _FakeCapResult())
 
-    async def _fake_respond(*, provider_config, summary, tail, system_prompt=None,
-                            action_results=None, **kw):
-        return "spotted it"
+    async def _fake(config, messages, *, tools=None):
+        return _text_round("spotted it")
 
-    monkeypatch.setattr(v2_responder, "respond", _fake_respond)
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
     # A concurrency-1 semaphore is the killer case: if the screen_recent fetch is

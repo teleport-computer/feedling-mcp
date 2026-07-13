@@ -1,5 +1,15 @@
 """V2 short planner（spec §7.2/7.3）。
 
+**PR C9b 状态更新**：这套 is_official → `rule_plan`/`official_plan` 分流的 json-plan 管线
+不再是生产回合的驱动路径——chat（Task 7）/wake（Task 8）都已迁到 `tool_loop.run_tool_loop`
+（provider-native 统一工具循环，每个模型走同一套目录/同一个循环，见 worker.py 模块文档；
+Global Constraints "no behavior tiering"）。`worker.py` 自 PR C9b 起不再 import 本模块。
+本模块没有被删除——`scripts/loadtest/compare_tokens.py`（D4 token-per-turn 回滚门）仍在
+直接驱动 `plan`/`rule_plan`/`official_plan`/`validate_plan` 来测量旧管线的开销基线，且有
+自己的真实、通过中的测试（`tests/test_v2_planner*.py`、`tests/test_loadtest_compare.py`）。
+`tests/test_v2_no_dispatch_tiering.py` 锁定的真正不变量是"worker.py 生产代码不调用这些
+函数"，而不是"这个模块不存在"。
+
 official/可信模型 → 用**用户自己的 BYOK key** 的结构化 JSON planner（Task 4）；
 弱/杂牌模型 → **确定性、零 LLM** 的规则 planner。**不存在平台级 LLM key 兜底**（§7.3 硬不变量）。
 planner 只出 [{type,payload}]（≤5），非响应 action 不产生可见文本，需回复则含末位 final_response。

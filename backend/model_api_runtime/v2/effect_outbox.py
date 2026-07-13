@@ -7,6 +7,16 @@ from __future__ import annotations
 import json
 from typing import Callable
 import db
+from model_api_runtime.v2 import effect_id as _effect_id
+
+
+def enqueue_effect(*, job_id, user_id, effect_type, ordinal, expected_generation, payload) -> str:
+    """Producer-side entry to the generation-fenced outbox (spec C5 / PR A A4). Derives the
+    deterministic effect_id, enqueues (ON CONFLICT DO NOTHING = retry-idempotent), returns the id.
+    PR C's tool loop is the first caller; the already-wired apply_pending_effects drains it."""
+    eid = _effect_id.derive(job_id=job_id, effect_type=effect_type, ordinal=ordinal)
+    db.effect_enqueue(eid, user_id, job_id, effect_type, expected_generation, payload)
+    return eid
 
 
 def apply_pending_effects(user_id: str, *, dispatch: Callable[[str, dict], None]) -> dict:

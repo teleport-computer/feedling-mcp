@@ -27,10 +27,13 @@ worker.py 明确不 import `hosted` 或 `agent_runtime.spawners`——official/�
   解密取明文（服务器永不本地解密）；绝不以“最后一条 assistant”切片，因为回复与并发
   follow-up 交错时会吞消息。带上 id/ts 供 v2.coalesce 去重。enclave-bound。
 
-respond/append_reply 不再是 TurnDeps 的字段：worker.process_job 现在直接调用同层的
-`model_api_runtime.v2.responder.respond`（本就 hosted-free）和自己的
-`_write_encrypted_reply`（只 import core.envelope/core.store，同样 hosted-free），不需要
-再经这层装配转发一次。
+respond/append_reply 不再是 TurnDeps 的字段：worker.process_job/`_run_wake` 现在直接调用
+同层的 `model_api_runtime.v2.tool_loop.run_tool_loop`（provider-native 统一工具循环，PR
+C9b，本就 hosted-free）和自己的 `_write_encrypted_reply`（只 import core.envelope/
+core.store，同样 hosted-free），不需要再经这层装配转发一次。`model_api_runtime.v2.responder.
+respond`（旧的强制 responder round-trip）不再是那条调用路径的一部分——它仍然存在，只是
+被 `scripts/loadtest/compare_tokens.py`（D4 token-per-turn 回滚门）和几个 wire-shape 回归
+测试直接驱动，见 `tests/test_v2_no_dispatch_tiering.py`。
 """
 from __future__ import annotations
 
@@ -838,13 +841,24 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     """`reply` sink. Payload keys: ``{"text": str}``. Reuses
     `v2_worker._write_encrypted_reply` (the same shared-envelope local-
     encryption writer the chat-turn success path already uses) — does not
-    reimplement reply persistence."""
+    reimplement reply persistence.
+
+    `_write_encrypted_reply` returns ``None`` (does NOT raise) when the shared-
+    envelope build fails (e.g. the user never onboarded encryption) — see its
+    docstring. Treat that the same as a raised exception: release the claim
+    and raise, so the effect stays pending / the turn surfaces the failure,
+    instead of silently marking a never-written reply as applied (no-filler /
+    reply-is-terminal invariant; restores the deleted
+    `test_reply_envelope_failure_is_terminal_not_success` guarantee on the
+    new PR A effect-sink path)."""
     eid = payload["effect_id"]
     if not db.effect_sink_claim(eid):
         return  # replay after a crash between sink-write and status=applied -> no-op
     try:
         store = core_store.get_store(user_id)
-        v2_worker._write_encrypted_reply(store, str(payload.get("text") or ""))
+        row = v2_worker._write_encrypted_reply(store, str(payload.get("text") or ""))
+        if row is None:
+            raise RuntimeError("reply envelope build failed")
     except Exception:
         db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
         raise
@@ -961,19 +975,44 @@ _SCHEDULE_PAYLOAD_KEYS = (
 )
 
 
+_SCHEDULE_CAPABILITY_OPS = frozenset({"schedule_wake", "cancel_wake"})
+
+
 def _sink_schedule(user_id: str, payload: dict) -> None:
-    """`schedule` sink. Payload keys: any subset of
-    `jobs_store.upsert_wake_schedule`'s kwargs (`next_heartbeat_at` /
-    `next_capture_at` / `payment_cooldown_until` / `next_screen_watch_at` /
-    `last_screen_watch_frame_id`). Reuses `upsert_wake_schedule` — the same
-    writer `_fire_scheduled_for_user`/`_tick_screen_watch_for_user` call;
-    does not duplicate the wake-schedule upsert logic."""
+    """`schedule` sink — two distinct producers share this one effect_type:
+
+    1. Worker's write-tool-call mapping (`worker.process_job`'s
+       `_enqueue_write_effect`, spec C6): a `schedule_wake`/`cancel_wake` tool
+       call becomes ``{"op": tc.name, **tc.args}`` — the user CAPABILITY params
+       (``at``/``tz``/``reason`` for schedule_wake, ``wake_id``/``reason`` for
+       cancel_wake; see `capabilities/wake.py`'s `schedule`/`cancel`). When
+       ``payload["op"]`` names one of these, route through
+       `cap_registry.run_capability` — the same dispatcher
+       `_sink_identity`/executor already use for capability writes — so the
+       capability actually runs, instead of falling through to
+       `upsert_wake_schedule` with none of its kwargs present (a silent no-op:
+       none of ``at``/``tz``/``reason``/``wake_id`` are in
+       `_SCHEDULE_PAYLOAD_KEYS`, which are PR A/D's own wake-TIMING-TABLE
+       fields, an unrelated shape).
+    2. PR A/D producers (`_fire_scheduled_for_user`/`_tick_screen_watch_for_user`
+       and future maintenance-lane wake-timing writers): payloads keyed by
+       `_SCHEDULE_PAYLOAD_KEYS` (`next_heartbeat_at`/`next_capture_at`/
+       `payment_cooldown_until`/`next_screen_watch_at`/
+       `last_screen_watch_frame_id`) — no ``op`` key. Keep routing those
+       through `jobs_store.upsert_wake_schedule`, unchanged.
+    """
     eid = payload["effect_id"]
     if not db.effect_sink_claim(eid):
         return
     try:
-        kwargs = {k: v for k, v in payload.items() if k in _SCHEDULE_PAYLOAD_KEYS}
-        jobs_store.upsert_wake_schedule(user_id, **kwargs)
+        op = payload.get("op")
+        if op in _SCHEDULE_CAPABILITY_OPS:
+            store = core_store.get_store(user_id)
+            params = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+            cap_registry.run_capability(op, store, api_key=None, params=params)
+        else:
+            kwargs = {k: v for k, v in payload.items() if k in _SCHEDULE_PAYLOAD_KEYS}
+            jobs_store.upsert_wake_schedule(user_id, **kwargs)
     except Exception:
         db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
         raise

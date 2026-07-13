@@ -14,11 +14,14 @@ action_digest 只粗计数（ok/count，落 runtime_state，spec §5/§9 红线�
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from capabilities import registry as cap_registry
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import provenance as _prov
 from model_api_runtime.v2 import status_stream
+from provider_types import ToolResult
 
 # 非 capability 的 planner 控制/延迟 action（final_response/preliminary_response 由
 # responder 作者；sleep/capture_memory/schedule_followup 是 worker/别的子系统解读的控制
@@ -126,6 +129,12 @@ async def execute_plan(
     {"ok","count"}}}。action_results 含敏感 data，只在内存传给 responder；action_digest
     非敏感，worker 落 runtime_state。skipped action 不出现在这两者里——它们不是
     executor 的失败，是别的子系统（responder/worker）解读的控制流。
+
+    **PR C9b**：`worker.py` 自 Task 7 起不再调用本函数——chat/wake 都改走
+    `dispatch_tool_calls`（下方，`tool_loop.run_tool_loop` 每轮的派发口）。`execute_plan`
+    没有被删除：`tests/test_v2_executor.py` 仍在直接、完整地测它（读并行/写串行/status
+    事件/enclave-auth 凭证转发），删掉会丢一整套现成的 executor 行为回归覆盖，不删是因为
+    这些测试仍然通过、仍然有效，不是因为生产还在用它。
     """
     reads, writes, skipped = _split_plan(plan)
     results: dict[str, list[dict]] = {}
@@ -180,3 +189,99 @@ def _digest(results: dict[str, list[dict]]) -> dict[str, dict]:
     for action_type, runs in results.items():
         out[action_type] = {"ok": sum(1 for r in runs if r.get("ok")), "count": len(runs)}
     return out
+
+
+# ---------------------------------------------------------------------------
+# C3: provider-native tool-call dispatcher (spec §C3). Reuses _run_one + the
+# read-parallel/write-serial shape above, but speaks ToolCall/ToolResult (PR B)
+# instead of plan dicts, and treats writes as PR A generation-fenced effects
+# (enqueued, never run inline) gated by PR A's provenance write_gate.
+# ---------------------------------------------------------------------------
+
+# 单个 tool_call 结果喂回模型前的字符上限。没有它，一个返回大 blob 的 capability
+# 能把整轮对话的 context 预算吃光（BUG-1 的一般形式）——与 responder.py 的
+# _fold_action_results/_action_context_str 用同一套防线（blob 键剥掉 + 单结果截断），
+# 只是这里单位是"一个 tool_call 的结果"而不是"一个 action_type 的多次 run"。
+_RESULT_CHAR_CAP = 2000
+_BLOB_KEYS = frozenset({"image_b64"})
+
+
+def _strip_blobs(value: Any) -> Any:
+    """递归剥掉 `_BLOB_KEYS`（与 responder.py 同名助手同规则）。"""
+    if isinstance(value, dict):
+        return {k: _strip_blobs(v) for k, v in value.items() if k not in _BLOB_KEYS}
+    if isinstance(value, list):
+        return [_strip_blobs(v) for v in value]
+    return value
+
+
+def _summarize_capability_result(data: dict) -> str:
+    """把单次 `run_capability(...).to_dict()` 结果渲染成喂回模型 tool content 的
+    字符串：失败只暴露稳定 error code（不回显 message，可能带解密体/URL/查询词），
+    成功先剥 blob 键再 json 序列化，超 `_RESULT_CHAR_CAP` 截断——防一个肥 capability
+    把整轮对话挤爆（BUG-1 defence-in-depth，样式抄 responder.py 的
+    _fold_action_results/_action_context_str）。"""
+    if not isinstance(data, dict):
+        return str(data)[:_RESULT_CHAR_CAP]
+    if not data.get("ok"):
+        err = data.get("error") or {}
+        code = err.get("code") if isinstance(err, dict) else None
+        return f"error: {code or 'capability_failed'}"
+    payload = _strip_blobs(data.get("data"))
+    if not payload:
+        return "ok"
+    rendered = json.dumps(payload, ensure_ascii=False)
+    if len(rendered) > _RESULT_CHAR_CAP:
+        rendered = rendered[:_RESULT_CHAR_CAP] + "...[truncated]"
+    return rendered
+
+
+async def dispatch_tool_calls(
+    tool_calls, *, store, api_key, runtime_token, enclave_sem,
+    turn_authorization: bool, enqueue_write_effect, before_write=None,
+) -> list[ToolResult]:
+    """Dispatch provider tool_calls (spec C3). READ_ACTIONS run inline-parallel (their content
+    feeds back to the model); WRITE_ACTIONS pass the provenance write_gate then are ENQUEUED as
+    generation-fenced effects (not run inline); `reply` is handled by the caller (tool_loop), not
+    here — it never appears in READ_ACTIONS/WRITE_ACTIONS so it falls into the unknown-tool branch
+    if ever passed in by mistake. Every call_id is preserved in the returned ToolResults, in the
+    original tool_calls order. Never raises on a bad tool_call."""
+    results_by_id: dict[str, ToolResult] = {}
+    reads, writes = [], []
+    for tc in tool_calls:
+        if not tc.args_ok:
+            results_by_id[tc.id] = ToolResult(call_id=tc.id, content=f"error: unparseable args for {tc.name}")
+        elif tc.name in cap_registry.READ_ACTIONS:
+            reads.append(tc)
+        elif tc.name in cap_registry.WRITE_ACTIONS:
+            writes.append(tc)
+        else:
+            results_by_id[tc.id] = ToolResult(call_id=tc.id, content=f"error: unknown tool {tc.name}")
+
+    async def _read(tc):
+        step = {"type": tc.name, "payload": tc.args}
+        _t, data = await _run_one(store, step, api_key=api_key, runtime_token=runtime_token,
+                                   enclave_sem=enclave_sem)
+        content = _summarize_capability_result(data)
+        return tc.id, ToolResult(call_id=tc.id, content=content)
+
+    read_sem = asyncio.Semaphore(4)
+
+    async def _guarded(tc):
+        async with read_sem:
+            return await _read(tc)
+
+    for cid, tr in (await asyncio.gather(*[_guarded(t) for t in reads]) if reads else []):
+        results_by_id[cid] = tr
+
+    for tc in writes:   # serial + provenance gate + fence
+        allowed, reason = _prov.write_gate(tc.name, turn_authorization=turn_authorization)
+        if not allowed:
+            results_by_id[tc.id] = ToolResult(call_id=tc.id, content=reason)
+            continue
+        if before_write is not None:
+            await before_write()
+        enqueue_write_effect(tc)   # producer -> PR A outbox (drained at turn end)
+        results_by_id[tc.id] = ToolResult(call_id=tc.id, content=f"queued: {tc.name}")
+
+    return [results_by_id[tc.id] for tc in tool_calls]   # preserve original order + every call_id

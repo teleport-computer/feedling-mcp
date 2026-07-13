@@ -3,9 +3,11 @@ job -> summary populated + watermark advanced, end to end through real
 jobs_store/DB primitives.
 
 Hermetic (no live enclave, no live provider network call):
-- `v2_responder.respond` (the chat turn's own LLM call) is monkeypatched — its
-  correctness is covered exhaustively by test_v2_responder.py; this test only
-  cares that the *dispatch* (summary+tail plumbing, over-budget enqueue) wires up.
+- `provider_client.chat_completion_async` (the chat turn's own LLM call, via
+  the unified `tool_loop.run_tool_loop` — Task 7) is monkeypatched to a
+  scripted terminal-text round — its correctness is covered exhaustively by
+  test_v2_worker_tool_loop.py; this test only cares that the *dispatch*
+  (summary+tail plumbing, over-budget enqueue) wires up.
 - `provider_client.reliable_chat_completion_async` (the LLM injected into
   `v2_compaction.compact`) is monkeypatched to a deterministic fake bullet —
   `compaction.compact`'s own fold logic is covered by test_v2_compaction.py.
@@ -30,8 +32,9 @@ import db
 import provider_client
 import pytest
 from capabilities import registry as cap_registry
+from core import store as core_store
+from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import worker
 
 _BYOK = provider_client.ProviderConfig(
@@ -123,16 +126,28 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
 
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult())
 
-    async def _fake_respond(*, provider_config, summary, tail, action_results=None, usage_out=None):
-        return "model reply"
+    async def _fake_chat_completion(config, messages, *, tools=None):
+        # Terminal plain-text round (Task 7): no tool_calls -> that text IS the
+        # chat turn's final reply through the unified tool_loop.run_tool_loop.
+        return {"reply": "model reply", "tool_calls": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 
-    monkeypatch.setattr(v2_responder, "respond", _fake_respond)
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake_chat_completion)
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
     async def _fake_llm(cfg, msgs, **kw):
         return {"reply": "- folded integration bullet"}
 
     monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _fake_llm)
+
+    def _reply_effect_dispatch(user_id):
+        def dispatch(effect_type, payload):
+            if effect_type == "reply":
+                worker._write_encrypted_reply(core_store.get_store(user_id), str(payload.get("text") or ""))
+        return dispatch
+
+    def _apply_effects(user_id):
+        return v2_effect_outbox.apply_pending_effects(user_id, dispatch=_reply_effect_dispatch(user_id))
 
     deps = worker.TurnDeps(
         read_messages=read_messages,
@@ -142,6 +157,7 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
         read_tail=read_tail,
         read_summary=read_summary,
         write_summary=write_summary,
+        apply_pending_effects=_apply_effects,
     )
 
     # --- chat turn ---

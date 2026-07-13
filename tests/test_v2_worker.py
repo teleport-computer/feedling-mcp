@@ -27,6 +27,7 @@ from capabilities import registry as cap_registry
 from core import store as core_store
 from model_api_runtime.v2 import agent_loop as v2_agent_loop
 from model_api_runtime.v2 import compaction as v2_compaction
+from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import invalidation as v2_inval
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import planner as v2_planner
@@ -90,6 +91,69 @@ def _patch_cheap_boundaries(monkeypatch, *, reply="model reply", memory_index=No
         monkeypatch.setattr(v2_responder, "respond", _return)
 
 
+def _reply_effect_dispatch(user_id):
+    """Test-local production-shaped sink for the chat lane's `reply` effect_type
+    only (this file's chat-turn tests never enqueue memory/identity/schedule
+    effects — those are covered in tests/test_v2_effect_sinks.py). Mirrors
+    `serve_worker._sink_reply`'s real write (`worker._write_encrypted_reply`)
+    without pulling in serve_worker's hosted-adjacent wiring.
+    `worker._write_encrypted_reply` is looked up via the module attribute at
+    call time, so a test that monkeypatches it (most already do) still sees
+    its own stub take effect here."""
+    def dispatch(effect_type, payload):
+        if effect_type == "reply":
+            worker._write_encrypted_reply(core_store.get_store(user_id), str(payload.get("text") or ""))
+    return dispatch
+
+
+def _apply_effects(user_id):
+    """`TurnDeps.apply_pending_effects` test wiring (Task 7 / spec C6): drains
+    this turn's PR A outbox through `_reply_effect_dispatch` above — the same
+    seam `on_reply` calls mid-loop for an intermediate bubble and process_job
+    calls again at end-of-turn."""
+    return v2_effect_outbox.apply_pending_effects(user_id, dispatch=_reply_effect_dispatch(user_id))
+
+
+def _script_provider(monkeypatch, responses):
+    """Monkeypatch `provider_client.chat_completion_async` — what
+    `tool_loop.run_tool_loop` calls once per round — to return the given
+    scripted results in order. Each `responses[i]` is a dict `{"reply": str,
+    "tool_calls": [...], "usage": {...}|None}` matching the wire contract
+    `provider_types.ProviderResponse.from_result` reads. Returns the list of
+    captured `{"messages": ..., "tools": ...}` call records so a test can
+    assert what the model actually saw each round (e.g. that a prior round's
+    tool observation was folded in)."""
+    it = iter(responses)
+    calls = []
+
+    async def _fake(config, messages, *, tools=None):
+        calls.append({"messages": messages, "tools": tools})
+        return next(it)
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
+    return calls
+
+
+def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
+    """A scripted terminal round: no tool_calls -> `run_tool_loop` treats `text`
+    as the final reply (Global Constraints: "no-tool-call plain text is the
+    final reply")."""
+    return {"reply": text, "tool_calls": [],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+
+
+def _tool_round(*tool_calls, prompt_tokens=1, completion_tokens=1):
+    """A scripted non-terminal round: one or more tool_calls (built via `_tc`
+    below), no plain-text bubble (accompanying text would be preamble, not a
+    reply — Global Constraints)."""
+    return {"reply": "", "tool_calls": list(tool_calls),
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+
+
+def _tc(call_id, name, **args):
+    return {"id": call_id, "name": name, "args": args}
+
+
 def _deps(*, messages, provider=None, is_official=False, token="rt-enclave"):
     provider = provider if provider is not None else (_BYOK, {})
     return worker.TurnDeps(
@@ -97,6 +161,7 @@ def _deps(*, messages, provider=None, is_official=False, token="rt-enclave"):
         resolve_provider=lambda uid: provider,
         is_official=lambda cfg: is_official,
         mint_enclave_token=lambda uid: token,
+        apply_pending_effects=_apply_effects,
     )
 
 
@@ -165,17 +230,17 @@ def test_write_encrypted_reply_propagates_strict_database_failure(monkeypatch):
 # ------------------------------------------------------------------
 
 def test_process_job_end_to_end_writes_reply_and_completes(monkeypatch):
-    """Happy path (spec §13 steps 5-8): a pending user message -> real coalesce ->
-    real rule_plan (is_official=False) -> real executor (control-only plan, no
-    capability calls) -> stubbed responder -> encrypted reply written -> job
-    completed -> action_digest folded into runtime_state."""
+    """Happy path (Task 7 / spec C6+C9a): a pending user message -> real coalesce ->
+    ONE round-trip through the unified `tool_loop.run_tool_loop` (no tool_calls,
+    plain text) -> the reply effect drained through the real outbox -> encrypted
+    reply written -> job completed -> action_digest folded into runtime_state."""
     uid = "u_w_happy"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="MODEL REPLY")
+    _script_provider(monkeypatch, [_text_round("MODEL REPLY")])
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}])
     written = {}
     monkeypatch.setattr(
@@ -195,6 +260,10 @@ def test_process_job_end_to_end_writes_reply_and_completes(monkeypatch):
 
 
 def test_message_coalesced_during_responder_creates_successor(monkeypatch):
+    """finish_chat_job's late-input successor creation lives entirely in
+    jobs_store (input_generation vs observed_generation), independent of what
+    drives the turn body — this just needs SOME provider call to happen mid-turn
+    during which a concurrent enqueue_job bumps the row's input_generation."""
     uid = "u_w_late_successor"
     conftest.seed_user(uid)
     _reset(uid)
@@ -207,12 +276,12 @@ def test_message_coalesced_during_responder_creates_successor(monkeypatch):
         lambda action_type, store, **kwargs: _FakeCapResult({}),
     )
 
-    async def _respond(**kwargs):
+    async def _fake(config, messages, *, tools=None):
         same_id, coalesced = jobs_store.enqueue_job(uid, "chat", reason="late-B")
         assert (same_id, coalesced) == (job_id, True)
-        return "reply to A"
+        return _text_round("reply to A")
 
-    monkeypatch.setattr(v2_responder, "respond", _respond)
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
     deps = _deps(messages=[{"id": "A", "ts": 10.0, "role": "user", "content": "first"}])
 
@@ -229,26 +298,17 @@ def test_message_coalesced_during_responder_creates_successor(monkeypatch):
     assert rows[1][1:] == ("pending", "coalesced_followup")
 
 
-def test_reply_envelope_failure_is_terminal_not_success(monkeypatch):
-    uid = "u_w_reply_envelope_failure"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-envelope")
-
-    _patch_cheap_boundaries(monkeypatch, reply="model reply")
-    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: None)
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}])
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False,
-        api_key=None, runtime_token="rt"))
-
-    assert status == "failed"
-    row = _job_status(job_id)
-    assert row[0] == "failed"
-    assert row[1] == "turn_failed:runtimeerror"
-    assert "reply_encryption_failed" not in row[1]
+# NOTE (Task 7 / spec C6): test_reply_envelope_failure_is_terminal_not_success was
+# deleted here, not converted. Its premise no longer holds: process_job's chat
+# branch never calls worker._write_encrypted_reply directly anymore (that call
+# now lives behind the PR A effect outbox, in serve_worker._sink_reply, invoked
+# via deps.apply_pending_effects). serve_worker._sink_reply does not currently
+# check _write_encrypted_reply's None return (envelope-build failure) and
+# re-raise, so an envelope failure today applies the effect as if it had
+# succeeded (no exception, no mark_failed) -- a real behavior gap, but one that
+# lives in serve_worker.py / the PR A sink layer, outside worker.py and outside
+# this task's assigned scope. Flagged in the Task 7 report; belongs with
+# serve_worker._sink_reply's own tests (tests/test_v2_effect_sinks.py), not here.
 
 
 def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(monkeypatch):
@@ -259,14 +319,31 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
     calls (memory_index/perception_snapshot) ran unbounded -> N concurrent
     workers could hit the single-threaded enclave without ever passing through
     the shared gate. Uses a real (counting) Semaphore, not a mock, so the
-    assertion exercises actual async acquire/release semantics."""
+    assertion exercises actual async acquire/release semantics.
+
+    Task 7: the old planner-lane memory_index/perception_snapshot prefetches
+    are gone (the unified tool loop only fetches what the model actually asks
+    for), so this now drives a 2-round script — a `web_search` tool call, then
+    a terminal reply — to exercise a THIRD enclave-bound call
+    (`executor.dispatch_tool_calls`'s inline read, same `_run_one` capability
+    path the old prefetches used) alongside `_coalesce_inputs`'s read_messages
+    and the summary/tail read block, preserving the ">= 3 acquisitions" shape.
+
+    Task 7 FIX (BUG-2): the per-round fold ahead of round 1 (call_idx > 0) is
+    now ALSO gated by the same enclave_sem (`_make_fold_new_messages` wraps its
+    reader call in `async with enclave_sem` + `asyncio.to_thread`, exactly like
+    `_coalesce_inputs`) — so the minimum acquisition count is now 4, not 3."""
     uid = "u_w_semaphore"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="R")
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    _script_provider(monkeypatch, [
+        _tool_round(_tc("c1", "web_search", query="x")),
+        _text_round("R"),
+    ])
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
     read_messages_calls = {"n": 0}
@@ -280,6 +357,11 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
         resolve_provider=lambda uid_: (_BYOK, {}),
         is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
+        apply_pending_effects=_apply_effects,
+        # Wired (even trivially) so the summary/tail read block below runs
+        # under enclave_sem too — see the docstring's acquisition count.
+        read_summary=lambda uid_: ("", 0.0, 0),
+        read_tail=lambda uid_, after_ts, limit: [],
     )
     sem = _CountingSemaphore(2)
 
@@ -289,11 +371,17 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
     ))
 
     assert status == "completed"
-    assert read_messages_calls["n"] == 1
-    # 1 acquisition for read_messages (_coalesce_inputs) + 1 for memory_index
-    # prefetch + 1 for perception_snapshot prefetch, at minimum (a replan would
-    # add more, but the happy path here takes none).
-    assert sem.acquire_count >= 3
+    # 2 calls: the turn's initial coalesce, plus the Task 6 per-round fold ahead
+    # of round 1 (call_idx > 0) — it falls back to the same `deps.read_messages`
+    # reader since no `read_messages_since` is wired here (see
+    # `_make_fold_new_messages`'s fallback, matching `_coalesce_inputs`'s own).
+    assert read_messages_calls["n"] == 2
+    # 1 acquisition for read_messages (_coalesce_inputs) + 1 for the summary/tail
+    # read block + 1 for the web_search tool call's capability dispatch + 1 for
+    # the per-round fold's own read (BUG-2 fix: `_make_fold_new_messages` now
+    # gates its reader call through the SAME enclave_sem `process_job` passed
+    # in, instead of calling the reader directly with no semaphore), at minimum.
+    assert sem.acquire_count >= 4
 
 
 def test_coalesce_inputs_and_cap_data_tolerate_enclave_sem_none(monkeypatch):
@@ -322,15 +410,17 @@ def test_coalesce_inputs_and_cap_data_tolerate_enclave_sem_none(monkeypatch):
 
 
 def test_process_job_responder_error_marks_failed_no_filler(monkeypatch):
-    """ResponderError (empty model reply / provider failure) must mark the job
-    failed and must NEVER write a placeholder bubble — the no-filler invariant."""
+    """An empty terminal reply (no tool_calls, blank text) must mark the job
+    failed and must NEVER write a placeholder bubble — the no-filler invariant
+    (BUG-4: chat lane always replies; an empty final text is a model/provider
+    failure here, not legitimate silence)."""
     uid = "u_w_resperr"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply=v2_responder.ResponderError("empty_reply"))
+    _script_provider(monkeypatch, [_text_round("")])
     deps = _deps(messages=[{"id": "m1", "ts": 5.0, "role": "user", "content": "hi"}])
     write_called = {"n": 0}
     monkeypatch.setattr(
@@ -384,34 +474,32 @@ def test_process_job_no_pending_messages_chat_lane_completes_without_planning(mo
     assert ("chat", uid) in wakes
 
 
-def test_process_job_replans_on_concurrent_new_message_within_budget(monkeypatch):
-    """The safe-point invalidation state machine (spec §8): a concurrent new
-    message arriving mid-turn triggers exactly one replan (within the default
-    budget of 2), then a second safe-point check with no further new messages
-    finishes normally. invalidation.evaluate's OWN new-message detection logic
-    is unit-tested exhaustively in test_v2_invalidation.py — here we stub the
-    safe-point DECISION to isolate what Task 8 actually wires: does process_job's
-    loop correctly react to REPLAN/CONTINUE (re-coalesce, call invalidate(),
-    bounded re-planning) end to end, with the real coalesce/planner/executor
-    otherwise running."""
+def test_process_job_picks_up_concurrent_new_message_via_per_round_fold(monkeypatch):
+    """Task 7 replaces the old outer replan state machine (v2_inval safe-point
+    REPLAN/CONTINUE, re-coalesce, bounded re-planning) with `tool_loop`'s
+    per-round fold: no restart, the turn just keeps going and picks up newly-
+    visible user messages before each provider call after the first (Global
+    Constraints "per-round fold, no debounce/restart"). This is the direct
+    successor of the old `..._replans_on_concurrent_new_message_within_budget`
+    test — same scenario (a second message arrives mid-turn), same durable
+    outcome (last_replied_ts reflects BOTH messages), different mechanism."""
     uid = "u_w_replan"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="R")
-    plan_calls = {"n": 0}
-    orig_plan = v2_planner.plan
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("c1", "web_search", query="x")),  # round 0: forces a round 1
+        _text_round("R"),                                  # round 1: terminal reply
+    ])
 
-    def _counting_plan(*a, **k):
-        plan_calls["n"] += 1
-        return orig_plan(*a, **k)
-
-    monkeypatch.setattr(v2_planner, "plan", _counting_plan)
-
-    # First coalesce sees only m1; after the (stubbed) executor "runs", a safe-point
-    # check discovers m2 arrived concurrently -> replan -> re-coalesce sees both.
+    # `deps.read_messages` (no read_messages_since wired) backs BOTH the turn's
+    # initial coalesce AND the fold closure (same fallback `_coalesce_inputs`
+    # itself uses) — so the 1st call (initial coalesce, before the loop starts)
+    # sees only m1; the 2nd call (the fold ahead of round 1, call_idx>0) sees m2
+    # arriving concurrently, mirroring "a message showed up mid-turn."
     feed = iter([
         [{"id": "m1", "ts": 10.0, "role": "user", "content": "first"}],
         [{"id": "m1", "ts": 10.0, "role": "user", "content": "first"},
@@ -422,14 +510,8 @@ def test_process_job_replans_on_concurrent_new_message_within_budget(monkeypatch
         resolve_provider=lambda uid: (_BYOK, {}),
         is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: "rt",
+        apply_pending_effects=_apply_effects,
     )
-
-    decisions = iter([v2_inval.REPLAN, v2_inval.CONTINUE])
-    monkeypatch.setattr(v2_inval, "evaluate", lambda *a, **k: next(decisions))
-    invalidate_calls = []
-    monkeypatch.setattr(
-        v2_inval, "invalidate",
-        lambda job_id, *, replan_job_id: invalidate_calls.append((job_id, replan_job_id)) or 0)
 
     written = {}
     monkeypatch.setattr(
@@ -440,12 +522,13 @@ def test_process_job_replans_on_concurrent_new_message_within_budget(monkeypatch
         job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert plan_calls["n"] == 2          # planned once, replanned exactly once
-    assert invalidate_calls == [(job_id, job_id)]  # within-job replan: replan_job_id == job_id
+    assert len(calls) == 2               # exactly the scripted 2 rounds, no restart
+    # round 1's messages carry the folded-in second message's content.
+    assert any("second" in str(m.get("content", "")) for m in calls[1]["messages"])
     assert written["text"] == "R"
     assert _job_status(job_id)[0] == "completed"
-    # last_replied_ts should reflect the SECOND (post-replan) coalesce cursor (20.0),
-    # not the first (10.0) — the replanned turn answered both messages.
+    # last_replied_ts should reflect the fold's cursor (20.0), not just the
+    # turn's initial coalesce (10.0) — the turn answered both messages.
     assert jobs_store.get_runtime_state(uid).get("last_replied_ts") == 20.0
 
 
@@ -466,8 +549,10 @@ def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monk
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="should not matter")
-    monkeypatch.setattr(v2_planner, "plan", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("planner blew up")))
+    async def _boom(config, messages, *, tools=None):
+        raise RuntimeError("provider blew up")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
     write_called = {"n": 0}
     monkeypatch.setattr(
         worker, "_write_encrypted_reply",
@@ -500,7 +585,7 @@ def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monk
     assert rec_uid == uid
     assert rec_msg == "turn_failed:runtimeerror"
     assert row[1] == rec_msg
-    assert "planner blew up" not in rec_msg
+    assert "provider blew up" not in rec_msg
 
 
 def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
@@ -513,8 +598,10 @@ def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="x")
-    monkeypatch.setattr(v2_planner, "plan", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    async def _boom(config, messages, *, tools=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
     deps = _deps(messages=[{"id": "m1", "ts": 5.0, "role": "user", "content": "hi"}])
     assert deps.record_terminal_error is None
 
@@ -628,20 +715,22 @@ def test_run_turn_heartbeat_resolve_failure_is_silent_no_user_error(monkeypatch)
 
 def test_run_turn_resolves_provider_exactly_once_even_across_a_replan(monkeypatch):
     """Single-decrypt-per-turn invariant: resolve_provider (the BYOK decrypt) must
-    be called exactly once per turn, even when the turn internally replans."""
+    be called exactly once per turn, even when the turn internally spans
+    multiple tool-loop rounds (Task 7: the old outer replan is gone, replaced by
+    per-round fold — see test_process_job_picks_up_concurrent_new_message_via_per_round_fold —
+    but the single-decrypt invariant must hold across that too)."""
     uid = "u_w_singledecrypt"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="R")
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    _script_provider(monkeypatch, [
+        _tool_round(_tc("c1", "web_search", query="x")),
+        _text_round("R"),
+    ])
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
-
-    async def _final_response_plan(*a, **k):
-        return [{"type": "final_response", "payload": {}}]
-
-    monkeypatch.setattr(v2_planner, "plan", _final_response_plan)
 
     feed = iter([
         [{"id": "m1", "ts": 1.0, "role": "user", "content": "a"}],
@@ -659,10 +748,8 @@ def test_run_turn_resolves_provider_exactly_once_even_across_a_replan(monkeypatc
         resolve_provider=_resolve,
         is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: "rt",
+        apply_pending_effects=_apply_effects,
     )
-    decisions = iter([v2_inval.REPLAN, v2_inval.CONTINUE])
-    monkeypatch.setattr(v2_inval, "evaluate", lambda *a, **k: next(decisions))
-    monkeypatch.setattr(v2_inval, "invalidate", lambda job_id, *, replan_job_id: 0)
 
     status = asyncio.run(worker._run_turn(job, deps))
 
@@ -708,11 +795,12 @@ def _ok_deps(rec, *, messages=None):
         resolve_provider=lambda uid: (_BYOK, {}),
         is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: "rt",
+        apply_pending_effects=_apply_effects,
     )
 
 
 def _patch_loop_boundaries(monkeypatch, rec, *, reply="model reply"):
-    _patch_cheap_boundaries(monkeypatch, reply=reply)
+    _script_provider(monkeypatch, [_text_round(reply)])
     monkeypatch.setattr(
         worker, "_write_encrypted_reply",
         lambda store, text: rec.setdefault("replies", []).append((store.user_id, text)) or {"id": "r1"})
@@ -934,13 +1022,7 @@ def test_process_job_reply_uses_deps_summary_and_tail_and_enqueues_compaction_wh
         {"id": f"m{i}", "ts": float(i), "role": "user" if i % 2 == 0 else "openclaw", "content": f"msg {i}"}
         for i in range(worker._TAIL_BUDGET + 5)
     ]
-    respond_calls = []
-
-    async def _spy_respond(*, provider_config, summary, tail, action_results=None, usage_out=None):
-        respond_calls.append({"summary": summary, "tail": tail})
-        return "REPLY"
-
-    monkeypatch.setattr(v2_responder, "respond", _spy_respond)
+    calls = _script_provider(monkeypatch, [_text_round("REPLY")])
 
     enqueue_calls = []
     orig_enqueue = jobs_store.enqueue_job
@@ -958,15 +1040,19 @@ def test_process_job_reply_uses_deps_summary_and_tail_and_enqueues_compaction_wh
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: big_tail,
         read_summary=lambda uid_: ("prior summary", 0.0, 3),
+        apply_pending_effects=_apply_effects,
     )
 
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert len(respond_calls) == 1
-    assert respond_calls[0]["summary"] == "prior summary"
-    assert respond_calls[0]["tail"] == big_tail
+    assert len(calls) == 1
+    # the base context built once at loop entry from deps.read_summary/read_tail
+    # (D1) — the summary header + every tail turn must reach the provider call.
+    joined = " ".join(str(m.get("content", "")) for m in calls[0]["messages"])
+    assert "prior summary" in joined
+    assert "msg 0" in joined and f"msg {len(big_tail) - 1}" in joined
     assert (uid, "maintenance", "compaction") in enqueue_calls
 
 
@@ -981,11 +1067,7 @@ def test_process_job_reply_skips_compaction_enqueue_when_under_budget(monkeypatc
 
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
-
-    async def _spy_respond(*, provider_config, summary, tail, action_results=None, usage_out=None):
-        return "REPLY"
-
-    monkeypatch.setattr(v2_responder, "respond", _spy_respond)
+    _script_provider(monkeypatch, [_text_round("REPLY")])
 
     enqueue_calls = []
     orig_enqueue = jobs_store.enqueue_job
@@ -1003,6 +1085,7 @@ def test_process_job_reply_skips_compaction_enqueue_when_under_budget(monkeypatc
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         read_summary=lambda uid_: ("", 0.0, 0),
+        apply_pending_effects=_apply_effects,
     )
 
     status = asyncio.run(worker.process_job(
@@ -1180,19 +1263,14 @@ def test_process_job_records_whole_turn_metric_after_successful_respond(monkeypa
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
-    async def _spy_respond(*, provider_config, summary, tail, action_results=None, usage_out=None):
-        if usage_out is not None:
-            usage_out["prompt_tokens"] = 42
-            usage_out["completion_tokens"] = 8
-        return "REPLY"
-
-    monkeypatch.setattr(v2_responder, "respond", _spy_respond)
+    _script_provider(monkeypatch, [_text_round("REPLY", prompt_tokens=42, completion_tokens=8)])
 
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
         is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
+        apply_pending_effects=_apply_effects,
     )
 
     status = asyncio.run(worker.process_job(
@@ -1208,7 +1286,7 @@ def test_process_job_records_whole_turn_metric_after_successful_respond(monkeypa
     assert row[1] == "chat"
     assert row[2] == 42
     assert row[3] == 8
-    assert row[4] == 1  # is_official=False -> rule_plan (zero-LLM) never adds a call; only respond() does
+    assert row[4] == 1  # exactly one round-trip through the unified tool loop
     assert row[5] is False
     assert row[6] == "ok"
     assert row[7] >= 0
@@ -1226,17 +1304,14 @@ def test_process_job_records_failed_whole_turn_metric_on_responder_error(monkeyp
     job = jobs_store.claim_next_job("w")
 
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
-
-    async def _raise_respond(*, provider_config, summary, tail, action_results=None, usage_out=None):
-        raise v2_responder.ResponderError("empty_reply")
-
-    monkeypatch.setattr(v2_responder, "respond", _raise_respond)
+    _script_provider(monkeypatch, [_text_round("")])  # empty terminal text -> no-filler failure
 
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
         is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
+        apply_pending_effects=_apply_effects,
     )
 
     status = asyncio.run(worker.process_job(
@@ -1252,31 +1327,26 @@ def test_process_job_records_failed_whole_turn_metric_on_responder_error(monkeyp
 
 
 def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
-    """PR B review finding: `_run_wake` makes a real `v2_responder.respond` BYOK
-    call (this IS the lane that burns idle-user tokens on heartbeat/scheduled
-    wakes) but a SUCCESSFUL wake used to never flush a `v2_turn_metrics` row at
-    all — `process_job` returns early at lane dispatch (`return await
+    """PR B review finding: `_run_wake` makes a real provider BYOK call (this IS
+    the lane that burns idle-user tokens on heartbeat/scheduled wakes) but a
+    SUCCESSFUL wake used to never flush a `v2_turn_metrics` row at all —
+    `process_job` returns early at lane dispatch (`return await
     _run_wake(...)`), so its own success-path flush was never reached, and
     `_run_wake` itself never called `tm.add_call`/`tm.flush(failed=False, ...)`.
-    Mirrors the chat-lane usage_out plumbing in
+    Mirrors the chat-lane usage plumbing in
     `test_process_job_records_whole_turn_metric_after_successful_respond` above
-    — `v2_responder.respond`'s `usage_out` out-param is the same mechanism for
-    both lanes, so a successful wake now records real prompt/completion tokens,
-    not just a bare model_calls count."""
+    — since Task 8, `add_usage=tm.add_call` is wired straight into
+    `tool_loop.run_tool_loop`, the same mechanism for both lanes, so a
+    successful wake now records real prompt/completion tokens, not just a bare
+    model_calls count."""
     uid = "u_w_wake_turnmetric"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    async def _spy_respond(*, provider_config, summary, tail, action_results=None,
-                            system_prompt=None, usage_out=None):
-        if usage_out is not None:
-            usage_out["prompt_tokens"] = 17
-            usage_out["completion_tokens"] = 4
-        return "hey, thinking of you"
-
-    monkeypatch.setattr(v2_responder, "respond", _spy_respond)
+    _script_provider(monkeypatch, [
+        _text_round("hey, thinking of you", prompt_tokens=17, completion_tokens=4)])
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
     deps = worker.TurnDeps(
@@ -1286,6 +1356,7 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: [],
         read_summary=lambda uid_: ("", 0.0, 0),
+        apply_pending_effects=_apply_effects,
     )
 
     status = asyncio.run(worker.process_job(
@@ -1299,32 +1370,24 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
     assert row is not None
     assert row[0] == uid
     assert row[1] == "heartbeat"
-    assert row[2] == 17          # real usage, surfaced via respond()'s usage_out
+    assert row[2] == 17          # real usage, surfaced via the scripted round's usage
     assert row[3] == 4
-    assert row[4] == 1           # exactly one model call: respond()
+    assert row[4] == 1           # exactly one model call
     assert row[5] is False
     assert row[6] == "ok"
 
 
 def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(monkeypatch):
-    """empty_reply is a SUCCESSFUL weak-wake sleep, but it's still a REAL,
-    billed provider call (usage_out is filled by respond() before empty_reply
-    is raised) — the metric row must count it, not silently drop to
-    model_calls=0 the way a pre-fix failed wake used to."""
+    """An empty terminal reply is a SUCCESSFUL weak-wake sleep, but it's still a
+    REAL, billed provider call — the metric row must count it, not silently
+    drop to model_calls=0 the way a pre-fix failed wake used to."""
     uid = "u_w_wake_turnmetric_weak"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    async def _weak_respond(*, provider_config, summary, tail, action_results=None,
-                             system_prompt=None, usage_out=None):
-        if usage_out is not None:
-            usage_out["prompt_tokens"] = 9
-            usage_out["completion_tokens"] = 0
-        raise v2_responder.ResponderError("empty_reply")
-
-    monkeypatch.setattr(v2_responder, "respond", _weak_respond)
+    _script_provider(monkeypatch, [_text_round("", prompt_tokens=9, completion_tokens=0)])
 
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
@@ -1333,6 +1396,7 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: [],
         read_summary=lambda uid_: ("", 0.0, 0),
+        apply_pending_effects=_apply_effects,
     )
 
     status = asyncio.run(worker.process_job(
@@ -1410,7 +1474,7 @@ def test_process_job_tolerates_missing_record_turn_metric_callback(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="R")
+    _script_provider(monkeypatch, [_text_round("R")])
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
     deps = _deps(messages=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     assert deps.record_turn_metric is None
@@ -1465,150 +1529,133 @@ def test_run_compaction_under_keep_threshold_completes_as_noop(monkeypatch):
 # INNER model-driven tool loop; one _TURN_MAX_LLM_CALLS counter spans both.
 # ------------------------------------------------------------------
 
-def test_chat_turn_always_replies_even_when_plan_omits_final_response(monkeypatch):
-    """BUG-4: a trusted model's plan without final_response must NOT silently swallow the turn.
-    Pre-loop, `wants_reply` was False and the responder never ran — the user got nothing."""
+def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
+    """BUG-4 structural successor (Task 7): in the old json_planner pipeline, a
+    plan that never asked for `final_response` could silently swallow the turn
+    (fixed back then by forcing `wants_reply=True` for the chat lane). In the
+    unified tool loop this can no longer happen BY CONSTRUCTION:
+    `tool_loop.run_tool_loop`'s last round always omits `tools` (forcing plain
+    text — Global Constraints), so a model that just keeps calling tools every
+    round still gets forced to a real reply at the `_TURN_MAX_LLM_CALLS`
+    budget — never a placeholder, never a silent swallow."""
     uid = "u_w_loop_bug4"
     conftest.seed_user(uid)
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="MODEL REPLY")
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}],
-                 is_official=True)
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    n = worker._TURN_MAX_LLM_CALLS
+    script = [_tool_round(_tc(f"c{i}", "memory_index")) for i in range(n - 1)]
+    script.append(_text_round("MODEL REPLY"))
+    calls = _script_provider(monkeypatch, script)
+
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}])
     written = {}
     monkeypatch.setattr(worker, "_write_encrypted_reply",
                         lambda store, text: written.update(text=text) or {"id": "r1"})
 
-    # Each round asks for a DIFFERENT action; an identical plan would trip the loop's
-    # `no_progress` guard and we would never reach the max_rounds path this test is about.
-    plans = [
-        [{"type": "memory_index", "payload": {}}],                # round 0: no final_response
-        [{"type": "memory_search", "payload": {"query": "a"}}],   # round 1: still none
-        [{"type": "memory_fetch", "payload": {"ids": ["a"]}}],    # round 2: still none -> max_rounds
-    ]
-    calls = {"plan": 0}
-
-    async def fake_plan(store, **kw):
-        i = calls["plan"]; calls["plan"] += 1
-        return [dict(s) for s in plans[min(i, len(plans) - 1)]]
-
-    monkeypatch.setattr(v2_planner, "plan", fake_plan)
-
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert calls["plan"] == worker._LOOP_MAX_ROUNDS   # looped; did not stop after round 0
+    assert len(calls) == n            # ran to the budget, no early silent stop
+    assert calls[-1]["tools"] is None  # last round forced plain text
     assert written.get("text") == "MODEL REPLY"       # forced reply at the cap — no silent swallow
 
 
-def test_planner_second_round_receives_first_round_results(monkeypatch):
+def test_second_round_receives_first_round_tool_observation(monkeypatch):
+    """Successor of the old planner-prior_action_results test: in the unified
+    loop, a read tool's result is fed back as grounding context to the NEXT
+    round's `build_messages` call (Global Constraints "reads run parallel,
+    content fed back"), not replayed as a wire-level tool round-trip."""
     uid = "u_w_loop_prior"
     conftest.seed_user(uid)
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="R")
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}],
-                 is_official=True)
+    monkeypatch.setattr(
+        cap_registry, "run_capability",
+        lambda action_type, store, **k: _FakeCapResult({"marker": "OBSERVED_MEMORY_INDEX"}))
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("c1", "memory_index")),
+        _text_round("R"),
+    ])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}])
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
-    seen_prior = []
-
-    async def fake_plan(store, **kw):
-        seen_prior.append(kw.get("prior_action_results"))
-        if len(seen_prior) == 1:
-            return [{"type": "memory_index", "payload": {}}]
-        return [{"type": "final_response", "payload": {}}]
-
-    monkeypatch.setattr(v2_planner, "plan", fake_plan)
-
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert seen_prior[0] in (None, {})               # round 0: nothing observed yet
-    assert "memory_index" in (seen_prior[1] or {})   # round 1: the observation was fed back
+    assert len(calls) == 2
+    round0_joined = " ".join(str(m.get("content", "")) for m in calls[0]["messages"])
+    round1_joined = " ".join(str(m.get("content", "")) for m in calls[1]["messages"])
+    assert "OBSERVED_MEMORY_INDEX" not in round0_joined  # round 0: nothing observed yet
+    assert "OBSERVED_MEMORY_INDEX" in round1_joined       # round 1: the observation was fed back
 
 
-def test_turn_llm_call_budget_binds_across_replan_and_rounds(monkeypatch):
-    """replan_budget(2) x _LOOP_MAX_ROUNDS(3) + 1 = 7 > _TURN_MAX_LLM_CALLS(6). It must bite."""
+def test_turn_llm_call_budget_binds_even_with_continuous_new_input(monkeypatch):
+    """The `_TURN_MAX_LLM_CALLS` budget (spec §6: bounds runaway BYOK spend) must
+    hold even when new user messages keep arriving mid-turn (the per-round
+    fold — Task 6/7's replacement for the old outer replan mechanism) and the
+    model keeps asking for tools every round: the turn must still terminate at
+    EXACTLY the budget, forced to plain text on the last round (`tools=None`),
+    never running away past it."""
     uid = "u_w_loop_budget"
     conftest.seed_user(uid)
     _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="R")
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}],
-                 is_official=True)
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    n = worker._TURN_MAX_LLM_CALLS
+    script = [_tool_round(_tc(f"c{i}", "memory_index")) for i in range(n - 1)]
+    script.append(_text_round("R"))
+    calls = _script_provider(monkeypatch, script)
+
+    # A new message keeps "arriving" — every read returns one more row than the
+    # last, so the fold ahead of every round after the first sees something new,
+    # mirroring a talkative user who never lets the turn go quiet.
+    counter = {"n": 0}
+
+    def _read_messages(uid_):
+        counter["n"] += 1
+        return [{"id": f"m{i}", "ts": float(i), "role": "user", "content": f"msg{i}"}
+                for i in range(1, counter["n"] + 1)]
+
+    deps = worker.TurnDeps(
+        read_messages=_read_messages,
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        apply_pending_effects=_apply_effects,
+    )
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
-    calls = {"plan": 0, "respond": 0}
-
-    async def fake_plan(store, **kw):
-        calls["plan"] += 1
-        # Payload varies per call so `no_progress` never fires — this test is about the
-        # LLM-call budget, and a no-progress stop would mask it.
-        return [{"type": "memory_index", "payload": {"n": calls["plan"]}}]   # never asks to reply
-
-    async def fake_respond(**kw):
-        calls["respond"] += 1
-        return "reply"
-
-    monkeypatch.setattr(v2_planner, "plan", fake_plan)
-    monkeypatch.setattr(v2_responder, "respond", fake_respond)
-    monkeypatch.setattr(v2_inval, "evaluate", lambda *a, **k: v2_inval.REPLAN)
-
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    # Walk it: outer iter 1 burns rounds 0,1,2 (llm_calls=3) -> max_rounds. evaluate=REPLAN and
-    # 3 < 5, so replan. Outer iter 2: rounds 0,1 plan (llm_calls=5); round 2 sees the budget
-    # exhausted and returns wants_reply with no actions. evaluate=REPLAN but 5 < 5 is False ->
-    # break. The responder takes the reserved 6th slot.
-    assert calls["plan"] == 5
-    assert calls["respond"] == 1   # the reserved responder slot is never eaten by the planner
-    assert calls["plan"] + calls["respond"] == worker._TURN_MAX_LLM_CALLS
+    assert len(calls) == n
+    with db.get_pool().connection() as c:
+        row = c.execute(
+            "SELECT model_calls FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
+    assert row[0] == n
 
 
-def test_final_text_from_decide_short_circuits_the_responder(monkeypatch):
-    """Native-tools seam: if `decide` authored the reply, do not pay for a responder call."""
-    uid = "u_w_loop_finaltext"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w")
-
-    _patch_cheap_boundaries(monkeypatch, reply="SHOULD NOT BE USED")
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}],
-                 is_official=True)
-    written = {}
-    monkeypatch.setattr(worker, "_write_encrypted_reply",
-                        lambda store, text: written.update(text=text) or {"id": "r"})
-
-    called = {"respond": 0}
-
-    async def fake_run_turn(*, decide, run_tools, max_rounds):
-        return v2_agent_loop.LoopResult({}, {}, "authored inline", 1, v2_agent_loop.WANTS_REPLY)
-
-    async def fake_respond(**kw):
-        called["respond"] += 1
-        return "should not happen"
-
-    monkeypatch.setattr(v2_agent_loop, "run_turn", fake_run_turn)
-    monkeypatch.setattr(v2_responder, "respond", fake_respond)
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
-
-    assert status == "completed"
-    assert called["respond"] == 0
-    assert written.get("text") == "authored inline"
+# NOTE (Task 7): test_final_text_from_decide_short_circuits_the_responder was
+# deleted here, not converted. Its premise was specific to the old two-callback
+# shape (a `decide` step separate from a forced `responder.respond` round-trip,
+# with `LoopResult.final_text` as the seam letting a "native tools" backend
+# skip the extra call). The unified tool loop has no such seam to test:
+# EVERY model is "native tools" now (Global Constraints "no behavior
+# tiering") and a terminal plain-text round costs exactly one provider call by
+# construction — there is no separate responder call to short-circuit. That
+# "one round, one bubble, no forced second call" guarantee is exactly what
+# test_process_job_end_to_end_writes_reply_and_completes above (and
+# tests/test_v2_worker_tool_loop.py's first scenario) already covers.
 
 
 def test_unhandled_lane_never_writes_a_bubble_and_fails_loudly_in_the_db(monkeypatch):
@@ -1660,7 +1707,8 @@ def test_chat_still_works_and_takes_the_chat_path(monkeypatch):
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="REPLY")
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    _script_provider(monkeypatch, [_text_round("REPLY")])
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
     written = {}
     monkeypatch.setattr(worker, "_write_encrypted_reply",
@@ -1682,7 +1730,8 @@ def test_chat_lane_still_takes_the_chat_path(monkeypatch):
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="REPLY")
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    _script_provider(monkeypatch, [_text_round("REPLY")])
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
     written = {}
     monkeypatch.setattr(worker, "_write_encrypted_reply",

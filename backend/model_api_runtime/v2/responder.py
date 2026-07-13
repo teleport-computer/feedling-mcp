@@ -1,5 +1,19 @@
 """model-authored responder（子项目 B 起步，C §7.5 扩展，D1 改用 summary+tail）。
 
+**PR C9b 状态更新**：`respond()` 本身自 Task 7（chat）/ Task 8（wake）起已不再是生产回合
+的驱动路径——`worker.py` 的 `process_job`/`_run_wake` 现在统一走 `tool_loop.run_tool_loop`
+（provider-native 工具循环，每个模型同一套目录/同一个循环，见 worker.py 模块文档），不再
+有"强制 responder round-trip"这一步。`respond()`/`ResponderError`/`_fold_action_results`/
+`_action_context_str` 没有被删除——它们仍是几处真实、独立的消费者：
+  - `scripts/loadtest/compare_tokens.py`：D4 的 token-per-turn 回滚门，直接驱动 `respond()`
+    （以及 `planner.py`/`agent_loop.py`）来测量旧管线的 token 开销基线。
+  - `tests/test_v2_no_gateway_dependency.py` / `tests/test_v2_multimodal_e2e.py`：拿 `respond()`
+    当一个方便的、真实的 `provider_client` wire-shape 回归探针（网关绕过 / 多模态图片块）。
+  - `worker.py` 仍在用 `ResponderError`（chat lane 空终态回复的报错信号，见
+    `_on_reply`）和 `_action_context_str`（wake lane 的 screen_watch 静态预取渲染）。
+详见 `tests/test_v2_no_dispatch_tiering.py`：它锁定的真正不变量是"worker.py 生产代码
+不调用 `respond()`"，而不是"这个模块不存在"。
+
 用**用户自己的 BYOK** ProviderConfig 出最终回复（spec §7.3 不变量：无平台 key 兜底）。
 D1：不再只喂"合并的未回复用户消息"——改为消费一个 `summary`（早前对话摘要字符串）+
 `tail`（双角色逐条消息列表），组装委托给纯函数 `context.build_turn_messages`，让模型
@@ -49,7 +63,15 @@ def _strip_blobs(value: Any) -> Any:
 
 
 class ResponderError(Exception):
-    """responder 无法产出 model-authored 文本（无用户消息 / provider 空回复 / provider 错）。
+    """无法产出 model-authored 文本（无用户消息 / provider 空回复 / provider 错）。
+
+    **PR C9b**：不再是"responder 专属"的错误类型——它现在是统一工具循环（`tool_loop.
+    run_tool_loop`）的空终态回复 / 回合错误信号。`worker.py` 的 `_on_reply`（`process_job`
+    chat-lane 分支）在终态文本为空时直接 `raise v2_responder.ResponderError("empty_reply")`，
+    从不经过本模块的 `respond()`；`worker._safe_failure_code` 用 `isinstance(exc,
+    v2_responder.ResponderError)` 对这两个生产落点（这个类 + `respond()` 内部自己抛的那些）
+    做统一分类，落成 `agent_jobs.last_error` 里稳定的 plaintext 错误码。类留在 `responder.py`
+    只是历史位置（`respond()` 本身仍在，见模块文档），不代表这个异常只可能从 `respond()` 里冒出来。
 
     `.kind`（D3 Task 7，类级默认 `""` —— 无需 `getattr` 兜底）：仅 provider 调用失败这一支
     会被填成 `provider_client.classify_provider_error(exc)` 的结果（"transient" /

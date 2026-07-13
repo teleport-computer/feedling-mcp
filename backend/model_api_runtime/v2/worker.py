@@ -1,19 +1,28 @@
-"""V2 worker：Postgres 队列 consumer 的编排（子项目 C 收口 Task 8）。
+"""V2 worker：Postgres 队列 consumer 的编排（子项目 C 收口 Task 8，PR C9b 摘掉旧 staged 管线）。
 
 进程入口在 serve_worker.py；本模块做「一回合一 worker」的编排：claim → coalesce →
-planner → executor →（安全点 replan，预算内）→ responder → 落加密回复。turn 执行体走
-注入式 TurnDeps（生产实现由 serve_worker 装配、可 import hosted/core；测试注入假实现，
-不碰真 enclave/provider/LLM）。
+`tool_loop.run_tool_loop`（provider-native 统一工具循环，spec C6/C7）→ 落加密回复
+（chat）/沉默是合法结果（wake）。旧的两层 while/replan（`invalidation.py`）+
+json_planner（`planner.py`：`plan`/`rule_plan`/`official_plan`）+ 强制 `responder.respond`
+round-trip 管线已被 Task 7（chat）/Task 8（wake）整体替换——worker.py 自 PR C9b 起不再
+import/调用 `planner.py`/`agent_loop.py`，每个模型（无论 is_official）都走同一套工具目录 +
+同一个循环，没有按可信度分流的行为分叉（Global Constraints "no behavior tiering"，见
+`tests/test_v2_no_dispatch_tiering.py`）。`planner.py`/`agent_loop.py`/`responder.respond`
+本体没有被删除——D4 的 token-per-turn 回滚门（`scripts/loadtest/compare_tokens.py`）和几个
+wire-shape 回归测试（`test_v2_no_gateway_dependency.py`/`test_v2_multimodal_e2e.py`）仍在
+直接驱动它们，见那几个模块自己的文档。turn 执行体走注入式 TurnDeps（生产实现由
+serve_worker 装配、可 import hosted/core；测试注入假实现，不碰真 enclave/provider/LLM）。
 
 依赖方向（CONTRIBUTING §2）：本模块只 import core.*/model_api_runtime.v2.*/capabilities.*/
 provider_client —— 绝不 import `hosted` 或 `agent_runtime.spawners`。official/非官方判定
 （是否用户在跑受信任模型）需要 `agent_runtime.spawners._is_official_identity`，那是
 hosted-adjacent 的东西；因此它被挪到 TurnDeps.is_official（生产实现在 serve_worker.py
-里包一层调用 spawners），worker.py 只拿到已解析好的 bool / 可调用对象。
+里包一层调用 spawners），worker.py 只拿到已解析好的 bool / 可调用对象——PR C9b 起这个
+bool 不再驱动任何分支（见该字段自己的注释），保留只是为了不破坏既有装配/测试签名。
 
 两套凭证不混（spec §5）：
-- provider_config（用户 BYOK）：只喂 planner（official_plan 内部）与 responder 的 LLM
-  调用。resolve_provider(user_id) 在本回合只解密一次（single-flight 之外的每 job 一次），
+- provider_config（用户 BYOK）：只喂统一工具循环里的 provider 调用（`tool_loop.run_tool_loop`）。
+  resolve_provider(user_id) 在本回合只解密一次（single-flight 之外的每 job 一次），
   由 `_slot_loop` 在把 job 交给 `process_job` 之前调用、并把结果原样传入、整个回合复用。
 - api_key + runtime_token（enclave-auth）：只喂 executor 的 capability 调用 + 便宜预取
   （memory_index/perception_snapshot）+ `TurnDeps.read_messages`（enclave 内解密取明文）。
@@ -36,28 +45,29 @@ ENCLAVE_SEMAPHORE 框住 turn 里所有 enclave-bound 调用（provider-key 解�
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
+import db
 import provider_client
 from capabilities import registry as cap_registry
 from core import envelope as core_envelope
 from core import store as core_store
 from core import wake_bus as core_wake_bus
-from model_api_runtime.v2 import agent_loop as v2_agent_loop
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
+from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
-from model_api_runtime.v2 import invalidation as v2_inval
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import planner as v2_planner
 from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import status_stream
+from model_api_runtime.v2 import tool_loop as v2_tool_loop
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
 # （extraction.py 同样只 import 这两个 + provider_client）。
 from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
@@ -201,7 +211,12 @@ class TurnDeps:
     """
     read_messages: Callable[[str], list[dict]]           # user_id -> [{"id","ts","role","content"}]（enclave 解密明文）
     resolve_provider: Callable[[str], tuple[Any, dict]]   # user_id -> (ProviderConfig|None, meta)：BYOK，回合内只调一次
-    is_official: Callable[[Any], bool]                    # provider_config -> bool；生产实现包 agent_runtime.spawners（hosted-adjacent），worker.py 自身不 import 它
+    # provider_config -> bool；生产实现包 agent_runtime.spawners（hosted-adjacent），worker.py 自身不 import 它。
+    # PR C9b：结果仍在 `_run_turn` 里算好、原样传给 `process_job`，但 process_job 内部
+    # 不再读它做任何分支（Global Constraints "no behavior tiering"——is_official 不再
+    # 驱动 rule_plan/official_plan 那种分流，因为那条老管线整个被 tool_loop 取代了）。
+    # 字段留着只是为了不破坏既有装配/测试签名，算是一个尚未接线的 telemetry 挂钩。
+    is_official: Callable[[Any], bool]
     mint_enclave_token: Callable[[str], str]              # user_id -> 短时效 runtime_token（HMAC 签发，非解密，可按需多铸）
     # (user_id, message) -> None：终态失败时的第二个可见性出口（Task 3）——agent_jobs.last_error
     # 对 iOS 不可见，这个回调让 serve_worker 把同一条 message 也 patch 进
@@ -286,28 +301,30 @@ class TurnMetrics:
     return AND every `mark_failed` call site — chat, `maintenance` (compaction),
     wake (`heartbeat`/`scheduled`/`manual_wake`/`screen_watch`) and extraction
     (`capture`/`dream`) alike. The background lanes are not metric-free: each
-    makes exactly one real BYOK provider call per job (`_run_wake` →
-    `v2_responder.respond`, `_run_extraction` → `v2_extraction.extract`,
-    `_run_compaction` → `v2_compaction.compact`, the last two only when the
-    lane actually reaches its compaction/extraction call — e.g. a compaction
-    job whose tail is already under budget skips the call and legitimately
-    flushes `model_calls=0`), so a success there carries real token/usage
-    data worth a row — this is precisely the lane that burns idle-user BYOK
-    tokens on heartbeat/scheduled wakes, so it is the metric consumers most
-    need. `responder.respond` surfaces usage via its `usage_out` out-param
-    (mirroring the chat path), so the wake lane records real prompt/completion
-    tokens. `v2_extraction.extract`/`v2_compaction.compact` do not currently
+    makes at least one real BYOK provider call per job (`_run_wake` and chat's
+    `process_job` both drive `tool_loop.run_tool_loop`, which calls `add_call`
+    itself via its `add_usage` callback for every provider round; `_run_extraction`
+    → `v2_extraction.extract`, `_run_compaction` → `v2_compaction.compact`, the
+    last two only when the lane actually reaches its compaction/extraction call —
+    e.g. a compaction job whose tail is already under budget skips the call and
+    legitimately flushes `model_calls=0`), so a success there carries real
+    token/usage data worth a row — this is precisely the lane that burns
+    idle-user BYOK tokens on heartbeat/scheduled wakes, so it is the metric
+    consumers most need. `tool_loop.run_tool_loop` surfaces usage via its
+    `add_usage` callback (chat and wake alike, since PR C9b — see `process_job`/
+    `_run_wake`), so both lanes record real prompt/completion tokens per provider
+    round. `v2_extraction.extract`/`v2_compaction.compact` do not currently
     surface usage from their underlying provider call at all (no `usage_out`
     equivalent) — their lanes still call `add_call(None)` so `model_calls` is
     at least correctly counted; `prompt_tokens`/`completion_tokens` for those
     two lanes stay 0 until those modules grow their own usage out-param (a
     follow-up, not invented here).
 
-    `add_call` accumulates usage from a REAL provider call — the json_planner
-    backend's `official_plan` (BYOK-official users only; `rule_plan` is
-    deterministic/zero-LLM and must never bump `model_calls`), `responder.respond`
-    (chat AND wake lanes), `v2_extraction.extract`, and `v2_compaction.compact`.
-    `retries` stays 0 today: `reliable_chat_completion*` retries internally but
+    `add_call` accumulates usage from a REAL provider call — `tool_loop.run_tool_loop`
+    (chat AND wake lanes, one call per provider round, every model uniformly —
+    PR C9b removed the old json_planner `official_plan`/`rule_plan` split and the
+    forced `responder.respond` round-trip that used to feed this), `v2_extraction.extract`,
+    and `v2_compaction.compact`. `retries` stays 0 today: `reliable_chat_completion*` retries internally but
     doesn't yet surface a retry count to its callers (out of scope for this
     task) — the column/field exist so a future provider-level retry count can
     be wired in without another migration.
@@ -351,7 +368,8 @@ class TurnMetrics:
 
 async def _cap_data(store, action_type, *, api_key, runtime_token, params=None, enclave_sem=None) -> dict:
     """便宜预取一个 capability 的 data（无 LLM，用 enclave-auth 凭证）。失败退化为 {}——
-    planner 有 index 更好、没有也能规划（rule_plan/official_plan 都容忍空 memory_index）。
+    调用方（如 `_run_wake` 的 screen_watch screen_recent 预取）容忍空结果，不是必须成功
+    的前提，模型自己会看到空 grounding context 并据此决定要不要再发 tool_call 补查。
 
     enclave-bound（spec §11 R3）：capability 调用可能触达 enclave（如 perception_snapshot
     的解密读），跟 executor._run_one 的 capability 调用一样必须过 enclave_sem，否则多 worker
@@ -395,6 +413,162 @@ async def _coalesce_inputs(
     else:
         messages = await _read()
     return v2_coalesce.coalesce_pending(messages, since_ts=since_ts)
+
+
+def _make_fold_new_messages(
+    user_id: str, deps: TurnDeps, cursor_box: dict, enclave_sem: "asyncio.Semaphore | None" = ENCLAVE_SEMAPHORE
+) -> Callable[[], Awaitable[list[dict]]]:
+    """Build the per-round message-fold closure `tool_loop.run_tool_loop` calls before every
+    provider round after the first (spec C7 / C6 wiring; Global Constraints "per-round fold,
+    no debounce/restart").
+
+    MUST reuse the SAME enclave-decrypt path the turn's own coalesce step uses
+    (`_coalesce_inputs`'s `_read()` inner: `deps.read_messages_since` when wired, else
+    `deps.read_messages`) — NOT `db.chat_messages_after_seq`. Production `chat_messages`
+    rows for real users are E2E envelopes (`body_ct`/`K_enclave`); the raw DB layer never
+    sees plaintext, only the enclave-bound reader does (see `serve_worker._read_messages`,
+    which decrypts each row via `/v1/envelope/decrypt` before returning it). Reading the raw
+    DB doc here would feed CIPHERTEXT straight into the model prompt for every real user —
+    this closure exists specifically to avoid that, so it must call the injected reader, the
+    same as the turn's initial coalesce.
+
+    ASYNC + enclave_sem-gated (BUG-2 fix): the reader is a synchronous, enclave-bound HTTP
+    decrypt call — exactly like `_coalesce_inputs`'s own read. `_coalesce_inputs` already
+    wraps that identical call in `async with enclave_sem` + `asyncio.to_thread` so it neither
+    blocks the event loop thread nor bypasses the shared enclave concurrency gate (spec §11
+    R3). This closure must do the same: it is called once per round by
+    `tool_loop.run_tool_loop`, which `await`s it, so calling the sync reader directly here
+    (no thread offload, no semaphore) would block the loop thread for the enclave round-trip
+    AND let concurrent workers hit the single-threaded enclave ungated. `enclave_sem` defaults
+    to the module-level `ENCLAVE_SEMAPHORE` (the same shared gate `process_job` uses); tests
+    that want to exercise the closure with no gating pass `enclave_sem=None` (mirrors
+    `_coalesce_inputs`/`_cap_data`'s own `enclave_sem is None` no-gate tolerance).
+
+    `cursor_box` is a single-key `{"ts": float}` mutable dict the caller owns and shares with
+    this closure by reference — `run_tool_loop` holds no cursor state itself, it only calls
+    the closure — so repeated `fold_new_messages()` calls across rounds advance the SAME
+    cursor in place. Callers seed it with the turn's `since_ts` (the durable
+    `last_replied_ts` cursor used by the turn's own initial coalesce — see
+    `_coalesce_inputs`), so the first fold call only sees messages newer than what the turn
+    already coalesced at claim time.
+
+    Merge/filter goes through `coalesce.coalesce_pending(rows, since_ts=cursor_box["ts"])`
+    exactly like `_coalesce_inputs` — user-role filter, id-dedupe, empty-content drop — and
+    the cursor advances to `max(cursor_box["ts"], cursor)` after every call (never regresses:
+    `coalesce_pending` returns cursor==0.0 when nothing new was folded, and `max()` keeps the
+    box monotonic instead of that 0.0 clobbering a real prior value). Because dedup is by
+    message **id** (not by ts), two messages sharing an identical wall-clock ts within the
+    same read are still both folded exactly once — the ts-cursor's only job is bounding which
+    rows are even candidates, id-dedup inside a single call handles the rest. This is the same
+    boundary condition `_coalesce_inputs` already lives with at turn-claim time, so reusing it
+    here is not a new regression.
+    """
+
+    async def fold_new_messages() -> list[dict]:
+        reader = deps.read_messages_since if deps.read_messages_since is not None else deps.read_messages
+        args = (user_id, cursor_box["ts"]) if deps.read_messages_since is not None else (user_id,)
+
+        async def _read():
+            return await asyncio.to_thread(reader, *args)
+
+        if enclave_sem is not None:
+            async with enclave_sem:
+                rows = await _read()
+        else:
+            rows = await _read()
+        coalesced, cursor = v2_coalesce.coalesce_pending(rows, since_ts=cursor_box["ts"])
+        if cursor:
+            cursor_box["ts"] = max(cursor_box["ts"], cursor)
+        return coalesced
+
+    return fold_new_messages
+
+
+def _tool_results_context_str(prior_tool_results) -> str:
+    """Render `run_tool_loop`'s `prior_tool_results` (a `list[provider_types.ToolResult]`,
+    read-tool observations from `dispatch_tools` — Global Constraints "reads run parallel,
+    content fed back") as an `action_context` string in the same shape
+    `responder._action_context_str` already renders executor `action_results` for the legacy
+    responder path. Deliberately NOT re-injected as OpenAI-style `role: tool` messages paired
+    to the assistant's original tool_calls turn — spec's "reads run inline" means the
+    observation becomes grounding context for the *next* round's provider call, not a replayed
+    wire-level tool round-trip (the loop never re-sends the assistant's prior tool_calls
+    message, only its own resulting text/tool_calls each round — see `tool_loop.run_tool_loop`).
+    Empty input renders to `""` so a tool-free round leaves `build_turn_messages`'s
+    `action_context` block out entirely, matching existing (no action_results) behavior."""
+    if not prior_tool_results:
+        return ""
+    rendered = "\n".join(str(r.content) for r in prior_tool_results if getattr(r, "content", ""))
+    if not rendered:
+        return ""
+    return (
+        "Grounding context fetched for this turn (tool results) — use it if relevant, do not "
+        "narrate that it was fetched:\n" + rendered
+    )
+
+
+def _make_build_messages_fn(
+    *, system_prompt: str, summary: str, tail: list[dict], extra_context: str = ""
+) -> Callable[[list[dict], list], list[dict]]:
+    """Adapt `context.build_turn_messages` (+ the salvaged action-context rendering pattern
+    from `responder._action_context_str`) to the `build_messages(folded_inputs,
+    prior_tool_results)` shape `tool_loop.run_tool_loop` calls every round (spec C7).
+
+    `system_prompt`/`summary`/`tail` are the turn's base context — captured once at loop
+    entry (D1: the caller already resolved these once via `deps.read_summary`/`deps.read_tail`
+    before starting the loop, exactly as the legacy responder path does today). Each round
+    then layers on top of that fixed base:
+      - `folded_inputs`: the accumulated `fold_new_messages()` output so far this turn (each
+        entry `{"id","ts","content"}` per `coalesce.coalesce_pending`'s output shape) —
+        appended as additional user-role tail turns, since `_make_fold_new_messages` only ever
+        returns user-role rows.
+      - `prior_tool_results`: read-tool observations gathered so far this turn, folded into
+        one `action_context` string via `_tool_results_context_str` (mirrors the
+        `action_results` path `responder.respond` already uses) rather than replayed as
+        wire-level tool-role messages.
+
+    `extra_context` (optional, spec C8): a STATIC grounding string resolved once before the
+    loop starts (e.g. the wake lane's `screen_recent` prefetch for the `screen_watch` lane,
+    rendered via `responder._action_context_str` — the same one-shot prefetch
+    `v2_responder.respond`'s old `action_results` kwarg used to carry) — unlike
+    `prior_tool_results`, it does not grow round-to-round. When both are non-empty they are
+    joined with a blank line; default `""` leaves chat-lane callers byte-identical to before
+    this parameter existed.
+
+    Called fresh every round (`build_messages(folded, prior_results)`, not incrementally) — it
+    is a pure function of its two arguments plus the closed-over base context, so a retried
+    round reproduces byte-identical messages for the same inputs.
+    """
+
+    def build_messages(folded_inputs: list[dict], prior_tool_results: list) -> list[dict]:
+        extra_tail = [
+            {"role": "user", "content": m.get("content", "")} for m in folded_inputs
+        ]
+        parts = [p for p in (extra_context, _tool_results_context_str(prior_tool_results)) if p]
+        return context.build_turn_messages(
+            system_prompt=system_prompt,
+            summary=summary,
+            tail=tail + extra_tail,
+            action_context="\n\n".join(parts),
+        )
+
+    return build_messages
+
+
+def _write_tool_effect_payload(tc) -> tuple[str, dict]:
+    """Map a WRITE_ACTIONS tool_call to its PR A `(effect_type, payload)` (spec C6). ONE
+    definition shared by every lane's `enqueue_write_effect` closure (`process_job`'s chat
+    branch — Task 7 — and `_run_wake` — Task 8) so the write-tool -> effect_type mapping never
+    drifts between lanes. `cap_registry.WRITE_ACTIONS` is the closed set
+    `executor.dispatch_tool_calls` ever routes here — a new write capability shipping without a
+    mapping below must fail loudly, not silently drop the write."""
+    if tc.name == "memory_write":
+        return "memory", {"actions": tc.args.get("actions")}
+    if tc.name == "identity_patch":
+        return "identity", {"patch": tc.args.get("patch")}
+    if tc.name in ("schedule_wake", "cancel_wake"):
+        return "schedule", {"op": tc.name, **tc.args}
+    raise ValueError(f"no effect mapping for write tool {tc.name!r}")
 
 
 def _write_encrypted_reply(store, text: str) -> dict | None:
@@ -525,26 +699,36 @@ async def _run_wake(
     enclave_sem: "asyncio.Semaphore", claimed_by: str,
     tm: "TurnMetrics | None" = None,
 ) -> str:
-    """wake-lane（heartbeat/scheduled/manual_wake）turn：让伴侣主动开口，而不是回答用户
-    刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
+    """wake-lane（heartbeat/scheduled/manual_wake/screen_watch）turn：让伴侣主动开口，而不是
+    回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
     一体、自己的 try/except：这是后台/主动发起的 job，provider 解析失败或任何未预期异常
     都静默 `mark_failed`，绝不 `_surface_terminal_error`、绝不写占位气泡。
 
-    跟 `_run_compaction` 的关键区别：压缩从不产出用户可见内容，wake 恰恰相反——目的就是
-    让模型主动写一条聊天气泡。区分两种"没写成"：
-    - "weak wake sleeps"（弱唤醒睡回去）：`v2_responder.respond` 抛
-      `ResponderError("empty_reply")`（模型选择保持沉默）或
-      `ResponderError("no_user_messages")`（tail+nudge 退化到没有非 system 轮次，理论上
-      不会发生——nudge 本身就是一条 user 消息——但同样按"无话可说"处理，保险）。这两种
-      都不是失败：`mark_completed`，零气泡，不弹 error。
-    - 真 provider 错误（其他任何 `ResponderError`，如 402/enclave 瞬时故障）：真失败，
-      `mark_failed`，同样静默（不弹用户可见 error chip——背景 job，同 maintenance 的
-      隔离口径）。
+    D3 Task 8 (PR C spec C8)：跟 chat 分支（`process_job`，Task 7）一样跑同一个
+    `tool_loop.run_tool_loop`——不再有 wake 专属的 `v2_responder.respond` 调用、不再有
+    `ResponderError` 分支。`turn_authorization=True` 传给 `dispatch_tool_calls`（跟 chat
+    传的值一样，语义是 wake_trigger 而不是 user——两者都在 `provenance.turn_has_write_
+    authorization` 意义下"有资格授权写"）。跟 chat 分支的两点关键差异：
+    - 不要求非空用户消息：`wake_tail` 恒含一条固定的 `_WAKE_NUDGE`（user-role），
+      `build_messages` 因此永远至少有一条非 system 轮次——不需要（也不再有）旧
+      `ResponderError("no_user_messages")` 那种显式空 tail 报错分支。
+    - 空回复合法："weak wake sleeps"（弱唤醒睡回去）：`_on_reply` 对空文本（无论
+      intermediate 还是 terminal）直接 no-op，不入队 reply effect、不报错——跟 chat 分支
+      "终态空文本 = no-filler 失败"的语义**相反**。循环正常跑完（`run_tool_loop` 不抛异常）
+      即视为成功，`mark_completed`，只是没写出气泡。
 
-    prompt 组装：读 summary+tail（同 chat 路径的 D1 读法），追加一条固定的
-    `_WAKE_NUDGE`（as a user-role turn，让 `context.build_turn_messages`/
-    `responder.respond` 的"至少一条非 system 消息"不变量恒真，即使 tail 本身是空的）。
-    `system_prompt=_WAKE_SYSTEM_PROMPT` 覆盖聊天默认提示，明确告诉模型这是主动时刻。
+    真 provider 错误（`chat_completion_async` 抛出的任何异常）：静默 `mark_failed`，同样
+    不弹用户可见 error chip——背景 job，同 maintenance 的隔离口径。402/401/403 一类
+    "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown（D3 Task 7），
+    让 scheduler 的 `due_heartbeat_users` 停止对一把修不好的钥匙反复重试。
+
+    prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）+ 固定的 `_WAKE_NUDGE`。
+    `system_prompt`：`_SCREEN_WATCH_SYSTEM_PROMPT`（screen_watch lane）或
+    `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent` 预取
+    结果通过 `_make_build_messages_fn` 的 `extra_context` 参数（复用
+    `v2_responder._action_context_str` 的渲染）注入——它是回合开始时取一次的静态
+    grounding，不随 tool-loop 轮次增长，跟 `prior_tool_results`（每轮动态积累的工具
+    观测）是两回事。
     """
     try:
         store = core_store.get_store(user_id)
@@ -574,6 +758,14 @@ async def _run_wake(
             tail = await asyncio.to_thread(
                 _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images)
         wake_tail = list(tail) + [{"role": "user", "content": _WAKE_NUDGE}]
+
+        # Minted ONCE, unconditionally: cheap HMAC signing (not a decrypt — see
+        # TurnDeps.mint_enclave_token's docstring), used both by the screen_watch
+        # prefetch below and by every capability the tool loop's dispatcher may
+        # invoke this turn (any wake lane can now read/write through the same
+        # catalog chat uses, not just screen_watch's screen_recent prefetch).
+        token = deps.mint_enclave_token(user_id)
+
         # screen_watch lane grounds on recent shared-screen frames (Task 3). Fetch
         # ONLY screen_recent — NOT perception_snapshot: the resident explicitly sets
         # perception_digest=None for screen-watch jobs (chat_resident_consumer.py:6611).
@@ -587,47 +779,76 @@ async def _run_wake(
         # call — _cap_data holds the semaphore for its own turn.
         screen_results = None
         if lane == "screen_watch":
-            token = deps.mint_enclave_token(user_id)
             data = await _cap_data(
                 store, "screen_recent", api_key=None, runtime_token=token,
                 enclave_sem=enclave_sem)
             # _fold_action_results caps each action at _PER_ACTION_CHAR_CAP=2000 chars
             # (the multimodal round's anti-poisoning cap); captions fit.
             screen_results = {"screen_recent": [{"ok": True, "data": data}]}
-        # spec B5: usage_out mirrors the chat-lane pattern in `process_job` — respond()
-        # fills this in-place right after a real provider call succeeds (even an
-        # empty_reply is a real, billed call; only no_user_messages short-circuits
-        # BEFORE any call is made, so usage_out stays {} in that one case).
-        _usage: dict = {}
+
+        gen = await asyncio.to_thread(db.get_runtime_generation, user_id)  # pinned once for every effect this turn
+        ordinal = itertools.count()
+
+        def _enqueue_write_effect(tc) -> None:
+            effect_type, payload = _write_tool_effect_payload(tc)
+            v2_effect_outbox.enqueue_effect(
+                job_id=job_id, user_id=user_id, effect_type=effect_type,
+                ordinal=next(ordinal), expected_generation=gen, payload=payload)
+
+        async def _before_write() -> None:
+            await _fence_wake_effect("memory/identity/schedule write")
+
+        async def _dispatch_tools(tool_calls):
+            await _fence_wake_effect("tool dispatch")
+            return await v2_executor.dispatch_tool_calls(
+                tool_calls, store=store, api_key=None, runtime_token=token,
+                enclave_sem=enclave_sem, turn_authorization=True,  # wake_trigger authorizes writes
+                enqueue_write_effect=_enqueue_write_effect, before_write=_before_write)
+
+        async def _on_reply(text: str, *, final: bool) -> None:
+            text = str(text or "").strip()
+            if not text:
+                # Silence is a legitimate wake outcome — both mid-loop (an empty
+                # `reply{}` call) and terminal ("weak wake sleeps"): unlike the chat
+                # lane, an empty terminal text is NOT a failure here, so this is a
+                # plain no-op, never a raise.
+                return
+            v2_effect_outbox.enqueue_effect(
+                job_id=job_id, user_id=user_id, effect_type="reply",
+                ordinal=next(ordinal), expected_generation=gen, payload={"text": text})
+            # C6: drain immediately so an intermediate bubble is visible mid-loop.
+            # Offloaded — the reply sink's enclave envelope round-trip must not
+            # block the event loop thread (same reasoning as the chat `_on_reply`
+            # below and the already-fixed per-round fold offload).
+            if deps.apply_pending_effects is not None:
+                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+
+        def _add_usage(usage) -> None:
+            if tm is not None:
+                tm.add_call(usage)
+
+        # Seeded to "now" (turn start), not the turn's own tail read — wake_tail's
+        # historical rows are already baked into the closed-over `tail` above;
+        # fold_new_messages's only job is picking up messages that arrive AFTER
+        # this point, mid-loop (e.g. the user starts typing while the wake turn is
+        # composing).
+        cursor_box = {"ts": time.time()}
+        fold_new_messages = _make_fold_new_messages(user_id, deps, cursor_box, enclave_sem=enclave_sem)
+        build_messages = _make_build_messages_fn(
+            system_prompt=(_SCREEN_WATCH_SYSTEM_PROMPT if lane == "screen_watch"
+                           else _WAKE_SYSTEM_PROMPT),
+            summary=summary, tail=wake_tail,
+            extra_context=v2_responder._action_context_str(screen_results) if screen_results else "")
+
+        await _fence_wake_effect("wake turn")
         try:
-            reply = await v2_responder.respond(
-                provider_config=provider_config, summary=summary, tail=wake_tail,
-                action_results=screen_results,
-                system_prompt=(_SCREEN_WATCH_SYSTEM_PROMPT if lane == "screen_watch"
-                               else _WAKE_SYSTEM_PROMPT),
-                usage_out=_usage)
-        except v2_responder.ResponderError as e:
-            msg = str(e)
-            if "no_user_messages" in msg:
-                # Degenerate prompt with zero non-system turns — respond() bails out
-                # BEFORE the provider call, so no model call was made at all.
-                await asyncio.to_thread(
-                    jobs_store.mark_completed, job_id, claimed_by=claimed_by)
-                if tm is not None:
-                    tm.flush(failed=False, status="ok")
-                return "completed"
-            if "empty_reply" in msg:
-                # Weak wake sleeps: the model chose silence after a REAL provider call
-                # (usage_out was already filled by respond() before this was raised) —
-                # this is a SUCCESSFUL wake, not a failure. No bubble, no error surface.
-                if tm is not None:
-                    tm.add_call(_usage)
-                await asyncio.to_thread(
-                    jobs_store.mark_completed, job_id, claimed_by=claimed_by)
-                if tm is not None:
-                    tm.flush(failed=False, status="ok")
-                return "completed"
-            if e.kind == "provider_config":
+            await v2_tool_loop.run_tool_loop(
+                provider_config=provider_config, build_messages=build_messages,
+                dispatch_tools=_dispatch_tools, on_reply=_on_reply,
+                fold_new_messages=fold_new_messages, add_usage=_add_usage,
+                max_calls=_TURN_MAX_LLM_CALLS)
+        except Exception as e:  # noqa: BLE001 — classify below, then let it fall to the outer silent mark_failed
+            if provider_client.classify_provider_error(e) == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
                 # BEFORE the silent mark_failed below, so the scheduler stops hammering
                 # this key every heartbeat interval (Task 1's due_heartbeat_users query
@@ -636,19 +857,20 @@ async def _run_wake(
                 await asyncio.to_thread(
                     jobs_store.upsert_wake_schedule, user_id,
                     payment_cooldown_until=time.time() + _WAKE_COOLDOWN_SEC)
-            # Any other ResponderError is a genuine provider_call_failed — a real call
-            # was attempted (and failed), so it still counts, just with no usage data.
-            if tm is not None:
-                tm.add_call(None)
             raise
-        if tm is not None:
-            tm.add_call(_usage)
-        await _fence_wake_effect("wake reply")
-        row = await asyncio.to_thread(_write_encrypted_reply, store, reply)
-        if row is None:
-            raise RuntimeError("reply_encryption_failed")
+
         await asyncio.to_thread(
             jobs_store.mark_completed, job_id, claimed_by=claimed_by)
+        # End-of-turn drain (mirrors process_job's chat-branch finalize): a write
+        # tool_call in the LAST round has no subsequent on_reply to trigger a drain,
+        # so flush whatever's still pending. Best-effort — the job is already
+        # durably completed by this point, so a drain failure must not flip it to
+        # failed (same reasoning as the chat-lane end-of-turn drain).
+        if deps.apply_pending_effects is not None:
+            try:
+                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+            except Exception as e:  # noqa: BLE001 — see comment above
+                log.warning("[v2.worker] wake apply_pending_effects failed user=%s: %s", user_id, e)
         if tm is not None:
             tm.flush(failed=False, status="ok")
         return "completed"
@@ -808,15 +1030,21 @@ async def process_job(
     runtime_token: str,
     enclave_sem: "asyncio.Semaphore" = None,
     read_parallelism: int = None,
-    replan_budget: int = v2_inval.DEFAULT_REPLAN_BUDGET,
     tm: "TurnMetrics | None" = None,
 ) -> str:
-    """一回合：coalesce → planner → executor → (安全点 replan，预算内) → responder（spec §7/§8）。
+    """一回合：coalesce → `tool_loop.run_tool_loop`（provider-native 统一工具循环）→ 落
+    加密回复（chat）/沉默是合法结果（wake，见 `_run_wake`）。PR C9b 前是 coalesce → planner
+    → executor → (安全点 replan，预算内) → responder；Task 7 把两层 while/replan +
+    json_planner + 强制 responder round-trip 整体换成了这一个循环调用，`replan_budget`
+    形参（旧 `invalidation.py` REPLAN 预算）随之一并摘掉——本函数体内已无处读它。
 
     provider_config/is_official 由调用方（`_run_turn`）在回合开始前解析好、原样传入并复用
     全程——本函数内绝不再调 `deps.resolve_provider`（single-decrypt-per-turn 不变量）。
-    api_key/runtime_token 是 enclave-auth 的两套凭证，只喂 capability 侧（预取 + executor +
-    replan 时的 read_messages），从不流向 planner/responder 的 LLM 调用。
+    `is_official` 本身自 PR C9b 起不再驱动任何分支（Global Constraints "no behavior
+    tiering"——每个模型走同一套工具目录/同一个循环），留在签名里只是为了不破坏既有
+    调用点/测试；见 `tests/test_v2_no_dispatch_tiering.py` 锁定这条不变量。
+    api_key/runtime_token 是 enclave-auth 的两套凭证，只喂 capability 侧（预取 + executor
+    的 tool_call 派发），从不流向 provider 的 LLM 调用。
 
     返回终态字符串（"completed"/"failed"），任一步失败 → mark_failed（绝不写占位气泡）。
 
@@ -930,155 +1158,137 @@ async def process_job(
             tm.flush(failed=False, status="ok")
             return "completed"
 
-        replan_count = 0
-        # 跨两层循环共享的 LLM 调用计数（见 _TURN_MAX_LLM_CALLS）。外层 replan 不重置它。
-        llm_calls = 0
-        loop_res = v2_agent_loop.LoopResult({}, {}, None, 0, v2_agent_loop.NO_ACTIONS)
+        # —— Task 7 (spec C6 + C9a): unified provider-native tool loop ——
+        # Replaces the old two-layer while/replan (invalidation.py) + json_planner
+        # (planner.py's plan/rule_plan/official_plan + agent_loop.py's run_turn)
+        # + forced responder.respond pipeline with ONE `tool_loop.run_tool_loop`
+        # call. worker.py no longer imports planner.py/agent_loop.py at all (PR
+        # C9b); those modules' old surface still exists only for
+        # scripts/loadtest/compare_tokens.py's D4 rollback gate and a couple of
+        # wire-shape regression tests — see tests/test_v2_no_dispatch_tiering.py.
+        # No is_official branch (Global
+        # Constraints "no behavior tiering") — every model drives the same
+        # catalog through the same loop. Writes never run inline; they become
+        # PR A generation-fenced effects (enqueued here, drained by
+        # `deps.apply_pending_effects`). `reply` (intermediate) and terminal
+        # plain text both flow through `on_reply` -> a "reply" effect, drained
+        # immediately for mid-loop visibility (C6) instead of waiting for a
+        # forced responder round-trip.
+        gen = await asyncio.to_thread(db.get_runtime_generation, user_id)  # pinned once for every effect this turn
+        ordinal = itertools.count()
+        action_digest: dict[str, dict] = {}
 
-        while True:
-            # 便宜预取（无 LLM，enclave-auth 凭证）：memory index + 感知摘要；确定性 digest（无 LLM，§7.2）。
-            memory_index = await _cap_data(
-                store, "memory_index", api_key=api_key, runtime_token=runtime_token,
-                enclave_sem=enclave_sem)
-            perception_summary = await _cap_data(
-                store, "perception_snapshot", api_key=api_key, runtime_token=runtime_token,
-                enclave_sem=enclave_sem)
-            digest = {"messages": [{"content": m["content"][:400]} for m in coalesced[-6:]]}
+        # D1 base context (summary + tail), read once at loop entry — same
+        # reader pattern the old responder call site used. deps.read_summary/
+        # read_tail being None (older/minimal test deps) degrades to empty
+        # summary/tail, exactly as before.
+        if deps.read_summary is not None and deps.read_tail is not None:
+            async with enclave_sem:
+                summary, watermark, _ver = await asyncio.to_thread(deps.read_summary, user_id)
+                tail = await asyncio.to_thread(deps.read_tail, user_id, watermark, _TAIL_HARD_CAP)
+                tail = await asyncio.to_thread(
+                    _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images)
+        else:
+            summary, tail = "", []
 
-            async def _decide(round_idx: int, prior: dict) -> v2_agent_loop.Decision:
-                """json_planner 后端（spec §5 默认）：跑用户 BYOK 的结构化 JSON planner。
+        def _enqueue_write_effect(tc) -> None:
+            """WRITE tool_call -> PR A effect (spec C6). Mapping lives in the shared
+            `_write_tool_effect_payload` (also used by `_run_wake` — Task 8)."""
+            effect_type, payload = _write_tool_effect_payload(tc)
+            v2_effect_outbox.enqueue_effect(
+                job_id=job_id, user_id=user_id, effect_type=effect_type,
+                ordinal=next(ordinal), expected_generation=gen, payload=payload)
 
-                预算耗尽 → 立刻收手（wants_reply=True），把最后一个名额留给 responder。
-                `final_text` 恒为 None —— 散文由 responder 写（spec §4）。
-                """
-                nonlocal llm_calls
-                await _renew_lease()
-                if llm_calls >= _TURN_MAX_LLM_CALLS - 1:
-                    return v2_agent_loop.Decision(actions=[], wants_reply=True)
-                llm_calls += 1
-                steps = await v2_planner.plan(
-                    store,
-                    provider_config=provider_config, is_official=is_official,
-                    coalesced_messages=coalesced, digest=digest, memory_index=memory_index,
-                    perception_summary=perception_summary, runtime_state=runtime_state,
-                    lane=lane, reason=str(job.get("reason") or ""),
-                    prior_action_results=prior or None)
-                if is_official:
-                    # rule_plan (is_official=False) is deterministic/zero-LLM (spec §7.3) —
-                    # only official_plan actually hits a provider, so only that counts as
-                    # a model call for the whole-turn metric (spec B5).
-                    tm.add_call(None)
-                return v2_agent_loop.Decision(
-                    actions=[s for s in steps if s["type"] != "final_response"],
-                    wants_reply=any(s["type"] == "final_response" for s in steps))
-
-            async def _run_tools(actions: list[dict]) -> dict:
-                """Persist trajectory shape, fence ownership, then drain tools."""
-                # A planner call happens between the preceding renewal and this
-                # side-effect boundary. Fence again before any capability executes,
-                # especially the serialized write actions.
-                await _ensure_runtime_mode()
-                await _renew_lease()
-                action_ids = await asyncio.to_thread(
-                    jobs_store.add_actions, job_id, user_id,
-                    [{"type": s["type"], "payload": s["payload"]} for s in actions])
-                for s, aid in zip(actions, action_ids):
-                    s["_action_id"] = aid
-
-                async def _before_write() -> None:
-                    await _ensure_runtime_mode()
-                    await _renew_lease()
-
-                return await v2_executor.execute_plan(
-                    store, job_id, api_key=api_key, runtime_token=runtime_token,
-                    plan=actions, read_parallelism=read_parallelism,
-                    enclave_sem=enclave_sem, before_write=_before_write)
-
-            loop_res = await v2_agent_loop.run_turn(
-                decide=_decide, run_tools=_run_tools, max_rounds=_LOOP_MAX_ROUNDS)
-
-            # 安全点（before_final_response）：跨进程/跨 worker 写入的新消息只活在 DB 里，
-            # 本进程内存态的 store.chat_messages 未必看得到——先 reload 再判定，避免漏判。
-            # evaluate 只看 role/ts（密文行本身不含明文，无需解密即可判定「有没有新用户消息」）。
-            refresh_chat = getattr(store, "reload_chat_strict", None)
-            if not callable(refresh_chat):
-                refresh_chat = store.reload
-            await asyncio.to_thread(refresh_chat)
-            decision = v2_inval.evaluate(
-                store.chat_messages, safe_point="before_final_response",
-                coalesced_cursor_ts=cursor, replan_count=replan_count, replan_budget=replan_budget)
-            if decision == v2_inval.REPLAN and llm_calls < _TURN_MAX_LLM_CALLS - 1:
-                await asyncio.to_thread(v2_inval.invalidate, job_id, replan_job_id=job_id)
-                replan_count += 1
-                generation = await asyncio.to_thread(
-                    jobs_store.get_input_generation, job_id, claimed_by=claimed_by)
-                if generation is None:
-                    raise LostJobLease("job ownership lost before replan read")
-                observed_generation = generation
-                coalesced, cursor = await _coalesce_inputs(deps, user_id, since, enclave_sem=enclave_sem)
-                continue
-            break
-
-        action_state = {"action_results": loop_res.action_results,
-                        "action_digest": loop_res.action_digest}
-        # BUG-4（矩阵 §E）：chat lane **恒**回复。「planner 没要 final_response」在单轮形状下
-        # 被 worker 误读成「这回合不用回复」，可信模型漏写时用户消息被静默吞掉、零气泡。
-        # 循环下同一个信号的含义是「想再查一轮」；轮数/预算用尽就用手上的结果强制收口。
-        # 这不是占位气泡——responder 仍然产出真正的 model-authored 文本（no-filler 不变量）。
-        wants_reply = lane == "chat" or loop_res.stop_reason == v2_agent_loop.WANTS_REPLY
-        if wants_reply:
+        async def _before_write() -> None:
+            # Same runtime-mode/lease fence execute_plan's before_write used —
+            # called before each serialized write inside dispatch_tool_calls.
             await _ensure_runtime_mode()
             await _renew_lease()
-            await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
-            # D1：responder 现在吃 summary（早前对话摘要）+ tail（双角色逐字近期窗口），
-            # 不再是"仅合并的未回复 user 消息"。deps.read_summary/read_tail 为 None 时
-            # （既有单测不装配这两样、只打桩 v2_responder.respond）退化成空摘要+空 tail——
-            # 不影响那些测试的断言（它们看的是 respond 被打桩后的返回值/调用与否）。
-            if deps.read_summary is not None and deps.read_tail is not None:
-                async with enclave_sem:
-                    summary, watermark, _ver = await asyncio.to_thread(deps.read_summary, user_id)
-                    tail = await asyncio.to_thread(deps.read_tail, user_id, watermark, _TAIL_HARD_CAP)
-                    tail = await asyncio.to_thread(
-                        _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images)
-            else:
-                summary, tail = "", []
-            # responder 走 BYOK provider_config；ResponderError（空回复/provider 错）交给下面
-            # 统一的 except 兜底 mark_failed——no-filler 铁律：绝不写占位气泡。v2_responder.respond
-            # 现在原生 async，直接 await，不再经 to_thread 桥线程池（同上，治并发天花板）。
-            # spec B5：usage_out 是纯出参（responder 保持 hosted-free/无 job 上下文），成功
-            # 返回后由 worker 折进本回合的 `tm`（TurnMetrics whole-turn 累加器），终态时
-            # 一次性 flush 成一行 v2_turn_metrics（旧的逐次 record_turn_metric INSERT 已移除
-            # ——一个 job 现在恰好一行，见 jobs_store.record_whole_turn_metric）。
-            if loop_res.final_text:
-                # 原生 tool-calling 后端在收手时自带回复（spec §3.1）。默认的 json_planner
-                # 后端恒为 None，所以今天这条分支不会走到——留着，是为了别在接原生后端时
-                # 白丢一次已经生成好的文本、再花一次 token 让 responder 重写。
-                reply = loop_res.final_text
-            else:
-                _usage: dict = {}
-                reply = await v2_responder.respond(
-                    provider_config=provider_config, summary=summary, tail=tail,
-                    action_results=action_state["action_results"], usage_out=_usage)
-                tm.add_call(_usage)
+
+        async def _dispatch_tools(tool_calls):
+            # Fence once per round before any capability executes (mirrors the
+            # old _run_tools's renewal ahead of the read burst); writes get a
+            # second, per-write fence via before_write above.
             await _ensure_runtime_mode()
             await _renew_lease()
-            reply_row = await asyncio.to_thread(_write_encrypted_reply, store, reply)
-            if reply_row is None:
-                raise RuntimeError("reply_encryption_failed")
-            # 超预算 → best-effort 入队一个 maintenance lane 的压缩 job（不阻塞、不拖垮
-            # 本回合——enqueue_job 本身命中 single-flight 会 coalesce，失败只记日志）。
-            if tail and context.needs_compaction(tail, budget=_TAIL_BUDGET):
-                try:
-                    await asyncio.to_thread(jobs_store.enqueue_job, user_id, "maintenance", reason="compaction")
-                except Exception as e:  # noqa: BLE001 — 压缩入队失败绝不能拖垮已经写成的这条回复
-                    log.warning("[v2.worker] enqueue compaction failed for %s: %s", user_id, e)
+            for tc in tool_calls:
+                action_digest.setdefault(tc.name, {"ok": 0, "count": 0})["count"] += 1
+            results = await v2_executor.dispatch_tool_calls(
+                tool_calls, store=store, api_key=api_key, runtime_token=runtime_token,
+                enclave_sem=enclave_sem, turn_authorization=True,
+                enqueue_write_effect=_enqueue_write_effect, before_write=_before_write)
+            for tc, r in zip(tool_calls, results):
+                if not r.content.startswith("error"):
+                    action_digest[tc.name]["ok"] += 1
+            return results
 
-        # last_replied_ts 单调前进：cursor==0.0（本轮没折入新消息，如纯 sleep 的 heartbeat）
-        # 时绝不回退已有游标——否则下一回合会把早就答过的旧消息重新折入。
-        new_last_replied = cursor if cursor > since else since
+        async def _on_reply(text: str, *, final: bool) -> None:
+            text = str(text or "").strip()
+            if final and not text:
+                # BUG-4 no-filler: chat lane always replies — an empty terminal
+                # text is a model/provider failure here (unlike wake, where
+                # silence is legitimate), so this becomes a mark_failed via the
+                # outer except below, never a placeholder bubble.
+                raise v2_responder.ResponderError("empty_reply")
+            if not text:
+                return  # empty intermediate reply{} call: no bubble, not an error
+            v2_effect_outbox.enqueue_effect(
+                job_id=job_id, user_id=user_id, effect_type="reply",
+                ordinal=next(ordinal), expected_generation=gen, payload={"text": text})
+            # C6: drain immediately so an intermediate bubble is visible mid-loop,
+            # not only at end-of-turn. Offloaded — the reply sink's
+            # `_write_encrypted_reply` does an enclave envelope round-trip and must
+            # not run synchronously on the event-loop thread (the old chat path
+            # offloaded this same write via `asyncio.to_thread`; mid-loop drain
+            # dropped that until now — same failure class as the per-round fold
+            # offload above).
+            if deps.apply_pending_effects is not None:
+                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+
+        cursor_box = {"ts": cursor}  # seeded to what the turn's own coalesce already saw
+        # Pass THIS turn's enclave_sem through explicitly (not the closure's module-level
+        # default) — process_job may have been called with an injected/test semaphore
+        # (e.g. tests/test_v2_worker.py's _CountingSemaphore), and the per-round fold must
+        # share the exact same gate the rest of this turn's enclave-bound calls use.
+        fold_new_messages = _make_fold_new_messages(user_id, deps, cursor_box, enclave_sem=enclave_sem)
+        build_messages = _make_build_messages_fn(
+            system_prompt=v2_responder._SYSTEM_PROMPT, summary=summary, tail=tail)
+
+        await _ensure_runtime_mode()
+        await _renew_lease()
+        await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
+        outcome = await v2_tool_loop.run_tool_loop(
+            provider_config=provider_config, build_messages=build_messages,
+            dispatch_tools=_dispatch_tools, on_reply=_on_reply,
+            fold_new_messages=fold_new_messages, add_usage=tm.add_call,
+            max_calls=_TURN_MAX_LLM_CALLS)
+        if not outcome.replied_intermediate and not (outcome.final_text or "").strip():
+            # BUG-4 no-filler class: the loop returned WITHOUT ever producing a
+            # bubble — budget_exhausted (max_calls reached with no terminal
+            # final_text call), or a misbehaving last round that returns
+            # tool_calls despite tools=None (so `_on_reply`'s own "final and not
+            # text" guard above never fires because pr.tool_calls was truthy and
+            # on_reply was never called with final=True at all). Chat always
+            # replies — silently completing here would drop the user's message
+            # exactly like the already-fixed BUG-4. Raise the same signal
+            # `_on_reply` uses so it falls into the outer except below:
+            # mark_failed + terminal error status + tm.flush(failed=True).
+            raise v2_responder.ResponderError("empty_reply")
+
+        # 超预算 → best-effort 入队一个 maintenance lane 的压缩 job（不阻塞、不拖垮
+        # 本回合——enqueue_job 本身命中 single-flight 会 coalesce，失败只记日志）。
+        if tail and context.needs_compaction(tail, budget=_TAIL_BUDGET):
+            try:
+                await asyncio.to_thread(jobs_store.enqueue_job, user_id, "maintenance", reason="compaction")
+            except Exception as e:  # noqa: BLE001 — 压缩入队失败绝不能拖垮已经写成的这条回复
+                log.warning("[v2.worker] enqueue compaction failed for %s: %s", user_id, e)
+
+        # last_replied_ts 单调前进：cursor_box["ts"] 恒 >= 本轮初始 coalesce 的 cursor
+        # （fold_new_messages 只前进不回退）；since 本身是上一次回复的水位——两者取大。
+        new_last_replied = cursor_box["ts"] if cursor_box["ts"] > since else since
         await asyncio.to_thread(
             jobs_store.upsert_runtime_state, user_id,
-            {"last_replied_ts": new_last_replied, "action_digest": action_state["action_digest"]})
+            {"last_replied_ts": new_last_replied, "action_digest": action_digest})
         await _ensure_runtime_mode()
         completed, successor_id = await asyncio.to_thread(
             jobs_store.finish_chat_job,

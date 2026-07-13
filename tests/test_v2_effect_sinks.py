@@ -137,3 +137,125 @@ def test_production_deps_apply_pending_effects_wired_and_safe_with_empty_outbox(
     deps = serve_worker.build_production_deps()
     assert deps.apply_pending_effects is not None
     assert deps.apply_pending_effects("u_sink_wired") == {"applied": 0, "discarded": 0}
+
+
+def _sink_applied_row_exists(effect_id: str) -> bool:
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM v2_effect_sink_applied WHERE effect_id=%s", (effect_id,)
+        ).fetchone()
+    return row is not None
+
+
+# ------------------------------------------------------------------
+# BUG-1: reply-sink must not silently swallow an envelope-build failure
+# (v2_worker._write_encrypted_reply returns None, does not raise, on
+# failure — see its docstring). Restores the deleted
+# test_reply_envelope_failure_is_terminal_not_success invariant on the
+# new PR A effect-sink path.
+# ------------------------------------------------------------------
+
+def test_sink_reply_raises_and_releases_claim_when_envelope_build_fails(pg_clean, monkeypatch):
+    seed_user("u_sink_reply_fail")
+    monkeypatch.setattr(serve_worker.v2_worker, "_write_encrypted_reply", lambda store, text: None)
+
+    dispatch = serve_worker.build_production_effect_dispatch("u_sink_reply_fail")
+    eid = "job_reply_fail:reply:0"
+    with pytest.raises(RuntimeError, match="reply envelope build failed"):
+        dispatch("reply", {"effect_id": eid, "text": "hello"})
+
+    # The claim must be released -- no surviving row -- so a replay (the outbox
+    # applier re-driving this pending effect) can re-attempt the write instead
+    # of a permanently-orphaned claim silently no-oping forever.
+    assert not _sink_applied_row_exists(eid)
+
+
+def test_sink_reply_succeeds_and_keeps_claim_when_write_succeeds(pg_clean, monkeypatch):
+    seed_user("u_sink_reply_ok")
+    monkeypatch.setattr(
+        serve_worker.v2_worker, "_write_encrypted_reply", lambda store, text: {"id": "r1"})
+
+    dispatch = serve_worker.build_production_effect_dispatch("u_sink_reply_ok")
+    eid = "job_reply_ok:reply:0"
+    dispatch("reply", {"effect_id": eid, "text": "hello"})  # must not raise
+
+    assert _sink_applied_row_exists(eid)
+
+
+# ------------------------------------------------------------------
+# BUG-3: the `schedule` effect_type has two producers sharing one sink.
+# schedule_wake/cancel_wake write-tool-calls carry capability params
+# (at/tz/reason/wake_id) under payload["op"] and must route through
+# cap_registry.run_capability -- NOT jobs_store.upsert_wake_schedule,
+# whose kwargs (_SCHEDULE_PAYLOAD_KEYS) are an unrelated PR A/D
+# wake-timing-table shape that silently drops every capability param.
+# ------------------------------------------------------------------
+
+def test_sink_schedule_routes_schedule_wake_op_through_run_capability(pg_clean, monkeypatch):
+    seed_user("u_sink_sched_wake")
+    calls = []
+
+    def fake_run_capability(action_type, store, *, api_key=None, runtime_token=None, params=None):
+        calls.append((action_type, store.user_id, api_key, params))
+        from capabilities.types import ok
+        return ok(data={})
+
+    monkeypatch.setattr(serve_worker.cap_registry, "run_capability", fake_run_capability)
+    monkeypatch.setattr(
+        serve_worker.jobs_store, "upsert_wake_schedule",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not touch wake-timing table")))
+
+    dispatch = serve_worker.build_production_effect_dispatch("u_sink_sched_wake")
+    dispatch("schedule", {
+        "effect_id": "job_sw:schedule:0", "op": "schedule_wake",
+        "at": "2026-07-11T09:00:00Z", "tz": "Asia/Shanghai", "reason": "remind me",
+    })
+
+    assert len(calls) == 1
+    action_type, user_id, api_key, params = calls[0]
+    assert action_type == "schedule_wake"
+    assert user_id == "u_sink_sched_wake"
+    assert api_key is None
+    assert params == {
+        "at": "2026-07-11T09:00:00Z", "tz": "Asia/Shanghai", "reason": "remind me",
+    }
+
+
+def test_sink_schedule_routes_cancel_wake_op_through_run_capability(pg_clean, monkeypatch):
+    seed_user("u_sink_sched_cancel")
+    calls = []
+
+    def fake_run_capability(action_type, store, *, api_key=None, runtime_token=None, params=None):
+        calls.append((action_type, params))
+        from capabilities.types import ok
+        return ok(data={})
+
+    monkeypatch.setattr(serve_worker.cap_registry, "run_capability", fake_run_capability)
+
+    dispatch = serve_worker.build_production_effect_dispatch("u_sink_sched_cancel")
+    dispatch("schedule", {
+        "effect_id": "job_cw:schedule:0", "op": "cancel_wake", "wake_id": "w1",
+    })
+
+    assert calls == [("cancel_wake", {"wake_id": "w1"})]
+
+
+def test_sink_schedule_without_op_still_upserts_wake_schedule(pg_clean, monkeypatch):
+    """PR A/D producers (_fire_scheduled_for_user/_tick_screen_watch_for_user) never
+    set payload["op"] -- their _SCHEDULE_PAYLOAD_KEYS-filtered upsert path must be
+    unchanged by the BUG-3 fix."""
+    seed_user("u_sink_sched_timing")
+    calls = []
+    monkeypatch.setattr(
+        serve_worker.jobs_store, "upsert_wake_schedule",
+        lambda user_id, **kwargs: calls.append((user_id, kwargs)))
+    monkeypatch.setattr(
+        serve_worker.cap_registry, "run_capability",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call run_capability")))
+
+    dispatch = serve_worker.build_production_effect_dispatch("u_sink_sched_timing")
+    dispatch("schedule", {
+        "effect_id": "job_timing:schedule:0", "next_heartbeat_at": 123.0,
+    })
+
+    assert calls == [("u_sink_sched_timing", {"next_heartbeat_at": 123.0})]
