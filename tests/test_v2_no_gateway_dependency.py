@@ -95,12 +95,22 @@ def test_v2_responder_reaches_the_users_upstream_not_the_gateway(monkeypatch, pr
 
     async def _async_post(self, url, **kw):
         seen.append(str(url))
+        # Body carries both the openai-compat shape ("choices") and the gemini
+        # shape ("candidates") so this single fixture covers every provider in
+        # _GATEWAY_PROVIDERS without a per-provider branch — each wire's parser
+        # only reads its own key and ignores the other.
         return httpx.Response(
-            200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}},
+            200,
+            json={"choices": [{"message": {"content": "ok"}}],
+                  "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+                  "usage": {}},
             request=httpx.Request("POST", url))
 
-    # gemini/anthropic bounce through anyio.to_thread -> the SYNC client;
-    # openrouter/openai_compatible take the native async transport. Patch both.
+    # anthropic/gemini/openai_compatible/openrouter all take the native async
+    # transport (PR B Task 7 removed the anyio.to_thread bridge for
+    # anthropic/gemini/openai-responses). The sync httpx.Client mock is kept
+    # as a belt-and-suspenders guard in case a wire ever regresses back to
+    # the thread bridge.
     monkeypatch.setattr(httpx.Client, "post", _sync_post)
     monkeypatch.setattr(httpx.AsyncClient, "post", _async_post)
 

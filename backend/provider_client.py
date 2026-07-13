@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
+
+if TYPE_CHECKING:
+    from provider_types import ToolSpec
 
 
 class ProviderError(Exception):
@@ -469,6 +473,142 @@ def _split_system_messages_gemini(
     return "\n\n".join(system_parts).strip(), provider_messages
 
 
+def _normalize_usage(provider: str, raw: dict | None) -> dict:
+    """Normalize a provider's raw usage blob to {prompt_tokens, completion_tokens,
+    total_tokens} (spec B4). OpenAI/compat/Responses already use those key names;
+    Anthropic uses input/output_tokens; Gemini uses promptTokenCount/
+    candidatesTokenCount/totalTokenCount. Missing -> None; total defaults to the
+    sum of prompt+completion when the provider omits an explicit total."""
+    raw = raw if isinstance(raw, dict) else {}
+    if provider == "anthropic":
+        pt = raw.get("input_tokens")
+        ct = raw.get("output_tokens")
+        tt = raw.get("total_tokens")
+    elif provider == "gemini":
+        pt = raw.get("promptTokenCount")
+        ct = raw.get("candidatesTokenCount")
+        tt = raw.get("totalTokenCount")
+    else:  # openai, openrouter, deepseek, openai_compatible, responses
+        pt = raw.get("prompt_tokens")
+        ct = raw.get("completion_tokens")
+        tt = raw.get("total_tokens")
+    if tt is None and (pt is not None or ct is not None):
+        tt = (pt or 0) + (ct or 0)
+    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt}
+
+
+def _parse_tool_args(raw) -> tuple[dict, str, bool]:
+    """Normalize a provider tool-call args payload to (dict, raw_str, ok).
+    OpenAI/Responses send a JSON *string*; Anthropic/Gemini send an object."""
+    if isinstance(raw, dict):
+        return raw, "", True
+    s = "" if raw is None else str(raw)
+    try:
+        parsed = json.loads(s) if s else {}
+        return (parsed if isinstance(parsed, dict) else {}), ("" if isinstance(parsed, dict) else s), isinstance(parsed, dict)
+    except (ValueError, TypeError):
+        return {}, s, False
+
+
+def _encode_tools_openai_chat(tools) -> list[dict]:
+    return [{"type": "function", "function": {
+        "name": t.name, "description": t.description, "parameters": t.parameters}} for t in tools]
+
+
+def _decode_tool_calls_openai_chat(body: dict) -> list[dict]:
+    try:
+        raw_calls = body["choices"][0]["message"].get("tool_calls") or []
+    except (KeyError, IndexError, TypeError):
+        return []
+    out = []
+    for c in raw_calls:
+        fn = c.get("function") or {}
+        args, args_raw, ok = _parse_tool_args(fn.get("arguments"))
+        out.append({"id": str(c.get("id") or ""), "name": str(fn.get("name") or ""),
+                    "args": args, "args_raw": args_raw, "args_ok": ok})
+    return out
+
+
+def _encode_tools_openai_responses(tools) -> list[dict]:
+    return [{"type": "function", "name": t.name, "description": t.description,
+             "parameters": t.parameters} for t in tools]
+
+
+def _decode_tool_calls_openai_responses(body: dict) -> list[dict]:
+    out = []
+    for item in (body.get("output") or []):
+        if item.get("type") != "function_call":
+            continue
+        args, args_raw, ok = _parse_tool_args(item.get("arguments"))
+        out.append({"id": str(item.get("call_id") or ""), "name": str(item.get("name") or ""),
+                    "args": args, "args_raw": args_raw, "args_ok": ok})
+    return out
+
+
+def _encode_tool_results_openai_chat(results) -> list[dict]:
+    return [{"role": "tool", "tool_call_id": r.call_id, "content": r.content} for r in results]
+
+
+def _encode_tool_results_openai_responses(results) -> list[dict]:
+    return [{"type": "function_call_output", "call_id": r.call_id, "output": r.content} for r in results]
+
+
+def _encode_tools_anthropic(tools) -> list[dict]:
+    return [{"name": t.name, "description": t.description, "input_schema": t.parameters}
+            for t in tools]
+
+
+def _decode_tool_calls_anthropic(body: dict) -> list[dict]:
+    out = []
+    for block in (body.get("content") or []):
+        if block.get("type") != "tool_use":
+            continue
+        args, args_raw, ok = _parse_tool_args(block.get("input"))
+        out.append({"id": str(block.get("id") or ""), "name": str(block.get("name") or ""),
+                    "args": args, "args_raw": args_raw, "args_ok": ok})
+    return out
+
+
+def _encode_tool_results_anthropic(results) -> list[dict]:
+    # Anthropic carries tool results as tool_result content blocks in ONE user turn.
+    return [{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": r.call_id, "content": r.content} for r in results]}]
+
+
+def _encode_tools_gemini(tools) -> list[dict]:
+    return [{"functionDeclarations": [
+        {"name": t.name, "description": t.description, "parameters": t.parameters} for t in tools]}]
+
+
+def _decode_tool_calls_gemini(body: dict) -> list[dict]:
+    out = []
+    try:
+        parts = body["candidates"][0]["content"]["parts"] or []
+    except (KeyError, IndexError, TypeError):
+        return []
+    idx = 0
+    for part in parts:
+        fc = part.get("functionCall")
+        if not isinstance(fc, dict):
+            continue
+        name = str(fc.get("name") or "")
+        args, args_raw, ok = _parse_tool_args(fc.get("args"))
+        out.append({"id": f"call_{idx}_{name}", "name": name,
+                    "args": args, "args_raw": args_raw, "args_ok": ok})
+        idx += 1
+    return out
+
+
+def _encode_tool_results_gemini(results, id_to_name: dict) -> list[dict]:
+    # Gemini keys functionResponse on the tool NAME (no id); resolve each result's
+    # synthetic call_id back to its name via the map the decoder's ids imply.
+    parts = []
+    for r in results:
+        name = id_to_name.get(r.call_id, r.call_id)
+        parts.append({"functionResponse": {"name": name, "response": {"content": r.content}}})
+    return [{"role": "user", "parts": parts}]
+
+
 def _extract_reply(body: dict[str, Any], *, required: bool = True) -> str:
     choices = body.get("choices")
     has_shape = isinstance(choices, list) and len(choices) > 0 and isinstance(choices[0], dict)
@@ -702,18 +842,22 @@ def _extract_openai_responses_output(body: dict[str, Any]) -> tuple[str, str]:
     return "\n".join(reply_parts).strip(), "\n\n".join(reasoning_parts).strip()
 
 
-def _chat_completion_openai_responses(
+# openai-responses 的 wire 编解码是 sync（_chat_completion_openai_responses）
+# 与 async（chat_completion_async）共用的单实现——同 openai-compat 段的分工
+# 方式：payload 构造（含 reasoning/response_format 处理）、响应解析都在下面
+# 两个纯函数里，两个调用方只各自保留 httpx sync/async 的 transport 差异。
+
+def _build_openai_responses_payload(
     *,
     model: str,
     base_url: str,
     key: str,
     messages: list[dict[str, Any]],
     max_tokens: int,
-    timeout: float,
     response_format: dict[str, Any] | None,
-    require_reply: bool = True,
     include_reasoning: bool = False,
-) -> dict[str, Any]:
+    tools: "list[ToolSpec] | None" = None,
+) -> tuple[dict[str, Any], str, dict[str, str]]:
     instructions, input_items = _openai_responses_input(messages)
     if response_format:
         json_instruction = _json_only_instruction(response_format)
@@ -729,14 +873,57 @@ def _chat_completion_openai_responses(
         payload["reasoning"] = {"effort": "medium", "summary": "concise"}
     if instructions:
         payload["instructions"] = instructions
+    if tools:
+        payload["tools"] = _encode_tools_openai_responses(tools)
+
+    url = f"{base_url.rstrip('/')}/responses"
+    headers = _headers(ProviderConfig("openai", model, key, base_url))
+    return payload, url, headers
+
+
+def _parse_openai_responses_body(
+    body: dict[str, Any], *, model: str, require_reply: bool,
+) -> dict[str, Any]:
+    reply, reasoning = _extract_openai_responses_output(body)
+    if require_reply and not reply:
+        raise ProviderError("provider response had no usable reply text")
+    return {
+        "reply": reply,
+        "reasoning": reasoning,
+        "usage": _normalize_usage("openai", body.get("usage")),
+        "raw_id": body.get("id", ""),
+        "stop_reason": str(
+            (body.get("incomplete_details") if isinstance(body.get("incomplete_details"), dict) else {}).get("reason")
+            or body.get("status")
+            or "",
+        ).strip(),
+        "provider": "openai",
+        "model": model,
+        "tool_calls": _decode_tool_calls_openai_responses(body),
+    }
+
+
+def _chat_completion_openai_responses(
+    *,
+    model: str,
+    base_url: str,
+    key: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    timeout: float,
+    response_format: dict[str, Any] | None,
+    require_reply: bool = True,
+    include_reasoning: bool = False,
+    tools: "list[ToolSpec] | None" = None,
+) -> dict[str, Any]:
+    payload, url, headers = _build_openai_responses_payload(
+        model=model, base_url=base_url, key=key, messages=messages,
+        max_tokens=max_tokens, response_format=response_format,
+        include_reasoning=include_reasoning, tools=tools,
+    )
 
     try:
-        resp = _http_client().post(
-            f"{base_url.rstrip('/')}/responses",
-            headers=_headers(ProviderConfig("openai", model, key, base_url)),
-            json=payload,
-            timeout=timeout,
-        )
+        resp = _http_client().post(url, headers=headers, json=payload, timeout=timeout)
     except httpx.HTTPError as e:
         raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
@@ -748,22 +935,7 @@ def _chat_completion_openai_responses(
         raise ProviderError("provider returned non-json response") from e
     if not isinstance(body, dict):
         raise ProviderError("provider returned non-object response")
-    reply, reasoning = _extract_openai_responses_output(body)
-    if require_reply and not reply:
-        raise ProviderError("provider response had no usable reply text")
-    return {
-        "reply": reply,
-        "reasoning": reasoning,
-        "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
-        "raw_id": body.get("id", ""),
-        "stop_reason": str(
-            (body.get("incomplete_details") if isinstance(body.get("incomplete_details"), dict) else {}).get("reason")
-            or body.get("status")
-            or "",
-        ).strip(),
-        "provider": "openai",
-        "model": model,
-    }
+    return _parse_openai_responses_body(body, model=model, require_reply=require_reply)
 
 
 # openai-compat 的 wire 编解码是 sync（_chat_completion_openai_compatible）与
@@ -781,6 +953,7 @@ def _build_openai_compat_payload(
     response_format: dict[str, Any] | None,
     extra_body: dict[str, Any] | None,
     include_reasoning: bool,
+    tools: "list[ToolSpec] | None" = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
@@ -800,6 +973,8 @@ def _build_openai_compat_payload(
         payload.update(extra_body)
     if include_reasoning and provider == "openrouter":
         payload.setdefault("reasoning", {"enabled": True, "exclude": False})
+    if tools:
+        payload["tools"] = _encode_tools_openai_chat(tools)
     return payload
 
 
@@ -851,11 +1026,12 @@ def _parse_openai_compat_body(
     return {
         "reply": _extract_reply(body, required=require_reply),
         "reasoning": _extract_openai_compatible_reasoning(body),
-        "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
+        "usage": _normalize_usage(provider, body.get("usage")),
         "raw_id": body.get("id", ""),
         "stop_reason": _extract_openai_compatible_stop_reason(body),
         "provider": provider,
         "model": model,
+        "tool_calls": _decode_tool_calls_openai_chat(body),
     }
 
 
@@ -873,12 +1049,13 @@ def _chat_completion_openai_compatible(
     extra_body: dict[str, Any] | None = None,
     require_reply: bool = True,
     include_reasoning: bool = False,
+    tools: "list[ToolSpec] | None" = None,
 ) -> dict[str, Any]:
     payload = _build_openai_compat_payload(
         provider=provider, model=model, messages=messages,
         temperature=temperature, max_tokens=max_tokens,
         response_format=response_format, extra_body=extra_body,
-        include_reasoning=include_reasoning)
+        include_reasoning=include_reasoning, tools=tools)
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
@@ -909,7 +1086,12 @@ def _chat_completion_openai_compatible(
         resp, provider=provider, model=model, require_reply=require_reply)
 
 
-def _chat_completion_anthropic(
+# anthropic 的 wire 编解码是 sync（_chat_completion_anthropic）与 async
+# （chat_completion_async）共用的单实现：payload 构造（含 thinking-budget 判定）、
+# 响应解析都在下面两个纯函数里，两个调用方只各自保留 httpx sync/async 的
+# transport 差异。改契约改这里，两边自动同步。
+
+def _build_anthropic_payload(
     *,
     model: str,
     base_url: str,
@@ -917,11 +1099,10 @@ def _chat_completion_anthropic(
     messages: list[dict[str, Any]],
     max_tokens: int,
     temperature: float | None,
-    timeout: float,
     response_format: dict[str, Any] | None,
-    require_reply: bool = True,
     include_reasoning: bool = False,
-) -> dict[str, Any]:
+    tools: "list[ToolSpec] | None" = None,
+) -> tuple[dict[str, Any], str, dict[str, str]]:
     system, provider_messages = _split_system_messages_anthropic(messages)
     json_instruction = _json_only_instruction(response_format)
     if json_instruction:
@@ -938,6 +1119,53 @@ def _chat_completion_anthropic(
         payload["temperature"] = temperature
     if system:
         payload["system"] = system
+    if tools:
+        payload["tools"] = _encode_tools_anthropic(tools)
+
+    url = f"{base_url.rstrip('/')}/messages"
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    return payload, url, headers
+
+
+def _parse_anthropic_body(
+    body: dict[str, Any], *, model: str, require_reply: bool,
+) -> dict[str, Any]:
+    return {
+        "reply": _extract_anthropic_reply(body, required=require_reply),
+        "reasoning": _extract_anthropic_reasoning(body),
+        "usage": _normalize_usage("anthropic", body.get("usage")),
+        "raw_id": body.get("id", ""),
+        "stop_reason": str(body.get("stop_reason") or "").strip(),
+        "provider": "anthropic",
+        "model": model,
+        "tool_calls": _decode_tool_calls_anthropic(body),
+    }
+
+
+def _chat_completion_anthropic(
+    *,
+    model: str,
+    base_url: str,
+    key: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+    response_format: dict[str, Any] | None,
+    require_reply: bool = True,
+    include_reasoning: bool = False,
+    tools: "list[ToolSpec] | None" = None,
+) -> dict[str, Any]:
+    payload, url, headers = _build_anthropic_payload(
+        model=model, base_url=base_url, key=key, messages=messages,
+        max_tokens=max_tokens, temperature=temperature,
+        response_format=response_format, include_reasoning=include_reasoning,
+        tools=tools,
+    )
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
@@ -974,18 +1202,13 @@ def _chat_completion_anthropic(
     if not isinstance(body, dict):
         raise ProviderError("provider returned non-object response")
 
-    return {
-        "reply": _extract_anthropic_reply(body, required=require_reply),
-        "reasoning": _extract_anthropic_reasoning(body),
-        "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
-        "raw_id": body.get("id", ""),
-        "stop_reason": str(body.get("stop_reason") or "").strip(),
-        "provider": "anthropic",
-        "model": model,
-    }
+    return _parse_anthropic_body(body, model=model, require_reply=require_reply)
 
 
-def _chat_completion_gemini(
+# gemini 的 wire 编解码是 sync（_chat_completion_gemini）与 async
+# （chat_completion_async）共用的单实现——同上一段注释的分工方式。
+
+def _build_gemini_payload(
     *,
     model: str,
     base_url: str,
@@ -993,11 +1216,10 @@ def _chat_completion_gemini(
     messages: list[dict[str, Any]],
     max_tokens: int,
     temperature: float | None,
-    timeout: float,
     response_format: dict[str, Any] | None,
-    require_reply: bool = True,
     include_reasoning: bool = False,
-) -> dict[str, Any]:
+    tools: "list[ToolSpec] | None" = None,
+) -> tuple[dict[str, Any], str, dict[str, str]]:
     system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
         "maxOutputTokens": max(1, min(int(max_tokens), 8192)),
@@ -1018,17 +1240,55 @@ def _chat_completion_gemini(
     }
     if system:
         payload["systemInstruction"] = {"parts": [{"text": system}]}
+    if tools:
+        payload["tools"] = _encode_tools_gemini(tools)
+
+    url = f"{base_url.rstrip('/')}/models/{quote(model, safe='')}:generateContent"
+    headers = {
+        "x-goog-api-key": key,
+        "Content-Type": "application/json",
+    }
+    return payload, url, headers
+
+
+def _parse_gemini_body(
+    body: dict[str, Any], *, model: str, require_reply: bool,
+) -> dict[str, Any]:
+    return {
+        "reply": _extract_gemini_reply(body, required=require_reply),
+        "reasoning": _extract_gemini_reasoning(body),
+        "usage": _normalize_usage("gemini", body.get("usageMetadata")),
+        "raw_id": body.get("responseId", ""),
+        "stop_reason": _extract_gemini_stop_reason(body),
+        "provider": "gemini",
+        "model": model,
+        "tool_calls": _decode_tool_calls_gemini(body),
+    }
+
+
+def _chat_completion_gemini(
+    *,
+    model: str,
+    base_url: str,
+    key: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+    response_format: dict[str, Any] | None,
+    require_reply: bool = True,
+    include_reasoning: bool = False,
+    tools: "list[ToolSpec] | None" = None,
+) -> dict[str, Any]:
+    payload, url, headers = _build_gemini_payload(
+        model=model, base_url=base_url, key=key, messages=messages,
+        max_tokens=max_tokens, temperature=temperature,
+        response_format=response_format, include_reasoning=include_reasoning,
+        tools=tools,
+    )
 
     try:
-        resp = _http_client().post(
-            f"{base_url.rstrip('/')}/models/{quote(model, safe='')}:generateContent",
-            headers={
-                "x-goog-api-key": key,
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout,
-        )
+        resp = _http_client().post(url, headers=headers, json=payload, timeout=timeout)
     except httpx.HTTPError as e:
         raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
@@ -1041,19 +1301,7 @@ def _chat_completion_gemini(
     if not isinstance(body, dict):
         raise ProviderError("provider returned non-object response")
 
-    return {
-        "reply": _extract_gemini_reply(body, required=require_reply),
-        "reasoning": _extract_gemini_reasoning(body),
-        "usage": (
-            body.get("usageMetadata")
-            if isinstance(body.get("usageMetadata"), dict)
-            else {}
-        ),
-        "raw_id": body.get("responseId", ""),
-        "stop_reason": _extract_gemini_stop_reason(body),
-        "provider": "gemini",
-        "model": model,
-    }
+    return _parse_gemini_body(body, model=model, require_reply=require_reply)
 
 
 def chat_completion(
@@ -1066,6 +1314,7 @@ def chat_completion(
     response_format: dict[str, Any] | None = None,
     require_reply: bool = True,
     include_reasoning: bool = False,
+    tools: "list[ToolSpec] | None" = None,
 ) -> dict[str, Any]:
     provider, model, base_url = validate_config(
         config.provider, config.model, config.base_url
@@ -1087,6 +1336,7 @@ def chat_completion(
             response_format=response_format,
             require_reply=require_reply,
             include_reasoning=include_reasoning,
+            tools=tools,
         )
     if provider == "gemini":
         return _chat_completion_gemini(
@@ -1100,6 +1350,7 @@ def chat_completion(
             response_format=response_format,
             require_reply=require_reply,
             include_reasoning=include_reasoning,
+            tools=tools,
         )
 
     if provider == "openai" and _openai_uses_responses_for_reasoning(request_model):
@@ -1113,6 +1364,7 @@ def chat_completion(
             response_format=response_format,
             require_reply=require_reply,
             include_reasoning=include_reasoning,
+            tools=tools,
         )
 
     return _chat_completion_openai_compatible(
@@ -1128,6 +1380,7 @@ def chat_completion(
         extra_body=extra_body,
         require_reply=require_reply,
         include_reasoning=include_reasoning,
+        tools=tools,
     )
 
 
@@ -1198,10 +1451,11 @@ def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
 
 
 # --- async variant (enclave ASGI migration) --------------------------------
-# 只有 openai-wire（openai 非 responses / openrouter / deepseek /
-# openai_compatible）有原生 async 实现——enclave caption 走 openrouter，这是
-# 唯一需要"45s 长等待只挂协程"的调用方。anthropic / gemini / openai-responses
-# 的编解码保持单实现（同步版），经 anyio 线程桥调用，避免双份 wire codec 漂移。
+# 全部 4 个 wire（openai-compat / anthropic / gemini / openai-responses）都有
+# 原生 async 实现——payload 构造 + 响应解析各自与同步 chat_completion 共用单
+# 实现（_build_<wire>_payload / _parse_<wire>_body），两条路径只各自保留
+# httpx sync/async 的 transport 差异，不再有 anyio 线程桥（曾把这几个
+# provider 的并发上限静默锁死在线程池大小）。
 # 同步 chat_completion 与异步版各用各的 httpx client，绝不混用（spec §4）。
 
 _shared_async_client: httpx.AsyncClient | None = None
@@ -1237,6 +1491,7 @@ async def chat_completion_async(
     response_format: dict[str, Any] | None = None,
     require_reply: bool = True,
     include_reasoning: bool = False,
+    tools: "list[ToolSpec] | None" = None,
 ) -> dict[str, Any]:
     provider, model, base_url = validate_config(
         config.provider, config.model, config.base_url
@@ -1246,18 +1501,72 @@ async def chat_completion_async(
     if not key:
         raise ProviderError("api_key required")
 
-    if provider in ("anthropic", "gemini") or (
-        provider == "openai" and _openai_uses_responses_for_reasoning(request_model)
-    ):
-        import anyio.to_thread
-        from functools import partial
+    # anthropic / gemini / openai-responses 各自的编解码与同步版共享单实现
+    # （_build_<wire>_payload / _parse_<wire>_body），这里只保留 async
+    # transport——不再经 anyio 线程桥调用同步 chat_completion（该桥曾把这 3
+    # 个 provider 的并发上限静默锁死在线程池大小）。
 
-        return await anyio.to_thread.run_sync(partial(
-            chat_completion, config, messages,
-            max_tokens=max_tokens, temperature=temperature, timeout=timeout,
-            response_format=response_format, require_reply=require_reply,
-            include_reasoning=include_reasoning,
-        ))
+    if provider == "anthropic":
+        payload, url, headers = _build_anthropic_payload(
+            model=model, base_url=base_url, key=key, messages=messages,
+            max_tokens=max_tokens, temperature=temperature,
+            response_format=response_format, include_reasoning=include_reasoning,
+            tools=tools,
+        )
+        try:
+            resp = await _async_http_client().post(
+                url, headers=headers, json=payload, timeout=timeout)
+        except httpx.HTTPError as e:
+            raise ProviderError(f"provider network error: {type(e).__name__}") from e
+        _raise_for_provider_status(resp)
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise ProviderError("provider returned non-json response") from e
+        if not isinstance(body, dict):
+            raise ProviderError("provider returned non-object response")
+        return _parse_anthropic_body(body, model=model, require_reply=require_reply)
+
+    if provider == "gemini":
+        payload, url, headers = _build_gemini_payload(
+            model=model, base_url=base_url, key=key, messages=messages,
+            max_tokens=max_tokens, temperature=temperature,
+            response_format=response_format, include_reasoning=include_reasoning,
+            tools=tools,
+        )
+        try:
+            resp = await _async_http_client().post(
+                url, headers=headers, json=payload, timeout=timeout)
+        except httpx.HTTPError as e:
+            raise ProviderError(f"provider network error: {type(e).__name__}") from e
+        _raise_for_provider_status(resp)
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise ProviderError("provider returned non-json response") from e
+        if not isinstance(body, dict):
+            raise ProviderError("provider returned non-object response")
+        return _parse_gemini_body(body, model=model, require_reply=require_reply)
+
+    if provider == "openai" and _openai_uses_responses_for_reasoning(request_model):
+        payload, url, headers = _build_openai_responses_payload(
+            model=request_model, base_url=base_url, key=key, messages=messages,
+            max_tokens=max_tokens, response_format=response_format,
+            include_reasoning=include_reasoning, tools=tools,
+        )
+        try:
+            resp = await _async_http_client().post(
+                url, headers=headers, json=payload, timeout=timeout)
+        except httpx.HTTPError as e:
+            raise ProviderError(f"provider network error: {type(e).__name__}") from e
+        _raise_for_provider_status(resp)
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise ProviderError("provider returned non-json response") from e
+        if not isinstance(body, dict):
+            raise ProviderError("provider returned non-object response")
+        return _parse_openai_responses_body(body, model=request_model, require_reply=require_reply)
 
     # openai-compat 编解码与同步版共享单实现（_build/_reasoning_fallback/
     # _parse 三个纯函数），这里只保留 async transport。
@@ -1269,7 +1578,7 @@ async def chat_completion_async(
         provider=provider, model=request_model, messages=messages,
         temperature=temperature, max_tokens=max_tokens,
         response_format=response_format, extra_body=extra_body,
-        include_reasoning=include_reasoning)
+        include_reasoning=include_reasoning, tools=tools)
 
     async def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:

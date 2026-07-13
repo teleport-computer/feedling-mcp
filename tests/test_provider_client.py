@@ -345,7 +345,8 @@ def test_parse_openai_compat_body_result_shape():
         resp, provider="openrouter", model="m", require_reply=True)
     assert out["reply"] == "hi there"
     assert out["reasoning"] == "why"
-    assert out["usage"] == {"total_tokens": 3}
+    # PR B Task 2 (B4): usage is normalized in place to prompt/completion/total keys.
+    assert out["usage"] == {"prompt_tokens": None, "completion_tokens": None, "total_tokens": 3}
     assert out["raw_id"] == "chatcmpl-1"
     assert out["provider"] == "openrouter"
     assert out["model"] == "m"
@@ -381,7 +382,8 @@ def test_parse_deepseek_body_extracts_reasoning_content():
 
     assert out["reply"] == "visible answer"
     assert out["reasoning"] == "deepseek reasoning summary"
-    assert out["usage"] == {"total_tokens": 11}
+    # PR B Task 2 (B4): usage is normalized in place to prompt/completion/total keys.
+    assert out["usage"] == {"prompt_tokens": None, "completion_tokens": None, "total_tokens": 11}
     assert out["provider"] == "deepseek"
 
 

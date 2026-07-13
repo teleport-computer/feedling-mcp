@@ -1160,14 +1160,17 @@ def test_compaction_rollback_during_llm_blocks_summary_write(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# Task 4: TurnDeps.record_turn_metric — worker records per-turn provider token
-# usage + latency after a SUCCESSFUL respond() call (chat lane only; the
-# metric records at the worker call site, not inside responder, to keep
-# responder.respond hosted-free/job-context-free — see D0 rollout plan Task 4
-# note and responder.py's usage_out docstring).
+# spec B5 (Hosted Runtime V2 PR B, Task 8): the OLD per-call `TurnDeps.
+# record_turn_metric` callback firing after a successful respond() (D0 Task 4)
+# is superseded by a per-job `TurnMetrics` whole-turn accumulator that upserts
+# ONE idempotent `v2_turn_metrics` row per job_id at the turn's single terminal
+# point — success AND every mark_failed path (not just responder success).
+# `record_turn_metric` itself is left wired as a dead-but-harmless TurnDeps
+# field/serve_worker injection (see worker.TurnDeps docstring); these tests now
+# assert the real DB row instead of the old callback firing.
 # ------------------------------------------------------------------
 
-def test_process_job_records_turn_metric_after_successful_respond(monkeypatch):
+def test_process_job_records_whole_turn_metric_after_successful_respond(monkeypatch):
     uid = "u_w_turnmetric"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1185,33 +1188,37 @@ def test_process_job_records_turn_metric_after_successful_respond(monkeypatch):
 
     monkeypatch.setattr(v2_responder, "respond", _spy_respond)
 
-    metric_calls = []
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
         is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
-        record_turn_metric=lambda **kwargs: metric_calls.append(kwargs),
     )
 
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert len(metric_calls) == 1
-    call = metric_calls[0]
-    assert call["job_id"] == job_id
-    assert call["user_id"] == uid
-    assert call["lane"] == "chat"
-    assert call["prompt_tokens"] == 42
-    assert call["completion_tokens"] == 8
-    assert isinstance(call["latency_ms"], int) and call["latency_ms"] >= 0
+    with db.get_pool().connection() as c:
+        row = c.execute(
+            "SELECT user_id, lane, prompt_tokens, completion_tokens, model_calls, failed, status, latency_ms "
+            "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
+    assert row is not None
+    assert row[0] == uid
+    assert row[1] == "chat"
+    assert row[2] == 42
+    assert row[3] == 8
+    assert row[4] == 1  # is_official=False -> rule_plan (zero-LLM) never adds a call; only respond() does
+    assert row[5] is False
+    assert row[6] == "ok"
+    assert row[7] >= 0
 
 
-def test_process_job_does_not_record_turn_metric_on_responder_error(monkeypatch):
-    """No-filler-adjacent invariant for metrics: a failed turn (ResponderError)
-    never happened as a "turn" from D4's perspective — only successful respond()
-    calls get metered."""
+def test_process_job_records_failed_whole_turn_metric_on_responder_error(monkeypatch):
+    """Inverted from the old per-call semantics: a failed turn (ResponderError)
+    now DOES get a whole-turn metric row — spec B5 explicitly covers failed
+    turns, not just successful ones (that's the point of a turn-level failure
+    rate the load-test gate can read)."""
     uid = "u_w_turnmetric_err"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1225,20 +1232,173 @@ def test_process_job_does_not_record_turn_metric_on_responder_error(monkeypatch)
 
     monkeypatch.setattr(v2_responder, "respond", _raise_respond)
 
-    metric_calls = []
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
         is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
-        record_turn_metric=lambda **kwargs: metric_calls.append(kwargs),
     )
 
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
-    assert metric_calls == []
+    with db.get_pool().connection() as c:
+        row = c.execute(
+            "SELECT failed, status FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
+    assert row is not None
+    assert row[0] is True
+    assert row[1] == "turn_failed:empty_reply"
+
+
+def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
+    """PR B review finding: `_run_wake` makes a real `v2_responder.respond` BYOK
+    call (this IS the lane that burns idle-user tokens on heartbeat/scheduled
+    wakes) but a SUCCESSFUL wake used to never flush a `v2_turn_metrics` row at
+    all — `process_job` returns early at lane dispatch (`return await
+    _run_wake(...)`), so its own success-path flush was never reached, and
+    `_run_wake` itself never called `tm.add_call`/`tm.flush(failed=False, ...)`.
+    Mirrors the chat-lane usage_out plumbing in
+    `test_process_job_records_whole_turn_metric_after_successful_respond` above
+    — `v2_responder.respond`'s `usage_out` out-param is the same mechanism for
+    both lanes, so a successful wake now records real prompt/completion tokens,
+    not just a bare model_calls count."""
+    uid = "u_w_wake_turnmetric"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+
+    async def _spy_respond(*, provider_config, summary, tail, action_results=None,
+                            system_prompt=None, usage_out=None):
+        if usage_out is not None:
+            usage_out["prompt_tokens"] = 17
+            usage_out["completion_tokens"] = 4
+        return "hey, thinking of you"
+
+    monkeypatch.setattr(v2_responder, "respond", _spy_respond)
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        read_tail=lambda uid_, after_ts, limit: [],
+        read_summary=lambda uid_: ("", 0.0, 0),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    with db.get_pool().connection() as c:
+        row = c.execute(
+            "SELECT user_id, lane, prompt_tokens, completion_tokens, model_calls, failed, status "
+            "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
+    assert row is not None
+    assert row[0] == uid
+    assert row[1] == "heartbeat"
+    assert row[2] == 17          # real usage, surfaced via respond()'s usage_out
+    assert row[3] == 4
+    assert row[4] == 1           # exactly one model call: respond()
+    assert row[5] is False
+    assert row[6] == "ok"
+
+
+def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(monkeypatch):
+    """empty_reply is a SUCCESSFUL weak-wake sleep, but it's still a REAL,
+    billed provider call (usage_out is filled by respond() before empty_reply
+    is raised) — the metric row must count it, not silently drop to
+    model_calls=0 the way a pre-fix failed wake used to."""
+    uid = "u_w_wake_turnmetric_weak"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+
+    async def _weak_respond(*, provider_config, summary, tail, action_results=None,
+                             system_prompt=None, usage_out=None):
+        if usage_out is not None:
+            usage_out["prompt_tokens"] = 9
+            usage_out["completion_tokens"] = 0
+        raise v2_responder.ResponderError("empty_reply")
+
+    monkeypatch.setattr(v2_responder, "respond", _weak_respond)
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        read_tail=lambda uid_, after_ts, limit: [],
+        read_summary=lambda uid_: ("", 0.0, 0),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    with db.get_pool().connection() as c:
+        row = c.execute(
+            "SELECT prompt_tokens, model_calls, failed, status "
+            "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
+    assert row is not None
+    assert row[0] == 9
+    assert row[1] == 1
+    assert row[2] is False
+    assert row[3] == "ok"
+
+
+def test_run_compaction_records_whole_turn_metric_on_success(monkeypatch):
+    """PR B review finding, compaction side: `_run_compaction` makes a real
+    `v2_compaction.compact` BYOK call but never flushed a success row. Unlike
+    the wake lane, `v2_compaction.compact` doesn't surface usage from its
+    provider call (no `usage_out` equivalent) — the fix counts the call via
+    `add_call(None)` so `model_calls` is at least right; token columns stay 0
+    (a documented gap, not invented data)."""
+    uid = "u_w_compaction_turnmetric"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+        return (current_summary + "\n- new bullet").strip()
+
+    monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
+    writes = {"n": 0}
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        # A few messages over _TAIL_KEEP but well under _COMPACTION_BATCH +
+        # _TAIL_KEEP — enough to trigger a real compact() call without also
+        # tripping the catch-up re-enqueue branch (not what this test is about).
+        read_tail=lambda uid_, after_ts, limit: [
+            {"id": f"m{i}", "ts": float(i), "role": "user", "content": "hi"}
+            for i in range(worker._TAIL_KEEP + 5)],
+        read_summary=lambda uid_: ("existing", 0.0, 1),
+        write_summary=lambda *a, **k: writes.update(n=writes["n"] + 1) or True,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert writes["n"] == 1
+    with db.get_pool().connection() as c:
+        row = c.execute(
+            "SELECT lane, prompt_tokens, completion_tokens, model_calls, failed, status "
+            "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
+    assert row is not None
+    assert row[0] == "maintenance"
+    assert row[1] == 0 and row[2] == 0   # documented token-gap: compact() surfaces no usage
+    assert row[3] == 1                    # but the call itself IS counted
+    assert row[4] is False
+    assert row[5] == "ok"
 
 
 def test_process_job_tolerates_missing_record_turn_metric_callback(monkeypatch):

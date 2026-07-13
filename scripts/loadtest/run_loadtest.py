@@ -10,7 +10,7 @@ V2 worker needs enclave-bound BYOK + enclave-auth wiring
 driver/CI without a real enclave, so ``drain()`` instead takes an *injectable*
 ``processor`` callable and this module ships a SIMULATED one
 (``build_simulated_processor``) that advances jobs directly via
-``jobs_store`` primitives (claim -> mark_running -> record_turn_metric ->
+``jobs_store`` primitives (claim -> mark_running -> record_whole_turn_metric ->
 mark_completed) with deterministic fake token counts. That still exercises
 the real DB queue (agent_jobs) and the real metrics table (v2_turn_metrics)
 end to end — it just never calls a real LLM or the real worker pipeline. A
@@ -60,7 +60,7 @@ from scripts.loadtest.mock_provider import (  # noqa: E402
     MockProvider,
 )
 
-# Simulated per-turn latency stamped by the level-B processor (record_turn_metric
+# Simulated per-turn latency stamped by the level-B processor (record_whole_turn_metric
 # wants a latency_ms; there's no real call to time, so a small fixed value keeps
 # turn_latency_p95_ms non-null/sane without pretending it means anything about
 # real provider latency).
@@ -145,12 +145,15 @@ def build_simulated_processor(
 ) -> Callable[[], bool]:
     """Return a zero-arg callable ("processor") that advances ONE pending job
     per call through the real lifecycle (claim -> mark_running ->
-    record_turn_metric -> mark_completed) with deterministic fake token
-    counts, so ``collect_report()``'s queue-wait/latency/tokens/stuck
-    calculations run against real DB rows without a real LLM/worker. Returns
-    True if it processed a job, False if the queue had nothing claimable
-    (used by ``drain`` only implicitly — the return value isn't required by
-    the ``drain`` contract, just handy for callers/tests)."""
+    record_whole_turn_metric -> mark_completed) with deterministic fake token
+    counts, so ``collect_report()``'s queue-wait/latency/tokens/stuck/failed
+    calculations run against real DB rows without a real LLM/worker. Writes a
+    whole-turn row (spec B5: one idempotent row per job_id, model_calls=1,
+    retries=0, failed=False, status="ok") rather than the older per-call
+    ``record_turn_metric`` shape. Returns True if it processed a job, False if
+    the queue had nothing claimable (used by ``drain`` only implicitly — the
+    return value isn't required by the ``drain`` contract, just handy for
+    callers/tests)."""
 
     def _tick() -> bool:
         job = jobs_store.claim_next_job(worker_id)
@@ -158,10 +161,10 @@ def build_simulated_processor(
             return False
         job_id = job["id"]
         jobs_store.mark_running(job_id, claimed_by=str(job["claimed_by"]))
-        jobs_store.record_turn_metric(
+        jobs_store.record_whole_turn_metric(
             job_id=job_id, user_id=job["user_id"], lane=job.get("lane") or "chat",
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-            latency_ms=latency_ms,
+            latency_ms=latency_ms, model_calls=1, retries=0, failed=False, status="ok",
         )
         jobs_store.mark_completed(job_id, claimed_by=str(job["claimed_by"]))
         return True
@@ -198,6 +201,7 @@ def collect_report() -> dict:
         "turn_latency_p95_ms": collect.p95(turn_latency),
         "tokens_per_turn_mean": collect.mean(tokens),
         "stuck_jobs": collect.stuck_job_count(),
+        "failed_turns": collect.failed_turn_count(),
         "rss_kb": collect.peak_rss_kb(os.getpid()),
     }
 

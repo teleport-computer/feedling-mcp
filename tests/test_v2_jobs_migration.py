@@ -59,10 +59,12 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     }
     # Head advanced by Hosted Runtime V2 PR A (effect foundation): 0025 runtime
     # generation, 0026 job expected_generation, 0027 effect outbox, 0028 effect
-    # sink-applied dedup guard, chained after 0024_v2_worker_capacity. The
+    # sink-applied dedup guard, chained after 0024_v2_worker_capacity. PR B's
+    # B5 (idempotent whole-turn metric) chains 0029 after that: v2_turn_metrics
+    # gains model_calls/retries/failed/status + UNIQUE(job_id). The
     # deployed-history + profiles-merge invariants above are unchanged; only
     # the single-head tip moved.
-    assert script.get_current_head() == "0028_v2_effect_sink_applied"
+    assert script.get_current_head() == "0029_v2_turn_metrics_whole_turn"
 
 
 def test_singleflight_unique_index_enforced():

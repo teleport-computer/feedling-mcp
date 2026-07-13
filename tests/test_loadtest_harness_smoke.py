@@ -75,13 +75,26 @@ def test_smoke_5_users_simulated_drain_produces_full_report():
 
     expected_keys = {
         "queue_wait_p95_sec", "queue_wait_mean_sec", "turn_latency_p95_ms",
-        "tokens_per_turn_mean", "stuck_jobs", "rss_kb",
+        "tokens_per_turn_mean", "stuck_jobs", "failed_turns", "rss_kb",
     }
     assert expected_keys <= set(report.keys())
     assert report["tokens_per_turn_mean"] == pytest.approx(111 + 33)
     assert report["stuck_jobs"] == 0
+    assert report["failed_turns"] == 0
     assert report["queue_wait_p95_sec"] is not None
     assert report["turn_latency_p95_ms"] is not None
+
+    # The simulated processor now writes whole-turn rows via
+    # record_whole_turn_metric (spec B5), not the older per-call
+    # record_turn_metric shape — every row should carry model_calls>=1.
+    with db.get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT model_calls, failed, status FROM v2_turn_metrics")
+            rows = cur.fetchall()
+    assert len(rows) == 5
+    assert all(model_calls >= 1 for model_calls, _failed, _status in rows)
+    assert all(failed is False for _model_calls, failed, _status in rows)
+    assert all(status == "ok" for _model_calls, _failed, status in rows)
 
 
 def test_seed_synthetic_users_wires_db_action_v2_and_activation():

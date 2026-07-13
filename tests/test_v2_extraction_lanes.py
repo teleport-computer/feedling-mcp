@@ -75,6 +75,41 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
+def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane):
+    """PR B review finding: `_run_extraction` makes a real `v2_extraction.extract`
+    BYOK call but never flushed a `v2_turn_metrics` row on success.
+    `v2_extraction.extract` doesn't currently surface usage from its provider
+    call (no `usage_out` equivalent, unlike `v2_responder.respond`) — the fix
+    counts the call via `add_call(None)` so `model_calls` is at least right;
+    token columns stay 0 (a documented gap, not invented data)."""
+    uid = f"u_x_metric_{lane}"
+    conftest.seed_user(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(*, provider_config, prompt, parse, **kw):
+        return ([{"action": "add", "summary": "s", "content": "c"}], None)
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    deps = _deps()
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    with db.get_pool().connection() as c:
+        row = c.execute(
+            "SELECT lane, prompt_tokens, completion_tokens, model_calls, failed, status "
+            "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
+    assert row is not None
+    assert row[0] == lane
+    assert row[1] == 0 and row[2] == 0   # documented token-gap: extract() surfaces no usage
+    assert row[3] == 1                    # but the call itself IS counted
+    assert row[4] is False
+    assert row[5] == "ok"
+
+
+@pytest.mark.parametrize("lane", ["capture", "dream"])
 def test_zero_results_completes_without_applying_anything(monkeypatch, lane):
     """`nothing_worth_keeping` is SUCCESS — mirrors the wake lane's weak-wake-sleeps."""
     uid = f"u_x_empty_{lane}"

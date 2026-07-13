@@ -51,17 +51,17 @@ def test_openai_compatible_wire_carries_the_image_block(monkeypatch):
 
 
 def test_anthropic_wire_maps_the_image_block(monkeypatch):
-    """anthropic + gemini do NOT use the async transport: reliable_chat_completion_async
-    bounces them through `anyio.to_thread.run_sync(chat_completion, ...)` (provider_client
-    :1200-1208), i.e. the SYNC httpx.Client. Patching httpx.AsyncClient here would capture
+    """anthropic now takes the native ASYNC transport too (PR B Task 7): no more
+    anyio.to_thread bridge to the sync httpx.Client — chat_completion_async POSTs
+    directly via `_async_http_client()`. Patching httpx.Client here would capture
     nothing."""
     captured = []
 
-    def _fake_post(self, url, **kw):
+    async def _fake_apost(self, url, **kw):
         captured.append(kw.get("json"))
         return _resp(url, {"content": [{"type": "text", "text": "ok"}]})
 
-    monkeypatch.setattr(httpx.Client, "post", _fake_post)
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_apost)
     cfg = provider_client.ProviderConfig(
         provider="anthropic", model="claude-x", api_key="k", base_url="")
     reply = asyncio.run(v2_responder.respond(

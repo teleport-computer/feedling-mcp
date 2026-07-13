@@ -214,11 +214,12 @@ class TurnDeps:
     read_messages_since: Callable[[str, float], list[dict]] | None = None
     runtime_mode_enabled: Callable[[str], bool] | None = None
     # (job_id, user_id, lane, prompt_tokens, completion_tokens, latency_ms) -> None
-    # （kwargs-only，见 jobs_store.record_turn_metric）：D4 load-testing 消费的每回合
-    # provider token usage + 延迟。只在 responder.respond 成功返回后（chat lane）由
-    # worker 调用——responder 自己不落库/不知道 job_id/lane（见 responder.respond 的
-    # usage_out 出参文档）。默认 None：worker.py 自身不 import jobs_store 的落库细节
-    # 之外的东西，测试/其他调用方不必提供；生产装配见 serve_worker.build_production_deps。
+    # （kwargs-only，见 jobs_store.record_turn_metric）：**已废弃/不再被 process_job 调用**
+    # ——spec B5 把逐次 per-call INSERT 换成了一个 per-job 的 `TurnMetrics` 累加器，终态时
+    # 直接调 `jobs_store.record_whole_turn_metric`（worker.py 内部完成，不再需要经这个
+    # 注入回调）。字段留着只是不破坏既有装配/测试（`serve_worker.build_production_deps`
+    # 仍会注入 `jobs_store.record_turn_metric`，但 worker.py 不再读它）；新代码不要依赖
+    # 这个回调被调用。
     record_turn_metric: Callable[..., None] | None = None
     # (user_id, after_ts, limit) -> [{"id","ts","role","content"}]：最近窗口，BOTH
     # roles，ts>after_ts，enclave 解密明文（D1：让 turn 能看见真实对话上下文，不再局限于
@@ -268,6 +269,84 @@ class TurnDeps:
     # of an empty pending set; the field exists so the call site is already wired
     # ahead of the producer landing.
     apply_pending_effects: Callable[[str], dict] | None = None
+
+
+@dataclass
+class TurnMetrics:
+    """Per-job whole-turn metric accumulator (Hosted Runtime V2 PR B / spec B5).
+
+    Exactly one instance is created per job at turn start (in `_run_turn`, the
+    earliest point `job_id`/`user_id`/`lane` are known — before that, chat-turn
+    setup failures like an unresolvable BYOK provider have nowhere else to
+    attribute a metric row to) and threaded down through `process_job` and
+    each self-contained lane handler (`_run_compaction`/`_run_wake`/
+    `_run_extraction`). `flush()` upserts ONE `v2_turn_metrics` row per job_id
+    (idempotent replace, never append — see `jobs_store.record_whole_turn_metric`),
+    called at exactly the terminal points spec'd by B5: EVERY lane's success
+    return AND every `mark_failed` call site — chat, `maintenance` (compaction),
+    wake (`heartbeat`/`scheduled`/`manual_wake`/`screen_watch`) and extraction
+    (`capture`/`dream`) alike. The background lanes are not metric-free: each
+    makes exactly one real BYOK provider call per job (`_run_wake` →
+    `v2_responder.respond`, `_run_extraction` → `v2_extraction.extract`,
+    `_run_compaction` → `v2_compaction.compact`, the last two only when the
+    lane actually reaches its compaction/extraction call — e.g. a compaction
+    job whose tail is already under budget skips the call and legitimately
+    flushes `model_calls=0`), so a success there carries real token/usage
+    data worth a row — this is precisely the lane that burns idle-user BYOK
+    tokens on heartbeat/scheduled wakes, so it is the metric consumers most
+    need. `responder.respond` surfaces usage via its `usage_out` out-param
+    (mirroring the chat path), so the wake lane records real prompt/completion
+    tokens. `v2_extraction.extract`/`v2_compaction.compact` do not currently
+    surface usage from their underlying provider call at all (no `usage_out`
+    equivalent) — their lanes still call `add_call(None)` so `model_calls` is
+    at least correctly counted; `prompt_tokens`/`completion_tokens` for those
+    two lanes stay 0 until those modules grow their own usage out-param (a
+    follow-up, not invented here).
+
+    `add_call` accumulates usage from a REAL provider call — the json_planner
+    backend's `official_plan` (BYOK-official users only; `rule_plan` is
+    deterministic/zero-LLM and must never bump `model_calls`), `responder.respond`
+    (chat AND wake lanes), `v2_extraction.extract`, and `v2_compaction.compact`.
+    `retries` stays 0 today: `reliable_chat_completion*` retries internally but
+    doesn't yet surface a retry count to its callers (out of scope for this
+    task) — the column/field exist so a future provider-level retry count can
+    be wired in without another migration.
+    """
+    job_id: Any
+    user_id: str
+    lane: str
+    model_calls: int = 0
+    retries: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    _flushed: bool = False
+    _started: float = 0.0
+
+    def __post_init__(self) -> None:
+        self._started = time.monotonic()
+
+    def add_call(self, usage: dict | None, *, retried: bool = False) -> None:
+        self.model_calls += 1
+        if retried:
+            self.retries += 1
+        if usage:
+            self.prompt_tokens += int(usage.get("prompt_tokens") or 0)
+            self.completion_tokens += int(usage.get("completion_tokens") or 0)
+
+    def flush(self, *, failed: bool, status: str) -> None:
+        """Idempotent per-job upsert; guarded so this SAME accumulator instance
+        never double-writes even if a lane handler somehow reaches two terminal
+        points (harmless either way — the DB side is an idempotent replace on
+        job_id — but this avoids a redundant round-trip)."""
+        if self._flushed:
+            return
+        self._flushed = True
+        latency_ms = int((time.monotonic() - self._started) * 1000)
+        jobs_store.record_whole_turn_metric(
+            self.job_id, self.user_id, self.lane,
+            prompt_tokens=self.prompt_tokens, completion_tokens=self.completion_tokens,
+            latency_ms=latency_ms, model_calls=self.model_calls, retries=self.retries,
+            failed=failed, status=status)
 
 
 async def _cap_data(store, action_type, *, api_key, runtime_token, params=None, enclave_sem=None) -> dict:
@@ -363,6 +442,7 @@ def _surface_terminal_error(deps: TurnDeps, user_id: str, job_id, message: str) 
 async def _run_compaction(
     job_id, user_id: str, deps: TurnDeps, provider_config: Any,
     enclave_sem: "asyncio.Semaphore", claimed_by: str | None = None,
+    tm: "TurnMetrics | None" = None,
 ) -> str:
     """maintenance-lane 压缩：把超预算 tail 的最旧一批折进加密 summary（append-and-merge，
     CAS 原子写，见 `model_api_runtime.v2.compaction.compact` + `jobs_store.upsert_summary_row_cas`）。
@@ -379,17 +459,27 @@ async def _run_compaction(
             tail = await asyncio.to_thread(
                 reader, user_id, watermark, _COMPACTION_BATCH + _TAIL_KEEP)
         if len(tail) <= _TAIL_KEEP:
+            # No compaction call made at all (tail already under budget) — a
+            # legitimate model_calls=0 success.
             await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by)
+            if tm is not None:
+                tm.flush(failed=False, status="ok")
             return "completed"
         old = tail[: min(_COMPACTION_BATCH, len(tail) - _TAIL_KEEP)]
         new_watermark = old[-1]["ts"]
         new_summary = await v2_compaction.compact(
             provider_config=provider_config, current_summary=summary, old_messages=old,
             llm=provider_client.reliable_chat_completion_async)
+        if tm is not None:
+            # v2_compaction.compact doesn't surface usage from its provider call
+            # (no usage_out equivalent) — count the call, no token data.
+            tm.add_call(None)
         if new_summary.strip() == summary.strip():  # 空/no-op 折叠 → 不推进 watermark/version
             await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by)
+            if tm is not None:
+                tm.flush(failed=False, status="ok")
             return "completed"
         if claimed_by and not await asyncio.to_thread(
             jobs_store.renew_job_lease, job_id, claimed_by,
@@ -410,10 +500,14 @@ async def _run_compaction(
                 await asyncio.to_thread(
                     jobs_store.enqueue_job, user_id, "maintenance", reason="compaction_catchup")
                 await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            if tm is not None:
+                tm.flush(failed=False, status="ok")
             return "completed"
         # CAS 没落地：别的写手已经推进过版本，本次压缩视为丢弃，不重试、不报错。
         await asyncio.to_thread(
             jobs_store.mark_failed, job_id, "summary_cas_lost", claimed_by=claimed_by)
+        if tm is not None:
+            tm.flush(failed=True, status="summary_cas_lost")
         return "failed"
     except Exception as e:  # noqa: BLE001 — 后台 job：静默 mark_failed，绝不弹用户可见 error/写气泡
         code = _safe_failure_code("compaction_failed", e)
@@ -421,12 +515,15 @@ async def _run_compaction(
         await asyncio.to_thread(
             jobs_store.mark_failed, job_id, code,
             claimed_by=claimed_by)
+        if tm is not None:
+            tm.flush(failed=True, status=code)
         return "failed"
 
 
 async def _run_wake(
     job_id, user_id: str, lane: str, deps: TurnDeps, provider_config: Any,
     enclave_sem: "asyncio.Semaphore", claimed_by: str,
+    tm: "TurnMetrics | None" = None,
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake）turn：让伴侣主动开口，而不是回答用户
     刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
@@ -497,18 +594,38 @@ async def _run_wake(
             # _fold_action_results caps each action at _PER_ACTION_CHAR_CAP=2000 chars
             # (the multimodal round's anti-poisoning cap); captions fit.
             screen_results = {"screen_recent": [{"ok": True, "data": data}]}
+        # spec B5: usage_out mirrors the chat-lane pattern in `process_job` — respond()
+        # fills this in-place right after a real provider call succeeds (even an
+        # empty_reply is a real, billed call; only no_user_messages short-circuits
+        # BEFORE any call is made, so usage_out stays {} in that one case).
+        _usage: dict = {}
         try:
             reply = await v2_responder.respond(
                 provider_config=provider_config, summary=summary, tail=wake_tail,
                 action_results=screen_results,
                 system_prompt=(_SCREEN_WATCH_SYSTEM_PROMPT if lane == "screen_watch"
-                               else _WAKE_SYSTEM_PROMPT))
+                               else _WAKE_SYSTEM_PROMPT),
+                usage_out=_usage)
         except v2_responder.ResponderError as e:
-            if "empty_reply" in str(e) or "no_user_messages" in str(e):
-                # Weak wake sleeps: the model (or a degenerate prompt) chose silence —
-                # this is a SUCCESSFUL wake, not a failure. No bubble, no error surface.
+            msg = str(e)
+            if "no_user_messages" in msg:
+                # Degenerate prompt with zero non-system turns — respond() bails out
+                # BEFORE the provider call, so no model call was made at all.
                 await asyncio.to_thread(
                     jobs_store.mark_completed, job_id, claimed_by=claimed_by)
+                if tm is not None:
+                    tm.flush(failed=False, status="ok")
+                return "completed"
+            if "empty_reply" in msg:
+                # Weak wake sleeps: the model chose silence after a REAL provider call
+                # (usage_out was already filled by respond() before this was raised) —
+                # this is a SUCCESSFUL wake, not a failure. No bubble, no error surface.
+                if tm is not None:
+                    tm.add_call(_usage)
+                await asyncio.to_thread(
+                    jobs_store.mark_completed, job_id, claimed_by=claimed_by)
+                if tm is not None:
+                    tm.flush(failed=False, status="ok")
                 return "completed"
             if e.kind == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
@@ -519,25 +636,36 @@ async def _run_wake(
                 await asyncio.to_thread(
                     jobs_store.upsert_wake_schedule, user_id,
                     payment_cooldown_until=time.time() + _WAKE_COOLDOWN_SEC)
+            # Any other ResponderError is a genuine provider_call_failed — a real call
+            # was attempted (and failed), so it still counts, just with no usage data.
+            if tm is not None:
+                tm.add_call(None)
             raise
+        if tm is not None:
+            tm.add_call(_usage)
         await _fence_wake_effect("wake reply")
         row = await asyncio.to_thread(_write_encrypted_reply, store, reply)
         if row is None:
             raise RuntimeError("reply_encryption_failed")
         await asyncio.to_thread(
             jobs_store.mark_completed, job_id, claimed_by=claimed_by)
+        if tm is not None:
+            tm.flush(failed=False, status="ok")
         return "completed"
     except Exception as e:  # noqa: BLE001 — wake job: silent mark_failed, never surface/bubble
         code = _safe_failure_code("wake_failed", e)
         log.warning("[v2.worker] wake job %s lane=%s failed code=%s", job_id, lane, code)
         await asyncio.to_thread(
             jobs_store.mark_failed, job_id, code, claimed_by=claimed_by)
+        if tm is not None:
+            tm.flush(failed=True, status=code)
         return "failed"
 
 
 async def _run_extraction(job_id, user_id: str, lane: str, deps: TurnDeps,
                           provider_config: Any, enclave_sem: "asyncio.Semaphore",
-                          claimed_by: str | None = None) -> str:
+                          claimed_by: str | None = None,
+                          tm: "TurnMetrics | None" = None) -> str:
     """capture / dream：后台记忆抽取。自成一体的 try/except —— 绝不落进 process_job 那个
     chat-turn 的 except（那条会 emit 用户可见的 error status + record_terminal_error）。
 
@@ -577,16 +705,26 @@ async def _run_extraction(job_id, user_id: str, lane: str, deps: TurnDeps,
 
         items, reason = await v2_extraction.extract(
             provider_config=provider_config, prompt=prompt, parse=parse)
+        if tm is not None:
+            # v2_extraction.extract always makes exactly one provider call attempt
+            # (success, empty_reply, parse-error and provider_call_failed alike) but
+            # doesn't currently surface usage from it (no usage_out equivalent) —
+            # count the call, no token data.
+            tm.add_call(None)
         if reason:
             raise RuntimeError(reason)
         if not items:
             await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by)
+            if tm is not None:
+                tm.flush(failed=False, status="ok")
             return "completed"
 
         if deps.build_memory_envelope is None or deps.apply_memory_actions is None:
             await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by)
+            if tm is not None:
+                tm.flush(failed=False, status="ok")
             return "completed"
 
         actions, _added, _superseded = to_actions(
@@ -604,6 +742,8 @@ async def _run_extraction(job_id, user_id: str, lane: str, deps: TurnDeps,
         await asyncio.to_thread(deps.apply_memory_actions, user_id, actions)
         await asyncio.to_thread(
             jobs_store.mark_completed, job_id, claimed_by=claimed_by)
+        if tm is not None:
+            tm.flush(failed=False, status="ok")
         return "completed"
     except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
         code = _safe_failure_code("extraction_failed", e)
@@ -611,6 +751,8 @@ async def _run_extraction(job_id, user_id: str, lane: str, deps: TurnDeps,
         await asyncio.to_thread(
             jobs_store.mark_failed, job_id, code,
             claimed_by=claimed_by)
+        if tm is not None:
+            tm.flush(failed=True, status=code)
         return "failed"
 
 
@@ -667,6 +809,7 @@ async def process_job(
     enclave_sem: "asyncio.Semaphore" = None,
     read_parallelism: int = None,
     replan_budget: int = v2_inval.DEFAULT_REPLAN_BUDGET,
+    tm: "TurnMetrics | None" = None,
 ) -> str:
     """一回合：coalesce → planner → executor → (安全点 replan，预算内) → responder（spec §7/§8）。
 
@@ -676,6 +819,10 @@ async def process_job(
     replan 时的 read_messages），从不流向 planner/responder 的 LLM 调用。
 
     返回终态字符串（"completed"/"failed"），任一步失败 → mark_failed（绝不写占位气泡）。
+
+    `tm`（spec B5，可选）：`_run_turn` 创建的这个 job 的 `TurnMetrics` whole-turn 累加器；
+    None 时（既有直调 `process_job` 的单测、未经 `_run_turn`）就地新建一个，本函数自己
+    的终态 flush 点仍然生效。
     """
     if enclave_sem is None:
         enclave_sem = ENCLAVE_SEMAPHORE
@@ -687,6 +834,8 @@ async def process_job(
     lane = job.get("lane") or "chat"
     claimed_by = str(job.get("claimed_by") or "")
     observed_generation = int(job.get("input_generation") or 0)
+    if tm is None:
+        tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
 
     try:
         if not claimed_by or not await asyncio.to_thread(
@@ -714,6 +863,7 @@ async def process_job(
                 "runtime_mode_changed",
                 claimed_by=claimed_by,
             )
+            tm.flush(failed=True, status="runtime_mode_changed")
             raise RuntimeModeChanged("user is no longer assigned to V2")
 
         await _ensure_runtime_mode()
@@ -723,21 +873,21 @@ async def process_job(
             # 函数下面那个 chat-turn 的 `except`——那个分支会 emit 用户可见的 error status
             # + record_terminal_error（iOS 错误 chip），压缩失败是后台维护事，不该弹给用户。
             return await _run_compaction(
-                job_id, user_id, deps, provider_config, enclave_sem, claimed_by)
+                job_id, user_id, deps, provider_config, enclave_sem, claimed_by, tm)
         if lane in _WAKE_LANES:
             # Self-contained wake path (D3 Task 6): proactive turn, not a reply to a
             # just-sent user message. Own try/except inside `_run_wake` — never falls
             # into the chat-turn `except` below (that branch emits a user-visible
             # error status + record_terminal_error, which wake failures must not do).
             return await _run_wake(
-                job_id, user_id, lane, deps, provider_config, enclave_sem, claimed_by)
+                job_id, user_id, lane, deps, provider_config, enclave_sem, claimed_by, tm)
         if lane in _EXTRACTION_LANES:
             # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
             # parse → memory actions。同 _run_compaction/_run_wake 一样有自己的 try/except，
             # 绝不落进下面 chat-turn 的 except（那条会 emit 用户可见 error status +
             # record_terminal_error）——后台 job 永不写气泡、永不弹 error chip。
             return await _run_extraction(
-                job_id, user_id, lane, deps, provider_config, enclave_sem, claimed_by)
+                job_id, user_id, lane, deps, provider_config, enclave_sem, claimed_by, tm)
         if lane != "chat":
             # 真·未注册 lane 的兜底：maintenance/wake（heartbeat/scheduled/manual_wake）/
             # capture/dream 都已在上面各自的 handler 里分派完；能落到这里的只剩既不是 chat、
@@ -750,6 +900,7 @@ async def process_job(
             await asyncio.to_thread(
                 jobs_store.mark_failed, job_id, f"unhandled_lane:{lane}",
                 claimed_by=claimed_by)
+            tm.flush(failed=True, status=f"unhandled_lane:{lane}")
             return "failed"
         store = core_store.get_store(user_id)
         runtime_state = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
@@ -776,6 +927,7 @@ async def process_job(
                 await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
             await asyncio.to_thread(_emit_status, user_id, job_id, "done")
             await asyncio.to_thread(core_wake_bus.notify, "chat", user_id)
+            tm.flush(failed=False, status="ok")
             return "completed"
 
         replan_count = 0
@@ -811,6 +963,11 @@ async def process_job(
                     perception_summary=perception_summary, runtime_state=runtime_state,
                     lane=lane, reason=str(job.get("reason") or ""),
                     prior_action_results=prior or None)
+                if is_official:
+                    # rule_plan (is_official=False) is deterministic/zero-LLM (spec §7.3) —
+                    # only official_plan actually hits a provider, so only that counts as
+                    # a model call for the whole-turn metric (spec B5).
+                    tm.add_call(None)
                 return v2_agent_loop.Decision(
                     actions=[s for s in steps if s["type"] != "final_response"],
                     wants_reply=any(s["type"] == "final_response" for s in steps))
@@ -888,8 +1045,10 @@ async def process_job(
             # responder 走 BYOK provider_config；ResponderError（空回复/provider 错）交给下面
             # 统一的 except 兜底 mark_failed——no-filler 铁律：绝不写占位气泡。v2_responder.respond
             # 现在原生 async，直接 await，不再经 to_thread 桥线程池（同上，治并发天花板）。
-            # Task 4：usage_out 是纯出参（responder 保持 hosted-free/无 job 上下文），成功
-            # 返回后由 worker（有 job_id/user_id/lane）记 v2_turn_metrics，喂 D4 load-test。
+            # spec B5：usage_out 是纯出参（responder 保持 hosted-free/无 job 上下文），成功
+            # 返回后由 worker 折进本回合的 `tm`（TurnMetrics whole-turn 累加器），终态时
+            # 一次性 flush 成一行 v2_turn_metrics（旧的逐次 record_turn_metric INSERT 已移除
+            # ——一个 job 现在恰好一行，见 jobs_store.record_whole_turn_metric）。
             if loop_res.final_text:
                 # 原生 tool-calling 后端在收手时自带回复（spec §3.1）。默认的 json_planner
                 # 后端恒为 None，所以今天这条分支不会走到——留着，是为了别在接原生后端时
@@ -897,21 +1056,10 @@ async def process_job(
                 reply = loop_res.final_text
             else:
                 _usage: dict = {}
-                _t0 = time.monotonic()
                 reply = await v2_responder.respond(
                     provider_config=provider_config, summary=summary, tail=tail,
                     action_results=action_state["action_results"], usage_out=_usage)
-                if deps.record_turn_metric is not None:
-                    try:
-                        await asyncio.to_thread(
-                            deps.record_turn_metric,
-                            job_id=job_id, user_id=user_id, lane=lane,
-                            prompt_tokens=_usage.get("prompt_tokens"),
-                            completion_tokens=_usage.get("completion_tokens"),
-                            latency_ms=int((time.monotonic() - _t0) * 1000),
-                        )
-                    except Exception as e:  # noqa: BLE001 — 记指标失败绝不能拖垮已经产出的回复
-                        log.warning("[v2.worker] record_turn_metric failed job=%s: %s", job_id, e)
+                tm.add_call(_usage)
             await _ensure_runtime_mode()
             await _renew_lease()
             reply_row = await asyncio.to_thread(_write_encrypted_reply, store, reply)
@@ -960,13 +1108,19 @@ async def process_job(
                 await asyncio.to_thread(deps.apply_pending_effects, user_id)
             except Exception as e:  # noqa: BLE001 — see comment above
                 log.warning("[v2.worker] apply_pending_effects failed user=%s: %s", user_id, e)
+        tm.flush(failed=False, status="ok")
         return "completed"
     except LostJobLease as e:
         # The winning lifecycle transition (normally the reaper) owns terminal
         # visibility. A stale worker must not overwrite it or emit a duplicate error.
+        # No tm.flush here on purpose: this worker doesn't own the terminal state,
+        # so it must not also claim ownership of (or overwrite) the metric row.
         log.warning("[v2.worker] job %s fenced out: %s", job_id, e)
         return "failed"
     except RuntimeModeChanged as e:
+        # Same non-ownership reasoning as LostJobLease above — and _ensure_runtime_mode
+        # already flushed (failed=True, status="runtime_mode_changed") before raising
+        # this, so a second flush here would be redundant even if it were warranted.
         log.info("[v2.worker] job %s stopped at rollout fence: %s", job_id, e)
         return "failed"
     except Exception as e:  # noqa: BLE001 — 任何失败落 last_error，绝不写占位气泡
@@ -976,6 +1130,7 @@ async def process_job(
             jobs_store.mark_failed, job_id, message, claimed_by=claimed_by)
         if owned:
             await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, message)
+        tm.flush(failed=True, status=message)
         return "failed"
 
 
@@ -983,11 +1138,17 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
     """把一个已 claim 的 job 交给 `process_job` 之前，先做一次性的 enclave-bound 解析：
     单次解密 BYOK provider key（single-decrypt-per-turn）+ 判定 is_official + 铸一个
     enclave-auth runtime_token。resolve_provider 失败（未配置/解密失败等）直接 mark_failed，
-    不进入全流程（没有可用 provider，planner/responder 都跑不了）。"""
+    不进入全流程（没有可用 provider，planner/responder 都跑不了）。
+
+    spec B5：这是 job_id/user_id/lane 最早齐全的地方，所以本 job 的 `TurnMetrics`
+    whole-turn 累加器在这里创建（早于 `process_job`——provider 解析失败时根本不会进
+    `process_job`，那次失败仍需要一行 v2_turn_metrics），再原样传给 `process_job`
+    复用（同一个 job 只有一行，不会因为累加器实例不同而分裂成两次 upsert）。"""
     job_id = job["id"]
     user_id = str(job["user_id"])
     claimed_by = str(job.get("claimed_by") or "")
     lane = str(job.get("lane") or "chat")
+    tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
     try:
         async with ENCLAVE_SEMAPHORE:
             provider_config, meta = await asyncio.to_thread(deps.resolve_provider, user_id)
@@ -997,6 +1158,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                 jobs_store.mark_failed, job_id, err, claimed_by=claimed_by)
             if owned and lane == "chat":
                 await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, err)
+            tm.flush(failed=True, status=err)
             return "failed"
         is_official = deps.is_official(provider_config)
         runtime_token = await asyncio.to_thread(deps.mint_enclave_token, user_id)
@@ -1004,6 +1166,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             job, deps,
             provider_config=provider_config, is_official=is_official,
             api_key=None, runtime_token=runtime_token,
+            tm=tm,
         )
     except asyncio.CancelledError:
         raise
@@ -1014,6 +1177,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             jobs_store.mark_failed, job_id, message, claimed_by=claimed_by)
         if owned and lane == "chat":
             await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, message)
+        tm.flush(failed=True, status=message)
         return "failed"
 
 
@@ -1113,6 +1277,23 @@ async def _slot_loop(
                     if owned and str(job.get("lane") or "chat") == "chat":
                         await asyncio.to_thread(
                             _surface_terminal_error, deps, user_id, job["id"], message)
+                    # spec B5: `_run_turn` already wraps its whole body in its own
+                    # `except Exception` that flushes `tm` before returning "failed" (and
+                    # its `except asyncio.CancelledError: raise` doesn't land here either —
+                    # CancelledError is BaseException, not Exception, so this outer
+                    # `except Exception` wouldn't catch it even if it did propagate this
+                    # far). What CAN still reach here despite that: a secondary exception
+                    # raised from WITHIN `_run_turn`'s own except-block bookkeeping itself
+                    # (e.g. `jobs_store.mark_failed`/`tm.flush` throwing before the flush
+                    # completes) — a narrow escape where `_run_turn`'s own `tm` never got
+                    # a chance to flush, so this whole-turn-metric gap still needs its own
+                    # row (model_calls=0 — no visibility into how far the turn got before
+                    # it escaped).
+                    await asyncio.to_thread(
+                        jobs_store.record_whole_turn_metric,
+                        job["id"], user_id, str(job.get("lane") or "chat"),
+                        prompt_tokens=0, completion_tokens=0, latency_ms=0,
+                        model_calls=0, retries=0, failed=True, status=message)
                 except Exception as recovery_error:  # noqa: BLE001
                     # Recovery is best-effort: the independent lease reaper is
                     # the final owner of terminalization.  A second DB/error-

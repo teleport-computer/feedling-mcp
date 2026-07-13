@@ -65,20 +65,31 @@ def test_missing_key_raises():
             cfg, [{"role": "user", "content": "hi"}]))
 
 
-def test_non_openai_wire_bridges_to_sync(monkeypatch):
-    called = {}
+def test_non_openai_wire_native_async(monkeypatch):
+    """PR B Task 7 (B3): anthropic/gemini/openai-responses no longer bridge to
+    the sync `chat_completion` via anyio.to_thread — they POST natively async
+    through the shared _async_http_client, same as the openai-compat wire."""
+    def boom(*a, **k):
+        raise AssertionError("must not call sync chat_completion (thread bridge removed)")
 
-    def fake_sync(config, messages, **kw):
-        called["provider"] = config.provider
-        return {"reply": "from-sync"}
+    monkeypatch.setattr(provider_client, "chat_completion", boom)
 
-    monkeypatch.setattr(provider_client, "chat_completion", fake_sync)
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "msg_1",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "stop_reason": "end_turn",
+        })
+
+    _mock_async_client(monkeypatch, handler)
     cfg = provider_client.ProviderConfig(
         provider="anthropic", model="claude-sonnet-5", api_key="k")
     out = asyncio.run(provider_client.chat_completion_async(
         cfg, [{"role": "user", "content": "hi"}]))
-    assert out == {"reply": "from-sync"}
-    assert called["provider"] == "anthropic"
+    assert out["reply"] == "hi"
+    assert out["provider"] == "anthropic"
+    assert out["tool_calls"] == []
 
 
 def test_openai_compatible_returns_remapped_model_async(monkeypatch):

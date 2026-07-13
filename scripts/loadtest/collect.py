@@ -88,6 +88,22 @@ def tokens_per_turn_samples(*, within_hours: int = 24) -> list[float]:
             return [float(row[0]) for row in cur.fetchall()]
 
 
+def failed_turn_count(*, within_hours: int = 24) -> int:
+    """Count of v2_turn_metrics rows with failed=true in the recent window —
+    whole-turn failures recorded by ``jobs_store.record_whole_turn_metric``
+    (spec B5), independent of the older per-call ``record_turn_metric`` rows
+    (those never set ``failed``, so they're naturally excluded)."""
+    with db.get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM v2_turn_metrics "
+                "WHERE failed "
+                "  AND created_at > now() - make_interval(hours => %s)",
+                (int(within_hours),),
+            )
+            return int(cur.fetchone()[0])
+
+
 def stuck_job_count(*, within_hours: int = 24) -> int:
     """Count of agent_jobs reaper-expired (status='expired') within the window
     — these are jobs the pool claimed but never finished in time."""

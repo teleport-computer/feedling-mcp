@@ -6,6 +6,7 @@ CONTRIBUTING §2：新表存取逻辑全部收进本模块（jobs_store）。连
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 import time
@@ -16,6 +17,8 @@ from psycopg.types.json import Jsonb
 
 import db
 from core import wake_bus
+
+log = logging.getLogger("feedling.runtime_v2.jobs_store")
 
 LANES = {"chat", "manual_wake", "heartbeat", "scheduled", "capture", "maintenance", "dream", "screen_watch"}
 
@@ -693,6 +696,28 @@ def record_turn_metric(
             "VALUES (%s,%s,%s,%s,%s,%s)",
             (job_id, str(user_id), str(lane), prompt_tokens, completion_tokens, latency_ms),
         )
+
+
+def record_whole_turn_metric(job_id, user_id, lane, *, prompt_tokens, completion_tokens,
+                             latency_ms, model_calls, retries, failed, status) -> None:
+    """One idempotent whole-turn metric per job (spec B5): upsert on job_id so a
+    re-drive (redelivery/retry of the same job) REPLACES rather than appends. Covers
+    all model calls, retries, and failed turns. Best-effort: never raises to the turn."""
+    try:
+        with _pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_turn_metrics (job_id, user_id, lane, prompt_tokens, "
+                "completion_tokens, latency_ms, model_calls, retries, failed, status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (job_id) DO UPDATE SET "
+                "prompt_tokens=EXCLUDED.prompt_tokens, completion_tokens=EXCLUDED.completion_tokens, "
+                "latency_ms=EXCLUDED.latency_ms, model_calls=EXCLUDED.model_calls, "
+                "retries=EXCLUDED.retries, failed=EXCLUDED.failed, status=EXCLUDED.status, "
+                "updated_at=now()",
+                (job_id, user_id, lane, prompt_tokens, completion_tokens, latency_ms,
+                 model_calls, retries, failed, status))
+    except Exception as e:  # noqa: BLE001 — best-effort instrumentation, never fail the turn
+        log.error("[jobs_store] record_whole_turn_metric(%s) failed: %s", job_id, e)
 
 
 def recent_mean_tokens_per_turn(*, lane: str = "chat", limit: int = 50) -> float | None:

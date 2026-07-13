@@ -169,6 +169,35 @@ def test_stuck_job_count_excludes_outside_window():
     assert collect.stuck_job_count(within_hours=24) == 0
 
 
+def test_failed_turn_count_counts_only_failed_whole_turn_rows():
+    seed_user("u_lt_10")
+    jobs_store.record_whole_turn_metric(
+        job_id=90001, user_id="u_lt_10", lane="chat",
+        prompt_tokens=10, completion_tokens=5, latency_ms=100,
+        model_calls=1, retries=0, failed=True, status="error",
+    )
+    jobs_store.record_whole_turn_metric(
+        job_id=90002, user_id="u_lt_10", lane="chat",
+        prompt_tokens=10, completion_tokens=5, latency_ms=100,
+        model_calls=1, retries=0, failed=False, status="ok",
+    )
+    assert collect.failed_turn_count(within_hours=24) == 1
+
+
+def test_failed_turn_count_excludes_outside_window():
+    seed_user("u_lt_11")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(job_id, user_id, lane, prompt_tokens, completion_tokens, latency_ms, "
+            "model_calls, retries, failed, status, created_at) "
+            "VALUES (90003, %s, 'chat', 10, 5, 100, 1, 0, true, 'error', "
+            "now() - interval '48 hours')",
+            ("u_lt_11",),
+        )
+    assert collect.failed_turn_count(within_hours=24) == 0
+
+
 # --- peak_rss_kb ----------------------------------------------------------
 
 
