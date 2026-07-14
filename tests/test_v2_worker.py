@@ -27,6 +27,7 @@ from capabilities import registry as cap_registry
 from core import store as core_store
 from model_api_runtime.v2 import agent_loop as v2_agent_loop
 from model_api_runtime.v2 import compaction as v2_compaction
+from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import invalidation as v2_inval
 from model_api_runtime.v2 import jobs_store
@@ -103,6 +104,12 @@ def _reply_effect_dispatch(user_id):
     def dispatch(effect_type, payload):
         if effect_type == "reply":
             worker._write_encrypted_reply(core_store.get_store(user_id), str(payload.get("text") or ""))
+        elif effect_type == "cursor":
+            # Mirror serve_worker._sink_cursor: persist the advanced seq reply
+            # cursor into the model_api_runtime blob (D5). Simplified — no
+            # effect_sink_claim (the reply branch above skips it too).
+            db.patch_blob_strict(
+                user_id, "model_api_runtime", {v2_cursor.CURSOR_KEY: int(payload["new_seq"])})
     return dispatch
 
 
@@ -399,8 +406,10 @@ def test_coalesce_inputs_and_cap_data_tolerate_enclave_sem_none(monkeypatch):
         is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
     )
-    coalesced, cursor = asyncio.run(worker._coalesce_inputs(deps, uid, 0.0, enclave_sem=None))
-    assert cursor == 1.0
+    coalesced, seq_cursor, ts_cursor = asyncio.run(
+        worker._coalesce_inputs(deps, uid, 0, enclave_sem=None))
+    assert ts_cursor == 1.0  # max ts of coalesced (rollback last_replied_ts feed)
+    assert seq_cursor == 0   # row carries no seq -> falls back to the since_seq default
     assert coalesced and coalesced[0]["content"] == "hi"
 
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({"x": 1}))
@@ -501,9 +510,9 @@ def test_process_job_picks_up_concurrent_new_message_via_per_round_fold(monkeypa
     # sees only m1; the 2nd call (the fold ahead of round 1, call_idx>0) sees m2
     # arriving concurrently, mirroring "a message showed up mid-turn."
     feed = iter([
-        [{"id": "m1", "ts": 10.0, "role": "user", "content": "first"}],
-        [{"id": "m1", "ts": 10.0, "role": "user", "content": "first"},
-         {"id": "m2", "ts": 20.0, "role": "user", "content": "second"}],
+        [{"id": "m1", "ts": 10.0, "seq": 1, "role": "user", "content": "first"}],
+        [{"id": "m1", "ts": 10.0, "seq": 1, "role": "user", "content": "first"},
+         {"id": "m2", "ts": 20.0, "seq": 2, "role": "user", "content": "second"}],
     ])
     deps = worker.TurnDeps(
         read_messages=lambda uid: next(feed),
@@ -527,8 +536,13 @@ def test_process_job_picks_up_concurrent_new_message_via_per_round_fold(monkeypa
     assert any("second" in str(m.get("content", "")) for m in calls[1]["messages"])
     assert written["text"] == "R"
     assert _job_status(job_id)[0] == "completed"
-    # last_replied_ts should reflect the fold's cursor (20.0), not just the
-    # turn's initial coalesce (10.0) — the turn answered both messages.
+    # The DURABLE seq reply cursor advances to the fold's max seq (2) — the turn
+    # answered BOTH messages, so the next turn resumes at seq > 2, never re-
+    # reading either. This is the source of truth in the seq world.
+    from core import store as _cs
+    assert v2_cursor.load_seq(_cs.get_store(uid)) == 2
+    # last_replied_ts is dual-written (vestigial rollback cursor) and still
+    # reflects both messages' max ts (20.0), tracked across the mid-turn fold.
     assert jobs_store.get_runtime_state(uid).get("last_replied_ts") == 20.0
 
 

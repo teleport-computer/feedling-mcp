@@ -66,7 +66,12 @@ def coalesce_pending(
             continue
         if mid:
             seen.add(mid)
-        out.append({"id": mid, "ts": ts, "content": content})
+        # `seq` (the stable chat_messages identity column) is forwarded verbatim
+        # when the caller supplied it (the production seq reader does; the pure
+        # ts-only unit inputs don't) so the worker can advance the DURABLE reply
+        # cursor by seq — never by `cursor` above, which is a ts and only seeds
+        # the in-turn fold boundary. See `model_api_runtime.v2.cursor` / D5.
+        out.append({"id": mid, "ts": ts, "seq": m.get("seq"), "content": content})
         if ts > cursor:
             cursor = ts
     return out, cursor

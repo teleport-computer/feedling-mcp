@@ -61,6 +61,7 @@ from core import wake_bus as core_wake_bus
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
+from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
@@ -396,19 +397,55 @@ async def _cap_data(store, action_type, *, api_key, runtime_token, params=None, 
         return {}
 
 
+def _max_seq(rows: list[dict], *, default: int) -> int:
+    """Highest ``seq`` among ``rows`` (coalesced messages carry it — see
+    ``coalesce.coalesce_pending``), or ``default`` when none carries one (pure
+    ts-only test inputs). Used to advance the DURABLE reply cursor to the max
+    answered seq; never regresses below ``default`` (the turn's start cursor)."""
+    seqs = [int(r["seq"]) for r in rows if r.get("seq") is not None]
+    return max(seqs) if seqs else default
+
+
+def _load_reply_cursor_seq(store, runtime_state: dict) -> int:
+    """Durable **seq** reply cursor for ``store``'s user (spec A1 / D5), with a
+    ONE-TIME bootstrap for hosted users that were answered under the legacy
+    wall-clock ``last_replied_ts`` cursor and have no ``v2_reply_cursor_seq``
+    yet (migration default 0). Returning a raw 0 for such a user would make the
+    first V2 turn re-read — and re-answer — their whole history; instead map the
+    old ts boundary to the equivalent seq via ``db.chat_max_seq_at_or_before_ts``
+    (``ts <= last_replied_ts``, all roles, so the boundary sits past the last
+    answered user message AND its reply). A genuinely fresh user (no ts cursor
+    either) correctly starts at 0 and reads everything once."""
+    seq = v2_cursor.load_seq(store)
+    if seq > 0:
+        return seq
+    try:
+        last_ts = float(runtime_state.get("last_replied_ts") or 0)
+    except (TypeError, ValueError):
+        last_ts = 0.0
+    if last_ts > 0:
+        return db.chat_max_seq_at_or_before_ts(store.user_id, last_ts)
+    return 0
+
+
 async def _coalesce_inputs(
-    deps: TurnDeps, user_id: str, since_ts: float, *, enclave_sem=None
-) -> tuple[list[dict], float]:
+    deps: TurnDeps, user_id: str, since_seq: int, *, enclave_sem=None
+) -> tuple[list[dict], int, float]:
     """经注入的 `TurnDeps.read_messages` 取 enclave 内解密的**明文**近期消息，再按 §7.1 合并。
 
     `read_messages` 逐条在 enclave 内解密（worker 不 shell out、不碰 K_user）——enclave-bound
     （spec §11 R3），过 enclave_sem 才能跟 provider-key 解密/executor capability 调用共享同一
     闸门，否则 N 个并发 worker 会绕开闸门直接打单线程 enclave。enclave_sem 为 None（部分单测
-    直调）时不设闸。返回 (coalesced, cursor)。cursor==0.0 表示本次没有新消息被折入（调用方
-    不应据此回退 last_replied_ts——见 process_job 里的单调前进处理）。"""
+    直调）时不设闸。
+
+    读边界是 **seq**（`since_seq`），由注入的 reader（生产 `_read_messages`）在 DB 层用
+    `seq > since_seq` 过滤——故这里的 `coalesce_pending` 用 `since_ts=-1.0`（不再设 ts 闸，
+    避免把合法的 ts<=0 行也丢掉），只保留 coalesce 的按-id 去重 / 丢空内容 / 排序职责。
+    返回 (coalesced, max_seq, ts_cursor)：`max_seq` 是折入消息的最大 seq，用于推进**持久
+    回复游标**；`ts_cursor` 仅供 last_replied_ts 的回滚兜底双写（seq 世界里已无人读它）。"""
     async def _read():
         if deps.read_messages_since is not None:
-            return await asyncio.to_thread(deps.read_messages_since, user_id, since_ts)
+            return await asyncio.to_thread(deps.read_messages_since, user_id, since_seq)
         return await asyncio.to_thread(deps.read_messages, user_id)
 
     if enclave_sem is not None:
@@ -416,7 +453,8 @@ async def _coalesce_inputs(
             messages = await _read()
     else:
         messages = await _read()
-    return v2_coalesce.coalesce_pending(messages, since_ts=since_ts)
+    coalesced, ts_cursor = v2_coalesce.coalesce_pending(messages, since_ts=-1.0)
+    return coalesced, _max_seq(coalesced, default=since_seq), ts_cursor
 
 
 def _make_fold_new_messages(
@@ -448,29 +486,26 @@ def _make_fold_new_messages(
     that want to exercise the closure with no gating pass `enclave_sem=None` (mirrors
     `_coalesce_inputs`/`_cap_data`'s own `enclave_sem is None` no-gate tolerance).
 
-    `cursor_box` is a single-key `{"ts": float}` mutable dict the caller owns and shares with
+    `cursor_box` is a single-key `{"seq": int}` mutable dict the caller owns and shares with
     this closure by reference — `run_tool_loop` holds no cursor state itself, it only calls
     the closure — so repeated `fold_new_messages()` calls across rounds advance the SAME
-    cursor in place. Callers seed it with the turn's `since_ts` (the durable
-    `last_replied_ts` cursor used by the turn's own initial coalesce — see
-    `_coalesce_inputs`), so the first fold call only sees messages newer than what the turn
-    already coalesced at claim time.
+    **seq** cursor in place. Callers seed it with the max seq the turn's own initial coalesce
+    already answered (see `_coalesce_inputs`), so the first fold call only sees messages with
+    `seq >` that — the injected seq reader (`serve_worker._read_messages(user_id, after_seq)`)
+    does the `seq > cursor` filter at the DB layer.
 
-    Merge/filter goes through `coalesce.coalesce_pending(rows, since_ts=cursor_box["ts"])`
-    exactly like `_coalesce_inputs` — user-role filter, id-dedupe, empty-content drop — and
-    the cursor advances to `max(cursor_box["ts"], cursor)` after every call (never regresses:
-    `coalesce_pending` returns cursor==0.0 when nothing new was folded, and `max()` keeps the
-    box monotonic instead of that 0.0 clobbering a real prior value). Because dedup is by
-    message **id** (not by ts), two messages sharing an identical wall-clock ts within the
-    same read are still both folded exactly once — the ts-cursor's only job is bounding which
-    rows are even candidates, id-dedup inside a single call handles the rest. This is the same
-    boundary condition `_coalesce_inputs` already lives with at turn-claim time, so reusing it
-    here is not a new regression.
+    Merge/filter goes through `coalesce.coalesce_pending(rows, since_ts=-1.0)` — no ts gate
+    (the reader already bounded rows by seq), leaving only coalesce's user-role filter,
+    id-dedupe and empty-content drop. The cursor advances to `max(cursor_box["seq"], max seq
+    folded)` after every call and never regresses (seq is a monotonic identity column, so a
+    later message always has a strictly greater seq — unlike wall-clock ts, where a same-ts
+    tie or a late-arriving earlier-ts message could strand a message below the boundary
+    forever; that ts fragility is exactly the D5 no-reply bug this seq wiring fixes).
     """
 
     async def fold_new_messages() -> list[dict]:
         reader = deps.read_messages_since if deps.read_messages_since is not None else deps.read_messages
-        args = (user_id, cursor_box["ts"]) if deps.read_messages_since is not None else (user_id,)
+        args = (user_id, cursor_box["seq"]) if deps.read_messages_since is not None else (user_id,)
 
         async def _read():
             return await asyncio.to_thread(reader, *args)
@@ -480,9 +515,14 @@ def _make_fold_new_messages(
                 rows = await _read()
         else:
             rows = await _read()
-        coalesced, cursor = v2_coalesce.coalesce_pending(rows, since_ts=cursor_box["ts"])
-        if cursor:
-            cursor_box["ts"] = max(cursor_box["ts"], cursor)
+        coalesced, ts_cursor = v2_coalesce.coalesce_pending(rows, since_ts=-1.0)
+        new_seq = _max_seq(coalesced, default=cursor_box["seq"])
+        if new_seq > cursor_box["seq"]:
+            cursor_box["seq"] = new_seq  # 单调前进：seq reader 已按 seq>cursor 过滤
+        # Also carry the max ts forward so the vestigial last_replied_ts rollback
+        # cursor stays faithful to folds (never READ in the seq world). Monotonic.
+        if ts_cursor > cursor_box.get("ts", 0.0):
+            cursor_box["ts"] = ts_cursor
         return coalesced
 
     return fold_new_messages
@@ -1109,8 +1149,11 @@ async def _run_wake(
         # historical rows are already baked into the closed-over `tail` above;
         # fold_new_messages's only job is picking up messages that arrive AFTER
         # this point, mid-loop (e.g. the user starts typing while the wake turn is
-        # composing).
-        cursor_box = {"ts": time.time()}
+        # composing). The fold is seq-keyed (D5), so seed the seq cursor to the
+        # user's current max seq — only genuinely newer rows fold in. `ts` rides
+        # along for the same reason it does on the chat path (fold's ts tracking).
+        cursor_box = {"seq": await asyncio.to_thread(db.chat_max_seq, user_id),
+                      "ts": time.time()}
         fold_new_messages = _make_fold_new_messages(user_id, deps, cursor_box, enclave_sem=enclave_sem)
         build_messages = _make_build_messages_fn(
             system_prompt=(_SCREEN_WATCH_SYSTEM_PROMPT if lane == "screen_watch"
@@ -1426,13 +1469,18 @@ async def process_job(
         runtime_state = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
         await asyncio.to_thread(_emit_status, user_id, job_id, "processing")
 
-        since = float(runtime_state.get("last_replied_ts") or 0)
+        # Durable reply boundary is the stable SEQ cursor (D5), not wall-clock
+        # last_replied_ts — a same-ts tie or a late earlier-ts message would
+        # otherwise be skipped forever (the pre-env no-reply / reconcile-loop
+        # bug). `_load_reply_cursor_seq` bootstraps legacy ts-cursor users once.
+        since_seq = await asyncio.to_thread(_load_reply_cursor_seq, store, runtime_state)
         generation = await asyncio.to_thread(
             jobs_store.get_input_generation, job_id, claimed_by=claimed_by)
         if generation is None:
             raise LostJobLease("job ownership lost before input read")
         observed_generation = generation
-        coalesced, cursor = await _coalesce_inputs(deps, user_id, since, enclave_sem=enclave_sem)
+        coalesced, cursor_seq, cursor_ts = await _coalesce_inputs(
+            deps, user_id, since_seq, enclave_sem=enclave_sem)
         if not coalesced and lane == "chat":
             # 无未回复消息（已被别的回合吃掉，或是竞态下的重复 claim）——干净收尾，不落 filler。
             completed, successor_id = await asyncio.to_thread(
@@ -1551,7 +1599,9 @@ async def process_job(
             if deps.apply_pending_effects is not None:
                 await asyncio.to_thread(deps.apply_pending_effects, user_id)
 
-        cursor_box = {"ts": cursor}  # seeded to what the turn's own coalesce already saw
+        # seq is the durable reply cursor; ts rides along only to keep the
+        # vestigial last_replied_ts rollback cursor faithful across mid-turn folds.
+        cursor_box = {"seq": cursor_seq, "ts": cursor_ts}
         # Pass THIS turn's enclave_sem through explicitly (not the closure's module-level
         # default) — process_job may have been called with an injected/test semaphore
         # (e.g. tests/test_v2_worker.py's _CountingSemaphore), and the per-round fold must
@@ -1589,9 +1639,33 @@ async def process_job(
             except Exception as e:  # noqa: BLE001 — 压缩入队失败绝不能拖垮已经写成的这条回复
                 log.warning("[v2.worker] enqueue compaction failed for %s: %s", user_id, e)
 
-        # last_replied_ts 单调前进：cursor_box["ts"] 恒 >= 本轮初始 coalesce 的 cursor
-        # （fold_new_messages 只前进不回退）；since 本身是上一次回复的水位——两者取大。
-        new_last_replied = cursor_box["ts"] if cursor_box["ts"] > since else since
+        # Advance the DURABLE reply cursor by seq (D5): cursor_box["seq"] is the
+        # max seq answered this turn (initial coalesce + every mid-turn fold,
+        # monotonic). Emitted as a generation-fenced 'cursor' outbox effect
+        # (idempotent like every other V2 side effect — its sink
+        # `serve_worker._sink_cursor` writes `v2_reply_cursor_seq` into the
+        # model_api_runtime blob), drained by the end-of-turn
+        # `apply_pending_effects` below. Only advance forward (never regress
+        # below the turn's start cursor).
+        new_seq = cursor_box["seq"] if cursor_box["seq"] > since_seq else since_seq
+        if new_seq > since_seq:
+            # Same enqueue path as the reply/write effects: enqueue_effect derives
+            # the effect id from (job_id, "cursor", ordinal) — the exact shape
+            # `cursor.advance_effect` documents — so one next(ordinal) is enough.
+            v2_effect_outbox.enqueue_effect(
+                job_id=job_id, user_id=user_id, effect_type="cursor",
+                ordinal=next(ordinal), expected_generation=gen, payload={"new_seq": new_seq})
+        # Keep last_replied_ts freshly dual-written: nothing READS it in the seq
+        # world, but a code rollback to the ts boundary must resume from a fresh
+        # cursor rather than re-reading history. cursor_box["ts"] tracks the max
+        # ts answered across the initial coalesce AND every mid-turn fold, so the
+        # rollback cursor stays faithful. action_digest rides this same upsert.
+        _prev_ts = 0.0
+        try:
+            _prev_ts = float(runtime_state.get("last_replied_ts") or 0)
+        except (TypeError, ValueError):
+            _prev_ts = 0.0
+        new_last_replied = cursor_box["ts"] if cursor_box["ts"] > _prev_ts else _prev_ts
         await asyncio.to_thread(
             jobs_store.upsert_runtime_state, user_id,
             {"last_replied_ts": new_last_replied, "action_digest": action_digest})

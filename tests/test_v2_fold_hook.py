@@ -38,11 +38,16 @@ def _run_fold(fold):
 @dataclass
 class _FakeReader:
     """Scripted stand-in for the enclave-decrypt reader. `rows` is mutated by the test
-    between fold() calls to simulate new plaintext messages becoming visible."""
+    between fold() calls to simulate new plaintext messages becoming visible.
+
+    Honours the SEQ boundary the production reader (`serve_worker._read_messages`)
+    enforces at the DB layer — returns only rows with `seq > after_seq`. In the seq
+    design the reader owns cross-call de-duplication (the fold no longer applies a ts
+    gate in coalesce), so a fake that ignored the arg would falsely re-deliver rows."""
     rows: list[dict] = field(default_factory=list)
 
-    def __call__(self, user_id: str, since_ts: float) -> list[dict]:
-        return list(self.rows)
+    def __call__(self, user_id: str, after_seq: int) -> list[dict]:
+        return [r for r in self.rows if (r.get("seq") or 0) > after_seq]
 
 
 def _deps(reader: _FakeReader) -> TurnDeps:
@@ -56,42 +61,42 @@ def _deps(reader: _FakeReader) -> TurnDeps:
 
 
 def test_fold_returns_first_message_and_advances_cursor():
-    reader = _FakeReader(rows=[{"id": "m1", "ts": 100.0, "role": "user", "content": "hi"}])
-    cursor_box = {"ts": 0.0}
+    reader = _FakeReader(rows=[{"id": "m1", "ts": 100.0, "seq": 1, "role": "user", "content": "hi"}])
+    cursor_box = {"seq": 0}
     fold = worker._make_fold_new_messages("u_fold1", _deps(reader), cursor_box, enclave_sem=None)
 
     out = _run_fold(fold)
     assert [m["id"] for m in out] == ["m1"]
     assert out[0]["content"] == "hi"
-    assert cursor_box["ts"] == 100.0
+    assert cursor_box["seq"] == 1
 
     # Second call before any new message arrives: no re-fold of m1, no dup.
     assert _run_fold(fold) == []
-    assert cursor_box["ts"] == 100.0
+    assert cursor_box["seq"] == 1
 
 
 def test_fold_second_call_returns_only_new_message_no_dup():
-    reader = _FakeReader(rows=[{"id": "m1", "ts": 100.0, "role": "user", "content": "one"}])
-    cursor_box = {"ts": 0.0}
+    reader = _FakeReader(rows=[{"id": "m1", "ts": 100.0, "seq": 1, "role": "user", "content": "one"}])
+    cursor_box = {"seq": 0}
     fold = worker._make_fold_new_messages("u_fold2", _deps(reader), cursor_box, enclave_sem=None)
 
     first = _run_fold(fold)
     assert [m["id"] for m in first] == ["m1"]
 
     # A newer message becomes visible via the reader (fake "new row arrived").
-    reader.rows.append({"id": "m2", "ts": 101.0, "role": "user", "content": "two"})
+    reader.rows.append({"id": "m2", "ts": 101.0, "seq": 2, "role": "user", "content": "two"})
 
     second = _run_fold(fold)
     assert [m["id"] for m in second] == ["m2"]  # ONLY the new one — no re-fold of m1
-    assert cursor_box["ts"] == 101.0
+    assert cursor_box["seq"] == 2
 
     # A third call with nothing new returns [] — no restart, no phantom re-delivery.
     assert _run_fold(fold) == []
 
 
 def test_fold_no_new_messages_returns_empty_list():
-    reader = _FakeReader(rows=[{"id": "m1", "ts": 100.0, "role": "user", "content": "hi"}])
-    cursor_box = {"ts": 100.0}  # start already caught up (turn's own coalesce already saw m1)
+    reader = _FakeReader(rows=[{"id": "m1", "ts": 100.0, "seq": 1, "role": "user", "content": "hi"}])
+    cursor_box = {"seq": 1}  # start already caught up (turn's own coalesce already saw m1)
     fold = worker._make_fold_new_messages("u_fold3", _deps(reader), cursor_box, enclave_sem=None)
 
     assert _run_fold(fold) == []
@@ -100,16 +105,16 @@ def test_fold_no_new_messages_returns_empty_list():
 
 def test_fold_filters_non_user_roles():
     reader = _FakeReader(rows=[
-        {"id": "m1", "ts": 100.0, "role": "user", "content": "hi"},
-        {"id": "m2", "ts": 101.0, "role": "openclaw", "content": "reply"},
-        {"id": "m3", "ts": 102.0, "role": "user", "content": "again"},
+        {"id": "m1", "ts": 100.0, "seq": 1, "role": "user", "content": "hi"},
+        {"id": "m2", "ts": 101.0, "seq": 2, "role": "openclaw", "content": "reply"},
+        {"id": "m3", "ts": 102.0, "seq": 3, "role": "user", "content": "again"},
     ])
-    cursor_box = {"ts": 0.0}
+    cursor_box = {"seq": 0}
     fold = worker._make_fold_new_messages("u_fold4", _deps(reader), cursor_box, enclave_sem=None)
 
     out = _run_fold(fold)
     assert [m["id"] for m in out] == ["m1", "m3"]  # m2 (assistant) filtered out
-    assert cursor_box["ts"] == 102.0
+    assert cursor_box["seq"] == 3  # max seq of the KEPT user messages (m3), never rewinds
     assert _run_fold(fold) == []
 
 
@@ -132,8 +137,8 @@ def test_fold_acquires_the_given_enclave_semaphore():
     """BUG-2 regression: the per-round fold's enclave-bound read must be gated
     by the SAME semaphore the rest of the turn uses (spec §11 R3) — before the
     fix, the closure called the reader directly with no semaphore at all."""
-    reader = _FakeReader(rows=[{"id": "m1", "ts": 100.0, "role": "user", "content": "hi"}])
-    cursor_box = {"ts": 0.0}
+    reader = _FakeReader(rows=[{"id": "m1", "ts": 100.0, "seq": 1, "role": "user", "content": "hi"}])
+    cursor_box = {"seq": 0}
     sem = _CountingSemaphore(2)
     fold = worker._make_fold_new_messages("u_fold_sem", _deps(reader), cursor_box, enclave_sem=sem)
 
@@ -145,8 +150,8 @@ def test_fold_acquires_the_given_enclave_semaphore():
 def test_fold_defaults_to_module_enclave_semaphore():
     """No enclave_sem passed -> the closure defaults to worker.ENCLAVE_SEMAPHORE
     (the same shared gate `process_job` uses), not an unbounded direct call."""
-    reader = _FakeReader(rows=[{"id": "m1", "ts": 100.0, "role": "user", "content": "hi"}])
-    cursor_box = {"ts": 0.0}
+    reader = _FakeReader(rows=[{"id": "m1", "ts": 100.0, "seq": 1, "role": "user", "content": "hi"}])
+    cursor_box = {"seq": 0}
     fold = worker._make_fold_new_messages("u_fold_default", _deps(reader), cursor_box)
 
     before = worker.ENCLAVE_SEMAPHORE._value
@@ -167,7 +172,7 @@ def test_fold_uses_read_messages_when_read_messages_since_absent():
 
     def reader(user_id: str) -> list[dict]:
         calls.append(user_id)
-        return [{"id": "m1", "ts": 100.0, "role": "user", "content": "hi"}]
+        return [{"id": "m1", "ts": 100.0, "seq": 1, "role": "user", "content": "hi"}]
 
     deps = TurnDeps(
         read_messages=reader,
@@ -176,7 +181,7 @@ def test_fold_uses_read_messages_when_read_messages_since_absent():
         mint_enclave_token=_unused,
         read_messages_since=None,
     )
-    cursor_box = {"ts": 0.0}
+    cursor_box = {"seq": 0}
     fold = worker._make_fold_new_messages("u_fold6", deps, cursor_box, enclave_sem=None)
 
     out = _run_fold(fold)

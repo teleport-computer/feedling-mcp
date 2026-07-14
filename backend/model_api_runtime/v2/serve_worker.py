@@ -303,56 +303,60 @@ def _resolve_provider(user_id: str):
     return runtime, {}
 
 
-def _read_messages(user_id: str, after_ts: float = 0.0) -> list[dict]:
-    """Read user messages after the durable reply cursor and decrypt them.
+def _read_messages(user_id: str, after_seq: int = 0) -> list[dict]:
+    """Read user messages strictly after the durable **seq** reply cursor and
+    decrypt them.
 
-    Never infer unanswered state from the latest assistant position. A user
+    Keyed on ``chat_messages.seq`` (a monotonic identity column), NEVER on
+    wall-clock ``ts`` (D5 / spec A1): two messages appended in the same instant
+    can share an identical ``ts``, and a late-delivered message can carry an
+    earlier client-assigned ``ts`` than an already-answered one — a ``ts <=
+    cursor`` boundary silently skips such a message FOREVER, stranding it in a
+    reconcile no-op loop with no reply. ``seq`` has no such gap, so reading
+    ``seq > after_seq`` never loses or re-answers a message. ``after_seq`` is
+    the user's committed ``cursor.CURSOR_KEY`` (see
+    ``model_api_runtime.v2.cursor.load_seq`` + the legacy-ts bootstrap in
+    ``worker._load_reply_cursor_seq``).
+
+    Never infer unanswered state from the latest assistant position: a user
     message can arrive while a responder is running and be stored immediately
     before that responder's assistant row; assistant slicing would then hide it
-    forever. ``runtime_state.last_replied_ts`` is the source of truth.
+    forever. The durable seq cursor is the source of truth.
 
-    服务器永不本地解密——每条信封走 enclave /v1/envelope/decrypt。
+    Rows come from ``db.chat_messages_after_seq`` (source of truth, ``seq``-
+    ordered, seq merged into each doc) rather than the process-local store ring,
+    precisely so each returned row can carry its ``seq`` without polluting the
+    shared ``core.store`` cache with a seq key.
 
-    The full stored message dict is forwarded to ``_decrypt_envelope_via_enclave``
-    (not a hand-picked subset) — mirrors ``content.content_core._build_rewrapped_envelope``,
-    which passes the whole ``record``. This matters: the enclave's AEAD
-    additional-data is ``owner_user_id||v||id`` (see ``enclave/envelope.py
-    decrypt_envelope`` / ``build_aead_aad``), so dropping the message's ``id``
-    would make every real (non-synthetic) chat envelope fail AEAD verification.
+    服务器永不本地解密——每条信封走 enclave /v1/envelope/decrypt。 The full stored
+    message dict is forwarded to ``_decrypt_envelope_via_enclave`` (not a
+    hand-picked subset) — the enclave's AEAD additional-data is
+    ``owner_user_id||v||id``, so dropping ``id`` would fail AEAD verification.
 
-    Each returned dict carries ``id``/``ts`` alongside ``role``/``content`` (Task 8):
-    ``model_api_runtime.v2.coalesce.coalesce_pending`` filters by ``ts > since_ts`` and
-    dedupes by ``id`` — Plan B's shape (``role``/``content`` only) predates the v2
-    coalesce/planner/executor pipeline and didn't need either field.
+    Each returned dict carries ``id``/``ts``/``seq`` alongside ``role``/
+    ``content``: ``coalesce.coalesce_pending`` dedupes by ``id`` and forwards
+    ``seq`` so the turn advances the durable cursor to the max answered seq.
     """
-    store = core_store.get_store(user_id)
-    reload_chat = getattr(store, "reload_chat_strict", None)
-    if callable(reload_chat):
-        rows = reload_chat()
-    else:  # lightweight test doubles retain the older reload seam
-        reload_store = getattr(store, "reload", None)
-        if callable(reload_store):
-            reload_store()
-        rows = list(getattr(store, "chat_messages", []) or [])
+    rows = db.chat_messages_after_seq(
+        user_id, after_seq, limit=core_store.MAX_CHAT_MESSAGES)
     token = _mint_runtime_token(user_id)
     out: list[dict] = []
     caption_budget = [_CAPTION_DECRYPT_LIMIT]
     for m in rows:
         if str(m.get("role") or "") != "user":
             continue
-        try:
-            if float(m.get("ts") or 0.0) <= float(after_ts):
-                continue
-        except (TypeError, ValueError):
-            continue
-        mid, ts = m.get("id"), m.get("ts")
+        mid, ts, seq = m.get("id"), m.get("ts"), m.get("seq")
         if m.get("content_type") == "image":
-            out.append(_image_row(m, mid=mid, ts=ts, role="user",
-                                   token=token, caption_budget=caption_budget))
+            row = _image_row(m, mid=mid, ts=ts, role="user",
+                             token=token, caption_budget=caption_budget)
+            row["seq"] = seq
+            out.append(row)
             continue
         if m.get("content_type") == "file":
-            out.append(_file_row(m, mid=mid, ts=ts, role="user",
-                                  token=token, caption_budget=caption_budget))
+            row = _file_row(m, mid=mid, ts=ts, role="user",
+                            token=token, caption_budget=caption_budget)
+            row["seq"] = seq
+            out.append(row)
             continue
         if not m.get("body_ct") or m.get("K_enclave") is None:
             continue  # 无 enclave 钥的合成/本地-only 消息跳过
@@ -360,7 +364,7 @@ def _read_messages(user_id: str, after_ts: float = 0.0) -> list[dict]:
             m, None, purpose="v2_chat_read", runtime_token=token
         ).decode("utf-8")
         if plaintext.strip():
-            out.append({"id": mid, "ts": ts, "role": "user", "content": plaintext})
+            out.append({"id": mid, "ts": ts, "seq": seq, "role": "user", "content": plaintext})
     return out
 
 

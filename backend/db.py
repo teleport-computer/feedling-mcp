@@ -2893,6 +2893,30 @@ def seq_for_watermark_ts(user_id: str, watermark_ts: float) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
+def chat_max_seq_at_or_before_ts(user_id: str, ts: float) -> int:
+    """One-time ts->seq bootstrap for the stable reply cursor (D5): the highest
+    ``chat_messages.seq`` whose ``ts <= ts``, over ALL roles, or 0 if none.
+
+    Unlike :func:`seq_for_watermark_ts` (strictly-less, for the *summary*
+    watermark), this uses ``<=`` to exactly reproduce the LEGACY reply boundary
+    semantics that ``coalesce`` enforced as ``ts <= last_replied_ts`` (a message
+    at exactly the cursor ts was treated as already answered). It exists so a
+    hosted user that answered messages under the old ``last_replied_ts`` cursor,
+    but has no ``v2_reply_cursor_seq`` yet (migration default), resumes at the
+    right seq instead of re-reading — and re-answering — their whole history the
+    first time a V2 worker picks them up after this wiring ships. All roles are
+    considered (not just ``user``) so the boundary sits past the last answered
+    user message AND its assistant reply, never re-delivering the just-answered
+    message."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM chat_messages "
+            "WHERE user_id = %s AND ts <= %s",
+            (user_id, ts),
+        ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def _is_chat_file_pointer(doc) -> bool:
     return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
 

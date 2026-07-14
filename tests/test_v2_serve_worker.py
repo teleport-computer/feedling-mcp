@@ -114,18 +114,22 @@ def test_read_messages_returns_list_for_user_with_no_messages():
 
 
 def test_read_messages_uses_cursor_not_latest_assistant_position(monkeypatch):
-    class _Store:
-        chat_messages = [
-            {"id": "A", "ts": 10.0, "role": "user", "body_ct": "a", "K_enclave": "k"},
-            # B arrived during A's responder; R was appended after B.
-            {"id": "B", "ts": 20.0, "role": "user", "body_ct": "b", "K_enclave": "k"},
-            {"id": "R", "ts": 30.0, "role": "openclaw", "body_ct": "r", "K_enclave": "k"},
-        ]
+    """A user message (B) that arrived before the latest assistant row (R) must
+    still be read when the seq cursor sits at A — assistant-position slicing
+    would hide it. Boundary is seq (chat_messages_after_seq), never ts."""
+    import db
+    import conftest
 
-        def reload(self):
-            return None
-
-    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: _Store())
+    conftest.seed_user("u_srw_cursor")
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM chat_messages WHERE user_id=%s", ("u_srw_cursor",))
+    for mid, ts, role, ct in [("A", 10.0, "user", "a"), ("B", 20.0, "user", "b"),
+                              ("R", 30.0, "openclaw", "r")]:
+        db.chat_append("u_srw_cursor", mid, ts,
+                       {"id": mid, "ts": ts, "role": role, "content_type": "text",
+                        "body_ct": ct, "K_enclave": "k"}, 5000)
+    rows = db.chat_messages_after_seq("u_srw_cursor", 0, limit=10)
+    a_seq, b_seq = rows[0]["seq"], rows[1]["seq"]
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
     monkeypatch.setattr(
         serve_worker.core_enclave,
@@ -133,22 +137,19 @@ def test_read_messages_uses_cursor_not_latest_assistant_position(monkeypatch):
         lambda row, *args, **kwargs: f"text-{row['id']}".encode(),
     )
 
-    assert serve_worker._read_messages("u", after_ts=10.0) == [
-        {"id": "B", "ts": 20.0, "role": "user", "content": "text-B"}
+    assert serve_worker._read_messages("u_srw_cursor", after_seq=a_seq) == [
+        {"id": "B", "ts": 20.0, "seq": b_seq, "role": "user", "content": "text-B"}
     ]
 
 
-def test_read_messages_propagates_strict_database_reload_failure(monkeypatch):
-    class _Store:
-        chat_messages = [{"id": "cached", "ts": 1.0, "role": "user"}]
+def test_read_messages_propagates_strict_database_read_failure(monkeypatch):
+    def _boom(*a, **k):
+        raise RuntimeError("database unavailable")
 
-        def reload_chat_strict(self):
-            raise RuntimeError("database unavailable")
-
-    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: _Store())
+    monkeypatch.setattr(serve_worker.db, "chat_messages_after_seq", _boom)
 
     with pytest.raises(RuntimeError, match="database unavailable"):
-        serve_worker._read_messages("u", after_ts=0.0)
+        serve_worker._read_messages("u", after_seq=0)
 
 
 def test_compaction_reader_is_oldest_first_while_context_reader_is_newest(monkeypatch):
@@ -242,26 +243,23 @@ def test_resident_mode_is_final_fence_for_scheduled_and_screen_watch(monkeypatch
     assert serve_worker._tick_screen_watch_for_user("resident") == 0
 
 
-def test_read_messages_carries_id_and_ts_for_coalesce(client, backend_env, monkeypatch):
-    """Task 8: model_api_runtime.v2.coalesce.coalesce_pending filters by ts and
-    dedupes by id, so _read_messages (feeding TurnDeps.read_messages) must forward
-    both — Plan B's {"role","content"}-only shape predates the v2 pipeline."""
+def test_read_messages_carries_id_and_ts_and_seq_for_coalesce(client, backend_env, monkeypatch):
+    """coalesce_pending dedupes by id and forwards seq (the durable reply-cursor
+    key), so _read_messages must carry id/ts/seq — the image shorthand branch
+    exercises the id/ts/seq-carrying path without an enclave round trip."""
     import conftest
-    from core import store as core_store
+    import db
 
     serve_worker.wire_assembly()
     user_id = "u_serve_worker_idts"
     conftest.seed_user(user_id)
-    store = core_store.get_store(user_id)
-    monkeypatch.setattr(store, "reload_chat_strict", lambda: list(store.chat_messages))
-    store.chat_messages.append({
-        "id": "m_synthetic_1", "ts": 12345.0, "role": "user",
-        "content_type": "text", "body_ct": None, "K_enclave": None,
-    })
-    # Synthetic local-only row (no body_ct/K_enclave) is skipped by design, so
-    # exercise the id/ts-carrying branch that doesn't require an enclave round
-    # trip: the image shorthand.
-    store.chat_messages[-1]["content_type"] = "image"
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (user_id,))
+    db.chat_append(user_id, "m_synthetic_1", 12345.0, {
+        "id": "m_synthetic_1", "ts": 12345.0, "role": "user", "content_type": "image",
+        "body_ct": None, "K_enclave": None,
+    }, 5000)
+    seq = db.chat_messages_after_seq(user_id, 0, limit=10)[0]["seq"]
 
     deps = serve_worker.build_production_deps()
     messages = deps.read_messages(user_id)
@@ -270,7 +268,7 @@ def test_read_messages_carries_id_and_ts_for_coalesce(client, backend_env, monke
     # caption envelope on this synthetic row -> the "[image]" placeholder); bytes never
     # enter this read path, because compaction shares it.
     assert messages == [{
-        "id": "m_synthetic_1", "ts": 12345.0, "role": "user", "content": "[image]",
+        "id": "m_synthetic_1", "ts": 12345.0, "seq": seq, "role": "user", "content": "[image]",
         "has_image": True, "image_mime": "image/jpeg",
     }]
 

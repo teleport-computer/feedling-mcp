@@ -447,6 +447,27 @@ def _pending_chat_messages_for_poll(
     now = time.time()
     claimed: list[dict] = []
     redelivered = 0
+    # Resident↔V2 flip-window guard (defense-in-depth): a user flipped to
+    # db_action_v2 is served ONLY by the V2 worker pool. The D0 exclusivity guard
+    # (db.list_agent_runtime_enabled_users) reaps that user's resident consumer,
+    # but only on the next supervisor tick (~15s). In that window the still-
+    # running resident consumer's CLAIMING poll would claim + reply to the user's
+    # message via the CLI path — while the V2 worker independently reads it too
+    # (the V2 read boundary is the durable SEQ cursor; it does NOT look at
+    # reply_claimed_by), yielding a double reply / a confusing claimed-then-
+    # abandoned state. Refuse the resident's claiming poll for db_action_v2 users
+    # at the source so V2 is the sole responder regardless of supervisor lag.
+    # NOTE: this is NOT the fix for the no-reply/reconcile-loop bug — that was a
+    # ts-cursor fragility, fixed by the seq reply cursor (see
+    # worker._load_reply_cursor_seq / serve_worker._read_messages). Read-only
+    # polls (claim=False — e.g. the client reading the V2 reply) are unaffected.
+    # Config mode is the single source of truth every other router already uses
+    # (D0 guard, worker.runtime_mode_enabled); the separate v2_runtime_state
+    # cutover machine is not consumed by any routing yet.
+    if claim:
+        from hosted import config_store as _hosted_cfg  # lazy: chat must not own hosted startup
+        if _hosted_cfg.get_hosted_runtime_mode(store) == _hosted_cfg.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+            return []
     with store.chat_lock:
         redelivery_floor = _redelivery_floor(store, now)
         for msg in store.chat_messages:
