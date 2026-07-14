@@ -1175,8 +1175,6 @@ jobs:
           AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
-          FEEDLING_LITELLM_ENABLE:      ${{ vars.TEST_FEEDLING_LITELLM_ENABLE }}
-          FEEDLING_LITELLM_API_KEY:     ${{ secrets.TEST_FEEDLING_LITELLM_API_KEY }}
           # Host-all: agent-runner hosts every configured user (zero-roster, via
           # runtime token) + backend routes their sends to it. Needs the token
           # secret above. Empty = off. Both services read it from the encrypted env.
@@ -1220,8 +1218,6 @@ jobs:
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
             -e "AGENT_TICK_INTERVAL_SEC=$AGENT_TICK_INTERVAL_SEC" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
-            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
@@ -1398,8 +1394,6 @@ jobs:
           AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
-          FEEDLING_LITELLM_ENABLE:      ${{ vars.TEST_FEEDLING_LITELLM_ENABLE }}
-          FEEDLING_LITELLM_API_KEY:     ${{ secrets.TEST_FEEDLING_LITELLM_API_KEY }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
@@ -1423,8 +1417,6 @@ jobs:
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
-            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             --wait
 
