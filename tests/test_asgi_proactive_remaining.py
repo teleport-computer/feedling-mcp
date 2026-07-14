@@ -156,6 +156,7 @@ def _norm(obj):
     ("GET", "/v1/proactive/state", None),
     ("GET", "/v1/device/events", None),
     ("POST", "/v1/capture/tick", {}),
+    ("GET", "/v1/dream/status", None),
     ("POST", "/v1/proactive/tick", {}),
     ("POST", "/v1/proactive/jobs/pj_x/claim", {}),
     ("POST", "/v1/proactive/jobs/pj_x/status", {}),

@@ -2499,6 +2499,10 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
     assert extra["dream_result"]["job_kind"] == "memory_dream"
     assert extra["cards_merged"] == 1
     assert extra["cards_superseded"] == 2
+    assert extra["organized_count"] == 2
+    assert extra["merged_count"] == 1
+    assert extra["dream_result"]["organized_count"] == 2
+    assert extra["dream_result"]["merged_count"] == 1
     assert extra["questions"] == ["确认是否只是不喝牛奶？"]
 
 
@@ -2542,6 +2546,8 @@ def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatc
     extra = _dream_final_status(captured)[3]["extra"]
     assert extra["cards_merged"] == 0
     assert extra["cards_superseded"] == 2
+    assert extra["organized_count"] == 2
+    assert extra["merged_count"] == 0
     assert extra["dream_result"]["cards_thickened"] == 1
 
 
@@ -2563,6 +2569,8 @@ def test_dream_job_empty_consolidations_completes_noop_without_memory_write_or_c
     assert extra["dream_result"]["status"] == "noop"
     assert extra["questions"] == ["下次问 TA 是否还喝拿铁"]
     assert extra["noop_reason"] == "dream_nothing_to_consolidate"
+    assert extra.get("organized_count", 0) == 0
+    assert extra.get("merged_count", 0) == 0
 
 
 def test_dream_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
