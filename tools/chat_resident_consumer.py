@@ -4800,16 +4800,36 @@ def _refresh_whoami_for_encrypted_reply() -> bool:
     return False
 
 
-def poll_chat(since: float) -> dict:
+def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> dict:
+    poll_to = POLL_TIMEOUT if timeout is None else max(0, int(timeout))
     url = f"{FEEDLING_API_URL}/v1/chat/poll"
-    params = {"since": since, "timeout": POLL_TIMEOUT}
-    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=POLL_TIMEOUT + 10)
+    params = {"since": since, "timeout": poll_to}
+    if not claim:
+        # read-only peek: MUST NOT write the default 600s reply claim (that lease
+        # would make other consumers wait on a message this call only glanced at).
+        params["claim"] = "false"
+    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=poll_to + 10)
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
         _update_chat_runtime_v2_profile(body.get("runtime_v2"))
         _update_user_mcp_advertised(body.get("user_mcp"))
     return body
+
+
+def _user_chat_pending(since: float) -> bool:
+    """Non-blocking, claim-free peek: is a user message waiting since ``since``?
+    Gives user turns priority over proactive turns — a waiting human must never
+    queue behind proactive wake turns on the single per-user consumer (turn lock
+    is single-flight). Uses timeout=0 (no long-poll) and claim=false (never leases
+    the message). Best-effort: on any error, report 'not pending' so proactive
+    still runs (fail-open — a transient poll error must never starve proactive)."""
+    try:
+        body = poll_chat(since, timeout=0, claim=False)
+    except Exception as e:
+        log.warning("user-pending peek failed (fail-open, proactive proceeds): %s", e)
+        return False
+    return bool(isinstance(body, dict) and (body.get("messages") or []))
 
 
 def _update_chat_runtime_v2_profile(profile: Any) -> None:
@@ -7121,7 +7141,9 @@ def _process_dream_jobs(jobs: list) -> float:
 
 
 def _process_proactive_jobs(jobs: list) -> float:
-    """Realize hidden proactive jobs through the same configured agent entry."""
+    """Realize hidden proactive jobs through the same configured agent entry.
+    The user-turn priority gate lives in ``_process_resident_jobs`` (it must
+    cover capture/dream/migrate model turns too, not just proactive)."""
     latest = 0.0
     for job in jobs:
         ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
@@ -7588,32 +7610,47 @@ def _process_migrate_jobs(jobs: list) -> float:
     return latest
 
 
-def _process_resident_jobs(jobs: list) -> float:
-    capture_jobs = [
-        job for job in (jobs or [])
-        if isinstance(job, dict) and _is_memory_capture_job(job)
-    ]
-    dream_jobs = [
-        job for job in (jobs or [])
-        if isinstance(job, dict) and _is_memory_dream_job(job)
-    ]
-    migrate_jobs = [
-        job for job in (jobs or [])
-        if isinstance(job, dict) and _is_memory_migrate_job(job)
-    ]
-    proactive_jobs = [
-        job for job in (jobs or [])
-        if not (
-            isinstance(job, dict)
-            and (_is_memory_capture_job(job) or _is_memory_dream_job(job) or _is_memory_migrate_job(job))
-        )
-    ]
-    return max(
-        _process_capture_jobs(capture_jobs) if capture_jobs else 0.0,
-        _process_dream_jobs(dream_jobs) if dream_jobs else 0.0,
-        _process_migrate_jobs(migrate_jobs) if migrate_jobs else 0.0,
-        _process_proactive_jobs(proactive_jobs) if proactive_jobs else 0.0,
-    )
+_resident_jobs_deferred_for_user = False
+
+
+def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float:
+    """Dispatch background jobs (capture → dream → migrate → proactive) one at
+    a time, each through its class processor as a single-element batch.
+
+    ① user-turn priority: when ``chat_since`` is given, peek (claim-free,
+    non-blocking) for a waiting user message BEFORE each job's model turn — ALL
+    four classes call the agent, so the gate must sit here, not inside any one
+    processor. If a user message is pending, stop and defer the remaining jobs:
+    a waiting human then waits at most the current, non-preemptible model turn,
+    never a whole batch. On defer, sets ``_resident_jobs_deferred_for_user`` so
+    the caller keeps the OLD job checkpoint (unprocessed jobs re-poll; the
+    per-class ``_mark_seen`` dedup skips the ones already done — no same-ts
+    cursor skip). The flag is reset unconditionally on every batch entry so a
+    previous defer can never leak into a batch that completes fully.
+    ``chat_since=None`` (the default) keeps the legacy no-gate behavior."""
+    global _resident_jobs_deferred_for_user
+    _resident_jobs_deferred_for_user = False
+    ordered: list = []
+    for job in (jobs or []):
+        if isinstance(job, dict) and _is_memory_capture_job(job):
+            ordered.append((0, _process_capture_jobs, job))
+        elif isinstance(job, dict) and _is_memory_dream_job(job):
+            ordered.append((1, _process_dream_jobs, job))
+        elif isinstance(job, dict) and _is_memory_migrate_job(job):
+            ordered.append((2, _process_migrate_jobs, job))
+        else:
+            ordered.append((3, _process_proactive_jobs, job))
+    ordered.sort(key=lambda entry: entry[0])  # stable: keeps arrival order within a class
+    latest = 0.0
+    for _, processor, job in ordered:
+        if chat_since is not None and _user_chat_pending(chat_since):
+            _resident_jobs_deferred_for_user = True
+            log.info(
+                "deferring remaining background job(s): user message pending (user-turn priority)"
+            )
+            break
+        latest = max(latest, processor([job]))
+    return latest
 
 
 def _quoted_memory_context(msg: dict) -> str:
@@ -8592,8 +8629,17 @@ def run() -> None:
                     job_result = poll_proactive_jobs(last_job_ts)
                     jobs = job_result.get("jobs") or []
                     if jobs:
-                        new_job_ts = _process_resident_jobs(jobs)
-                        if new_job_ts > last_job_ts:
+                        # ① user-turn priority: a waiting user must never queue behind
+                        # background job turns (capture/dream/migrate/proactive — each
+                        # a full model turn). Turns are single-flight per user, so a
+                        # batch would otherwise hold the lock while the user's reply
+                        # waits — the "typing… forever" the user sees.
+                        # _process_resident_jobs peeks (claim-free) before each job and
+                        # defers the rest when a user message is pending; on defer we
+                        # KEEP the old checkpoint so the unrun jobs re-poll (already-run
+                        # ones are _mark_seen-skipped).
+                        new_job_ts = _process_resident_jobs(jobs, chat_since=last_ts)
+                        if not _resident_jobs_deferred_for_user and new_job_ts > last_job_ts:
                             last_job_ts = new_job_ts
                             _save_proactive_checkpoint(last_job_ts)
                 except httpx.HTTPStatusError as e:

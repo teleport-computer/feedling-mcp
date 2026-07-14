@@ -5277,3 +5277,152 @@ def test_context_text_image_with_caption_keeps_caption_and_hint():
 
 def test_context_text_plain_text_message_unchanged():
     assert crc._message_text_for_context({"content": "hello there"}) == "hello there"
+
+
+def test_user_chat_pending_peeks_nonblocking_claimfree_and_fails_open(monkeypatch):
+    # ① user-turn priority: a non-blocking peek for a waiting user message so
+    # proactive turns can defer to it. Must use timeout=0 AND claim=False (a
+    # claiming peek would write the 600s reply claim on a message it only
+    # glanced at), and fail OPEN (return False on error) so a transient poll
+    # error never starves proactive.
+    calls = []
+
+    def fake_poll(since, timeout=None, claim=True):
+        calls.append((since, timeout, claim))
+        return {"messages": [{"id": "m1"}]}
+    monkeypatch.setattr(crc, "poll_chat", fake_poll)
+    assert crc._user_chat_pending(12.0) is True
+    assert calls[-1] == (12.0, 0, False)   # non-blocking, claim-free peek
+
+    monkeypatch.setattr(crc, "poll_chat", lambda since, timeout=None, claim=True: {"messages": []})
+    assert crc._user_chat_pending(12.0) is False
+
+    def boom(since, timeout=None, claim=True):
+        raise RuntimeError("poll down")
+    monkeypatch.setattr(crc, "poll_chat", boom)
+    assert crc._user_chat_pending(12.0) is False   # fail-open, never starve proactive
+
+
+def test_poll_chat_claim_false_sends_param_claim_true_omits_it(monkeypatch):
+    # transport contract for the peek: claim=False must send claim=false to the
+    # server; the default claiming poll must NOT send the param (server default
+    # is claim=true — omitting keeps existing behavior byte-identical).
+    seen = []
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"messages": []}
+
+    class _HTTP:
+        def get(self, url, params=None, headers=None, timeout=None):
+            seen.append(dict(params or {}))
+            return _Resp()
+
+    monkeypatch.setattr(crc, "_HTTP", _HTTP())
+    crc.poll_chat(5.0, timeout=0, claim=False)
+    assert seen[-1].get("claim") == "false"
+    assert seen[-1]["timeout"] == 0
+    crc.poll_chat(5.0, timeout=0)
+    assert "claim" not in seen[-1]
+
+
+def _install_resident_job_gate_harness(monkeypatch):
+    # record which (class, job_id) each processor was dispatched — the gate in
+    # _process_resident_jobs must call each with a single-element batch.
+    ran = []
+
+    def _fake(kind):
+        def proc(jobs):
+            assert len(jobs) == 1            # per-job dispatch, never a batch
+            ran.append((kind, jobs[0].get("job_id")))
+            return float(jobs[0].get("ts") or 0)
+        return proc
+
+    monkeypatch.setattr(crc, "_process_capture_jobs", _fake("capture"))
+    monkeypatch.setattr(crc, "_process_dream_jobs", _fake("dream"))
+    monkeypatch.setattr(crc, "_process_migrate_jobs", _fake("migrate"))
+    monkeypatch.setattr(crc, "_process_proactive_jobs", _fake("proactive"))
+    return ran
+
+
+def test_resident_jobs_gate_covers_all_classes_and_defers_mid_batch(monkeypatch):
+    # ① user-turn priority: the gate sits in _process_resident_jobs and covers
+    # ALL background classes (capture/dream/migrate/proactive — each is a model
+    # turn). When the user message arrives after the first job, the second job
+    # must NOT run, the defer flag is set (run() then keeps the OLD checkpoint
+    # so unrun jobs re-poll; _mark_seen replays safely), and only the completed
+    # job's ts is reported.
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    pending = iter([False, True])            # arrives after job #1's turn
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: next(pending))
+
+    jobs = [
+        {"job_id": "c1", "ts": 111.0, "source": "memory_capture"},
+        {"job_id": "p1", "ts": 222.0, "source": crc.PROACTIVE_JOB_SOURCE},
+    ]
+    assert crc._process_resident_jobs(jobs, chat_since=10.0) == pytest.approx(111.0)
+    assert ran == [("capture", "c1")]        # second job deferred, never ran
+    assert crc._resident_jobs_deferred_for_user is True
+
+
+def test_resident_jobs_defer_before_any_job_and_class_order_kept(monkeypatch):
+    # pending before job #1 → nothing runs at all, no ts progress; without a
+    # pending user the dispatch order is capture → dream → migrate → proactive
+    # regardless of arrival order (matches the old per-class batching).
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: True)
+
+    jobs = [
+        {"job_id": "p1", "ts": 444.0, "source": crc.PROACTIVE_JOB_SOURCE},
+        {"job_id": "d1", "ts": 333.0, "source": "memory_dream"},
+    ]
+    assert crc._process_resident_jobs(jobs, chat_since=10.0) == pytest.approx(0.0)
+    assert ran == []
+    assert crc._resident_jobs_deferred_for_user is True
+
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    jobs = [
+        {"job_id": "p1", "ts": 444.0, "source": crc.PROACTIVE_JOB_SOURCE},
+        {"job_id": "m1", "ts": 200.0, "source": "memory_migrate"},
+        {"job_id": "d1", "ts": 333.0, "source": "memory_dream"},
+        {"job_id": "c1", "ts": 111.0, "source": "memory_capture"},
+    ]
+    assert crc._process_resident_jobs(jobs, chat_since=10.0) == pytest.approx(444.0)
+    assert ran == [
+        ("capture", "c1"), ("dream", "d1"), ("migrate", "m1"), ("proactive", "p1"),
+    ]
+    assert crc._resident_jobs_deferred_for_user is False
+
+
+def test_resident_jobs_defer_flag_resets_every_batch_even_without_proactive(monkeypatch):
+    # the flag must reset unconditionally on batch entry: a capture/dream-only
+    # batch (no proactive job at all) after a deferred batch must clear it —
+    # otherwise a stale True blocks the checkpoint advance for a batch that
+    # completed fully.
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: True)
+    crc._process_resident_jobs(
+        [{"job_id": "p1", "ts": 1.0, "source": crc.PROACTIVE_JOB_SOURCE}], chat_since=10.0
+    )
+    assert crc._resident_jobs_deferred_for_user is True
+
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    assert crc._process_resident_jobs(
+        [{"job_id": "c1", "ts": 555.0, "source": "memory_capture"}], chat_since=10.0
+    ) == pytest.approx(555.0)
+    assert crc._resident_jobs_deferred_for_user is False   # no stale defer
+    assert ran[-1] == ("capture", "c1")
+
+    # legacy path (no chat_since) must not peek at all and also resets the flag
+    crc._resident_jobs_deferred_for_user = True
+    monkeypatch.setattr(
+        crc, "_user_chat_pending",
+        lambda since: (_ for _ in ()).throw(AssertionError("peeked without chat_since")),
+    )
+    assert crc._process_resident_jobs(
+        [{"job_id": "d1", "ts": 333.0, "source": "memory_dream"}]
+    ) == pytest.approx(333.0)
+    assert crc._resident_jobs_deferred_for_user is False
