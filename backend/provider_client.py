@@ -885,7 +885,10 @@ def _parse_openai_responses_body(
     body: dict[str, Any], *, model: str, require_reply: bool,
 ) -> dict[str, Any]:
     reply, reasoning = _extract_openai_responses_output(body)
-    if require_reply and not reply:
+    # See _parse_openai_compat_body: a pure tool-call response has no reply text
+    # and must not be rejected — require reply only when no tool_calls are present.
+    tool_calls = _decode_tool_calls_openai_responses(body)
+    if require_reply and not reply and not tool_calls:
         raise ProviderError("provider response had no usable reply text")
     return {
         "reply": reply,
@@ -899,7 +902,7 @@ def _parse_openai_responses_body(
         ).strip(),
         "provider": "openai",
         "model": model,
-        "tool_calls": _decode_tool_calls_openai_responses(body),
+        "tool_calls": tool_calls,
     }
 
 
@@ -1023,15 +1026,23 @@ def _parse_openai_compat_body(
         raise ProviderError("provider returned non-json response") from e
     if not isinstance(body, dict):
         raise ProviderError("provider returned non-object response")
+    # A tool-call response legitimately carries NO reply text (the model chose to
+    # call a tool instead of answering) — decode tool_calls first and treat their
+    # presence as making reply text optional. Without this, a tool round on the
+    # V2 unified loop raises "no usable reply text" on the very first provider
+    # call (openai/gemini return content=null for a pure tool call), never
+    # reaching the executor. A genuinely empty/error response (no text AND no
+    # tool_calls) still raises when require_reply is set.
+    tool_calls = _decode_tool_calls_openai_chat(body)
     return {
-        "reply": _extract_reply(body, required=require_reply),
+        "reply": _extract_reply(body, required=require_reply and not tool_calls),
         "reasoning": _extract_openai_compatible_reasoning(body),
         "usage": _normalize_usage(provider, body.get("usage")),
         "raw_id": body.get("id", ""),
         "stop_reason": _extract_openai_compatible_stop_reason(body),
         "provider": provider,
         "model": model,
-        "tool_calls": _decode_tool_calls_openai_chat(body),
+        "tool_calls": tool_calls,
     }
 
 
@@ -1134,15 +1145,18 @@ def _build_anthropic_payload(
 def _parse_anthropic_body(
     body: dict[str, Any], *, model: str, require_reply: bool,
 ) -> dict[str, Any]:
+    # See _parse_openai_compat_body: a pure tool-call response has no reply text
+    # and must not be rejected — require reply only when no tool_calls are present.
+    tool_calls = _decode_tool_calls_anthropic(body)
     return {
-        "reply": _extract_anthropic_reply(body, required=require_reply),
+        "reply": _extract_anthropic_reply(body, required=require_reply and not tool_calls),
         "reasoning": _extract_anthropic_reasoning(body),
         "usage": _normalize_usage("anthropic", body.get("usage")),
         "raw_id": body.get("id", ""),
         "stop_reason": str(body.get("stop_reason") or "").strip(),
         "provider": "anthropic",
         "model": model,
-        "tool_calls": _decode_tool_calls_anthropic(body),
+        "tool_calls": tool_calls,
     }
 
 
@@ -1254,15 +1268,18 @@ def _build_gemini_payload(
 def _parse_gemini_body(
     body: dict[str, Any], *, model: str, require_reply: bool,
 ) -> dict[str, Any]:
+    # See _parse_openai_compat_body: a pure tool-call response has no reply text
+    # and must not be rejected — require reply only when no tool_calls are present.
+    tool_calls = _decode_tool_calls_gemini(body)
     return {
-        "reply": _extract_gemini_reply(body, required=require_reply),
+        "reply": _extract_gemini_reply(body, required=require_reply and not tool_calls),
         "reasoning": _extract_gemini_reasoning(body),
         "usage": _normalize_usage("gemini", body.get("usageMetadata")),
         "raw_id": body.get("responseId", ""),
         "stop_reason": _extract_gemini_stop_reason(body),
         "provider": "gemini",
         "model": model,
-        "tool_calls": _decode_tool_calls_gemini(body),
+        "tool_calls": tool_calls,
     }
 
 
