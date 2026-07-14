@@ -105,7 +105,7 @@ services:
   # holds NO data volume — all V2 state lives in Postgres (agent_jobs queue,
   # v2_worker_heartbeats, v2_turn_metrics, v2_conversation_summary). Turns are
   # pure async HTTP provider calls (no per-user home, no codex subprocess), so it
-  # needs neither /agent-data nor the LiteLLM child. Claims chat/maintenance (and,
+  # needs neither /agent-data nor any per-user child process. Claims chat/maintenance (and,
   # after D3, wake) jobs via FOR UPDATE SKIP LOCKED. Coexists with the resident
   # supervisor — the D0 exclusivity guard keeps each user on exactly one path.
   # Adding this service changes compose_hash → on-chain addComposeHash() re-auth

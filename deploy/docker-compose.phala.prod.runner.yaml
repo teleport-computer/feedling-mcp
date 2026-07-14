@@ -105,11 +105,6 @@ services:
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
-      # in-CVM LiteLLM gateway — needed if hosting gemini/openrouter/openai_compatible
-      # (codex-gateway providers); harmless when off.
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
-      FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
-      FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
       # V2 worker pool sizing. N in-process asyncio job slots share the agent_jobs
       # queue via FOR UPDATE SKIP LOCKED. Rides the encrypted env channel → tuning
       # needs no on-chain re-auth (unlike adding the service).

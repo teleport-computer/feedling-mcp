@@ -65,9 +65,16 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     # kill switch) chains 0030 after that: single-row v2_runtime_control table.
     # D5 (seq-cursor migration, Task 9) chains 0031 after that:
     # v2_conversation_summary gains a watermark_seq column alongside the
-    # existing watermark_ts. The deployed-history + profiles-merge invariants
-    # above are unchanged; only the single-head tip moved.
-    assert script.get_current_head() == "0031_v2_summary_watermark_seq"
+    # existing watermark_ts. Finally, rebasing feat/hosted-runtime-v2 onto test
+    # joins the tee-pg shadow chain (0015_tee_sync_runs → 0016_tee_sync_table_
+    # failures, which branched off 0014_model_api_profiles) with this V2 chain via
+    # a no-op merge migration 0032_merge_tee_v2. The deployed-history +
+    # profiles-merge invariants above are unchanged; only the single-head tip moved.
+    assert set(script.get_revision("0032_merge_tee_v2").down_revision) == {
+        "0016_tee_sync_table_failures",
+        "0031_v2_summary_watermark_seq",
+    }
+    assert script.get_current_head() == "0032_merge_tee_v2"
 
 
 def test_singleflight_unique_index_enforced():

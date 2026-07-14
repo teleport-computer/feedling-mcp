@@ -1857,55 +1857,58 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     "reasoning_effort"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
     /v1/responses capability, set at setup; selects native passthrough vs the
-    LiteLLM chat-completions bridge)。"""
+    LiteLLM chat-completions bridge)。
+
+    This is authoritative desired-state input for the resident supervisor: a
+    genuine empty result means "stop every resident". Database failures must
+    therefore PROPAGATE — coercing a read outage to ``[]`` would tear down the
+    whole fleet. The supervisor's tick loop already wraps this call and skips
+    reconciliation (leaving existing children alone) when it raises, so a DB
+    blip pauses reconciliation rather than reaping every consumer."""
     providers = ["anthropic", "claude", "deepseek", "openai",
                  "gemini", "openrouter", "openai_compatible"]
-    try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT r.user_id,
-                  CASE LOWER(c.provider)
-                    WHEN 'anthropic' THEN 'claude'
-                    WHEN 'claude'    THEN 'claude'
-                    WHEN 'deepseek'  THEN 'claude'
-                    WHEN 'openai'    THEN 'codex'
-                    ELSE 'pi'
-                  END AS driver,
-                  LOWER(c.provider) AS provider,
-                  r.model AS model,
-                  c.base_url AS base_url,
-                  c.supports_responses AS supports_responses,
-                  COALESCE(r.reasoning_effort, '') AS reasoning_effort
-                FROM model_api_routes r
-                JOIN model_api_credentials c ON c.id = r.credential_id
-                WHERE r.is_active
-                  AND r.test_status = 'ok'
-                  AND LOWER(c.provider) = ANY(%s)
-                  -- D0 exclusivity guard (Hosted Runtime V2): a user flipped to
-                  -- db_action_v2 runs on the V2 worker pool, so drop them from the
-                  -- resident roster to prevent a double-run. hosted_runtime_mode
-                  -- still lives in the user_blobs 'model_api_runtime' profile even
-                  -- after the model-api-multi-profile migration moved provider
-                  -- config into model_api_routes/credentials.
-                  AND NOT EXISTS (
-                    SELECT 1 FROM user_blobs mrt
-                    WHERE mrt.user_id = r.user_id
-                      AND mrt.kind = 'model_api_runtime'
-                      AND COALESCE(mrt.doc->>'hosted_runtime_mode', '') = 'db_action_v2'
-                  )
-                ORDER BY r.user_id
-                """,
-                (providers,),
-            ).fetchall()
-        return [{"user_id": uid, "driver": driver, "provider": provider,
-                 "model": model, "base_url": base_url,
-                 "supports_responses": bool(supports_responses),
-                 "reasoning_effort": reasoning_effort}
-                for uid, driver, provider, model, base_url, supports_responses, reasoning_effort in rows]
-    except Exception as e:
-        log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
-        return []
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.user_id,
+              CASE LOWER(c.provider)
+                WHEN 'anthropic' THEN 'claude'
+                WHEN 'claude'    THEN 'claude'
+                WHEN 'deepseek'  THEN 'claude'
+                WHEN 'openai'    THEN 'codex'
+                ELSE 'pi'
+              END AS driver,
+              LOWER(c.provider) AS provider,
+              r.model AS model,
+              c.base_url AS base_url,
+              c.supports_responses AS supports_responses,
+              COALESCE(r.reasoning_effort, '') AS reasoning_effort
+            FROM model_api_routes r
+            JOIN model_api_credentials c ON c.id = r.credential_id
+            WHERE r.is_active
+              AND r.test_status = 'ok'
+              AND LOWER(c.provider) = ANY(%s)
+              -- D0 exclusivity guard (Hosted Runtime V2): a user flipped to
+              -- db_action_v2 runs on the V2 worker pool, so drop them from the
+              -- resident roster to prevent a double-run. hosted_runtime_mode
+              -- still lives in the user_blobs 'model_api_runtime' profile even
+              -- after the model-api-multi-profile migration moved provider
+              -- config into model_api_routes/credentials.
+              AND NOT EXISTS (
+                SELECT 1 FROM user_blobs mrt
+                WHERE mrt.user_id = r.user_id
+                  AND mrt.kind = 'model_api_runtime'
+                  AND COALESCE(mrt.doc->>'hosted_runtime_mode', '') = 'db_action_v2'
+              )
+            ORDER BY r.user_id
+            """,
+            (providers,),
+        ).fetchall()
+    return [{"user_id": uid, "driver": driver, "provider": provider,
+             "model": model, "base_url": base_url,
+             "supports_responses": bool(supports_responses),
+             "reasoning_effort": reasoning_effort}
+            for uid, driver, provider, model, base_url, supports_responses, reasoning_effort in rows]
 
 
 def try_stamp_hosted_tick(user_id: str, doc: dict, now: float, interval_sec: float) -> bool:

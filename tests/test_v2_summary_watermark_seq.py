@@ -54,12 +54,16 @@ def _reset(uid):
 # Migration
 # ---------------------------------------------------------------------------
 
-def test_migration_head_is_0031_and_column_exists():
+def test_migration_head_and_watermark_seq_column():
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_current_head() == "0031_v2_summary_watermark_seq"
+    # Head is the tee-pg × V2 merge point added when feat/hosted-runtime-v2 was
+    # rebased onto test (0032_merge_tee_v2 joins 0016_tee_sync_table_failures with
+    # 0031_v2_summary_watermark_seq). 0031 remains the V2 chain's watermark_seq
+    # migration, chained after 0030, unchanged by the merge.
+    assert script.get_current_head() == "0032_merge_tee_v2"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )
