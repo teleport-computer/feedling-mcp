@@ -62,12 +62,26 @@ PARAMS: dict[str, dict] = {
         "properties": {"ids": {"type": "array", "items": _STR}},
         "required": ["ids"],
     },
-    # memory.write(store, ...) -> memory_core.actions: payload.get("actions") (list),
-    # with single-action shorthand handled server-side; the tool contract asks for
-    # "actions" explicitly.
+    # memory.write: the model emits PLAINTEXT cards; the worker's
+    # `_memory_tool_actions` translates each into the server's memory-action shape
+    # ({"type":"memory.add","memory":{summary,content,bucket,threads}}) and the
+    # server builds the E2E envelope (it never sees a model-built envelope — see
+    # worker._memory_tool_actions / _write_tool_effect_payload). The item schema is
+    # explicit so the model supplies summary+content (required for add) rather than
+    # guessing a shape the write path rejects with title_required/400.
     "memory_write": {
         "type": "object",
-        "properties": {"actions": {"type": "array", "items": {"type": "object"}}},
+        "properties": {"actions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["add", "update", "delete"]},
+                "summary": {"type": "string"},
+                "content": {"type": "string"},
+                "bucket": {"type": "string"},
+                "target_id": {"type": "string"},
+            },
+            "required": ["op"],
+        }}},
         "required": ["actions"],
     },
 
@@ -165,7 +179,11 @@ DESCRIPTIONS: dict[str, str] = {
     "memory_index": "List recent memory cards, optionally capped by limit.",
     "memory_search": "Keyword-search memory cards by a required query string.",
     "memory_fetch": "Fetch specific memory cards by their ids.",
-    "memory_write": "Write, update, or delete memory cards via a list of actions.",
+    "memory_write": ("Write, update, or delete memory cards. Each action needs an "
+                     "'op': 'add' (supply a one-line 'summary' AND full 'content', "
+                     "optional 'bucket'), 'update' (supply 'target_id' plus new "
+                     "'summary'/'content'), or 'delete' (supply 'target_id'). Get "
+                     "target_ids from memory_search/memory_index first."),
     "perception_snapshot": "Read the latest perception snapshot for the given signals.",
     "perception_trend": "Read a trend summary for a perception signal over recent days.",
     "perception_history": "Read raw historical values for a perception signal over recent days.",

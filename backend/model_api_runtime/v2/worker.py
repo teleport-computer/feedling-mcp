@@ -599,6 +599,46 @@ def _make_build_messages_fn(
     return build_messages
 
 
+def _memory_tool_actions(raw_actions) -> list[dict]:
+    """Translate the model's PLAINTEXT memory_write actions (tool_schema:
+    ``{op, summary, content, bucket, target_id}``) into the server-side
+    memory-action shape ``memory.actions._execute_memory_action`` accepts —
+    ``{"type": "memory.add"|"memory.supersede"|"memory.delete", "memory":
+    {summary, content, bucket, threads}, ...}`` — WITHOUT an ``envelope`` so the
+    plaintext write path (`memory.actions._memory_add_action`) builds the E2E
+    envelope server-side (the model can never build one). Mirrors the inner shape
+    ``extraction._inner_from_card`` uses. Before this, the raw model actions went
+    straight to ``memory_core.actions`` and were rejected with title_required/400,
+    so every memory_write tool turn died with turn_failed:runtimeerror."""
+    out: list[dict] = []
+    for a in raw_actions or []:
+        if not isinstance(a, dict):
+            continue
+        op = str(a.get("op") or a.get("action") or a.get("type") or "add").strip().lower()
+        op = op.replace("memory.", "")
+        summary = str(a.get("summary") or a.get("title") or "").strip()
+        content = str(a.get("content") or a.get("description") or a.get("text") or summary).strip()
+        if not summary:
+            summary = content[:80]
+        target = str(a.get("target_id") or a.get("id") or a.get("supersedes") or "").strip()
+        if op in ("delete", "remove") and target:
+            out.append({"type": "memory.delete", "memory_id": target})
+            continue
+        inner = {
+            "summary": summary,
+            "content": content or summary,
+            "bucket": str(a.get("bucket") or "").strip(),
+            "threads": list(a.get("threads") or []) if isinstance(a.get("threads"), list) else [],
+        }
+        base = {"reason": "Written by the agent via the memory_write tool.",
+                "capture_mode": "agent_tool"}
+        if op in ("update", "supersede", "merge", "patch") and target:
+            out.append({"type": "memory.supersede", "supersedes": target, "memory": inner, **base})
+        else:
+            out.append({"type": "memory.add", "memory": inner, **base})
+    return out
+
+
 def _write_tool_effect_payload(tc) -> tuple[str, dict]:
     """Map a WRITE_ACTIONS tool_call to its PR A `(effect_type, payload)` (spec C6). ONE
     definition shared by every lane's `enqueue_write_effect` closure (`process_job`'s chat
@@ -607,7 +647,7 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
     `executor.dispatch_tool_calls` ever routes here — a new write capability shipping without a
     mapping below must fail loudly, not silently drop the write."""
     if tc.name == "memory_write":
-        return "memory", {"actions": tc.args.get("actions")}
+        return "memory", {"actions": _memory_tool_actions(tc.args.get("actions"))}
     if tc.name == "identity_patch":
         return "identity", {"patch": tc.args.get("patch")}
     if tc.name in ("schedule_wake", "cancel_wake"):

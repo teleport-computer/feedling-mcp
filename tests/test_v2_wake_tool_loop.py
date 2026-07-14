@@ -299,7 +299,16 @@ def test_wake_memory_write_is_authorized_and_enqueued_not_refused(monkeypatch):
 
     memory_sinks = [p for (t, p) in sink_calls if t == "memory"]
     assert len(memory_sinks) == 1
-    assert memory_sinks[0]["actions"] == [{"op": "add", "text": "likes tea"}]
+    # The raw model action ({"op":"add","text":...}) is translated into the server
+    # memory-action shape (worker._memory_tool_actions) — no envelope, nested
+    # plaintext memory dict — so the plaintext write path builds the E2E envelope.
+    # NOT passed through raw (which memory_core.actions rejects with 400).
+    assert memory_sinks[0]["actions"] == [{
+        "type": "memory.add",
+        "memory": {"summary": "likes tea", "content": "likes tea", "bucket": "", "threads": []},
+        "reason": "Written by the agent via the memory_write tool.",
+        "capture_mode": "agent_tool",
+    }]
     assert _job_status(job_id)[0] == "completed"
 
 
