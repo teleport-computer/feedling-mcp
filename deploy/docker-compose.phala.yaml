@@ -172,6 +172,9 @@ services:
     environment:
       FEEDLING_API_KEY: ""
       FEEDLING_ADMIN_TOKEN: "${FEEDLING_ADMIN_TOKEN:-}"
+      # Password login for the admin data-track page. Inject only through the
+      # encrypted deploy env channel; the legacy admin-token routes stay valid.
+      FEEDLING_ADMIN_PASSWORD: "${FEEDLING_ADMIN_PASSWORD:-}"
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_WS_PORT: "9998"
       # ASGI backend: start the per-worker background services (the :9998 WS
