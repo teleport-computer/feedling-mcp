@@ -662,13 +662,24 @@ def _apply_memory_actions(user_id: str, actions: list[dict]) -> dict:
     memory.supersede 走 envelope 分支（memory/actions.py:698），两条都不需要服务器解密旧卡，
     因此 memory_core.actions 也无 runtime_token 形参（其签名只有 store/api_key/payload）。
 
-    顶层 status>=400（整批被拒）时抛 —— 让 worker._run_extraction 的自有 try/except 把它
-    转成静默 mark_failed（背景 job：不写气泡、不弹 error chip），而不是把一次失败的持久化
-    伪装成成功。"""
+    失败分两类（一个后台/工具发起的记忆写，绝不能因此拖垮用户的聊天回合）：
+
+    - **5xx（瞬时：DB/enclave 抖动）** → 抛。让 outbox 重放重试，让
+      `worker._run_extraction` 的自有 try/except 转成静默 mark_failed。
+    - **4xx（永久：客户端侧被拒）** → 记 warning 后**丢弃、不抛**。典型是模型在
+      一个多轮回合里对**已删/已改的卡重复操作**（`not_found` 404）、或产出一条校验
+      不过的 action。这类错重放永远还是错，若抛出会经 `_sink_memory` →
+      `on_reply` 的 `apply_pending_effects`（awaited）冒上去，把整个聊天回合打成
+      `turn_failed:runtimeerror`——即使真正想做的写已经提交（实测：显式 id 删除，
+      卡确实删了、turn 却失败）。丢弃+记日志：用户照常拿到回复，被拒的 action 在
+      runner 日志里可见（body 打进 warning，供事后定位）。"""
     store = core_store.get_store(user_id)
     body, status = memory_core.actions(store, None, {"actions": actions})
-    if status >= 400:
+    if status >= 500:
         raise RuntimeError(f"memory_actions_failed: status={status} body={str(body)[:160]}")
+    if status >= 400:
+        log.warning("[v2.serve_worker] memory action rejected (4xx, dropped) user=%s status=%s body=%s",
+                    user_id, status, str(body)[:300])
     return body
 
 
