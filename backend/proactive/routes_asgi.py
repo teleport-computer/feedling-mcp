@@ -153,6 +153,12 @@ async def dream_tick(request: Request, auth: AuthResult = Depends(require_auth))
     return JSONResponse(body, status_code=status)
 
 
+@router.get("/v1/dream/status")
+async def dream_status(auth: AuthResult = Depends(require_auth)):
+    body = await threadpool.run_db(proactive_core.dream_status, auth.store)
+    return JSONResponse(body)
+
+
 @router.post("/v1/proactive/tick")
 async def proactive_tick(request: Request, auth: AuthResult = Depends(require_auth)):
     payload = (await asgi_http.read_json_silent(request)) or {}

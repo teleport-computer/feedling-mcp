@@ -6878,11 +6878,13 @@ def _dream_actions_from_consolidations(
     *,
     card_map: dict[str, dict],
     occurred_at: str,
-) -> tuple[list[dict], int, int, int]:
+) -> tuple[list[dict], int, int, int, int, int]:
     actions: list[dict] = []
     cards_merged = 0
     cards_thickened = 0
     cards_superseded = 0
+    organized_ids: set[str] = set()
+    merged_count = 0
     for row in consolidations[: max(1, DREAM_MAX_CONSOLIDATIONS)]:
         op = str(row.get("op") or "").strip().lower()
         card_ids = [
@@ -6893,6 +6895,9 @@ def _dream_actions_from_consolidations(
         card_ids = list(dict.fromkeys(card_ids))
         if not card_ids:
             continue
+        organized_ids.update(card_ids)
+        if op == "merge":
+            merged_count += max(0, len(card_ids) - 1)
         result = row.get("result") if isinstance(row.get("result"), dict) else {}
         card = {
             "type": "fact",
@@ -6920,7 +6925,7 @@ def _dream_actions_from_consolidations(
         cards_superseded += len(card_ids)
     if consolidations and not actions:
         raise ValueError("dream_no_memory_actions")
-    return actions, cards_merged, cards_thickened, cards_superseded
+    return actions, cards_merged, cards_thickened, cards_superseded, len(organized_ids), merged_count
 
 
 def _process_dream_jobs(jobs: list) -> float:
@@ -7028,7 +7033,14 @@ def _process_dream_jobs(jobs: list) -> float:
             continue
         try:
             occurred_at = _format_message_time(time.time())
-            actions, cards_merged, cards_thickened, cards_superseded = _dream_actions_from_consolidations(
+            (
+                actions,
+                cards_merged,
+                cards_thickened,
+                cards_superseded,
+                organized_count,
+                merged_count,
+            ) = _dream_actions_from_consolidations(
                 consolidations,
                 card_map=card_map,
                 occurred_at=occurred_at,
@@ -7080,6 +7092,8 @@ def _process_dream_jobs(jobs: list) -> float:
                     "actions": len(actions),
                     "questions": len(questions),
                     "cards_thickened": cards_thickened,
+                    "organized_count": organized_count,
+                    "merged_count": merged_count,
                 },
                 "memory_action_status": {
                     "status": memory_result.get("status", "ok"),
@@ -7089,6 +7103,8 @@ def _process_dream_jobs(jobs: list) -> float:
                 "memory_results": memory_result.get("results") or [],
                 "cards_merged": cards_merged,
                 "cards_superseded": cards_superseded,
+                "organized_count": organized_count,
+                "merged_count": merged_count,
                 "questions": questions,
             },
         )
