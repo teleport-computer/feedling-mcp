@@ -50,6 +50,17 @@ PROFILE_ROWS = [
 ]
 
 
+def _synthetic_lease(index: int) -> dict[str, object]:
+    return {
+        "registered": True,
+        "lease_id": f"lease_{index:032x}",
+        "absence_token": f"{index:064x}",
+        "expires_at": "2099-01-01T00:00:00+00:00",
+        "expires_at_epoch": 4_070_908_800,
+        "ttl_seconds": provisioner.MAX_SYNTHETIC_TTL_SECONDS,
+    }
+
+
 def _write_coverage(tmp_path: Path, rows=None) -> Path:
     path = tmp_path / "coverage-lock.json"
     path.write_text(json.dumps({"profiles": PROFILE_ROWS if rows is None else rows}))
@@ -95,6 +106,8 @@ class FakeSmokeClient:
         self.runtime_configured = True
         self.reset_fail_for: set[str] = set()
         self.already_reset_for: set[str] = set()
+        self.revoked_keys: set[str] = set()
+        self.deleted_config_keys: set[str] = set()
 
     def register(self, label: str) -> Session:
         index = len(self.registered)
@@ -184,8 +197,24 @@ class FakeSmokeClient:
 
     def _req(self, method, path, *, api_key=None, body=None, **_kwargs):
         if path == "/v1/users/whoami":
+            if api_key in self.revoked_keys or api_key in self.already_reset_for:
+                return 401, {"error": "unauthorized"}
             session = next(s for _label, s in self.registered if s.api_key == api_key)
             return 200, {"user_id": session.user_id, "active_route": "model_api"}
+        if path.startswith("/v1/model_api/") and api_key in self.revoked_keys:
+            return 401, {"error": "unauthorized"}
+        if path == "/v1/model_api/get":
+            return 200, {
+                "config": {"configured": api_key not in self.deleted_config_keys}
+            }
+        if path == "/v1/model_api/delete":
+            assert method == "DELETE"
+            self.deleted_config_keys.add(api_key)
+            return 200, {"deleted": True}
+        if path == "/v1/model_api/key_envelope":
+            if api_key in self.deleted_config_keys:
+                return 404, {"error": "model_api_key_envelope_missing"}
+            return 200, {"api_key_envelope": {"ciphertext": "not-public"}}
         if path == "/v1/chat/history?limit=1":
             return 200, {"messages": []}
         if path == "/v1/memory/list?limit=1":
@@ -204,10 +233,11 @@ class FakeSmokeClient:
             }
         if path == "/v1/account/reset":
             self.reset_calls.append((api_key, body))
-            if api_key in self.already_reset_for:
+            if api_key in self.already_reset_for or api_key in self.revoked_keys:
                 return 401, {"error": "unauthorized"}
             if api_key in self.reset_fail_for:
                 return 503, {"error": "unavailable"}
+            self.revoked_keys.add(api_key)
             return 200, {"deleted": True}
         raise AssertionError(f"unexpected request: {method} {path}")
 
@@ -222,7 +252,9 @@ class FakeAdminClient:
 
     def register_synthetic(self, label: str, *, ttl_seconds: int):
         if self.smoke is None:
-            raise AssertionError("synthetic registration requires the fake smoke client")
+            raise AssertionError(
+                "synthetic registration requires the fake smoke client"
+            )
         session = self.smoke.register(label)
         self.calls.append(
             (
@@ -232,10 +264,7 @@ class FakeAdminClient:
             )
         )
         return session, {
-            "registered": True,
-            "lease_id": f"lease_{len(self.smoke.registered):032x}",
-            "expires_at": "2099-01-01T00:00:00+00:00",
-            "expires_at_epoch": 4_070_908_800,
+            **_synthetic_lease(len(self.smoke.registered)),
             "ttl_seconds": ttl_seconds,
         }
 
@@ -249,11 +278,37 @@ class FakeAdminClient:
                 "label_prefix": provisioner.SYNTHETIC_LABEL_PREFIX,
                 "max_ttl_seconds": provisioner.MAX_SYNTHETIC_TTL_SECONDS,
             }
+        if path == provisioner.SYNTHETIC_ABSENCE_PATH:
+            if self.user_lookup_status is not None:
+                return self.user_lookup_status, {"error": "lookup_unavailable"}
+            user_id = str((body or {}).get("user_id") or "")
+            lease_id = str((body or {}).get("lease_id") or "")
+            absent = user_id in self.missing_users
+            if self.smoke is not None:
+                absent = absent or any(
+                    session.user_id == user_id
+                    and session.api_key in self.smoke.revoked_keys
+                    for _label, session in self.smoke.registered
+                )
+            return 200, {
+                "schema_version": 1,
+                "status": "absent" if absent else "present",
+                "user_id": user_id,
+                "lease_id": lease_id,
+                "lease_attested": True,
+                "database_authoritative": True,
+            }
         if path.startswith("/v1/admin/data-track/users/"):
             user_id = path.rsplit("/", 1)[1]
             if self.user_lookup_status is not None:
                 return self.user_lookup_status, {"error": "lookup_unavailable"}
             if user_id in self.missing_users:
+                return 404, {"error": "user_not_found"}
+            if self.smoke is not None and any(
+                session.user_id == user_id
+                and session.api_key in self.smoke.revoked_keys
+                for _label, session in self.smoke.registered
+            ):
                 return 404, {"error": "user_not_found"}
             return 200, {"user": {"user_id": user_id}}
         if method == "POST":
@@ -284,7 +339,7 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
     assert len(smoke.registered) == 9
     assert len(smoke.setup_calls) == 16
     assert len(smoke.trace_calls) == 8
-    assert len(admin.calls) == 26
+    assert len(admin.calls) == 10
     assert admin.calls[0] == ("GET", provisioner.SYNTHETIC_REAPER_PATH, None)
     for index in range(0, len(smoke.setup_calls), 2):
         assert smoke.setup_calls[index][4] == provisioner.INVALID_PROVIDER_KEY
@@ -306,10 +361,12 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
     assert all(row["registration_verified"] for row in result["profiles"])
     assert all(row["fresh_state_verified"] for row in result["profiles"])
     assert all(row["trace_enabled"] for row in result["profiles"])
+    assert all(row["runtime_mode"] == "hosted_resident" for row in result["profiles"])
     assert all(
-        row["runtime_mode"] == "hosted_resident" for row in result["profiles"]
+        row["runtime_mode_set_required"] is False
+        and row["runtime_mode_set_verified"] is False
+        for row in result["profiles"]
     )
-    assert all(row["runtime_mode_set_verified"] for row in result["profiles"])
     assert all(row["runtime_mode_readback_verified"] for row in result["profiles"])
     assert [row["profile_id"] for row in result["profiles"]] == list(
         provisioner.PROFILE_SPECS
@@ -349,13 +406,9 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
             "base_url": spec.expected_configured_base_url,
             "reasoning_effort": provisioner.EXPECTED_REASONING_EFFORT,
         }
-        assert profile["synthetic_account_lease"] == {
-            "registered": True,
-            "lease_id": f"lease_{list(provisioner.PROFILE_SPECS).index(profile['profile_id']) + 1:032x}",
-            "expires_at": "2099-01-01T00:00:00+00:00",
-            "expires_at_epoch": 4_070_908_800,
-            "ttl_seconds": provisioner.MAX_SYNTHETIC_TTL_SECONDS,
-        }
+        assert profile["synthetic_account_lease"] == _synthetic_lease(
+            list(provisioner.PROFILE_SPECS).index(profile["profile_id"]) + 1
+        )
     assert persisted["auxiliary_accounts"] == [
         {
             "profile_id": provisioner.MEMORY_CONTRACT_PROFILE_ID,
@@ -367,13 +420,7 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
             "public_key_b64": provisioner.base64.b64encode(bytes([19]) * 32).decode(),
             "provision_status": provisioner.PROVISION_STATUS_READY,
             "provision_failure_code": provisioner.PROVISION_FAILURE_NONE,
-            "synthetic_account_lease": {
-                "registered": True,
-                "lease_id": "lease_" + f"{9:032x}",
-                "expires_at": "2099-01-01T00:00:00+00:00",
-                "expires_at_epoch": 4_070_908_800,
-                "ttl_seconds": provisioner.MAX_SYNTHETIC_TTL_SECONDS,
-            },
+            "synthetic_account_lease": _synthetic_lease(9),
         }
     ]
 
@@ -657,6 +704,7 @@ def test_admin_client_registers_server_marked_account_without_exporting_private_
             "api_key": "account-key",
             "label": body["label"],
             "lease_id": "lease_" + "a" * 32,
+            "absence_token": "b" * 64,
             "expires_at": "2099-01-01T00:00:00+00:00",
             "expires_at_epoch": int(time.time()) + 600,
         }
@@ -677,6 +725,7 @@ def test_admin_client_registers_server_marked_account_without_exporting_private_
     assert "private_key" not in observed["body"]
     assert session.user_id == "usr_unit"
     assert receipt["registered"] is True
+    assert receipt["absence_token"] == "b" * 64
     assert receipt["ttl_seconds"] == 600
 
 
@@ -703,9 +752,7 @@ def test_admin_client_never_retries_non_idempotent_synthetic_registration():
     with pytest.raises(
         provisioner.ProvisionError, match="synthetic account registration failed"
     ):
-        client.register_synthetic(
-            "agent-e2e-run-official-gemini", ttl_seconds=600
-        )
+        client.register_synthetic("agent-e2e-run-official-gemini", ttl_seconds=600)
 
     assert opener.calls == 1
 
@@ -732,9 +779,33 @@ def test_admin_client_rejects_unbound_synthetic_registration_receipt(monkeypatch
     )
 
     with pytest.raises(provisioner.ProvisionError, match="receipt is invalid"):
-        client.register_synthetic(
-            "agent-e2e-run-official-gemini", ttl_seconds=600
-        )
+        client.register_synthetic("agent-e2e-run-official-gemini", ttl_seconds=600)
+
+
+def test_admin_client_requires_server_absence_attestation(monkeypatch):
+    client = provisioner.AdminClient(
+        provisioner.ALLOWED_BASE_URL,
+        "admin-sensitive-value",
+    )
+    label = "agent-e2e-run-official-gemini"
+    monkeypatch.setattr(
+        client,
+        "request",
+        lambda *_args, **_kwargs: (
+            201,
+            {
+                "user_id": "usr_unit",
+                "api_key": "account-key",
+                "label": label,
+                "lease_id": "lease_" + "a" * 32,
+                "expires_at": "2099-01-01T00:00:00+00:00",
+                "expires_at_epoch": int(time.time()) + 600,
+            },
+        ),
+    )
+
+    with pytest.raises(provisioner.ProvisionError, match="receipt is invalid"):
+        client.register_synthetic(label, ttl_seconds=600)
 
 
 def test_coverage_must_contain_exact_locked_profiles(tmp_path):
@@ -1274,8 +1345,8 @@ def test_manifest_is_checkpointed_after_each_successful_profile_stage(
         admin_client=FakeAdminClient(smoke),
     )
 
-    assert len(snapshots) == 8 * len(provisioner.PROFILE_SPECS) + 1
-    first_profile_stages = [snapshot["profiles"][0] for snapshot in snapshots[:8]]
+    assert len(snapshots) == 6 * len(provisioner.PROFILE_SPECS) + 1
+    first_profile_stages = [snapshot["profiles"][0] for snapshot in snapshots[:6]]
     assert first_profile_stages[0]["provision_failure_code"] == (
         provisioner.PROVISION_FAILURE_INCOMPLETE
     )
@@ -1283,14 +1354,15 @@ def test_manifest_is_checkpointed_after_each_successful_profile_stage(
     assert first_profile_stages[2]["invalid_key_rejected"] is True
     assert first_profile_stages[3]["valid_key_configured"] is True
     assert first_profile_stages[4]["trace_enabled"] is True
-    assert first_profile_stages[5]["runtime_mode_set_verified"] is True
-    assert first_profile_stages[6]["runtime_mode_readback_verified"] is True
-    assert first_profile_stages[7]["runtime_readback_receipt"] == {
+    assert first_profile_stages[5]["runtime_mode_set_required"] is False
+    assert first_profile_stages[5]["runtime_mode_set_verified"] is False
+    assert first_profile_stages[5]["runtime_mode_readback_verified"] is True
+    assert first_profile_stages[5]["runtime_readback_receipt"] == {
         "configured": True,
         "runtime_mode": "hosted_resident",
         "runtime_version": 2,
     }
-    assert first_profile_stages[7]["provision_status"] == (
+    assert first_profile_stages[5]["provision_status"] == (
         provisioner.PROVISION_STATUS_READY
     )
 
@@ -1369,6 +1441,306 @@ def test_cleanup_resets_every_account_and_removes_manifest(tmp_path):
     assert not manifest_path.exists()
 
 
+def test_release_cleanup_writes_sanitized_deterministic_receipt_and_retains_manifest(
+    tmp_path,
+):
+    smoke = FakeSmokeClient()
+    entries = []
+    for profile_id in [*provisioner.PROFILE_SPECS, "memory-contract"]:
+        session = smoke.register(f"label-{profile_id}")
+        entries.append(
+            {
+                "profile_id": profile_id,
+                "user_id": session.user_id,
+                "api_key": session.api_key,
+                "synthetic_account_lease": _synthetic_lease(len(entries) + 1),
+                **(
+                    {
+                        "valid_key_configured": True,
+                        "valid_key_receipt": {"status": "configured"},
+                    }
+                    if profile_id != "memory-contract"
+                    else {}
+                ),
+            }
+        )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "base_url": provisioner.ALLOWED_BASE_URL,
+                "profiles": entries[:-1],
+                "auxiliary_accounts": entries[-1:],
+            }
+        )
+    )
+    receipt_path = tmp_path / "cleanup-receipt.json"
+
+    result = provisioner.cleanup(
+        manifest_path,
+        client=smoke,
+        admin_client=FakeAdminClient(smoke),
+        receipt_path=receipt_path,
+        run_id="unit-run-0001",
+        retain_manifest=True,
+    )
+
+    assert result == {
+        "attempted": 9,
+        "cleaned": 9,
+        "failed_profile_ids": [],
+        "manifest_deleted": False,
+        "manifest_missing": False,
+        "receipt_written": True,
+    }
+    assert manifest_path.exists()
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["kind"] == "deterministic_cleanup_receipt"
+    assert receipt["run_id"] == "unit-run-0001"
+    assert receipt["manifest_retained_for_scan"] is True
+    assert [row["profile_id"] for row in receipt["profiles"]] == list(
+        provisioner.PROFILE_SPECS
+    )
+    assert receipt["auxiliary_accounts"][0]["profile_id"] == "memory-contract"
+    assert all(
+        row["status"] == "PASS"
+        for row in [
+            *receipt["profiles"],
+            *receipt["auxiliary_accounts"],
+        ]
+    )
+    serialized = receipt_path.read_text()
+    assert "api_key" not in serialized
+    assert "user_id" not in serialized
+    assert "absence_token" not in serialized
+    assert "feedling-account-key" not in serialized
+
+
+def test_release_cleanup_receipt_fails_closed_when_revocation_is_not_observable(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_ATTEMPTS", 1)
+    smoke = FakeSmokeClient()
+    entries = []
+    for profile_id in [*provisioner.PROFILE_SPECS, "memory-contract"]:
+        session = smoke.register(f"label-{profile_id}")
+        entries.append(
+            {
+                "profile_id": profile_id,
+                "user_id": session.user_id,
+                "api_key": session.api_key,
+                "synthetic_account_lease": _synthetic_lease(len(entries) + 1),
+                **(
+                    {
+                        "valid_key_configured": True,
+                        "valid_key_receipt": {"status": "configured"},
+                    }
+                    if profile_id != "memory-contract"
+                    else {}
+                ),
+            }
+        )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "base_url": provisioner.ALLOWED_BASE_URL,
+                "profiles": entries[:-1],
+                "auxiliary_accounts": entries[-1:],
+            }
+        )
+    )
+    admin = FakeAdminClient(smoke)
+    admin.user_lookup_status = 503
+    receipt_path = tmp_path / "cleanup-receipt.json"
+
+    result = provisioner.cleanup(
+        manifest_path,
+        client=smoke,
+        admin_client=admin,
+        receipt_path=receipt_path,
+        run_id="unit-run-0001",
+        retain_manifest=True,
+    )
+
+    assert result["cleaned"] == 0
+    assert result["failed_profile_ids"] == [
+        *provisioner.PROFILE_SPECS,
+        "memory-contract",
+    ]
+    assert manifest_path.exists()
+    assert all(
+        row["old_credential_rejected"] is True
+        and row["user_absence_verified"] is False
+        and row["status"] == "FAIL"
+        for row in [
+            *json.loads(receipt_path.read_text())["profiles"],
+            *json.loads(receipt_path.read_text())["auxiliary_accounts"],
+        ]
+    )
+
+
+def test_release_cleanup_retries_a_transient_reset_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_DELAY_SECONDS", 0)
+    smoke = FakeSmokeClient()
+    entries = []
+    for profile_id in [*provisioner.PROFILE_SPECS, "memory-contract"]:
+        session = smoke.register(f"label-{profile_id}")
+        entries.append(
+            {
+                "profile_id": profile_id,
+                "user_id": session.user_id,
+                "api_key": session.api_key,
+                "synthetic_account_lease": _synthetic_lease(len(entries) + 1),
+                **(
+                    {
+                        "valid_key_configured": True,
+                        "valid_key_receipt": {"status": "configured"},
+                    }
+                    if profile_id != "memory-contract"
+                    else {}
+                ),
+            }
+        )
+    first_api_key = entries[0]["api_key"]
+    original_request = smoke._req
+    transient_failures = {first_api_key: 2}
+
+    def transient_request(method, path, *, api_key=None, body=None, **kwargs):
+        if path == "/v1/account/reset" and transient_failures.get(api_key, 0) > 0:
+            transient_failures[api_key] -= 1
+            smoke.reset_calls.append((api_key, body))
+            return 503, {"error": "unavailable"}
+        return original_request(method, path, api_key=api_key, body=body, **kwargs)
+
+    monkeypatch.setattr(smoke, "_req", transient_request)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "base_url": provisioner.ALLOWED_BASE_URL,
+                "profiles": entries[:-1],
+                "auxiliary_accounts": entries[-1:],
+            }
+        )
+    )
+
+    result = provisioner.cleanup(
+        manifest_path,
+        client=smoke,
+        admin_client=FakeAdminClient(smoke),
+        receipt_path=tmp_path / "cleanup-receipt.json",
+        run_id="unit-run-transient-reset",
+        retain_manifest=True,
+    )
+
+    assert result["cleaned"] == 9
+    assert result["failed_profile_ids"] == []
+    assert transient_failures[first_api_key] == 0
+
+
+def test_release_cleanup_still_removes_partial_provisioning_accounts(tmp_path):
+    smoke = FakeSmokeClient()
+    session = smoke.register("partial")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "base_url": provisioner.ALLOWED_BASE_URL,
+                "profiles": [
+                    {
+                        "profile_id": "official-deepseek",
+                        "user_id": session.user_id,
+                        "api_key": session.api_key,
+                        "synthetic_account_lease": _synthetic_lease(1),
+                        "valid_key_configured": True,
+                        "valid_key_receipt": {"status": "configured"},
+                    }
+                ],
+                "auxiliary_accounts": [],
+            }
+        )
+    )
+    receipt_path = tmp_path / "cleanup-receipt.json"
+
+    result = provisioner.cleanup(
+        manifest_path,
+        client=smoke,
+        admin_client=FakeAdminClient(smoke),
+        receipt_path=receipt_path,
+        run_id="unit-run-partial",
+        retain_manifest=True,
+    )
+
+    assert result["attempted"] == result["cleaned"] == 1
+    assert result["failed_profile_ids"] == []
+    receipt = json.loads(receipt_path.read_text())
+    assert [row["profile_id"] for row in receipt["profiles"]] == ["official-deepseek"]
+    assert receipt["profiles"][0]["status"] == "PASS"
+    assert session.api_key in smoke.revoked_keys
+
+
+def test_release_cleanup_verifies_accounts_already_reset_by_profile_workers(tmp_path):
+    smoke = FakeSmokeClient()
+    entries = []
+    for profile_id in [*provisioner.PROFILE_SPECS, "memory-contract"]:
+        session = smoke.register(f"label-{profile_id}")
+        smoke.revoked_keys.add(session.api_key)
+        entries.append(
+            {
+                "profile_id": profile_id,
+                "user_id": session.user_id,
+                "api_key": session.api_key,
+                "synthetic_account_lease": _synthetic_lease(len(entries) + 1),
+                **(
+                    {
+                        "valid_key_configured": True,
+                        "valid_key_receipt": {"status": "configured"},
+                    }
+                    if profile_id != "memory-contract"
+                    else {}
+                ),
+            }
+        )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "base_url": provisioner.ALLOWED_BASE_URL,
+                "profiles": entries[:-1],
+                "auxiliary_accounts": entries[-1:],
+            }
+        )
+    )
+    admin = FakeAdminClient(smoke)
+    admin.missing_users.update(entry["user_id"] for entry in entries)
+    receipt_path = tmp_path / "cleanup-receipt.json"
+
+    result = provisioner.cleanup(
+        manifest_path,
+        client=smoke,
+        admin_client=admin,
+        receipt_path=receipt_path,
+        run_id="unit-run-precleaned",
+        retain_manifest=True,
+    )
+
+    assert result["cleaned"] == 9
+    assert result["failed_profile_ids"] == []
+    receipt = json.loads(receipt_path.read_text())
+    assert all(
+        row["status"] == "PASS"
+        and row["provider_config_live_predelete_observed"] is False
+        and row["provider_config_deletion_source"] == "account_cascade"
+        for row in receipt["profiles"]
+    )
+
+
 def test_adminless_diagnostic_cleanup_needs_no_admin_token(tmp_path):
     manifest_path = tmp_path / "diagnostic.json"
     manifest_path.write_text(
@@ -1405,7 +1777,12 @@ def test_cleanup_failure_keeps_manifest_for_retry(tmp_path):
                 "schema_version": 1,
                 "base_url": provisioner.ALLOWED_BASE_URL,
                 "profiles": [
-                    {"profile_id": "p1", "user_id": "u1", "api_key": "account-1"},
+                    {
+                        "profile_id": "p1",
+                        "user_id": "u1",
+                        "api_key": "account-1",
+                        "synthetic_account_lease": _synthetic_lease(1),
+                    },
                 ],
             }
         )
@@ -1428,7 +1805,12 @@ def test_cleanup_treats_already_reset_401_as_success(tmp_path):
                 "schema_version": 1,
                 "base_url": provisioner.ALLOWED_BASE_URL,
                 "profiles": [
-                    {"profile_id": "p1", "user_id": "u1", "api_key": "account-1"},
+                    {
+                        "profile_id": "p1",
+                        "user_id": "u1",
+                        "api_key": "account-1",
+                        "synthetic_account_lease": _synthetic_lease(1),
+                    },
                 ],
             }
         )
@@ -1444,7 +1826,17 @@ def test_cleanup_treats_already_reset_401_as_success(tmp_path):
     assert result["failed_profile_ids"] == []
     assert result["manifest_deleted"] is True
     assert not manifest_path.exists()
-    assert admin.calls == [("GET", "/v1/admin/data-track/users/u1", None)]
+    assert admin.calls == [
+        (
+            "POST",
+            provisioner.SYNTHETIC_ABSENCE_PATH,
+            {
+                "user_id": "u1",
+                "lease_id": _synthetic_lease(1)["lease_id"],
+                "absence_token": _synthetic_lease(1)["absence_token"],
+            },
+        )
+    ]
 
 
 def test_cleanup_401_without_admin_proof_keeps_manifest(tmp_path):
@@ -1455,7 +1847,12 @@ def test_cleanup_401_without_admin_proof_keeps_manifest(tmp_path):
                 "schema_version": 1,
                 "base_url": provisioner.ALLOWED_BASE_URL,
                 "profiles": [
-                    {"profile_id": "p1", "user_id": "u1", "api_key": "account-1"},
+                    {
+                        "profile_id": "p1",
+                        "user_id": "u1",
+                        "api_key": "account-1",
+                        "synthetic_account_lease": _synthetic_lease(1),
+                    },
                 ],
             }
         )
@@ -1508,7 +1905,12 @@ def test_cleanup_401_with_existing_admin_user_keeps_manifest(tmp_path):
                 "schema_version": 1,
                 "base_url": provisioner.ALLOWED_BASE_URL,
                 "profiles": [
-                    {"profile_id": "p1", "user_id": "u1", "api_key": "account-1"},
+                    {
+                        "profile_id": "p1",
+                        "user_id": "u1",
+                        "api_key": "account-1",
+                        "synthetic_account_lease": _synthetic_lease(1),
+                    },
                 ],
             }
         )

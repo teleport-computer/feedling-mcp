@@ -21,8 +21,8 @@ The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are requirements.
   `QA_EXPECTED_DEPLOYMENT_SHA`. An operator-supplied label is not evidence.
 - Each synthetic account MUST independently read its authenticated runtime
   status before chat begins. `QA_EXPECTED_RUNTIME=deployed_current` records the
-  runtime actually deployed without requiring the future Hosted Runtime V2
-  architecture. `QA_EXPECTED_RUNTIME=hosted_resident` is the opt-in strict V2 gate.
+  configured runtime actually deployed without requiring a particular mode or
+  version. `QA_EXPECTED_RUNTIME=hosted_resident` is the strict V2 user-path gate.
 - Use one freshly provisioned synthetic account per profile. Never use a
   customer account.
 - Provision one additional fresh synthetic account exclusively for the
@@ -231,10 +231,10 @@ Provider credentials are provisioner-only secrets, not agent context.
 - The provisioner uses a generated, clearly fake value for invalid-key testing.
   The supervisor audits the sanitized receipt; it does not repeat setup.
 - Every mode may use the test admin token in deterministic parent code to read
-  the protected build identity. The baseline diagnostic does not use it to
-  select a runtime. The strict V2 release path may additionally use it only for
-  selecting the synthetic account's runtime, reading it back, V2 worker
-  identity, reaper, and cleanup controls.
+  the protected build identity and to operate the synthetic-account reaper and
+  cleanup controls. Runtime configuration and readback use the synthetic
+  account's authenticated user API. Qualification MUST NOT depend on a test-only
+  admin mode switch or worker-metrics endpoint.
 - Feedling user API keys and content private keys are in-memory session material.
   They MUST NOT appear in artifacts.
 - The supervisor shell MUST use `feedling-e2e-supervisor`, and each worker MUST
@@ -254,7 +254,7 @@ schema-approved fixed evidence/diagnostic/failure codes, safe identifiers,
 booleans, counts, durations, and approved metadata. Never place an observed
 response fragment inside an identifier or code field.
 
-## 4. Runtime discovery and optional V2 proof
+## 4. Runtime discovery and strict V2 user-path proof
 
 Before enabling hosted chat, every worker MUST:
 
@@ -266,16 +266,22 @@ Before enabling hosted chat, every worker MUST:
 
 When `QA_EXPECTED_RUNTIME=hosted_resident`, the strict V2 path additionally MUST:
 
-1. Require observed mode `hosted_resident` with runtime version `2`.
-2. Require trusted pre/post deployment receipts proving the expected backend
-   and homogeneous live-worker build.
-3. Correlate chat evidence with V2 worker/queue trace evidence when supported.
+1. Require every provisioned profile's authenticated `/v1/model_api/runtime`
+   readback to report configured mode `hosted_resident` and runtime version `2`.
+2. Require the parent-owned P0-05 live probe to re-read and match that exact
+   target for every profile.
+3. Require the parent-owned P0-07 activation probe to verify the hosted loop,
+   re-read the same exact target, and prove that verification created no orphan
+   turn.
+4. Require trusted pre/post deployment receipts proving endpoint liveness and
+   the expected backend build identity.
 
 An unreadable or unconfigured runtime is `BLOCKED_DEPLOYMENT`. In strict V2 mode,
-an inability to select or verify V2 is `BLOCKED_DEPLOYMENT` (or
-`BLOCKED_CREDENTIAL` when the test admin credential is absent). A backend's
-legacy `runtime_version: 2` label alone is never proof that the new Hosted
-Runtime V2 architecture is deployed.
+an exact mode/version mismatch is `BLOCKED_DEPLOYMENT`. A backend's legacy
+`runtime_version: 2` label alone is never sufficient: the mode, version, and
+live hosted-loop receipts must agree for each profile. Worker SHA and live-worker
+count remain explicitly unavailable (`null`), so this gate qualifies observable
+user behavior and does not attest an internal worker binary or queue topology.
 
 ## 5. Scenario execution and bounded diagnosis
 
@@ -330,12 +336,16 @@ There is no `SKIP`, `EXPECTED_FAIL`, or inferred pass.
 The test is about the product-visible reasoning contract, never disclosure of raw
 private chain-of-thought. For a locked profile with `reasoning_expected: true`:
 
-- The configured and observed reasoning effort MUST be `medium`; off, omitted,
-  or an unverified provider default is not sufficient.
-- The correlated harness/model capability MUST explicitly report reasoning as
-  enabled. Requested, configured, and effective effort are separate evidence
-  fields and MUST each equal `medium`; a configured value does not pass if the
-  effective value was clamped to `off`.
+- The profile MUST request `medium`, and an authenticated live route readback
+  MUST attest configured `medium` for the same provider/model/base URL. Off,
+  omitted, a route mismatch, or an unverified provider default is not
+  sufficient.
+- The correlated harness/model capability MUST expose a positive reasoning
+  signal. Requested, configured, and effective effort remain separate evidence
+  fields. The current deployed runtime does not attest per-turn applied effort,
+  so effective effort MUST remain `unknown` with
+  `reasoning_effective_effort_not_attested: true`; it MUST NOT be inferred from
+  requested/configured state or from visible reasoning.
 - The exact P0-12 turn MUST contain at least one provider-visible
   reasoning/thinking event. A positive event count proves that reasoning or a
   provider-produced summary traversed the harness; it does not claim access to a
@@ -350,10 +360,11 @@ private chain-of-thought. For a locked profile with `reasoning_expected: true`:
   event/token counts, and disclosure length. It MUST NOT store the disclosure
   text or raw private reasoning.
 - The result schemas deliberately allow bounded failed observations such as
-  `capability_enabled: false`, `effective_effort: off`, and an event count of
-  zero so diagnostic artifacts remain renderable. The deterministic release
-  gate still requires the healthy values above for PASS; agents MUST NOT coerce
-  observed failures into success-shaped evidence.
+  `capability_enabled: false`, a non-medium configured effort, and an event
+  count of zero so diagnostic artifacts remain renderable. The deterministic
+  release gate still requires the healthy values above for PASS; agents MUST
+  NOT coerce observed failures into success-shaped evidence or claim an
+  effective effort the runtime did not attest.
 - P0-12 MUST be driven exactly once by the deterministic launcher through
   `qa/cot_delivery_probe.py`. The profile writes only the fixed
   `$QA_WORK_ROOT/.cot-probe-request` marker and waits for the parent-authored
@@ -466,12 +477,23 @@ status. The worker SHOULD:
 
 Cleanup failure prevents an overall `PASS`. Never run account reset against an
 account whose generated label and user ID were not established by this run.
-The workflow also invokes the deterministic cleanup command under `always()` as
-an ordinary-failure fallback. An already-reset account counts as cleaned; any
-remaining synthetic account is reset there before the release decision. This is
-not crash-safe against runner loss or forced job termination: the deployment
-MUST provide a server-side TTL/reaper for `agent-e2e-*` accounts, and the runner
-MUST be destroyed after its single job.
+The workflow also invokes deterministic cleanup under `always()`. For each
+provider profile it MUST bind manifest proof that a valid provider route was
+configured, attempt the authenticated route deletion when possible, verify the
+public config and encrypted key envelope are absent, reset the account, require
+the QA-only absence endpoint to validate the registration receipt's HMAC-bound
+`user_id` and `lease_id` and return strict PostgreSQL absence, and require the
+old Feedling key to return `401`. If a profile worker reset first, this
+lease-attested database absence is the authoritative account/provider-config
+cascade boundary. A process-local registry 404 is never cleanup evidence.
+The parent writes `cleanup-receipt.json` without account IDs, keys, or response
+bodies; `qa/validate_cleanup_receipt.py` MUST require the exact eight profiles,
+the memory-contract account, nine successful cleanups, and exact agreement with
+the canonical result's cleanup fields. Partial provisioning MUST still clean
+every account that exists, even though its incomplete receipt cannot qualify.
+This is not crash-safe against runner loss or forced job termination: the
+deployment MUST provide a server-side TTL/reaper for `agent-e2e-*` accounts, and
+the runner MUST be destroyed after its single job.
 
 ## 9. Artifacts and release decision
 
@@ -484,6 +506,7 @@ renderer validates the canonical JSON against the schema and writes the derived 
 
 ```text
 run-result.json
+cleanup-receipt.json
 memory-contract.json
 matrix.md
 latency.csv
@@ -515,11 +538,15 @@ The overall result is `PASS` only when:
   terminal statuses and sum to eight;
 - all thirteen exact scenario IDs occur once for every profile;
 - all scenario and profile statuses are `PASS`;
-- the observed runtime is present for every profile and, in the strict V2 release
-  path, equals `hosted_resident` with the required V2 receipt evidence;
+- the observed runtime is present for every profile and, in the strict V2
+  qualification path, equals `hosted_resident` version `2` in the provisioner
+  and parent-owned P0-05/P0-07 receipt evidence;
 - pre/post endpoint liveness and backend build identity agree with the expected
-  deployment; in strict V2 mode, worker build identity also agrees;
-- every synthetic account is cleaned up;
+  deployment; worker build identity is explicitly unavailable and is not
+  invented by either mode;
+- every synthetic account is cleaned up and the deterministic cleanup receipt
+  proves exact matrix coverage, provider-config/envelope deletion, admin-side
+  account absence, old-key rejection, and agreement with the canonical result;
 - all eight always-required memory checks pass and the two migration checks
   satisfy the checked-in migration policy;
 - every profile worker has at least one completed qualification-tool execution;

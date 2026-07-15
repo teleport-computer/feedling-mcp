@@ -57,8 +57,12 @@ MANIFEST_SCHEMA_VERSION = 1
 SYNTHETIC_LABEL_PREFIX = "agent-e2e-"
 SYNTHETIC_REAPER_PATH = "/v1/admin/qa/synthetic-account-reaper"
 SYNTHETIC_REGISTRATION_PATH = "/v1/admin/qa/synthetic-accounts/register"
+SYNTHETIC_ABSENCE_PATH = "/v1/admin/qa/synthetic-accounts/absence"
 MAX_SYNTHETIC_TTL_SECONDS = 14_400
+CLEANUP_EVIDENCE_ATTEMPTS = 8
+CLEANUP_EVIDENCE_DELAY_SECONDS = 2.0
 _SYNTHETIC_LEASE_RE = re.compile(r"^lease_[0-9a-f]{32}$")
+_SYNTHETIC_ABSENCE_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
 PROVISION_STATUS_READY = "ready"
 PROVISION_STATUS_BLOCKED = "blocked"
 PROVISION_FAILURE_NONE = "NONE"
@@ -562,6 +566,7 @@ class AdminClient:
         user_id = response_body.get("user_id")
         api_key = response_body.get("api_key")
         lease_id = response_body.get("lease_id")
+        absence_token = response_body.get("absence_token")
         expires_at = response_body.get("expires_at")
         expires_at_epoch = response_body.get("expires_at_epoch")
         if (
@@ -573,6 +578,8 @@ class AdminClient:
             or response_body.get("label") != label
             or not isinstance(lease_id, str)
             or _SYNTHETIC_LEASE_RE.fullmatch(lease_id) is None
+            or not isinstance(absence_token, str)
+            or _SYNTHETIC_ABSENCE_TOKEN_RE.fullmatch(absence_token) is None
             or not isinstance(expires_at, str)
             or not expires_at
             or type(expires_at_epoch) is not int
@@ -584,6 +591,7 @@ class AdminClient:
             {
                 "registered": True,
                 "lease_id": lease_id,
+                "absence_token": absence_token,
                 "expires_at": expires_at,
                 "expires_at_epoch": expires_at_epoch,
                 "ttl_seconds": ttl_seconds,
@@ -619,9 +627,10 @@ def _manifest_entry(
         "trace_enabled": False,
         "runtime_mode": "",
         "runtime_version": 0,
-        "runtime_mode_set_required": (
-            not diagnostic and runtime_requirement == RUNTIME_V2_REQUIREMENT
-        ),
+        # Current Runtime V2 auto-migrates every configured model-API profile.
+        # Qualification proves the resulting user-scoped readback instead of
+        # depending on a test-only mutation endpoint that production does not use.
+        "runtime_mode_set_required": False,
         "runtime_readback_receipt": None,
         "registration_verified": False,
         "fresh_state_verified": False,
@@ -835,48 +844,6 @@ def _enable_trace(client: SmokeClient, session: Session, entry: dict[str, Any]) 
     entry["trace_enabled"] = True
 
 
-def _set_runtime_mode(
-    admin_client: AdminClient, session: Session, entry: dict[str, Any]
-) -> None:
-    try:
-        set_status, set_body = admin_client.request(
-            "POST",
-            "/v1/admin/hosted-runtime-mode",
-            {"user_id": session.user_id, "mode": EXPECTED_RUNTIME_MODE},
-        )
-    except Exception:
-        raise _ProfileProvisionFailure("RUNTIME_MODE_SET_FAILED") from None
-    if (
-        set_status != 200
-        or not isinstance(set_body, Mapping)
-        or set_body.get("hosted_runtime_mode") != EXPECTED_RUNTIME_MODE
-        or set_body.get("user_id") != session.user_id
-    ):
-        raise _ProfileProvisionFailure("RUNTIME_MODE_SET_FAILED")
-    entry["runtime_mode_set_verified"] = True
-
-
-def _verify_runtime_mode(
-    admin_client: AdminClient, session: Session, entry: dict[str, Any]
-) -> None:
-    query = urllib.parse.urlencode({"user_id": session.user_id})
-    try:
-        get_status, get_body = admin_client.request(
-            "GET", f"/v1/admin/hosted-runtime-mode?{query}"
-        )
-    except Exception:
-        raise _ProfileProvisionFailure("RUNTIME_MODE_VERIFICATION_FAILED") from None
-    if (
-        get_status != 200
-        or not isinstance(get_body, Mapping)
-        or get_body.get("hosted_runtime_mode") != EXPECTED_RUNTIME_MODE
-        or get_body.get("user_id") != session.user_id
-    ):
-        raise _ProfileProvisionFailure("RUNTIME_MODE_VERIFICATION_FAILED")
-    entry["runtime_mode"] = EXPECTED_RUNTIME_MODE
-    entry["runtime_mode_readback_verified"] = True
-
-
 def _verify_diagnostic_runtime(
     client: SmokeClient,
     session: Session,
@@ -889,9 +856,7 @@ def _verify_diagnostic_runtime(
     except Exception:
         raise _ProfileProvisionFailure("RUNTIME_MODE_VERIFICATION_FAILED") from None
     runtime_mode = body.get("runtime_mode") if isinstance(body, Mapping) else None
-    runtime_version = (
-        body.get("runtime_version") if isinstance(body, Mapping) else None
-    )
+    runtime_version = body.get("runtime_version") if isinstance(body, Mapping) else None
     generic_readback_invalid = (
         not isinstance(body, Mapping)
         or body.get("configured") is not True
@@ -901,8 +866,7 @@ def _verify_diagnostic_runtime(
         or runtime_version < 1
     )
     runtime_v2_mismatch = runtime_requirement == RUNTIME_V2_REQUIREMENT and (
-        runtime_mode != RUNTIME_V2_REQUIREMENT
-        or runtime_version != RUNTIME_V2_VERSION
+        runtime_mode != RUNTIME_V2_REQUIREMENT or runtime_version != RUNTIME_V2_VERSION
     )
     if generic_readback_invalid or runtime_v2_mismatch:
         raise _ProfileProvisionFailure("RUNTIME_MODE_VERIFICATION_FAILED")
@@ -963,6 +927,12 @@ def _complete_diagnostic_manifest(manifest: Mapping[str, Any]) -> bool:
             for field in ("user_id", "api_key", "secret_key_b64", "public_key_b64")
         ):
             return False
+        if manifest.get(
+            "qualification_mode"
+        ) != QUALIFICATION_MODE_DIAGNOSTIC and not _synthetic_absence_attestation_valid(
+            row
+        ):
+            return False
     auxiliary = manifest.get("auxiliary_accounts")
     if manifest.get("qualification_mode") == QUALIFICATION_MODE_DIAGNOSTIC:
         return auxiliary == []
@@ -985,20 +955,62 @@ def _complete_diagnostic_manifest(manifest: Mapping[str, Any]) -> bool:
                 "public_key_b64",
             )
         )
-        and isinstance(memory.get("synthetic_account_lease"), Mapping)
+        and _synthetic_absence_attestation_valid(memory)
     )
 
 
-def _admin_confirms_user_absent(admin_client: AdminClient | None, user_id: str) -> bool:
-    """Require the authenticated admin lookup's explicit not-found contract."""
-    if admin_client is None or not user_id:
+def _synthetic_absence_attestation_valid(entry: Mapping[str, Any]) -> bool:
+    lease = entry.get("synthetic_account_lease")
+    return bool(
+        isinstance(lease, Mapping)
+        and lease.get("registered") is True
+        and isinstance(lease.get("lease_id"), str)
+        and _SYNTHETIC_LEASE_RE.fullmatch(lease["lease_id"]) is not None
+        and isinstance(lease.get("absence_token"), str)
+        and _SYNTHETIC_ABSENCE_TOKEN_RE.fullmatch(lease["absence_token"]) is not None
+    )
+
+
+def _admin_confirms_user_absent(
+    admin_client: AdminClient | None, entry: Mapping[str, Any]
+) -> bool:
+    """Require a lease-attested, strict database absence response."""
+    if admin_client is None:
         return False
-    path = f"/v1/admin/data-track/users/{urllib.parse.quote(user_id, safe='')}"
+    user_id = str(entry.get("user_id") or "")
+    lease = entry.get("synthetic_account_lease")
+    if not isinstance(lease, Mapping):
+        return False
+    lease_id = str(lease.get("lease_id") or "")
+    absence_token = str(lease.get("absence_token") or "")
+    if (
+        not user_id
+        or _SYNTHETIC_LEASE_RE.fullmatch(lease_id) is None
+        or _SYNTHETIC_ABSENCE_TOKEN_RE.fullmatch(absence_token) is None
+    ):
+        return False
     try:
-        status, body = admin_client.request("GET", path)
+        status, body = admin_client.request(
+            "POST",
+            SYNTHETIC_ABSENCE_PATH,
+            {
+                "user_id": user_id,
+                "lease_id": lease_id,
+                "absence_token": absence_token,
+            },
+        )
     except Exception:
         return False
-    return status == 404 and body.get("error") == "user_not_found"
+    return bool(
+        status == 200
+        and isinstance(body, Mapping)
+        and body.get("schema_version") == 1
+        and body.get("status") == "absent"
+        and body.get("user_id") == user_id
+        and body.get("lease_id") == lease_id
+        and body.get("lease_attested") is True
+        and body.get("database_authoritative") is True
+    )
 
 
 def _reset_one(
@@ -1007,7 +1019,6 @@ def _reset_one(
     admin_client: AdminClient | None = None,
 ) -> bool:
     api_key = str(entry.get("api_key") or "")
-    user_id = str(entry.get("user_id") or "")
     if not api_key:
         return False
     try:
@@ -1024,10 +1035,216 @@ def _reset_one(
         # accept only after the admin lookup independently proves the synthetic
         # user no longer exists.
         if status == 401:
-            return _admin_confirms_user_absent(admin_client, user_id)
+            return _admin_confirms_user_absent(admin_client, entry)
         return False
     except Exception:
         return False
+
+
+def _request_account_reset(client: SmokeClient, entry: Mapping[str, Any]) -> bool:
+    """Issue one reset request without treating the response as final evidence."""
+    api_key = str(entry.get("api_key") or "")
+    if not api_key:
+        return False
+    try:
+        status, body = client._req(
+            "POST",
+            "/v1/account/reset",
+            api_key=api_key,
+            body={"confirm": "delete-all-data"},
+        )
+    except Exception:
+        return False
+    return (status == 200 and body.get("deleted") is True) or status == 401
+
+
+def _old_credential_is_rejected(client: SmokeClient, api_key: str) -> bool:
+    if not api_key:
+        return False
+    try:
+        status, _body = client._req("GET", "/v1/users/whoami", api_key=api_key)
+    except Exception:
+        return False
+    return status == 401
+
+
+def _delete_provider_config_with_evidence(
+    client: SmokeClient, entry: Mapping[str, Any]
+) -> tuple[bool, bool, bool, bool]:
+    """Delete one configured route and prove both projection and envelope absence."""
+    api_key = str(entry.get("api_key") or "")
+    if not api_key:
+        return False, False, False, False
+    valid_receipt = entry.get("valid_key_receipt")
+    preexisted = (
+        entry.get("valid_key_configured") is True
+        and isinstance(valid_receipt, Mapping)
+        and valid_receipt.get("status") == "configured"
+    )
+    live_predelete_observed = False
+    for attempt in range(3):
+        try:
+            before_status, before = client._req(
+                "GET", "/v1/model_api/get", api_key=api_key
+            )
+            before_config = (
+                before.get("config") if isinstance(before, Mapping) else None
+            )
+            if before_status == 401:
+                return preexisted, False, False, False
+            if (
+                before_status == 200
+                and isinstance(before_config, Mapping)
+                and before_config.get("configured") is True
+            ):
+                live_predelete_observed = True
+            delete_status, _deleted = client._req(
+                "DELETE", "/v1/model_api/delete", api_key=api_key
+            )
+            post_status, after = client._req(
+                "GET", "/v1/model_api/get", api_key=api_key
+            )
+            post_config = after.get("config") if isinstance(after, Mapping) else None
+            projection_absent = (
+                post_status == 200
+                and isinstance(post_config, Mapping)
+                and post_config.get("configured") is False
+            )
+            envelope_status, _envelope = client._req(
+                "GET", "/v1/model_api/key_envelope", api_key=api_key
+            )
+            envelope_absent = envelope_status == 404
+            if delete_status == 200 and projection_absent and envelope_absent:
+                return preexisted, live_predelete_observed, True, True
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(float(attempt + 1))
+    return preexisted, live_predelete_observed, False, False
+
+
+def _cleanup_evidence_rows(
+    client: SmokeClient,
+    admin_client: AdminClient | None,
+    entries: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reset all accounts, then prove deletion after one shared retry window.
+
+    The public rows contain only locked profile IDs and booleans. Account IDs,
+    account keys, and response bodies remain confined to the private manifest.
+    """
+    work: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
+    for entry in entries:
+        profile_id = str(entry.get("profile_id") or "unknown")
+        if profile_id == MEMORY_CONTRACT_PROFILE_ID:
+            config_preexisted = False
+            config_deleted = True
+            envelope_deleted = True
+            config_deletion_source = "not_applicable"
+        else:
+            (
+                config_preexisted,
+                config_live_predelete_observed,
+                config_deleted,
+                envelope_deleted,
+            ) = _delete_provider_config_with_evidence(client, entry)
+            config_deletion_source = "explicit_api" if config_deleted else "unknown"
+        if profile_id == MEMORY_CONTRACT_PROFILE_ID:
+            config_live_predelete_observed = False
+        accepted = _request_account_reset(client, entry)
+        row = {
+            "profile_id": profile_id,
+            "attempted": True,
+            "reset_response_accepted": accepted,
+            "provider_config_preexisted": config_preexisted,
+            "provider_config_live_predelete_observed": (config_live_predelete_observed),
+            "provider_config_deleted": config_deleted,
+            "key_envelope_deleted": envelope_deleted,
+            "provider_config_deletion_source": config_deletion_source,
+            "account_reset": False,
+            "old_credential_rejected": False,
+            "user_absence_verified": False,
+            "status": "FAIL",
+        }
+        work.append((entry, row))
+
+    for attempt in range(CLEANUP_EVIDENCE_ATTEMPTS):
+        pending = False
+        for entry, row in work:
+            if row["status"] == "PASS":
+                continue
+            if not row["reset_response_accepted"]:
+                row["reset_response_accepted"] = _request_account_reset(client, entry)
+                if not row["reset_response_accepted"]:
+                    pending = True
+                    continue
+            api_key = str(entry.get("api_key") or "")
+            user_absent = _admin_confirms_user_absent(admin_client, entry)
+            credential_rejected = _old_credential_is_rejected(client, api_key)
+            row["user_absence_verified"] = user_absent
+            row["old_credential_rejected"] = credential_rejected
+            row["account_reset"] = user_absent
+            if (
+                user_absent
+                and row["profile_id"] != MEMORY_CONTRACT_PROFILE_ID
+                and row["provider_config_preexisted"] is True
+                and row["provider_config_deleted"] is not True
+            ):
+                # Account deletion is an authoritative FK-cascade boundary for
+                # provider credentials/routes. This also verifies runs where a
+                # profile worker reset first and the parent sees only 401.
+                row["provider_config_deleted"] = True
+                row["key_envelope_deleted"] = True
+                row["provider_config_deletion_source"] = "account_cascade"
+            provider_proof_valid = (
+                row["provider_config_deleted"] is True
+                and row["key_envelope_deleted"] is True
+                and (
+                    row["provider_config_preexisted"] is True
+                    or row["profile_id"] == MEMORY_CONTRACT_PROFILE_ID
+                )
+            )
+            if user_absent and credential_rejected and provider_proof_valid:
+                row["status"] = "PASS"
+            else:
+                pending = True
+        if not pending:
+            break
+        if attempt + 1 < CLEANUP_EVIDENCE_ATTEMPTS:
+            time.sleep(CLEANUP_EVIDENCE_DELAY_SECONDS)
+    return [row for _entry, row in work]
+
+
+def _validate_receipted_cleanup_manifest(
+    profiles: Sequence[Mapping[str, Any]],
+    auxiliary: Sequence[Mapping[str, Any]],
+) -> None:
+    profile_ids = [str(row.get("profile_id") or "") for row in profiles]
+    auxiliary_ids = [str(row.get("profile_id") or "") for row in auxiliary]
+    if (
+        any(profile_id not in PROFILE_SPECS for profile_id in profile_ids)
+        or len(set(profile_ids)) != len(profile_ids)
+        or profile_ids
+        != [profile_id for profile_id in PROFILE_SPECS if profile_id in profile_ids]
+    ):
+        raise ProvisionError("cleanup receipt profile rows are invalid")
+    if auxiliary_ids not in ([], [MEMORY_CONTRACT_PROFILE_ID]):
+        raise ProvisionError("cleanup receipt auxiliary rows are invalid")
+    entries = [*profiles, *auxiliary]
+    if any(
+        not isinstance(row, Mapping) or not _synthetic_absence_attestation_valid(row)
+        for row in entries
+    ):
+        raise ProvisionError("cleanup receipt requires synthetic absence attestations")
+    user_ids = [str(row.get("user_id") or "") for row in entries]
+    api_keys = [str(row.get("api_key") or "") for row in entries]
+    if (
+        not all(user_ids)
+        or len(set(user_ids)) != len(user_ids)
+        or not all(api_keys)
+        or len(set(api_keys)) != len(api_keys)
+    ):
+        raise ProvisionError("cleanup receipt requires unique account credentials")
 
 
 def cleanup(
@@ -1036,6 +1253,9 @@ def cleanup(
     env: Mapping[str, str] | None = None,
     client: SmokeClient | None = None,
     admin_client: AdminClient | None = None,
+    receipt_path: Path | None = None,
+    run_id: str | None = None,
+    retain_manifest: bool = False,
 ) -> dict[str, Any]:
     """Reset every account in a private manifest, deleting it only on success."""
     if not manifest_path.exists():
@@ -1069,6 +1289,49 @@ def cleanup(
                 admin_token,
                 getattr(active_client, "_ssl", None),
             )
+
+    if receipt_path is not None:
+        if not retain_manifest:
+            raise ProvisionError("cleanup receipt requires retained manifest scanning")
+        safe_run_id = str(run_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", safe_run_id):
+            raise ProvisionError("cleanup receipt run ID is invalid")
+        _validate_receipted_cleanup_manifest(profiles, auxiliary)
+        evidence = _cleanup_evidence_rows(
+            active_client,
+            verification_admin,
+            [row for row in entries if isinstance(row, Mapping)],
+        )
+        profile_rows = evidence[: len(profiles)]
+        auxiliary_rows = evidence[len(profiles) :]
+        failed = [
+            str(row["profile_id"])
+            for row in evidence
+            if row.get("status") != "PASS"
+        ]
+        cleaned = len(evidence) - len(failed)
+        receipt = {
+            "schema_version": 1,
+            "kind": "deterministic_cleanup_receipt",
+            "run_id": safe_run_id,
+            "generated_at": _utc_now(),
+            "attempted": len(evidence),
+            "cleaned": cleaned,
+            "failed_profile_ids": failed,
+            "manifest_deleted": False,
+            "manifest_retained_for_scan": True,
+            "profiles": profile_rows,
+            "auxiliary_accounts": auxiliary_rows,
+        }
+        _atomic_write_manifest(receipt_path, receipt)
+        return {
+            "attempted": receipt["attempted"],
+            "cleaned": cleaned,
+            "failed_profile_ids": failed,
+            "manifest_deleted": False,
+            "manifest_missing": False,
+            "receipt_written": True,
+        }
 
     cleaned = 0
     failed: list[str] = []
@@ -1270,15 +1533,6 @@ def provision(
                 _atomic_write_manifest(manifest_path, manifest)
                 _enable_trace(active_client, session, entry)
                 _atomic_write_manifest(manifest_path, manifest)
-                if not diagnostic and requirement == RUNTIME_V2_REQUIREMENT:
-                    if active_admin is None:  # pragma: no cover - defensive type guard
-                        raise ProvisionError(
-                            "strict provisioning requires admin client"
-                        )
-                    _set_runtime_mode(active_admin, session, entry)
-                    _atomic_write_manifest(manifest_path, manifest)
-                    _verify_runtime_mode(active_admin, session, entry)
-                    _atomic_write_manifest(manifest_path, manifest)
                 _verify_diagnostic_runtime(
                     active_client,
                     session,
@@ -1305,7 +1559,9 @@ def provision(
                     ttl_seconds=int(reaper_receipt["max_ttl_seconds"]),
                 )
             except Exception:
-                raise ProvisionError("memory contract account registration failed") from None
+                raise ProvisionError(
+                    "memory contract account registration failed"
+                ) from None
             memory_entry = _memory_contract_entry(
                 memory_session, memory_label, memory_lease
             )
@@ -1380,6 +1636,9 @@ def _parser() -> argparse.ArgumentParser:
         "cleanup", help="reset all accounts in a private manifest"
     )
     remove.add_argument("--manifest", type=Path, required=True)
+    remove.add_argument("--receipt", type=Path)
+    remove.add_argument("--run-id")
+    remove.add_argument("--retain-manifest", action="store_true")
     return parser
 
 
@@ -1391,7 +1650,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ProvisionError("runtime requirement flags are mutually exclusive")
             requirement = (
                 BASELINE_RUNTIME_REQUIREMENT
-                if args.baseline_runtime or (args.diagnostic and not args.require_runtime_v2)
+                if args.baseline_runtime
+                or (args.diagnostic and not args.require_runtime_v2)
                 else RUNTIME_V2_REQUIREMENT
             )
             if args.diagnostic:
@@ -1436,7 +1696,12 @@ def main(argv: list[str] | None = None) -> int:
                 summary["qualification_mode"] = QUALIFICATION_MODE_DIAGNOSTIC
             print(json.dumps(summary))
             return 0
-        result = cleanup(args.manifest)
+        result = cleanup(
+            args.manifest,
+            receipt_path=args.receipt,
+            run_id=args.run_id,
+            retain_manifest=args.retain_manifest,
+        )
         print(
             json.dumps(
                 {

@@ -165,7 +165,7 @@ def test_profile_artifact_preserves_bounded_persona_and_reasoning_receipts(tmp_p
     }
 
 
-def test_exact_reasoning_clamp_failure_is_schema_valid_and_renderable(tmp_path):
+def test_reasoning_configuration_mismatch_is_schema_valid_and_renderable(tmp_path):
     result = _valid_result()
     profile = result["profiles"][0]
     scenario = next(
@@ -174,14 +174,14 @@ def test_exact_reasoning_clamp_failure_is_schema_valid_and_renderable(tmp_path):
     failure = {
         "category": "PRODUCT_FAIL",
         "stage_code": "REASONING",
-        "failure_code": "REASONING_EFFORT_CLAMPED",
+        "failure_code": "MODEL_ROUTE_MISMATCH",
         "reproducible": True,
     }
     profile["reasoning"].update(
         capability_enabled=False,
         requested_effort="medium",
-        configured_effort="medium",
-        effective_effort="off",
+        configured_effort="off",
+        effective_effort="unknown",
         reasoning_event_count=0,
         metadata_present=False,
         token_metadata_present=False,
@@ -194,7 +194,8 @@ def test_exact_reasoning_clamp_failure_is_schema_valid_and_renderable(tmp_path):
     scenario["status"] = "PRODUCT_FAIL"
     scenario["assertions"].update(
         reasoning_capability_enabled=False,
-        reasoning_effective_effort_medium=False,
+        reasoning_configured_effort_medium=False,
+        reasoning_effective_effort_not_attested=True,
         reasoning_event_observed=False,
         reasoning_metadata_present=False,
         reasoning_tokens_present=False,
@@ -216,9 +217,9 @@ def test_exact_reasoning_clamp_failure_is_schema_valid_and_renderable(tmp_path):
 
     assert rendered["reasoning"] == profile["reasoning"]
     assert rendered["reasoning"]["capability_enabled"] is False
-    assert rendered["reasoning"]["effective_effort"] == "off"
+    assert rendered["reasoning"]["effective_effort"] == "unknown"
     assert rendered["reasoning"]["reasoning_event_count"] == 0
-    assert "REASONING_EFFORT_CLAMPED" in (artifacts / "junit.xml").read_text(
+    assert "MODEL_ROUTE_MISMATCH" in (artifacts / "junit.xml").read_text(
         encoding="utf-8"
     )
 

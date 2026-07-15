@@ -2302,14 +2302,7 @@ def execute(
             not _SHA_RE.fullmatch(observed_backend_sha)
             or resolved_candidate_sha != observed_backend_sha
             or observed_deployment_sha != resolved_candidate_sha
-            or (
-                options.runtime_requirement == BASELINE_RUNTIME
-                and observed_worker_sha is not None
-            )
-            or (
-                options.runtime_requirement == RUNTIME_V2_RUNTIME
-                and observed_worker_sha != resolved_candidate_sha
-            )
+            or observed_worker_sha is not None
             or deployment_receipt.get("liveness_verified") is not True
             or deployment_receipt.get("deployment_identity_verified") is not True
         ):

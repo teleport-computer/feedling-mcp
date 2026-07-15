@@ -379,6 +379,11 @@ def _register_user(public_key: str | None = None,
         try:
             persist_user(entry)  # per-row upsert (multi-worker-safe) + users broadcast
         except Exception:
+            if _qa_synthetic_metadata_builder is None:
+                # Preserve the ordinary registration path's existing failure
+                # semantics. The rollback below exists only to make the
+                # short-lived, server-marked QA registration all-or-nothing.
+                raise
             # ``persist_user`` can fail after the primary upsert (for example,
             # during mirror replication or the cross-worker notification).
             # Roll back both representations before withholding the API key so

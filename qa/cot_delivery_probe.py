@@ -35,10 +35,11 @@ from tools.provider_smoke.client import (  # noqa: E402
 
 
 LOCKED_BASE_URL = "https://test-api.feedling.app"
-RECEIPT_SCHEMA_VERSION = 1
+RECEIPT_SCHEMA_VERSION = 2
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 TRACE_POLL_SECONDS = 20.0
 TRACE_POLL_INTERVAL_SECONDS = 1.0
+EXPECTED_REASONING_EFFORT = "medium"
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 _FAILURE_CODES = frozenset(
     {
@@ -109,10 +110,13 @@ def _decode_key(value: object, label: str) -> bytes:
     return raw
 
 
-def load_profile_session(
-    manifest_path: Path, expected_profile_id: str | None = None
-) -> tuple[str, str, Session]:
-    """Load exactly one provisioned session without exposing its credentials."""
+def _load_profile(
+    manifest_path: Path,
+    expected_profile_id: str | None,
+    *,
+    require_cot_context: bool,
+) -> tuple[dict[str, Any], str, Session]:
+    """Load one provisioned profile and optionally require COT route context."""
     raw = _owned_private_file(
         manifest_path, "one-profile manifest", max_bytes=MAX_MANIFEST_BYTES
     )
@@ -128,7 +132,7 @@ def load_profile_session(
         or not isinstance(profiles[0], dict)
     ):
         raise CotProbeError("one-profile manifest is invalid")
-    profile = profiles[0]
+    profile = dict(profiles[0])
     profile_id = str(profile.get("profile_id") or "")
     if expected_profile_id and profile_id != expected_profile_id:
         raise CotProbeError("one-profile manifest assignment does not match")
@@ -143,8 +147,16 @@ def load_profile_session(
         or profile.get("provision_status") != "ready"
     ):
         raise CotProbeError("one-profile manifest is not ready")
+    if require_cot_context and (
+        not str(profile.get("provider") or "").strip()
+        or not str(profile.get("configured_model") or "").strip()
+        or not isinstance(profile.get("configured_base_url"), str)
+        or str(profile.get("reasoning_effort") or "").strip().lower()
+        != EXPECTED_REASONING_EFFORT
+    ):
+        raise CotProbeError("one-profile manifest is not ready")
     return (
-        profile_id,
+        profile,
         base_url,
         Session(
             user_id=user_id,
@@ -153,6 +165,75 @@ def load_profile_session(
             pk=_decode_key(profile.get("public_key_b64"), "public key"),
         ),
     )
+
+
+def load_profile_context(
+    manifest_path: Path, expected_profile_id: str | None = None
+) -> tuple[dict[str, Any], str, Session]:
+    """Load the COT route context plus its private authenticated session."""
+
+    return _load_profile(
+        manifest_path,
+        expected_profile_id,
+        require_cot_context=True,
+    )
+
+
+def load_profile_session(
+    manifest_path: Path, expected_profile_id: str | None = None
+) -> tuple[str, str, Session]:
+    """Compatibility wrapper returning no profile document or credentials."""
+
+    profile, base_url, session = _load_profile(
+        manifest_path,
+        expected_profile_id,
+        require_cot_context=False,
+    )
+    return str(profile["profile_id"]), base_url, session
+
+
+def read_configured_effort(
+    client: SmokeClient, session: Session, profile: Mapping[str, Any]
+) -> tuple[str, bool, bool]:
+    """Read the persisted effort from the authenticated active-route endpoint.
+
+    The booleans attest the effort field and whether the live route matches the
+    manifest. Transport/auth/malformed responses stay unattested; they never
+    suppress the delivery probe or masquerade as a product configuration.
+    """
+
+    try:
+        status, body = client._req(
+            "GET",
+            "/v1/model_api/get",
+            api_key=session.api_key,
+            attempts=2,
+            read_timeout=15,
+        )
+    except Exception:  # External evidence failure must remain unavailable, not fatal.
+        return "unknown", False, False
+    if status != 200 or not isinstance(body, Mapping):
+        return "unknown", False, False
+    config = body.get("config")
+    if not isinstance(config, Mapping):
+        return "unknown", False, False
+    if config.get("configured") is not True:
+        return "unknown", False, False
+
+    raw = config.get("reasoning_effort")
+    value = str(raw).strip().lower() if isinstance(raw, (str, int)) else ""
+    if value in {"off", "minimal", "low", "medium", "high", "xhigh"}:
+        effort = value
+    elif value:
+        effort = "unsupported"
+    else:
+        return "unknown", False, False
+    route_matches = bool(
+        config.get("provider") == profile.get("provider")
+        and config.get("model") == profile.get("configured_model")
+        and config.get("base_url") == profile.get("configured_base_url")
+    )
+    return effort, True, route_matches
 
 
 def _matching_events(
@@ -458,10 +539,22 @@ def run_probe(
         raise CotProbeError("probe nonce is invalid")
     if not 10 <= timeout_seconds <= 300:
         raise CotProbeError("probe timeout is invalid")
-    profile_id, base_url, session = load_profile_session(
+    profile, base_url, session = load_profile_context(
         manifest_path, expected_profile_id
     )
+    profile_id = str(profile["profile_id"])
     active_client = client or SmokeClient(base_url)
+    requested_effort = str(profile["reasoning_effort"]).strip().lower()
+    (
+        configured_effort,
+        configured_effort_attested,
+        configured_route_matches_manifest,
+    ) = read_configured_effort(active_client, session, profile)
+    # Runtime V2 currently emits no trusted field proving which effort the
+    # harness/provider actually applied.  Keep this explicitly unattested; a
+    # visible reasoning event proves reasoning happened, not its effort level.
+    effective_effort = "unknown"
+    effective_effort_attested = False
     request_id = ""
     reply_message_id = ""
     ack_latency_ms: float | None = None
@@ -568,6 +661,12 @@ def run_probe(
         "reply_message_id": reply_message_id,
         "status": status,
         "failure_code": failure_code,
+        "requested_effort": requested_effort,
+        "configured_effort": configured_effort,
+        "configured_effort_attested": configured_effort_attested,
+        "configured_route_matches_manifest": configured_route_matches_manifest,
+        "effective_effort": effective_effort,
+        "effective_effort_attested": effective_effort_attested,
         "release_qualified": False,
         "delivery_qualified": status == "PASS",
         "final_answer_correct": final_answer_correct,

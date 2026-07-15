@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -79,6 +80,26 @@ class _SettlingClient:
         snapshot = self.snapshots[min(self.history_calls, len(self.snapshots) - 1)]
         self.history_calls += 1
         return 200, {"messages": snapshot}
+
+
+class _RuntimeTargetClient:
+    def __init__(self, runtime: dict) -> None:
+        self.runtime = runtime
+
+    def runtime_status(self, _session):
+        return dict(self.runtime)
+
+    def _req(self, method, path, *, api_key):
+        assert method == "GET"
+        assert path == "/v1/chat/history?limit=200"
+        assert api_key == "key"
+        return 200, {"messages": []}
+
+    def enable_hosting(self, _session):
+        return "model_api"
+
+    def open_chat_gate(self, _session):
+        return {"passing": True}
 
 
 def _receipt(
@@ -213,6 +234,69 @@ def _profile_projection(aggregate: dict) -> dict:
                     }
                 )
     return {"scenarios": scenarios, "turns": turns}
+
+
+@pytest.mark.parametrize(
+    "runtime_requirement", ("deployed_current", "hosted_resident")
+)
+def test_one_profile_manifest_preserves_runtime_requirement(
+    tmp_path: Path, runtime_requirement: str
+):
+    manifest = tmp_path / "profile.json"
+    encoded_key = base64.b64encode(b"k" * 32).decode("ascii")
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "base_url": probe.LOCKED_BASE_URL,
+                "runtime_mode": runtime_requirement,
+                "profiles": [
+                    {
+                        "profile_id": "official-gemini",
+                        "provision_status": "ready",
+                        "user_id": "synthetic-user",
+                        "api_key": "synthetic-key",
+                        "secret_key_b64": encoded_key,
+                        "public_key_b64": encoded_key,
+                    }
+                ],
+            }
+        )
+    )
+    manifest.chmod(0o600)
+
+    profile, session = probe.load_profile(manifest, "official-gemini")
+
+    assert profile["_qualification_runtime_requirement"] == runtime_requirement
+    assert session.user_id == "synthetic-user"
+
+
+def test_one_profile_manifest_rejects_unknown_runtime_requirement(tmp_path: Path):
+    manifest = tmp_path / "profile.json"
+    encoded_key = base64.b64encode(b"k" * 32).decode("ascii")
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "base_url": probe.LOCKED_BASE_URL,
+                "runtime_mode": "unlocked-runtime",
+                "profiles": [
+                    {
+                        "profile_id": "official-gemini",
+                        "provision_status": "ready",
+                        "user_id": "synthetic-user",
+                        "api_key": "synthetic-key",
+                        "secret_key_b64": encoded_key,
+                        "public_key_b64": encoded_key,
+                    }
+                ],
+            }
+        )
+    )
+    manifest.chmod(0o600)
+
+    with pytest.raises(probe.LiveScenarioProbeError, match="not ready"):
+        probe.load_profile(manifest, "official-gemini")
 
 
 def test_request_marker_is_exact_one_shot_and_profile_bound(tmp_path: Path):
@@ -356,6 +440,126 @@ def test_settled_turn_summary_flags_out_of_order_history():
     assert summary["reply_count"] == 1
     assert summary["duplicate_detected"] is False
     assert summary["out_of_order_detected"] is True
+
+
+@pytest.mark.parametrize(
+    ("requirement", "runtime", "expected_match"),
+    (
+        (
+            "hosted_resident",
+            {
+                "configured": True,
+                "runtime_mode": "hosted_resident",
+                "runtime_version": 2,
+            },
+            True,
+        ),
+        (
+            "hosted_resident",
+            {
+                "configured": True,
+                "runtime_mode": "hosted_resident",
+                "runtime_version": 1,
+            },
+            False,
+        ),
+        (
+            "hosted_resident",
+            {
+                "configured": True,
+                "runtime_mode": "legacy_container",
+                "runtime_version": 2,
+            },
+            False,
+        ),
+        (
+            "deployed_current",
+            {
+                "configured": True,
+                "runtime_mode": "legacy_container",
+                "runtime_version": 1,
+            },
+            True,
+        ),
+    ),
+)
+def test_p0_05_runtime_readback_is_target_aware(requirement, runtime, expected_match):
+    assertions, turns, observations = probe._run_actions(
+        "P0-05",
+        nonce="runtime-target",
+        profile={"_qualification_runtime_requirement": requirement},
+        session=probe.Session("user", "key", b"s" * 32, b"p" * 32),
+        client=_RuntimeTargetClient(runtime),
+    )
+
+    assert assertions == {
+        "runtime_status_readback_succeeds": True,
+        "runtime_configured": True,
+        "runtime_metadata_recorded": expected_match,
+    }
+    assert turns == []
+    assert observations == {
+        "runtime_mode": runtime["runtime_mode"],
+        "runtime_version": runtime["runtime_version"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("requirement", "runtime", "expected_match"),
+    (
+        (
+            "hosted_resident",
+            {
+                "configured": True,
+                "runtime_mode": "hosted_resident",
+                "runtime_version": 2,
+            },
+            True,
+        ),
+        (
+            "hosted_resident",
+            {
+                "configured": True,
+                "runtime_mode": "legacy_container",
+                "runtime_version": 2,
+            },
+            False,
+        ),
+        (
+            "deployed_current",
+            {
+                "configured": True,
+                "runtime_mode": "legacy_container",
+                "runtime_version": 1,
+            },
+            True,
+        ),
+    ),
+)
+def test_p0_07_hosted_loop_rechecks_selected_runtime_target(
+    requirement, runtime, expected_match
+):
+    assertions, turns, observations = probe._run_actions(
+        "P0-07",
+        nonce="runtime-target",
+        profile={"_qualification_runtime_requirement": requirement},
+        session=probe.Session("user", "key", b"s" * 32, b"p" * 32),
+        client=_RuntimeTargetClient(runtime),
+    )
+
+    assert assertions == {
+        "driver_enabled": True,
+        "chat_loop_verified": True,
+        "runtime_status_readback_succeeds": expected_match,
+        "no_orphan_turn": True,
+    }
+    assert turns == []
+    assert observations == {
+        "driver": "model_api",
+        "verify_passing": True,
+        "runtime_mode": runtime["runtime_mode"],
+        "runtime_version": runtime["runtime_version"],
+    }
 
 
 def test_bounded_transient_retry_can_bind_final_pass():

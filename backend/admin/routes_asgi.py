@@ -301,5 +301,27 @@ async def qa_synthetic_account_register(request: Request):
     return JSONResponse(result, status_code=201)
 
 
+@router.post("/v1/admin/qa/synthetic-accounts/absence")
+async def qa_synthetic_account_absence(request: Request):
+    """Verify an attested QA lease against the authoritative users table."""
+    _require_admin(request)
+    payload = (await read_json_silent(request)) or {}
+    try:
+        result = await threadpool.run_db(
+            qa_synthetic_accounts.synthetic_account_absence, payload
+        )
+    except qa_synthetic_accounts.SyntheticAccountBadRequest:
+        return JSONResponse(
+            {"error": "invalid_synthetic_account_proof"}, status_code=400
+        )
+    except qa_synthetic_accounts.SyntheticAccountDisabled:
+        return JSONResponse({"error": "synthetic_accounts_disabled"}, status_code=503)
+    except qa_synthetic_accounts.SyntheticAccountStoreUnavailable:
+        return JSONResponse(
+            {"error": "synthetic_account_store_unavailable"}, status_code=503
+        )
+    return JSONResponse(result)
+
+
 def register_asgi(app) -> None:
     app.include_router(router)

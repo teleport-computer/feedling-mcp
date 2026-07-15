@@ -145,9 +145,12 @@ write access can run:
 gh workflow run ci.yml --ref main -f runtime_target=deployed_current
 ```
 
-Use `hosted_resident` only when the deployed environment is expected to satisfy
-the strict Runtime V2 receipts. The current-runtime target still verifies the
-exact deployed backend SHA; it does not claim Runtime V2.
+Use `hosted_resident` when every configured synthetic profile is expected to
+read back exact mode `hosted_resident` and version `2` through
+`/v1/model_api/runtime`, and to preserve that target through the parent-owned
+P0-05/P0-07 live probes. `deployed_current` remains the baseline target: it
+verifies the exact deployed backend SHA and the configured user path without
+claiming V2. Neither target invents unavailable worker SHA/count evidence.
 
 Provisioning waits for an exact-name, exact-label, online, idle runner before
 the secret-bearing job is queued. Startup failure triggers immediate hosted

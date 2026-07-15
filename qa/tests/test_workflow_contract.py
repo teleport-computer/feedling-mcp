@@ -84,12 +84,32 @@ def test_github_hosted_controller_provisions_private_jit_aws_runner():
     assert 'runner_identity="feedling-e2e-${run_key}"' in provision
     assert '"labels": ["self-hosted", "linux", "x64", "feedling-e2e", label]' in provision
     assert 'echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"' in provision
+    assert provision.index(
+        'echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"'
+    ) < provision.index("runner_bound=false")
     assert 'runner.get("runner_group_id")' not in provision
     assert (
-        "/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100"
+        "/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100&page=1"
         in provision
     )
-    assert 'matches = [item for item in runners if item.get("id") == expected_id]' in provision
+    assert (
+        "/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100&page=${page}"
+        in provision
+    )
+    assert "membership_attempts=12" in provision
+    assert "backoff=$((1 << (attempt - 1)))" in provision
+    assert 'if [ "$backoff" -gt 10 ]' in provision
+    assert "--connect-timeout 5" in provision
+    assert "--max-time 20" in provision
+    assert "--max-time 30" in provision
+    assert "page_count = max(1, (total_count + 99) // 100)" in provision
+    assert "len(all_runners) != expected_total" in provision
+    assert "len(set(runner_ids)) != len(runner_ids)" in provision
+    assert (
+        'matches = [item for item in all_runners if item.get("id") == expected_id]'
+        in provision
+    )
+    assert "total_count > 100" not in provision
     assert "GitHub JIT runner was not bound to the dedicated runner group" in provision
     assert 'runner.get("name") != os.environ["RUNNER_NAME"]' in provision
     assert "JIT runner group membership is missing its unique label" in provision
@@ -198,6 +218,8 @@ def test_github_hosted_cleanup_always_terminates_exact_managed_attempt():
     assert "needs.provision-aws-runner.outputs.runner_name" in cleanup
     assert "len(matches) > 1" in cleanup
     assert "?name=${derived_name}&per_page=100" in cleanup
+    assert cleanup.count("--connect-timeout 5") >= 2
+    assert cleanup.count("--max-time 20") >= 2
     assert "runner_id != int(supplied_id)" in cleanup
     assert "/actions/runners/${runner_id}" in cleanup
     assert "204)" in cleanup
@@ -325,7 +347,7 @@ def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
     )
     scan = _step(
         "Scan public artifacts for secrets and raw evidence",
-        "Cleanup every synthetic account",
+        "Upload sanitized public qualification artifacts",
     )
     for secret_name in (
         "QA_DEEPSEEK_API_KEY",
@@ -504,10 +526,10 @@ def test_selected_runtime_target_is_checked_before_and_after_live_profile_agents
     assert "--orchestration-receipt" in validate
 
 
-def test_manual_dispatch_defaults_to_current_runtime_and_preserves_strict_v2_option():
+def test_manual_dispatch_defaults_to_strict_v2_and_preserves_baseline_option():
     trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
     assert "runtime_target:" in trigger
-    assert "default: deployed_current" in trigger
+    assert "default: hosted_resident" in trigger
     assert "- deployed_current" in trigger
     assert "- hosted_resident" in trigger
 
@@ -606,7 +628,7 @@ def test_memory_contract_uses_isolated_account_and_deterministic_gate_policy():
 def test_secret_scan_includes_credentials_oauth_and_persona_privacy_fixture():
     scan = _step(
         "Scan public artifacts for secrets and raw evidence",
-        "Cleanup every synthetic account",
+        "Upload sanitized public qualification artifacts",
     )
     assert "qa/scan_artifacts.py" in scan
     assert "--manifest" in scan
@@ -628,7 +650,15 @@ def test_secret_scan_includes_credentials_oauth_and_persona_privacy_fixture():
 
 def test_cleanup_diagnostic_upload_and_final_gate_are_fail_closed():
     cleanup = _step(
-        "Cleanup every synthetic account",
+        "Cleanup every synthetic account with deterministic evidence",
+        "Validate deterministic cleanup receipt",
+    )
+    cleanup_receipt = _step(
+        "Validate deterministic cleanup receipt",
+        "Scan public artifacts for secrets and raw evidence",
+    )
+    scan = _step(
+        "Scan public artifacts for secrets and raw evidence",
         "Upload sanitized public qualification artifacts",
     )
     upload = _step(
@@ -637,8 +667,15 @@ def test_cleanup_diagnostic_upload_and_final_gate_are_fail_closed():
     )
     assert "if: always()" in cleanup
     assert "qa/provision_profiles.py cleanup" in cleanup
+    assert "--receipt" in cleanup
+    assert "--run-id" in cleanup
+    assert "--retain-manifest" in cleanup
+    assert "qa/validate_cleanup_receipt.py" in cleanup_receipt
+    assert "if: always()" in cleanup_receipt
+    assert "qa/scan_artifacts.py" in scan
     assert "steps.secret_scan.outcome == 'success'" in upload
     assert "steps.cleanup.outcome == 'success'" in upload
+    assert "steps.cleanup_receipt.outcome == 'success'" in upload
     assert "steps.validate.outcome" not in upload
     assert "include-hidden-files: false" in upload
     assert "retention-days: 14" in upload
@@ -647,4 +684,5 @@ def test_cleanup_diagnostic_upload_and_final_gate_are_fail_closed():
     assert '"orchestration:$ORCHESTRATION"' in WORKFLOW
     assert '"validate:$VALIDATE"' in WORKFLOW
     assert '"secret-scan:$SECRET_SCAN"' in WORKFLOW
+    assert '"cleanup-receipt:$CLEANUP_RECEIPT"' in WORKFLOW
     assert "release qualification: PASS" in WORKFLOW

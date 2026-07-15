@@ -115,14 +115,16 @@ without reviewing the decrypted evidence surfaces.
 - Audit the provisioner's authenticated, user-scoped runtime readback receipt.
 - Record the observed runtime mode and version without treating the backend's
   legacy version label as proof that the new Hosted Runtime V2 architecture is deployed.
-- When `QA_EXPECTED_RUNTIME=hosted_resident`, additionally require mode
-  `hosted_resident`, runtime version `2`, and the trusted parent-owned V2
-  deployment receipts.
+- The parent-owned P0-05 live probe must independently call
+  `/v1/model_api/runtime`. When `QA_EXPECTED_RUNTIME=hosted_resident`, both the
+  provisioner readback and this live probe must report configured mode
+  `hosted_resident` and runtime version `2` for this exact profile.
 
 **Pass**
 
 - The account is configured, runtime status is readable, and the observed mode
-  and version are recorded. In strict V2 mode, all additional V2 requirements match.
+  and version are recorded. In strict V2 mode, both independent per-profile
+  readbacks match exact mode `hosted_resident` and version `2`.
 
 ## P0-06 — Persona-file import and distillation
 
@@ -191,12 +193,16 @@ without reviewing the decrypted evidence surfaces.
 
 - Enable the model-API driver.
 - Run `chat/verify_loop` before the first real user message.
+- Re-read `/v1/model_api/runtime` in the parent-owned P0-07 probe. In strict V2
+  mode, require configured mode `hosted_resident` and version `2` after hosted
+  activation; in baseline mode, require a configured runtime with recorded
+  nonempty mode and positive version.
 
 **Pass**
 
 - The selected driver is returned, verification reaches `passing=true`, the
-  observed runtime remains configured, and no orphan user turn is created
-  during verification.
+  observed runtime still matches the selected qualification target, and no
+  orphan user turn is created during verification.
 
 ## P0-08 — Basic chat and acknowledgement latency
 
@@ -291,10 +297,13 @@ without reviewing the decrypted evidence surfaces.
 - The probe sends `17 × 19`, requires final answer `323`, exact-correlates the
   resulting user turn and stored reply, and records only bounded metadata. Do
   not send a second reasoning task or substitute a different turn.
-- Verify the correlated route and harness expose reasoning capability as enabled.
-  Record requested, configured, and effective effort separately; all three must
-  be `medium`. A configured route value alone is insufficient if the harness or
-  selected model clamps effective effort to `off`.
+- Verify the correlated route and harness expose a positive reasoning signal.
+  Record requested, configured, and effective effort separately. Requested and
+  authenticated live configured effort must be `medium`, and the live route
+  must match the manifest provider/model/base URL. Because the current runtime
+  does not expose trustworthy per-turn applied effort, record effective effort
+  exactly as `unknown` and unattested; never infer it from configured state or
+  visible reasoning.
 - Bind the profile result to the receipt's exact request/turn/trace and reply
   IDs. Inspect its bounded reasoning kind/source/model, token-metadata status,
   provider-visible reasoning event count, and separately encrypted user-visible
@@ -313,19 +322,22 @@ without reviewing the decrypted evidence surfaces.
 
 **Pass**
 
-- Final answer is correct; capability is enabled; requested, configured, and
-  effective effort are all `medium`; the correlated turn has a positive
-  provider-visible reasoning/thinking event count; required reasoning and token
-  metadata are present; user-visible disclosure decrypts and is nonempty;
-  artifacts contain only metadata/counts/length. Provider-visible reasoning or a
-  provider-produced summary is the contract; hidden raw chain-of-thought is
-  neither promised, requested, nor stored.
+- Final answer is correct; capability is enabled; requested and authenticated
+  live configured effort are `medium` for the manifest route; effective effort
+  is explicitly `unknown` and unattested; the correlated turn has a positive
+  provider-visible reasoning/thinking event count and explicit positive
+  reasoning-token count; required reasoning metadata is present; user-visible
+  disclosure decrypts and is nonempty; artifacts contain only
+  metadata/counts/length. Provider-visible reasoning or a provider-produced
+  summary is the contract; hidden raw chain-of-thought is neither promised,
+  requested, nor stored.
 
-If the profile requested and configured `medium` but the trace reports
-`capability_enabled: false`, `effective_effort: off`, or zero reasoning events,
-record those observed values verbatim, classify P0-12 as `PRODUCT_FAIL` at stage
-`REASONING` with `REASONING_EFFORT_CLAMPED`, and preserve the sanitized failure
-artifact. Never replace a failed observation with success-shaped defaults.
+If live route readback is unavailable, classify P0-12 as `BLOCKED_EVIDENCE` /
+`PRECONDITION_MISSING`. If the route mismatches the manifest, classify it as
+`PRODUCT_FAIL` / `MODEL_ROUTE_MISMATCH`; if the attested configured effort is
+not `medium`, use `PRODUCT_FAIL` / `REASONING_EFFORT_CLAMPED`. A missing positive
+reasoning signal follows the delivery mapping below. Preserve every sanitized
+failed observation and never replace it with success-shaped defaults.
 
 Map deterministic delivery failures without inventing evidence:
 
@@ -372,6 +384,13 @@ Map deterministic delivery failures without inventing evidence:
   `routing`, `queue`, `provider`, `persistence`, and `delivery`; every PASS-stage
   latency is numeric and no stage is missing; cleanup succeeds and the old
   account credential no longer authenticates.
+- In protected qualification, the profile's sanitized cleanup projection is
+  provisional until the deterministic post-run receipt proves the provider
+  route/envelope are absent, the QA-only absence POST verifies the private
+  HMAC-bound lease receipt and a strict PostgreSQL read reports the account
+  absent, the old key returns `401`, and the exact profile row matches that
+  projection. An already-reset account is not accepted from `401` or a
+  process-local registry 404 alone.
 
 **Classify**
 

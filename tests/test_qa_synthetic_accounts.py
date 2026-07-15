@@ -55,6 +55,14 @@ def _synthetic_payload(label: str = "agent-e2e-run-official-openai") -> dict:
     }
 
 
+def _absence_payload(account: dict) -> dict:
+    return {
+        "user_id": account["user_id"],
+        "lease_id": account["lease_id"],
+        "absence_token": account["absence_token"],
+    }
+
+
 def _exists(user_id: str) -> bool:
     return registry._user_entry_snapshot(user_id) is not None
 
@@ -100,6 +108,8 @@ def test_admin_auth_status_and_registration_contract(qa_client):
     assert body["user_id"].startswith("usr_")
     assert body["api_key"]
     assert body["lease_id"].startswith("lease_")
+    assert len(body["absence_token"]) == 64
+    assert all(char in "0123456789abcdef" for char in body["absence_token"])
     stored = registry._user_entry_snapshot(body["user_id"])
     assert stored[synthetic.METADATA_FIELD]["kind"] == synthetic.METADATA_KIND
     assert stored[synthetic.METADATA_FIELD]["label"] == body["label"]
@@ -108,6 +118,97 @@ def test_admin_auth_status_and_registration_contract(qa_client):
         stored[synthetic.METADATA_FIELD]["api_key_hash"]
         == stored["api_keys"][0]["api_key_hash"]
     )
+
+
+def test_absence_endpoint_uses_database_not_process_registry(qa_client):
+    account = _register_direct("agent-e2e-authoritative-absence", now=1_000, ttl=1)
+    user_id = account["user_id"]
+
+    unauthenticated = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/absence",
+        json=_absence_payload(account),
+    )
+    assert unauthenticated.status_code == 401
+
+    present = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/absence",
+        json=_absence_payload(account),
+        headers=_admin_headers(),
+    )
+    assert present.status_code == 200
+    assert present.get_json() == {
+        "schema_version": 1,
+        "status": "present",
+        "user_id": user_id,
+        "lease_id": account["lease_id"],
+        "lease_attested": True,
+        "database_authoritative": True,
+    }
+
+    # Model a worker that missed the best-effort users NOTIFY. The generic
+    # data-track route now reports a process-local false 404 even though the
+    # authoritative PostgreSQL row remains present.
+    with registry._users_lock:
+        registry._users[:] = [
+            entry for entry in registry._users if entry.get("user_id") != user_id
+        ]
+        registry._rebuild_key_cache()
+    stale_lookup = qa_client.get(
+        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
+    assert stale_lookup.status_code == 404
+    assert stale_lookup.get_json() == {"error": "user_not_found"}
+    assert synthetic.db.load_user_document(user_id) is not None
+
+    authoritative = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/absence",
+        json=_absence_payload(account),
+        headers=_admin_headers(),
+    )
+    assert authoritative.status_code == 200
+    assert authoritative.get_json()["status"] == "present"
+
+    deleted = synthetic.reap_expired_accounts(
+        now_epoch=1_002, purge_archives=lambda _user_id: None
+    )
+    assert deleted["deleted"] == 1
+    absent = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/absence",
+        json=_absence_payload(account),
+        headers=_admin_headers(),
+    )
+    assert absent.status_code == 200
+    assert absent.get_json()["status"] == "absent"
+    assert absent.get_json()["database_authoritative"] is True
+
+
+def test_absence_endpoint_rejects_forgery_and_store_failure(qa_client, monkeypatch):
+    account = _register_direct("agent-e2e-absence-fail-closed", now=1_000, ttl=60)
+    forged = _absence_payload(account)
+    token = account["absence_token"]
+    forged["absence_token"] = ("0" if token[0] != "0" else "1") + token[1:]
+    rejected = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/absence",
+        json=forged,
+        headers=_admin_headers(),
+    )
+    assert rejected.status_code == 400
+    assert rejected.get_json() == {"error": "invalid_synthetic_account_proof"}
+    assert synthetic.db.load_user_document(account["user_id"]) is not None
+
+    def unavailable(_user_id: str):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(synthetic.db, "load_user_document", unavailable)
+    unavailable_response = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/absence",
+        json=_absence_payload(account),
+        headers=_admin_headers(),
+    )
+    assert unavailable_response.status_code == 503
+    assert unavailable_response.get_json() == {
+        "error": "synthetic_account_store_unavailable"
+    }
 
 
 def test_protected_test_build_identity_requires_matching_full_shas(qa_client):
@@ -215,6 +316,34 @@ def test_registration_rolls_back_primary_row_when_post_upsert_step_fails(
     assert all(
         user.get("user_id") != captured_user_id for user in registry.db.load_all_users()
     )
+
+
+def test_qa_rollback_does_not_change_ordinary_registration_failure_semantics(
+    qa_client, monkeypatch
+):
+    captured_user_id = ""
+
+    def fail_before_upsert(entry):
+        nonlocal captured_user_id
+        captured_user_id = entry["user_id"]
+        raise RuntimeError("ordinary persist failure")
+
+    monkeypatch.setattr(registry, "persist_user", fail_before_upsert)
+    with pytest.raises(RuntimeError, match="ordinary persist failure"):
+        registry._register_user(access_mode="model_api", label="ordinary-user")
+
+    # This intentionally matches the pre-QA behavior: the generic path is not
+    # silently widened by the synthetic-account rollback policy.
+    assert captured_user_id
+    assert registry._user_entry_snapshot(captured_user_id) is not None
+    assert registry.db.load_user_document(captured_user_id) is None
+    with registry._users_lock:
+        registry._users[:] = [
+            entry
+            for entry in registry._users
+            if entry.get("user_id") != captured_user_id
+        ]
+        registry._rebuild_key_cache()
 
 
 def test_disabled_or_invalid_config_fails_closed(qa_client, monkeypatch):

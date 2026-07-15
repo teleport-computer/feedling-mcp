@@ -41,6 +41,7 @@ PROFILE_IDS = (
 MEMORY_CONTRACT_PROFILE_ID = "memory-contract"
 EXPECTED_PUBLIC_FILES = {
     "run-result.json",
+    "cleanup-receipt.json",
     "memory-contract.json",
     "matrix.md",
     "latency.csv",
@@ -200,6 +201,13 @@ def _secret_values(
                     "private manifest secret material is incomplete"
                 )
             add(value, decode_base64=(field == "secret_key_b64"))
+        lease = profile.get("synthetic_account_lease")
+        absence_token = lease.get("absence_token") if isinstance(lease, dict) else None
+        if not isinstance(absence_token, str) or not absence_token:
+            raise ArtifactScanError(
+                "private manifest absence attestation is incomplete"
+            )
+        add(absence_token)
 
     memory_profiles = memory_manifest["profiles"]
     if len(memory_profiles) != 1 or not isinstance(memory_profiles[0], dict):
@@ -214,6 +222,15 @@ def _secret_values(
                 "private memory manifest secret material is incomplete"
             )
         add(value, decode_base64=(field == "secret_key_b64"))
+    memory_lease = memory_profile.get("synthetic_account_lease")
+    memory_absence_token = (
+        memory_lease.get("absence_token") if isinstance(memory_lease, dict) else None
+    )
+    if not isinstance(memory_absence_token, str) or not memory_absence_token:
+        raise ArtifactScanError(
+            "private memory manifest absence attestation is incomplete"
+        )
+    add(memory_absence_token)
     return values
 
 
@@ -299,7 +316,9 @@ def _can_reconstruct_secret(parts: tuple[bytes, ...], secret: bytes) -> bool:
             else:
                 high = middle - 1
         is_short_final_tail = (
-            fragments > 0 and low == len(remaining) and 0 < low < MIN_RECONSTRUCTED_FRAGMENT_BYTES
+            fragments > 0
+            and low == len(remaining)
+            and 0 < low < MIN_RECONSTRUCTED_FRAGMENT_BYTES
         )
         if low < MIN_RECONSTRUCTED_FRAGMENT_BYTES and not is_short_final_tail:
             continue

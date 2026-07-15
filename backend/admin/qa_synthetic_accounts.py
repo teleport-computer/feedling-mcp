@@ -51,7 +51,9 @@ _LABEL_RE = re.compile(r"^agent-e2e-[A-Za-z0-9_.-]{1,112}$")
 _USER_ID_RE = re.compile(r"^usr_[0-9a-f]{16}$")
 _PRINCIPAL_ID_RE = re.compile(r"^prn_[0-9a-f]{16}$")
 _API_KEY_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_ABSENCE_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
 _SIGNING_CONTEXT = b"feedling-qa-synthetic-account-v1\0"
+_ABSENCE_TOKEN_CONTEXT = b"feedling-qa-synthetic-account-absence-v1\0"
 _PROCESS_ID = secrets.token_hex(8)
 
 _last_run_lock = threading.Lock()
@@ -67,6 +69,10 @@ class SyntheticAccountNotReady(RuntimeError):
 
 
 class SyntheticAccountBadRequest(ValueError):
+    pass
+
+
+class SyntheticAccountStoreUnavailable(RuntimeError):
     pass
 
 
@@ -217,6 +223,24 @@ def _sign_metadata(metadata: dict) -> str:
     ).hexdigest()
 
 
+def _absence_token(*, user_id: str, lease_id: str) -> str:
+    """Mint a read-only attestation binding one synthetic identity and lease.
+
+    This token never authorizes deletion.  It lets the cleanup verifier prove
+    that an absence query refers to a lease actually minted by this server even
+    after the authoritative ``users`` row (and its signed metadata) is gone.
+    A separate signing context prevents reuse as reaper metadata.
+    """
+    payload = json.dumps(
+        {"lease_id": lease_id, "user_id": user_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(
+        registry._pepper(), _ABSENCE_TOKEN_CONTEXT + payload, hashlib.sha256
+    ).hexdigest()
+
+
 def _new_metadata(
     *,
     label: str,
@@ -303,15 +327,69 @@ def register_synthetic_account(payload: dict, *, now_epoch: int | None = None) -
         _qa_synthetic_metadata_builder=build_metadata,
     )
     metadata = metadata_holder["value"]
-    # Return only the receipt fields the deterministic provisioner needs; the
-    # server signature and account-key pepper never cross the boundary.
+    # Return only the receipt fields the deterministic provisioner needs. The
+    # destructive reaper signature and account-key pepper never cross the
+    # boundary; ``absence_token`` is separately domain-separated and can only
+    # attest the identity of a subsequent read-only absence query.
     return {
         **result,
         "label": label,
         "lease_id": metadata["lease_id"],
+        "absence_token": _absence_token(
+            user_id=metadata["user_id"], lease_id=metadata["lease_id"]
+        ),
         "expires_at": metadata["expires_at"],
         "expires_at_epoch": metadata["expires_at_epoch"],
     }
+
+
+def synthetic_account_absence(payload: dict) -> dict:
+    """Authoritatively report whether one attested synthetic row is absent.
+
+    The ordinary data-track lookup reads a process-local registry snapshot and
+    can be stale after a cross-worker notification is missed.  Cleanup evidence
+    must instead use this strict PostgreSQL read, which raises on store failure
+    and therefore never turns an outage into a false absence.
+    """
+    if not config()["enabled"]:
+        raise SyntheticAccountDisabled("synthetic account verification is disabled")
+    if not isinstance(payload, dict):
+        raise SyntheticAccountBadRequest("JSON object required")
+
+    user_id = str(payload.get("user_id") or "").strip()
+    lease_id = str(payload.get("lease_id") or "").strip()
+    absence_token = str(payload.get("absence_token") or "").strip()
+    if _USER_ID_RE.fullmatch(user_id) is None:
+        raise SyntheticAccountBadRequest("user_id is invalid")
+    if _LEASE_RE.fullmatch(lease_id) is None:
+        raise SyntheticAccountBadRequest("lease_id is invalid")
+    if _ABSENCE_TOKEN_RE.fullmatch(absence_token) is None:
+        raise SyntheticAccountBadRequest("absence_token is invalid")
+    expected = _absence_token(user_id=user_id, lease_id=lease_id)
+    if not hmac.compare_digest(absence_token, expected):
+        raise SyntheticAccountBadRequest("absence_token is invalid")
+
+    try:
+        entry = db.load_user_document(user_id)
+    except Exception as exc:
+        raise SyntheticAccountStoreUnavailable(
+            "synthetic account store is unavailable"
+        ) from exc
+
+    base = {
+        "schema_version": 1,
+        "user_id": user_id,
+        "lease_id": lease_id,
+        "lease_attested": True,
+        "database_authoritative": True,
+    }
+    if entry is None:
+        return {**base, "status": "absent"}
+
+    metadata = _valid_metadata(entry, authoritative_user_id=user_id)
+    if not metadata or metadata.get("lease_id") != lease_id:
+        raise SyntheticAccountBadRequest("synthetic account identity mismatch")
+    return {**base, "status": "present"}
 
 
 def _active_key_matches_lease(entry: dict, metadata: dict) -> bool:

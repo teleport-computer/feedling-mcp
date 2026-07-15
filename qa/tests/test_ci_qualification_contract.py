@@ -140,9 +140,22 @@ def test_e2e_uses_pinned_jit_app_and_oidc_actions_with_hosted_cleanup():
     assert '"api-key-e2e.yml@refs/heads/main"' in provision
     assert 'runner.get("runner_group_id")' not in provision
     assert (
-        "/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100"
+        "/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100&page=1"
         in provision
     )
+    assert (
+        "/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100&page=${page}"
+        in provision
+    )
+    assert provision.index(
+        'echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"'
+    ) < provision.index("runner_bound=false")
+    assert "membership_attempts=12" in provision
+    assert "page_count = max(1, (total_count + 99) // 100)" in provision
+    assert "len(all_runners) != expected_total" in provision
+    assert "total_count > 100" not in provision
+    assert "--connect-timeout 5" in provision
+    assert "--max-time 20" in provision
     assert "GitHub JIT runner was not bound to the dedicated runner group" in provision
     assert (
         "if: ${{ always() && needs.validate-dispatch.result == 'success' && "
@@ -154,6 +167,10 @@ def test_e2e_uses_pinned_jit_app_and_oidc_actions_with_hosted_cleanup():
     assert "Mint fresh GitHub App token for registration cleanup" in cleanup
     assert "Delete exact stale JIT runner registration" in cleanup
     assert "if: ${{ always() && steps.github_cleanup_app.outcome == 'success' }}" in cleanup
+    assert 'runner_id="$EXPECTED_RUNNER_ID"' in cleanup
+    assert cleanup.index('runner_id="$EXPECTED_RUNNER_ID"') < cleanup.index(
+        "/actions/runners/${runner_id}"
+    )
     assert "/actions/runners/${runner_id}" in cleanup
 
 

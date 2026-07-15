@@ -40,6 +40,8 @@ from tools.provider_smoke.client import Session, SmokeClient, SmokeError  # noqa
 
 
 LOCKED_BASE_URL = "https://test-api.feedling.app"
+BASELINE_RUNTIME = "deployed_current"
+RUNTIME_V2_RUNTIME = "hosted_resident"
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 CHAT_TIMEOUT_SECONDS = 120.0
 CHAT_SETTLE_SECONDS = 1.0
@@ -164,6 +166,7 @@ def load_profile(
     ):
         raise LiveScenarioProbeError("one-profile manifest is invalid")
     profile = dict(profiles[0])
+    runtime_requirement = document.get("runtime_mode")
     if (
         profile.get("profile_id") != expected_profile_id
         or profile.get("provision_status") != "ready"
@@ -171,8 +174,10 @@ def load_profile(
         or not profile["user_id"]
         or not isinstance(profile.get("api_key"), str)
         or not profile["api_key"]
+        or runtime_requirement not in {BASELINE_RUNTIME, RUNTIME_V2_RUNTIME}
     ):
         raise LiveScenarioProbeError("one-profile manifest is not ready")
+    profile["_qualification_runtime_requirement"] = runtime_requirement
     return profile, Session(
         user_id=profile["user_id"],
         api_key=profile["api_key"],
@@ -533,15 +538,23 @@ def _run_actions(
         runtime = client.runtime_status(session)
         mode = runtime.get("runtime_mode") if isinstance(runtime, Mapping) else None
         version = runtime.get("runtime_version") if isinstance(runtime, Mapping) else None
+        strict_v2 = (
+            profile.get("_qualification_runtime_requirement") == RUNTIME_V2_RUNTIME
+        )
+        runtime_matches_target = bool(
+            isinstance(mode, str)
+            and mode
+            and type(version) is int
+            and version >= 1
+            and (
+                not strict_v2
+                or (mode == RUNTIME_V2_RUNTIME and version == 2)
+            )
+        )
         assertions = {
             "runtime_status_readback_succeeds": isinstance(runtime, Mapping),
             "runtime_configured": runtime.get("configured") is True,
-            "runtime_metadata_recorded": bool(
-                isinstance(mode, str)
-                and mode
-                and type(version) is int
-                and version >= 1
-            ),
+            "runtime_metadata_recorded": runtime_matches_target,
         }
         return assertions, [], {"runtime_mode": mode, "runtime_version": version}
 
@@ -551,13 +564,35 @@ def _run_actions(
         verification = client.open_chat_gate(session)
         after = _message_count(client, session)
         runtime = client.runtime_status(session)
+        mode = runtime.get("runtime_mode") if isinstance(runtime, Mapping) else None
+        version = runtime.get("runtime_version") if isinstance(runtime, Mapping) else None
+        strict_v2 = (
+            profile.get("_qualification_runtime_requirement") == RUNTIME_V2_RUNTIME
+        )
+        runtime_matches_target = bool(
+            isinstance(runtime, Mapping)
+            and runtime.get("configured") is True
+            and isinstance(mode, str)
+            and mode
+            and type(version) is int
+            and version >= 1
+            and (
+                not strict_v2
+                or (mode == RUNTIME_V2_RUNTIME and version == 2)
+            )
+        )
         assertions = {
             "driver_enabled": bool(driver),
             "chat_loop_verified": verification.get("passing") is True,
-            "runtime_status_readback_succeeds": runtime.get("configured") is True,
+            "runtime_status_readback_succeeds": runtime_matches_target,
             "no_orphan_turn": before == after,
         }
-        return assertions, [], {"driver": driver[:80], "verify_passing": verification.get("passing") is True}
+        return assertions, [], {
+            "driver": driver[:80],
+            "verify_passing": verification.get("passing") is True,
+            "runtime_mode": mode,
+            "runtime_version": version,
+        }
 
     turns: list[dict[str, Any]] = []
     private_turns: list[dict[str, Any]] = []

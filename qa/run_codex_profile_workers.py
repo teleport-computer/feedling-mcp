@@ -225,7 +225,15 @@ Copy receipt facts exactly: empty receipt request/turn/trace IDs map to empty
 reasoning IDs and empty scenario ID arrays; empty delivered kind/source/model
 strings map to null result fields. Never substitute the configured provider
 model for an empty delivered-thinking model, and copy the receipt's disclosure
-length exactly.
+length exactly. Copy requested_effort, configured_effort, and effective_effort
+exactly from the trusted receipt. Effective effort is not runtime-attested, so
+it must remain unknown and reasoning_effective_effort_not_attested must be true;
+never infer effective medium from requested/configured medium or from a visible
+reasoning event. An unattested configured effort is BLOCKED_EVIDENCE with
+PRECONDITION_MISSING; an attested route mismatch is PRODUCT_FAIL with
+MODEL_ROUTE_MISMATCH; an attested non-medium effort on the matching route is
+PRODUCT_FAIL with REASONING_EFFORT_CLAMPED. Preserve the delivery observations
+in the reasoning object even when configuration evidence determines P0-12.
 Missing provider reasoning-token evidence remains BLOCKED_EVIDENCE; do not infer
 reasoning tokens from ordinary input/output token totals. Always leave the
 trusted handshake files in place for launcher validation.
@@ -1369,10 +1377,37 @@ def _validate_cot_result_binding(
     expected_request_ids = [request_id] if request_id else []
     expected_turn_ids = [turn_id] if turn_id else []
     expected_trace_ids = [trace_id] if trace_id else []
-    token_present = receipt.get("token_metadata_status") == "PRESENT"
+    token_present = bool(
+        receipt.get("token_metadata_status") == "PRESENT"
+        and isinstance(receipt.get("reasoning_token_count"), int)
+        and not isinstance(receipt.get("reasoning_token_count"), bool)
+        and receipt.get("reasoning_token_count", 0) > 0
+    )
+    capability_enabled = receipt.get("reasoning_event_count") == 1
+    requested_medium = receipt.get("requested_effort") == "medium"
+    configured_medium = bool(
+        receipt.get("configured_effort") == "medium"
+        and receipt.get("configured_effort_attested") is True
+    )
+    configured_route_matches = (
+        receipt.get("configured_route_matches_manifest") is True
+    )
+    effective_not_attested = bool(
+        receipt.get("effective_effort") == "unknown"
+        and receipt.get("effective_effort_attested") is False
+    )
     receipt_status = receipt.get("status")
     receipt_code = receipt.get("failure_code")
-    if receipt_status == "PASS" and not token_present:
+    if not requested_medium or receipt.get("configured_effort_attested") is not True:
+        expected_status = "BLOCKED_EVIDENCE"
+        expected_failure_code = "PRECONDITION_MISSING"
+    elif not configured_route_matches:
+        expected_status = "PRODUCT_FAIL"
+        expected_failure_code = "MODEL_ROUTE_MISMATCH"
+    elif not configured_medium:
+        expected_status = "PRODUCT_FAIL"
+        expected_failure_code = "REASONING_EFFORT_CLAMPED"
+    elif receipt_status == "PASS" and not token_present:
         expected_status = "BLOCKED_EVIDENCE"
         expected_failure_code = "REASONING_TOKENS_MISSING"
     elif receipt_status == "PASS":
@@ -1438,6 +1473,11 @@ def _validate_cot_result_binding(
         or reasoning.get("request_id") != request_id
         or reasoning.get("turn_id") != turn_id
         or reasoning.get("trace_id") != trace_id
+        or reasoning.get("expected") is not True
+        or reasoning.get("capability_enabled") is not capability_enabled
+        or reasoning.get("requested_effort") != receipt.get("requested_effort")
+        or reasoning.get("configured_effort") != receipt.get("configured_effort")
+        or reasoning.get("effective_effort") != receipt.get("effective_effort")
         or reasoning.get("reasoning_event_count")
         != receipt.get("reasoning_event_count")
         or reasoning.get("metadata_present") != receipt.get("metadata_present")
@@ -1460,6 +1500,12 @@ def _validate_cot_result_binding(
         or scenario.get("trace_ids") != expected_trace_ids
         or assertions.get("objective_answer_correct")
         != receipt.get("final_answer_correct")
+        or assertions.get("reasoning_capability_enabled") is not capability_enabled
+        or assertions.get("reasoning_requested_effort_medium") is not requested_medium
+        or assertions.get("reasoning_configured_effort_medium")
+        is not configured_medium
+        or assertions.get("reasoning_effective_effort_not_attested")
+        is not effective_not_attested
         or assertions.get("reasoning_event_observed")
         is not (receipt.get("reasoning_event_count") == 1)
         or assertions.get("reasoning_metadata_present")

@@ -37,7 +37,7 @@ def _qualification_runtime(tmp_path: Path) -> tuple[Path, Path]:
     executable = binary_dir / "python3"
     executable.write_text(
         "#!/bin/sh\n"
-        f"exec {shlex.quote(str(Path(sys.executable).resolve()))} \"$@\"\n"
+        f"exec {shlex.quote(sys.executable)} \"$@\"\n"
     )
     executable.chmod(0o700)
     return runtime, executable
@@ -185,7 +185,7 @@ def _apply_diagnostic_parent_cleanup_deferral(result: dict[str, Any]) -> None:
 
 def _passing_cot_receipt(profile_id: str) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile_id": profile_id,
         "request_id": "request-1",
         "turn_id": "request-1",
@@ -193,6 +193,12 @@ def _passing_cot_receipt(profile_id: str) -> dict[str, Any]:
         "reply_message_id": "reply-1",
         "status": "PASS",
         "failure_code": "NONE",
+        "requested_effort": "medium",
+        "configured_effort": "medium",
+        "configured_effort_attested": True,
+        "configured_route_matches_manifest": True,
+        "effective_effort": "unknown",
+        "effective_effort_attested": False,
         "release_qualified": False,
         "delivery_qualified": True,
         "final_answer_correct": True,
@@ -229,6 +235,15 @@ def _passing_cot_receipt(profile_id: str) -> dict[str, Any]:
 def _cot_scenario_projection(receipt: dict[str, Any]) -> tuple[str, str | None]:
     status = receipt["status"]
     code = receipt["failure_code"]
+    if (
+        receipt["requested_effort"] != "medium"
+        or receipt["configured_effort_attested"] is not True
+    ):
+        return "BLOCKED_EVIDENCE", "PRECONDITION_MISSING"
+    if receipt["configured_route_matches_manifest"] is not True:
+        return "PRODUCT_FAIL", "MODEL_ROUTE_MISMATCH"
+    if receipt["configured_effort"] != "medium":
+        return "PRODUCT_FAIL", "REASONING_EFFORT_CLAMPED"
     if status == "PASS" and receipt["token_metadata_status"] != "PRESENT":
         return "BLOCKED_EVIDENCE", "REASONING_TOKENS_MISSING"
     if status == "PASS":
@@ -250,6 +265,126 @@ def _cot_scenario_projection(receipt: dict[str, Any]) -> tuple[str, str | None]:
     }[code]
 
 
+def _bound_cot_profile(receipt: dict[str, Any]) -> dict[str, Any]:
+    status, failure_code = _cot_scenario_projection(receipt)
+    failure = (
+        None
+        if failure_code is None
+        else {
+            "category": status,
+            "stage_code": "REASONING",
+            "failure_code": failure_code,
+            "reproducible": True,
+        }
+    )
+    token_present = (
+        receipt["token_metadata_status"] == "PRESENT"
+        and isinstance(receipt["reasoning_token_count"], int)
+        and receipt["reasoning_token_count"] > 0
+    )
+    capability_enabled = receipt["reasoning_event_count"] == 1
+    return {
+        "status": status,
+        "reasoning": {
+            "expected": True,
+            "capability_enabled": capability_enabled,
+            "requested_effort": receipt["requested_effort"],
+            "configured_effort": receipt["configured_effort"],
+            "effective_effort": receipt["effective_effort"],
+            "request_id": receipt["request_id"],
+            "turn_id": receipt["turn_id"],
+            "trace_id": receipt["trace_id"],
+            "reasoning_event_count": receipt["reasoning_event_count"],
+            "metadata_present": receipt["metadata_present"],
+            "token_metadata_present": token_present,
+            "user_visible_disclosure_present": receipt[
+                "user_visible_disclosure_present"
+            ],
+            "reasoning_token_count": receipt["reasoning_token_count"],
+            "disclosure_length": receipt["delivered_thinking_len"],
+            "kind": receipt["delivered_thinking_kind"],
+            "source": receipt["delivered_thinking_source"],
+            "model": receipt["delivered_thinking_model"],
+            "raw_private_reasoning_stored": False,
+        },
+        "scenarios": [
+            {
+                "scenario_id": "P0-12",
+                "status": status,
+                "attempts": 1,
+                "attempt_results": [
+                    {"attempt": 1, "status": status, "failure": failure}
+                ],
+                "failure": failure,
+                "request_ids": [receipt["request_id"]],
+                "turn_ids": [receipt["turn_id"]],
+                "trace_ids": [receipt["trace_id"]],
+                "assertions": {
+                    "objective_answer_correct": receipt["final_answer_correct"],
+                    "reasoning_capability_enabled": capability_enabled,
+                    "reasoning_requested_effort_medium": (
+                        receipt["requested_effort"] == "medium"
+                    ),
+                    "reasoning_configured_effort_medium": (
+                        receipt["configured_effort"] == "medium"
+                        and receipt["configured_effort_attested"] is True
+                    ),
+                    "reasoning_effective_effort_not_attested": (
+                        receipt["effective_effort"] == "unknown"
+                        and receipt["effective_effort_attested"] is False
+                    ),
+                    "reasoning_event_observed": capability_enabled,
+                    "reasoning_metadata_present": receipt["metadata_present"],
+                    "reasoning_tokens_present": token_present,
+                    "user_disclosure_present": receipt[
+                        "user_visible_disclosure_present"
+                    ],
+                    "raw_private_reasoning_omitted": True,
+                },
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("configuration", "expected_status", "expected_failure_code"),
+    (
+        ({}, "PASS", None),
+        (
+            {"configured_effort": "off"},
+            "PRODUCT_FAIL",
+            "REASONING_EFFORT_CLAMPED",
+        ),
+        (
+            {"configured_route_matches_manifest": False},
+            "PRODUCT_FAIL",
+            "MODEL_ROUTE_MISMATCH",
+        ),
+        (
+            {
+                "configured_effort": "unknown",
+                "configured_effort_attested": False,
+                "configured_route_matches_manifest": False,
+            },
+            "BLOCKED_EVIDENCE",
+            "PRECONDITION_MISSING",
+        ),
+    ),
+)
+def test_cot_binding_projects_configuration_context_without_losing_delivery(
+    configuration, expected_status, expected_failure_code
+):
+    receipt = _passing_cot_receipt("official-deepseek")
+    receipt.update(configuration)
+    profile = _bound_cot_profile(receipt)
+
+    assert receipt["status"] == "PASS"
+    assert profile["scenarios"][0]["status"] == expected_status
+    failure = profile["scenarios"][0]["failure"]
+    assert (failure or {}).get("failure_code") == expected_failure_code
+    launcher._validate_cot_result_binding(profile, receipt)
+
+
 def _request_passing_cot_probe(
     spec: launcher.WorkerSpec, receipt: dict[str, Any] | None = None
 ) -> None:
@@ -268,9 +403,14 @@ def _request_passing_cot_probe(
         if isinstance(reasoning, dict):
             reasoning.update(
                 {
-                    "request_id": "request-1",
-                    "turn_id": "request-1",
-                    "trace_id": "request-1",
+                    "expected": True,
+                    "capability_enabled": receipt["reasoning_event_count"] == 1,
+                    "requested_effort": receipt["requested_effort"],
+                    "configured_effort": receipt["configured_effort"],
+                    "effective_effort": receipt["effective_effort"],
+                    "request_id": receipt["request_id"],
+                    "turn_id": receipt["turn_id"],
+                    "trace_id": receipt["trace_id"],
                     "reasoning_event_count": receipt["reasoning_event_count"],
                     "metadata_present": receipt["metadata_present"],
                     "token_metadata_present": (
@@ -334,6 +474,20 @@ def _request_passing_cot_probe(
                                 "objective_answer_correct": receipt[
                                     "final_answer_correct"
                                 ],
+                                "reasoning_capability_enabled": (
+                                    receipt["reasoning_event_count"] == 1
+                                ),
+                                "reasoning_requested_effort_medium": (
+                                    receipt["requested_effort"] == "medium"
+                                ),
+                                "reasoning_configured_effort_medium": (
+                                    receipt["configured_effort"] == "medium"
+                                    and receipt["configured_effort_attested"] is True
+                                ),
+                                "reasoning_effective_effort_not_attested": (
+                                    receipt["effective_effort"] == "unknown"
+                                    and receipt["effective_effort_attested"] is False
+                                ),
                                 "reasoning_event_observed": (
                                     receipt["reasoning_event_count"] == 1
                                 ),

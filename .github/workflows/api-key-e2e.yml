@@ -7,7 +7,7 @@ on:
         description: Test the current deployed runtime or require strict Hosted Runtime V2 proof
         required: true
         type: choice
-        default: deployed_current
+        default: hosted_resident
         options:
           - deployed_current
           - hosted_resident
@@ -193,10 +193,22 @@ jobs:
           umask 077
           request_path="${RUNNER_TEMP}/feedling-jit-request-${RUN_KEY}.json"
           group_response_path="${RUNNER_TEMP}/feedling-runner-group-${RUN_KEY}.json"
-          group_runners_path="${RUNNER_TEMP}/feedling-runner-group-members-${RUN_KEY}.json"
+          group_runners_prefix="${RUNNER_TEMP}/feedling-runner-group-members-${RUN_KEY}"
           response_path="${RUNNER_TEMP}/feedling-jit-response-${RUN_KEY}.json"
           jit_config_file="${RUNNER_TEMP}/feedling-jit-config-${RUN_KEY}"
-          trap 'rm -f -- "$request_path" "$group_response_path" "$group_runners_path" "$response_path" "$jit_config_file"' EXIT
+          group_page_paths=()
+
+          remove_group_pages() {
+            if [ "${#group_page_paths[@]}" -gt 0 ]; then
+              rm -f -- "${group_page_paths[@]}"
+            fi
+            group_page_paths=()
+          }
+          cleanup_jit_step() {
+            remove_group_pages
+            rm -f -- "$request_path" "$group_response_path" "$response_path" "$jit_config_file"
+          }
+          trap cleanup_jit_step EXIT
 
           python3 - "$request_path" <<'PY'
           import json
@@ -228,6 +240,8 @@ jobs:
 
           curl --fail --silent --show-error \
             --proto '=https' \
+            --connect-timeout 5 \
+            --max-time 20 \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer ${GH_APP_TOKEN}" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -273,6 +287,8 @@ jobs:
           curl --fail --silent --show-error \
             --request POST \
             --proto '=https' \
+            --connect-timeout 5 \
+            --max-time 30 \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer ${GH_APP_TOKEN}" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -327,19 +343,30 @@ jobs:
             echo "::error::GitHub returned an invalid JIT runner id"
             exit 1
           fi
+          # Persist the exact returned id before the eventually-consistent
+          # group-membership read. Downstream cleanup can then delete this
+          # registration even if the proof below never becomes visible.
+          echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"
 
           runner_bound=false
-          for attempt in $(seq 1 5); do
+          membership_attempts=12
+          for ((attempt = 1; attempt <= membership_attempts; attempt++)); do
+            remove_group_pages
+            first_page_path="${group_runners_prefix}-attempt-${attempt}-page-1.json"
+            group_page_paths+=("$first_page_path")
+            pagination=""
             if curl --fail --silent --show-error \
               --proto '=https' \
+              --connect-timeout 5 \
+              --max-time 20 \
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer ${GH_APP_TOKEN}" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
-              --output "$group_runners_path" \
-              "https://api.github.com/orgs/${GITHUB_REPOSITORY_OWNER}/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100" && \
-              python3 - "$group_runners_path" "$runner_id" <<'PY'
+              --output "$first_page_path" \
+              "https://api.github.com/orgs/${GITHUB_REPOSITORY_OWNER}/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100&page=1"
+            then
+              pagination="$(python3 - "$first_page_path" <<'PY'
           import json
-          import os
           import sys
 
           try:
@@ -355,14 +382,95 @@ jobs:
               not isinstance(total_count, int)
               or isinstance(total_count, bool)
               or total_count < 0
-              or total_count > 100
               or not isinstance(runners, list)
               or any(not isinstance(item, dict) for item in runners)
+              or len(runners) > 100
               or len(runners) > total_count
           ):
               raise SystemExit("GitHub returned an invalid runner-group membership response")
-          expected_id = int(sys.argv[2])
-          matches = [item for item in runners if item.get("id") == expected_id]
+          page_count = max(1, (total_count + 99) // 100)
+          # This remains a bounded control-plane proof while supporting normal
+          # GitHub pagination well beyond the first page.
+          if page_count > 100:
+              raise SystemExit("runner group is too large to verify safely")
+          print(total_count, page_count)
+          PY
+              )" || pagination=""
+            fi
+
+            snapshot_complete=false
+            if [[ "$pagination" =~ ^([0-9]+)[[:space:]]+([1-9][0-9]*)$ ]]; then
+              total_count="${BASH_REMATCH[1]}"
+              page_count="${BASH_REMATCH[2]}"
+              snapshot_complete=true
+              for ((page = 2; page <= page_count; page++)); do
+                page_path="${group_runners_prefix}-attempt-${attempt}-page-${page}.json"
+                group_page_paths+=("$page_path")
+                if ! curl --fail --silent --show-error \
+                  --proto '=https' \
+                  --connect-timeout 5 \
+                  --max-time 20 \
+                  --header "Accept: application/vnd.github+json" \
+                  --header "Authorization: Bearer ${GH_APP_TOKEN}" \
+                  --header "X-GitHub-Api-Version: 2022-11-28" \
+                  --output "$page_path" \
+                  "https://api.github.com/orgs/${GITHUB_REPOSITORY_OWNER}/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100&page=${page}"
+                then
+                  snapshot_complete=false
+                  break
+                fi
+              done
+            fi
+
+            if [ "$snapshot_complete" = true ] && \
+              python3 - "$runner_id" "$total_count" "${group_page_paths[@]}" <<'PY'
+          import json
+          import os
+          import sys
+
+          expected_id = int(sys.argv[1])
+          expected_total = int(sys.argv[2])
+          paths = sys.argv[3:]
+          expected_pages = max(1, (expected_total + 99) // 100)
+          if len(paths) != expected_pages:
+              raise SystemExit("GitHub returned an incomplete runner-group membership snapshot")
+
+          all_runners = []
+          for path in paths:
+              try:
+                  with open(path, encoding="utf-8") as handle:
+                      payload = json.load(handle)
+              except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                  raise SystemExit(
+                      "GitHub returned an invalid runner-group membership response"
+                  ) from exc
+              if not isinstance(payload, dict):
+                  raise SystemExit("GitHub returned an invalid runner-group membership response")
+              runners = payload.get("runners")
+              total_count = payload.get("total_count")
+              if (
+                  not isinstance(total_count, int)
+                  or isinstance(total_count, bool)
+                  or total_count != expected_total
+                  or not isinstance(runners, list)
+                  or len(runners) > 100
+                  or any(not isinstance(item, dict) for item in runners)
+              ):
+                  raise SystemExit("GitHub returned an invalid runner-group membership response")
+              all_runners.extend(runners)
+
+          if len(all_runners) != expected_total:
+              raise SystemExit("GitHub returned an incomplete runner-group membership snapshot")
+          runner_ids = [item.get("id") for item in all_runners]
+          if (
+              any(
+                  not isinstance(item, int) or isinstance(item, bool) or item <= 0
+                  for item in runner_ids
+              )
+              or len(set(runner_ids)) != len(runner_ids)
+          ):
+              raise SystemExit("GitHub returned invalid runner ids in the dedicated group")
+          matches = [item for item in all_runners if item.get("id") == expected_id]
           if len(matches) != 1:
               raise SystemExit("JIT runner is not present in the dedicated runner group")
           runner = matches[0]
@@ -376,9 +484,17 @@ jobs:
           PY
             then
               runner_bound=true
+              remove_group_pages
               break
             fi
-            sleep 1
+            remove_group_pages
+            if [ "$attempt" -lt "$membership_attempts" ]; then
+              backoff=$((1 << (attempt - 1)))
+              if [ "$backoff" -gt 10 ]; then
+                backoff=10
+              fi
+              sleep "$backoff"
+            fi
           done
           if [ "$runner_bound" != true ]; then
             echo "::error::GitHub JIT runner was not bound to the dedicated runner group"
@@ -387,8 +503,7 @@ jobs:
 
           chmod 600 "$jit_config_file"
           echo "jit_config_file=$jit_config_file" >> "$GITHUB_OUTPUT"
-          echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"
-          rm -f -- "$request_path" "$group_response_path" "$group_runners_path" "$response_path"
+          rm -f -- "$request_path" "$group_response_path" "$response_path"
           trap - EXIT
 
       - name: Configure short-lived AWS credentials for provisioning
@@ -446,6 +561,8 @@ jobs:
             rm -f -- "$response_path"
             if curl --fail --silent --show-error \
               --proto '=https' \
+              --connect-timeout 5 \
+              --max-time 20 \
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer ${GH_APP_TOKEN}" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -1215,11 +1332,11 @@ jobs:
           https://test-api.feedling.app, expected deployment SHA
           ${QA_EXPECTED_DEPLOYMENT_SHA}, and expected runtime
           ${QA_EXPECTED_RUNTIME}. When expected runtime is hosted_resident,
-          trusted pre/post checks proved that backend and every live worker
-          remained at the expected SHA, so set both observed SHA fields to that
-          value. When expected runtime is deployed_current, trusted pre/post
-          checks still proved the backend image identity at the expected SHA,
-          but did not claim a V2 worker identity. Set observed_backend_sha to
+          every profile's trusted provisioning readback and live scenario
+          receipts must prove hosted_resident version 2. The pre/post checks
+          prove the backend image identity at the expected SHA; no deployed
+          endpoint currently attests the separate worker image SHA. For both
+          runtime targets, set observed_backend_sha to
           ${QA_EXPECTED_DEPLOYMENT_SHA} and observed_worker_sha to null.
 
           Set supervisor_count=1, configured concurrency=3, observed concurrency
@@ -1303,6 +1420,33 @@ jobs:
             --expected-runtime "$QA_EXPECTED_RUNTIME" \
             --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA"
 
+      - name: Cleanup every synthetic account with deterministic evidence
+        id: cleanup
+        if: always()
+        env:
+          QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
+          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          python qa/provision_profiles.py cleanup \
+            --manifest "${{ steps.context.outputs.manifest }}" \
+            --receipt "$QA_ARTIFACT_DIR/cleanup-receipt.json" \
+            --run-id "${{ steps.context.outputs.run_id }}" \
+            --retain-manifest
+
+      - name: Validate deterministic cleanup receipt
+        id: cleanup_receipt
+        if: always()
+        env:
+          QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
+        run: |
+          set -euo pipefail
+          python qa/validate_cleanup_receipt.py \
+            --receipt "$QA_ARTIFACT_DIR/cleanup-receipt.json" \
+            --result "$QA_ARTIFACT_DIR/run-result.json"
+
+      # Retain the private manifests until the scanner has compared every
+      # public byte, including the cleanup receipt, against real secret values.
       - name: Scan public artifacts for secrets and raw evidence
         id: secret_scan
         if: always()
@@ -1327,19 +1471,9 @@ jobs:
             --codex-auth "${{ steps.codex_preflight.outputs.codex_auth }}" \
             --fixture qa/fixtures/persona-import-v1.json
 
-      - name: Cleanup every synthetic account
-        id: cleanup
-        if: always()
-        env:
-          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
-        run: |
-          set -euo pipefail
-          python qa/provision_profiles.py cleanup \
-            --manifest "${{ steps.context.outputs.manifest }}"
-
       - name: Upload sanitized public qualification artifacts
         id: upload
-        if: always() && steps.secret_scan.outcome == 'success' && steps.cleanup.outcome == 'success'
+        if: always() && steps.secret_scan.outcome == 'success' && steps.cleanup.outcome == 'success' && steps.cleanup_receipt.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: feedling-api-key-e2e-${{ steps.context.outputs.run_id }}
@@ -1446,6 +1580,7 @@ jobs:
           VALIDATE: ${{ steps.validate.outcome }}
           SECRET_SCAN: ${{ steps.secret_scan.outcome }}
           CLEANUP: ${{ steps.cleanup.outcome }}
+          CLEANUP_RECEIPT: ${{ steps.cleanup_receipt.outcome }}
           UPLOAD: ${{ steps.upload.outcome }}
           PUBLIC_CLEANUP: ${{ steps.public_cleanup.outcome }}
           PRIVATE_CLEANUP: ${{ steps.private_cleanup.outcome }}
@@ -1467,6 +1602,7 @@ jobs:
             "validate:$VALIDATE" \
             "secret-scan:$SECRET_SCAN" \
             "cleanup:$CLEANUP" \
+            "cleanup-receipt:$CLEANUP_RECEIPT" \
             "upload:$UPLOAD" \
             "public-cleanup:$PUBLIC_CLEANUP" \
             "private-cleanup:$PRIVATE_CLEANUP"
@@ -1577,19 +1713,31 @@ jobs:
             echo "::error::refusing invalid runner cleanup id"
             exit 1
           fi
+          if [ -n "$EXPECTED_RUNNER_ID" ] && { [ "$EXPECTED_RUNNER_NAME" != "$derived_name" ] || [ "$EXPECTED_RUNNER_LABEL" != "$derived_name" ]; }; then
+            echo "::error::runner cleanup outputs are incomplete or inconsistent"
+            exit 1
+          fi
 
           response_path="${RUNNER_TEMP}/feedling-runner-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
           delete_response_path="${response_path}.delete"
           trap 'rm -f -- "$response_path" "$delete_response_path"' EXIT
-          curl --fail --silent --show-error \
-            --proto '=https' \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer ${GH_APP_TOKEN}" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            --output "$response_path" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners?name=${derived_name}&per_page=100"
+          if [ -n "$EXPECTED_RUNNER_ID" ]; then
+            # This id came directly from the validated JIT response and was
+            # emitted before the eventually-consistent membership proof. Use
+            # it directly so cleanup cannot silently miss a fresh registration.
+            runner_id="$EXPECTED_RUNNER_ID"
+          else
+            curl --fail --silent --show-error \
+              --proto '=https' \
+              --connect-timeout 5 \
+              --max-time 20 \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_APP_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --output "$response_path" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners?name=${derived_name}&per_page=100"
 
-          runner_id="$(python3 - "$response_path" <<'PY'
+            runner_id="$(python3 - "$response_path" <<'PY'
           import json
           import os
           import sys
@@ -1625,7 +1773,8 @@ jobs:
               raise SystemExit("exact-name runner is missing its unique label")
           print(runner_id)
           PY
-          )"
+            )"
+          fi
           if [ -z "$runner_id" ]; then
             echo "JIT runner registration is already absent"
             exit 0
@@ -1638,6 +1787,8 @@ jobs:
           status="$(curl --silent --show-error \
             --request DELETE \
             --proto '=https' \
+            --connect-timeout 5 \
+            --max-time 20 \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer ${GH_APP_TOKEN}" \
             --header "X-GitHub-Api-Version: 2022-11-28" \

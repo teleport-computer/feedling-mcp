@@ -711,7 +711,7 @@
                 "reasoning_capability_enabled",
                 "reasoning_requested_effort_medium",
                 "reasoning_configured_effort_medium",
-                "reasoning_effective_effort_medium",
+                "reasoning_effective_effort_not_attested",
                 "reasoning_event_observed",
                 "reasoning_metadata_present",
                 "reasoning_tokens_present",
@@ -731,7 +731,7 @@
                 "reasoning_configured_effort_medium": {
                   "type": "boolean"
                 },
-                "reasoning_effective_effort_medium": {
+                "reasoning_effective_effort_not_attested": {
                   "type": "boolean"
                 },
                 "reasoning_event_observed": {
@@ -1274,10 +1274,11 @@
         "PROVIDER_CONFIG_MATCHED",
         "PROVISIONING_RECEIPTS_CONFIRMED",
         "REASONING_CAPABILITY_CONFIRMED",
-        "REASONING_EFFORT_CONFIRMED",
+        "REASONING_CONFIGURATION_CONFIRMED",
+        "REASONING_EFFECTIVE_EFFORT_UNATTESTED",
         "REASONING_EVENT_CONFIRMED",
         "REASONING_METADATA_CONFIRMED",
-        "REASONING_TOKENS_CONFIRMED",
+        "EXPLICIT_REASONING_TOKEN_COUNT_CONFIRMED",
         "RETRY_OBSERVATION_RECORDED",
         "RUNTIME_CONFIGURED",
         "RUNTIME_METADATA_RECORDED",

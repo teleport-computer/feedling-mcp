@@ -19,8 +19,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-RECEIPT_SCHEMA_VERSION = 1
+RECEIPT_SCHEMA_VERSION = 2
 MAX_RECEIPT_BYTES = 64 * 1024
+_EFFORT_VALUES = frozenset(
+    {"off", "minimal", "low", "medium", "high", "xhigh", "unsupported", "unknown"}
+)
 
 RECEIPT_KEYS = frozenset(
     {
@@ -32,6 +35,12 @@ RECEIPT_KEYS = frozenset(
         "reply_message_id",
         "status",
         "failure_code",
+        "requested_effort",
+        "configured_effort",
+        "configured_effort_attested",
+        "configured_route_matches_manifest",
+        "effective_effort",
+        "effective_effort_attested",
         "release_qualified",
         "delivery_qualified",
         "final_answer_correct",
@@ -96,6 +105,9 @@ _BOOLEAN_FIELDS = frozenset(
         "delivered_thinking_present",
         "metadata_present",
         "user_visible_disclosure_present",
+        "configured_effort_attested",
+        "configured_route_matches_manifest",
+        "effective_effort_attested",
         "raw_reply_stored",
         "raw_thinking_stored",
         "raw_trace_stored",
@@ -397,6 +409,25 @@ def _validate_receipt(receipt: object, expected_profile_id: str) -> dict[str, An
         raise CotReceiptError("COT receipt turn correlation is inconsistent")
     if receipt["reply_message_id"] and not receipt["request_id"]:
         raise CotReceiptError("COT receipt reply correlation is inconsistent")
+
+    for field in ("requested_effort", "configured_effort", "effective_effort"):
+        if receipt.get(field) not in _EFFORT_VALUES:
+            raise CotReceiptError(f"COT receipt {field} is invalid")
+    if receipt["requested_effort"] != "medium":
+        raise CotReceiptError("COT receipt requested effort is not locked medium")
+    if (
+        receipt["effective_effort"] != "unknown"
+        or receipt.get("effective_effort_attested") is not False
+    ):
+        raise CotReceiptError("COT receipt invents effective effort evidence")
+    configured_attested = receipt.get("configured_effort_attested")
+    route_matches = receipt.get("configured_route_matches_manifest")
+    if configured_attested is True and receipt["configured_effort"] == "unknown":
+        raise CotReceiptError("COT receipt configured effort attestation is inconsistent")
+    if configured_attested is False and receipt["configured_effort"] != "unknown":
+        raise CotReceiptError("COT receipt configured effort attestation is inconsistent")
+    if route_matches is True and configured_attested is not True:
+        raise CotReceiptError("COT receipt configured route attestation is inconsistent")
 
     for field in _BOOLEAN_FIELDS:
         if not isinstance(receipt[field], bool):

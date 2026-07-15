@@ -4,8 +4,9 @@
 The headless qualification agent must not be the authority for its own target.
 Every mode reads the test-only admin build-identity endpoint and requires the
 image-baked source SHA to equal the SHA injected by the serialized test deploy.
-Strict V2 mode additionally requires one homogeneous live-worker build. The
-read-only receipt stays outside the agent's writable artifact directory.
+Strict V2 mode is completed later by parent-owned per-profile runtime readbacks
+and live driver/chat receipts. The read-only build receipt stays outside the
+agent's writable artifact directory.
 """
 
 from __future__ import annotations
@@ -120,87 +121,21 @@ def verify_deployment(
             "deployed backend build does not match the candidate"
         )
 
-    if expected_runtime == BASELINE_RUNTIME:
-        receipt = {
-            "schema_version": RECEIPT_SCHEMA_VERSION,
-            "environment": "test",
-            "base_url": base_url,
-            "expected_runtime": BASELINE_RUNTIME,
-            "expected_deployment_sha": expected,
-            "observed_backend_sha": backend_sha,
-            "observed_deployment_sha": deployment_sha,
-            "observed_worker_sha": None,
-            "live_worker_count": None,
-            "liveness_verified": True,
-            "deployment_identity_verified": True,
-            "verified_at": datetime.now(timezone.utc).isoformat(),
-        }
-        try:
-            _write_read_only_json(receipt_path, receipt)
-        except OSError:
-            raise DeploymentVerificationError(
-                "deployment receipt could not be checkpointed"
-            ) from None
-        return receipt
-
-    try:
-        status, payload = client.request("GET", "/v1/admin/v2-metrics")
-    except ProvisionError:
-        raise DeploymentVerificationError(
-            "V2 deployment identity endpoint was unreachable"
-        ) from None
-    if status != 200 or not isinstance(payload, dict):
-        raise DeploymentVerificationError(
-            "V2 deployment identity endpoint is unavailable"
-        )
-
-    metrics_backend_sha = str(payload.get("backend_sha") or "").strip().lower()
-    worker_shas_raw = payload.get("worker_shas")
-    live_workers = payload.get("live_workers")
-    if not _SHA_RE.fullmatch(metrics_backend_sha):
-        raise DeploymentVerificationError(
-            "V2 metrics has no valid backend build identity"
-        )
-    if not isinstance(worker_shas_raw, list) or not worker_shas_raw:
-        raise DeploymentVerificationError(
-            "V2 metrics has no live worker build identity"
-        )
-    worker_shas_normalized = [
-        value.strip().lower() if isinstance(value, str) else ""
-        for value in worker_shas_raw
-    ]
-    worker_shas = set(worker_shas_normalized)
-    if (
-        not isinstance(live_workers, int)
-        or isinstance(live_workers, bool)
-        or live_workers < 1
-        or len(worker_shas_raw) != live_workers
-        or len(worker_shas) != 1
-        or any(not _SHA_RE.fullmatch(value) for value in worker_shas_normalized)
-    ):
-        raise DeploymentVerificationError(
-            "V2 worker build identity is incomplete or heterogeneous"
-        )
-    worker_sha = next(iter(worker_shas))
-    if (
-        metrics_backend_sha != expected
-        or metrics_backend_sha != backend_sha
-        or worker_sha != expected
-    ):
-        raise DeploymentVerificationError(
-            "deployed backend and worker builds do not match the candidate"
-        )
-
     receipt = {
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "environment": "test",
         "base_url": base_url,
-        "expected_runtime": RUNTIME_V2_RUNTIME,
+        "expected_runtime": expected_runtime,
         "expected_deployment_sha": expected,
         "observed_backend_sha": backend_sha,
         "observed_deployment_sha": deployment_sha,
-        "observed_worker_sha": worker_sha,
-        "live_worker_count": live_workers,
+        "observed_worker_sha": None,
+        "live_worker_count": None,
+        "runtime_evidence_source": (
+            "per_profile_runtime_readback_and_live_scenarios"
+            if expected_runtime == RUNTIME_V2_RUNTIME
+            else "deployed_runtime_readback"
+        ),
         "liveness_verified": True,
         "deployment_identity_verified": True,
         "verified_at": datetime.now(timezone.utc).isoformat(),
@@ -242,7 +177,7 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "ok": True,
                 "expected_runtime": receipt["expected_runtime"],
-                "live_worker_count": receipt["live_worker_count"],
+                "runtime_evidence_source": receipt["runtime_evidence_source"],
             }
         )
     )

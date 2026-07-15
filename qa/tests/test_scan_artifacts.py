@@ -39,6 +39,10 @@ def _write_inputs(
         json.dumps({"redaction": {"provider_keys_omitted": True}}),
         encoding="utf-8",
     )
+    (artifacts / "cleanup-receipt.json").write_text(
+        json.dumps({"kind": "deterministic_cleanup_receipt"}),
+        encoding="utf-8",
+    )
     (artifacts / "memory-contract.json").write_text("{}\n", encoding="utf-8")
     (artifacts / "matrix.md").write_text("matrix\n", encoding="utf-8")
     (artifacts / "latency.csv").write_text("latency_ms\n", encoding="utf-8")
@@ -52,6 +56,9 @@ def _write_inputs(
             "profile_id": f"profile-{index}",
             "api_key": f"feedling-sensitive-account-{index}",
             "secret_key_b64": base64.b64encode(bytes([index + 1]) * 32).decode(),
+            "synthetic_account_lease": {
+                "absence_token": f"{index + 1:064x}",
+            },
         }
         for index in range(len(scanner.PROFILE_IDS))
     ]
@@ -59,6 +66,9 @@ def _write_inputs(
         "profile_id": scanner.MEMORY_CONTRACT_PROFILE_ID,
         "api_key": "feedling-sensitive-memory-account",
         "secret_key_b64": base64.b64encode(bytes([99]) * 32).decode(),
+        "synthetic_account_lease": {
+            "absence_token": f"{99:064x}",
+        },
     }
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
@@ -269,9 +279,12 @@ def test_reordered_padded_json_secret_fragments_do_not_false_positive(tmp_path):
         encoding="utf-8",
     )
 
-    assert scanner.scan_artifacts(
-        artifacts, manifest, memory_manifest, codex_auth, fixture, env=env
-    ) == []
+    assert (
+        scanner.scan_artifacts(
+            artifacts, manifest, memory_manifest, codex_auth, fixture, env=env
+        )
+        == []
+    )
 
 
 def test_credential_shaped_token_fails(tmp_path):
@@ -380,6 +393,60 @@ def test_memory_contract_account_secrets_are_scanned(tmp_path, field):
 
     assert findings == ["public artifact contains exact credential material"]
     assert secret not in "\n".join(findings)
+
+
+@pytest.mark.parametrize("source", ("provider", "memory"))
+def test_synthetic_absence_attestations_are_scanned(tmp_path, source):
+    artifacts, manifest, memory_manifest, codex_auth, fixture, env = _write_inputs(
+        tmp_path
+    )
+    provisioning = json.loads(manifest.read_text())
+    if source == "provider":
+        secret = provisioning["profiles"][0]["synthetic_account_lease"]["absence_token"]
+    else:
+        secret = json.loads(memory_manifest.read_text())["profiles"][0][
+            "synthetic_account_lease"
+        ]["absence_token"]
+    (artifacts / "matrix.md").write_text(secret, encoding="utf-8")
+
+    findings = scanner.scan_artifacts(
+        artifacts,
+        manifest,
+        memory_manifest,
+        codex_auth,
+        fixture,
+        env=env,
+    )
+
+    assert findings == ["public artifact contains exact credential material"]
+    assert secret not in "\n".join(findings)
+
+
+@pytest.mark.parametrize("source", ("provider", "memory"))
+def test_missing_synthetic_absence_attestation_fails_closed(tmp_path, source):
+    artifacts, manifest, memory_manifest, codex_auth, fixture, env = _write_inputs(
+        tmp_path
+    )
+    provisioning = json.loads(manifest.read_text())
+    if source == "provider":
+        del provisioning["profiles"][0]["synthetic_account_lease"]["absence_token"]
+        manifest.write_text(json.dumps(provisioning), encoding="utf-8")
+    else:
+        memory = json.loads(memory_manifest.read_text())
+        del memory["profiles"][0]["synthetic_account_lease"]["absence_token"]
+        provisioning["auxiliary_accounts"] = memory["profiles"]
+        manifest.write_text(json.dumps(provisioning), encoding="utf-8")
+        memory_manifest.write_text(json.dumps(memory), encoding="utf-8")
+
+    with pytest.raises(scanner.ArtifactScanError, match="attestation is incomplete"):
+        scanner.scan_artifacts(
+            artifacts,
+            manifest,
+            memory_manifest,
+            codex_auth,
+            fixture,
+            env=env,
+        )
 
 
 def test_memory_manifest_must_match_provisioning_auxiliary_account(tmp_path):

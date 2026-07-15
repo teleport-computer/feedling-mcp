@@ -36,7 +36,7 @@ def _qualification_runtime(tmp_path: Path) -> tuple[Path, Path]:
     binary_dir.chmod(0o755)
     executable = binary_dir / "python3"
     executable.write_text(
-        f'#!/bin/sh\nexec {shlex.quote(str(Path(sys.executable).resolve()))} "$@"\n'
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n'
     )
     executable.chmod(0o700)
     return runtime, executable
@@ -233,8 +233,13 @@ def _deployment_verification(
         "expected_deployment_sha": sha,
         "observed_backend_sha": sha,
         "observed_deployment_sha": sha,
-        "observed_worker_sha": sha if expected_runtime == "hosted_resident" else None,
-        "live_worker_count": 1 if expected_runtime == "hosted_resident" else None,
+        "observed_worker_sha": None,
+        "live_worker_count": None,
+        "runtime_evidence_source": (
+            "per_profile_runtime_readback_and_live_scenarios"
+            if expected_runtime == "hosted_resident"
+            else "deployed_runtime_readback"
+        ),
         "liveness_verified": True,
         "deployment_identity_verified": True,
         "verified_at": "2026-07-14T00:00:00+00:00",
@@ -1427,6 +1432,11 @@ def test_preflight_discovers_authoritative_deployment_sha_before_codex(tmp_path)
             "observed_deployment_sha": discovered_sha,
             "observed_worker_sha": None,
             "live_worker_count": None,
+            "runtime_evidence_source": (
+                "per_profile_runtime_readback_and_live_scenarios"
+                if expected_runtime == "hosted_resident"
+                else "deployed_runtime_readback"
+            ),
             "liveness_verified": True,
             "deployment_identity_verified": True,
             "verified_at": "2026-07-14T00:00:00+00:00",

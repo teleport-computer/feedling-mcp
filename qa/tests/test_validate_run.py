@@ -145,7 +145,7 @@ def _profile(profile_id: str, index: int) -> dict:
             "capability_enabled": True,
             "requested_effort": "medium",
             "configured_effort": "medium",
-            "effective_effort": "medium",
+            "effective_effort": "unknown",
             "reasoning_event_count": 1,
             "metadata_present": True,
             "token_metadata_present": True,
@@ -192,7 +192,7 @@ def _valid_result() -> dict:
             "base_url": "https://test-api.feedling.app",
             "expected_deployment_sha": SHA,
             "observed_backend_sha": SHA,
-            "observed_worker_sha": SHA,
+            "observed_worker_sha": None,
             "expected_runtime": "hosted_resident",
         },
         "overall_status": "PASS",
@@ -430,8 +430,11 @@ def _write_receipt(
         "expected_deployment_sha": SHA,
         "observed_backend_sha": SHA,
         "observed_deployment_sha": SHA,
-        "observed_worker_sha": SHA,
-        "live_worker_count": 2,
+        "observed_worker_sha": None,
+        "live_worker_count": None,
+        "runtime_evidence_source": (
+            "per_profile_runtime_readback_and_live_scenarios"
+        ),
         "liveness_verified": True,
         "deployment_identity_verified": True,
         "verified_at": (
@@ -483,6 +486,7 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
                 "synthetic_account_lease": {
                     "registered": True,
                     "lease_id": "lease_" + "a" * 32,
+                    "absence_token": "c" * 64,
                     "expires_at": "2026-07-13T15:58:00+00:00",
                     "expires_at_epoch": 1_783_958_280,
                     "ttl_seconds": 14_400,
@@ -490,7 +494,7 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
                 "trace_enabled": True,
                 "runtime_mode": "hosted_resident",
                 "runtime_version": 2,
-                "runtime_mode_set_required": True,
+                "runtime_mode_set_required": False,
                 "runtime_readback_receipt": {
                     "configured": True,
                     "runtime_mode": "hosted_resident",
@@ -512,7 +516,7 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
                     "base_url": gate._PROFILE_CONFIGURED_BASE_URLS[profile_id],
                     "reasoning_effort": "medium",
                 },
-                "runtime_mode_set_verified": True,
+                "runtime_mode_set_verified": False,
                 "runtime_mode_readback_verified": True,
             }
         )
@@ -532,6 +536,7 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
             "synthetic_account_lease": {
                 "registered": True,
                 "lease_id": "lease_" + "b" * 32,
+                "absence_token": "d" * 64,
                 "expires_at": "2026-07-13T15:58:00+00:00",
                 "expires_at_epoch": 1_783_958_280,
                 "ttl_seconds": 14_400,
@@ -747,6 +752,7 @@ def test_baseline_release_accepts_backend_identity_without_v2_worker_identity(tm
         "observed_deployment_sha": SHA,
         "observed_worker_sha": None,
         "live_worker_count": None,
+        "runtime_evidence_source": "deployed_runtime_readback",
         "liveness_verified": True,
         "deployment_identity_verified": True,
     }
@@ -771,6 +777,49 @@ def test_baseline_release_accepts_backend_identity_without_v2_worker_identity(tm
     )
 
     assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("expected_runtime", "wrong_source"),
+    (
+        ("hosted_resident", "deployed_runtime_readback"),
+        (
+            "deployed_current",
+            "per_profile_runtime_readback_and_live_scenarios",
+        ),
+    ),
+)
+def test_deployment_receipt_runtime_evidence_source_is_target_bound(
+    expected_runtime, wrong_source
+):
+    result = _valid_result()
+    result["target"]["expected_runtime"] = expected_runtime
+    receipt = {
+        "schema_version": 1,
+        "environment": "test",
+        "base_url": "https://test-api.feedling.app",
+        "expected_runtime": expected_runtime,
+        "expected_deployment_sha": SHA,
+        "observed_backend_sha": SHA,
+        "observed_deployment_sha": SHA,
+        "observed_worker_sha": None,
+        "live_worker_count": None,
+        "runtime_evidence_source": wrong_source,
+        "liveness_verified": True,
+        "deployment_identity_verified": True,
+    }
+
+    errors = gate._validate_deployment_receipt(
+        receipt,
+        result,
+        SHA,
+        expected_runtime,
+        "pre",
+    )
+
+    assert errors == [
+        "pre-run trusted deployment receipt has an invalid runtime evidence source"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -876,7 +925,7 @@ def test_coverage_lock_cannot_weaken_evidence_contract(mutate):
         ),
         (
             lambda result: result["target"].update(observed_worker_sha="b" * 40),
-            "observed worker SHA",
+            "unavailable worker build identity",
         ),
         (
             lambda result: result["redaction"].update(provider_keys_omitted=False),
@@ -1030,6 +1079,7 @@ def test_p0_12_reasoning_correlation_ids_are_required(tmp_path, field):
         ("requested_effort", "off"),
         ("configured_effort", "off"),
         ("effective_effort", "off"),
+        ("effective_effort", "medium"),
         ("reasoning_event_count", 0),
     ],
 )
@@ -1046,20 +1096,12 @@ def test_p0_12_capability_effort_and_event_evidence_fail_closed(tmp_path, field,
     )
 
 
-def test_p0_12_rejects_configured_medium_when_capability_clamps_effective_off(
-    tmp_path,
-):
+def test_p0_12_rejects_claimed_effective_medium_without_runtime_attestation(tmp_path):
     result = _valid_result()
     profile = result["profiles"][0]
     reasoning = profile["reasoning"]
     assert profile["reasoning_effort"] == "medium"
-    reasoning.update(
-        capability_enabled=False,
-        requested_effort="medium",
-        configured_effort="medium",
-        effective_effort="off",
-        reasoning_event_count=0,
-    )
+    reasoning["effective_effort"] = "medium"
 
     errors = _validate(tmp_path, result, receipt_result=result)
 
@@ -1620,7 +1662,7 @@ def test_abbreviated_candidate_sha_is_rejected(tmp_path):
     assert errors == ["expected deployment SHA is malformed"]
 
 
-def test_trusted_deployment_receipt_must_match_candidate_and_result(tmp_path):
+def test_trusted_deployment_receipt_rejects_invented_worker_identity(tmp_path):
     artifacts, result_path = _write_run(tmp_path, _valid_result())
     receipt = _write_receipt(tmp_path, observed_worker_sha="b" * 40)
     qa_dir = Path(__file__).resolve().parents[1]
@@ -1638,7 +1680,10 @@ def test_trusted_deployment_receipt_must_match_candidate_and_result(tmp_path):
         expected_runtime="hosted_resident",
         expected_sha=SHA,
     )
-    assert "pre-run trusted deployment receipt does not match the candidate" in errors
+    assert (
+        "pre-run trusted deployment receipt has an invalid runtime evidence source"
+        in errors
+    )
     assert "agent result deployment identity differs from the pre-run receipt" in errors
 
 
@@ -1711,6 +1756,7 @@ def test_trusted_provisioning_manifest_blocked_profile_cannot_release(tmp_path):
     (
         ("registered", False),
         ("lease_id", "forged"),
+        ("absence_token", "forged"),
         ("expires_at_epoch", True),
         ("ttl_seconds", 60),
     ),
@@ -1821,7 +1867,7 @@ def test_trusted_provisioning_manifest_must_be_owner_only_regular_file(tmp_path)
         )
 
 
-def test_post_run_receipt_must_match_pre_run_identity(tmp_path):
+def test_post_run_receipt_rejects_invented_worker_identity(tmp_path):
     artifacts, result_path = _write_run(tmp_path, _valid_result())
     pre_receipt = _write_receipt(tmp_path)
     post_receipt = _write_receipt(
@@ -1842,7 +1888,10 @@ def test_post_run_receipt_must_match_pre_run_identity(tmp_path):
         expected_runtime="hosted_resident",
         expected_sha=SHA,
     )
-    assert "post-run trusted deployment receipt does not match the candidate" in errors
+    assert (
+        "post-run trusted deployment receipt has an invalid runtime evidence source"
+        in errors
+    )
     assert "deployment identity changed during the qualification run" in errors
 
 

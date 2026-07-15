@@ -378,10 +378,20 @@ def set_global_blob_strict(key: str, doc) -> None:
 
 
 def set_global_blob(key: str, doc) -> None:
+    sql = ("INSERT INTO global_blobs (key, doc) VALUES (%s, %s) "
+           "ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc")
+    params = (key, Jsonb(doc))
     try:
-        set_global_blob_strict(key, doc)
+        with get_pool().connection() as conn:
+            conn.execute(sql, params)
     except Exception as e:
         log.error("[db] set_global_blob(%s) failed: %s", key, e)
+        return
+    # Preserve the historical caller-visible mirror behavior: primary-store
+    # failures are logged and swallowed, while a configured mirror failure is
+    # not silently reclassified as a primary-store failure.
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
 
 
 # ---------------------------------------------------------------------------

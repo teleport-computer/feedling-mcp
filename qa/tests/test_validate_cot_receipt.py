@@ -17,7 +17,7 @@ PROFILE_ID = "official-gemini"
 
 def _passing_receipt() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile_id": PROFILE_ID,
         "request_id": "request-1",
         "turn_id": "request-1",
@@ -25,6 +25,12 @@ def _passing_receipt() -> dict[str, object]:
         "reply_message_id": "reply-1",
         "status": "PASS",
         "failure_code": "NONE",
+        "requested_effort": "medium",
+        "configured_effort": "medium",
+        "configured_effort_attested": True,
+        "configured_route_matches_manifest": True,
+        "effective_effort": "unknown",
+        "effective_effort_attested": False,
         "release_qualified": False,
         "delivery_qualified": True,
         "final_answer_correct": True,
@@ -169,9 +175,15 @@ def test_accepts_receipt_emitted_by_current_probe(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         probe,
-        "load_profile_session",
+        "load_profile_context",
         lambda *_args, **_kwargs: (
-            PROFILE_ID,
+            {
+                "profile_id": PROFILE_ID,
+                "provider": "gemini",
+                "configured_model": "gemini-2.5-flash",
+                "configured_base_url": "",
+                "reasoning_effort": "medium",
+            },
             probe.LOCKED_BASE_URL,
             Session(
                 user_id="synthetic-user",
@@ -183,6 +195,20 @@ def test_accepts_receipt_emitted_by_current_probe(tmp_path, monkeypatch):
     )
 
     class FakeClient:
+        def _req(self, method, path, *, api_key, attempts, read_timeout):
+            assert (method, path) == ("GET", "/v1/model_api/get")
+            assert api_key == "private-key"
+            assert (attempts, read_timeout) == (2, 15)
+            return 200, {
+                "config": {
+                    "configured": True,
+                    "provider": "gemini",
+                    "model": "gemini-2.5-flash",
+                    "base_url": "",
+                    "reasoning_effort": "medium",
+                }
+            }
+
         def send(self, _session, _text):
             return {"user_message": {"id": "request-1", "ts": 100.0}}
 
@@ -367,6 +393,96 @@ def test_rejects_profile_mismatch(tmp_path):
     with pytest.raises(validator.CotReceiptError, match="profile assignment"):
         validator.validate_cot_receipt(
             _write_receipt(tmp_path, _passing_receipt()), "official-openai"
+        )
+
+
+@pytest.mark.parametrize(
+    ("configured_effort", "attested", "route_matches"),
+    [
+        ("off", True, True),
+        ("medium", True, False),
+        ("unknown", False, False),
+    ],
+)
+def test_accepts_configuration_context_without_changing_delivery_status(
+    tmp_path, configured_effort, attested, route_matches
+):
+    receipt = _passing_receipt()
+    receipt.update(
+        configured_effort=configured_effort,
+        configured_effort_attested=attested,
+        configured_route_matches_manifest=route_matches,
+    )
+
+    parsed, _ = validator.validate_cot_receipt(
+        _write_receipt(tmp_path, receipt), PROFILE_ID
+    )
+
+    assert parsed["status"] == "PASS"
+    assert parsed["failure_code"] == "NONE"
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"requested_effort": "low"}, "requested effort"),
+        ({"effective_effort": "medium"}, "effective effort"),
+        ({"effective_effort_attested": True}, "effective effort"),
+        (
+            {
+                "configured_effort": "unknown",
+                "configured_effort_attested": True,
+            },
+            "configured effort",
+        ),
+        (
+            {
+                "configured_effort": "off",
+                "configured_effort_attested": False,
+                "configured_route_matches_manifest": False,
+            },
+            "configured effort",
+        ),
+        (
+            {
+                "configured_effort": "unknown",
+                "configured_effort_attested": False,
+                "configured_route_matches_manifest": True,
+            },
+            "configured route",
+        ),
+    ],
+)
+def test_rejects_untruthful_or_inconsistent_effort_evidence(
+    tmp_path, changes, message
+):
+    receipt = _passing_receipt()
+    receipt.update(changes)
+
+    with pytest.raises(validator.CotReceiptError, match=message):
+        validator.validate_cot_receipt(
+            _write_receipt(tmp_path, receipt), PROFILE_ID
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "failure_code"),
+    [
+        ("FAIL", "REASONING_CONFIGURATION_MISMATCH"),
+        ("UNVERIFIED", "REASONING_CONFIGURATION_UNAVAILABLE"),
+    ],
+)
+def test_rejects_configuration_as_delivery_status(tmp_path, status, failure_code):
+    receipt = _passing_receipt()
+    receipt.update(
+        status=status,
+        failure_code=failure_code,
+        delivery_qualified=False,
+    )
+
+    with pytest.raises(validator.CotReceiptError, match="status and failure code"):
+        validator.validate_cot_receipt(
+            _write_receipt(tmp_path, receipt), PROFILE_ID
         )
 
 

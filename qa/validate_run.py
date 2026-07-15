@@ -319,7 +319,7 @@ _SCENARIO_CONTRACTS: dict[str, dict[str, Any]] = {
             "reasoning_capability_enabled",
             "reasoning_requested_effort_medium",
             "reasoning_configured_effort_medium",
-            "reasoning_effective_effort_medium",
+            "reasoning_effective_effort_not_attested",
             "reasoning_event_observed",
             "reasoning_metadata_present",
             "reasoning_tokens_present",
@@ -328,10 +328,11 @@ _SCENARIO_CONTRACTS: dict[str, dict[str, Any]] = {
         ],
         "required_evidence_codes": [
             "REASONING_CAPABILITY_CONFIRMED",
-            "REASONING_EFFORT_CONFIRMED",
+            "REASONING_CONFIGURATION_CONFIRMED",
+            "REASONING_EFFECTIVE_EFFORT_UNATTESTED",
             "REASONING_EVENT_CONFIRMED",
             "REASONING_METADATA_CONFIRMED",
-            "REASONING_TOKENS_CONFIRMED",
+            "EXPLICIT_REASONING_TOKEN_COUNT_CONFIRMED",
             "DISCLOSURE_PRESENT",
             "EXACT_REPLY_CORRELATED",
         ],
@@ -383,7 +384,8 @@ _REASONING_CONTRACT = {
     "capability_enabled_required_when_expected": True,
     "requested_effort_required_when_expected": "medium",
     "configured_effort_required_when_expected": "medium",
-    "effective_effort_required_when_expected": "medium",
+    "effective_effort_required_when_expected": "unknown",
+    "effective_effort_attested_required_when_expected": False,
     "positive_reasoning_event_count_required_when_expected": True,
     "provider_metadata_required_when_expected": True,
     "provider_token_metadata_required_when_expected": True,
@@ -1209,11 +1211,8 @@ def _validate_result_semantics(
         != expected_sha.lower()
     ):
         errors.append("observed backend SHA does not match the expected deployment")
-    if expected_runtime == EXPECTED_RUNTIME:
-        if str(target.get("observed_worker_sha") or "").lower() != expected_sha.lower():
-            errors.append("observed worker SHA does not match the expected deployment")
-    elif target.get("observed_worker_sha") is not None:
-        errors.append("baseline result must not invent worker build identity")
+    if target.get("observed_worker_sha") is not None:
+        errors.append("result must not invent unavailable worker build identity")
 
     profiles = result.get("profiles")
     if not isinstance(profiles, list):
@@ -1455,7 +1454,7 @@ def _validate_result_semantics(
             or reasoning.get("capability_enabled") is not True
             or reasoning.get("requested_effort") != "medium"
             or reasoning.get("configured_effort") != "medium"
-            or reasoning.get("effective_effort") != "medium"
+            or reasoning.get("effective_effort") != "unknown"
             or not isinstance(reasoning.get("reasoning_event_count"), int)
             or isinstance(reasoning.get("reasoning_event_count"), bool)
             or reasoning.get("reasoning_event_count", 0) <= 0
@@ -1734,6 +1733,8 @@ def _synthetic_lease_valid(value: Any, reaper: Mapping[str, Any]) -> bool:
         and value.get("registered") is True
         and isinstance(value.get("lease_id"), str)
         and re.fullmatch(r"lease_[0-9a-f]{32}", value.get("lease_id", "")) is not None
+        and isinstance(value.get("absence_token"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value.get("absence_token", "")) is not None
         and isinstance(value.get("expires_at"), str)
         and bool(value.get("expires_at"))
         and type(value.get("expires_at_epoch")) is int
@@ -1824,8 +1825,8 @@ def _validate_provisioning_manifest(
         )
         if expected_runtime == EXPECTED_RUNTIME:
             runtime_contract_valid = (
-                entry.get("runtime_mode_set_required") is True
-                and entry.get("runtime_mode_set_verified") is True
+                entry.get("runtime_mode_set_required") is False
+                and entry.get("runtime_mode_set_verified") is False
                 and runtime_mode == EXPECTED_RUNTIME
                 and runtime_version == 2
                 and runtime_readback_valid
@@ -1985,19 +1986,17 @@ def _validate_deployment_receipt(
     ):
         errors.append(f"{label} does not match the candidate")
     live_worker_count = receipt.get("live_worker_count")
-    if expected_runtime == EXPECTED_RUNTIME:
-        if (
-            worker_sha != expected
-        ):
-            errors.append(f"{label} does not match the candidate")
-        if (
-            not isinstance(live_worker_count, int)
-            or isinstance(live_worker_count, bool)
-            or live_worker_count < 1
-        ):
-            errors.append(f"{label} has no live V2 worker")
-    elif receipt.get("observed_worker_sha") is not None or live_worker_count is not None:
-        errors.append(f"{label} invents unavailable baseline worker identity")
+    expected_source = (
+        "per_profile_runtime_readback_and_live_scenarios"
+        if expected_runtime == EXPECTED_RUNTIME
+        else "deployed_runtime_readback"
+    )
+    if (
+        receipt.get("observed_worker_sha") is not None
+        or live_worker_count is not None
+        or receipt.get("runtime_evidence_source") != expected_source
+    ):
+        errors.append(f"{label} has an invalid runtime evidence source")
     target = result.get("target")
     if isinstance(target, dict) and (
         str(target.get("observed_backend_sha") or "").lower() != backend_sha
@@ -2032,6 +2031,7 @@ def _validate_deployment_receipt_pair(
         "observed_backend_sha",
         "observed_deployment_sha",
         "observed_worker_sha",
+        "runtime_evidence_source",
         "liveness_verified",
         "deployment_identity_verified",
     )

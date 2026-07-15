@@ -11,7 +11,7 @@ on:
         description: Runtime contract expected from the deployed test endpoint
         required: true
         type: choice
-        default: deployed_current
+        default: hosted_resident
         options:
           - deployed_current
           - hosted_resident

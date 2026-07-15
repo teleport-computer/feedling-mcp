@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from qa import cot_delivery_probe as probe
+from qa import validate_cot_receipt as receipt_validator
 from tools.provider_smoke.client import Session, SmokeError
 
 
@@ -318,6 +319,10 @@ def _manifest(tmp_path: Path) -> Path:
                     {
                         "profile_id": "official-gemini",
                         "provision_status": "ready",
+                        "provider": "gemini",
+                        "configured_model": "gemini-2.5-flash",
+                        "configured_base_url": "",
+                        "reasoning_effort": "medium",
                         "user_id": "user-1",
                         "api_key": "feedling-user-secret",
                         "secret_key_b64": base64.b64encode(b"s" * 32).decode(),
@@ -329,6 +334,120 @@ def _manifest(tmp_path: Path) -> Path:
     )
     path.chmod(0o600)
     return path
+
+
+def _configured_route(**overrides):
+    config = {
+        "configured": True,
+        "provider": "gemini",
+        "model": "gemini-2.5-flash",
+        "base_url": "",
+        "reasoning_effort": "medium",
+    }
+    config.update(overrides)
+    return {"config": config}
+
+
+def _manifest_profile() -> dict[str, object]:
+    return {
+        "provider": "gemini",
+        "configured_model": "gemini-2.5-flash",
+        "configured_base_url": "",
+    }
+
+
+def test_configured_effort_readback_requires_exact_live_route():
+    session = Session(
+        user_id="user-1",
+        api_key="feedling-user-secret",
+        sk=b"s" * 32,
+        pk=b"p" * 32,
+    )
+
+    class FakeClient:
+        def _req(self, method, path, *, api_key, attempts, read_timeout):
+            assert (method, path) == ("GET", "/v1/model_api/get")
+            assert api_key == "feedling-user-secret"
+            assert (attempts, read_timeout) == (2, 15)
+            return 200, _configured_route()
+
+    assert probe.read_configured_effort(
+        FakeClient(), session, _manifest_profile()
+    ) == ("medium", True, True)
+
+
+@pytest.mark.parametrize(
+    ("body", "effort", "route_matches"),
+    [
+        (_configured_route(reasoning_effort="off"), "off", True),
+        (_configured_route(model="another-model"), "medium", False),
+        (
+            _configured_route(reasoning_effort="provider-default"),
+            "unsupported",
+            True,
+        ),
+    ],
+)
+def test_configured_effort_readback_attests_readable_values_and_route(
+    body, effort, route_matches
+):
+    session = Session(
+        user_id="user-1",
+        api_key="feedling-user-secret",
+        sk=b"s" * 32,
+        pk=b"p" * 32,
+    )
+
+    class FakeClient:
+        def _req(self, *_args, **_kwargs):
+            return 200, body
+
+    assert probe.read_configured_effort(
+        FakeClient(), session, _manifest_profile()
+    ) == (effort, True, route_matches)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        (503, {}),
+        (200, {}),
+        (200, {"config": []}),
+        (200, _configured_route(configured=False)),
+    ],
+)
+def test_configured_effort_readback_leaves_unavailable_values_unattested(response):
+    session = Session(
+        user_id="user-1",
+        api_key="feedling-user-secret",
+        sk=b"s" * 32,
+        pk=b"p" * 32,
+    )
+
+    class FakeClient:
+        def _req(self, *_args, **_kwargs):
+            return response
+
+    assert probe.read_configured_effort(
+        FakeClient(), session, _manifest_profile()
+    ) == ("unknown", False, False)
+
+
+def test_configured_effort_readback_reports_transport_unavailable():
+    session = Session(
+        user_id="user-1",
+        api_key="feedling-user-secret",
+        sk=b"s" * 32,
+        pk=b"p" * 32,
+    )
+
+    class FakeClient:
+        def _req(self, *_args, **_kwargs):
+            raise SmokeError("configuration", "unavailable")
+
+    assert probe.read_configured_effort(
+        FakeClient(), session, _manifest_profile()
+    ) == ("unknown", False, False)
 
 
 def test_manifest_loader_requires_private_one_row_assignment(tmp_path):
@@ -344,6 +463,17 @@ def test_manifest_loader_requires_private_one_row_assignment(tmp_path):
     manifest.chmod(0o644)
     with pytest.raises(probe.CotProbeError, match="unsafe"):
         probe.load_profile_session(manifest, "official-gemini")
+
+
+def test_manifest_loader_requires_locked_requested_effort(tmp_path):
+    manifest = _manifest(tmp_path)
+    document = json.loads(manifest.read_text())
+    document["profiles"][0]["reasoning_effort"] = "low"
+    manifest.write_text(json.dumps(document))
+    manifest.chmod(0o600)
+
+    with pytest.raises(probe.CotProbeError, match="not ready"):
+        probe.load_profile_context(manifest, "official-gemini")
 
 
 def test_private_receipt_contains_no_raw_evidence(tmp_path):
@@ -378,6 +508,12 @@ def test_run_probe_projects_reasoning_delivery_without_raw_text(tmp_path, monkey
     output = parent / "cot.json"
 
     class FakeClient:
+        def _req(self, method, path, *, api_key, attempts, read_timeout):
+            assert (method, path) == ("GET", "/v1/model_api/get")
+            assert api_key == "feedling-user-secret"
+            assert (attempts, read_timeout) == (2, 15)
+            return 200, _configured_route()
+
         def send(self, session, text):
             assert session.user_id == "user-1"
             assert "17 multiplied by 19" in text
@@ -408,6 +544,12 @@ def test_run_probe_projects_reasoning_delivery_without_raw_text(tmp_path, monkey
     )
 
     assert receipt["status"] == "PASS"
+    assert receipt["requested_effort"] == "medium"
+    assert receipt["configured_effort"] == "medium"
+    assert receipt["configured_effort_attested"] is True
+    assert receipt["configured_route_matches_manifest"] is True
+    assert receipt["effective_effort"] == "unknown"
+    assert receipt["effective_effort_attested"] is False
     assert receipt["request_id"] == receipt["turn_id"] == receipt["trace_id"]
     assert receipt["reasoning_event_count"] == 1
     assert receipt["metadata_present"] is True
@@ -425,6 +567,9 @@ def test_run_probe_preserves_reply_ids_when_trace_is_unavailable(tmp_path, monke
     output = parent / "cot.json"
 
     class FakeClient:
+        def _req(self, *_args, **_kwargs):
+            return 200, _configured_route()
+
         def send(self, _session, _text):
             return {"user_message": {"id": "turn-1", "ts": 100.0}}
 
@@ -451,3 +596,81 @@ def test_run_probe_preserves_reply_ids_when_trace_is_unavailable(tmp_path, monke
     assert receipt["request_id"] == "turn-1"
     assert receipt["reply_message_id"] == "reply-1"
     assert receipt["final_answer_correct"] is True
+
+
+@pytest.mark.parametrize(
+    ("readback", "expected_effort", "attested", "route_matches"),
+    [
+        (
+            (200, _configured_route(reasoning_effort="off")),
+            "off",
+            True,
+            True,
+        ),
+        (
+            (200, _configured_route(model="another-model")),
+            "medium",
+            True,
+            False,
+        ),
+        ((200, _configured_route(configured=False)), "unknown", False, False),
+        ((200, {"config": []}), "unknown", False, False),
+        (SmokeError("configuration", "unavailable"), "unknown", False, False),
+    ],
+)
+def test_run_probe_always_tests_delivery_regardless_of_configuration_readback(
+    tmp_path,
+    monkeypatch,
+    readback,
+    expected_effort,
+    attested,
+    route_matches,
+):
+    manifest = _manifest(tmp_path)
+    parent = tmp_path / "receipt-root"
+    parent.mkdir(mode=0o700)
+    output = parent / "cot.json"
+
+    class FakeClient:
+        send_calls = 0
+
+        def _req(self, *_args, **_kwargs):
+            if isinstance(readback, Exception):
+                raise readback
+            return readback
+
+        def send(self, _session, _text):
+            self.send_calls += 1
+            return {"user_message": {"id": "turn-1", "ts": 100.0}}
+
+        def poll_reply_record(self, *_args, **_kwargs):
+            return {"reply": "323", "message": {"id": "reply-1"}}
+
+    monkeypatch.setattr(probe, "decrypt_reply_record", lambda *_args: _reply())
+    monkeypatch.setattr(probe, "_poll_trace", lambda *_args, **_kwargs: _trace())
+    client = FakeClient()
+
+    receipt = probe.run_probe(
+        manifest,
+        output,
+        nonce="nonce_123456",
+        expected_profile_id="official-gemini",
+        client=client,
+    )
+
+    assert client.send_calls == 1
+    assert receipt["status"] == "PASS"
+    assert receipt["failure_code"] == "NONE"
+    assert receipt["requested_effort"] == "medium"
+    assert receipt["configured_effort"] == expected_effort
+    assert receipt["configured_effort_attested"] is attested
+    assert receipt["configured_route_matches_manifest"] is route_matches
+    assert receipt["effective_effort"] == "unknown"
+    assert receipt["effective_effort_attested"] is False
+    assert receipt["request_id"] == "turn-1"
+    assert receipt["model_call_count"] == 1
+
+    parsed, _ = receipt_validator.validate_cot_receipt(
+        output, "official-gemini"
+    )
+    assert parsed == receipt

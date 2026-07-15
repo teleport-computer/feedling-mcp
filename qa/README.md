@@ -9,13 +9,16 @@ workstreams.
 
 There are two targets:
 
-- **baseline** (the local driver's default) tests the runtime currently deployed
-  on `test-api.feedling.app`, proves its protected backend build identity, records
-  its reported mode/version, and does not
+- **baseline** (`deployed_current`, and the local driver's default) tests the
+  runtime currently deployed on `test-api.feedling.app`, proves its protected
+  backend build identity, records its reported mode/version, and does not
   claim that a legacy `runtime_version: 2` label proves the new Hosted Runtime V2 architecture;
-- **strict Hosted Runtime V2** is an opt-in target of the protected GitHub
-  workflow and additionally requires admin mode selection, homogeneous
-  worker/backend build identity, and V2 receipts.
+- **strict Hosted Runtime V2** (`hosted_resident`) qualifies the deployed V2
+  **user path**: every synthetic provider profile must independently read back
+  exact mode `hosted_resident` and version `2` from `/v1/model_api/runtime`, and
+  parent-owned P0-05 and P0-07 probes must re-confirm that target before and
+  after hosted-loop activation. It does not claim worker-binary or queue-topology
+  attestation because those identities are not exposed by the current runtime.
 
 The protected workflow is deliberately split across explicit trust zones:
 
@@ -35,19 +38,22 @@ The protected workflow is deliberately split across explicit trust zones:
 
 1. `verify_deployment.py` uses the test admin credential before Codex starts and
    again after the agent finishes. Every mode requires the image-baked source SHA
-   to equal the SHA injected by the serialized test deployment. Strict V2 mode
-   additionally requires homogeneous live-worker builds. Both receipts remain
-   outside the public artifact directory.
+   to equal the SHA injected by the serialized test deployment. Worker SHA and
+   live-worker count are explicitly unavailable and remain `null`; strict V2
+   behavior is proven by the per-profile user path described below. Both
+   deployment receipts remain outside the public artifact directory.
 2. `provision_profiles.py` is a deterministic credential boundary. It creates
    eight fresh provider-profile accounts plus one dedicated memory-contract
    account, proves invalid-key rejection and valid-key
    recovery without accepting echoed credentials, enables user-scoped trace
    access, requires a server-side synthetic-account TTL/reaper before the first
    registration, and reads the configured runtime through the user API. In
-   strict V2 mode it also uses the test admin token to set and independently
-   verify `hosted_resident`. A present-but-expired provider key becomes a fixed-code
-   blocked row while provisioning continues through the other profiles, so a
-   failed credential still produces a complete eight-row diagnostic matrix.
+   strict V2 mode that authenticated readback must already report exact mode
+   `hosted_resident` and version `2`; qualification does not mutate runtime mode
+   through a test-only admin endpoint. A present-but-expired provider key becomes
+   a fixed-code blocked row while provisioning continues through the other
+   profiles, so a failed credential still produces a complete eight-row
+   diagnostic matrix.
    P0-06 uses four checked-in representative onboarding files: each profile
    archives all four through the deployed multipart endpoint before submitting
    the exact same bytes and filenames to Genesis for agent-judged distillation.
@@ -105,10 +111,20 @@ The protected workflow is deliberately split across explicit trust zones:
    one supervisor plus exactly eight uniquely assigned independent profile
    workers with no more than three observed concurrently, exact agreement with
    the trusted process/thread/hash receipt, unchanged trusted pre/post liveness
-   receipts, strict Runtime V2 identity when selected, exact binding to the owner-only read-only
-   provisioning manifest, PASS statuses, and required artifact paths.
-9. The workflow always resets all nine synthetic accounts and uploads only the
-   public artifact directory after cleanup succeeds and an exact secret scan.
+   receipts, strict Runtime V2 user-path evidence when selected, exact binding
+   to the owner-only read-only provisioning manifest, PASS statuses, and required
+   artifact paths.
+9. The workflow always runs deterministic cleanup across all nine synthetic
+   accounts. For every provider profile it proves the configured route existed,
+   deletes the route when it is still authenticated, verifies the public
+   projection and encrypted key envelope are gone, resets the account, confirms
+   lease-attested PostgreSQL absence, and confirms the old Feedling key returns
+   `401`. An account already reset by its profile worker is accepted only after
+   the same database-authoritative proof; provider cleanup is then bound to the
+   account deletion cascade. `validate_cleanup_receipt.py` requires the exact
+   locked matrix and binds this sanitized receipt to the agent's cleanup
+   fields. The private manifests remain available for the final secret scan,
+   and only a scanned, cleanup-bound public artifact directory is uploaded.
 
 `codex_output_schema.py --check` proves offline that the checked-in Codex
 authoring schema is the exact compatible projection of the gate schema plus
@@ -139,7 +155,8 @@ environment.
 
 The default is baseline qualification: it accepts any configured runtime status,
 records the observed mode/version, and runs the full user-behavior journey. Add
-`--require-runtime-v2` only after the new Hosted Runtime V2 candidate is deployed.
+`--require-runtime-v2` when the deployed target is expected to expose exact
+`hosted_resident` version `2` through the full user path.
 
 Before copying that OAuth bundle, the local driver treats PATH only as a package
 locator, derives the native binary from the pinned official npm layout, and
@@ -254,18 +271,25 @@ the model's internal reasoning or defeat a deliberately deceptive judge that
 manufactures an alternate prefill and copies it later; that would require a
 second independent judge or a different trust model.
 
-All eight profiles lock reasoning effort to `medium`. A provider default, omitted
-setting, or disabled reasoning cannot produce a release PASS.
+All eight profiles request reasoning effort `medium`, and the authenticated live
+route readback must attest that `medium` is configured for the same
+provider/model/base URL. A provider default, omitted setting, route mismatch, or
+disabled reasoning cannot produce a release PASS.
 
 P0-12 also guards the failure chain recorded in
 [Router entry mrj6pdgl-6dppch](https://router.feedling.app/entry?id=mrj6pdgl-6dppch):
-a route merely reporting `medium` is insufficient. The exact
-correlated turn must prove reasoning capability enabled, requested/configured/
-effective effort all equal to `medium`, a positive provider-visible
-reasoning/thinking event count, token metadata, and a nonempty user-visible
-summary/disclosure. `reasoning:false`, an effective `off` clamp, or zero events
-fails even if setup echoed the requested effort. The suite never requests or
-stores a model's hidden private chain-of-thought.
+a route merely reporting `medium` is insufficient. The exact correlated turn
+must prove a positive provider-visible reasoning/thinking signal, explicit
+positive reasoning-token metadata, valid reasoning metadata, and a nonempty
+user-visible summary/disclosure. The current deployed runtime does not expose a
+trustworthy per-turn applied-effort field, so effective effort is deliberately
+reported as `unknown` and unattested instead of being inferred from configured
+state. This catches disabled or dropped reasoning, metadata, token, and
+disclosure regressions without making the false claim that configured `medium`
+was necessarily the model's applied effort. Exact applied-effort qualification
+requires separate runtime trace instrumentation and is outside this QA-only
+change. The suite never requests or stores a model's hidden private
+chain-of-thought.
 At P0-12 the worker writes a fixed request marker, and the trusted launcher runs
 `cot_delivery_probe.py` once. The authoritative private receipt lives in that
 profile's directory beneath the worker-output root, which the profile's
@@ -288,21 +312,18 @@ their own virtual environments or install dependencies during qualification.
 the **test** backend's admin routes. Its value must match that deployment's
 `FEEDLING_ADMIN_TOKEN`. This is not issued by Feedling: the operator chooses one
 strong random value, for example with `openssl rand -hex 32`, and stores it only
-in secret managers. Every qualification mode uses it only to read the protected
-test build identity before Codex or provisioning begins. Protected self-service
-qualification also uses it for the test-account reaper and cleanup; strict V2
-mode additionally uses it to call:
+in secret managers. Protected self-service qualification uses it to read the
+test build identity before Codex, verify the synthetic-account reaper, register
+short-lived accounts, and prove cleanup. The adminless local diagnostic does not
+use it. Runtime selection and runtime readback are authenticated user operations,
+not admin operations. The bounded QA admin calls include:
 
-- `POST /v1/admin/hosted-runtime-mode`, to select `hosted_resident` for a newly
-  created synthetic user; and
-- `GET /v1/admin/hosted-runtime-mode`, to independently read the selection
-  back;
-- `GET /v1/admin/v2-metrics`, before and after Codex runs, to produce the
-  trusted deployment receipts from `backend_sha`, homogeneous `worker_shas`,
-  and live worker count; and
-- `GET /v1/admin/data-track/users/{id}`, only after an ambiguous cleanup `401`,
-  to prove that the synthetic account is absent before treating it as already
-  reset; and
+- `POST /v1/admin/qa/synthetic-accounts/absence` after cleanup, with the
+  private `user_id`, `lease_id`, and server-issued HMAC absence token from the
+  registration receipt. The endpoint verifies that lease attestation and reads
+  PostgreSQL directly; a stale worker registry or database outage can never
+  become a false absence. This proof is required before accepting either a
+  fresh reset or an already-reset `401`; and
 - `GET /v1/admin/qa/synthetic-account-reaper`, before creating any account, to
   require an enabled `agent-e2e-` label reaper with a maximum TTL no greater
   than four hours.
@@ -494,20 +515,24 @@ also needs the test-only `GET /v1/admin/qa/build-identity` route, with the image
 full `FEEDLING_GIT_COMMIT` equal to the serialized deploy's
 `FEEDLING_TEST_DEPLOY_SHA`. This branch must therefore be deployed to `test` once
 before the hardened local driver can run; absence or mismatch fails before any
-provider key is used. This path does not wait for the new Hosted Runtime V2
-feature branch.
+provider key is used. This baseline path does not require the deployed target to
+identify itself as Hosted Runtime V2.
 
-For the strict Hosted Runtime V2 GitHub release run, the deployed candidate must additionally provide:
+For the strict Hosted Runtime V2 GitHub qualification run, the deployed
+candidate must additionally provide:
 
-- the Runtime V2 admin set/readback routes;
-- the admin-gated V2 metrics contract with `backend_sha`, `worker_shas`, and a
-  positive live-worker count matching the candidate SHA;
-- `hosted_resident` Runtime V2 workers and queues;
+- an authenticated `/v1/model_api/runtime` readback of exact mode
+  `hosted_resident` and version `2` for every configured synthetic profile;
+- a functioning hosted-loop path that preserves that exact readback through
+  parent-owned P0-05 discovery and P0-07 activation probes;
 - deploy-enabled, user-scoped traces; and
 - the admin-gated synthetic-account reaper status contract, backed by a real
-  server-side TTL/janitor for `agent-e2e-` labels; and
-- observable backend and worker build identity that can be matched to the
-  candidate commit.
+  server-side TTL/janitor for `agent-e2e-` labels.
+
+The pre/post deployment receipts still match the observable backend build to
+the candidate. They deliberately record `observed_worker_sha: null` and
+`live_worker_count: null`: current Runtime V2 does not expose trustworthy worker
+binary identity, so this suite does not fabricate that stronger attestation.
 
 Trigger **CI** manually at protected `main`. Any collaborator with repository
 write access may do this; no Environment reviewer needs to be online:
@@ -530,18 +555,18 @@ resolve inside current `test` history, or the protected live backend reports a
 different full SHA.
 
 There is deliberately no free-form deployment-SHA or candidate-branch input.
-Use `runtime_target=deployed_current` for today's runtime and reserve
-`hosted_resident` for the future strict Runtime V2 proof. Any controller ref
-other than protected `main` fails before the Environment or its secrets are
-reached. Manual mode is intentional for the first stabilization phase; the
-qualification itself has no push, schedule, or deployment trigger. Only the
-secretless AWS expiry reaper runs hourly.
+Use `runtime_target=deployed_current` to qualify whichever configured runtime is
+currently deployed, or `hosted_resident` to require the exact V2 user path. Any
+controller ref other than protected `main` fails before the Environment or its
+secrets are reached. Manual mode is intentional for the first stabilization
+phase; the qualification itself has no push, schedule, or deployment trigger.
+Only the secretless AWS expiry reaper runs hourly.
 
 The baseline target requires authoritative backend image identity plus the
-currently deployed API-key/user contracts. The optional strict Runtime V2 target
-additionally fails before semantic testing unless worker build identity and all
-strict control-plane receipts exist. Those strict requirements are future
-product/deployment prerequisites, not claims made by this testing branch.
+currently deployed API-key/user contracts. The strict Runtime V2 target requires
+all eight provisioner readbacks and parent-owned P0-05/P0-07 receipts to prove
+exact `hosted_resident` version `2`. This is end-user-path qualification, not a
+claim about an unobservable worker binary or internal queue topology.
 
 Runner cleanup has four independent paths: normal one-job shutdown with EC2
 terminate-on-shutdown, a GitHub-hosted `always()` cleanup job, a root-owned
@@ -558,6 +583,9 @@ authoritative result JSON; the trusted publisher installs `run-result.json`, and
 and profile-summary rows), `junit.xml`, and exact `profiles/<profile-id>.json`
 copies directly beneath the same directory. The deterministic memory probe adds
 `memory-contract.json`; it is not authored or adjudicated by a profile agent.
+After all profile work, deterministic cleanup adds `cleanup-receipt.json`. That
+receipt contains only locked IDs, booleans, a deletion-source enum, and a run ID;
+it never contains account IDs, account keys, provider keys, or response bodies.
 No second run-ID directory is
 created. Public files must never contain provider keys, Feedling account keys,
 private content keys, raw chat, raw traces, raw private reasoning, or free-form
@@ -568,9 +596,11 @@ and must sum to eight. The gate is green only when all eight profiles and all
 thirteen scenarios per profile are present in order and PASS with their locked
 assertions, evidence codes, required IDs, and preserved attempt history; pre/post
 endpoint liveness and backend candidate identity are proven in every mode, with
-worker identity and strict V2 controls required only when that target is
-selected; all chat turns have the
-five required trace stages and numeric per-turn stage timing; cleanup succeeds;
+worker identity explicitly unavailable and strict V2 per-profile user-path
+evidence required when that target is selected; all chat turns have the
+five required trace stages and numeric per-turn stage timing; deterministic
+cleanup proves all nine accounts absent and all old keys rejected, and its exact
+receipt agrees with the eight agent cleanup projections;
 each worker has a completed qualification-tool event and a valid, passing,
 result-bound P0-12 receipt; every parent-probed scenario has an exact helper
 command plus a valid result-bound parent receipt, while P0-06 has its three
