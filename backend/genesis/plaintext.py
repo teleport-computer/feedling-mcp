@@ -711,8 +711,21 @@ def _run_plaintext_genesis_v2(
         all_fact_candidates.extend([c for c in candidates if isinstance(c, dict)])
 
     core = primary_reduce.get("core_fact_candidates") or foreground.select_core_for_foreground(all_fact_candidates)
-    if not core:
+    msgs = analysis_messages if isinstance(analysis_messages, list) else []
+    # fresh_start-only = every analysis message is the synthetic sentinel (routed
+    # into the history bucket by _plaintext_route_family, so group source_kind
+    # can't tell it apart from real history — the message `source` can).
+    fresh_start_only = bool(msgs) and all(
+        str(m.get("source") or "") == history_import._FRESH_START_SOURCE
+        for m in msgs if isinstance(m, dict)
+    )
+    if not core and not fresh_start_only:
         return False  # nothing to work with -> let the v1 full path handle it
+    # fresh_start has no material BY DEFINITION, so `core` is always empty for it.
+    # Falling back to v1 here would complete the job WITHOUT the onboarding
+    # greeting (the v1 full path never greets) — the user would open an empty
+    # chat. Continue instead: the nameless greeting+done branch below handles an
+    # empty core, and _fact_write short-circuits on zero candidates.
 
     full_fact_write = worker.build_memory_output_from_fact_candidates(
         user_id=store.user_id,
@@ -743,17 +756,22 @@ def _run_plaintext_genesis_v2(
     # explicit relationship_started_at (user typed a date) -> honored verbatim below,
     # per the documented priority; blank -> _store_identity_payload falls back to memory.
     explicit_started_at = str((relationship_anchor or {}).get("relationship_started_at") or "").strip()
-    msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
 
     # Foreground-ready contract: derive identity when the material contains a real
     # signal, but never invent one or make its absence a speaking gate. Greeting and
     # Genesis completion still happen before entry; heavy voice/persona/full-memory
-    # stay in background.
-    identity_payload, id_warnings = foreground_identity.derive_foreground_identity(
-        runtime=runtime, analysis_messages=msgs, core_memories=full_memories,
-        days_with_user=days, language=language,
-    )
+    # stay in background. fresh_start skips the identity LLM entirely: deriving a
+    # name from the synthetic sentinel is meaningless (a hallucinated one would be
+    # wrong), and a provider hiccup there must not push a material-less onboarding
+    # into the retryable-failed path — the greeting below must land regardless.
+    if fresh_start_only:
+        identity_payload, id_warnings = {"agent_name": "", "dimensions": []}, []
+    else:
+        identity_payload, id_warnings = foreground_identity.derive_foreground_identity(
+            runtime=runtime, analysis_messages=msgs, core_memories=full_memories,
+            days_with_user=days, language=language,
+        )
     provider_failure = _provider_identity_failure(id_warnings)
     if provider_failure or not foreground_identity.has_identity_signal(identity_payload):
         # Non-LLM lightweight fallback: try to salvage a name from the uploaded
