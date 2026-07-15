@@ -27,7 +27,7 @@ from model_api_runtime.v2 import serve_worker
 from hosted import config_store as hosted_config_store
 from core import store as core_store
 
-from conftest import configure_model_api_route, seed_user
+from conftest import configure_model_api_route, seed_user, set_v2_runtime_owner
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
@@ -39,7 +39,8 @@ pytestmark = pytest.mark.skipif(
 def pg_clean():
     with db.get_pool().connection() as conn:
         conn.execute(
-            "TRUNCATE chat_messages, agent_jobs, v2_runtime_state, user_blobs, "
+            "TRUNCATE chat_messages, agent_jobs, v2_effect_outbox, "
+            "v2_effect_sink_applied, v2_runtime_state, user_blobs, "
             "model_api_routes, model_api_credentials CASCADE"
         )
     yield
@@ -130,3 +131,54 @@ def test_per_iteration_exception_does_not_crash_the_loop(monkeypatch):
 
     asyncio.run(_driver())
     assert calls["n"] >= 2  # survived the first raise and ticked again
+
+
+def test_one_iteration_drains_pending_effect_without_a_future_turn(monkeypatch):
+    """A completed wake/turn is not required to revisit a failed outbox row."""
+    uid = "u_reconcile_sweep_effect"
+    seed_user(uid)
+    set_v2_runtime_owner(uid)
+    generation = db.get_runtime_generation(uid)
+    assert db.effect_enqueue(
+        "job-reconcile:status:0",
+        uid,
+        991,
+        "status",
+        generation,
+        {"kind": "processing"},
+    )
+
+    calls = {"n": 0}
+    real_apply = serve_worker._apply_pending_effects_for_user
+
+    def counting_apply(user_id):
+        calls["n"] += 1
+        return real_apply(user_id)
+
+    monkeypatch.setattr(
+        serve_worker,
+        "_apply_pending_effects_for_user",
+        counting_apply,
+    )
+    stop_event = asyncio.Event()
+
+    async def _driver():
+        task = asyncio.create_task(
+            serve_worker._reconcile_loop(stop_event, interval=0.02)
+        )
+        for _ in range(200):
+            if calls["n"] >= 1 and not db.effect_pending(uid):
+                break
+            await asyncio.sleep(0.01)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    asyncio.run(_driver())
+
+    assert calls["n"] >= 1
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM v2_effect_outbox WHERE effect_id=%s",
+            ("job-reconcile:status:0",),
+        ).fetchone()
+    assert row == ("applied",)

@@ -178,6 +178,7 @@ def v2_metrics() -> dict:
         "mean_service_sec": jobs_store.recent_mean_service_sec(lane="chat"),
         "recent_mean_tokens_per_turn": jobs_store.recent_mean_tokens_per_turn(lane="chat"),
         "wake": jobs_store.wake_success_stats(),
+        "effects": db.effect_outbox_health(),
         # The genesis import worker rides in the serve_worker process on its own
         # thread, and `run_loop` imports `genesis.worker` lazily — so that thread can
         # die while the turn loops keep beating. Without this field, a dead genesis

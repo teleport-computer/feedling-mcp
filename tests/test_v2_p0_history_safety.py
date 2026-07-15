@@ -53,6 +53,7 @@ def _reset(uid: str) -> None:
         conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_effect_outbox WHERE user_id=%s", (uid,))
+    conftest.set_v2_runtime_owner(uid)
 
 
 @pytest.fixture(autouse=True)
@@ -668,6 +669,14 @@ def test_kill_between_sink_write_and_status_flip_yields_exactly_one_reply():
         # Re-drive: re-run apply_pending_effects over the still-pending row
         # (the recovery path — a resumed/re-claimed worker re-applies the
         # outbox exactly the way it would after a real process kill+restart).
+        # Advance the durable retry clock instead of sleeping through the
+        # production backoff window.
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE v2_effect_outbox SET next_attempt_at=now() "
+                "WHERE effect_id=%s AND status='pending'",
+                (eid,),
+            )
         res = effect_outbox.apply_pending_effects(uid, dispatch=dispatch)
         assert res == {"applied": 1, "discarded": 0}
 

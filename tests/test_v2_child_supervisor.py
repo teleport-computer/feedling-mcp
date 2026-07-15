@@ -18,6 +18,7 @@ import time
 
 import pytest
 
+from model_api_runtime.v2 import child_supervisor as child_supervisor_module
 from model_api_runtime.v2.child_supervisor import ChildSupervisor
 
 # ---------------------------------------------------------------------------
@@ -134,10 +135,19 @@ def test_wedged_child_stays_alive_but_progress_goes_stale():
     sup = ChildSupervisor(_fake_target_wedge_after_one, liveness_timeout_sec=liveness_timeout_sec)
     sup.start()
     try:
-        # The single progress message should land quickly.
-        assert _wait_until(lambda: sup.poll_liveness()["last_progress_age_sec"] < 1.0)
-        # Now wait past the liveness timeout with no further progress.
-        time.sleep(liveness_timeout_sec + 0.5)
+        # start() seeds _last_progress_at to avoid a false startup wedge. Wait
+        # for the child's actual one-and-only progress message to replace that
+        # seed; merely checking age < 1 can pass before the spawned child runs.
+        with sup._lock:
+            startup_seed = sup._last_progress_at
+        assert _wait_until(
+            lambda: sup._last_progress_at is not None
+            and sup._last_progress_at != startup_seed
+        )
+        # Now wait until that real heartbeat—not the startup seed—is stale.
+        assert _wait_until(
+            lambda: sup.poll_liveness()["last_progress_age_sec"] > liveness_timeout_sec
+        )
         liveness = sup.poll_liveness()
         assert liveness["alive"] is True, "the OS process is still running (it's wedged, not dead)"
         assert liveness["last_progress_age_sec"] > liveness_timeout_sec, (
@@ -201,6 +211,43 @@ def test_idle_slot_reports_zero_current_turn_age():
         assert sup.poll_liveness()["current_turn_age_sec"] == 0.0
     finally:
         sup.stop()
+
+
+def test_round_and_catchup_boundaries_refresh_stall_not_absolute_age(monkeypatch):
+    """Deterministic fake-clock proof for the production budget mismatch.
+
+    Simulate ten successful 60-second provider/compaction boundaries.  The
+    turn is now 601s old (well past the former 180s hard kill) but only 1s
+    stalled, so the supervisor must expose those as different clocks.  Once
+    no further boundary arrives, the stall clock grows and becomes killable.
+    """
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(
+        child_supervisor_module.time, "monotonic", lambda: clock["now"])
+    sup = ChildSupervisor(_fake_target_idle_only, liveness_timeout_sec=45.0)
+    turn_start = clock["now"]
+    sup._handle_message(("progress", 3, turn_start, turn_start))
+
+    for elapsed in range(60, 601, 60):
+        clock["now"] = turn_start + elapsed
+        sup._handle_message(("progress", 3, clock["now"], turn_start))
+
+    clock["now"] = turn_start + 601.0
+    progressing = sup.poll_liveness()
+    assert progressing["current_turn_age_sec"] == pytest.approx(601.0)
+    assert progressing["current_turn_stall_age_sec"] == pytest.approx(1.0)
+
+    # Event-loop liveness is a separate signal and cannot keep a wedged turn
+    # alive.  It refreshes the coarse process clock, not this slot's stall age.
+    clock["now"] = turn_start + 850.0
+    sup._handle_message(("loop_heartbeat", clock["now"]))
+    wedged = sup.poll_liveness()
+    assert wedged["last_progress_age_sec"] == pytest.approx(0.0)
+    assert wedged["event_loop_heartbeat_age_sec"] == pytest.approx(0.0)
+    assert wedged["last_slot_progress_age_sec"] == pytest.approx(250.0)
+    assert wedged["active_turn_count"] == 1
+    assert wedged["current_turn_age_sec"] == pytest.approx(850.0)
+    assert wedged["current_turn_stall_age_sec"] == pytest.approx(250.0)
 
 
 def test_kill_and_respawn_replaces_wedged_child_with_a_fresh_pid():

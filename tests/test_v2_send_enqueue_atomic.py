@@ -36,7 +36,10 @@ def pg_clean():
     (or another module sharing the session-scoped DB) never leak into the
     next — mirrors test_v2_effect_outbox.py's pg_clean fixture."""
     with db.get_pool().connection() as conn:
-        conn.execute("TRUNCATE chat_messages, agent_jobs, v2_runtime_state CASCADE")
+        conn.execute(
+            "TRUNCATE v2_conversation_summary, chat_messages, "
+            "agent_jobs, v2_runtime_state CASCADE"
+        )
     yield
 
 
@@ -108,6 +111,60 @@ def test_success_persists_message_and_one_job_with_generation(monkeypatch):
     assert int(expected_gen) == gen
 
 
+def test_atomic_send_trim_mirrors_exact_tee_evictions(monkeypatch):
+    """Message+job atomicity must not leave trimmed rows in the TEE shadow."""
+    uid = "u_atomic_send_tee_trim"
+    seed_user(uid)
+    gen = db.get_runtime_generation(uid)
+    for index in range(1, 4):
+        db.chat_append(
+            uid,
+            f"old-{index}",
+            float(index),
+            _msg_doc(f"old-{index}"),
+            0,
+        )
+    old_two_seq = db.chat_seq_for_msg_id(uid, "old-2")
+    assert old_two_seq is not None
+    assert jobs_store.upsert_summary_row_cas(
+        uid,
+        summary_envelope={"body_ct": "summary"},
+        watermark_ts=2.0,
+        watermark_seq=old_two_seq,
+        expected_version=0,
+    )
+
+    from tee_shadow import mirror
+
+    mirrored: list[list[tuple[str, tuple]]] = []
+    monkeypatch.setattr(mirror, "execute_many", lambda statements: mirrored.append(statements))
+
+    new_id = "new-message"
+    db.chat_append_and_enqueue(
+        uid,
+        new_id,
+        4.0,
+        _msg_doc(new_id),
+        2,
+        "chat",
+        reason="chat_send",
+        trace_id=new_id,
+        expected_generation=gen,
+    )
+
+    with db.get_pool().connection() as conn:
+        remaining = {
+            row[0]
+            for row in conn.execute(
+                "SELECT msg_id FROM chat_messages WHERE user_id=%s", (uid,)
+            ).fetchall()
+        }
+    assert remaining == {"old-3", new_id}
+    assert len(mirrored) == 1
+    assert mirrored[0][0][1] == (uid, ["old-1", "old-2"])
+    assert mirrored[0][1][1] == (uid, ["old-1", "old-2"])
+
+
 def test_singleflight_race_retries_and_preserves_message(monkeypatch):
     """Simulates the concurrent same-user/same-lane race: the FIRST coalesce
     attempt hits the unique-index UniqueViolation a real racer would produce
@@ -166,3 +223,164 @@ def test_unknown_lane_raises_before_any_write():
             "SELECT 1 FROM chat_messages WHERE user_id=%s AND msg_id=%s", (uid, msg_id),
         ).fetchall()
     assert msg_rows == []
+
+
+def test_runtime_control_cas_rolls_back_send_after_observed_tuple_changes():
+    uid = "u_atomic_runtime_cas_loss"
+    seed_user(uid)
+    msg_id = uuid.uuid4().hex
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO user_blobs (user_id,kind,doc) "
+            "VALUES (%s,'model_api_runtime',%s) "
+            "ON CONFLICT (user_id,kind) DO UPDATE SET doc=EXCLUDED.doc",
+            (uid, db.Jsonb({"hosted_runtime_mode": "db_action_v2"})),
+        )
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) "
+            "VALUES (%s,'v2',9) ON CONFLICT (user_id) DO UPDATE SET "
+            "hosted_runtime_state='v2',runtime_generation=9",
+            (uid,),
+        )
+    observed = db.get_hosted_runtime_control_strict(uid)
+    assert observed == ("db_action_v2", "v2", 9)
+
+    # Simulate a cutover winning after chat/send's read but before the atomic
+    # append. The CAS must reject both halves of the write.
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_runtime_state SET hosted_runtime_state='resident', "
+            "runtime_generation=10 WHERE user_id=%s",
+            (uid,),
+        )
+        conn.execute(
+            "UPDATE user_blobs SET doc=doc || %s WHERE user_id=%s "
+            "AND kind='model_api_runtime'",
+            (db.Jsonb({"hosted_runtime_mode": "resident_cli"}), uid),
+        )
+
+    with pytest.raises(db.RuntimeControlChangedError):
+        db.chat_append_and_enqueue(
+            uid,
+            msg_id,
+            time.time(),
+            _msg_doc(msg_id),
+            5000,
+            "chat",
+            reason="chat_send",
+            trace_id=msg_id,
+            expected_generation=observed[2],
+            expected_runtime_state=observed[1],
+            expected_runtime_mode=observed[0],
+        )
+
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (uid, msg_id),
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM agent_jobs WHERE user_id=%s",
+            (uid,),
+        ).fetchone() is None
+
+
+def test_runtime_control_cas_accepts_unchanged_v2_tuple():
+    uid = "u_atomic_runtime_cas_success"
+    seed_user(uid)
+    msg_id = uuid.uuid4().hex
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO user_blobs (user_id,kind,doc) "
+            "VALUES (%s,'model_api_runtime',%s) "
+            "ON CONFLICT (user_id,kind) DO UPDATE SET doc=EXCLUDED.doc",
+            (uid, db.Jsonb({"hosted_runtime_mode": "db_action_v2"})),
+        )
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) "
+            "VALUES (%s,'v2',4) ON CONFLICT (user_id) DO UPDATE SET "
+            "hosted_runtime_state='v2',runtime_generation=4",
+            (uid,),
+        )
+
+    seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        msg_id,
+        time.time(),
+        _msg_doc(msg_id),
+        5000,
+        "chat",
+        expected_generation=4,
+        expected_runtime_state="v2",
+        expected_runtime_mode="db_action_v2",
+    )
+    assert seq > 0 and job_id > 0
+
+
+def test_fenced_send_and_claim_share_runtime_then_job_lock_order(monkeypatch):
+    """Deterministically exercise the old ABBA shape. The send pauses while
+    holding runtime_state immediately before it locks/coalesces the job; a
+    concurrent claim must wait on runtime_state rather than lock the job first.
+    Releasing send therefore lets both operations finish without deadlock."""
+    import concurrent.futures
+    import threading
+
+    uid = "u_atomic_send_claim_lock_order"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO user_blobs (user_id,kind,doc) "
+            "VALUES (%s,'model_api_runtime',%s) "
+            "ON CONFLICT (user_id,kind) DO UPDATE SET doc=EXCLUDED.doc",
+            (uid, db.Jsonb({"hosted_runtime_mode": "db_action_v2"})),
+        )
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) "
+            "VALUES (%s,'v2',5) ON CONFLICT (user_id) DO UPDATE SET "
+            "hosted_runtime_state='v2',runtime_generation=5",
+            (uid,),
+        )
+    jobs_store.enqueue_job(uid, "chat", expected_generation=5)
+
+    reached_job_lock = threading.Event()
+    release_send = threading.Event()
+    original_coalesce = jobs_store.coalesce_or_insert_on_cursor
+
+    def _paused_coalesce(*args, **kwargs):
+        reached_job_lock.set()
+        assert release_send.wait(timeout=5)
+        return original_coalesce(*args, **kwargs)
+
+    monkeypatch.setattr(
+        jobs_store, "coalesce_or_insert_on_cursor", _paused_coalesce)
+    msg_id = uuid.uuid4().hex
+
+    def _send():
+        return db.chat_append_and_enqueue(
+            uid,
+            msg_id,
+            time.time(),
+            _msg_doc(msg_id),
+            5000,
+            "chat",
+            expected_generation=5,
+            expected_runtime_state="v2",
+            expected_runtime_mode="db_action_v2",
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        send_future = pool.submit(_send)
+        assert reached_job_lock.wait(timeout=5)
+        claim_future = pool.submit(
+            jobs_store.claim_next_job, "w-lock-order")
+        # Give claim a chance to reach (and block on) the runtime row.
+        threading.Event().wait(0.1)
+        release_send.set()
+        _seq, sent_job_id = send_future.result(timeout=5)
+        claimed = claim_future.result(timeout=5)
+
+    assert claimed is not None
+    assert claimed["id"] == sent_job_id

@@ -52,8 +52,11 @@ def test_anthropic_returns_two_tool_calls(monkeypatch):
     }
     monkeypatch.setattr(pc, "_http_client", lambda: _fake_client(body))
     cfg = pc.ProviderConfig("anthropic", "claude-x", "k", "https://api.anthropic.com/v1")
-    res = pc.chat_completion(cfg, [{"role": "user", "content": "hi"}], tools=TOOLS, require_reply=False)
+    # Tool-only is a valid non-terminal provider response; callers must not need
+    # to opt out of the normal reply requirement explicitly.
+    res = pc.chat_completion(cfg, [{"role": "user", "content": "hi"}], tools=TOOLS)
     assert [c["id"] for c in res["tool_calls"]] == ["t_a", "t_b"]
+    assert res["assistant_turn"] == {"wire": "anthropic", "payload": body["content"]}
 
 
 def test_anthropic_no_tools_empty_list(monkeypatch):
@@ -87,9 +90,11 @@ def test_gemini_returns_two_tool_calls(monkeypatch):
     }
     monkeypatch.setattr(pc, "_http_client", lambda: _fake_client(body))
     cfg = pc.ProviderConfig("gemini", "gemini-2.5-flash", "k", "https://generativelanguage.googleapis.com/v1beta")
-    res = pc.chat_completion(cfg, [{"role": "user", "content": "hi"}], tools=TOOLS, require_reply=False)
+    res = pc.chat_completion(cfg, [{"role": "user", "content": "hi"}], tools=TOOLS)
     assert [c["name"] for c in res["tool_calls"]] == ["web_search", "get_time"]
     assert len(res["tool_calls"]) == 2
+    assert res["assistant_turn"] == {
+        "wire": "gemini", "payload": body["candidates"][0]["content"]}
 
 
 def test_gemini_no_tools_empty_list(monkeypatch):
@@ -123,8 +128,10 @@ def test_openai_compatible_returns_two_tool_calls(monkeypatch):
     }
     monkeypatch.setattr(pc, "_http_client", lambda: _fake_client(body))
     cfg = pc.ProviderConfig("deepseek", "deepseek-v4-flash", "k", "https://api.deepseek.com")
-    res = pc.chat_completion(cfg, [{"role": "user", "content": "hi"}], tools=TOOLS, require_reply=False)
+    res = pc.chat_completion(cfg, [{"role": "user", "content": "hi"}], tools=TOOLS)
     assert [c["id"] for c in res["tool_calls"]] == ["call_a", "call_b"]
+    assert res["assistant_turn"] == {
+        "wire": "openai_chat", "payload": body["choices"][0]["message"]}
 
 
 def test_openai_compatible_no_tools_empty_list(monkeypatch):
@@ -158,8 +165,9 @@ def test_openai_responses_returns_two_tool_calls(monkeypatch):
     }
     monkeypatch.setattr(pc, "_http_client", lambda: _fake_client(body))
     cfg = pc.ProviderConfig("openai", "gpt-5", "k", "https://api.openai.com/v1")
-    res = pc.chat_completion(cfg, [{"role": "user", "content": "hi"}], tools=TOOLS, require_reply=False)
+    res = pc.chat_completion(cfg, [{"role": "user", "content": "hi"}], tools=TOOLS)
     assert [c["id"] for c in res["tool_calls"]] == ["call_a", "call_b"]
+    assert res["assistant_turn"] == {"wire": "openai_responses", "payload": body["output"]}
 
 
 def test_openai_responses_no_tools_empty_list(monkeypatch):
@@ -204,7 +212,7 @@ def test_chat_completion_async_openai_compatible_threads_tools(monkeypatch):
 
     async def run():
         return await pc.chat_completion_async(
-            cfg, [{"role": "user", "content": "hi"}], tools=TOOLS, require_reply=False,
+            cfg, [{"role": "user", "content": "hi"}], tools=TOOLS,
         )
 
     res = anyio.run(run)
@@ -229,7 +237,7 @@ def test_chat_completion_async_anthropic_native_threads_tools(monkeypatch):
 
     async def run():
         return await pc.chat_completion_async(
-            cfg, [{"role": "user", "content": "hi"}], tools=TOOLS, require_reply=False,
+            cfg, [{"role": "user", "content": "hi"}], tools=TOOLS,
         )
 
     res = anyio.run(run)

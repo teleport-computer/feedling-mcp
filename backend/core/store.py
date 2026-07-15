@@ -348,6 +348,10 @@ class UserStore:
         *,
         strict: bool = False,
         enqueue: dict | None = None,
+        reply_through_seq: int | None = None,
+        resident_runtime_fenced: bool = False,
+        resident_reply_to: str | None = None,
+        resident_replied_by: str = "",
     ) -> dict:
         """Append a v1 ciphertext chat message. `envelope` holds the AEAD
         payload. See docs/DESIGN_E2E.md §3.2 for field definitions. Server
@@ -369,12 +373,33 @@ class UserStore:
         `db.chat_append_strict` — closing the crash window where the message
         persists but the process dies before the job is queued, orphaning it.
         Shape: `{"lane": str, "reason": str | None, "trace_id": str | None,
-        "expected_generation": int | None}`. `None` (the default) preserves
+        "expected_generation": int | None, "expected_runtime_state": str | None,
+        "expected_runtime_mode": str | None}`. The three expected runtime
+        values form the send-time ownership CAS. `None` (the default) preserves
         today's `chat_append_strict`/`chat_append` behavior byte-for-byte —
         the in-memory cache append, trim, `wake_bus.notify`, and
         `capture_scheduler.record_chat_append` side effects are unaffected
         either way.
+
+        `reply_through_seq` is the V2 final-reply path. It requires
+        `strict=True` and no `enqueue`, and commits the deterministic reply row
+        plus the durable reply cursor in one transaction. Replays do not
+        rebroadcast or reschedule capture.
+
+        `resident_runtime_fenced` is the resident response path. Every response
+        verifies resident ownership under the DB cutover lock; when
+        `resident_reply_to` is present, the same transaction also CAS-marks that
+        parent answered. It cannot be combined with the V2/strict enqueue paths.
         """
+        if reply_through_seq is not None and (not strict or enqueue is not None):
+            raise ValueError("reply_through_seq requires strict=True and no enqueue")
+        if (resident_runtime_fenced or resident_reply_to is not None) and (
+            strict or enqueue is not None or reply_through_seq is not None
+        ):
+            raise ValueError(
+                "resident response cannot combine with strict/enqueue/V2 reply")
+        resident_runtime_fenced = bool(
+            resident_runtime_fenced or resident_reply_to is not None)
         msg_id = envelope.get("id") if isinstance(envelope.get("id"), str) and envelope["id"] else uuid.uuid4().hex
         ct = content_type if content_type in ("text", "image", "file") else "text"
 
@@ -456,19 +481,57 @@ class UserStore:
                 "reply_message_id",
                 "replied_by",
                 "replied_at",
+                "resident_delivery_id",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
                     msg[key] = value.strip()
                 elif isinstance(value, bool):
                     msg[key] = value
+        if resident_reply_to is not None:
+            msg["reply_to_message_id"] = str(resident_reply_to)
 
+        persisted_new = True
         with self.chat_lock:
             # The legacy route is deliberately best-effort for compatibility.
             # V2 terminal replies opt into strict ordering: commit first, then
             # expose the row in the process cache.  A failed DB write therefore
             # cannot leave a phantom reply that makes the job look successful.
-            if strict and enqueue is not None:
+            resident_parent_doc = None
+            if resident_reply_to is not None:
+                (
+                    seq,
+                    persisted_new,
+                    resident_parent_doc,
+                    persisted_reply_doc,
+                ) = db.chat_append_resident_reply(
+                    self.user_id,
+                    msg_id,
+                    msg["ts"],
+                    msg,
+                    MAX_CHAT_MESSAGES,
+                    parent_msg_id=str(resident_reply_to),
+                    replied_by=resident_replied_by,
+                )
+                msg = dict(persisted_reply_doc)
+                msg["seq"] = seq
+            elif resident_runtime_fenced:
+                seq, persisted_new, persisted_reply_doc = db.chat_append_resident_message(
+                    self.user_id,
+                    msg_id,
+                    msg["ts"],
+                    msg,
+                    MAX_CHAT_MESSAGES,
+                )
+                msg = dict(persisted_reply_doc)
+                msg["seq"] = seq
+            elif strict and reply_through_seq is not None:
+                seq, persisted_new = db.chat_append_effect_with_cursor(
+                    self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES,
+                    int(reply_through_seq),
+                )
+                msg["seq"] = seq
+            elif strict and enqueue is not None:
                 # A7: message persist + job enqueue/coalesce in one transaction
                 # so a crash between them can never orphan the message.
                 _seq, _job_id = db.chat_append_and_enqueue(
@@ -477,20 +540,36 @@ class UserStore:
                     reason=enqueue.get("reason"),
                     trace_id=enqueue.get("trace_id"),
                     expected_generation=enqueue.get("expected_generation"),
+                    expected_runtime_state=enqueue.get("expected_runtime_state"),
+                    expected_runtime_mode=enqueue.get("expected_runtime_mode"),
                 )
             elif strict:
                 db.chat_append_strict(
                     self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
-            self.chat_messages.append(msg)
+            if not any(str(existing.get("id") or "") == msg_id for existing in self.chat_messages):
+                self.chat_messages.append(msg)
             if len(self.chat_messages) > MAX_CHAT_MESSAGES:
                 self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+            if resident_parent_doc is not None:
+                for existing in self.chat_messages:
+                    if str(existing.get("id") or "") == str(resident_reply_to):
+                        existing.update(resident_parent_doc)
+                        break
             if not strict:
-                db.chat_append(self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
+                if not resident_runtime_fenced:
+                    db.chat_append(
+                        self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
         # Cross-worker wake: other workers' pollers for this user park on their
         # own threading.Events, which our notify_chat_waiters can't reach. The
         # local fast path (the caller's notify_chat_waiters) stays; this only
         # broadcasts the genuine write. Emitted here (the sole new-message
         # chokepoint), never from the wake/reload path, so it can't loop.
+        if not persisted_new:
+            if resident_runtime_fenced:
+                replayed = dict(msg)
+                replayed["_resident_replayed"] = True
+                return replayed
+            return msg
         wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler

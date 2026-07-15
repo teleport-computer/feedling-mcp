@@ -63,6 +63,7 @@ def _reset(uid):
         conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
+    conftest.set_v2_runtime_owner(uid)
 
 
 def _make_fake_conversation_deps(messages: list[dict]):

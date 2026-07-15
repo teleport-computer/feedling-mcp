@@ -60,3 +60,33 @@ def test_injected_decrypt_is_used():
     coalesced, _ = v2_coalesce.coalesce_pending(
         messages, since_ts=0.0, decrypt=lambda m: "PLAIN")
     assert coalesced[0]["content"] == "PLAIN"
+
+
+def test_seq_native_path_keeps_same_timestamp_messages_in_db_order():
+    messages = [
+        {**_msg("m2", "user", 100.0, "second"), "seq": 12},
+        {**_msg("m1", "user", 100.0, "first"), "seq": 11},
+        {**_msg("old", "user", 99.0, "already replied"), "seq": 10},
+    ]
+
+    coalesced, cursor = v2_coalesce.coalesce_pending(messages, since_seq=10)
+
+    assert [(m["id"], m["seq"]) for m in coalesced] == [("m1", 11), ("m2", 12)]
+    assert cursor == 12
+
+
+def test_seq_native_path_fails_closed_on_missing_identity():
+    import pytest
+
+    with pytest.raises(ValueError, match="seq"):
+        v2_coalesce.coalesce_pending(
+            [_msg("m1", "user", 100.0, "must not disappear")],
+            since_seq=0,
+        )
+
+
+def test_coalesce_rejects_ambiguous_dual_cursor():
+    import pytest
+
+    with pytest.raises(ValueError, match="exactly one"):
+        v2_coalesce.coalesce_pending([], since_ts=1.0, since_seq=1)

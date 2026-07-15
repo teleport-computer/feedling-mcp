@@ -3,11 +3,10 @@
 `serve_worker.build_effect_dispatch(deps)` is the pure router: it maps each of
 the 7 outbox effect_types (reply/status/cursor/job/memory/identity/schedule)
 to its injected sink callable and raises on anything else. Production sinks
-(`serve_worker._sink_*` / `build_production_effect_dispatch`) each wrap the
-real write with `db.effect_sink_claim` — the universal exactly-once guard
-table (spec A6) — so a replayed dispatch (same effect_id, e.g. after a crash
-between the sink write and the outbox row flipping to 'applied') performs the
-underlying write exactly once.
+(`serve_worker._sink_*` / `build_production_effect_dispatch`) wrap generic
+writes in the two-phase sink ledger: claim, durable write, complete. A replay
+of a completed effect no-ops; an interrupted claim fails visibly as delivery-
+uncertain instead of silently skipping or blindly duplicating the write.
 """
 from __future__ import annotations
 
@@ -21,9 +20,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import effect_outbox
 from model_api_runtime.v2 import serve_worker
 
-from conftest import seed_user
+from conftest import seed_user, set_v2_runtime_owner
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
@@ -82,6 +82,7 @@ def test_replay_same_effect_id_performs_underlying_write_once(pg_clean):
         if not db.effect_sink_claim(payload["effect_id"]):
             return
         writes.append(payload)
+        db.effect_sink_complete(payload["effect_id"])
 
     deps = serve_worker.EffectSinkDeps(
         reply=claimed_sink,
@@ -94,6 +95,17 @@ def test_replay_same_effect_id_performs_underlying_write_once(pg_clean):
     dispatch("reply", dict(payload))  # replay after a crash before status=applied
     assert len(writes) == 1
     assert writes[0]["text"] == "hi"
+
+
+def test_late_release_cannot_erase_completed_sink_marker(pg_clean):
+    eid = "job1:status:completed-release-guard"
+    assert db.effect_sink_claim(eid) is True
+    db.effect_sink_complete(eid)
+
+    db.effect_sink_release(eid)
+
+    assert _sink_claim_state(eid) == "completed"
+    assert db.effect_sink_claim(eid) is False
 
 
 def test_job_sink_fence_skips_enqueue_when_generation_advanced(pg_clean, monkeypatch):
@@ -111,6 +123,7 @@ def test_job_sink_fence_skips_enqueue_when_generation_advanced(pg_clean, monkeyp
         "effect_id": "job9:job:0", "lane": "chat", "expected_generation": 1,
     })
     assert calls == []
+    assert _sink_claim_state("job9:job:0") == "completed"
 
 
 def test_job_sink_enqueues_when_generation_still_current(pg_clean, monkeypatch):
@@ -130,6 +143,58 @@ def test_job_sink_enqueues_when_generation_still_current(pg_clean, monkeypatch):
     args, kwargs = calls[0]
     assert args[:2] == ("u_sink_job2", "chat")
     assert kwargs.get("reason") == "follow_up"
+    assert kwargs.get("expected_generation") == gen
+    assert _sink_claim_state("job10:job:0") == "completed"
+
+
+def test_job_effect_dispatch_does_not_relock_outer_runtime_row(pg_clean):
+    """apply_pending_effects holds runtime_state FOR UPDATE across dispatch.
+    The job sink must pass that validated generation into enqueue_job instead
+    of asking a second connection to lock the same row."""
+    uid = "u_sink_job_outer_lock"
+    seed_user(uid)
+    set_v2_runtime_owner(uid)
+    generation = db.get_runtime_generation(uid)
+    assert db.effect_enqueue(
+        "job-outer-lock:job:0",
+        uid,
+        1010,
+        "job",
+        generation,
+        {
+            "lane": "maintenance",
+            "reason": "outer_lock_regression",
+            "expected_generation": generation,
+        },
+    )
+    dispatch = serve_worker.build_production_effect_dispatch(uid)
+
+    result = effect_outbox.apply_pending_effects(uid, dispatch=dispatch)
+
+    assert result == {"applied": 1, "discarded": 0}
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT lane,status,expected_runtime_generation FROM agent_jobs "
+            "WHERE user_id=%s",
+            (uid,),
+        ).fetchone()
+    assert row == ("maintenance", "pending", generation)
+
+
+def test_cursor_sink_is_monotonic_across_out_of_order_effects(pg_clean):
+    uid = "u_sink_cursor_monotonic"
+    seed_user(uid)
+    db.set_blob_strict(
+        uid, "model_api_runtime", {"hosted_runtime_mode": "db_action_v2"},
+    )
+    dispatch = serve_worker.build_production_effect_dispatch(uid)
+
+    dispatch("cursor", {"effect_id": "job20:cursor:0", "new_seq": 30})
+    dispatch("cursor", {"effect_id": "job19:cursor:0", "new_seq": 10})
+
+    profile = db.get_blob_strict(uid, "model_api_runtime")
+    assert profile[serve_worker.v2_cursor.CURSOR_KEY] == 30
+    assert profile["hosted_runtime_mode"] == "db_action_v2"
 
 
 def test_production_deps_apply_pending_effects_wired_and_safe_with_empty_outbox(pg_clean):
@@ -145,6 +210,15 @@ def _sink_applied_row_exists(effect_id: str) -> bool:
             "SELECT 1 FROM v2_effect_sink_applied WHERE effect_id=%s", (effect_id,)
         ).fetchone()
     return row is not None
+
+
+def _sink_claim_state(effect_id: str) -> str | None:
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT claim_state FROM v2_effect_sink_applied WHERE effect_id=%s",
+            (effect_id,),
+        ).fetchone()
+    return str(row[0]) if row else None
 
 
 # ------------------------------------------------------------------
@@ -180,6 +254,113 @@ def test_sink_reply_succeeds_and_keeps_claim_when_write_succeeds(pg_clean, monke
     dispatch("reply", {"effect_id": eid, "text": "hello"})  # must not raise
 
     assert _sink_applied_row_exists(eid)
+    assert _sink_claim_state(eid) == "completed"
+
+
+@pytest.mark.parametrize(
+    ("effect_type", "payload", "failure_code"),
+    [
+        (
+            "identity",
+            {"patch": {"signature": "new"}},
+            "identity_patch_failed",
+        ),
+        (
+            "schedule",
+            {"op": "schedule_wake", "at": "2026-07-15T09:00:00Z"},
+            "schedule_wake_failed",
+        ),
+    ],
+)
+def test_capability_sink_result_failure_releases_claim_and_raises_stable_code(
+    pg_clean, monkeypatch, effect_type, payload, failure_code
+):
+    uid = f"u_sink_cap_failure_{effect_type}"
+    seed_user(uid)
+    eid = f"job_cap_failure:{effect_type}:0"
+
+    def failed_capability(*_args, **_kwargs):
+        from capabilities.types import err
+        return err("upstream", "secret provider response", retryable=True)
+
+    monkeypatch.setattr(
+        serve_worker.cap_registry, "run_capability", failed_capability
+    )
+    dispatch = serve_worker.build_production_effect_dispatch(
+        uid, runtime_token_provider=lambda: "rt-test")
+
+    with pytest.raises(RuntimeError, match=f"^{failure_code}$") as caught:
+        dispatch(effect_type, {"effect_id": eid, **payload})
+
+    assert "secret provider response" not in str(caught.value)
+    assert _sink_claim_state(eid) is None
+
+
+def test_identity_sink_forwards_enclave_runtime_token(pg_clean, monkeypatch):
+    uid = "u_sink_identity_runtime_token"
+    seed_user(uid)
+    seen = []
+
+    def fake_run_capability(
+        action_type, store, *, api_key=None, runtime_token=None, params=None
+    ):
+        from capabilities.types import ok
+
+        seen.append((action_type, store.user_id, api_key, runtime_token, params))
+        return ok(data={})
+
+    monkeypatch.setattr(
+        serve_worker.cap_registry, "run_capability", fake_run_capability
+    )
+    dispatch = serve_worker.build_production_effect_dispatch(
+        uid,
+        runtime_token_provider=lambda: "rt-envelope-decrypt",
+    )
+    dispatch("identity", {
+        "effect_id": "job_identity:identity:0",
+        "patch": {"signature": "new"},
+    })
+
+    assert seen == [(
+        "identity_patch",
+        uid,
+        None,
+        "rt-envelope-decrypt",
+        {"patch": {"signature": "new"}},
+    )]
+    assert _sink_claim_state("job_identity:identity:0") == "completed"
+
+
+def test_memory_sink_forwards_enclave_runtime_token(pg_clean, monkeypatch):
+    uid = "u_sink_memory_runtime_token"
+    seed_user(uid)
+    seen = []
+
+    def fake_actions(store, api_key, payload, *, runtime_token=""):
+        seen.append((store.user_id, api_key, payload, runtime_token))
+        return {"results": [{"status": "ok"}]}, 200
+
+    monkeypatch.setattr(serve_worker.memory_core, "actions", fake_actions)
+    dispatch = serve_worker.build_production_effect_dispatch(
+        uid,
+        runtime_token_provider=lambda: "rt-envelope-decrypt",
+    )
+    actions = [{
+        "type": "memory.add",
+        "memory": {"type": "fact", "title": "tea", "description": "likes tea"},
+    }]
+    dispatch("memory", {
+        "effect_id": "job_memory:memory:0",
+        "actions": actions,
+    })
+
+    assert seen == [(
+        uid,
+        None,
+        {"actions": actions},
+        "rt-envelope-decrypt",
+    )]
+    assert _sink_claim_state("job_memory:memory:0") == "completed"
 
 
 # ------------------------------------------------------------------

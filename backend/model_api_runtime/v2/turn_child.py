@@ -25,31 +25,13 @@ turn_child`，两边互相在对方还没加载完时导入对方，会踩 Pytho
 还没跑完 module body 的半成品模块）。函数体内 import 在 `_serve()` 真正被调用时才执行，
 那时 `serve_worker` 模块早已加载完毕，没有这个风险。
 
-**progress pipe（Task 2 更新：slot 驱动而非自由跑计时器）**：早前版本用一个跟
-`run_worker_loop` 并发跑在同一个事件循环里的独立协程 `_progress_ticker`，每隔一小段
-时间无条件往父进程发一条 `("progress", -1, monotonic)`。那个信号只在事件循环整体被
-某个未经 `to_thread` 桥出去的同步阻塞点（死锁、失控的 provider SDK 调用等）卡住时才会
-停摆——它抓不住"事件循环本身仍在正常调度、但每个 turn slot 都各自挂在一个永不返回的
-`await` 上"这种情况：ticker 协程本身跟 slot 无关，只要 loop 还能调度任务它就按时发心跳，
-哪怕全部 slot 一个 job 也claim不到/一个回合也跑不完（Task 3 的 watchdog 需要能分辨这两种
-"卡死"）。
-
-现在 progress 由 `worker.run_worker_loop`/`_slot_loop` 的 `progress_cb` 参数驱动
-（真实 slot 活动：claim 到 job、`_run_turn` 跑完、每次空转 poll 醒来）——本模块把
-`conn.send(("progress", slot_id, time.monotonic(), turn_start))` 包成这个回调传进去，
-不再有独立的计时协程。净效果：全部 slot 同时卡在一个永不返回的 `await` 上时（没有
-claim、没有 turn 完成、也没有空转唤醒，因为它们根本不是空闲——是卡住了），progress 会
-变陈旧，Task 3 的 watchdog 才能据此判定"全部 slot 永久卡死"这个验收场景。
-
-**per-turn 硬超时（曾经是死代码，现已接线）**：这条同一根 pipe 现在还额外携带
-`turn_start`——slot claim 到 job、即将进入 `_run_turn` 时的那个 `time.monotonic()`，
-turn 跑完/空转时为 `None`。`ChildSupervisor` 用它算出 `current_turn_age_sec`（父进程
-挂钟时间减去最后一次收到的 `turn_start`，见 `child_supervisor.py` 的 progress pipe 协议
-注释），喂给 `watchdog.should_kill` 的 clause (c)。这解决的是 clause (b)（全池陈旧+有活
-可抢）覆盖不到的场景：**单个** slot 卡在 `_run_turn` 里，其它 slot 仍然健康工作——
-`last_progress_age_sec` 整体依然新鲜（其它 slot 在正常发 progress），clause (b) 不会
-触发，卡住的那一个 slot 只能靠 `current_turn_age_sec`（挂钟时间持续增长，不依赖这个 slot
-之后还发不发消息）单独抓出来。
+**progress pipe 有两类信号**：`loop_heartbeat` 每 5s 证明 event loop 还能调度；slot
+`progress` 则只在 claim/idle/turn 内真实 provider、tool、compaction 边界发送，并携带固定
+`turn_start`。父进程分别维护 loop age、slot age、active-turn stall age 与 absolute age。
+所以同步阻塞会让 loop heartbeat 变旧；卡在一个永不返回的 async await 会让该 slot 的 stall
+age 变旧（即使 loop heartbeat 仍新鲜）；合法的 60/90s provider 调用、多轮工具循环和 600s
+prompt catch-up 会在边界持续刷新 stall age，却不会重置 absolute start。这个分离同时避免
+旧 45s pool-wide / 180s absolute 两种误杀，也仍能物理 SIGKILL 真正卡住的 child。
 """
 from __future__ import annotations
 
@@ -107,6 +89,40 @@ def _make_progress_cb(conn: "Connection") -> "callable":
     return _progress_cb
 
 
+async def _event_loop_heartbeat(
+    conn: "Connection",
+    stop_event: asyncio.Event,
+    *,
+    interval: float = 5.0,
+) -> None:
+    """Prove that the child event loop itself can still schedule callbacks.
+
+    This signal refreshes only the supervisor's process-level liveness clock;
+    it deliberately does not refresh any active turn's stall clock.  The two
+    signals cover different failure modes:
+
+    * a synchronous event-loop block stops this heartbeat and trips the short
+      pool-wide liveness watchdog;
+    * an ``await`` that never returns leaves the loop heartbeat healthy, but
+      its slot stops crossing provider/tool/compaction boundaries and trips
+      the per-turn stall watchdog.
+
+    Keeping them separate also prevents a normal 60-second async provider wait
+    from looking like a dead 45-second child merely because all slots happen to
+    be busy while another job is queued.
+    """
+    while not stop_event.is_set():
+        try:
+            conn.send(("loop_heartbeat", time.monotonic()))
+        except (BrokenPipeError, OSError, ValueError) as e:
+            log.info("[v2.turn_child] heartbeat pipe closed: %s", e)
+            return
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _run(conn: "Connection", worker_id: str, poll_interval: float) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -141,6 +157,7 @@ async def _run(conn: "Connection", worker_id: str, poll_interval: float) -> None
             wake_event=wake_event,
             progress_cb=_make_progress_cb(conn),
         )),
+        asyncio.create_task(_event_loop_heartbeat(conn, stop_event)),
     ]
     try:
         # run_worker_loop 已经把所有可恢复的 per-slot 故障吞在内部；能逃出来的异常代表
@@ -177,6 +194,10 @@ def main(conn: "Connection", worker_id: str, poll_interval: float | None = None)
     logging.basicConfig(level=logging.INFO)
     log.info("[v2.turn_child] child process starting pid=%s worker_id=%s", os.getpid(), worker_id)
     try:
+        # Validate before db.init_schema() creates this fresh process's lazy
+        # pool.  The parent normally exports the computed ceiling before spawn;
+        # the child repeats the check so direct invocation cannot bypass it.
+        serve_worker._configure_db_pool_capacity(v2_worker.MAX_WORKERS)
         db.init_schema()
         serve_worker.wire_assembly()
         interval = (

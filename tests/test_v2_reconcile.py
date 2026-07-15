@@ -67,13 +67,91 @@ def test_orphan_user_message_gets_a_catchup_job():
 
     with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT lane, status, reason FROM agent_jobs WHERE user_id=%s", (uid,),
+            "SELECT lane, status, reason, trace_id FROM agent_jobs WHERE user_id=%s",
+            (uid,),
         ).fetchall()
     assert len(rows) == 1
-    lane, status, reason = rows[0]
+    lane, status, reason, trace_id = rows[0]
     assert lane == "chat"
     assert status == "pending"
     assert reason == "reconcile"
+    assert trace_id == "m-orphan-1"
+
+
+def test_terminal_reconcile_job_is_a_durable_per_message_stop_marker():
+    uid = "u_reconcile_terminal"
+    seed_user(uid)
+    _mark_db_action_v2(uid)
+    _insert_user_message(uid, "m-terminal-1")
+
+    assert db.reconcile_unenqueued_v2_messages() == 1
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET status='failed',finished_at=now(),"
+            "last_error='provider_error' WHERE user_id=%s",
+            (uid,),
+        )
+
+    assert db.reconcile_unenqueued_v2_messages() == 0
+    assert db.reconcile_unenqueued_v2_messages() == 0
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT status,reason,trace_id FROM agent_jobs WHERE user_id=%s",
+            (uid,),
+        ).fetchall()
+    assert rows == [("failed", "reconcile", "m-terminal-1")]
+
+
+def test_newer_message_gets_its_own_single_reconcile_attempt():
+    uid = "u_reconcile_new_message"
+    seed_user(uid)
+    _mark_db_action_v2(uid)
+    _insert_user_message(uid, "m-old")
+    assert db.reconcile_unenqueued_v2_messages() == 1
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET status='expired',finished_at=now() "
+            "WHERE user_id=%s",
+            (uid,),
+        )
+
+    _insert_user_message(uid, "m-new")
+    assert db.reconcile_unenqueued_v2_messages() == 1
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT trace_id,status FROM agent_jobs WHERE user_id=%s "
+            "ORDER BY id",
+            (uid,),
+        ).fetchall()
+    assert rows == [("m-old", "expired"), ("m-new", "pending")]
+
+
+def test_superseded_cutover_race_does_not_consume_message_retry_marker():
+    uid = "u_reconcile_superseded"
+    seed_user(uid)
+    _mark_db_action_v2(uid)
+    _insert_user_message(uid, "m-cutover-race")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO agent_jobs "
+            "(user_id,lane,status,reason,trace_id,last_error,finished_at) "
+            "VALUES (%s,'chat','superseded','reconcile',%s,"
+            "'stale_runtime_generation',now())",
+            (uid, "m-cutover-race"),
+        )
+
+    # The earlier row never ran; after ownership returns to V2 this message is
+    # still entitled to its one real catch-up attempt.
+    assert db.reconcile_unenqueued_v2_messages() == 1
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT status,trace_id FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+    assert rows == [
+        ("superseded", "m-cutover-race"),
+        ("pending", "m-cutover-race"),
+    ]
 
 
 def test_user_with_active_chat_job_is_not_double_enqueued():
@@ -128,3 +206,22 @@ def test_resident_user_with_orphan_message_is_ignored():
             "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (uid,),
         ).fetchone()
     assert rows[0] == 0
+
+
+def test_stale_blob_mode_cannot_override_authoritative_resident_state():
+    uid = "u_reconcile_split_control"
+    seed_user(uid)
+    _mark_db_action_v2(uid)
+    _insert_user_message(uid, "m-split-1")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_runtime_state SET hosted_runtime_state='resident' "
+            "WHERE user_id=%s",
+            (uid,),
+        )
+
+    assert db.reconcile_unenqueued_v2_messages() == 0
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (uid,),
+        ).fetchone()[0] == 0

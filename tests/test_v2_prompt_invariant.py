@@ -50,6 +50,7 @@ def _reset(uid):
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
+    conftest.set_v2_runtime_owner(uid)
 
 
 def _seed_messages(uid: str, n: int) -> list[dict]:
@@ -193,6 +194,85 @@ def test_ensure_prompt_coverage_runs_inline_catchup_and_closes_gap(monkeypatch):
 
     # Post-assembly hard assertion must now pass cleanly (no raise).
     asyncio.run(worker._assert_prompt_covers(uid, tail_limit))
+
+
+def test_prompt_catchup_allows_many_bounded_batches_and_renews_lease(monkeypatch):
+    """A healthy backlog can require far more than the no-progress retry budget.
+
+    Every provider request must receive an oldest-first prefix bounded by both
+    message count and rendered chars; successful watermark movement resets the
+    retry counter, and the active job lease is renewed before the next batch.
+    """
+    uid = "u_prompt_inv_many_batches"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, covers, tail_limit = 30, 2, 4
+    messages = _seed_messages(uid, n)
+    _seed_summary(uid, covers=covers, messages=messages)
+    monkeypatch.setattr(worker, "_COMPACTION_BATCH", 3)
+    monkeypatch.setattr(worker, "_COMPACTION_BATCH_CHARS", 34)
+
+    compact_calls: list[list[dict]] = []
+
+    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+        compact_calls.append(list(old_messages))
+        return (current_summary + f"\n- folded-{len(compact_calls)}").strip()
+
+    monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
+    progress_events = []
+    monkeypatch.setattr(worker, "_report_turn_progress", progress_events.append)
+
+    lease_calls = []
+
+    def _renew(job_id, claimed_by, *, ttl_sec):
+        lease_calls.append((job_id, claimed_by, ttl_sec))
+        return True
+
+    monkeypatch.setattr(jobs_store, "renew_job_lease", _renew)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    watermark_seq, max_seq = asyncio.run(worker._ensure_prompt_coverage(
+        uid,
+        deps,
+        provider_config=_BYOK,
+        enclave_sem=None,
+        tail_limit=tail_limit,
+        job_id="job-catchup",
+        claimed_by="worker-catchup",
+    ))
+
+    assert len(compact_calls) > 3  # successful batches do not consume retry budget
+    assert progress_events.count("prompt_catchup_batch_start") == len(compact_calls)
+    assert progress_events.count("prompt_catchup_batch_complete") == len(compact_calls)
+    assert progress_events.count("prompt_catchup_watermark_write") == len(compact_calls)
+    assert len(lease_calls) == len(compact_calls)
+    assert all(call[:2] == ("job-catchup", "worker-catchup") for call in lease_calls)
+    assert all(len(batch) <= worker._COMPACTION_BATCH for batch in compact_calls)
+    assert all(
+        sum(worker._compaction_message_chars(message) for message in batch)
+        <= worker._COMPACTION_BATCH_CHARS
+        for batch in compact_calls
+    )
+
+    folded = [message for batch in compact_calls for message in batch]
+    expected = messages[covers:n - tail_limit]
+    assert [message["seq"] for message in folded] == [message["seq"] for message in expected]
+    assert watermark_seq == expected[-1]["seq"]
+    assert max_seq == messages[-1]["seq"]
+    assert not asyncio.run(worker._prompt_coverage_gap(
+        uid, watermark_seq=watermark_seq, tail_limit=tail_limit))
 
 
 def test_ensure_prompt_coverage_no_gap_is_a_noop(monkeypatch):

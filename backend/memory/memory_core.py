@@ -161,7 +161,13 @@ def threads(store, api_key, *, post_enclave) -> tuple[dict, int]:
 # write actions
 # --------------------------------------------------------------------------- #
 
-def actions(store, api_key, payload: dict) -> tuple[dict, int]:
+def actions(
+    store,
+    api_key,
+    payload: dict,
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, int]:
     acts = payload.get("actions")
     if acts is None and isinstance(payload.get("action"), dict):
         acts = [payload["action"]]
@@ -169,7 +175,8 @@ def actions(store, api_key, payload: dict) -> tuple[dict, int]:
         acts = [payload]
     if not isinstance(acts, list):
         return {"error": "actions required"}, 400
-    body, status = memory_actions_mod._execute_memory_actions(store, api_key, acts)
+    body, status = memory_actions_mod._execute_memory_actions(
+        store, api_key, acts, runtime_token=runtime_token)
     _types = [str(a.get("type") or a.get("action") or "") for a in acts if isinstance(a, dict)][:20]
     _results = body.get("results") if isinstance(body.get("results"), list) else []
     debug_trace.trace_event(

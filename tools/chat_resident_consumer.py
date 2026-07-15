@@ -90,6 +90,7 @@ import base64
 from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
+import hmac
 import inspect
 import io
 import json
@@ -1185,11 +1186,39 @@ def _empty_checkpoint_data() -> dict[str, Any]:
     return data
 
 
+_PENDING_REPLY_CHECKPOINT_FIELD = "pending_reply_retry_v1"
+_PENDING_REPLY_CHECKPOINT_AAD = b"feedling-resident-pending-reply-v1"
+
+
+class _CheckpointStateError(RuntimeError):
+    """The durable resident cursor/recovery record cannot be trusted."""
+
+
+class _CheckpointIOError(_CheckpointStateError):
+    """The durable resident checkpoint could not be read or committed."""
+
+
+def _checkpoint_runtime_error_class(exc: BaseException) -> str:
+    return (
+        "resident_checkpoint_io"
+        if isinstance(exc, _CheckpointIOError)
+        else "resident_checkpoint_corrupt"
+    )
+
+
 def _load_checkpoint_data() -> dict[str, Any]:
     try:
-        data = json.loads(CHECKPOINT_FILE.read_text())
+        raw = CHECKPOINT_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        raise _CheckpointIOError(
+            f"checkpoint read failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        data = json.loads(raw)
         if not isinstance(data, dict):
-            return {}
+            raise ValueError("checkpoint root is not an object")
         current_user_id = _checkpoint_user_id()
         stored_user_id = str(data.get("user_id") or "").strip()
         stored_fingerprint = str(data.get("api_key_fingerprint") or "").strip()
@@ -1216,16 +1245,45 @@ def _load_checkpoint_data() -> dict[str, Any]:
         }
         if stored_user_id or current_user_id:
             result["user_id"] = stored_user_id or current_user_id
+        if _PENDING_REPLY_CHECKPOINT_FIELD in data:
+            pending = data.get(_PENDING_REPLY_CHECKPOINT_FIELD)
+            if not isinstance(pending, dict):
+                raise ValueError("pending reply checkpoint is not an object")
+            # The opaque value contains only AEAD ciphertext plus nonce/version;
+            # plaintext replies, thinking, and error details never enter /tmp.
+            result[_PENDING_REPLY_CHECKPOINT_FIELD] = dict(pending)
         return result
-    except Exception:
-        return {}
+    except _CheckpointStateError:
+        raise
+    except Exception as exc:
+        raise _CheckpointStateError(
+            f"checkpoint parse failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _write_checkpoint_data(data: dict[str, Any]) -> None:
+    temp_path = CHECKPOINT_FILE.with_name(
+        f".{CHECKPOINT_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
     try:
-        CHECKPOINT_FILE.write_text(json.dumps(data))
+        # A write-ahead pending turn is a correctness boundary for non-idempotent
+        # actions.  Replace atomically so a process crash cannot leave half JSON,
+        # and keep the encrypted recovery record private even on shared hosts.
+        with temp_path.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, CHECKPOINT_FILE)
     except Exception as e:
         log.warning("checkpoint write failed: %s", e)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise _CheckpointIOError(
+            f"checkpoint write failed: {type(e).__name__}: {e}"
+        ) from e
 
 
 def _load_checkpoint() -> float:
@@ -1251,6 +1309,158 @@ def _save_proactive_checkpoint(ts: float) -> None:
     data = _load_checkpoint_data()
     data.setdefault("last_ts", 0.0)
     data["last_job_ts"] = ts
+    data["api_key_fingerprint"] = CHECKPOINT_API_KEY_FINGERPRINT
+    user_id = _checkpoint_user_id()
+    if user_id:
+        data["user_id"] = user_id
+    _write_checkpoint_data(data)
+
+
+def _pending_reply_checkpoint_key() -> bytes:
+    """Local-only AEAD key for pending turn recovery.
+
+    The API key is already required to run the resident and is never written to
+    the checkpoint.  Domain separation prevents this key from overlapping any
+    wire/content-encryption key derived elsewhere in the product.
+    """
+    return hashlib.sha256(
+        b"feedling-resident-pending-reply-key-v1\0"
+        + FEEDLING_API_KEY.encode("utf-8")
+    ).digest()
+
+
+def _pending_reply_checkpoint_plaintext(
+    key: str, prepared: dict[str, Any]
+) -> bytes:
+    notice = prepared.get("pending_failure_notice")
+    notice_data = None
+    if notice is not None:
+        notice_data = {
+            "type": type(notice).__name__,
+            "message": str(notice)[:4000],
+        }
+    safe = {
+        "key": str(key),
+        "prepared": {
+            "replies": [str(item) for item in (prepared.get("replies") or [])],
+            "reply_to_message_id": str(prepared.get("reply_to_message_id") or ""),
+            "thinking_summary": str(prepared.get("thinking_summary") or ""),
+            "thinking_kind": str(prepared.get("thinking_kind") or ""),
+            "thinking_source": str(prepared.get("thinking_source") or ""),
+            "thinking_model": str(prepared.get("thinking_model") or ""),
+            "thinking_native": prepared.get("thinking_native"),
+            "pending_failure_notice": notice_data,
+            "source_ts": float(prepared.get("source_ts") or 0.0),
+        },
+    }
+    return json.dumps(safe, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _encrypt_pending_reply_retry(
+    key: str, prepared: dict[str, Any]
+) -> dict[str, Any]:
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+    nonce = os.urandom(12)
+    ciphertext = ChaCha20Poly1305(_pending_reply_checkpoint_key()).encrypt(
+        nonce,
+        _pending_reply_checkpoint_plaintext(key, prepared),
+        _PENDING_REPLY_CHECKPOINT_AAD,
+    )
+    return {
+        "v": 1,
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        # Timestamp is routing metadata, not conversation content. Keeping it
+        # outside the ciphertext lets cursor saves prove whether it is safe to
+        # clear a completed pending record without exposing reply text.
+        "source_ts": float(prepared.get("source_ts") or 0.0),
+    }
+
+
+def _decrypt_pending_reply_retry(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+    if int(raw.get("v") or 0) != 1:
+        raise ValueError("unsupported pending reply checkpoint version")
+    plaintext = ChaCha20Poly1305(_pending_reply_checkpoint_key()).decrypt(
+        base64.b64decode(str(raw.get("nonce") or ""), validate=True),
+        base64.b64decode(str(raw.get("ciphertext") or ""), validate=True),
+        _PENDING_REPLY_CHECKPOINT_AAD,
+    )
+    decoded = json.loads(plaintext.decode("utf-8"))
+    if not isinstance(decoded, dict) or not isinstance(decoded.get("prepared"), dict):
+        raise ValueError("invalid pending reply checkpoint payload")
+    key = str(decoded.get("key") or "").strip()
+    if not key:
+        raise ValueError("pending reply checkpoint missing key")
+    saved = decoded["prepared"]
+    notice_data = saved.get("pending_failure_notice")
+    notice = None
+    if isinstance(notice_data, dict):
+        label = str(notice_data.get("type") or "RuntimeError")
+        message = str(notice_data.get("message") or "")
+        notice = RuntimeError(f"{label}: {message}" if message else label)
+    replies = saved.get("replies")
+    if not isinstance(replies, list) or any(not isinstance(item, str) for item in replies):
+        raise ValueError("pending reply checkpoint has invalid replies")
+    prepared = {
+        "replies": tuple(replies),
+        "reply_to_message_id": str(saved.get("reply_to_message_id") or ""),
+        "thinking_summary": str(saved.get("thinking_summary") or ""),
+        "thinking_kind": str(saved.get("thinking_kind") or ""),
+        "thinking_source": str(saved.get("thinking_source") or ""),
+        "thinking_model": str(saved.get("thinking_model") or ""),
+        "thinking_native": saved.get("thinking_native"),
+        "pending_failure_notice": notice,
+        "source_ts": float(saved.get("source_ts") or raw.get("source_ts") or 0.0),
+    }
+    return key, prepared
+
+
+def _persist_pending_reply_retry(key: str, prepared: dict[str, Any]) -> None:
+    try:
+        encrypted = _encrypt_pending_reply_retry(key, prepared)
+    except Exception as exc:
+        raise _CheckpointStateError(
+            "failed to encrypt pending reply recovery state: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    data = _load_checkpoint_data()
+    data.setdefault("last_ts", 0.0)
+    data.setdefault("last_job_ts", 0.0)
+    data["api_key_fingerprint"] = CHECKPOINT_API_KEY_FINGERPRINT
+    user_id = _checkpoint_user_id()
+    if user_id:
+        data["user_id"] = user_id
+    data[_PENDING_REPLY_CHECKPOINT_FIELD] = encrypted
+    _write_checkpoint_data(data)
+
+
+def _clear_pending_reply_checkpoint(
+    key: str, *, completed_ts: float | None = None
+) -> None:
+    data = _load_checkpoint_data()
+    raw = data.get(_PENDING_REPLY_CHECKPOINT_FIELD)
+    if isinstance(raw, dict):
+        try:
+            stored_key, _prepared = _decrypt_pending_reply_retry(raw)
+        except Exception as exc:
+            raise _CheckpointStateError(
+                "cannot verify pending reply checkpoint before clear: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if stored_key != key:
+            raise _CheckpointStateError(
+                "refusing to clear another pending reply "
+                f"key={stored_key} requested={key}"
+            )
+    data.pop(_PENDING_REPLY_CHECKPOINT_FIELD, None)
+    if completed_ts is not None:
+        data["last_ts"] = max(
+            float(data.get("last_ts", 0.0) or 0.0), float(completed_ts)
+        )
+    data.setdefault("last_job_ts", 0.0)
     data["api_key_fingerprint"] = CHECKPOINT_API_KEY_FINGERPRINT
     user_id = _checkpoint_user_id()
     if user_id:
@@ -1362,6 +1572,89 @@ def _mark_seen(key: str) -> bool:
     if len(_seen_ids_order) > _SEEN_MAX:
         _seen_ids.discard(_seen_ids_order.pop(0))
     return True
+
+
+def _cache_pending_reply_retry(key: str, prepared: dict[str, Any]) -> bool:
+    """Keep one already-executed turn for reply-only redelivery.
+
+    The provider call and agent actions may be non-idempotent (notably
+    ``memory.add``), so a terminal chat write failure must retry the stable
+    delivery ids without re-running either layer. The cache is deliberately
+    bounded like ``_seen_ids``; durable checkpointing remains the source of
+    truth across process restarts.
+    """
+    global _pending_reply_retry_checkpoint_loaded
+    if key not in _pending_reply_retries:
+        if len(_pending_reply_retry_order) >= _PENDING_REPLY_RETRY_MAX:
+            # Never evict an unresolved turn into `_seen_ids`: that silently
+            # advances its checkpoint on redelivery. Production is single-flight
+            # and stops at the first unresolved turn, so this is a defensive
+            # fail-closed boundary rather than an expected queueing path.
+            log.critical(
+                "pending reply retry cache full; refusing new key=%s without eviction",
+                key,
+            )
+            _seen_ids.discard(key)
+            try:
+                _seen_ids_order.remove(key)
+            except ValueError:
+                pass
+            return False
+        _pending_reply_retry_order.append(key)
+    _pending_reply_retries[key] = prepared
+    _pending_reply_retry_checkpoint_loaded = True
+    _persist_pending_reply_retry(key, prepared)
+    return True
+
+
+def _drop_pending_reply_retry(
+    key: str, *, completed_ts: float | None = None
+) -> None:
+    # Any trust/durability failure raises and leaves the in-memory prepared turn
+    # intact. The process must exit visibly; retrying in-place would wedge every
+    # newer message behind a checkpoint that can never be advanced safely.
+    _clear_pending_reply_checkpoint(key, completed_ts=completed_ts)
+    _pending_reply_retries.pop(key, None)
+    try:
+        _pending_reply_retry_order.remove(key)
+    except ValueError:
+        pass
+
+
+def _restore_pending_reply_retry() -> None:
+    global _pending_reply_retry_checkpoint_loaded, _pending_reply_retry_restore_error
+    if _pending_reply_retry_checkpoint_loaded:
+        return
+    _pending_reply_retry_checkpoint_loaded = True
+    try:
+        raw = _load_checkpoint_data().get(_PENDING_REPLY_CHECKPOINT_FIELD)
+    except _CheckpointStateError as exc:
+        _pending_reply_retry_restore_error = str(exc)
+        log.critical(
+            "resident checkpoint is unreadable; refusing to process turns: %s",
+            exc,
+        )
+        return
+    if not isinstance(raw, dict):
+        return
+    try:
+        key, prepared = _decrypt_pending_reply_retry(raw)
+    except Exception as exc:
+        _pending_reply_retry_restore_error = (
+            f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        )
+        log.critical(
+            "pending reply recovery state is unreadable; refusing to process newer turns: %s",
+            exc,
+        )
+        return
+    _pending_reply_retries[key] = prepared
+    if key not in _pending_reply_retry_order:
+        _pending_reply_retry_order.append(key)
+    _seen_ids.add(key)
+    if key not in _seen_ids_order:
+        _seen_ids_order.append(key)
+    log.warning("restored pending reply-only retry key=%s", key)
 
 
 # ---------------------------------------------------------------------------
@@ -5216,6 +5509,11 @@ _whoami_cache: dict = {
 # keys; 0.0 until the first success so the first reply still fetches.
 _whoami_cache_loaded_at: float = 0.0
 
+
+class _AgentActionPreflightRejectedError(RuntimeError):
+    """Local validation rejected the action before any endpoint was called."""
+
+
 def execute_identity_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
@@ -5263,7 +5561,11 @@ def execute_agent_actions(actions: list[dict]) -> dict:
         else:
             unsupported.append(action_type)
     if unsupported:
-        raise RuntimeError(f"unsupported_agent_actions:{unsupported}")
+        # No endpoint has been called yet, so this is a definite rejection rather
+        # than an ambiguous transport outcome.
+        raise _AgentActionPreflightRejectedError(
+            f"unsupported_agent_actions:{unsupported}"
+        )
     identity_result = execute_identity_actions(identity_actions)
     memory_result = execute_memory_actions(memory_actions)
     return {
@@ -5280,6 +5582,19 @@ def _identity_action_failure_reply(source_message: str) -> str:
     return "I could not write that update, so I will not pretend it changed."
 
 
+def _identity_action_indeterminate_reply(source_message: str) -> str:
+    """Honest recovery text for a crash during a non-idempotent action call."""
+    if re.search(r"[\u4e00-\u9fff]", source_message or ""):
+        return (
+            "我没法确认刚才的更新是否已经写入，所以不会自动重试，避免重复修改。"
+            "请先检查一下，再决定是否重试。"
+        )
+    return (
+        "I could not confirm whether that update finished, so I will not retry it "
+        "automatically and risk applying it twice. Please check before retrying."
+    )
+
+
 def _identity_action_success_reply(source_message: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", source_message or ""):
         return "改好了。"
@@ -5290,6 +5605,11 @@ def _identity_action_success_reply(source_message: str) -> str:
 # restart with a stale checkpoint or if poll races with checkpoint save.
 _seen_ids: set[str] = set()
 _seen_ids_order: list[str] = []
+_PENDING_REPLY_RETRY_MAX = 256
+_pending_reply_retries: dict[str, dict[str, Any]] = {}
+_pending_reply_retry_order: list[str] = []
+_pending_reply_retry_checkpoint_loaded = False
+_pending_reply_retry_restore_error = ""
 _SEEN_MAX = 500
 
 # Persisted agent conversation session id (for CLI agents like Hermes), keyed by user_id.
@@ -6007,6 +6327,7 @@ def post_reply(
     thinking_native: bool | None = None,
     role: str = "",
     notice_kind: str = "",
+    delivery_id: str = "",
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -6041,6 +6362,7 @@ def post_reply(
             user_pk_bytes=user_pk,
             enclave_pk_bytes=enc_pk,
             visibility=visibility,
+            item_id=(delivery_id or None),
         )
         thinking_envelope = None
         safe_thinking = _sanitize_thinking_summary(thinking_summary)
@@ -6077,6 +6399,8 @@ def post_reply(
             body["notice_kind"] = notice_kind
         if reply_to_message_id:
             body["reply_to_message_id"] = reply_to_message_id
+        if delivery_id:
+            body["resident_delivery_id"] = delivery_id
         if gate_decision_id:
             body["gate_decision_id"] = gate_decision_id
         if proactive_job_id:
@@ -6108,6 +6432,7 @@ def post_reply(
             "gate_decision_id": gate_decision_id,
             "proactive_job_id": proactive_job_id,
             "reply_to_message_id": reply_to_message_id,
+            "resident_delivery_id": delivery_id,
             "thinking_summary": _sanitize_thinking_summary(thinking_summary),
             "thinking_kind": _sanitize_thinking_kind(thinking_kind),
             "thinking_source": _sanitize_thinking_meta(thinking_source, max_len=80),
@@ -6119,6 +6444,25 @@ def post_reply(
         headers=_HEADERS, timeout=15,
     )
     return _handle_post_reply_response(resp)
+
+
+def _resident_reply_delivery_id(parent_message_id: str, slot: str) -> str:
+    """Stable opaque idempotency key for one resident turn bubble.
+
+    Intermediate ordinals and the terminal bubble use separate namespaces, so
+    a retry that changes the number of intermediate bubbles still converges on
+    one terminal reply. The API key makes the deterministic value opaque to
+    observers while keeping it stable across resident process restarts.
+    """
+    material = (
+        "feedling-resident-reply-v1\0"
+        + str(parent_message_id or "")
+        + "\0"
+        + str(slot or "")
+    ).encode("utf-8")
+    return hmac.new(
+        FEEDLING_API_KEY.encode("utf-8"), material, hashlib.sha256
+    ).hexdigest()[:32]
 
 
 def _handle_post_reply_response(resp) -> dict:
@@ -6143,6 +6487,12 @@ def _handle_post_reply_response(resp) -> dict:
                 body.get("memory_count"),
                 body.get("identity_written"),
             )
+            return body
+        if body.get("error") == "already_answered":
+            # This is an authoritative terminal outcome: another responder (or
+            # the same delivery replayed after cutover) already won the parent
+            # CAS. Returning the structured body lets the caller clear recovery
+            # state and advance without emitting a duplicate failure notice.
             return body
     resp.raise_for_status()
     try:
@@ -8482,10 +8832,102 @@ def _quoted_memory_context(msg: dict) -> str:
     )
 
 
+def _post_prepared_replies(prepared: dict[str, Any]) -> tuple[bool, bool]:
+    """Post an already action-processed turn using stable delivery ids.
+
+    Returns ``(terminal_reply_posted, terminal_response_error)``. Keeping this
+    operation separate lets a redelivery retry only the failed durable chat
+    write; it never calls the provider or repeats agent actions.
+    """
+    replies = list(prepared.get("replies") or [])
+    reply_to_message_id = str(prepared.get("reply_to_message_id") or "")
+    terminal_reply_posted = False
+    terminal_response_error = False
+    for idx, reply in enumerate(replies):
+        is_terminal_reply = idx == len(replies) - 1
+        try:
+            post_kwargs: dict[str, Any] = {}
+            if reply_to_message_id:
+                slot = "terminal" if is_terminal_reply else f"intermediate:{idx}"
+                post_kwargs["delivery_id"] = _resident_reply_delivery_id(
+                    reply_to_message_id, slot)
+                # Only the terminal bubble consumes the parent's one-answer
+                # CAS. Intermediate progress bubbles remain fenced writes.
+                if is_terminal_reply:
+                    post_kwargs["reply_to_message_id"] = reply_to_message_id
+            if idx == 0 and prepared.get("thinking_summary"):
+                post_kwargs["thinking_summary"] = prepared["thinking_summary"]
+                post_kwargs["thinking_kind"] = prepared.get("thinking_kind") or ""
+                post_kwargs["thinking_source"] = prepared.get("thinking_source") or ""
+                post_kwargs["thinking_model"] = prepared.get("thinking_model") or ""
+                post_kwargs["thinking_native"] = prepared.get("thinking_native")
+            result = post_reply(reply, **post_kwargs)
+            if isinstance(result, dict) and result.get("error"):
+                if result.get("error") in {"bootstrap_incomplete", "already_answered"}:
+                    terminal_response_error = True
+                    log.error(
+                        "reply reached terminal response error=%s; advancing without retry",
+                        result.get("error"),
+                    )
+                    break
+                raise RuntimeError(str(result)[:500])
+            if is_terminal_reply:
+                terminal_reply_posted = True
+            log.info("reply sent: %s", reply[:80])
+        except Exception as exc:
+            log.error("failed to post reply: %s", exc)
+            # Preserve bubble ordering. If an intermediate write is uncertain,
+            # do not let the terminal overtake it; retry the complete prepared
+            # sequence (server-side stable delivery ids dedupe accepted bubbles).
+            break
+    return terminal_reply_posted, terminal_response_error
+
+
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
     global _last_user_message_wall
     latest = 0.0
+    _restore_pending_reply_retry()
+    if _pending_reply_retry_restore_error:
+        error = _CheckpointStateError(_pending_reply_retry_restore_error)
+        _report_runtime_error(str(error), _checkpoint_runtime_error_class(error))
+        raise error
+    if _pending_reply_retry_order:
+        oldest_pending = _pending_reply_retry_order[0]
+        batch_keys = [
+            _msg_key(item)
+            for item in messages
+            if isinstance(item, dict) and item.get("role") == "user"
+        ]
+        if oldest_pending not in batch_keys:
+            # A terminal insert may have committed even though its HTTP response
+            # was lost. In that case the parent is already marked replied and the
+            # poll endpoint will correctly NEVER redeliver it. Retry the encrypted
+            # prepared turn directly before touching newer messages: the stable
+            # delivery id yields an idempotent replay/already_answered response.
+            log.warning(
+                "retrying pending reply key=%s ahead of newer chat batch",
+                oldest_pending,
+            )
+            prepared = _pending_reply_retries[oldest_pending]
+            replies = list(prepared.get("replies") or [])
+            if not replies:
+                log.critical(
+                    "pending reply key=%s has no prepared replies; refusing checkpoint advance",
+                    oldest_pending,
+                )
+                return latest
+            terminal_reply_posted, terminal_response_error = (
+                _post_prepared_replies(prepared)
+            )
+            if not terminal_reply_posted and not terminal_response_error:
+                return latest
+            source_ts = float(prepared.get("source_ts") or 0.0)
+            _drop_pending_reply_retry(oldest_pending, completed_ts=source_ts)
+            pending_notice = prepared.get("pending_failure_notice")
+            if pending_notice is not None and terminal_reply_posted:
+                _notify_agent_turn_failure(pending_notice, foreground=True)
+            latest = max(latest, source_ts)
     for msg in messages:
         # Tolerate both "ts" and "timestamp" key names across API versions.
         ts = float(msg.get("ts", msg.get("timestamp", 0)) or 0)
@@ -8496,6 +8938,22 @@ def _process_messages(messages: list) -> float:
 
         # Idempotency — skip messages already processed in this session.
         key = _msg_key(msg)
+        pending_retry = _pending_reply_retries.get(key)
+        if pending_retry is not None:
+            terminal_reply_posted, terminal_response_error = (
+                _post_prepared_replies(pending_retry)
+            )
+            replies = list(pending_retry.get("replies") or [])
+            if replies and not terminal_reply_posted and not terminal_response_error:
+                # Keep both the durable checkpoint and prepared turn behind this
+                # message; the next poll retries only the stable reply writes.
+                return latest
+            _drop_pending_reply_retry(key, completed_ts=ts)
+            pending_notice = pending_retry.get("pending_failure_notice")
+            if pending_notice is not None and terminal_reply_posted:
+                _notify_agent_turn_failure(pending_notice, foreground=True)
+            latest = max(latest, ts)
+            continue
         if not _mark_seen(key):
             log.debug("skipping already-processed message key=%s", key)
             latest = max(latest, ts)
@@ -8579,6 +9037,7 @@ def _process_messages(messages: list) -> float:
             continue
 
         content = msg.get("content", "").strip()
+        source_message_text = content
         content_type = msg.get("content_type", "text")
         image_payloads: list[dict[str, str]] = []
         image_paths: list[str] = []
@@ -8710,7 +9169,7 @@ def _process_messages(messages: list) -> float:
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
-        # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
+        # 服务端接受 terminal reply 后再发（Codex review）：claim 过期 failover 时另
         # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
         # 发就成了重复错误气泡。让通知与回复共享同一份排他性。
         pending_failure_notice: BaseException | None = None
@@ -8773,55 +9232,94 @@ def _process_messages(messages: list) -> float:
                 action for action in actions
                 if _proactive_action_type(action).removeprefix("proactive.") != "needs_background"
             ]
+        reply_to_message_id = str(
+            msg.get("id") or msg.get("message_id") or ""
+        ).strip()
         if actions:
-            try:
-                action_result = execute_agent_actions(actions)
-                log.info(
-                    "agent action(s) executed count=%d effects=%d",
-                    len(actions),
-                    len(action_result.get("effects") or []),
+            # Write-ahead recovery makes action execution at-most-once across a
+            # resident crash. If the process dies after the API accepts a
+            # memory.add but before the terminal chat write, restart posts this
+            # honest indeterminate/failure reply and NEVER calls the action API
+            # again. Once the action returns, the prepared reply is replaced
+            # durably below before any chat write is attempted.
+            action_recovery_reply = {
+                "replies": (_identity_action_indeterminate_reply(source_message_text),),
+                "reply_to_message_id": reply_to_message_id,
+                "thinking_summary": turn.thinking_summary,
+                "thinking_kind": turn.thinking_kind,
+                "thinking_source": turn.thinking_source,
+                "thinking_model": turn.thinking_model,
+                "thinking_native": turn.thinking_native,
+                "pending_failure_notice": pending_failure_notice,
+                "source_ts": ts,
+            }
+            action_write_ahead_ok = _cache_pending_reply_retry(
+                key, action_recovery_reply
+            )
+            if key not in _pending_reply_retries:
+                # Defensive cache-pressure path: no action has run, the seen
+                # marker was removed, and stopping here lets redelivery retry.
+                return latest
+            if not action_write_ahead_ok:
+                log.error(
+                    "action recovery checkpoint unavailable; refusing non-idempotent actions"
                 )
-                if not replies:
-                    replies = [_identity_action_success_reply(content)]
-            except Exception as e:
-                log.error("agent action execution failed; suppressing optimistic agent reply: %s", e)
-                replies = [_identity_action_failure_reply(content)]
+                replies = [_identity_action_failure_reply(source_message_text)]
+            else:
+                try:
+                    action_result = execute_agent_actions(actions)
+                    log.info(
+                        "agent action(s) executed count=%d effects=%d",
+                        len(actions),
+                        len(action_result.get("effects") or []),
+                    )
+                    if not replies:
+                        replies = [_identity_action_success_reply(source_message_text)]
+                except _AgentActionPreflightRejectedError as e:
+                    log.error(
+                        "agent action request was rejected; suppressing optimistic reply: %s",
+                        e,
+                    )
+                    replies = [_identity_action_failure_reply(source_message_text)]
+                except Exception as e:
+                    # Transport loss, 5xx, invalid success payloads, and partial
+                    # multi-endpoint execution cannot prove whether an update
+                    # committed. Never turn that uncertainty into a false denial.
+                    log.error(
+                        "agent action outcome is indeterminate; suppressing optimistic reply: %s",
+                        e,
+                    )
+                    replies = [_identity_action_indeterminate_reply(source_message_text)]
 
-        reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
-        posted_any = False
-        terminal_response_error = False
-        for idx, reply in enumerate(replies):
-            try:
-                post_kwargs = {}
-                if reply_to_message_id:
-                    post_kwargs["reply_to_message_id"] = reply_to_message_id
-                if idx == 0 and turn.thinking_summary:
-                    post_kwargs["thinking_summary"] = turn.thinking_summary
-                    post_kwargs["thinking_kind"] = turn.thinking_kind
-                    post_kwargs["thinking_source"] = turn.thinking_source
-                    post_kwargs["thinking_model"] = turn.thinking_model
-                    post_kwargs["thinking_native"] = turn.thinking_native
-                result = post_reply(reply, **post_kwargs)
-                if isinstance(result, dict) and result.get("error"):
-                    if result.get("error") == "bootstrap_incomplete":
-                        terminal_response_error = True
-                        log.error("reply rejected by bootstrap gate; advancing past this dead-end message")
-                        continue
-                    raise RuntimeError(str(result)[:500])
-                posted_any = True
-                log.info("reply sent: %s", reply[:80])
-            except Exception as e:
-                log.error("failed to post reply: %s", e)
+        prepared_reply = {
+            "replies": tuple(replies),
+            "reply_to_message_id": reply_to_message_id,
+            "thinking_summary": turn.thinking_summary,
+            "thinking_kind": turn.thinking_kind,
+            "thinking_source": turn.thinking_source,
+            "thinking_model": turn.thinking_model,
+            "thinking_native": turn.thinking_native,
+            "pending_failure_notice": pending_failure_notice,
+            "source_ts": ts,
+        }
+        if replies:
+            _cache_pending_reply_retry(key, prepared_reply)
+            if key not in _pending_reply_retries:
+                return latest
+        terminal_reply_posted, terminal_response_error = (
+            _post_prepared_replies(prepared_reply)
+        )
 
-        if replies and not posted_any and not terminal_response_error:
-            # Keep checkpoint behind this message. The server-side claim lease
-            # will expire, allowing this or another responder to retry instead
-            # of permanently dropping a user turn after a transient write error.
-            # pending_failure_notice 随之丢弃：本家的回复没被接受（含 already_
-            # answered 409 failover），错误通知由真正被接受的那次尝试来发。
-            continue
+        if replies and not terminal_reply_posted and not terminal_response_error:
+            # Stop the batch here. Processing a newer turn would move the
+            # timestamp cursor beyond this one and make the redelivery floor
+            # classify the unresolved parent as superseded.
+            return latest
 
-        if pending_failure_notice is not None and posted_any:
+        if replies:
+            _drop_pending_reply_retry(key, completed_ts=ts)
+
+        if pending_failure_notice is not None and terminal_reply_posted:
             _notify_agent_turn_failure(pending_failure_notice, foreground=True)
 
         latest = max(latest, ts)
@@ -9458,7 +9956,22 @@ def run() -> None:
             "Set FEEDLING_ENCLAVE_URL (direct enclave) to fix this."
         )
 
-    last_ts = _load_checkpoint()
+    try:
+        last_ts = _load_checkpoint()
+    except _CheckpointStateError as exc:
+        _report_runtime_error(str(exc), _checkpoint_runtime_error_class(exc))
+        log.critical("resident checkpoint cannot be trusted; exiting: %s", exc)
+        raise
+
+    # Validate/decrypt pending recovery before history seeding or any checkpoint
+    # save. Otherwise malformed state could be mistaken for a fresh install and
+    # overwritten, erasing the only evidence of an already-executed action.
+    _restore_pending_reply_retry()
+    if _pending_reply_retry_restore_error:
+        exc = _CheckpointStateError(_pending_reply_retry_restore_error)
+        _report_runtime_error(str(exc), "resident_checkpoint_corrupt")
+        log.critical("pending reply recovery cannot be trusted; exiting: %s", exc)
+        raise exc
 
     if last_ts == 0.0:
         try:
@@ -9467,13 +9980,18 @@ def run() -> None:
         except Exception as e:
             log.warning("could not seed from history: %s", e)
 
-    _save_checkpoint(last_ts)
+    try:
+        _save_checkpoint(last_ts)
+        last_job_ts = _load_proactive_checkpoint()
+    except _CheckpointStateError as exc:
+        _report_runtime_error(str(exc), _checkpoint_runtime_error_class(exc))
+        log.critical("resident checkpoint initialization failed; exiting: %s", exc)
+        raise
     # Wedge guard: consecutive poll cycles where the claimed ids never show up in
     # decrypt history, keyed on the cursor they're stuck behind (see
     # _advance_past_unfetchable). After CHAT_POLL_WEDGE_SKIP_AFTER we skip past them.
     wedge_miss_ts: float | None = None
     wedge_miss_count = 0
-    last_job_ts = _load_proactive_checkpoint()
     proactive_enabled = PROACTIVE_POLL_ENABLED
     # Unconditional: see the resident-distill contract note above. Only the 404
     # capability probe below may flip this off for the process lifetime.
@@ -9482,7 +10000,14 @@ def run() -> None:
         # Start from "now" on first boot so historical hidden jobs are not
         # replayed after an operator installs the consumer.
         last_job_ts = time.time()
-        _save_proactive_checkpoint(last_job_ts)
+        try:
+            _save_proactive_checkpoint(last_job_ts)
+        except _CheckpointStateError as exc:
+            _report_runtime_error(str(exc), _checkpoint_runtime_error_class(exc))
+            log.critical(
+                "initial proactive checkpoint write failed; exiting: %s", exc
+            )
+            raise
     last_broadcast_state = ""
     next_proactive_tick_mono = time.monotonic() + max(0, PROACTIVE_TICK_START_DELAY_SEC)
     scheduled_fire_enabled = proactive_enabled and PROACTIVE_SCHEDULED_FIRE_ENABLED
@@ -9776,6 +10301,10 @@ def run() -> None:
                     sys.exit(1)
             consecutive_errors += 1
             time.sleep(min(2 ** consecutive_errors, 60))
+        except _CheckpointStateError as e:
+            _report_runtime_error(str(e), _checkpoint_runtime_error_class(e))
+            log.critical("resident checkpoint became untrustworthy; exiting: %s", e)
+            raise
         except Exception as e:
             log.error("poll error: %s", e)
             consecutive_errors += 1

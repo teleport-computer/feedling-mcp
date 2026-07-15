@@ -23,13 +23,12 @@ import pytest
 import conftest
 import db
 import provider_client
+from provider_types import ToolExchange
 from capabilities import registry as cap_registry
 from core import store as core_store
-from model_api_runtime.v2 import agent_loop as v2_agent_loop
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
-from model_api_runtime.v2 import invalidation as v2_inval
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import planner as v2_planner
 from model_api_runtime.v2 import responder as v2_responder
@@ -54,6 +53,7 @@ def _reset(uid):
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
+    conftest.set_v2_runtime_owner(uid)
 
 
 _BYOK = provider_client.ProviderConfig(
@@ -533,7 +533,11 @@ def test_process_job_picks_up_concurrent_new_message_via_per_round_fold(monkeypa
     assert status == "completed"
     assert len(calls) == 2               # exactly the scripted 2 rounds, no restart
     # round 1's messages carry the folded-in second message's content.
-    assert any("second" in str(m.get("content", "")) for m in calls[1]["messages"])
+    assert any(
+        "second" in str(m.get("content", ""))
+        for m in calls[1]["messages"]
+        if isinstance(m, dict)
+    )
     assert written["text"] == "R"
     assert _job_status(job_id)[0] == "completed"
     # The DURABLE seq reply cursor advances to the fold's max seq (2) — the turn
@@ -548,6 +552,66 @@ def test_process_job_picks_up_concurrent_new_message_via_per_round_fold(monkeypa
 
 def _status_events(uid):
     return jobs_store.list_status_events(uid, after_id=0, limit=100)
+
+
+def test_final_drain_uncertain_delivery_surfaces_without_rewriting_completed_job(
+    monkeypatch,
+):
+    """A generic effect can become uncertain only in the final drain.
+
+    The final reply and job transition are already durable at that point, so
+    the worker preserves ``completed`` while still emitting an error status
+    and updating the hosted error hook with a sanitized stable code.
+    """
+    uid = "u_w_final_drain_uncertain"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    _script_provider(monkeypatch, [_text_round("reply already durable")])
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r-final"}
+    )
+
+    apply_calls = {"n": 0}
+
+    def apply_then_find_uncertain(user_id):
+        apply_calls["n"] += 1
+        if apply_calls["n"] == 1:
+            return _apply_effects(user_id)  # immediate final-reply drain succeeds
+        raise db.EffectDeliveryUncertainError(
+            "raw target details must never reach the client"
+        )
+
+    recorded: list[tuple[str, str]] = []
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 5.0, "role": "user", "content": "hi"}]
+    )
+    deps.apply_pending_effects = apply_then_find_uncertain
+    deps.record_terminal_error = (
+        lambda user_id, message: recorded.append((user_id, message))
+    )
+
+    result = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            is_official=False,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert result == "completed"
+    assert _job_status(job_id)[0] == "completed"
+    assert apply_calls["n"] == 2
+    error_events = [e for e in _status_events(uid) if e["kind"] == "error"]
+    assert len(error_events) == 1
+    assert error_events[0]["job_id"] == job_id
+    assert recorded[-1] == (uid, "effect_delivery_uncertain")
+    assert all("raw target details" not in message for _uid, message in recorded)
 
 
 def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monkeypatch):
@@ -625,6 +689,70 @@ def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
     assert status == "failed"
     events = _status_events(uid)
     assert any(e["kind"] == "error" for e in events)
+
+
+def test_process_job_post_claim_kill_switch_failure_surfaces_terminal_error(monkeypatch):
+    """An accepted chat can observe the live kill switch only after claim.
+    When this worker owns the failed transition, that terminal result must be
+    visible through both the status stream and hosted last_runtime_error hook."""
+    uid = "u_w_post_claim_halted"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(worker.kill_switch, "turns_halted", lambda: True)
+    recorded = []
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: (_ for _ in ()).throw(
+            AssertionError("halted turn must not read input")),
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        record_terminal_error=lambda user_id, message: recorded.append((user_id, message)),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert _job_status(job_id) == ("failed", "turns_halted")
+    error_events = [e for e in _status_events(uid) if e["kind"] == "error"]
+    assert len(error_events) == 1
+    assert error_events[0]["job_id"] == job_id
+    assert recorded == [(uid, "turns_halted")]
+
+
+def test_process_job_post_claim_runtime_mode_change_surfaces_terminal_error(monkeypatch):
+    """A user rollback racing an already-claimed chat has the same visible
+    terminal contract as other owned chat failures; it cannot fail silently."""
+    uid = "u_w_post_claim_mode_changed"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(worker.kill_switch, "turns_halted", lambda: False)
+    recorded = []
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: (_ for _ in ()).throw(
+            AssertionError("rolled-back turn must not read input")),
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        is_official=lambda cfg: False,
+        mint_enclave_token=lambda uid_: "rt",
+        record_terminal_error=lambda user_id, message: recorded.append((user_id, message)),
+        runtime_mode_enabled=lambda user_id: False,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert _job_status(job_id) == ("failed", "runtime_mode_changed")
+    error_events = [e for e in _status_events(uid) if e["kind"] == "error"]
+    assert len(error_events) == 1
+    assert error_events[0]["job_id"] == job_id
+    assert recorded == [(uid, "runtime_mode_changed")]
 
 
 def test_run_turn_provider_resolve_failure_emits_error_status_and_callback(monkeypatch):
@@ -757,10 +885,13 @@ def test_run_turn_resolves_provider_exactly_once_even_across_a_replan(monkeypatc
         resolve_calls["n"] += 1
         return _BYOK, {}
 
+    def _obsolete_classifier(_cfg):
+        raise AssertionError("production must not pre-classify model providers")
+
     deps = worker.TurnDeps(
         read_messages=lambda uid: next(feed),
         resolve_provider=_resolve,
-        is_official=lambda cfg: False,
+        is_official=_obsolete_classifier,
         mint_enclave_token=lambda uid: "rt",
         apply_pending_effects=_apply_effects,
     )
@@ -1578,7 +1709,7 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
     assert written.get("text") == "MODEL REPLY"       # forced reply at the cap — no silent swallow
 
 
-def test_second_round_receives_first_round_tool_observation(monkeypatch):
+def test_second_round_receives_first_round_native_tool_exchange(monkeypatch):
     """Successor of the old planner-prior_action_results test: in the unified
     loop, a read tool's result is fed back as grounding context to the NEXT
     round's `build_messages` call (Global Constraints "reads run parallel,
@@ -1604,10 +1735,10 @@ def test_second_round_receives_first_round_tool_observation(monkeypatch):
 
     assert status == "completed"
     assert len(calls) == 2
-    round0_joined = " ".join(str(m.get("content", "")) for m in calls[0]["messages"])
-    round1_joined = " ".join(str(m.get("content", "")) for m in calls[1]["messages"])
-    assert "OBSERVED_MEMORY_INDEX" not in round0_joined  # round 0: nothing observed yet
-    assert "OBSERVED_MEMORY_INDEX" in round1_joined       # round 1: the observation was fed back
+    assert not any(isinstance(m, ToolExchange) for m in calls[0]["messages"])
+    exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
+    assert len(exchanges) == 1
+    assert "OBSERVED_MEMORY_INDEX" in " ".join(r.content for r in exchanges[0].results)
 
 
 def test_turn_llm_call_budget_binds_even_with_continuous_new_input(monkeypatch):
@@ -1868,6 +1999,95 @@ def test_slot_loop_progress_cb_reports_turn_start_at_claim_and_none_after_comple
     second_slot_id, second_turn_start = calls[1]
     assert second_slot_id == 3
     assert second_turn_start is None
+
+
+def test_slot_loop_in_turn_boundaries_refresh_same_turn_stall_clock(monkeypatch):
+    """Deep helpers report progress through the slot-local context callback.
+
+    Every in-turn boundary must carry the original turn_start (absolute clock
+    stays fixed) while producing a fresh pipe message (stall clock refreshes).
+    """
+    stop = asyncio.Event()
+    claims = {"n": 0}
+
+    def _claim(worker_id, lanes=None):
+        claims["n"] += 1
+        if claims["n"] == 1:
+            return {"id": "job-progress", "user_id": "u", "lane": "chat",
+                    "claimed_by": worker_id}
+        stop.set()
+        return None
+
+    async def _run_turn_stub(_job, _deps):
+        worker._report_turn_progress("provider_complete")
+        worker._report_turn_progress("prompt_catchup_batch_complete")
+
+    monkeypatch.setattr(jobs_store, "claim_next_job", _claim)
+    monkeypatch.setattr(worker, "_run_turn", _run_turn_stub)
+    events = []
+
+    asyncio.run(worker._slot_loop(
+        "w-in-turn-progress", poll_interval=0.001, stop_event=stop,
+        deps=_ok_deps({}), slot_id=4,
+        progress_cb=lambda slot_id, turn_start=None: events.append(
+            (slot_id, turn_start))))
+
+    active = [event for event in events if event[1] is not None]
+    assert len(active) == 3  # claim plus two real in-turn boundaries
+    assert {event[0] for event in active} == {4}
+    assert len({event[1] for event in active}) == 1  # absolute start never resets
+    assert any(turn_start is None for _slot, turn_start in events)
+
+
+def test_active_job_lease_keeper_renews_until_stopped(monkeypatch):
+    calls = []
+
+    def _renew(job_id, claimed_by, *, ttl_sec):
+        calls.append((job_id, claimed_by, ttl_sec))
+        return True
+
+    monkeypatch.setattr(jobs_store, "renew_job_lease", _renew)
+
+    async def _driver():
+        stop = asyncio.Event()
+        task = asyncio.create_task(worker._keep_active_job_lease(
+            "job-long", "worker-long", stop, interval=0.005))
+        for _ in range(100):
+            if len(calls) >= 2:
+                break
+            await asyncio.sleep(0.002)
+        stop.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(_driver())
+    assert len(calls) >= 2
+    assert all(call == ("job-long", "worker-long", jobs_store.RUNNING_TTL_SEC)
+               for call in calls)
+
+
+def test_compaction_reliable_attempts_refresh_turn_progress(monkeypatch):
+    progress = []
+    monkeypatch.setattr(worker, "_report_turn_progress", progress.append)
+
+    async def _fake_reliable(*args, progress_cb=None, **kwargs):
+        assert progress_cb is not None
+        progress_cb("attempt_start", 1)
+        progress_cb("attempt_failed", 1)
+        progress_cb("attempt_start", 2)
+        progress_cb("attempt_complete", 2)
+        return {"reply": "- folded"}
+
+    monkeypatch.setattr(
+        worker.provider_client, "reliable_chat_completion_async", _fake_reliable)
+    result = asyncio.run(worker._compaction_llm_with_progress("cfg", []))
+
+    assert result == {"reply": "- folded"}
+    assert progress == [
+        "compaction_provider_attempt_start_1",
+        "compaction_provider_attempt_failed_1",
+        "compaction_provider_attempt_start_2",
+        "compaction_provider_attempt_complete_2",
+    ]
 
 
 def test_chat_lane_still_takes_the_chat_path(monkeypatch):

@@ -1,10 +1,11 @@
-# docker-compose.phala.prod.runner.yaml — STANDALONE prod agent-runner CVM (Form B)
+# docker-compose.phala.prod.runner.yaml — dedicated prod runtime CVM (Form B)
 #
-# ONE runner per CVM (deliberate — see below). A separate Phala CVM that runs a
-# SINGLE agent-runner supervisor: no backend, no enclave, no ingress. It hosts the
-# API-user resident consumers OFF the main prod CVM, which (measured 2026-07-02)
-# was RAM-saturated running 99 consumers (~6.4GB) alongside backend+enclave on one
-# 15GB box (≈1.1GB free). Moving hosting here frees the main CVM.
+# ONE resident runner per CVM (deliberate — see below), plus one sibling Hosted
+# Runtime V2 serve-worker. This separate Phala CVM has no FastAPI backend, enclave,
+# or ingress. It hosts both runtime generations OFF the main prod CVM, which
+# (measured 2026-07-02) was RAM-saturated running 99 consumers (~6.4GB) alongside
+# backend+enclave on one 15GB box (≈1.1GB free). Moving hosting here frees the
+# main CVM.
 #
 # ── Why ONE runner per CVM (not N containers per CVM) ──────────────────────────
 #   A single supervisor already hosts ~99 users fine (that's exactly what the main
@@ -27,8 +28,9 @@
 #
 # ── Capacity ───────────────────────────────────────────────────────────────────
 #   AGENT_MAX_CHILDREN = 0 (UNBOUNDED) per runner. The main prod CVM's inline
-#   agent-runner has been removed, so this runner CVM is the ONLY host: a fixed cap
-#   could leave users beyond it unserved (the send guard does not capacity-gate),
+#   resident agent-runner has been removed, so the dedicated runner fleet is the
+#   ONLY resident host (and also carries the V2 sibling): a fixed cap could leave
+#   resident users beyond it unserved (the send guard does not capacity-gate),
 #   so 0 lets one runner hold everyone AND absorb future growth. Capacity ref:
 #   measured ~65MB/consumer, so ~120 consumers ~= 8GB fits a 15GB CVM -- watch RAM
 #   as users grow and add another runner CVM (also 0) before memory is exhausted.

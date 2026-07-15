@@ -60,7 +60,7 @@ from model_api_runtime.v2 import planner as v2_planner
 from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
 from model_api_runtime.v2 import worker
-from provider_types import ToolCall
+from provider_types import ToolCall, ToolExchange
 
 pytestmark = pytest.mark.skipif(
     not __import__("os").environ.get("DATABASE_URL"),
@@ -90,6 +90,7 @@ def _reset(uid):
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_effect_outbox WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
+    conftest.set_v2_runtime_owner(uid)
 
 
 @pytest.fixture(autouse=True)
@@ -245,10 +246,10 @@ def test_p0_reply_then_web_search_ordering_and_exactly_once_replay(monkeypatch):
 
     assert status == "completed"
     assert len(calls) == 2
-    # round 1 (the web_search round's follow-up call) carries round 0's tool
-    # observation as grounding context — the read completed inline.
-    round1_joined = " ".join(str(m.get("content", "")) for m in calls[1]["messages"])
-    assert "search result" in round1_joined
+    # Round 1 carries the native assistant call and call-id-matched observation.
+    exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
+    assert len(exchanges) == 1
+    assert "search result" in " ".join(r.content for r in exchanges[0].results)
 
     bubbles = _bubbles(uid)
     assert len(bubbles) == 2
@@ -352,10 +353,15 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
     assert outcome.rounds == 2                     # STRONG: round counter monotonic, 2 not 3+.
     assert outcome.stop_reason == "final_text"
 
-    round1_joined = " ".join(str(m.get("content", "")) for m in calls[1]["messages"])
+    round1_joined = " ".join(
+        str(m.get("content", ""))
+        for m in calls[1]["messages"]
+        if isinstance(m, dict)
+    )
     assert "gate-message-A-unique" in round1_joined     # A: base tail context.
     assert "gate-message-B-unique" in round1_joined     # B: folded in mid-turn, no restart.
-    assert "search-result-unique" in round1_joined       # round-1's tool_results preserved.
+    exchange = next(m for m in calls[1]["messages"] if isinstance(m, ToolExchange))
+    assert "search-result-unique" in " ".join(r.content for r in exchange.results)
 
     assert _bubbles(uid)[0]["body_ct"] == "done"
 
@@ -390,9 +396,15 @@ def test_p0_malicious_page_write_refusal_no_effect_no_capability_call(monkeypatc
         user_id = uid
 
     tool_calls = [
-        ToolCall(id="w1", name="memory_write", args={"actions": [{"op": "add", "text": "injected"}]}),
+        ToolCall(id="w1", name="memory_write", args={"actions": [{
+            "op": "add",
+            "summary": "injected",
+            "content": "injected",
+        }]}),
         ToolCall(id="w2", name="identity_patch", args={"patch": {"persona": "evil"}}),
-        ToolCall(id="w3", name="schedule_wake", args={"when": "now"}),
+        # Keep this tool call schema-valid so the test isolates the provenance
+        # refusal instead of the dispatcher's argument-validation refusal.
+        ToolCall(id="w3", name="schedule_wake", args={"at": "now"}),
     ]
 
     results = asyncio.run(v2_executor.dispatch_tool_calls(
@@ -501,8 +513,8 @@ def test_p0_four_providers_two_reads_dispatch_and_reply_by_call_id(monkeypatch, 
 
     build_calls = []
 
-    def _build_messages(folded, prior_results):
-        build_calls.append((list(folded), list(prior_results)))
+    def _build_messages(transcript):
+        build_calls.append(list(transcript))
         return [{"role": "user", "content": "turn"}]
 
     on_reply_calls = []
@@ -537,10 +549,12 @@ def test_p0_four_providers_two_reads_dispatch_and_reply_by_call_id(monkeypatch, 
     assert sorted(ran) == ["memory_search", "web_search"]
 
     # (c) STRONG: the 2 ToolResults dispatch_tools returned this round are exactly the
-    # prior_tool_results build_messages saw for round 1, keyed by the RIGHT call_id --
+    # native ToolExchange build_messages saw for round 1, keyed by the RIGHT call_id --
     # memory_search's result under memory_search's id, web_search's under web_search's,
     # never swapped, regardless of the wire's id shape.
-    _folded1, prior_results1 = build_calls[1]
+    exchange = build_calls[1][0]
+    assert isinstance(exchange, ToolExchange)
+    prior_results1 = exchange.results
     assert len(prior_results1) == 2
     by_call_id = {r.call_id: r.content for r in prior_results1}
     assert set(by_call_id) == set(call_ids)

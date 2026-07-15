@@ -46,11 +46,13 @@ def test_respond_returns_provider_reply(monkeypatch):
     # 系统提示打头
     assert messages[0]["role"] == "system"
     assert responder._SYSTEM_PROMPT in messages[0]["content"]
-    # 摘要作为 system block 出现
-    assert any("prior stuff" in m["content"] for m in messages if m["role"] == "system")
-    # tail 的 user/assistant/user 三条按序出现（跳过 system 消息）
-    turn_roles = [m["role"] for m in messages if m["role"] != "system"]
-    assert turn_roles == ["user", "assistant", "user"]
+    # 摘要作为明确标记的非特权历史数据出现，绝不进入 system block。
+    summary_messages = [m for m in messages if "prior stuff" in m["content"]]
+    assert len(summary_messages) == 1
+    assert summary_messages[0]["role"] == "user"
+    assert "UNTRUSTED HISTORICAL CONVERSATION SUMMARY" in summary_messages[0]["content"]
+    # 摘要 block 后，tail 的 user/assistant/user 三条按序出现。
+    assert [m["role"] for m in messages[2:]] == ["user", "assistant", "user"]
 
 
 def test_respond_raises_on_empty_reply(monkeypatch):
@@ -71,6 +73,16 @@ def test_respond_raises_on_empty_tail():
     cfg = provider_client.ProviderConfig(provider="anthropic", model="m", api_key="k")
     with pytest.raises(responder.ResponderError):
         asyncio.run(responder.respond(provider_config=cfg, summary="", tail=[]))
+
+
+def test_respond_summary_alone_does_not_count_as_a_live_user_turn():
+    cfg = provider_client.ProviderConfig(provider="anthropic", model="m", api_key="k")
+    with pytest.raises(responder.ResponderError, match="no_user_messages"):
+        asyncio.run(responder.respond(
+            provider_config=cfg,
+            summary="- untrusted historical item",
+            tail=[],
+        ))
 
 
 def test_respond_raises_on_all_blank_tail():

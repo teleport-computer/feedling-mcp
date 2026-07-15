@@ -1,9 +1,10 @@
-# docker-compose.phala.runner.yaml — STANDALONE agent-runner CVM (test, Form B)
+# docker-compose.phala.runner.yaml — dedicated runtime CVM (test, Form B)
 #
-# A SEPARATE Phala CVM that runs ONLY an agent-runner supervisor — no backend, no
-# enclave, no ingress. It scales the hosted agent-runtime off the main CVM: if this
-# CVM dies, the main CVM's ingress/backend/enclave are untouched, and the per-user
-# Postgres lease lets a surviving runner (here or on the main CVM) take over.
+# A SEPARATE Phala CVM that runs one resident agent-runner supervisor plus its
+# sibling Hosted Runtime V2 serve-worker — no FastAPI backend, enclave, or ingress.
+# If this CVM dies, the main CVM's ingress/backend/enclave stay up, but there is
+# deliberately NO main-CVM runtime fallback; another dedicated runner CVM (if
+# provisioned) takes over via the Postgres lease/job queues.
 #
 # SINGLE runner per CVM (mirrors the prod runner compose). Earlier this file ran
 # TWO runners (agent-runner-0/1) with SEPARATE data volumes; because the per-user

@@ -25,6 +25,7 @@ async def extract(
     prompt: str,
     parse: Callable[[str], tuple],
     max_tokens: int = _MAX_TOKENS,
+    progress_cb: Callable[[str, int], None] | None = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
 
@@ -36,6 +37,7 @@ async def extract(
         result = await provider_client.reliable_chat_completion_async(
             provider_config, messages,
             max_tokens=max_tokens, temperature=_TEMPERATURE, timeout=_TIMEOUT_SEC,
+            progress_cb=progress_cb,
         )
     except Exception as e:  # noqa: BLE001 — 背景 job：归一成 reason，绝不抛
         return None, f"provider_call_failed:{type(e).__name__}"

@@ -45,6 +45,27 @@ def test_reliable_async_retries_transient_then_succeeds(monkeypatch):
     assert calls["n"] == 3  # two failures + one success
 
 
+def test_reliable_async_reports_each_attempt_boundary_without_forwarding_callback(monkeypatch):
+    fn, calls = _fake_async([ProviderError("e", status_code=503), "ok"])
+    monkeypatch.setattr(pc, "chat_completion_async", fn)
+    progress = []
+
+    out = asyncio.run(reliable_chat_completion_async(
+        max_attempts=3,
+        base_delay_sec=0.0,
+        progress_cb=lambda stage, attempt: progress.append((stage, attempt)),
+    ))
+
+    assert out == "ok"
+    assert calls["n"] == 2
+    assert progress == [
+        ("attempt_start", 1),
+        ("attempt_failed", 1),
+        ("attempt_start", 2),
+        ("attempt_complete", 2),
+    ]
+
+
 def test_reliable_async_exhausts_persistent_transient(monkeypatch):
     fn, calls = _fake_async([ProviderError("e", status_code=500)])
     monkeypatch.setattr(pc, "chat_completion_async", fn)

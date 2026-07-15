@@ -23,8 +23,10 @@ from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
+from chat import chat_core  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
+from push import service as push_service  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -158,6 +160,81 @@ def test_chat_response_marks_first_user_success_once_for_real_chat_sources(clien
     )
     assert second.status_code == 200, second.get_data(as_text=True)
     assert store.first_chat_ok_at() == first_chat_ok_at
+
+
+def test_resident_delivery_replay_returns_winner_without_duplicate_push(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        boot_gates,
+        "_gate_bootstrap_for_chat",
+        lambda store, allow_verify_reply=False, is_verify_reply=False: None,
+    )
+    delivered = []
+    monkeypatch.setattr(
+        push_service,
+        "_deliver_ai_message_push_if_background",
+        lambda *args, **kwargs: delivered.append(kwargs) or {
+            "push_decision": "sent",
+            "push_reason": "test",
+        },
+    )
+
+    store = core_store.get_store(user_id)
+    real_mark_first_chat_ok = chat_core._maybe_mark_first_chat_ok
+    mark_attempts = 0
+
+    def _crash_window_then_self_heal(mark_store, parent_message_id):
+        nonlocal mark_attempts
+        mark_attempts += 1
+        if mark_attempts == 1:
+            # Model the process dying after the reply transaction commits but
+            # before the separate idempotent activation marker is written.
+            return None
+        return real_mark_first_chat_ok(mark_store, parent_message_id)
+
+    monkeypatch.setattr(
+        chat_core,
+        "_maybe_mark_first_chat_ok",
+        _crash_window_then_self_heal,
+    )
+    parent = store.append_chat(
+        "user", "chat", _chat_envelope(user_id, "resident-replay-parent"))
+    delivery_id = "a" * 32
+    first_envelope = _chat_envelope(user_id, delivery_id)
+    second_envelope = {
+        **first_envelope,
+        "body_ct": "fresh-ciphertext-for-same-semantic-delivery",
+        "nonce": "fresh-nonce",
+        "K_user": "fresh-user-key",
+        "K_enclave": "fresh-enclave-key",
+    }
+    payload = {
+        "envelope": first_envelope,
+        "reply_to_message_id": parent["id"],
+        "resident_delivery_id": delivery_id,
+        "alert_body": "done",
+    }
+
+    first = client.post(
+        "/v1/chat/response", json=payload, headers=_headers(api_key))
+    assert store.proactive_activation_ready() is False
+    replay = client.post(
+        "/v1/chat/response",
+        json={**payload, "envelope": second_envelope},
+        headers=_headers(api_key),
+    )
+
+    assert first.status_code == 200, first.get_data(as_text=True)
+    assert replay.status_code == 200, replay.get_data(as_text=True)
+    assert replay.get_json() == first.get_json()
+    assert mark_attempts == 2
+    assert store.proactive_activation_ready() is True
+    assert len(delivered) == 1
+    stored = [msg for msg in store.chat_messages if msg.get("id") == delivery_id]
+    assert len(stored) == 1
+    assert stored[0]["body_ct"] == first_envelope["body_ct"]
+    parent_row = next(msg for msg in store.chat_messages if msg["id"] == parent["id"])
+    assert parent_row["reply_message_id"] == delivery_id
 
 
 def test_chat_response_does_not_mark_first_chat_ok_for_verify_ping(client, monkeypatch):

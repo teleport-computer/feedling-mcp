@@ -193,27 +193,31 @@ def test_build_messages_appends_folded_inputs_and_tool_results():
     build_messages = worker._make_build_messages_fn(
         system_prompt="sys", summary="", tail=[{"role": "user", "content": "earlier"}]
     )
-    from provider_types import ToolResult
+    from provider_types import ToolCall, ToolExchange, ToolResult
 
     folded_inputs = [{"id": "m9", "ts": 1.0, "content": "new user turn"}]
-    prior_tool_results = [ToolResult(call_id="c1", content='{"ok": true, "data": "x"}')]
+    exchange = ToolExchange(
+        calls=(ToolCall(id="c1", name="memory_search", args={"query": "x"}),),
+        results=(ToolResult(call_id="c1", content='{"ok": true, "data": "x"}'),),
+    )
 
-    messages = build_messages(folded_inputs, prior_tool_results)
+    messages = build_messages([exchange, *folded_inputs])
 
     assert messages[0] == {"role": "system", "content": "sys"}
-    roles = [m["role"] for m in messages]
+    roles = [m["role"] for m in messages if isinstance(m, dict)]
     assert "user" in roles
-    joined = " ".join(str(m.get("content", "")) for m in messages)
+    joined = " ".join(str(m.get("content", "")) for m in messages if isinstance(m, dict))
     assert "earlier" in joined
     assert "new user turn" in joined
-    assert "x" in joined  # tool observation folded in as grounding context
+    assert messages[2] is exchange  # native assistant call + tool result stay structured
+    assert exchange.results[0].content.endswith('"x"}')
 
 
 def test_build_messages_with_no_folded_inputs_or_results_is_stable():
     build_messages = worker._make_build_messages_fn(
         system_prompt="sys", summary="", tail=[{"role": "user", "content": "hello"}]
     )
-    messages = build_messages([], [])
+    messages = build_messages([])
     assert messages == [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "hello"},

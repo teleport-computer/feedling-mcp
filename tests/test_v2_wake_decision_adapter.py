@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from conftest import seed_user  # noqa: E402
+from conftest import seed_user, set_v2_runtime_owner  # noqa: E402
 import db  # noqa: E402
 from core import store as core_store  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
@@ -23,6 +23,7 @@ def _enable_v2(uid: str) -> None:
     db.patch_blob_strict(uid, hosted_config_store.MODEL_API_RUNTIME_BLOB, {
         "hosted_runtime_mode": hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
     })
+    set_v2_runtime_owner(uid)
 
 
 def test_wake_decision_blocks_unactivated_user():

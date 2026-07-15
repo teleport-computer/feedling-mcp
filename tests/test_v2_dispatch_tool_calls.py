@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -81,7 +82,9 @@ def test_write_with_authorization_is_enqueued_not_run_inline(monkeypatch):
         ran.append(action_type)   # must never be called for a write
         return _FakeResult(True, {})
 
-    tool_calls = [ToolCall(id="w1", name="memory_write", args={"actions": []})]
+    tool_calls = [ToolCall(id="w1", name="memory_write", args={"actions": [{
+        "op": "add", "summary": "tea", "content": "likes tea",
+    }]})]
     results, enqueued = _run(
         tool_calls, turn_authorization=True, run_capability=_run_capability, monkeypatch=monkeypatch)
 
@@ -92,11 +95,64 @@ def test_write_with_authorization_is_enqueued_not_run_inline(monkeypatch):
     assert "memory_write" in results[0].content
 
 
+def test_async_write_enqueue_is_awaited_without_blocking_event_loop(monkeypatch):
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("write must not run inline")),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    ticks = {"n": 0}
+
+    def slow_sync_persist():
+        started.set()
+        assert release.wait(timeout=2)
+
+    async def enqueue_write_effect(_tc):
+        await asyncio.to_thread(slow_sync_persist)
+
+    async def scenario():
+        dispatch_task = asyncio.create_task(v2_executor.dispatch_tool_calls(
+            [ToolCall(
+                id="w-async",
+                name="identity_patch",
+                args={"signature": "new"},
+            )],
+            store=_Store(),
+            api_key="k",
+            runtime_token="rt",
+            enclave_sem=asyncio.Semaphore(1),
+            turn_authorization=True,
+            enqueue_write_effect=enqueue_write_effect,
+        ))
+
+        async def heartbeat():
+            while not release.is_set():
+                ticks["n"] += 1
+                await asyncio.sleep(0.005)
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        assert await asyncio.to_thread(started.wait, 1.0)
+        await asyncio.sleep(0.03)
+        assert not dispatch_task.done()
+        assert ticks["n"] >= 3
+        release.set()
+        results = await dispatch_task
+        await heartbeat_task
+        return results
+
+    results = asyncio.run(scenario())
+    assert results[0].content == "queued: identity_patch"
+
+
 def test_write_without_authorization_is_refused_not_enqueued(monkeypatch):
     def _run_capability(action_type, store, *, api_key, runtime_token, params):
         raise AssertionError("run_capability must not be called for a refused write")
 
-    tool_calls = [ToolCall(id="w2", name="identity_patch", args={"patch": {}})]
+    tool_calls = [ToolCall(
+        id="w2", name="identity_patch", args={"patch": {"signature": "new"}})]
     results, enqueued = _run(
         tool_calls, turn_authorization=False, run_capability=_run_capability, monkeypatch=monkeypatch)
 
@@ -131,12 +187,50 @@ def test_args_not_ok_returns_error_result_no_raise(monkeypatch):
     assert "error" in results[0].content
 
 
+def test_invalid_schema_args_never_run_or_enqueue(monkeypatch):
+    def _run_capability(action_type, store, *, api_key, runtime_token, params):
+        raise AssertionError("run_capability must not be called for invalid args")
+
+    tool_calls = [
+        ToolCall(id="missing", name="web_search", args={}),
+        ToolCall(id="wrong-type", name="memory_index", args={"limit": "many"}),
+        ToolCall(id="unknown", name="identity_get", args={"surprise": True}),
+    ]
+    results, enqueued = _run(
+        tool_calls, turn_authorization=True, run_capability=_run_capability, monkeypatch=monkeypatch)
+
+    assert enqueued == []
+    assert [r.call_id for r in results] == ["missing", "wrong-type", "unknown"]
+    assert all("invalid args" in r.content for r in results)
+
+
+def test_schedule_args_cannot_override_trusted_internal_op(monkeypatch):
+    def _run_capability(action_type, store, *, api_key, runtime_token, params):
+        raise AssertionError("write tools must never run inline")
+
+    # worker._write_tool_effect_payload supplies this trusted key.  A model-provided
+    # value must be rejected before the ToolCall reaches that outbox mapper.
+    tool_calls = [ToolCall(
+        id="smuggle-op", name="schedule_wake",
+        args={"at": "2026-07-15T09:00:00+08:00", "op": "cancel_wake"},
+    )]
+    results, enqueued = _run(
+        tool_calls, turn_authorization=True, run_capability=_run_capability, monkeypatch=monkeypatch)
+
+    assert enqueued == []
+    assert results[0].call_id == "smuggle-op"
+    assert "invalid args" in results[0].content
+    assert "unknown field: op" in results[0].content
+
+
 def test_mixed_batch_preserves_original_order_and_every_call_id(monkeypatch):
     def _run_capability(action_type, store, *, api_key, runtime_token, params):
         return _FakeResult(True, {"body": "ok"})
 
     tool_calls = [
-        ToolCall(id="a", name="memory_write", args={"actions": []}),          # write, authorized
+        ToolCall(id="a", name="memory_write", args={"actions": [{
+            "op": "add", "summary": "tea", "content": "likes tea",
+        }]}),                                                                    # write, authorized
         ToolCall(id="b", name="bogus_tool", args={}),                          # unknown
         ToolCall(id="c", name="memory_index", args={}),                        # read
         ToolCall(id="d", name="schedule_wake", args={"when": "x"}, args_ok=False, args_raw="oops"),  # bad args

@@ -24,6 +24,19 @@ _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
 
+_MEMORY_TOOL_ACTION = {
+    "type": "object",
+    "properties": {
+        "op": {"type": "string", "enum": ["add", "update", "delete"]},
+        "summary": _STR,
+        "content": _STR,
+        "bucket": _STR,
+        "target_id": _STR,
+    },
+    "required": ["op"],
+    "additionalProperties": False,
+}
+
 PARAMS: dict[str, dict] = {
     # -- identity.py --
     # identity.get(store, ...): ignores params entirely.
@@ -71,17 +84,7 @@ PARAMS: dict[str, dict] = {
     # guessing a shape the write path rejects with title_required/400.
     "memory_write": {
         "type": "object",
-        "properties": {"actions": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "op": {"type": "string", "enum": ["add", "update", "delete"]},
-                "summary": {"type": "string"},
-                "content": {"type": "string"},
-                "bucket": {"type": "string"},
-                "target_id": {"type": "string"},
-            },
-            "required": ["op"],
-        }}},
+        "properties": {"actions": {"type": "array", "items": _MEMORY_TOOL_ACTION}},
         "required": ["actions"],
     },
 
@@ -173,6 +176,17 @@ PARAMS: dict[str, dict] = {
     },
 }
 
+# Tool arguments cross an untrusted model boundary.  Close every model-facing
+# top-level object even when a provider ignores JSON Schema's
+# ``additionalProperties`` keyword; ``validate_tool_args`` below enforces the
+# same contract again before a capability is run or a write effect is queued.
+# The identity ``patch`` object remains capability-owned/free-form. Memory
+# actions are closed explicitly above so the provider sees the model-facing
+# plaintext vocabulary instead of inventing shapes the sink will later reject.
+for _parameters in PARAMS.values():
+    if _parameters.get("type") == "object":
+        _parameters["additionalProperties"] = False
+
 DESCRIPTIONS: dict[str, str] = {
     "identity_get": "Read the persona's current identity/profile fields.",
     "identity_patch": "Update the persona's identity/profile (self_introduction, signature, or an explicit patch object).",
@@ -197,6 +211,105 @@ DESCRIPTIONS: dict[str, str] = {
     "cancel_wake": "Cancel a previously scheduled self-wake by its wake_id.",
     REPLY_TOOL: "Send an immediate reply bubble to the user with the given text.",
 }
+
+
+def _matches_json_type(value, expected: str) -> bool:
+    """Small JSON-Schema type predicate for the schema subset used above."""
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        # bool is an int subclass in Python, but a distinct JSON type.
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    return False
+
+
+def _validate_value(value, schema: dict, *, path: str) -> str | None:
+    """Validate the deliberately small JSON-Schema subset used by ``PARAMS``.
+
+    Returning a stable error instead of raising lets the dispatcher feed a
+    bounded tool error back to the model without exposing argument values.
+    """
+    expected = schema.get("type")
+    if expected and not _matches_json_type(value, expected):
+        return f"{path} must be {expected}"
+    allowed = schema.get("enum")
+    if allowed is not None and value not in allowed:
+        return f"{path} has unsupported value"
+
+    if expected == "object":
+        required = schema.get("required") or []
+        for field in required:
+            if field not in value:
+                return f"missing required field: {field}"
+
+        properties = schema.get("properties") or {}
+        if schema.get("additionalProperties") is False:
+            unknown = sorted(str(field) for field in value if field not in properties)
+            if unknown:
+                return f"unknown field: {unknown[0]}"
+
+        for field, child_schema in properties.items():
+            if field in value:
+                error = _validate_value(value[field], child_schema, path=f"{path}.{field}")
+                if error:
+                    return error
+
+    if expected == "array" and "items" in schema:
+        for index, item in enumerate(value):
+            error = _validate_value(item, schema["items"], path=f"{path}[{index}]")
+            if error:
+                return error
+
+    return None
+
+
+def validate_tool_args(name: str, args) -> str | None:
+    """Return ``None`` when args satisfy a model-facing tool's schema.
+
+    This is intentionally dependency-free and covers the complete schema
+    vocabulary currently emitted by this module: object/array/scalar types,
+    required fields, array items, and closed top-level objects.
+    """
+    schema = PARAMS.get(name)
+    if schema is None:
+        return "tool is not model-facing"
+    error = _validate_value(args, schema, path="args")
+    if error:
+        return error
+    if name == "identity_patch":
+        has_patch = isinstance(args.get("patch"), dict) and bool(args["patch"])
+        has_top_level = any(
+            isinstance(args.get(field), str) and bool(args[field].strip())
+            for field in ("self_introduction", "signature")
+        )
+        if not has_patch and not has_top_level:
+            return "identity_patch requires a non-empty patch or profile field"
+    if name == "memory_write":
+        actions = args.get("actions") or []
+        if not actions:
+            return "memory_write requires at least one action"
+        for index, action in enumerate(actions):
+            op = action["op"]
+            summary = str(action.get("summary") or "").strip()
+            content = str(action.get("content") or "").strip()
+            target_id = str(action.get("target_id") or "").strip()
+            if op == "add" and (not summary or not content):
+                return f"args.actions[{index}] add requires summary and content"
+            if op == "update" and (not target_id or not summary or not content):
+                return f"args.actions[{index}] update requires target_id, summary, and content"
+            if op == "delete" and not target_id:
+                return f"args.actions[{index}] delete requires target_id"
+    return None
 
 
 def build_tool_specs() -> list[ToolSpec]:

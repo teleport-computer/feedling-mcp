@@ -27,7 +27,11 @@ def _stub_store(monkeypatch):
 
 
 def _stub_actions(monkeypatch, body, status):
-    monkeypatch.setattr(serve_worker.memory_core, "actions", lambda store, api_key, payload: (body, status))
+    monkeypatch.setattr(
+        serve_worker.memory_core,
+        "actions",
+        lambda store, api_key, payload, **kwargs: (body, status),
+    )
 
 
 def test_4xx_not_found_is_dropped_not_raised(monkeypatch, caplog):

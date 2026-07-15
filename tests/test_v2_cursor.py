@@ -54,6 +54,64 @@ def test_after_seq_respects_after_and_limit(pg_clean):
     assert db.chat_max_seq("u_cur2") == first_seq + 4
 
 
+def test_newest_seq_window_is_bounded_then_restored_to_ascending(pg_clean):
+    seed_user("u_cur_newest")
+    for i in range(5):
+        db.chat_append(
+            "u_cur_newest", f"m{i}", float(i),
+            {"id": "stale", "ts": -1.0, "role": "user", "n": i}, 5000,
+        )
+
+    rows = db.chat_messages_after_seq(
+        "u_cur_newest", 0, limit=2, oldest_first=False,
+    )
+
+    assert [row["id"] for row in rows] == ["m3", "m4"]
+    assert [row["ts"] for row in rows] == [3.0, 4.0]
+    assert [row["seq"] for row in rows] == sorted(row["seq"] for row in rows)
+    assert db.chat_seqs_after_seq(
+        "u_cur_newest", 0, limit=2, oldest_first=False,
+    ) == [row["seq"] for row in rows]
+
+
+def test_unbounded_seq_window_returns_every_row_after_cursor(pg_clean):
+    seed_user("u_cur_unbounded")
+    for i in range(4):
+        db.chat_append(
+            "u_cur_unbounded", f"m{i}", 100.0,
+            {"role": "user", "n": i}, 5000,
+        )
+    first = db.chat_messages_after_seq("u_cur_unbounded", 0, limit=1)[0]["seq"]
+
+    rows = db.chat_messages_after_seq("u_cur_unbounded", first, limit=None)
+
+    assert [row["n"] for row in rows] == [1, 2, 3]
+    assert db.chat_seqs_after_seq("u_cur_unbounded", first) == [
+        row["seq"] for row in rows
+    ]
+
+
+def test_through_seq_freezes_both_row_and_identity_windows(pg_clean):
+    uid = "u_cur_snapshot"
+    seed_user(uid)
+    for i in range(5):
+        db.chat_append(
+            uid, f"m{i}", 100.0, {"role": "user", "n": i}, 5000,
+        )
+    all_rows = db.chat_messages_after_seq(uid, 0)
+    through_seq = all_rows[3]["seq"]
+
+    rows = db.chat_messages_after_seq(
+        uid, 0, limit=2, oldest_first=False, through_seq=through_seq,
+    )
+
+    assert [row["n"] for row in rows] == [2, 3]
+    assert db.chat_seqs_after_seq(
+        uid, 0, limit=2, oldest_first=False, through_seq=through_seq,
+    ) == [row["seq"] for row in rows]
+    assert all(row["seq"] <= through_seq for row in rows)
+
+
 def test_max_seq_zero_for_unknown_user(pg_clean):
     assert db.chat_max_seq("u_cur_never_wrote") == 0
     assert db.chat_messages_after_seq("u_cur_never_wrote", 0, limit=10) == []
@@ -87,3 +145,43 @@ def test_load_seq_reads_back_committed_value(pg_clean):
     seed_user("u_cur_loadseq2")
     db.set_blob("u_cur_loadseq2", "model_api_runtime", {cursor.CURSOR_KEY: 42})
     assert cursor.load_seq(_FakeStore("u_cur_loadseq2")) == 42
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, True, "1.5", "broken", {}])
+def test_load_seq_rejects_corrupt_cursor_instead_of_replaying_from_zero(pg_clean, bad):
+    uid = f"u_cur_bad_{str(bad).replace(' ', '_')}"
+    seed_user(uid)
+    db.set_blob_strict(uid, "model_api_runtime", {cursor.CURSOR_KEY: bad})
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        cursor.load_seq(_FakeStore(uid))
+
+
+def test_load_seq_propagates_strict_database_failure(monkeypatch):
+    monkeypatch.setattr(
+        db, "get_blob_strict",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
+
+    with pytest.raises(RuntimeError, match="db down"):
+        cursor.load_seq(_FakeStore("u_cur_db_down"))
+
+
+def test_atomic_integer_advance_is_monotonic_and_preserves_siblings(pg_clean):
+    uid = "u_cur_atomic_max"
+    seed_user(uid)
+    db.set_blob_strict(
+        uid, "model_api_runtime",
+        {cursor.CURSOR_KEY: 20, "hosted_runtime_mode": "db_action_v2"},
+    )
+
+    older = db.advance_blob_int_strict(
+        uid, "model_api_runtime", cursor.CURSOR_KEY, 10,
+    )
+    newer = db.advance_blob_int_strict(
+        uid, "model_api_runtime", cursor.CURSOR_KEY, 30,
+    )
+
+    assert older[cursor.CURSOR_KEY] == 20
+    assert newer[cursor.CURSOR_KEY] == 30
+    assert newer["hosted_runtime_mode"] == "db_action_v2"

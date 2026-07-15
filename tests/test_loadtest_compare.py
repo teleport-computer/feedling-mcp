@@ -5,8 +5,9 @@ regress vs the resident runtime on identical fixtures).
 Two pieces under test:
   1. ``compare_tokens_per_turn`` — pure math, no I/O.
   2. ``measure_v2_tokens_per_turn`` — drives the real
-     ``model_api_runtime.v2.responder.respond`` path against a MockProvider
-     (scripts/loadtest/mock_provider.py) and returns mean tokens/turn.
+     ``model_api_runtime.v2.tool_loop.run_tool_loop`` path against a
+     MockProvider (scripts/loadtest/mock_provider.py), including a native
+     tool-call round and the reserved tools-disabled final reply.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.loadtest.compare_tokens import (
     compare_tokens_per_turn,
+    measure_turn_tokens,
     measure_v2_tokens_per_turn,
 )
 from scripts.loadtest.mock_provider import MockProvider
@@ -90,7 +92,7 @@ def test_nonfinite_v2_mean_is_rejected(value):
         compare_tokens_per_turn(value, 100.0)
 
 
-# --- measure_v2_tokens_per_turn (against MockProvider, real responder) ---
+# --- measure_v2_tokens_per_turn (MockProvider + production native loop) ---
 
 
 _FIXTURES = [
@@ -108,21 +110,46 @@ _FIXTURES = [
     },
 ]
 
+_TOOL_CALL = {
+    "id": "loadtest-search-1",
+    "name": "memory_search",
+    "args": {"query": "hello"},
+}
+
 
 def test_measure_v2_tokens_per_turn_matches_mock_usage():
-    with MockProvider(prompt_tokens=100, completion_tokens=20) as provider:
+    with MockProvider(
+        prompt_tokens=100,
+        completion_tokens=20,
+        tool_call=_TOOL_CALL,
+    ) as provider:
+        mean_tokens = measure_v2_tokens_per_turn(
+            _FIXTURES, mock_base_url=provider.base_url
+        )
+    # Each turn is one tools-enabled function call + one tools-disabled final.
+    assert mean_tokens == 240.0
+    assert provider.request_count == 2 * len(_FIXTURES)
+    for tool_request, final_request in zip(
+        provider.request_payloads[::2], provider.request_payloads[1::2]
+    ):
+        assert tool_request["tools"]
+        assert "tools" not in final_request
+        # The final request replays the provider-native assistant call and its
+        # call-id-matched tool observation, not a flattened planner digest.
+        assert any(message.get("tool_calls") for message in final_request["messages"])
+        assert any(message.get("role") == "tool" for message in final_request["messages"])
+
+
+def test_measure_v2_tokens_per_turn_reflects_configured_usage():
+    with MockProvider(
+        prompt_tokens=50,
+        completion_tokens=10,
+        tool_call=_TOOL_CALL,
+    ) as provider:
         mean_tokens = measure_v2_tokens_per_turn(
             _FIXTURES, mock_base_url=provider.base_url
         )
     assert mean_tokens == 120.0
-
-
-def test_measure_v2_tokens_per_turn_reflects_configured_usage():
-    with MockProvider(prompt_tokens=50, completion_tokens=10) as provider:
-        mean_tokens = measure_v2_tokens_per_turn(
-            _FIXTURES, mock_base_url=provider.base_url
-        )
-    assert mean_tokens == 60.0
 
 
 # --- exit-code / rollback-signal logic (no subprocess needed) -----------
@@ -137,39 +164,29 @@ def test_regression_result_is_the_nonzero_exit_signal():
     assert ok["regression"] is False
 
 
-# --- measure_turn_tokens (drives planner + responder, whole-turn baseline) --
+# --- measure_turn_tokens (drives the production unified native loop) --------
 
 
-def test_measure_turn_tokens_counts_planner_and_responder():
-    from scripts.loadtest.compare_tokens import measure_turn_tokens
-    from scripts.loadtest.mock_provider import MockProvider
-
-    # The mock must answer the planner with parseable JSON; responder gets the
-    # same string back, which is fine — we are counting tokens, not reading prose.
-    plan_json = '{"plan":[{"type":"final_response","payload":{}}],"reason":"t"}'
+def test_measure_turn_tokens_counts_one_shot_unified_loop():
     fixtures = [{"summary": "", "tail": [{"role": "user", "content": "hello"}]}]
 
-    with MockProvider(reply=plan_json, estimate_tokens=True) as p:
+    with MockProvider(reply="final", estimate_tokens=True) as p:
         report = measure_turn_tokens(fixtures, provider=p)
 
-    # One planner call + one responder call per turn, today (pre-loop).
-    assert report["llm_calls_per_turn"] == 2.0
+    # A weak model that does not call tools naturally degrades to one request.
+    assert report["llm_calls_per_turn"] == 1.0
     assert report["tokens_per_turn"] > 0
     assert report["tokens_per_turn"] == (
         p.total_prompt_tokens + p.total_completion_tokens) / len(fixtures)
 
 
 def test_measure_turn_tokens_grows_with_prompt_size():
-    from scripts.loadtest.compare_tokens import measure_turn_tokens
-    from scripts.loadtest.mock_provider import MockProvider
-
-    plan_json = '{"plan":[{"type":"final_response","payload":{}}],"reason":"t"}'
     small = [{"summary": "", "tail": [{"role": "user", "content": "hi"}]}]
     large = [{"summary": "S" * 8000, "tail": [{"role": "user", "content": "hi"}]}]
 
-    with MockProvider(reply=plan_json, estimate_tokens=True) as p:
+    with MockProvider(reply="final", estimate_tokens=True) as p:
         small_report = measure_turn_tokens(small, provider=p)
-    with MockProvider(reply=plan_json, estimate_tokens=True) as p:
+    with MockProvider(reply="final", estimate_tokens=True) as p:
         large_report = measure_turn_tokens(large, provider=p)
 
     assert large_report["tokens_per_turn"] > small_report["tokens_per_turn"]
@@ -178,31 +195,26 @@ def test_measure_turn_tokens_grows_with_prompt_size():
 def test_multi_round_turn_costs_more_llm_calls_than_single_round():
     """The loop's cost is real and the instrument must see it. If this passes trivially
     (equal call counts), the mock is not driving the loop and the gate is blind."""
-    from scripts.loadtest.compare_tokens import measure_turn_tokens
-    from scripts.loadtest.mock_provider import MockProvider
-
-    one_shot = '{"plan":[{"type":"final_response","payload":{}}],"reason":"t"}'
     fixtures = [{"summary": "", "tail": [{"role": "user", "content": "hello"}]}]
 
-    with MockProvider(reply=one_shot, estimate_tokens=True) as p:
+    with MockProvider(reply="final", estimate_tokens=True) as p:
         single = measure_turn_tokens(fixtures, provider=p)
 
-    assert single["llm_calls_per_turn"] == 2.0            # planner + responder
+    assert single["llm_calls_per_turn"] == 1.0
     assert single["tokens_per_turn"] > 0
 
     two_round = [{
         "summary": "",
         "tail": [{"role": "user", "content": "hello"}],
-        "planner_replies": [
-            '{"plan":[{"type":"memory_search","payload":{"query":"hello"}}]}',
-            one_shot,
-        ],
+        "tool_call": _TOOL_CALL,
     }]
-    with MockProvider(reply=one_shot, estimate_tokens=True) as p:
+    with MockProvider(reply="final", estimate_tokens=True) as p:
         multi = measure_turn_tokens(two_round, provider=p)
 
-    assert multi["llm_calls_per_turn"] == 3.0  # two planner rounds + responder
+    assert multi["llm_calls_per_turn"] == 2.0  # native tool call + final text
     assert multi["tokens_per_turn"] > single["tokens_per_turn"]
+    assert p.request_payloads[0]["tools"]
+    assert "tools" not in p.request_payloads[1]
 
 
 def test_main_uses_whole_turn_measurement_and_reports_call_count(capsys):
@@ -212,7 +224,8 @@ def test_main_uses_whole_turn_measurement_and_reports_call_count(capsys):
     report = __import__("json").loads(capsys.readouterr().out)
 
     assert exit_code == 0
-    assert report["llm_calls_per_turn"] > 2.0
+    # The shared workload mixes two one-shot turns with one native-tool turn.
+    assert report["llm_calls_per_turn"] > 1.0
     assert report["v2_mean"] > 0
 
 

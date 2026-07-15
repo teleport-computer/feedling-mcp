@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,32 @@ pytestmark = pytest.mark.skipif(
 def _reset(uid):
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) "
+            "VALUES (%s,'v2',1) ON CONFLICT (user_id) DO UPDATE SET "
+            "hosted_runtime_state='v2',runtime_generation=1",
+            (uid,),
+        )
+
+
+def _seed_active_route(uid: str, *, error: str = "") -> str:
+    credential_id = str(uuid.uuid4())
+    route_id = str(uuid.uuid4())
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO model_api_credentials "
+            "(id,user_id,provider,label,base_url,api_key_envelope) "
+            "VALUES (%s,%s,'anthropic','test','','{}'::jsonb)",
+            (credential_id, uid),
+        )
+        conn.execute(
+            "INSERT INTO model_api_routes "
+            "(id,user_id,credential_id,model,is_active,test_status,last_runtime_error) "
+            "VALUES (%s,%s,%s,'claude-test',true,'ok',%s)",
+            (route_id, uid, credential_id, error),
+        )
+    return route_id
 
 
 @pytest.fixture(autouse=True)
@@ -89,10 +116,15 @@ def test_enqueue_replaces_overdue_pending_row_instead_of_coalescing():
             "WHERE user_id=%s ORDER BY id",
             ("u_js_stale_pending",),
         ).fetchall()
+        marker = conn.execute(
+            "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (old_id,),
+        ).fetchone()
     assert rows == [
         (old_id, "expired", "queue_timeout"),
         (new_id, "pending", None),
     ]
+    assert marker == ("queue_timeout",)
 
 
 def test_enqueue_replaces_expired_active_lease_and_fences_old_owner():
@@ -213,6 +245,297 @@ def test_mark_failed_increments_attempt_count():
     assert row[2] == "boom"
 
 
+def test_mark_expired_retained_helper_also_queues_chat_visibility():
+    uid = "u_js_mark_expired"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+
+    jobs_store.mark_expired(job_id, "queue_timeout")
+
+    with db.get_pool().connection() as conn:
+        job = conn.execute(
+            "SELECT status,last_error FROM agent_jobs WHERE id=%s", (job_id,)
+        ).fetchone()
+        marker = conn.execute(
+            "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert job == ("expired", "queue_timeout")
+    assert marker == ("queue_timeout",)
+
+
+def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once():
+    """Simulate death immediately after terminalization by doing no inline
+    surfacing.  A later reconciler must find both obligations, and replaying it
+    again must not duplicate either the status event or the idempotent callback.
+    """
+    uid = "u_js_terminal_crash"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+
+    assert jobs_store.mark_failed(
+        job_id, "turn_failed:runtimeerror", claimed_by="w") is True
+
+    with db.get_pool().connection() as conn:
+        marker = conn.execute(
+            "SELECT user_id,error_code,status_delivered_at,"
+            "runtime_error_delivered_at FROM v2_terminal_failure_outbox "
+            "WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert marker == (uid, "turn_failed:runtimeerror", None, None)
+
+    recorded = []
+    first = jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=lambda user_id, code: recorded.append((user_id, code)),
+        job_id=job_id,
+    )
+    second = jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=lambda user_id, code: recorded.append((user_id, code)),
+        job_id=job_id,
+    )
+
+    assert first == {
+        "examined": 1,
+        "status_delivered": 1,
+        "runtime_error_delivered": 1,
+    }
+    assert second == {
+        "examined": 0,
+        "status_delivered": 0,
+        "runtime_error_delivered": 0,
+    }
+    assert recorded == [(uid, "turn_failed:runtimeerror")]
+    errors = [
+        event for event in jobs_store.list_status_events(uid, after_id=0)
+        if event["kind"] == "error" and event["job_id"] == job_id
+    ]
+    assert len(errors) == 1
+
+
+def test_terminal_visibility_retries_each_fail_once_sink_without_duplicates(monkeypatch):
+    uid = "u_js_terminal_retry"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(job_id, "provider_unavailable", claimed_by="w")
+
+    real_status_sink = jobs_store._deliver_terminal_failure_status
+    status_attempts = {"n": 0}
+
+    def _status_fails_once(*args, **kwargs):
+        status_attempts["n"] += 1
+        if status_attempts["n"] == 1:
+            raise RuntimeError("transient status sink")
+        return real_status_sink(*args, **kwargs)
+
+    runtime_attempts = {"n": 0}
+    recorded = []
+
+    def _runtime_fails_once(user_id, code):
+        runtime_attempts["n"] += 1
+        if runtime_attempts["n"] == 1:
+            raise RuntimeError("transient runtime sink")
+        recorded.append((user_id, code))
+
+    monkeypatch.setattr(
+        jobs_store, "_deliver_terminal_failure_status", _status_fails_once)
+
+    base_now = time.time()
+    first = jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=_runtime_fails_once, job_id=job_id, now=base_now)
+    second = jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=_runtime_fails_once, job_id=job_id, now=base_now + 2)
+    third = jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=_runtime_fails_once, job_id=job_id, now=base_now + 4)
+
+    assert first["status_delivered"] == 0
+    assert first["runtime_error_delivered"] == 0
+    assert second["status_delivered"] == 1
+    assert second["runtime_error_delivered"] == 1
+    assert third["examined"] == 0
+    assert status_attempts["n"] == 2
+    assert runtime_attempts["n"] == 2
+    assert recorded == [(uid, "provider_unavailable")]
+    errors = [
+        event for event in jobs_store.list_status_events(uid, after_id=0)
+        if event["kind"] == "error" and event["job_id"] == job_id
+    ]
+    assert len(errors) == 1
+
+
+def test_terminal_visibility_redacts_unstable_error_before_user_sinks():
+    uid = "u_js_terminal_redact"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(
+        job_id, "raw provider secret sk-do-not-leak", claimed_by="w")
+
+    recorded = []
+    jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=lambda user_id, code: recorded.append((user_id, code)),
+        job_id=job_id,
+    )
+    assert recorded == [(uid, "runtime_failed")]
+
+
+def test_production_runtime_error_sink_updates_captured_active_route_atomically():
+    uid = "u_js_terminal_route_delivery"
+    seed_user(uid)
+    _reset(uid)
+    _seed_active_route(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(job_id, "lease_timeout", claimed_by="w")
+
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    assert result["runtime_error_delivered"] == 1
+    with db.get_pool().connection() as conn:
+        route_error = conn.execute(
+            "SELECT last_runtime_error FROM model_api_routes "
+            "WHERE user_id=%s AND is_active",
+            (uid,),
+        ).fetchone()[0]
+        delivered = conn.execute(
+            "SELECT runtime_error_delivered_at IS NOT NULL "
+            "FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()[0]
+    assert route_error == "lease_timeout"
+    assert delivered is True
+
+
+def test_poison_oldest_rotates_so_newer_marker_delivers_both_sinks(monkeypatch):
+    uid = "u_js_terminal_fair"
+    seed_user(uid)
+    _reset(uid)
+    old_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w-old")
+    assert jobs_store.mark_failed(old_id, "queue_timeout", claimed_by="w-old")
+    new_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w-new")
+    assert jobs_store.mark_failed(new_id, "lease_timeout", claimed_by="w-new")
+
+    real_status = jobs_store._deliver_terminal_failure_status
+
+    def _poison_old_status(job_id, **kwargs):
+        if job_id == old_id:
+            raise RuntimeError("permanent old status poison")
+        return real_status(job_id, **kwargs)
+
+    delivered_runtime = []
+
+    def _poison_old_runtime(user_id, code):
+        if code == "queue_timeout":
+            raise RuntimeError("permanent old runtime poison")
+        delivered_runtime.append((user_id, code))
+
+    monkeypatch.setattr(
+        jobs_store, "_deliver_terminal_failure_status", _poison_old_status)
+    base_now = time.time()
+    jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=_poison_old_runtime, limit=1, now=base_now)
+    second = jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=_poison_old_runtime, limit=1, now=base_now + 2)
+
+    assert second["status_delivered"] == 1
+    assert second["runtime_error_delivered"] == 1
+    assert delivered_runtime == [(uid, "lease_timeout")]
+    errors = [
+        event for event in jobs_store.list_status_events(uid, after_id=0)
+        if event["kind"] == "error"
+    ]
+    assert [event["job_id"] for event in errors] == [new_id]
+
+
+def test_delayed_failure_cannot_overwrite_newer_success(monkeypatch):
+    uid = "u_js_terminal_newer_success"
+    seed_user(uid)
+    _reset(uid)
+    _seed_active_route(uid)
+
+    failed_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w-fail")
+    assert jobs_store.mark_failed(
+        failed_id, "provider_unavailable", claimed_by="w-fail")
+
+    real_runtime_sink = jobs_store._deliver_terminal_failure_runtime_error
+    attempts = {"n": 0}
+
+    def _runtime_fails_once(job_id):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("transient route write")
+        return real_runtime_sink(job_id)
+
+    monkeypatch.setattr(
+        jobs_store, "_deliver_terminal_failure_runtime_error", _runtime_fails_once)
+    base_now = time.time()
+    jobs_store.reconcile_terminal_failure_outbox(job_id=failed_id, now=base_now)
+
+    success_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w-success")
+    assert jobs_store.mark_running(success_id, claimed_by="w-success")
+    completed, _successor = jobs_store.finish_chat_job(
+        success_id, claimed_by="w-success", observed_generation=0)
+    assert completed
+
+    retried = jobs_store.reconcile_terminal_failure_outbox(
+        job_id=failed_id, now=base_now + 2)
+    assert retried["runtime_error_delivered"] == 1
+    with db.get_pool().connection() as conn:
+        route_error = conn.execute(
+            "SELECT last_runtime_error FROM model_api_routes "
+            "WHERE user_id=%s AND is_active",
+            (uid,),
+        ).fetchone()[0]
+    assert route_error == ""
+
+
+def test_delayed_failure_never_stamps_newly_active_route(monkeypatch):
+    uid = "u_js_terminal_route_switch"
+    seed_user(uid)
+    _reset(uid)
+    old_route_id = _seed_active_route(uid)
+    failed_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(failed_id, "lease_timeout", claimed_by="w")
+
+    real_runtime_sink = jobs_store._deliver_terminal_failure_runtime_error
+    monkeypatch.setattr(
+        jobs_store,
+        "_deliver_terminal_failure_runtime_error",
+        lambda _job_id: (_ for _ in ()).throw(RuntimeError("transient route write")),
+    )
+    base_now = time.time()
+    jobs_store.reconcile_terminal_failure_outbox(job_id=failed_id, now=base_now)
+
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE model_api_routes SET is_active=false,updated_at=now() WHERE id=%s",
+            (old_route_id,),
+        )
+    new_route_id = _seed_active_route(uid)
+    monkeypatch.setattr(
+        jobs_store, "_deliver_terminal_failure_runtime_error", real_runtime_sink)
+    jobs_store.reconcile_terminal_failure_outbox(
+        job_id=failed_id, now=base_now + 2)
+    with db.get_pool().connection() as conn:
+        errors = conn.execute(
+            "SELECT id::text,last_runtime_error FROM model_api_routes "
+            "WHERE id IN (%s,%s) ORDER BY id",
+            (old_route_id, new_route_id),
+        ).fetchall()
+    assert all(error == "" for _route_id, error in errors)
+
+
 def test_enqueue_after_failed_job_also_coalesces_free(monkeypatch=None):
     """Partial-index crux: a job in a TERMINAL status ('failed') must not block
     a fresh enqueue for the same (user, lane) — only 'pending'/'claimed'/'running'
@@ -239,7 +562,12 @@ def test_reap_expires_stuck_claimed_job_by_deadline():
     assert reaped == 1
     with db.get_pool().connection() as conn:
         row = conn.execute("SELECT status FROM agent_jobs WHERE id=%s", (job_id,)).fetchone()
+        marker = conn.execute(
+            "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
     assert row[0] == "expired"
+    assert marker == ("lease_timeout",)
 
 
 def test_reap_leaves_fresh_running_job_alone():
@@ -579,6 +907,11 @@ def test_genesis_worker_alive_false_when_nothing_beats():
 def test_enqueue_stamps_expected_generation():
     seed_user("u_jobgen")
     gen = db.get_runtime_generation("u_jobgen")  # 1
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_runtime_state SET hosted_runtime_state='v2' WHERE user_id=%s",
+            ("u_jobgen",),
+        )
     jid, _created = jobs_store.enqueue_job("u_jobgen", "chat", expected_generation=gen)
     row = jobs_store.claim_next_job("w1")
     assert row["id"] == jid
@@ -594,3 +927,120 @@ def test_stale_generation_job_superseded_at_claim():
     claimed = jobs_store.claim_next_job("w1")
     # stale job is not handed out for a turn; it is terminal 'superseded'
     assert claimed is None or claimed["status"] == "superseded"
+
+
+def test_resident_owned_job_is_superseded_without_running():
+    uid = "u_job_resident_owned"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(
+        uid, "chat", expected_generation=generation)
+
+    assert jobs_store.claim_next_job("w-resident-fence") is None
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,last_error FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert row == ("superseded", "runtime_state_not_v2")
+
+
+def test_v2_enqueue_auto_pins_authoritative_generation():
+    uid = "u_job_auto_generation"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    with db.get_pool().connection() as conn:
+        expected = conn.execute(
+            "SELECT expected_runtime_generation FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()[0]
+    assert expected == 1
+
+
+def test_claim_pins_legacy_null_generation_to_authoritative_generation():
+    """Pre-fence pending rows survive migration but become ABA-safe at claim."""
+    uid = "u_job_claim_pins_legacy_generation"
+    seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        job_id = conn.execute(
+            "INSERT INTO agent_jobs (user_id,lane,status,priority) "
+            "VALUES (%s,'heartbeat','pending',50) RETURNING id",
+            (uid,),
+        ).fetchone()[0]
+
+    claimed = jobs_store.claim_next_job("w-legacy-generation")
+
+    assert claimed is not None and claimed["id"] == job_id
+    assert claimed["expected_runtime_generation"] == 1
+
+
+def test_generation_aba_between_claim_and_start_loses_ownership():
+    uid = "u_job_claim_start_aba"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    claimed = jobs_store.claim_next_job("w-aba")
+    assert claimed is not None and claimed["id"] == job_id
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_runtime_state SET runtime_generation=3 "
+            "WHERE user_id=%s AND hosted_runtime_state='v2'",
+            (uid,),
+        )
+
+    assert jobs_store.mark_running(job_id, claimed_by="w-aba") is False
+
+
+def test_generation_aba_during_turn_prevents_lease_renewal():
+    uid = "u_job_running_aba"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    claimed = jobs_store.claim_next_job("w-running-aba")
+    assert claimed is not None
+    assert jobs_store.mark_running(
+        job_id, claimed_by="w-running-aba") is True
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_runtime_state SET runtime_generation=3 "
+            "WHERE user_id=%s AND hosted_runtime_state='v2'",
+            (uid,),
+        )
+
+    assert jobs_store.renew_job_lease(
+        job_id, "w-running-aba") is False
+
+
+def test_enqueue_after_generation_aba_replaces_old_pending_job():
+    uid = "u_job_enqueue_aba_successor"
+    seed_user(uid)
+    _reset(uid)
+    old_id, _ = jobs_store.enqueue_job(uid, "chat")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_runtime_state SET runtime_generation=3 "
+            "WHERE user_id=%s AND hosted_runtime_state='v2'",
+            (uid,),
+        )
+
+    new_id, coalesced = jobs_store.enqueue_job(uid, "chat")
+
+    assert coalesced is False
+    assert new_id != old_id
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT id,status,expected_runtime_generation FROM agent_jobs "
+            "WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+        marker = conn.execute(
+            "SELECT 1 FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (old_id,),
+        ).fetchone()
+    assert rows == [
+        (old_id, "superseded", 1),
+        (new_id, "pending", 3),
+    ]
+    assert marker is None

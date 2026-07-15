@@ -132,6 +132,8 @@ def test_resident_chat_response_emits_route_trace(client, monkeypatch):
     )
     user_id, api_key = _register(client)
     _enable_trace(client, api_key)
+    core_store.get_store(user_id).append_chat(
+        "user", "chat", _env(user_id, "user-msg-1"))
 
     res = client.post(
         "/v1/chat/response",

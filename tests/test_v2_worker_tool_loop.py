@@ -23,6 +23,7 @@ import pytest
 import conftest
 import db
 import provider_client
+from provider_types import ToolExchange
 from capabilities import registry as cap_registry
 from core import store as core_store
 from model_api_runtime.v2 import effect_id as v2_effect_id
@@ -56,6 +57,7 @@ def _reset(uid):
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_effect_outbox WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
+    conftest.set_v2_runtime_owner(uid)
 
 
 @pytest.fixture(autouse=True)
@@ -228,9 +230,10 @@ def test_intermediate_reply_then_terminal_text_and_exactly_once_replay(monkeypat
 
     assert status == "completed"
     assert len(calls) == 2
-    # round 1's messages carry round 0's web_search observation as grounding context.
-    round1_joined = " ".join(str(m.get("content", "")) for m in calls[1]["messages"])
-    assert "search result" in round1_joined
+    # Round 1 carries the native assistant call and call-id-matched observation.
+    exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
+    assert len(exchanges) == 1
+    assert "search result" in " ".join(r.content for r in exchanges[0].results)
 
     bubbles = _bubbles(uid)
     assert len(bubbles) == 2

@@ -39,13 +39,14 @@ def test_db_action_v2_enqueues_job_and_skips_resident(monkeypatch):
         chat_send_core.core_envelope, "_build_shared_envelope_for_store",
         lambda s, pt, **kw: ({"id": "u-msg-1", "body_ct": "c", "nonce": "n", "K_user": "k"}, ""),
     )
-    # _load_runtime_provider_config (hosted.config_store) decrypts the stored
-    # provider-key envelope via the enclave before the driver is even resolved;
-    # stub it so this stays offline/deterministic (same pattern as
-    # test_asgi_hosted_chat_send.py's `env` fixture).
+    # V2 must claim/enqueue before provider BYOK resolution. The worker owns the
+    # decrypt and will surface a durable terminal error if it fails there.
     monkeypatch.setattr(
-        core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose, **kw: b"sk-or-test",
+        hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("V2 send must not decrypt provider config")
+        ),
     )
     monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
     # append_chat 走真 store 会尝试 DB；用真的即可（已 seed user）。返回其真实 row。
@@ -95,7 +96,7 @@ def test_runtime_mode_read_failure_refuses_before_persistence(monkeypatch):
     store = core_store.get_store("u_send_mode_db_failure")
     monkeypatch.setattr(
         hosted_config_store,
-        "get_hosted_runtime_mode_strict",
+        "get_hosted_runtime_control_strict",
         lambda _store: (_ for _ in ()).throw(RuntimeError("database unavailable")),
     )
     monkeypatch.setattr(
@@ -110,6 +111,32 @@ def test_runtime_mode_read_failure_refuses_before_persistence(monkeypatch):
 
     assert status == 503
     assert body == {"error": "runtime_control_unavailable"}
+
+
+def test_v2_blob_without_authoritative_v2_state_fails_closed(monkeypatch):
+    uid = "u_send_split_runtime_control"
+    _seed(uid)
+    store = core_store.get_store(uid)
+    # Reproduce the deployed pre-0034 split: blob opted into V2 while the new
+    # authoritative row is absent/default resident.
+    db.patch_blob_strict(
+        uid,
+        hosted_config_store.MODEL_API_RUNTIME_BLOB,
+        {"hosted_runtime_mode": "db_action_v2"},
+    )
+    monkeypatch.setattr(
+        store,
+        "append_chat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("split ownership must not persist")),
+    )
+
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key="key", runtime_tok="", payload={"message": "hi"},
+    )
+
+    assert status == 503
+    assert body == {"error": "runtime_control_inconsistent"}
 
 
 def test_db_action_v2_input_write_failure_never_enqueues(monkeypatch):

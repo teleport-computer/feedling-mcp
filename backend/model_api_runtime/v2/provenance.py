@@ -1,9 +1,12 @@
-"""Provenance tagging + deterministic write gate (spec C4).
+"""Provenance tagging + deterministic write gates (spec C4).
 
-Every tool observation is tagged with where its authorization comes from. A durable-write
-tool_call is refused when the turn holds no user/wake authorization — i.e. a purely web-driven
-round cannot self-authorize a memory_write/identity_patch/schedule. Fixed rule in code, independent
-of what the tool content says, so a prompt-injecting page can never grant itself write access.
+A user/wake seed is necessary for a durable write, but it is not sufficient after
+the model has observed untrusted web content.  The unified loop therefore removes
+all durable writes and free-form outbound web calls after a ``web_search``/
+``web_fetch`` dispatch.  It permits only exact ``web_fetch`` URLs returned by a
+preceding search in the same turn, preserving the normal search -> read flow
+without letting page text invent an exfiltration URL/query.  The seed gate below
+remains defence in depth for direct executor callers and wake/user-less paths.
 """
 from __future__ import annotations
 from capabilities import registry as cap_registry
@@ -13,11 +16,11 @@ WAKE_TRIGGER = "wake_trigger"
 EXTERNAL = "external"
 INTERNAL = "internal"
 
-_EXTERNAL_READS = frozenset({"web_search", "web_fetch"})
+EXTERNAL_READS = frozenset({"web_search", "web_fetch"})
 
 
 def provenance_for_read(tool_name: str) -> str:
-    return EXTERNAL if tool_name in _EXTERNAL_READS else INTERNAL
+    return EXTERNAL if tool_name in EXTERNAL_READS else INTERNAL
 
 
 def turn_has_write_authorization(seed: str) -> bool:

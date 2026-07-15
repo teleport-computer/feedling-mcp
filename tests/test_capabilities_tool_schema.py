@@ -27,3 +27,17 @@ def test_write_tools_have_object_params():
     specs = {s.name: s for s in tool_schema.build_tool_specs()}
     for w in ("memory_write", "identity_patch", "schedule_wake"):
         assert specs[w].parameters["type"] == "object"
+
+
+def test_all_model_facing_tools_reject_unknown_top_level_fields():
+    for spec in tool_schema.build_tool_specs():
+        assert spec.parameters["additionalProperties"] is False, spec.name
+
+
+def test_server_validation_covers_required_types_unknowns_and_array_items():
+    assert tool_schema.validate_tool_args("web_search", {}) == "missing required field: query"
+    assert tool_schema.validate_tool_args("web_search", {"query": 42}) == "args.query must be string"
+    assert tool_schema.validate_tool_args("memory_index", {"limit": True}) == "args.limit must be integer"
+    assert tool_schema.validate_tool_args("identity_get", {"unused": "x"}) == "unknown field: unused"
+    assert tool_schema.validate_tool_args("memory_fetch", {"ids": ["ok", 2]}) == "args.ids[1] must be string"
+    assert tool_schema.validate_tool_args("schedule_wake", {"at": "tomorrow"}) is None

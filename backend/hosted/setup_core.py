@@ -362,16 +362,26 @@ def model_api_test(store, *, api_key: str | None) -> tuple[dict, int]:
 
 
 def model_api_delete(store) -> tuple[dict, int]:
-    # Delete every credential (CASCADE removes its routes) + the runtime blob.
-    # Also clear the frozen legacy model_api blob if a pre-migration user still
-    # carries one, so the "deleted" flag reflects any removal.
-    deleted = False
-    for cred in db.model_api_credentials_list(store.user_id):
-        if db.model_api_credential_delete(store.user_id, cred["id"]):
-            deleted = True
-    if db.delete_blob(store.user_id, "model_api"):
-        deleted = True
-    db.delete_blob(store.user_id, hosted_config_store.MODEL_API_RUNTIME_BLOB)
+    # Fence V2 and preserve its durable seq cursor BEFORE deleting provider
+    # credentials. If this fails, fail closed: removing the credentials while a
+    # current-generation turn/effect remains eligible would strand or misapply
+    # work, and deleting the cursor would replay old history on reconfiguration.
+    try:
+        hosted_config_store.prepare_model_api_delete(store)
+    except Exception:
+        return {"error": "model_api_runtime_disable_failed"}, 500
+
+    # Delete every credential (CASCADE removes routes) and the frozen legacy
+    # model_api blob in one fail-loud transaction.  The old list/delete loop
+    # used best-effort DB helpers; a read or delete outage could therefore
+    # return 200 while BYOK ciphertext was still stored.  The
+    # model_api_runtime control blob intentionally remains (resident mode +
+    # correctness cursor/rollout state; provider-scoped keys were scrubbed by
+    # prepare_model_api_delete above).
+    try:
+        deleted = db.model_api_config_delete_strict(store.user_id)
+    except Exception:
+        return {"error": "model_api_config_delete_failed"}, 500
     # 配置没了,任何 config 期发出的 model_api 警告(如 responses_unsupported)也随之
     # 作废——否则 /v1/notices 会为一个已不存在的 provider 一直显示活跃警告。
     try:

@@ -25,6 +25,24 @@ def test_extract_returns_parsed_on_success(monkeypatch):
     assert parsed == ["ok"] and err is None
 
 
+def test_extract_forwards_reliable_attempt_progress(monkeypatch):
+    seen = []
+
+    async def _fake(cfg, messages, **kw):
+        callback = kw["progress_cb"]
+        callback("attempt_start", 1)
+        callback("attempt_complete", 1)
+        return {"reply": '{"cards": []}'}
+
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _fake)
+    parsed, err = asyncio.run(extraction.extract(
+        provider_config=object(), prompt="P", parse=lambda raw: (["ok"], None),
+        progress_cb=lambda stage, attempt: seen.append((stage, attempt))))
+
+    assert parsed == ["ok"] and err is None
+    assert seen == [("attempt_start", 1), ("attempt_complete", 1)]
+
+
 def test_extract_returns_reason_on_provider_error(monkeypatch):
     async def _boom(cfg, messages, **kw):
         raise RuntimeError("402 no credit")

@@ -52,5 +52,10 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
 
 
 def write(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
-    body, status = memory_core.actions(store, api_key, params or {})
+    body, status = memory_core.actions(
+        store,
+        api_key,
+        params or {},
+        runtime_token=runtime_token or "",
+    )
     return _norm(body, status, default_msg="memory write unavailable")

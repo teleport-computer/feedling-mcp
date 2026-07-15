@@ -1,16 +1,39 @@
 # Hosted Runtime V2 — tokens/turn measurements
 
-> Current rollout-gate result (2026-07-11, shared fixtures): **574.0
-> tokens/turn, 2.3333 LLM calls/turn**. The 545.3/2.0 values below are retained
-> as the historical pre-loop measurement, not as the current go/no-go number.
+> Current rollout-gate result (2026-07-14, shared fixtures): **1707.0
+> tokens/turn, 1.3333 LLM calls/turn**. This is the first measurement through
+> the production provider-native `tool_loop.run_tool_loop`; every older number
+> below is retained as staged-pipeline history, not a current go/no-go number.
+
+## Current method and result
+
+`scripts/loadtest/compare_tokens.measure_turn_tokens` drives the same unified
+native tool loop as the production worker. The shared workload contains two
+one-shot replies and one `memory_search` tool turn; that tool turn makes one
+tools-enabled native function call, replays the call-id-matched observation,
+then uses the loop's reserved tools-disabled final reply. The mock estimator
+counts message content, native tool calls/results, and the full tool catalog.
+
+| metric | current value |
+|---|---|
+| `tokens_per_turn` | **1707.0** |
+| `llm_calls_per_turn` | **1.3333333333333333** |
+
+Against the measured resident baseline of 9303.0 tokens/turn, the current V2
+fixture is about **81.65% lower** (5.45× smaller). This offline comparison does
+not replace production whole-turn telemetry.
+
+---
+
+## Historical staged-pipeline measurements
 
 Taken on 2026-07-10, at commit `3bfb7f2`, BEFORE `agent_loop.py` existed.
 Purpose: give D4's rollback gate (`scripts/loadtest/compare_tokens.py`) a reference point,
 per the agent-loop spec §12 decision 3.
 
-## Method
+### Original method
 
-`scripts/loadtest/compare_tokens.measure_turn_tokens` drives the REAL
+The old `scripts/loadtest/compare_tokens.measure_turn_tokens` drove
 `planner.plan` + `responder.respond` for each fixture against
 `MockProvider(estimate_tokens=True)`, and reads the mock's server-side
 accumulators. Token counts are a 4-chars-per-token estimate — **relative**,
@@ -19,7 +42,7 @@ not absolute. The gate compares ratios, so this is sufficient and provider-indep
 Three fixtures: a bare one-liner, a mid-length turn with a real summary + 3-message tail,
 and a long-summary turn. Exact fixture bodies are in this plan, Task 3 Step 5.
 
-## Result (single-round `plan → execute → reply`)
+### Result (single-round `plan → execute → reply`)
 
 | metric | value |
 |---|---|
@@ -29,7 +52,7 @@ and a long-summary turn. Exact fixture bodies are in this plan, Task 3 Step 5.
 This is a historical pre-loop reference. Do not paste it into the current
 runbook gate.
 
-## How to re-measure after the loop lands
+### Historical re-measurement note
 
 Run the same snippet (Task 3 Step 5). `llm_calls_per_turn` will exceed 2.0 whenever the
 planner asks for a second round. The rollback gate is `tokens_per_turn` growth > +10%
@@ -38,7 +61,7 @@ tells you whether a regression came from the loop or from somewhere else.
 
 ---
 
-# After the agent loop — MEASURED, not extrapolated
+# Historical staged agent loop — MEASURED, not extrapolated
 
 Driven through the real `worker.process_job` (real `planner.official_plan`, real
 `executor`, real `responder.respond`) against a `MockProvider(estimate_tokens=True)` whose
@@ -83,9 +106,9 @@ capped `prior_action_results` preview. So:
 The fixture above is deliberately small-context, so treat 4.09× as an upper bound for the
 typical turn, not an average.
 
-## What actually happens in production
+## What the retired staged pipeline did
 
-The typical turn is **unchanged**. A planner that emits `final_response` on round 0 — which
+Its typical turn was **unchanged**. A planner that emitted `final_response` on round 0 — which
 is what the prompt tells it to do, and what every `rule_plan` (weak/relay model) turn does
 unconditionally — costs exactly 2 calls, exactly as before the loop. Only turns where the
 model genuinely asks for more context pay more. That is the feature, and it is bounded.
@@ -132,13 +155,13 @@ and is essentially independent of what the user said. It is the whole story.
 ```text
                                       tokens/turn   calls/turn   vs resident
 resident (codex, shared prompts)          9303.0        1.0000         —
-V2 current shared-fixture gate             574.0        2.3333      -93.83%
+V2 current native-loop shared fixture     1707.0        1.3333      -81.65%
 ```
 
 The separately forced small-context stress fixtures remain useful bounds but
 are not the same workload: a three-round loop measured 1336 tokens and the
 six-call hard-gate case measured 2066. The current shared-fixture V2 result is
-about **16.2× lower** than the measured resident baseline. This large offline
+about **5.45× lower** than the measured resident baseline. This large offline
 margin does not replace production whole-turn telemetry or CVM load evidence.
 
 ## Honest caveats

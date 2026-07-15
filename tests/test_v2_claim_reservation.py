@@ -16,12 +16,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db
 from model_api_runtime.v2 import jobs_store
 
-from conftest import seed_user
+from conftest import seed_user, set_v2_runtime_owner
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
     reason="DB-backed V2 jobs_store tests require the PostgreSQL test fixture",
 )
+
+
+def _seed_v2(uid: str) -> None:
+    seed_user(uid)
+    set_v2_runtime_owner(uid)
 
 
 @pytest.fixture(autouse=True)
@@ -34,9 +39,9 @@ def _clean_agent_jobs_table():
 
 
 def test_reserved_slot_skips_background_lanes_until_chat_arrives():
-    seed_user("u_res_1")
-    seed_user("u_res_2")
-    seed_user("u_res_3")
+    _seed_v2("u_res_1")
+    _seed_v2("u_res_2")
+    _seed_v2("u_res_3")
     jobs_store.enqueue_job("u_res_1", "heartbeat")
     jobs_store.enqueue_job("u_res_2", "capture")
 
@@ -52,8 +57,8 @@ def test_reserved_slot_skips_background_lanes_until_chat_arrives():
 
 
 def test_general_slot_priority_order_chat_before_heartbeat():
-    seed_user("u_gen_1")
-    seed_user("u_gen_2")
+    _seed_v2("u_gen_1")
+    _seed_v2("u_gen_2")
     hb_id, _ = jobs_store.enqueue_job("u_gen_1", "heartbeat")
     chat_id, _ = jobs_store.enqueue_job("u_gen_2", "chat")  # enqueued later in time
 

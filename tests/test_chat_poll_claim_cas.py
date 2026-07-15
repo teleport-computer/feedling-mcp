@@ -139,7 +139,12 @@ def test_db_action_v2_claiming_poll_gated_but_readonly_still_delivers(store):
     ignores reply_claimed_by — that would double-reply). A read-only poll (the
     client fetching the V2 reply) is unaffected."""
     import db  # noqa: E402
-    db.set_blob(store.user_id, "model_api_runtime", {"hosted_runtime_mode": "db_action_v2"})
+    db.patch_blob_strict(
+        store.user_id,
+        "model_api_runtime",
+        {"hosted_runtime_mode": "db_action_v2"},
+        runtime_state_target="v2",
+    )
     _append_reply(store, "m_v2_1")
 
     # resident consumer's claiming poll: gated → nothing claimed
@@ -156,3 +161,17 @@ def test_resident_cli_claiming_poll_unaffected_by_guard(store):
     only fires for explicit db_action_v2 users."""
     _append_reply(store, "m_res_1")
     assert [m["id"] for m in _poll(store, "agent-runner:x", claim=True)] == ["m_res_1"]
+
+
+def test_runtime_control_read_failure_never_grants_resident_claim(store, monkeypatch):
+    from hosted import config_store as hosted_config_store  # noqa: E402
+
+    _append_reply(store, "m_control_down")
+    monkeypatch.setattr(
+        hosted_config_store,
+        "get_hosted_runtime_control_strict",
+        lambda _store: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    assert _poll(store, "agent-runner:x", claim=True) == []
+    assert [m["id"] for m in _poll(store, "client", claim=False)] == ["m_control_down"]

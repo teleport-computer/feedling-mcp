@@ -25,7 +25,6 @@ import db
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import serve_worker
-from model_api_runtime.v2 import worker as v2_worker
 from core import enclave as core_enclave
 
 from conftest import seed_user
@@ -98,21 +97,20 @@ def test_coalesce_passes_seq_through():
     assert [(m["id"], m["seq"]) for m in coalesced] == [("m1", 7), ("m2", 9)]
 
 
-def test_reply_cursor_bootstrap_maps_legacy_last_replied_ts_to_seq(pg_clean):
-    """A hosted user that answered under the OLD ts cursor (last_replied_ts set,
-    v2_reply_cursor_seq absent) must resume at the seq of the last answered
-    message — NOT 0, which would re-read and re-answer their whole history."""
+def test_zero_reply_cursor_does_not_reapply_legacy_timestamp_boundary(pg_clean):
+    """Runtime reads must never reconstruct a seq cursor from last_replied_ts.
+
+    Migration 0033 owns the conservative one-time conversion.  A runtime
+    ``<=`` fallback can hide a same-timestamp user message forever, so a zero
+    seq remains zero and safely replays instead of silently losing input.
+    """
     seed_user("u_rc_boot")
     db.chat_append("u_rc_boot", "u1", 100.0, _enc_doc("u1", 100.0), 5000)
     db.chat_append("u_rc_boot", "r1", 101.0, _enc_doc("r1", 101.0, role="openclaw"), 5000)
-    boundary_seq = db.chat_max_seq_at_or_before_ts("u_rc_boot", 101.0)
 
     class _Store:
         user_id = "u_rc_boot"
 
-    # No v2_reply_cursor_seq in the blob; legacy ts cursor at the reply ts.
+    # No v2_reply_cursor_seq in the blob. Even if a legacy timestamp exists in
+    # runtime state, the authoritative seq cursor remains conservative.
     assert v2_cursor.load_seq(_Store()) == 0
-    seq = v2_worker._load_reply_cursor_seq(_Store(), {"last_replied_ts": 101.0})
-    assert seq == boundary_seq
-    # Fresh user (no ts cursor either) starts at 0 — reads everything once.
-    assert v2_worker._load_reply_cursor_seq(_Store(), {}) == 0

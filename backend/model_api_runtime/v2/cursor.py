@@ -32,21 +32,40 @@ def advance_effect(*, job_id: int, ordinal: int, generation: int, new_seq: int):
     outbox applier reading ``expected_generation`` at apply time, not by the
     id shape.
     """
+    seq = int(new_seq)
+    if seq < 0:
+        raise ValueError("new_seq must be >= 0")
     eid = effect_id.derive(job_id=job_id, effect_type="cursor", ordinal=ordinal)
-    return eid, {"new_seq": new_seq}
+    return eid, {"new_seq": seq}
 
 
 def load_seq(store) -> int:
     """Last durably committed reply-cursor seq for ``store``'s user, or 0 if
     never advanced. ``store`` is duck-typed to anything carrying a
     ``user_id`` (e.g. ``core.store.UserStore``) — this module reads the raw
-    ``model_api_runtime`` blob directly via ``db.get_blob`` rather than going
+    ``model_api_runtime`` blob directly via ``db.get_blob_strict`` rather than going
     through ``hosted.config_store``, so it stays import-clean of ``hosted``
-    (dependency-direction guard, spec constraints)."""
-    profile = db.get_blob(store.user_id, "model_api_runtime")
+    (dependency-direction guard, spec constraints). Invalid stored values and
+    database errors propagate: resetting a broken/unreadable correctness cursor
+    to zero would replay an arbitrary amount of conversation history."""
+    # Correctness cursors use the strict reader: a transient DB failure must
+    # fail the turn, never masquerade as "cursor unset" and replay history.
+    profile = db.get_blob_strict(store.user_id, "model_api_runtime")
+    if profile is None:
+        return 0
     if not isinstance(profile, dict):
+        raise ValueError("model_api_runtime blob must be an object")
+    raw = profile.get(CURSOR_KEY)
+    if raw is None or raw == "":
         return 0
-    try:
-        return int(profile.get(CURSOR_KEY) or 0)
-    except (TypeError, ValueError):
-        return 0
+    if isinstance(raw, bool):
+        raise ValueError(f"{CURSOR_KEY} must be a non-negative integer")
+    if isinstance(raw, int):
+        seq = raw
+    elif isinstance(raw, str) and raw.strip().isdecimal():
+        seq = int(raw.strip())
+    else:
+        raise ValueError(f"{CURSOR_KEY} must be a non-negative integer")
+    if seq < 0:
+        raise ValueError(f"{CURSOR_KEY} must be a non-negative integer")
+    return seq

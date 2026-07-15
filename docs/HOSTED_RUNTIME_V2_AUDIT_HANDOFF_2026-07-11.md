@@ -1,5 +1,10 @@
 # Hosted Runtime V2 audit and engineer handoff — 2026-07-11
 
+> **STATUS: HISTORICAL SNAPSHOT.** This handoff is pinned to the audited SHA
+> below and intentionally preserves the gaps seen on that date. For current
+> implementation status use `docs/superpowers/specs/runtime-v2-parity-matrix.md`;
+> for live rollout gates use `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`.
+
 > Audited upstream: `feat/hosted-runtime-v2` at
 > `0333bc4f8a251d99570a6e0df57cafee751d99b7`
 > Follow-up branch: `codex/hosted-runtime-v2-p0-followup`

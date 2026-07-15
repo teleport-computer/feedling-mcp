@@ -59,8 +59,8 @@ def test_runtime_mode_fence_uses_strict_control_plane_read(monkeypatch):
     monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: object())
     monkeypatch.setattr(
         serve_worker.hosted_config_store,
-        "get_hosted_runtime_mode_strict",
-        lambda store: "db_action_v2",
+        "hosted_runtime_v2_enabled_strict",
+        lambda store: True,
     )
 
     assert serve_worker._build_scheduler_deps().runtime_mode_enabled("u1") is True

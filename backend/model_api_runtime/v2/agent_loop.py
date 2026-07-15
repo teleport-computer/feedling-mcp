@@ -4,12 +4,10 @@
 `plan`/`rule_plan`/`official_plan` 使用。chat（Task 7）/wake（Task 8）都已迁到
 `tool_loop.run_tool_loop`（provider-native 统一工具循环——不需要一个独立的
 decide/act 状态机，因为"决定要不要再发工具"这件事现在就是模型自己 tool_calls
-是否为空这一个信号）。`worker.py` 自 PR C9b 起不再 import 本模块。本模块没有被
-删除——`scripts/loadtest/compare_tokens.py`（D4 token-per-turn 回滚门）仍在直接
-驱动 `run_turn`/`Decision` 来测量旧管线的开销基线，且有自己的真实、通过中的测试
-（`tests/test_v2_agent_loop.py`、`tests/test_loadtest_compare.py`）。
-`tests/test_v2_no_dispatch_tiering.py` 锁定的真正不变量是"worker.py 生产代码不
-调用 `run_turn`"，而不是"这个模块不存在"。
+是否为空这一个信号）。`worker.py` 与 D4 token-per-turn 回滚门自 PR C9b 起都不再
+import 本模块；D4 直接驱动生产 `tool_loop.run_tool_loop`。本模块暂留给旧状态机的
+兼容性单测（`tests/test_v2_agent_loop.py`）。`tests/test_v2_no_dispatch_tiering.py`
+锁定的真正不变量是生产代码和回滚门都不调用 `run_turn`，而不是"这个模块不存在"。
 
 设计见 docs/superpowers/specs/2026-07-10-hosted-runtime-v2-agent-loop-design.md。
 

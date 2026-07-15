@@ -11,14 +11,15 @@ RAM and process count become a function of the worker-pool size, not the user co
 - **D0 landed**: worker pool container (`serve-worker`) added to the runner compose; discovery exclusivity guard live (`db.list_agent_runtime_enabled_users` excludes `db_action_v2` users); admin mode-setter (`/v1/admin/hosted-runtime-mode` + `io_cli set-/list-runtime-mode`); per-turn metrics (`v2_turn_metrics` + `/v1/admin/v2-metrics`).
 - **D3 landed**: proactive/wake migrated to lanes (scheduler + wake handler). **Full kill-resident cannot happen until D3 is deployed** — before that, `db_action_v2` only reroutes interactive chat; a flipped user's proactive wakes would be lost.
 - Both runner composes carry the `serve-worker` service (`deploy/docker-compose.phala.runner.yaml`, `deploy/docker-compose.phala.prod.runner.yaml`).
-- **Audit blockers closed first**: do not enroll even an internal user until the cutover cursor, transactional reply boundary, hard wedged-turn recovery, live turn-pool kill switch, and fault-injection/rollback drill in `docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md` are complete.
+- **Audit blockers closed first**: the branch now contains the stable cutover cursor, transactional reply boundary, hard wedged-turn recovery, and database-backed live turn-pool kill switch. Do not enroll even an internal user until the deployed image has also passed the fault-injection/rollback drill in `docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md`.
 - Capture/dream producers are currently default-off. Any early infrastructure soak is capability-incomplete and is not evidence that V2 can replace resident.
+- Web results are untrusted: after `web_search`/`web_fetch` returns, the native loop removes every durable-write tool and blocks new searches/fresh outbound URLs for the remainder of that turn. A `web_search` result may be fetched once only by its exact returned URL; search-and-save still needs a fresh user turn. Do not widen that boundary without per-result taint tracking, outbound data-loss controls, and an explicit confirmation protocol.
 
 ## Step 0 — Deploy the worker pool
 
 1. Adding the `serve-worker` service is a **compose change** → new `compose_hash` → **on-chain `addComposeHash()` re-auth** (pre `FeedlingAppAuth 0x6584…`, prod `0x6c8A…`). See `deploy/DEPLOYMENTS.md` "How to re-run the deploy".
 2. Build `feedling-agent-runner:<sha>`, bump the compose tag, `phala deploy --cvm-id <runner>`, `deploy/publish-compose-hash.sh`.
-3. Env (encrypted channel, no re-auth): `FEEDLING_V2_MAX_WORKERS` (default 4), `FEEDLING_V2_CHAT_RESERVED_SLOTS` (default `max(1, MAX_WORKERS//2)`, clamped so at least one slot remains unrestricted), `FEEDLING_V2_SCHEDULER_INTERVAL_SEC` (default 30). Non-positive/invalid worker, enclave, TTL, poll, and scheduler settings now fail startup.
+3. Env (encrypted channel, no re-auth): `FEEDLING_V2_MAX_WORKERS` (default 4), `FEEDLING_V2_CHAT_RESERVED_SLOTS` (default `max(1, MAX_WORKERS//2)`, clamped so at least one slot remains unrestricted), `FEEDLING_V2_SCHEDULER_INTERVAL_SEC` (default 30). Watchdog budgets are deliberately split: `FEEDLING_V2_TURN_STALL_TIMEOUT_SEC` defaults to 240s (minimum 210s), `FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC` defaults to 1500s and must cover the configured prompt-catch-up/provider envelope (1440s minimum at current defaults), `FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC` defaults to 45s, and `FEEDLING_V2_WATCHDOG_DB_TIMEOUT_SEC` defaults to 5s. **Remove any existing `FEEDLING_V2_TURN_HARD_TIMEOUT_SEC=180` override before deploy**: the legacy key is now only a stall-timeout alias, and values below 210s intentionally fail startup. Do not set the absolute budget back to 180s; legitimate `FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=600` catch-up plus bounded provider rounds can exceed it while still making progress. `serve-worker` automatically sizes its process-local `FEEDLING_DB_POOL_MAX_SIZE` floor to `max(16, 2*MAX_WORKERS+4)` because every generation-fenced effect drain may hold one outer transaction while its sink borrows a second connection; an explicit lower override fails startup instead of deadlocking all slots. Non-positive/invalid worker, pool, enclave, TTL, poll, scheduler, and watchdog settings fail startup.
 4. **Verify**: `v2_worker_heartbeats` has fresh rows (`jobs_store.workers_alive()` True); `GET /v1/admin/v2-metrics` returns live_workers ≥ 1.
 5. **Verify genesis rehome** (2026-07-10): the genesis import worker now runs inside `serve-worker`, not `agent-runner` — `genesis_import_jobs` has exactly one drain in the codebase, so if this container is unhealthy, every new user's onboarding distillation stalls silently. Confirm `GET /v1/admin/v2-metrics` returns `genesis_alive: true`, then drive **one real genesis import end-to-end** and confirm it decrypts (the runner CVM reaches the main enclave over the passthrough URL with `verify=False`; `deploy/DEPLOYMENTS.md` has always flagged this as a post-cutover check). A `genesis_alive: false` with `live_workers ≥ 1` means the genesis thread died while the turn loops kept beating — check the serve-worker logs for `[genesis:daemon]`.
 
@@ -28,12 +29,12 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 
 1. Start the mock provider: `python scripts/loadtest/mock_provider.py --port 8099 --prompt-tokens 100 --completion-tokens 20 --latency-ms 200`.
 2. Drive load: `python scripts/loadtest/run_loadtest.py --users 100 --workers 16` (for the real run, point the driver's processor at a live `serve_worker` pool configured against the mock; the in-CI smoke uses the simulated drain). Collect: queue-wait P95, turn latency, tokens/turn, stuck jobs, RSS.
-3. **tokens/turn vs resident (rollback gate)**: the resident baseline is **measured, not assumed** — `python scripts/loadtest/measure_resident.py` (spawns the real `codex` CLI against MockProvider; see `docs/HOSTED_RUNTIME_V2_TOKEN_BASELINE.md`). The current shared-fixture baseline is **9303.0 tokens/turn**. Then run `python scripts/loadtest/compare_tokens.py --resident-baseline 9303.0 --threshold 0.10`. Exit code 1 = regression > +10%; exit code 2 = invalid/non-finite gate input; either means **do not roll out**. On 2026-07-11 the loop-aware command reports **574.0 tokens/turn, 2.3333 LLM calls/turn, -93.83% vs resident**. Re-measure both sides whenever the fixtures, loop, prompts, tools, model, or agent CLI version changes. This offline mock result is a regression gate, not production capacity evidence.
+3. **tokens/turn vs resident (rollback gate)**: the resident baseline is **measured, not assumed** — `python scripts/loadtest/measure_resident.py` (spawns the real `codex` CLI against MockProvider; see `docs/HOSTED_RUNTIME_V2_TOKEN_BASELINE.md`). The current shared-fixture baseline is **9303.0 tokens/turn**. Then run `python scripts/loadtest/compare_tokens.py --resident-baseline 9303.0 --threshold 0.10`. Exit code 1 = regression > +10%; exit code 2 = invalid/non-finite gate input; either means **do not roll out**. On 2026-07-14 the production-native-loop command reports **1707.0 tokens/turn, 1.3333 LLM calls/turn, -81.65% vs resident**; the workload mixes two one-shot replies with one native tool-call round and reserved tools-disabled final reply. Re-measure both sides whenever the fixtures, loop, prompts, tools, model, or agent CLI version changes. This offline mock result is a regression gate, not production capacity evidence.
 4. Sanity vs the capacity model: 100 users, 16 workers × ~20 s/turn ≈ 50 turns/min → the everyone-at-once spike clears in ~2 min; queue-wait P95 should not contradict this.
 
 ## Step 2 — Gated rollout (evidence-first)
 
-1. **Current state: HOLD.** The audit verdict is NO-GO for user flips until the prerequisites above and the handoff's P0 gates are closed. Once they pass, start with one explicitly consented internal user: `io_cli set-runtime-mode <internal_uid> db_action_v2`. Watch `/v1/admin/v2-metrics` (inflight/pending/wake success and current responder-only token samples) + error chips + subjective chat quality for 24–48 h. Treat production token metrics as non-authoritative until whole-turn aggregation lands.
+1. **Current state: HOLD.** The remaining gate is deployed operational evidence, not the former P0 code omissions: finish the prerequisites above and the handoff's fault/rollback checks before any user flip. Once they pass, start with one explicitly consented internal user: `io_cli set-runtime-mode <internal_uid> db_action_v2`. Watch `/v1/admin/v2-metrics` (inflight/pending/wake success and whole-turn chat/wake provider usage) + error chips + subjective chat quality for 24–48 h. Extraction and compaction calls do not yet contribute token usage, so treat totals for those maintenance lanes as incomplete.
 2. **Ramp cohorts**: 5 → 20 → 50 → all. `io_cli list-runtime-mode` to track who's on what. Each batch: confirm tokens/turn not regressed, queue-wait P95 within SLA, `wake.success_rate` healthy, `stuck_jobs ≈ 0`.
 3. **Mixed-fleet safety**: the D0 exclusivity guard keeps each user on exactly ONE path — only an explicit `db_action_v2` value enrolls V2; missing/invalid values remain resident. A flipped user runs on V2 and their resident consumer is reaped (~15 s, next supervisor tick); an un-flipped user stays resident. A runtime-control read failure must refuse routing, and a resident-discovery query failure must skip reconciliation rather than look like an empty roster. No double-run and no outage-driven fleet teardown.
 
@@ -48,11 +49,37 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 
 - **Fastest** (no on-chain re-auth): revert a user's flag — `io_cli set-runtime-mode <uid> resident_cli`. They fall back to the default path; the supervisor re-spawns their resident next tick.
 - **Drain before image rollback.** Stop new V2 admission, move enrolled users to `resident_cli`, wait for claimed/running V2 rows to terminalize, and verify no V2 reply is in flight before deploying an older worker image. The schema keeps separate queue and execution deadlines for mixed-version safety, but an old worker does not have the new ownership/effect fences.
-- **Do not mistake the CI deploy gate for a live kill switch.** `gh variable set DEPLOY_*_RUNNER_CVM --body false` only prevents future deploy jobs; the already-running CVM keeps serving its last image. Roll back every flipped user first. A true pool-wide stop/drain control that leaves Genesis alive is still an explicit follow-up.
+- **Encrypted write-effect compatibility.** New memory/identity/schedule rows use
+  versioned durable types (`*_encrypted_v1`). An older worker cannot interpret
+  them and therefore leaves them pending instead of applying an empty payload;
+  the current worker's parent sweeper drains them after upgrade. Do not leave an
+  old image running as the only worker: pending encrypted writes will remain
+  visible in `effects.pending` until a current worker returns. Rows that require
+  human judgment surface as `effects.needs_reconciliation`.
+- **Do not mistake the CI deploy gate for the live turn switch.** `gh variable set DEPLOY_*_RUNNER_CVM --body false` only prevents future deploy jobs; the already-running CVM keeps serving its last image. The database-backed `v2_runtime_control.turns_halted` switch is the live control: setting it true fail-closes new V2 admission, stops new turn claims, and fences writes while leaving Genesis alive. It does not cancel an already-running provider request, so roll back every flipped user and drain terminal jobs before an image rollback.
 - **Image rollback**: re-pin an older `:<sha>` in the runner compose and redeploy.
 
 ## Deferred (explicit, out of this round)
 
+- **D follow-up ledger (do not read this runbook as claiming completion)**:
+  prompt caching is not implemented; whole-turn chat/wake usage is implemented
+  but extraction/compaction usage and a real concurrent CVM load run remain;
+  admission ceiling is implemented; typing-signal pre-warm is not implemented;
+  encrypted full-trajectory storage plus side-effect-disabled dream-lane failure
+  replay is not implemented; and fleet-wide resident retirement is an operator
+  outcome only after wake/capture/dream parity and the rollout gates above pass.
+- **Long-horizon conversation frontier is not implemented.** The current
+  encrypted itemized summary is append-only and is sent in full on every turn,
+  so it preserves coverage and fails visibly rather than dropping history, but
+  its prompt footprint still grows without bound until a BYOK model's context
+  limit is reached. This is acceptable for bounded test soaking, not a
+  fleet-wide production cutover claim. Before broad rollout, add immutable
+  encrypted summary segments plus append-only higher-level checkpoints and a
+  CAS-managed non-overlapping active frontier, then budget the complete rendered
+  prompt (system + frontier + verbatim tail + tool transcript) against provider
+  context limits. Do not "fix" this by truncating the summary or silently
+  advancing its watermark: either approach loses the full-conversation
+  invariant.
 - **Default flip** — do not infer fleet membership from a missing blob. After every gate is complete, backfill existing users to an explicit mode and make onboarding persist its intended mode transactionally; only then consider changing new-user policy. A missing/invalid value remains a safety fallback, not a cutover signal.
 - **Authoritative 4c/8GB load run** — rerun Step 1 on CVM-class hardware if the local indicative numbers are borderline.
 - **Promoting genesis to its own container.** It is now a dedicated thread inside `serve-worker` rather than inside `agent-runner` — better, but still a thread in someone else's process. Its own service would give it a restart policy and a real crash domain. Costs one more `addComposeHash()`, so it was not bundled here.

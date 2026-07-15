@@ -11,6 +11,8 @@ from urllib.parse import quote
 
 import httpx
 
+from provider_types import ToolExchange
+
 if TYPE_CHECKING:
     from provider_types import ToolSpec
 
@@ -424,11 +426,18 @@ def _split_system_messages(
 
 
 def _split_system_messages_anthropic(
-    messages: list[dict[str, Any]],
+    messages: list[Any],
 ) -> tuple[str, list[dict[str, Any]]]:
     system_parts: list[str] = []
     provider_messages: list[dict[str, Any]] = []
     for message in messages:
+        if isinstance(message, ToolExchange):
+            payload = _assistant_payload_for_wire(message, "anthropic")
+            if not isinstance(payload, list):
+                raise ProviderError("anthropic assistant turn content must be a list")
+            provider_messages.append({"role": "assistant", "content": payload})
+            provider_messages.extend(_encode_tool_results_anthropic(message.results))
+            continue
         role = str(message.get("role") or "").strip().lower()
         content = message.get("content")
         text = _content_text(content)
@@ -451,11 +460,22 @@ def _split_system_messages_anthropic(
 
 
 def _split_system_messages_gemini(
-    messages: list[dict[str, Any]],
+    messages: list[Any],
 ) -> tuple[str, list[dict[str, Any]]]:
     system_parts: list[str] = []
     provider_messages: list[dict[str, Any]] = []
     for message in messages:
+        if isinstance(message, ToolExchange):
+            payload = _assistant_payload_for_wire(message, "gemini")
+            if not isinstance(payload, dict):
+                raise ProviderError("gemini assistant turn content must be an object")
+            assistant_content = dict(payload)
+            assistant_content.setdefault("role", "model")
+            provider_messages.append(assistant_content)
+            id_to_name = {call.id: call.name for call in message.calls}
+            provider_messages.extend(
+                _encode_tool_results_gemini(message.results, id_to_name))
+            continue
         role = str(message.get("role") or "").strip().lower()
         content = message.get("content")
         text = _content_text(content)
@@ -510,19 +530,160 @@ def _parse_tool_args(raw) -> tuple[dict, str, bool]:
         return {}, s, False
 
 
+def _malformed_tool_call(*, call_id: str = "", name: str = "") -> dict:
+    """Normalize an unusable provider tool-call element without raising.
+
+    Provider and relay responses are untrusted JSON.  Returning an explicit
+    ``args_ok=False`` call keeps malformed wire shapes on the tool loop's
+    fail-closed path (no capability dispatch, then the bounded text fallback)
+    instead of letting an ``AttributeError`` escape while decoding.
+    """
+    return {
+        "id": str(call_id or ""),
+        "name": str(name or ""),
+        "args": {},
+        "args_raw": "",
+        "args_ok": False,
+    }
+
+
+def _tool_args_json(call) -> str:
+    if not call.args_ok and call.args_raw:
+        return call.args_raw
+    return json.dumps(call.args, ensure_ascii=False, separators=(",", ":"))
+
+
+def _validate_tool_exchange(exchange: ToolExchange) -> None:
+    call_ids = [call.id for call in exchange.calls]
+    result_ids = [result.call_id for result in exchange.results]
+    if call_ids != result_ids:
+        raise ProviderError(
+            "tool exchange results must match assistant call ids in original order")
+
+
+def _synthesized_assistant_payload(exchange: ToolExchange, wire: str):
+    """Compatibility path for tests/legacy fakes without an exact native turn.
+
+    Real provider responses always carry ``NativeAssistantTurn``.  Keeping this
+    deterministic fallback avoids forcing every scripted loop test to manufacture
+    provider JSON while ensuring production never discards provider-only fields.
+    """
+    if wire == "openai_chat":
+        return {
+            "role": "assistant",
+            "content": exchange.assistant_text or None,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": _tool_args_json(call),
+                    },
+                }
+                for call in exchange.calls
+            ],
+        }
+    if wire == "openai_responses":
+        items: list[dict[str, Any]] = []
+        if exchange.assistant_text:
+            items.append({
+                "role": "assistant",
+                "content": [{"type": "input_text", "text": exchange.assistant_text}],
+            })
+        items.extend({
+            "type": "function_call",
+            "call_id": call.id,
+            "name": call.name,
+            "arguments": _tool_args_json(call),
+        } for call in exchange.calls)
+        return items
+    if wire == "anthropic":
+        blocks: list[dict[str, Any]] = []
+        if exchange.assistant_text:
+            blocks.append({"type": "text", "text": exchange.assistant_text})
+        blocks.extend({
+            "type": "tool_use",
+            "id": call.id,
+            "name": call.name,
+            "input": call.args,
+        } for call in exchange.calls)
+        return blocks
+    if wire == "gemini":
+        parts: list[dict[str, Any]] = []
+        if exchange.assistant_text:
+            parts.append({"text": exchange.assistant_text})
+        parts.extend({
+            "functionCall": {"name": call.name, "args": call.args}
+        } for call in exchange.calls)
+        return {"role": "model", "parts": parts}
+    raise ProviderError(f"unknown tool exchange wire: {wire}")
+
+
+def _assistant_payload_for_wire(exchange: ToolExchange, wire: str):
+    _validate_tool_exchange(exchange)
+    native = exchange.assistant_turn
+    if native is None:
+        return _synthesized_assistant_payload(exchange, wire)
+    if native.wire != wire:
+        raise ProviderError(
+            f"tool exchange wire mismatch: expected {wire}, got {native.wire}")
+    return native.payload
+
+
+def _encode_messages_openai_chat(messages: list[Any]) -> list[dict[str, Any]]:
+    encoded: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, ToolExchange):
+            encoded.append(message)
+            continue
+        payload = _assistant_payload_for_wire(message, "openai_chat")
+        if not isinstance(payload, dict):
+            raise ProviderError("openai chat assistant turn must be an object")
+        assistant_message = dict(payload)
+        assistant_message.setdefault("role", "assistant")
+        encoded.append(assistant_message)
+        encoded.extend(_encode_tool_results_openai_chat(message.results))
+    return encoded
+
+
 def _encode_tools_openai_chat(tools) -> list[dict]:
     return [{"type": "function", "function": {
         "name": t.name, "description": t.description, "parameters": t.parameters}} for t in tools]
 
 
 def _decode_tool_calls_openai_chat(body: dict) -> list[dict]:
-    try:
-        raw_calls = body["choices"][0]["message"].get("tool_calls") or []
-    except (KeyError, IndexError, TypeError):
+    if not isinstance(body, dict):
+        return [_malformed_tool_call()]
+    choices = body.get("choices")
+    if choices is None:
         return []
+    if not isinstance(choices, list):
+        return [_malformed_tool_call()]
+    if not choices:
+        return []
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return [_malformed_tool_call()]
+    message = choice.get("message")
+    if message is None:
+        return []
+    if not isinstance(message, dict):
+        return [_malformed_tool_call()]
+    raw_calls = message.get("tool_calls")
+    if raw_calls is None:
+        return []
+    if not isinstance(raw_calls, list):
+        return [_malformed_tool_call()]
     out = []
     for c in raw_calls:
+        if not isinstance(c, dict):
+            out.append(_malformed_tool_call())
+            continue
         fn = c.get("function") or {}
+        if not isinstance(fn, dict):
+            out.append(_malformed_tool_call(call_id=str(c.get("id") or "")))
+            continue
         args, args_raw, ok = _parse_tool_args(fn.get("arguments"))
         out.append({"id": str(c.get("id") or ""), "name": str(fn.get("name") or ""),
                     "args": args, "args_raw": args_raw, "args_ok": ok})
@@ -536,7 +697,17 @@ def _encode_tools_openai_responses(tools) -> list[dict]:
 
 def _decode_tool_calls_openai_responses(body: dict) -> list[dict]:
     out = []
-    for item in (body.get("output") or []):
+    if not isinstance(body, dict):
+        return [_malformed_tool_call()]
+    output = body.get("output")
+    if output is None:
+        return []
+    if not isinstance(output, list):
+        return [_malformed_tool_call()]
+    for item in output:
+        if not isinstance(item, dict):
+            out.append(_malformed_tool_call())
+            continue
         if item.get("type") != "function_call":
             continue
         args, args_raw, ok = _parse_tool_args(item.get("arguments"))
@@ -560,7 +731,17 @@ def _encode_tools_anthropic(tools) -> list[dict]:
 
 def _decode_tool_calls_anthropic(body: dict) -> list[dict]:
     out = []
-    for block in (body.get("content") or []):
+    if not isinstance(body, dict):
+        return [_malformed_tool_call()]
+    content = body.get("content")
+    if content is None:
+        return []
+    if not isinstance(content, list):
+        return [_malformed_tool_call()]
+    for block in content:
+        if not isinstance(block, dict):
+            out.append(_malformed_tool_call())
+            continue
         if block.get("type") != "tool_use":
             continue
         args, args_raw, ok = _parse_tool_args(block.get("input"))
@@ -582,14 +763,40 @@ def _encode_tools_gemini(tools) -> list[dict]:
 
 def _decode_tool_calls_gemini(body: dict) -> list[dict]:
     out = []
-    try:
-        parts = body["candidates"][0]["content"]["parts"] or []
-    except (KeyError, IndexError, TypeError):
+    if not isinstance(body, dict):
+        return [_malformed_tool_call()]
+    candidates = body.get("candidates")
+    if candidates is None:
         return []
+    if not isinstance(candidates, list):
+        return [_malformed_tool_call()]
+    if not candidates:
+        return []
+    candidate = candidates[0]
+    if not isinstance(candidate, dict):
+        return [_malformed_tool_call()]
+    content = candidate.get("content")
+    if content is None:
+        return []
+    if not isinstance(content, dict):
+        return [_malformed_tool_call()]
+    parts = content.get("parts")
+    if parts is None:
+        return []
+    if not isinstance(parts, list):
+        return [_malformed_tool_call()]
     idx = 0
     for part in parts:
+        if not isinstance(part, dict):
+            out.append(_malformed_tool_call(call_id=f"call_{idx}_malformed"))
+            idx += 1
+            continue
+        if "functionCall" not in part:
+            continue
         fc = part.get("functionCall")
         if not isinstance(fc, dict):
+            out.append(_malformed_tool_call(call_id=f"call_{idx}_malformed"))
+            idx += 1
             continue
         name = str(fc.get("name") or "")
         args, args_raw, ok = _parse_tool_args(fc.get("args"))
@@ -787,10 +994,17 @@ def _content_to_openai_responses_parts(content: Any) -> list[dict[str, Any]]:
     return parts
 
 
-def _openai_responses_input(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+def _openai_responses_input(messages: list[Any]) -> tuple[str, list[dict[str, Any]]]:
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
     for message in messages:
+        if isinstance(message, ToolExchange):
+            payload = _assistant_payload_for_wire(message, "openai_responses")
+            if not isinstance(payload, list):
+                raise ProviderError("openai responses assistant turn must be a list")
+            input_items.extend(payload)
+            input_items.extend(_encode_tool_results_openai_responses(message.results))
+            continue
         role = str(message.get("role") or "").strip().lower()
         content = message.get("content")
         if role == "system":
@@ -890,6 +1104,7 @@ def _parse_openai_responses_body(
     tool_calls = _decode_tool_calls_openai_responses(body)
     if require_reply and not reply and not tool_calls:
         raise ProviderError("provider response had no usable reply text")
+    output = body.get("output")
     return {
         "reply": reply,
         "reasoning": reasoning,
@@ -903,6 +1118,10 @@ def _parse_openai_responses_body(
         "provider": "openai",
         "model": model,
         "tool_calls": tool_calls,
+        "assistant_turn": {
+            "wire": "openai_responses",
+            "payload": output if isinstance(output, list) else [],
+        },
     }
 
 
@@ -960,7 +1179,7 @@ def _build_openai_compat_payload(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": _encode_messages_openai_chat(messages),
         "stream": False,
         "max_tokens": max(1, min(int(max_tokens), 8192)),
     }
@@ -1034,6 +1253,12 @@ def _parse_openai_compat_body(
     # reaching the executor. A genuinely empty/error response (no text AND no
     # tool_calls) still raises when require_reply is set.
     tool_calls = _decode_tool_calls_openai_chat(body)
+    try:
+        assistant_payload = body["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        assistant_payload = {}
+    if not isinstance(assistant_payload, dict):
+        assistant_payload = {}
     return {
         "reply": _extract_reply(body, required=require_reply and not tool_calls),
         "reasoning": _extract_openai_compatible_reasoning(body),
@@ -1043,6 +1268,7 @@ def _parse_openai_compat_body(
         "provider": provider,
         "model": model,
         "tool_calls": tool_calls,
+        "assistant_turn": {"wire": "openai_chat", "payload": assistant_payload},
     }
 
 
@@ -1148,6 +1374,7 @@ def _parse_anthropic_body(
     # See _parse_openai_compat_body: a pure tool-call response has no reply text
     # and must not be rejected — require reply only when no tool_calls are present.
     tool_calls = _decode_tool_calls_anthropic(body)
+    content = body.get("content")
     return {
         "reply": _extract_anthropic_reply(body, required=require_reply and not tool_calls),
         "reasoning": _extract_anthropic_reasoning(body),
@@ -1157,6 +1384,10 @@ def _parse_anthropic_body(
         "provider": "anthropic",
         "model": model,
         "tool_calls": tool_calls,
+        "assistant_turn": {
+            "wire": "anthropic",
+            "payload": content if isinstance(content, list) else [],
+        },
     }
 
 
@@ -1271,6 +1502,12 @@ def _parse_gemini_body(
     # See _parse_openai_compat_body: a pure tool-call response has no reply text
     # and must not be rejected — require reply only when no tool_calls are present.
     tool_calls = _decode_tool_calls_gemini(body)
+    try:
+        assistant_payload = body["candidates"][0]["content"]
+    except (KeyError, IndexError, TypeError):
+        assistant_payload = {}
+    if not isinstance(assistant_payload, dict):
+        assistant_payload = {}
     return {
         "reply": _extract_gemini_reply(body, required=require_reply and not tool_calls),
         "reasoning": _extract_gemini_reasoning(body),
@@ -1280,6 +1517,7 @@ def _parse_gemini_body(
         "provider": "gemini",
         "model": model,
         "tool_calls": tool_calls,
+        "assistant_turn": {"wire": "gemini", "payload": assistant_payload},
     }
 
 
@@ -1642,6 +1880,7 @@ async def reliable_chat_completion_async(
     max_attempts: int = 3,
     base_delay_sec: float = 1.0,
     max_delay_sec: float = 30.0,
+    progress_cb: Any = None,
     **kwargs: Any,
 ) -> Any:
     """`chat_completion_async` + bounded retry on *transient* failures only.
@@ -1654,10 +1893,26 @@ async def reliable_chat_completion_async(
     """
     attempts = max(1, int(max_attempts))
     last_exc: BaseException | None = None
-    for attempt in range(1, attempts + 1):
+
+    def _progress(stage: str, attempt: int) -> None:
+        # Optional hosted-runtime watchdog telemetry.  Keep it out of kwargs so
+        # provider adapters never see it, and never let observation change retry
+        # semantics.  Other callers simply omit it.
+        if progress_cb is None:
+            return
         try:
-            return await chat_completion_async(*args, **kwargs)
+            progress_cb(stage, attempt)
+        except Exception:  # noqa: BLE001
+            pass
+
+    for attempt in range(1, attempts + 1):
+        _progress("attempt_start", attempt)
+        try:
+            result = await chat_completion_async(*args, **kwargs)
+            _progress("attempt_complete", attempt)
+            return result
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
+            _progress("attempt_failed", attempt)
             cls = classify_provider_error(exc)
             last_exc = exc
             if cls == "provider_config" or attempt >= attempts:

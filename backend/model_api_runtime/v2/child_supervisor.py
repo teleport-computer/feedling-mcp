@@ -34,18 +34,13 @@ per-slot 的 `_turn_starts` 字典——``turn_start is None``（slot 空闲）�
 `time.monotonic()` 算出来的挂钟差保持同源，所以这里不能替换成父进程收到时刻——参见
 `poll_liveness()` 对它的用法）。
 
-**per-turn 硬超时**（曾经是死代码——D2 `watchdog.should_kill` 的 clause (c) 一直在读
-`current_turn_age_sec`，但直到这次改动之前从没有任何东西往 `poll_liveness()` 的返回值
-里填过这个字段）：`poll_liveness()` 现在额外算出 `current_turn_age_sec` = 当前挂钟时间
-减去 `_turn_starts` 里最老的那个 turn_start（没有任何 slot 在跑 turn 时为 `0.0`）。
-CRITICAL 的性质：一个卡在 `_run_turn` 里的 slot 会彻底停止发送任何消息（既不会再
-claim，也不会跑完 `_run_turn`，也不会空转唤醒）——它留在 `_turn_starts` 里的那个
-turn_start 就此定住不再更新，但 `poll_liveness()` 每次调用都用**当下**的挂钟时间去减
-它，所以 `current_turn_age_sec` 会随真实流逝的挂钟时间持续增长，直到超过
-`turn_hard_timeout_sec`，即使这个 slot 一条新消息都不再发。这正是它跟粗粒度的
-`last_progress_age_sec` 互补的地方：其它 slot 仍在正常工作时，`last_progress_age_sec`
-整体依然新鲜（clause (b) 不会触发），只有 `current_turn_age_sec` 能把这一个卡住的
-turn 单独抓出来。
+**四只独立时钟**：`last_progress_age_sec`/`event_loop_heartbeat_age_sec` 只看 child event
+loop 是否还能调度；`last_slot_progress_age_sec` 看有没有 slot 穿过 claim/idle/turn 边界；
+active slot 另外有 `current_turn_stall_age_sec`（距本 turn 最近真实 provider/tool/compaction
+边界）和 `current_turn_age_sec`（距 turn 开始）。watchdog 用 stall age 抓永久卡住的 await，
+用更大的 absolute age 防止一个不断制造进度却永不终止的回合。这样合法的多轮/600s 历史
+catch-up 不会再因为绝对年龄超过旧 180s 就被误杀，而 event-loop heartbeat 也不会替某个
+卡住的 turn 刷新 stall clock。
 
 用法（`serve_worker._serve`）::
 
@@ -97,12 +92,23 @@ class ChildSupervisor:
         self._lock = threading.Lock()
         self._proc: mp.process.BaseProcess | None = None
         self._read_conn = None
+        # Process/event-loop liveness.  Kept under the historical attribute
+        # name because a few narrow tests inspect the startup seed directly.
         self._last_progress_at: float | None = None
-        # hard-timeout fix: per-slot turn_start, keyed by slot_id. Populated/cleared
+        # Real slot activity (claim/idle/turn boundaries), deliberately not
+        # refreshed by the free-running event-loop heartbeat.
+        self._last_slot_progress_at: float | None = None
+        # Absolute-budget clock: per-slot turn_start, keyed by slot_id. Populated/cleared
         # by _handle_message on every ("progress", slot_id, ts, turn_start) message;
         # read by poll_liveness() to compute current_turn_age_sec. See module
-        # docstring's "progress pipe 协议" / "per-turn 硬超时" sections.
+        # docstring's "progress pipe 协议" / split-budget sections.
         self._turn_starts: dict[Any, float] = {}
+        # Parent-local receive time for the newest *in-turn* progress boundary
+        # from each active slot.  Unlike ``_turn_starts`` this intentionally
+        # moves forward at provider-round/tool/compaction boundaries.  The
+        # watchdog uses its age to distinguish a long but progressing turn from
+        # one stuck forever inside a single await.
+        self._turn_progress_at: dict[Any, float] = {}
 
         self._reader_thread: threading.Thread | None = None
         self._reader_stop = threading.Event()
@@ -135,10 +141,12 @@ class ChildSupervisor:
             # 进程还没来得及发第一条心跳的这一小段窗口里，poll_liveness() 会读到一个
             # `last_progress_at is None` → age=inf 的假阳性"卡死"读数。
             self._last_progress_at = time.monotonic()
+            self._last_slot_progress_at = self._last_progress_at
             # Fresh generation of child == fresh turn-tracking state. A prior
             # generation's slot_ids/turn_starts must never leak into this one
             # (kill_and_respawn() calls start() again after killing the old proc).
             self._turn_starts = {}
+            self._turn_progress_at = {}
 
         self._reader_stop = threading.Event()
         self._reader_thread = threading.Thread(
@@ -148,16 +156,15 @@ class ChildSupervisor:
                  proc.pid, getattr(self._spawn_target, "__qualname__", self._spawn_target))
 
     def poll_liveness(self) -> dict:
-        """`{"alive": bool, "last_progress_age_sec": float, "current_turn_age_sec": float}`.
+        """Return process, slot, per-turn stall, and absolute-age liveness clocks.
 
         `alive` 只反映"OS 进程还在不在"（`proc.is_alive()`），不代表它没卡死——一个
-        在死锁里转不动的进程同样 `is_alive() == True`。粗粒度的卡死信号是
-        `last_progress_age_sec`：多久没收到过**任意** slot 的一条 progress 消息了。从未
-        收到过/尚未 `start()` 过时返回 `math.inf`，好让调用方（D2 watchdog）的阈值比较
-        `age > liveness_timeout_sec` 自然成立，不需要单独判 None。
+        在死锁里转不动的进程同样 `is_alive() == True`。`last_progress_age_sec`（兼容名）/
+        `event_loop_heartbeat_age_sec` 是 event-loop 调度心跳年龄；
+        `last_slot_progress_age_sec` 才是任意 slot 最近真实活动的年龄。从未 start 时均为
+        `math.inf`，让 watchdog 的阈值比较自然成立。
 
-        `current_turn_age_sec`（hard-timeout fix，喂给 `watchdog.should_kill` 的
-        clause (c)）：当下挂钟时间减去 `_turn_starts` 里最老的那个 turn_start——也就是
+        `current_turn_age_sec`：当下挂钟时间减去 `_turn_starts` 里最老的那个 turn_start——也就是
         "跑得最久、仍然没完成的那个 turn 已经跑了多久"。没有任何 slot 当前在跑 turn（
         `_turn_starts` 为空）时是 `0.0`，不是 `inf`——一个空闲子进程不该被 clause (c)
         误判为"有个 turn 卡了 inf 秒"。这个字段跟 `last_progress_age_sec` 互补：一个
@@ -172,16 +179,35 @@ class ChildSupervisor:
         with self._lock:
             proc = self._proc
             last = self._last_progress_at
+            last_slot = self._last_slot_progress_at
             turn_starts = list(self._turn_starts.values())
+            turn_progress_at = [
+                self._turn_progress_at[slot_id]
+                for slot_id in self._turn_starts
+                if slot_id in self._turn_progress_at
+            ]
         alive = bool(proc is not None and proc.is_alive())
         age = math.inf if last is None else max(0.0, time.monotonic() - last)
+        slot_age = (
+            math.inf if last_slot is None
+            else max(0.0, time.monotonic() - last_slot)
+        )
         now = time.monotonic()
         current_turn_age_sec = max((now - ts for ts in turn_starts), default=0.0)
         current_turn_age_sec = max(0.0, current_turn_age_sec)
+        current_turn_stall_age_sec = max(
+            (now - ts for ts in turn_progress_at), default=0.0)
+        current_turn_stall_age_sec = max(0.0, current_turn_stall_age_sec)
         return {
             "alive": alive,
+            # Historical name now means event-loop/process progress; explicit
+            # alias makes the split unambiguous for the watchdog.
             "last_progress_age_sec": age,
+            "event_loop_heartbeat_age_sec": age,
+            "last_slot_progress_age_sec": slot_age,
+            "active_turn_count": len(turn_starts),
             "current_turn_age_sec": current_turn_age_sec,
+            "current_turn_stall_age_sec": current_turn_stall_age_sec,
         }
 
     def kill_and_respawn(self, *, join_timeout: float = 5.0) -> None:
@@ -259,6 +285,15 @@ class ChildSupervisor:
             kind = msg[0]
         except (TypeError, IndexError):
             return
+        if kind == "loop_heartbeat":
+            # Event-loop heartbeat is deliberately process-level only.  It
+            # proves the child's loop can still schedule work, but must never
+            # refresh a particular turn's stall clock: an await that never
+            # returns leaves that slot's ``_turn_progress_at`` untouched and
+            # is still killed by the per-turn stall watchdog.
+            with self._lock:
+                self._last_progress_at = time.monotonic()
+            return
         if kind != "progress":
             return
         # msg shape: ("progress", slot_id, monotonic_ts, turn_start). The 4th
@@ -269,13 +304,17 @@ class ChildSupervisor:
         # coarse last_progress_at clock below.
         slot_id = msg[1] if len(msg) > 1 else None
         turn_start = msg[3] if len(msg) > 3 else None
+        received_at = time.monotonic()
         with self._lock:
-            self._last_progress_at = time.monotonic()
+            self._last_progress_at = received_at
+            self._last_slot_progress_at = received_at
             if len(msg) > 3:
                 if turn_start is None:
                     self._turn_starts.pop(slot_id, None)
+                    self._turn_progress_at.pop(slot_id, None)
                 else:
                     self._turn_starts[slot_id] = turn_start
+                    self._turn_progress_at[slot_id] = received_at
 
     def _stop_reader(self) -> None:
         self._reader_stop.set()

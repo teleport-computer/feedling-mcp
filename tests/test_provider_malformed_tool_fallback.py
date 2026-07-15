@@ -1,0 +1,365 @@
+"""Malformed provider tool-call containers fail closed into one text fallback."""
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+import provider_client
+from provider_types import ToolResult
+from capabilities import registry as cap_registry
+from model_api_runtime.v2 import tool_loop
+
+
+_CASES = (
+    (
+        "openai_chat",
+        provider_client._decode_tool_calls_openai_chat,
+        {"choices": [{"message": {"tool_calls": ["not-an-object"]}}]},
+    ),
+    (
+        "openai_responses",
+        provider_client._decode_tool_calls_openai_responses,
+        {"output": ["not-an-object"]},
+    ),
+    (
+        "anthropic",
+        provider_client._decode_tool_calls_anthropic,
+        {"content": ["not-an-object"]},
+    ),
+    (
+        "gemini",
+        provider_client._decode_tool_calls_gemini,
+        {"candidates": [{"content": {"parts": ["not-an-object"]}}]},
+    ),
+)
+
+_MALFORMED_CONTAINERS = (
+    (
+        "openai_chat",
+        provider_client._decode_tool_calls_openai_chat,
+        {"choices": [{"message": {"tool_calls": {}}}]},
+    ),
+    (
+        "openai_responses",
+        provider_client._decode_tool_calls_openai_responses,
+        {"output": {}},
+    ),
+    (
+        "anthropic",
+        provider_client._decode_tool_calls_anthropic,
+        {"content": {}},
+    ),
+    (
+        "gemini",
+        provider_client._decode_tool_calls_gemini,
+        {"candidates": [{"content": {"parts": {}}}]},
+    ),
+)
+
+
+@pytest.mark.parametrize("_wire,decoder,body", _CASES)
+def test_non_object_tool_element_normalizes_to_failed_call(_wire, decoder, body):
+    calls = decoder(body)
+
+    assert len(calls) == 1
+    assert calls[0]["args"] == {}
+    assert calls[0]["args_ok"] is False
+
+
+@pytest.mark.parametrize("_wire,decoder,body", _MALFORMED_CONTAINERS)
+def test_non_list_tool_container_normalizes_to_failed_call(_wire, decoder, body):
+    calls = decoder(body)
+
+    assert len(calls) == 1
+    assert calls[0]["args"] == {}
+    assert calls[0]["args_ok"] is False
+
+
+@pytest.mark.parametrize("_wire,decoder,body", _CASES)
+def test_malformed_wire_uses_exactly_one_tools_disabled_fallback(
+    monkeypatch, _wire, decoder, body,
+):
+    provider_tools = []
+    decoded_calls = []
+
+    async def _provider(_config, _messages, *, tools=None):
+        provider_tools.append(tools)
+        if tools is None:
+            return {"reply": "plain fallback", "tool_calls": [], "usage": {}}
+        calls = decoder(body)
+        decoded_calls.extend(calls)
+        return {"reply": "", "tool_calls": calls, "usage": {}}
+
+    async def _dispatch(_calls):
+        raise AssertionError("malformed tool calls must never be dispatched")
+
+    replies = []
+
+    async def _on_reply(text, *, final):
+        replies.append((text, final))
+
+    async def _fold():
+        return []
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=object(),
+        build_messages=lambda _transcript: [{"role": "user", "content": "hello"}],
+        dispatch_tools=_dispatch,
+        on_reply=_on_reply,
+        fold_new_messages=_fold,
+        add_usage=lambda _usage: None,
+        max_calls=5,
+    ))
+
+    assert decoded_calls
+    assert all(call["args_ok"] is False for call in decoded_calls)
+    assert sum(tools is None for tools in provider_tools) == 1
+    assert provider_tools[-1] is None
+    assert replies == [("plain fallback", True)]
+    assert outcome.final_text == "plain fallback"
+
+
+def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
+    provider_tools = []
+    responses = iter([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "web-1", "name": "web_fetch",
+                "args": {"url": "https://example.com"},
+            }],
+            "usage": {},
+        },
+        # A broken/compromised relay invents a write even though it was not in
+        # round two's offered catalog.  It must never reach dispatch.
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "write-1", "name": "identity_patch",
+                "args": {"signature": "injected"},
+            }],
+            "usage": {},
+        },
+        {"reply": "safe final", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _provider(_config, _messages, *, tools=None):
+        provider_tools.append(tools)
+        return next(responses)
+
+    dispatched = []
+
+    async def _dispatch(calls):
+        dispatched.extend(calls)
+        return [ToolResult(call_id=tc.id, content="external page text") for tc in calls]
+
+    replies = []
+
+    async def _on_reply(text, *, final):
+        replies.append((text, final))
+
+    async def _fold():
+        return []
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=object(),
+        build_messages=lambda _transcript: [{"role": "user", "content": "look this up"}],
+        dispatch_tools=_dispatch,
+        on_reply=_on_reply,
+        fold_new_messages=_fold,
+        add_usage=lambda _usage: None,
+        max_calls=4,
+    ))
+
+    first_names = {spec.name for spec in provider_tools[0]}
+    second_names = {spec.name for spec in provider_tools[1]}
+    assert cap_registry.WRITE_ACTIONS <= first_names
+    assert cap_registry.WRITE_ACTIONS.isdisjoint(second_names)
+    assert tool_loop.provenance.EXTERNAL_READS.isdisjoint(second_names)
+    assert provider_tools[2] is None
+    assert [tc.name for tc in dispatched] == ["web_fetch"]
+    assert replies == [("safe final", True)]
+    assert outcome.final_text == "safe final"
+
+
+def test_web_search_allows_only_exact_returned_url_for_followup_fetch(monkeypatch):
+    provider_tools = []
+    allowed_url = "https://example.com/article?id=7"
+    responses = iter([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "search-1", "name": "web_search",
+                "args": {"query": "example article"},
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "fetch-1", "name": "web_fetch",
+                "args": {"url": allowed_url},
+            }],
+            "usage": {},
+        },
+        {"reply": "grounded answer", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _provider(_config, _messages, *, tools=None):
+        provider_tools.append(tools)
+        return next(responses)
+
+    dispatched = []
+
+    async def _dispatch(calls):
+        dispatched.extend(calls)
+        return [
+            ToolResult(
+                call_id=tc.id,
+                content=(
+                    '{"results":[{"title":"Example","url":"'
+                    + allowed_url
+                    + '"}]}'
+                    if tc.name == "web_search"
+                    else "trusted fetch result wrapper containing untrusted page text"
+                ),
+            )
+            for tc in calls
+        ]
+
+    replies = []
+
+    async def _on_reply(text, *, final):
+        replies.append((text, final))
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=object(),
+        build_messages=lambda _transcript: [{"role": "user", "content": "look this up"}],
+        dispatch_tools=_dispatch,
+        on_reply=_on_reply,
+        fold_new_messages=lambda: asyncio.sleep(0, result=[]),
+        add_usage=lambda _usage: None,
+        max_calls=4,
+    ))
+
+    second_names = {spec.name for spec in provider_tools[1]}
+    assert "web_fetch" in second_names
+    assert "web_search" not in second_names
+    assert cap_registry.WRITE_ACTIONS.isdisjoint(second_names)
+    assert [(tc.name, tc.args) for tc in dispatched] == [
+        ("web_search", {"query": "example article"}),
+        ("web_fetch", {"url": allowed_url}),
+    ]
+    assert replies == [("grounded answer", True)]
+    assert outcome.final_text == "grounded answer"
+
+
+def test_web_search_result_cannot_redirect_model_to_fresh_fetch_url(monkeypatch):
+    allowed_url = "https://example.com/allowed"
+    responses = iter([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "search-1", "name": "web_search", "args": {"query": "safe"},
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "fetch-evil", "name": "web_fetch",
+                "args": {"url": "https://attacker.invalid/injected"},
+            }],
+            "usage": {},
+        },
+        {"reply": "safe fallback", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _provider(_config, _messages, *, tools=None):
+        return next(responses)
+
+    dispatched = []
+
+    async def _dispatch(calls):
+        dispatched.extend(calls)
+        return [ToolResult(
+            call_id=tc.id,
+            content='{"results":[{"url":"' + allowed_url + '"}]}',
+        ) for tc in calls]
+
+    replies = []
+
+    async def _on_reply(text, *, final):
+        replies.append((text, final))
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=object(),
+        build_messages=lambda _transcript: [{"role": "user", "content": "search"}],
+        dispatch_tools=_dispatch,
+        on_reply=_on_reply,
+        fold_new_messages=lambda: asyncio.sleep(0, result=[]),
+        add_usage=lambda _usage: None,
+        max_calls=4,
+    ))
+
+    assert [tc.name for tc in dispatched] == ["web_search"]
+    assert replies == [("safe fallback", True)]
+    assert outcome.final_text == "safe fallback"
+
+
+def test_reply_and_durable_write_same_batch_fail_closed(monkeypatch):
+    provider_tools = []
+    responses = iter([
+        {
+            "reply": "",
+            "tool_calls": [
+                {
+                    "id": "write-1", "name": "identity_patch",
+                    "args": {"signature": "new"},
+                },
+                {"id": "reply-1", "name": "reply", "args": {"text": "saved"}},
+            ],
+            "usage": {},
+        },
+        {"reply": "I couldn't safely apply that change.", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _provider(_config, _messages, *, tools=None):
+        provider_tools.append(tools)
+        return next(responses)
+
+    async def _dispatch(_calls):
+        raise AssertionError("mixed reply+write batch must not dispatch")
+
+    replies = []
+
+    async def _on_reply(text, *, final):
+        replies.append((text, final))
+
+    async def _fold():
+        return []
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=object(),
+        build_messages=lambda _transcript: [{"role": "user", "content": "remember this"}],
+        dispatch_tools=_dispatch,
+        on_reply=_on_reply,
+        fold_new_messages=_fold,
+        add_usage=lambda _usage: None,
+        max_calls=3,
+    ))
+
+    assert provider_tools[0] is not None
+    assert provider_tools[1] is None
+    assert replies == [("I couldn't safely apply that change.", True)]
+    assert outcome.final_text == "I couldn't safely apply that change."

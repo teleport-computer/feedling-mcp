@@ -563,11 +563,20 @@ def write_response(
         return {"error": "verify_ping reply without a pending verify ping"}, 409
     alert_body = str(payload.get("alert_body") or "")
     push_body = str(payload.get("push_body") or "")
+    resident_delivery_id = str(payload.get("resident_delivery_id") or "").strip()
+    if resident_delivery_id and (
+        len(resident_delivery_id) != 32
+        or any(ch not in "0123456789abcdef" for ch in resident_delivery_id)
+        or str(envelope.get("id") or "") != resident_delivery_id
+    ):
+        return {"error": "invalid resident_delivery_id"}, 400
     extra = {
         "gate_decision_id": str(payload.get("gate_decision_id") or ""),
         "proactive_job_id": str(payload.get("proactive_job_id") or ""),
         **thinking_extra,
     }
+    if resident_delivery_id:
+        extra["resident_delivery_id"] = resident_delivery_id
     if notice_kind:
         extra["notice_kind"] = notice_kind
     if source == proactive_service.PROACTIVE_JOB_SOURCE:
@@ -578,33 +587,41 @@ def write_response(
             extra["push_body_preview"] = push_body.strip()[:240]
         extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
     reply_to_message_id = _reply_to_message_id(payload)
-    if reply_to_message_id and role != "system":
-        _parent = _chat_message_by_id(store, reply_to_message_id)
-        if _parent is not None and (
-            _parent.get("reply_status") == "replied" or _parent.get("reply_message_id")
-        ):
-            # Reply-exclusivity guard (delivery exclusivity is the claim CAS's job).
-            # If this turn was ALREADY answered — e.g. THIS consumer's claim expired
-            # mid-turn (>CHAT_POLL_CLAIM_TTL_SEC), the lease failed over, and the new
-            # consumer already replied — don't append a duplicate reply and
-            # double-burn the user's model key. Drop it with 409. (Guarding only on
-            # already-replied, not claim ownership, so a legit reply that omits its
-            # consumer_id is never rejected.)
-            return {"error": "already_answered", "reply_status": "replied"}, 409
-    msg = store.append_chat(
-        role,
-        source,
-        envelope,
-        content_type=content_type,
-        extra=extra,
-    )
-    if reply_to_message_id and role != "system":
-        store.update_chat_message_metadata(reply_to_message_id, {
+    try:
+        msg = store.append_chat(
+            role,
+            source,
+            envelope,
+            content_type=content_type,
+            extra=extra,
+            resident_runtime_fenced=True,
+            resident_reply_to=(
+                reply_to_message_id
+                if reply_to_message_id and role != "system"
+                else None
+            ),
+            resident_replied_by=consumer_id,
+        )
+    except db.ResidentReplyRejected as exc:
+        # The DB transaction is authoritative: this covers stale worker caches,
+        # a competing responder, and an in-flight resident turn that reaches
+        # its final write after hosted runtime cutover.
+        return {
+            "error": "already_answered",
             "reply_status": "replied",
-            "reply_message_id": str(msg.get("id") or ""),
-            "replied_by": consumer_id,
-            "replied_at": f"{time.time():.3f}",
-        })
+            "detail": exc.reason,
+        }, 409
+    if msg.get("_resident_replayed"):
+        # The database returned the row that already won this delivery key.
+        # A transport/process retry is an acknowledgement only: first-chat,
+        # APNs/Live Activity, metadata, capture, wake, and trace side effects
+        # must all remain exactly-once. First-chat activation is the exception:
+        # it is an idempotent marker and must self-heal when the original process
+        # committed the reply but died before reaching the marker write.
+        if reply_to_message_id and role != "system":
+            _maybe_mark_first_chat_ok(store, reply_to_message_id)
+        return {"id": msg["id"], "ts": msg["ts"], "v": msg["v"]}, 200
+    if reply_to_message_id and role != "system":
         _maybe_mark_first_chat_ok(store, reply_to_message_id)
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()

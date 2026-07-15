@@ -156,9 +156,11 @@ def _save_model_api_runtime_profile(
     data["updated_at"] = core_util._now_iso()
     if not data.get("created_at"):
         data["created_at"] = data["updated_at"]
-    # hosted_runtime_mode is an independent control-plane key.  Normalization
-    # of the broader runtime profile must never overwrite a concurrent flip.
+    # hosted_runtime_mode and the V2 reply cursor have dedicated atomic
+    # writers.  Normalization starts from a potentially stale full profile, so
+    # it must never echo either correctness key back through a generic merge.
     data.pop("hosted_runtime_mode", None)
+    data.pop("v2_reply_cursor_seq", None)
     scrubbed = set(data.get(V2_AUTOSEED_SCRUBBED_FLAGS) or [])
     remove_keys = [
         key for key in (*AUTOSEED_SCRUB_FLAGS, PERCEPTION_V2_AUTOSEED_SCRUBBED)
@@ -249,6 +251,10 @@ def _patch_model_api_runtime_profile(store: UserStore, patch: dict) -> dict | No
         "runtime_version": MODEL_API_RUNTIME_VERSION,
         "updated_at": core_util._now_iso(),
     })
+    # Ownership mode and reply cursor are correctness keys with dedicated
+    # transactional/monotonic writers, never generic profile fields.
+    values.pop("hosted_runtime_mode", None)
+    values.pop("v2_reply_cursor_seq", None)
     persisted = db.patch_blob(store.user_id, MODEL_API_RUNTIME_BLOB, values)
     if isinstance(persisted, dict):
         return persisted
@@ -437,6 +443,20 @@ HOSTED_RUNTIME_MODE_RESIDENT = "resident_cli"
 HOSTED_RUNTIME_MODE_DB_ACTION_V2 = "db_action_v2"
 _HOSTED_RUNTIME_MODES = {HOSTED_RUNTIME_MODE_RESIDENT, HOSTED_RUNTIME_MODE_DB_ACTION_V2}
 
+# Provider/config-scoped fields can be discarded when the user deletes every
+# model API credential. Correctness state (notably v2_reply_cursor_seq), rollout
+# flags, and unknown future control keys deliberately remain in the blob.
+_MODEL_API_DELETE_REMOVE_KEYS = (
+    "provider",
+    "model",
+    "memory_quality_warning",
+    "last_runtime_error",
+    "last_runtime_error_class",
+    "recap_cursor",
+    "last_recap_at",
+    "last_action_trace_id",
+)
+
 
 def effective_hosted_runtime_mode(value: object) -> str:
     """Return the rollout-safe effective mode for a persisted value.
@@ -460,6 +480,23 @@ def get_hosted_runtime_mode_strict(store: UserStore) -> str:
     profile = db.get_blob_strict(store.user_id, MODEL_API_RUNTIME_BLOB)
     profile = profile if isinstance(profile, dict) else {}
     return effective_hosted_runtime_mode(profile.get("hosted_runtime_mode"))
+
+
+def get_hosted_runtime_control_strict(
+    store: UserStore,
+) -> tuple[str, str, int]:
+    """Read normalized blob mode plus authoritative state/generation once."""
+    raw_mode, state, generation = db.get_hosted_runtime_control_strict(
+        store.user_id)
+    if state not in {"resident", "draining", "v2"}:
+        raise RuntimeError(f"invalid hosted runtime state: {state!r}")
+    return effective_hosted_runtime_mode(raw_mode), state, generation
+
+
+def hosted_runtime_v2_enabled_strict(store: UserStore) -> bool:
+    """True only when routing and the authoritative ownership row agree."""
+    mode, state, _generation = get_hosted_runtime_control_strict(store)
+    return mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2 and state == "v2"
 
 
 def set_hosted_runtime_mode(store: UserStore, mode: str) -> str:
@@ -488,8 +525,42 @@ def set_hosted_runtime_mode(store: UserStore, mode: str) -> str:
             "runtime_version": MODEL_API_RUNTIME_VERSION,
             "updated_at": core_util._now_iso(),
         },
+        runtime_state_target=(
+            "v2" if mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2 else "resident"
+        ),
     )
     readback = db.get_blob_strict(store.user_id, MODEL_API_RUNTIME_BLOB)
     if not isinstance(readback, dict) or readback.get("hosted_runtime_mode") != mode:
         raise RuntimeError("hosted_runtime_mode persistence verification failed")
     return mode
+
+
+def prepare_model_api_delete(store: UserStore) -> dict:
+    """Fence V2 work before credentials disappear, preserving reply history.
+
+    This does not require an active provider route: deletion is idempotent and
+    must also repair stale/split-brain runtime state. The runtime row and blob
+    mode move to resident in the same transaction, bumping generation whenever
+    routing actually changes so pending V2 effects become ineligible. The
+    durable seq cursor remains in ``model_api_runtime``; deleting that cursor
+    would replay the user's old conversation if they configured a provider
+    again later.
+    """
+    persisted = db.patch_blob_strict(
+        store.user_id,
+        MODEL_API_RUNTIME_BLOB,
+        {
+            "hosted_runtime_mode": HOSTED_RUNTIME_MODE_RESIDENT,
+            "runtime_mode": MODEL_API_RUNTIME_MODE,
+            "runtime_version": MODEL_API_RUNTIME_VERSION,
+            "updated_at": core_util._now_iso(),
+        },
+        remove_keys=_MODEL_API_DELETE_REMOVE_KEYS,
+        runtime_state_target="resident",
+    )
+    if (
+        not isinstance(persisted, dict)
+        or persisted.get("hosted_runtime_mode") != HOSTED_RUNTIME_MODE_RESIDENT
+    ):
+        raise RuntimeError("model_api delete runtime fence did not persist")
+    return persisted

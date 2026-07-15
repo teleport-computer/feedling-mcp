@@ -26,8 +26,12 @@ def _post(base_url: str, path: str, payload: dict) -> tuple[int, dict]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    # The mock is always loopback. Bypass macOS/system proxy settings so a
+    # stopped ephemeral port produces the real connection-refused signal
+    # instead of a proxy-generated empty 502 response.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with opener.open(req, timeout=10) as resp:
             status = resp.status
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:

@@ -27,6 +27,30 @@ def test_provider_thread_limiter_scales_with_worker_slots(monkeypatch):
     asyncio.run(_run())
 
 
+def test_db_pool_capacity_scales_for_nested_effect_sinks(monkeypatch):
+    monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
+
+    # Sixteen simultaneous effect drains can each hold an outer generation-lock
+    # connection while requesting one nested sink connection: 2*16 + 4.
+    assert serve_worker._configure_db_pool_capacity(16) == 36
+    assert __import__("os").environ["FEEDLING_DB_POOL_MAX_SIZE"] == "36"
+
+
+def test_db_pool_capacity_rejects_explicit_saturation_cliff(monkeypatch):
+    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", "35")
+
+    with pytest.raises(RuntimeError, match=r"too small.*require >= 36"):
+        serve_worker._configure_db_pool_capacity(16)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "nope"])
+def test_db_pool_capacity_bad_override_fails_closed(monkeypatch, raw):
+    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", raw)
+
+    with pytest.raises(RuntimeError, match="FEEDLING_DB_POOL_MAX_SIZE"):
+        serve_worker._configure_db_pool_capacity(4)
+
+
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "nope"])
 def test_positive_loop_intervals_fail_closed(monkeypatch, raw):
     monkeypatch.setenv("TEST_V2_INTERVAL", raw)
@@ -50,9 +74,13 @@ def test_build_production_deps_returns_turndeps():
     deps = serve_worker.build_production_deps()
     assert isinstance(deps, worker.TurnDeps)
     assert callable(deps.read_messages)
+    assert callable(deps.read_messages_after_seq)
     assert callable(deps.resolve_provider)
-    assert callable(deps.is_official)
+    assert deps.is_official is None
     assert callable(deps.mint_enclave_token)
+    assert callable(deps.read_tail_after_seq)
+    assert callable(deps.read_compaction_tail_after_seq)
+    assert callable(deps.read_summary_with_seq)
 
 
 def test_wire_assembly_injects_envelope_pubkey_getter():
@@ -78,8 +106,6 @@ def test_resolve_provider_missing_config_returns_none_and_error():
     fabricated ProviderConfig and never a platform/system key fallback."""
     import uuid
 
-    from core import store as core_store
-
     serve_worker.wire_assembly()
     user_id = f"u_serve_worker_test_{uuid.uuid4().hex[:8]}"
     with __import__("db").get_pool().connection() as conn:
@@ -88,7 +114,6 @@ def test_resolve_provider_missing_config_returns_none_and_error():
             "ON CONFLICT (user_id) DO NOTHING",
             (user_id,),
         )
-    store = core_store.get_store(user_id)
     deps = serve_worker.build_production_deps()
     provider_config, meta = deps.resolve_provider(user_id)
     assert provider_config is None
@@ -97,8 +122,6 @@ def test_resolve_provider_missing_config_returns_none_and_error():
 
 def test_read_messages_returns_list_for_user_with_no_messages():
     import uuid
-
-    from core import store as core_store
 
     serve_worker.wire_assembly()
     user_id = f"u_serve_worker_test_{uuid.uuid4().hex[:8]}"
@@ -194,6 +217,78 @@ def test_tail_reader_selects_window_before_enclave_decrypt(monkeypatch):
     assert calls == ["m499", "m500"]
 
 
+def test_seq_catchup_reader_uses_strict_db_order_and_preserves_seq(monkeypatch):
+    calls = []
+    rows = [
+        {"id": "m1", "seq": 11, "ts": 100.0, "role": "user",
+         "body_ct": "x", "K_enclave": "k"},
+        {"id": "a1", "seq": 12, "ts": 100.0, "role": "assistant",
+         "body_ct": "x", "K_enclave": "k"},
+        {"id": "m2", "seq": 13, "ts": 100.0, "role": "user",
+         "body_ct": "x", "K_enclave": "k"},
+    ]
+    monkeypatch.setattr(
+        serve_worker.db, "chat_messages_after_seq",
+        lambda uid, after_seq, *, limit, oldest_first=True, through_seq=None: (
+            calls.append((uid, after_seq, limit, oldest_first, through_seq)) or rows
+        ),
+    )
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave, "_decrypt_envelope_via_enclave",
+        lambda row, *args, **kwargs: f"text-{row['id']}".encode(),
+    )
+
+    out = serve_worker._read_messages_after_seq("u", 10, through_seq=13)
+
+    assert calls == [("u", 10, None, True, 13)]
+    assert [(row["id"], row["seq"]) for row in out] == [("m1", 11), ("m2", 13)]
+
+
+def test_seq_tail_readers_request_exact_oldest_and_newest_windows(monkeypatch):
+    calls = []
+
+    def _rows(uid, after_seq, *, limit, oldest_first=True, through_seq=None):
+        calls.append((uid, after_seq, limit, oldest_first, through_seq))
+        return [{"id": "m", "seq": 21, "ts": 5.0, "role": "user",
+                 "body_ct": "x", "K_enclave": "k"}]
+
+    monkeypatch.setattr(serve_worker.db, "chat_messages_after_seq", _rows)
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave, "_decrypt_envelope_via_enclave",
+        lambda row, *args, **kwargs: b"text",
+    )
+
+    assert serve_worker._read_tail_after_seq(
+        "u", 20, 2, through_seq=25,
+    )[0]["seq"] == 21
+    assert serve_worker._read_compaction_tail_after_seq(
+        "u", 20, 3, through_seq=26,
+    )[0]["seq"] == 21
+    assert calls == [
+        ("u", 20, 2, False, 25), ("u", 20, 3, True, 26),
+    ]
+
+
+def test_seq_reader_preserves_local_only_row_as_safe_placeholder(monkeypatch):
+    monkeypatch.setattr(
+        serve_worker.db, "chat_messages_after_seq",
+        lambda *args, **kwargs: [{
+            "id": "local", "seq": 11, "ts": 100.0, "role": "user",
+            "body_ct": None, "K_enclave": None,
+        }],
+    )
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+
+    out = serve_worker._read_messages_after_seq("u", 10, through_seq=11)
+
+    assert out == [{
+        "id": "local", "seq": 11, "ts": 100.0, "role": "user",
+        "content": "[message unavailable]",
+    }]
+
+
 def test_main_module_has_entrypoint_guard():
     import inspect
 
@@ -202,36 +297,17 @@ def test_main_module_has_entrypoint_guard():
     assert "def main() -> None" in src or "def main():" in src
 
 
-def test_is_official_wraps_spawners_and_defaults_true_for_none():
-    """Task 8 dependency-direction fix: worker.py must not import
-    agent_runtime.spawners (hosted-adjacent) itself, so the official/non-official
-    judgment is resolved here and injected via TurnDeps.is_official. Delegates to
-    the same ``_is_official_identity`` the hosted prompt-rewrite path uses."""
-    import provider_client
-    from agent_runtime import spawners as agent_spawners
-
-    official_cfg = provider_client.ProviderConfig(
-        provider="anthropic", model="claude-x", api_key="k", base_url="")
-    third_party_cfg = provider_client.ProviderConfig(
-        provider="deepseek", model="deepseek-chat", api_key="k",
-        base_url="https://relay.example.com/v1")
-
-    assert serve_worker._is_official(official_cfg) is agent_spawners._is_official_identity(
-        "anthropic", "")
-    assert serve_worker._is_official(third_party_cfg) is agent_spawners._is_official_identity(
-        "deepseek", "https://relay.example.com/v1")
-    assert serve_worker._is_official(third_party_cfg) is False
-    # No provider resolved at all (resolve_provider failed) -> default True (matches
-    # _is_official_identity's own "missing provider -> official" convention).
-    assert serve_worker._is_official(None) is True
+def test_production_deps_do_not_install_a_model_classifier():
+    deps = serve_worker.build_production_deps()
+    assert deps.is_official is None
 
 
 def test_resident_mode_is_final_fence_for_scheduled_and_screen_watch(monkeypatch):
     monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: object())
     monkeypatch.setattr(
         serve_worker.hosted_config_store,
-        "get_hosted_runtime_mode_strict",
-        lambda store: serve_worker.hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT,
+        "hosted_runtime_v2_enabled_strict",
+        lambda store: False,
     )
     monkeypatch.setattr(
         jobs_store,
@@ -333,6 +409,30 @@ def test_reaper_loop_transient_db_error_does_not_kill_the_loop(monkeypatch):
 
     asyncio.run(_driver())
     assert calls["n"] >= 2  # survived the first raise and ticked again
+
+
+def test_r2_cleanup_loop_is_a_separate_driver(monkeypatch):
+    calls = []
+
+    async def _fake_loop(stop_event, **kwargs):
+        calls.append((stop_event, kwargs))
+
+    monkeypatch.setattr(v2_reaper, "run_cleanup_loop", _fake_loop)
+    stop_event = asyncio.Event()
+
+    asyncio.run(
+        serve_worker._r2_cleanup_loop(
+            stop_event,
+            interval=7.0,
+            limit=4,
+            inventory_limit=2,
+        )
+    )
+
+    assert calls == [(
+        stop_event,
+        {"interval": 7.0, "limit": 4, "inventory_limit": 2},
+    )]
 
 
 class _HealthySupervisor:
@@ -494,6 +594,8 @@ def test_read_summary_missing_returns_empty(monkeypatch):
     out = serve_worker._read_summary("u_summary_test")
     assert out == ("", 0.0, 0)
 
+    assert serve_worker._read_summary_with_seq("u_summary_test") == ("", 0.0, 0, 0)
+
 
 def test_read_summary_decrypts_present_row(monkeypatch):
     from core import enclave as core_enclave
@@ -501,33 +603,91 @@ def test_read_summary_decrypts_present_row(monkeypatch):
 
     monkeypatch.setattr(
         v2_jobs_store, "get_summary_row",
-        lambda uid: {"summary_envelope": {"body_ct": "x"}, "watermark_ts": 7.0, "version": 3})
+        lambda uid: {"summary_envelope": {"body_ct": "x"}, "watermark_ts": 7.0,
+                     "watermark_seq": 19, "version": 3})
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
         lambda envelope, key, *, purpose, runtime_token="": b"- prior chat")
 
     out = serve_worker._read_summary("u_summary_test")
     assert out == ("- prior chat", 7.0, 3)
+    assert serve_worker._read_summary_with_seq("u_summary_test") == (
+        "- prior chat", 7.0, 3, 19,
+    )
 
 
-def test_read_summary_empty_envelope(monkeypatch):
-    """summary_envelope is None (row exists but nothing compressed into it yet,
-    e.g. Task 2's first-write path) -> plaintext "" without touching the
-    enclave at all."""
+@pytest.mark.parametrize(
+    "watermark_ts,watermark_seq",
+    [(4.0, 0), (0.0, 19)],
+)
+def test_read_summary_nonzero_watermark_without_envelope_fails_closed(
+    monkeypatch, watermark_ts, watermark_seq,
+):
+    """Coverage must never advance unless its encrypted summary is readable."""
     from core import enclave as core_enclave
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(
         v2_jobs_store, "get_summary_row",
-        lambda uid: {"summary_envelope": None, "watermark_ts": 4.0, "version": 1})
+        lambda uid: {
+            "summary_envelope": None,
+            "watermark_ts": watermark_ts,
+            "watermark_seq": watermark_seq,
+            "version": 1,
+        },
+    )
 
     def _boom(*a, **k):
         raise AssertionError("must not decrypt when summary_envelope is empty")
 
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
 
-    out = serve_worker._read_summary("u_summary_test")
-    assert out == ("", 4.0, 1)
+    with pytest.raises(RuntimeError, match="^v2_summary_integrity_error:"):
+        serve_worker._read_summary_with_seq("u_summary_test")
+
+
+def test_read_summary_nonzero_watermark_with_empty_plaintext_fails_closed(monkeypatch):
+    from core import enclave as core_enclave
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(
+        v2_jobs_store, "get_summary_row",
+        lambda uid: {
+            "summary_envelope": {"body_ct": "x"},
+            "watermark_ts": 7.0,
+            "watermark_seq": 19,
+            "version": 3,
+        },
+    )
+    monkeypatch.setattr(
+        core_enclave, "_decrypt_envelope_via_enclave",
+        lambda envelope, key, *, purpose, runtime_token="": b" \n\t",
+    )
+
+    with pytest.raises(RuntimeError, match="^v2_summary_integrity_error:"):
+        serve_worker._read_summary("u_summary_test")
+
+
+def test_read_summary_zero_watermark_without_envelope_is_valid(monkeypatch):
+    from core import enclave as core_enclave
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(
+        v2_jobs_store, "get_summary_row",
+        lambda uid: {
+            "summary_envelope": None,
+            "watermark_ts": 0.0,
+            "watermark_seq": 0,
+            "version": 1,
+        },
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("zero-coverage state must not call the enclave")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
+
+    assert serve_worker._read_summary_with_seq("u_summary_test") == ("", 0.0, 1, 0)
 
 
 def test_write_summary_builds_envelope_and_cas(monkeypatch):
@@ -583,8 +743,8 @@ def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, bac
     conftest.seed_user(uid)
     monkeypatch.setattr(
         serve_worker.hosted_config_store,
-        "get_hosted_runtime_mode_strict",
-        lambda _store: serve_worker.hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+        "hosted_runtime_v2_enabled_strict",
+        lambda _store: True,
     )
 
     calls = []

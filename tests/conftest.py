@@ -184,6 +184,26 @@ def seed_user(user_id: str, **doc) -> None:
             registry._users.append(entry)
 
 
+def set_v2_runtime_owner(user_id: str, *, generation: int | None = None) -> None:
+    """Test helper: make the authoritative runtime row explicitly V2-owned.
+
+    Production reaches this state through the atomic hosted-runtime cutover;
+    low-level worker/job tests intentionally bypass that assembly path and
+    therefore opt in through this helper before claiming work.
+    """
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) "
+            "VALUES (%s,'v2',COALESCE(%s,1)) "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "hosted_runtime_state='v2', "
+            "runtime_generation=COALESCE(%s,v2_runtime_state.runtime_generation), "
+            "updated_at=now()",
+            (user_id, generation, generation),
+        )
+
+
 _DEFAULT_MODEL_API_ENVELOPE = {"v": 1, "body_ct": "ct", "nonce": "n"}
 
 

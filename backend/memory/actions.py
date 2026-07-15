@@ -702,7 +702,13 @@ def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[di
     }, [_memory_action_effect("memory.retype", memory_id, ["type", "anchor_memory_ids"])], 200
 
 
-def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+def _memory_supersede_action(
+    store: UserStore,
+    api_key: str | None,
+    action: dict,
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     if isinstance(action.get("envelope"), dict):
         return _memory_supersede_envelope_action(store, action)
 
@@ -742,7 +748,14 @@ def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict
     if not ok:
         return {"status": "error", **(err or {}), "action": "memory.supersede"}, [], 400
 
-    old_inner, _old_inner_err = _memory_plain_from_envelope(old_cards[0], api_key)
+    old_inner, old_inner_err = _memory_plain_from_envelope(
+        old_cards[0], api_key, runtime_token=runtime_token)
+    if old_inner is None:
+        return {
+            "status": "error",
+            "error": old_inner_err,
+            "action": "memory.supersede",
+        }, [], 409
     inherited = _memory_inheritable_inner_fields(old_inner)
     raw_for_inner = {**inherited, **raw, "type": mem_type, "title": title, "description": description}
     if "importance" not in raw_for_inner and old_cards[0].get("importance") is not None:
@@ -928,7 +941,13 @@ def _memory_delete_action(store: UserStore, action: dict) -> tuple[dict, list[di
     return {"status": "ok", "action": "memory.delete", "memory": {"id": memory_id}, "change": change}, [effect], 200
 
 
-def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+def _execute_memory_action(
+    store: UserStore,
+    api_key: str | None,
+    action: dict,
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     if not isinstance(action, dict):
         return {"status": "error", "error": "action_must_be_object"}, [], 400
     action_type = str(action.get("type") or action.get("action") or "").strip()
@@ -955,11 +974,12 @@ def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) 
             "reason": action.get("reason") or "Memory patched by superseding old card.",
             "capture_mode": action.get("capture_mode") or "",
             "source_chat_message_ids": action.get("source_chat_message_ids") or [],
-        })
+        }, runtime_token=runtime_token)
     if action_type == "memory.retype":
         return _memory_retype_action(store, action)
     if action_type == "memory.supersede":
-        return _memory_supersede_action(store, api_key, action)
+        return _memory_supersede_action(
+            store, api_key, action, runtime_token=runtime_token)
     if action_type == "memory.upgrade":
         # In-place legacy→v1 upgrade (migration). Its OWN branch — must never be
         # rewritten to supersede (that mints a new id; upgrade preserves id).
@@ -976,13 +996,20 @@ def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) 
     }, [], 400
 
 
-def _execute_memory_actions(store: UserStore, api_key: str | None, actions: list[dict]) -> tuple[dict, int]:
+def _execute_memory_actions(
+    store: UserStore,
+    api_key: str | None,
+    actions: list[dict],
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, int]:
     if not isinstance(actions, list) or not actions:
         return {"status": "error", "error": "actions_required", "results": [], "effects": []}, 400
     results: list[dict] = []
     effects: list[dict] = []
     for action in actions[:20]:
-        result, action_effects, status = _execute_memory_action(store, api_key, action)
+        result, action_effects, status = _execute_memory_action(
+            store, api_key, action, runtime_token=runtime_token)
         results.append(result)
         effects.extend(action_effects)
         if status >= 400:

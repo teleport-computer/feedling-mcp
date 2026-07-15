@@ -30,13 +30,15 @@ def test_index_maps_503_retryable(monkeypatch):
 
 def test_write_delegates_to_actions(monkeypatch):
     seen = {}
-    def fake_actions(store, api_key, payload):
+    def fake_actions(store, api_key, payload, *, runtime_token=""):
         seen["payload"] = payload
+        seen["runtime_token"] = runtime_token
         return {"applied": 1}, 200
     monkeypatch.setattr(memory_core, "actions", fake_actions)
     r = cap_memory.write("STORE", api_key="k", params={"actions": [{"type": "memory.add"}]})
     assert r.ok is True and r.data == {"applied": 1}
     assert seen["payload"] == {"actions": [{"type": "memory.add"}]}
+    assert seen["runtime_token"] == ""
 
 
 def test_index_caps_large_item_list(monkeypatch):

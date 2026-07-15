@@ -8,6 +8,7 @@ return type for backward compatibility; PR C uses from_result() for typed access
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,36 @@ class ToolResult:
 
 
 @dataclass(frozen=True)
+class NativeAssistantTurn:
+    """Opaque provider-native assistant output needed for the next tool round.
+
+    Reconstructing an assistant tool-call turn from normalized ``ToolCall`` values is
+    lossy for provider-specific fields (for example Gemini thought signatures and
+    OpenAI Responses item ids).  Provider parsers therefore retain the exact JSON
+    fragment and label the wire that produced it.  It stays in-process only; it is
+    never persisted in runtime state.
+    """
+
+    wire: str
+    payload: Any
+
+
+@dataclass(frozen=True)
+class ToolExchange:
+    """One assistant tool-call turn and its complete, call-id-matched results.
+
+    ``assistant_turn`` is present for real provider responses.  It may be ``None``
+    for unit-test/legacy fakes that return only normalized calls; provider_client
+    has a deterministic synthesis fallback for that compatibility path.
+    """
+
+    calls: tuple[ToolCall, ...]
+    results: tuple[ToolResult, ...]
+    assistant_text: str = ""
+    assistant_turn: NativeAssistantTurn | None = None
+
+
+@dataclass(frozen=True)
 class Usage:
     prompt_tokens: int | None
     completion_tokens: int | None
@@ -45,6 +76,7 @@ class ProviderResponse:
     tool_calls: list[ToolCall]
     usage: Usage
     raw: dict
+    assistant_turn: NativeAssistantTurn | None = None
 
     @classmethod
     def from_result(cls, result: dict) -> "ProviderResponse":
@@ -65,5 +97,13 @@ class ProviderResponse:
             completion_tokens=u.get("completion_tokens"),
             total_tokens=u.get("total_tokens"),
         )
+        raw_turn = result.get("assistant_turn")
+        if isinstance(raw_turn, NativeAssistantTurn):
+            assistant_turn = raw_turn
+        elif isinstance(raw_turn, dict) and raw_turn.get("wire") and "payload" in raw_turn:
+            assistant_turn = NativeAssistantTurn(
+                wire=str(raw_turn["wire"]), payload=raw_turn["payload"])
+        else:
+            assistant_turn = None
         return cls(text=str(result.get("reply") or ""), tool_calls=calls,
-                   usage=usage, raw=result)
+                   usage=usage, raw=result, assistant_turn=assistant_turn)

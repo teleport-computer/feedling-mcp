@@ -168,9 +168,9 @@ async def respond(
         tail=tail,
         action_context=action_context,
     )
-    # 除了 system 块（system prompt / summary / action context）没有任何 tail 轮次
-    # 折进来——保留原有"无用户消息报错"不变量，现在是对 tail 判的。
-    if not any(m["role"] != "system" for m in messages):
+    # Summary 现在刻意是非特权 user-role 历史数据，不能再用组装后 message role
+    # 判断“有没有真实 tail”。直接检查 tail，保留 summary-only 时仍报错的不变量。
+    if not any(context._has_payload(m.get("content")) for m in tail):
         raise ResponderError("no_user_messages")
     try:
         result = await provider_client.reliable_chat_completion_async(

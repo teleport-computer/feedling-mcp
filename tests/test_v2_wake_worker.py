@@ -66,6 +66,7 @@ def _reset(uid):
         conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_effect_outbox WHERE user_id=%s", (uid,))
+    conftest.set_v2_runtime_owner(uid)
 
 
 _BYOK = provider_client.ProviderConfig(

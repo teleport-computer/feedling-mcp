@@ -15,6 +15,11 @@ _BYOK = provider_client.ProviderConfig(
     provider="anthropic", model="claude-x", api_key="sk-user", base_url="")
 
 
+def _seed_v2(uid: str) -> None:
+    conftest.seed_user(uid)
+    conftest.set_v2_runtime_owner(uid)
+
+
 @pytest.fixture(autouse=True)
 def _clean():
     with db.get_pool().connection() as conn:
@@ -54,7 +59,7 @@ def test_dream_is_a_lane_with_background_priority():
 @pytest.mark.parametrize("lane", ["capture", "dream"])
 def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
     uid = f"u_x_{lane}"
-    conftest.seed_user(uid)
+    _seed_v2(uid)
     job_id, _ = jobs_store.enqueue_job(uid, lane)
     job = jobs_store.claim_next_job("w")
 
@@ -83,7 +88,7 @@ def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane)
     counts the call via `add_call(None)` so `model_calls` is at least right;
     token columns stay 0 (a documented gap, not invented data)."""
     uid = f"u_x_metric_{lane}"
-    conftest.seed_user(uid)
+    _seed_v2(uid)
     job_id, _ = jobs_store.enqueue_job(uid, lane)
     job = jobs_store.claim_next_job("w")
 
@@ -113,7 +118,7 @@ def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane)
 def test_zero_results_completes_without_applying_anything(monkeypatch, lane):
     """`nothing_worth_keeping` is SUCCESS — mirrors the wake lane's weak-wake-sleeps."""
     uid = f"u_x_empty_{lane}"
-    conftest.seed_user(uid)
+    _seed_v2(uid)
     job_id, _ = jobs_store.enqueue_job(uid, lane)
     job = jobs_store.claim_next_job("w")
 
@@ -134,7 +139,7 @@ def test_zero_results_completes_without_applying_anything(monkeypatch, lane):
 @pytest.mark.parametrize("lane", ["capture", "dream"])
 def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane):
     uid = f"u_x_fail_{lane}"
-    conftest.seed_user(uid)
+    _seed_v2(uid)
     job_id, _ = jobs_store.enqueue_job(uid, lane)
     job = jobs_store.claim_next_job("w")
 
@@ -160,7 +165,7 @@ def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane)
 
 def test_extraction_rollback_during_llm_blocks_memory_write(monkeypatch):
     uid = "u_x_rollback"
-    conftest.seed_user(uid)
+    _seed_v2(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "capture")
     job = jobs_store.claim_next_job("w")
 
@@ -187,7 +192,7 @@ def test_extraction_rollback_during_llm_blocks_memory_write(monkeypatch):
 def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
     """Context fetch failure must degrade, not fail the job (spec §3.5)."""
     uid = "u_x_nocontext"
-    conftest.seed_user(uid)
+    _seed_v2(uid)
     jobs_store.enqueue_job(uid, "capture")
     job = jobs_store.claim_next_job("w")
 
@@ -229,7 +234,7 @@ def test_extraction_reads_go_through_the_enclave_semaphore(monkeypatch):
             super().release()
 
     uid = "u_x_sem"
-    conftest.seed_user(uid)
+    _seed_v2(uid)
     jobs_store.enqueue_job(uid, "capture")
     job = jobs_store.claim_next_job("w")
 

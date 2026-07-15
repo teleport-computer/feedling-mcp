@@ -44,11 +44,19 @@ def estimate_tokens_from_text(text: str) -> int:
 
 
 def _estimate_prompt_tokens(payload: dict) -> int:
-    parts = [
-        str(m.get("content") or "")
-        for m in (payload.get("messages") or [])
-        if isinstance(m, dict)
-    ]
+    parts: list[str] = []
+    for message in payload.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        parts.append(str(message.get("content") or ""))
+        # Native tool transcripts carry meaningful prompt bytes outside
+        # ``content``.  Count the assistant calls as well as the catalog that is
+        # resent on every tools-enabled round; otherwise the V2 rollback gate
+        # materially understates the production unified-loop prompt.
+        if message.get("tool_calls"):
+            parts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
+    if payload.get("tools"):
+        parts.append(json.dumps(payload["tools"], ensure_ascii=False))
     return estimate_tokens_from_text("".join(parts))
 
 
@@ -87,20 +95,53 @@ def _make_handler(provider: "MockProvider") -> type:
                 self._serve_responses(raw_body)
                 return
 
+            try:
+                payload = json.loads(raw_body) if raw_body else {}
+            except json.JSONDecodeError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+
+            # Optional native-tool behavior for the D4 V2 rollback gate.  A
+            # tools-enabled request receives one valid OpenAI function call;
+            # the loop's reserved tools-disabled request receives ``reply`` as
+            # terminal text.  Default ``tool_call=None`` preserves the original
+            # one-shot mock behavior for every other load test.
+            raw_tool_call = provider.tool_call if payload.get("tools") else None
+            if raw_tool_call:
+                call_id = str(raw_tool_call.get("id") or "loadtest-call-1")
+                call_name = str(raw_tool_call.get("name") or "memory_search")
+                call_args = raw_tool_call.get("args") or {}
+                assistant_message = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": call_name,
+                            "arguments": json.dumps(call_args, ensure_ascii=False),
+                        },
+                    }],
+                }
+                finish_reason = "tool_calls"
+                completion_text = json.dumps(assistant_message["tool_calls"], ensure_ascii=False)
+            else:
+                assistant_message = {"role": "assistant", "content": provider.reply}
+                finish_reason = "stop"
+                completion_text = provider.reply
+
             if provider.estimate_tokens:
-                try:
-                    payload = json.loads(raw_body) if raw_body else {}
-                except json.JSONDecodeError:
-                    payload = {}
                 prompt_tokens = _estimate_prompt_tokens(payload)
-                completion_tokens = estimate_tokens_from_text(provider.reply)
+                completion_tokens = estimate_tokens_from_text(completion_text)
             else:
                 prompt_tokens = provider.prompt_tokens
                 completion_tokens = provider.completion_tokens
-            # 服务端累加器：无论调用方是 planner 的第 N 轮还是 responder，每一次
-            # provider 调用都被计入。这是"整回合 token"唯一可靠的观测点——它不依赖
-            # 调用方自报 usage，也不需要知道一个回合内到底发生了几次 LLM 调用。
+            # 服务端累加器：无论统一工具循环跑到第几轮，每一次 provider 调用都被计入。
+            # 这是"整回合 token"唯一可靠的观测点——它不依赖调用方自报 usage，也不需要
+            # 预先知道一个回合内到底发生了几次 LLM 调用。
             with provider._lock:
+                provider.request_payloads.append(payload)
                 provider.total_prompt_tokens += prompt_tokens
                 provider.total_completion_tokens += completion_tokens
                 provider.request_count += 1
@@ -110,8 +151,8 @@ def _make_handler(provider: "MockProvider") -> type:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": provider.reply},
-                        "finish_reason": "stop",
+                        "message": assistant_message,
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": {
@@ -193,6 +234,7 @@ class MockProvider:
         self,
         *,
         reply: str = DEFAULT_REPLY,
+        tool_call: dict | None = None,
         prompt_tokens: int = DEFAULT_PROMPT_TOKENS,
         completion_tokens: int = DEFAULT_COMPLETION_TOKENS,
         latency_ms: int = DEFAULT_LATENCY_MS,
@@ -201,6 +243,7 @@ class MockProvider:
         port: int = 0,
     ) -> None:
         self.reply = reply
+        self.tool_call = dict(tool_call) if tool_call else None
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.latency_ms = latency_ms
@@ -213,6 +256,7 @@ class MockProvider:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.request_count = 0
+        self.request_payloads: list[dict] = []
 
     def start(self) -> None:
         if self._server is not None:

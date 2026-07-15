@@ -19,10 +19,14 @@ SHARED_TURN_FIXTURES = [
         "prompt": "帮我回忆一下上周说的那个计划",
         "summary": "- 用户上周提到过一个计划",
         "tail": [{"role": "user", "content": "帮我回忆一下上周说的那个计划"}],
-        "planner_replies": [
-            '{"plan":[{"type":"memory_search","payload":{"query":"上周的计划"}}]}',
-            '{"plan":[{"type":"final_response","payload":{}}]}',
-        ],
+        # The production V2 loop is provider-native: the mock emits this
+        # function call while tools are enabled, then plain final text on the
+        # loop's reserved tools-disabled request.
+        "tool_call": {
+            "id": "shared-memory-search",
+            "name": "memory_search",
+            "args": {"query": "上周的计划"},
+        },
     },
 ]
 

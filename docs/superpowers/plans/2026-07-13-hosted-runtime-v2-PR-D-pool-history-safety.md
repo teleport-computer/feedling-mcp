@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the V2 turn pool a killable/restartable child-process crash domain with a hard-timeout watchdog + health-reflecting capacity + a live kill switch (turns halt, Genesis unaffected), and close the history-integrity gaps (seq cursor, prompt-coverage invariant via synchronous catch-up compaction, coverage-gated GC, compaction CAS-loss requeue, reconcile sweeper).
+**Goal:** Make the V2 turn pool a killable/restartable child-process crash domain with a split stall/absolute-budget watchdog + health-reflecting capacity + a live kill switch (turns halt, Genesis unaffected), and close the history-integrity gaps (seq cursor, prompt-coverage invariant via synchronous catch-up compaction, coverage-gated GC, compaction CAS-loss requeue, reconcile sweeper).
 
 **Architecture:** Split `serve_worker._serve` into a parent supervisor (heartbeat/reaper/scheduler/Genesis/watchdog/kill-switch-poll/reconcile-sweeper) + a killable turn-child subprocess running `run_worker_loop`'s N slots. History safety wires the (already-built) PR A seq cursor + effect outbox into production and gates deletion/coverage on the summary watermark.
 
@@ -100,7 +100,7 @@ def downgrade():
 
 ---
 
-### Task 3: D2 — Watchdog + hard-timeout (`watchdog.py` + parent loop)
+### Task 3: D2 — Watchdog + split stall/absolute budgets (`watchdog.py` + parent loop)
 
 **Files:**
 - Create: `backend/model_api_runtime/v2/watchdog.py`
@@ -109,11 +109,11 @@ def downgrade():
 
 **Interfaces:**
 - Consumes: `child_supervisor.ChildSupervisor.poll_liveness`, `jobs_store.record_worker_heartbeat` (capacity=0 on kill).
-- Produces: `watchdog.should_kill(liveness: dict, *, turn_hard_timeout_sec, child_liveness_timeout_sec, jobs_claimable: bool) -> bool` (pure decision) + `_watchdog_loop(supervisor, worker_id, stop_event, *, interval)` (parent loop: poll → if `should_kill` → write capacity=0, `supervisor.kill_and_respawn()`).
+- Produces: `watchdog.should_kill(liveness: dict, *, turn_stall_timeout_sec, turn_absolute_timeout_sec, child_liveness_timeout_sec, jobs_claimable: bool) -> bool` (pure decision) + `_watchdog_loop(supervisor, worker_id, stop_event, *, interval)` (parent loop: poll → if `should_kill` → bounded best-effort capacity=0 write → `supervisor.kill_and_respawn()`).
 
-- [ ] **Step 1: Failing test** `tests/test_v2_watchdog.py` (pure `should_kill`): healthy (fresh progress) → False; wedged (`last_progress_age_sec > child_liveness_timeout_sec` AND jobs_claimable) → True; child dead → True; a single turn over `turn_hard_timeout_sec` → True; idle (no progress but no claimable jobs) → False (don't kill an idle-but-healthy child). Plus a loop test with a fake supervisor asserting capacity=0 is written and `kill_and_respawn` is called on the kill decision.
+- [ ] **Step 1: Failing test** `tests/test_v2_watchdog.py` (pure `should_kill`): healthy/fresh progress → False; stale event-loop heartbeat or child dead → True without queue I/O; stale slot progress with no active turn AND jobs claimable → True; idle with no claimable jobs → False; active-turn stall budget crossed → True; absolute budget crossed despite ongoing progress → True. Prove a turn older than the former 180s ceiling remains healthy when its stall clock is fresh. Add loop tests for capacity=0 + respawn, bounded DB calls, and at most one retained in-flight claimability query.
 
-- [ ] **Step 2-4:** implement `should_kill` (pure) + `_watchdog_loop` (interruptible `wait_for(stop_event.wait(), timeout=interval)` like the other loops; on kill: `await asyncio.to_thread(jobs_store.record_worker_heartbeat, worker_id, capacity=0, kind='turn')` THEN `supervisor.kill_and_respawn()`). Add it to `_serve`'s task list. `TURN_HARD_TIMEOUT_SEC` env-configurable (default 180), `CHILD_LIVENESS_TIMEOUT_SEC` default 45.
+- [ ] **Step 2-4:** implement `should_kill` (pure) + `_watchdog_loop` (interruptible `wait_for(stop_event.wait(), timeout=interval)` like the other loops; on kill: attempt a timeout-bounded `jobs_store.record_worker_heartbeat(..., capacity=0, kind='turn')`, then recover the child even if that DB write fails). Add it to `_serve`'s task list. Use `FEEDLING_V2_TURN_STALL_TIMEOUT_SEC` (default 240, minimum 210), `FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC` (default 1500 and validated against the configured catch-up/provider envelope), `FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC` (default 45), and `FEEDLING_V2_WATCHDOG_DB_TIMEOUT_SEC` (default 5). Treat legacy `FEEDLING_V2_TURN_HARD_TIMEOUT_SEC` only as a stall alias; an old 180s override must fail startup rather than silently restore the unsafe policy.
 
 - [ ] **Step 5: Run** `python -m pytest tests/test_v2_watchdog.py -q` → PASS. Leave in working tree.
 
@@ -141,7 +141,7 @@ def downgrade():
 
 - [ ] **P0 — all slots stuck → capacity zeroes + child restarts + Genesis unaffected:** with a fake wedged child (progress frozen) + jobs claimable, drive one `_watchdog_loop` iteration → assert capacity=0 recorded AND `kill_and_respawn` issued; assert a `kind='genesis'` heartbeat written independently stays fresh (Genesis untouched).
 - [ ] **kill switch:** `set_turns_halted(True)` → `chat_send_core` admission returns 503 `turns_halted`; `_slot_loop` claims nothing (monkeypatch claim_next_job, assert not called while halted); an in-flight write is fenced; a Genesis import path is unaffected (its claim fn still callable). Flip back → resumes.
-- [ ] **watchdog hard-timeout:** `should_kill` returns True for a turn exceeding `TURN_HARD_TIMEOUT_SEC`.
+- [ ] **watchdog split budgets:** a fake clock shows a progressing turn can exceed 180s, a no-progress turn is killed at the stall budget, and a continually-progressing pathological turn is killed at the larger absolute budget.
 - [ ] **Run** `python -m pytest tests/test_v2_p0_pool_safety.py -q` → PASS. Leave in working tree.
 
 ---

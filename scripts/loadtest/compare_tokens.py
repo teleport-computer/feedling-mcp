@@ -11,12 +11,13 @@ runbook). What THIS module provides instead:
      read against resident-tagged rows). A regression here (V2 using more
      than ``threshold`` extra tokens/turn than resident) is the documented
      ROLLBACK condition for the V2 cutover (D4 plan, hard gate).
-  2. ``measure_v2_tokens_per_turn`` — actually drives V2's real
-     ``model_api_runtime.v2.responder.respond`` path (same code the V2 worker
-     calls in production) against fixture conversations, through a
-     ``MockProvider`` (deterministic token counts, no BYOK credit burn), and
-     returns the mean tokens/turn V2 produced. This is the "V2 side" of the
-     comparison; the resident side is supplied by the caller/operator.
+  2. ``measure_v2_tokens_per_turn`` — drives V2's production unified native
+     tool loop (``model_api_runtime.v2.tool_loop.run_tool_loop``) against
+     fixture conversations through a ``MockProvider`` (deterministic token
+     counts, no BYOK credit burn), and returns the mean tokens/turn V2
+     produced. Tool fixtures exercise both a native tool-call round and the
+     loop's reserved tools-disabled terminal reply. This is the "V2 side" of
+     the comparison; the resident side is supplied by the caller/operator.
 
 Usage (manual)::
 
@@ -40,9 +41,10 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 import provider_client  # noqa: E402
-from model_api_runtime.v2 import planner as v2_planner  # noqa: E402
+from provider_types import ToolExchange, ToolResult  # noqa: E402
+from model_api_runtime.v2 import context as v2_context  # noqa: E402
 from model_api_runtime.v2 import responder as v2_responder  # noqa: E402
-from model_api_runtime.v2 import agent_loop as v2_agent_loop  # noqa: E402
+from model_api_runtime.v2 import tool_loop as v2_tool_loop  # noqa: E402
 
 from scripts.loadtest.mock_provider import MockProvider  # noqa: E402
 from scripts.loadtest.fixtures import v2_turn_fixtures  # noqa: E402
@@ -89,15 +91,15 @@ async def _measure_v2_tokens_per_turn_async(
     fixtures: list[dict[str, Any]], *, mock_base_url: str
 ) -> list[float]:
     # provider="openai_compatible" is the only ProviderConfig shape that
-    # routes reliable_chat_completion_async straight to the async HTTP POST
+    # routes chat_completion_async straight to the async HTTP POST
     # against an arbitrary base_url without a special-cased provider branch
     # (anthropic/gemini bounce through anyio.to_thread + a real-provider
     # wire shape; openai can bounce through the Responses API for reasoning
     # models) — openai_compatible always POSTs {base_url}/chat/completions
     # with the plain OpenAI chat-completions request/response shape, which
-    # is exactly what MockProvider speaks. This exercises the SAME code path
-    # (responder.respond -> provider_client.reliable_chat_completion_async)
-    # the real V2 worker uses in production, just pointed at the mock.
+    # is exactly what MockProvider speaks. This exercises the SAME provider-native
+    # loop and async transport the real V2 worker uses in production, just
+    # pointed at the mock.
     provider_config = provider_client.ProviderConfig(
         provider="openai_compatible",
         model="loadtest-mock",
@@ -106,16 +108,8 @@ async def _measure_v2_tokens_per_turn_async(
     )
     totals: list[float] = []
     for fixture in fixtures:
-        usage_out: dict[str, Any] = {}
-        await v2_responder.respond(
-            provider_config=provider_config,
-            summary=str(fixture.get("summary") or ""),
-            tail=list(fixture.get("tail") or []),
-            usage_out=usage_out,
-        )
-        prompt_tokens = usage_out.get("prompt_tokens") or 0
-        completion_tokens = usage_out.get("completion_tokens") or 0
-        totals.append(float(prompt_tokens) + float(completion_tokens))
+        result = await _drive_turn_async(provider_config, fixture)
+        totals.append(result["tokens"])
     return totals
 
 
@@ -123,9 +117,9 @@ def measure_v2_tokens_per_turn(
     fixtures: list[dict[str, Any]], *, mock_base_url: str
 ) -> float:
     """Drive each fixture (``{"summary": str, "tail": list[dict]}``) through
-    the real ``model_api_runtime.v2.responder.respond`` path against a mock
-    provider listening at ``mock_base_url``, and return the mean tokens/turn
-    (prompt_tokens + completion_tokens per turn, averaged across fixtures).
+    the real ``model_api_runtime.v2.tool_loop.run_tool_loop`` path against a
+    mock provider listening at ``mock_base_url``, and return mean tokens/turn
+    (prompt_tokens + completion_tokens across every call in each turn).
 
     Raises if ``fixtures`` is empty (nothing to measure -> mean is undefined;
     callers should always pass at least one fixture).
@@ -138,66 +132,95 @@ def measure_v2_tokens_per_turn(
     return sum(totals) / len(totals)
 
 
-async def _drive_turn_async(provider_config, fixture: dict[str, Any], *, provider) -> None:
-    """跑一个**完整回合**的 LLM 调用序列：planner（可能多轮）+ responder。
-
-    这是 token 门唯一正确的观测口径。老的 `measure_v2_tokens_per_turn` 只跑 responder，
-    因此对"循环让 planner 多跑几轮"这件事完全失明——而那恰恰是本次改动的全部风险。
-    token 计数不在这里做：由 MockProvider 的服务端累加器统计，它看得见每一次调用，
-    无论调用方是谁、调了几次。
-    """
+def _build_messages_for_fixture(fixture: dict[str, Any]):
+    """Mirror the production worker's base-context + native transcript shape."""
     tail = list(fixture.get("tail") or [])
-    coalesced = [m for m in tail if m.get("role") == "user"]
-    scripted = list(fixture.get("planner_replies") or [])
-
-    async def _decide(round_idx: int, prior: dict) -> v2_agent_loop.Decision:
-        if scripted:
-            provider.reply = scripted[min(round_idx, len(scripted) - 1)]
-        steps = await v2_planner.plan(
-            None,
-            provider_config=provider_config, is_official=True,
-            coalesced_messages=coalesced,
-            digest={"messages": [{"content": str(m.get("content") or "")[:400]} for m in coalesced[-6:]]},
-            memory_index={}, perception_summary={}, runtime_state={},
-            lane="chat", reason="loadtest", prior_action_results=prior or None,
-        )
-        return v2_agent_loop.Decision(
-            actions=[step for step in steps if step["type"] != "final_response"],
-            wants_reply=any(step["type"] == "final_response" for step in steps),
-        )
-
-    async def _run_tools(actions: list[dict]) -> dict:
-        # Token measurement needs the loop shape, not live capabilities. Return a
-        # deterministic observation so the next planner round receives results.
-        results = {
-            str(action.get("type") or "unknown"): [
-                {"ok": True, "data": {"count": 1}}
-            ]
-            for action in actions
-        }
-        return {
-            "action_results": results,
-            "action_digest": {
-                action_type: {"ok": len(runs), "count": len(runs)}
-                for action_type, runs in results.items()
-            },
-        }
-
-    await v2_agent_loop.run_turn(
-        decide=_decide,
-        run_tools=_run_tools,
-        max_rounds=int(fixture.get("max_rounds") or 3),
-    )
-    provider.reply = str(fixture.get("response_reply") or "Measured final response.")
-    await v2_responder.respond(
-        provider_config=provider_config,
+    base = v2_context.build_turn_messages(
+        system_prompt=v2_responder._SYSTEM_PROMPT,
         summary=str(fixture.get("summary") or ""),
         tail=tail,
     )
 
+    def build_messages(transcript: list) -> list:
+        rendered: list = []
+        for item in transcript:
+            if isinstance(item, ToolExchange):
+                rendered.append(item)
+                continue
+            if isinstance(item, dict) and v2_context._has_payload(item.get("content")):
+                rendered.append({"role": "user", "content": item["content"]})
+        return list(base) + rendered
+
+    return build_messages
+
+
+async def _drive_turn_async(
+    provider_config,
+    fixture: dict[str, Any],
+) -> dict[str, Any]:
+    """Run one whole production V2 native-tool turn and collect all call usage.
+
+    Capabilities are deterministic fakes because this is a token gate, not a
+    capability integration test. The actual loop, tool catalog, OpenAI-compatible
+    wire encoding, native ToolExchange replay, and tools-disabled final call are
+    production code.
+    """
+    call_tokens: list[float] = []
+    dispatched_batches: list[list] = []
+    replies: list[tuple[str, bool]] = []
+
+    async def _dispatch_tools(tool_calls) -> list[ToolResult]:
+        calls = list(tool_calls)
+        dispatched_batches.append(calls)
+        return [
+            ToolResult(
+                call_id=call.id,
+                content=json.dumps(
+                    {"ok": True, "data": {"query": call.args.get("query"), "count": 1}},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
+            for call in calls
+        ]
+
+    async def _on_reply(text: str, *, final: bool) -> None:
+        replies.append((str(text), final))
+
+    async def _fold_new_messages() -> list[dict]:
+        return []
+
+    def _add_usage(usage) -> None:
+        if not usage:
+            call_tokens.append(0.0)
+            return
+        call_tokens.append(
+            float(usage.get("prompt_tokens") or 0)
+            + float(usage.get("completion_tokens") or 0)
+        )
+
+    outcome = await v2_tool_loop.run_tool_loop(
+        provider_config=provider_config,
+        build_messages=_build_messages_for_fixture(fixture),
+        dispatch_tools=_dispatch_tools,
+        on_reply=_on_reply,
+        fold_new_messages=_fold_new_messages,
+        add_usage=_add_usage,
+        # One tools-enabled tool round plus the reserved tools-disabled final
+        # reply is the representative multi-call fixture for this rollback gate.
+        max_calls=int(fixture.get("max_calls") or 2),
+    )
+    return {
+        "tokens": sum(call_tokens),
+        "llm_calls": outcome.rounds,
+        "tool_batches": dispatched_batches,
+        "replies": replies,
+        "outcome": outcome,
+    }
+
 
 def measure_turn_tokens(fixtures: list[dict[str, Any]], *, provider) -> dict[str, Any]:
-    """把每个 fixture 当成一个完整回合跑过 planner+responder，返回每回合的 token 与
+    """把每个 fixture 当成一个完整统一 tool-loop 回合，返回每回合的 token 与
     LLM 调用次数均值。`provider` 是一个已启动的 `MockProvider(estimate_tokens=True)`。
 
     fixtures 为空 → 抛（均值无定义）。
@@ -208,17 +231,30 @@ def measure_turn_tokens(fixtures: list[dict[str, Any]], *, provider) -> dict[str
         provider="openai_compatible", model="loadtest-mock",
         api_key="mock-key", base_url=provider.base_url,
     )
+    before_prompt = provider.total_prompt_tokens
+    before_completion = provider.total_completion_tokens
+    before_calls = provider.request_count
+    default_tool_call = provider.tool_call
 
     async def _run() -> None:
-        for fixture in fixtures:
-            await _drive_turn_async(provider_config, fixture, provider=provider)
+        try:
+            for fixture in fixtures:
+                # Fixture-local native tool behavior lets the shared workload mix
+                # one-shot replies with tool-using turns deterministically.
+                provider.tool_call = fixture.get("tool_call", default_tool_call)
+                await _drive_turn_async(provider_config, fixture)
+        finally:
+            provider.tool_call = default_tool_call
 
     asyncio.run(_run())
     turns = float(len(fixtures))
-    total = provider.total_prompt_tokens + provider.total_completion_tokens
+    total = (
+        provider.total_prompt_tokens - before_prompt
+        + provider.total_completion_tokens - before_completion
+    )
     return {
         "tokens_per_turn": total / turns,
-        "llm_calls_per_turn": provider.request_count / turns,
+        "llm_calls_per_turn": (provider.request_count - before_calls) / turns,
     }
 
 
@@ -258,8 +294,7 @@ def main(argv: list[str] | None = None) -> int:
             "threshold": args.threshold,
         }, indent=2))
         return 2
-    one_shot = '{"plan":[{"type":"final_response","payload":{}}]}'
-    with MockProvider(reply=one_shot, estimate_tokens=True) as provider:
+    with MockProvider(reply="Measured final response.", estimate_tokens=True) as provider:
         report = measure_turn_tokens(_DEFAULT_FIXTURES, provider=provider)
     result = compare_tokens_per_turn(
         report["tokens_per_turn"], args.resident_baseline, threshold=args.threshold

@@ -1,15 +1,8 @@
-"""D5 / Hosted Runtime V2 PR D Task 9: `v2_conversation_summary` gains a
-`watermark_seq` column (migration 0031) alongside the existing `watermark_ts`,
-and `worker._run_compaction` advances it atomically in the SAME CAS write as
-the ts watermark. `db.seq_for_watermark_ts` gives a conservative one-time
-ts->seq translation for rows that predate this migration (still at the
-column's default of 0).
+"""Summary watermark sequence plumbing and migration graph coverage.
 
-Scope note (see the migration file's docstring / the D5 task write-up): this
-task deliberately does NOT migrate the reply-cursor / turn-read boundary
-(`since = last_replied_ts`) to seq, and does NOT wire PR A's `cursor.py`
-(`load_seq`/`advance_effect`) into the outbox. Those remain future work; this
-file only covers the summary watermark_seq plumbing added here.
+Migration 0031 introduced ``watermark_seq``. Migration 0033 and the V2 worker
+now also move the reply/turn boundary from ``last_replied_ts`` to the durable
+``v2_reply_cursor_seq``; this module remains focused on summary coverage.
 """
 from __future__ import annotations
 
@@ -48,6 +41,7 @@ def _reset(uid):
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
+    conftest.set_v2_runtime_owner(uid)
 
 
 # ---------------------------------------------------------------------------
@@ -59,13 +53,31 @@ def test_migration_head_and_watermark_seq_column():
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
-    # Head is the tee-pg × V2 merge point added when feat/hosted-runtime-v2 was
-    # rebased onto test: 0032_merge_tee_v2 joins 0016_tee_sync_table_failures with
-    # 0031_v2_summary_watermark_seq, then 0033_merge_tee_reconcile joins in test's
-    # later tee-pg extension (0018_tee_reconcile_cursors, forked at 0016) as the
-    # single current head. 0031 remains the V2 chain's watermark_seq migration,
-    # chained after 0030, unchanged by either merge.
-    assert script.get_current_head() == "0033_merge_tee_reconcile"
+    # 0032 joins the original tee-pg and V2 lineages. The deployed Runtime V2
+    # path continues through 0033/0034 while test's later tee extension is
+    # independently joined to 0032 by 0033_merge_tee_reconcile. 0035 merges
+    # those valid deployed heads without rewriting either history.
+    assert set(script.get_revision("0033_merge_tee_reconcile").down_revision) == {
+        "0032_merge_tee_v2",
+        "0018_tee_reconcile_cursors",
+    }
+    assert script.get_revision("0033_v2_seq_cursor_effect_order").down_revision == (
+        "0032_merge_tee_v2"
+    )
+    assert script.get_revision("0034_v2_legacy_sink_reconcile").down_revision == (
+        "0033_v2_seq_cursor_effect_order"
+    )
+    assert set(script.get_revision("0035_merge_v2_tee_reconcile").down_revision) == {
+        "0033_merge_tee_reconcile",
+        "0034_v2_legacy_sink_reconcile",
+    }
+    assert script.get_revision("0036_chat_r2_lifecycle").down_revision == (
+        "0035_merge_v2_tee_reconcile"
+    )
+    assert script.get_revision("0037_v2_terminal_failure_outbox").down_revision == (
+        "0036_chat_r2_lifecycle"
+    )
+    assert script.get_current_head() == "0037_v2_terminal_failure_outbox"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

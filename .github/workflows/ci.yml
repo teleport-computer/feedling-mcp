@@ -879,10 +879,10 @@ jobs:
   # DEPLOY — standalone runner CVM (test, multi-node Form B)
   #
   # Deploys deploy/docker-compose.phala.runner.yaml to a SEPARATE Phala CVM that
-  # runs only agent-runner supervisors (see deploy/DEPLOYMENTS.md “横向扩展”). It
-  # reuses the same feedling-agent-runner:<sha> image, shares the main CVM's
-  # Postgres + token secret, and reaches the main CVM's backend/enclave over their
-  # public ingress + gateway-passthrough URLs.
+  # runs one resident agent-runner plus a sibling Hosted Runtime V2 serve-worker
+  # (see deploy/DEPLOYMENTS.md “横向扩展”). Both share the same backend-code image,
+  # main-CVM Postgres + token secret, and reach the main backend/enclave over their
+  # public ingress + gateway-passthrough URLs. Neither runs on the main CVM.
   #
   # DORMANT BY DEFAULT: skipped unless the repo var DEPLOY_TEST_RUNNER_CVM == 'true'
   # AND deploy/test-runner-cvm-id.txt names a provisioned runner CVM. So merging

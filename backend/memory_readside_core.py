@@ -178,6 +178,7 @@ def readside_candidates(
     limit: int | None = None,
     ambient: bool = False,
     ambient_top_n: int | None = None,
+    exact_query: bool = False,
 ) -> tuple[list[dict], int]:
     candidates = [
         dict(moment, score=memory_score(moment))
@@ -202,6 +203,12 @@ def readside_candidates(
             ),
             reverse=True,
         )
+    if exact_query:
+        # Exact private-content search must inspect every eligible ciphertext.
+        # The caller pages this ordered list through the enclave in bounded
+        # batches, so HARD_MAX remains a per-request resource bound rather than
+        # a recall boundary that can hide an old/low-score match forever.
+        return candidates, len(candidates)
     capped_limit = int(ambient_top_n or 0) if ambient and ambient_top_n else effective_readside_limit(limit)
     if capped_limit <= 0:
         capped_limit = effective_readside_limit(limit)
@@ -268,37 +275,55 @@ def memory_index_core(
             raise ValueError("invalid ambient_top_n")
     limit = effective_readside_limit(payload.get("limit"))
     query = str(payload.get("query") or "")[:500]
-    # ``limit`` is the caller's requested *result* count.  A private-content
-    # query can only be evaluated after enclave decryption, so applying that
-    # limit to the ciphertext candidates first creates deterministic false
-    # negatives (a matching low-score card after the first N is never seen).
-    # Search the bounded full window; the enclave filters and slices results.
-    candidate_limit = readside_hard_max() if query.strip() else limit
+    # ``limit`` is the caller's requested *result* count. A private-content
+    # query can only be evaluated after enclave decryption, so applying either
+    # it or HARD_MAX to the ciphertext candidates creates deterministic false
+    # negatives. Exact query search therefore walks every eligible card in
+    # score order, using HARD_MAX only as the enclave request page size.
     candidates, user_card_count = readside_candidates(
         memory_service._load_moments(store),
         store.user_id,
-        limit=candidate_limit,
+        limit=limit,
         ambient=ambient,
         ambient_top_n=ambient_top_n,
+        exact_query=bool(query.strip()),
     )
-    response = (post_enclave or post_enclave_readside)(
-        api_key,
-        candidates,
-        operation="index",
-        payload={
+    post = post_enclave or post_enclave_readside
+    payload_base = {
             "ambient": ambient,
             "bucket": str(payload.get("bucket") or "")[:120],
             "thread": str(payload.get("thread") or "")[:120],
             "include_sensitive": bool(payload.get("include_sensitive", False)),
             "limit": limit,
             "query": query,
-        },
-    )
-    items = response.get("items") if isinstance(response.get("items"), list) else []
+    }
+    if query.strip():
+        items: list = []
+        page_size = readside_hard_max()
+        for offset in range(0, len(candidates), page_size):
+            remaining = limit - len(items)
+            if remaining <= 0:
+                break
+            response = post(
+                api_key,
+                candidates[offset:offset + page_size],
+                operation="index",
+                payload={**payload_base, "limit": remaining},
+            )
+            page_items = response.get("items") if isinstance(response.get("items"), list) else []
+            items.extend(page_items[:remaining])
+    else:
+        response = post(
+            api_key,
+            candidates,
+            operation="index",
+            payload=payload_base,
+        )
+        items = response.get("items") if isinstance(response.get("items"), list) else []
     return {
         "items": items,
         "limit": limit,
-        "truncated": user_card_count > len(candidates),
+        "truncated": False if query.strip() else user_card_count > len(candidates),
         "user_card_count": user_card_count,
     }
 

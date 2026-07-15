@@ -20,6 +20,8 @@ Key wake-specific differences from the chat lane, both asserted here:
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import sys
 from pathlib import Path
 
@@ -30,11 +32,13 @@ import pytest
 import conftest
 import db
 import provider_client
+from provider_types import ToolExchange
 from core import store as core_store
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import planner as v2_planner
 from model_api_runtime.v2 import responder as v2_responder
+from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
 
 pytestmark = pytest.mark.skipif(
@@ -52,6 +56,7 @@ def _reset(uid):
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_effect_outbox WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
+    conftest.set_v2_runtime_owner(uid)
 
 
 @pytest.fixture(autouse=True)
@@ -77,6 +82,23 @@ def _patch_real_write(monkeypatch):
     monkeypatch.setattr(worker, "_write_encrypted_reply", _real_write)
 
 
+def _patch_tool_effect_encryption(monkeypatch):
+    """Provide a deterministic test envelope without a live enclave.
+
+    The durable payload contains only base64 test ciphertext; the local sink
+    adapter below decodes it solely so this integration test can keep asserting
+    the authorized memory action that reached the sink.
+    """
+    def _fake_build(store, plaintext, *, item_id=None):
+        return ({
+            "id": item_id,
+            "owner_user_id": store.user_id,
+            "body_ct": base64.b64encode(plaintext).decode("ascii"),
+        }, "")
+
+    monkeypatch.setattr(worker.core_envelope, "_build_shared_envelope_for_store", _fake_build)
+
+
 def _effect_dispatch(user_id, sink_calls):
     """Test-local production-shaped sink for BOTH `reply` (mirrors
     `serve_worker._sink_reply`) and `memory` (records the payload instead of
@@ -84,8 +106,17 @@ def _effect_dispatch(user_id, sink_calls):
     has its own test files; this file only cares whether the write tool_call
     made it INTO the outbox authorized, not refused by the provenance gate)."""
     def dispatch(effect_type, payload):
-        sink_calls.append((effect_type, payload))
-        if effect_type == "reply":
+        logical_effect_type = {
+            stored: logical
+            for logical, stored in worker.ENCRYPTED_TOOL_EFFECT_TYPES.items()
+        }.get(effect_type, effect_type)
+        if "effect_envelope" in payload:
+            envelope = payload["effect_envelope"]
+            decoded = json.loads(base64.b64decode(envelope["body_ct"]).decode("utf-8"))
+            decoded["effect_id"] = payload["effect_id"]
+            payload = decoded
+        sink_calls.append((logical_effect_type, payload))
+        if logical_effect_type == "reply":
             worker._write_encrypted_reply(core_store.get_store(user_id), str(payload.get("text") or ""))
     return dispatch
 
@@ -279,8 +310,16 @@ def test_wake_memory_write_is_authorized_and_enqueued_not_refused(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     _patch_real_write(monkeypatch)
+    _patch_tool_effect_encryption(monkeypatch)
     calls = _script_provider(monkeypatch, [
-        _tool_round(_tc("w1", "memory_write", actions=[{"op": "add", "text": "likes tea"}])),
+        _tool_round(_tc(
+            "w1", "memory_write",
+            actions=[{
+                "op": "add",
+                "summary": "likes tea",
+                "content": "likes tea",
+            }],
+        )),
         _text_round(""),
     ])
     sink_calls = []
@@ -291,15 +330,16 @@ def test_wake_memory_write_is_authorized_and_enqueued_not_refused(monkeypatch):
 
     assert status == "completed"
     assert len(calls) == 2
-    # round 1's messages carry round 0's write-tool observation as grounding
-    # context — "queued: memory_write", NOT a provenance-gate refusal string.
-    round1_joined = " ".join(str(m.get("content", "")) for m in calls[1]["messages"])
-    assert "queued: memory_write" in round1_joined
-    assert "refused" not in round1_joined
+    # Round 1 carries the native assistant call and call-id-matched write result.
+    exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
+    assert len(exchanges) == 1
+    round1_results = " ".join(r.content for r in exchanges[0].results)
+    assert "queued: memory_write" in round1_results
+    assert "refused" not in round1_results
 
     memory_sinks = [p for (t, p) in sink_calls if t == "memory"]
     assert len(memory_sinks) == 1
-    # The raw model action ({"op":"add","text":...}) is translated into the server
+    # The raw model action ({"op":"add","summary":...,"content":...}) is translated into the server
     # memory-action shape (worker._memory_tool_actions) — no envelope, nested
     # plaintext memory dict — so the plaintext write path builds the E2E envelope.
     # NOT passed through raw (which memory_core.actions rejects with 400).
@@ -309,6 +349,18 @@ def test_wake_memory_write_is_authorized_and_enqueued_not_refused(monkeypatch):
         "reason": "Written by the agent via the memory_write tool.",
         "capture_mode": "agent_tool",
     }]
+    serve_worker._validate_decrypted_tool_effect(
+        "memory", {**memory_sinks[0], "effect_id": "wake-memory-effect"})
+    # The durable outbox still contains only the encrypted wrapper; the model's
+    # plaintext action is revealed only after sink-side enclave decryption.
+    with db.get_pool().connection() as conn:
+        stored_payload = conn.execute(
+            "SELECT payload::text FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type=%s",
+            (uid, worker.ENCRYPTED_TOOL_EFFECT_TYPES["memory"]),
+        ).fetchone()[0]
+    assert "likes tea" not in stored_payload
+    assert "effect_envelope" in stored_payload
     assert _job_status(job_id)[0] == "completed"
 
 

@@ -76,23 +76,35 @@ def model_api_chat_send_core(
     if len(message) > 12000:
         return {"error": "message too long", "max_chars": 12000}, 413
 
-    # ---- Hosted Runtime V2 gates: BEFORE the enclave round-trip below ----------
-    # `_load_runtime_provider_config` (next) does a per-request, uncached enclave
-    # call to unwrap the user's BYOK key, and the enclave is the single-threaded
-    # bottleneck this whole subproject exists to stop overloading. So both V2 gates
-    # run FIRST: they need only a cheap blob read (`get_hosted_runtime_mode`) plus
-    # two indexed counts, and they are exactly the two cases where we want to shed
-    # load without touching the enclave at all. Keeping them behind the decrypt
-    # meant (a) every refused send still burned an enclave round-trip precisely
-    # when the system was overloaded, and (b) a dead worker pool was masked by a
-    # 400 decrypt error whenever the enclave itself was down. Both gates still
-    # refuse BEFORE anything is persisted (nothing below has written yet).
+    # ---- Hosted Runtime V2 gates: no send-time provider decrypt -----------------
+    # V2 claims immediately after cheap durable control/capacity checks. The worker
+    # resolves and decrypts BYOK at turn start, where any failure becomes a durable
+    # terminal job error. Repeating that uncached enclave round-trip here delayed
+    # enqueue/notify and could reject the message before the no-wedge job machinery
+    # owned it. Resident remains unchanged and validates its provider before send.
     try:
+        _runtime_mode, _runtime_state, _generation = (
+            hosted_config_store.get_hosted_runtime_control_strict(store)
+        )
         _v2_mode = (
-            hosted_config_store.get_hosted_runtime_mode_strict(store) == "db_action_v2"
+            _runtime_mode
+            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
         )
     except Exception:
         return {"error": "runtime_control_unavailable"}, 503
+    # The blob is the routing selector while v2_runtime_state is the
+    # authoritative ownership fence.  A split tuple must not fall through to
+    # either runtime: resident would eventually lose its reply fence and V2
+    # would run without generation ownership.
+    _expected_state = "v2" if _v2_mode else "resident"
+    if _runtime_state != _expected_state:
+        debug_trace.trace_event(
+            store, subsystem="route", type="route.decided",
+            actor="host_agent_runtime", status="gated",
+            summary="runtime_control_inconsistent",
+            detail={"mode": "blocked", "reason": "runtime_control_inconsistent"},
+        )
+        return {"error": "runtime_control_inconsistent"}, 503
 
     # V2 liveness guard: db_action_v2 users skip the resident wedge guard further
     # down, and without this they'd have NO replacement — if every serve_worker
@@ -157,17 +169,23 @@ def model_api_chat_send_core(
             return {"error": "busy", "reason": "queue_over_sla", "est_wait_sec": int(_est)}, 503
     # ---- end V2 gates ---------------------------------------------------------
 
-    runtime = hosted_config_store._load_runtime_provider_config(store, api_key, runtime_token=runtime_tok)
-    if isinstance(runtime, tuple):
-        _, err = runtime
-        hosted_config_store._append_model_api_action_trace(store, {
-            "status": "failed",
-            "error": err.get("error", "runtime_load_failed"),
-            "context": {"stage": "load_runtime"},
-            "duration_ms": int((time.time() - trace_start) * 1000),
-        })
-        return err, 400
-    hosted_config_store._ensure_model_api_runtime_profile(store, hosted_config_store._load_model_api_config(store), touch=True)
+    config = hosted_config_store._load_model_api_config(store)
+    if not _v2_mode:
+        runtime = hosted_config_store._load_runtime_provider_config(
+            store, api_key, runtime_token=runtime_tok,
+        )
+        if isinstance(runtime, tuple):
+            _, err = runtime
+            hosted_config_store._append_model_api_action_trace(store, {
+                "status": "failed",
+                "error": err.get("error", "runtime_load_failed"),
+                "context": {"stage": "load_runtime"},
+                "duration_ms": int((time.time() - trace_start) * 1000),
+            })
+            return err, 400
+        hosted_config_store._ensure_model_api_runtime_profile(
+            store, config, touch=True,
+        )
 
     if has_image:
         user_plaintext = image_bytes
@@ -180,7 +198,6 @@ def model_api_chat_send_core(
         return {"error": "user_message_envelope_failed", "detail": env_err}, 409
     # 收口：配了 fit provider 即托管到 agent-runner，否则 409。
     # 先校验 driver 再入 store，避免未配置时写入孤儿用户消息。
-    config = hosted_config_store._load_model_api_config(store)
     try:
         driver = agent_runtime_cutover.resolve_driver(config)
     except agent_runtime_cutover.UnsupportedProviderError:
@@ -250,26 +267,38 @@ def model_api_chat_send_core(
     # stored message's msg_id) — both must be known before the call since the
     # enqueue now happens INSIDE store.append_chat via db.chat_append_and_enqueue,
     # not as a separate call afterward.
-    _generation = db.get_runtime_generation(store.user_id) if _v2_mode else None
     _envelope_id = user_env.get("id")
     _trace_id = str(_envelope_id) if isinstance(_envelope_id, str) and _envelope_id else None
-    user_row = store.append_chat(
-        "user",
-        "model_api",
-        user_env,
-        content_type="image" if has_image else ("file" if has_file else "text"),
-        extra=extra or None,
-        strict=_v2_mode,
-        enqueue=(
-            {
-                "lane": "chat",
-                "reason": "chat_send",
-                "trace_id": _trace_id,
-                "expected_generation": _generation,
-            }
-            if _v2_mode else None
-        ),
-    )
+    try:
+        user_row = store.append_chat(
+            "user",
+            "model_api",
+            user_env,
+            content_type="image" if has_image else ("file" if has_file else "text"),
+            extra=extra or None,
+            strict=_v2_mode,
+            enqueue=(
+                {
+                    "lane": "chat",
+                    "reason": "chat_send",
+                    "trace_id": _trace_id,
+                    "expected_generation": _generation,
+                    "expected_runtime_state": "v2",
+                    "expected_runtime_mode": (
+                        hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+                    ),
+                }
+                if _v2_mode else None
+            ),
+        )
+    except db.RuntimeControlChangedError:
+        debug_trace.trace_event(
+            store, subsystem="route", type="route.decided",
+            actor="host_agent_runtime", status="gated",
+            summary="runtime_control_changed",
+            detail={"mode": "blocked", "reason": "runtime_control_changed"},
+        )
+        return {"error": "runtime_control_changed"}, 503
     store.notify_chat_waiters()
 
     # image turn 不再被挡在 legacy；consumer 已能处理图片 envelope。

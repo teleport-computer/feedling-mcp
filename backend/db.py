@@ -14,8 +14,9 @@ stored verbatim as JSONB and returned byte-for-byte, so the enclave's decrypt
 path is unaffected.
 
 Concurrency: ``-w N`` workers, ``--threads 32`` each in production compose. Each
-worker has its own ``psycopg_pool.ConnectionPool`` (max_size=16) shared across
-its threads, plus one pool-external connection for the LISTEN wake bus (see
+worker has its own ``psycopg_pool.ConnectionPool`` (default max_size=16,
+overridable with ``FEEDLING_DB_POOL_MAX_SIZE``) shared across its threads, plus
+one pool-external connection for the LISTEN wake bus (see
 ``listen_connection`` / ``pg_notify`` and ``core/wake_bus.py``). The long-poll
 endpoints block on in-memory ``threading.Event``s, NOT on a held DB connection,
 so they don't starve the pool; cross-worker wakes ride the NOTIFY channel.
@@ -32,6 +33,8 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -63,6 +66,25 @@ def _database_url() -> str:
     return url
 
 
+def _pool_max_size() -> int:
+    """Return the process-local pool ceiling, failing closed on bad config.
+
+    The ordinary backend default remains 16.  Hosted Runtime V2's standalone
+    entrypoint sets this env before the pool is first opened so its nested
+    outbox-transaction + sink-write shape has two connections per turn slot
+    plus operational headroom.  Keeping the generic parser here means a typo
+    cannot silently fall back to an undersized pool.
+    """
+    raw = os.environ.get("FEEDLING_DB_POOL_MAX_SIZE", "16").strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("FEEDLING_DB_POOL_MAX_SIZE must be an integer >= 2") from exc
+    if value < 2:
+        raise RuntimeError("FEEDLING_DB_POOL_MAX_SIZE must be an integer >= 2")
+    return value
+
+
 def get_pool() -> ConnectionPool:
     global _pool
     if _pool is not None:
@@ -72,7 +94,7 @@ def get_pool() -> ConnectionPool:
             _pool = ConnectionPool(
                 _database_url(),
                 min_size=2,
-                max_size=16,
+                max_size=_pool_max_size(),
                 timeout=10,
                 max_idle=300,
                 kwargs={"autocommit": True},
@@ -462,12 +484,43 @@ def save_all_users(users: list[dict]) -> None:
                 keep_ids = [str(e.get("user_id")) for e in users if e.get("user_id")]
                 # Remove only genuinely-absent users (empty snapshot ⇒ remove all).
                 if keep_ids:
-                    delete_sql, delete_params = (
-                        "DELETE FROM users WHERE NOT (user_id = ANY(%s))", (keep_ids,))
+                    removed_sql, removed_params = (
+                        "SELECT user_id FROM users "
+                        "WHERE NOT (user_id = ANY(%s))",
+                        (keep_ids,),
+                    )
                 else:
-                    delete_sql, delete_params = ("DELETE FROM users", ())
-                conn.execute(delete_sql, delete_params)
-                mirror_group.append((delete_sql, delete_params))
+                    removed_sql, removed_params = (
+                        "SELECT user_id FROM users", ()
+                    )
+                removed_ids = sorted({
+                    str(row[0])
+                    for row in conn.execute(removed_sql, removed_params).fetchall()
+                })
+                # A bulk-registry removal is an account deletion just as much as
+                # delete_user(). Advance the durable object generation before the
+                # users-row CASCADE and leave inventory work for the isolated R2
+                # cleanup worker; never make registry persistence wait on R2.
+                with conn.cursor() as cur:
+                    for removed_id in removed_ids:
+                        _lock_chat_user_fence_on_cursor(
+                            cur, removed_id, exclusive=True,
+                        )
+                        _mark_chat_r2_inventory_pending_on_cursor(
+                            cur, removed_id, advance_generation=True,
+                        )
+                        # Preserve the global lifecycle -> users/chat lock order.
+                        # A bulk users FOR UPDATE before lifecycle would deadlock
+                        # against append/clear, which take the lifecycle fence
+                        # first. Deleting only the IDs observed above also avoids
+                        # erasing a concurrently registered user absent from this
+                        # older full-registry snapshot.
+                        cur.execute(
+                            "DELETE FROM users WHERE user_id=%s", (removed_id,),
+                        )
+                        mirror_group.append(
+                            ("DELETE FROM users WHERE user_id=%s", (removed_id,))
+                        )
                 for entry in users:
                     uid = entry.get("user_id")
                     if not uid:
@@ -487,7 +540,18 @@ def save_all_users(users: list[dict]) -> None:
 def delete_user(user_id: str) -> None:
     sql = "DELETE FROM users WHERE user_id = %s"
     with get_pool().connection() as conn:
-        conn.execute(sql, (user_id,))
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(
+                    cur, user_id, exclusive=True,
+                )
+                # Lock before the users-row DELETE/FK cascade. The chat DELETE
+                # trigger writes cleanup rows with no users FK, so both lifecycle
+                # generation and exact-key intents survive account removal.
+                _mark_chat_r2_inventory_pending_on_cursor(
+                    cur, user_id, advance_generation=True,
+                )
+                cur.execute(sql, (user_id,))
     from tee_shadow import mirror
     mirror.execute(sql, (user_id,))
 
@@ -1714,6 +1778,27 @@ def admin_api_key_stats() -> dict:
 # ---------------------------------------------------------------------------
 
 
+_BLOB_REVISION_KEY = "_rds_revision"
+_REVISIONED_BLOB_KINDS = frozenset({"model_api_runtime", "v1_flow_trace"})
+
+
+def _blob_revision(doc) -> int:
+    """Return a bounded internal mirror revision from a JSON document."""
+    if not isinstance(doc, dict):
+        return 0
+    raw = str(doc.get(_BLOB_REVISION_KEY, ""))
+    if not raw.isdigit() or len(raw) > 18:
+        return 0
+    return int(raw)
+
+
+def _next_blob_revision(doc) -> int:
+    revision = _blob_revision(doc)
+    if revision >= 999_999_999_999_999_999:
+        raise RuntimeError("blob mirror revision exhausted")
+    return revision + 1
+
+
 def get_blob_strict(user_id: str, kind: str):
     """Return a blob or ``None`` for a genuine miss; propagate DB failures."""
     with get_pool().connection() as conn:
@@ -1802,30 +1887,380 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         mirror.execute(sql, (user_id, kind, Jsonb(doc)))
 
 
+def _mirror_persisted_blob(user_id: str, kind: str, doc) -> None:
+    """Mirror an already-committed blob document exactly.
+
+    Strict blob helpers cannot reuse :func:`set_blob`: doing so would perform a
+    second primary write and reopen the read/modify/write races those helpers
+    exist to close.  Mirror only the post-commit document, while preserving the
+    same ownership exclusions as ``set_blob``/the reconciler.
+    """
+    if kind in ("identity", "consumer_state"):
+        return
+    from tee_shadow import mirror
+
+    revision = _blob_revision(doc)
+    if revision:
+        # Primary row locks make revisions strictly increasing, but mirror
+        # writes happen after commit and can finish in either order. The TEE
+        # compare-and-set keeps a delayed older full document from restoring a
+        # stale cursor or sibling field after a newer document already landed.
+        sql = (
+            "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc "
+            "WHERE (CASE "
+            "  WHEN COALESCE(user_blobs.doc ->> %s, '') ~ '^[0-9]{1,18}$' "
+            "  THEN (user_blobs.doc ->> %s)::bigint ELSE 0 END) <= %s::bigint"
+        )
+        mirror.execute(
+            sql,
+            (
+                user_id,
+                kind,
+                Jsonb(doc),
+                _BLOB_REVISION_KEY,
+                _BLOB_REVISION_KEY,
+                revision,
+            ),
+        )
+        return
+    sql = (
+        "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+        "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc"
+    )
+    mirror.execute(sql, (user_id, kind, Jsonb(doc)))
+
+
+def append_blob_events_strict(
+    user_id: str,
+    kind: str,
+    new_events: list[dict],
+    *,
+    cutoff_ts: float,
+    max_events: int,
+):
+    """Atomically append a bounded event batch to one blob ring.
+
+    The row lock covers the read, merge, and full-document update. That makes
+    the operation safe across threads, workers, and processes, unlike the
+    legacy ``get_blob`` + ``set_blob`` pair. A monotonic document revision also
+    orders the post-commit TEE mirrors.
+    """
+    incoming = [dict(event) for event in new_events if isinstance(event, dict)]
+    if not incoming:
+        return get_blob_strict(user_id, kind)
+    cap = max(1, int(max_events))
+    cutoff = float(cutoff_ts)
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO user_blobs (user_id,kind,doc) "
+                "VALUES (%s,%s,'{}'::jsonb) "
+                "ON CONFLICT (user_id,kind) DO NOTHING",
+                (user_id, kind),
+            )
+            row = conn.execute(
+                "SELECT doc FROM user_blobs "
+                "WHERE user_id=%s AND kind=%s FOR UPDATE",
+                (user_id, kind),
+            ).fetchone()
+            current = (
+                row["doc"] if isinstance(row, dict) else row[0]
+            ) if row is not None else {}
+            events = (
+                list(current.get("events"))
+                if isinstance(current, dict)
+                and isinstance(current.get("events"), list)
+                else []
+            )
+            events.extend(incoming)
+            retained = [
+                event
+                for event in events
+                if isinstance(event, dict)
+                and float(event.get("ts") or 0) >= cutoff
+            ][-cap:]
+            persisted = {
+                "v": 1,
+                "events": retained,
+                _BLOB_REVISION_KEY: _next_blob_revision(current),
+            }
+            conn.execute(
+                "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
+                (Jsonb(persisted), user_id, kind),
+            )
+    _mirror_persisted_blob(user_id, kind, persisted)
+    return persisted
+
+
 def patch_blob_strict(
     user_id: str,
     kind: str,
     patch: dict,
     *,
     remove_keys: tuple[str, ...] | list[str] = (),
+    runtime_state_target: str | None = None,
 ):
     """Atomically merge top-level blob keys and optionally remove keys.
 
     Unlike a Python read/modify/full-write, the merge happens in one UPSERT, so
     independent control-plane writers cannot resurrect stale sibling fields.
     Returns the persisted document and propagates DB failures.
+
+    ``runtime_state_target`` is reserved for the hosted-runtime control-plane
+    flip.  When supplied, the blob patch and the mandatory
+    resident/v2 -> draining -> target generation changes commit in the SAME
+    PostgreSQL transaction. Readers therefore see either the old routing flag
+    and generation or the new pair, never a split-brain combination. The
+    runtime-state row is locked before the blob, matching the effect applier's
+    lock order so an in-flight generation-fenced dispatch drains before cutover.
     """
     clean_patch = dict(patch or {})
-    keys = [str(key) for key in remove_keys if str(key)]
+    revisioned = kind in _REVISIONED_BLOB_KINDS
+    if revisioned:
+        clean_patch.pop(_BLOB_REVISION_KEY, None)
+    keys = [
+        str(key)
+        for key in remove_keys
+        if str(key) and (not revisioned or str(key) != _BLOB_REVISION_KEY)
+    ]
+    resident_bridge_ids: list[str] = []
+    resident_bridge_fields = {
+        "reply_status": "replied",
+        "replied_by": "hosted_runtime_v2_cutover",
+    }
+    if runtime_state_target not in (None, "resident", "v2"):
+        raise ValueError("runtime_state_target must be resident or v2")
     with get_pool().connection() as conn:
-        row = conn.execute(
+        with conn.transaction():
+            if runtime_state_target is not None:
+                conn.execute(
+                    "INSERT INTO v2_runtime_state (user_id) "
+                    "SELECT %s WHERE EXISTS "
+                    "(SELECT 1 FROM users WHERE user_id=%s) "
+                    "ON CONFLICT (user_id) DO NOTHING",
+                    (user_id, user_id),
+                )
+                state_row = conn.execute(
+                    "SELECT hosted_runtime_state FROM v2_runtime_state "
+                    "WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                ).fetchone()
+                if state_row is None:
+                    raise ValueError("cannot cut over unknown user")
+                current_state = str(state_row[0])
+                if current_state not in {"resident", "draining", "v2"}:
+                    raise RuntimeError(
+                        f"invalid hosted runtime state: {current_state!r}")
+                expected_mode = (
+                    "db_action_v2"
+                    if runtime_state_target == "v2"
+                    else "resident_cli"
+                )
+                requested_mode = str(
+                    clean_patch.get("hosted_runtime_mode") or "")
+                if requested_mode != expected_mode:
+                    raise ValueError(
+                        "hosted_runtime_mode patch does not match runtime_state_target")
+                # Materialize then lock the blob row after the runtime row. This
+                # both preserves the global runtime->blob lock order and lets us
+                # detect/repair pre-existing split-brain state atomically.
+                conn.execute(
+                    "INSERT INTO user_blobs (user_id, kind, doc) "
+                    "VALUES (%s,%s,'{}'::jsonb) "
+                    "ON CONFLICT (user_id,kind) DO NOTHING",
+                    (user_id, kind),
+                )
+                blob_row = conn.execute(
+                    "SELECT doc FROM user_blobs "
+                    "WHERE user_id=%s AND kind=%s FOR UPDATE",
+                    (user_id, kind),
+                ).fetchone()
+                existing_doc = blob_row[0] if blob_row else {}
+                existing_mode = str(
+                    (existing_doc or {}).get("hosted_runtime_mode") or "")
+                if existing_mode not in {"resident_cli", "db_action_v2"}:
+                    existing_mode = "resident_cli"
+                routing_changed = (
+                    current_state != runtime_state_target
+                    or existing_mode != expected_mode
+                )
+                if routing_changed:
+                    if current_state != "draining":
+                        conn.execute(
+                            "UPDATE v2_runtime_state SET "
+                            "hosted_runtime_state='draining', "
+                            "runtime_generation=runtime_generation+1, updated_at=now() "
+                            "WHERE user_id=%s",
+                            (user_id,),
+                        )
+                    conn.execute(
+                        "UPDATE v2_runtime_state SET hosted_runtime_state=%s, "
+                        "runtime_generation=runtime_generation+1, updated_at=now() "
+                        "WHERE user_id=%s AND hosted_runtime_state='draining'",
+                        (runtime_state_target, user_id),
+                    )
+            if revisioned:
+                insert_doc = {
+                    **clean_patch,
+                    _BLOB_REVISION_KEY: 1,
+                }
+                row = conn.execute(
+                    "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (user_id, kind) DO UPDATE SET doc = "
+                    "((user_blobs.doc - %s::text[]) || EXCLUDED.doc) || "
+                    "jsonb_build_object(%s::text, "
+                    "  (CASE WHEN COALESCE(user_blobs.doc ->> %s, '') "
+                    "              ~ '^[0-9]{1,18}$' "
+                    "        THEN (user_blobs.doc ->> %s)::bigint ELSE 0 END) + 1"
+                    ") RETURNING doc",
+                    (
+                        user_id,
+                        kind,
+                        Jsonb(insert_doc),
+                        keys,
+                        _BLOB_REVISION_KEY,
+                        _BLOB_REVISION_KEY,
+                        _BLOB_REVISION_KEY,
+                    ),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (user_id, kind) DO UPDATE SET "
+                    "doc = (user_blobs.doc - %s::text[]) || EXCLUDED.doc "
+                    "RETURNING doc",
+                    (user_id, kind, Jsonb(clean_patch), keys),
+                ).fetchone()
+            if runtime_state_target == "v2":
+                # Bidirectional resident -> V2 cutover bridge. Resident replies
+                # mark their parent user row instead of advancing V2's seq
+                # cursor. Advancing through the newest replied user row also
+                # consumes any older unanswered row that resident redelivery
+                # already considers superseded. Do this in the SAME transaction
+                # as the routing flag/generation so V2 can never observe the new
+                # mode with a stale cursor and re-answer resident history.
+                bridge = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM chat_messages "
+                    "WHERE user_id=%s AND doc->>'role'='user' "
+                    "  AND COALESCE(doc->>'source','') <> 'verify_ping' "
+                    "  AND (doc->>'reply_status'='replied' "
+                    "       OR COALESCE(doc->>'reply_message_id','') <> '')",
+                    (user_id,),
+                ).fetchone()
+                bridge_seq = int(bridge[0] or 0) if bridge else 0
+                with conn.cursor() as cur:
+                    persisted = _advance_blob_int_on_cursor(
+                        cur,
+                        user_id,
+                        kind,
+                        "v2_reply_cursor_seq",
+                        bridge_seq,
+                    )
+                row = (persisted,)
+            elif runtime_state_target == "resident":
+                persisted_doc = row[0] if row else {}
+                raw_cursor = str(
+                    (persisted_doc or {}).get("v2_reply_cursor_seq", 0)
+                )
+                if not raw_cursor.isdigit():
+                    raise RuntimeError("invalid persisted V2 reply cursor")
+                v2_cursor_seq = int(raw_cursor)
+                if v2_cursor_seq > 0:
+                    updated = conn.execute(
+                        "UPDATE chat_messages SET doc=doc || %s "
+                        "WHERE user_id=%s AND seq<=%s AND doc->>'role'='user' "
+                        "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                        "  AND COALESCE(doc->>'reply_message_id','')='' "
+                        "RETURNING msg_id",
+                        (
+                            Jsonb(resident_bridge_fields),
+                            user_id,
+                            v2_cursor_seq,
+                        ),
+                    ).fetchall()
+                    resident_bridge_ids.extend(str(value[0]) for value in updated)
+    if resident_bridge_ids:
+        from tee_shadow import mirror
+        mirror.execute(
+            "UPDATE chat_messages SET doc=doc || %s "
+            "WHERE user_id=%s AND msg_id=ANY(%s)",
+            (Jsonb(resident_bridge_fields), user_id, resident_bridge_ids),
+        )
+    persisted_doc = row[0]
+    _mirror_persisted_blob(user_id, kind, persisted_doc)
+    return persisted_doc
+
+
+def advance_blob_int_strict(user_id: str, kind: str, key: str, new_value: int):
+    """Atomically advance one non-negative integer field without regression.
+
+    Independent/replayed outbox effects may arrive out of order.  A regular
+    JSON merge would let an older cursor overwrite a newer one; this UPSERT
+    persists ``max(existing, new_value)`` in PostgreSQL while preserving every
+    sibling key. Invalid existing values raise instead of being silently reset,
+    keeping correctness cursors fail-closed.
+    """
+    field = str(key)
+    if not field:
+        raise ValueError("key must be non-empty")
+    value = int(new_value)
+    if value < 0:
+        raise ValueError("new_value must be >= 0")
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            row = _advance_blob_int_on_cursor(
+                cur, user_id, kind, field, value)
+    _mirror_persisted_blob(user_id, kind, row)
+    return row
+
+
+def _advance_blob_int_on_cursor(cur, user_id: str, kind: str, key: str, new_value: int):
+    """Cursor-level form used when a correctness cursor shares a transaction
+    with another durable write (notably final V2 reply persistence)."""
+    field = str(key)
+    value = int(new_value)
+    if kind in _REVISIONED_BLOB_KINDS:
+        cur.execute(
             "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
-            "ON CONFLICT (user_id, kind) DO UPDATE SET "
-            "doc = (user_blobs.doc - %s::text[]) || EXCLUDED.doc "
-            "RETURNING doc",
-            (user_id, kind, Jsonb(clean_patch), keys),
-        ).fetchone()
-    return row[0]
+            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = "
+            "user_blobs.doc || jsonb_build_object("
+            "  %s::text, GREATEST("
+            "    COALESCE(NULLIF(user_blobs.doc ->> %s::text, ''), '0')::bigint, "
+            "    %s::bigint"
+            "  ), "
+            "  %s::text, (CASE "
+            "    WHEN COALESCE(user_blobs.doc ->> %s, '') ~ '^[0-9]{1,18}$' "
+            "    THEN (user_blobs.doc ->> %s)::bigint ELSE 0 END) + 1"
+            ") RETURNING doc",
+            (
+                user_id,
+                kind,
+                Jsonb({field: value, _BLOB_REVISION_KEY: 1}),
+                field,
+                field,
+                value,
+                _BLOB_REVISION_KEY,
+                _BLOB_REVISION_KEY,
+                _BLOB_REVISION_KEY,
+            ),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = "
+            "user_blobs.doc || jsonb_build_object("
+            "  %s::text, GREATEST("
+            "    COALESCE(NULLIF(user_blobs.doc ->> %s::text, ''), '0')::bigint, "
+            "    %s::bigint"
+            "  )"
+            ") RETURNING doc",
+            (user_id, kind, Jsonb({field: value}), field, field, value),
+        )
+    fetched = cur.fetchone()
+    if fetched is None:
+        raise RuntimeError("integer blob advance returned no row")
+    return fetched["doc"] if isinstance(fetched, dict) else fetched[0]
 
 
 def patch_blob(
@@ -2805,6 +3240,34 @@ def chat_insert_onboarding_greeting_once(
 # (a pointer is anything with body_key), so adding a type here is write-side only.
 _R2_OFFLOAD_CONTENT_TYPES = ("file", "image")
 
+# Only fields that define/decrypt the main ciphertext belong in the offload
+# compare-and-swap. Operational metadata (reply claims/status, push delivery,
+# etc.) is deliberately excluded so it can be merged while an upload is in
+# flight without forcing the heavy body to stay inline. Presence is compared as
+# well as value: an absent field and an explicit JSON null are distinct envelope
+# versions.
+_CHAT_BODY_CAS_FIELDS = (
+    "id",
+    "v",
+    "body_ct",
+    "nonce",
+    "K_user",
+    "K_enclave",
+    "enclave_pk_fpr",
+    "content_pk_fpr",
+    "visibility",
+    "owner_user_id",
+    "content_type",
+)
+_CHAT_BODY_CAS_PREDICATE = " AND ".join(
+    f"(doc->'{field}') IS NOT DISTINCT FROM %s"
+    for field in _CHAT_BODY_CAS_FIELDS
+)
+
+
+class ChatPointerReplayConflict(RuntimeError):
+    """A pointer-only envelope tried to create or restore a non-current key."""
+
 
 def chat_max_seq(user_id: str) -> int:
     """Highest ``chat_messages.seq`` for the user, or 0 if the user has no
@@ -2820,18 +3283,127 @@ def chat_max_seq(user_id: str) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
-def chat_messages_after_seq(user_id: str, after_seq: int, *, limit: int) -> list[dict]:
-    """Messages strictly newer than ``after_seq``, in ``seq`` order (never
-    ``ts`` order — see :func:`chat_max_seq`). Each returned dict is the stored
-    doc with ``seq`` merged in, so a caller can persist exactly how far it has
-    read and resume from there without re-deriving position from timestamps."""
+def chat_messages_after_seq(
+    user_id: str,
+    after_seq: int,
+    *,
+    limit: int | None = None,
+    oldest_first: bool = True,
+    through_seq: int | None = None,
+) -> list[dict]:
+    """Return one exact per-user ``seq`` window strictly after ``after_seq``.
+
+    ``oldest_first=True`` returns the oldest ``limit`` rows after the cursor;
+    ``False`` returns the newest ``limit`` rows after it, but still orders the
+    selected window ascending for prompt/replay consumers.  ``limit=None`` is
+    the unbounded catch-up form used by the reply coalescer. ``through_seq``
+    freezes the upper edge of the window (inclusive), so messages arriving
+    after a turn's snapshot cannot change exact prompt membership mid-read.
+
+    The relational ``msg_id``/``ts`` columns are authoritative and overwrite
+    any stale copies in ``doc``.  Every result therefore carries an exact
+    ``id``/``ts``/``seq`` triple suitable for a durable cursor and for exact
+    prompt-membership checks.  Ordering never depends on wall-clock ``ts``.
+    """
+    cursor_seq = int(after_seq)
+    if cursor_seq < 0:
+        raise ValueError("after_seq must be >= 0")
+    upper_seq = int(through_seq) if through_seq is not None else None
+    if upper_seq is not None and upper_seq < 0:
+        raise ValueError("through_seq must be >= 0")
+    if upper_seq is not None and upper_seq <= cursor_seq:
+        return []
+    if limit is not None and int(limit) <= 0:
+        return []
+    predicate = "WHERE user_id = %s AND seq > %s"
+    params: list = [user_id, cursor_seq]
+    if upper_seq is not None:
+        predicate += " AND seq <= %s"
+        params.append(upper_seq)
     with get_pool().connection() as conn:
-        rows = conn.execute(
-            "SELECT seq, doc FROM chat_messages WHERE user_id = %s AND seq > %s "
-            "ORDER BY seq ASC LIMIT %s",
-            (user_id, after_seq, limit),
-        ).fetchall()
-    return [{**r[1], "seq": int(r[0])} for r in rows]
+        if limit is None:
+            rows = conn.execute(
+                "SELECT seq, msg_id, ts, doc FROM chat_messages "
+                f"{predicate} ORDER BY seq ASC",
+                tuple(params),
+            ).fetchall()
+        elif oldest_first:
+            rows = conn.execute(
+                "SELECT seq, msg_id, ts, doc FROM chat_messages "
+                f"{predicate} ORDER BY seq ASC LIMIT %s",
+                (*params, int(limit)),
+            ).fetchall()
+        else:
+            # Pick the newest bounded window with the index-friendly DESC
+            # scan, then restore chronological order for the caller.
+            rows = conn.execute(
+                "SELECT seq, msg_id, ts, doc FROM ("
+                "  SELECT seq, msg_id, ts, doc FROM chat_messages "
+                f"  {predicate} ORDER BY seq DESC LIMIT %s"
+                ") newest ORDER BY seq ASC",
+                (*params, int(limit)),
+            ).fetchall()
+    return [
+        {
+            **dict(r[3] or {}),
+            "id": str(r[1]),
+            "ts": float(r[2]),
+            "seq": int(r[0]),
+        }
+        for r in rows
+    ]
+
+
+def chat_seqs_after_seq(
+    user_id: str,
+    after_seq: int,
+    *,
+    limit: int | None = None,
+    oldest_first: bool = True,
+    through_seq: int | None = None,
+) -> list[int]:
+    """Return only the exact seq identities for the same window as
+    :func:`chat_messages_after_seq`.
+
+    This metadata-only form lets the V2 prompt invariant compare expected DB
+    membership with the decrypted prompt tail without decrypting rows twice.
+    """
+    cursor_seq = int(after_seq)
+    if cursor_seq < 0:
+        raise ValueError("after_seq must be >= 0")
+    upper_seq = int(through_seq) if through_seq is not None else None
+    if upper_seq is not None and upper_seq < 0:
+        raise ValueError("through_seq must be >= 0")
+    if upper_seq is not None and upper_seq <= cursor_seq:
+        return []
+    if limit is not None and int(limit) <= 0:
+        return []
+    predicate = "WHERE user_id = %s AND seq > %s"
+    params: list = [user_id, cursor_seq]
+    if upper_seq is not None:
+        predicate += " AND seq <= %s"
+        params.append(upper_seq)
+    with get_pool().connection() as conn:
+        if limit is None:
+            rows = conn.execute(
+                f"SELECT seq FROM chat_messages {predicate} ORDER BY seq ASC",
+                tuple(params),
+            ).fetchall()
+        elif oldest_first:
+            rows = conn.execute(
+                f"SELECT seq FROM chat_messages {predicate} "
+                "ORDER BY seq ASC LIMIT %s",
+                (*params, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT seq FROM ("
+                f"  SELECT seq FROM chat_messages {predicate} "
+                "  ORDER BY seq DESC LIMIT %s"
+                ") newest ORDER BY seq ASC",
+                (*params, int(limit)),
+            ).fetchall()
+    return [int(r[0]) for r in rows]
 
 
 def count_messages_after_seq(user_id: str, after_seq: int) -> int:
@@ -2893,30 +3465,6 @@ def seq_for_watermark_ts(user_id: str, watermark_ts: float) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
-def chat_max_seq_at_or_before_ts(user_id: str, ts: float) -> int:
-    """One-time ts->seq bootstrap for the stable reply cursor (D5): the highest
-    ``chat_messages.seq`` whose ``ts <= ts``, over ALL roles, or 0 if none.
-
-    Unlike :func:`seq_for_watermark_ts` (strictly-less, for the *summary*
-    watermark), this uses ``<=`` to exactly reproduce the LEGACY reply boundary
-    semantics that ``coalesce`` enforced as ``ts <= last_replied_ts`` (a message
-    at exactly the cursor ts was treated as already answered). It exists so a
-    hosted user that answered messages under the old ``last_replied_ts`` cursor,
-    but has no ``v2_reply_cursor_seq`` yet (migration default), resumes at the
-    right seq instead of re-reading — and re-answering — their whole history the
-    first time a V2 worker picks them up after this wiring ships. All roles are
-    considered (not just ``user``) so the boundary sits past the last answered
-    user message AND its assistant reply, never re-delivering the just-answered
-    message."""
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) FROM chat_messages "
-            "WHERE user_id = %s AND ts <= %s",
-            (user_id, ts),
-        ).fetchone()
-    return int(row[0]) if row and row[0] is not None else 0
-
-
 def _is_chat_file_pointer(doc) -> bool:
     return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
 
@@ -2946,29 +3494,660 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
     return out
 
 
+def _chat_body_cas_params(doc: dict) -> tuple:
+    """JSONB parameters that exactly identify one inline crypto envelope."""
+    return tuple(
+        Jsonb(doc[field]) if field in doc else None
+        for field in _CHAT_BODY_CAS_FIELDS
+    )
+
+
+def _normalize_chat_body_doc(doc: dict) -> dict:
+    """Return the canonical write shape for one chat envelope.
+
+    A document carrying a body is a new inline version even if a stale cached
+    pointer accompanied it (content re-wrap does this).  Keeping that old key on
+    the inline row makes later replay ambiguous, so strip it before persistence.
+    Pointer-only documents are left untouched and handled by the replay-only
+    branch in :func:`_chat_insert_on_cursor`.
+    """
+    out = dict(doc or {})
+    if out.get("body_ct") is not None:
+        out.pop("body_key", None)
+        out.pop("body_ct_len", None)
+    return out
+
+
+_chat_outer_fence_users: ContextVar[frozenset[str]] = ContextVar(
+    "chat_outer_fence_users",
+    default=frozenset(),
+)
+
+
+@contextmanager
+def _chat_user_fence_held_by_outer_transaction(user_id: str):
+    """Scope nested chat writes under an already-held shared deletion fence.
+
+    The V2 effect applier owns a shared advisory lock on its outer connection
+    while a synchronous sink commits through a second connection.  If an
+    account deletion has already queued for the exclusive form, PostgreSQL's
+    fair lock queue puts a second shared acquisition behind that waiter and the
+    application deadlocks (outer waits for nested; delete waits for outer).
+
+    Enter this scope only *after* the outer transaction acquired the shared
+    lock.  Same-user nested transactions may then omit their redundant shared
+    acquisition: the outer lock remains the deletion barrier until dispatch
+    returns.  Exclusive acquisitions are never skipped.
+    """
+    normalized = str(user_id)
+    token = _chat_outer_fence_users.set(
+        _chat_outer_fence_users.get() | frozenset({normalized})
+    )
+    try:
+        yield
+    finally:
+        _chat_outer_fence_users.reset(token)
+
+
+def _lock_chat_user_fence_on_cursor(
+    cur,
+    user_id: str,
+    *,
+    exclusive: bool = False,
+) -> None:
+    """Fence account deletion against nested per-user chat transactions.
+
+    Ordinary operations take a shared transaction lock. This deliberately lets
+    an effect-outbox transaction and its nested sink connection coexist. Account
+    deletion takes the exclusive form before touching any child/parent row, so it
+    either precedes the whole nested dispatch or waits until every shared holder
+    commits—without parent/child/lifecycle lock-order cycles.
+    """
+    if not exclusive and str(user_id) in _chat_outer_fence_users.get():
+        return
+    lock_fn = (
+        "pg_advisory_xact_lock"
+        if exclusive
+        else "pg_advisory_xact_lock_shared"
+    )
+    cur.execute(
+        f"SELECT {lock_fn}(hashtextextended('chat-user-fence:' || %s, 0))",
+        (user_id,),
+    )
+
+
+def _lock_chat_r2_lifecycle_on_cursor(cur, user_id: str) -> int:
+    """Materialize and lock one user's durable chat-object generation."""
+    _lock_chat_user_fence_on_cursor(cur, user_id)
+    cur.execute(
+        "INSERT INTO chat_r2_lifecycle (user_id) VALUES (%s) "
+        "ON CONFLICT (user_id) DO NOTHING",
+        (user_id,),
+    )
+    cur.execute(
+        "SELECT generation FROM chat_r2_lifecycle "
+        "WHERE user_id=%s FOR UPDATE",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError("chat R2 lifecycle row disappeared")
+    value = row["generation"] if isinstance(row, dict) else row[0]
+    return int(value)
+
+
+def _mark_chat_r2_inventory_pending_on_cursor(
+    cur,
+    user_id: str,
+    *,
+    advance_generation: bool,
+) -> int:
+    """Durably request a generation inventory while holding its row fence.
+
+    Clear/account deletion advances the generation in the same transaction that
+    removes chat rows. The marker deliberately survives deletion of ``users``;
+    the isolated R2 worker can therefore retry a failed LIST after the account
+    and all ordinary request traffic are gone.
+    """
+    generation = _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+    next_generation = generation + 1 if advance_generation else generation
+    cur.execute(
+        "UPDATE chat_r2_lifecycle SET "
+        " generation=%s, inventory_pending=TRUE, "
+        " inventory_next_attempt_at=now(), inventory_attempt_count=0, "
+        " inventory_last_error='', updated_at=now() "
+        "WHERE user_id=%s",
+        (next_generation, user_id),
+    )
+    return next_generation
+
+
+def _chat_body_referenced_on_cursor(cur, user_id: str, key: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM chat_messages "
+        "WHERE user_id=%s AND doc->>'body_key'=%s "
+        "  AND (NOT (doc ? 'body_ct') "
+        "       OR doc->'body_ct' = 'null'::jsonb) "
+        "LIMIT 1",
+        (user_id, key),
+    )
+    return cur.fetchone() is not None
+
+
+def _enqueue_chat_r2_cleanup_on_cursor(
+    cur,
+    user_id: str,
+    key: str,
+    generation: int | None,
+    reason: str,
+) -> None:
+    """Persist one idempotent object-deletion intent on the caller's tx."""
+    if not key:
+        return
+    cur.execute(
+        "INSERT INTO chat_r2_cleanup "
+        "(body_key,user_id,generation,reason) VALUES (%s,%s,%s,%s) "
+        "ON CONFLICT (body_key) DO UPDATE SET "
+        " user_id=EXCLUDED.user_id, generation=EXCLUDED.generation, "
+        " reason=EXCLUDED.reason, attempt_count=0, last_attempt_at=NULL, "
+        " next_attempt_at=now(), last_error=''",
+        (key, user_id, generation, reason),
+    )
+
+
+def _defer_chat_r2_cleanup_on_cursor(cur, user_id: str, key: str, error: str) -> None:
+    """Back off one failed object tombstone so poison rows cannot starve FIFO."""
+    cur.execute(
+        "UPDATE chat_r2_cleanup SET "
+        " attempt_count=attempt_count+1, last_attempt_at=now(), "
+        " next_attempt_at=now() + ("
+        "   LEAST(3600, 5 * (1 << LEAST(attempt_count, 9)))"
+        "   * interval '1 second'"
+        " ), last_error=%s "
+        "WHERE body_key=%s AND user_id=%s",
+        (str(error or "R2 delete failed")[:1000], key, user_id),
+    )
+
+
+def _reconcile_one_chat_r2_cleanup(user_id: str, key: str) -> bool:
+    """Delete one queued private key without holding a DB row lock over R2 I/O.
+
+    The per-key advisory lock spans both short reference-check transactions and
+    the DELETE. Legitimate promotion takes that same key lock; pointer-only input
+    can only replay an already-live exact pointer, which the first reference
+    check detects. Keys are private/immutable per upload, so no writer can create
+    a new reference to an unreferenced retired key while the network call runs.
+    """
+    try:
+        with get_pool().connection() as conn:
+            acquired_row = conn.execute(
+                "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
+                (key,),
+            ).fetchone()
+            acquired = bool(acquired_row and acquired_row[0])
+            if not acquired:
+                return False
+            try:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                        cur.execute(
+                            "SELECT 1 FROM chat_r2_cleanup "
+                            "WHERE body_key=%s AND user_id=%s "
+                            "AND next_attempt_at<=now() FOR UPDATE",
+                            (key, user_id),
+                        )
+                        if cur.fetchone() is None:
+                            return False
+                        if _chat_body_referenced_on_cursor(cur, user_id, key):
+                            # A live pointer is authoritative. A stale/duplicate
+                            # cleanup intent must never delete through it.
+                            cur.execute(
+                                "DELETE FROM chat_r2_cleanup "
+                                "WHERE body_key=%s AND user_id=%s",
+                                (key, user_id),
+                            )
+                            return True
+                # Never hold the per-user lifecycle row lock or a transaction
+                # across object-store latency. The private-key advisory lock is
+                # the cross-process serialization boundary for this object.
+                deleted = object_storage.delete_chat_body(key, user_id)
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                        cur.execute(
+                            "SELECT 1 FROM chat_r2_cleanup "
+                            "WHERE body_key=%s AND user_id=%s FOR UPDATE",
+                            (key, user_id),
+                        )
+                        if cur.fetchone() is None:
+                            return False
+                        if _chat_body_referenced_on_cursor(cur, user_id, key):
+                            # This should only be the harmless live-reference
+                            # case found in phase one. Keep the row if an object
+                            # was unexpectedly deleted so operators see/retry the
+                            # invariant violation rather than hiding data loss.
+                            if deleted:
+                                _defer_chat_r2_cleanup_on_cursor(
+                                    cur,
+                                    user_id,
+                                    key,
+                                    "reference appeared during private-key delete",
+                                )
+                                log.error(
+                                    "[db] chat R2 key became referenced during "
+                                    "delete (%s,%s)",
+                                    user_id,
+                                    key,
+                                )
+                                return False
+                            cur.execute(
+                                "DELETE FROM chat_r2_cleanup "
+                                "WHERE body_key=%s AND user_id=%s",
+                                (key, user_id),
+                            )
+                            return True
+                        if deleted:
+                            cur.execute(
+                                "DELETE FROM chat_r2_cleanup "
+                                "WHERE body_key=%s AND user_id=%s",
+                                (key, user_id),
+                            )
+                            return True
+                        _defer_chat_r2_cleanup_on_cursor(
+                            cur, user_id, key, "R2 delete failed",
+                        )
+            finally:
+                conn.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                    (key,),
+                )
+    except Exception as exc:  # noqa: BLE001
+        # A DELETE followed by an ambiguous DB commit is safe: S3 deletion is
+        # idempotent and the durable row, if it survived, is retried.
+        log.error("[db] chat R2 cleanup(%s,%s) failed: %s", user_id, key, exc)
+        try:
+            with get_pool().connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        _defer_chat_r2_cleanup_on_cursor(
+                            cur, user_id, key, str(exc),
+                        )
+        except Exception as defer_exc:  # noqa: BLE001
+            log.error(
+                "[db] defer chat R2 cleanup(%s,%s) failed: %s",
+                user_id,
+                key,
+                defer_exc,
+            )
+    return False
+
+
+def _defer_chat_r2_inventory(
+    user_id: str,
+    expected_generation: int,
+    error: str,
+) -> None:
+    """Back off one failed LIST without losing a post-deletion inventory marker."""
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE chat_r2_lifecycle SET "
+                " inventory_attempt_count=inventory_attempt_count+1, "
+                " inventory_next_attempt_at=now() + ("
+                "   LEAST(3600, 5 * (1 << LEAST(inventory_attempt_count, 9)))"
+                "   * interval '1 second'"
+                " ), inventory_last_error=%s, updated_at=now() "
+                "WHERE user_id=%s AND generation=%s AND inventory_pending",
+                (str(error or "R2 inventory failed")[:1000], user_id, expected_generation),
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.error("[db] defer chat R2 inventory(%s) failed: %s", user_id, exc)
+
+
+def _reconcile_one_chat_r2_inventory(
+    user_id: str,
+    expected_generation: int,
+) -> bool:
+    """Inventory one retired generation under a cross-process session lock.
+
+    LIST happens outside a database transaction. The generation is checked again
+    under the lifecycle row lock before any keys are queued or the durable marker
+    is cleared, so a concurrent clear cannot be acknowledged by an older scan.
+    """
+    lock_name = f"chat-r2-inventory:{user_id}"
+    try:
+        with get_pool().connection() as conn:
+            acquired_row = conn.execute(
+                "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
+                (lock_name,),
+            ).fetchone()
+            acquired = bool(acquired_row and acquired_row[0])
+            if not acquired:
+                return False
+            try:
+                try:
+                    keys = object_storage.list_user_chat_body_keys(user_id)
+                except Exception as exc:  # noqa: BLE001
+                    _defer_chat_r2_inventory(
+                        user_id, expected_generation, str(exc),
+                    )
+                    log.error("[db] chat R2 inventory(%s) failed: %s", user_id, exc)
+                    return False
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        current_generation = _lock_chat_r2_lifecycle_on_cursor(
+                            cur, user_id,
+                        )
+                        cur.execute(
+                            "SELECT inventory_pending FROM chat_r2_lifecycle "
+                            "WHERE user_id=%s",
+                            (user_id,),
+                        )
+                        pending_row = cur.fetchone()
+                        pending = bool(
+                            pending_row
+                            and (
+                                pending_row["inventory_pending"]
+                                if isinstance(pending_row, dict)
+                                else pending_row[0]
+                            )
+                        )
+                        if (
+                            not pending
+                            or current_generation != int(expected_generation)
+                        ):
+                            return False
+                        for key in keys:
+                            key_generation = (
+                                object_storage.chat_body_storage_generation(
+                                    key, user_id,
+                                )
+                            )
+                            retired = (
+                                key_generation is not None
+                                and key_generation < current_generation
+                            )
+                            # Once clear/account delete advanced the generation,
+                            # legacy keys can only be retained by a live legacy
+                            # pointer. New writers never create legacy keys.
+                            retired_legacy = (
+                                key_generation is None and current_generation > 0
+                            )
+                            if retired or retired_legacy:
+                                _enqueue_chat_r2_cleanup_on_cursor(
+                                    cur,
+                                    user_id,
+                                    key,
+                                    key_generation,
+                                    "retired_generation_inventory",
+                                )
+                        cur.execute(
+                            "UPDATE chat_r2_lifecycle SET "
+                            " inventory_pending=FALSE, "
+                            " inventory_next_attempt_at=now(), "
+                            " inventory_attempt_count=0, inventory_last_error='', "
+                            " updated_at=now() "
+                            "WHERE user_id=%s AND generation=%s",
+                            (user_id, expected_generation),
+                        )
+                return True
+            finally:
+                conn.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                    (lock_name,),
+                )
+    except Exception as exc:  # noqa: BLE001
+        _defer_chat_r2_inventory(user_id, expected_generation, str(exc))
+        log.error("[db] reconcile chat R2 inventory(%s) failed: %s", user_id, exc)
+        return False
+
+
+def reconcile_chat_r2_cleanup(
+    user_id: str | None = None,
+    *,
+    limit: int = 25,
+    include_inventory: bool = True,
+    inventory_limit: int = 1,
+) -> int:
+    """Best-effort durable cleanup worker; safe under retries and concurrency.
+
+    ``chat_r2_cleanup`` is the correctness boundary. A crash/ambiguous commit
+    leaves rows for the next pass; retry scheduling prevents a poison FIFO head.
+    Inventory is driven by durable lifecycle markers, including markers left by
+    deleted accounts. This function must run only in the isolated cleanup loop;
+    correctness-critical request/reply paths merely commit outbox rows.
+    """
+    if not object_storage.chat_files_enabled() or int(limit) <= 0:
+        return 0
+    if include_inventory and int(inventory_limit) > 0:
+        inventory_sql = (
+            "SELECT user_id,generation FROM chat_r2_lifecycle "
+            "WHERE inventory_pending "
+            "AND inventory_next_attempt_at <= now() "
+            + ("AND user_id=%s " if user_id is not None else "")
+            + "ORDER BY inventory_next_attempt_at,updated_at,user_id "
+            "LIMIT %s"
+        )
+        inventory_params = (
+            (user_id, int(inventory_limit))
+            if user_id is not None
+            else (int(inventory_limit),)
+        )
+        try:
+            with get_pool().connection() as conn:
+                inventory_rows = conn.execute(
+                    inventory_sql, inventory_params,
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            log.error("[db] list chat R2 inventory work failed: %s", exc)
+            inventory_rows = []
+        for inventory_row in inventory_rows:
+            _reconcile_one_chat_r2_inventory(
+                str(inventory_row[0]), int(inventory_row[1]),
+            )
+    sql = (
+        "SELECT user_id,body_key FROM chat_r2_cleanup "
+        "WHERE next_attempt_at <= now() "
+        + ("AND user_id=%s " if user_id is not None else "")
+        + "ORDER BY next_attempt_at,created_at,body_key LIMIT %s"
+    )
+    params = (user_id, int(limit)) if user_id is not None else (int(limit),)
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        log.error("[db] list chat R2 cleanup failed: %s", exc)
+        return 0
+    completed = 0
+    for row in rows:
+        uid = str(row[0])
+        key = str(row[1])
+        if _reconcile_one_chat_r2_cleanup(uid, key):
+            completed += 1
+    return completed
+
+
+def _offload_chat_body_after_commit(
+    user_id: str,
+    msg_id: str,
+    doc: dict,
+    expected_generation: int,
+) -> None:
+    """Best-effort heavy-body offload for an already-committed inline row.
+
+    Before upload, a deletion tombstone is committed for the private key. A
+    per-object PostgreSQL advisory lock then spans final validation, R2 PUT, and
+    promotion. Cleanup takes the same lock, while the short validation/promotion
+    transactions take the per-user generation fence. A committed promotion
+    removes the tombstone atomically; every rollback, CAS loss, process death,
+    or commit ambiguity leaves it for reconciliation. This closes the otherwise
+    unavoidable PUT-to-DB crash gap without holding a user-wide row lock during
+    network I/O.
+    """
+    if not (
+        object_storage.chat_files_enabled()
+        and isinstance(doc, dict)
+        and doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
+        and doc.get("body_ct") is not None
+    ):
+        return
+    normalized_doc = _normalize_chat_body_doc(doc)
+    content_type = str(normalized_doc.get("content_type") or "file")
+    upload_version = object_storage.new_chat_body_upload_version()
+    key = object_storage.chat_body_key(
+        user_id,
+        msg_id,
+        content_type,
+        upload_version=upload_version,
+        storage_generation=expected_generation,
+    )
+    promoted = False
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    current_generation = _lock_chat_r2_lifecycle_on_cursor(
+                        cur, user_id,
+                    )
+                    if current_generation != int(expected_generation):
+                        return
+                    cur.execute(
+                        "SELECT 1 FROM chat_messages "
+                        "WHERE user_id=%s AND msg_id=%s "
+                        "  AND storage_generation=%s AND "
+                        f"{_CHAT_BODY_CAS_PREDICATE} FOR UPDATE",
+                        (
+                            user_id,
+                            msg_id,
+                            expected_generation,
+                            *_chat_body_cas_params(normalized_doc),
+                        ),
+                    )
+                    if cur.fetchone() is None:
+                        return
+                    _enqueue_chat_r2_cleanup_on_cursor(
+                        cur,
+                        user_id,
+                        key,
+                        expected_generation,
+                        "upload_guard",
+                    )
+        body_ct_len = len(normalized_doc["body_ct"])
+        pointer = {"body_key": key, "body_ct_len": body_ct_len}
+        with get_pool().connection() as conn:
+            conn.execute(
+                "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                (key,),
+            )
+            try:
+                upload_allowed = False
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        current_generation = _lock_chat_r2_lifecycle_on_cursor(
+                            cur, user_id,
+                        )
+                        cur.execute(
+                            "SELECT 1 FROM chat_r2_cleanup "
+                            "WHERE body_key=%s AND user_id=%s FOR UPDATE",
+                            (key, user_id),
+                        )
+                        guard_exists = cur.fetchone() is not None
+                        cur.execute(
+                            "SELECT 1 FROM chat_messages "
+                            "WHERE user_id=%s AND msg_id=%s "
+                            "  AND storage_generation=%s AND "
+                            f"{_CHAT_BODY_CAS_PREDICATE} FOR UPDATE",
+                            (
+                                user_id,
+                                msg_id,
+                                expected_generation,
+                                *_chat_body_cas_params(normalized_doc),
+                            ),
+                        )
+                        row_matches = cur.fetchone() is not None
+                        upload_allowed = (
+                            guard_exists
+                            and row_matches
+                            and current_generation == int(expected_generation)
+                        )
+                if upload_allowed:
+                    object_storage.put_chat_body(
+                        user_id,
+                        msg_id,
+                        normalized_doc["body_ct"],
+                        content_type,
+                        upload_version=upload_version,
+                        storage_generation=expected_generation,
+                    )
+                    with conn.transaction():
+                        with conn.cursor() as cur:
+                            current_generation = _lock_chat_r2_lifecycle_on_cursor(
+                                cur, user_id,
+                            )
+                            cur.execute(
+                                "SELECT 1 FROM chat_r2_cleanup "
+                                "WHERE body_key=%s AND user_id=%s FOR UPDATE",
+                                (key, user_id),
+                            )
+                            guard_exists = cur.fetchone() is not None
+                            if (
+                                guard_exists
+                                and current_generation == int(expected_generation)
+                            ):
+                                cur.execute(
+                                    "UPDATE chat_messages "
+                                    "SET doc = (doc - 'body_ct') || %s "
+                                    "WHERE user_id=%s AND msg_id=%s "
+                                    "  AND storage_generation=%s AND "
+                                    f"{_CHAT_BODY_CAS_PREDICATE} RETURNING 1",
+                                    (
+                                        Jsonb(pointer),
+                                        user_id,
+                                        msg_id,
+                                        expected_generation,
+                                        *_chat_body_cas_params(normalized_doc),
+                                    ),
+                                )
+                                promoted = cur.fetchone() is not None
+                                if promoted:
+                                    cur.execute(
+                                        "DELETE FROM chat_r2_cleanup "
+                                        "WHERE body_key=%s AND user_id=%s",
+                                        (key, user_id),
+                                    )
+            finally:
+                conn.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                    (key,),
+                )
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "[db] chat body offload(%s,%s) failed, left inline: %s",
+            user_id,
+            msg_id,
+            e,
+        )
+        # The upload guard was committed before PUT. Never perform network
+        # cleanup on this write path: the isolated cleanup worker owns retries,
+        # including ambiguous PUT/COMMIT outcomes.
+
+
 def _chat_insert_on_cursor(
     cur, user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
-    *, trimmed_docs_out: list | None = None, trimmed_ids_out: list | None = None,
+    *, trimmed_ids_out: list | None = None,
     coverage_gated: bool = False,
-) -> int:
+) -> tuple[int, int]:
     """INSERT one chat message (ON CONFLICT upsert) + trim to the newest
-    ``max_messages`` rows, on the CALLER's cursor/transaction. Returns the
-    row's ``seq``. Does NOT do R2 offload — the caller handles that
-    post-commit, same as ``_chat_append_impl`` does today.
-
-    ``trimmed_docs_out``: optional list the caller pre-allocates; any row docs
-    deleted by the trim are appended to it so the caller can best-effort clean
-    up R2 objects for offloaded files just trimmed (mirrors the pre-refactor
-    ``_chat_append_impl`` behavior). ``None`` (the default, used by the new
-    atomic send+enqueue path) skips collecting them — R2 offload/cleanup is
-    intentionally out of that path.
+    ``max_messages`` rows, on the CALLER's cursor/transaction. Returns
+    ``(seq, storage_generation)``. Does NOT do R2 offload — the caller handles
+    that post-commit with the exact generation pinned here.
 
     ``trimmed_ids_out``: optional list the caller pre-allocates; the ``msg_id``
     of every trimmed row is appended so the caller can pin the TEE-shadow mirror
     DELETE to the EXACT rows evicted from RDS (tee_shadow.mirror, see
-    ``_chat_append_impl``). Kept separate from ``trimmed_docs_out`` because the
-    two callers need different projections (R2 cleanup needs the doc; the mirror
-    needs the id).
+    ``_chat_append_impl``). R2 cleanup never depends on this process-local list:
+    the DELETE trigger queues each persisted body key in the same transaction.
 
     ``coverage_gated``: selects which trim policy runs. ``False`` (the
     default) is the plain ring-buffer trim — delete everything but the
@@ -2987,39 +4166,89 @@ def _chat_insert_on_cursor(
     or a ``dict_row`` cursor (see :func:`chat_append_and_enqueue`, which opens
     a separate ``dict_row`` cursor on the same connection/transaction for the
     coalesce-or-insert job op)."""
+    generation = _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+    stored_doc = _normalize_chat_body_doc(doc)
     cur.execute(
-        "INSERT INTO chat_messages (user_id, msg_id, ts, doc) VALUES (%s,%s,%s,%s) "
-        "ON CONFLICT (user_id, msg_id) DO UPDATE SET ts=EXCLUDED.ts, doc=EXCLUDED.doc "
-        "RETURNING seq",
-        (user_id, msg_id, ts, Jsonb(doc)),
+        "SELECT seq,doc,storage_generation FROM chat_messages "
+        "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+        (user_id, msg_id),
     )
-    row = cur.fetchone()
-    seq = row["seq"] if isinstance(row, dict) else row[0]
+    existing = cur.fetchone()
+    incoming_pointer = _is_chat_file_pointer(stored_doc)
+    if incoming_pointer:
+        incoming_key = str(stored_doc.get("body_key") or "")
+        if not object_storage.chat_key_owned_by(incoming_key, user_id):
+            raise ChatPointerReplayConflict("pointer key is not owned by user")
+        if existing is None:
+            raise ChatPointerReplayConflict(
+                "pointer-only documents cannot create chat rows"
+            )
+        existing_doc = existing["doc"] if isinstance(existing, dict) else existing[1]
+        existing_generation = int(
+            existing["storage_generation"]
+            if isinstance(existing, dict)
+            else existing[2]
+        )
+        if (
+            existing_generation != generation
+            or not _is_chat_file_pointer(existing_doc)
+            or str(existing_doc.get("body_key") or "") != incoming_key
+        ):
+            raise ChatPointerReplayConflict(
+                "stale pointer does not match the current chat body"
+            )
+        # Exact same-key replay is a true no-op. In particular, do not replace
+        # newer operational metadata with an older transport snapshot.
+        seq = existing["seq"] if isinstance(existing, dict) else existing[0]
+    elif existing is None:
+        cur.execute(
+            "INSERT INTO chat_messages "
+            "(user_id,msg_id,ts,doc,storage_generation) "
+            "VALUES (%s,%s,%s,%s,%s) RETURNING seq",
+            (user_id, msg_id, ts, Jsonb(stored_doc), generation),
+        )
+        inserted = cur.fetchone()
+        seq = inserted["seq"] if isinstance(inserted, dict) else inserted[0]
+    else:
+        existing_generation = int(
+            existing["storage_generation"]
+            if isinstance(existing, dict)
+            else existing[2]
+        )
+        if existing_generation != generation:
+            raise RuntimeError("chat row belongs to a retired storage generation")
+        cur.execute(
+            "UPDATE chat_messages SET ts=%s,doc=%s,storage_generation=%s "
+            "WHERE user_id=%s AND msg_id=%s RETURNING seq",
+            (ts, Jsonb(stored_doc), generation, user_id, msg_id),
+        )
+        updated = cur.fetchone()
+        seq = updated["seq"] if isinstance(updated, dict) else updated[0]
     if max_messages and max_messages > 0:
         if coverage_gated:
-            # GC/retention gate (D7): never delete a row the summary hasn't
-            # covered yet. A row is "covered" only if its ts is STRICTLY less
-            # than the user's v2_conversation_summary.watermark_ts — same-ts
-            # boundary rows may not have made it into the compacted batch, so
-            # we err on keeping them. The watermark is read via a correlated
-            # subquery in the SAME DELETE (same cursor/transaction, single
-            # round-trip): no row for the user (never compacted), or a
-            # watermark_ts of 0/NULL, makes the subquery return NULL — and
-            # `ts < NULL` is never true in SQL — so the DELETE naturally
-            # deletes nothing at all (fail-safe: never trim uncovered
-            # history). This means the row count can exceed max_messages
-            # until compaction advances the watermark past these rows; that
-            # is intended, not a bug. ONLY for V2 writes (see docstring) —
-            # legacy never writes a summary row and would trim nothing.
+            # GC/retention gate (D7): delete only rows the encrypted summary
+            # proves it has covered. ``watermark_seq`` is exact even when two
+            # messages share a timestamp; the former ``ts < watermark_ts``
+            # test could not represent a boundary inside such a tie.  A
+            # missing summary makes the boundary NULL, so the DELETE naturally
+            # becomes a fail-safe no-op. For a pre-0031/compatibility row whose
+            # seq is still zero but watermark_ts is real, derive the same
+            # conservative ``ts < watermark_ts`` seq used by
+            # jobs_store.get_summary_row: it may retain an extra tie row, but
+            # can never classify an ambiguous same-ts row as covered.
             cur.execute(
                 "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
                 "  SELECT MIN(seq) FROM ("
                 "    SELECT seq FROM chat_messages WHERE user_id = %s "
                 "    ORDER BY seq DESC LIMIT %s"
                 "  ) t"
-                ") AND ts < ("
-                "  SELECT watermark_ts FROM v2_conversation_summary WHERE user_id = %s"
-                ") RETURNING msg_id, doc",
+                ") AND seq <= ("
+                "  SELECT COALESCE("
+                "    NULLIF(s.watermark_seq, 0),"
+                "    (SELECT NULLIF(MAX(cm.seq), 0) FROM chat_messages cm "
+                "     WHERE cm.user_id = s.user_id AND cm.ts < s.watermark_ts)"
+                "  ) FROM v2_conversation_summary s WHERE s.user_id = %s"
+                ") RETURNING msg_id",
                 (user_id, user_id, max_messages, user_id),
             )
         else:
@@ -3032,15 +4261,27 @@ def _chat_insert_on_cursor(
                 "    SELECT seq FROM chat_messages WHERE user_id = %s "
                 "    ORDER BY seq DESC LIMIT %s"
                 "  ) t"
-                ") RETURNING msg_id, doc",
+                ") RETURNING msg_id",
                 (user_id, user_id, max_messages),
             )
         rows = cur.fetchall()
-        if trimmed_docs_out is not None:
-            trimmed_docs_out.extend(r["doc"] if isinstance(r, dict) else r[1] for r in rows)
         if trimmed_ids_out is not None:
             trimmed_ids_out.extend(r["msg_id"] if isinstance(r, dict) else r[0] for r in rows)
-    return int(seq)
+    return int(seq), generation
+
+
+def _mirror_trimmed_chat_ids(user_id: str, trimmed_ids: list[str]) -> None:
+    """Mirror only the exact primary chat rows removed by a retention trim."""
+    if not trimmed_ids:
+        return
+    from tee_shadow import mirror
+    mirror.execute_many([
+        ("DELETE FROM chat_messages WHERE user_id = %s AND msg_id = ANY(%s)",
+         (user_id, trimmed_ids)),
+        ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+         "AND table_name = 'chat_messages' AND item_id = ANY(%s)",
+         (user_id, trimmed_ids)),
+    ])
 
 
 def _chat_append_impl(
@@ -3063,55 +4304,24 @@ def _chat_append_impl(
     ordering as frame_upsert: the row is written inline (readable, no pointer)
     BEFORE the object exists and flipped to the pointer shape only AFTER the
     upload succeeds — a crash never leaves a pointer to a missing object."""
-    offload = (
-        object_storage.chat_files_enabled()
-        and isinstance(doc, dict)
-        and doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
-        and doc.get("body_ct") is not None
-    )
-    trimmed_docs: list = []
     trimmed_ids: list[str] = []
     with get_pool().connection() as conn:
         with conn.transaction():
             # 1) inline first — message readable, references no R2 object yet.
             with conn.cursor() as cur:
-                _chat_insert_on_cursor(
+                _seq, storage_generation = _chat_insert_on_cursor(
                     cur, user_id, msg_id, ts, doc, max_messages,
-                    trimmed_docs_out=trimmed_docs, trimmed_ids_out=trimmed_ids,
+                    trimmed_ids_out=trimmed_ids,
                     coverage_gated=coverage_gated,
                 )
-    if offload:
-        # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
-        try:
-            body_ct_len = len(doc["body_ct"])
-            # The key comes back from the upload rather than being recomputed —
-            # the row can then never point somewhere the object isn't.
-            key = object_storage.put_chat_body(
-                user_id, msg_id, doc["body_ct"], str(doc.get("content_type") or "file")
-            )
-            # 3) object exists → flip the row to the pointer shape as the last
-            #    durable step. ATOMIC on the CURRENT row (not a stale snapshot):
-            #    drop only body_ct and add the pointer keys, so any reply/claim
-            #    metadata another worker merged into `doc` during the upload is
-            #    preserved. The `? 'body_ct'` guard makes it a no-op if the row
-            #    was already flipped (idempotent, avoids a double-flip race).
-            pointer = {"body_key": key, "body_ct_len": body_ct_len}
-            with get_pool().connection() as conn:
-                conn.execute(
-                    "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
-                    "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
-                    (Jsonb(pointer), user_id, msg_id),
-                )
-        except Exception as e:  # noqa: BLE001
-            log.error("[db] chat_append(%s,%s) R2 offload failed, left inline: %s",
-                      user_id, msg_id, e)
-    # Best-effort: drop R2 objects for any offloaded rows just trimmed. Driven by
-    # the row's own body_key (not content_type, not a recomputed key) — a pointer
-    # row always has exactly one object to reclaim, whatever type/layout wrote it.
-    if trimmed_docs and object_storage.chat_files_enabled():
-        for d in trimmed_docs:
-            if isinstance(d, dict) and d.get("body_key"):
-                object_storage.delete_chat_body(str(d["body_key"]), user_id)
+    # 2/3) upload outside the transaction, then atomically flip the current row
+    # to its pointer shape only after the object exists.
+    _offload_chat_body_after_commit(
+        user_id, msg_id, doc, storage_generation,
+    )
+    # UPDATE/DELETE triggers committed exact retirement intents together with
+    # replacements and trims. The isolated R2 worker drains them; doing so here
+    # would put object-store latency inside chat delivery/cutover transactions.
     # tee-shadow: pin the mirror DELETE to the EXACT rows evicted from RDS (same
     # "pin to actual eviction" pattern as frame_prune_to). The primary trim above
     # already committed; a primary-write failure raises out of this function
@@ -3119,15 +4329,7 @@ def _chat_append_impl(
     # runs after a real commit. Also drop any tee_pending_device_migration markers
     # those rows carry — else a trimmed-away row's pending marker survives with no
     # RDS row to justify it, permanently unbalancing verify's rds == tee equation.
-    if trimmed_ids:
-        from tee_shadow import mirror
-        mirror.execute_many([
-            ("DELETE FROM chat_messages WHERE user_id = %s AND msg_id = ANY(%s)",
-             (user_id, trimmed_ids)),
-            ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
-             "AND table_name = 'chat_messages' AND item_id = ANY(%s)",
-             (user_id, trimmed_ids)),
-        ])
+    _mirror_trimmed_chat_ids(user_id, trimmed_ids)
 
 
 def chat_append_strict(
@@ -3147,6 +4349,678 @@ def chat_append_strict(
     _chat_append_impl(user_id, msg_id, ts, doc, max_messages, coverage_gated=True)
 
 
+class ResidentReplyRejected(RuntimeError):
+    """A resident reply lost the durable runtime/parent ownership race."""
+
+    def __init__(self, reason: str):
+        self.reason = str(reason)
+        super().__init__(self.reason)
+
+
+def _same_reply_envelope(existing_doc, requested_doc) -> bool:
+    existing_delivery_id = str(
+        (existing_doc or {}).get("resident_delivery_id") or ""
+    ) if isinstance(existing_doc, dict) else ""
+    requested_delivery_id = str(
+        (requested_doc or {}).get("resident_delivery_id") or ""
+    ) if isinstance(requested_doc, dict) else ""
+    if requested_delivery_id:
+        # The resident consumer derives this id from the parent + stable bubble
+        # ordinal and also uses it as the AEAD item id. Retries necessarily
+        # rebuild fresh ciphertext, so compare the authenticated delivery key
+        # and routing metadata rather than random nonce/ciphertext bytes.
+        stable_delivery_fields = (
+            "id", "role", "source", "visibility", "owner_user_id",
+            "content_type", "reply_to_message_id", "resident_delivery_id",
+        )
+        return (
+            existing_delivery_id == requested_delivery_id
+            and all(
+                existing_doc.get(field) == requested_doc.get(field)
+                for field in stable_delivery_fields
+            )
+        )
+    immutable_reply_fields = (
+        "id", "role", "source", "v", "body_ct", "nonce",
+        "K_user", "K_enclave", "enclave_pk_fpr", "visibility",
+        "owner_user_id", "content_type", "reply_to_message_id",
+    )
+    if not isinstance(existing_doc, dict) or not isinstance(requested_doc, dict):
+        return False
+    if _is_chat_file_pointer(existing_doc) and requested_doc.get("body_ct") is not None:
+        # Post-commit R2 offload intentionally replaces body_ct with a pointer.
+        # A retry still has the original inline envelope, so compare every other
+        # immutable crypto/routing field and use the persisted ciphertext length
+        # to bridge the one deliberate shape change.
+        pointer_fields = tuple(
+            field for field in immutable_reply_fields if field != "body_ct"
+        )
+        return (
+            all(
+                existing_doc.get(field) == requested_doc.get(field)
+                for field in pointer_fields
+            )
+            and existing_doc.get("body_ct_len") == len(requested_doc["body_ct"])
+        )
+    return all(
+        existing_doc.get(field) == requested_doc.get(field)
+        for field in immutable_reply_fields
+    )
+
+
+def chat_append_resident_reply(
+    user_id: str,
+    msg_id: str,
+    ts: float,
+    doc: dict,
+    max_messages: int,
+    *,
+    parent_msg_id: str,
+    replied_by: str,
+) -> tuple[int, bool, dict, dict]:
+    """Atomically commit a linked resident reply under the cutover fence.
+
+    The runtime-state lock is the hand-off barrier shared with
+    ``patch_blob_strict`` and the V2 reply sink.  Parent ownership, assistant
+    insertion, and the answered marker then commit together, eliminating both
+    the old read-cache race and the append/metadata crash window.
+
+    Returns ``(reply_seq, inserted, persisted_parent_doc,
+    persisted_reply_doc)``. Replaying the same envelope/delivery key against
+    the same already-linked parent is idempotent and returns the row that
+    actually won; a different reply, missing/invalid parent, or non-resident
+    runtime fails closed.
+    """
+    parent_id = str(parent_msg_id or "").strip()
+    if not parent_id:
+        raise ValueError("parent_msg_id is required")
+    reply_doc = _normalize_chat_body_doc(doc)
+    if _is_chat_file_pointer(reply_doc) and not object_storage.chat_key_owned_by(
+        str(reply_doc.get("body_key") or ""), user_id,
+    ):
+        raise ResidentReplyRejected("pointer_key_not_owned")
+    reply_doc["reply_to_message_id"] = parent_id
+    replied_fields = {
+        "reply_status": "replied",
+        "reply_message_id": msg_id,
+        "replied_by": str(replied_by or ""),
+        "replied_at": f"{float(ts):.3f}",
+    }
+    trimmed_ids: list[str] = []
+    parent_changed = False
+
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                # Global order: runtime-state before any chat row. A cutover
+                # already in progress wins; a reply already committing makes
+                # cutover wait and then becomes visible to its cursor bridge.
+                cur.execute(
+                    "INSERT INTO v2_runtime_state (user_id) "
+                    "SELECT %s WHERE EXISTS "
+                    "(SELECT 1 FROM users WHERE user_id=%s) "
+                    "ON CONFLICT (user_id) DO NOTHING",
+                    (user_id, user_id),
+                )
+                cur.execute(
+                    "SELECT hosted_runtime_state FROM v2_runtime_state "
+                    "WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                state_row = cur.fetchone()
+                state = (
+                    state_row["hosted_runtime_state"]
+                    if isinstance(state_row, dict)
+                    else state_row[0]
+                ) if state_row else ""
+                if state != "resident":
+                    raise ResidentReplyRejected("runtime_not_resident")
+
+                storage_generation = _lock_chat_r2_lifecycle_on_cursor(
+                    cur, user_id,
+                )
+
+                cur.execute(
+                    "SELECT doc FROM chat_messages "
+                    "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                    (user_id, parent_id),
+                )
+                parent_row = cur.fetchone()
+                if parent_row is None:
+                    raise ResidentReplyRejected("reply_parent_not_found")
+                parent_doc = (
+                    parent_row["doc"]
+                    if isinstance(parent_row, dict)
+                    else parent_row[0]
+                )
+                if not isinstance(parent_doc, dict) or parent_doc.get("role") != "user":
+                    raise ResidentReplyRejected("reply_parent_not_user")
+
+                prior_reply_id = str(parent_doc.get("reply_message_id") or "")
+                already_replied = (
+                    parent_doc.get("reply_status") == "replied"
+                    or bool(prior_reply_id)
+                )
+                if already_replied:
+                    if prior_reply_id != msg_id:
+                        raise ResidentReplyRejected("already_answered")
+                    cur.execute(
+                        "SELECT seq,doc,storage_generation FROM chat_messages "
+                        "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                        (user_id, msg_id),
+                    )
+                    existing = cur.fetchone()
+                    if existing is None:
+                        raise ResidentReplyRejected("linked_reply_missing")
+                    if isinstance(existing, dict):
+                        seq = int(existing["seq"])
+                        existing_doc = existing["doc"]
+                    else:
+                        seq = int(existing[0])
+                        existing_doc = existing[1]
+                    existing_storage_generation = int(
+                        existing["storage_generation"]
+                        if isinstance(existing, dict)
+                        else existing[2]
+                    )
+                    if existing_storage_generation != storage_generation:
+                        raise ResidentReplyRejected("reply_storage_generation_retired")
+                    if not _same_reply_envelope(existing_doc, reply_doc):
+                        raise ResidentReplyRejected("reply_id_collision")
+                    inserted = False
+                    persisted_reply_doc = existing_doc
+                else:
+                    if _is_chat_file_pointer(reply_doc):
+                        raise ResidentReplyRejected("pointer_replay_missing_current_row")
+                    cur.execute(
+                        "INSERT INTO chat_messages "
+                        "(user_id,msg_id,ts,doc,storage_generation) "
+                        "VALUES (%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (user_id,msg_id) DO NOTHING RETURNING seq",
+                        (
+                            user_id,
+                            msg_id,
+                            ts,
+                            Jsonb(reply_doc),
+                            storage_generation,
+                        ),
+                    )
+                    inserted_row = cur.fetchone()
+                    inserted = inserted_row is not None
+                    if inserted:
+                        seq = int(
+                            inserted_row["seq"]
+                            if isinstance(inserted_row, dict)
+                            else inserted_row[0]
+                        )
+                        persisted_reply_doc = reply_doc
+                    else:
+                        cur.execute(
+                            "SELECT seq,doc,storage_generation FROM chat_messages "
+                            "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                            (user_id, msg_id),
+                        )
+                        existing = cur.fetchone()
+                        if existing is None:
+                            raise ResidentReplyRejected("reply_id_collision")
+                        if isinstance(existing, dict):
+                            seq = int(existing["seq"])
+                            existing_doc = existing["doc"]
+                        else:
+                            seq = int(existing[0])
+                            existing_doc = existing[1]
+                        existing_storage_generation = int(
+                            existing["storage_generation"]
+                            if isinstance(existing, dict)
+                            else existing[2]
+                        )
+                        if existing_storage_generation != storage_generation:
+                            raise ResidentReplyRejected(
+                                "reply_storage_generation_retired"
+                            )
+                        if not _same_reply_envelope(existing_doc, reply_doc):
+                            raise ResidentReplyRejected("reply_id_collision")
+                        persisted_reply_doc = existing_doc
+
+                    cur.execute(
+                        "UPDATE chat_messages SET doc=doc || %s "
+                        "WHERE user_id=%s AND msg_id=%s "
+                        "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                        "  AND COALESCE(doc->>'reply_message_id','')='' "
+                        "RETURNING doc",
+                        (Jsonb(replied_fields), user_id, parent_id),
+                    )
+                    updated_parent = cur.fetchone()
+                    if updated_parent is None:
+                        raise ResidentReplyRejected("already_answered")
+                    parent_doc = (
+                        updated_parent["doc"]
+                        if isinstance(updated_parent, dict)
+                        else updated_parent[0]
+                    )
+                    parent_changed = True
+
+                    if max_messages and max_messages > 0:
+                        cur.execute(
+                            "DELETE FROM chat_messages WHERE user_id=%s AND seq < ("
+                            "  SELECT MIN(seq) FROM ("
+                            "    SELECT seq FROM chat_messages WHERE user_id=%s "
+                            "    ORDER BY seq DESC LIMIT %s"
+                            "  ) newest"
+                            ") RETURNING msg_id, doc",
+                            (user_id, user_id, max_messages),
+                        )
+                        trimmed_rows = cur.fetchall()
+                        trimmed_ids.extend(
+                            str(row["msg_id"] if isinstance(row, dict) else row[0])
+                            for row in trimmed_rows
+                        )
+    _offload_chat_body_after_commit(
+        user_id, msg_id, persisted_reply_doc, storage_generation,
+    )
+    # Both mirror operations are post-commit and best-effort. Chat inserts are
+    # owned by tee_replicator; this direct mirror is only the in-place parent
+    # mutation that its forward cursor would otherwise miss.
+    if parent_changed:
+        from tee_shadow import mirror
+
+        mirror.execute(
+            "UPDATE chat_messages SET doc=doc || %s "
+            "WHERE user_id=%s AND msg_id=%s",
+            (Jsonb(replied_fields), user_id, parent_id),
+        )
+    _mirror_trimmed_chat_ids(user_id, trimmed_ids)
+    return seq, inserted, parent_doc, persisted_reply_doc
+
+
+def chat_append_resident_message(
+    user_id: str,
+    msg_id: str,
+    ts: float,
+    doc: dict,
+    max_messages: int,
+) -> tuple[int, bool, dict]:
+    """Commit an unlinked resident response under the runtime cutover fence.
+
+    Proactive messages, verify replies, and infrastructure notices do not
+    always have a parent user message, but they still must not leak out of a
+    resident process after the user has moved to V2. Linked chat finals use the
+    stronger :func:`chat_append_resident_reply` parent CAS instead.
+    """
+    message_doc = _normalize_chat_body_doc(doc)
+    trimmed_ids: list[str] = []
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                cur.execute(
+                    "INSERT INTO v2_runtime_state (user_id) "
+                    "SELECT %s WHERE EXISTS "
+                    "(SELECT 1 FROM users WHERE user_id=%s) "
+                    "ON CONFLICT (user_id) DO NOTHING",
+                    (user_id, user_id),
+                )
+                cur.execute(
+                    "SELECT hosted_runtime_state FROM v2_runtime_state "
+                    "WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                state_row = cur.fetchone()
+                state = (
+                    state_row["hosted_runtime_state"]
+                    if isinstance(state_row, dict)
+                    else state_row[0]
+                ) if state_row else ""
+                if state != "resident":
+                    raise ResidentReplyRejected("runtime_not_resident")
+
+                storage_generation = _lock_chat_r2_lifecycle_on_cursor(
+                    cur, user_id,
+                )
+                if _is_chat_file_pointer(message_doc):
+                    if not object_storage.chat_key_owned_by(
+                        str(message_doc.get("body_key") or ""), user_id,
+                    ):
+                        raise ResidentReplyRejected("pointer_key_not_owned")
+                    cur.execute(
+                        "SELECT seq,doc,storage_generation FROM chat_messages "
+                        "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                        (user_id, msg_id),
+                    )
+                    existing = cur.fetchone()
+                    if existing is None:
+                        raise ResidentReplyRejected(
+                            "pointer_replay_missing_current_row"
+                        )
+                    inserted = False
+                else:
+                    cur.execute(
+                        "INSERT INTO chat_messages "
+                        "(user_id,msg_id,ts,doc,storage_generation) "
+                        "VALUES (%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (user_id,msg_id) DO NOTHING "
+                        "RETURNING seq",
+                        (
+                            user_id,
+                            msg_id,
+                            ts,
+                            Jsonb(message_doc),
+                            storage_generation,
+                        ),
+                    )
+                    inserted_row = cur.fetchone()
+                    inserted = inserted_row is not None
+                    if inserted:
+                        seq = int(
+                            inserted_row["seq"]
+                            if isinstance(inserted_row, dict)
+                            else inserted_row[0]
+                        )
+                        persisted_doc = message_doc
+                        existing = None
+                    else:
+                        cur.execute(
+                            "SELECT seq,doc,storage_generation "
+                            "FROM chat_messages "
+                            "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                            (user_id, msg_id),
+                        )
+                        existing = cur.fetchone()
+                if not inserted:
+                    if existing is None:
+                        raise ResidentReplyRejected("reply_id_collision")
+                    if isinstance(existing, dict):
+                        seq = int(existing["seq"])
+                        existing_doc = existing["doc"]
+                    else:
+                        seq = int(existing[0])
+                        existing_doc = existing[1]
+                    existing_storage_generation = int(
+                        existing["storage_generation"]
+                        if isinstance(existing, dict)
+                        else existing[2]
+                    )
+                    if existing_storage_generation != storage_generation:
+                        raise ResidentReplyRejected(
+                            "reply_storage_generation_retired"
+                        )
+                    if not _same_reply_envelope(existing_doc, message_doc):
+                        raise ResidentReplyRejected("reply_id_collision")
+                    persisted_doc = existing_doc
+
+                if max_messages and max_messages > 0:
+                    cur.execute(
+                        "DELETE FROM chat_messages WHERE user_id=%s AND seq < ("
+                        "  SELECT MIN(seq) FROM ("
+                        "    SELECT seq FROM chat_messages WHERE user_id=%s "
+                        "    ORDER BY seq DESC LIMIT %s"
+                        "  ) newest"
+                        ") RETURNING msg_id, doc",
+                        (user_id, user_id, max_messages),
+                    )
+                    trimmed_rows = cur.fetchall()
+                    trimmed_ids.extend(
+                        str(row["msg_id"] if isinstance(row, dict) else row[0])
+                        for row in trimmed_rows
+                    )
+    _offload_chat_body_after_commit(
+        user_id, msg_id, persisted_doc, storage_generation,
+    )
+    _mirror_trimmed_chat_ids(user_id, trimmed_ids)
+    return seq, inserted, persisted_doc
+
+
+def chat_append_effect_with_cursor(
+    user_id: str,
+    msg_id: str,
+    ts: float,
+    doc: dict,
+    max_messages: int,
+    reply_through_seq: int,
+) -> tuple[int, bool]:
+    """Atomically persist one deterministic V2 reply and advance its input cursor.
+
+    ``msg_id`` is derived from the outbox effect id, making replay naturally
+    idempotent.  The reply row and ``v2_reply_cursor_seq`` commit in the same
+    PostgreSQL transaction, so no crash can expose the reply while leaving the
+    cursor old (which would generate a duplicate answer on recovery).
+
+    Runtime-mode/generation ownership is fenced by
+    ``effect_outbox.apply_pending_effects`` around this sink call. That outer
+    transaction intentionally holds ``v2_runtime_state FOR UPDATE`` throughout
+    dispatch; reacquiring it here through another pooled connection would
+    self-deadlock.
+
+    Returns ``(seq, inserted)``. A replay returns the existing seq and still
+    monotonically advances the cursor, then skips duplicate cache/notification
+    side effects at the Store layer.
+    """
+    from model_api_runtime.v2 import cursor as v2_cursor
+
+    cursor_seq = int(reply_through_seq)
+    if cursor_seq < 0:
+        raise ValueError("reply_through_seq must be >= 0")
+
+    effect_doc = _normalize_chat_body_doc(doc)
+    trimmed_ids: list[str] = []
+    replied_user_ids: list[str] = []
+    persisted_runtime_doc: dict | None = None
+    replied_fields = {
+        "reply_status": "replied",
+        "reply_message_id": msg_id,
+        "replied_by": "hosted_runtime_v2",
+        "replied_at": f"{float(ts):.3f}",
+    }
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                # Lock/materialize the cursor row before deciding whether a
+                # resident reply raced this V2 turn. If any newly-consumed user
+                # input was answered after V2 assembled its prompt, abort before
+                # inserting another assistant bubble. Conversely, once V2 wins
+                # below it marks those parents replied in this same transaction,
+                # so a late resident response is rejected by its existing CAS.
+                cur.execute(
+                    "INSERT INTO user_blobs (user_id,kind,doc) "
+                    "VALUES (%s,'model_api_runtime','{}'::jsonb) "
+                    "ON CONFLICT (user_id,kind) DO NOTHING",
+                    (user_id,),
+                )
+                cur.execute(
+                    "SELECT doc FROM user_blobs "
+                    "WHERE user_id=%s AND kind='model_api_runtime' FOR UPDATE",
+                    (user_id,),
+                )
+                cursor_row = cur.fetchone()
+                cursor_doc = (
+                    cursor_row["doc"]
+                    if isinstance(cursor_row, dict)
+                    else cursor_row[0]
+                ) if cursor_row else {}
+                raw_previous_cursor = str(
+                    (cursor_doc or {}).get(v2_cursor.CURSOR_KEY, 0)
+                )
+                if not raw_previous_cursor.isdigit():
+                    raise RuntimeError("invalid persisted V2 reply cursor")
+                previous_cursor = int(raw_previous_cursor)
+                storage_generation = _lock_chat_r2_lifecycle_on_cursor(
+                    cur, user_id,
+                )
+                cur.execute(
+                    "SELECT msg_id FROM chat_messages "
+                    "WHERE user_id=%s AND seq>%s AND seq<=%s "
+                    "  AND doc->>'role'='user' "
+                    "  AND (doc->>'reply_status'='replied' "
+                    "       OR COALESCE(doc->>'reply_message_id','') <> '') "
+                    "LIMIT 1",
+                    (user_id, previous_cursor, cursor_seq),
+                )
+                if cur.fetchone() is not None:
+                    raise RuntimeError(
+                        "V2 reply input was already answered by another runtime")
+
+                if _is_chat_file_pointer(effect_doc):
+                    if not object_storage.chat_key_owned_by(
+                        str(effect_doc.get("body_key") or ""), user_id,
+                    ):
+                        raise ChatPointerReplayConflict(
+                            "pointer key is not owned by user"
+                        )
+                    cur.execute(
+                        "SELECT seq,doc,storage_generation FROM chat_messages "
+                        "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                        (user_id, msg_id),
+                    )
+                    existing = cur.fetchone()
+                    if existing is None:
+                        raise ChatPointerReplayConflict(
+                            "pointer-only documents cannot create V2 reply rows"
+                        )
+                    inserted = False
+                else:
+                    cur.execute(
+                        "INSERT INTO chat_messages "
+                        "(user_id,msg_id,ts,doc,storage_generation) "
+                        "VALUES (%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (user_id,msg_id) DO NOTHING RETURNING seq",
+                        (
+                            user_id,
+                            msg_id,
+                            ts,
+                            Jsonb(effect_doc),
+                            storage_generation,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    inserted = row is not None
+                    existing = None
+                if inserted:
+                    seq = int(row["seq"] if isinstance(row, dict) else row[0])
+                    persisted_reply_doc = effect_doc
+                    if max_messages and max_messages > 0:
+                        # Same V2 coverage-gated retention rule as
+                        # ``_chat_insert_on_cursor``. Returning the deleted docs
+                        # makes the DELETE trigger durably queue any older
+                        # R2-backed row crossed by this reply's retention trim.
+                        cur.execute(
+                            "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
+                            "  SELECT MIN(seq) FROM ("
+                            "    SELECT seq FROM chat_messages WHERE user_id = %s "
+                            "    ORDER BY seq DESC LIMIT %s"
+                            "  ) t"
+                            ") AND seq <= ("
+                            "  SELECT COALESCE("
+                            "    NULLIF(s.watermark_seq, 0),"
+                            "    (SELECT NULLIF(MAX(cm.seq), 0) FROM chat_messages cm "
+                            "     WHERE cm.user_id = s.user_id AND cm.ts < s.watermark_ts)"
+                            "  ) FROM v2_conversation_summary s WHERE s.user_id = %s"
+                            ") RETURNING msg_id, doc",
+                            (user_id, user_id, max_messages, user_id),
+                        )
+                        trimmed_rows = cur.fetchall()
+                        trimmed_ids.extend(
+                            str(trimmed["msg_id"] if isinstance(trimmed, dict) else trimmed[0])
+                            for trimmed in trimmed_rows
+                        )
+                else:
+                    if existing is None:
+                        cur.execute(
+                            "SELECT seq,doc,storage_generation "
+                            "FROM chat_messages "
+                            "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                            (user_id, msg_id),
+                        )
+                        existing = cur.fetchone()
+                    if existing is None:
+                        raise RuntimeError("idempotent reply row disappeared")
+                    if isinstance(existing, dict):
+                        seq = int(existing["seq"])
+                        existing_doc = existing["doc"]
+                    else:
+                        seq = int(existing[0])
+                        existing_doc = existing[1]
+                    existing_storage_generation = int(
+                        existing["storage_generation"]
+                        if isinstance(existing, dict)
+                        else existing[2]
+                    )
+                    if existing_storage_generation != storage_generation:
+                        raise RuntimeError(
+                            "reply row belongs to retired storage generation"
+                        )
+                    # A client can choose chat envelope ids, while V2 reply ids
+                    # are deterministic. Never let a colliding user/stale row
+                    # masquerade as an idempotent reply and advance the input
+                    # cursor without delivering this assistant envelope.
+                    immutable_reply_fields = (
+                        "id", "role", "source", "v", "body_ct", "nonce",
+                        "K_user", "K_enclave", "enclave_pk_fpr", "visibility",
+                        "owner_user_id", "content_type",
+                    )
+                    if not isinstance(existing_doc, dict) or any(
+                        existing_doc.get(field) != effect_doc.get(field)
+                        for field in immutable_reply_fields
+                    ):
+                        raise RuntimeError("reply id collision with different content")
+                    if _is_chat_file_pointer(effect_doc) and (
+                        not _is_chat_file_pointer(existing_doc)
+                        or str(existing_doc.get("body_key") or "")
+                        != str(effect_doc.get("body_key") or "")
+                    ):
+                        raise ChatPointerReplayConflict(
+                            "stale V2 reply pointer does not match current body"
+                        )
+                    persisted_reply_doc = existing_doc
+
+                # V2 -> resident rollback bridge. Link every still-unanswered
+                # user input consumed through this final reply to the
+                # deterministic assistant row. Resident poll/redelivery already
+                # treats these fields as the authoritative answered marker.
+                cur.execute(
+                    "UPDATE chat_messages SET doc=doc || %s "
+                    "WHERE user_id=%s AND seq>%s AND seq<=%s "
+                    "  AND doc->>'role'='user' "
+                    "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                    "  AND COALESCE(doc->>'reply_message_id','')='' "
+                    "RETURNING msg_id",
+                    (
+                        Jsonb(replied_fields),
+                        user_id,
+                        previous_cursor,
+                        cursor_seq,
+                    ),
+                )
+                replied_user_ids.extend(
+                    str(updated["msg_id"] if isinstance(updated, dict) else updated[0])
+                    for updated in cur.fetchall()
+                )
+
+                persisted_runtime_doc = _advance_blob_int_on_cursor(
+                    cur,
+                    user_id,
+                    "model_api_runtime",
+                    v2_cursor.CURSOR_KEY,
+                    cursor_seq,
+                )
+    _offload_chat_body_after_commit(
+        user_id, msg_id, persisted_reply_doc, storage_generation,
+    )
+    _mirror_trimmed_chat_ids(user_id, trimmed_ids)
+    if replied_user_ids:
+        from tee_shadow import mirror
+        mirror.execute(
+            "UPDATE chat_messages SET doc=doc || %s "
+            "WHERE user_id=%s AND msg_id=ANY(%s)",
+            (Jsonb(replied_fields), user_id, replied_user_ids),
+        )
+    if persisted_runtime_doc is not None:
+        _mirror_persisted_blob(
+            user_id, "model_api_runtime", persisted_runtime_doc)
+    return seq, inserted
+
+
 def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int) -> None:
     """Best-effort legacy (pre-V2) chat write. Plain ring-buffer trim — this
     path never writes a ``v2_conversation_summary`` row, so it must NOT
@@ -3158,19 +5032,26 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
 
 
+class RuntimeControlChangedError(RuntimeError):
+    """The hosted-runtime ownership tuple changed before a fenced write."""
+
+
 def chat_append_and_enqueue(
     user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int, lane: str,
     *, reason=None, trace_id=None, expected_generation: int | None = None,
+    expected_runtime_state: str | None = None,
+    expected_runtime_mode: str | None = None,
 ) -> tuple[int, int]:
     """Atomically persist one chat message AND enqueue/coalesce its job in ONE
     transaction. Either both commit or neither does — closes the orphan-message
     gap where the message persisted but the process died before the job insert
     (spec A7). Returns ``(seq, job_id)``.
 
-    R2 offload of heavy file bodies is intentionally out of this atomic path
-    (rare on the send path; ``_chat_append_impl`` still owns the offload for
-    the legacy route) — trimmed offloaded-file cleanup is likewise skipped
-    here (best-effort, and rare enough on the send path not to matter).
+    Heavy file/image bodies follow the same crash-safe post-commit offload as
+    other chat writes. The inline message and job still commit atomically; only
+    after that transaction succeeds do we upload and flip the row to a pointer,
+    while retention evictions commit durable cleanup tombstones for the isolated
+    R2 worker and mirror their row deletions to the TEE shadow.
 
     One pool connection, one transaction, two cursors (a default cursor for
     the message INSERT, a ``dict_row`` cursor for the job coalesce-or-insert)
@@ -3194,14 +5075,55 @@ def chat_append_and_enqueue(
 
     if lane not in jobs_store.LANES:
         raise ValueError(f"unknown lane: {lane!r}")
+    fenced = expected_runtime_state is not None or expected_runtime_mode is not None
+    if fenced and (
+        expected_runtime_state is None
+        or expected_runtime_mode is None
+        or expected_generation is None
+    ):
+        raise ValueError(
+            "runtime-control CAS requires expected state, mode, and generation")
     priority = jobs_store.LANE_PRIORITY.get(lane, 0)
 
-    def _attempt() -> tuple[int, int]:
+    def _attempt() -> tuple[int, int, int, list[str]]:
+        trimmed_ids: list[str] = []
         with get_pool().connection() as conn:
             with conn.transaction():
+                with conn.cursor() as fence_cur:
+                    _lock_chat_user_fence_on_cursor(fence_cur, user_id)
+                if fenced:
+                    # Match the cutover writer's runtime-row -> blob-row lock
+                    # order.  Holding both locks until message+job commit makes
+                    # this a true CAS on the tuple observed by chat/send: a
+                    # concurrent disable either wins before us (we write
+                    # nothing) or waits until the admitted V2 job is durable.
+                    state_row = conn.execute(
+                        "SELECT hosted_runtime_state, runtime_generation "
+                        "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                        (user_id,),
+                    ).fetchone()
+                    if state_row is None:
+                        raise RuntimeControlChangedError(
+                            "runtime control row disappeared")
+                    current_state, current_generation = state_row
+                    blob_row = conn.execute(
+                        "SELECT doc->>'hosted_runtime_mode' FROM user_blobs "
+                        "WHERE user_id=%s AND kind='model_api_runtime' FOR UPDATE",
+                        (user_id,),
+                    ).fetchone()
+                    current_mode = str(blob_row[0] or "") if blob_row else ""
+                    if (
+                        str(current_state) != str(expected_runtime_state)
+                        or int(current_generation) != int(expected_generation)
+                        or current_mode != str(expected_runtime_mode)
+                    ):
+                        raise RuntimeControlChangedError(
+                            "hosted runtime control changed before enqueue")
                 with conn.cursor() as mc:
-                    seq = _chat_insert_on_cursor(
-                        mc, user_id, msg_id, ts, doc, max_messages, coverage_gated=True,
+                    seq, storage_generation = _chat_insert_on_cursor(
+                        mc, user_id, msg_id, ts, doc, max_messages,
+                        trimmed_ids_out=trimmed_ids,
+                        coverage_gated=True,
                     )
                 with conn.cursor(row_factory=dict_row) as jc:
                     job_id, _coalesced = jobs_store.coalesce_or_insert_on_cursor(
@@ -3209,21 +5131,35 @@ def chat_append_and_enqueue(
                         priority=priority, deadline_at=None,
                         expected_generation=expected_generation,
                     )
+        return seq, job_id, storage_generation, trimmed_ids
+
+    def _finish(
+        result: tuple[int, int, int, list[str]],
+    ) -> tuple[int, int]:
+        seq, job_id, storage_generation, trimmed_ids = result
+        # The primary message+job transaction is already committed. Mirror the
+        # exact retention evictions now, using the same post-commit helpers as
+        # the legacy and atomic-reply paths.
+        _offload_chat_body_after_commit(
+            user_id, msg_id, doc, storage_generation,
+        )
+        _mirror_trimmed_chat_ids(user_id, trimmed_ids)
         return seq, job_id
 
     for _ in range(3):
         try:
-            return _attempt()
+            result = _attempt()
         except psycopg.errors.UniqueViolation:
             continue  # 并发 racer 抢先建了 active job；重跑整个事务并 coalesce
-    return _attempt()
+        return _finish(result)
+    return _finish(_attempt())
 
 
 def reconcile_unenqueued_v2_messages() -> int:
     """Belt to :func:`chat_append_and_enqueue`'s braces (spec A7): find
-    ``db_action_v2`` users whose newest chat message is an UNANSWERED user
+    authoritative V2 users whose newest chat message is an UNANSWERED user
     message (``doc->>'role' = 'user'``) with NO active (pending/claimed/running)
-    ``chat`` lane job, and single-flight enqueue a catch-up chat job for each.
+    ``chat`` lane job, and single-flight enqueue one catch-up per message.
 
     "Orphan" here means: the user's chat_messages row with the highest ``seq``
     has ``doc->>'role' = 'user'`` (nothing has replied to it yet) AND there is
@@ -3234,47 +5170,70 @@ def reconcile_unenqueued_v2_messages() -> int:
     partially applied outside its own transaction (e.g. a bug, a manual data
     fix, or a pre-A7 message written before this function existed).
 
-    Idempotent via ``enqueue_job``'s single-flight coalescing — calling this
-    repeatedly against the same orphan will not create duplicate jobs. Returns
-    the count of catch-up jobs enqueued. Periodic wiring (a scheduler calling
-    this on an interval) is deferred to PR D's sweeper; this function is not
-    invoked anywhere in this PR.
+    A durable ``reason='reconcile', trace_id=<msg_id>`` job is the per-message
+    marker across every terminal status. This is intentionally stronger than
+    active-job single-flight: a provider/config failure must not cause the same
+    unanswered input to be retried and billed every scheduler tick. A later
+    message has a different id and remains eligible for one catch-up.
     """
     from model_api_runtime.v2 import jobs_store  # lazy — precedent db.py cutover import
 
     with get_pool().connection() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT ON (cm.user_id) cm.user_id, cm.doc->>'role' AS role "
-            "FROM chat_messages cm "
-            "JOIN user_blobs mrt ON mrt.user_id = cm.user_id AND mrt.kind = 'model_api_runtime' "
-            "WHERE mrt.doc->>'hosted_runtime_mode' = 'db_action_v2' "
-            "ORDER BY cm.user_id, cm.seq DESC"
+        candidates = conn.execute(
+            "WITH latest AS ("
+            "  SELECT DISTINCT ON (cm.user_id) "
+            "         cm.user_id,cm.msg_id,cm.doc->>'role' AS role, "
+            "         rs.runtime_generation "
+            "  FROM chat_messages cm "
+            "  JOIN user_blobs mrt ON mrt.user_id=cm.user_id "
+            "    AND mrt.kind='model_api_runtime' "
+            "  JOIN v2_runtime_state rs ON rs.user_id=cm.user_id "
+            "    AND rs.hosted_runtime_state='v2' "
+            "  WHERE mrt.doc->>'hosted_runtime_mode'='db_action_v2' "
+            "  ORDER BY cm.user_id,cm.seq DESC"
+            ") "
+            "SELECT latest.user_id,latest.msg_id,latest.runtime_generation "
+            "FROM latest "
+            "WHERE latest.role='user' "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM agent_jobs active "
+            "  WHERE active.user_id=latest.user_id AND active.lane='chat' "
+            "    AND active.status IN ('pending','claimed','running')"
+            ") "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM agent_jobs prior "
+            "  WHERE prior.user_id=latest.user_id AND prior.lane='chat' "
+            "    AND prior.reason='reconcile' AND prior.trace_id=latest.msg_id "
+            "    AND prior.status <> 'superseded'"
+            ")"
         ).fetchall()
-        candidate_user_ids = [r[0] for r in rows if r[1] == "user"]
-        if not candidate_user_ids:
-            return 0
-        active_rows = conn.execute(
-            "SELECT DISTINCT user_id FROM agent_jobs "
-            "WHERE lane='chat' AND status IN ('pending','claimed','running') "
-            "AND user_id = ANY(%s)",
-            (candidate_user_ids,),
-        ).fetchall()
-        active_user_ids = {r[0] for r in active_rows}
 
-    orphan_user_ids = [uid for uid in candidate_user_ids if uid not in active_user_ids]
-    for uid in orphan_user_ids:
-        jobs_store.enqueue_job(uid, "chat", reason="reconcile")
-    return len(orphan_user_ids)
+    for uid, msg_id, runtime_generation in candidates:
+        jobs_store.enqueue_job(
+            str(uid), "chat", reason="reconcile", trace_id=str(msg_id),
+            expected_generation=int(runtime_generation),
+        )
+    return len(candidates)
 
 
 def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None:
     """Shallow-merge ``fields`` into the stored message doc. Returns the merged
     doc, or None if the message was not found."""
+    # Pointer identity is not metadata. Allowing this helper to install one
+    # would bypass the generation/replay protocol and could resurrect a key
+    # after the cleanup worker's fenced reference check.
+    if any(name in (fields or {}) for name in ("body_key", "body_ct_len")):
+        log.error("[db] chat_update_metadata refused chat body pointer fields")
+        return None
     sql = ("UPDATE chat_messages SET doc = doc || %s WHERE user_id = %s AND msg_id = %s "
            "RETURNING doc")
     try:
         with get_pool().connection() as conn:
-            row = conn.execute(sql, (Jsonb(fields), user_id, msg_id)).fetchone()
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                    cur.execute(sql, (Jsonb(fields), user_id, msg_id))
+                    row = cur.fetchone()
     except Exception as e:
         log.error("[db] chat_update_metadata(%s,%s) failed: %s", user_id, msg_id, e)
         return None
@@ -3391,7 +5350,11 @@ def chat_delete(user_id: str, msg_id: str) -> bool:
     sql = "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s"
     try:
         with get_pool().connection() as conn:
-            row = conn.execute(sql + " RETURNING doc", (user_id, msg_id)).fetchone()
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                    cur.execute(sql + " RETURNING 1", (user_id, msg_id))
+                    row = cur.fetchone()
     except Exception as e:
         log.error("[db] chat_delete(%s,%s) failed: %s", user_id, msg_id, e)
         return False
@@ -3405,39 +5368,38 @@ def chat_delete(user_id: str, msg_id: str) -> bool:
     ])
     if row is None:
         return False
-    # Drop the offloaded R2 body if this row was a pointer. Driven by the row's own
-    # body_key — see the trim path in chat_append.
-    doc = row[0]
-    if (
-        object_storage.chat_files_enabled()
-        and isinstance(doc, dict)
-        and doc.get("body_key")
-    ):
-        object_storage.delete_chat_body(str(doc["body_key"]), user_id)
+    # The DELETE trigger committed the exact persisted body key. The isolated
+    # cleanup loop owns network deletion so this request cannot wedge on R2.
     return True
 
 
 def chat_clear(user_id: str) -> int | None:
     """Delete every chat row for one user. Returns deleted row count, or None
-    if the database operation failed."""
+    if the database operation failed. Even an already-empty clear advances the
+    durable generation so a delayed pre-clear upload can never promote."""
     sql = "DELETE FROM chat_messages WHERE user_id = %s"
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(sql, (user_id,))
-        # Prefix-delete every offloaded chat-file body for this user (cheap no-op
-        # when R2 is unconfigured or the user never sent a file).
-        if object_storage.chat_files_enabled():
-            object_storage.delete_user_chat_files(user_id)
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _mark_chat_r2_inventory_pending_on_cursor(
+                        cur, user_id, advance_generation=True,
+                    )
+                    cur.execute(sql, (user_id,))
+                    deleted_count = int(cur.rowcount)
     except Exception as e:
         log.error("[db] chat_clear(%s) failed: %s", user_id, e)
         return None
+    # The trigger queued referenced keys; the same transaction also left a
+    # durable inventory marker for pre-guard/legacy objects. Never LIST/DELETE
+    # R2 here: clear must return independently of object-store health.
     from tee_shadow import mirror
     mirror.execute_many([
         (sql, (user_id,)),
         ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
          "AND table_name = 'chat_messages'", (user_id,)),
     ])
-    return cur.rowcount
+    return deleted_count
 
 
 # ---------------------------------------------------------------------------
@@ -3729,6 +5691,33 @@ def model_api_credentials_list(user_id: str) -> list[dict]:
     except Exception as e:
         log.error("[db] model_api_credentials_list(%s) failed: %s", user_id, e)
         return []
+
+
+def model_api_config_delete_strict(user_id: str) -> bool:
+    """Delete every provider credential/route and the frozen legacy blob.
+
+    This is the all-config DELETE endpoint's fail-loud persistence primitive.
+    Credentials cascade to routes, and the legacy blob is removed in the same
+    transaction, so a database error cannot produce a partial success that the
+    API reports as complete.  The ``model_api_runtime`` control blob is
+    intentionally outside this function: it carries the V2 correctness cursor
+    and is fenced/scrubbed first by ``prepare_model_api_delete``.
+    """
+    legacy_sql = "DELETE FROM user_blobs WHERE user_id = %s AND kind = 'model_api'"
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            credentials = conn.execute(
+                "DELETE FROM model_api_credentials WHERE user_id = %s",
+                (user_id,),
+            ).rowcount
+            legacy = conn.execute(legacy_sql, (user_id,)).rowcount
+
+    # The primary transaction is authoritative.  Mirror the plaintext-safe
+    # deletion only after it commits, matching delete_blob's shadow behavior.
+    if legacy:
+        from tee_shadow import mirror
+        mirror.execute(legacy_sql, (user_id,))
+    return bool(credentials or legacy)
 
 
 def model_api_credential_get(user_id: str, credential_id: str) -> dict | None:
@@ -4471,10 +6460,18 @@ def delete_user_frames(user_id: str) -> None:
 
 
 def delete_user_chat_files(user_id: str) -> None:
-    """Best-effort R2 chat-file body cleanup (no DB rows — the chat_messages
-    CASCADE already dropped the pointer rows). Mirrors delete_user_frames."""
-    if object_storage.chat_files_enabled():
-        object_storage.delete_user_chat_files(user_id)
+    """Durably schedule account cleanup without performing network I/O.
+
+    ``delete_user`` advanced the lifecycle before its chat CASCADE. Following
+    that persisted boundary avoids a whole-prefix sweep deleting a same-id
+    account's newer-generation object if registration races reset cleanup.
+    """
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _mark_chat_r2_inventory_pending_on_cursor(
+                    cur, user_id, advance_generation=False,
+                )
 
 
 def list_agent_status_events(user_id: str, *, after_id: int = 0, limit: int = 50) -> list[dict]:
@@ -4492,6 +6489,31 @@ def list_agent_status_events(user_id: str, *, after_id: int = 0, limit: int = 50
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
     return [dict(zip(cols, row)) for row in rows]
+
+
+def get_hosted_runtime_control_strict(user_id: str) -> tuple[str, str, int]:
+    """Read routing mode, authoritative state, and generation together.
+
+    The three values come from one PostgreSQL snapshot so callers never
+    synthesize a control tuple from independent blob/state reads.  Missing
+    rows retain the rollout-safe resident defaults; an unknown user is an
+    error rather than a fabricated control record.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(blobs.doc->>'hosted_runtime_mode','resident_cli'), "
+            "       COALESCE(state.hosted_runtime_state,'resident'), "
+            "       COALESCE(state.runtime_generation,1) "
+            "FROM users "
+            "LEFT JOIN user_blobs AS blobs "
+            "  ON blobs.user_id=users.user_id AND blobs.kind='model_api_runtime' "
+            "LEFT JOIN v2_runtime_state AS state ON state.user_id=users.user_id "
+            "WHERE users.user_id=%s",
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError("unknown user runtime control")
+    return str(row[0]), str(row[1]), int(row[2])
 
 
 def get_runtime_generation(user_id: str) -> int:
@@ -4569,20 +6591,61 @@ def effect_enqueue(effect_id, user_id, job_id, effect_type, expected_generation,
     return inserted
 
 
-def effect_pending(user_id) -> list[dict]:
-    """All still-pending effects for a user, oldest first. Backed by the
-    partial index on (user_id, created_at) WHERE status='pending'."""
+def effect_pending(user_id, *, due_prefix_only: bool = False) -> list[dict]:
+    """Pending effects for a user in durable insertion order.
+
+    ``due_prefix_only`` returns only the consecutive due prefix.  A failed head
+    effect therefore preserves ordering and its exponential backoff instead of
+    letting an eager turn-boundary drain retry it (or skip past it) immediately.
+    """
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT effect_id, job_id, effect_type, expected_generation, payload "
-                "FROM v2_effect_outbox WHERE user_id=%s AND status='pending' "
-                "ORDER BY created_at ASC",
-                (user_id,),
-            )
+            if due_prefix_only:
+                cur.execute(
+                    "WITH ordered AS ("
+                    " SELECT effect_id,job_id,effect_type,expected_generation,payload,"
+                    "        enqueue_seq,"
+                    "        bool_and(next_attempt_at <= now()) OVER ("
+                    "          ORDER BY enqueue_seq ROWS BETWEEN UNBOUNDED PRECEDING "
+                    "          AND CURRENT ROW"
+                    "        ) AS prefix_due "
+                    " FROM v2_effect_outbox "
+                    " WHERE user_id=%s AND status='pending'"
+                    ") SELECT effect_id,job_id,effect_type,expected_generation,payload "
+                    "FROM ordered WHERE prefix_due ORDER BY enqueue_seq",
+                    (user_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT effect_id, job_id, effect_type, expected_generation, payload "
+                    "FROM v2_effect_outbox WHERE user_id=%s AND status='pending' "
+                    "ORDER BY enqueue_seq ASC",
+                    (user_id,),
+                )
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     return rows
+
+
+def effect_pending_users(*, limit: int = 500) -> list[str]:
+    """Users with pending outbox work, oldest effect first.
+
+    This is the parent-process reconciliation work list.  Per-user application
+    still re-reads and locks every row in ``apply_pending_effects``; this query
+    is only a bounded hint and is safe to race with normal end-of-turn drains.
+    """
+    bounded_limit = max(1, min(int(limit), 5000))
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "WITH oldest AS ("
+            " SELECT DISTINCT ON (user_id) user_id,enqueue_seq,next_attempt_at "
+            " FROM v2_effect_outbox WHERE status='pending' "
+            " ORDER BY user_id,enqueue_seq"
+            ") SELECT user_id FROM oldest WHERE next_attempt_at <= now() "
+            "ORDER BY enqueue_seq ASC LIMIT %s",
+            (bounded_limit,),
+        ).fetchall()
+    return [str(row[0]) for row in rows]
 
 
 def effect_mark(effect_id, status, *, error="") -> None:
@@ -4604,42 +6667,164 @@ def effect_mark(effect_id, status, *, error="") -> None:
                 )
 
 
-def effect_sink_claim(effect_id: str) -> bool:
-    """Universal sink-level exactly-once guard (spec A6): the FIRST caller for a
-    given effect_id claims it (returns True) and should proceed to perform the
-    real durable write; every replay after that (the outbox applier re-running
-    a row that is still 'pending' because a crash landed between the sink
-    write and the status='applied' flip) gets False and must no-op. One shared
-    table backs ALL 7 effect types, so no sink needs its own per-table
-    effect_id column.
+def _effect_record_error_on_cursor(
+    cur,
+    effect_id: str,
+    error: str,
+    *,
+    reconciliation_required: bool = False,
+    max_attempts: int = 8,
+) -> None:
+    """Record one sanitized apply failure on the caller's transaction."""
+    cur.execute(
+        "UPDATE v2_effect_outbox "
+        "SET last_error=%s, attempt_count=attempt_count+1, "
+        "    last_attempt_at=now(), "
+        "    next_attempt_at=now() + "
+        "      (LEAST(3600, 15 * (1 << LEAST(attempt_count, 8))) * interval '1 second'), "
+        "    status=CASE WHEN %s OR attempt_count+1 >= %s "
+        "                THEN 'needs_reconciliation' ELSE status END "
+        "WHERE effect_id=%s AND status='pending'",
+        (
+            str(error)[:256],
+            bool(reconciliation_required),
+            max(1, int(max_attempts)),
+            effect_id,
+        ),
+    )
 
-    This claim commits on its own connection BEFORE the sink's durable write
-    runs. Every sink therefore follows claim -> try write -> except: release +
-    re-raise (see `effect_sink_release`) so a write failure un-claims and lets
-    a replay redo the write instead of silently skipping a never-completed
-    effect. The one residual gap this does NOT cover: a HARD process crash in
-    the microsecond window between the claim commit and the write starting —
-    no exception is raised to trigger a release, so the claim is left
-    orphaned and a replay would no-op a never-performed write. That narrow
-    window is closed by a PR D effect-sweeper (releases claims whose outbox
-    row is still 'pending'); claim-release-on-failure here fully covers the
-    realistic write-ERROR fault."""
+
+def effect_record_error(
+    effect_id: str,
+    error: str,
+    *,
+    reconciliation_required: bool = False,
+    max_attempts: int = 8,
+) -> None:
+    """Record one sanitized apply failure without terminalizing the effect.
+
+    Transient failures remain ``pending`` with exponential sweeper backoff.
+    Ambiguous delivery, or a poison row that reaches ``max_attempts``, moves to
+    explicit ``needs_reconciliation`` so it cannot hot-loop or block later
+    effects forever. Only the caller-provided, already-sanitized summary is
+    stored; raw exception text can contain user content or provider credentials
+    and must never be passed here.
+    """
     with get_pool().connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO v2_effect_sink_applied (effect_id) VALUES (%s) "
-                "ON CONFLICT (effect_id) DO NOTHING",
-                (effect_id,),
-            )
-            claimed = cur.rowcount == 1
-    return claimed
+        _effect_record_error_on_cursor(
+            conn,
+            effect_id,
+            error,
+            reconciliation_required=reconciliation_required,
+            max_attempts=max_attempts,
+        )
+
+
+def effect_outbox_health() -> dict:
+    """Non-sensitive operator counters for pending/manual effect delivery."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT "
+            "  count(*) FILTER (WHERE status='pending'), "
+            "  count(*) FILTER (WHERE status='needs_reconciliation'), "
+            "  COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at) FILTER "
+            "    (WHERE status IN ('pending','needs_reconciliation')))), 0) "
+            "FROM v2_effect_outbox"
+        ).fetchone()
+    return {
+        "pending": int(row[0] or 0),
+        "needs_reconciliation": int(row[1] or 0),
+        "oldest_unresolved_age_sec": float(row[2] or 0.0),
+    }
+
+
+class EffectDeliveryUncertainError(RuntimeError):
+    """A prior process claimed an effect but never recorded completion.
+
+    The durable write may or may not have landed, so automatic replay would
+    choose blindly between loss and duplication. Callers must fail visibly and
+    move the outbox row to explicit manual reconciliation.
+    """
+
+
+def effect_sink_claim(effect_id: str) -> bool:
+    """Begin the generic sink delivery protocol for ``effect_id``.
+
+    Returns ``True`` only for a brand-new claim.  A replay of a row whose sink
+    has recorded ``completed`` returns ``False`` and safely no-ops.  A replay
+    of an unresolved ``claimed`` row raises
+    :class:`EffectDeliveryUncertainError`: a hard process death may have
+    happened either before or after the real durable write, so neither an
+    automatic retry nor an automatic success is safe.
+
+    Successful sinks MUST call :func:`effect_sink_complete` after their durable
+    write.  Ordinary write failures MUST call :func:`effect_sink_release`.
+    Do not add a time-based claim sweeper: age cannot tell whether the target
+    write landed and releasing an old claim can duplicate external effects.
+    """
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO v2_effect_sink_applied (effect_id, claim_state) "
+                    "VALUES (%s, 'claimed') ON CONFLICT (effect_id) DO NOTHING",
+                    (effect_id,),
+                )
+                if cur.rowcount == 1:
+                    return True
+                cur.execute(
+                    "SELECT claim_state FROM v2_effect_sink_applied "
+                    "WHERE effect_id=%s FOR UPDATE",
+                    (effect_id,),
+                )
+                row = cur.fetchone()
+                if row and row[0] == "completed":
+                    return False
+                if row and row[0] == "claimed":
+                    raise EffectDeliveryUncertainError(
+                        "effect delivery uncertain after interrupted sink claim"
+                    )
+                raise RuntimeError("effect sink claim row has invalid state")
+
+
+def effect_sink_complete(effect_id: str) -> None:
+    """Record that the durable sink write for ``effect_id`` completed.
+
+    This transition is idempotent.  Importantly, callers invoke it *outside*
+    the write-failure handler: if this bookkeeping write fails after the real
+    target write landed, the claim must remain unresolved rather than being
+    released and risking a duplicate on replay.
+    """
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE v2_effect_sink_applied "
+                    "SET claim_state='completed', completed_at=COALESCE(completed_at, now()) "
+                    "WHERE effect_id=%s AND claim_state='claimed'",
+                    (effect_id,),
+                )
+                if cur.rowcount == 1:
+                    return
+                cur.execute(
+                    "SELECT claim_state FROM v2_effect_sink_applied WHERE effect_id=%s",
+                    (effect_id,),
+                )
+                row = cur.fetchone()
+                if row and row[0] == "completed":
+                    return
+                raise RuntimeError("cannot complete an effect without an active claim")
 
 
 def effect_sink_release(effect_id: str) -> None:
-    """Undo a claim taken by effect_sink_claim when the sink's durable write then FAILED, so a
-    replay re-claims and re-writes instead of silently skipping a never-completed effect. Paired
-    with the claim in each sink: claim -> try write -> except: release + re-raise. This restores
-    exactly-once under a write-error fault (the applier's transaction rolls back on the re-raised
-    exception, leaving the outbox row 'pending' for a clean re-drive)."""
+    """Undo only an unresolved claim after the durable write raised.
+
+    Completed rows are deliberately retained, so an accidental late release
+    cannot erase the replay guard for a write that already succeeded.
+    """
     with get_pool().connection() as conn:
-        conn.execute("DELETE FROM v2_effect_sink_applied WHERE effect_id=%s", (effect_id,))
+        conn.execute(
+            "DELETE FROM v2_effect_sink_applied "
+            "WHERE effect_id=%s AND claim_state='claimed'",
+            (effect_id,),
+        )

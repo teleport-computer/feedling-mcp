@@ -10,15 +10,19 @@ import sys
 import uuid
 from pathlib import Path
 
-from psycopg.types.json import Jsonb
-
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import backfill_chat_images_to_r2 as backfill  # noqa: E402
 import db  # noqa: E402
 import object_storage  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
-from test_chat_file_r2 import _BUCKET, _enable_r2, _image_doc, _raw_doc  # noqa: E402
+from test_chat_file_r2 import (  # noqa: E402
+    _BUCKET,
+    _assert_versioned_key,
+    _enable_r2,
+    _image_doc,
+    _raw_doc,
+)
 from test_frame_r2 import _FakeS3  # noqa: E402
 
 
@@ -63,9 +67,10 @@ def test_backfill_moves_bodies_and_round_trips(backend_env, monkeypatch):
 
     for mid, body in bodies.items():
         raw = _raw_doc(uid, mid)
-        assert raw["body_key"] == f"chatimages/{uid}/{mid}"    # row is now a pointer
+        key = str(raw["body_key"])
+        _assert_versioned_key(key, uid, mid, "image")          # row is now a pointer
         assert "body_ct" not in raw
-        assert client.store[(_BUCKET, f"chatimages/{uid}/{mid}")] == body
+        assert client.store[(_BUCKET, key)] == body
         # The whole point: the read path reconstitutes the ORIGINAL ciphertext.
         assert base64.b64decode(db.hydrate_chat_file_body(uid, raw)["body_ct"]) == body
 
@@ -138,3 +143,24 @@ def test_flip_preserves_metadata_written_during_upload(backend_env, monkeypatch)
     assert raw["reply_status"] == "replied"                   # concurrent write survived
     assert raw["reply_message_id"] == "r1"
     assert raw.get("body_key") and "body_ct" not in raw       # and the flip still happened
+
+
+def test_clear_during_backfill_cannot_promote_or_orphan_old_generation(
+    backend_env, monkeypatch,
+):
+    uid = _uid(); seed_user(uid); mid = uuid.uuid4().hex
+    _write_inline_image(monkeypatch, uid, mid, b"clear-race")
+
+    class _ClearingS3(_FakeS3):
+        def put_object(self, Bucket, Key, Body, **kw):
+            assert db.chat_clear(uid) == 1
+            return super().put_object(Bucket, Key, Body, **kw)
+
+    client = _ClearingS3()
+    _enable_r2(monkeypatch, client)
+    assert backfill.run(batch_size=10, dry_run=False, only_user=uid) == 0
+    for _ in range(3):
+        db.reconcile_chat_r2_cleanup(uid, limit=1000, inventory_limit=10)
+
+    assert _raw_doc(uid, mid) is None
+    assert client.store == {}

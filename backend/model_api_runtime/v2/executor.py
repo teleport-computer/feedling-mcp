@@ -14,10 +14,12 @@ action_digest 只粗计数（ok/count，落 runtime_state，spec §5/§9 红线�
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import Any
 
 from capabilities import registry as cap_registry
+from capabilities import tool_schema
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import provenance as _prov
 from model_api_runtime.v2 import status_stream
@@ -251,12 +253,15 @@ async def dispatch_tool_calls(
     for tc in tool_calls:
         if not tc.args_ok:
             results_by_id[tc.id] = ToolResult(call_id=tc.id, content=f"error: unparseable args for {tc.name}")
+        elif tc.name not in cap_registry.READ_ACTIONS and tc.name not in cap_registry.WRITE_ACTIONS:
+            results_by_id[tc.id] = ToolResult(call_id=tc.id, content=f"error: unknown tool {tc.name}")
+        elif validation_error := tool_schema.validate_tool_args(tc.name, tc.args):
+            results_by_id[tc.id] = ToolResult(
+                call_id=tc.id, content=f"error: invalid args for {tc.name}: {validation_error}")
         elif tc.name in cap_registry.READ_ACTIONS:
             reads.append(tc)
         elif tc.name in cap_registry.WRITE_ACTIONS:
             writes.append(tc)
-        else:
-            results_by_id[tc.id] = ToolResult(call_id=tc.id, content=f"error: unknown tool {tc.name}")
 
     async def _read(tc):
         step = {"type": tc.name, "payload": tc.args}
@@ -281,7 +286,9 @@ async def dispatch_tool_calls(
             continue
         if before_write is not None:
             await before_write()
-        enqueue_write_effect(tc)   # producer -> PR A outbox (drained at turn end)
+        enqueued = enqueue_write_effect(tc)  # producer -> PR A outbox (drained at turn end)
+        if inspect.isawaitable(enqueued):
+            await enqueued
         results_by_id[tc.id] = ToolResult(call_id=tc.id, content=f"queued: {tc.name}")
 
     return [results_by_id[tc.id] for tc in tool_calls]   # preserve original order + every call_id

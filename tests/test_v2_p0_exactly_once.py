@@ -6,9 +6,10 @@ applier (``effect_outbox.apply_pending_effects``) does the status flip in the
 SAME transaction as the ``dispatch`` call (see effect_outbox.py); if
 ``dispatch`` raises, the transaction rolls back and the row stays 'pending' —
 that IS the crash simulation, no production seam needed. Recovery re-runs
-``apply_pending_effects`` over the still-pending row; the sink's own
-``db.effect_sink_claim`` (a separate autocommit connection, spec A6) is what
-makes the replay a no-op rather than a duplicate write.
+``apply_pending_effects`` over the still-pending row; the sink's two-phase
+``claim -> durable write -> complete`` ledger makes a completed replay a no-op.
+An interrupted claim whose write outcome is unknowable fails visibly instead
+of guessing between loss and duplication (covered by the hard-crash test).
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ import db
 from model_api_runtime.v2 import effect_outbox, effect_id, serve_worker
 from model_api_runtime.v2 import worker as v2_worker
 
-from conftest import seed_user
+from conftest import seed_user, set_v2_runtime_owner
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
@@ -51,14 +52,24 @@ def _row_status(eid: str) -> str:
     return row[0]
 
 
+def _advance_retry_window(eid: str) -> None:
+    """Advance durable time in fault tests without sleeping 15+ seconds."""
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_effect_outbox SET next_attempt_at=now() "
+            "WHERE effect_id=%s AND status='pending'",
+            (eid,),
+        )
+
+
 def _make_dispatch(writes: list, *, crash_point: str):
     """Test double simulating a real durable sink. ``writes`` is a shared
     list; a successful claim+write appends 1 to it (that IS the sink write).
     Whether it raises (simulating a crash) depends on ``crash_point``:
       - "before_write": raise before claiming — nothing written.
-      - "after_write_before_status": claim + count, THEN raise — write
-        happened but the applier's status flip never runs.
-      - "after_status": claim + count, return normally — no-crash baseline.
+      - "after_write_before_status": claim + count + complete, THEN raise —
+        write happened but the applier's status flip never runs.
+      - "after_status": claim + count + complete, return normally — baseline.
       - "write_error": mirrors the PRODUCTION claim-release wrapper every
         `serve_worker._sink_*` follows — claim, THEN the write itself raises
         (not a bare crash after a successful write); on the exception, undo
@@ -83,6 +94,7 @@ def _make_dispatch(writes: list, *, crash_point: str):
                 raise
         if db.effect_sink_claim(eid):
             writes.append(1)
+            db.effect_sink_complete(eid)
         if crash_point == "after_write_before_status":
             raise RuntimeError("simulated crash AFTER sink write, BEFORE status flip")
         # "after_status": fall through, return normally.
@@ -97,6 +109,7 @@ def _make_dispatch(writes: list, *, crash_point: str):
 def test_exactly_once_across_crash_recovery(pg_clean, crash_point):
     uid = f"u_p0once_{crash_point}"
     seed_user(uid)
+    set_v2_runtime_owner(uid)
     g = db.get_runtime_generation(uid)
     eid = effect_id.derive(job_id=1, effect_type="reply", ordinal=0)
     assert db.effect_enqueue(eid, uid, 1, "reply", g, {"text": "hi"}) is True
@@ -121,6 +134,11 @@ def test_exactly_once_across_crash_recovery(pg_clean, crash_point):
             uid, dispatch=_make_dispatch(writes, crash_point=crash_point)
         )
     assert _row_status(eid) == "pending"
+    with db.get_pool().connection() as conn:
+        recorded_error = conn.execute(
+            "SELECT last_error FROM v2_effect_outbox WHERE effect_id=%s", (eid,)
+        ).fetchone()[0]
+    assert recorded_error == "dispatch_failed:RuntimeError"
 
     if crash_point in ("before_write", "write_error"):
         # "before_write": crash happened before the sink write occurred.
@@ -131,7 +149,8 @@ def test_exactly_once_across_crash_recovery(pg_clean, crash_point):
         assert writes == [1]  # the write DID happen before the simulated crash
 
     # Recovery: re-run apply over the still-pending row with a non-crashing
-    # dispatch (same claim+count logic).
+    # dispatch (same claim+count logic) after its durable retry window opens.
+    _advance_retry_window(eid)
     res = effect_outbox.apply_pending_effects(
         uid, dispatch=_make_dispatch(writes, crash_point="after_status")
     )
@@ -169,6 +188,7 @@ def test_write_error_after_claim_releases_and_replay_completes_real_reply_sink(
     chat_messages persistence, not just a plain Python side effect."""
     uid = "u_p0_writeerror_reply_sink"
     seed_user(uid)
+    set_v2_runtime_owner(uid)
     g = db.get_runtime_generation(uid)
     eid = effect_id.derive(job_id=1, effect_type="reply", ordinal=0)
     assert db.effect_enqueue(eid, uid, 1, "reply", g, {"text": "hi from write-error test"}) is True
@@ -215,6 +235,7 @@ def test_write_error_after_claim_releases_and_replay_completes_real_reply_sink(
 
     # Recovery: re-run apply over the still-pending row. The writer now
     # succeeds on its (second) call.
+    _advance_retry_window(eid)
     res = effect_outbox.apply_pending_effects(uid, dispatch=dispatch)
     assert res == {"applied": 1, "discarded": 0}
     assert _row_status(eid) == "applied"
@@ -228,3 +249,58 @@ def test_write_error_after_claim_releases_and_replay_completes_real_reply_sink(
             (uid,),
         ).fetchall()
     assert rows == [("openclaw", "model_api")]  # exactly one reply exists, written once
+
+
+def test_hard_crash_after_claim_fails_visible_instead_of_silent_loss(pg_clean):
+    """An interrupted generic claim is unknown, never automatic success.
+
+    ``effect_sink_claim`` commits before the target write.  Seeding only that
+    claim models SIGKILL in the exact claim-before-write window.  Recovery
+    must not no-op the sink and mark the outbox applied; it raises the specific
+    uncertainty error, moves the row to explicit manual reconciliation, and
+    records a sanitized error without replaying a possibly-landed external effect.
+    """
+    uid = "u_p0_hard_crash_after_claim"
+    seed_user(uid)
+    set_v2_runtime_owner(uid)
+    generation = db.get_runtime_generation(uid)
+    eid = effect_id.derive(job_id=90210, effect_type="status", ordinal=0)
+    assert db.effect_enqueue(
+        eid, uid, 90210, "status", generation, {"kind": "processing"}
+    )
+
+    assert db.effect_sink_claim(eid) is True
+    durable_writes: list[str] = []
+
+    def recovered_dispatch(_effect_type, payload):
+        if not db.effect_sink_claim(payload["effect_id"]):
+            return
+        durable_writes.append("written")
+        db.effect_sink_complete(payload["effect_id"])
+
+    with pytest.raises(
+        db.EffectDeliveryUncertainError,
+        match="effect delivery uncertain after interrupted sink claim",
+    ):
+        effect_outbox.apply_pending_effects(uid, dispatch=recovered_dispatch)
+
+    assert durable_writes == []
+    with db.get_pool().connection() as conn:
+        outbox = conn.execute(
+            "SELECT status, last_error, attempt_count "
+            "FROM v2_effect_outbox WHERE effect_id=%s",
+            (eid,),
+        ).fetchone()
+        sink = conn.execute(
+            "SELECT claim_state, completed_at "
+            "FROM v2_effect_sink_applied WHERE effect_id=%s",
+            (eid,),
+        ).fetchone()
+
+    assert outbox == (
+        "needs_reconciliation",
+        "delivery_uncertain: unresolved sink claim requires reconciliation",
+        1,
+    )
+    assert sink[0] == "claimed"
+    assert sink[1] is None

@@ -27,6 +27,27 @@ def _ts(m: dict[str, Any]) -> float:
         return 0.0
 
 
+def _seq(m: dict[str, Any]) -> int:
+    """Return a validated DB sequence identity.
+
+    On the seq-native path a missing/corrupt identity is a correctness error,
+    not something to sort as zero and silently skip: doing that could advance
+    the durable cursor past a user message that never reached the model.
+    """
+    raw = m.get("seq")
+    if isinstance(raw, bool):
+        raise ValueError("message seq must be a positive integer")
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str) and raw.strip().isdecimal():
+        value = int(raw.strip())
+    else:
+        raise ValueError("message seq must be a positive integer")
+    if value <= 0:
+        raise ValueError("message seq must be a positive integer")
+    return value
+
+
 def last_replied_ts(messages: list[dict[str, Any]]) -> float:
     """最近一条模型作者消息的 ts（无则 0.0）。此 ts 之后的用户消息都未回复，须并入下一回合。"""
     latest = 0.0
@@ -38,26 +59,74 @@ def last_replied_ts(messages: list[dict[str, Any]]) -> float:
     return latest
 
 
+def last_replied_seq(messages: list[dict[str, Any]]) -> int:
+    """Legacy-assistant-derived seq boundary, for migrations/tests only.
+
+    Production turns load their durable boundary from ``cursor.load_seq``;
+    this helper exists so any compatibility caller that previously used
+    :func:`last_replied_ts` can move to the same total order without inventing
+    timestamp tie-breaking.
+    """
+    latest = 0
+    for m in messages:
+        if str(m.get("role") or "") in _ASSISTANT_ROLES:
+            latest = max(latest, _seq(m))
+    return latest
+
+
 def coalesce_pending(
     messages: list[dict[str, Any]],
     *,
-    since_ts: float,
+    since_ts: float | None = None,
+    since_seq: int | None = None,
     decrypt: Callable[[dict[str, Any]], str] = _plain_content,
-) -> tuple[list[dict[str, Any]], float]:
-    """把 ts > since_ts 的未回复用户消息按时间升序并成一轮。
+) -> tuple[list[dict[str, Any]], float | int]:
+    """Coalesce unseen user messages in one deterministic turn.
 
-    返回 (coalesced, cursor)。cursor = 折入的最大用户 ts（0.0 表示无），调用方记录它，
-    使后续回合不再重复折入同一批。按 id 去重、丢空内容。
+    New callers pass ``since_seq`` and receive an integer seq cursor; rows are
+    ordered and filtered exclusively by the database identity, so equal
+    timestamps cannot drop a message.  ``since_ts`` remains as an explicit
+    compatibility path until worker integration is complete. Supplying both
+    boundaries is rejected rather than choosing one silently.
+
+    Output on the seq path includes each row's ``seq``. Rows with an invalid
+    or missing seq fail closed. Both paths dedupe by id and drop empty content.
     """
+    if since_seq is not None and since_ts is not None:
+        raise ValueError("pass exactly one of since_seq or since_ts")
+
+    seq_native = since_seq is not None
+    if seq_native:
+        if isinstance(since_seq, bool):
+            raise ValueError("since_seq must be a non-negative integer")
+        if isinstance(since_seq, int):
+            boundary_seq = since_seq
+        elif isinstance(since_seq, str) and since_seq.strip().isdecimal():
+            boundary_seq = int(since_seq.strip())
+        else:
+            raise ValueError("since_seq must be a non-negative integer")
+        if boundary_seq < 0:
+            raise ValueError("since_seq must be a non-negative integer")
+        user_rows = [m for m in messages if str(m.get("role") or "") in _USER_ROLES]
+        ordered = sorted(user_rows, key=_seq)
+    else:
+        boundary_ts = float(since_ts or 0.0)
+        ordered = sorted(messages, key=_ts)
+
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
-    cursor = 0.0
-    for m in sorted(messages, key=_ts):
+    cursor: float | int = 0 if seq_native else 0.0
+    for m in ordered:
         if str(m.get("role") or "") not in _USER_ROLES:
             continue
         ts = _ts(m)
-        if ts <= since_ts:
-            continue
+        if seq_native:
+            seq = _seq(m)
+            if seq <= boundary_seq:
+                continue
+        else:
+            if ts <= boundary_ts:
+                continue
         mid = str(m.get("id") or "")
         if mid and mid in seen:
             continue
@@ -66,12 +135,16 @@ def coalesce_pending(
             continue
         if mid:
             seen.add(mid)
-        # `seq` (the stable chat_messages identity column) is forwarded verbatim
-        # when the caller supplied it (the production seq reader does; the pure
-        # ts-only unit inputs don't) so the worker can advance the DURABLE reply
-        # cursor by seq — never by `cursor` above, which is a ts and only seeds
-        # the in-turn fold boundary. See `model_api_runtime.v2.cursor` / D5.
-        out.append({"id": mid, "ts": ts, "seq": m.get("seq"), "content": content})
-        if ts > cursor:
-            cursor = ts
+        item = {"id": mid, "ts": ts, "content": content}
+        # Preserve the stable database identity whenever the reader supplied
+        # one, including on the compatibility timestamp path.  The timestamp
+        # cursor remains a timestamp; callers that are migrating can still
+        # inspect/advance the durable seq cursor without a second coalesce.
+        if m.get("seq") is not None:
+            item["seq"] = _seq(m)
+        if seq_native:
+            cursor = max(int(cursor), seq)
+        else:
+            cursor = max(float(cursor), ts)
+        out.append(item)
     return out, cursor

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import time
 
 import psycopg
@@ -56,6 +57,19 @@ RUNNING_TTL_SEC = _positive_float_env("FEEDLING_V2_LEASE_TTL_SEC", "300")
 
 _ACTIVE_STATUSES = ("pending", "claimed", "running")
 
+_TERMINAL_ERROR_CODE_RE = re.compile(r"^[a-z0-9_:-]{1,120}$")
+
+
+def _terminal_error_code(error: object) -> str:
+    """Return the only form allowed to cross the user-visible failure outbox.
+
+    Worker call sites normally pass stable codes already.  This final boundary
+    prevents a future/legacy caller from copying an exception message into
+    ``last_runtime_error`` through the reconciler.
+    """
+    value = str(error or "")
+    return value if _TERMINAL_ERROR_CODE_RE.fullmatch(value) else "runtime_failed"
+
 
 def _pool():
     return db.get_pool()
@@ -78,7 +92,7 @@ def coalesce_or_insert_on_cursor(
     事务里复用同一段逻辑，而不是重开一个连接。语义与原 enqueue_job 内嵌闭包
     完全一致，见该函数 docstring。"""
     cur.execute(
-        "SELECT id,status,CASE "
+        "SELECT id,status,expected_runtime_generation,CASE "
         "WHEN status='pending' THEN "
         "  COALESCE(queue_deadline_at, deadline_at, "
         "    CASE WHEN lane='chat' THEN "
@@ -93,7 +107,16 @@ def coalesce_or_insert_on_cursor(
         (float(PENDING_CHAT_TTL_SEC), user_id, lane),
     )
     existing = cur.fetchone()
-    if existing is not None and not bool(existing["stale"]):
+    generation_stale = (
+        existing is not None
+        and expected_generation is not None
+        and (
+            existing["expected_runtime_generation"] is None
+            or int(existing["expected_runtime_generation"])
+            != int(expected_generation)
+        )
+    )
+    if existing is not None and not bool(existing["stale"]) and not generation_stale:
         cur.execute(
             "UPDATE agent_jobs SET input_generation=input_generation+1 "
             "WHERE id=%s RETURNING id",
@@ -104,14 +127,36 @@ def coalesce_or_insert_on_cursor(
         # Reclaim the single-flight key inside the same transaction.  The
         # fresh chat job will re-read every message after the durable cursor,
         # so input attached to the expired row is not lost or stranded.
-        cur.execute(
-            "UPDATE agent_jobs SET status='expired',finished_at=now(), "
-            "attempt_count=attempt_count+1, "
-            "last_error=CASE WHEN status='pending' "
-            "THEN 'queue_timeout' ELSE 'lease_timeout' END "
-            "WHERE id=%s",
-            (existing["id"],),
-        )
+        if generation_stale:
+            cur.execute(
+                "UPDATE agent_jobs SET status='superseded',finished_at=now(), "
+                "last_error='stale_runtime_generation' WHERE id=%s",
+                (existing["id"],),
+            )
+        else:
+            cur.execute(
+                "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+                "attempt_count=attempt_count+1, "
+                "last_error=CASE WHEN status='pending' "
+                "THEN 'queue_timeout' ELSE 'lease_timeout' END "
+                "WHERE id=%s",
+                (existing["id"],),
+            )
+            # A fresh enqueue can win the timeout race before the independent
+            # reaper sees this row.  Queue the same visibility obligation in
+            # this caller-owned transaction; generation supersession above is
+            # intentional/silent and must not create an error marker.
+            cur.execute(
+                "INSERT INTO v2_terminal_failure_outbox "
+                "(job_id,user_id,error_code,target_route_id,target_route_updated_at) "
+                "SELECT j.id,j.user_id,j.last_error,r.id,r.updated_at "
+                "FROM agent_jobs j LEFT JOIN LATERAL ("
+                "  SELECT id,updated_at FROM model_api_routes "
+                "  WHERE user_id=j.user_id AND is_active LIMIT 1"
+                ") r ON TRUE WHERE j.id=%s AND j.lane='chat' "
+                "ON CONFLICT (job_id) DO NOTHING",
+                (existing["id"],),
+            )
     cur.execute(
         "INSERT INTO agent_jobs "
         "(user_id, lane, status, reason, trace_id, priority, queue_deadline_at, "
@@ -150,11 +195,10 @@ def enqueue_job(
     heartbeat/scheduled=50，capture/maintenance=10）；调用方显式传一个 int 则原样
     使用，不被 lane 派生值覆盖。
 
-    expected_generation：入队方（通常是 send/wake 入口，已经读过
-    db.get_runtime_generation(user_id)）观测到的运行时代数，原样落到新建行的
-    expected_runtime_generation 列（None 表示调用方未接入 cutover 代数校验，
-    该行永不因代数过期被判 superseded）。只影响新建分支——coalesce 到既有 pending
-    行时沿用那一行已经落库的代数，不覆盖。
+    expected_generation：入队方观测到的运行时代数。省略时，如果权威状态当前为
+    v2，本函数会在 state->job 的锁顺序下自动钉住当前 generation；resident 状态
+    仍保留 None 并会在 claim 时被所有权闸 supersede。若 active 行钉的是另一代，
+    不得把新输入 coalesce 进旧代：先 supersede 旧行再建当前代 successor。
     """
     if lane not in LANES:
         raise ValueError(f"unknown lane: {lane!r}")
@@ -166,10 +210,24 @@ def enqueue_job(
             with _pool().connection() as conn:
                 with conn.transaction():
                     with conn.cursor(row_factory=dict_row) as cur:
+                        effective_generation = expected_generation
+                        if effective_generation is None:
+                            cur.execute(
+                                "SELECT hosted_runtime_state, runtime_generation "
+                                "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                                (user_id,),
+                            )
+                            control = cur.fetchone()
+                            if (
+                                control is not None
+                                and str(control["hosted_runtime_state"]) == "v2"
+                            ):
+                                effective_generation = int(
+                                    control["runtime_generation"])
                         return coalesce_or_insert_on_cursor(
                             cur, user_id, lane, reason=reason, trace_id=trace_id,
                             priority=priority, deadline_at=deadline_at,
-                            expected_generation=expected_generation,
+                            expected_generation=effective_generation,
                         )
         except psycopg.errors.UniqueViolation:
             continue  # 并发 racer 抢先建了 active job；重读并 coalesce
@@ -179,16 +237,30 @@ def enqueue_job(
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
+                effective_generation = expected_generation
+                if effective_generation is None:
+                    cur.execute(
+                        "SELECT hosted_runtime_state, runtime_generation "
+                        "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                        (user_id,),
+                    )
+                    control = cur.fetchone()
+                    if (
+                        control is not None
+                        and str(control["hosted_runtime_state"]) == "v2"
+                    ):
+                        effective_generation = int(control["runtime_generation"])
                 return coalesce_or_insert_on_cursor(
                     cur, user_id, lane, reason=reason, trace_id=trace_id,
                     priority=priority, deadline_at=deadline_at,
-                    expected_generation=expected_generation,
+                    expected_generation=effective_generation,
                 )
 
 
 def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | None:
-    """抢下一个 pending job（priority DESC, created_at）。用 FOR UPDATE SKIP LOCKED 让
-    多进程/多 slot 无争用地各抢各的。pending → claimed，落 claimed_by/claimed_at。
+    """抢下一个 pending job（priority DESC, created_at）。先乐观选候选，再按
+    runtime-state -> job 的统一锁顺序用 FOR UPDATE SKIP LOCKED 完成独占。
+    pending → claimed，落 claimed_by/claimed_at。
     返回整行 dict（含 id/user_id/lane/trace_id/expected_runtime_generation/...），
     无活可抢返回 None。
 
@@ -196,19 +268,17 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
     "manual_wake"}，保证聊天回复不被 heartbeat/capture 之类的后台唤醒风暴饿死）。
     None（默认）＝不限制 lane，行为与改动前完全一致。
 
-    代过期早退（PR A / spec A3）：候选行的 expected_runtime_generation 若非空且
-    小于该用户当前 db.get_runtime_generation(user_id)（意味着入队之后发生过一次
-    resident<->v2 cutover，这一行是为旧运行时排的队，新运行时不认它），本次
+    所有权/代过期早退（PR A / spec A3）：只有权威状态仍为 v2 的用户
+    可以被 claim。候选行的 expected_runtime_generation 若非空且不等于
+    该用户当前 generation（意味着入队之后发生过 cutover），本次
     claim 不把它交给任何 worker 过一轮——同一事务内直接把它判终态 'superseded'，
     然后继续看下一个候选，直到拿到一个非过期的可抢行或彻底抢空。必须在同一个
     claim 事务里做，否则两个并发 worker 可能都读到这个陈旧代的行、一个刚判
     superseded、另一个已经把它当活的 claimed 出去。"""
     if lanes is None:
         select_sql = (
-            "SELECT j.id, j.user_id, j.expected_runtime_generation, "
-            "COALESCE(rs.runtime_generation, 1) AS current_generation FROM agent_jobs j "
+            "SELECT j.id, j.user_id, j.expected_runtime_generation FROM agent_jobs j "
             "JOIN users u ON u.user_id=j.user_id "
-            "LEFT JOIN v2_runtime_state rs ON rs.user_id=j.user_id "
             "WHERE j.status='pending' "
             "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
             "CASE WHEN j.lane='chat' THEN "
@@ -219,16 +289,13 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
             "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
             "WHERE active.user_id=j.user_id "
             "AND active.status IN ('claimed','running')) "
-            "ORDER BY j.priority DESC, j.created_at "
-            "FOR UPDATE OF j,u SKIP LOCKED LIMIT 1"
+            "ORDER BY j.priority DESC, j.created_at LIMIT 1"
         )
         select_args = (float(PENDING_CHAT_TTL_SEC), float(PENDING_CHAT_TTL_SEC))
     else:
         select_sql = (
-            "SELECT j.id, j.user_id, j.expected_runtime_generation, "
-            "COALESCE(rs.runtime_generation, 1) AS current_generation FROM agent_jobs j "
+            "SELECT j.id, j.user_id, j.expected_runtime_generation FROM agent_jobs j "
             "JOIN users u ON u.user_id=j.user_id "
-            "LEFT JOIN v2_runtime_state rs ON rs.user_id=j.user_id "
             "WHERE j.status='pending' "
             "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
             "CASE WHEN j.lane='chat' THEN "
@@ -240,21 +307,66 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
             "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
             "WHERE active.user_id=j.user_id "
             "AND active.status IN ('claimed','running')) "
-            "ORDER BY j.priority DESC, j.created_at "
-            "FOR UPDATE OF j,u SKIP LOCKED LIMIT 1"
+            "ORDER BY j.priority DESC, j.created_at LIMIT 1"
         )
         select_args = (float(PENDING_CHAT_TTL_SEC), float(PENDING_CHAT_TTL_SEC), list(lanes))
 
+    # Lock order is runtime-state -> job everywhere. chat/send's atomic
+    # append+coalesce and cutover already use that order; claiming the job
+    # first would create an ABBA deadlock (send holds state and wants job while
+    # claim holds job and wants state). Select a candidate optimistically,
+    # then lock its state and re-lock/revalidate the job in one short
+    # transaction. A competing worker that won the job simply makes the
+    # revalidation return no row and we retry.
     with _pool().connection() as conn:
-        with conn.transaction():
-            with conn.cursor(row_factory=dict_row) as cur:
-                while True:
+        while True:
+            with conn.transaction():
+                with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(select_sql, select_args)
                     head = cur.fetchone()
                     if head is None:
                         return None
-                    expected_gen = head["expected_runtime_generation"]
-                    if expected_gen is not None and int(expected_gen) < int(head["current_generation"]):
+                    # v2_runtime_state is the ownership authority. Lock it in
+                    # the same transaction as the pending->claimed transition
+                    # so a cutover cannot race between validation and claim.
+                    cur.execute(
+                        "SELECT hosted_runtime_state, runtime_generation "
+                        "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                        (head["user_id"],),
+                    )
+                    control = cur.fetchone()
+                    cur.execute(
+                        "SELECT expected_runtime_generation FROM agent_jobs j "
+                        "WHERE j.id=%s AND j.status='pending' "
+                        "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
+                        "CASE WHEN j.lane='chat' THEN "
+                        "j.created_at + make_interval(secs => %s) END) IS NULL OR "
+                        "COALESCE(j.queue_deadline_at, j.deadline_at, "
+                        "CASE WHEN j.lane='chat' THEN "
+                        "j.created_at + make_interval(secs => %s) END) > now()) "
+                        "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
+                        "WHERE active.user_id=j.user_id "
+                        "AND active.status IN ('claimed','running')) "
+                        "FOR UPDATE OF j SKIP LOCKED",
+                        (
+                            head["id"],
+                            float(PENDING_CHAT_TTL_SEC),
+                            float(PENDING_CHAT_TTL_SEC),
+                        ),
+                    )
+                    locked_job = cur.fetchone()
+                    if locked_job is None:
+                        continue
+                    if control is None or str(control["hosted_runtime_state"]) != "v2":
+                        cur.execute(
+                            "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
+                            "last_error='runtime_state_not_v2' WHERE id=%s",
+                            (head["id"],),
+                        )
+                        continue
+                    expected_gen = locked_job["expected_runtime_generation"]
+                    current_generation = int(control["runtime_generation"])
+                    if expected_gen is not None and int(expected_gen) != current_generation:
                         cur.execute(
                             "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
                             "last_error='stale_runtime_generation' WHERE id=%s",
@@ -263,39 +375,94 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
                         continue
                     cur.execute(
                         "UPDATE agent_jobs SET status='claimed', claimed_by=%s, claimed_at=now(), "
+                        "expected_runtime_generation="
+                        "COALESCE(expected_runtime_generation,%s), "
                         "lease_expires_at = now() + make_interval(secs => %s), "
                         "deadline_at = now() + make_interval(secs => %s) "
                         "WHERE id=%s RETURNING *",
-                        (worker_id, float(RUNNING_TTL_SEC), float(RUNNING_TTL_SEC), head["id"]),
+                        (
+                            worker_id,
+                            current_generation,
+                            float(RUNNING_TTL_SEC),
+                            float(RUNNING_TTL_SEC),
+                            head["id"],
+                        ),
                     )
                     return cur.fetchone()
 
 
 def mark_running(job_id, *, claimed_by: str) -> bool:
     with _pool().connection() as conn:
-        cur = conn.execute(
-            "UPDATE agent_jobs SET status='running', started_at=now(), "
-            "lease_expires_at = now() + make_interval(secs => %s), "
-            "deadline_at = now() + make_interval(secs => %s) "
-            "WHERE id=%s AND status='claimed' "
-            "AND (lease_expires_at IS NULL OR lease_expires_at > now()) "
-            "AND claimed_by=%s",
-            (float(RUNNING_TTL_SEC), float(RUNNING_TTL_SEC), job_id, str(claimed_by)),
-        )
-        return cur.rowcount == 1
+        with conn.transaction():
+            # Discover the user without taking a job lock, then preserve the
+            # global runtime-state -> job lock order. Holding the state row
+            # through the transition gives turn start a real ownership
+            # linearization point instead of a SELECT/UPDATE TOCTOU window.
+            row = conn.execute(
+                "SELECT user_id FROM agent_jobs WHERE id=%s",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            control = conn.execute(
+                "SELECT hosted_runtime_state, runtime_generation "
+                "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                (row[0],),
+            ).fetchone()
+            if control is None or str(control[0]) != "v2":
+                return False
+            cur = conn.execute(
+                "UPDATE agent_jobs SET status='running', started_at=now(), "
+                "lease_expires_at = now() + make_interval(secs => %s), "
+                "deadline_at = now() + make_interval(secs => %s) "
+                "WHERE id=%s AND status='claimed' "
+                "AND (lease_expires_at IS NULL OR lease_expires_at > now()) "
+                "AND claimed_by=%s "
+                "AND expected_runtime_generation=%s",
+                (
+                    float(RUNNING_TTL_SEC),
+                    float(RUNNING_TTL_SEC),
+                    job_id,
+                    str(claimed_by),
+                    int(control[1]),
+                ),
+            )
+            return cur.rowcount == 1
 
 
 def renew_job_lease(job_id, claimed_by: str, *, ttl_sec: float = RUNNING_TTL_SEC) -> bool:
     with _pool().connection() as conn:
-        cur = conn.execute(
-            "UPDATE agent_jobs SET "
-            "lease_expires_at=now() + make_interval(secs => %s), "
-            "deadline_at=now() + make_interval(secs => %s) "
-            "WHERE id=%s AND claimed_by=%s AND status IN ('claimed','running') "
-            "AND lease_expires_at > now()",
-            (float(ttl_sec), float(ttl_sec), job_id, str(claimed_by)),
-        )
-        return cur.rowcount == 1
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT user_id FROM agent_jobs WHERE id=%s",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            control = conn.execute(
+                "SELECT hosted_runtime_state, runtime_generation "
+                "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                (row[0],),
+            ).fetchone()
+            if control is None or str(control[0]) != "v2":
+                return False
+            cur = conn.execute(
+                "UPDATE agent_jobs SET "
+                "lease_expires_at=now() + make_interval(secs => %s), "
+                "deadline_at=now() + make_interval(secs => %s) "
+                "WHERE id=%s AND claimed_by=%s "
+                "AND status IN ('claimed','running') "
+                "AND lease_expires_at > now() "
+                "AND expected_runtime_generation=%s",
+                (
+                    float(ttl_sec),
+                    float(ttl_sec),
+                    job_id,
+                    str(claimed_by),
+                    int(control[1]),
+                ),
+            )
+            return cur.rowcount == 1
 
 
 def mark_completed(job_id, *, claimed_by: str) -> bool:
@@ -310,22 +477,52 @@ def mark_completed(job_id, *, claimed_by: str) -> bool:
 
 
 def mark_failed(job_id, error: str, *, claimed_by: str) -> bool:
+    """Fail an owned job and transactionally queue chat failure visibility.
+
+    The CTE is intentionally one statement: there is no process-crash window
+    in which ``agent_jobs`` is terminal but the status/error obligation is not
+    durable.  Background lanes remain silent and do not get an outbox row.
+    """
+    visible_error = _terminal_error_code(error)
     with _pool().connection() as conn:
         cur = conn.execute(
-            "UPDATE agent_jobs SET status='failed', finished_at=now(), "
-            "last_error=%s, attempt_count=attempt_count+1 "
-            "WHERE id=%s AND status IN ('claimed','running') "
-            "AND claimed_by=%s AND lease_expires_at > now()",
-            (str(error)[:500], job_id, str(claimed_by)),
+            "WITH terminal AS ("
+            "  UPDATE agent_jobs SET status='failed', finished_at=now(), "
+            "    last_error=%s, attempt_count=attempt_count+1 "
+            "  WHERE id=%s AND status IN ('claimed','running') "
+            "    AND claimed_by=%s AND lease_expires_at > now() "
+            "  RETURNING id,user_id,lane"
+            "), queued AS ("
+            "  INSERT INTO v2_terminal_failure_outbox "
+            "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
+            "  SELECT t.id,t.user_id,%s,r.id,r.updated_at FROM terminal t "
+            "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
+            "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
+            "  WHERE t.lane='chat' "
+            "  ON CONFLICT (job_id) DO NOTHING RETURNING job_id"
+            ") SELECT EXISTS (SELECT 1 FROM terminal)",
+            (str(error)[:500], job_id, str(claimed_by), visible_error),
         )
-        return cur.rowcount == 1
+        row = cur.fetchone()
+        return bool(row and row[0])
 
 
-def mark_expired(job_id) -> None:
+def mark_expired(job_id, error: str = "runtime_expired") -> None:
+    visible_error = _terminal_error_code(error)
     with _pool().connection() as conn:
         conn.execute(
-            "UPDATE agent_jobs SET status='expired', finished_at=now() WHERE id=%s",
-            (job_id,),
+            "WITH terminal AS ("
+            "  UPDATE agent_jobs SET status='expired',finished_at=now(),last_error=%s "
+            "  WHERE id=%s RETURNING id,user_id,lane"
+            "), queued AS ("
+            "  INSERT INTO v2_terminal_failure_outbox "
+            "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
+            "  SELECT t.id,t.user_id,%s,r.id,r.updated_at FROM terminal t "
+            "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
+            "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
+            "  WHERE t.lane='chat' ON CONFLICT (job_id) DO NOTHING"
+            ") SELECT 1",
+            (str(error)[:500], job_id, visible_error),
         )
 
 
@@ -340,22 +537,297 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "UPDATE agent_jobs SET status='expired', finished_at=now(), "
-                "attempt_count=attempt_count+1, "
-                "last_error=CASE WHEN status='pending' THEN 'queue_timeout' ELSE 'lease_timeout' END "
-                "WHERE (status='pending' "
-                "       AND COALESCE(queue_deadline_at, deadline_at, "
-                "           CASE WHEN lane='chat' THEN "
-                "             created_at + make_interval(secs => %s) END) "
-                "           <= COALESCE(to_timestamp(%s), now())) "
-                "   OR (status IN ('claimed','running') "
-                "       AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
-                "       AND COALESCE(lease_expires_at, deadline_at) "
-                "           <= COALESCE(to_timestamp(%s), now())) "
-                "RETURNING id,user_id,lane,last_error,claimed_by",
+                "WITH terminal AS ("
+                "  UPDATE agent_jobs SET status='expired', finished_at=now(), "
+                "  attempt_count=attempt_count+1, "
+                "  last_error=CASE WHEN status='pending' "
+                "                  THEN 'queue_timeout' ELSE 'lease_timeout' END "
+                "  WHERE (status='pending' "
+                "         AND COALESCE(queue_deadline_at, deadline_at, "
+                "             CASE WHEN lane='chat' THEN "
+                "               created_at + make_interval(secs => %s) END) "
+                "             <= COALESCE(to_timestamp(%s), now())) "
+                "     OR (status IN ('claimed','running') "
+                "         AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+                "         AND COALESCE(lease_expires_at, deadline_at) "
+                "             <= COALESCE(to_timestamp(%s), now())) "
+                "  RETURNING id,user_id,lane,last_error,claimed_by"
+                "), queued AS ("
+                "  INSERT INTO v2_terminal_failure_outbox "
+                "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
+                "  SELECT t.id,t.user_id,t.last_error,r.id,r.updated_at FROM terminal t "
+                "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
+                "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
+                "  WHERE t.lane='chat' "
+                "  ON CONFLICT (job_id) DO NOTHING RETURNING job_id"
+                ") SELECT id,user_id,lane,last_error,claimed_by FROM terminal",
                 (float(PENDING_CHAT_TTL_SEC), ts, ts),
             )
             return [dict(row) for row in cur.fetchall()]
+
+
+def ensure_terminal_failure_outbox(job_id, user_id: str, error: str) -> bool:
+    """Idempotently ensure a durable visibility marker exists for ``job_id``.
+
+    ``mark_failed`` and the timeout reaper create this in the terminal
+    transaction.  The explicit helper also covers post-completion delivery
+    uncertainty, which is user-visible even though the reply job itself stays
+    completed.
+    """
+    with _pool().connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO v2_terminal_failure_outbox "
+            "(job_id,user_id,error_code,target_route_id,target_route_updated_at) "
+            "SELECT j.id,j.user_id,%s,r.id,r.updated_at FROM agent_jobs j "
+            "LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
+            "  WHERE user_id=j.user_id AND is_active LIMIT 1) r ON TRUE "
+            "WHERE j.id=%s AND j.user_id=%s "
+            "ON CONFLICT (job_id) DO NOTHING",
+            (_terminal_error_code(error), job_id, str(user_id)),
+        )
+        return cur.rowcount == 1
+
+
+def _pending_terminal_failure_rows(
+    sink: str, *, job_id=None, limit: int = 100, now=None,
+) -> list[dict]:
+    """List one sink's due markers with unattempted/fair-rotation priority."""
+    if sink == "status":
+        delivered_column = "status_delivered_at"
+        next_column = "status_next_attempt_at"
+        last_column = "status_last_attempt_at"
+    elif sink == "runtime_error":
+        delivered_column = "runtime_error_delivered_at"
+        next_column = "runtime_error_next_attempt_at"
+        last_column = "runtime_error_last_attempt_at"
+    else:
+        raise ValueError(f"unknown terminal failure sink: {sink!r}")
+    bounded = max(1, min(int(limit), 1000))
+    where_job = " AND job_id=%s" if job_id is not None else ""
+    ts = float(now) if now is not None else None
+    args: tuple = (ts, job_id, bounded) if job_id is not None else (ts, bounded)
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT job_id,user_id,error_code,target_route_id,"
+                "target_route_updated_at,status_delivered_at,"
+                "runtime_error_delivered_at FROM v2_terminal_failure_outbox "
+                f"WHERE {delivered_column} IS NULL "
+                f"AND {next_column} <= COALESCE(to_timestamp(%s),now())"
+                f"{where_job} ORDER BY {last_column} NULLS FIRST,"
+                f"{next_column},created_at,job_id LIMIT %s",
+                args,
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def _defer_terminal_failure_sink(job_id, sink: str, *, now=None) -> None:
+    """Rotate a poison marker behind unattempted work with bounded backoff."""
+    if sink == "status":
+        attempt_column = "status_attempt_count"
+        last_column = "status_last_attempt_at"
+        next_column = "status_next_attempt_at"
+        delivered_column = "status_delivered_at"
+    elif sink == "runtime_error":
+        attempt_column = "runtime_error_attempt_count"
+        last_column = "runtime_error_last_attempt_at"
+        next_column = "runtime_error_next_attempt_at"
+        delivered_column = "runtime_error_delivered_at"
+    else:
+        raise ValueError(f"unknown terminal failure sink: {sink!r}")
+    ts = float(now) if now is not None else None
+    with _pool().connection() as conn:
+        conn.execute(
+            f"UPDATE v2_terminal_failure_outbox SET "
+            f"{attempt_column}={attempt_column}+1,"
+            f"{last_column}=COALESCE(to_timestamp(%s),now()),"
+            f"{next_column}=COALESCE(to_timestamp(%s),now()) + "
+            f"make_interval(secs => LEAST(300.0,power(2.0,"
+            f"LEAST({attempt_column},8)::double precision))),updated_at=now() "
+            f"WHERE job_id=%s AND {delivered_column} IS NULL",
+            (ts, ts, job_id),
+        )
+
+
+def _deliver_terminal_failure_status(
+    job_id, *, kind: str, label: str | None, detail: dict | None,
+) -> bool:
+    """Atomically insert the unique error event and acknowledge that sink.
+
+    A crash can commit both operations or neither.  ``ON CONFLICT`` adopts an
+    event emitted by pre-outbox code, and the partial unique index added in
+    0037 prevents duplicate error events across concurrent reconcilers.
+    """
+    delivered = False
+    user_id = ""
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT user_id,status_delivered_at "
+                    "FROM v2_terminal_failure_outbox WHERE job_id=%s FOR UPDATE",
+                    (job_id,),
+                )
+                row = cur.fetchone()
+                if row is None or row["status_delivered_at"] is not None:
+                    return False
+                user_id = str(row["user_id"])
+                cur.execute(
+                    "INSERT INTO agent_status_events "
+                    "(job_id,user_id,kind,label,detail_json,seq) "
+                    "VALUES (%s,%s,%s,%s,%s,0) "
+                    "ON CONFLICT (job_id) "
+                    "WHERE kind='error' AND job_id IS NOT NULL DO NOTHING",
+                    (job_id, user_id, str(kind), label, Jsonb(dict(detail or {}))),
+                )
+                cur.execute(
+                    "UPDATE v2_terminal_failure_outbox "
+                    "SET status_delivered_at=now(),updated_at=now() "
+                    "WHERE job_id=%s",
+                    (job_id,),
+                )
+                delivered = True
+    if delivered:
+        try:
+            wake_bus.notify("chat", user_id)
+        except Exception:  # noqa: BLE001 — poll timeout remains the fallback
+            pass
+    return delivered
+
+
+def _ack_terminal_runtime_error(job_id) -> bool:
+    with _pool().connection() as conn:
+        cur = conn.execute(
+            "UPDATE v2_terminal_failure_outbox "
+            "SET runtime_error_delivered_at=now(),updated_at=now() "
+            "WHERE job_id=%s AND runtime_error_delivered_at IS NULL",
+            (job_id,),
+        )
+        return cur.rowcount == 1
+
+
+def _deliver_terminal_failure_runtime_error(job_id) -> bool:
+    """Atomically set the captured active route and acknowledge the marker.
+
+    The route id/version captured with terminalization prevents a delayed
+    failure from stamping a newly selected (or reactivated) provider route.
+    ``finish_chat_job`` clears the active route and changes ``updated_at`` in
+    the same transaction as a later success, so an old marker either wins
+    first (and the success clears it) or loses its version predicate and is
+    acknowledged without restoring stale UI state.
+    """
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT user_id,error_code,target_route_id,"
+                    "target_route_updated_at,runtime_error_delivered_at "
+                    "FROM v2_terminal_failure_outbox WHERE job_id=%s FOR UPDATE",
+                    (job_id,),
+                )
+                row = cur.fetchone()
+                if row is None or row["runtime_error_delivered_at"] is not None:
+                    return False
+                route_id = row.get("target_route_id")
+                if route_id is not None:
+                    cur.execute(
+                        "UPDATE model_api_routes SET last_runtime_error=%s,"
+                        "last_runtime_error_class='',updated_at=now() "
+                        "WHERE id=%s AND user_id=%s AND is_active "
+                        "AND updated_at IS NOT DISTINCT FROM %s "
+                        "AND NOT EXISTS (SELECT 1 FROM agent_jobs newer "
+                        "  WHERE newer.user_id=%s AND newer.lane='chat' "
+                        "  AND newer.status='completed' AND newer.id>%s)",
+                        (
+                            str(row["error_code"]),
+                            route_id,
+                            str(row["user_id"]),
+                            row.get("target_route_updated_at"),
+                            str(row["user_id"]),
+                            job_id,
+                        ),
+                    )
+                cur.execute(
+                    "UPDATE v2_terminal_failure_outbox "
+                    "SET runtime_error_delivered_at=now(),updated_at=now() "
+                    "WHERE job_id=%s",
+                    (job_id,),
+                )
+                return True
+
+
+def reconcile_terminal_failure_outbox(
+    *, record_terminal_error=None, job_id=None, limit: int = 100, now=None,
+) -> dict[str, int]:
+    """Best-effort replay of both user-visible terminal failure sinks.
+
+    Each sink has an independent due queue, so poisoned route delivery cannot
+    hide newer status errors.  Production leaves ``record_terminal_error``
+    unset and uses the route-version-fenced atomic DB sink above.  The callback
+    remains only as a compatibility/test seam for dependency-isolated callers.
+    """
+    # Local import keeps jobs_store's storage primitives independent of the
+    # status vocabulary during module initialization.
+    from model_api_runtime.v2 import status_stream
+
+    status_rows = _pending_terminal_failure_rows(
+        "status", job_id=job_id, limit=limit, now=now)
+    runtime_rows = _pending_terminal_failure_rows(
+        "runtime_error", job_id=job_id, limit=limit, now=now)
+    status_count = 0
+    runtime_error_count = 0
+    event = status_stream.redact_status("error")
+    for row in status_rows:
+        current_job_id = row["job_id"]
+        try:
+            if _deliver_terminal_failure_status(
+                current_job_id,
+                kind=event["kind"],
+                label=event["label"],
+                detail=event["detail"],
+            ):
+                status_count += 1
+        except Exception as exc:  # noqa: BLE001 — marker remains pending
+            try:
+                _defer_terminal_failure_sink(current_job_id, "status", now=now)
+            except Exception:  # noqa: BLE001 — original DB outage may persist
+                pass
+            log.warning(
+                "terminal status reconciliation failed job=%s code=%s",
+                current_job_id,
+                type(exc).__name__.lower(),
+            )
+    for row in runtime_rows:
+        current_job_id = row["job_id"]
+        try:
+            if record_terminal_error is not None:
+                delivered = record_terminal_error(
+                    str(row["user_id"]), str(row["error_code"])
+                )
+                if delivered is False:
+                    raise RuntimeError("runtime-error sink rejected delivery")
+                if _ack_terminal_runtime_error(current_job_id):
+                    runtime_error_count += 1
+            elif _deliver_terminal_failure_runtime_error(current_job_id):
+                runtime_error_count += 1
+        except Exception as exc:  # noqa: BLE001 — marker remains pending
+            try:
+                _defer_terminal_failure_sink(
+                    current_job_id, "runtime_error", now=now)
+            except Exception:  # noqa: BLE001 — original DB outage may persist
+                pass
+            log.warning(
+                "terminal runtime-error reconciliation failed job=%s code=%s",
+                current_job_id,
+                type(exc).__name__.lower(),
+            )
+    examined = {row["job_id"] for row in status_rows}
+    examined.update(row["job_id"] for row in runtime_rows)
+    return {
+        "examined": len(examined),
+        "status_delivered": status_count,
+        "runtime_error_delivered": runtime_error_count,
+    }
 
 
 def reap_stuck_jobs(now=None) -> int:
@@ -373,6 +845,21 @@ def get_input_generation(job_id, *, claimed_by: str) -> int | None:
             (job_id, str(claimed_by)),
         ).fetchone()
     return int(row[0]) if row is not None else None
+
+
+def get_expected_runtime_generation(
+    job_id, *, claimed_by: str,
+) -> int | None:
+    """Return the claim-time runtime generation pinned on an owned job."""
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "SELECT expected_runtime_generation FROM agent_jobs "
+            "WHERE id=%s AND claimed_by=%s AND status IN ('claimed','running')",
+            (job_id, str(claimed_by)),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
 
 
 def finish_chat_job(
@@ -404,6 +891,15 @@ def finish_chat_job(
                 cur.execute(
                     "UPDATE agent_jobs SET status='completed',finished_at=now() WHERE id=%s",
                     (job_id,),
+                )
+                # The success clear and completed outcome are one transaction.
+                # A delayed older failure therefore cannot race in after this:
+                # its captured route.updated_at predicate no longer matches.
+                cur.execute(
+                    "UPDATE model_api_routes SET last_runtime_error='',"
+                    "last_runtime_error_class='',updated_at=now() "
+                    "WHERE user_id=%s AND is_active",
+                    (row["user_id"],),
                 )
                 successor_id = None
                 if int(row["input_generation"] or 0) > int(observed_generation):

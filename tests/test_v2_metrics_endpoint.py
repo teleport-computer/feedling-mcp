@@ -21,6 +21,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from admin import routes_asgi as admin_asgi  # noqa: E402
+from admin import admin_core  # noqa: E402
 from asgi import middleware  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
@@ -48,6 +49,15 @@ def env(monkeypatch):
     monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: 4.5)
     monkeypatch.setattr(jobs_store, "recent_mean_tokens_per_turn", lambda **kw: 123.0)
     monkeypatch.setattr(jobs_store, "genesis_worker_alive", lambda **kw: True)
+    monkeypatch.setattr(
+        admin_core.db,
+        "effect_outbox_health",
+        lambda: {
+            "pending": 2,
+            "needs_reconciliation": 1,
+            "oldest_unresolved_age_sec": 45.0,
+        },
+    )
     monkeypatch.setattr(
         jobs_store,
         "wake_success_stats",
@@ -103,6 +113,11 @@ def test_v2_metrics_returns_every_field(env):
             "expired": 0,
             "success_rate": 0.8,
             "by_lane": {"heartbeat": {"completed": 4}, "scheduled": {"failed": 1}},
+        },
+        "effects": {
+            "pending": 2,
+            "needs_reconciliation": 1,
+            "oldest_unresolved_age_sec": 45.0,
         },
         "genesis_alive": True,
     }

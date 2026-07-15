@@ -1,12 +1,9 @@
 """Chat history items, thinking metadata, poll/claim helpers."""
 
-import json
 import os
 import re
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
 
 import db
 from core import envelope as core_envelope
@@ -459,14 +456,24 @@ def _pending_chat_messages_for_poll(
     # at the source so V2 is the sole responder regardless of supervisor lag.
     # NOTE: this is NOT the fix for the no-reply/reconcile-loop bug — that was a
     # ts-cursor fragility, fixed by the seq reply cursor (see
-    # worker._load_reply_cursor_seq / serve_worker._read_messages). Read-only
+    # serve_worker._read_messages). Read-only
     # polls (claim=False — e.g. the client reading the V2 reply) are unaffected.
-    # Config mode is the single source of truth every other router already uses
-    # (D0 guard, worker.runtime_mode_enabled); the separate v2_runtime_state
-    # cutover machine is not consumed by any routing yet.
+    # The blob flag alone is not an ownership proof: cutover state/generation is
+    # authoritative, and a split tuple must fail closed rather than feed both
+    # responders. Only the exact resident_cli+resident tuple may claim.
     if claim:
         from hosted import config_store as _hosted_cfg  # lazy: chat must not own hosted startup
-        if _hosted_cfg.get_hosted_runtime_mode(store) == _hosted_cfg.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        try:
+            mode, state, _generation = _hosted_cfg.get_hosted_runtime_control_strict(store)
+        except Exception:
+            # A transient control-plane read failure is safer as an empty long
+            # poll than as a duplicate resident turn. The client will poll
+            # again; no claim/cursor has moved.
+            return []
+        if not (
+            mode == _hosted_cfg.HOSTED_RUNTIME_MODE_RESIDENT
+            and state == "resident"
+        ):
             return []
     with store.chat_lock:
         redelivery_floor = _redelivery_floor(store, now)

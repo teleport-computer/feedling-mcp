@@ -1,14 +1,11 @@
 # Hosted Runtime V2 — Parity Matrix
 
-> **STATUS: HISTORICAL / SUPERSEDED FOR GO-NO-GO.** This matrix records useful
-> capability archaeology, but its “shipped,” “bucket empty,” and resident-deletion
-> conclusions are no longer authoritative. Use
-> `docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md` for current acceptance.
-> In particular, capture/dream producers are default-off and lack a durable
-> lifecycle; the provider-native unified tool loop is not implemented; full
-> conversation coverage, transactional effects, hard wedged-turn recovery, and
-> safe resident cutover remain blockers. Do not delete resident or enroll users
-> based on this file alone.
+> **STATUS: HISTORICAL / SUPERSEDED FOR GO-NO-GO.** This matrix preserves the
+> 2026-07-10 capability archaeology; every live/broken conclusion below is a
+> point-in-time finding, not current runtime status. Use
+> `docs/superpowers/specs/runtime-v2-parity-matrix.md` for implementation parity
+> and `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md` for the current rollout gates. Do not
+> delete resident or enroll users based on this file alone.
 
 > **This is walkthrough §8 gate 0**, built late (2026-07-10). The gate said: *"Table of every resident capability → V2 action. Gate: every later acceptance test traces to a row."* We skipped it and started at gate 1, so capability gaps have been discovered by accident (three real bugs below were found while building this table, not by tests). Every future V2 acceptance test should cite a row here.
 >

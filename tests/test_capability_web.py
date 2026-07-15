@@ -127,9 +127,10 @@ class _FakeResponse:
 def test_fetch_happy_path_strips_html_and_caps_size(monkeypatch):
     html_body = "<html><head><style>.x{}</style></head><body><p>Hello  World</p></body></html>"
 
-    def fake_get(url, *, timeout, follow_redirects, headers):
+    def fake_get(url, *, resolved_ip, timeout, follow_redirects, headers):
         assert follow_redirects is False
         assert "User-Agent" in headers
+        assert resolved_ip == "93.184.216.34"
         return _FakeResponse(status_code=200, text=html_body)
 
     monkeypatch.setattr(cap_web, "_stream_get", fake_get)
@@ -138,6 +139,65 @@ def test_fetch_happy_path_strips_html_and_caps_size(monkeypatch):
     assert r.data["url"] == "https://example.com/page"
     assert "Hello World" in r.data["text"]
     assert "<" not in r.data["text"]
+
+
+def test_stream_get_pins_ip_preserves_host_and_disables_env_proxy(monkeypatch):
+    captured = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def stream(self, method, url, **kwargs):
+            captured.update(method=method, url=url, request_kwargs=kwargs)
+            return _FakeResponse(status_code=200, text="ok")
+
+    monkeypatch.setattr(cap_web.httpx, "Client", _FakeClient)
+    with cap_web._stream_get(
+        "https://example.com:8443/path?q=1",
+        resolved_ip="93.184.216.34",
+        timeout=8.0,
+        follow_redirects=False,
+        headers={"User-Agent": "test"},
+    ) as response:
+        assert response.status_code == 200
+
+    assert captured["client_kwargs"] == {"trust_env": False}
+    assert captured["url"] == "https://93.184.216.34:8443/path?q=1"
+    assert captured["request_kwargs"]["headers"]["Host"] == "example.com:8443"
+    assert captured["request_kwargs"]["extensions"] == {"sni_hostname": "example.com"}
+
+
+def test_fetch_uses_the_same_dns_answer_it_validated(monkeypatch):
+    resolutions = {"n": 0}
+
+    def resolve(_host):
+        resolutions["n"] += 1
+        # A rebinding resolver would return private on a second lookup. The
+        # fetch path must resolve exactly once and pass the validated public IP
+        # into the direct connection helper.
+        return ["93.184.216.34"] if resolutions["n"] == 1 else ["127.0.0.1"]
+
+    connected = []
+
+    def fake_get(url, *, resolved_ip, **_kwargs):
+        connected.append((url, resolved_ip))
+        return _FakeResponse(status_code=200, text="safe")
+
+    monkeypatch.setattr(cap_web, "_resolve_ips", resolve)
+    monkeypatch.setattr(cap_web, "_stream_get", fake_get)
+
+    result = cap_web.fetch("STORE", params={"url": "https://example.com/page"})
+
+    assert result.ok is True
+    assert resolutions["n"] == 1
+    assert connected == [("https://example.com/page", "93.184.216.34")]
 
 
 def test_fetch_missing_url_is_invalid():

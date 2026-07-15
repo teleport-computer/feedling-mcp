@@ -44,6 +44,14 @@ _worker_lock = threading.Lock()
 _worker_started = False
 _dropped_lock = threading.Lock()
 _dropped_by_uid: dict[str, int] = {}
+# Count events from enqueue until either the background worker or a synchronous
+# debug read has finished persisting them. Queue emptiness is insufficient: the
+# worker removes an item before its 250ms batching window, so a concurrent GET
+# could otherwise observe neither the queued event nor the not-yet-committed
+# blob write. Product writes never wait; only the explicit debug read uses this
+# condition as a bounded read-your-writes barrier.
+_pending_condition = threading.Condition()
+_pending_by_uid: dict[str, int] = {}
 
 
 def _hard_disabled() -> bool:
@@ -189,13 +197,15 @@ def _append_events(uid: str, new_events: list[dict[str, Any]]) -> None:
                 "job_id": "",
                 "detail": {"dropped": dropped},
             }] + new_events
-        buf = db.get_blob(uid, DEBUG_TRACE_BLOB)
-        events = buf.get("events") if isinstance(buf, dict) and isinstance(buf.get("events"), list) else []
-        events.extend(new_events)
         cutoff = now - _TTL_SEC
         cap = _MAX_EVENTS_VERBOSE if verbose else _MAX_EVENTS
-        events = [e for e in events if float(e.get("ts") or 0) >= cutoff][-cap:]
-        db.set_blob(uid, DEBUG_TRACE_BLOB, {"v": 1, "events": events})
+        db.append_blob_events_strict(
+            uid,
+            DEBUG_TRACE_BLOB,
+            new_events,
+            cutoff_ts=cutoff,
+            max_events=cap,
+        )
     except Exception:
         _record_drop(uid, len(new_events))
 
@@ -210,6 +220,7 @@ def _flush_batch(batch: list[tuple[str, dict[str, Any]]]) -> None:
 
 def _worker_loop() -> None:
     while True:
+        batch: list[tuple[str, dict[str, Any]]] = []
         try:
             item = _event_queue.get()
             batch = [item]
@@ -225,6 +236,16 @@ def _worker_loop() -> None:
             _flush_batch(batch)
         except Exception:
             pass
+        finally:
+            if batch:
+                with _pending_condition:
+                    for uid, _event in batch:
+                        remaining = _pending_by_uid.get(uid, 0) - 1
+                        if remaining > 0:
+                            _pending_by_uid[uid] = remaining
+                        else:
+                            _pending_by_uid.pop(uid, None)
+                    _pending_condition.notify_all()
 
 
 def _ensure_worker_started() -> None:
@@ -240,39 +261,38 @@ def _ensure_worker_started() -> None:
 
 def _enqueue(uid: str, event: dict[str, Any]) -> None:
     _ensure_worker_started()
+    with _pending_condition:
+        _pending_by_uid[uid] = _pending_by_uid.get(uid, 0) + 1
     try:
         _event_queue.put_nowait((uid, event))
     except queue.Full:
+        with _pending_condition:
+            remaining = _pending_by_uid.get(uid, 0) - 1
+            if remaining > 0:
+                _pending_by_uid[uid] = remaining
+            else:
+                _pending_by_uid.pop(uid, None)
+            _pending_condition.notify_all()
         _record_drop(uid)
 
 
 def _flush_pending_for_user(uid: str, *, timeout: float = 0.5) -> None:
-    """Best-effort debug-read helper: drain queued events for one user.
+    """Best-effort read barrier that waits for the sole local queue writer.
 
-    This may touch DB, so only callers on debug/admin read paths should use it.
-    The product write path (`trace_event`) never waits for this.
+    The request path must not drain or persist queue items itself: becoming a
+    second writer races a batch already owned by the background thread. The DB
+    append is atomic across processes; this condition only supplies bounded
+    read-your-writes behavior for events queued in this process.
     """
     if not uid:
         return
     deadline = time.monotonic() + max(0.0, timeout)
-    mine: list[dict[str, Any]] = []
-    others: list[tuple[str, dict[str, Any]]] = []
-    while time.monotonic() < deadline:
-        try:
-            item_uid, event = _event_queue.get_nowait()
-        except queue.Empty:
-            break
-        if item_uid == uid:
-            mine.append(event)
-        else:
-            others.append((item_uid, event))
-    for item in others:
-        try:
-            _event_queue.put_nowait(item)
-        except queue.Full:
-            _record_drop(item[0])
-    if mine:
-        _append_events(uid, mine)
+    with _pending_condition:
+        while _pending_by_uid.get(uid, 0) > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _pending_condition.wait(timeout=remaining)
 
 
 def trace_event(
@@ -343,7 +363,9 @@ def read_trace(store, *, limit: int = 200, subsystem: str = "") -> list[dict]:
 def clear_trace(store) -> None:
     uid = getattr(store, "user_id", "") or ""
     if uid:
-        db.set_blob(uid, DEBUG_TRACE_BLOB, {"v": 1, "events": []})
+        # Share the append path's row ordering + mirror revision so a delayed
+        # pre-clear TEE batch cannot resurrect events after the clear lands.
+        db.patch_blob_strict(uid, DEBUG_TRACE_BLOB, {"v": 1, "events": []})
 
 
 def _safe_detail(detail: dict[str, Any] | None) -> dict[str, Any]:
