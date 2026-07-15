@@ -92,6 +92,8 @@ def _state_doc(raw: Any) -> dict[str, Any]:
     doc = dict(raw) if isinstance(raw, dict) else {}
     return {
         "last_dream_completed_at": _safe_float(doc.get("last_dream_completed_at"), 0.0),
+        "last_dream_organized_count": max(0, _safe_int(doc.get("last_dream_organized_count"), 0)),
+        "last_dream_merged_count": max(0, _safe_int(doc.get("last_dream_merged_count"), 0)),
         "last_dreamed_until": str(doc.get("last_dreamed_until") or "")[:240],
         "last_dreamed_card_count": max(0, _safe_int(doc.get("last_dreamed_card_count"), 0)),
         "last_dreamed_turn_count": max(0, _safe_int(doc.get("last_dreamed_turn_count"), 0)),
@@ -311,7 +313,22 @@ def record_dream_job_status(store, job: Mapping[str, Any], *, status: str, now: 
     if status_text == "completed":
         stats = job.get("dream_stats") if isinstance(job.get("dream_stats"), Mapping) else {}
         until = job.get("dream_until") if isinstance(job.get("dream_until"), Mapping) else {}
+        dream_result = job.get("dream_result") if isinstance(job.get("dream_result"), Mapping) else {}
+        organized_count = _safe_int(
+            job.get("organized_count")
+            or dream_result.get("organized_count")
+            or job.get("cards_superseded"),
+            0,
+        )
+        merged_count = _safe_int(
+            job.get("merged_count")
+            or dream_result.get("merged_count")
+            or job.get("cards_merged"),
+            0,
+        )
         state["last_dream_completed_at"] = now_ts
+        state["last_dream_organized_count"] = max(0, organized_count)
+        state["last_dream_merged_count"] = max(0, merged_count)
         state["last_dreamed_card_count"] = max(0, _safe_int(stats.get("card_count"), 0))
         state["last_dreamed_turn_count"] = max(0, _safe_int(stats.get("turn_count"), 0))
         state["last_dream_signature"] = str(stats.get("signature") or until.get("signature") or "")[:240]

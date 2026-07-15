@@ -73,3 +73,55 @@ def test_dispatch_store_channel_evicts(monkeypatch):
 
 def test_dispatch_ignores_malformed_payload():
     wake_bus._dispatch("not json")  # must not raise
+
+
+def test_reconnect_catch_up_refreshes_stores_and_handlers(monkeypatch):
+    # 重连补课：LISTEN 断线窗口内的 NOTIFY 永久丢失（PG 不补发），重新建立 LISTEN
+    # 后必须把本 worker 已缓存的 store 全部就地刷新（并唤醒 waiter），同时重放
+    # 注册过的 extra handlers（如 users → 注册表 reload），把漏广播的损失从
+    # 「最长 15min TTL」压到「重连即恢复」。
+    from core import store as core_store
+
+    evicted = []
+    monkeypatch.setattr(core_store, "_evict_store",
+                        lambda uid: evicted.append(uid) or True)
+    monkeypatch.setattr(core_store, "_stores",
+                        {"u1": object(), "u2": object()})
+    fired = []
+    monkeypatch.setattr(wake_bus, "_extra_handlers",
+                        {"users": [lambda uid: fired.append(("users", uid))]})
+
+    wake_bus._reconnect_catch_up()
+    assert sorted(evicted) == ["u1", "u2"]
+    assert fired == [("users", "")]
+
+
+def test_reconnect_catch_up_empty_cache_is_noop(monkeypatch):
+    # 首次连接（worker 刚启动）时缓存为空 → 天然 no-op，但 handlers 照样重放
+    # （注册表可能在监听建立前就被别的 worker 改过）。
+    from core import store as core_store
+
+    monkeypatch.setattr(core_store, "_stores", {})
+    fired = []
+    monkeypatch.setattr(wake_bus, "_extra_handlers",
+                        {"users": [lambda uid: fired.append(uid)]})
+    wake_bus._reconnect_catch_up()   # must not raise
+    assert fired == [""]
+
+
+def test_reconnect_catch_up_survives_evict_errors(monkeypatch):
+    # 单个 store 刷新失败不得中断补课（其余 store 照常刷）。
+    from core import store as core_store
+
+    evicted = []
+
+    def evict(uid):
+        if uid == "bad":
+            raise RuntimeError("boom")
+        evicted.append(uid)
+    monkeypatch.setattr(core_store, "_evict_store", evict)
+    monkeypatch.setattr(core_store, "_stores",
+                        {"bad": object(), "good": object()})
+    monkeypatch.setattr(wake_bus, "_extra_handlers", {})
+    wake_bus._reconnect_catch_up()
+    assert evicted == ["good"]

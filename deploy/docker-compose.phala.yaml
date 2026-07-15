@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:f81563a
+    image: ghcr.io/teleport-computer/feedling:d21b0c0
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -109,7 +109,10 @@ services:
       # the GIL-bound envelope-decrypt crypto across processes. No :9998 bind in
       # the enclave (that's the backend's), so N>1 is safe here. Encrypted env,
       # not baked into compose_hash — flip via var without on-chain re-auth.
-      FEEDLING_ENCLAVE_WORKERS: "${FEEDLING_ENCLAVE_WORKERS:-2}"
+      # 2026-07-15 2→4：enclave 是全部 iOS 读路径的解密代理（GIL 密集 crypto），
+      # 实测 2 worker 仅 223MB/7% CPU——4 worker 让解密并行度翻倍、单 worker 忙时
+      # 尾延迟更稳，资源代价可忽略（每 worker ~100-200MB，无 PG 连接、无端口单例）。
+      FEEDLING_ENCLAVE_WORKERS: "${FEEDLING_ENCLAVE_WORKERS:-4}"
       # model_api reads from the memory read-side (mirrors the test enclave).
       MEMORY_READSIDE_FOR_MODEL_API: "true"
       # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
@@ -146,7 +149,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:f81563a
+    image: ghcr.io/teleport-computer/feedling:d21b0c0
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -172,6 +175,9 @@ services:
     environment:
       FEEDLING_API_KEY: ""
       FEEDLING_ADMIN_TOKEN: "${FEEDLING_ADMIN_TOKEN:-}"
+      # Password login for the admin data-track page. Inject only through the
+      # encrypted deploy env channel; the legacy admin-token routes stay valid.
+      FEEDLING_ADMIN_PASSWORD: "${FEEDLING_ADMIN_PASSWORD:-}"
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_WS_PORT: "9998"
       # ASGI backend: start the per-worker background services (the :9998 WS
@@ -284,7 +290,21 @@ services:
       # safe. Encrypted env, not baked into compose_hash — flip via var without
       # on-chain re-auth. Default 4 here since the deployed image has the leader
       # patch; set to 1 if ever deploying a pre-leader-election image.
-      FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-4}"
+      # 2026-07-15 4→6：实测容量支持（prod RDS max_connections=402、当前仅用 ~82，
+      # +2 worker ≈ +36 连接仍宽裕；CVM 8 核、available ~12GB，worker 峰值 RSS 被
+      # max_requests 回收 + MALLOC_ARENA_MAX 封在 ~1GB，6×1GB 预算内）。收益：长轮询
+      # 并发摊薄 + 单 worker 回收时容量只降 1/6。注意 wake-bus fan-out 随 worker 数
+      # 线性放大（每条 chat NOTIFY 多 2 个 worker 的 store 刷新），当前消息速率下可忽略。
+      FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-6}"
+      # TEE 影子库 per-worker 连接池预算（tee_shadow/mirror.py，代码默认 max=32
+      # 是按 4 worker 算的：4×32=128 < 200）。worker 提到 6 后必须显式下调：
+      # 6×24=144 + 非 app 角色 ~10 + superuser 保留 3 ≈ 157 < TEE PG
+      # max_connections=200（2026-07-15 实测），留 ~40 余量。min 同步 8→4：
+      # 6 worker × 4 = 24 条热连接（直连 TLS 走 Phala 网关，闲置越多被网关
+      # 静默掐断的暴露面越大，见 mirror._pool_max_lifetime 注释）。
+      # 有 tests/test_gunicorn_conf.py 的预算守卫测试联动。
+      FEEDLING_TEE_POOL_MAX: "24"
+      FEEDLING_TEE_POOL_MIN: "4"
       # glibc per-thread malloc arena 数量封顶。不设时 64 位默认 8×核数（8 核=64
       # 个），与 anyio 线程池 40 线程相乘的结果是 2026-07-14 prod 实测形态：每个
       # worker ~60 个 64MiB arena 近乎全驻留、占 RSS 80%+、12h 涨到 2-3GB/worker

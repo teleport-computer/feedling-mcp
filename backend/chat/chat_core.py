@@ -192,6 +192,65 @@ def _hide_verify_ping_from_feed(m: dict, now: float) -> bool:
     return (now - ts) > VERIFY_PING_VISIBLE_TTL_SEC
 
 
+def _visible_msgs_and_raw_max(store: UserStore, now: float) -> tuple[list, float]:
+    """Snapshot the visible transcript + the RAW newest ts under chat_lock.
+
+    Visible list scrubs verify-loop liveness rows:
+      - the REPLY (agent/openclaw) is always hidden — a reply that outlives
+        verify_loop's GC window would otherwise leak as a stray "__verify_ack__".
+      - the PING (user-role) is KEPT WHILE FRESH: the enclave decrypt proxy
+        reuses this very route (enclave/routes/chat.py -> backend_client
+        .backend_get("/v1/chat/history")) to deliver the ping to the resident
+        consumer, which detects it by source. It is hidden ONLY once stale
+        (see _hide_verify_ping_from_feed), so a ping whose verify_loop GC was
+        skipped (mid-run SIGTERM) self-heals out of the feed instead of
+        lingering as a visible "__VERIFY_PING__:..." bubble.
+
+    ``raw_max_ts`` is computed over the UNFILTERED ring — it feeds the staleness
+    probe (_self_heal_if_stale), which must compare against everything the store
+    actually holds: comparing against the visible list would see a hidden verify
+    row as "missing" and re-reload on every empty poll."""
+    with store.chat_lock:
+        raw_max_ts = max(
+            (float(m.get("ts", 0) or 0) for m in store.chat_messages), default=0.0
+        )
+        visible = [
+            m for m in store.chat_messages
+            if not _hide_verify_ping_from_feed(m, now)
+        ]
+    return visible, raw_max_ts
+
+
+def _self_heal_if_stale(store: UserStore, raw_max_ts: float) -> bool:
+    """Read-time staleness probe + in-place heal (2026-07-15 延迟诊断报告 P1).
+
+    Multi-worker reads serve from each worker's in-memory store; cross-worker
+    freshness rides on LISTEN/NOTIFY. A missed broadcast (listener down for a
+    blip, worker recycled before its LISTEN was up) previously meant this worker
+    served stale chat for up to STORE_CACHE_TTL_SECONDS (15 min) — push arrives,
+    chat page doesn't. On an EMPTY since-poll, probe the DB's newest-appended
+    row ts (single-row (user_id, seq) index lookup — the empty since-poll is hot,
+    ~9/s on prod, so the probe must stay this cheap) and reload in place only
+    when the DB is genuinely ahead of the raw in-memory ring. Fail-open: a probe
+    error returns the (possibly stale) answer rather than 500 — staleness
+    degrades, availability doesn't."""
+    try:
+        newest_db_ts = db.chat_newest_ts(store.user_id)
+    except Exception as e:  # noqa: BLE001 — probe is best-effort by contract
+        print(f"[chat/history:{store.user_id}] stale probe failed (fail-open): {e}")
+        return False
+    if newest_db_ts is None or newest_db_ts <= raw_max_ts:
+        return False
+    from core import store as core_store  # lazy: chat_core imports UserStore only
+
+    core_store._evict_store(store.user_id)
+    print(
+        f"[chat/history:{store.user_id}] stale store self-healed "
+        f"(db newest ts={newest_db_ts} > mem raw max={raw_max_ts})"
+    )
+    return True
+
+
 def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tuple[dict, int]:
     try:
         limit = int(query.get("limit", 200))
@@ -217,22 +276,8 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
     ).lower() not in {"0", "false", "no", "off"}
 
     now = time.time()
-    with store.chat_lock:
-        # Scrub verify-loop liveness rows from the visible transcript:
-        #   - the REPLY (agent/openclaw) is always hidden — a reply that outlives
-        #     verify_loop's GC window would otherwise leak as a stray "__verify_ack__".
-        #   - the PING (user-role) is KEPT WHILE FRESH: the enclave decrypt proxy
-        #     reuses this very route (enclave/routes/chat.py -> backend_client
-        #     .backend_get("/v1/chat/history")) to deliver the ping to the resident
-        #     consumer, which detects it by source. It is hidden ONLY once stale
-        #     (see _hide_verify_ping_from_feed), so a ping whose verify_loop GC was
-        #     skipped (mid-run SIGTERM) self-heals out of the feed instead of
-        #     lingering as a visible "__VERIFY_PING__:..." bubble.
-        all_msgs = [
-            m for m in store.chat_messages
-            if not _hide_verify_ping_from_feed(m, now)
-        ]
-        total = len(all_msgs)
+    all_msgs, raw_max_ts = _visible_msgs_and_raw_max(store, now)
+    total = len(all_msgs)
 
     if before > 0:
         filtered = [m for m in all_msgs if float(m.get("ts", 0)) < before]
@@ -242,6 +287,13 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
         page_mode = "before"
     elif since > 0:
         filtered = [m for m in all_msgs if float(m.get("ts", 0)) > since]
+        if not filtered and _self_heal_if_stale(store, raw_max_ts):
+            # Cross-worker staleness healed in place — re-read and re-answer so
+            # THIS response already carries the recovered rows (the whole point:
+            # the user must not wait for the next poll, let alone the 15-min TTL).
+            all_msgs, raw_max_ts = _visible_msgs_and_raw_max(store, now)
+            total = len(all_msgs)
+            filtered = [m for m in all_msgs if float(m.get("ts", 0)) > since]
         msgs = filtered[:limit]
         has_more_older = bool(all_msgs and msgs and float(all_msgs[0].get("ts", 0)) < float(msgs[0].get("ts", 0)))
         has_more_newer = len(filtered) > len(msgs)

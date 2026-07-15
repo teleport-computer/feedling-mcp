@@ -29,7 +29,13 @@ jobs:
       - name: Derive tags
         id: tags
         run: |
-          COMMIT_SHORT=$(git rev-parse --short HEAD)
+          # Fixed-length 7-char slice, NOT `git rev-parse --short`: the latter's
+          # length is the shortest unambiguous prefix in THIS clone's object DB,
+          # so a shallow publish checkout yields 7 chars while the deploy job's
+          # full-history checkout (fetch-depth: 0) can extend the same commit to
+          # 8, and the image tag never matches (CI run #906). Must stay identical
+          # to the ci.yml deploy waiters, which use the same ${GITHUB_SHA:0:7}.
+          COMMIT_SHORT="${GITHUB_SHA:0:7}"
           IMAGE=ghcr.io/${{ github.repository_owner }}/feedling
           # lowercase owner to satisfy ghcr's naming rules
           IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')

@@ -156,3 +156,45 @@ def test_reconcile_skips_orphan_child_rows_without_aborting(backend_env):
     assert report["skipped"] >= 1
     assert _tee("SELECT count(*) FROM user_blobs WHERE user_id='usr_ok'")[0][0] == 1
     assert _tee("SELECT count(*) FROM user_blobs WHERE user_id='usr_orphan'")[0][0] == 0
+
+
+# --- resume cursor (alembic 0018) ------------------------------------------ #
+
+def test_json_safe_cursor_guards_non_json_pk():
+    """text/number/bool pk → JSON list; a DATE component (perception_daily) → None
+    so that table skips cursor persistence rather than crash on json.dumps."""
+    import datetime
+    assert reconciler._json_safe_cursor(("usr", "chat", 5)) == ["usr", "chat", 5]
+    assert reconciler._json_safe_cursor((True,)) == [True]
+    assert reconciler._json_safe_cursor(("usr", datetime.date(2026, 7, 15), "s")) is None
+
+
+def test_reconcile_cursor_db_roundtrip(backend_env):
+    db.clear_reconcile_cursor("users")
+    assert db.load_reconcile_cursor("users") is None
+    db.save_reconcile_cursor("users", ["usr_x", "kind", 7])
+    assert db.load_reconcile_cursor("users") == ["usr_x", "kind", 7]
+    db.save_reconcile_cursor("users", ["usr_y"])          # upsert overwrites
+    assert db.load_reconcile_cursor("users") == ["usr_y"]
+    db.clear_reconcile_cursor("users")
+    assert db.load_reconcile_cursor("users") is None
+
+
+def test_reconcile_resumes_from_saved_cursor_and_clears(backend_env):
+    """A persisted cursor makes reconcile skip everything at/below it (already
+    copied in a prior window) and only backfill rows past it — then it clears the
+    cursor on completion. This is what lets a large table finish across the
+    max_requests-recycled worker lifetimes it can't fit in one of."""
+    for u in ("usr_curtest_a", "usr_curtest_b", "usr_curtest_c"):
+        db.upsert_user({"user_id": u, "api_key_hash": "h"})  # RDS only (dual-write off)
+    # Pretend a prior window already copied through usr_curtest_b.
+    db.save_reconcile_cursor("users", ["usr_curtest_b"])
+
+    reconciler.reconcile_table("users", prune=False)  # prune off: don't touch other users
+
+    # Only the row strictly after the cursor is copied; at/below are skipped.
+    assert _tee("SELECT count(*) FROM users WHERE user_id='usr_curtest_c'")[0][0] == 1
+    assert _tee("SELECT count(*) FROM users WHERE user_id='usr_curtest_a'")[0][0] == 0
+    assert _tee("SELECT count(*) FROM users WHERE user_id='usr_curtest_b'")[0][0] == 0
+    # Pass finished → cursor cleared so the next periodic reconcile starts fresh.
+    assert db.load_reconcile_cursor("users") is None
