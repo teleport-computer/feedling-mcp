@@ -138,8 +138,12 @@ def test_e2e_uses_pinned_jit_app_and_oidc_actions_with_hosted_cleanup():
     assert "restricted_to_workflows" in provision
     assert "selected_workflows != [expected_workflow]" in provision
     assert '"api-key-e2e.yml@refs/heads/main"' in provision
-    assert 'runner_group_id = runner.get("runner_group_id")' in provision
-    assert 'runner_group_id != int(os.environ["RUNNER_GROUP_ID"])' in provision
+    assert 'runner.get("runner_group_id")' not in provision
+    assert (
+        "/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100"
+        in provision
+    )
+    assert "GitHub JIT runner was not bound to the dedicated runner group" in provision
     assert (
         "if: ${{ always() && needs.validate-dispatch.result == 'success' && "
         "needs.provision-aws-runner.result != 'skipped' }}" in cleanup

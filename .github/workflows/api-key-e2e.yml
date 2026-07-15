@@ -193,9 +193,10 @@ jobs:
           umask 077
           request_path="${RUNNER_TEMP}/feedling-jit-request-${RUN_KEY}.json"
           group_response_path="${RUNNER_TEMP}/feedling-runner-group-${RUN_KEY}.json"
+          group_runners_path="${RUNNER_TEMP}/feedling-runner-group-members-${RUN_KEY}.json"
           response_path="${RUNNER_TEMP}/feedling-jit-response-${RUN_KEY}.json"
           jit_config_file="${RUNNER_TEMP}/feedling-jit-config-${RUN_KEY}"
-          trap 'rm -f -- "$request_path" "$group_response_path" "$response_path"' EXIT
+          trap 'rm -f -- "$request_path" "$group_response_path" "$group_runners_path" "$response_path" "$jit_config_file"' EXIT
 
           python3 - "$request_path" <<'PY'
           import json
@@ -304,13 +305,11 @@ jobs:
           if not isinstance(runner, dict):
               raise SystemExit("GitHub returned an invalid JIT runner")
           runner_id = runner.get("id")
-          runner_group_id = runner.get("runner_group_id")
           if (
               not isinstance(runner_id, int)
               or isinstance(runner_id, bool)
               or runner_id <= 0
               or runner.get("name") != os.environ["RUNNER_NAME"]
-              or runner_group_id != int(os.environ["RUNNER_GROUP_ID"])
           ):
               raise SystemExit("GitHub returned an invalid JIT runner")
           labels = runner.get("labels")
@@ -328,10 +327,69 @@ jobs:
             echo "::error::GitHub returned an invalid JIT runner id"
             exit 1
           fi
+
+          runner_bound=false
+          for attempt in $(seq 1 5); do
+            if curl --fail --silent --show-error \
+              --proto '=https' \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_APP_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --output "$group_runners_path" \
+              "https://api.github.com/orgs/${GITHUB_REPOSITORY_OWNER}/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100" && \
+              python3 - "$group_runners_path" "$runner_id" <<'PY'
+          import json
+          import os
+          import sys
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as handle:
+                  payload = json.load(handle)
+          except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+              raise SystemExit("GitHub returned an invalid runner-group membership response") from exc
+          if not isinstance(payload, dict):
+              raise SystemExit("GitHub returned an invalid runner-group membership response")
+          runners = payload.get("runners")
+          total_count = payload.get("total_count")
+          if (
+              not isinstance(total_count, int)
+              or isinstance(total_count, bool)
+              or total_count < 0
+              or total_count > 100
+              or not isinstance(runners, list)
+              or any(not isinstance(item, dict) for item in runners)
+              or len(runners) > total_count
+          ):
+              raise SystemExit("GitHub returned an invalid runner-group membership response")
+          expected_id = int(sys.argv[2])
+          matches = [item for item in runners if item.get("id") == expected_id]
+          if len(matches) != 1:
+              raise SystemExit("JIT runner is not present in the dedicated runner group")
+          runner = matches[0]
+          if runner.get("name") != os.environ["RUNNER_NAME"]:
+              raise SystemExit("JIT runner group membership has the wrong name")
+          labels = runner.get("labels")
+          if not isinstance(labels, list) or any(not isinstance(item, dict) for item in labels):
+              raise SystemExit("JIT runner group membership has invalid labels")
+          if os.environ["RUNNER_LABEL"] not in {item.get("name") for item in labels}:
+              raise SystemExit("JIT runner group membership is missing its unique label")
+          PY
+            then
+              runner_bound=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$runner_bound" != true ]; then
+            echo "::error::GitHub JIT runner was not bound to the dedicated runner group"
+            exit 1
+          fi
+
           chmod 600 "$jit_config_file"
-          rm -f -- "$request_path" "$group_response_path" "$response_path"
           echo "jit_config_file=$jit_config_file" >> "$GITHUB_OUTPUT"
           echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"
+          rm -f -- "$request_path" "$group_response_path" "$group_runners_path" "$response_path"
+          trap - EXIT
 
       - name: Configure short-lived AWS credentials for provisioning
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.0

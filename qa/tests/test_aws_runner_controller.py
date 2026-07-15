@@ -18,6 +18,7 @@ from qa.aws.common import (
     AwsCli,
     AwsRunnerError,
     load_private_ascii_file,
+    validate_region,
 )
 from qa.aws.launch import (
     REQUIRED_CODEX_MEMBERS,
@@ -43,6 +44,13 @@ RUN_ATTEMPT = 2
 TARGET_SHA = "a" * 40
 CONTROLLER_SHA = "b" * 40
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+
+
+def test_region_validator_accepts_commercial_aws_and_rejects_govcloud():
+    assert validate_region("us-east-1") == "us-east-1"
+    assert validate_region("eu-central-1") == "eu-central-1"
+    with pytest.raises(AwsRunnerError, match="invalid AWS region"):
+        validate_region("us-gov-west-1")
 
 
 def _private_file(path: Path, value: str = "sensitive-jit-token") -> Path:

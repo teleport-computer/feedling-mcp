@@ -33,7 +33,8 @@ credentials.
 
 This first version supports the commercial `aws` partition; it intentionally
 rejects GovCloud because the pinned Canonical AMI ownership contract differs.
-Choose one AWS region, an existing VPC, and a public IPv4 subnet. The subnet
+Choose one commercial AWS region (GovCloud is deliberately unsupported), an
+existing VPC, and a public IPv4 subnet. The subnet
 must have `MapPublicIpOnLaunch=true` and one Internet Gateway default route.
 The controller rejects a private/NAT subnet in this first version so network
 behavior is explicit and reproducible. The generated security group has no
@@ -84,7 +85,8 @@ Create a GitHub App owned by the organization and install it only on
 which is needed to generate JIT runner configuration, inspect the exact runner,
 and delete a stale registration. Grant organization `Self-hosted runners: Read`
 so the controller can fail closed if the configured runner-group ID, name, or
-workflow restriction drifts. Do not grant code or secret permissions.
+workflow restriction drifts, and verify that the generated runner is listed in
+that exact group. Do not grant code or secret permissions.
 
 Generate one App private key. Store the PEM only as the `feedling-e2e-test`
 Environment secret `QA_RUNNER_GITHUB_APP_PRIVATE_KEY`; store the numeric App ID

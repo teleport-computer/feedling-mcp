@@ -84,8 +84,15 @@ def test_github_hosted_controller_provisions_private_jit_aws_runner():
     assert 'runner_identity="feedling-e2e-${run_key}"' in provision
     assert '"labels": ["self-hosted", "linux", "x64", "feedling-e2e", label]' in provision
     assert 'echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"' in provision
-    assert 'runner_group_id = runner.get("runner_group_id")' in provision
-    assert 'runner_group_id != int(os.environ["RUNNER_GROUP_ID"])' in provision
+    assert 'runner.get("runner_group_id")' not in provision
+    assert (
+        "/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100"
+        in provision
+    )
+    assert 'matches = [item for item in runners if item.get("id") == expected_id]' in provision
+    assert "GitHub JIT runner was not bound to the dedicated runner group" in provision
+    assert 'runner.get("name") != os.environ["RUNNER_NAME"]' in provision
+    assert "JIT runner group membership is missing its unique label" in provision
     assert "python3 qa/aws/launch.py" in provision
     assert '--jit-config-file "$JIT_CONFIG_FILE"' in provision
     assert 'rm -f -- "$JIT_CONFIG_FILE"' in provision

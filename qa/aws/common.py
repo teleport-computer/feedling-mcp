@@ -23,7 +23,7 @@ MIN_TTL_SECONDS = 900
 MAX_TTL_SECONDS = 21_600
 
 _AWS_ID = re.compile(r"^(?:ami|subnet|sg|i)-[0-9a-f]{8,17}$")
-_REGION = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
+_REGION = re.compile(r"^[a-z]{2}-[a-z]+-\d$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _REPOSITORY = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?/"
