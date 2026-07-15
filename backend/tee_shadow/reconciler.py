@@ -146,9 +146,13 @@ def reconcile_table(table: str, *, prune: bool = True) -> dict:
                 break
             rds_rows += len(rows)
             try:
-                with dst.transaction():
-                    for row in rows:
-                        dst.execute(upsert, _wrap_jsonb(row))
+                with dst.transaction(), dst.cursor() as cur:
+                    # executemany(而非逐行 execute):psycopg3 对同一条 SQL 的多组参数
+                    # 自动走 pipeline,把整批的往返压成一次网络交换。reconcile 经 Phala
+                    # 网关 direct-TLS,单行往返延迟正是大表(user_logs 38 万行)回填慢到
+                    # 几小时的根源(2026-07-14 prod 实测),批量化把它砍掉一两个数量级。
+                    # 注意:executemany 是 cursor 方法(connection 只有 execute 快捷方式)。
+                    cur.executemany(upsert, [_wrap_jsonb(row) for row in rows])
                 copied += len(rows)
             except pg_errors.ForeignKeyViolation:
                 # 并发账号删除(CASCADE)会让本批个别子行的 parent(users)在 TEE 里
