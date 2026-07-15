@@ -5268,7 +5268,7 @@ def test_call_agent_cli_pi_marks_session_bridged_after_injected_turn(monkeypatch
     # A successful foreground turn that actually carried a transcript closes the
     # bridge debt for this session — the next turn rides pi's native continuity.
     _pi_cli_env(monkeypatch, tmp_path, "usr_pi_mark")
-    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
 
     assert crc.call_agent_cli(injected) == "ok"
     assert crc._agent_session_is_bridged() is True
@@ -5294,7 +5294,7 @@ def test_call_agent_cli_pi_failed_turn_does_not_mark_bridged(monkeypatch, tmp_pa
     # test_call_agent_cli_pi_api_error_turn_does_not_mark_bridged below for pi's
     # actual routine failure shape (rc=0, no assistant reply).
     _pi_cli_env(monkeypatch, tmp_path, "usr_pi_fail", returncode=1, stdout="")
-    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
 
     with pytest.raises(RuntimeError):
         crc.call_agent_cli(injected)
@@ -5331,7 +5331,7 @@ def test_call_agent_cli_pi_api_error_turn_does_not_mark_bridged(monkeypatch, tmp
         monkeypatch, tmp_path, "usr_pi_api_fail",
         returncode=0, stdout=_pi_stream_lines(_PI_HEADER),
     )
-    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
 
     with pytest.raises(RuntimeError, match="pi agent produced no reply"):
         crc.call_agent_cli(injected)
@@ -5823,7 +5823,7 @@ def test_claude_resume_skipped_when_transcript_was_injected(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
     cmd = crc._prepare_cli_command(injected)
 
     assert "--resume" not in cmd
@@ -6413,3 +6413,27 @@ def test_cwd_resolution_failure_preserves_existing_session(monkeypatch, tmp_path
     crc._agent_session_meta_cache.clear()
     _reset_cli_cwd_cache(monkeypatch)
     assert crc._load_agent_session_id() == "sess_keep"
+
+
+def test_foreground_transcript_closed_by_explicit_separator(monkeypatch):
+    # "---" (not a bare blank line) ends the quoted history: weaker
+    # self-hosted models read "\n\n" as another turn boundary inside the
+    # transcript and answer the wrong message.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    now = time.time()
+    hist = [
+        {"role": "user", "content": "昨天的旧消息", "ts": now - 60},
+        {"role": "user", "content": "新消息", "ts": now},
+    ]
+    monkeypatch.setattr(
+        crc, "get_decrypted_history",
+        lambda since, limit=20, include_image_body=True: list(hist),
+    )
+
+    out = crc._foreground_agent_message("新消息", current_ts=now)
+
+    assert "\n---\n新消息" in out
+    assert out.endswith("新消息")
+    assert out.startswith(crc.FOREGROUND_CHAT_CONTEXT_HEADER)
+    assert crc._message_has_injected_history(out)

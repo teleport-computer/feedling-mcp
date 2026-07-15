@@ -4969,7 +4969,11 @@ def _foreground_agent_message(content: str, *, current_ts: float) -> str:
     transcript = _recent_chat_context_for_foreground(before_ts=current_ts)
     if not transcript:
         return content
-    return f"{FOREGROUND_CHAT_CONTEXT_HEADER}\n{transcript}\n\n{content}"
+    # "---" (not a bare blank line) closes the transcript: weaker self-hosted
+    # models read "\n\n" as just another turn boundary inside the quoted
+    # history and answer the wrong message. Nothing parses this marker back —
+    # _message_has_injected_history keys on the header prefix only.
+    return f"{FOREGROUND_CHAT_CONTEXT_HEADER}\n{transcript}\n---\n{content}"
 
 
 def _message_has_injected_history(message: str) -> bool:
