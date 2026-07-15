@@ -104,6 +104,37 @@ def _dispatch(payload: str) -> None:
             log.exception("[wake_bus] handler failed for channel=%s", channel)
 
 
+def _reconnect_catch_up() -> None:
+    """Catch up after (re)establishing LISTEN: notifies sent while this worker
+    had no live listener are gone forever (LISTEN/NOTIFY has no replay), so any
+    store cached before/through that window may be stale for up to the 15-min
+    TTL — the "push arrived, chat page didn't" failure (2026-07-15 延迟诊断).
+    Refresh every cached store in place (which also wakes its parked long-poll
+    waiters) and replay the injected channel handlers (e.g. the accounts
+    registry reload on "users") once. Runs AFTER LISTEN is active, so notifies
+    arriving during the refresh buffer on the connection instead of being lost.
+    First connect at worker boot: the store cache is empty → pure no-op (except
+    the cheap handler replay, which covers registry writes that landed between
+    lifespan's load_users and this LISTEN going live)."""
+    from core import store as core_store  # lazy — breaks the store<->wake_bus cycle
+
+    refreshed = 0
+    for user_id in list(core_store._stores.keys()):
+        try:
+            core_store._evict_store(user_id)
+            refreshed += 1
+        except Exception:  # noqa: BLE001 — one bad store must not stop the sweep
+            log.exception("[wake_bus] reconnect refresh failed for user=%s", user_id)
+    for channel, fns in _extra_handlers.items():
+        for fn in fns:
+            try:
+                fn("")
+            except Exception:  # noqa: BLE001
+                log.exception("[wake_bus] reconnect handler replay failed for channel=%s", channel)
+    if refreshed:
+        log.info("[wake_bus] reconnect catch-up: refreshed %d cached store(s)", refreshed)
+
+
 def _listen_loop() -> None:
     while True:
         conn = None
@@ -111,6 +142,7 @@ def _listen_loop() -> None:
             conn = db.listen_connection()
             conn.execute(f"LISTEN {PG_CHANNEL}")
             log.info("[wake_bus] listening on %s (worker=%s)", PG_CHANNEL, WORKER_ID)
+            _reconnect_catch_up()  # notifies missed while unlistened are gone — resync once
             for note in conn.notifies():  # blocks; raises if the conn drops
                 _dispatch(note.payload)
         except Exception as e:
