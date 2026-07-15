@@ -2486,6 +2486,22 @@ def genesis_complete_job(
 # ---------------------------------------------------------------------------
 
 
+def chat_newest_ts(user_id: str) -> float | None:
+    """``ts`` of the user's newest-APPENDED chat row (by ``seq``), or None when
+    the user has no rows. Single-row probe on the (user_id, seq) index — cheap
+    enough for the /chat/history read-time staleness self-heal, which calls it
+    on every empty since-poll (prod ~9/s). Newest-by-seq deliberately: the
+    staleness this probe detects is a missed cross-worker APPEND broadcast, and
+    seq is the append order. Raises on DB failure — the caller fails open."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT ts FROM chat_messages WHERE user_id = %s "
+            "ORDER BY seq DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return float(row[0]) if row else None
+
+
 def chat_load(user_id: str) -> list[dict]:
     """Load the user's chat ring. R2-offloaded file rows are returned as SLIM
     POINTERS (``body_key`` + ``body_ct_len``, no ``body_ct``) — the heavy
