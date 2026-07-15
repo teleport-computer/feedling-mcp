@@ -158,7 +158,7 @@ def _resolve_local_ref(document: dict[str, Any], ref: str) -> Any:
 def test_public_operation_and_parameter_inventory(
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
-    assert len(operations) == 142
+    assert len(operations) == 143
     assert sum("requestBody" in operation for operation in operations.values()) == 65
 
     query_operations = {

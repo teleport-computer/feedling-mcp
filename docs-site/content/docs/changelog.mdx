@@ -12,6 +12,9 @@ change must not be interpreted as an API guarantee.
 
 ### Documentation and contract
 
+- Add `GET /v1/dream/status` — read-only dream (memory distillation) banner
+  status for the authenticated user, exposing scheduler state and counts for
+  client status banners.
 - Change plaintext role-card imports (`mode=update_identity`) to create an
   identity when none exists or update the existing card while preserving its
   relationship anchor by default. Reusing a completed `client_job_id` still

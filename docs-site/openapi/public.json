@@ -1620,6 +1620,38 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/dream/status": {
+      "get": {
+        "summary": "Dream Status",
+        "operationId": "dream_status_v1_dream_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ],
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/dream/tick": {
       "post": {
         "summary": "Dream Tick",
@@ -6992,13 +7024,6 @@
           "type": {
             "type": "string",
             "title": "Error Type"
-          },
-          "input": {
-            "title": "Input"
-          },
-          "ctx": {
-            "type": "object",
-            "title": "Context"
           }
         },
         "type": "object",
