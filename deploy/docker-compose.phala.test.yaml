@@ -265,9 +265,9 @@ services:
       # split-map path (hard rollback). Enabled on both test and prod.
       FEEDLING_GENESIS_COMBINED_MAP: "true"
       # Host-all: every configured user is served by the agent-runner (the send
-      # routing must agree with the supervisor's host_all discovery). Defaults to
-      # "true" to match prod; mirror the agent-runner's value.
-      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-true}"
+      # routing must agree with the supervisor's host_all discovery). Empty = off
+      # (per-user flag still required). Mirror the agent-runner's value.
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
       # Legacy memory migration is opt-in. Empty = off; set to 1 only after
       # seeded real-device Garden verification passes. Mirror agent-runner.
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
