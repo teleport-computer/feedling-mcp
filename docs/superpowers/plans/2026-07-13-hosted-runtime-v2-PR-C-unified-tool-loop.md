@@ -1,5 +1,7 @@
 # Hosted Runtime V2 — PR C: Unified Provider-Native Tool Loop — Implementation Plan
 
+> **STATUS: LANDED / CURRENT ARCHITECTURE IMPLEMENTATION RECORD.**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the staged `is_official → rule_plan/official_plan → executor → forced responder` V2-foreground pipeline (chat + wake lanes) with ONE provider-native tool loop where every model uses the same tool catalog + loop, `reply{text}` is a special tool writing an immediate bubble, and no-tool-call plain text is the final reply.

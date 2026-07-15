@@ -115,7 +115,7 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
     # budget and triggers the best-effort maintenance enqueue. The LAST message
     # must be an unanswered `user` turn — otherwise `_read_messages` (mirroring
     # "everything after the last assistant reply") sees nothing pending and the
-    # chat lane short-circuits before ever reaching the responder/enqueue step.
+    # chat lane short-circuits before reaching the provider/effect-enqueue step.
     n = worker._TAIL_BUDGET + 8
     messages = [
         {"id": f"m{i}", "ts": float(i + 1), "role": "user" if i % 2 == 0 else "assistant",
@@ -153,7 +153,6 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
     deps = worker.TurnDeps(
         read_messages=read_messages,
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=read_tail,
         read_summary=read_summary,
@@ -165,7 +164,7 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
     jobs_store.enqueue_job(uid, "chat")
     chat_job = jobs_store.claim_next_job("w-chat")
     status = asyncio.run(worker.process_job(
-        chat_job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        chat_job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
     assert status == "completed"
 
     # (a) the over-budget tail must have triggered a maintenance-lane enqueue.
@@ -182,7 +181,7 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
     maint_job = jobs_store.claim_next_job("w-maint")
     assert maint_job["lane"] == "maintenance"
     status2 = asyncio.run(worker.process_job(
-        maint_job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        maint_job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
     assert status2 == "completed"
 
     # (b) get_summary_row is now populated: non-null envelope, version==1,

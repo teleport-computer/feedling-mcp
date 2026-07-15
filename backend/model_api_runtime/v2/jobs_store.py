@@ -1,4 +1,4 @@
-"""DB 存取：agent_jobs / agent_action_queue / agent_status_events / runtime_state.
+"""DB access for V2 jobs, status events, summaries, schedules, and metrics.
 
 CONTRIBUTING §2：新表存取逻辑全部收进本模块（jobs_store）。连接走 db.get_pool()
 （autocommit）；需要跨语句持行锁的地方（SKIP LOCKED claim / single-flight 选举）
@@ -958,112 +958,6 @@ def get_runtime_state(user_id) -> dict:
     return dict(row["state_json"]) if row else {}
 
 
-def add_actions(job_id, user_id, actions: list[dict]) -> list[int]:
-    """把一批 action 追加进 job 的队列（seq 接续现有最大 seq）。action 形状：
-    {type, payload?, visible?, requires_model_authorship?}。返回新建 action id 列表。
-    注意：user_id 由调用方（parent job 的 user_id）统一传入，逐行写入每个 action
-    （agent_action_queue.user_id 只经 job_id 间接 FK 到 users，没有直接约束——
-    这里不信任按 action 逐条区分 user_id，一律用传入的这一个）。"""
-    ids: list[int] = []
-    with _pool().connection() as conn:
-        with conn.transaction():
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    "SELECT COALESCE(MAX(seq), -1) AS m FROM agent_action_queue WHERE job_id=%s",
-                    (job_id,),
-                )
-                start = int(cur.fetchone()["m"]) + 1
-                for offset, action in enumerate(actions):
-                    cur.execute(
-                        "INSERT INTO agent_action_queue "
-                        "(job_id, user_id, seq, type, payload_json, visible, requires_model_authorship) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                        (
-                            job_id,
-                            user_id,
-                            start + offset,
-                            str(action["type"]),
-                            # Planner payloads can contain decrypted memory text,
-                            # search terms, URLs, or identity patches. Execution
-                            # uses the in-memory plan; no production consumer
-                            # reloads payload_json. Persist trajectory shape, not
-                            # conversation data, until encrypted trajectories land.
-                            Jsonb({}),
-                            bool(action.get("visible", False)),
-                            bool(action.get("requires_model_authorship", False)),
-                        ),
-                    )
-                    ids.append(int(cur.fetchone()["id"]))
-    return ids
-
-
-def next_pending_action(job_id) -> dict | None:
-    with _pool().connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "SELECT * FROM agent_action_queue "
-                "WHERE job_id=%s AND status='pending' ORDER BY seq ASC LIMIT 1",
-                (job_id,),
-            )
-            return cur.fetchone()
-
-
-def mark_action_running(action_id) -> None:
-    with _pool().connection() as conn:
-        conn.execute(
-            "UPDATE agent_action_queue SET status='running', started_at=now() WHERE id=%s",
-            (action_id,),
-        )
-
-
-def mark_action_done(action_id, result: dict) -> None:
-    with _pool().connection() as conn:
-        conn.execute(
-            "UPDATE agent_action_queue SET status='completed', finished_at=now(), "
-            "result_json=%s WHERE id=%s",
-            # Capability data remains in memory for the responder. Persist only
-            # the non-sensitive outcome bit; full result bodies may contain
-            # decrypted cards, perception, or fetched web content.
-            (Jsonb({"ok": bool((result or {}).get("ok", True))}), action_id),
-        )
-
-
-def mark_action_failed(action_id, error: str) -> None:
-    with _pool().connection() as conn:
-        conn.execute(
-            "UPDATE agent_action_queue SET status='failed', finished_at=now(), "
-            "last_error=%s WHERE id=%s",
-            (str(error)[:500], action_id),
-        )
-
-
-def mark_action_skipped(action_id) -> None:
-    with _pool().connection() as conn:
-        conn.execute(
-            "UPDATE agent_action_queue SET status='skipped', finished_at=now() WHERE id=%s",
-            (action_id,),
-        )
-
-
-def invalidate_pending_actions(job_id, *, by_job_id: int) -> int:
-    """把 job 现有 pending action 置为 invalidated，并在 job 上记 invalidated_by_job_id
-    （replan/coalesce 的安全点，C 用）。返回被作废的 pending action 数。"""
-    with _pool().connection() as conn:
-        with conn.transaction():
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE agent_action_queue SET status='invalidated', finished_at=now() "
-                    "WHERE job_id=%s AND status='pending'",
-                    (job_id,),
-                )
-                affected = cur.rowcount
-                cur.execute(
-                    "UPDATE agent_jobs SET invalidated_by_job_id=%s WHERE id=%s",
-                    (int(by_job_id), job_id),
-                )
-    return affected
-
-
 def record_worker_heartbeat(
     worker_id: str, *, kind: str = "turn", capacity: int = 1
 ) -> None:
@@ -1182,8 +1076,8 @@ def record_turn_metric(
     completion_tokens: int | None,
     latency_ms: int | None,
 ) -> None:
-    """插一行到 v2_turn_metrics（append-only，无 FK）。由 responder/worker 在一轮
-    turn 结束后调用；provider 未回 usage 时 prompt/completion_tokens 传 None，
+    """插一行到 v2_turn_metrics（append-only，无 FK）。由 turn 调用方在
+    一轮结束后调用；provider 未回 usage 时 prompt/completion_tokens 传 None，
     该行仍落地（latency 仍可信），只是不参与 recent_mean_tokens_per_turn 的均值。"""
     with _pool().connection() as conn:
         conn.execute(
@@ -1194,8 +1088,13 @@ def record_turn_metric(
         )
 
 
-def record_whole_turn_metric(job_id, user_id, lane, *, prompt_tokens, completion_tokens,
-                             latency_ms, model_calls, retries, failed, status) -> None:
+def record_whole_turn_metric(
+    job_id, user_id, lane, *, prompt_tokens, completion_tokens,
+    latency_ms, model_calls, retries, failed, status,
+    cache_read_tokens=None, cache_write_tokens=None, cache_miss_tokens=None,
+    usage_reported_calls=0, cache_reported_calls=0,
+    provider=None, model=None, cache_route_fingerprint=None,
+) -> None:
     """One idempotent whole-turn metric per job (spec B5): upsert on job_id so a
     re-drive (redelivery/retry of the same job) REPLACES rather than appends. Covers
     all model calls, retries, and failed turns. Best-effort: never raises to the turn."""
@@ -1203,15 +1102,31 @@ def record_whole_turn_metric(job_id, user_id, lane, *, prompt_tokens, completion
         with _pool().connection() as conn:
             conn.execute(
                 "INSERT INTO v2_turn_metrics (job_id, user_id, lane, prompt_tokens, "
-                "completion_tokens, latency_ms, model_calls, retries, failed, status) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "completion_tokens, cache_read_tokens, cache_write_tokens, "
+                "cache_miss_tokens, usage_reported_calls, cache_reported_calls, "
+                "provider, model, cache_route_fingerprint, latency_ms, model_calls, "
+                "retries, failed, status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (job_id) DO UPDATE SET "
+                "user_id=EXCLUDED.user_id, lane=EXCLUDED.lane, "
                 "prompt_tokens=EXCLUDED.prompt_tokens, completion_tokens=EXCLUDED.completion_tokens, "
+                "cache_read_tokens=EXCLUDED.cache_read_tokens, "
+                "cache_write_tokens=EXCLUDED.cache_write_tokens, "
+                "cache_miss_tokens=EXCLUDED.cache_miss_tokens, "
+                "usage_reported_calls=EXCLUDED.usage_reported_calls, "
+                "cache_reported_calls=EXCLUDED.cache_reported_calls, "
+                "provider=EXCLUDED.provider, model=EXCLUDED.model, "
+                "cache_route_fingerprint=EXCLUDED.cache_route_fingerprint, "
                 "latency_ms=EXCLUDED.latency_ms, model_calls=EXCLUDED.model_calls, "
                 "retries=EXCLUDED.retries, failed=EXCLUDED.failed, status=EXCLUDED.status, "
                 "updated_at=now()",
-                (job_id, user_id, lane, prompt_tokens, completion_tokens, latency_ms,
-                 model_calls, retries, failed, status))
+                (
+                    job_id, user_id, lane, prompt_tokens, completion_tokens,
+                    cache_read_tokens, cache_write_tokens, cache_miss_tokens,
+                    int(usage_reported_calls), int(cache_reported_calls),
+                    provider, model, cache_route_fingerprint,
+                    latency_ms, model_calls, retries, failed, status,
+                ))
     except Exception as e:  # noqa: BLE001 — best-effort instrumentation, never fail the turn
         log.error("[jobs_store] record_whole_turn_metric(%s) failed: %s", job_id, e)
 
@@ -1231,6 +1146,158 @@ def recent_mean_tokens_per_turn(*, lane: str = "chat", limit: int = 50) -> float
             )
             row = cur.fetchone()
             return None if row is None or row[0] is None else float(row[0])
+
+
+def recent_prompt_cache_stats(
+    *,
+    lane: str = "chat",
+    limit: int = 100,
+    provider: str | None = None,
+    model: str | None = None,
+    cache_route_fingerprint: str | None = None,
+    user_id: str | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+    include_turns: bool = False,
+) -> dict:
+    """Aggregate honest prompt-cache telemetry over the most recent turns.
+
+    Token totals remain ``None`` when no sampled provider call reported that
+    field.  Coverage ratios make partial provider telemetry explicit instead
+    of converting unknown cache behavior into a false miss or hit.
+    """
+    provider_filter = str(provider or "").strip().lower() or None
+    model_filter = str(model or "").strip() or None
+    route_filter = str(cache_route_fingerprint or "").strip() or None
+    user_filter = str(user_id or "").strip() or None
+    where = ["lane=%s"]
+    params: list = [str(lane)]
+    if provider_filter is not None:
+        where.append("provider=%s")
+        params.append(provider_filter)
+    if model_filter is not None:
+        where.append("model=%s")
+        params.append(model_filter)
+    if route_filter is not None:
+        where.append("cache_route_fingerprint=%s")
+        params.append(route_filter)
+    if user_filter is not None:
+        where.append("user_id=%s")
+        params.append(user_filter)
+    if since_ts is not None:
+        where.append("created_at >= to_timestamp(%s)")
+        params.append(float(since_ts))
+    if until_ts is not None:
+        where.append("created_at <= to_timestamp(%s)")
+        params.append(float(until_ts))
+    params.append(max(1, min(int(limit), 1000)))
+
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "WITH recent AS (SELECT id, job_id, created_at, model_calls, "
+                "usage_reported_calls, cache_reported_calls, prompt_tokens, "
+                "cache_read_tokens, cache_write_tokens, cache_miss_tokens, "
+                "cache_route_fingerprint, provider, model, failed, status "
+                "FROM v2_turn_metrics "
+                f"WHERE {' AND '.join(where)} "
+                "ORDER BY created_at DESC, id DESC LIMIT %s), "
+                "aggregate AS (SELECT count(*), coalesce(sum(model_calls), 0), "
+                "coalesce(sum(usage_reported_calls), 0), "
+                "coalesce(sum(cache_reported_calls), 0), "
+                "sum(prompt_tokens), sum(cache_read_tokens), "
+                "sum(cache_write_tokens), sum(cache_miss_tokens), "
+                "count(cache_route_fingerprint), "
+                "count(DISTINCT cache_route_fingerprint), "
+                "CASE WHEN count(DISTINCT cache_route_fingerprint)=1 "
+                "THEN min(cache_route_fingerprint) ELSE NULL END FROM recent) "
+                "SELECT aggregate.*, COALESCE((SELECT jsonb_agg(jsonb_build_object("
+                "'job_id', job_id, "
+                "'created_at_ts', EXTRACT(EPOCH FROM created_at)::double precision, "
+                "'model_calls', model_calls, "
+                "'usage_reported_calls', usage_reported_calls, "
+                "'cache_reported_calls', cache_reported_calls, "
+                "'prompt_tokens', prompt_tokens, "
+                "'cache_read_tokens', cache_read_tokens, "
+                "'cache_write_tokens', cache_write_tokens, "
+                "'cache_miss_tokens', cache_miss_tokens, "
+                "'provider', provider, 'model', model, "
+                "'cache_route_fingerprint', cache_route_fingerprint, "
+                "'failed', failed, 'status', status) "
+                "ORDER BY created_at ASC, id ASC) FROM recent), '[]'::jsonb) "
+                "FROM aggregate",
+                tuple(params),
+            )
+            row = cur.fetchone()
+
+    sampled_turns = int(row[0] or 0) if row is not None else 0
+    model_calls = int(row[1] or 0) if row is not None else 0
+    usage_calls = int(row[2] or 0) if row is not None else 0
+    cache_calls = int(row[3] or 0) if row is not None else 0
+
+    def _optional_int(index: int) -> int | None:
+        if row is None or row[index] is None:
+            return None
+        return int(row[index])
+
+    prompt_tokens = _optional_int(4)
+    cache_read = _optional_int(5)
+    cache_write = _optional_int(6)
+    cache_miss = _optional_int(7)
+    route_identified_turns = int(row[8] or 0) if row is not None else 0
+    route_fingerprint_count = int(row[9] or 0) if row is not None else 0
+    sole_route_fingerprint = (
+        str(row[10]) if row is not None and row[10] is not None else None
+    )
+    effective_input = None
+    if cache_calls and cache_read is not None and cache_miss is not None:
+        # Writes are a subset of the miss side for providers with explicit
+        # cache creation (not an additional input category).  Adding writes
+        # here would double-count Anthropic/OpenAI cache creation tokens.
+        effective_input = cache_read + cache_miss
+    hit_ratio = None
+    if effective_input:
+        hit_ratio = float(cache_read or 0) / float(effective_input)
+    result = {
+        "sampled_turns": sampled_turns,
+        "model_calls": model_calls,
+        "usage_reported_calls": usage_calls,
+        "cache_reported_calls": cache_calls,
+        "usage_telemetry_coverage": (
+            float(usage_calls) / float(model_calls) if model_calls else None
+        ),
+        "cache_telemetry_coverage": (
+            float(cache_calls) / float(model_calls) if model_calls else None
+        ),
+        "route_identity_coverage": (
+            float(route_identified_turns) / float(sampled_turns)
+            if sampled_turns else None
+        ),
+        "route_fingerprint_count": route_fingerprint_count,
+        "route_fingerprint": sole_route_fingerprint,
+        "prompt_tokens": prompt_tokens,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "cache_miss_tokens": cache_miss,
+        "effective_input_tokens": effective_input,
+        "hit_ratio": hit_ratio,
+    }
+    if include_turns:
+        turns = row[11] if row is not None and len(row) > 11 else []
+        result["turns"] = list(turns) if isinstance(turns, list) else []
+    if include_turns or any(value is not None for value in (
+        provider_filter, model_filter, route_filter, user_filter, since_ts, until_ts,
+    )):
+        result["filter"] = {
+            "provider": provider_filter,
+            "model": model_filter,
+            "cache_route_fingerprint": route_filter,
+            "user_id": user_filter,
+            "since_ts": float(since_ts) if since_ts is not None else None,
+            "until_ts": float(until_ts) if until_ts is not None else None,
+            "include_turns": bool(include_turns),
+        }
+    return result
 
 
 WAKE_LANES = ("heartbeat", "scheduled", "manual_wake")

@@ -7,7 +7,7 @@ dict that provider_client.chat_completion* returns — the dict stays the wire
 return type for backward compatibility; PR C uses from_result() for typed access.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -68,6 +68,9 @@ class Usage:
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    cache_miss_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,9 @@ class ProviderResponse:
             prompt_tokens=u.get("prompt_tokens"),
             completion_tokens=u.get("completion_tokens"),
             total_tokens=u.get("total_tokens"),
+            cache_read_tokens=u.get("cache_read_tokens"),
+            cache_write_tokens=u.get("cache_write_tokens"),
+            cache_miss_tokens=u.get("cache_miss_tokens"),
         )
         raw_turn = result.get("assistant_turn")
         if isinstance(raw_turn, NativeAssistantTurn):

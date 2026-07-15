@@ -103,6 +103,7 @@ async def compact(
     current_summary: str,
     old_messages: list[dict[str, Any]],
     llm: Callable[..., Awaitable[Any]],
+    usage_out: Callable[[dict | None], None] | None = None,
 ) -> str:
     """把 `old_messages` 折叠成新 bullet 行，append 到 `current_summary` 后返回。
 
@@ -123,7 +124,15 @@ async def compact(
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
-    result = await llm(provider_config, messages, max_tokens=500, temperature=0.3, timeout=60.0)
+    try:
+        result = await llm(
+            provider_config, messages, max_tokens=500, temperature=0.3, timeout=60.0)
+    except Exception:
+        if usage_out is not None:
+            usage_out(None)
+        raise
+    if usage_out is not None:
+        usage_out(result.get("usage") if isinstance(result, dict) else None)
     raw_reply = result.get("reply") if isinstance(result, dict) else None
     new_bullets = _validated_new_bullets(raw_reply, current_summary=current_summary)
     if new_bullets is None:

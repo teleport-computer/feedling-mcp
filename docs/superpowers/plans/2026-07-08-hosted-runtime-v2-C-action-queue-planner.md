@@ -1,5 +1,10 @@
 # Hosted Runtime V2 — 子项目 C（action queue + short planner/executor/responder）Implementation Plan
 
+> **STATUS: HISTORICAL / SUPERSEDED.** The staged planner/responder pipeline in
+> this implementation plan has been retired in favor of the unified
+> provider-native tool loop. This file is retained only as an implementation
+> record.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把 Plan B 的「无 planner、直接 responder」最小闭环，替换成

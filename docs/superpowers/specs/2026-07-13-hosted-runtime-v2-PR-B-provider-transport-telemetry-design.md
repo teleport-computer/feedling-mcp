@@ -1,6 +1,6 @@
 # Hosted Runtime V2 — PR B: Provider Transport / Telemetry — Design
 
-**Status:** Approved (design), awaiting spec review → plan
+**Status:** LANDED / HISTORICAL DESIGN RECORD
 **Depends on:** PR A (generation-fenced effect foundation, merged @ `d7e19a9`)
 **Directive:** @sxysun 4-PR next round (PR A control plane · **PR B transport/telemetry** · PR C unified native tool loop · PR D pool/history safety). Product hard decision: NO official/rule behavior tiering by provider/model — all models go through ONE provider-native tool loop (the loop itself is PR C; PR B ships the transport it needs).
 

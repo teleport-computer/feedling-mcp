@@ -1,6 +1,4 @@
-"""Task 7 (PR C, spec C6+C9a): worker.process_job's chat branch on the unified
-provider-native tool loop (`tool_loop.run_tool_loop`) — replacing the old
-two-layer while/replan + json_planner + forced responder.respond pipeline.
+"""worker.process_job's chat branch on the unified provider-native tool loop.
 
 Style mirrors tests/test_v2_worker.py: real jobs_store (real DB claim/mark_*/
 runtime_state), real core_store (real DB chat/reload), real
@@ -29,8 +27,6 @@ from core import store as core_store
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import planner as v2_planner
-from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import worker
 
 pytestmark = pytest.mark.skipif(
@@ -131,7 +127,6 @@ def _deps(*, messages, token="rt-enclave"):
     return worker.TurnDeps(
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: token,
         apply_pending_effects=_apply_effects,
     )
@@ -154,31 +149,22 @@ def _turn_metric_row(job_id):
     return row
 
 
-def test_single_round_plain_text_writes_exactly_one_bubble_no_planner_or_responder(monkeypatch):
+def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     """Round 1: no tool_calls, plain text -> that text IS the final reply
-    (Global Constraints). Must never touch the old json_planner/responder
-    machinery at all."""
+    (Global Constraints)."""
     uid = "u_toolloop_happy"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    def _boom_plan(*a, **k):
-        raise AssertionError("the unified tool loop must never call v2_planner.plan")
-
-    async def _boom_respond(*a, **k):
-        raise AssertionError("the unified tool loop must never call v2_responder.respond")
-
-    monkeypatch.setattr(v2_planner, "plan", _boom_plan)
-    monkeypatch.setattr(v2_responder, "respond", _boom_respond)
     _patch_real_write(monkeypatch)
 
     calls = _script_provider(monkeypatch, [_text_round("hello from the model")])
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert len(calls) == 1
@@ -226,7 +212,7 @@ def test_intermediate_reply_then_terminal_text_and_exactly_once_replay(monkeypat
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert len(calls) == 2
@@ -295,7 +281,7 @@ def test_chat_turn_with_no_reply_produced_marks_job_failed_not_completed(monkeyp
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
     assert len(calls) == 1

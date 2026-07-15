@@ -98,7 +98,36 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0037_v2_terminal_failure_outbox").down_revision == (
         "0036_chat_r2_lifecycle"
     )
-    assert script.get_current_head() == "0037_v2_terminal_failure_outbox"
+    assert script.get_revision("0038_v2_prompt_cache_metrics").down_revision == (
+        "0037_v2_terminal_failure_outbox"
+    )
+    assert script.get_current_head() == "0038_v2_prompt_cache_metrics"
+
+
+def test_prompt_cache_metric_columns_and_recent_window_index_exist():
+    with db.get_pool().connection() as conn:
+        columns = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='v2_turn_metrics' AND column_name IN "
+            "('provider','model','cache_read_tokens','cache_write_tokens',"
+            "'cache_miss_tokens','usage_reported_calls','cache_reported_calls',"
+            "'cache_route_fingerprint')"
+        ).fetchall()
+        indexes = conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename='v2_turn_metrics'"
+        ).fetchall()
+    assert {row[0] for row in columns} == {
+        "provider",
+        "model",
+        "cache_route_fingerprint",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_miss_tokens",
+        "usage_reported_calls",
+        "cache_reported_calls",
+    }
+    assert "ix_v2_turn_metrics_lane_created_at" in {row[0] for row in indexes}
+    assert "ix_v2_turn_metrics_cache_proof" in {row[0] for row in indexes}
 
 
 def test_terminal_failure_outbox_schema_and_error_event_idempotency_guard_exist():

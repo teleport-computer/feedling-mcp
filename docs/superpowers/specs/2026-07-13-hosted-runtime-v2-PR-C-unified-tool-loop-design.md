@@ -1,6 +1,6 @@
 # Hosted Runtime V2 — PR C: Unified Provider-Native Tool Loop — Design
 
-**Status:** Approved (design), awaiting spec review → plan
+**Status:** LANDED / CURRENT ARCHITECTURE RECORD
 **Depends on:** PR A (effect foundation, merged `d7e19a9`) + PR B (provider transport/telemetry, merged)
 **Directive:** @sxysun 4-PR next round — PR C is "unified loop". Product hard decision: NO official/rule behavior tiering by provider/model. All models go through ONE provider-native tool loop; behavior degrades naturally from what the model actually does. **7 P0 fault injections must be green before any deploy / any internal-user flip.**
 

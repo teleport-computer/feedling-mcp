@@ -77,7 +77,10 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0037_v2_terminal_failure_outbox").down_revision == (
         "0036_chat_r2_lifecycle"
     )
-    assert script.get_current_head() == "0037_v2_terminal_failure_outbox"
+    assert script.get_revision("0038_v2_prompt_cache_metrics").down_revision == (
+        "0037_v2_terminal_failure_outbox"
+    )
+    assert script.get_current_head() == "0038_v2_prompt_cache_metrics"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )
@@ -243,7 +246,9 @@ def test_run_compaction_advances_watermark_seq_to_last_compacted_row(monkeypatch
     job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
     job = jobs_store.claim_next_job("w")
 
-    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+    async def _fake_compact(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+    ):
         return current_summary + "\n- new"
 
     monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
@@ -256,7 +261,6 @@ def test_run_compaction_advances_watermark_seq_to_last_compacted_row(monkeypatch
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: tail_rows,
         read_summary=lambda uid_: ("- old", 0.0, 0),
@@ -264,7 +268,7 @@ def test_run_compaction_advances_watermark_seq_to_last_compacted_row(monkeypatch
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     summary_row = jobs_store.get_summary_row(uid)
@@ -287,7 +291,9 @@ def test_run_compaction_without_id_in_tail_row_leaves_seq_watermark_unadvanced(m
         for i in range(worker._TAIL_KEEP + 6)
     ]
 
-    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+    async def _fake_compact(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+    ):
         return current_summary + "\n- new"
 
     monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
@@ -302,7 +308,6 @@ def test_run_compaction_without_id_in_tail_row_leaves_seq_watermark_unadvanced(m
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: tail,
         read_summary=lambda uid_: ("- old", 0.0, 0),
@@ -310,7 +315,7 @@ def test_run_compaction_without_id_in_tail_row_leaves_seq_watermark_unadvanced(m
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     old_count = len(tail) - worker._TAIL_KEEP

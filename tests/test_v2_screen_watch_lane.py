@@ -3,13 +3,9 @@ a chat bubble — so it joins `worker._WAKE_LANES` and reuses `_run_wake`, but w
 its own system prompt (`_SCREEN_WATCH_SYSTEM_PROMPT`) and grounded on recent
 screen frames (`screen_recent` capability) instead of a perception snapshot.
 
-PR C Task 8 (spec C8): `_run_wake` (and therefore `screen_watch`) now runs on
-the unified `tool_loop.run_tool_loop` — the LLM wire boundary is
-`provider_client.chat_completion_async`, not `v2_responder.respond`. The
-`screen_recent` prefetch flows in as a STATIC `extra_context` string (rendered
-via `responder._action_context_str`, resolved once before the loop starts —
-see `_make_build_messages_fn`'s `extra_context` parameter) rather than as the
-old `action_results=` kwarg to `respond()`.
+`_run_wake` (and therefore `screen_watch`) runs on the unified
+`tool_loop.run_tool_loop`. The `screen_recent` prefetch flows in as a static
+`extra_context` string rendered by `context.action_context_str`.
 
 Contract (from the task brief):
 - `"screen_watch" in worker._WAKE_LANES`.
@@ -41,7 +37,6 @@ import provider_client
 from core import store as core_store
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import planner as v2_planner
 from model_api_runtime.v2 import worker
 
 
@@ -95,7 +90,6 @@ def _wake_deps(*, summary="", tail=None):
     return worker.TurnDeps(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: "rt",
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
         read_summary=lambda uid: (summary, 0.0, 0),
@@ -145,12 +139,6 @@ def test_screen_watch_turn_passes_screen_context_and_its_own_prompt(monkeypatch)
 
     monkeypatch.setattr(worker, "_cap_data", _fake_cap_data)
 
-    # The planner must never run for a wake-lane job.
-    async def _boom_plan(*a, **k):
-        raise AssertionError("planner must not run for a screen_watch job")
-
-    monkeypatch.setattr(v2_planner, "plan", _boom_plan)
-
     written = {}
     monkeypatch.setattr(
         worker, "_write_encrypted_reply",
@@ -158,7 +146,7 @@ def test_screen_watch_turn_passes_screen_context_and_its_own_prompt(monkeypatch)
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
@@ -209,7 +197,7 @@ def test_screen_watch_silence_completes_without_a_bubble(monkeypatch):
 
     deps = _wake_deps(tail=[])
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert write_called["n"] == 0                     # no chat bubble
@@ -262,7 +250,7 @@ def test_screen_watch_does_not_deadlock_when_cap_data_reacquires_enclave_sem(mon
     async def _drive():
         return await asyncio.wait_for(
             worker.process_job(
-                job, _wake_deps(tail=[]), provider_config=_BYOK, is_official=False,
+                job, _wake_deps(tail=[]), provider_config=_BYOK,
                 api_key=None, runtime_token="rt", enclave_sem=sem),
             timeout=10.0)
 

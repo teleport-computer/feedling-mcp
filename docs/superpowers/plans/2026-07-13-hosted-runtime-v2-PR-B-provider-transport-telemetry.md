@@ -1,5 +1,7 @@
 # Hosted Runtime V2 — PR B: Provider Transport / Telemetry — Implementation Plan
 
+> **STATUS: LANDED / HISTORICAL IMPLEMENTATION RECORD.**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn `backend/provider_client.py` into a normalized, tool-capable, natively-async transport and make per-turn telemetry one idempotent whole-turn metric per job.

@@ -39,7 +39,6 @@ import pytest
 from core import store as core_store
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import worker
 
 _BYOK = provider_client.ProviderConfig(
@@ -144,7 +143,9 @@ def test_ensure_prompt_coverage_runs_inline_catchup_and_closes_gap(monkeypatch):
 
     compact_calls = []
 
-    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+    async def _fake_compact(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+    ):
         compact_calls.append(list(old_messages))
         return (current_summary + "\n- folded").strip()
 
@@ -160,7 +161,6 @@ def test_ensure_prompt_coverage_runs_inline_catchup_and_closes_gap(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_summary=read_summary,
         read_compaction_tail=read_compaction_tail,
@@ -215,7 +215,9 @@ def test_prompt_catchup_allows_many_bounded_batches_and_renews_lease(monkeypatch
 
     compact_calls: list[list[dict]] = []
 
-    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+    async def _fake_compact(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+    ):
         compact_calls.append(list(old_messages))
         return (current_summary + f"\n- folded-{len(compact_calls)}").strip()
 
@@ -235,7 +237,6 @@ def test_prompt_catchup_allows_many_bounded_batches_and_renews_lease(monkeypatch
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_summary=read_summary,
         read_compaction_tail=read_compaction_tail,
@@ -302,7 +303,6 @@ def test_ensure_prompt_coverage_no_gap_is_a_noop(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_summary=read_summary,
         read_compaction_tail=read_compaction_tail,
@@ -335,7 +335,9 @@ def test_prompt_coverage_hole_that_survives_the_retry_budget_raises(monkeypatch)
     messages = _seed_messages(uid, n)
     seeded_watermark_seq = _seed_summary(uid, covers=5, messages=messages, summary="- old")
 
-    async def _noop_compact(*, provider_config, current_summary, old_messages, llm):
+    async def _noop_compact(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+    ):
         return current_summary  # unchanged -> watermark never advances
 
     monkeypatch.setattr(v2_compaction, "compact", _noop_compact)
@@ -344,7 +346,6 @@ def test_prompt_coverage_hole_that_survives_the_retry_budget_raises(monkeypatch)
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_summary=read_summary,
         read_compaction_tail=read_compaction_tail,
@@ -352,7 +353,7 @@ def test_prompt_coverage_hole_that_survives_the_retry_budget_raises(monkeypatch)
         write_summary=write_summary,
     )
 
-    with pytest.raises(v2_responder.ResponderError, match="prompt_coverage_incomplete"):
+    with pytest.raises(worker.TurnError, match="prompt_coverage_incomplete"):
         asyncio.run(worker._ensure_prompt_coverage(
             uid, deps, provider_config=_BYOK, enclave_sem=None, tail_limit=tail_limit,
             max_retries=3))
@@ -363,7 +364,7 @@ def test_prompt_coverage_hole_that_survives_the_retry_budget_raises(monkeypatch)
     # raise too, not silently pass.
     row = jobs_store.get_summary_row(uid)
     assert row["watermark_seq"] == seeded_watermark_seq
-    with pytest.raises(v2_responder.ResponderError, match="prompt_coverage_incomplete"):
+    with pytest.raises(worker.TurnError, match="prompt_coverage_incomplete"):
         asyncio.run(worker._assert_prompt_covers(uid, tail_limit))
 
 
@@ -404,7 +405,7 @@ def test_assert_prompt_covers_seq_db_boundary(monkeypatch):
 
     # One message further back: count == tail_limit + 1 -> raises.
     watermark_over_cap = messages[n - tail_limit - 2]["seq"]
-    with pytest.raises(v2_responder.ResponderError, match="prompt_coverage_incomplete"):
+    with pytest.raises(worker.TurnError, match="prompt_coverage_incomplete"):
         asyncio.run(worker._assert_prompt_covers_seq(
             uid, watermark_seq=watermark_over_cap, tail_limit=tail_limit))
 
@@ -548,7 +549,6 @@ def test_prompt_coverage_gap_false_positive_under_multiuser_interleaving(monkeyp
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_summary=_read_summary_a,
         read_compaction_tail=_read_compaction_tail_a,
@@ -599,7 +599,9 @@ def test_process_job_chat_turn_runs_inline_catchup_before_replying(monkeypatch):
     seeded_watermark_seq = _seed_summary(uid, covers=5, messages=messages)
     monkeypatch.setattr(worker, "_TAIL_HARD_CAP", tail_limit)
 
-    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+    async def _fake_compact(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+    ):
         return (current_summary + "\n- folded").strip()
 
     monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
@@ -634,7 +636,6 @@ def test_process_job_chat_turn_runs_inline_catchup_before_replying(monkeypatch):
         read_messages=lambda uid_: [{"id": "new1", "ts": messages[-1]["ts"] + 1.0,
                                       "role": "user", "content": "final unanswered"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_summary=read_summary,
         read_compaction_tail=read_compaction_tail,
@@ -646,7 +647,7 @@ def test_process_job_chat_turn_runs_inline_catchup_before_replying(monkeypatch):
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-e2e")
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     row = jobs_store.get_summary_row(uid)

@@ -43,7 +43,6 @@ if str(_repo_root) not in sys.path:
 import provider_client  # noqa: E402
 from provider_types import ToolExchange, ToolResult  # noqa: E402
 from model_api_runtime.v2 import context as v2_context  # noqa: E402
-from model_api_runtime.v2 import responder as v2_responder  # noqa: E402
 from model_api_runtime.v2 import tool_loop as v2_tool_loop  # noqa: E402
 
 from scripts.loadtest.mock_provider import MockProvider  # noqa: E402
@@ -91,11 +90,10 @@ async def _measure_v2_tokens_per_turn_async(
     fixtures: list[dict[str, Any]], *, mock_base_url: str
 ) -> list[float]:
     # provider="openai_compatible" is the only ProviderConfig shape that
-    # routes chat_completion_async straight to the async HTTP POST
-    # against an arbitrary base_url without a special-cased provider branch
-    # (anthropic/gemini bounce through anyio.to_thread + a real-provider
-    # wire shape; openai can bounce through the Responses API for reasoning
-    # models) — openai_compatible always POSTs {base_url}/chat/completions
+    # routes chat_completion_async to an arbitrary OpenAI-compatible base URL;
+    # all provider families now use native async HTTP, but the others require
+    # their provider-specific wire shapes and endpoints. openai_compatible
+    # always POSTs {base_url}/chat/completions
     # with the plain OpenAI chat-completions request/response shape, which
     # is exactly what MockProvider speaks. This exercises the SAME provider-native
     # loop and async transport the real V2 worker uses in production, just
@@ -136,7 +134,7 @@ def _build_messages_for_fixture(fixture: dict[str, Any]):
     """Mirror the production worker's base-context + native transcript shape."""
     tail = list(fixture.get("tail") or [])
     base = v2_context.build_turn_messages(
-        system_prompt=v2_responder._SYSTEM_PROMPT,
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
         summary=str(fixture.get("summary") or ""),
         tail=tail,
     )

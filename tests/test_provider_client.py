@@ -346,7 +346,14 @@ def test_parse_openai_compat_body_result_shape():
     assert out["reply"] == "hi there"
     assert out["reasoning"] == "why"
     # PR B Task 2 (B4): usage is normalized in place to prompt/completion/total keys.
-    assert out["usage"] == {"prompt_tokens": None, "completion_tokens": None, "total_tokens": 3}
+    assert out["usage"] == {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": 3,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "cache_miss_tokens": None,
+    }
     assert out["raw_id"] == "chatcmpl-1"
     assert out["provider"] == "openrouter"
     assert out["model"] == "m"
@@ -383,7 +390,14 @@ def test_parse_deepseek_body_extracts_reasoning_content():
     assert out["reply"] == "visible answer"
     assert out["reasoning"] == "deepseek reasoning summary"
     # PR B Task 2 (B4): usage is normalized in place to prompt/completion/total keys.
-    assert out["usage"] == {"prompt_tokens": None, "completion_tokens": None, "total_tokens": 11}
+    assert out["usage"] == {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": 11,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "cache_miss_tokens": None,
+    }
     assert out["provider"] == "deepseek"
 
 

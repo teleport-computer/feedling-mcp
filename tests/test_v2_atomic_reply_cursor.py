@@ -647,7 +647,6 @@ def test_pending_final_reply_recovers_before_any_new_provider_call(monkeypatch):
         read_messages=lambda _uid: [],
         read_messages_after_seq=_read_after_seq,
         resolve_provider=lambda _uid: (None, {}),
-        is_official=lambda _cfg: False,
         mint_enclave_token=lambda _uid: "rt",
         apply_pending_effects=lambda user_id: effect_outbox.apply_pending_effects(
             user_id,
@@ -659,7 +658,6 @@ def test_pending_final_reply_recovers_before_any_new_provider_call(monkeypatch):
         job,
         deps,
         provider_config=object(),
-        is_official=False,
         api_key=None,
         runtime_token="rt",
     ))
@@ -778,7 +776,6 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
         read_compaction_tail_after_seq=_compact_after,
         read_summary_with_seq=_summary_with_snapshot_race,
         resolve_provider=lambda _uid: (None, {}),
-        is_official=lambda _cfg: False,
         mint_enclave_token=lambda _uid: "rt",
         write_summary=lambda *_args: True,
         apply_pending_effects=_apply,
@@ -787,7 +784,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("same-ts-worker")
     assert asyncio.run(worker.process_job(
-        job, deps, provider_config=object(), is_official=False,
+        job, deps, provider_config=object(),
         api_key=None, runtime_token="rt",
     )) == "completed"
 
@@ -812,7 +809,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     jobs_store.enqueue_job(uid, "chat")
     empty_job = jobs_store.claim_next_job("same-ts-empty")
     assert asyncio.run(worker.process_job(
-        empty_job, deps, provider_config=object(), is_official=False,
+        empty_job, deps, provider_config=object(),
         api_key=None, runtime_token="rt",
     )) == "completed"
 
@@ -828,7 +825,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     jobs_store.enqueue_job(uid, "chat")
     fourth_job = jobs_store.claim_next_job("same-ts-fourth")
     assert asyncio.run(worker.process_job(
-        fourth_job, deps, provider_config=object(), is_official=False,
+        fourth_job, deps, provider_config=object(),
         api_key=None, runtime_token="rt",
     )) == "completed"
     assert calls_after

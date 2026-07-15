@@ -16,7 +16,6 @@ tool-call 行为自然降级。
   解密 provider key（单次；只留内存，不落库）。enclave-bound（受 worker.ENCLAVE_SEMAPHORE 框住）。
   BYOK-only：`_load_runtime_provider_config` 只从该用户自己的 `model_api_config` 信封解出
   provider key，从不读取/回退任何平台系统 key。
-- is_official：仅为旧 TurnDeps 构造保留的兼容字段；生产不注入、不调用。
 - mint_enclave_token：签发 enclave-auth runtime_token（scope=envelope_decrypt）。只是 HMAC
   签名，不是解密，回合内可按需多签（executor 的 capability 调用 + read_messages 的逐条
   chat 解密都要用它）。
@@ -25,17 +24,15 @@ tool-call 行为自然降级。
   assistant”切片，因为同 ts / 回复与 follow-up 交错都会吞消息。带上 id/ts/seq 供
   v2.coalesce 去重和精确推进。enclave-bound。
 
-respond/append_reply 不再是 TurnDeps 的字段：worker.process_job/`_run_wake` 现在直接调用
-同层的 `model_api_runtime.v2.tool_loop.run_tool_loop`（provider-native 统一工具循环，PR
-C9b，本就 hosted-free）和自己的 `_write_encrypted_reply`（只 import core.envelope/
-core.store，同样 hosted-free），不需要再经这层装配转发一次。`model_api_runtime.v2.responder.
-respond`（旧的强制 responder round-trip）不再是那条调用路径的一部分——它仍然存在，只是
-被 `scripts/loadtest/compare_tokens.py`（D4 token-per-turn 回滚门）和几个 wire-shape 回归
-测试直接驱动，见 `tests/test_v2_no_dispatch_tiering.py`。
+Model calls and reply construction are hosted-free and stay directly in the
+worker/tool-loop layer; only hosted configuration, enclave access, and effect
+sinks are assembled here.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import math
@@ -47,9 +44,10 @@ import threading
 import time
 import types
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 # Put the backend dir on sys.path BEFORE importing backend modules. When this is
 # run as a script (`python backend/model_api_runtime/v2/serve_worker.py` — how the
@@ -94,6 +92,7 @@ from proactive import dream_scheduler
 from proactive import gate as proactive_gate
 import db
 import memory_readside_core
+import provider_client
 
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
 
@@ -117,28 +116,6 @@ _ASSISTANT_ROLES = ("openclaw", "assistant", "agent")
 _EXTRACTION_ENABLED = os.environ.get(
     "FEEDLING_V2_EXTRACTION_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _configure_provider_thread_limiter(max_workers: int) -> int:
-    """Ensure sync provider bridges can occupy every configured turn slot.
-
-    Anthropic, Gemini, and OpenAI Responses currently use
-    ``anyio.to_thread.run_sync``. A standalone worker has no ASGI lifespan, so
-    AnyIO otherwise retains its silent default of roughly forty threads even if
-    ``FEEDLING_V2_MAX_WORKERS`` is larger. Never lower an existing process-wide
-    limit; an explicit override can reserve extra headroom.
-    """
-    import anyio.to_thread
-
-    raw = os.environ.get("FEEDLING_V2_PROVIDER_THREAD_LIMIT", "").strip()
-    try:
-        requested = int(raw) if raw else int(max_workers)
-    except ValueError:
-        log.warning("invalid FEEDLING_V2_PROVIDER_THREAD_LIMIT=%r; using max_workers", raw)
-        requested = int(max_workers)
-    limiter = anyio.to_thread.current_default_thread_limiter()
-    limiter.total_tokens = max(int(limiter.total_tokens), max(1, requested), int(max_workers))
-    return int(limiter.total_tokens)
 
 
 def _configure_db_pool_capacity(max_workers: int) -> int:
@@ -325,6 +302,54 @@ def _mint_genesis_token(user_id: str, scopes: list[str] | None = None) -> str:
     )
 
 
+def _prompt_cache_route_scope(runtime, *, secret: bytes) -> str:
+    """Return an unambiguous provider/model/destination/credential namespace.
+
+    The user HMAC must not be linkable across unrelated relays. ProviderConfig
+    permits a custom HTTPS base URL even for ``provider='openai'``, so provider
+    name alone is not enough: include the normalized destination (without
+    credentials, query, or fragment) and rotate the resulting pseudonym when a
+    user changes routes.
+    """
+    provider = provider_client.normalize_provider(
+        str(getattr(runtime, "provider", "") or ""))
+    model = str(getattr(runtime, "model", "") or "").strip().lower()
+    api_key = str(getattr(runtime, "api_key", "") or "").strip().encode("utf-8")
+    credential_fingerprint = hmac.new(
+        secret,
+        b"feedling:v2:prompt-cache-credential:v1\0" + api_key,
+        hashlib.sha256,
+    ).hexdigest()
+    base_url = str(getattr(runtime, "base_url", "") or "").strip()
+    if not base_url:
+        base_url = provider_client.default_base_url(provider)
+    parsed = urlsplit(base_url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+    normalized_port = None if port is None or default_port else int(port)
+    path = parsed.path.rstrip("/")
+    # Structured serialization avoids delimiter/IPv6 collisions (for example,
+    # an IPv6 host ending in ``:8000`` versus the same prefix plus port 8000).
+    return json.dumps(
+        [
+            provider,
+            model,
+            scheme,
+            host,
+            normalized_port,
+            path,
+            credential_fingerprint,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
 def _resolve_provider(user_id: str):
     """单次解密该用户 provider key（enclave-bound，BYOK-only）。返回 (ProviderConfig|None, meta)。
 
@@ -345,7 +370,31 @@ def _resolve_provider(user_id: str):
     runtime = hosted_config_store._load_runtime_provider_config(store, None, runtime_token=token)
     if isinstance(runtime, tuple):
         return None, runtime[1]
-    return runtime, {}
+    # Per-user opaque affinity: provider caches must never receive the raw user
+    # id, and the key must rotate with the runtime secret.  Exact prompt/model
+    # matching remains the provider's correctness guard; this HMAC only improves
+    # routing/stickiness for repeated prefixes.
+    secret = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip().encode("utf-8")
+    route_scope = _prompt_cache_route_scope(runtime, secret=secret)
+    scope_bytes = route_scope.encode("utf-8")
+    cache_key = hmac.new(
+        secret,
+        b"feedling:v2:prompt-cache:v3\0"
+        + scope_bytes
+        + b"\0"
+        + str(user_id).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    route_fingerprint = hmac.new(
+        secret,
+        b"feedling:v2:prompt-cache-route:v1\0" + scope_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+    return replace(
+        runtime,
+        prompt_cache_key=f"feedling-v2-{cache_key}",
+        prompt_cache_route_fingerprint=f"feedling-v2-route-{route_fingerprint}",
+    ), {}
 
 
 def _decrypt_chat_rows(
@@ -444,8 +493,8 @@ def _read_messages(user_id: str, after_seq: int = 0) -> list[dict]:
     boundary conversion).
 
     Never infer unanswered state from the latest assistant position: a user
-    message can arrive while a responder is running and be stored immediately
-    before that responder's assistant row; assistant slicing would then hide it
+    message can arrive while a turn is running and be stored immediately
+    before that turn's assistant row; assistant slicing would then hide it
     forever. The durable seq cursor is the source of truth.
 
     Rows come from ``db.chat_messages_after_seq`` (source of truth, ``seq``-
@@ -475,10 +524,9 @@ def _read_tail_window(
 ) -> list[dict]:
     """读该用户最近一个窗口内的消息（BOTH roles），逐条经 enclave 解密取明文（D1）。
 
-    镜像 `_read_messages` 的解密/过滤规则，但服务于不同目的：`_read_messages` 只回放
-    "自上一条 assistant 回复之后"的未答 user 消息（喂 coalesce/planner 判断本回合要不要
-    起新 job）；`_read_tail` 给 turn 看一段**真实的、双角色的**近期对话尾巴（喂 responder
-    的上下文窗口），所以：
+    镜像 `_read_messages` 的解密/过滤规则，但服务于不同目的：`_read_messages`
+    只回放 durable cursor 之后的未答 user 消息；`_read_tail` 给 turn 看一段
+    **真实的、双角色的**近期对话尾巴，所以：
     - 不按 last_assistant 下标切片、不跳过非 user 行；
     - 只保留 ts > after_ts 的行；
     - assistant 角色（`_ASSISTANT_ROLES`：openclaw/assistant/agent）规整为 "assistant"，
@@ -546,7 +594,7 @@ def _read_compaction_tail_after_seq(
 
 
 def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
-    """Newest bounded verbatim window for responder/wake context."""
+    """Newest bounded verbatim window for chat/wake context."""
     return _read_tail_window(user_id, after_ts, limit, oldest_first=False)
 
 
@@ -678,9 +726,9 @@ def _fire_scheduled_for_user(user_id: str) -> int:
 
 
 def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
-    """按 id 取图片字节。复用**仍然注册、但 planner 词表够不到**的 chat_image_read
-    capability（见 multimodal spec §4.0）—— 能力还在，只是不再由模型选择、不再流经
-    responder 的文本 grounding context（那是 BUG-1 的成因）。
+    """按 id 取图片字节。复用内部 `chat_image_read` capability（见
+    multimodal spec §4.0），但它不暴露给模型；worker 仅把最近图片作为
+    native multimodal content block 注入 prompt，不经文本 grounding context。
 
     单条失败只跳过那一条，绝不抛——调用方 `worker._inject_tail_images` 会把缺失的图片
     行原样留成文本。
@@ -2017,8 +2065,9 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     ]
     try:
         # Each loop handles recoverable iteration failures internally.  An
-        # escaping exception means the worker is degraded; propagate it so the
-        # container restarts instead of leaving a live heartbeat with dead work.
+        # escaping exception means the worker is degraded; propagate it to
+        # `_run_forever`, which relaunches this service loop instead of leaving
+        # a live heartbeat with dead work.
         await asyncio.gather(*tasks)
     finally:
         stop_event.set()
@@ -2038,6 +2087,38 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     log.info("[v2.serve_worker] drained; exiting worker=%s", worker_id)
 
 
+# In-process relaunch backoff bounds (see _run_forever). Bounded exponential:
+# a transient crash recovers within a second; a persistent crash loop is throttled
+# to one relaunch per 30s so it cannot hot-spin the CPU or hammer the DB/provider.
+_RELAUNCH_BACKOFF_MIN_SEC = 1.0
+_RELAUNCH_BACKOFF_MAX_SEC = 30.0
+
+
+def _run_forever(worker_id: str, poll_interval: float) -> None:
+    """Run ``_serve``, relaunching it in-process after a fatal Python crash.
+
+    dstack CVMs do not honor Docker's restart policy for this container, so an
+    exception escaping ``_serve`` would otherwise leave the V2 worker pool dead
+    until a manual restart. A clean SIGTERM/SIGINT drain returns normally and
+    exits without relaunching. This cannot recover a hard interpreter death such
+    as OOM-kill/SIGKILL; the rollout still needs an external liveness repair for
+    that process-level failure mode.
+    """
+    backoff = _RELAUNCH_BACKOFF_MIN_SEC
+    while True:
+        try:
+            asyncio.run(_serve(worker_id, poll_interval=poll_interval))
+            return
+        except Exception:  # noqa: BLE001 — fatal loop escapes must relaunch
+            log.exception(
+                "[v2.serve_worker] _serve crashed; relaunching in %.0fs "
+                "(dstack does not auto-restart the container)",
+                backoff,
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * 2, _RELAUNCH_BACKOFF_MAX_SEC)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     db_pool_max = _configure_db_pool_capacity(v2_worker.MAX_WORKERS)
@@ -2055,7 +2136,7 @@ def main() -> None:
         db_pool_max,
         v2_worker.MAX_WORKERS,
     )
-    asyncio.run(_serve(worker_id, poll_interval=poll_interval))
+    _run_forever(worker_id, poll_interval)
 
 
 if __name__ == "__main__":

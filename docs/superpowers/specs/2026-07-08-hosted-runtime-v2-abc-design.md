@@ -1,5 +1,10 @@
 # Hosted Runtime V2 (A+B+C) — DB Job + Action Queue + Short Planner 实现设计
 
+> **STATUS: HISTORICAL / SUPERSEDED.** This document records the retired
+> `planner → executor → responder` design. Production V2 now uses the single
+> provider-native loop described by the PR C documents; the retired planner,
+> responder, and compatibility loop modules no longer define current behavior.
+
 Date: 2026-07-08
 Branch: `feat/hosted-runtime-v2`（基于 `origin/test` @ e15325d）
 Status: design approved — 待写实现 plan

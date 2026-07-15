@@ -37,7 +37,6 @@ def _deps(**over):
     base = dict(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
-        is_official=lambda cfg: True,
         mint_enclave_token=lambda uid: "rt",
         read_tail=lambda uid, after, limit: [
             {"id": "m1", "ts": 1.0, "role": "user", "content": "我换工作了"}],
@@ -72,7 +71,7 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
     deps = _deps(apply_memory_actions=lambda uid_, actions: applied.update(n=len(actions)) or {})
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert applied == {"n": 1}
@@ -83,35 +82,43 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
 def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane):
     """PR B review finding: `_run_extraction` makes a real `v2_extraction.extract`
     BYOK call but never flushed a `v2_turn_metrics` row on success.
-    `v2_extraction.extract` doesn't currently surface usage from its provider
-    call (no `usage_out` equivalent, unlike `v2_responder.respond`) — the fix
-    counts the call via `add_call(None)` so `model_calls` is at least right;
-    token columns stay 0 (a documented gap, not invented data)."""
+    Extraction now surfaces the same normalized usage/cache telemetry as the
+    native chat loop."""
     uid = f"u_x_metric_{lane}"
     _seed_v2(uid)
     job_id, _ = jobs_store.enqueue_job(uid, lane)
     job = jobs_store.claim_next_job("w")
 
     async def _fake_extract(*, provider_config, prompt, parse, **kw):
+        kw["usage_out"]({
+            "prompt_tokens": 90,
+            "completion_tokens": 9,
+            "cache_read_tokens": 70,
+            "cache_write_tokens": None,
+            "cache_miss_tokens": 20,
+        })
         return ([{"action": "add", "summary": "s", "content": "c"}], None)
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
     deps = _deps()
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     with db.get_pool().connection() as c:
         row = c.execute(
-            "SELECT lane, prompt_tokens, completion_tokens, model_calls, failed, status "
+            "SELECT lane, prompt_tokens, completion_tokens, model_calls, failed, status, "
+            "cache_read_tokens, cache_miss_tokens, usage_reported_calls, "
+            "cache_reported_calls, provider, model "
             "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
     assert row is not None
     assert row[0] == lane
-    assert row[1] == 0 and row[2] == 0   # documented token-gap: extract() surfaces no usage
-    assert row[3] == 1                    # but the call itself IS counted
+    assert row[1] == 90 and row[2] == 9
+    assert row[3] == 1
     assert row[4] is False
     assert row[5] == "ok"
+    assert row[6:] == (70, 20, 1, 1, "anthropic", "claude-x")
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
@@ -130,7 +137,7 @@ def test_zero_results_completes_without_applying_anything(monkeypatch, lane):
     deps = _deps(apply_memory_actions=lambda uid_, a: applied.update(n=applied["n"] + 1) or {})
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
     assert status == "completed"
     assert applied["n"] == 0
     assert _job_row(job_id)[0] == "completed"
@@ -154,7 +161,7 @@ def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane)
     monkeypatch.setattr(worker, "_emit_status", lambda *a, **k: emitted.append(a))
 
     status = asyncio.run(worker.process_job(
-        job, _deps(), provider_config=_BYOK, is_official=True, api_key=None, runtime_token="rt"))
+        job, _deps(), provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
     assert written == {}                       # no chat bubble
@@ -181,7 +188,7 @@ def test_extraction_rollback_during_llm_blocks_memory_write(monkeypatch):
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=True,
+        job, deps, provider_config=_BYOK,
         api_key=None, runtime_token="rt"))
 
     assert status == "failed"
@@ -205,7 +212,7 @@ def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
     monkeypatch.setattr(extraction, "extract", _cap)
     status = asyncio.run(worker.process_job(
         job, _deps(read_memory_context=None), provider_config=_BYOK,
-        is_official=True, api_key=None, runtime_token="rt"))
+        api_key=None, runtime_token="rt"))
     assert status == "completed"
     assert "（暂无）" in seen["prompt"]          # prompt builder's own fallback kicked in
 
@@ -256,7 +263,7 @@ def test_extraction_reads_go_through_the_enclave_semaphore(monkeypatch):
     deps = _deps(read_memory_context=_ctx, read_tail=_tail)
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=True, api_key=None,
+        job, deps, provider_config=_BYOK, api_key=None,
         runtime_token="rt", enclave_sem=sem))
 
     assert status == "completed"

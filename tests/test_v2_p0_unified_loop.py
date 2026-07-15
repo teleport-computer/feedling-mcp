@@ -4,8 +4,7 @@ for the unified provider-native tool loop (spec 2026-07-13 PR-C plan, "### Task 
 Each test below asserts a STRONG live-behavior property of the real loop (`tool_loop.
 run_tool_loop` + `worker.process_job`/`executor.dispatch_tool_calls`), not a weak proxy:
 
-  1. weak-model plain text     -> exactly 1 provider call, exactly 1 bubble, no
-                                   planner/responder invocation.
+  1. weak-model plain text     -> exactly 1 provider call and exactly 1 bubble.
   2. reply + web_search        -> intermediate bubble written BEFORE the terminal one
                                    (real chat_messages seq order), and a turn RE-DRIVE
                                    that re-enqueues the SAME effect_id produces NO
@@ -56,8 +55,6 @@ from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import planner as v2_planner
-from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
 from model_api_runtime.v2 import worker
 from provider_types import ToolCall, ToolExchange
@@ -159,7 +156,6 @@ def _deps(*, messages, token="rt-enclave"):
     return worker.TurnDeps(
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: token,
         apply_pending_effects=_apply_effects,
     )
@@ -183,9 +179,7 @@ def _job_status_row(job_id):
 
 
 # ---------------------------------------------------------------------------
-# P0 #1: weak-model plain text -> exactly 1 provider call, exactly 1 bubble,
-# no planner/responder invocation (Global Constraints: no forced responder,
-# no behavior tiering).
+# P0 #1: weak-model plain text -> exactly 1 provider call and exactly 1 bubble.
 # ---------------------------------------------------------------------------
 
 def test_p0_weak_model_plain_text_one_call_one_bubble_no_dispatch_tiering(monkeypatch):
@@ -195,21 +189,13 @@ def test_p0_weak_model_plain_text_one_call_one_bubble_no_dispatch_tiering(monkey
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    def _boom_plan(*a, **k):
-        raise AssertionError("the unified tool loop must never call v2_planner.plan")
-
-    async def _boom_respond(*a, **k):
-        raise AssertionError("the unified tool loop must never call v2_responder.respond")
-
-    monkeypatch.setattr(v2_planner, "plan", _boom_plan)
-    monkeypatch.setattr(v2_responder, "respond", _boom_respond)
     _patch_real_write(monkeypatch)
 
     calls = _script_provider(monkeypatch, [_text_round("hello from the weak model")])
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert len(calls) == 1                       # STRONG: exactly one provider call, no
@@ -242,7 +228,7 @@ def test_p0_reply_then_web_search_ordering_and_exactly_once_replay(monkeypatch):
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert len(calls) == 2
@@ -332,7 +318,6 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid: list(live_rows["rows"]),
         resolve_provider=lambda uid: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: "rt-enclave",
         apply_pending_effects=_apply_effects,
         read_messages_since=lambda uid, since_ts: list(live_rows["rows"]),
@@ -341,7 +326,7 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert sleep_calls == []                     # STRONG: no debounce sleep occurred.

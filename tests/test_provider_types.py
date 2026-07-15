@@ -13,7 +13,9 @@ from provider_types import (
 
 
 def test_types_construct():
-    ts = ToolSpec(name="web_search", description="search", parameters={"type": "object"})
+    assert ToolSpec(
+        name="web_search", description="search", parameters={"type": "object"}
+    ).name == "web_search"
     tc = ToolCall(id="c1", name="web_search", args={"q": "hi"})
     assert tc.args_ok is True and tc.args_raw == ""
     assert ToolResult(call_id="c1", content="ok").call_id == "c1"
@@ -29,7 +31,14 @@ def test_provider_response_from_result():
         "reply": "hello",
         "tool_calls": [{"id": "c1", "name": "web_search", "args": {"q": "x"},
                         "args_raw": "", "args_ok": True}],
-        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+        "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 4,
+            "total_tokens": 7,
+            "cache_read_tokens": 2,
+            "cache_write_tokens": 1,
+            "cache_miss_tokens": 0,
+        },
         "assistant_turn": {
             "wire": "openai_chat",
             "payload": {"role": "assistant", "tool_calls": [{"id": "c1"}]},
@@ -38,7 +47,14 @@ def test_provider_response_from_result():
     pr = ProviderResponse.from_result(result)
     assert pr.text == "hello"
     assert pr.tool_calls == [ToolCall(id="c1", name="web_search", args={"q": "x"})]
-    assert pr.usage == Usage(prompt_tokens=3, completion_tokens=4, total_tokens=7)
+    assert pr.usage == Usage(
+        prompt_tokens=3,
+        completion_tokens=4,
+        total_tokens=7,
+        cache_read_tokens=2,
+        cache_write_tokens=1,
+        cache_miss_tokens=0,
+    )
     assert pr.raw is result
     assert pr.assistant_turn == NativeAssistantTurn(
         "openai_chat", {"role": "assistant", "tool_calls": [{"id": "c1"}]})

@@ -75,6 +75,54 @@ def test_two_reads_dispatch_and_return_results_by_call_id(monkeypatch):
     assert enqueued == []
 
 
+def test_read_parallelism_is_bounded_by_configured_limit(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+    started_count = 0
+
+    def _run_capability(action_type, store, *, api_key, runtime_token, params):
+        nonlocal active, max_active, started_count
+        with lock:
+            active += 1
+            started_count += 1
+            max_active = max(max_active, active)
+            started.set()
+        assert release.wait(timeout=2)
+        with lock:
+            active -= 1
+        return _FakeResult(True, {"body": action_type})
+
+    monkeypatch.setattr(cap_registry, "run_capability", _run_capability)
+
+    async def scenario():
+        task = asyncio.create_task(v2_executor.dispatch_tool_calls(
+            [
+                ToolCall(id="c1", name="memory_index", args={}),
+                ToolCall(id="c2", name="web_search", args={"query": "x"}),
+            ],
+            store=_Store(),
+            api_key="k",
+            runtime_token="rt",
+            enclave_sem=asyncio.Semaphore(8),
+            turn_authorization=False,
+            enqueue_write_effect=lambda _tc: None,
+            read_parallelism=1,
+        ))
+        assert await asyncio.to_thread(started.wait, 1.0)
+        await asyncio.sleep(0.03)
+        with lock:
+            assert started_count == 1
+        release.set()
+        return await task
+
+    results = asyncio.run(scenario())
+    assert [result.call_id for result in results] == ["c1", "c2"]
+    assert max_active == 1
+
+
 def test_write_with_authorization_is_enqueued_not_run_inline(monkeypatch):
     ran = []
 

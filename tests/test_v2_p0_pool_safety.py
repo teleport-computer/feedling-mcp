@@ -380,7 +380,6 @@ def test_kill_switch_slot_loop_claim_gate_does_not_claim_while_halted(monkeypatc
             deps=worker.TurnDeps(
                 read_messages=lambda uid: [],
                 resolve_provider=lambda uid: (None, {}),
-                is_official=lambda cfg: False,
                 mint_enclave_token=lambda uid: "rt",
                 apply_pending_effects=lambda *a, **k: None,
             ),

@@ -144,12 +144,7 @@ if not _provisioned:
         "test_user_mcp_probe.py",
         "test_user_mcp_materialize.py",
         "test_v2_coalesce.py",
-        "test_v2_invalidation.py",
         "test_v2_status_stream.py",
-        "test_v2_planner_rule.py",
-        "test_v2_planner_official.py",
-        "test_v2_executor.py",
-        "test_v2_responder.py",
         "test_v2_dependency_direction.py",
     }
     collect_ignore = sorted(

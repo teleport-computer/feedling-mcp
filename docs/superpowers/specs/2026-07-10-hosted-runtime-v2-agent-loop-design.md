@@ -1,5 +1,10 @@
 # Hosted Runtime V2 — Agent Loop 设计
 
+> **STATUS: HISTORICAL / SUPERSEDED.** This intermediate JSON-planner loop was
+> replaced by the provider-native `tool_loop.py` architecture. Keep this file as
+> decision archaeology; do not use `agent_loop.py`, planner tiers, or a separate
+> responder as current implementation guidance.
+
 > 承接 `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md` §C（turn shape，最深的一条 gap）。这是 walkthrough §9 条件3 的**重新定义版**——当初判定为"陪伴产品过度设计"而弃做的是**原生 tool-calling wire 协议**，不是 agent loop 本身。两者不是一回事。
 
 **Goal:** 让 V2 有一个真正的 agent loop（`decide → act → observe → decide`），且**不把 provider 原生工具协议当作前置条件**。

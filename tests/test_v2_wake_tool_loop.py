@@ -1,6 +1,4 @@
-"""Task 8 (PR C, spec C8): worker._run_wake on the unified provider-native tool
-loop (`tool_loop.run_tool_loop`) — replacing the old wake-only `v2_responder.
-respond` call + its `ResponderError("empty_reply"/"no_user_messages")` branches.
+"""worker._run_wake on the unified provider-native tool loop.
 
 Style mirrors tests/test_v2_worker_tool_loop.py (Task 7's chat-lane sibling):
 real jobs_store (real DB claim/mark_*), real core_store (real DB chat/reload),
@@ -36,8 +34,6 @@ from provider_types import ToolExchange
 from core import store as core_store
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import planner as v2_planner
-from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
 
@@ -157,7 +153,6 @@ def _wake_deps(*, tail=None, summary="", sink_calls=None, token="rt-enclave"):
     return worker.TurnDeps(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: token,
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
         read_summary=lambda uid: (summary, 0.0, 0),
@@ -200,14 +195,6 @@ def test_wake_terminal_plain_text_writes_exactly_one_proactive_bubble(monkeypatc
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    def _boom_plan(*a, **k):
-        raise AssertionError("the unified tool loop must never call v2_planner.plan")
-
-    async def _boom_respond(*a, **k):
-        raise AssertionError("the unified tool loop must never call v2_responder.respond")
-
-    monkeypatch.setattr(v2_planner, "plan", _boom_plan)
-    monkeypatch.setattr(v2_responder, "respond", _boom_respond)
     _patch_real_write(monkeypatch)
 
     calls = _script_provider(monkeypatch, [_text_round("hey, thinking of you")])
@@ -218,7 +205,7 @@ def test_wake_terminal_plain_text_writes_exactly_one_proactive_bubble(monkeypatc
     # accumulator gets created and flushed, same as production's real
     # dispatch path (`_run_turn` -> `process_job` -> lane dispatch).
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert len(calls) == 1

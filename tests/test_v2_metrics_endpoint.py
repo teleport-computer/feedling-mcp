@@ -48,6 +48,27 @@ def env(monkeypatch):
     monkeypatch.setattr(jobs_store, "live_worker_capacity", lambda **kw: 8)
     monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: 4.5)
     monkeypatch.setattr(jobs_store, "recent_mean_tokens_per_turn", lambda **kw: 123.0)
+    monkeypatch.setattr(
+        jobs_store,
+        "recent_prompt_cache_stats",
+        lambda **kw: {
+            "sampled_turns": 4,
+            "model_calls": 5,
+            "usage_reported_calls": 5,
+            "cache_reported_calls": 4,
+            "usage_telemetry_coverage": 1.0,
+            "cache_telemetry_coverage": 0.8,
+            "route_identity_coverage": 1.0,
+            "route_fingerprint_count": 1,
+            "route_fingerprint": "feedling-v2-route-test",
+            "prompt_tokens": 1000,
+            "cache_read_tokens": 600,
+            "cache_write_tokens": 100,
+            "cache_miss_tokens": 400,
+            "effective_input_tokens": 1000,
+            "hit_ratio": 0.6,
+        },
+    )
     monkeypatch.setattr(jobs_store, "genesis_worker_alive", lambda **kw: True)
     monkeypatch.setattr(
         admin_core.db,
@@ -107,6 +128,23 @@ def test_v2_metrics_returns_every_field(env):
         "live_worker_capacity": 8,
         "mean_service_sec": 4.5,
         "recent_mean_tokens_per_turn": 123.0,
+        "prompt_cache": {
+            "sampled_turns": 4,
+            "model_calls": 5,
+            "usage_reported_calls": 5,
+            "cache_reported_calls": 4,
+            "usage_telemetry_coverage": 1.0,
+            "cache_telemetry_coverage": 0.8,
+            "route_identity_coverage": 1.0,
+            "route_fingerprint_count": 1,
+            "route_fingerprint": "feedling-v2-route-test",
+            "prompt_tokens": 1000,
+            "cache_read_tokens": 600,
+            "cache_write_tokens": 100,
+            "cache_miss_tokens": 400,
+            "effective_input_tokens": 1000,
+            "hit_ratio": 0.6,
+        },
         "wake": {
             "completed": 4,
             "failed": 1,
@@ -136,6 +174,77 @@ def test_v2_metrics_surfaces_a_dead_genesis_thread(env, monkeypatch):
     assert status == 200
     assert body["genesis_alive"] is False
     assert body["live_workers"] == 2
+
+
+def test_v2_metrics_filters_cache_proof_to_route_and_window(env, monkeypatch):
+    seen = {}
+
+    def _cache_stats(**kwargs):
+        seen.update(kwargs)
+        return {
+            "sampled_turns": 2,
+            "model_calls": 2,
+            "cache_read_tokens": 900,
+            "filter": {
+                "provider": kwargs.get("provider"),
+                "model": kwargs.get("model"),
+                "cache_route_fingerprint": kwargs.get("cache_route_fingerprint"),
+                "user_id": kwargs.get("user_id"),
+                "since_ts": kwargs.get("since_ts"),
+                "until_ts": kwargs.get("until_ts"),
+                "include_turns": kwargs.get("include_turns"),
+            },
+        }
+
+    monkeypatch.setattr(jobs_store, "recent_prompt_cache_stats", _cache_stats)
+    status, body = _asgi_json(
+        "GET",
+        "/v1/admin/v2-metrics?cache_provider=openai&cache_model=gpt-5"
+        "&cache_route_fingerprint=feedling-v2-route-test&cache_user_id=u-canary"
+        "&cache_since_ts=123.5&cache_until_ts=456.5",
+        headers=_admin(),
+    )
+
+    assert status == 200
+    assert seen == {
+        "lane": "chat",
+        "provider": "openai",
+        "model": "gpt-5",
+        "cache_route_fingerprint": "feedling-v2-route-test",
+        "user_id": "u-canary",
+        "since_ts": 123.5,
+        "until_ts": 456.5,
+        "include_turns": True,
+    }
+    assert body["prompt_cache"]["filter"] == {
+        "provider": "openai",
+        "model": "gpt-5",
+        "cache_route_fingerprint": "feedling-v2-route-test",
+        "user_id": "u-canary",
+        "since_ts": 123.5,
+        "until_ts": 456.5,
+        "include_turns": True,
+    }
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-1", "1e308", "not-a-number"])
+def test_v2_metrics_rejects_invalid_cache_window(env, raw):
+    status, body = _asgi_json(
+        "GET", f"/v1/admin/v2-metrics?cache_since_ts={raw}", headers=_admin())
+
+    assert status == 400
+    assert body == {"error": "invalid_cache_since_ts"}
+
+
+def test_v2_metrics_rejects_reversed_cache_window(env):
+    status, body = _asgi_json(
+        "GET",
+        "/v1/admin/v2-metrics?cache_since_ts=200&cache_until_ts=100",
+        headers=_admin(),
+    )
+
+    assert status == 400
+    assert body == {"error": "invalid_cache_window"}
 
 
 def test_v2_metrics_no_token_is_401(env):

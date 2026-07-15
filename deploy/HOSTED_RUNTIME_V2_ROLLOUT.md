@@ -11,7 +11,18 @@ RAM and process count become a function of the worker-pool size, not the user co
 - **D0 landed**: worker pool container (`serve-worker`) added to the runner compose; discovery exclusivity guard live (`db.list_agent_runtime_enabled_users` excludes `db_action_v2` users); admin mode-setter (`/v1/admin/hosted-runtime-mode` + `io_cli set-/list-runtime-mode`); per-turn metrics (`v2_turn_metrics` + `/v1/admin/v2-metrics`).
 - **D3 landed**: proactive/wake migrated to lanes (scheduler + wake handler). **Full kill-resident cannot happen until D3 is deployed** — before that, `db_action_v2` only reroutes interactive chat; a flipped user's proactive wakes would be lost.
 - Both runner composes carry the `serve-worker` service (`deploy/docker-compose.phala.runner.yaml`, `deploy/docker-compose.phala.prod.runner.yaml`).
+- Apply Alembic through `0038_v2_prompt_cache_metrics` before starting the new
+  worker image. Old workers ignore the additive columns; the new worker keeps
+  cache telemetry nullable so an older relay cannot masquerade as a zero-hit
+  provider.
 - **Audit blockers closed first**: the branch now contains the stable cutover cursor, transactional reply boundary, hard wedged-turn recovery, and database-backed live turn-pool kill switch. Do not enroll even an internal user until the deployed image has also passed the fault-injection/rollback drill in `docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md`.
+- **Prove process recovery, not only Python recovery.** `_run_forever` relaunches
+  `_serve` after an escaping Python exception, and the send heartbeat/deadline
+  guards turn a dead pool into a visible error. A SIGKILL/OOM of the worker PID
+  cannot relaunch itself, and the pre CVM has demonstrated that its Docker
+  restart policy is not sufficient. Install and test an external liveness
+  repair (or an equivalent parent supervisor) before the first canary; an alert
+  without automatic repair is not a completed availability gate.
 - Capture/dream producers are currently default-off. Any early infrastructure soak is capability-incomplete and is not evidence that V2 can replace resident.
 - Web results are untrusted: after `web_search`/`web_fetch` returns, the native loop removes every durable-write tool and blocks new searches/fresh outbound URLs for the remainder of that turn. A `web_search` result may be fetched once only by its exact returned URL; search-and-save still needs a fresh user turn. Do not widen that boundary without per-result taint tracking, outbound data-loss controls, and an explicit confirmation protocol.
 
@@ -21,7 +32,25 @@ RAM and process count become a function of the worker-pool size, not the user co
 2. Build `feedling-agent-runner:<sha>`, bump the compose tag, `phala deploy --cvm-id <runner>`, `deploy/publish-compose-hash.sh`.
 3. Env (encrypted channel, no re-auth): `FEEDLING_V2_MAX_WORKERS` (default 4), `FEEDLING_V2_CHAT_RESERVED_SLOTS` (default `max(1, MAX_WORKERS//2)`, clamped so at least one slot remains unrestricted), `FEEDLING_V2_SCHEDULER_INTERVAL_SEC` (default 30). Watchdog budgets are deliberately split: `FEEDLING_V2_TURN_STALL_TIMEOUT_SEC` defaults to 240s (minimum 210s), `FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC` defaults to 1500s and must cover the configured prompt-catch-up/provider envelope (1440s minimum at current defaults), `FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC` defaults to 45s, and `FEEDLING_V2_WATCHDOG_DB_TIMEOUT_SEC` defaults to 5s. **Remove any existing `FEEDLING_V2_TURN_HARD_TIMEOUT_SEC=180` override before deploy**: the legacy key is now only a stall-timeout alias, and values below 210s intentionally fail startup. Do not set the absolute budget back to 180s; legitimate `FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=600` catch-up plus bounded provider rounds can exceed it while still making progress. `serve-worker` automatically sizes its process-local `FEEDLING_DB_POOL_MAX_SIZE` floor to `max(16, 2*MAX_WORKERS+4)` because every generation-fenced effect drain may hold one outer transaction while its sink borrows a second connection; an explicit lower override fails startup instead of deadlocking all slots. Non-positive/invalid worker, pool, enclave, TTL, poll, scheduler, and watchdog settings fail startup.
 4. **Verify**: `v2_worker_heartbeats` has fresh rows (`jobs_store.workers_alive()` True); `GET /v1/admin/v2-metrics` returns live_workers ≥ 1.
-5. **Verify genesis rehome** (2026-07-10): the genesis import worker now runs inside `serve-worker`, not `agent-runner` — `genesis_import_jobs` has exactly one drain in the codebase, so if this container is unhealthy, every new user's onboarding distillation stalls silently. Confirm `GET /v1/admin/v2-metrics` returns `genesis_alive: true`, then drive **one real genesis import end-to-end** and confirm it decrypts (the runner CVM reaches the main enclave over the passthrough URL with `verify=False`; `deploy/DEPLOYMENTS.md` has always flagged this as a post-cutover check). A `genesis_alive: false` with `live_workers ≥ 1` means the genesis thread died while the turn loops kept beating — check the serve-worker logs for `[genesis:daemon]`.
+5. **Verify prompt caching with a real provider**: record a start epoch, send
+   exactly two canary-user requests whose exact shared prefix is comfortably
+   above that model's minimum, then record an end epoch. First query with
+   `cache_provider`, `cache_model`, `cache_user_id`, `cache_since_ts`, and
+   `cache_until_ts`; require `sampled_turns == 2`,
+   `route_identity_coverage == 1`, and `route_fingerprint_count == 1`. Repeat
+   the query with the returned opaque `route_fingerprint` supplied as
+   `cache_route_fingerprint`. The bounded user/time query includes a
+   chronological `turns` list: require exactly two successful rows,
+   `turns[0].model_calls == turns[1].model_calls == 1` (use a simple no-tool
+   prompt), and
+   `turns[1].cache_read_tokens > 0`. A non-zero aggregate is insufficient: it
+   could be a hit in the first turn or a later tool round inside that turn. Do not accept an
+   unfiltered fleet aggregate, an open-ended time window, or another user's
+   traffic as proof for one route. Also confirm `cache_telemetry_coverage`: a
+   missing metric is `null`/unreported, never a fabricated zero. Exercise one
+   relay that rejects cache fields and verify the bounded cache-off retry still
+   preserves the native tool catalog.
+6. **Verify genesis rehome** (2026-07-10): the genesis import worker now runs inside `serve-worker`, not `agent-runner` — `genesis_import_jobs` has exactly one drain in the codebase, so if this container is unhealthy, every new user's onboarding distillation stalls silently. Confirm `GET /v1/admin/v2-metrics` returns `genesis_alive: true`, then drive **one real genesis import end-to-end** and confirm it decrypts (the runner CVM reaches the main enclave over the passthrough URL with `verify=False`; `deploy/DEPLOYMENTS.md` has always flagged this as a post-cutover check). A `genesis_alive: false` with `live_workers ≥ 1` means the genesis thread died while the turn loops kept beating — check the serve-worker logs for `[genesis:daemon]`.
 
 ## Step 1 — Load test (LOCAL, before flipping real users)
 
@@ -34,7 +63,7 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 
 ## Step 2 — Gated rollout (evidence-first)
 
-1. **Current state: HOLD.** The remaining gate is deployed operational evidence, not the former P0 code omissions: finish the prerequisites above and the handoff's fault/rollback checks before any user flip. Once they pass, start with one explicitly consented internal user: `io_cli set-runtime-mode <internal_uid> db_action_v2`. Watch `/v1/admin/v2-metrics` (inflight/pending/wake success and whole-turn chat/wake provider usage) + error chips + subjective chat quality for 24–48 h. Extraction and compaction calls do not yet contribute token usage, so treat totals for those maintenance lanes as incomplete.
+1. **Current state: HOLD.** The remaining gate is deployed operational evidence, not the former P0 code omissions: finish the prerequisites above and the handoff's fault/rollback checks before any user flip. Once they pass, start with one explicitly consented internal user: `io_cli set-runtime-mode <internal_uid> db_action_v2`. Watch `/v1/admin/v2-metrics` (inflight/pending/wake success, whole-turn usage across chat/wake/extraction/compaction, and prompt-cache coverage/hit ratio) + error chips + subjective chat quality for 24–48 h.
 2. **Ramp cohorts**: 5 → 20 → 50 → all. `io_cli list-runtime-mode` to track who's on what. Each batch: confirm tokens/turn not regressed, queue-wait P95 within SLA, `wake.success_rate` healthy, `stuck_jobs ≈ 0`.
 3. **Mixed-fleet safety**: the D0 exclusivity guard keeps each user on exactly ONE path — only an explicit `db_action_v2` value enrolls V2; missing/invalid values remain resident. A flipped user runs on V2 and their resident consumer is reaped (~15 s, next supervisor tick); an un-flipped user stays resident. A runtime-control read failure must refuse routing, and a resident-discovery query failure must skip reconciliation rather than look like an empty roster. No double-run and no outage-driven fleet teardown.
 
@@ -62,8 +91,11 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 ## Deferred (explicit, out of this round)
 
 - **D follow-up ledger (do not read this runbook as claiming completion)**:
-  prompt caching is not implemented; whole-turn chat/wake usage is implemented
-  but extraction/compaction usage and a real concurrent CVM load run remain;
+  provider prompt caching and cache telemetry are implemented (OpenAI/OpenRouter
+  affinity, Anthropic automatic ephemeral caching, Gemini/DeepSeek implicit
+  caching, and cache-off compatibility fallback), and whole-turn usage now
+  includes extraction/compaction calls. A real two-request cache-hit proof and
+  a concurrent CVM load run still remain;
   admission ceiling is implemented; typing-signal pre-warm is not implemented;
   encrypted full-trajectory storage plus side-effect-disabled dream-lane failure
   replay is not implemented; and fleet-wide resident retirement is an operator

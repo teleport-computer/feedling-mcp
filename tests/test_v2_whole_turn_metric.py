@@ -9,7 +9,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db
 from model_api_runtime.v2 import jobs_store
 from conftest import seed_user
-import os, pytest
+import os
+import pytest
 pytestmark = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="needs PG")
 
 
@@ -30,7 +31,8 @@ def _seed_job(uid):
 
 
 def test_upsert_is_idempotent_by_job(pg_clean_metrics):
-    uid = "u_wtm1"; jid = _seed_job(uid)
+    uid = "u_wtm1"
+    jid = _seed_job(uid)
     jobs_store.record_whole_turn_metric(jid, uid, "chat", prompt_tokens=10,
         completion_tokens=5, latency_ms=100, model_calls=2, retries=0, failed=False, status="ok")
     jobs_store.record_whole_turn_metric(jid, uid, "chat", prompt_tokens=30,
@@ -42,9 +44,44 @@ def test_upsert_is_idempotent_by_job(pg_clean_metrics):
 
 
 def test_failed_turn_is_recorded(pg_clean_metrics):
-    uid = "u_wtm2"; jid = _seed_job(uid)
+    uid = "u_wtm2"
+    jid = _seed_job(uid)
     jobs_store.record_whole_turn_metric(jid, uid, "chat", prompt_tokens=7,
         completion_tokens=0, latency_ms=50, model_calls=1, retries=0, failed=True, status="provider_error")
     with db.get_pool().connection() as c:
         row = c.execute("SELECT failed, status FROM v2_turn_metrics WHERE job_id=%s", (jid,)).fetchone()
     assert row[0] is True and row[1] == "provider_error"
+
+
+def test_cache_telemetry_and_provider_identity_are_persisted(pg_clean_metrics):
+    uid = "u_wtm_cache"
+    jid = _seed_job(uid)
+    jobs_store.record_whole_turn_metric(
+        jid, uid, "chat",
+        prompt_tokens=100,
+        completion_tokens=12,
+        cache_read_tokens=70,
+        cache_write_tokens=10,
+        cache_miss_tokens=30,
+        usage_reported_calls=2,
+        cache_reported_calls=2,
+        provider="anthropic",
+        model="claude-test",
+        cache_route_fingerprint="feedling-v2-route-test",
+        latency_ms=50,
+        model_calls=2,
+        retries=0,
+        failed=False,
+        status="ok",
+    )
+    with db.get_pool().connection() as c:
+        row = c.execute(
+            "SELECT cache_read_tokens, cache_write_tokens, cache_miss_tokens, "
+            "usage_reported_calls, cache_reported_calls, provider, model, "
+            "cache_route_fingerprint "
+            "FROM v2_turn_metrics WHERE job_id=%s",
+            (jid,),
+        ).fetchone()
+    assert row == (
+        70, 10, 30, 2, 2, "anthropic", "claude-test", "feedling-v2-route-test"
+    )

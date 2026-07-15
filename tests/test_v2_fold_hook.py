@@ -54,7 +54,6 @@ def _deps(reader: _FakeReader) -> TurnDeps:
     return TurnDeps(
         read_messages=_unused,
         resolve_provider=_unused,
-        is_official=_unused,
         mint_enclave_token=_unused,
         read_messages_since=reader,
     )
@@ -177,7 +176,6 @@ def test_fold_uses_read_messages_when_read_messages_since_absent():
     deps = TurnDeps(
         read_messages=reader,
         resolve_provider=_unused,
-        is_official=_unused,
         mint_enclave_token=_unused,
         read_messages_since=None,
     )

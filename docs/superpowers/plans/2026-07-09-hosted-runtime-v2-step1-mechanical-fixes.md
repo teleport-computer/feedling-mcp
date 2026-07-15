@@ -1,5 +1,9 @@
 # Hosted Runtime V2 — Step 1: Mechanical Merge-Condition Fixes
 
+> **STATUS: HISTORICAL / LANDED.** This plan records the first mechanical
+> hardening pass. Use the current rollout runbook and production code for live
+> behavior and remaining gates.
+
 > **For agentic workers:** execute via superpowers:subagent-driven-development, **NO-COMMIT mode** (user commits themselves — never `git add`/`git commit`). Review each task via filesystem-snapshot diff.
 > **Source:** `2026-07-09-hosted-runtime-v2-merge-conditions-backlog.md` — this plan implements the "机械项 (A-C 补丁)" rows only. Conditions 2, 3, §6-admission-ceiling are deferred to subproject D (step 2).
 

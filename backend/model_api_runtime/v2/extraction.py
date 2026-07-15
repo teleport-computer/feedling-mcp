@@ -26,6 +26,7 @@ async def extract(
     parse: Callable[[str], tuple],
     max_tokens: int = _MAX_TOKENS,
     progress_cb: Callable[[str, int], None] | None = None,
+    usage_out: Callable[[dict | None], None] | None = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
 
@@ -40,7 +41,11 @@ async def extract(
             progress_cb=progress_cb,
         )
     except Exception as e:  # noqa: BLE001 — 背景 job：归一成 reason，绝不抛
+        if usage_out is not None:
+            usage_out(None)
         return None, f"provider_call_failed:{type(e).__name__}"
+    if usage_out is not None:
+        usage_out(result.get("usage") if isinstance(result, dict) else None)
     reply = str((result or {}).get("reply") or "").strip()
     if not reply:
         return None, "empty_reply"

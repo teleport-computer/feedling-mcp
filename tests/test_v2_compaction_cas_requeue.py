@@ -108,7 +108,6 @@ def test_cas_loss_requeues_fresh_maintenance_job(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=read_tail,
         read_summary=read_summary,
@@ -165,7 +164,6 @@ def test_cas_loss_requeue_is_single_flight_not_a_storm(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=read_tail,
         read_summary=read_summary,
@@ -215,7 +213,6 @@ def test_non_cas_failure_does_not_requeue(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=read_tail,
         read_summary=read_summary,
@@ -259,7 +256,6 @@ def test_cas_success_unchanged_no_double_requeue(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=read_tail,
         read_summary=read_summary,

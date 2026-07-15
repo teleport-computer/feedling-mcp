@@ -26,6 +26,50 @@ def test_compact_appends_new_bullets_preserving_old():
     assert "- talked about cats" in out and "- user asked about dogs" in out
     assert out.index("cats") < out.index("dogs")
 
+
+def test_compact_reports_provider_usage():
+    seen = []
+    llm = _fake_llm_result({
+        "reply": "- cached fact",
+        "usage": {
+            "prompt_tokens": 20,
+            "completion_tokens": 3,
+            "cache_read_tokens": 15,
+            "cache_write_tokens": None,
+            "cache_miss_tokens": 5,
+        },
+    })
+    out = asyncio.run(compaction.compact(
+        provider_config=object(),
+        current_summary="",
+        old_messages=[{"role": "user", "content": "remember this"}],
+        llm=llm,
+        usage_out=seen.append,
+    ))
+    assert out == "- cached fact"
+    assert seen == [{
+        "prompt_tokens": 20,
+        "completion_tokens": 3,
+        "cache_read_tokens": 15,
+        "cache_write_tokens": None,
+        "cache_miss_tokens": 5,
+    }]
+
+
+def test_compact_reports_unknown_usage_when_provider_raises():
+    seen = []
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("provider down")
+
+    with pytest.raises(RuntimeError, match="provider down"):
+        asyncio.run(compaction.compact(
+            provider_config=object(), current_summary="",
+            old_messages=[{"role": "user", "content": "x"}], llm=_boom,
+            usage_out=seen.append,
+        ))
+    assert seen == [None]
+
 def test_compact_empty_summary_is_just_new():
     llm = _fake_llm_returning("- first thing")
     out = asyncio.run(compaction.compact(provider_config=object(), current_summary="",

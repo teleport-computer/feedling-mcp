@@ -1,7 +1,4 @@
-"""D3 Task 6 (wake-lane processing: heartbeat/scheduled/manual_wake) + PR C Task 8
-(spec C8: the wake lane migrated onto the unified `tool_loop.run_tool_loop`,
-replacing the old wake-only `v2_responder.respond` call and its
-`ResponderError("empty_reply"/"no_user_messages")` branches).
+"""Wake-lane processing on the unified `tool_loop.run_tool_loop`.
 
 `_run_wake` mirrors `_run_compaction`'s self-contained shape (own try/except,
 silent `mark_failed`, never `_surface_terminal_error`, never a chat bubble on
@@ -45,7 +42,6 @@ import provider_client
 from core import store as core_store
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import planner as v2_planner
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import worker
 
@@ -109,7 +105,6 @@ def _wake_deps(*, summary="", tail=None):
     return worker.TurnDeps(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: "rt",
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
         read_summary=lambda uid: (summary, 0.0, 0),
@@ -291,7 +286,6 @@ def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=_boom_read_tail,
         read_summary=lambda uid_: ("", 0.0, 0),
@@ -332,7 +326,6 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         # read_tail/read_summary left at their TurnDeps default of None.
     )
@@ -502,7 +495,7 @@ def test_run_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
 
 # ------------------------------------------------------------------
 # process_job dispatch: heartbeat/scheduled/manual_wake route to _run_wake,
-# NOT the chat coalesce/planner path.
+# NOT the chat coalesce path.
 # ------------------------------------------------------------------
 
 @pytest.mark.parametrize("lane", ["heartbeat", "scheduled", "manual_wake"])
@@ -512,14 +505,6 @@ def test_process_job_dispatches_wake_lanes_to_run_wake_not_chat_path(monkeypatch
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, lane)
     job = jobs_store.claim_next_job("w")
-
-    plan_calls = {"n": 0}
-
-    async def _boom_plan(*a, **k):
-        plan_calls["n"] += 1
-        raise AssertionError("planner must not run for a wake-lane job")
-
-    monkeypatch.setattr(v2_planner, "plan", _boom_plan)
 
     coalesce_calls = {"n": 0}
     orig_coalesce = v2_coalesce.coalesce_pending
@@ -539,7 +524,6 @@ def test_process_job_dispatches_wake_lanes_to_run_wake_not_chat_path(monkeypatch
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: [],
         read_summary=lambda uid_: ("", 0.0, 0),
@@ -547,10 +531,9 @@ def test_process_job_dispatches_wake_lanes_to_run_wake_not_chat_path(monkeypatch
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert plan_calls["n"] == 0
     assert coalesce_calls["n"] == 0
     assert written["text"] == "a proactive nudge"
     assert _job_status(job_id)[0] == "completed"

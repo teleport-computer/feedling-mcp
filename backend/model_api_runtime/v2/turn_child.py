@@ -9,21 +9,20 @@ slot 里卡死的同步调用能拖死全部。现在父进程改用 `child_supe
 `v2_worker.run_worker_loop`——reaper/heartbeat/scheduler/Genesis 仍然留在父进程
 （父进程不受子进程卡死影响，才谈得上"父进程还活着才能 SIGKILL 子进程"）。
 
-**复用 `serve_worker` 而不是重复装配逻辑**：`wire_assembly()`/`build_production_deps()`/
-`_configure_provider_thread_limiter()` 都已经在 `serve_worker.py` 里实现好了——那是这个
+**复用 `serve_worker` 而不是重复装配逻辑**：`wire_assembly()`/
+`build_production_deps()` 都已经在 `serve_worker.py` 里实现好了——那是这个
 代码库里"唯一允许同时 import hosted/agent_runtime 和 core/model_api_runtime 的装配层"
-（见 serve_worker.py 模块 docstring）。本文件在函数体内部（不是模块顶层）`import
-serve_worker` 来复用它们，从而不必自己再 import 一遍 `hosted`/`agent_runtime`——这样
+（见 serve_worker.py 模块 docstring）。本文件只 `import serve_worker` 这个装配层来复用
+它们，从而不必自己再 import 一遍 `hosted`/`agent_runtime`——这样
 `tests/test_v2_dependency_direction.py`（把 v2/ 下除 serve_worker.py/__init__.py 外的每个
 模块都当作 core 模块，禁止直接 `import hosted`/`import agent_runtime`）天然通过：本文件
 自己的 AST 里根本没出现这两个词，"只有 serve_worker.py 直接碰 hosted/agent_runtime"这条
 不变量并没有被绕过，只是多了一层转发。
 
-反过来，`serve_worker._serve` 对本模块的 import 也刻意放在函数体内部而非模块顶层——
-`turn_child` 顶层要 `import serve_worker`，如果 `serve_worker.py` 顶层也 `import
-turn_child`，两边互相在对方还没加载完时导入对方，会踩 Python 循环 import 的坑（拿到一个
-还没跑完 module body 的半成品模块）。函数体内 import 在 `_serve()` 真正被调用时才执行，
-那时 `serve_worker` 模块早已加载完毕，没有这个风险。
+反过来，`serve_worker._serve` 对本模块的 import 刻意放在函数体内部而非模块顶层——如果
+`serve_worker.py` 顶层也 `import turn_child`，两边会在对方还没加载完时互相导入，踩到
+Python 循环 import。函数体内 import 在 `_serve()` 真正被调用时才执行，那时
+`serve_worker` 模块早已加载完毕，没有这个风险。
 
 **progress pipe 有两类信号**：`loop_heartbeat` 每 5s 证明 event loop 还能调度；slot
 `progress` 则只在 claim/idle/turn 内真实 provider、tool、compaction 边界发送，并携带固定
@@ -135,7 +134,6 @@ async def _run(conn: "Connection", worker_id: str, poll_interval: float) -> None
             # 路径（watchdog kill_and_respawn）完全不受影响，那条本来就是不可 catch 的。
             log.warning("[v2.turn_child] add_signal_handler unsupported for %s", sig)
 
-    provider_threads = serve_worker._configure_provider_thread_limiter(v2_worker.MAX_WORKERS)
     deps = serve_worker.build_production_deps()
     # "v2_jobs" 即时唤醒：跟父进程原来的 _serve 一样，wake_event 必须在 running loop 里
     # 创建/绑定。`wire_assembly()`（在 `main()` 里、进入这个协程之前）只负责注册
@@ -143,8 +141,8 @@ async def _run(conn: "Connection", worker_id: str, poll_interval: float) -> None
     wake_event = asyncio.Event()
     v2_worker.set_job_wake_context(loop, wake_event)
     log.info(
-        "[v2.turn_child] starting worker=%s max_workers=%s provider_threads=%s pid=%s",
-        worker_id, v2_worker.MAX_WORKERS, provider_threads, os.getpid(),
+        "[v2.turn_child] starting worker=%s max_workers=%s pid=%s",
+        worker_id, v2_worker.MAX_WORKERS, os.getpid(),
     )
 
     tasks = [

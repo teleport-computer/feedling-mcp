@@ -69,16 +69,15 @@ def test_registered_as_write_capabilities():
     assert {"schedule_wake", "cancel_wake"} <= cap_registry.WRITE_ACTIONS
 
 
-def test_planner_can_emit_them_and_executor_no_longer_skips_them():
-    from model_api_runtime.v2 import executor, planner
-    assert {"schedule_wake", "cancel_wake"} <= planner._WRITE_ACTIONS
-    assert "schedule_wake" in planner._PLANNER_SYSTEM
-    assert "schedule_wake" not in executor._CONTROL_ACTIONS
-    assert "cancel_wake" not in executor._CONTROL_ACTIONS
-    steps = planner.validate_plan({"plan": [
-        {"type": "schedule_wake", "payload": {"at": "2026-07-11T18:00"}},
-        {"type": "final_response", "payload": {}}]})
-    assert steps[0]["type"] == "schedule_wake"
+def test_unified_tool_catalog_offers_the_registered_wake_capabilities():
+    """The model-visible vocabulary comes from the same capability registry the
+    executor dispatches; there is no separate planner vocabulary to drift."""
+    from capabilities import tool_schema
+
+    specs = {spec.name: spec for spec in tool_schema.build_tool_specs()}
+    assert {"schedule_wake", "cancel_wake"} <= specs.keys()
+    assert "at" in specs["schedule_wake"].parameters["properties"]
+    assert "wake_id" in specs["cancel_wake"].parameters["properties"]
 
 
 def test_wake_capability_does_not_import_model_api_runtime():

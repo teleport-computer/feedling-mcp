@@ -11,20 +11,62 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import jobs_store, reaper as v2_reaper, serve_worker, worker
 
 
-def test_provider_thread_limiter_scales_with_worker_slots(monkeypatch):
-    import anyio.to_thread
+def _fake_serve_from_script(script, calls):
+    """Return an async _serve fake that raises/returns each scripted item."""
+    it = iter(script)
 
-    async def _run():
-        limiter = anyio.to_thread.current_default_thread_limiter()
-        limiter.total_tokens = 40
-        monkeypatch.delenv("FEEDLING_V2_PROVIDER_THREAD_LIMIT", raising=False)
-        assert serve_worker._configure_provider_thread_limiter(64) == 64
+    async def _fake(worker_id, *, poll_interval):
+        calls.append((worker_id, poll_interval))
+        item = next(it)
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
-        limiter.total_tokens = 40
-        monkeypatch.setenv("FEEDLING_V2_PROVIDER_THREAD_LIMIT", "96")
-        assert serve_worker._configure_provider_thread_limiter(64) == 96
+    return _fake
 
-    asyncio.run(_run())
+
+def test_run_forever_relaunches_crashes_then_exits_on_clean_return(monkeypatch):
+    calls, sleeps = [], []
+    monkeypatch.setattr(
+        serve_worker,
+        "_serve",
+        _fake_serve_from_script(
+            [RuntimeError("boom1"), RuntimeError("boom2"), None], calls),
+    )
+    monkeypatch.setattr(serve_worker.time, "sleep", sleeps.append)
+
+    serve_worker._run_forever("w-test", 1.0)
+
+    assert calls == [("w-test", 1.0)] * 3
+    assert sleeps == [
+        serve_worker._RELAUNCH_BACKOFF_MIN_SEC,
+        serve_worker._RELAUNCH_BACKOFF_MIN_SEC * 2,
+    ]
+
+
+def test_run_forever_clean_return_does_not_relaunch(monkeypatch):
+    calls, sleeps = [], []
+    monkeypatch.setattr(
+        serve_worker, "_serve", _fake_serve_from_script([None], calls))
+    monkeypatch.setattr(serve_worker.time, "sleep", sleeps.append)
+
+    serve_worker._run_forever("w-test", 1.0)
+
+    assert calls == [("w-test", 1.0)]
+    assert sleeps == []
+
+
+def test_run_forever_backoff_is_bounded(monkeypatch):
+    calls, sleeps = [], []
+    script = [RuntimeError(f"boom{i}") for i in range(8)] + [None]
+    monkeypatch.setattr(
+        serve_worker, "_serve", _fake_serve_from_script(script, calls))
+    monkeypatch.setattr(serve_worker.time, "sleep", sleeps.append)
+
+    serve_worker._run_forever("w-test", 1.0)
+
+    assert max(sleeps) == serve_worker._RELAUNCH_BACKOFF_MAX_SEC
+    assert sleeps[-1] == serve_worker._RELAUNCH_BACKOFF_MAX_SEC
 
 
 def test_db_pool_capacity_scales_for_nested_effect_sinks(monkeypatch):
@@ -76,7 +118,7 @@ def test_build_production_deps_returns_turndeps():
     assert callable(deps.read_messages)
     assert callable(deps.read_messages_after_seq)
     assert callable(deps.resolve_provider)
-    assert deps.is_official is None
+    assert not hasattr(deps, "is_official")
     assert callable(deps.mint_enclave_token)
     assert callable(deps.read_tail_after_seq)
     assert callable(deps.read_compaction_tail_after_seq)
@@ -299,7 +341,7 @@ def test_main_module_has_entrypoint_guard():
 
 def test_production_deps_do_not_install_a_model_classifier():
     deps = serve_worker.build_production_deps()
-    assert deps.is_official is None
+    assert not hasattr(deps, "is_official")
 
 
 def test_resident_mode_is_final_fence_for_scheduled_and_screen_watch(monkeypatch):

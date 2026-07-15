@@ -271,7 +271,9 @@ def test_prompt_coverage_after_catchup_no_message_falls_in_gap(monkeypatch):
     # --- Fold via a fake LLM (append a marker per call, no real provider) ---
     compact_calls = []
 
-    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+    async def _fake_compact(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+    ):
         compact_calls.append(list(old_messages))
         return (current_summary + "\n- folded").strip()
 
@@ -280,7 +282,6 @@ def test_prompt_coverage_after_catchup_no_message_falls_in_gap(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_summary=read_summary,
         read_compaction_tail=read_compaction_tail,
@@ -467,7 +468,6 @@ def test_prompt_coverage_no_false_gap_under_multiuser_seq_interleaving(monkeypat
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_summary=_read_summary_a,
         read_compaction_tail=_read_compaction_tail_a,
@@ -560,7 +560,6 @@ def test_compaction_cas_loss_requeues_never_permanently_abandons_tail(monkeypatc
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=read_tail,
         read_summary=read_summary,

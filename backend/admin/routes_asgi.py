@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import os
 import time
 from urllib.parse import parse_qs
@@ -290,7 +291,48 @@ async def hosted_runtime_modes_list(request: Request):
 @router.get("/v1/admin/v2-metrics")
 async def v2_metrics(request: Request):
     _require_admin(request)
-    payload = await threadpool.run_db(admin_core.v2_metrics)
+    cache_provider = (request.query_params.get("cache_provider") or "").strip() or None
+    cache_model = (request.query_params.get("cache_model") or "").strip() or None
+    cache_route_fingerprint = (
+        request.query_params.get("cache_route_fingerprint") or ""
+    ).strip() or None
+    cache_user_id = (request.query_params.get("cache_user_id") or "").strip() or None
+
+    # Python/JSON can represent finite floats far beyond PostgreSQL's timestamp
+    # range. Keep the admin proof window inside a deliberately conservative
+    # UTC year-9999 boundary so a malformed query returns 400 rather than 500.
+    max_cache_ts = 253402300799.0
+
+    def _cache_ts(name: str) -> tuple[float | None, JSONResponse | None]:
+        raw = (request.query_params.get(name) or "").strip()
+        if not raw:
+            return None, None
+        try:
+            value = float(raw)
+        except ValueError:
+            return None, JSONResponse({"error": f"invalid_{name}"}, status_code=400)
+        if not math.isfinite(value) or value < 0 or value > max_cache_ts:
+            return None, JSONResponse({"error": f"invalid_{name}"}, status_code=400)
+        return value, None
+
+    cache_since_ts, invalid = _cache_ts("cache_since_ts")
+    if invalid is not None:
+        return invalid
+    cache_until_ts, invalid = _cache_ts("cache_until_ts")
+    if invalid is not None:
+        return invalid
+    if (cache_since_ts is not None and cache_until_ts is not None
+            and cache_until_ts < cache_since_ts):
+        return JSONResponse({"error": "invalid_cache_window"}, status_code=400)
+    payload = await threadpool.run_db(
+        admin_core.v2_metrics,
+        cache_provider=cache_provider,
+        cache_model=cache_model,
+        cache_route_fingerprint=cache_route_fingerprint,
+        cache_user_id=cache_user_id,
+        cache_since_ts=cache_since_ts,
+        cache_until_ts=cache_until_ts,
+    )
     return JSONResponse(payload)
 
 

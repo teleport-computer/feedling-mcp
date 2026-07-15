@@ -169,7 +169,15 @@ def list_runtime_modes() -> dict:
 # throughput, all sourced from jobs_store's existing DB-backed counters).
 # --------------------------------------------------------------------------- #
 
-def v2_metrics() -> dict:
+def v2_metrics(
+    *,
+    cache_provider: str | None = None,
+    cache_model: str | None = None,
+    cache_route_fingerprint: str | None = None,
+    cache_user_id: str | None = None,
+    cache_since_ts: float | None = None,
+    cache_until_ts: float | None = None,
+) -> dict:
     return {
         "inflight": jobs_store.inflight_job_count(),
         "pending": jobs_store.pending_job_count(),
@@ -177,6 +185,20 @@ def v2_metrics() -> dict:
         "live_worker_capacity": jobs_store.live_worker_capacity(),
         "mean_service_sec": jobs_store.recent_mean_service_sec(lane="chat"),
         "recent_mean_tokens_per_turn": jobs_store.recent_mean_tokens_per_turn(lane="chat"),
+        "prompt_cache": jobs_store.recent_prompt_cache_stats(
+            lane="chat",
+            provider=cache_provider,
+            model=cache_model,
+            cache_route_fingerprint=cache_route_fingerprint,
+            user_id=cache_user_id,
+            since_ts=cache_since_ts,
+            until_ts=cache_until_ts,
+            include_turns=bool(
+                cache_user_id
+                and cache_since_ts is not None
+                and cache_until_ts is not None
+            ),
+        ),
         "wake": jobs_store.wake_success_stats(),
         "effects": db.effect_outbox_health(),
         # The genesis import worker rides in the serve_worker process on its own

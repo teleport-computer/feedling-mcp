@@ -1,23 +1,11 @@
-"""V2 worker：Postgres 队列 consumer 的编排（子项目 C 收口 Task 8，PR C9b 摘掉旧 staged 管线）。
+"""V2 Postgres-queue turn orchestration.
 
-进程入口在 serve_worker.py；本模块做「一回合一 worker」的编排：claim → coalesce →
-`tool_loop.run_tool_loop`（provider-native 统一工具循环，spec C6/C7）→ 落加密回复
-（chat）/沉默是合法结果（wake）。旧的两层 while/replan（`invalidation.py`）+
-json_planner（`planner.py`：`plan`/`rule_plan`/`official_plan`）+ 强制 `responder.respond`
-round-trip 管线已被 Task 7（chat）/Task 8（wake）整体替换——worker.py 自 PR C9b 起不再
-import/调用 `planner.py`/`agent_loop.py`，每个模型都走同一套工具目录 +
-同一个循环，没有按可信度分流的行为分叉（Global Constraints "no behavior tiering"，见
-`tests/test_v2_no_dispatch_tiering.py`）。`planner.py`/`agent_loop.py`/`responder.respond`
-本体没有被删除——仅兼容性/历史 wire-shape 回归测试仍直接驱动它们；当前 D4
-token-per-turn 回滚门已经改为测量生产 `tool_loop.run_tool_loop`，不再经过旧 staged
-管线。turn 执行体走注入式 TurnDeps（生产实现由
-serve_worker 装配、可 import hosted/core；测试注入假实现，不碰真 enclave/provider/LLM）。
-
-依赖方向（CONTRIBUTING §2）：本模块只 import core.*/model_api_runtime.v2.*/capabilities.*/
-provider_client —— 绝不 import `hosted` 或 `agent_runtime.spawners`。旧版
-`TurnDeps.is_official`/`process_job(is_official=...)` 只作为兼容签名保留；生产不再
-执行模型身份分类，传入值也不被读取。模型能力只由统一 native tool loop 中实际返回的
-tool calls 决定，不做预判分层。
+The process entrypoint is ``serve_worker.py``. Each claimed job enters the
+same provider-native ``tool_loop.run_tool_loop`` with the same tool catalog;
+there is no provider-identity classifier or alternate rule path. Chat turns
+must end in an encrypted model-authored reply, while proactive wake turns may
+legitimately remain silent. ``TurnDeps`` keeps hosted/enclave assembly above
+this module so the worker never imports the hosted layer.
 
 两套凭证不混（spec §5）：
 - provider_config（用户 BYOK）：只喂统一工具循环里的 provider 调用（`tool_loop.run_tool_loop`）。
@@ -29,15 +17,13 @@ tool calls 决定，不做预判分层。
   是解密），可以在回合内按需多铸，不违反「resolve_provider 只解密一次」的不变量（那条
   不变量特指 BYOK provider-key 的解密，不是 enclave-auth 令牌的签发次数）。
 
-敏感面分层（spec §5/§9）：executor 产出的 action_results（含解密后的 data）只在内存里
-传给 responder；action_digest（非敏感 ok/count 粗计数）才落 runtime_state。status 事件
-（processing/reading_*/writing_reply/done）经 status_stream.redact_status 脱敏，detail
-只含标签 + 粗计数，绝无原文。
+敏感面分层（spec §5/§9）：capability 结果只在当前 native tool transcript
+里存活；非敏感 action_digest（ok/count 粗计数）才落 runtime_state。status
+事件（processing/writing_reply/done/error）经 status_stream.redact_status 脱敏。
 
 并发：asyncio 事件循环 + asyncio.to_thread 把同步 jobs_store/enclave 调用移出 loop。
-provider 调用统一 await async facade；OpenAI-compatible chat 已是原生 async，仍需同步
-bridge 的 provider 路径由 serve-worker 把 AnyIO limiter 至少扩到 turn-slot 数，避免默认
-线程上限悄悄小于配置的并发。最终目标仍是所有 provider HTTP 原生 async。
+四种 provider wire 全部 await 原生 async HTTP transport；provider 并发不再受默认线程池
+大小限制。
 ENCLAVE_SEMAPHORE 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
 + capability 调用），治 spec R3（enclave 单线程瓶颈，多 worker 齐打会放大 502）。
 """
@@ -72,7 +58,6 @@ from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
-from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
@@ -142,11 +127,11 @@ def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
     r = max(0, min(r, n - 1))
     return [{"chat", "manual_wake"} if i < r else None for i in range(n)]
 
-# D1（full-conversation context）：responder 现在吃 summary+tail 而不是"仅未回复的 user
+# D1（full-conversation context）：turn 使用 summary+tail，而不是"仅未回复的 user
 # 消息"。tail 超过 _TAIL_BUDGET 条（双角色计数）时，chat turn 顺手（best-effort，不阻塞
 # 回复）入队一个 maintenance lane 的 compaction job，把最旧的一批折进摘要，只留
 # _TAIL_KEEP 条最近消息逐字保留。_TAIL_HARD_CAP 是 chat turn 读 tail 时的硬上限（喂
-# responder 用，不是压缩用——压缩自己读到 watermark 之后的全部，见 `_run_compaction`）。
+# 当前 turn，不是压缩用——压缩自己读到 watermark 之后的全部，见 `_run_compaction`）。
 _TAIL_BUDGET = int(os.environ.get("FEEDLING_V2_TAIL_BUDGET_MSGS", "20"))
 _TAIL_KEEP = int(os.environ.get("FEEDLING_V2_TAIL_KEEP_MSGS", "10"))
 _TAIL_HARD_CAP = int(os.environ.get("FEEDLING_V2_TAIL_HARD_CAP", "60"))
@@ -173,13 +158,8 @@ _TAIL_IMAGE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2"))
 # 单张图 b64 上限；超限跳过注入、退化成文本标记（不引入图像缩放依赖）。
 _IMAGE_MAX_B64_CHARS = int(os.environ.get("FEEDLING_V2_IMAGE_MAX_B64_CHARS", "2000000"))
 
-# 工具循环轮数上限（spec §6）。撞上限 → 停止取工具，用手上的结果强制收口回复。
-_LOOP_MAX_ROUNDS = int(os.environ.get("FEEDLING_V2_LOOP_MAX_ROUNDS", "3"))
-# 一个回合内**跨两层循环**（外层消息驱动 replan × 内层模型驱动 tool loop）的 LLM 调用硬闸。
-# 上界是 replan_budget(2) × _LOOP_MAX_ROUNDS(3) + 1(responder) = 7 —— 故意让 6 咬住它。
-# 两层语义不同（外层"用户又说话了"、内层"我还想再查"）不能合并，但必须共用一个预算，
-# 否则一个话痨用户 + 一个爱查东西的 planner 能把用户的 BYOK key 烧穿。
-# 恒留 1 个名额给 responder：no-filler 铁律要求 chat lane 一定产出 model-authored 文本。
+# 单个 native tool loop 的 provider 调用硬闸。最后一次调用会禁用
+# tools 来强制收口，使模型无法用无限工具链烧穿用户的 BYOK key。
 _TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "6"))
 
 # D3 Task 6 (proactive/wake lanes): the scheduler (Task 4/9) enqueues jobs in
@@ -231,15 +211,19 @@ class RuntimeModeChanged(RuntimeError):
     """The user rolled back while this V2 job was queued or running."""
 
 
+class TurnError(RuntimeError):
+    """A turn cannot safely produce or cover its required final reply."""
+
+
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
-    if isinstance(exc, v2_responder.ResponderError):
+    if isinstance(exc, TurnError):
         raw = str(exc)
         if raw in {"empty_reply", "no_user_messages"}:
             kind = raw
-        elif exc.kind in {"transient", "provider_config", "unknown"}:
-            kind = f"provider_{exc.kind}"
         else:
+            # Keep the established persisted code stable across the internal
+            # responder-module removal; dashboards and clients may group by it.
             kind = "responder_error"
     else:
         kind = type(exc).__name__.lower() or "error"
@@ -250,17 +234,13 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
 class TurnDeps:
     """turn 执行体的注入式依赖（生产实现见 serve_worker.build_production_deps）。
 
-    respond/append_reply 不在这里：那两步现在直接调用同层的 v2.responder（本就 hosted-
-    free，无需经 DI 间接一层）和本模块的 `_write_encrypted_reply`（只 import core.envelope/
-    core.store，同样 hosted-free）。留在 TurnDeps 里的四样都是必须跨依赖方向注入的东西：
-    enclave-bound 的解密/判定或需要 hosted.config_store 才能做的 BYOK 解析。
+    Hosted configuration, encrypted-message reads, and side-effect sinks are
+    injected here. Model calls and encrypted reply construction stay in this
+    hosted-free module.
     """
     read_messages: Callable[[str], list[dict]]           # user_id -> [{"id","ts","role","content"}]（enclave 解密明文）
     resolve_provider: Callable[[str], tuple[Any, dict]]   # user_id -> (ProviderConfig|None, meta)：BYOK，回合内只调一次
     mint_enclave_token: Callable[[str], str]              # user_id -> 短时效 runtime_token（HMAC 签发，非解密，可按需多铸）
-    # Deprecated compatibility seam. Production leaves this None and never
-    # calls it; model capability is observed inside the unified tool loop.
-    is_official: Callable[[Any], bool] | None = None
     # Compatibility/test seam for dependency-isolated callers. Production
     # leaves this None: jobs_store's terminal outbox now updates the captured
     # active route and acknowledges delivery in one route-version-fenced DB
@@ -365,19 +345,16 @@ class TurnMetrics:
     idle-user BYOK tokens on heartbeat/scheduled wakes, so it is the metric
     consumers most need. `tool_loop.run_tool_loop` surfaces usage via its
     `add_usage` callback (chat and wake alike, since PR C9b — see `process_job`/
-    `_run_wake`), so both lanes record real prompt/completion tokens per provider
-    round. `v2_extraction.extract`/`v2_compaction.compact` do not currently
-    surface usage from their underlying provider call at all (no `usage_out`
-    equivalent) — their lanes still call `add_call(None)` so `model_calls` is
-    at least correctly counted; `prompt_tokens`/`completion_tokens` for those
-    two lanes stay 0 until those modules grow their own usage out-param (a
-    follow-up, not invented here).
+    `_run_wake`), so both lanes record real prompt/completion/cache tokens per
+    provider round. `v2_extraction.extract` and `v2_compaction.compact` expose
+    the same usage callback, closing the former background-lane accounting gap.
+    Missing provider telemetry remains NULL rather than being invented as zero;
+    explicit coverage counters make partial telemetry visible.
 
-    `add_call` accumulates usage from a REAL provider call — `tool_loop.run_tool_loop`
-    (chat AND wake lanes, one call per provider round, every model uniformly —
-    PR C9b removed the old json_planner `official_plan`/`rule_plan` split and the
-    forced `responder.respond` round-trip that used to feed this), `v2_extraction.extract`,
-    and `v2_compaction.compact`. `retries` stays 0 today: `reliable_chat_completion*` retries internally but
+    `add_call` accumulates usage from a REAL provider call —
+    `tool_loop.run_tool_loop` (chat and wake both use the same provider-native
+    rounds), `v2_extraction.extract`, and `v2_compaction.compact`. `retries` stays 0
+    today: `reliable_chat_completion*` retries internally but
     doesn't yet surface a retry count to its callers (out of scope for this
     task) — the column/field exist so a future provider-level retry count can
     be wired in without another migration.
@@ -387,21 +364,70 @@ class TurnMetrics:
     lane: str
     model_calls: int = 0
     retries: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
+    provider: str | None = None
+    model: str | None = None
+    cache_route_fingerprint: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    cache_miss_tokens: int | None = None
+    usage_reported_calls: int = 0
+    cache_reported_calls: int = 0
     _flushed: bool = False
     _started: float = 0.0
 
     def __post_init__(self) -> None:
         self._started = time.monotonic()
 
+    @staticmethod
+    def _sum_optional(current: int | None, value: Any) -> int | None:
+        if value is None:
+            return current
+        try:
+            parsed = max(0, int(value))
+        except (TypeError, ValueError):
+            return current
+        return (current or 0) + parsed
+
+    def bind_provider(self, provider_config: Any) -> None:
+        """Record non-secret provider/model/cache-route identity after BYOK resolution."""
+        provider = str(getattr(provider_config, "provider", "") or "").strip()
+        model = str(getattr(provider_config, "model", "") or "").strip()
+        route = str(
+            getattr(provider_config, "prompt_cache_route_fingerprint", "") or ""
+        ).strip()
+        self.provider = provider or None
+        self.model = model or None
+        self.cache_route_fingerprint = route or None
+
     def add_call(self, usage: dict | None, *, retried: bool = False) -> None:
         self.model_calls += 1
         if retried:
             self.retries += 1
-        if usage:
-            self.prompt_tokens += int(usage.get("prompt_tokens") or 0)
-            self.completion_tokens += int(usage.get("completion_tokens") or 0)
+        if not isinstance(usage, dict):
+            return
+        usage_fields = (
+            "prompt_tokens", "completion_tokens", "total_tokens",
+            "cache_read_tokens", "cache_write_tokens", "cache_miss_tokens",
+        )
+        if any(usage.get(field) is not None for field in usage_fields):
+            self.usage_reported_calls += 1
+        cache_fields = (
+            "cache_read_tokens", "cache_write_tokens", "cache_miss_tokens",
+        )
+        if any(usage.get(field) is not None for field in cache_fields):
+            self.cache_reported_calls += 1
+        self.prompt_tokens = self._sum_optional(
+            self.prompt_tokens, usage.get("prompt_tokens"))
+        self.completion_tokens = self._sum_optional(
+            self.completion_tokens, usage.get("completion_tokens"))
+        self.cache_read_tokens = self._sum_optional(
+            self.cache_read_tokens, usage.get("cache_read_tokens"))
+        self.cache_write_tokens = self._sum_optional(
+            self.cache_write_tokens, usage.get("cache_write_tokens"))
+        self.cache_miss_tokens = self._sum_optional(
+            self.cache_miss_tokens, usage.get("cache_miss_tokens"))
 
     def flush(self, *, failed: bool, status: str) -> None:
         """Idempotent per-job upsert; guarded so this SAME accumulator instance
@@ -415,6 +441,13 @@ class TurnMetrics:
         jobs_store.record_whole_turn_metric(
             self.job_id, self.user_id, self.lane,
             prompt_tokens=self.prompt_tokens, completion_tokens=self.completion_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+            cache_write_tokens=self.cache_write_tokens,
+            cache_miss_tokens=self.cache_miss_tokens,
+            usage_reported_calls=self.usage_reported_calls,
+            cache_reported_calls=self.cache_reported_calls,
+            provider=self.provider, model=self.model,
+            cache_route_fingerprint=self.cache_route_fingerprint,
             latency_ms=latency_ms, model_calls=self.model_calls, retries=self.retries,
             failed=failed, status=status)
 
@@ -626,7 +659,7 @@ def _make_build_messages_fn(
 
     `extra_context` (optional, spec C8) is STATIC grounding resolved once before the
     loop starts (e.g. the wake lane's `screen_recent` prefetch for the `screen_watch` lane,
-    rendered via `responder._action_context_str`).  It remains in the base system context;
+    rendered via `context.action_context_str`). It remains in the base system context;
     dynamic tool results remain native exchanges.
     """
 
@@ -983,12 +1016,9 @@ async def _run_compaction(
         _report_turn_progress("compaction_batch_start")
         new_summary = await v2_compaction.compact(
             provider_config=provider_config, current_summary=summary, old_messages=old,
-            llm=_compaction_llm_with_progress)
+            llm=_compaction_llm_with_progress,
+            usage_out=tm.add_call if tm is not None else None)
         _report_turn_progress("compaction_batch_complete")
-        if tm is not None:
-            # v2_compaction.compact doesn't surface usage from its provider call
-            # (no usage_out equivalent) — count the call, no token data.
-            tm.add_call(None)
         if new_summary.strip() == summary.strip():  # 空/no-op 折叠 → 不推进 watermark/version
             await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by)
@@ -1104,12 +1134,12 @@ async def _prompt_coverage_gap(user_id: str, *, watermark_seq: int, tail_limit: 
 
 async def _assert_prompt_covers_seq(user_id: str, *, watermark_seq: int, tail_limit: int) -> None:
     """D6 hard invariant, count-based (see ``_prompt_coverage_gap``): raises
-    ``v2_responder.ResponderError`` if a coverage hole would remain — see
+    ``TurnError`` if a coverage hole would remain — see
     ``_assert_prompt_covers`` (the wrapper actually wired into the two call
     sites, which additionally re-derives ``watermark_seq`` fresh) for why
     raising, not truncating/ignoring, is the deliberate choice here."""
     if await _prompt_coverage_gap(user_id, watermark_seq=watermark_seq, tail_limit=tail_limit):
-        raise v2_responder.ResponderError("prompt_coverage_incomplete")
+        raise TurnError("prompt_coverage_incomplete")
 
 
 async def _assert_prompt_covers(user_id: str, tail_limit: int) -> None:
@@ -1155,7 +1185,7 @@ async def _assert_prompt_tail_exact(
     try:
         actual = [int(row["seq"]) for row in tail]
     except (KeyError, TypeError, ValueError) as exc:
-        raise v2_responder.ResponderError("prompt_coverage_incomplete") from exc
+        raise TurnError("prompt_coverage_incomplete") from exc
     expected = await asyncio.to_thread(
         db.chat_seqs_after_seq,
         user_id,
@@ -1163,7 +1193,7 @@ async def _assert_prompt_tail_exact(
         through_seq=int(through_seq),
     )
     if actual != expected:
-        raise v2_responder.ResponderError("prompt_coverage_incomplete")
+        raise TurnError("prompt_coverage_incomplete")
 
 
 async def _ensure_prompt_coverage(
@@ -1177,6 +1207,7 @@ async def _ensure_prompt_coverage(
     job_id: Any | None = None,
     claimed_by: str | None = None,
     catchup_deadline_sec: float | None = None,
+    add_usage: Callable[[dict | None], None] | None = None,
 ) -> tuple[int, int]:
     """D6 (Task 10): close a compaction backlog gap BEFORE assembling a turn's
     prompt. Today's bug: ``_read_tail`` only ever returns the newest
@@ -1229,7 +1260,7 @@ async def _ensure_prompt_coverage(
     ``claimed_by`` so the active lease is renewed between batches.
 
     Bounded-retry exhaustion is NOT a silent pass-through: raises
-    ``v2_responder.ResponderError("prompt_coverage_incomplete")`` so the turn
+    ``TurnError("prompt_coverage_incomplete")`` so the turn
     fails visibly (``mark_failed``, requeue-able) rather than shipping a
     prompt with a known coverage hole. ``deps.read_summary``/
     ``deps.read_compaction_tail``-or-``deps.read_tail``/``deps.write_summary``
@@ -1250,20 +1281,20 @@ async def _ensure_prompt_coverage(
         else float(catchup_deadline_sec)
     )
     if not math.isfinite(deadline_sec) or deadline_sec <= 0:
-        raise v2_responder.ResponderError("prompt_coverage_incomplete")
+        raise TurnError("prompt_coverage_incomplete")
     deadline_at = time.monotonic() + deadline_sec
 
     def _remaining() -> float:
         remaining = deadline_at - time.monotonic()
         if remaining <= 0:
-            raise v2_responder.ResponderError("prompt_coverage_incomplete")
+            raise TurnError("prompt_coverage_incomplete")
         return remaining
 
     async def _within_deadline(start: Callable[[], Awaitable[Any]]) -> Any:
         try:
             return await asyncio.wait_for(start(), timeout=_remaining())
         except asyncio.TimeoutError as exc:
-            raise v2_responder.ResponderError(
+            raise TurnError(
                 "prompt_coverage_incomplete") from exc
 
     async def _renew_catchup_lease() -> None:
@@ -1317,7 +1348,7 @@ async def _ensure_prompt_coverage(
         if no_progress_attempts >= max_retries or deps.write_summary is None or not (
             seq_callbacks or legacy_callbacks
         ):
-            raise v2_responder.ResponderError("prompt_coverage_incomplete")
+            raise TurnError("prompt_coverage_incomplete")
         fold_count = min(unsummarized_count - tail_limit, _COMPACTION_BATCH)
         if fold_count <= 0:
             continue
@@ -1359,14 +1390,14 @@ async def _ensure_prompt_coverage(
         try:
             old = _bounded_compaction_prefix(old)
         except ValueError as exc:
-            raise v2_responder.ResponderError(
+            raise TurnError(
                 "prompt_coverage_incomplete") from exc
         if not old:
             # The count says a gap exists but the reader returned nothing
             # (e.g. a ts-windowed fake/reader whose window doesn't line up
             # with the real seq boundary) — looping again would just burn
             # retry budget for no benefit. Fail now rather than spin.
-            raise v2_responder.ResponderError("prompt_coverage_incomplete")
+            raise TurnError("prompt_coverage_incomplete")
         attempted_since_observation = True
         _report_turn_progress("prompt_catchup_batch_start")
         new_summary = await _within_deadline(
@@ -1375,6 +1406,7 @@ async def _ensure_prompt_coverage(
                 current_summary=summary,
                 old_messages=old,
                 llm=_compaction_llm_with_progress,
+                usage_out=add_usage,
             )
         )
         _report_turn_progress("prompt_catchup_batch_complete")
@@ -1402,7 +1434,7 @@ async def _ensure_prompt_coverage(
                     lambda: asyncio.to_thread(
                         db.chat_seq_for_msg_id, user_id, last_id))
         if seq_callbacks and new_watermark_seq is None:
-            raise v2_responder.ResponderError("prompt_coverage_incomplete")
+            raise TurnError("prompt_coverage_incomplete")
         if new_watermark_seq is not None:
             await _within_deadline(
                 lambda: asyncio.to_thread(
@@ -1430,13 +1462,11 @@ async def _run_wake(
     都静默 `mark_failed`，绝不 `_surface_terminal_error`、绝不写占位气泡。
 
     D3 Task 8 (PR C spec C8)：跟 chat 分支（`process_job`，Task 7）一样跑同一个
-    `tool_loop.run_tool_loop`——不再有 wake 专属的 `v2_responder.respond` 调用、不再有
-    `ResponderError` 分支。`turn_authorization=True` 传给 `dispatch_tool_calls`（跟 chat
+    `tool_loop.run_tool_loop`。`turn_authorization=True` 传给 `dispatch_tool_calls`（跟 chat
     传的值一样，语义是 wake_trigger 而不是 user——两者都在 `provenance.turn_has_write_
     authorization` 意义下"有资格授权写"）。跟 chat 分支的两点关键差异：
     - 不要求非空用户消息：`wake_tail` 恒含一条固定的 `_WAKE_NUDGE`（user-role），
-      `build_messages` 因此永远至少有一条非 system 轮次——不需要（也不再有）旧
-      `ResponderError("no_user_messages")` 那种显式空 tail 报错分支。
+      `build_messages` 因此永远至少有一条非 system 轮次。
     - 空回复合法："weak wake sleeps"（弱唤醒睡回去）：`_on_reply` 对空文本（无论
       intermediate 还是 terminal）直接 no-op，不入队 reply effect、不报错——跟 chat 分支
       "终态空文本 = no-filler 失败"的语义**相反**。循环正常跑完（`run_tool_loop` 不抛异常）
@@ -1451,7 +1481,7 @@ async def _run_wake(
     `system_prompt`：`_SCREEN_WATCH_SYSTEM_PROMPT`（screen_watch lane）或
     `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent` 预取
     结果通过 `_make_build_messages_fn` 的 `extra_context` 参数（复用
-    `v2_responder._action_context_str` 的渲染）注入——它是回合开始时取一次的静态
+    `context.action_context_str` 的渲染）注入——它是回合开始时取一次的静态
     grounding，不随 tool-loop 轮次增长，跟 `prior_tool_results`（每轮动态积累的工具
     观测）是两回事。
     """
@@ -1491,7 +1521,8 @@ async def _run_wake(
             await _ensure_prompt_coverage(
                 user_id, deps, provider_config=provider_config,
                 enclave_sem=enclave_sem, tail_limit=_TAIL_BUDGET,
-                job_id=job_id, claimed_by=claimed_by)
+                job_id=job_id, claimed_by=claimed_by,
+                add_usage=tm.add_call if tm is not None else None)
         async with enclave_sem:
             if seq_context:
                 summary, _watermark_ts, _ver, watermark_seq = await asyncio.to_thread(
@@ -1603,7 +1634,8 @@ async def _run_wake(
             return await v2_executor.dispatch_tool_calls(
                 tool_calls, store=store, api_key=None, runtime_token=token,
                 enclave_sem=enclave_sem, turn_authorization=True,  # wake_trigger authorizes writes
-                enqueue_write_effect=_enqueue_write_effect, before_write=_before_write)
+                enqueue_write_effect=_enqueue_write_effect, before_write=_before_write,
+                read_parallelism=MAX_READ_ACTION_PARALLELISM)
 
         async def _on_reply(text: str, *, final: bool) -> None:
             text = str(text or "").strip()
@@ -1668,7 +1700,7 @@ async def _run_wake(
             system_prompt=(_SCREEN_WATCH_SYSTEM_PROMPT if lane == "screen_watch"
                            else _WAKE_SYSTEM_PROMPT),
             summary=summary, tail=wake_tail,
-            extra_context=v2_responder._action_context_str(screen_results) if screen_results else "")
+            extra_context=context.action_context_str(screen_results) if screen_results else "")
 
         await _fence_wake_effect("wake turn")
         try:
@@ -1774,14 +1806,9 @@ async def _run_extraction(job_id, user_id: str, lane: str, deps: TurnDeps,
             provider_config=provider_config, prompt=prompt, parse=parse,
             progress_cb=lambda stage, attempt: _report_turn_progress(
                 f"extraction_provider_{stage}_{attempt}"),
+            usage_out=tm.add_call if tm is not None else None,
         )
         _report_turn_progress("extraction_provider_complete")
-        if tm is not None:
-            # v2_extraction.extract always makes exactly one provider call attempt
-            # (success, empty_reply, parse-error and provider_call_failed alike) but
-            # doesn't currently surface usage from it (no usage_out equivalent) —
-            # count the call, no token data.
-            tm.add_call(None)
         if reason:
             raise RuntimeError(reason)
         if not items:
@@ -1915,21 +1942,15 @@ async def process_job(
     provider_config: Any,
     api_key: str | None,
     runtime_token: str,
-    is_official: bool | None = None,
     enclave_sem: "asyncio.Semaphore" = None,
     read_parallelism: int = None,
     tm: "TurnMetrics | None" = None,
 ) -> str:
     """一回合：coalesce → `tool_loop.run_tool_loop`（provider-native 统一工具循环）→ 落
-    加密回复（chat）/沉默是合法结果（wake，见 `_run_wake`）。PR C9b 前是 coalesce → planner
-    → executor → (安全点 replan，预算内) → responder；Task 7 把两层 while/replan +
-    json_planner + 强制 responder round-trip 整体换成了这一个循环调用，`replan_budget`
-    形参（旧 `invalidation.py` REPLAN 预算）随之一并摘掉——本函数体内已无处读它。
+    加密回复（chat）/沉默是合法结果（wake，见 `_run_wake`）。
 
     provider_config 由调用方（`_run_turn`）在回合开始前解析好、原样传入并复用全程——
     本函数内绝不再调 `deps.resolve_provider`（single-decrypt-per-turn 不变量）。
-    `is_official` 自 PR C9b 起不读取、不计算，只作为兼容关键字留在签名中；见
-    `tests/test_v2_no_dispatch_tiering.py` 锁定这条不变量。
     api_key/runtime_token 是 enclave-auth 的两套凭证，只喂 capability 侧（预取 + executor
     的 tool_call 派发），从不流向 provider 的 LLM 调用。
 
@@ -1951,6 +1972,7 @@ async def process_job(
     observed_generation = int(job.get("input_generation") or 0)
     if tm is None:
         tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
+    tm.bind_provider(provider_config)
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_task: asyncio.Task | None = None
 
@@ -2041,7 +2063,7 @@ async def process_job(
             # 真·未注册 lane 的兜底：maintenance/wake（heartbeat/scheduled/manual_wake）/
             # capture/dream 都已在上面各自的 handler 里分派完；能落到这里的只剩既不是 chat、
             # 又没有对应 handler 的 lane（配置错误 / 未来新增但未接线的 lane）。若放它掉进下面
-            # 的 chat 回合，planner 一旦要求回复就会写出用户可见的聊天气泡、失败还弹 error chip。
+            # 的 chat 回合，模型一旦回复就会写出用户可见的聊天气泡、失败还弹 error chip。
             #
             # 显式失败，静默（背景 job 的既有口径：不写气泡、不 _surface_terminal_error）——
             # 落到这里就是「明确失败」而不是「偷偷写气泡」。
@@ -2091,22 +2113,13 @@ async def process_job(
             tm.flush(failed=False, status="ok")
             return "completed"
 
-        # —— Task 7 (spec C6 + C9a): unified provider-native tool loop ——
-        # Replaces the old two-layer while/replan (invalidation.py) + json_planner
-        # (planner.py's plan/rule_plan/official_plan + agent_loop.py's run_turn)
-        # + forced responder.respond pipeline with ONE `tool_loop.run_tool_loop`
-        # call. worker.py no longer imports planner.py/agent_loop.py at all (PR
-        # C9b); those modules' old surface still exists only for
-        # scripts/loadtest/compare_tokens.py's D4 rollback gate and a couple of
-        # wire-shape regression tests — see tests/test_v2_no_dispatch_tiering.py.
-        # No is_official branch (Global
-        # Constraints "no behavior tiering") — every model drives the same
-        # catalog through the same loop. Writes never run inline; they become
+        # —— Unified provider-native tool loop (spec C6 + C9a) ——
+        # Every model drives the same catalog through the same loop. Writes
+        # never run inline; they become
         # PR A generation-fenced effects (enqueued here, drained by
         # `deps.apply_pending_effects`). `reply` (intermediate) and terminal
         # plain text both flow through `on_reply` -> a "reply" effect, drained
-        # immediately for mid-loop visibility (C6) instead of waiting for a
-        # forced responder round-trip.
+        # immediately for mid-loop visibility (C6).
         # Use claim-time ownership generation (ABA-safe); see wake path above.
         gen = int(
             job.get("expected_runtime_generation")
@@ -2116,8 +2129,7 @@ async def process_job(
         ordinal = itertools.count()
         action_digest: dict[str, dict] = {}
 
-        # D1 base context (summary + tail), read once at loop entry — same
-        # reader pattern the old responder call site used. deps.read_summary/
+        # D1 base context (summary + tail), read once at loop entry. deps.read_summary/
         # read_tail being None (older/minimal test deps) degrades to empty
         # summary/tail, exactly as before.
         seq_context = (
@@ -2134,7 +2146,8 @@ async def process_job(
             await _ensure_prompt_coverage(
                 user_id, deps, provider_config=provider_config,
                 enclave_sem=enclave_sem, tail_limit=_TAIL_HARD_CAP,
-                job_id=job_id, claimed_by=claimed_by)
+                job_id=job_id, claimed_by=claimed_by,
+                add_usage=tm.add_call)
             async with enclave_sem:
                 if seq_context:
                     summary, _watermark_ts, _ver, watermark_seq = await asyncio.to_thread(
@@ -2205,8 +2218,8 @@ async def process_job(
                 raise RuntimeError("tool effect id derivation mismatch")
 
         async def _before_write() -> None:
-            # Same runtime-mode/lease fence execute_plan's before_write used —
-            # called before each serialized write inside dispatch_tool_calls.
+            # Recheck runtime mode and lease before each serialized write in
+            # the native tool dispatcher.
             # D4 live kill switch check lives in _ensure_runtime_mode itself (see
             # below) so it gets the same mark_failed+flush bookkeeping as the
             # runtime-mode-disabled case, not a bare raise that would skip it.
@@ -2224,7 +2237,8 @@ async def process_job(
             results = await v2_executor.dispatch_tool_calls(
                 tool_calls, store=store, api_key=api_key, runtime_token=runtime_token,
                 enclave_sem=enclave_sem, turn_authorization=True,
-                enqueue_write_effect=_enqueue_write_effect, before_write=_before_write)
+                enqueue_write_effect=_enqueue_write_effect, before_write=_before_write,
+                read_parallelism=read_parallelism)
             for tc, r in zip(tool_calls, results):
                 if not r.content.startswith("error"):
                     action_digest[tc.name]["ok"] += 1
@@ -2237,7 +2251,7 @@ async def process_job(
                 # text is a model/provider failure here (unlike wake, where
                 # silence is legitimate), so this becomes a mark_failed via the
                 # outer except below, never a placeholder bubble.
-                raise v2_responder.ResponderError("empty_reply")
+                raise TurnError("empty_reply")
             if not text:
                 return  # empty intermediate reply{} call: no bubble, not an error
             # A cutover/ABA can happen while awaiting the provider. Fence at
@@ -2289,7 +2303,7 @@ async def process_job(
         # share the exact same gate the rest of this turn's enclave-bound calls use.
         fold_new_messages = _make_fold_new_messages(user_id, deps, cursor_box, enclave_sem=enclave_sem)
         build_messages = _make_build_messages_fn(
-            system_prompt=v2_responder._SYSTEM_PROMPT, summary=summary, tail=tail)
+            system_prompt=context.CHAT_SYSTEM_PROMPT, summary=summary, tail=tail)
 
         await _ensure_runtime_mode()
         await _renew_lease()
@@ -2311,7 +2325,7 @@ async def process_job(
             # exactly like the already-fixed BUG-4. Raise the same signal
             # `_on_reply` uses so it falls into the outer except below:
             # mark_failed + terminal error status + tm.flush(failed=True).
-            raise v2_responder.ResponderError("empty_reply")
+            raise TurnError("empty_reply")
         if seq_native:
             durable_seq = await asyncio.to_thread(v2_cursor.load_seq, store)
             if durable_seq < cursor_box["seq"]:
@@ -2429,7 +2443,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
     """把一个已 claim 的 job 交给 `process_job` 之前，先做一次性的 enclave-bound 解析：
     单次解密 BYOK provider key（single-decrypt-per-turn）+ 铸一个
     enclave-auth runtime_token。resolve_provider 失败（未配置/解密失败等）直接 mark_failed，
-    不进入全流程（没有可用 provider，planner/responder 都跑不了）。
+    不进入全流程（没有可用 provider，tool loop 跑不了）。
 
     spec B5：这是 job_id/user_id/lane 最早齐全的地方，所以本 job 的 `TurnMetrics`
     whole-turn 累加器在这里创建（早于 `process_job`——provider 解析失败时根本不会进
@@ -2452,6 +2466,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                 await asyncio.to_thread(_surface_terminal_error, deps, user_id, job_id, err)
             tm.flush(failed=True, status=err)
             return "failed"
+        tm.bind_provider(provider_config)
         runtime_token = await asyncio.to_thread(deps.mint_enclave_token, user_id)
         _report_turn_progress("runtime_token_minted")
         return await process_job(
@@ -2640,7 +2655,7 @@ async def _slot_loop(
                     await asyncio.to_thread(
                         jobs_store.record_whole_turn_metric,
                         job["id"], user_id, str(job.get("lane") or "chat"),
-                        prompt_tokens=0, completion_tokens=0, latency_ms=0,
+                        prompt_tokens=None, completion_tokens=None, latency_ms=0,
                         model_calls=0, retries=0, failed=True, status=message)
                 except Exception as recovery_error:  # noqa: BLE001
                     # Recovery is best-effort: the independent lease reaper is

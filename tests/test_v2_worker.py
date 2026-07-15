@@ -1,14 +1,7 @@
-"""worker：Task 8 全流程集成 —— process_job（coalesce→planner→executor→(replan)→responder）
-+ _run_turn（单次 BYOK 解密 + is_official/mint_enclave_token 装配）+ run_worker_loop（claim
-循环、优雅退出、故障隔离）。
+"""V2 worker integration: native tool-loop turns, lane dispatch, and failures.
 
-风格：真实 jobs_store（真 DB：claim/mark_*/status events/runtime_state 都落真表，断言真读
-回）+ 真实 core_store（真 DB chat/reload）+ 真实 v2.coalesce/v2.planner（is_official=False
-走确定性零 LLM 的 rule_plan）/v2.executor（真实读写分派、真实 status 事件）+ 真实
-v2.invalidation（决策路径未被打桩的测试里）；只在两个必须的边界打桩：
-cap_registry.run_capability（capability 自己的正确性有专门测试文件覆盖，这里只喂假 data）
-和 v2_responder.respond（LLM 出口，也有专门测试文件覆盖）。TurnDeps.read_messages 同样打桩
-——enclave 解密在单测环境不可用——喂给真实的 `worker._coalesce_inputs`/`coalesce_pending`。
+The tests keep real jobs/runtime state and effect-outbox persistence while
+stubbing enclave-bound reads, capability execution, and provider responses.
 """
 from __future__ import annotations
 
@@ -30,8 +23,6 @@ from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import planner as v2_planner
-from model_api_runtime.v2 import responder as v2_responder
 from model_api_runtime.v2 import worker
 
 
@@ -57,7 +48,8 @@ def _reset(uid):
 
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="")
+    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="",
+    prompt_cache_route_fingerprint="feedling-v2-route-test")
 
 
 class _FakeCapResult:
@@ -67,29 +59,6 @@ class _FakeCapResult:
 
     def to_dict(self):
         return {"ok": self._ok, "data": self._data, "error": None, "trace": {}, "warnings": []}
-
-
-def _patch_cheap_boundaries(monkeypatch, *, reply="model reply", memory_index=None):
-    """Stub the two things a unit test genuinely can't run for real: capability
-    dispatch (no enclave/DB-backed memory in this test process) and the LLM
-    responder call. `reply` may be an Exception instance to make v2_responder.respond
-    raise it instead of returning text (drives the ResponderError/no-filler test).
-
-    v2_responder.respond is now natively async (worker awaits it directly, no
-    asyncio.to_thread bridge — see provider_client.reliable_chat_completion_async's
-    module docstring), so both stub branches must themselves be awaitable."""
-    monkeypatch.setattr(
-        cap_registry, "run_capability",
-        lambda action_type, store, **k: _FakeCapResult(
-            memory_index if action_type == "memory_index" else {}))
-    if isinstance(reply, BaseException):
-        def _raise(*a, **k):
-            raise reply
-        monkeypatch.setattr(v2_responder, "respond", _raise)
-    else:
-        async def _return(*a, **k):
-            return reply
-        monkeypatch.setattr(v2_responder, "respond", _return)
 
 
 def _reply_effect_dispatch(user_id):
@@ -161,12 +130,11 @@ def _tc(call_id, name, **args):
     return {"id": call_id, "name": name, "args": args}
 
 
-def _deps(*, messages, provider=None, is_official=False, token="rt-enclave"):
+def _deps(*, messages, provider=None, token="rt-enclave"):
     provider = provider if provider is not None else (_BYOK, {})
     return worker.TurnDeps(
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: provider,
-        is_official=lambda cfg: is_official,
         mint_enclave_token=lambda uid: token,
         apply_pending_effects=_apply_effects,
     )
@@ -255,7 +223,7 @@ def test_process_job_end_to_end_writes_reply_and_completes(monkeypatch):
         lambda store, text: written.update(text=text, user_id=store.user_id) or {"id": "r1"})
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert written == {"text": "MODEL REPLY", "user_id": uid}
@@ -266,7 +234,7 @@ def test_process_job_end_to_end_writes_reply_and_completes(monkeypatch):
     assert "action_digest" in state  # non-sensitive digest only; no capability data leaked here
 
 
-def test_message_coalesced_during_responder_creates_successor(monkeypatch):
+def test_message_coalesced_during_provider_call_creates_successor(monkeypatch):
     """finish_chat_job's late-input successor creation lives entirely in
     jobs_store (input_generation vs observed_generation), independent of what
     drives the turn body — this just needs SOME provider call to happen mid-turn
@@ -293,7 +261,7 @@ def test_message_coalesced_during_responder_creates_successor(monkeypatch):
     deps = _deps(messages=[{"id": "A", "ts": 10.0, "role": "user", "content": "first"}])
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False,
+        job, deps, provider_config=_BYOK,
         api_key=None, runtime_token="rt"))
 
     assert status == "completed"
@@ -362,7 +330,6 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
     deps = worker.TurnDeps(
         read_messages=_read_messages,
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         apply_pending_effects=_apply_effects,
         # Wired (even trivially) so the summary/tail read block below runs
@@ -373,7 +340,7 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
     sem = _CountingSemaphore(2)
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt",
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
         enclave_sem=sem,
     ))
 
@@ -403,7 +370,6 @@ def test_coalesce_inputs_and_cap_data_tolerate_enclave_sem_none(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
     )
     coalesced, seq_cursor, ts_cursor = asyncio.run(
@@ -418,7 +384,7 @@ def test_coalesce_inputs_and_cap_data_tolerate_enclave_sem_none(monkeypatch):
     assert data == {"x": 1}
 
 
-def test_process_job_responder_error_marks_failed_no_filler(monkeypatch):
+def test_process_job_empty_terminal_reply_marks_failed_no_filler(monkeypatch):
     """An empty terminal reply (no tool_calls, blank text) must mark the job
     failed and must NEVER write a placeholder bubble — the no-filler invariant
     (BUG-4: chat lane always replies; an empty final text is a model/provider
@@ -437,7 +403,7 @@ def test_process_job_responder_error_marks_failed_no_filler(monkeypatch):
         lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
     assert write_called["n"] == 0
@@ -446,23 +412,22 @@ def test_process_job_responder_error_marks_failed_no_filler(monkeypatch):
     assert row[1] == "turn_failed:empty_reply"
 
 
-def test_process_job_no_pending_messages_chat_lane_completes_without_planning(monkeypatch):
+def test_process_job_no_pending_messages_chat_lane_completes_without_provider_call(monkeypatch):
     """A chat-lane job that finds no coalesced pending messages (already answered
-    by a racing job) must complete cleanly without ever invoking the planner —
-    no wasted LLM call, no filler."""
+    by a racing job) must complete cleanly without invoking the provider."""
     uid = "u_w_nopending"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    plan_calls = {"n": 0}
+    provider_calls = {"n": 0}
 
-    async def _counting_empty_plan(*a, **k):
-        plan_calls["n"] += 1
-        return []
+    async def _unexpected_provider(*args, **kwargs):
+        provider_calls["n"] += 1
+        raise AssertionError("empty chat job must not call the provider")
 
-    monkeypatch.setattr(v2_planner, "plan", _counting_empty_plan)
+    monkeypatch.setattr(provider_client, "chat_completion_async", _unexpected_provider)
     emitted = []
     wakes = []
     monkeypatch.setattr(worker, "_emit_status", lambda user_id, jid, kind: emitted.append(kind))
@@ -474,10 +439,10 @@ def test_process_job_no_pending_messages_chat_lane_completes_without_planning(mo
     deps = _deps(messages=[])  # nothing pending -> coalesce_pending returns ([], 0.0)
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert plan_calls["n"] == 0
+    assert provider_calls["n"] == 0
     assert _job_status(job_id)[0] == "completed"
     assert emitted == ["processing", "done"]
     assert ("chat", uid) in wakes
@@ -517,7 +482,6 @@ def test_process_job_picks_up_concurrent_new_message_via_per_round_fold(monkeypa
     deps = worker.TurnDeps(
         read_messages=lambda uid: next(feed),
         resolve_provider=lambda uid: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: "rt",
         apply_pending_effects=_apply_effects,
     )
@@ -528,7 +492,7 @@ def test_process_job_picks_up_concurrent_new_message_via_per_round_fold(monkeypa
         lambda store, text: written.update(text=text) or {"id": "r"})
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert len(calls) == 2               # exactly the scripted 2 rounds, no restart
@@ -598,7 +562,6 @@ def test_final_drain_uncertain_delivery_surfaces_without_rewriting_completed_job
             job,
             deps,
             provider_config=_BYOK,
-            is_official=False,
             api_key=None,
             runtime_token="rt",
         )
@@ -640,13 +603,12 @@ def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monk
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [{"id": "m1", "ts": 5.0, "role": "user", "content": "hi"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         record_terminal_error=lambda user_id, message: recorded.append((user_id, message)),
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
     assert write_called["n"] == 0
@@ -684,7 +646,7 @@ def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
     assert deps.record_terminal_error is None
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
     events = _status_events(uid)
@@ -707,13 +669,12 @@ def test_process_job_post_claim_kill_switch_failure_surfaces_terminal_error(monk
         read_messages=lambda uid_: (_ for _ in ()).throw(
             AssertionError("halted turn must not read input")),
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         record_terminal_error=lambda user_id, message: recorded.append((user_id, message)),
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
     assert _job_status(job_id) == ("failed", "turns_halted")
@@ -738,14 +699,13 @@ def test_process_job_post_claim_runtime_mode_change_surfaces_terminal_error(monk
         read_messages=lambda uid_: (_ for _ in ()).throw(
             AssertionError("rolled-back turn must not read input")),
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         record_terminal_error=lambda user_id, message: recorded.append((user_id, message)),
         runtime_mode_enabled=lambda user_id: False,
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
     assert _job_status(job_id) == ("failed", "runtime_mode_changed")
@@ -772,7 +732,6 @@ def test_run_turn_provider_resolve_failure_emits_error_status_and_callback(monke
     deps = worker.TurnDeps(
         read_messages=_boom,
         resolve_provider=lambda uid_: (None, {"error": "model_api_key_decrypt_failed"}),
-        is_official=_boom,
         mint_enclave_token=_boom,
         record_terminal_error=lambda user_id, message: recorded.append((user_id, message)),
     )
@@ -808,7 +767,6 @@ def test_run_turn_maintenance_resolve_failure_is_silent_no_user_error(monkeypatc
     deps = worker.TurnDeps(
         read_messages=_boom,
         resolve_provider=lambda uid_: (None, {"error": "model_api_key_decrypt_failed"}),
-        is_official=_boom,
         mint_enclave_token=_boom,
         record_terminal_error=lambda user_id, message: recorded.append((user_id, message)),
     )
@@ -839,7 +797,6 @@ def test_run_turn_heartbeat_resolve_failure_is_silent_no_user_error(monkeypatch)
     deps = worker.TurnDeps(
         read_messages=_boom,
         resolve_provider=lambda uid_: (None, {"error": "model_api_key_decrypt_failed"}),
-        is_official=_boom,
         mint_enclave_token=_boom,
         record_terminal_error=lambda user_id, message: recorded.append((user_id, message)),
     )
@@ -852,7 +809,7 @@ def test_run_turn_heartbeat_resolve_failure_is_silent_no_user_error(monkeypatch)
 
 
 # ------------------------------------------------------------------
-# _run_turn: single BYOK decrypt/turn + is_official/mint wiring
+# _run_turn: single BYOK decrypt per turn
 # ------------------------------------------------------------------
 
 def test_run_turn_resolves_provider_exactly_once_even_across_a_replan(monkeypatch):
@@ -885,13 +842,9 @@ def test_run_turn_resolves_provider_exactly_once_even_across_a_replan(monkeypatc
         resolve_calls["n"] += 1
         return _BYOK, {}
 
-    def _obsolete_classifier(_cfg):
-        raise AssertionError("production must not pre-classify model providers")
-
     deps = worker.TurnDeps(
         read_messages=lambda uid: next(feed),
         resolve_provider=_resolve,
-        is_official=_obsolete_classifier,
         mint_enclave_token=lambda uid: "rt",
         apply_pending_effects=_apply_effects,
     )
@@ -904,7 +857,7 @@ def test_run_turn_resolves_provider_exactly_once_even_across_a_replan(monkeypatc
 
 def test_run_turn_fails_when_provider_unresolved_and_never_enters_process_job(monkeypatch):
     """resolve_provider returning (None, {"error": ...}) must mark the job failed
-    and never touch read_messages/planner/responder (no wasted work, no filler)."""
+    and never touch read_messages/provider execution (no wasted work, no filler)."""
     uid = "u_w_noprovider"
     conftest.seed_user(uid)
     _reset(uid)
@@ -917,7 +870,6 @@ def test_run_turn_fails_when_provider_unresolved_and_never_enters_process_job(mo
     deps = worker.TurnDeps(
         read_messages=_boom,
         resolve_provider=lambda uid: (None, {"error": "model_api_key_decrypt_failed"}),
-        is_official=_boom,
         mint_enclave_token=_boom,
     )
     status = asyncio.run(worker._run_turn(job, deps))
@@ -938,7 +890,6 @@ def _ok_deps(rec, *, messages=None):
     return worker.TurnDeps(
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid: "rt",
         apply_pending_effects=_apply_effects,
     )
@@ -1149,7 +1100,7 @@ def test_reserved_lane_slots_reserved_zero_means_all_unrestricted():
 # ------------------------------------------------------------------
 
 def test_process_job_reply_uses_deps_summary_and_tail_and_enqueues_compaction_when_over_budget(monkeypatch):
-    """D1 responder call site: the reply must be produced from `deps.read_summary`/
+    """The tool-loop prompt must be produced from `deps.read_summary`/
     `deps.read_tail` (not the coalesced/runtime_state shape the old call site used).
     When the tail returned by `deps.read_tail` is over `_TAIL_BUDGET`, the turn must
     best-effort enqueue a maintenance-lane compaction job — without blocking or
@@ -1181,7 +1132,6 @@ def test_process_job_reply_uses_deps_summary_and_tail_and_enqueues_compaction_wh
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: big_tail,
         read_summary=lambda uid_: ("prior summary", 0.0, 3),
@@ -1189,7 +1139,7 @@ def test_process_job_reply_uses_deps_summary_and_tail_and_enqueues_compaction_wh
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert len(calls) == 1
@@ -1226,7 +1176,6 @@ def test_process_job_reply_skips_compaction_enqueue_when_under_budget(monkeypatc
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         read_summary=lambda uid_: ("", 0.0, 0),
@@ -1234,7 +1183,7 @@ def test_process_job_reply_skips_compaction_enqueue_when_under_budget(monkeypatc
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert enqueue_calls == []
@@ -1257,7 +1206,9 @@ def test_run_compaction_folds_oldest_batch_and_advances_watermark(monkeypatch):
         for i in range(worker._TAIL_KEEP + 6)
     ]
 
-    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+    async def _fake_compact(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+    ):
         return current_summary + "\n- new"
 
     monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
@@ -1281,7 +1232,6 @@ def test_run_compaction_folds_oldest_batch_and_advances_watermark(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: tail,
         read_summary=lambda uid_: ("- old", 0.0, 2),
@@ -1289,7 +1239,7 @@ def test_run_compaction_folds_oldest_batch_and_advances_watermark(monkeypatch):
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert write_bubble_called["n"] == 0
@@ -1330,7 +1280,6 @@ def test_run_compaction_failure_marks_failed_without_surfacing_user_error(monkey
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: [],
         read_summary=_boom_read_summary,
@@ -1338,7 +1287,7 @@ def test_run_compaction_failure_marks_failed_without_surfacing_user_error(monkey
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
     assert write_bubble_called["n"] == 0
@@ -1370,7 +1319,6 @@ def test_compaction_rollback_during_llm_blocks_summary_write(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         runtime_mode_enabled=lambda uid_: next(mode_checks),
         read_tail=lambda uid_, after_ts, limit: tail,
@@ -1379,7 +1327,7 @@ def test_compaction_rollback_during_llm_blocks_summary_write(monkeypatch):
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False,
+        job, deps, provider_config=_BYOK,
         api_key=None, runtime_token="rt"))
 
     assert status == "failed"
@@ -1413,13 +1361,12 @@ def test_process_job_records_whole_turn_metric_after_successful_respond(monkeypa
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         apply_pending_effects=_apply_effects,
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     with db.get_pool().connection() as c:
@@ -1437,7 +1384,7 @@ def test_process_job_records_whole_turn_metric_after_successful_respond(monkeypa
     assert row[7] >= 0
 
 
-def test_process_job_records_failed_whole_turn_metric_on_responder_error(monkeypatch):
+def test_process_job_records_failed_whole_turn_metric_on_provider_error(monkeypatch):
     """Inverted from the old per-call semantics: a failed turn (ResponderError)
     now DOES get a whole-turn metric row — spec B5 explicitly covers failed
     turns, not just successful ones (that's the point of a turn-level failure
@@ -1454,13 +1401,12 @@ def test_process_job_records_failed_whole_turn_metric_on_responder_error(monkeyp
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         apply_pending_effects=_apply_effects,
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
     with db.get_pool().connection() as c:
@@ -1497,7 +1443,6 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: [],
         read_summary=lambda uid_: ("", 0.0, 0),
@@ -1505,7 +1450,7 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     with db.get_pool().connection() as c:
@@ -1537,7 +1482,6 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: [],
         read_summary=lambda uid_: ("", 0.0, 0),
@@ -1545,7 +1489,7 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     with db.get_pool().connection() as c:
@@ -1561,18 +1505,24 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
 
 def test_run_compaction_records_whole_turn_metric_on_success(monkeypatch):
     """PR B review finding, compaction side: `_run_compaction` makes a real
-    `v2_compaction.compact` BYOK call but never flushed a success row. Unlike
-    the wake lane, `v2_compaction.compact` doesn't surface usage from its
-    provider call (no `usage_out` equivalent) — the fix counts the call via
-    `add_call(None)` so `model_calls` is at least right; token columns stay 0
-    (a documented gap, not invented data)."""
+    `v2_compaction.compact` BYOK call and now records its normalized
+    usage/cache telemetry with provider/model attribution."""
     uid = "u_w_compaction_turnmetric"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
     job = jobs_store.claim_next_job("w")
 
-    async def _fake_compact(*, provider_config, current_summary, old_messages, llm):
+    async def _fake_compact(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+    ):
+        usage_out({
+            "prompt_tokens": 80,
+            "completion_tokens": 8,
+            "cache_read_tokens": 60,
+            "cache_write_tokens": None,
+            "cache_miss_tokens": 20,
+        })
         return (current_summary + "\n- new bullet").strip()
 
     monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
@@ -1581,7 +1531,6 @@ def test_run_compaction_records_whole_turn_metric_on_success(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         # A few messages over _TAIL_KEEP but well under _COMPACTION_BATCH +
         # _TAIL_KEEP — enough to trigger a real compact() call without also
@@ -1594,20 +1543,65 @@ def test_run_compaction_records_whole_turn_metric_on_success(monkeypatch):
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert writes["n"] == 1
     with db.get_pool().connection() as c:
         row = c.execute(
-            "SELECT lane, prompt_tokens, completion_tokens, model_calls, failed, status "
+            "SELECT lane, prompt_tokens, completion_tokens, model_calls, failed, status, "
+            "cache_read_tokens, cache_write_tokens, cache_miss_tokens, "
+            "usage_reported_calls, cache_reported_calls, provider, model, "
+            "cache_route_fingerprint "
             "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
     assert row is not None
     assert row[0] == "maintenance"
-    assert row[1] == 0 and row[2] == 0   # documented token-gap: compact() surfaces no usage
-    assert row[3] == 1                    # but the call itself IS counted
+    assert row[1] == 80 and row[2] == 8
+    assert row[3] == 1
     assert row[4] is False
     assert row[5] == "ok"
+    assert row[6:11] == (60, None, 20, 1, 1)
+    assert row[11:] == ("anthropic", "claude-x", "feedling-v2-route-test")
+
+
+def test_turn_metrics_keep_unknown_usage_nullable_and_count_coverage(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        jobs_store,
+        "record_whole_turn_metric",
+        lambda *args, **kwargs: captured.update(args=args, kwargs=kwargs),
+    )
+    tm = worker.TurnMetrics(job_id=123, user_id="u", lane="chat")
+    tm.bind_provider(_BYOK)
+    tm.add_call(None)
+    tm.add_call({
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": None,
+        "cache_miss_tokens": 100,
+    })
+    tm.add_call({
+        "prompt_tokens": 50,
+        "completion_tokens": None,
+        "cache_read_tokens": 40,
+        "cache_write_tokens": None,
+        "cache_miss_tokens": 10,
+    })
+
+    tm.flush(failed=False, status="ok")
+
+    assert captured["args"] == (123, "u", "chat")
+    assert captured["kwargs"]["prompt_tokens"] == 150
+    assert captured["kwargs"]["completion_tokens"] == 10
+    assert captured["kwargs"]["cache_read_tokens"] == 40
+    assert captured["kwargs"]["cache_write_tokens"] is None
+    assert captured["kwargs"]["cache_miss_tokens"] == 110
+    assert captured["kwargs"]["usage_reported_calls"] == 2
+    assert captured["kwargs"]["cache_reported_calls"] == 2
+    assert captured["kwargs"]["provider"] == "anthropic"
+    assert captured["kwargs"]["model"] == "claude-x"
+    assert captured["kwargs"]["cache_route_fingerprint"] == "feedling-v2-route-test"
 
 
 def test_process_job_tolerates_missing_record_turn_metric_callback(monkeypatch):
@@ -1625,7 +1619,7 @@ def test_process_job_tolerates_missing_record_turn_metric_callback(monkeypatch):
     assert deps.record_turn_metric is None
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
 
@@ -1651,7 +1645,6 @@ def test_run_compaction_under_keep_threshold_completes_as_noop(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         read_tail=lambda uid_, after_ts, limit: [
             {"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
@@ -1660,7 +1653,7 @@ def test_run_compaction_under_keep_threshold_completes_as_noop(monkeypatch):
     )
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert compact_calls["n"] == 0
@@ -1669,9 +1662,8 @@ def test_run_compaction_under_keep_threshold_completes_as_noop(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# Task 6: wire the agent loop into process_job (and fix BUG-4). The
-# message-driven replan loop is the OUTER loop; agent_loop.run_turn is the
-# INNER model-driven tool loop; one _TURN_MAX_LLM_CALLS counter spans both.
+# Unified-loop regression coverage: one _TURN_MAX_LLM_CALLS budget spans the
+# complete chronological provider-native turn.
 # ------------------------------------------------------------------
 
 def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
@@ -1701,7 +1693,7 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
                         lambda store, text: written.update(text=text) or {"id": "r1"})
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert len(calls) == n            # ran to the budget, no early silent stop
@@ -1731,7 +1723,7 @@ def test_second_round_receives_first_round_native_tool_exchange(monkeypatch):
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert len(calls) == 2
@@ -1773,14 +1765,13 @@ def test_turn_llm_call_budget_binds_even_with_continuous_new_input(monkeypatch):
     deps = worker.TurnDeps(
         read_messages=_read_messages,
         resolve_provider=lambda uid_: (_BYOK, {}),
-        is_official=lambda cfg: False,
         mint_enclave_token=lambda uid_: "rt",
         apply_pending_effects=_apply_effects,
     )
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert len(calls) == n
@@ -1788,19 +1779,6 @@ def test_turn_llm_call_budget_binds_even_with_continuous_new_input(monkeypatch):
         row = c.execute(
             "SELECT model_calls FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
     assert row[0] == n
-
-
-# NOTE (Task 7): test_final_text_from_decide_short_circuits_the_responder was
-# deleted here, not converted. Its premise was specific to the old two-callback
-# shape (a `decide` step separate from a forced `responder.respond` round-trip,
-# with `LoopResult.final_text` as the seam letting a "native tools" backend
-# skip the extra call). The unified tool loop has no such seam to test:
-# EVERY model is "native tools" now (Global Constraints "no behavior
-# tiering") and a terminal plain-text round costs exactly one provider call by
-# construction — there is no separate responder call to short-circuit. That
-# "one round, one bubble, no forced second call" guarantee is exactly what
-# test_process_job_end_to_end_writes_reply_and_completes above (and
-# tests/test_v2_worker_tool_loop.py's first scenario) already covers.
 
 
 def test_unhandled_lane_never_writes_a_bubble_and_fails_loudly_in_the_db(monkeypatch):
@@ -1824,7 +1802,6 @@ def test_unhandled_lane_never_writes_a_bubble_and_fails_loudly_in_the_db(monkeyp
             "VALUES (%s, %s, 'pending', 0) RETURNING id", (uid, bogus_lane)).fetchone()[0]
     job = jobs_store.claim_next_job("w")
 
-    _patch_cheap_boundaries(monkeypatch, reply="SHOULD NOT BE WRITTEN")
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
     written = {}
     monkeypatch.setattr(worker, "_write_encrypted_reply",
@@ -1834,7 +1811,7 @@ def test_unhandled_lane_never_writes_a_bubble_and_fails_loudly_in_the_db(monkeyp
                         lambda uid_, jid, status, **kw: emitted.append(status))
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "failed"
     assert written == {}                       # no chat bubble
@@ -1860,7 +1837,7 @@ def test_chat_still_works_and_takes_the_chat_path(monkeypatch):
                         lambda store, text: written.update(text=text) or {"id": "r"})
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
     assert status == "completed"
     assert written == {"text": "REPLY"}
 
@@ -2108,6 +2085,6 @@ def test_chat_lane_still_takes_the_chat_path(monkeypatch):
                         lambda store, text: written.update(text=text) or {"id": "r"})
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, is_official=False, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
     assert status == "completed"
     assert written == {"text": "REPLY"}

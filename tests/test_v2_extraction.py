@@ -17,12 +17,18 @@ def _env(inner):
 
 def test_extract_returns_parsed_on_success(monkeypatch):
     async def _fake(cfg, messages, **kw):
-        return {"reply": '{"cards": []}'}
+        return {
+            "reply": '{"cards": []}',
+            "usage": {"prompt_tokens": 12, "cache_read_tokens": 8},
+        }
 
     monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _fake)
+    seen = []
     parsed, err = asyncio.run(extraction.extract(
-        provider_config=object(), prompt="P", parse=lambda raw: (["ok"], None)))
+        provider_config=object(), prompt="P", parse=lambda raw: (["ok"], None),
+        usage_out=seen.append))
     assert parsed == ["ok"] and err is None
+    assert seen == [{"prompt_tokens": 12, "cache_read_tokens": 8}]
 
 
 def test_extract_forwards_reliable_attempt_progress(monkeypatch):
@@ -48,10 +54,13 @@ def test_extract_returns_reason_on_provider_error(monkeypatch):
         raise RuntimeError("402 no credit")
 
     monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _boom)
+    seen = []
     parsed, err = asyncio.run(extraction.extract(
-        provider_config=object(), prompt="P", parse=lambda raw: (["x"], None)))
+        provider_config=object(), prompt="P", parse=lambda raw: (["x"], None),
+        usage_out=seen.append))
     assert parsed is None
     assert err.startswith("provider_call_failed:")
+    assert seen == [None]
 
 
 def test_extract_returns_reason_on_parse_error(monkeypatch):

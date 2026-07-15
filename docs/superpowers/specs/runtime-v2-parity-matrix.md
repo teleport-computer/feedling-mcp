@@ -36,7 +36,7 @@ Notes:
   alias remains absent so the model cannot select a verb the runtime cannot execute.
 - **`capture_memory` — pure removal, not deferred:** it duplicated `memory_write` (the
   real, already-registered memory-write capability) and never had its own capability
-  fn. Removed from the planner vocabulary; do not reintroduce it or add a
+  fn. It is absent from the provider-native tool catalog; do not reintroduce it or add a
   `capture_memory` capability — write through `memory_write` instead.
 - **`sleep` is a wake-lane outcome, not a missing capability:** an empty final reply in
   the unified native loop means the weak wake naturally sleeps. It is not exposed as a

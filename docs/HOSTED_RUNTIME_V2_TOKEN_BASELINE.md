@@ -1,5 +1,12 @@
 # Hosted Runtime V2 — tokens/turn measurements
 
+> Prompt-cache accounting: `prompt_tokens` remains the effective context size,
+> including cached input, so this regression baseline stays comparable before
+> and after caching. Runtime metrics separately report cache reads, writes, and
+> misses plus telemetry coverage. Do not subtract cached tokens from this
+> correctness/capacity metric; use the provider's cached-input price when
+> calculating billed cost.
+
 > Current rollout-gate result (2026-07-14, shared fixtures): **1707.0
 > tokens/turn, 1.3333 LLM calls/turn**. This is the first measurement through
 > the production provider-native `tool_loop.run_tool_loop`; every older number

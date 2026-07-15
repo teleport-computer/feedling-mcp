@@ -1,5 +1,9 @@
 # Hosted Runtime V2 — Agent Loop Implementation Plan
 
+> **STATUS: HISTORICAL / SUPERSEDED.** This plan produced an intermediate
+> JSON-planner state machine that is no longer part of production V2. Current
+> behavior lives in the unified provider-native `tool_loop.py` path.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give the V2 hosted runtime a real agent loop (`decide → act → observe → decide`) built on multi-round `plan → execute`, without depending on any provider's native tool-calling wire protocol.

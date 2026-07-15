@@ -1,5 +1,9 @@
 # Hosted Runtime V2 — Merge-Conditions Backlog
 
+> **STATUS: HISTORICAL SNAPSHOT (2026-07-09).** The live completion and rollout
+> gates are tracked in `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`; this file preserves
+> the pre-native-loop audit only.
+
 > **来源**：`~/downloads/feedling-runtime-v2-walkthrough.html`（2026-07-08，sxysun + Claude 的扩展愿景稿）§9「where the implementation stands」列出的 6 条 merge 前置条件 + §6 的 admission ceiling。
 > **对账基准**：`feat/hosted-runtime-v2` worktree，A+B+C 已实现未提交（2026-07-09 审计）。
 > **本文档只记账，不改代码。** 每条给：现状(带 file:line 证据) / 改法 / 归属(A-C 补丁 vs 子项目 D) / 优先级。

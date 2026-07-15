@@ -1,129 +1,89 @@
-"""Guard: no `is_official` -> rule/official dispatch in V2 production (PR C Task 9 /
-"C9b — delete the dispatch/planner/responder-hot-path/agent_loop machinery").
+"""Structural guards for the one-loop-for-every-model V2 runtime.
 
-Locks in the Global Constraint: "No behavior tiering: NO `is_official ->
-rule_plan/official_plan` dispatch in V2 production." Production does not even run
-the obsolete provider-identity classifier. Same tool catalog + loop for all models.
-Chat (Task 7) and wake (Task 8) both migrated off the old two-layer
-while/replan (`invalidation.py`) + json_planner (`planner.py`'s `plan`/`rule_plan`/
-`official_plan`) + forced `responder.respond` round-trip pipeline onto the single
-provider-native `tool_loop.run_tool_loop`.
-
-The old modules remain only as compatibility/test-helper surfaces; neither the
-production worker nor the D4 token rollback gate may use the staged pipeline. The
-durable invariant is that both execute `tool_loop.run_tool_loop` and never branch
-turn behavior on `is_official`.
+The retired JSON planner, staged agent loop, invalidation/replan helper, and
+standalone responder are deleted rather than kept as compatibility surfaces.
+Chat and wake both execute the provider-native ``tool_loop.run_tool_loop`` and
+provider identity is not part of the turn API.
 """
+from __future__ import annotations
+
 import ast
-import pathlib
+from pathlib import Path
 
-_V2 = pathlib.Path(__file__).parent.parent / "backend" / "model_api_runtime" / "v2"
+
+_ROOT = Path(__file__).parent.parent
+_V2 = _ROOT / "backend" / "model_api_runtime" / "v2"
 _WORKER = _V2 / "worker.py"
-_LOADTEST_COMPARE = pathlib.Path(__file__).parent.parent / "scripts" / "loadtest" / "compare_tokens.py"
-
-_FORBIDDEN_CALL_PATTERNS = (
-    "official_plan(",
-    "rule_plan(",
-    "v2_planner.plan(",
-    "planner.plan(",
-    "agent_loop.run_turn(",
-    "v2_agent_loop.run_turn(",
-    "responder.respond(",
-    "v2_responder.respond(",
-)
-
-# worker.py used to alias-import these two modules; PR C9b removed both imports
-# entirely (the third old-pipeline module, `invalidation.py`, keeps a live,
-# non-dispatch use elsewhere in worker.py's coalesce/fold machinery and is out of
-# this guard's scope).
-_FORBIDDEN_IMPORT_MODULES = {"planner", "agent_loop"}
+_LOADTEST_COMPARE = _ROOT / "scripts" / "loadtest" / "compare_tokens.py"
+_RETIRED_MODULES = ("planner.py", "agent_loop.py", "invalidation.py", "responder.py")
 
 
-def _non_comment_source(path: pathlib.Path) -> str:
-    """Strip full-line `#` comments before substring-matching, so a comment/docstring
-    explaining what Task 7/8 replaced (there are many, deliberately, across this
-    codebase) can't false-positive this guard. Mirrors the pattern already used by
-    tests/test_v2_no_gateway_dependency.py's `_modules()`/source-scan guard."""
-    src = path.read_text()
-    return "\n".join(
-        line for line in src.splitlines() if not line.lstrip().startswith("#")
+def _tree(path: Path) -> ast.Module:
+    return ast.parse(path.read_text())
+
+
+def _async_function(tree: ast.Module, name: str) -> ast.AsyncFunctionDef:
+    return next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == name
     )
 
 
-def test_worker_never_calls_the_old_staged_pipeline():
-    code = _non_comment_source(_WORKER)
-    offenders = [p for p in _FORBIDDEN_CALL_PATTERNS if p in code]
-    assert not offenders, (
-        "worker.py (the production turn driver) must not call into the old "
-        f"planner/responder/agent_loop pipeline; found: {offenders}"
+def _called_names(node: ast.AST) -> set[str]:
+    return {
+        ast.unparse(call.func)
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+    }
+
+
+def test_retired_staged_pipeline_modules_are_deleted():
+    remaining = [name for name in _RETIRED_MODULES if (_V2 / name).exists()]
+    assert remaining == [], f"retired V2 compatibility modules remain: {remaining}"
+
+
+def test_worker_turn_api_has_no_provider_identity_tier_parameter():
+    tree = _tree(_WORKER)
+    process_job = _async_function(tree, "process_job")
+    assert "is_official" not in {
+        arg.arg for arg in (*process_job.args.args, *process_job.args.kwonlyargs)
+    }
+
+    turn_deps = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "TurnDeps"
     )
+    fields = {
+        node.target.id
+        for node in turn_deps.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert "is_official" not in fields
 
 
-def test_worker_does_not_import_planner_or_agent_loop():
-    tree = ast.parse(_WORKER.read_text())
+def test_chat_and_wake_use_the_same_native_tool_loop():
+    tree = _tree(_WORKER)
+    for function_name in ("process_job", "_run_wake"):
+        function = _async_function(tree, function_name)
+        calls = _called_names(function)
+        assert "v2_tool_loop.run_tool_loop" in calls, function_name
+        assert all("is_official" not in call for call in calls), function_name
+
+
+def test_worker_does_not_import_retired_modules():
+    retired_stems = {Path(name).stem for name in _RETIRED_MODULES}
     imported: set[str] = set()
-    for node in ast.walk(tree):
+    for node in ast.walk(_tree(_WORKER)):
         if isinstance(node, ast.ImportFrom) and node.module == "model_api_runtime.v2":
-            for alias in node.names:
-                imported.add(alias.name)
-    offenders = imported & _FORBIDDEN_IMPORT_MODULES
-    assert not offenders, f"worker.py must not import the old dispatch modules: {offenders}"
-
-
-def test_process_job_never_branches_on_is_official():
-    """The optional compatibility keyword may remain for direct legacy tests,
-    but nothing inside `process_job` may read it in an `if` test — that would
-    resurrect is_official -> behavior dispatch."""
-    tree = ast.parse(_WORKER.read_text())
-    process_job = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "process_job"
-    )
-    offenders = [
-        ast.dump(node.test)
-        for node in ast.walk(process_job)
-        if isinstance(node, ast.If) and "is_official" in ast.dump(node.test)
-    ]
-    assert not offenders, f"process_job must not branch on is_official: {offenders}"
-
-
-def test_run_turn_never_calls_is_official():
-    """The old classifier must be absent from the production hot path, not
-    merely computed and then ignored."""
-    tree = ast.parse(_WORKER.read_text())
-    run_turn = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "_run_turn"
-    )
-    calls = [
-        ast.dump(node.func)
-        for node in ast.walk(run_turn)
-        if isinstance(node, ast.Call)
-    ]
-    assert not any("is_official" in call for call in calls)
-
-
-def test_run_wake_never_branches_on_is_official():
-    """Same invariant for the wake lane's own handler (`_run_wake`, Task 8) —
-    `is_official` isn't even threaded into it (it's not one of its parameters), but
-    this guard is here so an `is_official` re-introduction into that function would
-    also be caught even if a future change added the parameter back."""
-    tree = ast.parse(_WORKER.read_text())
-    run_wake = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "_run_wake"
-    )
-    offenders = [
-        ast.dump(node.test)
-        for node in ast.walk(run_wake)
-        if isinstance(node, ast.If) and "is_official" in ast.dump(node.test)
-    ]
-    assert not offenders, f"_run_wake must not branch on is_official: {offenders}"
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name.rsplit(".", 1)[-1] for alias in node.names)
+    assert imported.isdisjoint(retired_stems), imported & retired_stems
 
 
 def test_token_rollback_gate_uses_the_production_unified_loop():
-    """D4 must measure what production runs, not the retired staged pipeline."""
-    code = _non_comment_source(_LOADTEST_COMPARE)
+    code = _LOADTEST_COMPARE.read_text()
     assert "v2_tool_loop.run_tool_loop(" in code
-    offenders = [pattern for pattern in _FORBIDDEN_CALL_PATTERNS if pattern in code]
-    assert not offenders, f"token rollback gate uses retired pipeline: {offenders}"
+    for retired in ("planner", "agent_loop", "invalidation", "responder"):
+        assert f"v2_{retired}." not in code
+        assert f"import {retired}" not in code

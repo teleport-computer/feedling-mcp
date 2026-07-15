@@ -1,5 +1,10 @@
 # Hosted Runtime V2 — 子项目 B（DB job + 有界 worker 骨架）Implementation Plan
 
+> **STATUS: HISTORICAL IMPLEMENTATION RECORD.** The durable job/worker
+> foundation remains current, but the `agent_action_queue` planner pipeline and
+> its Python CRUD surface were superseded by provider-native tool calls plus the
+> generation-fenced effect outbox. Do not treat every API shown below as live.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 落地 Hosted Runtime V2 的 DB-job 管道地基：4 张专用 Alembic 表、`jobs_store`（CRUD + `SKIP LOCKED` claim + per-user single-flight + reaper + status 事件 + runtime_state + action-queue CRUD）、独立 worker 进程骨架，以及 `chat/send → job → worker claim → 单次解密 provider key → 最小 responder → 落加密 assistant 回复 → mark_completed` 的最小端到端闭环。

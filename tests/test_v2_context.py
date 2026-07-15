@@ -95,3 +95,34 @@ def test_needs_compaction_counts_image_rows():
     tail = [{"role": "user", "content": [{"type": "image_url",
                                           "image_url": {"url": "data:image/jpeg;base64,A"}}]}]
     assert context.needs_compaction(tail, budget=0) is True
+
+
+def test_fold_action_results_drops_image_blob():
+    folded = context.fold_action_results({
+        "chat_image_read": [{"ok": True, "data": {
+            "message_id": "m1", "image_mime": "image/jpeg", "image_b64": "A" * 50_000,
+        }}],
+    })
+    assert folded["chat_image_read"]["message_id"] == "m1"
+    assert folded["chat_image_read"]["image_mime"] == "image/jpeg"
+    assert "image_b64" not in folded["chat_image_read"]
+
+
+def test_fold_action_results_caps_one_oversized_action_without_evicting_others():
+    folded = context.fold_action_results({
+        "memory_fetch": [{"ok": True, "data": {"body": "B" * 50_000}}],
+        "perception_snapshot": [{"ok": True, "data": {"mood": "calm"}}],
+    })
+    assert folded["memory_fetch"]["_truncated"] is True
+    assert len(folded["memory_fetch"]["preview"]) <= context.PER_ACTION_CHAR_CAP
+    assert folded["perception_snapshot"] == {"mood": "calm"}
+
+
+def test_action_context_str_ignores_failed_and_empty_results():
+    rendered = context.action_context_str({
+        "memory_fetch": [{"ok": False, "data": {"secret": "DROP-ME"}}],
+        "perception_snapshot": [{"ok": True, "data": None}],
+        "memory_search": [{"ok": True, "data": {"cards": ["KEEP-ME"]}}],
+    })
+    assert "KEEP-ME" in rendered
+    assert "DROP-ME" not in rendered
