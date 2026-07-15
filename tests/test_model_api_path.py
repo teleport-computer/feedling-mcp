@@ -1398,6 +1398,35 @@ def test_onboarding_greeting_uses_reliable_provider_call_with_extended_timeout(m
     assert captured["kwargs"]["timeout"] == history_import.GENESIS_PROVIDER_DERIVE_TIMEOUT_SEC == 120.0
 
 
+def test_onboarding_greeting_append_marks_introduced(client):
+    # The onboarding greeting IS this user's introduction: a successful append
+    # must set the durable introduced marker so the resident introduction job
+    # (agent_runtime.introduction) can never double-greet — e.g. after a later
+    # route switch to resident, or a fast-path widened to model_api.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    assert store.introduction_done() is False
+    row = history_import._append_model_api_onboarding_greeting(store, "hello, first greeting")
+    assert row["model_api_kind"] == "onboarding_greeting"
+    assert store.introduction_done() is True
+
+
+def test_onboarding_greeting_envelope_failure_leaves_introduced_unset(client, monkeypatch):
+    # Marker must anchor on the greeting the user actually RECEIVES: an append
+    # that failed (no chat row) must not mark introduced, or the failure would
+    # be permanently papered over and suppress a later introduction.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, _body: (None, "forced_envelope_failure"),
+    )
+    with pytest.raises(RuntimeError):
+        history_import._append_model_api_onboarding_greeting(store, "never lands")
+    assert store.introduction_done() is False
+
+
 def test_support_material_sections_split_character_and_personal_profile():
     payload = {
         "persona_filename": "combined.md",

@@ -2909,6 +2909,19 @@ def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
     )
     store.notify_chat_waiters()
     boot_gates._log_bootstrap_event(store, "model_api_onboarding_greeting_written", success=True)
+    # The onboarding greeting IS this user's introduction — record the durable
+    # introduced marker (the same one agent_runtime.introduction dedups on) so
+    # the resident introduction job can never double-greet, e.g. after a later
+    # route switch to resident. Anchored HERE, after the append the user
+    # actually receives, never at identity-write time: a greeting that failed
+    # to land must stay eligible for a future introduction. Best-effort — the
+    # greeting row is already delivered, so a marker write hiccup must not fail
+    # the job (residual crash window between the two stores is accepted; no
+    # cross-store transaction exists).
+    try:
+        store.mark_introduced()
+    except Exception as e:  # noqa: BLE001
+        print(f"[history_import:{store.user_id}] mark_introduced after greeting failed: {type(e).__name__}:{str(e)[:160]}")
     return row
 
 
