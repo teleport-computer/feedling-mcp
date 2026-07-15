@@ -521,18 +521,36 @@ def record_tee_sync_run(summary: dict) -> None:
         log.error("[db] record_tee_sync_run failed: %s", e)
 
 
+def mark_reconcile_success() -> None:
+    """Stamp ``tee_reconcile_state`` the moment a reconcile pass completes (see
+    alembic 0019). Called from the scheduler right after reconcile, BEFORE the
+    slow replicate/verify — so a worker recycled mid-tick still leaves reconcile
+    marked done and the next leader skips reconcile-first instead of re-running it
+    and starving replicate. Best-effort: a failed stamp only costs one extra
+    reconcile, never breaks the loop."""
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO tee_reconcile_state (id, last_success_at) VALUES (TRUE, now()) "
+                "ON CONFLICT (id) DO UPDATE SET last_success_at = now()")
+    except Exception as e:  # noqa: BLE001
+        log.warning("[db] mark_reconcile_success failed: %s", e)
+
+
 def last_tee_reconcile_age_sec() -> float | None:
-    """Seconds since the most recent SUCCESSFUL reconcile tick, or None if there
-    has never been one. Read by the tee-sync scheduler at loop start so a new
-    leader (gunicorn worker recycling hands leadership over) does not restart
-    from ``last_reconcile=None`` and redo reconcile-first — a full reconcile
-    takes tens of minutes, so with short worker lifetimes it would never finish
-    (2026-07-14 test: 2h of leader churn, zero completed ticks). Age is computed
-    server-side (``now() - max(ran_at)``) so client clock skew is irrelevant."""
+    """Seconds since the last completed reconcile pass (``mark_reconcile_success``),
+    or None if there has never been one. Read by the tee-sync scheduler at loop
+    start so a new leader (gunicorn worker recycle) does NOT redo reconcile-first
+    when one completed recently — a full reconcile outlasts a max_requests worker
+    lifetime, so without this it never finished (2026-07-14 test: 2h of leader
+    churn, zero completed ticks). Sourced from tee_reconcile_state (stamped at
+    reconcile completion) rather than the end-of-tick tee_sync_runs row, because
+    the tick often dies in the slow replicate phase before that row is written
+    (2026-07-15 prod). Age is computed server-side so client clock skew is moot."""
     with get_pool().connection() as conn:
         row = conn.execute(
-            "SELECT EXTRACT(EPOCH FROM (now() - max(ran_at))) FROM tee_sync_runs "
-            "WHERE did_reconcile AND reconcile_ok IS TRUE"
+            "SELECT EXTRACT(EPOCH FROM (now() - last_success_at)) "
+            "FROM tee_reconcile_state WHERE id"
         ).fetchone()
     if not row or row[0] is None:
         return None

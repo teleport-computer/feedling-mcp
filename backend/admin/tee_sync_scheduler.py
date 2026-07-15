@@ -136,6 +136,11 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
             log.info("[tee-sync] reconcile done: copied=%s unconverged=%s",
                      summary["reconcile_copied"], unconv or "none")
             reconcile_ok = True
+            # Stamp completion NOW — before the slow replicate/verify below. If the
+            # worker is max_requests-recycled mid-replicate, reconcile still counts
+            # as done, so the next leader runs replicate-only ticks instead of
+            # redoing reconcile-first and re-starving replicate (2026-07-15 prod).
+            db.mark_reconcile_success()
         except tr.AlreadyRunning:
             reconcile_ok = True  # 别人（手动 run）在跑 → 不重试风暴
         except tr.Unconfigured:
