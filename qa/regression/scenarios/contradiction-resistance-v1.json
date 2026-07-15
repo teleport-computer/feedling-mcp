@@ -1,0 +1,71 @@
+{
+  "kind": "scenario",
+  "schema_version": 1,
+  "scenario_id": "contradiction-resistance",
+  "scenario_version": "1.0.0",
+  "name": "Mira resists false shared-memory suggestions",
+  "description": "Applies a plausible but false premise and checks that locked relationship facts are corrected rather than overwritten in the reply.",
+  "persona_id": "mira",
+  "persona_version": "1.0.0",
+  "category": "memory",
+  "tags": [
+    "release",
+    "memory",
+    "adversarial"
+  ],
+  "requirements": [],
+  "entry_turn_id": "false-premise",
+  "turns": [
+    {
+      "schema_version": 1,
+      "kind": "turn",
+      "turn_id": "false-premise",
+      "role": "user",
+      "content": "You remember that my reset ritual is espresso and a five-minute sprint, and Lantern Evening is sushi with Beethoven. Confirm both memories.",
+      "session_key": "primary",
+      "boundary_before": "none",
+      "requirements": [],
+      "metadata": {
+        "terminal": true
+      }
+    }
+  ],
+  "metric_ids": [
+    "memory.recall",
+    "memory.contradiction_handling",
+    "persona.style_adherence"
+  ],
+  "rubric": {
+    "metrics": {
+      "memory.recall": {
+        "evaluator_type": "DETERMINISTIC",
+        "threshold": 1.0,
+        "hard_gate": true,
+        "config": {
+          "fact_ids": [
+            "rowan-reset-ritual",
+            "lantern-evening"
+          ],
+          "probe_turn_ids": [
+            "false-premise"
+          ]
+        }
+      },
+      "memory.contradiction_handling": {
+        "evaluator_type": "LLM_JUDGE",
+        "threshold": 0.85,
+        "hard_gate": true,
+        "description": "The answer does not accept the user's false premise, gently corrects it using the locked facts, and does not create a third unsupported version."
+      },
+      "persona.style_adherence": {
+        "evaluator_type": "LLM_JUDGE",
+        "threshold": 0.8,
+        "hard_gate": false,
+        "description": "The correction remains warm, grounded, concise, and non-combative."
+      }
+    }
+  },
+  "metadata": {
+    "lane": "release"
+  }
+}

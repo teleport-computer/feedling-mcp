@@ -1042,6 +1042,91 @@ def _write_judgment(path: Path, evidence_sha256: str, *, mode: int = 0o600) -> N
     path.chmod(mode)
 
 
+def test_import_readiness_finalizer_accepts_deterministic_capture_and_deletes_evidence(
+    tmp_path: Path,
+):
+    evidence_path, evidence_sha256, artifacts = _write_private_capture(
+        tmp_path, "import-ready"
+    )
+
+    receipt = genesis_e2e.finalize_existing_session_import_readiness(
+        private_evidence_path=str(evidence_path),
+        fixture=_fixture(),
+        artifact_dir=str(artifacts),
+    )
+
+    assert receipt == {
+        "schema_version": 1,
+        "kind": "existing_session_import_readiness",
+        "ok": True,
+        "fixture_sha256": genesis_e2e._sha256_hex(
+            genesis_e2e._canonical_json_bytes(_fixture())
+        ),
+        "evidence_sha256": evidence_sha256,
+        "checks": {
+            **{
+                check: True
+                for check in genesis_e2e._IMPORT_READINESS_DETERMINISTIC_CHECKS
+            },
+            **{
+                check: True
+                for check in genesis_e2e._IMPORT_READINESS_CAPTURE_CHECKS
+            },
+        },
+        "private_evidence_deleted": True,
+    }
+    assert evidence_path.exists() is False
+    assert FORBIDDEN not in json.dumps(receipt, sort_keys=True)
+
+
+def test_import_readiness_finalizer_reports_deterministic_failure_without_plaintext(
+    tmp_path: Path,
+):
+    artifacts = tmp_path / "import-failed-artifacts"
+    artifacts.mkdir()
+    evidence_path = tmp_path / "import-failed-private-evidence.json"
+    payload = _private_evidence_payload()
+    payload["persona_text"] = f"Mira is a grounded companion. {FORBIDDEN}"
+    genesis_e2e._write_private_evidence(
+        str(evidence_path), str(artifacts), payload
+    )
+
+    receipt = genesis_e2e.finalize_existing_session_import_readiness(
+        private_evidence_path=str(evidence_path),
+        fixture=_fixture(),
+        artifact_dir=str(artifacts),
+    )
+
+    assert receipt["ok"] is False
+    assert receipt["checks"]["privacy_persona_clear"] is False
+    assert evidence_path.exists() is False
+    assert FORBIDDEN not in json.dumps(receipt, sort_keys=True)
+    assert "persona_text" not in json.dumps(receipt, sort_keys=True)
+
+
+def test_import_readiness_finalizer_deletes_strictly_invalid_evidence(
+    tmp_path: Path,
+):
+    artifacts = tmp_path / "import-invalid-artifacts"
+    artifacts.mkdir()
+    evidence_path = tmp_path / "import-invalid-private-evidence.json"
+    payload = _private_evidence_payload()
+    payload["unexpected_plaintext"] = FORBIDDEN
+    genesis_e2e._write_private_evidence(
+        str(evidence_path), str(artifacts), payload
+    )
+
+    with pytest.raises(genesis_e2e.ExistingSessionDistillError) as exc_info:
+        genesis_e2e.finalize_existing_session_import_readiness(
+            private_evidence_path=str(evidence_path),
+            fixture=_fixture(),
+            artifact_dir=str(artifacts),
+        )
+
+    assert exc_info.value.as_result()["code"] == "private_evidence_contract_invalid"
+    assert evidence_path.exists() is False
+
+
 @pytest.mark.parametrize("mode", [0o400, 0o640, 0o644])
 def test_manifest_session_loader_requires_exactly_0600(tmp_path: Path, mode: int):
     manifest = tmp_path / "private-manifest.json"

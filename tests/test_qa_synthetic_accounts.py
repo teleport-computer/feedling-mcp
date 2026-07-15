@@ -45,12 +45,15 @@ def _admin_headers(token: str = ADMIN_TOKEN) -> dict[str, str]:
     return {"X-Admin-Token": token}
 
 
-def _synthetic_payload(label: str = "agent-e2e-run-official-openai") -> dict:
+def _synthetic_payload(
+    label: str = "agent-e2e-run-official-openai", *, run_id: str = "run"
+) -> dict:
     return {
         "public_key": base64.b64encode(b"q" * 32).decode("ascii"),
         "access_mode": "model_api",
         "archive_language": "en",
         "label": label,
+        "run_id": run_id,
         "ttl_seconds": 600,
     }
 
@@ -67,8 +70,17 @@ def _exists(user_id: str) -> bool:
     return registry._user_entry_snapshot(user_id) is not None
 
 
-def _register_direct(label: str, *, now: int = 1_000, ttl: int = 60) -> dict:
-    payload = _synthetic_payload(label)
+def _register_direct(
+    label: str,
+    *,
+    run_id: str | None = None,
+    now: int = 1_000,
+    ttl: int = 60,
+) -> dict:
+    if run_id is None:
+        run_id = label.removeprefix("agent-e2e-")
+        label = f"{label}-account"
+    payload = _synthetic_payload(label, run_id=run_id)
     payload["public_key"] = ""
     payload["ttl_seconds"] = ttl
     return synthetic.register_synthetic_account(payload, now_epoch=now)
@@ -207,6 +219,169 @@ def test_absence_endpoint_rejects_forgery_and_store_failure(qa_client, monkeypat
     )
     assert unavailable_response.status_code == 503
     assert unavailable_response.get_json() == {
+        "error": "synthetic_account_store_unavailable"
+    }
+
+
+def test_cleanup_run_is_authoritative_aggregate_only_and_idempotent(qa_client):
+    run_id = "cleanup-run"
+    first = _register_direct(
+        "agent-e2e-cleanup-run-official-openai",
+        run_id=run_id,
+        now=1_000,
+        ttl=60,
+    )
+    second = _register_direct(
+        "agent-e2e-cleanup-run-official-gemini",
+        run_id=run_id,
+        now=1_000,
+        ttl=60,
+    )
+    other = _register_direct(
+        "agent-e2e-cleanup-runner-official-openai",
+        run_id="cleanup-runner",
+        now=1_000,
+        ttl=60,
+    )
+    ordinary = registry._register_user(
+        access_mode="model_api", label="agent-e2e-cleanup-run-ordinary"
+    )
+
+    unauthenticated = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/cleanup-run", json={"run_id": run_id}
+    )
+    assert unauthenticated.status_code == 401
+
+    response = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/cleanup-run",
+        json={"run_id": run_id},
+        headers=_admin_headers(),
+    )
+    assert response.status_code == 200
+    body = response.get_json()
+    assert set(body) == {
+        "schema_version",
+        "kind",
+        "run_id_sha256",
+        "label_prefix_sha256",
+        "database_authoritative",
+        "matched_count",
+        "deleted_count",
+        "already_absent_count",
+        "operation_failure_count",
+        "remaining_count",
+        "complete",
+    }
+    assert body["kind"] == synthetic.RUN_CLEANUP_KIND
+    assert body["database_authoritative"] is True
+    assert body["matched_count"] == 2
+    assert body["deleted_count"] == 2
+    assert body["operation_failure_count"] == 0
+    assert body["remaining_count"] == 0
+    assert body["complete"] is True
+    serialized = str(body)
+    for private_value in (
+        first["user_id"],
+        first["lease_id"],
+        second["user_id"],
+        second["lease_id"],
+        run_id,
+    ):
+        assert private_value not in serialized
+    assert not _exists(first["user_id"])
+    assert not _exists(second["user_id"])
+    assert _exists(other["user_id"])
+    assert _exists(ordinary["user_id"])
+
+    late_registration = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/register",
+        json=_synthetic_payload(
+            "agent-e2e-cleanup-run-late-account", run_id=run_id
+        ),
+        headers=_admin_headers(),
+    )
+    assert late_registration.status_code == 409
+    assert late_registration.get_json() == {
+        "error": "synthetic_account_run_closed"
+    }
+
+    repeated = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/cleanup-run",
+        json={"run_id": run_id},
+        headers=_admin_headers(),
+    )
+    assert repeated.status_code == 200
+    repeated_body = repeated.get_json()
+    assert repeated_body["matched_count"] == 0
+    assert repeated_body["deleted_count"] == 0
+    assert repeated_body["remaining_count"] == 0
+    assert repeated_body["complete"] is True
+
+
+@pytest.mark.parametrize("tamper", ["signature", "identity"])
+def test_cleanup_run_never_ignores_or_deletes_tampered_matching_metadata(
+    qa_client, tamper
+):
+    run_id = f"tampered-run-{tamper}"
+    account = _register_direct(
+        f"agent-e2e-{run_id}-account",
+        run_id=run_id,
+        now=1_000,
+        ttl=60,
+    )
+    with registry._users_lock:
+        entry = registry._find_user_entry_locked(account["user_id"])
+        metadata = entry[synthetic.METADATA_FIELD]
+        if tamper == "signature":
+            metadata["signature"] = "0" * 64
+        else:
+            metadata["user_id"] = "usr_" + "f" * 16
+        registry.persist_user(entry)
+
+    response = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/cleanup-run",
+        json={"run_id": run_id},
+        headers=_admin_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["matched_count"] == 1
+    assert body["deleted_count"] == 0
+    assert body["operation_failure_count"] == 1
+    assert body["remaining_count"] == 1
+    assert body["complete"] is False
+    assert _exists(account["user_id"])
+
+
+@pytest.mark.parametrize(
+    "run_id", ["", "bad/run", " leading", "x" * (synthetic.MAX_RUN_ID_LENGTH + 1)]
+)
+def test_cleanup_run_rejects_non_normalized_run_ids(qa_client, run_id):
+    response = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/cleanup-run",
+        json={"run_id": run_id},
+        headers=_admin_headers(),
+    )
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "invalid_synthetic_account_run"}
+
+
+def test_cleanup_run_fails_closed_when_authoritative_store_is_unavailable(
+    qa_client, monkeypatch
+):
+    monkeypatch.setattr(
+        synthetic.db,
+        "load_user_documents_with_field",
+        lambda _field: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+    response = qa_client.post(
+        "/v1/admin/qa/synthetic-accounts/cleanup-run",
+        json={"run_id": "store-failure"},
+        headers=_admin_headers(),
+    )
+    assert response.status_code == 503
+    assert response.get_json() == {
         "error": "synthetic_account_store_unavailable"
     }
 
@@ -375,6 +550,7 @@ def test_disabled_or_invalid_config_fails_closed(qa_client, monkeypatch):
         {"label": "ordinary-user"},
         {"label": "agent-e2e-"},
         {"label": "agent-e2e-bad space"},
+        {"run_id": "different-run"},
         {"ttl_seconds": True},
         {"ttl_seconds": 0},
         {"ttl_seconds": 3601},

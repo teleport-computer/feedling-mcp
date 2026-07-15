@@ -11,6 +11,14 @@ on:
         options:
           - deployed_current
           - hosted_resident
+      persona_repetitions:
+        description: Persona-memory depth (1 = developer smoke, 3 = release depth)
+        required: true
+        type: choice
+        default: "1"
+        options:
+          - "1"
+          - "3"
   # The default-branch controller can invoke the same trusted revision without
   # forwarding repository or organization secrets from the caller.
   workflow_call:
@@ -19,6 +27,11 @@ on:
         description: Runtime qualification target
         required: true
         type: string
+      persona_repetitions:
+        description: Persona-memory repetitions (1 or 3)
+        required: false
+        type: string
+        default: "1"
 
 permissions:
   contents: read
@@ -38,6 +51,7 @@ jobs:
           CONTROLLER_SHA: ${{ github.sha }}
           DISPATCH_REF: ${{ github.ref }}
           DISPATCH_REPOSITORY: ${{ github.repository }}
+          PERSONA_REPETITIONS: ${{ inputs.persona_repetitions }}
         run: |
           set -euo pipefail
           if [ "$DISPATCH_REPOSITORY" != "teleport-computer/feedling-mcp" ]; then
@@ -50,6 +64,10 @@ jobs:
           fi
           if [[ ! "$CONTROLLER_SHA" =~ ^[a-f0-9]{40}$ ]]; then
             echo "::error::controller revision must be an immutable full Git SHA"
+            exit 1
+          fi
+          if [ "$PERSONA_REPETITIONS" != "1" ] && [ "$PERSONA_REPETITIONS" != "3" ]; then
+            echo "::error::persona_repetitions must be exactly 1 or 3"
             exit 1
           fi
 
@@ -538,7 +556,7 @@ jobs:
             --target-sha "$TARGET_SHA" \
             --controller-sha "$CONTROLLER_SHA" \
             --jit-config-file "$JIT_CONFIG_FILE" \
-            --ttl-seconds 18000 \
+            --ttl-seconds 21600 \
             --github-output "$GITHUB_OUTPUT"
           rm -f -- "$JIT_CONFIG_FILE"
 
@@ -662,7 +680,7 @@ jobs:
     runs-on:
       group: ${{ needs.provision-aws-runner.outputs.runner_group }}
       labels: ${{ needs.provision-aws-runner.outputs.runner_label }}
-    timeout-minutes: 240
+    timeout-minutes: 330
 
     steps:
       - name: Check out immutable trusted controller revision
@@ -703,6 +721,7 @@ jobs:
         id: context
         env:
           EXPECTED_DEPLOYMENT_SHA: ${{ needs.resolve-test-deployment.outputs.sha }}
+          PERSONA_REPETITIONS: ${{ inputs.persona_repetitions }}
         run: |
           set -euo pipefail
 
@@ -719,6 +738,18 @@ jobs:
           supervisor_home="${private_root}/supervisor-home"
           supervisor_tmp="${private_root}/supervisor-tmp"
           supervisor_work="${private_root}/supervisor-work"
+          persona_judge_root="${private_root}/persona-judge"
+          persona_judge_scratch_root="${private_root}/persona-judge-scratch"
+          persona_import_work="${private_root}/persona-import-work"
+          persona_pool_manifest="${private_root}/persona-account-pool.json"
+          persona_readiness_receipt="${private_root}/persona-readiness.json"
+          persona_import_pre_receipt="${private_root}/persona-import-deployment-pre.json"
+          persona_import_post_receipt="${private_root}/persona-import-deployment-post.json"
+          persona_run_pre_receipt="${private_root}/persona-run-deployment-pre.json"
+          persona_run_post_receipt="${private_root}/persona-run-deployment-post.json"
+          persona_result="${private_root}/persona-result.json"
+          persona_cleanup_receipt="${private_root}/persona-cleanup-receipt.json"
+          persona_arm_receipt="${private_root}/persona-arm-receipt.json"
           codex_home="${private_root}/codex-home"
           orchestration_receipt="${private_root}/orchestration-receipt.json"
           private_result="${private_root}/agent-run-result.json"
@@ -736,6 +767,12 @@ jobs:
             "$supervisor_home" \
             "$supervisor_tmp" \
             "$supervisor_work" \
+            "$persona_judge_root" \
+            "${persona_judge_root}/home" \
+            "${persona_judge_root}/tmp" \
+            "${persona_judge_root}/work" \
+            "$persona_judge_scratch_root" \
+            "$persona_import_work" \
             "$codex_home"
           for agent_type in \
             profile_official_deepseek \
@@ -768,6 +805,19 @@ jobs:
             echo "supervisor_home=$supervisor_home"
             echo "supervisor_tmp=$supervisor_tmp"
             echo "supervisor_work=$supervisor_work"
+            echo "persona_judge_root=$persona_judge_root"
+            echo "persona_judge_scratch_root=$persona_judge_scratch_root"
+            echo "persona_import_work=$persona_import_work"
+            echo "persona_pool_manifest=$persona_pool_manifest"
+            echo "persona_readiness_receipt=$persona_readiness_receipt"
+            echo "persona_import_pre_receipt=$persona_import_pre_receipt"
+            echo "persona_import_post_receipt=$persona_import_post_receipt"
+            echo "persona_run_pre_receipt=$persona_run_pre_receipt"
+            echo "persona_run_post_receipt=$persona_run_post_receipt"
+            echo "persona_result=$persona_result"
+            echo "persona_cleanup_receipt=$persona_cleanup_receipt"
+            echo "persona_arm_receipt=$persona_arm_receipt"
+            echo "persona_repetitions=$PERSONA_REPETITIONS"
             echo "codex_home=$codex_home"
             echo "orchestration_receipt=$orchestration_receipt"
             echo "private_result=$private_result"
@@ -806,6 +856,8 @@ jobs:
           QA_SUPERVISOR_HOME: ${{ steps.context.outputs.supervisor_home }}
           QA_SUPERVISOR_TMP: ${{ steps.context.outputs.supervisor_tmp }}
           QA_SUPERVISOR_WORK: ${{ steps.context.outputs.supervisor_work }}
+          QA_PERSONA_JUDGE_ROOT: ${{ steps.context.outputs.persona_judge_root }}
+          QA_PERSONA_JUDGE_SCRATCH_ROOT: ${{ steps.context.outputs.persona_judge_scratch_root }}
           QA_CODEX_HOME: ${{ steps.context.outputs.codex_home }}
           QA_ORCHESTRATION_RECEIPT: ${{ steps.context.outputs.orchestration_receipt }}
           QA_CODEX_MODEL: ${{ vars.QA_CODEX_MODEL }}
@@ -853,6 +905,8 @@ jobs:
             --supervisor-home "$QA_SUPERVISOR_HOME" \
             --supervisor-tmp "$QA_SUPERVISOR_TMP" \
             --supervisor-work "$QA_SUPERVISOR_WORK" \
+            --persona-judge-root "$QA_PERSONA_JUDGE_ROOT" \
+            --persona-judge-scratch-root "$QA_PERSONA_JUDGE_SCRATCH_ROOT" \
             --worker-root "$QA_WORKER_ROOT" \
             --worker-output-root "$QA_WORKER_OUTPUT_ROOT" \
             --aggregation-input-root "$QA_AGGREGATION_INPUT_ROOT" \
@@ -863,6 +917,26 @@ jobs:
             --qualification-mode release \
             --runtime-read-root "$python_prefix" \
             --runtime-read-root "$python_base_prefix"
+
+          python - \
+            "$QA_CODEX_HOME/config.toml" \
+            "$QA_CODEX_HOME/persona_memory_judge.config.toml" <<'PY'
+          import os
+          import stat
+          import sys
+          from pathlib import Path
+
+          for raw in sys.argv[1:]:
+              path = Path(raw)
+              metadata = path.lstat()
+              if (
+                  not stat.S_ISREG(metadata.st_mode)
+                  or metadata.st_uid != os.geteuid()
+                  or metadata.st_nlink != 1
+                  or stat.S_IMODE(metadata.st_mode) != 0o600
+              ):
+                  raise SystemExit("Codex strict configuration file is unsafe")
+          PY
 
           printf '%s' "$QA_CODEX_AUTH_JSON_B64" | \
             python qa/install_codex_auth.py --codex-home "$QA_CODEX_HOME"
@@ -1047,6 +1121,43 @@ jobs:
               exit 1
             fi
           done
+
+          # The semantic judge is a separate top-level profile. It receives
+          # blinded requests on stdin and has no deployment/source/manifest
+          # access or tool-network egress.
+          judge_home="${QA_PERSONA_JUDGE_ROOT}/home"
+          judge_tmp="${QA_PERSONA_JUDGE_ROOT}/tmp"
+          judge_work="${QA_PERSONA_JUDGE_ROOT}/work"
+          env -i \
+            HOME="$judge_home" \
+            PATH="$PATH" \
+            CODEX_HOME="$QA_CODEX_HOME" \
+            LANG="C.UTF-8" \
+            TMPDIR="$judge_tmp" \
+            "$codex_bin" sandbox -p persona_memory_judge \
+              -P feedling-e2e-persona-memory-judge \
+              --include-managed-config -C "$judge_work" -- \
+              /bin/sh -eu -c '
+                printf "judge\n" > "$1"
+                test -r "$1"
+                rm -f "$1"
+                for denied in "$2" "$3" "$4" "$5" "$6" "$7" "$8"; do
+                  test ! -r "$denied"
+                done
+                if curl --fail --silent --show-error --proto "=https" \
+                  --max-redirs 0 --connect-timeout 5 --max-time 10 \
+                  --output /dev/null https://test-api.feedling.app/; then
+                  exit 1
+                fi
+              ' feedling-persona-judge-preflight \
+              "${judge_work}/.preflight" \
+              "$GITHUB_WORKSPACE/qa/SOP.md" \
+              "$QA_MANIFEST" \
+              "$QA_PROFILE_MANIFEST_DIR" \
+              "$QA_WORKER_OUTPUT_ROOT" \
+              "$QA_AGGREGATION_INPUT_ROOT" \
+              "$QA_PERSONA_JUDGE_SCRATCH_ROOT" \
+              "$QA_CODEX_HOME/auth.json"
 
           {
             echo "codex_bin=$codex_bin"
@@ -1270,6 +1381,136 @@ jobs:
             --manifest "$QA_MEMORY_MANIFEST" \
             --output "$QA_MEMORY_RECEIPT"
 
+      # A formal persona-memory arm is valid only when the deployed worker can
+      # be proven to be Hosted Runtime V2. Provisioning and import are trusted,
+      # deterministic code; no Codex process runs in this secret-bearing step.
+      - name: Provision and prepare persona-memory account pool
+        id: persona_prepare
+        if: inputs.runtime_target == 'hosted_resident' && steps.orchestration.outcome == 'success'
+        timeout-minutes: 60
+        env:
+          QA_FEEDLING_BASE_URL: https://test-api.feedling.app
+          QA_RUN_ID: ${{ steps.context.outputs.run_id }}-persona-memory
+          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+          QA_OPENAI_PROVIDER_API_KEY: ${{ secrets.QA_OPENAI_PROVIDER_API_KEY }}
+          QA_OPENAI_MODEL: ${{ vars.QA_OPENAI_MODEL }}
+          QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+          PERSONA_REPETITIONS: ${{ steps.context.outputs.persona_repetitions }}
+          PERSONA_POOL_MANIFEST: ${{ steps.context.outputs.persona_pool_manifest }}
+          PERSONA_IMPORT_WORK: ${{ steps.context.outputs.persona_import_work }}
+          PERSONA_READINESS_RECEIPT: ${{ steps.context.outputs.persona_readiness_receipt }}
+          PERSONA_IMPORT_PRE_RECEIPT: ${{ steps.context.outputs.persona_import_pre_receipt }}
+          PERSONA_IMPORT_POST_RECEIPT: ${{ steps.context.outputs.persona_import_post_receipt }}
+          PERSONA_RUN_PRE_RECEIPT: ${{ steps.context.outputs.persona_run_pre_receipt }}
+          QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
+        run: |
+          set -euo pipefail
+          umask 077
+          account_count=$((PERSONA_REPETITIONS * 8))
+          python qa/provision_profiles.py provision-pool \
+            --coverage qa/coverage-lock.json \
+            --manifest "$PERSONA_POOL_MANIFEST" \
+            --profile official-openai \
+            --count "$account_count" \
+            --require-runtime-v2
+          python qa/verify_deployment.py \
+            --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+            --expected-runtime hosted_resident \
+            --receipt "$PERSONA_IMPORT_PRE_RECEIPT"
+          python qa/prepare_persona_memory_accounts.py prepare \
+            --account-pool "$PERSONA_POOL_MANIFEST" \
+            --build-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+            --deployment-receipt "$PERSONA_IMPORT_PRE_RECEIPT" \
+            --post-deployment-receipt "$PERSONA_IMPORT_POST_RECEIPT" \
+            --work-dir "$PERSONA_IMPORT_WORK" \
+            --artifact-dir "$QA_ARTIFACT_DIR" \
+            --readiness-receipt "$PERSONA_READINESS_RECEIPT" \
+            --concurrency 3
+          python qa/verify_deployment.py \
+            --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+            --expected-runtime hosted_resident \
+            --receipt "$PERSONA_RUN_PRE_RECEIPT"
+
+      # The live driver reads only the synthetic account pool and locked
+      # fixtures. Its semantic evaluator reuses the same run-scoped ChatGPT
+      # OAuth and QA_CODEX_MODEL as the qualification agents. `env -i` proves
+      # that provider/admin secrets cannot reach this process or Codex.
+      - name: Run OAuth-backed Codex persona-memory qualification
+        id: persona_live
+        if: inputs.runtime_target == 'hosted_resident' && steps.persona_prepare.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 120
+        env:
+          CODEX_BIN: ${{ steps.codex_preflight.outputs.codex_bin }}
+          QA_CODEX_HOME: ${{ steps.context.outputs.codex_home }}
+          QA_CODEX_MODEL: ${{ vars.QA_CODEX_MODEL }}
+          QA_PERSONA_JUDGE_ROOT: ${{ steps.context.outputs.persona_judge_root }}
+          QA_PERSONA_JUDGE_SCRATCH_ROOT: ${{ steps.context.outputs.persona_judge_scratch_root }}
+          QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+          QA_RUN_ID: ${{ steps.context.outputs.run_id }}-persona-memory
+          PERSONA_REPETITIONS: ${{ steps.context.outputs.persona_repetitions }}
+          PERSONA_POOL_MANIFEST: ${{ steps.context.outputs.persona_pool_manifest }}
+          PERSONA_READINESS_RECEIPT: ${{ steps.context.outputs.persona_readiness_receipt }}
+          PERSONA_RUN_PRE_RECEIPT: ${{ steps.context.outputs.persona_run_pre_receipt }}
+          PERSONA_RESULT: ${{ steps.context.outputs.persona_result }}
+        run: |
+          set -euo pipefail
+          umask 077
+          env -i \
+            HOME="${QA_PERSONA_JUDGE_ROOT}/home" \
+            PATH="$PATH" \
+            CODEX_HOME="$QA_CODEX_HOME" \
+            LANG="C.UTF-8" \
+            TMPDIR="${QA_PERSONA_JUDGE_ROOT}/tmp" \
+            PYTHONDONTWRITEBYTECODE="1" \
+            PYTHONPATH="$GITHUB_WORKSPACE" \
+            QA_FEEDLING_BASE_URL="https://test-api.feedling.app" \
+            QA_RUN_ID="$QA_RUN_ID" \
+            python qa/run_persona_memory_regression.py run-live \
+              --target-id "current-test-${QA_EXPECTED_DEPLOYMENT_SHA}" \
+              --target-label candidate \
+              --build-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+              --deployment-receipt "$PERSONA_RUN_PRE_RECEIPT" \
+              --account-pool "$PERSONA_POOL_MANIFEST" \
+              --readiness-receipt "$PERSONA_READINESS_RECEIPT" \
+              --external-cleanup-guaranteed \
+              --repetitions "$PERSONA_REPETITIONS" \
+              --concurrency 3 \
+              --codex-bin "$CODEX_BIN" \
+              --codex-home "$QA_CODEX_HOME" \
+              --judge-work-root "${QA_PERSONA_JUDGE_ROOT}/work" \
+              --judge-model "$QA_CODEX_MODEL" \
+              --judge-id codex-oauth-persona-memory-v1 \
+              --judge-configuration-id persona-memory-rubric-v1 \
+              --judge-codex-profile persona_memory_judge \
+              --judge-permission-profile feedling-e2e-persona-memory-judge \
+              --judge-reasoning-effort medium \
+              --judge-timeout 180 \
+              --allow-private-judge-egress \
+              --output "$PERSONA_RESULT"
+
+      - name: Record non-formal persona qualification skip
+        id: persona_nonformal_skip
+        if: inputs.runtime_target == 'deployed_current'
+        env:
+          PERSONA_REPETITIONS: ${{ steps.context.outputs.persona_repetitions }}
+          QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
+          QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          python qa/publish_persona_memory_summary.py \
+            --nonformal-skip \
+            --build-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+            --repetitions "$PERSONA_REPETITIONS" \
+            --artifact-dir "$QA_ARTIFACT_DIR"
+          echo "::notice::persona-memory qualification is not formal for deployed_current; the mandatory eight-provider P0 matrix still ran"
+          {
+            echo "### Persona-memory qualification"
+            echo
+            echo "Not formally qualified: deployed_current cannot attest the Hosted Runtime V2 worker."
+            echo "Requested repetitions: ${PERSONA_REPETITIONS}."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Verify deployed endpoint and selected runtime target after profile testing
         id: deployment_post
         if: always() && steps.orchestration.outcome == 'success'
@@ -1434,6 +1675,93 @@ jobs:
             --run-id "${{ steps.context.outputs.run_id }}" \
             --retain-manifest
 
+      # This step deliberately receives the admin token but no provider keys
+      # or Codex OAuth. It always attempts every pool lease and preserves the
+      # atomic cleanup-pending recovery manifest on any incomplete absence
+      # attestation.
+      - name: Cleanup persona-memory pool with authoritative absence evidence
+        id: persona_cleanup
+        if: always() && inputs.runtime_target == 'hosted_resident' && steps.persona_prepare.outcome != 'skipped'
+        timeout-minutes: 30
+        env:
+          QA_FEEDLING_BASE_URL: https://test-api.feedling.app
+          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+          QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+          PERSONA_POOL_MANIFEST: ${{ steps.context.outputs.persona_pool_manifest }}
+          PERSONA_RUN_POST_RECEIPT: ${{ steps.context.outputs.persona_run_post_receipt }}
+          PERSONA_CLEANUP_RECEIPT: ${{ steps.context.outputs.persona_cleanup_receipt }}
+        run: |
+          set -uo pipefail
+          umask 077
+          failed=0
+          python qa/verify_deployment.py \
+            --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+            --expected-runtime hosted_resident \
+            --receipt "$PERSONA_RUN_POST_RECEIPT" || failed=1
+          if ! python qa/prepare_persona_memory_accounts.py cleanup \
+            --account-pool "$PERSONA_POOL_MANIFEST" \
+            --receipt "$PERSONA_CLEANUP_RECEIPT"
+          then
+            failed=1
+            # An interrupted provision may leave an incomplete pool that
+            # cannot satisfy the formal receipt contract. Delete any accounts
+            # immediately with the lower-level cleanup path, but keep this
+            # step failed so no release evidence can be uploaded.
+            pending="$(dirname "$PERSONA_POOL_MANIFEST")/.${PERSONA_POOL_MANIFEST##*/}.cleanup-pending"
+            for recovery_manifest in "$PERSONA_POOL_MANIFEST" "$pending"; do
+              if [ -f "$recovery_manifest" ]; then
+                python qa/provision_profiles.py cleanup \
+                  --manifest "$recovery_manifest" || true
+              fi
+            done
+          fi
+          exit "$failed"
+
+      - name: Validate persona-memory cleanup and finalize arm evidence
+        id: persona_finalize
+        if: always() && inputs.runtime_target == 'hosted_resident' && steps.persona_cleanup.outcome == 'success' && steps.persona_live.outcome != 'skipped'
+        env:
+          PERSONA_RESULT: ${{ steps.context.outputs.persona_result }}
+          PERSONA_READINESS_RECEIPT: ${{ steps.context.outputs.persona_readiness_receipt }}
+          PERSONA_IMPORT_PRE_RECEIPT: ${{ steps.context.outputs.persona_import_pre_receipt }}
+          PERSONA_IMPORT_POST_RECEIPT: ${{ steps.context.outputs.persona_import_post_receipt }}
+          PERSONA_RUN_PRE_RECEIPT: ${{ steps.context.outputs.persona_run_pre_receipt }}
+          PERSONA_RUN_POST_RECEIPT: ${{ steps.context.outputs.persona_run_post_receipt }}
+          PERSONA_CLEANUP_RECEIPT: ${{ steps.context.outputs.persona_cleanup_receipt }}
+          PERSONA_ARM_RECEIPT: ${{ steps.context.outputs.persona_arm_receipt }}
+          PERSONA_REPETITIONS: ${{ steps.context.outputs.persona_repetitions }}
+          QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python qa/run_persona_memory_regression.py finalize-arm \
+            --result "$PERSONA_RESULT" \
+            --readiness-receipt "$PERSONA_READINESS_RECEIPT" \
+            --import-pre-deployment-receipt "$PERSONA_IMPORT_PRE_RECEIPT" \
+            --import-post-deployment-receipt "$PERSONA_IMPORT_POST_RECEIPT" \
+            --pre-deployment-receipt "$PERSONA_RUN_PRE_RECEIPT" \
+            --post-deployment-receipt "$PERSONA_RUN_POST_RECEIPT" \
+            --cleanup-receipt "$PERSONA_CLEANUP_RECEIPT" \
+            --output "$PERSONA_ARM_RECEIPT"
+          python qa/publish_persona_memory_summary.py \
+            --result "$PERSONA_RESULT" \
+            --arm-receipt "$PERSONA_ARM_RECEIPT" \
+            --artifact-dir "$QA_ARTIFACT_DIR"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          receipt = json.loads(Path(os.environ["PERSONA_ARM_RECEIPT"]).read_text())
+          status = receipt.get("result_status")
+          if status not in {"PASS", "FAIL", "BLOCKED_EVIDENCE", "INFRA_ERROR"}:
+              raise SystemExit("persona-memory arm receipt status is invalid")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              summary.write("### Persona-memory qualification\n\n")
+              summary.write(f"Status: {status}. Repetitions: {os.environ['PERSONA_REPETITIONS']}. ")
+              summary.write("Judge: Codex OAuth / QA_CODEX_MODEL.\n")
+          PY
+
       - name: Validate deterministic cleanup receipt
         id: cleanup_receipt
         if: always()
@@ -1473,7 +1801,7 @@ jobs:
 
       - name: Upload sanitized public qualification artifacts
         id: upload
-        if: always() && steps.secret_scan.outcome == 'success' && steps.cleanup.outcome == 'success' && steps.cleanup_receipt.outcome == 'success'
+        if: always() && steps.secret_scan.outcome == 'success' && steps.cleanup.outcome == 'success' && steps.cleanup_receipt.outcome == 'success' && (inputs.runtime_target != 'hosted_resident' || (steps.persona_cleanup.outcome == 'success' && steps.persona_finalize.outcome == 'success'))
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: feedling-api-key-e2e-${{ steps.context.outputs.run_id }}
@@ -1519,9 +1847,7 @@ jobs:
         id: private_cleanup
         if: always()
         env:
-          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
           QA_PRIVATE_ROOT: ${{ steps.context.outputs.private_root }}
-          QA_PRIVATE_MANIFEST: ${{ steps.context.outputs.manifest }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -1540,27 +1866,11 @@ jobs:
           ):
               print("::error::refusing unsafe private scratch cleanup path", file=sys.stderr)
               raise SystemExit(1)
-
-          if os.environ.get("CLEANUP_OUTCOME") == "success":
-              if root.is_symlink():
-                  root.unlink()
-              elif root.exists():
-                  shutil.rmtree(root)
-              print("private qualification scratch removed")
-              raise SystemExit(0)
-
-          manifest = Path(os.environ.get("QA_PRIVATE_MANIFEST", "")).absolute()
-          if root.exists() and not root.is_symlink():
-              for child in root.iterdir():
-                  if child == manifest and child.is_file() and not child.is_symlink():
-                      child.chmod(0o600)
-                  elif child.is_dir() and not child.is_symlink():
-                      shutil.rmtree(child)
-                  else:
-                      child.unlink(missing_ok=True)
-          print(
-              "::warning::account cleanup failed; retained only a 0600 private manifest for operator retry"
-          )
+          if root.is_symlink():
+              root.unlink()
+          elif root.exists():
+              shutil.rmtree(root)
+          print("private qualification scratch removed")
           PY
 
       - name: Enforce fail-closed qualification outcome
@@ -1584,6 +1894,13 @@ jobs:
           UPLOAD: ${{ steps.upload.outcome }}
           PUBLIC_CLEANUP: ${{ steps.public_cleanup.outcome }}
           PRIVATE_CLEANUP: ${{ steps.private_cleanup.outcome }}
+          PERSONA_PREPARE: ${{ steps.persona_prepare.outcome }}
+          PERSONA_LIVE: ${{ steps.persona_live.outcome }}
+          PERSONA_CLEANUP: ${{ steps.persona_cleanup.outcome }}
+          PERSONA_FINALIZE: ${{ steps.persona_finalize.outcome }}
+          PERSONA_NONFORMAL_SKIP: ${{ steps.persona_nonformal_skip.outcome }}
+          QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
+          PERSONA_REPETITIONS: ${{ steps.context.outputs.persona_repetitions }}
         run: |
           set -euo pipefail
           failed=0
@@ -1614,11 +1931,302 @@ jobs:
               failed=1
             fi
           done
+          if [ "$QA_EXPECTED_RUNTIME" = "hosted_resident" ]; then
+            for item in \
+              "persona-prepare:$PERSONA_PREPARE" \
+              "persona-live:$PERSONA_LIVE" \
+              "persona-cleanup:$PERSONA_CLEANUP" \
+              "persona-finalize:$PERSONA_FINALIZE"
+            do
+              name="${item%%:*}"
+              outcome="${item#*:}"
+              if [ "$outcome" != "success" ]; then
+                echo "::error::$name outcome was $outcome"
+                failed=1
+              fi
+            done
+          elif [ "$PERSONA_NONFORMAL_SKIP" != "success" ]; then
+            echo "::error::persona non-formal skip was not recorded"
+            failed=1
+          fi
           if [ "$failed" -ne 0 ]; then
             echo "release qualification: FAIL"
             exit 1
           fi
-          echo "release qualification: PASS"
+          echo "release qualification: PASS (persona repetitions: $PERSONA_REPETITIONS)"
+
+  # Manifest-local cleanup is the evidence path for a passing qualification.
+  # This independent hosted sweep is the durability path: it still runs if the
+  # disposable evaluator crashes, loses a registration response before writing
+  # a manifest, or is cancelled during local cleanup.
+  cleanup-synthetic-accounts:
+    name: authoritatively remove synthetic QA accounts
+    if: ${{ always() && needs.validate-dispatch.result == 'success' }}
+    needs: [validate-dispatch, qualify-api-key-runtime]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: feedling-e2e-test
+    permissions:
+      contents: read
+    steps:
+      - name: Check out immutable trusted account cleanup controller
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify trusted account cleanup controller checkout
+        env:
+          CONTROLLER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse --verify HEAD)"
+          if [ "$checked_out_sha" != "$CONTROLLER_SHA" ]; then
+            echo "::error::account cleanup controller checkout moved"
+            exit 1
+          fi
+
+      - name: Set up Python for authoritative account cleanup
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: qa/requirements.lock
+
+      - name: Install hash-locked account cleanup dependencies
+        run: python -m pip install --require-hashes -r qa/requirements.lock
+
+      - name: Sweep exact base and persona run IDs with bounded retries
+        id: sweep
+        env:
+          QA_FEEDLING_BASE_URL: https://test-api.feedling.app
+          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          cleanup_root="${RUNNER_TEMP}/feedling-account-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 "$cleanup_root"
+
+          remove_cleanup_root() {
+            python - "$cleanup_root" <<'PY'
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1]).absolute()
+          expected_parent = Path(os.environ["RUNNER_TEMP"]).resolve()
+          if (
+              root.parent.resolve() != expected_parent
+              or not root.name.startswith("feedling-account-cleanup-")
+          ):
+              raise SystemExit("refusing unsafe hosted cleanup scratch path")
+          if root.is_symlink():
+              root.unlink()
+          elif root.exists():
+              shutil.rmtree(root)
+          PY
+          }
+          trap remove_cleanup_root EXIT
+
+          base_run_id="api-key-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          persona_run_id="${base_run_id}-persona-memory"
+          if [ "${#base_run_id}" -gt 48 ] || [ "${#persona_run_id}" -gt 48 ]; then
+            echo "::error::derived synthetic cleanup run ID exceeds the backend contract"
+            exit 1
+          fi
+
+          cleanup_one_run() {
+            local run_id="$1"
+            local scope="$2"
+            local output_variable="$3"
+            local succeeded=0
+            local attempt receipt
+            for attempt in 1 2; do
+              receipt="${cleanup_root}/${scope}-${attempt}.run-cleanup.json"
+              if python qa/provision_profiles.py cleanup-run \
+                  --run-id "$run_id" \
+                  --receipt "$receipt" \
+                && python - "$receipt" "$run_id" <<'PY'
+          import hashlib
+          import json
+          import sys
+
+          receipt_path, run_id = sys.argv[1:]
+          with open(receipt_path, encoding="utf-8") as handle:
+              payload = json.load(handle)
+          expected_keys = {
+              "schema_version",
+              "kind",
+              "run_id_sha256",
+              "label_prefix_sha256",
+              "database_authoritative",
+              "matched_count",
+              "deleted_count",
+              "already_absent_count",
+              "operation_failure_count",
+              "remaining_count",
+              "complete",
+          }
+          if set(payload) != expected_keys:
+              raise SystemExit("authoritative cleanup receipt shape is invalid")
+          counts = (
+              "matched_count",
+              "deleted_count",
+              "already_absent_count",
+              "operation_failure_count",
+              "remaining_count",
+          )
+          if any(type(payload.get(name)) is not int or payload[name] < 0 for name in counts):
+              raise SystemExit("authoritative cleanup receipt counts are invalid")
+          expected_run_hash = hashlib.sha256(run_id.encode()).hexdigest()
+          expected_label_hash = hashlib.sha256(
+              f"agent-e2e-{run_id}-".encode()
+          ).hexdigest()
+          if (
+              payload.get("schema_version") != 1
+              or payload.get("kind") != "qa_synthetic_run_cleanup"
+              or payload.get("run_id_sha256") != expected_run_hash
+              or payload.get("label_prefix_sha256") != expected_label_hash
+              or payload.get("database_authoritative") is not True
+              or payload.get("matched_count")
+              != payload.get("deleted_count")
+              + payload.get("already_absent_count")
+              + payload.get("operation_failure_count")
+              or payload.get("operation_failure_count") != 0
+              or payload.get("remaining_count") != 0
+              or payload.get("complete") is not True
+          ):
+              raise SystemExit("authoritative cleanup did not prove zero remaining accounts")
+          PY
+              then
+                succeeded=1
+                printf -v "$output_variable" '%s' "$receipt"
+                break
+              fi
+              echo "::warning::authoritative cleanup attempt ${attempt}/2 did not prove zero remaining accounts"
+              if [ "$attempt" -lt 2 ]; then
+                sleep $((attempt * 2))
+              fi
+            done
+            if [ "$succeeded" -ne 1 ]; then
+              echo "::error::authoritative synthetic cleanup exhausted bounded retries"
+              return 1
+            fi
+          }
+
+          base_receipt=""
+          persona_receipt=""
+          failed=0
+          cleanup_one_run "$base_run_id" base base_receipt || failed=1
+          cleanup_one_run "$persona_run_id" persona persona_receipt || failed=1
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::one or more authoritative synthetic cleanup scopes failed"
+            exit "$failed"
+          fi
+
+          artifact_root="${GITHUB_WORKSPACE}/hosted-cleanup-artifacts"
+          if [ -e "$artifact_root" ] || [ -L "$artifact_root" ]; then
+            echo "::error::refusing occupied hosted cleanup artifact path"
+            exit 1
+          fi
+          mkdir -m 700 "$artifact_root"
+          python - "$base_receipt" "$persona_receipt" \
+            "$artifact_root/synthetic-cleanup-summary.json" \
+            "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import os
+          import sys
+
+          base_path, persona_path, output_path, step_summary_path = sys.argv[1:]
+          rows = []
+          for scope, path in (("base", base_path), ("persona", persona_path)):
+              with open(path, encoding="utf-8") as handle:
+                  receipt = json.load(handle)
+              rows.append(
+                  {
+                      "scope": scope,
+                      "run_id_sha256": receipt["run_id_sha256"],
+                      "label_prefix_sha256": receipt["label_prefix_sha256"],
+                      "database_authoritative": receipt["database_authoritative"],
+                      "matched_count": receipt["matched_count"],
+                      "deleted_count": receipt["deleted_count"],
+                      "already_absent_count": receipt["already_absent_count"],
+                      "operation_failure_count": receipt["operation_failure_count"],
+                      "remaining_count": receipt["remaining_count"],
+                      "complete": receipt["complete"],
+                  }
+              )
+          summary = {
+              "schema_version": 1,
+              "kind": "qa_synthetic_cleanup_summary",
+              "database_authoritative": True,
+              "complete": True,
+              "runs": rows,
+          }
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+          if hasattr(os, "O_NOFOLLOW"):
+              flags |= os.O_NOFOLLOW
+          descriptor = os.open(output_path, flags, 0o600)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+              json.dump(summary, handle, sort_keys=True, indent=2)
+              handle.write("\n")
+              handle.flush()
+              os.fsync(handle.fileno())
+          with open(step_summary_path, "a", encoding="utf-8") as handle:
+              handle.write("## Authoritative synthetic account cleanup\n\n")
+              handle.write(
+                  "| Scope | Matched | Deleted | Already absent | Failures | Remaining | Complete | Run hash | Label hash |\n"
+              )
+              handle.write("|---|---:|---:|---:|---:|---:|---|---|---|\n")
+              for row in rows:
+                  handle.write(
+                      "| {scope} | {matched_count} | {deleted_count} | "
+                      "{already_absent_count} | {operation_failure_count} | "
+                      "{remaining_count} | {complete} | `{run_id_sha256}` | "
+                      "`{label_prefix_sha256}` |\n".format(**row)
+                  )
+          PY
+          echo "authoritative synthetic account cleanup proved zero remaining accounts for both run IDs"
+
+      - name: Upload sanitized authoritative account cleanup proof
+        if: ${{ success() && steps.sweep.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: feedling-synthetic-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/hosted-cleanup-artifacts
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 14
+          compression-level: 6
+
+      - name: Remove hosted cleanup artifact scratch
+        if: always()
+        env:
+          CLEANUP_ARTIFACT_ROOT: ${{ github.workspace }}/hosted-cleanup-artifacts
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+
+          root = Path(os.environ["CLEANUP_ARTIFACT_ROOT"]).absolute()
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          if (
+              root.parent.resolve() != workspace
+              or root.name != "hosted-cleanup-artifacts"
+          ):
+              print("::error::refusing unsafe hosted cleanup artifact path", file=sys.stderr)
+              raise SystemExit(1)
+          if root.is_symlink():
+              root.unlink()
+          elif root.exists():
+              shutil.rmtree(root)
+          print("hosted cleanup artifact scratch removed")
+          PY
 
   # A skipped provision never received JIT/AWS credentials because deployment
   # resolution failed first. Failed or cancelled provisioning may have created
@@ -1626,7 +2234,7 @@ jobs:
   cleanup-aws-runner:
     name: terminate disposable AWS evaluator
     if: ${{ always() && needs.validate-dispatch.result == 'success' && needs.provision-aws-runner.result != 'skipped' }}
-    needs: [validate-dispatch, provision-aws-runner, qualify-api-key-runtime]
+    needs: [validate-dispatch, provision-aws-runner, qualify-api-key-runtime, cleanup-synthetic-accounts]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: feedling-e2e-test

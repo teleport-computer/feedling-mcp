@@ -20,6 +20,7 @@ import re
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -45,6 +46,10 @@ DEFAULT_MAX_TTL_SECONDS = MAX_ALLOWED_TTL_SECONDS
 DEFAULT_REAPER_INTERVAL_SECONDS = 60
 MIN_HEARTBEAT_MAX_AGE_SECONDS = 30
 HEARTBEAT_INTERVAL_MULTIPLIER = 3
+MAX_RUN_ID_LENGTH = 48
+RUN_CLEANUP_KIND = "qa_synthetic_run_cleanup"
+RUN_CLOSED_KIND = "qa_synthetic_run_closed"
+RUN_CLOSED_KEY_PREFIX = "qa_synthetic_run_closed_v1:"
 
 _LEASE_RE = re.compile(r"^lease_[0-9a-f]{32}$")
 _LABEL_RE = re.compile(r"^agent-e2e-[A-Za-z0-9_.-]{1,112}$")
@@ -52,6 +57,7 @@ _USER_ID_RE = re.compile(r"^usr_[0-9a-f]{16}$")
 _PRINCIPAL_ID_RE = re.compile(r"^prn_[0-9a-f]{16}$")
 _API_KEY_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ABSENCE_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+_RUN_ID_RE = re.compile(rf"^[A-Za-z0-9_.-]{{1,{MAX_RUN_ID_LENGTH}}}$")
 _SIGNING_CONTEXT = b"feedling-qa-synthetic-account-v1\0"
 _ABSENCE_TOKEN_CONTEXT = b"feedling-qa-synthetic-account-absence-v1\0"
 _PROCESS_ID = secrets.token_hex(8)
@@ -73,6 +79,10 @@ class SyntheticAccountBadRequest(ValueError):
 
 
 class SyntheticAccountStoreUnavailable(RuntimeError):
+    pass
+
+
+class SyntheticAccountRunClosed(RuntimeError):
     pass
 
 
@@ -293,11 +303,14 @@ def register_synthetic_account(payload: dict, *, now_epoch: int | None = None) -
     if not isinstance(payload, dict):
         raise SyntheticAccountBadRequest("JSON object required")
 
+    run_id = _cleanup_run_id(payload)
     label = str(payload.get("label") or "").strip()
     if not _LABEL_RE.fullmatch(label):
         raise SyntheticAccountBadRequest(
             f"label must start with {LABEL_PREFIX} and contain only safe identifier characters"
         )
+    if not label.startswith(f"{LABEL_PREFIX}{run_id}-"):
+        raise SyntheticAccountBadRequest("label does not match the normalized run_id")
     ttl = _parse_ttl(payload.get("ttl_seconds"), maximum=cfg["max_ttl_seconds"])
     now = int(time.time() if now_epoch is None else now_epoch)
 
@@ -319,13 +332,17 @@ def register_synthetic_account(payload: dict, *, now_epoch: int | None = None) -
         metadata_holder["value"] = metadata
         return metadata
 
-    result = registry._register_user(
-        public_key=str(payload.get("public_key") or "").strip() or None,
-        archive_language=str(payload.get("archive_language") or "").strip() or None,
-        access_mode=str(payload.get("access_mode") or "model_api"),
-        label=label,
-        _qa_synthetic_metadata_builder=build_metadata,
-    )
+    with _serialized_run(run_id):
+        if _run_is_closed(run_id):
+            raise SyntheticAccountRunClosed("synthetic account run is closed")
+        result = registry._register_user(
+            public_key=str(payload.get("public_key") or "").strip() or None,
+            archive_language=str(payload.get("archive_language") or "").strip()
+            or None,
+            access_mode=str(payload.get("access_mode") or "model_api"),
+            label=label,
+            _qa_synthetic_metadata_builder=build_metadata,
+        )
     metadata = metadata_holder["value"]
     # Return only the receipt fields the deterministic provisioner needs. The
     # destructive reaper signature and account-key pepper never cross the
@@ -403,7 +420,12 @@ def _active_key_matches_lease(entry: dict, metadata: dict) -> bool:
     )
 
 
-def _valid_metadata(entry: dict, *, authoritative_user_id: str) -> dict | None:
+def _valid_metadata(
+    entry: dict,
+    *,
+    authoritative_user_id: str,
+    require_active_key: bool = True,
+) -> dict | None:
     if not isinstance(entry, dict):
         return None
     metadata = entry.get(METADATA_FIELD)
@@ -443,13 +465,266 @@ def _valid_metadata(entry: dict, *, authoritative_user_id: str) -> dict | None:
         or not 1 <= expires - created <= MAX_ALLOWED_TTL_SECONDS
         or not isinstance(signature, str)
         or len(signature) != 64
-        or not _active_key_matches_lease(entry, metadata)
+        or (require_active_key and not _active_key_matches_lease(entry, metadata))
     ):
         return None
     expected = _sign_metadata(metadata)
     if not hmac.compare_digest(signature, expected):
         return None
     return metadata
+
+
+def _cleanup_run_id(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        raise SyntheticAccountBadRequest("JSON object required")
+    run_id = payload.get("run_id")
+    if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+        raise SyntheticAccountBadRequest("run_id must be normalized")
+    return run_id
+
+
+def _run_closed_key(run_id: str) -> str:
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    return f"{RUN_CLOSED_KEY_PREFIX}{digest}"
+
+
+def _run_lock_key(run_id: str) -> int:
+    payload = f"feedling-qa-synthetic-run-v1\0{run_id}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=True)
+
+
+@contextmanager
+def _serialized_run(run_id: str):
+    """Serialize registration and terminal cleanup across backend workers."""
+    connection = None
+    try:
+        connection = db.listen_connection()
+        connection.execute("SELECT pg_advisory_lock(%s)", (_run_lock_key(run_id),))
+    except Exception as exc:
+        raise SyntheticAccountStoreUnavailable(
+            "synthetic account store is unavailable"
+        ) from exc
+    try:
+        yield
+    finally:
+        if connection is not None:
+            try:
+                connection.execute(
+                    "SELECT pg_advisory_unlock(%s)", (_run_lock_key(run_id),)
+                )
+            except Exception:
+                # Closing the session releases a session-level advisory lock.
+                log.exception("[qa-run] advisory unlock failed")
+            finally:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+
+def _run_is_closed(run_id: str) -> bool:
+    try:
+        marker = db.get_global_blob_strict(_run_closed_key(run_id))
+    except Exception as exc:
+        raise SyntheticAccountStoreUnavailable(
+            "synthetic account store is unavailable"
+        ) from exc
+    if marker is None:
+        return False
+    expected_hash = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    if not isinstance(marker, dict) or marker != {
+        "schema_version": 1,
+        "kind": RUN_CLOSED_KIND,
+        "run_id_sha256": expected_hash,
+    }:
+        # A malformed marker must close the run rather than allow a late account.
+        raise SyntheticAccountRunClosed("synthetic account run is closed")
+    return True
+
+
+def _close_run(run_id: str) -> None:
+    try:
+        db.set_global_blob_strict(
+            _run_closed_key(run_id),
+            {
+                "schema_version": 1,
+                "kind": RUN_CLOSED_KIND,
+                "run_id_sha256": hashlib.sha256(run_id.encode("utf-8")).hexdigest(),
+            },
+        )
+    except Exception as exc:
+        raise SyntheticAccountStoreUnavailable(
+            "synthetic account store is unavailable"
+        ) from exc
+
+
+def _run_metadata(
+    entry: dict,
+    *,
+    authoritative_user_id: str,
+    label_prefix: str,
+) -> dict | None:
+    """Return one server-signed lease belonging to an exact QA run prefix.
+
+    Run cleanup deliberately does not require the leased API key to remain
+    active. A prior, interrupted cleanup may already have revoked that key;
+    the server-owned HMAC still binds the row identity, principal, key hash,
+    lease, and label strongly enough to authorize deletion of that synthetic
+    row. Ordinary accounts that merely copy the public label prefix remain
+    ineligible.
+    """
+    metadata = _valid_metadata(
+        entry,
+        authoritative_user_id=authoritative_user_id,
+        require_active_key=False,
+    )
+    if not metadata or not str(metadata.get("label") or "").startswith(label_prefix):
+        return None
+    return metadata
+
+
+def _raw_run_label_matches(entry: dict, *, label_prefix: str) -> bool:
+    """Detect a claimed run before trusting any destructive metadata."""
+    if not isinstance(entry, dict):
+        return False
+    metadata = entry.get(METADATA_FIELD)
+    return bool(
+        isinstance(metadata, dict)
+        and isinstance(metadata.get("label"), str)
+        and metadata["label"].startswith(label_prefix)
+    )
+
+
+def _cleanup_synthetic_run_locked(
+    payload: dict,
+    *,
+    purge_archives: Callable[[str], Exception | None] | None = None,
+) -> dict:
+    """Delete every signed synthetic account for one normalized QA run.
+
+    This is the manifest-independent recovery path for a registration whose
+    response was lost before the client could checkpoint its credentials. The
+    users table is scanned authoritatively, every candidate is reloaded and
+    signature-checked immediately before reset, and the authoritative table is
+    scanned again before returning. The receipt contains aggregates only, so it
+    is safe to retain as CI evidence and safe to retry after any partial run.
+    """
+    run_id = _cleanup_run_id(payload)
+    label_prefix = f"{LABEL_PREFIX}{run_id}-"
+    purge = purge_archives or content_core._purge_onboarding_archives_with_retry
+
+    try:
+        scanned = db.load_user_documents_with_field(METADATA_FIELD)
+    except Exception as exc:
+        raise SyntheticAccountStoreUnavailable(
+            "synthetic account store is unavailable"
+        ) from exc
+
+    candidates: list[tuple[str, str]] = []
+    invalid_initial_count = 0
+    for authoritative_user_id, entry in scanned:
+        if not _raw_run_label_matches(entry, label_prefix=label_prefix):
+            continue
+        metadata = _run_metadata(
+            entry,
+            authoritative_user_id=authoritative_user_id,
+            label_prefix=label_prefix,
+        )
+        if metadata is not None:
+            candidates.append((authoritative_user_id, str(metadata["signature"])))
+        else:
+            # Never delete from an untrusted label alone, but also never report
+            # a clean run while a row claiming that exact run has malformed or
+            # tampered server metadata.
+            invalid_initial_count += 1
+
+    deleted_count = 0
+    already_absent_count = 0
+    operation_failure_count = invalid_initial_count
+    for authoritative_user_id, scanned_signature in candidates:
+        try:
+            live = db.load_user_document(authoritative_user_id)
+        except Exception as exc:
+            raise SyntheticAccountStoreUnavailable(
+                "synthetic account store is unavailable"
+            ) from exc
+        if live is None:
+            already_absent_count += 1
+            continue
+        metadata = _run_metadata(
+            live,
+            authoritative_user_id=authoritative_user_id,
+            label_prefix=label_prefix,
+        )
+        if metadata is None or not hmac.compare_digest(
+            str(metadata.get("signature") or ""), scanned_signature
+        ):
+            operation_failure_count += 1
+            continue
+        try:
+            body, status = content_core.account_reset(
+                core_store.get_store(authoritative_user_id),
+                {"confirm": "delete-all-data"},
+                purge_archives=purge,
+            )
+            if status == 200 and body.get("deleted") is True:
+                deleted_count += 1
+            else:
+                operation_failure_count += 1
+        except Exception:
+            operation_failure_count += 1
+            log.exception(
+                "[qa-run-cleanup] reset raised; preserving for retry user=%s",
+                authoritative_user_id,
+            )
+            _restore_for_retry(live)
+
+    try:
+        final_rows = db.load_user_documents_with_field(METADATA_FIELD)
+    except Exception as exc:
+        raise SyntheticAccountStoreUnavailable(
+            "synthetic account store is unavailable"
+        ) from exc
+    remaining_count = sum(
+        _raw_run_label_matches(entry, label_prefix=label_prefix)
+        for _authoritative_user_id, entry in final_rows
+    )
+    complete = operation_failure_count == 0 and remaining_count == 0
+    return {
+        "schema_version": 1,
+        "kind": RUN_CLEANUP_KIND,
+        "run_id_sha256": hashlib.sha256(run_id.encode("utf-8")).hexdigest(),
+        "label_prefix_sha256": hashlib.sha256(
+            label_prefix.encode("utf-8")
+        ).hexdigest(),
+        "database_authoritative": True,
+        "matched_count": len(candidates) + invalid_initial_count,
+        "deleted_count": deleted_count,
+        "already_absent_count": already_absent_count,
+        "operation_failure_count": operation_failure_count,
+        "remaining_count": remaining_count,
+        "complete": complete,
+    }
+
+
+def cleanup_synthetic_run(
+    payload: dict,
+    *,
+    purge_archives: Callable[[str], Exception | None] | None = None,
+) -> dict:
+    """Close one run, then sweep it under the cross-worker run lock.
+
+    The durable closure marker prevents a registration handler that was delayed
+    before acquiring the lock from committing after the final authoritative
+    cleanup scan has reported zero remaining rows.
+    """
+    run_id = _cleanup_run_id(payload)
+    with _serialized_run(run_id):
+        _close_run(run_id)
+        return _cleanup_synthetic_run_locked(
+            payload,
+            purge_archives=purge_archives,
+        )
 
 
 def _expired_reaper_eligible(

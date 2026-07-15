@@ -31,6 +31,8 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
 
 SUPERVISOR_PERMISSION_PROFILE = "feedling-e2e-supervisor"
 PROFILE_NAME = SUPERVISOR_PERMISSION_PROFILE  # Stable public constant.
+PERSONA_MEMORY_JUDGE_PROFILE_NAME = "persona_memory_judge"
+PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE = "feedling-e2e-persona-memory-judge"
 _DNS_NAME = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
@@ -226,6 +228,30 @@ def _network_lines(
     ]
 
 
+def _disabled_network_lines(profile: str) -> list[str]:
+    """Explicitly deny shell/tool network for an offline semantic judge.
+
+    Codex's own authenticated model transport is outside the tool sandbox.  The
+    judge therefore does not need access to either the Feedling deployment or
+    arbitrary egress in order to grade a blinded trajectory received on stdin.
+    """
+
+    key = _quoted(profile)
+    return [
+        "",
+        f"[permissions.{key}.network]",
+        "enabled = false",
+        'mode = "full"',
+        "enable_socks5 = false",
+        "enable_socks5_udp = false",
+        "allow_upstream_proxy = false",
+        "dangerously_allow_non_loopback_proxy = false",
+        "dangerously_allow_all_unix_sockets = false",
+        "allow_local_binding = false",
+        "",
+    ]
+
+
 def _shell_policy(
     home: Path,
     temporary: Path,
@@ -274,6 +300,42 @@ def _shell_policy(
         include.extend(("QA_AGGREGATION_INPUT_ROOT", "QA_ORCHESTRATION_RECEIPT"))
         fixed["QA_AGGREGATION_INPUT_ROOT"] = str(aggregation_input_root)
         fixed["QA_ORCHESTRATION_RECEIPT"] = str(orchestration_receipt)
+    lines = [
+        "[shell_environment_policy]",
+        'inherit = "all"',
+        "ignore_default_excludes = false",
+        "experimental_use_profile = false",
+        "include_only = [",
+    ]
+    lines.extend(f"  {_quoted(name)}," for name in include)
+    lines.extend(("]", "", "[shell_environment_policy.set]"))
+    lines.extend(f"{name} = {_quoted(value)}" for name, value in fixed.items())
+    lines.append("")
+    return lines
+
+
+def _judge_shell_policy(home: Path, temporary: Path, work: Path) -> list[str]:
+    """Return a deliberately tiny environment for the semantic judge.
+
+    In particular, this does not inherit the Feedling base URL, deployment
+    metadata, provisioning-manifest paths, provider keys, or admin token names
+    used by provisioning and live profile workers.
+    """
+
+    include = (
+        "HOME",
+        "PATH",
+        "LANG",
+        "TMPDIR",
+        "PYTHONDONTWRITEBYTECODE",
+        "QA_RUN_ID",
+        "QA_WORK_ROOT",
+    )
+    fixed = {
+        "HOME": str(home),
+        "TMPDIR": str(temporary),
+        "QA_WORK_ROOT": str(work),
+    }
     lines = [
         "[shell_environment_policy]",
         'inherit = "all"',
@@ -369,6 +431,28 @@ def _profile_config(
     return "\n".join(lines)
 
 
+def _persona_memory_judge_config(
+    *,
+    home: Path,
+    temporary: Path,
+    work: Path,
+    codex_model: str,
+) -> str:
+    lines = _base_settings(PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE, codex_model)
+    lines.insert(
+        2,
+        "developer_instructions = "
+        + _quoted(
+            "Grade only the blinded Feedling persona-memory trajectory supplied "
+            "on stdin. Return only the requested structured result. Never seek "
+            "provisioning data, account identities, provider/admin credentials, "
+            "deployment endpoints, source files, prior run evidence, or tools."
+        ),
+    )
+    lines.extend(_judge_shell_policy(home, temporary, work))
+    return "\n".join(lines)
+
+
 def build_config_bundle(
     *,
     output: Path,
@@ -389,6 +473,8 @@ def build_config_bundle(
     qualification_mode: str = "release",
     runtime_read_roots: Sequence[Path] = (),
     allow_local_binding: bool = False,
+    persona_judge_root: Path | None = None,
+    persona_judge_scratch_root: Path | None = None,
 ) -> CodexConfigBundle:
     codex_home = _private_directory(output.parent, "CODEX_HOME")
     destination = _future_file(output, "Codex config", private_parent=True)
@@ -421,6 +507,32 @@ def build_config_bundle(
     runtimes = tuple(
         dict.fromkeys(_runtime_directory(path) for path in runtime_read_roots)
     )
+    judge_paths: tuple[Path, Path, Path, Path, Path] | None = None
+    if (persona_judge_root is None) != (persona_judge_scratch_root is None):
+        raise CodexConfigError(
+            "persona judge profile and scratch roots must be configured together"
+        )
+    if persona_judge_root is not None and persona_judge_scratch_root is not None:
+        judge_root = _private_directory(persona_judge_root, "persona judge root")
+        judge_scratch = _private_directory(
+            persona_judge_scratch_root, "persona judge scratch root", empty=True
+        )
+        judge_home = _private_directory(
+            judge_root / "home", "persona judge home", empty=True
+        )
+        judge_tmp = _private_directory(
+            judge_root / "tmp", "persona judge temp", empty=True
+        )
+        judge_work = _private_directory(
+            judge_root / "work", "persona judge work", empty=True
+        )
+        try:
+            entries = {entry.name for entry in judge_root.iterdir()}
+        except OSError:
+            raise CodexConfigError("persona judge root is unreadable") from None
+        if entries != {"home", "tmp", "work"}:
+            raise CodexConfigError("persona judge root must contain only clean roots")
+        judge_paths = (judge_root, judge_home, judge_tmp, judge_work, judge_scratch)
 
     if qualification_mode not in {"release", "diagnostic"}:
         raise CodexConfigError("qualification mode is invalid")
@@ -439,6 +551,7 @@ def build_config_bundle(
         workers,
         worker_outputs,
         aggregation_inputs,
+        *((judge_paths[0], judge_paths[4]) if judge_paths is not None else ()),
     )
     if any(_contains(source, private) for private in top_level_private):
         raise CodexConfigError("private run data must be outside the source checkout")
@@ -520,6 +633,18 @@ def build_config_bundle(
             codex_model=codex_model,
             worker_python=worker_executable,
             qualification_mode=qualification_mode,
+        )
+
+    if judge_paths is not None:
+        _, judge_home, judge_tmp, judge_work, _ = judge_paths
+        judge_profile_path = (
+            codex_home / f"{PERSONA_MEMORY_JUDGE_PROFILE_NAME}.config.toml"
+        )
+        profile_configs[judge_profile_path] = _persona_memory_judge_config(
+            home=judge_home,
+            temporary=judge_tmp,
+            work=judge_work,
+            codex_model=codex_model,
         )
 
     lines = _base_settings(SUPERVISOR_PERMISSION_PROFILE, codex_model)
@@ -613,6 +738,41 @@ def build_config_bundle(
             )
         )
 
+    if judge_paths is not None:
+        judge_root, judge_home, judge_tmp, judge_work, judge_scratch = judge_paths
+        lines.extend(
+            _permission_header(
+                PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE,
+                "Offline semantic judge for blinded persona-memory trajectories",
+            )
+        )
+        judge_filesystem: list[tuple[str, str]] = [
+            (":minimal", "read"),
+            (str(source), "deny"),
+            (str(artifacts), "deny"),
+            (str(provisioning), "deny"),
+            (str(manifests), "deny"),
+            (str(workers), "deny"),
+            (str(worker_outputs), "deny"),
+            (str(aggregation_inputs), "deny"),
+            (str(receipt), "deny"),
+            (str(root_home), "deny"),
+            (str(root_tmp), "deny"),
+            (str(root_work), "deny"),
+            (str(codex_home), "deny"),
+            (str(judge_scratch), "deny"),
+            *((str(runtime), "deny") for runtime in runtimes),
+            (str(judge_root), "write"),
+            (str(judge_home), "write"),
+            (str(judge_tmp), "write"),
+            (str(judge_work), "write"),
+        ]
+        lines.extend(
+            f"{_quoted(path)} = {_quoted(access)}"
+            for path, access in judge_filesystem
+        )
+        lines.extend(_disabled_network_lines(PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE))
+
     return CodexConfigBundle(main="\n".join(lines), profiles=profile_configs)
 
 
@@ -674,6 +834,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-output-root", type=Path, required=True)
     parser.add_argument("--aggregation-input-root", type=Path, required=True)
     parser.add_argument("--orchestration-receipt", type=Path, required=True)
+    parser.add_argument(
+        "--persona-judge-root",
+        type=Path,
+        help=(
+            "Clean private root containing home/tmp/work for the optional "
+            "persona-memory Codex judge profile"
+        ),
+    )
+    parser.add_argument(
+        "--persona-judge-scratch-root",
+        type=Path,
+        help=(
+            "Clean private Codex judge invocation root; explicitly denied to "
+            "judge tools while the Codex host writes structured output"
+        ),
+    )
     parser.add_argument("--codex-model", required=True)
     parser.add_argument("--allowed-host", required=True)
     parser.add_argument("--worker-python", type=Path, required=True)
@@ -723,6 +899,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             qualification_mode=args.qualification_mode,
             runtime_read_roots=args.runtime_read_root,
             allow_local_binding=args.allow_local_binding,
+            persona_judge_root=args.persona_judge_root,
+            persona_judge_scratch_root=args.persona_judge_scratch_root,
         )
         write_bundle(args.output, bundle)
     except CodexConfigError as exc:

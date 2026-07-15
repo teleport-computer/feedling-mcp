@@ -414,7 +414,8 @@ class SmokeClient:
                 return e.code, payload
             except self._RETRYABLE as e:
                 last_err = e
-                time.sleep(2.0 * (attempt + 1))
+                if attempt + 1 < attempts:
+                    time.sleep(2.0 * (attempt + 1))
         detail = str(last_err) or repr(last_err)  # socket timeout str() is ""
         raise SmokeError(
             "network", f"{method} {path} failed after {attempts} tries: {detail}"
@@ -529,7 +530,9 @@ class SmokeClient:
                 return last
         raise SmokeError("verify", f"verify_loop never passed: {last}")
 
-    def send(self, sess: Session, message: str) -> dict:
+    def send(
+        self, sess: Session, message: str, *, read_timeout: float = 45
+    ) -> dict:
         status, body = self._req(
             "POST",
             "/v1/model_api/chat/send",
@@ -539,6 +542,7 @@ class SmokeClient:
             # turn but its response is lost, replaying the POST creates a second
             # user turn and can make qualification evaluate the wrong reply.
             attempts=1,
+            read_timeout=max(0.1, min(float(read_timeout), 45.0)),
         )
         if status != 202 or not is_hosted_response(body):
             raise SmokeError(
@@ -604,12 +608,15 @@ class SmokeClient:
             )
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
             since = max(0.0, float(after_ts) - 0.001)
             query = urllib.parse.urlencode({"since": f"{since:.6f}", "limit": 200})
             status, body = self._req(
                 "GET",
                 f"/v1/chat/history?{query}",
                 api_key=sess.api_key,
+                attempts=1,
+                read_timeout=max(0.1, min(remaining, 10.0)),
             )
             if status != 200 or not isinstance(body.get("messages"), list):
                 raise SmokeError("history", f"status={status} body={body}")
@@ -625,7 +632,9 @@ class SmokeClient:
                     sess.pk,
                     include_thinking=include_thinking,
                 )
-            time.sleep(interval)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(interval, remaining))
         return None
 
     def poll_reply_legacy(

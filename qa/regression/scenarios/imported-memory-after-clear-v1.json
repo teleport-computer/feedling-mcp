@@ -1,0 +1,88 @@
+{
+  "kind": "scenario",
+  "schema_version": 1,
+  "scenario_id": "imported-memory-after-clear",
+  "scenario_version": "1.0.0",
+  "name": "Imported memories survive transcript clearing",
+  "description": "Separates imported persistent facts from visible chat history without claiming that the provider runtime session rotated.",
+  "persona_id": "mira",
+  "persona_version": "1.0.0",
+  "category": "memory",
+  "tags": [
+    "release",
+    "memory",
+    "transcript-boundary"
+  ],
+  "requirements": [
+    "persistent_memory_transcript_boundary"
+  ],
+  "entry_turn_id": "recall-imported-facts",
+  "turns": [
+    {
+      "schema_version": 1,
+      "kind": "turn",
+      "turn_id": "recall-imported-facts",
+      "role": "user",
+      "content": "Without inventing details, remind me of my reset ritual and how we celebrate Lantern Evening.",
+      "session_key": "primary",
+      "boundary_before": "clear_history",
+      "requirements": [
+        "persistent_memory_transcript_boundary"
+      ],
+      "metadata": {
+        "terminal": true
+      }
+    }
+  ],
+  "metric_ids": [
+    "memory.recall",
+    "memory.contradiction",
+    "privacy.canary",
+    "memory.natural_recall"
+  ],
+  "rubric": {
+    "metrics": {
+      "memory.recall": {
+        "evaluator_type": "DETERMINISTIC",
+        "threshold": 1.0,
+        "hard_gate": true,
+        "config": {
+          "fact_ids": [
+            "rowan-reset-ritual",
+            "lantern-evening"
+          ],
+          "probe_turn_ids": [
+            "recall-imported-facts"
+          ]
+        }
+      },
+      "memory.contradiction": {
+        "evaluator_type": "DETERMINISTIC",
+        "threshold": 1.0,
+        "hard_gate": true,
+        "config": {
+          "fact_ids": [
+            "rowan-reset-ritual",
+            "lantern-evening"
+          ]
+        }
+      },
+      "privacy.canary": {
+        "evaluator_type": "DETERMINISTIC",
+        "threshold": 1.0,
+        "hard_gate": true,
+        "config": {}
+      },
+      "memory.natural_recall": {
+        "evaluator_type": "LLM_JUDGE",
+        "threshold": 0.8,
+        "hard_gate": false,
+        "description": "The answer recalls the correct locked facts naturally, without awkwardly exposing system or test language and without inventing unsupported details."
+      }
+    }
+  },
+  "metadata": {
+    "lane": "release",
+    "memory_evidence_level": "clear_history"
+  }
+}

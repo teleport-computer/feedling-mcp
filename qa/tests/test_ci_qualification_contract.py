@@ -45,6 +45,11 @@ def test_existing_default_branch_ci_dispatches_trusted_e2e_without_inheriting_se
     assert "uses: ./.github/workflows/api-key-e2e.yml" in manual_job
     assert "expected_deployment_sha" not in manual_job
     assert "runtime_target: ${{ inputs.runtime_target }}" in manual_job
+    assert "persona_repetitions: ${{ inputs.persona_repetitions }}" in manual_job
+    trigger = CI[CI.index("on:\n") : CI.index("# Cancel in-progress")]
+    assert "persona_repetitions:" in trigger
+    assert 'default: "1"' in trigger
+    assert '- "3"' in trigger
     assert "permissions:" in manual_job
     assert "contents: read" in manual_job
     assert "id-token: write" in manual_job
@@ -107,6 +112,11 @@ def test_e2e_uses_pinned_jit_app_and_oidc_actions_with_hosted_cleanup():
         )
     ]
     cleanup = E2E[E2E.index("  cleanup-aws-runner:\n") :]
+    account_cleanup = E2E[
+        E2E.index("  cleanup-synthetic-accounts:\n") : E2E.index(
+            "  cleanup-aws-runner:\n"
+        )
+    ]
 
     assert "runs-on: ubuntu-24.04" in provision
     assert "id-token: write" in provision
@@ -157,6 +167,10 @@ def test_e2e_uses_pinned_jit_app_and_oidc_actions_with_hosted_cleanup():
     assert "--connect-timeout 5" in provision
     assert "--max-time 20" in provision
     assert "GitHub JIT runner was not bound to the dedicated runner group" in provision
+    assert "runs-on: ubuntu-24.04" in account_cleanup
+    assert "qa/provision_profiles.py cleanup-run" in account_cleanup
+    assert "secrets.QA_TEST_ADMIN_TOKEN" in account_cleanup
+    assert "cleanup-synthetic-accounts" in cleanup.split("    steps:\n", 1)[0]
     assert (
         "if: ${{ always() && needs.validate-dispatch.result == 'success' && "
         "needs.provision-aws-runner.result != 'skipped' }}" in cleanup

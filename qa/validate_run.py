@@ -120,7 +120,7 @@ _PROFILE_ALLOWED_MODEL_REGEXES = {
     "official-deepseek": r"^deepseek-[a-z0-9][a-z0-9._-]*$",
     "official-anthropic": r"^claude-[a-z0-9][a-z0-9._-]*$",
     "official-openai": r"^(?:gpt-[a-z0-9][a-z0-9._-]*|o[1-9][a-z0-9._-]*)$",
-    "official-gemini": r"^gemini-2\.5-[a-z0-9][a-z0-9._-]*$",
+    "official-gemini": r"^gemini-(?:2\.5|3\.5)-[a-z0-9][a-z0-9._-]*$",
     "openrouter-claude": r"^anthropic/claude-[a-z0-9][a-z0-9._:-]*$",
     "openrouter-openai": (r"^openai/(?:gpt-[a-z0-9][a-z0-9._:-]*|o[a-z0-9._:-]*)$"),
     "openrouter-glm": r"^(?:z-ai|thudm)/glm-[a-z0-9][a-z0-9._:-]*$",

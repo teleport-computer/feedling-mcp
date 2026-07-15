@@ -1,0 +1,116 @@
+{
+  "kind": "scenario",
+  "schema_version": 1,
+  "scenario_id": "learned-memory-after-rotation",
+  "scenario_version": "1.0.0",
+  "name": "A newly learned fact survives a proven runtime-session rotation",
+  "description": "Strong persistent-memory evidence. The target must prove distinct before and after runtime session identifiers or the scenario is blocked before mutation.",
+  "persona_id": "mira",
+  "persona_version": "1.0.0",
+  "category": "memory",
+  "tags": [
+    "nightly",
+    "memory",
+    "strong-boundary"
+  ],
+  "requirements": [
+    "persistent_memory_strong"
+  ],
+  "entry_turn_id": "learn-new-fact",
+  "turns": [
+    {
+      "schema_version": 1,
+      "kind": "turn",
+      "turn_id": "learn-new-fact",
+      "role": "user",
+      "content": "Please remember this new planning ritual: I put a cobalt index card beside the kettle before planning tomorrow. Acknowledge briefly.",
+      "session_key": "primary",
+      "boundary_before": "none",
+      "requirements": [
+        "persistent_memory_strong"
+      ],
+      "metadata": {}
+    },
+    {
+      "schema_version": 1,
+      "kind": "turn",
+      "turn_id": "recall-after-rotation",
+      "role": "user",
+      "content": "What new planning ritual did I ask you to remember?",
+      "session_key": "primary",
+      "boundary_before": "rotate_runtime_session",
+      "requirements": [
+        "persistent_memory_strong"
+      ],
+      "metadata": {
+        "terminal": true
+      }
+    }
+  ],
+  "metric_ids": [
+    "memory.recall",
+    "memory.contradiction",
+    "memory.natural_recall"
+  ],
+  "rubric": {
+    "facts": [
+      {
+        "id": "cobalt-planning-ritual",
+        "text": "Rowan puts a cobalt index card beside the kettle before planning tomorrow.",
+        "keyword_groups": [
+          [
+            "cobalt"
+          ],
+          [
+            "index card"
+          ],
+          [
+            "kettle"
+          ]
+        ],
+        "contradictions": [
+          "red notebook beside the stove",
+          "blue phone beside the sink"
+        ],
+        "probe_turn_ids": [
+          "recall-after-rotation"
+        ]
+      }
+    ],
+    "metrics": {
+      "memory.recall": {
+        "evaluator_type": "DETERMINISTIC",
+        "threshold": 1.0,
+        "hard_gate": true,
+        "config": {
+          "fact_ids": [
+            "cobalt-planning-ritual"
+          ],
+          "probe_turn_ids": [
+            "recall-after-rotation"
+          ]
+        }
+      },
+      "memory.contradiction": {
+        "evaluator_type": "DETERMINISTIC",
+        "threshold": 1.0,
+        "hard_gate": true,
+        "config": {
+          "fact_ids": [
+            "cobalt-planning-ritual"
+          ]
+        }
+      },
+      "memory.natural_recall": {
+        "evaluator_type": "LLM_JUDGE",
+        "threshold": 0.8,
+        "hard_gate": false,
+        "description": "After a proven runtime-session rotation, the answer recalls the newly learned planning ritual naturally and without inventing details."
+      }
+    }
+  },
+  "metadata": {
+    "lane": "nightly",
+    "memory_evidence_level": "rotate_runtime_session"
+  }
+}

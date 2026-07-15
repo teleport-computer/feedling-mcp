@@ -199,6 +199,72 @@ There is no single public `/readyz` endpoint that proves all of these
 dependencies. Operators should compose synthetic, non-production probes for the
 capabilities they enable and keep `/healthz` as a lightweight liveness signal.
 
+## Formal live persona and memory evaluation
+
+The repository's formal live evaluation is operator-side QA, not a public API or
+an extension of `/healthz`. The self-service workflow qualifies the candidate
+already deployed to the protected `test` environment. It runs an eight-account
+smoke depth by default; release depth uses three repetitions and 24 accounts.
+The reusable library can also compare separately captured baseline and candidate
+arms, but that two-deployment sequence is manual and is not part of one
+self-service dispatch.
+
+The candidate path has these phases:
+
+1. A trusted outer workflow serializes access to the test deployment and runs
+   `provision-pool`. Each repetition allocates eight one-use synthetic accounts
+   on the locked official-OpenAI route: eight for the default smoke depth or 24
+   for release depth.
+2. `verify-deployment` records the deployed build before execution. A formal
+   deep arm requires `hosted_resident`. The backend receipt identifies the
+   expected backend and deployment revisions, while each synthetic account's
+   authenticated runtime readback must prove Hosted Runtime V2 mode and version.
+   The current contract does not expose a trustworthy worker binary SHA or live
+   worker count, and the evaluation does not claim either one.
+3. `prepare` imports the same versioned persona and memory-source bundle into
+   every account, performs an authorized decrypt/read-back check, clears the
+   import conversation and trace, and emits a short-lived, content-free
+   readiness receipt. A second deployment receipt brackets the completed import.
+   The readiness receipt binds both deployment receipts, the exact hydrated
+   source snapshot, persona, route, build, and account fingerprints; it does not
+   contain imported plaintext.
+4. `run-live` consumes the account pool and readiness receipt, runs isolated
+   conversations concurrently, and keeps plaintext trajectories private. A
+   fresh headless Codex process judges each blinded trajectory through the same
+   run-scoped ChatGPT OAuth credential used by the qualification agents; no
+   separate judge API key is used. A second deployment receipt after the run
+   detects a backend deployment change while the arm was executing.
+5. The supervisor runs full-pool cleanup even when execution fails. Cleanup
+   checkpoints a recoverable content-free outcome before deleting the credential
+   manifest and publishing a hash-bound receipt. `finalize-arm` binds the private
+   result to the import, readiness, pre/post-run deployment, and cleanup receipts.
+6. The self-service workflow publishes only an allowlisted candidate summary.
+   For a manual two-build experiment, `compare` accepts compatible finalized
+   baseline and candidate arms, requires different builds and disjoint account
+   fingerprints, and writes an allowlisted matrix, machine-readable result, and
+   JUnit report. Raw trajectories and per-account evidence remain private.
+
+The account count is isolation capacity rather than a container count. Chat and
+API-only evaluation needs separate account/session state; it does not require a
+Linux container per conversation.
+
+### Evaluation trust and receipt boundary
+
+The trusted supervisor owns provisioning/admin credentials, deployment
+serialization and verification, cleanup authority, and the receipt directory.
+The evaluator runner receives only the synthetic accounts needed for its arm and
+therefore sees their plaintext trajectories, but it must not receive an admin
+token or write access to supervisor-generated receipts.
+
+Receipt hashes prove that later artifacts refer to the same bytes; they are not
+signatures and do not authenticate a producer. File mode `0600` is insufficient
+when the runner shares the same operating-system identity or can write the
+parent directory. A formal deployment must place supervisor receipts behind an
+independent write boundary, such as a separate service account, a sandbox policy,
+or a read-only mount/file descriptor supplied to the runner. Keep private
+evidence outside published CI artifacts and delete it according to the
+evaluation retention policy after finalization.
+
 ## Security boundary summary
 
 Feedling's architecture is designed to provide:

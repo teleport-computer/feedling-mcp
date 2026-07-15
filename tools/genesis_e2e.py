@@ -2191,6 +2191,113 @@ def finalize_existing_session_distill_acceptance(
         _delete_private_evidence(private_evidence_path)
 
 
+_IMPORT_READINESS_DETERMINISTIC_CHECKS = (
+    "identity_agent_name",
+    "identity_category",
+    "identity_dimensions",
+    "identity_self_introduction",
+    "memory_count_reasonable",
+    "ground_truth_recall",
+    "no_explicit_contradictions",
+    "no_duplicate_memories",
+    "relationship_started_at",
+    "relationship_days",
+    "greeting_non_empty",
+    "persona_non_empty",
+    "voice_non_empty",
+    "validate_passing",
+    "privacy_identity_clear",
+    "privacy_persona_clear",
+    "privacy_self_introduction_clear",
+)
+_IMPORT_READINESS_CAPTURE_CHECKS = (
+    "archive_receipts_verified",
+    "genesis_upload_metadata_verified",
+    "identity_envelope_decrypted",
+    "persona_envelope_decrypted",
+    "memory_envelopes_decrypted",
+    "chat_envelopes_decrypted",
+)
+
+
+def finalize_existing_session_import_readiness(
+    *,
+    private_evidence_path: str,
+    fixture: dict,
+    artifact_dir: str,
+) -> dict:
+    """Verify deterministic import readiness, sanitize, then destroy plaintext.
+
+    This is deliberately narrower than distill acceptance: it proves that the
+    locked fixture reached the expected deterministic and decryptable surfaces,
+    but it does not claim that an independent semantic review occurred.
+    """
+    _require_private_path_outside_artifacts(private_evidence_path, artifact_dir)
+    try:
+        raw_evidence = _read_owner_only_file(
+            private_evidence_path,
+            stage="finalize",
+            code_prefix="private_evidence",
+        )
+        evidence_sha256 = _sha256_hex(raw_evidence)
+        evidence = _decode_private_evidence(raw_evidence, fixture)
+        report = evaluate_distill_acceptance(
+            fixture,
+            identity=evidence["identity"],
+            identity_meta=evidence["identity_meta"],
+            memories=evidence["memories"],
+            validate=evidence["validate"],
+            persona_text=evidence["persona_text"],
+            voice_text=evidence["voice_text"],
+            greeting_messages=evidence["greeting_messages"],
+            job=evidence["job"],
+            evidence_sha256=evidence_sha256,
+        )
+        evaluated_checks = report.get("checks")
+        deterministic_check_names = (
+            {
+                check
+                for check in evaluated_checks
+                if not check.startswith("semantic_")
+            }
+            if isinstance(evaluated_checks, dict)
+            else set()
+        )
+        if (
+            not isinstance(evaluated_checks, dict)
+            or deterministic_check_names
+            != set(_IMPORT_READINESS_DETERMINISTIC_CHECKS)
+            or any(
+                type(evaluated_checks.get(check)) is not bool
+                for check in _IMPORT_READINESS_DETERMINISTIC_CHECKS
+            )
+        ):
+            raise ExistingSessionDistillError(
+                "finalize", "import_readiness_checks_invalid"
+            )
+        checks = {
+            check: evaluated_checks[check]
+            for check in _IMPORT_READINESS_DETERMINISTIC_CHECKS
+        }
+        checks.update(
+            {
+                check: evidence["capture_checks"][check]
+                for check in _IMPORT_READINESS_CAPTURE_CHECKS
+            }
+        )
+        return {
+            "schema_version": 1,
+            "kind": "existing_session_import_readiness",
+            "ok": all(checks.values()),
+            "fixture_sha256": evidence["fixture_sha256"],
+            "evidence_sha256": evidence_sha256,
+            "checks": checks,
+            "private_evidence_deleted": True,
+        }
+    finally:
+        _delete_private_evidence(private_evidence_path)
+
+
 def _load_manifest_session(
     manifest_path: str, profile_id: str
 ) -> tuple[str, str, bytes]:

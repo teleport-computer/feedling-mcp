@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
+import math
 import os
 import re
 import ssl
+import stat
 import sys
 import tempfile
 import time
@@ -54,15 +57,26 @@ QUALIFICATION_MODE_DIAGNOSTIC = "diagnostic"
 EXPECTED_REASONING_EFFORT = "medium"
 INVALID_PROVIDER_KEY = "feedling-e2e-intentionally-invalid"
 MANIFEST_SCHEMA_VERSION = 1
+PERSONA_MEMORY_POOL_MANIFEST_KIND = "persona_memory_account_pool"
+MAX_PERSONA_MEMORY_POOL_COUNT = 24
 SYNTHETIC_LABEL_PREFIX = "agent-e2e-"
 SYNTHETIC_REAPER_PATH = "/v1/admin/qa/synthetic-account-reaper"
 SYNTHETIC_REGISTRATION_PATH = "/v1/admin/qa/synthetic-accounts/register"
 SYNTHETIC_ABSENCE_PATH = "/v1/admin/qa/synthetic-accounts/absence"
+SYNTHETIC_CLEANUP_RUN_PATH = "/v1/admin/qa/synthetic-accounts/cleanup-run"
+SYNTHETIC_CLEANUP_RUN_KIND = "qa_synthetic_run_cleanup"
+MAX_SYNTHETIC_RUN_ID_LENGTH = 48
 MAX_SYNTHETIC_TTL_SECONDS = 14_400
 CLEANUP_EVIDENCE_ATTEMPTS = 8
 CLEANUP_EVIDENCE_DELAY_SECONDS = 2.0
+MAX_PRIVATE_MANIFEST_BYTES = 2 * 1024 * 1024
+MANIFEST_CLEANUP_FAILURE_ID = "__manifest__"
 _SYNTHETIC_LEASE_RE = re.compile(r"^lease_[0-9a-f]{32}$")
 _SYNTHETIC_ABSENCE_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+_SYNTHETIC_RUN_ID_RE = re.compile(
+    rf"^[A-Za-z0-9_.-]{{1,{MAX_SYNTHETIC_RUN_ID_LENGTH}}}$"
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 PROVISION_STATUS_READY = "ready"
 PROVISION_STATUS_BLOCKED = "blocked"
 PROVISION_FAILURE_NONE = "NONE"
@@ -149,7 +163,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         model_family="gemini",
         credential_env="QA_GEMINI_API_KEY",
         model_env="QA_GEMINI_MODEL",
-        allowed_model_regex=r"^gemini-2\.5-[a-z0-9][a-z0-9._-]*$",
+        allowed_model_regex=r"^gemini-(?:2\.5|3\.5)-[a-z0-9][a-z0-9._-]*$",
         expected_configured_base_url=(
             "https://generativelanguage.googleapis.com/v1beta"
         ),
@@ -199,6 +213,18 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_synthetic_run_id(value: Any) -> str:
+    raw = str(value or "local")
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw)
+    if len(normalized) > MAX_SYNTHETIC_RUN_ID_LENGTH:
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+        prefix_length = MAX_SYNTHETIC_RUN_ID_LENGTH - len(digest) - 1
+        normalized = f"{normalized[:prefix_length]}-{digest}"
+    if _SYNTHETIC_RUN_ID_RE.fullmatch(normalized) is None:
+        raise ProvisionError("synthetic cleanup run ID is invalid")
+    return normalized
 
 
 def _required_env(env: Mapping[str, str], name: str) -> str:
@@ -458,7 +484,6 @@ def _atomic_write_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        os.chmod(path, 0o600)
     except Exception:
         if fd >= 0:
             os.close(fd)
@@ -467,6 +492,26 @@ def _atomic_write_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _validate_new_private_manifest_path(path: Path) -> Path:
+    """Fail before mutation unless a new manifest can live in a private dir."""
+    candidate = path.expanduser()
+    if not candidate.is_absolute() or candidate.exists() or candidate.is_symlink():
+        raise ProvisionError("pool manifest path must be a new absolute path")
+    try:
+        parent = candidate.parent.resolve(strict=True)
+        metadata = parent.stat()
+    except (OSError, RuntimeError):
+        raise ProvisionError("pool manifest parent is unavailable") from None
+    if (
+        parent != candidate.parent
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ProvisionError("pool manifest parent must be owner-controlled mode 0700")
+    return candidate
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -508,9 +553,16 @@ class AdminClient:
         body: dict[str, Any] | None = None,
         *,
         attempts: int = 5,
+        timeout_seconds: float = 45,
     ) -> tuple[int, dict]:
         if type(attempts) is not int or not 1 <= attempts <= 5:
             raise ValueError("attempts must be an integer between 1 and 5")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 1 <= float(timeout_seconds) <= 300
+        ):
+            raise ValueError("timeout_seconds must be between 1 and 300")
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = urllib.request.Request(
             f"{self.base_url}{path}",
@@ -520,7 +572,9 @@ class AdminClient:
         )
         for attempt in range(attempts):
             try:
-                with self._opener.open(request, timeout=45) as response:
+                with self._opener.open(
+                    request, timeout=float(timeout_seconds)
+                ) as response:
                     return response.status, json.loads(response.read() or b"{}")
             except urllib.error.HTTPError as exc:
                 try:
@@ -540,9 +594,16 @@ class AdminClient:
         raise ProvisionError("admin endpoint was unreachable") from None
 
     def register_synthetic(
-        self, label: str, *, ttl_seconds: int
+        self, label: str, *, run_id: str, ttl_seconds: int
     ) -> tuple[Session, dict[str, Any]]:
         """Create one server-marked account while keeping its private key local."""
+
+        if (
+            not isinstance(run_id, str)
+            or _SYNTHETIC_RUN_ID_RE.fullmatch(run_id) is None
+            or not label.startswith(f"{SYNTHETIC_LABEL_PREFIX}{run_id}-")
+        ):
+            raise ProvisionError("synthetic registration run binding is invalid")
 
         sk, pk = crypto.generate_keypair()
         try:
@@ -553,6 +614,7 @@ class AdminClient:
                     "public_key": base64.b64encode(pk).decode("ascii"),
                     "access_mode": "model_api",
                     "label": label,
+                    "run_id": run_id,
                     "ttl_seconds": ttl_seconds,
                 },
                 # This endpoint is deliberately non-idempotent. A lost response
@@ -597,6 +659,82 @@ class AdminClient:
                 "ttl_seconds": ttl_seconds,
             },
         )
+
+    def cleanup_synthetic_run(self, run_id: str) -> dict[str, Any]:
+        """Sweep one normalized run without relying on a local manifest."""
+        if (
+            not isinstance(run_id, str)
+            or _SYNTHETIC_RUN_ID_RE.fullmatch(run_id) is None
+        ):
+            raise ProvisionError("synthetic cleanup run ID is invalid")
+        try:
+            status, body = self.request(
+                "POST",
+                SYNTHETIC_CLEANUP_RUN_PATH,
+                {"run_id": run_id},
+                attempts=1,
+                timeout_seconds=180,
+            )
+        except Exception:
+            raise ProvisionError("synthetic run cleanup failed") from None
+        receipt = body if isinstance(body, Mapping) else {}
+        expected_keys = {
+            "schema_version",
+            "kind",
+            "run_id_sha256",
+            "label_prefix_sha256",
+            "database_authoritative",
+            "matched_count",
+            "deleted_count",
+            "already_absent_count",
+            "operation_failure_count",
+            "remaining_count",
+            "complete",
+        }
+        count_keys = {
+            "matched_count",
+            "deleted_count",
+            "already_absent_count",
+            "operation_failure_count",
+            "remaining_count",
+        }
+        expected_run_hash = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+        expected_label_hash = hashlib.sha256(
+            f"{SYNTHETIC_LABEL_PREFIX}{run_id}-".encode("utf-8")
+        ).hexdigest()
+        counts_valid = all(
+            type(receipt.get(key)) is int and receipt[key] >= 0
+            for key in count_keys
+        )
+        if (
+            status != 200
+            or set(receipt) != expected_keys
+            or receipt.get("schema_version") != 1
+            or receipt.get("kind") != SYNTHETIC_CLEANUP_RUN_KIND
+            or receipt.get("run_id_sha256") != expected_run_hash
+            or receipt.get("label_prefix_sha256") != expected_label_hash
+            or receipt.get("database_authoritative") is not True
+            or type(receipt.get("complete")) is not bool
+            or not counts_valid
+            or receipt.get("deleted_count", 0)
+            + receipt.get("already_absent_count", 0)
+            > receipt.get("matched_count", 0)
+            or receipt.get("operation_failure_count", 0)
+            > receipt.get("matched_count", 0)
+            or receipt.get("matched_count", 0)
+            != receipt.get("deleted_count", 0)
+            + receipt.get("already_absent_count", 0)
+            + receipt.get("operation_failure_count", 0)
+            or (
+                receipt.get("complete") is True
+                and (
+                    receipt.get("operation_failure_count") != 0
+                    or receipt.get("remaining_count") != 0
+                )
+            )
+        ):
+            raise ProvisionError("synthetic run cleanup receipt is invalid")
+        return dict(receipt)
 
 
 def _manifest_entry(
@@ -1013,6 +1151,182 @@ def _admin_confirms_user_absent(
     )
 
 
+def _complete_pool_manifest(manifest: Mapping[str, Any]) -> bool:
+    """Return whether a strict same-route account pool is ready for mutation."""
+    profile_id = manifest.get("pool_profile_id")
+    count = manifest.get("pool_count")
+    profiles = manifest.get("profiles")
+    reaper = manifest.get("synthetic_account_reaper")
+    if (
+        manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        or manifest.get("manifest_kind") != PERSONA_MEMORY_POOL_MANIFEST_KIND
+        or not isinstance(profile_id, str)
+        or profile_id not in PROFILE_SPECS
+        or type(count) is not int
+        or not 1 <= count <= MAX_PERSONA_MEMORY_POOL_COUNT
+        or not isinstance(profiles, list)
+        or len(profiles) != count
+        or manifest.get("auxiliary_accounts") != []
+        or not isinstance(reaper, Mapping)
+        or reaper.get("enabled") is not True
+        or reaper.get("ready") is not True
+        or reaper.get("heartbeat_fresh") is not True
+        or reaper.get("label_prefix") != SYNTHETIC_LABEL_PREFIX
+        or type(reaper.get("max_ttl_seconds")) is not int
+        or not 1 <= reaper["max_ttl_seconds"] <= MAX_SYNTHETIC_TTL_SECONDS
+    ):
+        return False
+
+    spec = PROFILE_SPECS[profile_id]
+    requirement = manifest.get("runtime_mode")
+    if requirement not in {BASELINE_RUNTIME_REQUIREMENT, RUNTIME_V2_REQUIREMENT}:
+        return False
+
+    labels: set[str] = set()
+    user_ids: set[str] = set()
+    api_keys: set[str] = set()
+    lease_ids: set[str] = set()
+    routes: set[tuple[Any, ...]] = set()
+    for index, row in enumerate(profiles, start=1):
+        if not isinstance(row, Mapping):
+            return False
+        lease = row.get("synthetic_account_lease")
+        runtime_version = row.get("runtime_version")
+        if (
+            row.get("profile_id") != profile_id
+            or row.get("pool_index") != index
+            or row.get("provider") != spec.provider
+            or row.get("route_family") != spec.route_family
+            or row.get("configured_base_url") != spec.expected_configured_base_url
+            or row.get("reasoning_effort") != EXPECTED_REASONING_EFFORT
+            or row.get("registration_verified") is not True
+            or row.get("fresh_state_verified") is not True
+            or row.get("invalid_key_rejected") is not True
+            or row.get("valid_key_configured") is not True
+            or row.get("trace_enabled") is not True
+            or row.get("runtime_mode_readback_verified") is not True
+            or not isinstance(row.get("runtime_mode"), str)
+            or not row["runtime_mode"]
+            or type(runtime_version) is not int
+            or runtime_version < 1
+            or row.get("provision_status") != PROVISION_STATUS_READY
+            or row.get("provision_failure_code") != PROVISION_FAILURE_NONE
+            or not all(
+                isinstance(row.get(field), str) and bool(row.get(field))
+                for field in (
+                    "label",
+                    "configured_model",
+                    "user_id",
+                    "api_key",
+                    "secret_key_b64",
+                    "public_key_b64",
+                )
+            )
+            or not isinstance(lease, Mapping)
+            or lease.get("registered") is not True
+            or not isinstance(lease.get("lease_id"), str)
+            or _SYNTHETIC_LEASE_RE.fullmatch(lease["lease_id"]) is None
+            or not _synthetic_absence_attestation_valid(row)
+            or lease.get("ttl_seconds") != reaper["max_ttl_seconds"]
+        ):
+            return False
+        if requirement == RUNTIME_V2_REQUIREMENT:
+            if (
+                row.get("runtime_mode") != RUNTIME_V2_REQUIREMENT
+                or runtime_version != RUNTIME_V2_VERSION
+                or row.get("runtime_mode_set_required") is not False
+                or row.get("runtime_mode_set_verified") is not False
+            ):
+                return False
+        elif (
+            row.get("runtime_mode_set_required") is not False
+            or row.get("runtime_mode_set_verified") is not False
+        ):
+            return False
+
+        label = str(row["label"])
+        user_id = str(row["user_id"])
+        api_key = str(row["api_key"])
+        lease_id = str(lease["lease_id"])
+        if (
+            label in labels
+            or user_id in user_ids
+            or api_key in api_keys
+            or lease_id in lease_ids
+        ):
+            return False
+        labels.add(label)
+        user_ids.add(user_id)
+        api_keys.add(api_key)
+        lease_ids.add(lease_id)
+        routes.add(
+            (
+                row.get("provider"),
+                row.get("configured_model"),
+                row.get("configured_base_url"),
+                row.get("runtime_mode"),
+                runtime_version,
+                row.get("reasoning_effort"),
+                row.get("trace_enabled"),
+            )
+        )
+    return len(routes) == 1
+
+
+def _cleanup_safe_pool_manifest(manifest: Mapping[str, Any]) -> bool:
+    """Return whether every checkpointed pool account is safe to delete.
+
+    Unlike ``_complete_pool_manifest``, this deliberately accepts an
+    all-or-nothing provisioning checkpoint that stopped before the requested
+    pool size was reached.  Cleanup needs only the account credentials and the
+    signed synthetic-account absence attestations; it must not strand the
+    accounts that were created before provisioning failed.
+    """
+    profile_id = manifest.get("pool_profile_id")
+    declared_count = manifest.get("pool_count")
+    profiles = manifest.get("profiles")
+    if (
+        manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        or manifest.get("manifest_kind") != PERSONA_MEMORY_POOL_MANIFEST_KIND
+        or not isinstance(profile_id, str)
+        or profile_id not in PROFILE_SPECS
+        or type(declared_count) is not int
+        or not 1 <= declared_count <= MAX_PERSONA_MEMORY_POOL_COUNT
+        or not isinstance(profiles, list)
+        or not 1 <= len(profiles) <= declared_count
+        or manifest.get("auxiliary_accounts") != []
+    ):
+        return False
+
+    user_ids: set[str] = set()
+    api_keys: set[str] = set()
+    lease_ids: set[str] = set()
+    for expected_index, row in enumerate(profiles, start=1):
+        if not isinstance(row, Mapping):
+            return False
+        user_id = row.get("user_id")
+        api_key = row.get("api_key")
+        lease = row.get("synthetic_account_lease")
+        if (
+            row.get("profile_id") != profile_id
+            or row.get("pool_index") != expected_index
+            or not isinstance(user_id, str)
+            or not user_id
+            or not isinstance(api_key, str)
+            or not api_key
+            or not isinstance(lease, Mapping)
+            or not _synthetic_absence_attestation_valid(row)
+        ):
+            return False
+        lease_id = str(lease.get("lease_id") or "")
+        if user_id in user_ids or api_key in api_keys or lease_id in lease_ids:
+            return False
+        user_ids.add(user_id)
+        api_keys.add(api_key)
+        lease_ids.add(lease_id)
+    return True
+
+
 def _reset_one(
     client: SmokeClient,
     entry: Mapping[str, Any],
@@ -1130,8 +1444,9 @@ def _cleanup_evidence_rows(
 ) -> list[dict[str, Any]]:
     """Reset all accounts, then prove deletion after one shared retry window.
 
-    The public rows contain only locked profile IDs and booleans. Account IDs,
-    account keys, and response bodies remain confined to the private manifest.
+    The public rows contain only locked profile IDs, optional pool indexes,
+    one-way user fingerprints, and booleans. Account IDs, account keys, and
+    response bodies remain confined to the private manifest.
     """
     work: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
     for entry in entries:
@@ -1166,6 +1481,13 @@ def _cleanup_evidence_rows(
             "user_absence_verified": False,
             "status": "FAIL",
         }
+        pool_index = entry.get("pool_index")
+        user_id = str(entry.get("user_id") or "")
+        if type(pool_index) is int and pool_index > 0 and user_id:
+            row["pool_index"] = pool_index
+            row["account_fingerprint"] = hashlib.sha256(
+                user_id.encode("utf-8")
+            ).hexdigest()
         work.append((entry, row))
 
     for attempt in range(CLEANUP_EVIDENCE_ATTEMPTS):
@@ -1187,7 +1509,6 @@ def _cleanup_evidence_rows(
             if (
                 user_absent
                 and row["profile_id"] != MEMORY_CONTRACT_PROFILE_ID
-                and row["provider_config_preexisted"] is True
                 and row["provider_config_deleted"] is not True
             ):
                 # Account deletion is an authoritative FK-cascade boundary for
@@ -1199,10 +1520,6 @@ def _cleanup_evidence_rows(
             provider_proof_valid = (
                 row["provider_config_deleted"] is True
                 and row["key_envelope_deleted"] is True
-                and (
-                    row["provider_config_preexisted"] is True
-                    or row["profile_id"] == MEMORY_CONTRACT_PROFILE_ID
-                )
             )
             if user_absent and credential_rejected and provider_proof_valid:
                 row["status"] = "PASS"
@@ -1247,8 +1564,214 @@ def _validate_receipted_cleanup_manifest(
         raise ProvisionError("cleanup receipt requires unique account credentials")
 
 
-def cleanup(
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("non-finite JSON number")
+
+
+def _finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
+
+
+def _owner_regular_file(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and metadata.st_nlink == 1
+    )
+
+
+def _manifest_read_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_cleanup_manifest_snapshot(
     manifest_path: Path,
+) -> tuple[dict[str, Any], tuple[int, int]] | None:
+    """Read one owner-held regular file without following its final symlink."""
+    try:
+        before = os.lstat(manifest_path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ProvisionError("private manifest is unreadable") from None
+    if not _owner_regular_file(before):
+        raise ProvisionError("private manifest must be an owner-owned regular file")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+
+    descriptor = -1
+    try:
+        descriptor = os.open(manifest_path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not _owner_regular_file(opened)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_size > MAX_PRIVATE_MANIFEST_BYTES
+        ):
+            raise ProvisionError("private manifest is unreadable")
+
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(65_536, MAX_PRIVATE_MANIFEST_BYTES + 1 - size),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_PRIVATE_MANIFEST_BYTES:
+                raise ProvisionError("private manifest is unreadable")
+
+        after = os.fstat(descriptor)
+        current = os.lstat(manifest_path)
+        if (
+            _manifest_read_signature(after) != _manifest_read_signature(opened)
+            or not _owner_regular_file(current)
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise ProvisionError("private manifest changed while reading")
+        try:
+            document = json.loads(
+                b"".join(chunks).decode("utf-8"),
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+                parse_float=_finite_json_float,
+            )
+        except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError):
+            raise ProvisionError("private manifest is unreadable") from None
+        if not isinstance(document, dict):
+            raise ProvisionError("private manifest is unreadable")
+        return document, (opened.st_dev, opened.st_ino)
+    except ProvisionError:
+        raise
+    except OSError:
+        raise ProvisionError("private manifest is unreadable") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def unlink_manifest_snapshot(
+    manifest_path: Path, manifest_identity: tuple[int, int]
+) -> str | None:
+    """Unlink only when the path still names the verified owner-held inode."""
+    try:
+        candidate = os.lstat(manifest_path)
+    except FileNotFoundError:
+        return "manifest_path_missing"
+    except OSError:
+        return "manifest_path_unreadable"
+    if not _owner_regular_file(candidate):
+        return "manifest_path_not_owner_regular"
+    if (candidate.st_dev, candidate.st_ino) != manifest_identity:
+        return "manifest_path_identity_changed"
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    descriptor = -1
+    try:
+        descriptor = os.open(manifest_path, flags)
+        opened = os.fstat(descriptor)
+        current = os.lstat(manifest_path)
+        if (
+            not _owner_regular_file(opened)
+            or not _owner_regular_file(current)
+            or (opened.st_dev, opened.st_ino) != manifest_identity
+            or (current.st_dev, current.st_ino) != manifest_identity
+        ):
+            return "manifest_path_identity_changed"
+        os.unlink(manifest_path)
+        return None
+    except FileNotFoundError:
+        return "manifest_path_missing"
+    except OSError:
+        return "manifest_unlink_failed"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _cleanup_pool_manifest_snapshot(
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+    manifest_identity: tuple[int, int],
+    *,
+    client: SmokeClient,
+    admin_client: AdminClient | None,
+    retain_manifest: bool,
+    delete_manifest: bool,
+) -> dict[str, Any]:
+    """Delete every checkpointed pool account and return sanitized evidence."""
+    if not _cleanup_safe_pool_manifest(manifest):
+        raise ProvisionError("persona-memory pool cleanup manifest is invalid")
+    profiles = manifest["profiles"]
+    evidence = _cleanup_evidence_rows(client, admin_client, profiles)
+    evidence.sort(key=lambda row: int(row.get("pool_index") or 0))
+    failed_rows = [row for row in evidence if row.get("status") != "PASS"]
+    failed = [
+        f"{row['profile_id']}#{int(row['pool_index']):03d}"
+        for row in failed_rows
+    ]
+    cleaned = len(evidence) - len(failed_rows)
+
+    deleted = False
+    delete_failure: str | None = None
+    if not failed and delete_manifest and not retain_manifest:
+        delete_failure = unlink_manifest_snapshot(manifest_path, manifest_identity)
+        deleted = delete_failure is None
+        if delete_failure is not None:
+            failed.append(MANIFEST_CLEANUP_FAILURE_ID)
+
+    result: dict[str, Any] = {
+        "attempted": len(evidence),
+        "cleaned": cleaned,
+        "failed_profile_ids": failed,
+        "manifest_deleted": deleted,
+        "manifest_missing": False,
+        "cleanup_accounts": evidence,
+    }
+    if (not delete_manifest or retain_manifest) and not failed:
+        result["manifest_retained"] = True
+    if delete_failure is not None:
+        result["manifest_delete_failure"] = delete_failure
+    return result
+
+
+def cleanup_manifest_snapshot(
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+    manifest_identity: tuple[int, int],
     *,
     env: Mapping[str, str] | None = None,
     client: SmokeClient | None = None,
@@ -1256,20 +1779,21 @@ def cleanup(
     receipt_path: Path | None = None,
     run_id: str | None = None,
     retain_manifest: bool = False,
+    delete_manifest: bool = True,
 ) -> dict[str, Any]:
-    """Reset every account in a private manifest, deleting it only on success."""
-    if not manifest_path.exists():
-        return {
-            "attempted": 0,
-            "cleaned": 0,
-            "failed_profile_ids": [],
-            "manifest_deleted": False,
-            "manifest_missing": True,
-        }
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        raise ProvisionError("private manifest is unreadable") from None
+    """Reset accounts from a verified snapshot without rereading its contents.
+
+    ``manifest_identity`` must be the ``(st_dev, st_ino)`` captured when the
+    mapping was read. A successful account reset never authorizes deletion of
+    a different object subsequently installed at ``manifest_path``.
+    """
+    if (
+        not isinstance(manifest, Mapping)
+        or not isinstance(manifest_identity, tuple)
+        or len(manifest_identity) != 2
+        or any(type(value) is not int or value < 0 for value in manifest_identity)
+    ):
+        raise ProvisionError("private manifest snapshot identity is invalid")
     if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         raise ProvisionError("private manifest schema version is unsupported")
     base_url = validate_base_url(str(manifest.get("base_url") or ""))
@@ -1277,7 +1801,10 @@ def cleanup(
     auxiliary = manifest.get("auxiliary_accounts", [])
     if not isinstance(profiles, list) or not isinstance(auxiliary, list):
         raise ProvisionError("private manifest has no profiles array")
-    entries = [*profiles, *auxiliary]
+    entries = [
+        dict(raw) if isinstance(raw, Mapping) else {}
+        for raw in [*profiles, *auxiliary]
+    ]
     active_client = client or SmokeClient(base_url)
     active_env = os.environ if env is None else env
     verification_admin = admin_client
@@ -1289,6 +1816,21 @@ def cleanup(
                 admin_token,
                 getattr(active_client, "_ssl", None),
             )
+
+    if manifest.get("manifest_kind") == PERSONA_MEMORY_POOL_MANIFEST_KIND:
+        if receipt_path is not None:
+            raise ProvisionError(
+                "persona-memory pool receipt must be finalized by its cleanup command"
+            )
+        return _cleanup_pool_manifest_snapshot(
+            manifest,
+            manifest_path,
+            manifest_identity,
+            client=active_client,
+            admin_client=verification_admin,
+            retain_manifest=retain_manifest,
+            delete_manifest=delete_manifest,
+        )
 
     if receipt_path is not None:
         if not retain_manifest:
@@ -1336,8 +1878,7 @@ def cleanup(
     cleaned = 0
     failed: list[str] = []
     seen_users: set[str] = set()
-    for raw in entries:
-        entry = raw if isinstance(raw, dict) else {}
+    for entry in entries:
         profile_id = str(entry.get("profile_id") or "unknown")
         user_id = str(entry.get("user_id") or "")
         if user_id and user_id in seen_users:
@@ -1350,16 +1891,81 @@ def cleanup(
             failed.append(profile_id)
 
     deleted = False
-    if not failed:
-        manifest_path.unlink(missing_ok=True)
-        deleted = True
-    return {
+    delete_failure: str | None = None
+    if not failed and delete_manifest and not retain_manifest:
+        delete_failure = unlink_manifest_snapshot(manifest_path, manifest_identity)
+        deleted = delete_failure is None
+        if delete_failure is not None:
+            failed.append(MANIFEST_CLEANUP_FAILURE_ID)
+    result = {
         "attempted": len(seen_users) if seen_users else len(entries),
         "cleaned": cleaned,
         "failed_profile_ids": failed,
         "manifest_deleted": deleted,
         "manifest_missing": False,
     }
+    if (not delete_manifest or retain_manifest) and not failed:
+        result["manifest_retained"] = True
+    if delete_failure is not None:
+        result["manifest_delete_failure"] = delete_failure
+    return result
+
+
+def cleanup(
+    manifest_path: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+    client: SmokeClient | None = None,
+    admin_client: AdminClient | None = None,
+    receipt_path: Path | None = None,
+    run_id: str | None = None,
+    retain_manifest: bool = False,
+    delete_manifest: bool = True,
+) -> dict[str, Any]:
+    """Securely load a private manifest, then clean its verified snapshot."""
+    snapshot = _read_cleanup_manifest_snapshot(manifest_path)
+    if snapshot is None:
+        return {
+            "attempted": 0,
+            "cleaned": 0,
+            "failed_profile_ids": [],
+            "manifest_deleted": False,
+            "manifest_missing": True,
+        }
+    manifest, manifest_identity = snapshot
+    return cleanup_manifest_snapshot(
+        manifest,
+        manifest_path=manifest_path,
+        manifest_identity=manifest_identity,
+        env=env,
+        client=client,
+        admin_client=admin_client,
+        receipt_path=receipt_path,
+        run_id=run_id,
+        retain_manifest=retain_manifest,
+        delete_manifest=delete_manifest,
+    )
+
+
+def cleanup_run(
+    run_id: str,
+    receipt_path: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+    admin_client: AdminClient | None = None,
+) -> dict[str, Any]:
+    """Authoritatively clean one run without reading an account manifest."""
+    normalized_run_id = normalize_synthetic_run_id(run_id)
+    if normalized_run_id != run_id and len(str(run_id)) <= MAX_SYNTHETIC_RUN_ID_LENGTH:
+        raise ProvisionError("synthetic cleanup run ID must already be normalized")
+    active_env = os.environ if env is None else env
+    base_url = validate_base_url(_required_env(active_env, "QA_FEEDLING_BASE_URL"))
+    admin_token = _required_env(active_env, "QA_TEST_ADMIN_TOKEN")
+    receipt_path = _validate_new_private_manifest_path(receipt_path)
+    active_admin = admin_client or AdminClient(base_url, admin_token)
+    receipt = active_admin.cleanup_synthetic_run(normalized_run_id)
+    _atomic_write_manifest(receipt_path, receipt)
+    return receipt
 
 
 def provision(
@@ -1426,9 +2032,7 @@ def provision(
             base_url, admin_token, active_client._ssl
         )
         reaper_receipt = _verify_synthetic_reaper(active_admin)
-    run_id = re.sub(
-        r"[^A-Za-z0-9_.-]+", "-", str(active_env.get("QA_RUN_ID") or "local")
-    )[:48]
+    run_id = normalize_synthetic_run_id(active_env.get("QA_RUN_ID") or "local")
     manifest: dict[str, Any] = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "generated_at": _utc_now(),
@@ -1471,6 +2075,7 @@ def provision(
                         )
                     session, synthetic_lease = active_admin.register_synthetic(
                         label,
+                        run_id=run_id,
                         ttl_seconds=int(reaper_receipt["max_ttl_seconds"]),
                     )
             except Exception:
@@ -1556,6 +2161,7 @@ def provision(
             try:
                 memory_session, memory_lease = active_admin.register_synthetic(
                     memory_label,
+                    run_id=run_id,
                     ttl_seconds=int(reaper_receipt["max_ttl_seconds"]),
                 )
             except Exception:
@@ -1605,6 +2211,197 @@ def provision(
     return manifest
 
 
+def provision_pool(
+    coverage_path: Path,
+    manifest_path: Path,
+    *,
+    profile_id: str,
+    count: int,
+    env: Mapping[str, str] | None = None,
+    client: SmokeClient | None = None,
+    admin_client: AdminClient | None = None,
+    runtime_requirement: str | None = None,
+) -> dict[str, Any]:
+    """Create an all-or-nothing strict pool on one locked provider route."""
+    if type(count) is not int or not 1 <= count <= MAX_PERSONA_MEMORY_POOL_COUNT:
+        raise ProvisionError(
+            f"pool count must be between 1 and {MAX_PERSONA_MEMORY_POOL_COUNT}"
+        )
+    selected_profile_id = str(profile_id or "").strip()
+    if selected_profile_id not in PROFILE_SPECS:
+        raise ProvisionError("pool profile is outside the locked API-key matrix")
+    requirement = runtime_requirement or RUNTIME_V2_REQUIREMENT
+    if requirement not in {BASELINE_RUNTIME_REQUIREMENT, RUNTIME_V2_REQUIREMENT}:
+        raise ProvisionError("runtime requirement is invalid")
+    manifest_path = _validate_new_private_manifest_path(manifest_path)
+
+    profiles = _load_coverage(coverage_path)
+    profile = next(
+        row
+        for row in profiles
+        if str(row.get("profile_id") or "") == selected_profile_id
+    )
+    spec = PROFILE_SPECS[selected_profile_id]
+    active_env = os.environ if env is None else env
+    base_url = validate_base_url(_required_env(active_env, "QA_FEEDLING_BASE_URL"))
+    admin_token = _required_env(active_env, "QA_TEST_ADMIN_TOKEN")
+
+    # Validate every selected-route input before checking the reaper or creating
+    # external state. Unrelated provider credentials are deliberately not read.
+    model = _model_for(profile, spec, active_env)
+    provider_key = _required_env(active_env, spec.credential_env)
+    provider_base_url = _provider_base_url_for(profile, spec, active_env)
+    reasoning_effort = _reasoning_effort_for(profile)
+    active_client = client or SmokeClient(base_url)
+    active_admin = admin_client or AdminClient(
+        base_url, admin_token, active_client._ssl
+    )
+    reaper_receipt = _verify_synthetic_reaper(active_admin)
+    run_id = normalize_synthetic_run_id(active_env.get("QA_RUN_ID") or "local")
+    manifest: dict[str, Any] = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "manifest_kind": PERSONA_MEMORY_POOL_MANIFEST_KIND,
+        "generated_at": _utc_now(),
+        "base_url": base_url,
+        "runtime_mode": requirement,
+        "pool_profile_id": selected_profile_id,
+        "pool_count": count,
+        "synthetic_account_reaper": reaper_receipt,
+        "profiles": [],
+        "auxiliary_accounts": [],
+    }
+    persisted_profile_count = 0
+
+    try:
+        for pool_index in range(1, count + 1):
+            label = (
+                f"{SYNTHETIC_LABEL_PREFIX}{run_id}-{selected_profile_id}-"
+                f"{pool_index:03d}"
+            )
+            try:
+                session, synthetic_lease = active_admin.register_synthetic(
+                    label,
+                    run_id=run_id,
+                    ttl_seconds=int(reaper_receipt["max_ttl_seconds"]),
+                )
+            except Exception:
+                raise ProvisionError(
+                    f"pool account registration failed at index: {pool_index}"
+                ) from None
+            try:
+                entry = _manifest_entry(
+                    profile,
+                    spec,
+                    model,
+                    spec.expected_configured_base_url,
+                    reasoning_effort,
+                    session,
+                    label,
+                    runtime_requirement=requirement,
+                    synthetic_lease=synthetic_lease,
+                )
+                entry["pool_index"] = pool_index
+            except Exception:
+                _reset_one(
+                    active_client,
+                    {
+                        "profile_id": selected_profile_id,
+                        "user_id": str(getattr(session, "user_id", "")),
+                        "api_key": str(getattr(session, "api_key", "")),
+                    },
+                    active_admin,
+                )
+                raise ProvisionError(
+                    f"pool account registration failed at index: {pool_index}"
+                ) from None
+            manifest["profiles"].append(entry)
+            _atomic_write_manifest(manifest_path, manifest)
+            persisted_profile_count = len(manifest["profiles"])
+
+            try:
+                _check_fresh_account(active_client, session, entry)
+                _atomic_write_manifest(manifest_path, manifest)
+                _check_invalid_key(
+                    active_client,
+                    session,
+                    spec,
+                    model,
+                    provider_base_url,
+                    reasoning_effort,
+                    entry,
+                )
+                _atomic_write_manifest(manifest_path, manifest)
+                _configure_valid_key(
+                    active_client,
+                    session,
+                    spec,
+                    model,
+                    provider_base_url,
+                    spec.expected_configured_base_url,
+                    reasoning_effort,
+                    provider_key,
+                    entry,
+                )
+                _atomic_write_manifest(manifest_path, manifest)
+                _enable_trace(active_client, session, entry)
+                _atomic_write_manifest(manifest_path, manifest)
+                # Runtime V2 auto-migrates configured model-API users.  Pools
+                # qualify the same production user path as the locked matrix;
+                # they must never rely on an admin-only mode mutation.
+                _verify_diagnostic_runtime(
+                    active_client,
+                    session,
+                    entry,
+                    runtime_requirement=requirement,
+                )
+                entry["provision_status"] = PROVISION_STATUS_READY
+                entry["provision_failure_code"] = PROVISION_FAILURE_NONE
+                _atomic_write_manifest(manifest_path, manifest)
+            except _ProfileProvisionFailure as failure:
+                entry["provision_status"] = PROVISION_STATUS_BLOCKED
+                entry["provision_failure_code"] = failure.code
+                _atomic_write_manifest(manifest_path, manifest)
+                raise ProvisionError(
+                    f"pool account provisioning blocked: {failure.code}"
+                ) from None
+
+        if not _complete_pool_manifest(manifest):
+            raise ProvisionError("provisioning did not produce a complete account pool")
+    except Exception:
+        # The aggregate manifest is the cleanup authority. A lost response from
+        # the non-idempotent registration endpoint remains covered by the
+        # server-signed expiry lease even when no credentials reached this process.
+        recovery_entries = list(manifest["profiles"][persisted_profile_count:])
+        try:
+            result = cleanup(
+                manifest_path,
+                env=active_env,
+                client=active_client,
+                admin_client=active_admin,
+            )
+            if result["manifest_missing"]:
+                recovery_entries = list(manifest["profiles"])
+        except Exception:
+            recovery_entries = list(manifest["profiles"])
+        unrecovered = [
+            entry
+            for entry in recovery_entries
+            if not _reset_one(active_client, entry, active_admin)
+        ]
+        if unrecovered:
+            # Preserve every credential we know, including an account whose
+            # first checkpoint failed, so `cleanup --manifest` can retry. The
+            # server-side signed lease remains the final fallback if storage is
+            # unavailable and this recovery checkpoint also fails.
+            try:
+                _atomic_write_manifest(manifest_path, manifest)
+            except Exception:
+                pass
+        raise
+
+    return manifest
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1632,6 +2429,24 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="qualify the currently deployed runtime without selecting Runtime V2",
     )
+    pool = commands.add_parser(
+        "provision-pool",
+        help="create a strict same-route persona-memory account pool",
+    )
+    pool.add_argument("--coverage", type=Path, default=Path("qa/coverage-lock.json"))
+    pool.add_argument("--manifest", type=Path, required=True)
+    pool.add_argument("--profile", required=True)
+    pool.add_argument("--count", type=int, required=True)
+    pool.add_argument(
+        "--require-runtime-v2",
+        action="store_true",
+        help="require hosted_resident runtime version 2 (the default)",
+    )
+    pool.add_argument(
+        "--baseline-runtime",
+        action="store_true",
+        help="qualify the currently deployed runtime without selecting Runtime V2",
+    )
     remove = commands.add_parser(
         "cleanup", help="reset all accounts in a private manifest"
     )
@@ -1639,21 +2454,55 @@ def _parser() -> argparse.ArgumentParser:
     remove.add_argument("--receipt", type=Path)
     remove.add_argument("--run-id")
     remove.add_argument("--retain-manifest", action="store_true")
+    remove_run = commands.add_parser(
+        "cleanup-run",
+        help="authoritatively reset signed accounts for one normalized run ID",
+    )
+    remove_run.add_argument("--run-id", required=True)
+    remove_run.add_argument("--receipt", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.command == "provision":
+        if args.command in {"provision", "provision-pool"}:
             if args.require_runtime_v2 and args.baseline_runtime:
                 raise ProvisionError("runtime requirement flags are mutually exclusive")
             requirement = (
                 BASELINE_RUNTIME_REQUIREMENT
                 if args.baseline_runtime
-                or (args.diagnostic and not args.require_runtime_v2)
+                or (
+                    args.command == "provision"
+                    and args.diagnostic
+                    and not args.require_runtime_v2
+                )
                 else RUNTIME_V2_REQUIREMENT
             )
+            if args.command == "provision-pool":
+                result = provision_pool(
+                    args.coverage,
+                    args.manifest,
+                    profile_id=args.profile,
+                    count=args.count,
+                    runtime_requirement=requirement,
+                )
+                if not _complete_pool_manifest(result):
+                    raise ProvisionError(
+                        "provisioning did not produce a complete account pool"
+                    )
+                print(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "manifest_kind": PERSONA_MEMORY_POOL_MANIFEST_KIND,
+                            "pool_profile_id": result["pool_profile_id"],
+                            "pool_count": result["pool_count"],
+                            "manifest": str(args.manifest),
+                        }
+                    )
+                )
+                return 0
             if args.diagnostic:
                 result = provision(
                     args.coverage,
@@ -1696,6 +2545,28 @@ def main(argv: list[str] | None = None) -> int:
                 summary["qualification_mode"] = QUALIFICATION_MODE_DIAGNOSTIC
             print(json.dumps(summary))
             return 0
+        if args.command == "cleanup-run":
+            result = cleanup_run(args.run_id, args.receipt)
+            ok = bool(
+                result["complete"]
+                and result["operation_failure_count"] == 0
+                and result["remaining_count"] == 0
+            )
+            print(
+                json.dumps(
+                    {
+                        "ok": ok,
+                        "matched_count": result["matched_count"],
+                        "deleted_count": result["deleted_count"],
+                        "operation_failure_count": result[
+                            "operation_failure_count"
+                        ],
+                        "remaining_count": result["remaining_count"],
+                        "receipt": str(args.receipt),
+                    }
+                )
+            )
+            return 0 if ok else 1
         result = cleanup(
             args.manifest,
             receipt_path=args.receipt,

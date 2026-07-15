@@ -35,6 +35,8 @@ def _paths(tmp_path: Path) -> dict[str, Path | str | list[Path]]:
     worker_root = private / "workers"
     worker_outputs = private / "worker-outputs"
     aggregation_inputs = private / "aggregation-inputs"
+    persona_judge_root = private / "persona-judge"
+    persona_judge_scratch_root = private / "persona-judge-scratch"
     for directory in (
         codex_home,
         supervisor_home,
@@ -44,8 +46,12 @@ def _paths(tmp_path: Path) -> dict[str, Path | str | list[Path]]:
         worker_root,
         worker_outputs,
         aggregation_inputs,
+        persona_judge_root,
+        persona_judge_scratch_root,
     ):
         _mkdir_private(directory)
+    for leaf in ("home", "tmp", "work"):
+        _mkdir_private(persona_judge_root / leaf)
     for _, agent_type in PROFILE_AGENT_TYPES:
         agent_root = worker_root / agent_type
         _mkdir_private(agent_root)
@@ -71,6 +77,8 @@ def _paths(tmp_path: Path) -> dict[str, Path | str | list[Path]]:
         "worker_output_root": worker_outputs,
         "aggregation_input_root": aggregation_inputs,
         "orchestration_receipt": private / "orchestration-receipt.json",
+        "persona_judge_root": persona_judge_root,
+        "persona_judge_scratch_root": persona_judge_scratch_root,
         "codex_model": "gpt-5.4",
         "allowed_host": "test-api.feedling.app",
         "worker_python": worker_python,
@@ -79,7 +87,7 @@ def _paths(tmp_path: Path) -> dict[str, Path | str | list[Path]]:
     }
 
 
-def test_bundle_isolates_eight_top_level_profiles_and_aggregation(tmp_path):
+def test_bundle_isolates_workers_aggregation_and_persona_judge(tmp_path):
     values = _paths(tmp_path)
     bundle = writer.build_config_bundle(**values)
     document = tomllib.loads(bundle.main)
@@ -112,7 +120,7 @@ def test_bundle_isolates_eight_top_level_profiles_and_aggregation(tmp_path):
         not in document["shell_environment_policy"]["include_only"]
     )
 
-    assert len(bundle.profiles) == len(PROFILE_AGENT_TYPES) == 8
+    assert len(bundle.profiles) == len(PROFILE_AGENT_TYPES) + 1 == 9
     manifests = Path(values["profile_manifest_dir"])
     worker_root = Path(values["worker_root"])
     permissions = document["permissions"]
@@ -167,6 +175,53 @@ def test_bundle_isolates_eight_top_level_profiles_and_aggregation(tmp_path):
         for leaf in ("home", "tmp", "work"):
             assert policy[str((worker_root / agent_type / leaf).resolve())] == "write"
 
+    judge_root = Path(values["persona_judge_root"])
+    judge_path = (
+        Path(values["output"]).parent
+        / f"{writer.PERSONA_MEMORY_JUDGE_PROFILE_NAME}.config.toml"
+    )
+    judge_profile = tomllib.loads(bundle.profiles[judge_path])
+    judge_permission = permissions[writer.PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE]
+    judge_policy = judge_permission["filesystem"]
+
+    assert (
+        judge_profile["default_permissions"]
+        == writer.PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE
+    )
+    assert judge_profile["model"] == "gpt-5.4"
+    assert judge_profile["approval_policy"] == "never"
+    assert set(judge_profile["shell_environment_policy"]["include_only"]) == {
+        "HOME",
+        "PATH",
+        "LANG",
+        "TMPDIR",
+        "PYTHONDONTWRITEBYTECODE",
+        "QA_RUN_ID",
+        "QA_WORK_ROOT",
+    }
+    assert "QA_FEEDLING_BASE_URL" not in bundle.profiles[judge_path]
+    assert "QA_TEST_ADMIN_TOKEN" not in bundle.profiles[judge_path]
+    assert "QA_PRIVATE_MANIFEST" not in bundle.profiles[judge_path]
+    assert judge_permission["network"]["enabled"] is False
+    assert "domains" not in judge_permission["network"]
+    for denied in (
+        values["source_root"],
+        values["artifact_root"],
+        values["full_manifest"],
+        values["profile_manifest_dir"],
+        values["worker_root"],
+        values["worker_output_root"],
+        values["aggregation_input_root"],
+        values["orchestration_receipt"],
+        Path(values["output"]).parent,
+        values["persona_judge_scratch_root"],
+        *values["runtime_read_roots"],
+    ):
+        assert judge_policy[str(Path(denied).resolve())] == "deny"
+    assert judge_policy[str(judge_root.resolve())] == "write"
+    for leaf in ("home", "tmp", "work"):
+        assert judge_policy[str((judge_root / leaf).resolve())] == "write"
+
 
 def test_local_binding_is_explicit_and_applies_to_every_locked_profile(tmp_path):
     values = _paths(tmp_path)
@@ -174,7 +229,12 @@ def test_local_binding_is_explicit_and_applies_to_every_locked_profile(tmp_path)
 
     document = tomllib.loads(writer.build_config_bundle(**values).main)
 
-    for permission in document["permissions"].values():
+    for name, permission in document["permissions"].items():
+        if name == writer.PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE:
+            assert permission["network"]["enabled"] is False
+            assert permission["network"]["allow_local_binding"] is False
+            assert "domains" not in permission["network"]
+            continue
         assert permission["network"]["allow_local_binding"] is True
         assert permission["network"]["domains"] == {"test-api.feedling.app": "allow"}
 
@@ -236,6 +296,8 @@ def test_pinned_codex_applies_each_top_level_profile_permission(tmp_path):
     canonical.chmod(0o600)
     public_artifact = Path(values["artifact_root"]) / "result.json"
     public_artifact.write_text("{}\n")
+    source_private = Path(values["source_root"]) / "qa" / "private.json"
+    source_private.write_text("{}\n")
 
     profile_id, agent_type = PROFILE_AGENT_TYPES[0]
     own_manifest = manifests / f"{profile_id}.json"
@@ -297,6 +359,46 @@ def test_pinned_codex_applies_each_top_level_profile_permission(tmp_path):
     for denied in (own_manifest, full_manifest, raw_result, public_artifact):
         assert supervisor_cat(denied).returncode != 0, denied
 
+    judge_root = Path(values["persona_judge_root"])
+    judge_work = judge_root / "work"
+    judge_scratch = judge_work / "scratch.json"
+    judge_scratch.write_text("{}\n")
+    judge_scratch.chmod(0o600)
+
+    def judge_cat(path: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                codex,
+                "sandbox",
+                "-p",
+                writer.PERSONA_MEMORY_JUDGE_PROFILE_NAME,
+                "-P",
+                writer.PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE,
+                "-C",
+                str(judge_work),
+                "/bin/cat",
+                str(path),
+            ],
+            cwd=judge_work,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert judge_cat(judge_scratch).returncode == 0
+    for denied in (
+        source_private,
+        own_manifest,
+        full_manifest,
+        receipt,
+        raw_result,
+        canonical,
+        public_artifact,
+        output,
+    ):
+        assert judge_cat(denied).returncode != 0, denied
+
 
 @pytest.mark.parametrize(
     ("field", "replacement"),
@@ -327,6 +429,33 @@ def test_private_directories_must_be_owner_only_and_empty(tmp_path):
     stale = Path(values["worker_output_root"]) / "stale.json"
     stale.write_text("{}\n")
     with pytest.raises(writer.CodexConfigError, match="must be empty"):
+        writer.build_config_bundle(**values)
+
+    values = _paths(tmp_path / "judge-stale")
+    (Path(values["persona_judge_root"]) / "stale.json").write_text("{}\n")
+    with pytest.raises(writer.CodexConfigError, match="only clean roots"):
+        writer.build_config_bundle(**values)
+
+    values = _paths(tmp_path / "judge-permissions")
+    (Path(values["persona_judge_root"]) / "work").chmod(0o755)
+    with pytest.raises(writer.CodexConfigError, match="persona judge work.*owner-only"):
+        writer.build_config_bundle(**values)
+
+    values = _paths(tmp_path / "judge-scratch")
+    (Path(values["persona_judge_scratch_root"]) / "stale.json").write_text("{}\n")
+    with pytest.raises(writer.CodexConfigError, match="scratch root.*empty"):
+        writer.build_config_bundle(**values)
+
+
+def test_persona_judge_profile_and_scratch_roots_are_atomic_configuration(tmp_path):
+    values = _paths(tmp_path)
+    values["persona_judge_scratch_root"] = None
+    with pytest.raises(writer.CodexConfigError, match="configured together"):
+        writer.build_config_bundle(**values)
+
+    values = _paths(tmp_path / "second")
+    values["persona_judge_root"] = None
+    with pytest.raises(writer.CodexConfigError, match="configured together"):
         writer.build_config_bundle(**values)
 
 

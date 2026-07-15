@@ -298,6 +298,14 @@ async def qa_synthetic_account_register(request: Request):
         return JSONResponse(
             {"error": "synthetic_account_reaper_not_ready"}, status_code=503
         )
+    except qa_synthetic_accounts.SyntheticAccountRunClosed:
+        return JSONResponse(
+            {"error": "synthetic_account_run_closed"}, status_code=409
+        )
+    except qa_synthetic_accounts.SyntheticAccountStoreUnavailable:
+        return JSONResponse(
+            {"error": "synthetic_account_store_unavailable"}, status_code=503
+        )
     return JSONResponse(result, status_code=201)
 
 
@@ -316,6 +324,26 @@ async def qa_synthetic_account_absence(request: Request):
         )
     except qa_synthetic_accounts.SyntheticAccountDisabled:
         return JSONResponse({"error": "synthetic_accounts_disabled"}, status_code=503)
+    except qa_synthetic_accounts.SyntheticAccountStoreUnavailable:
+        return JSONResponse(
+            {"error": "synthetic_account_store_unavailable"}, status_code=503
+        )
+    return JSONResponse(result)
+
+
+@router.post("/v1/admin/qa/synthetic-accounts/cleanup-run")
+async def qa_synthetic_account_cleanup_run(request: Request):
+    """Authoritatively sweep signed QA accounts for one normalized run ID."""
+    _require_admin(request)
+    payload = (await read_json_silent(request)) or {}
+    try:
+        result = await threadpool.run_db(
+            qa_synthetic_accounts.cleanup_synthetic_run, payload
+        )
+    except qa_synthetic_accounts.SyntheticAccountBadRequest:
+        return JSONResponse(
+            {"error": "invalid_synthetic_account_run"}, status_code=400
+        )
     except qa_synthetic_accounts.SyntheticAccountStoreUnavailable:
         return JSONResponse(
             {"error": "synthetic_account_store_unavailable"}, status_code=503

@@ -142,7 +142,9 @@ deployed through the normal protected `test` process, any collaborator with
 write access can run:
 
 ```bash
-gh workflow run ci.yml --ref main -f runtime_target=deployed_current
+gh workflow run ci.yml --ref main \
+  -f runtime_target=hosted_resident \
+  -f persona_repetitions=1
 ```
 
 Use `hosted_resident` when every configured synthetic profile is expected to
@@ -150,13 +152,19 @@ read back exact mode `hosted_resident` and version `2` through
 `/v1/model_api/runtime`, and to preserve that target through the parent-owned
 P0-05/P0-07 live probes. `deployed_current` remains the baseline target: it
 verifies the exact deployed backend SHA and the configured user path without
-claiming V2. Neither target invents unavailable worker SHA/count evidence.
+claiming V2, and records persona-memory as `NOT_FORMALLY_QUALIFIED`. Use
+`persona_repetitions=1` for the default eight-account developer smoke lane or
+`3` for the 24-account release-depth lane. Neither target invents unavailable
+worker SHA/count evidence.
 
 Provisioning waits for an exact-name, exact-label, online, idle runner before
 the secret-bearing job is queued. Startup failure triggers immediate hosted
 rollback. Final hosted cleanup runs even when qualification fails or is
-cancelled, and tag-based discovery still works if the instance-ID output was
-lost.
+cancelled. Before instance cleanup, a separate GitHub-hosted job uses only
+`QA_TEST_ADMIN_TOKEN` to sweep both exact synthetic-account run IDs with bounded
+retries and requires database-authoritative `remaining_count=0`; this path does
+not depend on a JIT manifest. Tag-based instance discovery still works if the
+instance-ID output was lost.
 
 Before enabling team-wide runs, perform one infrastructure canary with capped
 QA credentials. Confirm the real GitHub runner-group response passes the exact
@@ -169,7 +177,11 @@ for that first live AWS/GitHub integration proof.
 
 There is no always-on evaluator. Each dispatch creates at most one on-demand
 `m7i.xlarge` and one encrypted 40 GiB gp3 root volume. Normal completion shuts
-it down immediately; EC2's shutdown behavior is `terminate`. The maximum
-lifetime is bounded to five hours, with the scheduled reaper as a final safety
-net. Provider/model usage is separately limited by the dedicated capped QA
-accounts and keys.
+it down immediately; EC2's shutdown behavior is `terminate`. The lifetime is
+bounded to six hours, with the scheduled reaper as a final
+safety net. The release-depth qualification job is capped at 330 minutes and the
+instance hard expiry is six hours. The serial GitHub-hosted account sweep and
+AWS/runner cleanup jobs are each capped at 20 minutes; the hard expiry remains
+independent and can terminate the VM while those hosted controllers finish.
+Provider/model usage is separately limited by the dedicated capped QA accounts
+and keys.

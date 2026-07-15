@@ -5,6 +5,11 @@ Feedling API-key users. It intentionally covers API-key users only. VPS/OAuth,
 iOS UI automation, and customer-incident replay remain separate follow-up
 workstreams.
 
+The dependency-light persona/memory baseline-candidate harness lives in
+[`qa/regression/README.md`](regression/README.md). Its deterministic contract
+tests run in ordinary CI; live execution remains an explicit, credentialed QA
+operation.
+
 ## What runs
 
 There are two targets:
@@ -191,7 +196,7 @@ does not create Feedling users or call provider endpoints:
 ```sh
 python3 qa/run_local_diagnostic.py \
   --env-file /absolute/path/.env.test \
-  --codex-model gpt-5.4 \
+  --codex-model gpt-5.6 \
   --profile official-gemini \
   --preflight-only
 ```
@@ -318,6 +323,11 @@ short-lived accounts, and prove cleanup. The adminless local diagnostic does not
 use it. Runtime selection and runtime readback are authenticated user operations,
 not admin operations. The bounded QA admin calls include:
 
+- `POST /v1/admin/qa/synthetic-accounts/register`, with a normalized run ID
+  and an exact `agent-e2e-<run-id>-` label prefix. The backend mints the signed,
+  short-lived lease and rejects registration after that run enters terminal
+  cleanup;
+
 - `POST /v1/admin/qa/synthetic-accounts/absence` after cleanup, with the
   private `user_id`, `lease_id`, and server-issued HMAC absence token from the
   registration receipt. The endpoint verifies that lease attestation and reads
@@ -326,7 +336,12 @@ not admin operations. The bounded QA admin calls include:
   fresh reset or an already-reset `401`; and
 - `GET /v1/admin/qa/synthetic-account-reaper`, before creating any account, to
   require an enabled `agent-e2e-` label reaper with a maximum TTL no greater
-  than four hours.
+  than four hours; and
+- `POST /v1/admin/qa/synthetic-accounts/cleanup-run`, which atomically closes a
+  normalized run against late registration, deletes every server-signed row
+  under its exact label prefix, reloads PostgreSQL authoritatively, and returns
+  only aggregate hashes and counts. This manifest-independent zero-remaining
+  proof covers a lost registration response or a destroyed runner.
 
 This token has broader test-admin authority because the backend shares one
 admin credential across admin routes. Keep it in the protected
@@ -401,16 +416,22 @@ reasoning metadata and token accounting required by `P0-12`; a model without
 that capability correctly fails the release gate rather than silently reducing
 coverage:
 
-- `QA_CODEX_MODEL` (pin to `gpt-5.4` for the qualified Codex CLI contract)
-- `QA_DEEPSEEK_MODEL`
-- `QA_ANTHROPIC_MODEL`
-- `QA_OPENAI_MODEL`
-- `QA_GEMINI_MODEL`
-- `QA_OPENROUTER_CLAUDE_MODEL`
-- `QA_OPENROUTER_OPENAI_MODEL`
-- `QA_OPENROUTER_GLM_MODEL`
-- `QA_KONGBEIQIE_MODEL`
+- `QA_CODEX_MODEL=gpt-5.6`
+- `QA_DEEPSEEK_MODEL=deepseek-v4-flash`
+- `QA_ANTHROPIC_MODEL=claude-sonnet-5`
+- `QA_OPENAI_MODEL=gpt-5.6-terra`
+- `QA_GEMINI_MODEL=gemini-3.5-flash`
+- `QA_OPENROUTER_CLAUDE_MODEL=anthropic/claude-sonnet-5`
+- `QA_OPENROUTER_OPENAI_MODEL=openai/gpt-5.6-terra`
+- `QA_OPENROUTER_GLM_MODEL=z-ai/glm-5.2`
+- `QA_KONGBEIQIE_MODEL=[特价纯血]claude-sonnet-5`
 - `QA_KONGBEIQIE_BASE_URL` (the normalized HTTPS OpenAI-compatible endpoint)
+
+These are explicit recommended pins, not hidden defaults. Verify every exact ID
+against the configured provider endpoint before a live run; availability and
+reasoning/token metadata can differ by account, region, or relay catalog. Keep
+the variables required so a provider rename fails preflight instead of silently
+changing the measuring instrument.
 
 Add the non-secret disposable-runner variables described in
 [`qa/aws/README.md`](aws/README.md):
@@ -507,6 +528,52 @@ and credential-broker design (for example, short-lived scoped credentials or a
 trusted provider proxy) before it can preserve the same boundary. That preview
 and broker layer is explicitly not implemented by this version.
 
+The same dispatch also runs candidate-only persona and memory qualification
+after the mandatory eight-provider P0 matrix. `persona_repetitions=1` is the
+default developer smoke lane and uses eight fresh official-OpenAI synthetic
+accounts; `persona_repetitions=3` is release depth and uses 24. The deep lane is
+formal only for `runtime_target=hosted_resident`, where every account must prove
+the expected Hosted Runtime V2 user-path mode and version. Worker binary SHA and
+live-worker count remain unavailable and are not claimed. `deployed_current`
+does not require that strict V2 proof and records an explicit
+`NOT_FORMALLY_QUALIFIED` artifact rather than claiming missing coverage.
+
+The semantic judge reuses the run-scoped ChatGPT OAuth and `QA_CODEX_MODEL`; no
+`QA_EVAL_JUDGE_API_KEY` exists. Provision/import, Codex evaluation, and cleanup
+are separate workflow steps, and provider/admin secrets never enter the Codex
+step. Finalized cleanup must prove every synthetic account absent before the
+allowlisted `persona-memory-summary.json` and `persona-memory-matrix.md` can be
+uploaded. Raw conversations, judge rationales, evidence IDs, and account
+fingerprints remain private and are deleted with the disposable runner.
+
+An independent `cleanup-synthetic-accounts` job then runs on GitHub-hosted
+infrastructure under the same protected `feedling-e2e-test` environment. It
+uses only `QA_TEST_ADMIN_TOKEN`, derives the exact base and `-persona-memory`
+run IDs, and retries the idempotent `cleanup-run` admin operation at most two
+times per ID. The workflow fails unless the database-authoritative receipts
+prove zero operation failures and zero remaining accounts. Because this sweep
+does not depend on the disposable runner or a credential manifest, it also
+covers runner crashes and registration responses lost before checkpointing;
+private runner scratch is always removed instead of being retained for recovery.
+The backend closes each run ID under the same cross-worker database lock used by
+registration before it scans, so an in-flight registration either commits in
+time to be swept or is rejected after closure.
+On success, the hosted job uploads a separate 14-day
+`feedling-synthetic-cleanup-<run>-<attempt>` artifact and writes the same exact
+aggregate counts and hashes to the GitHub step summary; neither output contains
+run IDs, account identities, credentials, or response text.
+
+Release-depth timing is bounded explicitly: the qualification job may run for
+330 minutes, the disposable evaluator self-terminates after six hours, persona
+prepare/live/cleanup steps are capped at 60/120/30 minutes, the hosted account
+sweep at 20 minutes, and runner teardown at 20 minutes. The instance hard expiry
+is independent: it enforces the six-hour cap even if the serial GitHub-hosted
+cleanup controller is still finishing after the qualification deadline. The
+default smoke lane normally finishes substantially sooner. Persona readiness
+additionally refuses to start unless every account lease has at least 9,000
+seconds remaining, covering the 120-minute live step plus 30 minutes of post-run
+verification and local cleanup.
+
 ## Before a live run
 
 For a baseline local run, the deployed endpoint needs the existing API-key
@@ -570,9 +637,11 @@ claim about an unobservable worker binary or internal queue topology.
 
 Runner cleanup has four independent paths: normal one-job shutdown with EC2
 terminate-on-shutdown, a GitHub-hosted `always()` cleanup job, a root-owned
-five-hour hard-expiry timer, and an hourly GitHub-hosted AWS tag reaper. The
-backend still needs its separate server-side TTL/reaper for `agent-e2e-*`
-synthetic accounts so an abruptly lost runner cannot strand test users.
+six-hour hard-expiry timer, and an hourly GitHub-hosted AWS tag reaper. The
+synthetic accounts have separate protection: manifest-bound local cleanup,
+the GitHub-hosted run-wide database sweep, and the backend TTL reaper. The
+hosted sweep is ordered before AWS teardown and does not need the JIT evaluator
+to survive.
 
 ## Artifacts and qualification result
 

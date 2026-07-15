@@ -61,7 +61,7 @@
       "provider": "gemini",
       "provider_key_env": "QA_GEMINI_API_KEY",
       "model_env": "QA_GEMINI_MODEL",
-      "allowed_model_regex": "^gemini-2\\.5-[a-z0-9][a-z0-9._-]*$",
+      "allowed_model_regex": "^gemini-(?:2\\.5|3\\.5)-[a-z0-9][a-z0-9._-]*$",
       "reasoning_effort": "medium",
       "reasoning_expected": true
     },

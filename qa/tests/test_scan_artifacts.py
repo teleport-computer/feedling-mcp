@@ -44,6 +44,18 @@ def _write_inputs(
         encoding="utf-8",
     )
     (artifacts / "memory-contract.json").write_text("{}\n", encoding="utf-8")
+    (artifacts / "persona-memory-summary.json").write_text(
+        json.dumps(
+            {
+                "kind": "persona_memory_qualification_summary",
+                "status": "PASS",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "persona-memory-matrix.md").write_text(
+        "persona memory matrix\n", encoding="utf-8"
+    )
     (artifacts / "matrix.md").write_text("matrix\n", encoding="utf-8")
     (artifacts / "latency.csv").write_text("latency_ms\n", encoding="utf-8")
     (artifacts / "junit.xml").write_text("<testsuite/>\n", encoding="utf-8")
@@ -160,6 +172,34 @@ def test_forbidden_raw_field_fails(tmp_path):
     (artifacts / "profiles" / "official-deepseek.json").write_text(
         json.dumps({"body_ct": "not-even-a-real-ciphertext"}), encoding="utf-8"
     )
+    assert scanner.scan_artifacts(
+        artifacts, manifest, memory_manifest, codex_auth, fixture, env=env
+    ) == ["public artifact contains a forbidden private-data field"]
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "prompt",
+        "response",
+        "rationale",
+        "evidence_turn_ids",
+        "account_fingerprints",
+        "turn_id",
+        "session_id",
+        "request_id",
+        "response_id",
+        "trace_id",
+    ),
+)
+def test_persona_summary_rejects_private_evidence_fields(tmp_path, field):
+    artifacts, manifest, memory_manifest, codex_auth, fixture, env = _write_inputs(
+        tmp_path
+    )
+    (artifacts / "persona-memory-summary.json").write_text(
+        json.dumps({field: "private-value"}), encoding="utf-8"
+    )
+
     assert scanner.scan_artifacts(
         artifacts, manifest, memory_manifest, codex_auth, fixture, env=env
     ) == ["public artifact contains a forbidden private-data field"]

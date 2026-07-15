@@ -355,6 +355,38 @@ def test_qualification_polling_accepts_explicit_exact_turn_id(monkeypatch):
     assert record["message"]["id"] == "reply-1"
 
 
+def test_qualification_polling_passes_remaining_deadline_to_single_http_attempt(
+    monkeypatch,
+):
+    sess = _session()
+    smoke = client.SmokeClient("https://example.test")
+    reply = _assistant_turn("exact", sess, item_id="reply-1", ts=11)
+    calls = []
+
+    def fake_req(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 200, {
+            "messages": [
+                _user_turn("user-1", 10, reply_message_id="reply-1"),
+                reply,
+            ]
+        }
+
+    monkeypatch.setattr(smoke, "_req", fake_req)
+
+    smoke.poll_reply_record(
+        sess,
+        after_ts=10,
+        timeout=3,
+        interval=0,
+        user_message_id="user-1",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1]["attempts"] == 1
+    assert 0 < calls[0][1]["read_timeout"] <= 3
+
+
 def test_send_then_qualification_poll_uses_cached_exact_turn_id(monkeypatch):
     sess = _session()
     smoke = client.SmokeClient("https://example.test")

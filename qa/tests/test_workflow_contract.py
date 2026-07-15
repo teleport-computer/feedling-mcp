@@ -6,6 +6,9 @@ from pathlib import Path
 WORKFLOW = (
     Path(__file__).resolve().parents[2] / ".github" / "workflows" / "api-key-e2e.yml"
 ).read_text(encoding="utf-8")
+PROVISIONER = (
+    Path(__file__).resolve().parents[2] / "qa" / "provision_profiles.py"
+).read_text(encoding="utf-8")
 
 
 def _step(name: str, next_name: str) -> str:
@@ -31,7 +34,8 @@ def test_workflow_is_manual_only_and_uses_protected_jit_runner():
     assert "environment: feedling-e2e-test" in WORKFLOW
     assert "runs-on:\n      group: ${{ needs.provision-aws-runner.outputs.runner_group }}" in WORKFLOW
     assert "labels: ${{ needs.provision-aws-runner.outputs.runner_label }}" in WORKFLOW
-    assert "timeout-minutes: 240" in WORKFLOW
+    assert "timeout-minutes: 330" in WORKFLOW
+    assert "--ttl-seconds 21600" in WORKFLOW
     assert "group: feedling-test-environment" in WORKFLOW
     assert "persist-credentials: false" in WORKFLOW
     assert "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5" in WORKFLOW
@@ -187,7 +191,7 @@ def test_github_hosted_cleanup_always_terminates_exact_managed_attempt():
     )
     assert "needs.provision-aws-runner.result == 'success'" not in cleanup_header
     assert (
-        "needs: [validate-dispatch, provision-aws-runner, qualify-api-key-runtime]"
+        "needs: [validate-dispatch, provision-aws-runner, qualify-api-key-runtime, cleanup-synthetic-accounts]"
         in cleanup
     )
     assert "runs-on: ubuntu-24.04" in cleanup
@@ -290,6 +294,10 @@ def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
     assert "--worker-output-root" in preflight
     assert "--aggregation-input-root" in preflight
     assert "--orchestration-receipt" in preflight
+    assert "--persona-judge-root" in preflight
+    assert "--persona-judge-scratch-root" in preflight
+    assert "$QA_CODEX_HOME/persona_memory_judge.config.toml" in preflight
+    assert "Codex strict configuration file is unsafe" in preflight
     assert "--runtime-read-root" in preflight
     assert '--worker-python "$python_executable"' in preflight
     assert "--qualification-mode release" in preflight
@@ -311,6 +319,11 @@ def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
     assert "https://1.1.1.1/" in preflight
     assert "--noproxy" in preflight
     assert "-p profile_official_deepseek" in preflight
+    assert "sandbox -p persona_memory_judge" in preflight
+    assert "-P feedling-e2e-persona-memory-judge" in preflight
+    assert "QA_PERSONA_JUDGE_ROOT" in preflight
+    assert "feedling-persona-judge-preflight" in preflight
+    assert 'test ! -r "$denied"' in preflight
     assert "--strict-config" in preflight
     assert "--output-schema" in preflight
     assert "parse_exec_events" in preflight
@@ -330,6 +343,48 @@ def test_codex_preflight_network_denial_probe_has_balanced_conditionals():
 
     assert network_probe.count("if curl") == 2
     assert sum(line.strip() == "fi" for line in network_probe.splitlines()) == 2
+
+
+def test_persona_judge_profile_is_private_offline_and_reuses_codex_oauth():
+    context = _step(
+        "Prepare isolated run directories",
+        "Verify deployed endpoint and selected runtime target before qualification",
+    )
+    preflight = _step(
+        "Install and verify isolated headless Codex runtime",
+        "Provision eight isolated API-key profiles",
+    )
+    start = preflight.index("# The semantic judge is a separate top-level profile")
+    judge_probe = preflight[start:]
+
+    assert 'persona_judge_root="${private_root}/persona-judge"' in context
+    assert (
+        'persona_judge_scratch_root="${private_root}/persona-judge-scratch"'
+        in context
+    )
+    for leaf in ("home", "tmp", "work"):
+        assert f'"${{persona_judge_root}}/{leaf}"' in context
+    assert 'echo "persona_judge_root=$persona_judge_root"' in context
+    assert (
+        'echo "persona_judge_scratch_root=$persona_judge_scratch_root"' in context
+    )
+    assert "secrets.QA_CODEX_AUTH_JSON_B64" in preflight
+    assert 'CODEX_HOME="$QA_CODEX_HOME"' in judge_probe
+    assert "sandbox -p persona_memory_judge" in judge_probe
+    assert "-P feedling-e2e-persona-memory-judge" in judge_probe
+    assert "$QA_CODEX_HOME/auth.json" in judge_probe
+    assert "$QA_PERSONA_JUDGE_SCRATCH_ROOT" in judge_probe
+    assert "https://test-api.feedling.app/" in judge_probe
+    for forbidden in (
+        "QA_TEST_ADMIN_TOKEN",
+        "QA_DEEPSEEK_API_KEY",
+        "QA_ANTHROPIC_API_KEY",
+        "QA_OPENAI_PROVIDER_API_KEY",
+        "QA_OPENROUTER_API_KEY",
+        "QA_GEMINI_API_KEY",
+        "QA_KONGBEIQIE_API_KEY",
+    ):
+        assert forbidden not in judge_probe
 
 
 def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
@@ -359,10 +414,11 @@ def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
     ):
         assert f"secrets.{secret_name}" in provision
         assert f"secrets.{secret_name}" in scan
-        assert WORKFLOW.count(f"secrets.{secret_name}") == 2
+        expected_count = 3 if secret_name == "QA_OPENAI_PROVIDER_API_KEY" else 2
+        assert WORKFLOW.count(f"secrets.{secret_name}") == expected_count
         assert secret_name not in workers
         assert secret_name not in supervisor
-    assert WORKFLOW.count("secrets.QA_TEST_ADMIN_TOKEN") == 5
+    assert WORKFLOW.count("secrets.QA_TEST_ADMIN_TOKEN") == 8
     assert WORKFLOW.count("secrets.QA_CODEX_AUTH_JSON_B64") == 2
     assert "QA_TEST_ADMIN_TOKEN" not in workers
     assert "QA_TEST_ADMIN_TOKEN" not in supervisor
@@ -566,6 +622,283 @@ def test_manual_dispatch_defaults_to_strict_v2_and_preserves_baseline_option():
     assert '--expected-runtime "$QA_EXPECTED_RUNTIME"' in validate
 
 
+def test_persona_depth_is_locked_for_dispatch_and_reusable_workflow_calls():
+    trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
+    validation = _step(
+        "Reject qualification from any untrusted controller ref",
+        "Check out deployed test metadata without secrets",
+    )
+    context = _step(
+        "Prepare isolated run directories",
+        "Verify deployed endpoint and selected runtime target before qualification",
+    )
+
+    assert trigger.count("persona_repetitions:") == 2
+    assert 'default: "1"' in trigger
+    assert trigger.count('- "1"') == 1
+    assert trigger.count('- "3"') == 1
+    assert "type: string" in trigger
+    assert 'PERSONA_REPETITIONS: ${{ inputs.persona_repetitions }}' in validation
+    assert 'must be exactly 1 or 3' in validation
+    assert 'echo "persona_repetitions=$PERSONA_REPETITIONS"' in context
+
+
+def test_persona_live_judge_reuses_codex_oauth_without_admin_or_provider_secrets():
+    prepare = _step(
+        "Provision and prepare persona-memory account pool",
+        "Run OAuth-backed Codex persona-memory qualification",
+    )
+    live = _step(
+        "Run OAuth-backed Codex persona-memory qualification",
+        "Record non-formal persona qualification skip",
+    )
+    cleanup = _step(
+        "Cleanup persona-memory pool with authoritative absence evidence",
+        "Validate persona-memory cleanup and finalize arm evidence",
+    )
+
+    assert "secrets.QA_TEST_ADMIN_TOKEN" in prepare
+    assert "secrets.QA_OPENAI_PROVIDER_API_KEY" in prepare
+    assert "qa/provision_profiles.py provision-pool" in prepare
+    assert "qa/prepare_persona_memory_accounts.py prepare" in prepare
+    assert "--profile official-openai" in prepare
+    assert "PERSONA_REPETITIONS * 8" in prepare
+    assert "--require-runtime-v2" in prepare
+    assert "codex exec" not in prepare.lower()
+    assert "QA_CODEX_HOME" not in prepare
+    assert "QA_CODEX_AUTH_JSON_B64" not in prepare
+
+    assert "continue-on-error: true" in live
+    assert "env -i" in live
+    assert "qa/run_persona_memory_regression.py run-live" in live
+    assert '--codex-home "$QA_CODEX_HOME"' in live
+    assert '--judge-work-root "${QA_PERSONA_JUDGE_ROOT}/work"' in live
+    assert '--judge-work-root "$QA_PERSONA_JUDGE_SCRATCH_ROOT"' not in live
+    assert '--judge-model "$QA_CODEX_MODEL"' in live
+    assert "--judge-codex-profile persona_memory_judge" in live
+    assert "--judge-permission-profile feedling-e2e-persona-memory-judge" in live
+    assert "--judge-reasoning-effort medium" in live
+    assert "--allow-private-judge-egress" in live
+    assert "secrets." not in live
+    for forbidden in (
+        "QA_TEST_ADMIN_TOKEN",
+        "QA_DEEPSEEK_API_KEY",
+        "QA_ANTHROPIC_API_KEY",
+        "QA_OPENAI_PROVIDER_API_KEY",
+        "QA_OPENROUTER_API_KEY",
+        "QA_GEMINI_API_KEY",
+        "QA_KONGBEIQIE_API_KEY",
+        "QA_EVAL_JUDGE_API_KEY",
+    ):
+        assert forbidden not in live
+
+    assert "if: always()" in cleanup
+    assert "secrets.QA_TEST_ADMIN_TOKEN" in cleanup
+    assert "qa/prepare_persona_memory_accounts.py cleanup" in cleanup
+    assert "qa/provision_profiles.py cleanup" in cleanup
+    assert "cleanup-pending" in cleanup
+    assert "keep this" in cleanup
+    assert "step failed" in cleanup
+    assert "secrets.QA_OPENAI_PROVIDER_API_KEY" not in cleanup
+    assert "QA_CODEX_AUTH_JSON_B64" not in cleanup
+    assert "QA_EVAL_JUDGE_API_KEY" not in WORKFLOW
+
+
+def test_persona_formal_lane_is_hosted_only_and_records_diagnostic_skip():
+    prepare = _step(
+        "Provision and prepare persona-memory account pool",
+        "Run OAuth-backed Codex persona-memory qualification",
+    )
+    live = _step(
+        "Run OAuth-backed Codex persona-memory qualification",
+        "Record non-formal persona qualification skip",
+    )
+    skipped = _step(
+        "Record non-formal persona qualification skip",
+        "Verify deployed endpoint and selected runtime target after profile testing",
+    )
+
+    assert "inputs.runtime_target == 'hosted_resident'" in prepare
+    assert "inputs.runtime_target == 'hosted_resident'" in live
+    assert "inputs.runtime_target == 'deployed_current'" in skipped
+    assert "Not formally qualified" in skipped
+    assert "mandatory eight-provider P0 matrix still ran" in skipped
+    assert "qa/publish_persona_memory_summary.py" in skipped
+    assert "--nonformal-skip" in skipped
+    assert '--artifact-dir "$QA_ARTIFACT_DIR"' in skipped
+
+
+def test_persona_cleanup_is_validated_before_upload_and_private_scratch_is_removed():
+    cleanup = _step(
+        "Cleanup persona-memory pool with authoritative absence evidence",
+        "Validate persona-memory cleanup and finalize arm evidence",
+    )
+    finalize = _step(
+        "Validate persona-memory cleanup and finalize arm evidence",
+        "Validate deterministic cleanup receipt",
+    )
+    upload = _step(
+        "Upload sanitized public qualification artifacts",
+        "Remove public scratch after upload decision",
+    )
+    private_cleanup = _step(
+        "Remove private scratch after account cleanup",
+        "Enforce fail-closed qualification outcome",
+    )
+
+    assert "if: always()" in cleanup
+    assert "qa/verify_deployment.py" in cleanup
+    assert "qa/prepare_persona_memory_accounts.py cleanup" in cleanup
+    assert "failed=0" in cleanup
+    assert 'exit "$failed"' in cleanup
+    assert "qa/run_persona_memory_regression.py finalize-arm" in finalize
+    assert '--cleanup-receipt "$PERSONA_CLEANUP_RECEIPT"' in finalize
+    assert "qa/publish_persona_memory_summary.py" in finalize
+    assert '--arm-receipt "$PERSONA_ARM_RECEIPT"' in finalize
+    assert '--artifact-dir "$QA_ARTIFACT_DIR"' in finalize
+    assert "steps.persona_cleanup.outcome == 'success'" in upload
+    assert "steps.persona_finalize.outcome == 'success'" in upload
+    assert "if: always()" in private_cleanup
+    assert 'runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve()' in private_cleanup
+    assert "root.parent.resolve() != runner_temp" in private_cleanup
+    assert 'not root.name.startswith(\n              "api-key-e2e-"' in private_cleanup
+    assert "if root.is_symlink():\n              root.unlink()" in private_cleanup
+    assert "shutil.rmtree(root)" in private_cleanup
+    assert "PERSONA_CLEANUP_OUTCOME" not in private_cleanup
+    assert "cleanup-pending" not in private_cleanup
+    assert "recovery manifests" not in private_cleanup
+
+
+def test_github_hosted_run_wide_cleanup_is_durable_bounded_and_manifest_free():
+    hosted_cleanup = WORKFLOW[
+        WORKFLOW.index("  cleanup-synthetic-accounts:\n") : WORKFLOW.index(
+            "  cleanup-aws-runner:\n"
+        )
+    ]
+    header = hosted_cleanup[: hosted_cleanup.index("    steps:\n")]
+    sweep_start = hosted_cleanup.index(
+        "      - name: Sweep exact base and persona run IDs with bounded retries\n"
+    )
+    sweep = hosted_cleanup[sweep_start:]
+    aws_cleanup_header = WORKFLOW[
+        WORKFLOW.index("  cleanup-aws-runner:\n") : WORKFLOW.index(
+            "    steps:\n", WORKFLOW.index("  cleanup-aws-runner:\n")
+        )
+    ]
+
+    assert "if: ${{ always() && needs.validate-dispatch.result == 'success' }}" in header
+    assert "needs: [validate-dispatch, qualify-api-key-runtime]" in header
+    assert "runs-on: ubuntu-24.04" in header
+    assert "timeout-minutes: 20" in header
+    assert "environment: feedling-e2e-test" in header
+    assert "self-hosted" not in header
+    assert "ref: ${{ github.sha }}" in hosted_cleanup
+    assert "persist-credentials: false" in hosted_cleanup
+    assert "python qa/provision_profiles.py cleanup-run" in sweep
+    assert "QA_FEEDLING_BASE_URL: https://test-api.feedling.app" in sweep
+    assert "vars.QA_FEEDLING_BASE_URL" not in hosted_cleanup
+    assert 'base_run_id="api-key-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in sweep
+    assert 'persona_run_id="${base_run_id}-persona-memory"' in sweep
+    assert "for attempt in 1 2" in sweep
+    assert '--run-id "$run_id"' in sweep
+    assert '--receipt "$receipt"' in sweep
+    assert 'payload.get("database_authoritative") is not True' in sweep
+    assert 'payload.get("operation_failure_count") != 0' in sweep
+    assert 'payload.get("remaining_count") != 0' in sweep
+    assert 'payload.get("complete") is not True' in sweep
+    assert 'cleanup_one_run "$base_run_id" base base_receipt || failed=1' in sweep
+    assert (
+        'cleanup_one_run "$persona_run_id" persona persona_receipt || failed=1'
+        in sweep
+    )
+    assert sweep.index(
+        'cleanup_one_run "$base_run_id" base base_receipt || failed=1'
+    ) < sweep.index(
+        'cleanup_one_run "$persona_run_id" persona persona_receipt || failed=1'
+    ) < sweep.index('exit "$failed"')
+    cleanup_run_method = PROVISIONER[
+        PROVISIONER.index("    def cleanup_synthetic_run(") : PROVISIONER.index(
+            "\n\ndef ", PROVISIONER.index("    def cleanup_synthetic_run(") + 5
+        )
+    ]
+    assert "attempts=1" in cleanup_run_method
+    assert "timeout_seconds=180" in cleanup_run_method
+    assert 2 * 2 * 180 + 2 * 2 < 20 * 60
+    assert '"kind": "qa_synthetic_cleanup_summary"' in sweep
+    assert '"run_id_sha256": receipt["run_id_sha256"]' in sweep
+    assert '"label_prefix_sha256": receipt["label_prefix_sha256"]' in sweep
+    public_projection = sweep[
+        sweep.index('summary = {') : sweep.index(
+            'echo "authoritative synthetic account cleanup proved'
+        )
+    ]
+    assert '"run_id":' not in public_projection
+    assert "QA_TEST_ADMIN_TOKEN" not in public_projection
+    assert "GITHUB_STEP_SUMMARY" in sweep
+    assert "Upload sanitized authoritative account cleanup proof" in hosted_cleanup
+    assert "feedling-synthetic-cleanup-${{ github.run_id }}-${{ github.run_attempt }}" in hosted_cleanup
+    assert "retention-days: 14" in hosted_cleanup
+    artifact_cleanup = _step(
+        "Remove hosted cleanup artifact scratch",
+        "Terminate exact managed evaluator for this attempt",
+    )
+    assert "if: always()" in artifact_cleanup
+    assert 'root.name != "hosted-cleanup-artifacts"' in artifact_cleanup
+    assert "if root.is_symlink():\n              root.unlink()" in artifact_cleanup
+    assert "secrets.QA_TEST_ADMIN_TOKEN" in sweep
+    for forbidden in (
+        "QA_DEEPSEEK_API_KEY",
+        "QA_ANTHROPIC_API_KEY",
+        "QA_OPENAI_PROVIDER_API_KEY",
+        "QA_OPENROUTER_API_KEY",
+        "QA_GEMINI_API_KEY",
+        "QA_KONGBEIQIE_API_KEY",
+        "QA_CODEX_AUTH_JSON_B64",
+        "--manifest",
+    ):
+        assert forbidden not in hosted_cleanup
+    assert "cleanup-synthetic-accounts" in aws_cleanup_header
+
+
+def test_release_depth_timing_preserves_cleanup_reserve_before_vm_reaper():
+    qualify_header = WORKFLOW[
+        WORKFLOW.index("  qualify-api-key-runtime:\n") : WORKFLOW.index(
+            "    steps:\n", WORKFLOW.index("  qualify-api-key-runtime:\n")
+        )
+    ]
+    prepare = _step(
+        "Provision and prepare persona-memory account pool",
+        "Run OAuth-backed Codex persona-memory qualification",
+    )
+    live = _step(
+        "Run OAuth-backed Codex persona-memory qualification",
+        "Record non-formal persona qualification skip",
+    )
+    cleanup = _step(
+        "Cleanup persona-memory pool with authoritative absence evidence",
+        "Validate persona-memory cleanup and finalize arm evidence",
+    )
+    hosted_cleanup_header = WORKFLOW[
+        WORKFLOW.index("  cleanup-synthetic-accounts:\n") : WORKFLOW.index(
+            "    steps:\n", WORKFLOW.index("  cleanup-synthetic-accounts:\n")
+        )
+    ]
+    aws_cleanup_header = WORKFLOW[
+        WORKFLOW.index("  cleanup-aws-runner:\n") : WORKFLOW.index(
+            "    steps:\n", WORKFLOW.index("  cleanup-aws-runner:\n")
+        )
+    ]
+
+    assert "timeout-minutes: 330" in qualify_header
+    assert "--ttl-seconds 21600" in WORKFLOW
+    assert "timeout-minutes: 60" in prepare
+    assert "timeout-minutes: 120" in live
+    assert "timeout-minutes: 30" in cleanup
+    assert "timeout-minutes: 20" in hosted_cleanup_header
+    assert "timeout-minutes: 20" in aws_cleanup_header
+    assert 21600 - 330 * 60 == 30 * 60
+
+
 def test_agent_result_is_published_and_rendered_only_by_trusted_code():
     publish = _step(
         "Publish canonical result without following agent-created links",
@@ -589,7 +922,7 @@ def test_agent_result_is_published_and_rendered_only_by_trusted_code():
 def test_memory_contract_uses_isolated_account_and_deterministic_gate_policy():
     memory = _step(
         "Run deterministic memory contract on isolated synthetic account",
-        "Verify deployed endpoint and selected runtime target after profile testing",
+        "Provision and prepare persona-memory account pool",
     )
     validate = _step(
         "Validate complete release result",

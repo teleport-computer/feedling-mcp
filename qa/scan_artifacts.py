@@ -43,6 +43,8 @@ EXPECTED_PUBLIC_FILES = {
     "run-result.json",
     "cleanup-receipt.json",
     "memory-contract.json",
+    "persona-memory-summary.json",
+    "persona-memory-matrix.md",
     "matrix.md",
     "latency.csv",
     "junit.xml",
@@ -54,7 +56,9 @@ MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MIN_RECONSTRUCTED_FRAGMENT_BYTES = 8
 _FORBIDDEN_JSON_KEY = re.compile(
     rb'(?i)"(?:api_key|secret_key_b64|private_key(?:_b64)?|provider_key|admin_token|'
-    rb'raw_chat|raw_trace|raw_(?:private_)?reasoning|body_ct|thinking_body_ct|K_user)"\s*:'
+    rb'raw_chat|raw_trace|raw_(?:private_)?reasoning|body_ct|thinking_body_ct|K_user|'
+    rb'prompt|response|rationale|evidence_turn_ids|account_fingerprints|turn_id|'
+    rb'session_id|request_id|response_id|trace_id)"\s*:'
 )
 _CREDENTIAL_SIGNATURE = re.compile(rb"(?:sk-ant-|sk-or-v1-|sk-proj-)[A-Za-z0-9_-]{8,}")
 
