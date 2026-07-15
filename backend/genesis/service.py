@@ -775,6 +775,7 @@ def init_identity_if_absent(
         "owner_user_id": envelope["owner_user_id"],
         "created_at": (existing or {}).get("created_at") or now,
         "updated_at": now,
+        "replaced_at": now,
         "relationship_started_at": _relationship_anchor_from_output(store, output, days_int),
         "relationship_anchor_source": GENESIS_SOURCE,
         "relationship_anchor_evidence": evidence,
@@ -823,16 +824,27 @@ def _relationship_anchor_fields_for_replace(existing: dict, output: dict) -> dic
 
 
 def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
-    """Replace identity content for explicit update_identity imports.
+    """Create or replace identity content for explicit update_identity imports.
 
-    Product meaning: the user is redefining the companion's identity card. The
-    relationship anchor (relationship_started_at/source/evidence) is PRESERVED by
-    default and only overwritten when the upload carries an explicit, valid
+    With no existing card, reuse the Genesis initialization path so an uploaded
+    role card is a true create-or-update operation. With an existing card, the
+    relationship anchor (relationship_started_at/source/evidence) is PRESERVED
+    by default and only overwritten when the upload carries an explicit, valid
     relationship time — see ``_relationship_anchor_fields_for_replace`` (B2).
     """
     existing = identity_service._load_identity(store)
     if not existing:
-        return "identity_not_initialized"
+        init_output = dict(output)
+        anchor = output.get("relationship_anchor")
+        if isinstance(anchor, dict):
+            for key in (
+                "relationship_started_at",
+                "days_with_user",
+                "relationship_anchor_evidence",
+            ):
+                if key not in init_output and key in anchor:
+                    init_output[key] = anchor[key]
+        return init_identity_if_absent(store, init_output)
     payload = _identity_payload_for_replace(output)
     if not payload:
         return "not_provided"
@@ -858,6 +870,7 @@ def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
         "owner_user_id": envelope["owner_user_id"],
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
+        "replaced_at": now,
         **_relationship_anchor_fields_for_replace(existing, output),
         "identity_agent_name_present": bool(payload.get("agent_name")),
         "identity_dimension_count": len(payload.get("dimensions") or []),

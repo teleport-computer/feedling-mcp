@@ -158,7 +158,7 @@ def _resolve_local_ref(document: dict[str, Any], ref: str) -> Any:
 def test_public_operation_and_parameter_inventory(
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
-    assert len(operations) == 142
+    assert len(operations) == 143
     assert sum("requestBody" in operation for operation in operations.values()) == 65
 
     query_operations = {
@@ -248,7 +248,7 @@ def test_runtime_success_statuses_and_non_json_media_are_explicit(
     expected_success_statuses = {
         ("post", "/v1/identity/init"): {"201"},
         ("post", "/v1/genesis/imports"): {"200", "201"},
-        ("post", "/v1/genesis/imports/plaintext"): {"202"},
+        ("post", "/v1/genesis/imports/plaintext"): {"200", "202"},
         ("post", "/v1/genesis/imports/{job_id}/finalize"): {"200", "202"},
         ("post", "/v1/genesis/persona_backfill"): {"200", "202"},
         ("post", "/v1/history_import/upload"): {"200", "202"},

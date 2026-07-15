@@ -36,9 +36,16 @@ jobs:
           AWS_REGION: auto
           ENDPOINT: ${{ secrets.PROD_PG_BACKUP_R2_ENDPOINT }}
         run: |
+          # aws CLI 会自动分页：一个前缀 >1000 对象时，每页各输出一个「本页最新」
+          # 时间戳，newest() 于是吐出多行，下游 fromisoformat 直接炸（2026-07-14 prod
+          # 实测：wal_005/ 已 >1000 个 WAL 对象）。用 sort|tail 取跨页全局最新——对象
+          # key 按字典序≈时间序、ISO 时间戳字典序也=时间序，故排序末行即最新。空前缀
+          # aws 返回单行 "None"，经 sort|tail 仍是 "None"，check_age 照常当 EMPTY 处理。
+          # 注意：不能用 --no-paginate（只取第一页=最旧的 key → 反而误报 stale）。
           newest() { aws s3api list-objects-v2 --endpoint-url "$ENDPOINT" \
             --bucket io-in-enclave-db --prefix "$1" \
-            --query 'sort_by(Contents,&LastModified)[-1].LastModified' --output text; }
+            --query 'sort_by(Contents,&LastModified)[-1].LastModified' --output text \
+            | sort | tail -n1; }
           WAL_TS=$(newest "prod/wal-g/wal_005/")
           BASE_TS=$(newest "prod/wal-g/basebackups_005/")
           echo "newest wal: $WAL_TS | newest base sentinel: $BASE_TS"

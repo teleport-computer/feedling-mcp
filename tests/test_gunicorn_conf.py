@@ -48,8 +48,11 @@ def test_worker_recycling_bounds_arena_growth():
 
     gconf = importlib.import_module("gunicorn_conf")
     assert getattr(gconf, "max_requests", 0) >= 1000
-    # 无 jitter = 4 个 worker 几乎同时到阈值同时回收 → 服务闪断。
-    assert getattr(gconf, "max_requests_jitter", 0) > 0
+    # 无 jitter = 同批启动的 worker 几乎同时到阈值同时回收 → 服务闪断。而且
+    # jitter 太小（如 10k/50k=20%）会让同批 worker 的回收簇跨代保持松散同步
+    # （2026-07-15 prod 实测：01:14-01:30 十六分钟内 3/4 worker 相继回收）。
+    # ≥ max_requests 的一半才能让相位在一两代内充分去相关。
+    assert getattr(gconf, "max_requests_jitter", 0) >= 20000
     # 下限同样重要：prod 每 worker ~15.5 req/s，max_requests=2000 意味着 ~2 分钟
     # 就回收一次——长轮询高频被排空、leader 单例(tee-sync/:9998 WS)反复换手，
     # 后台 reconcile 永远跑不完(2026-07-14 test 实测:部署后 2h 零 tee-sync tick)。
@@ -79,3 +82,34 @@ def test_backend_compose_caps_malloc_arenas():
         env = compose["services"]["backend"]["environment"]
         assert "MALLOC_ARENA_MAX" in env, f"{name} backend 缺 MALLOC_ARENA_MAX"
         assert str(env["MALLOC_ARENA_MAX"]).strip('"') in {"2", "4"}
+
+
+def test_prod_compose_tee_pool_budget_fits_worker_count():
+    """TEE 影子库连接预算必须跟 worker 数联动：per-worker 池上限 × worker 数 +
+    非 app 角色(~10) + superuser 保留(3) 必须 < TEE PG max_connections=200。
+    tee_shadow/mirror.py 的默认 32 是按 4 worker 算的(128+余量)；worker 数一涨
+    (2026-07-15: 4→6)就必须显式下调池上限，否则 worst-case 把 TEE PG 打满
+    (mirror 注释原话:64→4worker=256>200 同理)。"""
+    import pathlib
+    import re
+
+    import yaml
+
+    compose = yaml.safe_load(
+        (pathlib.Path(__file__).parent.parent / "deploy" / "docker-compose.phala.yaml").read_text())
+    env = compose["services"]["backend"]["environment"]
+
+    def _default(v, fallback):
+        # "${VAR:-6}" → 6；纯数字字符串 → 数字；缺省 → fallback
+        m = re.search(r":-(\d+)", str(v or ""))
+        if m:
+            return int(m.group(1))
+        s = str(v or "").strip('"')
+        return int(s) if s.isdigit() else fallback
+
+    workers = _default(env.get("FEEDLING_BACKEND_WORKERS"), 1)
+    pool_max = _default(env.get("FEEDLING_TEE_POOL_MAX"), 32)  # 代码默认 32
+    assert workers * pool_max + 13 < 200, (
+        f"TEE pool budget over: {workers} workers × {pool_max} pool_max "
+        f"+ ~13 reserved >= 200 (TEE PG max_connections)"
+    )

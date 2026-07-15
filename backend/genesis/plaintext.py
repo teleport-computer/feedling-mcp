@@ -1077,10 +1077,7 @@ def _run_plaintext_update_identity_job(
     runtime,
     analysis_messages: list[dict] | None,
     relationship_anchor: dict | None = None,
-) -> None:
-    if not identity_service._load_identity(store):
-        service.mark_failed(store, job_id, "identity_not_initialized")
-        return
+) -> str | None:
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
     # 部分补全:merge onto the current card so fields the upload doesn't mention are
@@ -1125,7 +1122,7 @@ def _run_plaintext_update_identity_job(
     status = service.replace_identity_preserving_anchor(
         store, {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}}
     )
-    if status != "updated":
+    if status not in {"initialized", "updated"}:
         service.mark_failed(store, job_id, status)
         return
     try:
@@ -1138,7 +1135,7 @@ def _run_plaintext_update_identity_job(
         job_id,
         output={"stage": "plaintext_update_identity_done"},
         memory_action_count=0,
-        identity_status="updated",
+        identity_status=status,
         persona_ref=persona_ref,
         persona_sha256=persona_sha,
     )
@@ -1152,6 +1149,7 @@ def _run_plaintext_update_identity_job(
         # every mark_failed exit above returns immediately, so this branch and the
         # failure branches are mutually exclusive within a single run.
         notices_core.resolve(store, "genesis:")
+    return status
 
 
 def _run_plaintext_genesis_job(
@@ -1228,7 +1226,7 @@ def _run_plaintext_genesis_job(
         if mode == "update_identity":
             _trace_genesis(store, "genesis.plaintext.update_identity.started", job_id=job_id,
                            summary="update identity job started")
-            _run_plaintext_update_identity_job(
+            identity_status = _run_plaintext_update_identity_job(
                 store,
                 api_key,
                 job_id,
@@ -1237,7 +1235,8 @@ def _run_plaintext_genesis_job(
                 relationship_anchor=relationship_anchor,
             )
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="update identity job done",
-                           detail={"mode": mode}, dur_ms=(time.time() - started_at) * 1000)
+                           detail={"mode": mode, "identity_status": identity_status or ""},
+                           dur_ms=(time.time() - started_at) * 1000)
             return
 
         # Genesis v2 (FEEDLING_GENESIS_V2_ENABLED): foreground-fast — greet on 3-5 core

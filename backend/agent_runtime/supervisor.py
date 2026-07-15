@@ -1106,6 +1106,10 @@ def _genesis_worker_loop(*, api_url, enclave_url, mint_genesis, interval, stop_e
             # Reap imports wedged in 'processing' (worker/daemon died mid-run)
             # before claiming new work, so a crashed job can't block spawn forever.
             genesis_worker.reap_stale_processing_jobs()
+            # Resident-owned rows are EXCLUDED from the reap above; without this
+            # a resident-claimed distill job whose consumer died mid-run stayed
+            # 'processing' forever (live-e2e-confirmed 2026-07-14).
+            genesis_worker.reap_stale_resident_jobs()
             genesis_worker.tick(api_url=api_url, enclave_url=enclave_url,
                                 mint_runtime_token=mint_genesis, max_jobs=1)
         except Exception as e:  # noqa: BLE001

@@ -23,9 +23,6 @@ _MAIN_LOOP_STATE = {
     "stage": "main_loop",
     "memory_count": 3,
     "memory_floor": 2,
-    "counts": {"total": 3},
-    "floors": {"total": 2},
-    "missing_tabs": [],
     "identity_written": True,
 }
 

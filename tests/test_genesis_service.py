@@ -652,20 +652,56 @@ def test_replace_identity_preserving_anchor_replaces_body_only(monkeypatch):
     assert captured["saved"]["body_ct"] == "encrypted_new_identity"
 
 
-def test_replace_identity_preserving_anchor_requires_existing_identity(monkeypatch):
+def test_replace_identity_preserving_anchor_initializes_missing_identity(monkeypatch):
+    captured: dict = {}
     monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: None)
+
+    def fake_envelope(_store, plaintext, item_id=None):
+        captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
+        captured["item_id"] = item_id
+        return ({
+            "id": "identity_created",
+            "body_ct": "encrypted_identity",
+            "nonce": "nonce",
+            "K_user": "ku",
+            "K_enclave": "ke",
+            "visibility": "shared",
+            "owner_user_id": "usr_genesis",
+            "enclave_pk_fpr": "fpr",
+        }, "")
+
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
     monkeypatch.setattr(
-        service.core_envelope,
-        "_build_shared_envelope_for_store",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build identity")),
+        service.identity_service,
+        "_save_identity",
+        lambda _store, doc: captured.update({"saved": doc}),
     )
+    monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_args, **_kwargs: None)
 
     status = service.replace_identity_preserving_anchor(
         _store(),
-        {"identity": {"agent_name": "乔伊", "dimensions": []}},
+        {
+            "identity": {
+                "agent_name": "乔伊",
+                "dimensions": [{"name": "直爽", "value": 90, "description": "说人话。"}],
+            },
+            "relationship_anchor": {
+                "relationship_started_at": "2025-01-02",
+                "days_with_user": 558,
+                "relationship_anchor_evidence": "uploaded role card date",
+            },
+        },
     )
 
-    assert status == "identity_not_initialized"
+    assert status == "initialized"
+    assert captured["item_id"] is None
+    assert captured["plaintext"]["agent_name"] == "乔伊"
+    assert captured["saved"]["id"] == "identity_created"
+    assert captured["saved"]["relationship_started_at"] == "2025-01-02"
+    assert captured["saved"]["relationship_anchor_evidence"] == "uploaded role card date"
+    assert captured["saved"]["identity_agent_name_present"] is True
+    assert captured["saved"]["identity_dimension_count"] == 1
 
 
 def test_replace_identity_preserving_anchor_allows_nameless_nonempty_update(monkeypatch):

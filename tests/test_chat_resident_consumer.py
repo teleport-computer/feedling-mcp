@@ -1361,6 +1361,82 @@ def test_agent_session_meta_rotates_when_turn_bound_reached(monkeypatch, tmp_pat
     assert not crc._agent_session_file_for_user().exists()
 
 
+def _bridge_session_env(monkeypatch, tmp_path, user_id, *, max_turns=0):
+    """Isolated per-user session state for bridge tests.
+
+    AGENT_SESSION_FILE_TEMPLATE MUST be redirected at tmp_path: _agent_session_is_bridged
+    reads through _agent_session_file_for_user(), which would otherwise touch the real
+    on-disk session file of whatever user_id happens to be in the module-global cache.
+    """
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    monkeypatch.setattr(
+        crc, "_whoami_cache",
+        {"user_id": user_id, "user_pk": None, "enclave_pk": None},
+    )
+    monkeypatch.setattr(
+        crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "feedling_{user_id}.json")
+    )
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_TURNS", max_turns)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_BYTES", 0)
+
+
+def test_agent_session_bridged_survives_disk_roundtrip(monkeypatch, tmp_path):
+    # Guards the _coerce_agent_session_meta whitelist trap: coerce runs on BOTH the
+    # disk read and the in-memory cache read (_load_agent_session_meta), so a field
+    # missing from its whitelist silently dies within one turn.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_bridge")
+
+    crc._save_agent_session_id("sess_a")
+    crc._mark_agent_session_bridged("sess_a")
+
+    # Drop the in-memory caches — the flag must come back from disk.
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+
+    assert crc._agent_session_is_bridged() is True
+
+
+def test_record_turn_preserves_bridged_flag(monkeypatch, tmp_path):
+    # _record_agent_session_turn rebuilds meta on every turn; it must not clobber
+    # the flag for the session it is recording into.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_bridge_keep")
+
+    crc._save_agent_session_id("sess_a")
+    crc._mark_agent_session_bridged("sess_a")
+    crc._record_agent_session_turn("sess_a", sent_bytes=10, received_bytes=5)
+
+    assert crc._agent_session_is_bridged() is True
+
+
+def test_rotation_resets_bridged_flag(monkeypatch, tmp_path):
+    # The whole point: when the session rotates, the bridge debt resets.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_bridge_rot", max_turns=2)
+
+    crc._save_agent_session_id("sess_a")
+    crc._mark_agent_session_bridged("sess_a")
+    crc._record_agent_session_turn("sess_a", sent_bytes=1, received_bytes=1)
+    crc._record_agent_session_turn("sess_a", sent_bytes=1, received_bytes=1)
+
+    assert crc._agent_session_is_bridged() is False
+    assert crc._load_agent_session_id() == ""
+
+
+def test_mark_bridged_ignores_stale_session_id(monkeypatch, tmp_path):
+    # Defensive: marking a sid that is no longer current must not clobber the
+    # live session's turn count (or resurrect a dead session).
+    _bridge_session_env(monkeypatch, tmp_path, "usr_bridge_stale")
+
+    crc._save_agent_session_id("sess_live")
+    crc._record_agent_session_turn("sess_live", sent_bytes=1, received_bytes=1)
+
+    crc._mark_agent_session_bridged("sess_dead")
+
+    assert crc._agent_session_is_bridged() is False
+    assert crc._load_agent_session_meta()["turns"] == 1
+    assert crc._load_agent_session_id() == "sess_live"
+
+
 def test_prepare_cli_replaces_fixed_session_id_after_rotation(monkeypatch, tmp_path):
     crc._agent_session_id_cache.clear()
     crc._agent_session_meta_cache.clear()
@@ -2499,6 +2575,10 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
     assert extra["dream_result"]["job_kind"] == "memory_dream"
     assert extra["cards_merged"] == 1
     assert extra["cards_superseded"] == 2
+    assert extra["organized_count"] == 2
+    assert extra["merged_count"] == 1
+    assert extra["dream_result"]["organized_count"] == 2
+    assert extra["dream_result"]["merged_count"] == 1
     assert extra["questions"] == ["确认是否只是不喝牛奶？"]
 
 
@@ -2542,6 +2622,8 @@ def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatc
     extra = _dream_final_status(captured)[3]["extra"]
     assert extra["cards_merged"] == 0
     assert extra["cards_superseded"] == 2
+    assert extra["organized_count"] == 2
+    assert extra["merged_count"] == 0
     assert extra["dream_result"]["cards_thickened"] == 1
 
 
@@ -2563,6 +2645,8 @@ def test_dream_job_empty_consolidations_completes_noop_without_memory_write_or_c
     assert extra["dream_result"]["status"] == "noop"
     assert extra["questions"] == ["下次问 TA 是否还喝拿铁"]
     assert extra["noop_reason"] == "dream_nothing_to_consolidate"
+    assert extra.get("organized_count", 0) == 0
+    assert extra.get("merged_count", 0) == 0
 
 
 def test_dream_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
@@ -4568,6 +4652,153 @@ def _pi_stream_lines(*events) -> str:
 _PI_HEADER = {"type": "session", "version": 3, "id": "abc123", "cwd": "/h"}
 
 
+def _pi_chatty_stream(reply: str, thinking: str = "", *, tokens: int = 120) -> str:
+    """A pi --mode json stream shaped like the real thing (verified against pi 0.80.3):
+    the streaming event is ``message_update``, and each one re-sends the WHOLE message
+    snapshot so far — so transport grows quadratically with reply length while the
+    content delivered stays tiny. That is where prod's 225 KB/turn median came from, and
+    that ratio is the whole point of these tests."""
+    events = [_PI_HEADER]
+    for i in range(1, tokens + 1):
+        partial = reply[:max(1, len(reply) * i // tokens)]
+        events.append({"type": "message_update",
+                       "message": {"role": "assistant",
+                                   "content": [{"type": "text", "text": partial}]},
+                       "assistantMessageEvent": {"type": "text_delta"}})
+    content = []
+    if thinking:
+        content.append({"type": "thinking", "thinking": thinking})
+    content.append({"type": "text", "text": reply})
+    events.append({"type": "message_end",
+                   "message": {"role": "assistant", "content": content,
+                               "usage": {"input": 1200, "output": 40}}})
+    return _pi_stream_lines(*events)
+
+
+def test_turn_content_bytes_excludes_pi_delta_frames(monkeypatch):
+    # THE prod bug: received_bytes was fed the raw JSONL transport (streaming-delta
+    # framing), not the content. Measured in prod: 225 KB median per turn against a
+    # 250 KB session cap → the session died after ONE turn, 34% of rotations at turns=1,
+    # and pi's native --session-id resume became dead code. Delta frames are transport,
+    # never context, so they must not be charged.
+    raw = _pi_chatty_stream("好的，我记住了", thinking="用户在说他的猫")
+
+    counted = crc._turn_content_bytes(["pi", "--mode", "json"], raw)
+
+    # the 400 delta frames dominate the transport and must NOT be charged
+    assert counted < len(raw.encode("utf-8")) / 20
+    # but the content itself IS charged (both the text and the thinking block)
+    assert counted > len("好的，我记住了用户在说他的猫".encode("utf-8"))
+
+
+def test_turn_content_bytes_charges_pi_tool_calls_and_results(monkeypatch):
+    # Regression for a bug found in review of the FIRST attempt at this fix: building the
+    # accounting on _pi_turn_from_stream (the display extractor) silently dropped toolCall
+    # blocks and tool-result messages — 160 KB of tool output charged as 9 bytes. Those
+    # bytes are re-sent to the model on every subsequent turn of the session, so if they
+    # are not charged, AGENT_SESSION_MAX_BYTES can never fire and the context window blows.
+    big_tool_output = "x" * 50_000
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "我查一下"},
+            {"type": "toolCall", "name": "bash", "input": {"command": "cat big.log"}}]}},
+        {"type": "message_end", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": big_tool_output}]}},
+        {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "找到了"}]}},
+    )
+
+    counted = crc._turn_content_bytes(["pi", "--mode", "json"], raw)
+
+    # the tool result dominates the turn and MUST be charged
+    assert counted > 50_000, "tool output not charged — the byte bound cannot fire"
+    # the display extractor would have seen only the final reply
+    reply, _ = crc._pi_turn_from_stream(raw)
+    assert reply == "找到了" and len(reply.encode("utf-8")) < 20
+
+
+def test_turn_content_bytes_does_not_charge_image_pixels(monkeypatch):
+    # pi's ImageContent carries the pixels as INLINE base64 ({type,data,mimeType}), so a
+    # 1 MB photo is ~1.4 MB of base64 — but only ~1-2k tokens of context. Weighing the
+    # base64 would blow the entire 250 KB session budget on a single snapshot and rotate
+    # the session on EVERY image, re-creating the churn this whole fix exists to kill.
+    photo_b64 = "A" * 1_400_000
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {"type": "message_end", "message": {"role": "user", "content": [
+            {"type": "image", "data": photo_b64, "mimeType": "image/jpeg"},
+            {"type": "text", "text": "这是我的猫"}]}},
+        {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "好可爱"}]}},
+    )
+
+    counted = crc._turn_content_bytes(["pi", "--mode", "json"], raw)
+
+    assert counted < 10_000, "image base64 charged as context — one photo kills the session"
+    assert counted < crc.AGENT_SESSION_MAX_BYTES / 10
+    # the accompanying text IS still charged
+    assert counted > crc._PI_IMAGE_CONTEXT_BYTES
+
+
+def test_turn_content_bytes_keeps_transport_accounting_for_non_pi(monkeypatch):
+    # codex/claude scrape a fresh session id every turn, so their meta is rebuilt each
+    # turn and the byte bound can never fire for them — re-measuring them would be a
+    # behavior change with no benefit. hermes/self-hosted stream shapes are unverified.
+    # All of them keep the old transport accounting, stderr included.
+    out, err = "some stdout", "some stderr"
+    expected = len((out + "\n" + err).encode("utf-8"))
+
+    for cmd in (["codex", "exec", "--json"], ["claude", "-p"], ["hermes", "chat"]):
+        assert crc._turn_content_bytes(cmd, out, err) == expected
+
+
+def test_call_agent_cli_pi_charges_session_content_not_transport(monkeypatch, tmp_path):
+    # End-to-end regression for the prod bug: one ordinary pi turn must NOT come close
+    # to exhausting the 250 KB session budget. Before the fix this single turn charged
+    # ~the whole transport and the next turn found the session already over-budget.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_bytes")
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_BYTES", 250_000)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_TURNS", 24)
+    raw = _pi_chatty_stream("好的")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=""))
+
+    assert crc.call_agent_cli("你好") == "好的"
+
+    meta = crc._load_agent_session_meta(check_bounds=False)
+    transport_len = len(raw.encode("utf-8"))
+    assert meta["turns"] == 1
+    # charged the content (message + reply), nowhere near the transport
+    assert meta["bytes"] < transport_len / 10
+    # and therefore the session SURVIVES — the whole user-visible point
+    assert crc._load_agent_session_id() != ""
+
+
+def test_call_agent_cli_pi_session_survives_many_turns(monkeypatch, tmp_path):
+    # The session must live to its designed turn bound, not die on byte accounting.
+    # In prod 70% of rotations fired at turns<=2 against a turns cap of 24.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_longlived")
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_BYTES", 250_000)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_TURNS", 24)
+    raw = _pi_chatty_stream("嗯")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=""))
+
+    first_sid = None
+    for _ in range(10):
+        crc.call_agent_cli("在吗")
+        sid = crc._load_agent_session_id()
+        first_sid = first_sid or sid
+        assert sid == first_sid, "session rotated early — byte accounting regressed"
+
+    assert crc._load_agent_session_meta(check_bounds=False)["turns"] == 10
+
+
 def test_call_agent_cli_pi_folds_thinking_and_prefers_command_sid(monkeypatch, tmp_path):
     raw = _pi_stream_lines(
         _PI_HEADER,
@@ -4771,6 +5002,99 @@ def test_call_agent_cli_pi_feeds_message_via_stdin_not_argv(monkeypatch, tmp_pat
     assert captured["input"] == msg                 # message fed via stdin
     assert msg not in captured["cmd"]               # NEVER in argv
     assert not any(t.startswith("@") for t in captured["cmd"])  # no @ from the message
+
+
+_PI_OK_TURN = _pi_stream_lines(
+    _PI_HEADER,
+    {"type": "message_end", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "ok"}]}},
+)
+
+
+def _pi_cli_env(monkeypatch, tmp_path, user_id, *, returncode=0, stdout=_PI_OK_TURN):
+    _bridge_session_env(monkeypatch, tmp_path, user_id)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id}")
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(
+        crc.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=""),
+    )
+
+
+def test_call_agent_cli_pi_marks_session_bridged_after_injected_turn(monkeypatch, tmp_path):
+    # A successful foreground turn that actually carried a transcript closes the
+    # bridge debt for this session — the next turn rides pi's native continuity.
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_mark")
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+
+    assert crc.call_agent_cli(injected) == "ok"
+    assert crc._agent_session_is_bridged() is True
+
+
+def test_call_agent_cli_pi_background_turn_does_not_mark_bridged(monkeypatch, tmp_path):
+    # A background turn (proactive heartbeat) never injects, so it must not be able
+    # to satisfy the bridge — otherwise the user's next message drops out, which is
+    # precisely the bug this change fixes.
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_bare")
+
+    assert crc.call_agent_cli("heartbeat") == "ok"
+    assert crc._agent_session_is_bridged() is False
+
+
+def test_call_agent_cli_pi_failed_turn_does_not_mark_bridged(monkeypatch, tmp_path):
+    # Upstream hiccups (BYOK relay 429 / out of credit / timeout) are routine. A turn
+    # that died must not eat the bridge: the retry has to carry the transcript again.
+    # Re-feeding a transcript pi may already have consumed costs tokens; dropping the
+    # bridge costs the user their conversation. We pay the tokens.
+    #
+    # This case (rc=1, pi binary itself crashed) is the RARE failure shape — see
+    # test_call_agent_cli_pi_api_error_turn_does_not_mark_bridged below for pi's
+    # actual routine failure shape (rc=0, no assistant reply).
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_fail", returncode=1, stdout="")
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli(injected)
+
+    assert crc._agent_session_is_bridged() is False
+    assert crc._foreground_history_injection_enabled() is True   # retry re-bridges
+
+    # Drive the "retry re-bridges" claim for real, not just via the boolean gate
+    # above: the retry must actually carry the header on pi's stdin (pi's message
+    # rides stdin, not argv — see test_call_agent_cli_pi_feeds_message_via_stdin_not_argv),
+    # and a successful retry must actually close the bridge debt.
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout=_PI_OK_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    assert crc.call_agent_cli(injected) == "ok"
+    assert crc.FOREGROUND_CHAT_CONTEXT_HEADER in captured["input"]
+    assert crc._agent_session_is_bridged() is True
+
+
+def test_call_agent_cli_pi_api_error_turn_does_not_mark_bridged(monkeypatch, tmp_path):
+    # THE routine pi failure shape (verified against real pi 0.80.3, 2026-07-02;
+    # see the module comment above _pi_stream_lines): pi exits 0 EVEN ON API ERRORS
+    # (BYOK relay 429 / out of credit / upstream 4xx) — there is no assistant
+    # message_end at all, just the session header. returncode is NOT pi's success
+    # signal, so a bridge hook gated on "returncode == 0" would wrongly mark this
+    # failed turn as bridged, and the retry would face a blank, un-rebridgeable
+    # session. The gate must be on pi_reply (whether call_agent_cli actually got an
+    # assistant reply out of the stream), not on returncode.
+    _pi_cli_env(
+        monkeypatch, tmp_path, "usr_pi_api_fail",
+        returncode=0, stdout=_pi_stream_lines(_PI_HEADER),
+    )
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+
+    with pytest.raises(RuntimeError, match="pi agent produced no reply"):
+        crc.call_agent_cli(injected)
+
+    assert crc._agent_session_is_bridged() is False
 
 
 def test_agent_turn_skips_codex_reasoning_event_as_non_final():
@@ -5028,9 +5352,12 @@ def test_provider_payment_cooldown_lifecycle(monkeypatch):
 # ---------------------------------------------------------------------------
 # codex has no --resume and hosted claude's default command carries no session,
 # so cross-turn continuity is injected by the resident: a short recent-chat
-# transcript is prepended to the current turn. pi resumes natively and is skipped
-# to avoid double context. See _foreground_history_injection_enabled /
-# _foreground_agent_message.
+# transcript is prepended to the current turn. pi resumes natively via
+# --session-id, but a session rotates to a blank slate every N turns, so pi
+# gets bridged with the transcript exactly once per session (its first
+# foreground chat turn, gated on success — see _mark_agent_session_bridged in
+# call_agent_cli) and rides native continuity for the rest of that session's
+# turns. See _foreground_history_injection_enabled / _foreground_agent_message.
 
 _CODEX_CLI = (
     "codex exec --skip-git-repo-check --json "
@@ -5052,9 +5379,68 @@ def test_foreground_injection_enabled_for_claude(monkeypatch):
     assert crc._foreground_history_injection_enabled() is True
 
 
-def test_foreground_injection_skipped_for_pi(monkeypatch):
+def test_foreground_injection_bridges_pi_on_cold_start(monkeypatch, tmp_path):
+    # No session at all (fresh consumer / session file lost / just switched driver):
+    # pi opens a blank session, so this turn MUST carry the transcript.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_cold")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+
+    assert crc._foreground_history_injection_enabled() is True
+
+
+def test_foreground_injection_skipped_inside_bridged_pi_session(monkeypatch, tmp_path):
+    # The token-saving half of the design: once the session has been bridged, pi's
+    # native --session-id continuity carries the conversation. Do NOT re-feed.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_warm")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+
+    crc._save_agent_session_id("sess_warm")
+    crc._mark_agent_session_bridged("sess_warm")
+
+    assert crc._foreground_history_injection_enabled() is False
+
+
+def test_foreground_injection_bridges_pi_session_opened_by_background_turn(monkeypatch, tmp_path):
+    # THE regression that the naive "inject only when no live session" fix misses.
+    # _ensure_explicit_cli_session_id binds a session id on EVERY lane, but only the
+    # chat lane injects. So a proactive heartbeat (background lane) routinely opens
+    # the post-rotation session — it is alive, but pi has never seen the chat history
+    # in it. The user's next message must still get the bridge.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_bg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+
+    # a background turn opened the session and recorded a turn — but never bridged
+    crc._save_agent_session_id("sess_from_heartbeat")
+    crc._record_agent_session_turn("sess_from_heartbeat", sent_bytes=10, received_bytes=10)
+
+    assert crc._load_agent_session_id() == "sess_from_heartbeat"   # session IS alive
+    assert crc._foreground_history_injection_enabled() is True     # ...but unbridged
+
+
+def test_foreground_injection_bridges_pi_across_rotation(monkeypatch, tmp_path):
+    # Turn-bound rotation: the bounds check inside _agent_session_is_bridged clears
+    # the over-bound session, so the flag reads False and this turn re-bridges.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_rot", max_turns=2)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+
+    crc._save_agent_session_id("sess_old")
+    crc._mark_agent_session_bridged("sess_old")
+    crc._record_agent_session_turn("sess_old", sent_bytes=1, received_bytes=1)
+    crc._record_agent_session_turn("sess_old", sent_bytes=1, received_bytes=1)
+
+    assert crc._foreground_history_injection_enabled() is True
+
+
+def test_foreground_injection_off_mode_disables_even_unbridged_pi(monkeypatch, tmp_path):
+    # The explicit off switch outranks the bridge.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_off")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+
     assert crc._foreground_history_injection_enabled() is False
 
 
@@ -5152,13 +5538,38 @@ def test_foreground_message_first_turn_has_no_prior_returns_plain(monkeypatch):
     assert crc._foreground_agent_message("第一句", current_ts=now) == "第一句"
 
 
-def test_foreground_message_skipped_for_pi_returns_plain(monkeypatch):
+def test_foreground_message_bridges_pi_in_unbridged_session(monkeypatch, tmp_path):
+    # Message-layer twin of test_foreground_injection_bridges_pi_on_cold_start: an
+    # unbridged pi session is blank, so the turn must carry the transcript.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_msg_cold")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
     monkeypatch.setattr(
         crc, "get_decrypted_history",
         lambda since, limit=20, include_image_body=True: [{"role": "user", "content": "早", "ts": 1.0}],
     )
+
+    out = crc._foreground_agent_message("hi", current_ts=9.0)
+
+    assert out.startswith(crc.FOREGROUND_CHAT_CONTEXT_HEADER)
+    assert "早" in out
+    assert out.endswith("hi")
+
+
+def test_foreground_message_plain_for_pi_in_bridged_session(monkeypatch, tmp_path):
+    # Once bridged, pi's native --session-id carries the conversation: re-feeding the
+    # transcript every turn is exactly the waste this design avoids.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_msg_warm")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(
+        crc, "get_decrypted_history",
+        lambda since, limit=20, include_image_body=True: [{"role": "user", "content": "早", "ts": 1.0}],
+    )
+
+    crc._save_agent_session_id("sess_warm")
+    crc._mark_agent_session_bridged("sess_warm")
+
     assert crc._foreground_agent_message("hi", current_ts=9.0) == "hi"
 
 
@@ -5269,3 +5680,152 @@ def test_context_text_image_with_caption_keeps_caption_and_hint():
 
 def test_context_text_plain_text_message_unchanged():
     assert crc._message_text_for_context({"content": "hello there"}) == "hello there"
+
+
+def test_user_chat_pending_peeks_nonblocking_claimfree_and_fails_open(monkeypatch):
+    # ① user-turn priority: a non-blocking peek for a waiting user message so
+    # proactive turns can defer to it. Must use timeout=0 AND claim=False (a
+    # claiming peek would write the 600s reply claim on a message it only
+    # glanced at), and fail OPEN (return False on error) so a transient poll
+    # error never starves proactive.
+    calls = []
+
+    def fake_poll(since, timeout=None, claim=True):
+        calls.append((since, timeout, claim))
+        return {"messages": [{"id": "m1"}]}
+    monkeypatch.setattr(crc, "poll_chat", fake_poll)
+    assert crc._user_chat_pending(12.0) is True
+    assert calls[-1] == (12.0, 0, False)   # non-blocking, claim-free peek
+
+    monkeypatch.setattr(crc, "poll_chat", lambda since, timeout=None, claim=True: {"messages": []})
+    assert crc._user_chat_pending(12.0) is False
+
+    def boom(since, timeout=None, claim=True):
+        raise RuntimeError("poll down")
+    monkeypatch.setattr(crc, "poll_chat", boom)
+    assert crc._user_chat_pending(12.0) is False   # fail-open, never starve proactive
+
+
+def test_poll_chat_claim_false_sends_param_claim_true_omits_it(monkeypatch):
+    # transport contract for the peek: claim=False must send claim=false to the
+    # server; the default claiming poll must NOT send the param (server default
+    # is claim=true — omitting keeps existing behavior byte-identical).
+    seen = []
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"messages": []}
+
+    class _HTTP:
+        def get(self, url, params=None, headers=None, timeout=None):
+            seen.append(dict(params or {}))
+            return _Resp()
+
+    monkeypatch.setattr(crc, "_HTTP", _HTTP())
+    crc.poll_chat(5.0, timeout=0, claim=False)
+    assert seen[-1].get("claim") == "false"
+    assert seen[-1]["timeout"] == 0
+    crc.poll_chat(5.0, timeout=0)
+    assert "claim" not in seen[-1]
+
+
+def _install_resident_job_gate_harness(monkeypatch):
+    # record which (class, job_id) each processor was dispatched — the gate in
+    # _process_resident_jobs must call each with a single-element batch.
+    ran = []
+
+    def _fake(kind):
+        def proc(jobs):
+            assert len(jobs) == 1            # per-job dispatch, never a batch
+            ran.append((kind, jobs[0].get("job_id")))
+            return float(jobs[0].get("ts") or 0)
+        return proc
+
+    monkeypatch.setattr(crc, "_process_capture_jobs", _fake("capture"))
+    monkeypatch.setattr(crc, "_process_dream_jobs", _fake("dream"))
+    monkeypatch.setattr(crc, "_process_migrate_jobs", _fake("migrate"))
+    monkeypatch.setattr(crc, "_process_proactive_jobs", _fake("proactive"))
+    return ran
+
+
+def test_resident_jobs_gate_covers_all_classes_and_defers_mid_batch(monkeypatch):
+    # ① user-turn priority: the gate sits in _process_resident_jobs and covers
+    # ALL background classes (capture/dream/migrate/proactive — each is a model
+    # turn). When the user message arrives after the first job, the second job
+    # must NOT run, the defer flag is set (run() then keeps the OLD checkpoint
+    # so unrun jobs re-poll; _mark_seen replays safely), and only the completed
+    # job's ts is reported.
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    pending = iter([False, True])            # arrives after job #1's turn
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: next(pending))
+
+    jobs = [
+        {"job_id": "c1", "ts": 111.0, "source": "memory_capture"},
+        {"job_id": "p1", "ts": 222.0, "source": crc.PROACTIVE_JOB_SOURCE},
+    ]
+    assert crc._process_resident_jobs(jobs, chat_since=10.0) == pytest.approx(111.0)
+    assert ran == [("capture", "c1")]        # second job deferred, never ran
+    assert crc._resident_jobs_deferred_for_user is True
+
+
+def test_resident_jobs_defer_before_any_job_and_class_order_kept(monkeypatch):
+    # pending before job #1 → nothing runs at all, no ts progress; without a
+    # pending user the dispatch order is capture → dream → migrate → proactive
+    # regardless of arrival order (matches the old per-class batching).
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: True)
+
+    jobs = [
+        {"job_id": "p1", "ts": 444.0, "source": crc.PROACTIVE_JOB_SOURCE},
+        {"job_id": "d1", "ts": 333.0, "source": "memory_dream"},
+    ]
+    assert crc._process_resident_jobs(jobs, chat_since=10.0) == pytest.approx(0.0)
+    assert ran == []
+    assert crc._resident_jobs_deferred_for_user is True
+
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    jobs = [
+        {"job_id": "p1", "ts": 444.0, "source": crc.PROACTIVE_JOB_SOURCE},
+        {"job_id": "m1", "ts": 200.0, "source": "memory_migrate"},
+        {"job_id": "d1", "ts": 333.0, "source": "memory_dream"},
+        {"job_id": "c1", "ts": 111.0, "source": "memory_capture"},
+    ]
+    assert crc._process_resident_jobs(jobs, chat_since=10.0) == pytest.approx(444.0)
+    assert ran == [
+        ("capture", "c1"), ("dream", "d1"), ("migrate", "m1"), ("proactive", "p1"),
+    ]
+    assert crc._resident_jobs_deferred_for_user is False
+
+
+def test_resident_jobs_defer_flag_resets_every_batch_even_without_proactive(monkeypatch):
+    # the flag must reset unconditionally on batch entry: a capture/dream-only
+    # batch (no proactive job at all) after a deferred batch must clear it —
+    # otherwise a stale True blocks the checkpoint advance for a batch that
+    # completed fully.
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: True)
+    crc._process_resident_jobs(
+        [{"job_id": "p1", "ts": 1.0, "source": crc.PROACTIVE_JOB_SOURCE}], chat_since=10.0
+    )
+    assert crc._resident_jobs_deferred_for_user is True
+
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    assert crc._process_resident_jobs(
+        [{"job_id": "c1", "ts": 555.0, "source": "memory_capture"}], chat_since=10.0
+    ) == pytest.approx(555.0)
+    assert crc._resident_jobs_deferred_for_user is False   # no stale defer
+    assert ran[-1] == ("capture", "c1")
+
+    # legacy path (no chat_since) must not peek at all and also resets the flag
+    crc._resident_jobs_deferred_for_user = True
+    monkeypatch.setattr(
+        crc, "_user_chat_pending",
+        lambda since: (_ for _ in ()).throw(AssertionError("peeked without chat_since")),
+    )
+    assert crc._process_resident_jobs(
+        [{"job_id": "d1", "ts": 333.0, "source": "memory_dream"}]
+    ) == pytest.approx(333.0)
+    assert crc._resident_jobs_deferred_for_user is False

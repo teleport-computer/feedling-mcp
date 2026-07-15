@@ -58,6 +58,56 @@ def test_pending_claims_and_returns_sealed(monkeypatch):
     assert db.genesis_get_job(uid, jid)["status"] == "processing"     # claimed
 
 
+def test_pending_returns_identity_baseline_from_job_metadata(monkeypatch):
+    # P5 (Task 4): pending surfaces the base_identity_replaced_at snapshotted at
+    # job-creation time (Task 3's outer identity ``replaced_at`` field).
+    monkeypatch.delenv("FEEDLING_RESIDENT_DISTILL_MAX_BYTES", raising=False)
+    uid = "usr_ep_baseline"
+    seed_user(uid)
+    db.set_blob(uid, "identity", {"v": 1, "id": "card1", "replaced_at": "2026-07-01T00:00:00"})
+    jid = _upload(uid, b"m", client_job_id="cj-baseline")
+    body, st = genesis_core.resident_pending(_ns(uid), consumer_id="cons-A")
+    assert st == 200
+    mine = [j for j in body["jobs"] if j["job_id"] == jid]
+    assert len(mine) == 1
+    assert mine[0]["base_identity_replaced_at"] == "2026-07-01T00:00:00"
+
+
+def test_pending_legacy_job_without_baseline_key_returns_empty(monkeypatch):
+    # Back-compat: a job created BEFORE this field existed has no metadata key at all —
+    # pending must return "" (Task 5's consumer treats "" as "no baseline, skip check"),
+    # never KeyError/None.
+    monkeypatch.delenv("FEEDLING_RESIDENT_DISTILL_MAX_BYTES", raising=False)
+    uid = "usr_ep_legacy"
+    seed_user(uid)
+    ct = b"legacy-material"
+    created = db.genesis_create_job(uid, {
+        "job_id": "genesis_legacy_no_baseline",
+        "status": "awaiting_resident",
+        "source_kind": "resident",
+        "total_chunks": 1,
+        "total_bytes": len(ct),
+        "privacy_mode": "resident_sealed",
+        "metadata": {"mode": "add_memory", "material_kind": "", "client_job_id": "cj-legacy",
+                     "ingest": "resident_sealed"},   # no base_identity_replaced_at key
+    })
+    assert created is not None
+    db.genesis_put_chunk(
+        uid, "genesis_legacy_no_baseline",
+        seq=0, byte_start=0, byte_end=len(ct),
+        ciphertext_sha256=hashlib.sha256(ct).hexdigest(),
+        content_sha256="",
+        aad={"v": 1, "nonce": base64.b64encode(b"nonce").decode(), "K_user": base64.b64encode(b"ku").decode(),
+             "owner_user_id": uid, "visibility": "shared"},
+        encrypted_body=ct,
+    )
+    body, st = genesis_core.resident_pending(_ns(uid), consumer_id="cons-A")
+    assert st == 200
+    mine = [j for j in body["jobs"] if j["job_id"] == "genesis_legacy_no_baseline"]
+    assert len(mine) == 1
+    assert mine[0]["base_identity_replaced_at"] == ""
+
+
 def test_pending_requires_consumer_id():
     uid = "usr_ep_noc"
     seed_user(uid)

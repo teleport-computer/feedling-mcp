@@ -184,11 +184,14 @@ def _mint(uid: str, scope) -> str:
 
 
 def _norm_ident(body):
-    """Blank volatile created_at/updated_at inside an identity payload."""
+    """Blank volatile created_at/updated_at/replaced_at inside an identity payload.
+    replaced_at (Task 3 / P5 baseline) is stamped from `datetime.now()` at
+    init/replace time, same as created_at/updated_at — volatile across the two
+    separately-timed Flask/ASGI calls this helper compares."""
     body = copy.deepcopy(body)
     ident = body.get("identity") if isinstance(body, dict) else None
     if isinstance(ident, dict):
-        for k in ("created_at", "updated_at"):
+        for k in ("created_at", "updated_at", "replaced_at"):
             if k in ident:
                 ident[k] = "<ts>"
     return body

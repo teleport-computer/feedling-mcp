@@ -1620,6 +1620,38 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/dream/status": {
+      "get": {
+        "summary": "Dream Status",
+        "operationId": "dream_status_v1_dream_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ],
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/dream/tick": {
       "post": {
         "summary": "Dream Tick",
@@ -1764,6 +1796,16 @@
         "summary": "Genesis Import Plaintext",
         "operationId": "genesis_import_plaintext_v1_genesis_imports_plaintext_post",
         "responses": {
+          "200": {
+            "description": "Previously completed matching plaintext import reused.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
           "default": {
             "description": "Error response.",
             "content": {
@@ -1798,7 +1840,8 @@
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "compatibility",
+        "description": "Queue an asynchronous plaintext import. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default. Reusing a completed client_job_id returns the existing job."
       }
     },
     "/v1/genesis/imports/{job_id}": {

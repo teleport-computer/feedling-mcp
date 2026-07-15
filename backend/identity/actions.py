@@ -92,6 +92,14 @@ def _save_identity_action_payload(
         "owner_user_id": envelope["owner_user_id"],
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
+        # replaced_at is the P5 concurrency baseline: it is stamped ONLY by
+        # full-card writes (identity.init / identity.replace). Partial
+        # mutations (profile_patch / dimension_nudge, both routed through
+        # this helper) must carry it forward untouched, not drop it — this
+        # dict is an explicit field list, not a copy of `existing`, so it
+        # must be listed here or the raw blob overwrite in _save_identity
+        # would silently erase it.
+        "replaced_at": existing.get("replaced_at", ""),
         "relationship_started_at": existing.get("relationship_started_at", ""),
         "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
         "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
@@ -434,6 +442,24 @@ def _identity_replace_action(
     ok, err = card_policy.validate_full_identity_card(identity_payload)
     if not ok:
         return {"status": "error", "error": err, "action": "identity.replace"}, [], 400
+    # P5 optimistic concurrency (Task 5): the resident consumer snapshots the outer
+    # replaced_at baseline at job-creation time (Task 4's base_identity_replaced_at) and
+    # forwards it here. If ANOTHER full init/replace has moved replaced_at since then, this
+    # job's derive is stale (built off an outdated card) and must not clobber the newer one.
+    # Omitted or "" (every existing caller, and legacy jobs pre-dating the baseline) skips the
+    # check entirely — back-compat, not a security gate.
+    base_identity_replaced_at = str(action.get("base_identity_replaced_at") or "").strip()
+    if base_identity_replaced_at:
+        current_identity = identity_service._load_identity(store)
+        current_replaced_at = str((current_identity or {}).get("replaced_at") or "")
+        if base_identity_replaced_at != current_replaced_at:
+            return {"status": "error", "error": "identity_base_stale", "action": "identity.replace"}, [], 409
+    # Cloud plaintext role-card uploads use the shared service helper as an
+    # upsert. Resident identity.replace remains replace-only: its create path is
+    # owned by the resident consumer protocol and must not leak through here.
+    if not identity_service._load_identity(store):
+        return {"status": "error", "error": "identity_not_initialized",
+                "action": "identity.replace"}, [], 409
     from genesis import service as genesis_service  # lazy — avoid import cycle
     result = genesis_service.replace_identity_preserving_anchor(
         store, {"identity": identity_payload, "relationship_anchor": _replace_relationship_anchor(action)}

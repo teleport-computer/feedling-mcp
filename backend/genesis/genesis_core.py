@@ -124,6 +124,14 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     # the app entry (long-term-memory archive → keep_all, chat log → selective) — the sealed
     # blob has no source_family the way the cloud plaintext path does.
     material_kind = str(payload.get("material_kind") or "").strip().lower()
+    # base_identity_replaced_at snapshots the P5 concurrency baseline (Task 3's outer
+    # ``replaced_at`` field, stamped only by full identity init/replace) AT JOB-CREATION
+    # TIME, so a later conflict check (Task 5) compares against the identity that existed
+    # when this job was queued — not whatever identity happens to exist when the resident
+    # consumer eventually claims it. No identity on file (or a legacy card missing the
+    # field) → "" (back-compat: "" means "no baseline, skip the check").
+    current_identity = identity_service._load_identity(store)
+    base_identity_replaced_at = str((current_identity or {}).get("replaced_at") or "")
     created = db.genesis_create_job(store.user_id, {
         "job_id": job_id,
         "status": "awaiting_resident",
@@ -132,7 +140,8 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
         "total_bytes": len(encrypted_body),
         "privacy_mode": "resident_sealed",
         "metadata": {"mode": mode_hint, "material_kind": material_kind,
-                     "client_job_id": client_job_id, "ingest": "resident_sealed"},
+                     "client_job_id": client_job_id, "ingest": "resident_sealed",
+                     "base_identity_replaced_at": base_identity_replaced_at},
     })
     # created is None on ON CONFLICT DO NOTHING (idempotent re-upload) — chunk already stored.
     if created is not None:
@@ -172,6 +181,9 @@ def resident_pending(store, *, consumer_id: str) -> tuple[dict, int]:
             "job_id": job["job_id"],
             "mode": (meta.get("mode") or "") or job.get("source_kind") or "",
             "material_kind": str(meta.get("material_kind") or ""),
+            # "" for jobs created before this field existed (no metadata key) — the
+            # consumer (Task 5) must treat "" as "no baseline, skip the conflict check".
+            "base_identity_replaced_at": str(meta.get("base_identity_replaced_at") or ""),
             "sealed": sealed,
         })
     return {"jobs": jobs}, 200
@@ -486,8 +498,6 @@ def plaintext_import(
     input_hash = history_import._history_import_payload_hash(payload)
     client_job_id = history_import._history_import_client_job_id(payload)
     mode = plaintext_mode(payload, client_job_id=client_job_id)
-    if mode == "update_identity" and not identity_service._load_identity(store):
-        return _bad("identity_not_initialized", 409)
     existing = find_reusable(
         store,
         client_job_id=client_job_id,

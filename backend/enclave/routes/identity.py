@@ -60,6 +60,13 @@ async def v1_identity_get(request: Request):
         "created_at": identity.get("created_at"),
         "updated_at": identity.get("updated_at"),
     }
+    # P5 concurrency baseline (Task 3's outer replaced_at, stamped only by full
+    # init/replace) — outer field, not inside the ciphertext, so it's available even
+    # before decrypt. Forwarded additively/guarded-truthy (older cards predate it) so
+    # the resident consumer can refresh its baseline after an identity_base_stale
+    # conflict (Task 5).
+    if identity.get("replaced_at"):
+        base["replaced_at"] = identity.get("replaced_at")
     if identity.get("visibility") == "local_only":
         base.update({
             "visibility": "local_only",

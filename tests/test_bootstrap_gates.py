@@ -23,6 +23,7 @@ not touch prod.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import socket
 import subprocess
@@ -436,7 +437,6 @@ def test_chat_response_without_identity_only_hits_resident_gate(backend):
     assert body["error"] == "bootstrap_incomplete"
     assert body["stage"] == "needs_resident_consumer"
     assert body["identity_written"] is False
-    assert body["missing_tabs"] == []
     assert "resident" in body["required"].lower()
     assert "skill_url" in body
 
@@ -668,6 +668,11 @@ def test_bootstrap_status_complete_field_includes_loop_verified(backend):
 # ---------------------------------------------------------------------------
 
 def test_memory_verify_empty_user(backend):
+    """Guidance-only endpoint (Batch 4 A5). Memory NEVER gates: passing is
+    always True and no 409/gate narrative survives, regardless of the floor
+    curve. Under the current calibration (Seven 2026-07-14) a fresh <2-day
+    user has floor=2, so an empty garden IS below floor — that is a guidance
+    signal (one suggestion), never a gate."""
     user_id, api_key = _register(backend["base_url"])
     r = requests.get(
         f"{backend['base_url']}/v1/memory/verify",
@@ -677,60 +682,48 @@ def test_memory_verify_empty_user(backend):
     assert r.status_code == 200
     body = r.json()
     assert body["counts"]["total"] == 0
-    assert body["below_floor"]["story"] is True
-    assert body["below_floor"]["about_me"] is True
-    assert body["passing"] is False
-    assert body["passing_full"] is False
-    assert len(body["suggestions"]) >= 2  # one per missing tab
+    assert body["below_floor"]["story"] is False
+    assert body["below_floor"]["about_me"] is False
+    assert body["below_floor"]["ta_thinking"] is False
+    assert body["passing"] is True
+    assert body["memory_floor"] == 2
+    assert body["memory_below_floor"] is True
+    assert len(body["suggestions"]) == 1
+    assert "409" not in json.dumps(body)
 
 
-@pytest.mark.skip(reason="P6: /v1/memory/verify per-tab semantics retired by v1 "
-                  "_count_by_tab shim (every active card counts to all tabs). "
-                  "Pre-existing failure on origin/test from the v1 schema merge; "
-                  "rewrite when verify is reworked in P6 cleanup.")
-def test_memory_verify_passing_at_minimum_floor(backend):
-    """<2d tier needs Story=1 + About me=1 (TA Thinking=0 OK).
-    Writing 1 moment + 1 fact today should mark passing=true."""
+def test_memory_verify_guidance_only_below_floor(backend):
+    """Batch 4 A5: /v1/memory/verify is guidance-only, never a gate. A
+    relationship ≥30 days old with only 2 cards is below the days-scaled
+    reference floor (≥30d tier floor = 12 (Seven calibration), see
+    memory_service._per_tab_floors_for_days) — this must surface as
+    memory_below_floor=True + exactly one guidance suggestion, but must
+    NEVER flip passing and must NEVER mention the retired 409 gate."""
     user_id, api_key = _register(backend["base_url"])
-    _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
+    thirty_five_days_ago = (datetime.now() - timedelta(days=35)).isoformat()
+    _add_memory(backend["base_url"], user_id, api_key, "m0",
+                mem_type="moment", occurred_at=thirty_five_days_ago)
+    _add_memory(backend["base_url"], user_id, api_key, "f0",
+                mem_type="fact", occurred_at=thirty_five_days_ago)
     r = requests.get(
         f"{backend['base_url']}/v1/memory/verify",
         headers={"X-API-Key": api_key},
         timeout=TIMEOUT,
     )
+    assert r.status_code == 200
     body = r.json()
-    assert body["counts"]["story"] == 1
-    assert body["counts"]["about_me"] == 1
-    assert body["floors"]["story"] == 1
-    assert body["floors"]["about_me"] == 1
-    assert body["passing"] is True  # Story + About me OK
-    # TA Thinking floor at <2d is 0, so passing_full also holds.
-    assert body["passing_full"] is True
-
-
-@pytest.mark.skip(reason="P6: /v1/memory/verify per-tab semantics retired by v1 "
-                  "_count_by_tab shim. Pre-existing on origin/test; rewrite in P6.")
-def test_memory_verify_about_me_floor_only_passing(backend):
-    """Filling Story + About me but no TA Thinking memories → passing=true
-    (identity_init gate uses Story + About me) but passing_full=false."""
-    user_id, api_key = _register(backend["base_url"])
-    # 10 days ago → 2-30d tier → floors: story=3 / about_me=8 / ta_thinking=2
-    ten_days_ago = (datetime.now() - timedelta(days=10)).isoformat()
-    for i in range(3):
-        _add_memory(backend["base_url"], user_id, api_key, f"m{i}",
-                    mem_type="moment", occurred_at=ten_days_ago)
-    for i in range(8):
-        _add_memory(backend["base_url"], user_id, api_key, f"f{i}",
-                    mem_type="fact", occurred_at=ten_days_ago)
-    r = requests.get(
-        f"{backend['base_url']}/v1/memory/verify",
-        headers={"X-API-Key": api_key},
-        timeout=TIMEOUT,
-    )
-    body = r.json()
-    assert body["passing"] is True, body
-    assert body["passing_full"] is False, body
-    assert body["below_floor"]["ta_thinking"] is True
+    assert body["counts"]["total"] == 2
+    assert body["relationship_days"] >= 30
+    assert body["memory_floor"] == 12
+    assert body["memory_below_floor"] is True
+    # Never a gate, regardless of how far below floor the garden is.
+    assert body["passing"] is True
+    assert "passing_full" not in body
+    # Per-tab keys survive for shape-compat but never fire in v2.
+    assert body["below_floor"] == {"story": False, "about_me": False, "ta_thinking": False}
+    assert len(body["suggestions"]) == 1
+    assert "参考下限约 12 张" in body["suggestions"][0]
+    assert "409" not in json.dumps(body)
 
 
 def test_identity_verify_not_written(backend):

@@ -165,6 +165,40 @@ def test_plaintext_import_reuses_done_job_without_restart(monkeypatch):
     assert body["status"] == "done"
 
 
+def test_update_identity_reuses_done_job_without_existing_identity(monkeypatch):
+    client = _client(monkeypatch)
+    payload = {
+        "mode": "update_identity",
+        "ai_persona_content": "Name: 乔伊",
+        "client_job_id": "identity-idempotent",
+    }
+    existing = {
+        "job_id": "identity_done",
+        "status": "done",
+        "identity_status": "initialized",
+        "metadata": {
+            "ingest": "plaintext",
+            "client_job_id": "identity-idempotent",
+            "mode": "update_identity",
+        },
+    }
+    monkeypatch.setattr(plaintext.identity_service, "_load_identity", lambda _store: None)
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [existing])
+    monkeypatch.setattr(
+        plaintext,
+        "_start_plaintext_genesis_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not restart done job")),
+    )
+
+    resp = client.post("/v1/genesis/imports/plaintext", json=payload)
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "done"
+    assert body["job"]["job_id"] == "identity_done"
+    assert body["job"]["identity_status"] == "initialized"
+
+
 def test_prepare_plaintext_import_caps_windows(monkeypatch):
     monkeypatch.setattr(
         plaintext.history_import,
@@ -638,6 +672,7 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
 def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypatch):
     store = _store()
     calls: dict = {}
+    trace_events: list[dict] = []
     monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
     monkeypatch.setattr(plaintext.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
     monkeypatch.setattr(plaintext.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
@@ -656,6 +691,11 @@ def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypat
         "genesis_complete_job",
         lambda _user_id, _job_id, **kwargs: calls.update({"completed": kwargs}) or {"job_id": "job_identity", "status": "done"},
     )
+    monkeypatch.setattr(
+        plaintext,
+        "_trace_genesis",
+        lambda _store, event_type, **kwargs: trace_events.append({"event_type": event_type, **kwargs}),
+    )
 
     plaintext._run_plaintext_genesis_job(
         store,
@@ -670,6 +710,69 @@ def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypat
     assert calls["identity_output"]["identity"]["agent_name"] == "乔伊"
     assert calls["completed"]["memory_action_count"] == 0
     assert calls["completed"]["identity_status"] == "updated"
+    done = next(event for event in trace_events if event["event_type"] == "genesis.plaintext.done")
+    assert done["detail"] == {"mode": "update_identity", "identity_status": "updated"}
+
+
+def test_update_identity_mode_initializes_missing_identity(monkeypatch):
+    store = _store()
+    calls: dict = {}
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext.identity_service, "_load_identity", lambda _store: None)
+    monkeypatch.setattr(plaintext.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
+    monkeypatch.setattr(
+        plaintext.history_import,
+        "_derive_identity_with_provider",
+        lambda *_args, **_kwargs: ({
+            "agent_name": "乔伊",
+            "dimensions": [{"name": "活泼", "value": 88, "description": "上传角色卡明确写出。"}],
+        }, []),
+    )
+    _stub_update_identity_persona(monkeypatch)
+    monkeypatch.setattr(
+        plaintext.service,
+        "replace_identity_preserving_anchor",
+        lambda _store, output: calls.update({"identity_output": output}) or "initialized",
+    )
+    monkeypatch.setattr(
+        plaintext.service,
+        "mark_failed",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("missing identity must create, not fail")),
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_complete_job",
+        lambda _user_id, _job_id, **kwargs: calls.update({"completed": kwargs}) or {"job_id": "job_identity", "status": "done"},
+    )
+
+    trace_events: list[dict] = []
+    monkeypatch.setattr(
+        plaintext,
+        "_trace_genesis",
+        lambda _store, event_type, **kwargs: trace_events.append({"event_type": event_type, **kwargs}),
+    )
+
+    plaintext._run_plaintext_genesis_job(
+        store,
+        "api_key",
+        "job_identity",
+        mode="update_identity",
+        source_groups=[{"source_kind": "ai_persona_import", "source_family": "ai_persona", "chunk_texts": ["Name: 乔伊"]}],
+        analysis_messages=[{"role": "user", "content": "Name: 乔伊", "source": "ai_persona_import"}],
+        relationship_anchor={
+            "days_with_user": 42,
+            "relationship_started_at": "2026-06-02",
+            "relationship_anchor_evidence": "uploaded role card date",
+        },
+    )
+
+    assert calls["identity_output"]["identity"]["agent_name"] == "乔伊"
+    assert calls["completed"]["memory_action_count"] == 0
+    assert calls["completed"]["identity_status"] == "initialized"
+    done = next(event for event in trace_events if event["event_type"] == "genesis.plaintext.done")
+    assert done["detail"] == {"mode": "update_identity", "identity_status": "initialized"}
 
 
 def test_update_identity_rebuilds_persona_from_uploaded_role_card_material(monkeypatch):
@@ -850,13 +953,35 @@ def test_update_identity_mode_fails_on_empty_identity(monkeypatch):
     assert calls == {"job_id": "job_identity", "error": "identity_update_empty"}
 
 
-def test_update_identity_plaintext_requires_existing_identity(monkeypatch):
+def test_update_identity_plaintext_enqueues_without_existing_identity(monkeypatch):
     client = _client(monkeypatch)
+    captured: dict = {}
     monkeypatch.setattr(plaintext.identity_service, "_load_identity", lambda _store: None)
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         plaintext.service,
         "create_import_job",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not create job")),
+        lambda _store, payload: ({
+            "job_id": "identity_create",
+            "status": "created",
+            "source_kind": payload["source_kind"],
+            "metadata": payload["metadata"],
+        }, 201),
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda _user_id, _job_id, **_kwargs: {
+            "job_id": "identity_create",
+            "status": "processing",
+            "metadata": {"ingest": "plaintext", "mode": "update_identity"},
+        },
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plaintext,
+        "_start_plaintext_genesis_job",
+        lambda _store, _api_key, job, **kwargs: captured.update({"job": job, "mode": kwargs.get("mode")}) or True,
     )
 
     resp = client.post("/v1/genesis/imports/plaintext", json={
@@ -865,8 +990,10 @@ def test_update_identity_plaintext_requires_existing_identity(monkeypatch):
         "client_job_id": "identity-test",
     })
 
-    assert resp.status_code == 409
-    assert resp.get_json()["error"] == "identity_not_initialized"
+    assert resp.status_code == 202
+    assert resp.get_json()["status"] == "processing"
+    assert captured["job"]["job_id"] == "identity_create"
+    assert captured["mode"] == "update_identity"
 
 
 def test_foreground_history_chunks_capped_support_untouched(monkeypatch):

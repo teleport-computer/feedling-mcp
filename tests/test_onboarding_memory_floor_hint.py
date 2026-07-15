@@ -13,7 +13,7 @@ from hosted.onboarding_validation import _memory_floor_fields
 
 
 def _st(count, total_floor):
-    return {"memory_count": count, "floors": {"total": total_floor}}
+    return {"memory_count": count, "memory_floor": total_floor}
 
 
 def test_below_floor_sets_flag_and_hint():
@@ -51,8 +51,9 @@ def test_below_floor_never_flips_passing():
     assert "blocking" not in f
 
 
-def test_memory_floor_falls_back_to_flat_field():
-    # When `floors.total` is absent, fall back to the flat `memory_floor`.
+def test_memory_floor_reads_flat_field():
+    # `_memory_floor_fields` reads `memory_floor` directly off bootstrap_st
+    # (Batch 4: the old per-tab `floors` dict no longer exists there).
     f = _memory_floor_fields({"memory_count": 1, "memory_floor": 13})
     assert f["memory_floor"] == 13
     assert f["memory_below_floor"] is True

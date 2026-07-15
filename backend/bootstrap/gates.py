@@ -43,35 +43,29 @@ def _bootstrap_state(store) -> dict:
     Returns:
         {
           memory_count: int,                # total across tabs
-          memory_floor: int,                # total floor (back-compat)
-          counts: {story, about_me, ta_thinking, total},
-          floors: {story, about_me, ta_thinking, total},
+          memory_floor: int,                # days-scaled reference floor (guidance only)
           identity_written: bool,
           stage: "main_loop",
-          missing_tabs: []                  # always empty (memory no longer gates)
         }
 
     Gate semantics (2026-07): neither Memory Garden nor Identity Card content
     gates whether the agent may speak. ``identity_written`` remains available
-    to status/diagnostic consumers, but never drives ``stage``.
+    to status/diagnostic consumers, but never drives ``stage``. ``memory_floor``
+    is a guidance signal (see ``hosted.onboarding_validation._memory_floor_fields``)
+    — it never blocks and there is no per-tab breakdown any more.
     """
     moments = memory_service._load_moments(store)
-    counts = memory_service._count_by_tab(moments)
+    memory_count = memory_service._count_by_tab(moments)["total"]
     identity_written = identity_service._load_identity(store) is not None
-    floors = memory_service._per_tab_floors_for_days(identity_service._relationship_age_days(store))
-
-    # Memory and identity stay visible for status display only. Neither drives
-    # ``stage``; ``missing_tabs`` is retained for response-shape compatibility.
-    missing_tabs: list[str] = []
+    memory_floor = memory_service._memory_floor_for_days(
+        identity_service._relationship_age_days(store)
+    )
 
     return {
-        "memory_count": counts["total"],
-        "memory_floor": floors["total"],
-        "counts": counts,
-        "floors": floors,
+        "memory_count": memory_count,
+        "memory_floor": memory_floor,
         "identity_written": identity_written,
         "stage": "main_loop",
-        "missing_tabs": missing_tabs,
     }
 
 
@@ -173,9 +167,6 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
                 "stage": "needs_resident_consumer",
                 "memory_count": state["memory_count"],
                 "memory_floor": state["memory_floor"],
-                "counts": state["counts"],
-                "floors": state["floors"],
-                "missing_tabs": state["missing_tabs"],
                 "identity_written": state["identity_written"],
                 "resident_consumer": consumer_state,
                 "required": consumer_state["required"],
@@ -193,9 +184,6 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
                 "stage": "needs_live_connection",
                 "memory_count": state["memory_count"],
                 "memory_floor": state["memory_floor"],
-                "counts": state["counts"],
-                "floors": state["floors"],
-                "missing_tabs": state["missing_tabs"],
                 "identity_written": state["identity_written"],
                 "resident_consumer": consumer_state,
                 "required": required,

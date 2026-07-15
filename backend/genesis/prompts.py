@@ -236,17 +236,20 @@ def combined_map_messages(chunk_text: str) -> list[dict[str, str]]:
     ]
 
 
-def fact_write_messages(fact_digest: list[dict], persona_material: str = "", memory_summary: str = "", known_memories: list[str] | None = None, *, keep_all: bool = False, floor_note: str = "") -> list[dict[str, str]]:
+def fact_write_messages(fact_digest: list[dict], persona_material: str = "", memory_summary: str = "", known_memories: list[str] | None = None, *, keep_all: bool = False, floor_note: str = "", terms_note: str = "") -> list[dict[str, str]]:
     keep_all_suffix = FACT_WRITE_KEEP_ALL_SUFFIX if keep_all else ""
+    terms_note_text = (("\n\n★ " + str(terms_note).strip()) if str(terms_note or "").strip() else "")
     floor_note_text = (("\n\n★ " + str(floor_note).strip()) if str(floor_note or "").strip() else "")
+    insert_text = terms_note_text + floor_note_text
 
-    if floor_note_text:
-        # Insert floor_note before the firewall section, but anchor keep_all_suffix at the end
+    if insert_text:
+        # Insert terms_note (existing buckets/threads snapshot) then floor_note before the
+        # firewall section, but anchor keep_all_suffix at the end.
         firewall_idx = FACT_WRITE_PROMPT.find("\n防火墙:")
         if firewall_idx > 0:
             system = (
                 FACT_WRITE_PROMPT[:firewall_idx]
-                + floor_note_text
+                + insert_text
                 + FACT_WRITE_PROMPT[firewall_idx:]
                 + keep_all_suffix
                 + _STRICT_JSON_SUFFIX
@@ -255,7 +258,7 @@ def fact_write_messages(fact_digest: list[dict], persona_material: str = "", mem
             # Fallback if marker not found
             system = (
                 FACT_WRITE_PROMPT
-                + floor_note_text
+                + insert_text
                 + keep_all_suffix
                 + _STRICT_JSON_SUFFIX
             )

@@ -79,21 +79,22 @@ flowchart TD
 
 ### 1.0 前置：onboarding 是怎么完成的
 
-新 agent 接上 Feedling 后要先完成一套带验收的引导：种记忆 → 写身份卡 →
-验证回复管线 → 总验收。每一步都有服务端检查，做不达标就过不去：
+新 agent 接上 Feedling 后要先完成一套引导：种记忆 → 写身份卡 →
+验证回复管线 → 总验收。记忆花园是引导信号——`/v1/memory/verify` 按"关系
+天数 → 卡片数参考下限"给 suggestions，低于参考下限从不拦总验收（thin-
+but-true beats padded）；身份卡/回复管线/总验收仍有服务端检查，做不
+达标就过不去：
 
 ```mermaid
 flowchart LR
     B["feedling_bootstrap（MCP 工具）<br/>→ POST /v1/bootstrap<br/>返回任务说明：填身份卡、种记忆、打招呼"]
     M["种记忆花园<br/>feedling_memory_add_moment"]
-    MV{"GET /v1/memory/verify<br/>三个 tab 的卡片数<br/>是否达标？"}
+    MV["GET /v1/memory/verify<br/>引导信号：低于参考下限只给<br/>suggestions，从不拦流程"]
     I["feedling_identity_init（带质量门）<br/>→ GET /v1/identity/verify 确认落库"]
     VL["POST /v1/chat/verify_loop<br/>发一条合成 ping，<br/>30 秒内等到回复 = 管线通了"]
     OV{"GET /v1/onboarding/validate<br/>总验收全绿？"}
     OK(["完成，进入日常（下文四个循环）"])
-    B --> M --> MV
-    MV -->|"不达标：按 suggestions 补卡"| M
-    MV -->|"达标"| I --> VL --> OV
+    B --> M --> MV --> I --> VL --> OV
     OV -->|"不过：按 next_action 重做"| M
     OV -->|"过"| OK
 ```
@@ -648,7 +649,8 @@ agent 在对话中觉得"这件事值得记住"时主动写卡。两层闸门：
 
 Onboarding 期间的初始建库也走这条管线：skill 要求 agent 分多遍扫
 共同历史（先抓事件和原话，再补事实，最后写理解），扫完用
-`/v1/memory/verify` 对照"关系天数 → 卡片数下限"的标准验收。
+`/v1/memory/verify` 按"关系天数 → 卡片数参考下限"给引导 suggestions——
+guidance-only，从不拦总验收（Batch 4 A5：旧的硬门槛/标准验收叙事已废）。
 
 ### 4.2 管线二：托管捕获工人（Model API 路线）
 

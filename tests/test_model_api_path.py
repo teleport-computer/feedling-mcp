@@ -1137,7 +1137,6 @@ def test_large_history_extraction_windows_cover_full_timeline():
 
 def test_import_memory_targets_do_not_force_historical_floor_padding():
     targets = history_import._import_memory_targets(
-        {"story": 15, "about_me": 60, "ta_thinking": 12, "total": 87},
         [{"role": "user", "content": f"m{i}", "source": "history_import"} for i in range(120)],
         [],
     )
@@ -1161,7 +1160,6 @@ def test_history_import_profile_marks_three_year_history_as_ultra():
 
     profile = history_import._history_import_profile(messages, [], content_chars=80_000)
     targets = history_import._import_memory_targets(
-        {"story": 15, "about_me": 60, "ta_thinking": 12, "total": 87},
         messages,
         [],
         profile,

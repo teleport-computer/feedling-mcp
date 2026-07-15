@@ -3346,6 +3346,7 @@ def _empty_agent_session_meta(session_id: str = "") -> dict[str, Any]:
         "session_id": session_id,
         "turns": 0,
         "bytes": 0,
+        "bridged": False,
         "created_at": time.time() if session_id else 0.0,
         "updated_at": time.time() if session_id else 0.0,
     }
@@ -3371,6 +3372,7 @@ def _coerce_agent_session_meta(raw: Any) -> dict[str, Any]:
             meta[key] = max(0, int(raw.get(key) or 0))
         except (TypeError, ValueError):
             meta[key] = 0
+    meta["bridged"] = bool(raw.get("bridged"))
     for key in ("created_at", "updated_at"):
         try:
             meta[key] = float(raw.get(key) or meta[key] or 0.0)
@@ -3478,6 +3480,45 @@ def _record_agent_session_turn(sid: str, *, sent_bytes: int = 0, received_bytes:
         f.write_text(json.dumps(meta, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     except Exception as e:
         log.warning("failed to persist agent session metrics: %s", e)
+
+
+def _mark_agent_session_bridged(sid: str) -> None:
+    """Record that the current pi session has received one foreground transcript.
+
+    check_bounds=False is deliberate: this runs right after _record_agent_session_turn,
+    so turns may have just hit the ceiling — a bounds-checking read would delete the
+    session we are marking. Rotation is the NEXT turn's job."""
+    sid = (sid or "").strip()
+    if not sid:
+        return
+    meta = _load_agent_session_meta(check_bounds=False)
+    if str(meta.get("session_id") or "").strip() != sid:
+        return
+    if meta.get("bridged"):
+        return
+    meta = dict(meta)
+    meta["bridged"] = True
+    meta["updated_at"] = time.time()
+
+    user_id = _agent_session_user_id()
+    _agent_session_id_cache[user_id] = sid
+    _agent_session_meta_cache[user_id] = dict(meta)
+    try:
+        f = _agent_session_file_for_user()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(meta, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception as e:
+        log.warning("failed to persist agent session bridge flag: %s", e)
+
+
+def _agent_session_is_bridged() -> bool:
+    """Whether the CURRENT pi session already carries a foreground transcript.
+
+    check_bounds defaults to True on purpose: a session that is over its turn/byte
+    bound gets cleared right here, so the flag reads False and the next foreground
+    turn re-bridges. Reading with check_bounds=False would let a stale True survive
+    the rotation — exactly the drop-out this whole change exists to fix."""
+    return bool(_load_agent_session_meta().get("bridged"))
 
 
 def _extract_session_id(raw: str) -> str:
@@ -3633,10 +3674,12 @@ def _cli_cmd_tokens() -> list[str]:
 def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     """Whether foreground turns get a resident-injected recent-chat transcript.
 
-    Gated so we don't double up context for agents that already carry it: only
+    Gated so we don't double up context for agents that already carry it:
     codex (no --resume) and claude (hosted command has no session; its scrape +
-    --resume continuity is unreliable) inject in ``auto``. pi resumes natively so
-    it is skipped. ``on``/``always`` forces it for any driver; ``off`` disables.
+    --resume continuity is unreliable) inject every turn in ``auto``. pi resumes
+    natively, so it injects only ONCE per session — on the first foreground turn of
+    a session that has not been bridged yet (see _agent_session_is_bridged).
+    ``on``/``always`` forces it for any driver; ``off`` disables.
 
     A claude command that ALREADY carries its own continuity in the operator's
     template (``--resume`` / ``-r`` / ``--session-id``) is skipped in ``auto`` too:
@@ -3652,6 +3695,15 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
         return True
     if _is_claude_code_cmd(cmd):
         return not (_has_cli_resume(cmd) or _has_claude_session_id(cmd))
+    if _is_pi_cmd(cmd):
+        # pi resumes natively, so inside one session re-feeding the transcript is pure
+        # waste. But every NEW session starts blank — rotation (AGENT_SESSION_MAX_TURNS),
+        # a lost session file, a byte-bound clear, or a driver switch — and the turn that
+        # OPENS that session is usually a background one (proactive heartbeats bind a
+        # session id too, but never inject). So bridge once per session: the first
+        # foreground turn in an unbridged session carries the transcript; the rest ride
+        # pi's native --session-id.
+        return not _agent_session_is_bridged()
     return False
 
 
@@ -4135,6 +4187,91 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
     )
 
 
+# What one image costs the model's context, in bytes-equivalent. An image block carries
+# its pixels as inline base64 (pi's ImageContent = {type, data: <base64>, mimeType}), so
+# its serialized length says how big the FILE is, not how much context it occupies — a 1 MB
+# photo is ~1.4 MB of base64 but only ~1-2k tokens to the model. Charging the base64 would
+# blow the whole session budget on a single snapshot and rotate the session on every image.
+_PI_IMAGE_CONTEXT_BYTES = 2_000
+
+
+def _pi_session_content_bytes(raw: str) -> int:
+    """Bytes of everything this pi turn appends to its persistent session: EVERY
+    ``message_end`` message's content blocks, whatever the role and whatever the block
+    type — assistant text, thinking, toolCall blocks, and the tool-result messages that
+    come back. All of it lands in pi's ``--session-id`` store and is re-sent to the model
+    on the next turn, so all of it must be charged to the session's byte budget.
+    (Verified against pi 0.80.3: session persistence hangs off the ``message_end`` hook,
+    and ``--mode json`` prints every session event to stdout unfiltered.)
+
+    Deliberately NOT built on _pi_turn_from_stream: that one answers "what do we show the
+    user" (last text-bearing assistant message + thinking) and by design throws away tool
+    calls and tool results. Charging the session with it under-counted a real multi-step
+    turn by four orders of magnitude in review (160 KB of tool output → 9 bytes charged),
+    leaving AGENT_SESSION_MAX_BYTES unable to fire at all — the exact context blowout the
+    bound exists to prevent.
+
+    Not charged, all in the safe direction:
+    - Streaming frames (pi re-sends the whole message snapshot per token, so transport
+      grows quadratically with reply length — this is where prod's 225 KB/turn median came
+      from). They are transport, never context.
+    - Image pixels — see _PI_IMAGE_CONTEXT_BYTES.
+    - ``bashExecution`` / ``compactionSummary`` / ``branchSummary``, which pi persists
+      outside the message stream. compactionSummary only appears after pi auto-compacts,
+      which SHRINKS the real context while our counter keeps the pre-compaction total —
+      conservative (we may re-ground one turn early), never an under-count.
+
+    pi also echoes the user's prompt back as its own message, so that content is counted
+    here AND in ``sent_bytes``. Over-counting costs a re-ground; under-counting blows the
+    context window."""
+    total = 0
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or str(obj.get("type") or "").strip() != "message_end":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if content is None:
+            continue
+        if not isinstance(content, list):
+            total += len(json.dumps(content, ensure_ascii=False).encode("utf-8"))
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                total += _PI_IMAGE_CONTEXT_BYTES
+            else:
+                total += len(json.dumps(block, ensure_ascii=False).encode("utf-8"))
+    return total
+
+
+def _turn_content_bytes(cmd: list[str], stdout: str, stderr: str = "") -> int:
+    """Bytes this turn adds to the agent's session, for the AGENT_SESSION_MAX_BYTES bound.
+
+    That bound exists to rotate a session before its accumulated conversation blows the
+    model's context window, so it must be fed the conversation. For a long time it was fed
+    ``len(stdout + stderr)`` instead — the raw CLI transport, which for pi is streaming
+    delta framing (one JSON envelope per token). Measured on the prod runner (2026-07-15,
+    301 rotations over 11h across 79 users): a median 225 KB of transport per turn against
+    a 250 KB cap, so 34% of sessions were destroyed after a SINGLE turn and 70% within two
+    — while the turns bound of 24 never fired once. pi's native --session-id resume was
+    therefore dead code in production, and since pi (unlike codex/claude) skips the
+    per-turn history injection, pi users were talking to a context-free agent every message.
+
+    Only pi is corrected here. codex and claude scrape a FRESH session id out of every
+    turn's stream, so _record_agent_session_turn rebuilds their meta each turn and their
+    byte counter never accumulates — the bound cannot fire for them and re-measuring them
+    would be a behavior change with no benefit. They and any unknown driver (hermes /
+    self-hosted templates, whose stream shape we have not verified) keep the transport
+    accounting exactly as it was, stderr included."""
+    if _is_pi_cmd(cmd):
+        try:
+            return _pi_session_content_bytes(stdout or "")
+        except Exception as e:  # noqa: BLE001 — accounting must never break a turn
+            log.warning("pi session content accounting failed, charging transport: %s", e)
+    return len(((stdout or "") + "\n" + (stderr or "")).encode("utf-8"))
+
+
 def call_agent_cli(
     message: str,
     image_paths: list[str] | None = None,
@@ -4246,7 +4383,7 @@ def call_agent_cli(
         _record_agent_session_turn(
             observed_sid,
             sent_bytes=len((message or "").encode("utf-8")),
-            received_bytes=len(raw_transport.encode("utf-8")),
+            received_bytes=_turn_content_bytes(cmd, result.stdout or "", result.stderr or ""),
         )
 
     if result.returncode != 0:
@@ -4262,6 +4399,14 @@ def call_agent_cli(
     if _is_pi_cmd(cmd):
         pi_reply, pi_thinking = _pi_turn_from_stream(result.stdout)
         if pi_reply:
+            # A pi turn that actually carried a resident transcript closes this
+            # session's bridge debt: subsequent turns ride pi's native --session-id
+            # instead of re-feeding. Gated on pi_reply, NOT on returncode — pi exits
+            # 0 EVEN ON API ERRORS (see the raise below), so returncode is not pi's
+            # success signal. A failed turn must not eat the bridge, or the retry
+            # faces a blank session with no history and the user drops out.
+            if observed_sid and _message_has_injected_history(message):
+                _mark_agent_session_bridged(observed_sid)
             # Same lane discipline as codex: background memory lanes (raw_text)
             # get the bare reply; only foreground chat folds thinking into the
             # collapsible disclosure (pi separates thinking at the event layer,
@@ -4800,16 +4945,36 @@ def _refresh_whoami_for_encrypted_reply() -> bool:
     return False
 
 
-def poll_chat(since: float) -> dict:
+def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> dict:
+    poll_to = POLL_TIMEOUT if timeout is None else max(0, int(timeout))
     url = f"{FEEDLING_API_URL}/v1/chat/poll"
-    params = {"since": since, "timeout": POLL_TIMEOUT}
-    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=POLL_TIMEOUT + 10)
+    params = {"since": since, "timeout": poll_to}
+    if not claim:
+        # read-only peek: MUST NOT write the default 600s reply claim (that lease
+        # would make other consumers wait on a message this call only glanced at).
+        params["claim"] = "false"
+    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=poll_to + 10)
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
         _update_chat_runtime_v2_profile(body.get("runtime_v2"))
         _update_user_mcp_advertised(body.get("user_mcp"))
     return body
+
+
+def _user_chat_pending(since: float) -> bool:
+    """Non-blocking, claim-free peek: is a user message waiting since ``since``?
+    Gives user turns priority over proactive turns — a waiting human must never
+    queue behind proactive wake turns on the single per-user consumer (turn lock
+    is single-flight). Uses timeout=0 (no long-poll) and claim=false (never leases
+    the message). Best-effort: on any error, report 'not pending' so proactive
+    still runs (fail-open — a transient poll error must never starve proactive)."""
+    try:
+        body = poll_chat(since, timeout=0, claim=False)
+    except Exception as e:
+        log.warning("user-pending peek failed (fail-open, proactive proceeds): %s", e)
+        return False
+    return bool(isinstance(body, dict) and (body.get("messages") or []))
 
 
 def _update_chat_runtime_v2_profile(profile: Any) -> None:
@@ -6878,11 +7043,13 @@ def _dream_actions_from_consolidations(
     *,
     card_map: dict[str, dict],
     occurred_at: str,
-) -> tuple[list[dict], int, int, int]:
+) -> tuple[list[dict], int, int, int, int, int]:
     actions: list[dict] = []
     cards_merged = 0
     cards_thickened = 0
     cards_superseded = 0
+    organized_ids: set[str] = set()
+    merged_count = 0
     for row in consolidations[: max(1, DREAM_MAX_CONSOLIDATIONS)]:
         op = str(row.get("op") or "").strip().lower()
         card_ids = [
@@ -6893,6 +7060,9 @@ def _dream_actions_from_consolidations(
         card_ids = list(dict.fromkeys(card_ids))
         if not card_ids:
             continue
+        organized_ids.update(card_ids)
+        if op == "merge":
+            merged_count += max(0, len(card_ids) - 1)
         result = row.get("result") if isinstance(row.get("result"), dict) else {}
         card = {
             "type": "fact",
@@ -6920,7 +7090,7 @@ def _dream_actions_from_consolidations(
         cards_superseded += len(card_ids)
     if consolidations and not actions:
         raise ValueError("dream_no_memory_actions")
-    return actions, cards_merged, cards_thickened, cards_superseded
+    return actions, cards_merged, cards_thickened, cards_superseded, len(organized_ids), merged_count
 
 
 def _process_dream_jobs(jobs: list) -> float:
@@ -7028,7 +7198,14 @@ def _process_dream_jobs(jobs: list) -> float:
             continue
         try:
             occurred_at = _format_message_time(time.time())
-            actions, cards_merged, cards_thickened, cards_superseded = _dream_actions_from_consolidations(
+            (
+                actions,
+                cards_merged,
+                cards_thickened,
+                cards_superseded,
+                organized_count,
+                merged_count,
+            ) = _dream_actions_from_consolidations(
                 consolidations,
                 card_map=card_map,
                 occurred_at=occurred_at,
@@ -7080,6 +7257,8 @@ def _process_dream_jobs(jobs: list) -> float:
                     "actions": len(actions),
                     "questions": len(questions),
                     "cards_thickened": cards_thickened,
+                    "organized_count": organized_count,
+                    "merged_count": merged_count,
                 },
                 "memory_action_status": {
                     "status": memory_result.get("status", "ok"),
@@ -7089,6 +7268,8 @@ def _process_dream_jobs(jobs: list) -> float:
                 "memory_results": memory_result.get("results") or [],
                 "cards_merged": cards_merged,
                 "cards_superseded": cards_superseded,
+                "organized_count": organized_count,
+                "merged_count": merged_count,
                 "questions": questions,
             },
         )
@@ -7105,7 +7286,9 @@ def _process_dream_jobs(jobs: list) -> float:
 
 
 def _process_proactive_jobs(jobs: list) -> float:
-    """Realize hidden proactive jobs through the same configured agent entry."""
+    """Realize hidden proactive jobs through the same configured agent entry.
+    The user-turn priority gate lives in ``_process_resident_jobs`` (it must
+    cover capture/dream/migrate model turns too, not just proactive)."""
     latest = 0.0
     for job in jobs:
         ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
@@ -7572,32 +7755,47 @@ def _process_migrate_jobs(jobs: list) -> float:
     return latest
 
 
-def _process_resident_jobs(jobs: list) -> float:
-    capture_jobs = [
-        job for job in (jobs or [])
-        if isinstance(job, dict) and _is_memory_capture_job(job)
-    ]
-    dream_jobs = [
-        job for job in (jobs or [])
-        if isinstance(job, dict) and _is_memory_dream_job(job)
-    ]
-    migrate_jobs = [
-        job for job in (jobs or [])
-        if isinstance(job, dict) and _is_memory_migrate_job(job)
-    ]
-    proactive_jobs = [
-        job for job in (jobs or [])
-        if not (
-            isinstance(job, dict)
-            and (_is_memory_capture_job(job) or _is_memory_dream_job(job) or _is_memory_migrate_job(job))
-        )
-    ]
-    return max(
-        _process_capture_jobs(capture_jobs) if capture_jobs else 0.0,
-        _process_dream_jobs(dream_jobs) if dream_jobs else 0.0,
-        _process_migrate_jobs(migrate_jobs) if migrate_jobs else 0.0,
-        _process_proactive_jobs(proactive_jobs) if proactive_jobs else 0.0,
-    )
+_resident_jobs_deferred_for_user = False
+
+
+def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float:
+    """Dispatch background jobs (capture → dream → migrate → proactive) one at
+    a time, each through its class processor as a single-element batch.
+
+    ① user-turn priority: when ``chat_since`` is given, peek (claim-free,
+    non-blocking) for a waiting user message BEFORE each job's model turn — ALL
+    four classes call the agent, so the gate must sit here, not inside any one
+    processor. If a user message is pending, stop and defer the remaining jobs:
+    a waiting human then waits at most the current, non-preemptible model turn,
+    never a whole batch. On defer, sets ``_resident_jobs_deferred_for_user`` so
+    the caller keeps the OLD job checkpoint (unprocessed jobs re-poll; the
+    per-class ``_mark_seen`` dedup skips the ones already done — no same-ts
+    cursor skip). The flag is reset unconditionally on every batch entry so a
+    previous defer can never leak into a batch that completes fully.
+    ``chat_since=None`` (the default) keeps the legacy no-gate behavior."""
+    global _resident_jobs_deferred_for_user
+    _resident_jobs_deferred_for_user = False
+    ordered: list = []
+    for job in (jobs or []):
+        if isinstance(job, dict) and _is_memory_capture_job(job):
+            ordered.append((0, _process_capture_jobs, job))
+        elif isinstance(job, dict) and _is_memory_dream_job(job):
+            ordered.append((1, _process_dream_jobs, job))
+        elif isinstance(job, dict) and _is_memory_migrate_job(job):
+            ordered.append((2, _process_migrate_jobs, job))
+        else:
+            ordered.append((3, _process_proactive_jobs, job))
+    ordered.sort(key=lambda entry: entry[0])  # stable: keeps arrival order within a class
+    latest = 0.0
+    for _, processor, job in ordered:
+        if chat_since is not None and _user_chat_pending(chat_since):
+            _resident_jobs_deferred_for_user = True
+            log.info(
+                "deferring remaining background job(s): user message pending (user-turn priority)"
+            )
+            break
+        latest = max(latest, processor([job]))
+    return latest
 
 
 def _quoted_memory_context(msg: dict) -> str:
@@ -8108,6 +8306,66 @@ def _resident_floor_note() -> str:
     return ""
 
 
+def _resident_memory_index_summaries() -> list[str]:
+    """Best-effort /v1/memory/index read → per-card summary strings for known_memories
+    (semantic dedup guidance to fact_write). Cap 200 entries x 160 chars — a prompt-sized
+    digest, not a full dump. Any failure/empty garden → [] (zero impact)."""
+    try:
+        body = _capture_post_json(
+            "/v1/memory/index",
+            payload={"limit": max(0, DREAM_MEMORY_INDEX_LIMIT)},
+            timeout=20,
+        )
+        items = body.get("items") if isinstance(body.get("items"), list) else []
+        out: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            summary = str(item.get("summary") or "").strip()
+            if summary:
+                out.append(summary[:160])
+            if len(out) >= 200:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def _resident_memory_snapshot() -> tuple[str, list[str]]:
+    """One-shot read of the memory garden before a resident distill job: existing bucket/
+    thread names (so fact_write reuses instead of inventing near-synonym or bilingual
+    duplicate buckets) + known-memory summaries (so fact_write can semantically dedup via
+    known_memories). Fetch ONCE per job, reuse across the whole window loop — not once per
+    window. Empty garden or any error → ("", []), zero impact (parallels _resident_floor_note)."""
+    try:
+        buckets_body = _capture_get_json("/v1/memory/buckets")
+        threads_body = _capture_get_json("/v1/memory/threads")
+        bucket_names = [
+            str(b.get("name") or "").strip()
+            for b in (buckets_body.get("buckets") or [])
+            if isinstance(b, dict) and str(b.get("name") or "").strip()
+        ]
+        thread_names = [
+            str(t.get("name") or "").strip()
+            for t in (threads_body.get("threads") or [])
+            if isinstance(t, dict) and str(t.get("name") or "").strip()
+        ]
+        known = _resident_memory_index_summaries()
+        if not bucket_names and not thread_names:
+            return "", known
+        terms = (
+            "现有记忆桶/线索(先复用现有桶/线索,别造近义或中英重复桶——"
+            "例:已有「工作」别再造「Work」):\n"
+        )
+        if bucket_names:
+            terms += "buckets: " + "、".join(bucket_names) + "\n"
+        if thread_names:
+            terms += "threads: " + "、".join(thread_names) + "\n"
+        return terms.strip(), known
+    except Exception:
+        return "", []
+
+
 def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = False) -> list[dict]:
     """Reuse the CLOUD genesis memory engine on the VPS: window → fact_map (per window) →
     fact_write, driven by the local agent (persist_output=False = no backend DB). Returns
@@ -8122,6 +8380,7 @@ def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = F
     llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
     runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
     uid = str(_whoami_cache.get("user_id") or "resident")
+    terms_note, known_memories = _resident_memory_snapshot()  # one-shot: fetch once, reuse for whole job
     candidates: list[dict] = []
     for idx, window in enumerate(_window_document(document), start=1):
         out = genesis_worker.build_foreground_output_from_texts(
@@ -8136,6 +8395,7 @@ def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = F
         user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
         runtime=runtime, fact_candidates=candidates, llm=llm, keep_all=keep_all,
         floor_note=_resident_floor_note(),
+        known_memories=known_memories, terms_note=terms_note,
     )
     memories = [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
     # 收口二次 pass(仅 VPS resident):把原始素材 + 刚写的卡再给 agent,只补真实遗漏、
@@ -8172,6 +8432,25 @@ def _resident_existing_identity() -> dict:
         }
     except Exception:
         return {}
+
+
+def _resident_current_replaced_at() -> str:
+    """Best-effort read of the current identity's outer ``replaced_at`` (P5 concurrency
+    baseline, Task 3) — used to refresh the retry baseline after an identity_base_stale
+    conflict (Task 5). Same enclave-first / cloud-fallback shape as
+    ``_resident_existing_identity``; "" on any failure or missing field (never raises,
+    never invents a value)."""
+    try:
+        body = (
+            _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
+            if FEEDLING_ENCLAVE_URL else {}
+        )
+        if not isinstance(body.get("identity"), dict):
+            body = _capture_get_json("/v1/identity/get")
+        identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        return str(identity.get("replaced_at") or "")
+    except Exception:
+        return ""
 
 
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
@@ -8218,15 +8497,48 @@ def _process_resident_distill_once() -> None:
             identity_status = "skipped"
             if mode == "update_identity":
                 identity_payload = _resident_derive_identity(document, job_id)
-                if identity_payload:
-                    execute_identity_actions([{
-                        "type": "identity.replace",
-                        "source": "genesis_resident_distill",
-                        "job_id": job_id,
-                        "reason": "Distilled identity from material the user uploaded.",
-                        "identity": identity_payload,
-                    }])
-                    identity_status = "replaced"
+                # base_identity_replaced_at (Task 4) is the P5 concurrency baseline snapshotted
+                # at job-creation time; "" means no baseline (legacy job / no prior identity) —
+                # the backend then skips the check entirely (back-compat). Only a full
+                # init/replace moves replaced_at, so a signature patch/nudge landing while this
+                # job was pending never looks like a conflict here.
+                base_identity_replaced_at = str(job.get("base_identity_replaced_at") or "")
+                conflict_retried = False
+                while identity_payload is not None:
+                    try:
+                        execute_identity_actions([{
+                            "type": "identity.replace",
+                            "source": "genesis_resident_distill",
+                            "job_id": job_id,
+                            "reason": "Distilled identity from material the user uploaded.",
+                            "identity": identity_payload,
+                            "base_identity_replaced_at": base_identity_replaced_at,
+                        }])
+                        identity_status = "replaced"
+                        break
+                    except RuntimeError as e:
+                        if "identity_base_stale" not in str(e):
+                            raise
+                        if conflict_retried:
+                            log.error(
+                                "resident distill: identity_base_stale conflict persisted "
+                                "after re-derive job=%s — giving up, skipping identity update",
+                                job_id,
+                            )
+                            identity_status = "skipped_conflict"
+                            break
+                        log.warning(
+                            "resident distill: identity_base_stale conflict job=%s — "
+                            "re-fetching card + re-deriving once",
+                            job_id,
+                        )
+                        conflict_retried = True
+                        # _resident_derive_identity re-fetches the existing card internally
+                        # (_resident_existing_identity), so this re-call already merges against
+                        # whatever full replace won the race — then resubmit with a refreshed
+                        # baseline so the retry itself can't spuriously re-conflict.
+                        identity_payload = _resident_derive_identity(document, job_id)
+                        base_identity_replaced_at = _resident_current_replaced_at()
             else:  # add_memory / onboarding → cloud memory engine
                 # long-term-memory archive → keep_all (thorough); chat log → selective.
                 keep_all = material_kind == "memory_summary"
@@ -8462,8 +8774,17 @@ def run() -> None:
                     job_result = poll_proactive_jobs(last_job_ts)
                     jobs = job_result.get("jobs") or []
                     if jobs:
-                        new_job_ts = _process_resident_jobs(jobs)
-                        if new_job_ts > last_job_ts:
+                        # ① user-turn priority: a waiting user must never queue behind
+                        # background job turns (capture/dream/migrate/proactive — each
+                        # a full model turn). Turns are single-flight per user, so a
+                        # batch would otherwise hold the lock while the user's reply
+                        # waits — the "typing… forever" the user sees.
+                        # _process_resident_jobs peeks (claim-free) before each job and
+                        # defers the rest when a user message is pending; on defer we
+                        # KEEP the old checkpoint so the unrun jobs re-poll (already-run
+                        # ones are _mark_seen-skipped).
+                        new_job_ts = _process_resident_jobs(jobs, chat_since=last_ts)
+                        if not _resident_jobs_deferred_for_user and new_job_ts > last_job_ts:
                             last_job_ts = new_job_ts
                             _save_proactive_checkpoint(last_job_ts)
                 except httpx.HTTPStatusError as e:

@@ -543,9 +543,12 @@ def test_plaintext_reuses_done_job_200_parity(user, monkeypatch):
     assert f[1]["job"]["job_id"] == "plaindone"
 
 
-def test_plaintext_update_identity_not_initialized_409_parity(user):
+def test_plaintext_update_identity_without_identity_enqueues_202_parity(user, monkeypatch):
     _uid, api_key = user
     payload = {"mode": "update_identity", "ai_persona_content": "Name: Joy", "client_job_id": "identity-x"}
+    monkeypatch.setattr(genesis_routes, "_start_plaintext_genesis_job", lambda *_args, **_kwargs: True)
     f = _flask("POST", "/v1/genesis/imports/plaintext", headers=_headers(api_key), json_body=payload)
     a = _asgi("POST", "/v1/genesis/imports/plaintext", headers=_headers(api_key), json_body=payload)
-    assert f == a == (409, {"error": "identity_not_initialized"})
+    assert f[0] == a[0] == 202
+    assert _norm(f) == _norm(a)
+    assert f[1]["status"] == "processing"

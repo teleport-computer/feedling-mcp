@@ -122,7 +122,7 @@
 | `days_with_user_mismatch` | 400 | — | | |
 | `days_with_user_must_be_non_negative` | 400 | — | | |
 | `days_with_user_required` | 400 | — | | |
-| `identity_not_initialized` | 409 | — | | |
+| `identity_not_initialized` | 409 | — | 需要既有身份卡的 identity mutation / resident `identity.replace`；cloud plaintext 角色卡上传为 create-or-update，不返回此错误 | |
 | `dimension_required` | 400 | — | | |
 | `dimension_not_found` | 404 | — | | |
 | `delta_required` | 400 | — | | |
@@ -140,6 +140,7 @@
 | `do_not_say_must_be_list` | 400 | — | 同上 | |
 | `stable_definitions_must_be_list` | 400 | — | 同上 | |
 | `envelope_not_allowed` | 400 | — | identity.replace 不接受直接传 envelope | |
+| `identity_base_stale` | 409 | — | identity.replace 带基线且期间发生过全量替换(P5 乐观并发) | |
 | `identity_replace_requires_resident_distill_context` | 403 | — | | |
 | `not_a_live_resident_distill_job` | 403 | — | | |
 | `identity_required` | 400 | — | | |
@@ -193,7 +194,6 @@
 | `raw_reducer_field_not_allowed` | 400 | — | 实际 body 是 `raw_reducer_field_not_allowed:<field>` | |
 | `identity_unavailable` | 409 | — | persona_backfill：身份未就绪 | |
 | `persona_backfill_failed` | 500 | system | 实际 body 是 `persona_backfill_failed:<ExcType>:<msg>` | |
-| `identity_not_initialized` | 409 | — | plaintext_import 的 update_identity 模式 | |
 
 ## 导入 / 归档（history_import / onboarding_archive / diagnostics / copytext）
 

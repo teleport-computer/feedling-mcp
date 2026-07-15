@@ -20,9 +20,7 @@ def _install_model_api_harness(monkeypatch, *, genesis_jobs: list[dict], identit
         "_bootstrap_state",
         lambda _store: {
             "memory_count": memory_count,
-            "counts": {"story": 0, "about_me": 0, "ta_thinking": 0},
-            "floors": {"story": 1, "about_me": 1},
-            "missing_tabs": ["story", "about_me"],
+            "memory_floor": 2,
         },
     )
     monkeypatch.setattr(validation.identity_service, "_load_identity", lambda _store: identity)

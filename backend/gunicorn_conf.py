@@ -48,10 +48,13 @@ workers = _worker_count()
 #   - 下限：寿命必须盖过 leader 单例的后台长任务。2000 请求在 prod = **~2 分钟**
 #     一次回收——长轮询高频被排空、tee-sync/:9998 WS leader 反复换手，in-process
 #     reconcile（数十分钟）永远跑不完（test 实测：部署后 2h 零 tee-sync tick）。
-# jitter 必须非零：4 个 worker 几乎同速消化请求，无 jitter 会同时到阈值同时回收
-# → 服务闪断。
+# jitter 必须够大，不只是非零：同批启动的 worker 几乎同速消化请求，jitter 太小
+# （10k/50k=20%）时回收簇跨代保持松散同步——2026-07-15 prod 实测 01:14-01:30 的
+# 16 分钟里 3/4 worker 相继回收（各自寿命 59-76min 正常，但到期时刻聚成一簇，
+# 偶发两个窗口重叠就是瞬时容量减半）。取 max_requests 的一半，相位一两代内就
+# 完全去相关。
 max_requests = 50000
-max_requests_jitter = 10000
+max_requests_jitter = 25000
 
 # 回收/重启时排空在途请求的窗口。gunicorn 默认 30s，而 /v1/chat/poll 长轮询本身
 # 最长 30s——贴着悬崖，回收瞬间正好 park 住的 consumer 会被掐断（它靠重试恢复，

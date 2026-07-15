@@ -47,9 +47,7 @@ def _install_model_api_harness(monkeypatch, *, config: dict) -> None:
         "_bootstrap_state",
         lambda _store: {
             "memory_count": 0,
-            "counts": {"story": 0, "about_me": 0, "ta_thinking": 0},
-            "floors": {"story": 1, "about_me": 1},
-            "missing_tabs": ["story", "about_me"],
+            "memory_floor": 0,
         },
     )
     monkeypatch.setattr(validation.identity_service, "_load_identity", lambda _store: None)

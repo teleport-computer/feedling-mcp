@@ -103,3 +103,28 @@ def test_resident_upload_is_idempotent(monkeypatch):
     assert s1 == 200 and s2 == 200
     assert b1["job"]["job_id"] == b2["job"]["job_id"]
     assert len(db.genesis_list_chunks(uid, b1["job"]["job_id"])) == 1
+
+
+def test_resident_upload_snapshots_identity_baseline(monkeypatch):
+    # P5 (Task 4): job creation snapshots the CURRENT identity's outer ``replaced_at``
+    # (Task 3's concurrency baseline) into job metadata, so a later conflict check
+    # (Task 5) compares against the identity that existed when this job was queued.
+    monkeypatch.delenv("FEEDLING_RESIDENT_DISTILL_MAX_BYTES", raising=False)
+    uid = "usr_res_up_baseline"
+    seed_user(uid)
+    db.set_blob(uid, "identity", {"v": 1, "id": "card1", "replaced_at": "2026-07-01T00:00:00"})
+    body, status = _import(uid, _sealed_body(uid, b"m", client_job_id="cj-baseline"))
+    assert status == 200
+    job = db.genesis_get_job(uid, body["job"]["job_id"])
+    assert job["metadata"]["base_identity_replaced_at"] == "2026-07-01T00:00:00"
+
+
+def test_resident_upload_no_identity_baseline_is_empty(monkeypatch):
+    # No identity on file at job-creation time → "" (back-compat: consumer skips check).
+    monkeypatch.delenv("FEEDLING_RESIDENT_DISTILL_MAX_BYTES", raising=False)
+    uid = "usr_res_up_no_identity"
+    seed_user(uid)
+    body, status = _import(uid, _sealed_body(uid, b"m", client_job_id="cj-no-identity"))
+    assert status == 200
+    job = db.genesis_get_job(uid, body["job"]["job_id"])
+    assert job["metadata"]["base_identity_replaced_at"] == ""

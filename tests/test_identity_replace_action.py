@@ -53,10 +53,10 @@ def test_replace_rejected_when_job_not_a_live_resident_job():
     assert st == 403 and r["error"] == "not_a_live_resident_distill_job"
 
 
-def test_replace_valid_context_passes_gate_and_reaches_replace():
-    # Valid gate + live resident job, but the user has no initialized identity yet →
-    # the replace itself returns identity_not_initialized (409). That the call reaches this
-    # error proves the gate passed and dispatched into replace_identity_preserving_anchor.
+def test_replace_valid_context_without_identity_remains_409():
+    # Cloud plaintext uploads now create-or-update through the shared service
+    # helper. Resident identity.replace remains replace-only and must stop at its
+    # action-layer no-card guard before the helper can create an identity.
     uid = "usr_idrep_ok"
     jid = _live_resident_job(uid)
     r, _e, st = _run(_ns(uid), {"type": "identity.replace", "source": "genesis_resident_distill",
@@ -86,10 +86,10 @@ def test_replace_rejects_runtime_label_agent_name():
 def test_replace_accepts_sparse_two_dimension_card_and_reaches_replace():
     # Contract B: a sparse (2-dimension) card is a legal shape and must NOT be
     # rejected by card_policy. Proven the same way as
-    # test_replace_valid_context_passes_gate_and_reaches_replace: the user has no
-    # initialized identity yet, so a card that clears card_policy still reaches
-    # replace_identity_preserving_anchor and fails there with identity_not_initialized
-    # (409) — a card_policy rejection would instead surface as 400.
+    # test_replace_valid_context_without_identity_remains_409: the user has no
+    # initialized identity yet, so a card that clears card_policy reaches the
+    # resident no-card guard and returns identity_not_initialized (409) — a
+    # card_policy rejection would instead surface as 400.
     uid = "usr_idrep_sparse_ok"
     jid = _live_resident_job(uid)
     sparse_identity = {"agent_name": "Nyx", "dimensions": [

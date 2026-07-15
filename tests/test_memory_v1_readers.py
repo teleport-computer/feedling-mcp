@@ -192,12 +192,7 @@ def test_bootstrap_gate_uses_v1_count_shim_without_legacy_tabs(monkeypatch):
     monkeypatch.setattr(boot_gates.memory_service, "_load_moments", lambda _store: [
         {"id": "mem_v1", "status": "active", "bucket": "宠物"},
     ])
-    monkeypatch.setattr(boot_gates.memory_service, "_per_tab_floors_for_days", lambda _days: {
-        "story": 1,
-        "about_me": 1,
-        "ta_thinking": 0,
-        "total": 2,
-    })
+    monkeypatch.setattr(boot_gates.memory_service, "_memory_floor_for_days", lambda _days: 2)
     monkeypatch.setattr(boot_gates.identity_service, "_relationship_age_days", lambda _store: 1)
     monkeypatch.setattr(boot_gates.identity_service, "_load_identity", lambda _store: {"id": "identity"})
 
@@ -205,4 +200,7 @@ def test_bootstrap_gate_uses_v1_count_shim_without_legacy_tabs(monkeypatch):
 
     assert state["stage"] == "main_loop"
     assert state["memory_count"] == 1
-    assert state["missing_tabs"] == []
+    assert state["memory_floor"] == 2
+    assert "counts" not in state
+    assert "floors" not in state
+    assert "missing_tabs" not in state

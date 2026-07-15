@@ -438,21 +438,28 @@ Alembic 出现之前就已建表的生产 RDS 上。
   （超频返回 429）——思考需要底料积累，不许刷屏。
 - anchor 一律服务端校验存在性与归属。
 
-**验收门（bootstrap 的 gate，`/v1/memory/verify`）**：每个 tab 有按
-"关系天数"分档的卡片数下限（floors）——
+**`/v1/memory/verify`（Batch 4 A5 起：guidance-only，从不是 gate）**：
+`passing` 恒为 `True`——memory 从不阻塞 `identity_init` 或任何流程（hx：
+优先 onboarding 成功率，质量靠后续二次蒸馏补，不靠卡数量堵门）。v2 没有
+tab 概念，`below_floor` 的三个 per-tab key 仅为响应形状兼容保留、恒为
+`False`。真正还在起作用的信号是按"关系天数"分档的总量参考曲线
+（`memory_service._memory_floor_for_days`，2026-07-14 Seven 校准；
+纯引导、永不 gate）：
 
-| 关系时长 | story / about_me / ta_thinking |
-|---------|-------------------------------|
-| ≥6 个月 | 15 / 60 / 12 |
-| ≥1 个月 | 8 / 25 / 5 |
-| ≥2 天 | 3 / 8 / 2 |
-| 刚认识 | 1 / 1 / 0 |
+| 关系时长 | 总量参考 floor |
+|---------|---------------|
+| ≥6 个月 | 30 |
+| ≥1 个月 | 12 |
+| ≥2 天 | 5 |
+| <2 天 | 2 |
 
-`passing`（= Story + About me 达标）是 `identity_init` 的硬前置，不过不让
-写身份卡；`passing_full`（三 tab 全达标）是建议目标。verify 还做**时间
-分布检查**：关系超过 14 天但所有卡片 `occurred_at` 挤在 7 天内 → 判定
-"只扫了最近的历史"，要求回头补扫。响应里还带 `archive_language` 字段，
-锁定记忆花园的书写语言、防止 agent 随聊天语言漂移。
+低于这条曲线时，响应带 `memory_floor` / `memory_below_floor` 两个平铺
+字段，`suggestions` 最多给一条引导语（"参考下限约 N 张……绝不编造凑数"），
+纯提示、不拦流程。verify 还做**时间分布检查**（`issues` 里的
+`narrow_time_window`）：关系超过 14 天但所有卡片 `occurred_at` 挤在 7 天
+内 → 标记"只扫了最近的历史"，仅作诊断信息、不产生 suggestion 也不影响
+`passing`。响应里还带 `archive_language` 字段，锁定记忆花园的书写语言、
+防止 agent 随聊天语言漂移。
 
 **生命周期**：删除走归档而非物理删（`is_archived`/`archived_at`，归档卡
 不计入 floors）；`retype` 支持重新分类（转成 reflection 时豁免时间频控）；

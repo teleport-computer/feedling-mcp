@@ -910,6 +910,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/access/claim-token"): "Consume a one-time link token and issue an additional API key. Existing keys remain active.",
     ("post", "/v1/account/recover/verify"): "Verify keypair possession and issue an additional API key for the existing account. Existing keys remain active.",
     ("post", "/v1/account/reset"): "Permanently delete the account, its data, and all of its API keys. This is not a per-key revocation endpoint.",
+    ("post", "/v1/genesis/imports/plaintext"): "Queue an asynchronous plaintext import. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default. Reusing a completed client_job_id returns the existing job.",
 }
 
 
@@ -1025,6 +1026,10 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         }
     },
     ("post", "/v1/genesis/imports/plaintext"): {
+        "200": {
+            "description": "Previously completed matching plaintext import reused.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
         "202": {
             "description": "Plaintext import accepted for asynchronous processing.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
@@ -1173,7 +1178,6 @@ def apply_public_contracts(schema: dict[str, Any]) -> dict[str, Any]:
                     ("post", "/v1/onboarding/archive"),
                     ("post", "/v1/diagnostics/logs"),
                     ("post", "/v1/identity/init"),
-                    ("post", "/v1/genesis/imports/plaintext"),
                 }:
                     operation["responses"].pop("200", None)
 

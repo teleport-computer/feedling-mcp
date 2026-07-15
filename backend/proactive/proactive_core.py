@@ -99,6 +99,16 @@ def state_save(store, payload: dict) -> dict:
     return _proactive_state_doc(settings)
 
 
+def dream_status(store) -> dict:
+    state = dream_scheduler.load_dream_state(store)
+    return {
+        "dreaming": capture_jobs._find_active_dream(store) is not None,
+        "last_completed_at": state.get("last_dream_completed_at") or 0,
+        "organized_count": int(state.get("last_dream_organized_count") or 0),
+        "merged_count": int(state.get("last_dream_merged_count") or 0),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # device events
 # --------------------------------------------------------------------------- #
@@ -187,6 +197,8 @@ def _dream_response_doc(result: dict) -> dict:
         "new_turns": result.get("new_turns") or 0,
         "state": {
             "last_dream_completed_at": state.get("last_dream_completed_at") or 0,
+            "last_dream_organized_count": state.get("last_dream_organized_count") or 0,
+            "last_dream_merged_count": state.get("last_dream_merged_count") or 0,
             "last_dreamed_until": str(state.get("last_dreamed_until") or ""),
             "last_dreamed_card_count": state.get("last_dreamed_card_count") or 0,
             "last_dreamed_turn_count": state.get("last_dreamed_turn_count") or 0,
@@ -342,7 +354,7 @@ def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
         patch["memory_results"] = _safe_capture_doc(payload.get("memory_results"), max_items=20)
     if isinstance(payload.get("questions"), list):
         patch["questions"] = _safe_capture_doc(payload.get("questions"), max_items=10)
-    for key in ("cards_added", "cards_superseded", "cards_merged"):
+    for key in ("cards_added", "cards_superseded", "cards_merged", "organized_count", "merged_count"):
         if key in payload:
             try:
                 patch[key] = max(0, int(payload.get(key) or 0))

@@ -450,21 +450,38 @@ def retype(store, payload: dict) -> tuple[dict, int]:
 # --------------------------------------------------------------------------- #
 
 def verify(store) -> tuple[dict, int]:
+    """GUIDANCE-ONLY memory status signal — NEVER a gate.
+
+    v1/v2 has no tabs and no hard floor: ``passing`` is always True (memory
+    is never a gate — hx: 优先 onboarding 成功率, quality is backfilled by
+    later re-distillation, not by blocking onboarding on card counts). The
+    per-tab ``below_floor`` keys are kept for response-shape compat only and
+    are always False — nothing reads a per-tab distinction anymore.
+
+    The one live signal this endpoint still carries is the days-scaled
+    consistency curve: ``memory_floor`` / ``memory_below_floor`` (same
+    curve as ``bootstrap/status``'s and ``onboarding_validation``'s fields
+    of the same name — see ``memory_service._memory_floor_for_days``). When
+    below floor, at most ONE guidance suggestion is returned, phrased as a
+    non-blocking nudge to record more *real* history — never to fabricate
+    cards to hit a number.
+    """
     moments = memory_service._load_moments(store)
     counts = memory_service._count_by_tab(moments)
     days = identity_service._relationship_age_days(store)
     floors = memory_service._per_tab_floors_for_days(days)
+    memory_floor = memory_service._memory_floor_for_days(days)
+    memory_below_floor = counts["total"] < memory_floor
 
     issues = []
     suggestions = []
 
-    below_floor = {
-        "story":       counts["story"]       < floors["story"],
-        "about_me":    counts["about_me"]    < floors["about_me"],
-        "ta_thinking": counts["ta_thinking"] < floors["ta_thinking"],
-    }
+    # v2 has no tabs — these three keys are response-shape compat only and
+    # never fire. memory_below_floor (below) is the one signal that matters.
+    below_floor = {"story": False, "about_me": False, "ta_thinking": False}
 
-    # Time distribution — server-visible plaintext metadata
+    # Time distribution — still useful diagnostic metadata (informational
+    # only; never gates and never produces a suggestion string).
     occurred_ts = []
     for m in moments:
         if not isinstance(m, dict):
@@ -487,51 +504,28 @@ def verify(store) -> tuple[dict, int]:
                 "spread_days": spread_days,
                 "relationship_days": days,
             })
-            suggestions.append(
-                f"All {len(occurred_ts)} of your cards are within {spread_days} days of each other, "
-                f"but your relationship is {days} days old. Sweep older history — "
-                "you missed at least 80% of the relationship's span."
-            )
 
-    # Per-tab suggestions: be specific about which tab is underfilled and
-    # which types feed it. The skill maps types→tabs but reminding helps
-    # agents that haven't re-read the skill mid-bootstrap.
-    if below_floor["story"]:
+    if memory_below_floor:
         suggestions.append(
-            f"Story tab: {counts['story']}/{floors['story']} — write more "
-            "moment/quote memories (the things between you and the user). "
-            "feedling_identity_init will 409 until Story + About me floors are met."
-        )
-    if below_floor["about_me"]:
-        suggestions.append(
-            f"About me tab: {counts['about_me']}/{floors['about_me']} — this is the "
-            "density layer. Sweep for facts (preferences, relationships, dates, habits) "
-            "and events (specific things that happened in the user's life)."
-        )
-    if below_floor["ta_thinking"]:
-        suggestions.append(
-            f"TA 在想 tab: {counts['ta_thinking']}/{floors['ta_thinking']} — write "
-            "insights (your understanding of the user, each anchored to ≥1 prior memory) "
-            "and reflections (your standalone thinking, ≥2 anchors). This tab is not "
-            "blocking for identity_init but it's how the relationship feels reciprocal."
+            f"参考下限约 {memory_floor} 张(按相处天数);材料/对话里真实支持的事实"
+            "尽量都记,绝不编造凑数——这是引导,不拦任何流程。"
         )
 
-    # passing semantics: identity_init gate = Story + About me only.
-    # passing_full = all three tabs at floor.
-    passing = (not below_floor["story"]) and (not below_floor["about_me"]) and not issues
-    passing_full = passing and (not below_floor["ta_thinking"])
+    # Memory is NEVER a gate — passing is unconditionally True.
+    passing = True
 
     resp = {
         "counts": counts,
         "floors": floors,
         "below_floor": below_floor,
+        "memory_floor": memory_floor,
+        "memory_below_floor": memory_below_floor,
         "relationship_days": days,
         "issues": issues,
         "suggestions": suggestions,
         "passing": passing,
-        "passing_full": passing_full,
         # Backwards-compatible flat fields — iOS / older tests may still
-        # read these. The per-tab fields above are the new source of truth.
+        # read these. below/floor above are the new source of truth.
         "count": counts["total"],
         "floor": floors["total"],
     }

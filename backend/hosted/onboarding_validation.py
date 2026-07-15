@@ -78,8 +78,7 @@ def _memory_floor_fields(bootstrap_st: dict) -> dict:
     genuinely has the history — never to fabricate to hit a number.
     """
     count = int(bootstrap_st.get("memory_count") or 0)
-    floor = int((bootstrap_st.get("floors") or {}).get("total")
-                or bootstrap_st.get("memory_floor") or 0)
+    floor = int(bootstrap_st.get("memory_floor") or 0)
     below = bool(floor and count < floor)
     hint = ""
     if below:
@@ -289,9 +288,6 @@ def _model_api_steps_with_genesis(
         "passing": True,
         "blocking": False,
         "memory_count": bootstrap_st["memory_count"],
-        "counts": bootstrap_st["counts"],
-        "floors": bootstrap_st["floors"],
-        "missing_tabs": bootstrap_st["missing_tabs"],
         "genesis": True,
         "memory_action_count": memory_action_count,
         "required": "",
@@ -424,9 +420,6 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "passing": True,
             "blocking": False,
             "memory_count": bootstrap_st["memory_count"],
-            "counts": bootstrap_st["counts"],
-            "floors": bootstrap_st["floors"],
-            "missing_tabs": bootstrap_st["missing_tabs"],
             "required": "",
             **_memory_floor_fields(bootstrap_st),
         },
@@ -494,9 +487,6 @@ def _official_import_onboarding_validation_payload(store: UserStore) -> dict:
             "passing": True,
             "blocking": False,
             "memory_count": bootstrap_st["memory_count"],
-            "counts": bootstrap_st["counts"],
-            "floors": bootstrap_st["floors"],
-            "missing_tabs": bootstrap_st["missing_tabs"],
             "required": "",
             **_memory_floor_fields(bootstrap_st),
         },
@@ -558,9 +548,6 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
             "passing": True,
             "blocking": False,
             "memory_count": bootstrap_st["memory_count"],
-            "counts": bootstrap_st["counts"],
-            "floors": bootstrap_st["floors"],
-            "missing_tabs": bootstrap_st["missing_tabs"],
             "required": "",
             **_memory_floor_fields(bootstrap_st),
         },
