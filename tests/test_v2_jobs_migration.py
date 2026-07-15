@@ -74,7 +74,16 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
         "0016_tee_sync_table_failures",
         "0031_v2_summary_watermark_seq",
     }
-    assert script.get_current_head() == "0032_merge_tee_v2"
+    # A later rebase onto test picked up test's extension of the tee-pg shadow
+    # chain (0016_tee_sync_table_failures → 0017_dau_daily_snapshot →
+    # 0018_tee_reconcile_cursors), which forks at 0016 and so becomes a second
+    # head. 0033_merge_tee_reconcile is the no-op join that unifies it with
+    # 0032_merge_tee_v2 into the single current head.
+    assert set(script.get_revision("0033_merge_tee_reconcile").down_revision) == {
+        "0032_merge_tee_v2",
+        "0018_tee_reconcile_cursors",
+    }
+    assert script.get_current_head() == "0033_merge_tee_reconcile"
 
 
 def test_singleflight_unique_index_enforced():

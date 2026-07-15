@@ -60,10 +60,12 @@ def test_migration_head_and_watermark_seq_column():
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
     # Head is the tee-pg × V2 merge point added when feat/hosted-runtime-v2 was
-    # rebased onto test (0032_merge_tee_v2 joins 0016_tee_sync_table_failures with
-    # 0031_v2_summary_watermark_seq). 0031 remains the V2 chain's watermark_seq
-    # migration, chained after 0030, unchanged by the merge.
-    assert script.get_current_head() == "0032_merge_tee_v2"
+    # rebased onto test: 0032_merge_tee_v2 joins 0016_tee_sync_table_failures with
+    # 0031_v2_summary_watermark_seq, then 0033_merge_tee_reconcile joins in test's
+    # later tee-pg extension (0018_tee_reconcile_cursors, forked at 0016) as the
+    # single current head. 0031 remains the V2 chain's watermark_seq migration,
+    # chained after 0030, unchanged by either merge.
+    assert script.get_current_head() == "0033_merge_tee_reconcile"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )
