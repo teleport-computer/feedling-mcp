@@ -2665,14 +2665,13 @@ def chat_insert_onboarding_greeting_once(
         # Conflict fired yet the row is gone (deleted between statements, e.g.
         # a concurrent chat clear) — surface it rather than invent an answer.
         raise RuntimeError("onboarding_greeting_row_vanished_after_conflict")
-    if inserted:
-        from tee_shadow import mirror
-        # DO NOTHING is idempotent, so the mirror replay is race-safe too.
-        mirror.execute(
-            "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
-            "VALUES (%s, %s, %s, %s) ON CONFLICT (user_id, msg_id) DO NOTHING",
-            (user_id, msg_id, ts, Jsonb(doc)),
-        )
+    # Deliberately NO inline TEE mirror: TEE chat rows are produced by the
+    # replicator, which decrypts via the enclave (plaintext body, no
+    # body_ct/K_*) and assigns seq from its own copy pass. An inline mirror of
+    # this ENCRYPTED doc would write the wrong data shape into TEE and allocate
+    # an independent seq that later conflict-updates never repair. The RDS row
+    # is the immutable first-writer winner, so the normal replicator sweep
+    # copies it exactly once.
     return row[0], inserted
 
 

@@ -3011,7 +3011,7 @@ def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
             # capture cadence). A loser adds no new content — sync only.
             store.notify_chat_waiters()
             try:
-                import wake_bus
+                from core import wake_bus
                 wake_bus.notify("chat", store.user_id)
             except Exception as e:  # noqa: BLE001
                 print(f"[history_import:{store.user_id}] greeting wake notify failed: {type(e).__name__}")

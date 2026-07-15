@@ -1520,6 +1520,26 @@ def test_onboarding_greeting_lookup_failure_propagates(client, monkeypatch):
     assert store.introduction_done() is False
 
 
+def test_onboarding_greeting_wake_notify_fires_for_inserter_only(client, monkeypatch):
+    # The cross-worker wake must actually fire for the inserter (a broken
+    # import here was once swallowed silently — other workers' long-polls
+    # never woke), and must NOT fire for a loser/idempotent re-call that adds
+    # no new content.
+    from core import wake_bus as core_wake_bus
+
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    notified: list = []
+    monkeypatch.setattr(core_wake_bus, "notify",
+                        lambda kind, *args: notified.append((kind,) + args))
+
+    history_import._append_model_api_onboarding_greeting(store, "hello")
+    assert notified == [("chat", user_id)]
+
+    history_import._append_model_api_onboarding_greeting(store, "retry")
+    assert notified == [("chat", user_id)]
+
+
 def test_onboarding_greeting_insert_failure_does_not_mark(client, monkeypatch):
     # The greeting write path must never mark introduced when the row did not
     # durably land: the insert primitive RAISES on DB failure (unlike
