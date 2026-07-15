@@ -25,7 +25,7 @@
       "const": "1.0"
     },
     "suite_id": {
-      "const": "feedling-api-key-p0"
+      "const": "io-e2e-agent-driven-test-p0"
     },
     "run_id": {
       "type": "string",

@@ -13,7 +13,7 @@ The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are requirements.
 - Execute exactly the eight locked profiles and `P0-01` through `P0-13` for every
   profile. A required profile or scenario MUST NOT be skipped.
 - The system under test MUST be the deployed test endpoint named by
-  `QA_FEEDLING_BASE_URL` and the expected deployment named by
+  `IO_E2E_BASE_URL` and the expected deployment named by
   `QA_EXPECTED_DEPLOYMENT_SHA`.
 - Before Codex authentication or synthetic-account provisioning, trusted code
   MUST read the protected test build identity and prove that its image-baked
@@ -237,8 +237,8 @@ Provider credentials are provisioner-only secrets, not agent context.
   admin mode switch or worker-metrics endpoint.
 - Feedling user API keys and content private keys are in-memory session material.
   They MUST NOT appear in artifacts.
-- The supervisor shell MUST use `feedling-e2e-supervisor`, and each worker MUST
-  use its exact locked `feedling-e2e-<profile-id>` permission profile. They MUST
+- The supervisor shell MUST use `io-e2e-agent-driven-test-supervisor`, and each worker MUST
+  use its exact locked `io-e2e-agent-driven-test-<profile-id>` permission profile. They MUST
   NOT use web search, browser/apps/plugins, a login shell, arbitrary external
   network access, the runner's real home, or a legacy workspace-write sandbox.
 

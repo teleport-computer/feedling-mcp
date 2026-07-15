@@ -199,8 +199,8 @@ def test_bundle_isolates_workers_aggregation_and_persona_judge(tmp_path):
         "QA_RUN_ID",
         "QA_WORK_ROOT",
     }
-    assert "QA_FEEDLING_BASE_URL" not in bundle.profiles[judge_path]
-    assert "QA_TEST_ADMIN_TOKEN" not in bundle.profiles[judge_path]
+    assert "IO_E2E_BASE_URL" not in bundle.profiles[judge_path]
+    assert "IO_E2E_ADMIN_TOKEN" not in bundle.profiles[judge_path]
     assert "QA_PRIVATE_MANIFEST" not in bundle.profiles[judge_path]
     assert judge_permission["network"]["enabled"] is False
     assert "domains" not in judge_permission["network"]

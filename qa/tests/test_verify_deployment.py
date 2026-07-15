@@ -10,8 +10,8 @@ from qa import verify_deployment as deployment
 
 SHA = "a" * 40
 ENV = {
-    "QA_FEEDLING_BASE_URL": "https://test-api.feedling.app",
-    "QA_TEST_ADMIN_TOKEN": "test-admin-token",
+    "IO_E2E_BASE_URL": "https://test-api.feedling.app",
+    "IO_E2E_ADMIN_TOKEN": "test-admin-token",
 }
 
 
@@ -137,11 +137,11 @@ def test_unavailable_endpoint_and_missing_inputs_fail_closed(tmp_path):
             admin_client=FakeAdmin(status=404),
         )
     with pytest.raises(
-        deployment.DeploymentVerificationError, match="QA_TEST_ADMIN_TOKEN"
+        deployment.DeploymentVerificationError, match="IO_E2E_ADMIN_TOKEN"
     ):
         deployment.verify_deployment(
             SHA,
             tmp_path / "deployment.json",
-            env={"QA_FEEDLING_BASE_URL": ENV["QA_FEEDLING_BASE_URL"]},
+            env={"IO_E2E_BASE_URL": ENV["IO_E2E_BASE_URL"]},
             admin_client=FakeAdmin(),
         )

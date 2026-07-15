@@ -79,7 +79,7 @@ _P0_06_CAPTURE_TOKENS = (
     "$QA_SOURCE_ROOT/tools/genesis_e2e.py",
     "distill-existing-session",
     "--api-url",
-    "$QA_FEEDLING_BASE_URL",
+    "$IO_E2E_BASE_URL",
     "--session-manifest",
     "$QA_PRIVATE_MANIFEST",
     "--profile-id",
@@ -636,7 +636,7 @@ def _validate_receipt_shape(receipt: Any) -> list[dict[str, Any]]:
             or row.get("agent_type") != expected_agent
             or row.get("attempt") != 1
             or row.get("process_exit_code") != 0
-            or row.get("permission_profile") != f"feedling-e2e-{expected_profile}"
+            or row.get("permission_profile") != f"io-e2e-agent-driven-test-{expected_profile}"
             or not _valid_identifier(row.get("worker_id"))
             or row.get("thread_id") != row.get("worker_id")
             or (

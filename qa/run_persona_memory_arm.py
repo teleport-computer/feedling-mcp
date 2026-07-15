@@ -274,7 +274,7 @@ def _script(name: str, *arguments: str) -> list[str]:
 
 def _runner_environment(env: Mapping[str, str]) -> dict[str, str]:
     sanitized = dict(env)
-    sanitized.pop("QA_TEST_ADMIN_TOKEN", None)
+    sanitized.pop("IO_E2E_ADMIN_TOKEN", None)
     for name in _PROVIDER_SECRET_ENVS:
         sanitized.pop(name, None)
     return sanitized
@@ -848,7 +848,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-codex-profile", default="persona_memory_judge")
     parser.add_argument(
         "--judge-permission-profile",
-        default="feedling-e2e-persona-memory-judge",
+        default="io-e2e-agent-driven-test-persona-memory-judge",
     )
     parser.add_argument(
         "--judge-reasoning-effort",

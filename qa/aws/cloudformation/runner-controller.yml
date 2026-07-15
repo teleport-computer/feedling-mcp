@@ -27,14 +27,14 @@ Parameters:
     AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
   GitHubEnvironment:
     Type: String
-    Default: feedling-e2e-test
+    Default: io-e2e-agent-driven-test
     AllowedPattern: '^[A-Za-z0-9_.-]+$'
 
 Resources:
   RunnerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Feedling E2E disposable runner - no ingress and HTTPS egress only
+      GroupDescription: IO agent-driven E2E disposable runner - no ingress and HTTPS egress only
       VpcId: !Ref VpcId
       SecurityGroupIngress: []
       SecurityGroupEgress:
@@ -45,7 +45,7 @@ Resources:
           CidrIp: 0.0.0.0/0
       Tags:
         - Key: ManagedBy
-          Value: feedling-agentic-e2e
+          Value: io-e2e-agent-driven-test
         - Key: Purpose
           Value: api-key-e2e
 
@@ -53,7 +53,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       Description: >-
-        GitHub OIDC role that may launch and terminate only tagged Feedling E2E
+        GitHub OIDC role that may launch and terminate only tagged IO agent-driven E2E
         instances. It cannot pass an instance role or create ingress rules.
       MaxSessionDuration: 3600
       AssumeRolePolicyDocument:
@@ -96,7 +96,7 @@ Resources:
                 Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
                 Condition:
                   StringEquals:
-                    "aws:RequestTag/ManagedBy": feedling-agentic-e2e
+                    "aws:RequestTag/ManagedBy": io-e2e-agent-driven-test
                     "aws:RequestTag/Purpose": api-key-e2e
                     "aws:RequestTag/Repository": !Ref Repository
                     "ec2:InstanceType": m7i.xlarge
@@ -130,7 +130,7 @@ Resources:
                 Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
                 Condition:
                   StringEquals:
-                    "aws:RequestTag/ManagedBy": feedling-agentic-e2e
+                    "aws:RequestTag/ManagedBy": io-e2e-agent-driven-test
                     "aws:RequestTag/Purpose": api-key-e2e
                     "aws:RequestTag/Repository": !Ref Repository
                     "ec2:VolumeType": gp3
@@ -166,7 +166,7 @@ Resources:
                 Condition:
                   StringEquals:
                     "ec2:CreateAction": RunInstances
-                    "aws:RequestTag/ManagedBy": feedling-agentic-e2e
+                    "aws:RequestTag/ManagedBy": io-e2e-agent-driven-test
                     "aws:RequestTag/Purpose": api-key-e2e
                     "aws:RequestTag/Repository": !Ref Repository
                   ForAllValues:StringEquals:
@@ -194,20 +194,20 @@ Resources:
                 Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
                 Condition:
                   StringEquals:
-                    "ec2:ResourceTag/ManagedBy": feedling-agentic-e2e
+                    "ec2:ResourceTag/ManagedBy": io-e2e-agent-driven-test
                     "ec2:ResourceTag/Purpose": api-key-e2e
                     "ec2:ResourceTag/Repository": !Ref Repository
 
 Outputs:
   AwsRoleArn:
-    Description: Set this as the feedling-e2e-test variable QA_AWS_ROLE_ARN.
+    Description: Set this as the io-e2e-agent-driven-test variable QA_AWS_ROLE_ARN.
     Value: !GetAtt RunnerControllerRole.Arn
   SecurityGroupId:
-    Description: Set this as the feedling-e2e-test variable QA_AWS_SECURITY_GROUP_ID.
+    Description: Set this as the io-e2e-agent-driven-test variable QA_AWS_SECURITY_GROUP_ID.
     Value: !Ref RunnerSecurityGroup
   SubnetId:
-    Description: Set this as the feedling-e2e-test variable QA_AWS_SUBNET_ID.
+    Description: Set this as the io-e2e-agent-driven-test variable QA_AWS_SUBNET_ID.
     Value: !Ref PublicSubnetId
   AmiId:
-    Description: Set this as the feedling-e2e-test variable QA_AWS_AMI_ID.
+    Description: Set this as the io-e2e-agent-driven-test variable QA_AWS_AMI_ID.
     Value: !Ref CanonicalAmiId

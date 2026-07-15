@@ -377,14 +377,14 @@ umask 077
 cleanup() {{
   status=$?
   trap - EXIT
-  rm -f /run/feedling-runner-jit /run/feedling-runner-jit.b64
+  rm -f /run/io-e2e-runner-jit /run/io-e2e-runner-jit.b64
   find /var/lib/cloud/instances -maxdepth 3 -type f \\( -name 'user-data.txt' -o -name 'user-data.txt.i' -o -path '*/scripts/part-*' \\) -delete 2>/dev/null || true
   sync || true
   shutdown -h now || poweroff -f || true
   exit "$status"
 }}
 trap cleanup EXIT
-systemd-run --quiet --unit=feedling-runner-hard-expiry \
+systemd-run --quiet --unit=io-e2e-runner-hard-expiry \
   --on-active={ttl_seconds}s --timer-property=AccuracySec=1min \
   --property=Type=oneshot /sbin/shutdown -h now
 export DEBIAN_FRONTEND=noninteractive
@@ -406,10 +406,10 @@ fi
 apt-get update -q
 apt-get install -y --no-install-recommends ca-certificates curl git jq tar gzip xz-utils unzip bubblewrap
 install -d -m 0755 /opt/actions-runner /opt/codex
-if ! id feedling-runner >/dev/null 2>&1; then
-  useradd --create-home --shell /bin/bash --user-group feedling-runner
+if ! id io-e2e-runner >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash --user-group io-e2e-runner
 fi
-install -d -m 0700 -o feedling-runner -g feedling-runner /opt/actions-runner/_tool
+install -d -m 0700 -o io-e2e-runner -g io-e2e-runner /opt/actions-runner/_tool
 bootstrap_dir="$(mktemp -d /opt/feedling-bootstrap.XXXXXX)"
 runner_archive="$bootstrap_dir/actions-runner.tgz"
 codex_archive="$bootstrap_dir/codex.tgz"
@@ -430,7 +430,7 @@ if [ -n "$unsafe_member" ]; then
 fi
 cp -a "$bootstrap_dir/package/." /opt/codex/
 chown -R root:root /opt/codex
-chown -R feedling-runner:feedling-runner /opt/actions-runner
+chown -R io-e2e-runner:io-e2e-runner /opt/actions-runner
 find /opt/codex -type d -exec chmod 0755 {{}} +
 find /opt/codex -type f -exec chmod 0644 {{}} +
 chmod 0755 \
@@ -441,18 +441,18 @@ chmod 0755 \
   /opt/codex/vendor/x86_64-unknown-linux-musl/codex-resources/zsh/bin/zsh
 ln -s /opt/codex/vendor/x86_64-unknown-linux-musl/bin/codex /usr/local/bin/codex
 printf '%s\\n' 'RUNNER_TOOL_CACHE=/opt/actions-runner/_tool' > /opt/actions-runner/.env
-chown feedling-runner:feedling-runner /opt/actions-runner/.env /opt/actions-runner/_tool
-printf '%s' '{encoded_jit}' > /run/feedling-runner-jit.b64
-base64 --decode /run/feedling-runner-jit.b64 > /run/feedling-runner-jit
-chown feedling-runner:feedling-runner /run/feedling-runner-jit
-chmod 0600 /run/feedling-runner-jit
-rm -rf "$bootstrap_dir" /run/feedling-runner-jit.b64
+chown io-e2e-runner:io-e2e-runner /opt/actions-runner/.env /opt/actions-runner/_tool
+printf '%s' '{encoded_jit}' > /run/io-e2e-runner-jit.b64
+base64 --decode /run/io-e2e-runner-jit.b64 > /run/io-e2e-runner-jit
+chown io-e2e-runner:io-e2e-runner /run/io-e2e-runner-jit
+chmod 0600 /run/io-e2e-runner-jit
+rm -rf "$bootstrap_dir" /run/io-e2e-runner-jit.b64
 find /var/lib/cloud/instances -maxdepth 3 -type f \\( -name 'user-data.txt' -o -name 'user-data.txt.i' -o -path '*/scripts/part-*' \\) -delete 2>/dev/null || true
-runuser -u feedling-runner -- env HOME=/home/feedling-runner PATH=/usr/local/bin:/usr/bin:/bin RUNNER_TOOL_CACHE=/opt/actions-runner/_tool /bin/bash -c '
+runuser -u io-e2e-runner -- env HOME=/home/io-e2e-runner PATH=/usr/local/bin:/usr/bin:/bin RUNNER_TOOL_CACHE=/opt/actions-runner/_tool /bin/bash -c '
   set -Eeuo pipefail
   cd /opt/actions-runner
-  jit_config="$(</run/feedling-runner-jit)"
-  rm -f /run/feedling-runner-jit
+  jit_config="$(</run/io-e2e-runner-jit)"
+  rm -f /run/io-e2e-runner-jit
   exec ./run.sh --jitconfig "$jit_config"
 '
 """
@@ -625,7 +625,7 @@ def launch(
         expires_at=expires_at,
     )
     client_token = (
-        "feedling-e2e-"
+        "io-e2e-agent-driven-test-"
         + hashlib.sha256(
             f"{repository}\0{run_id}\0{run_attempt}".encode("utf-8")
         ).hexdigest()[:48]

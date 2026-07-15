@@ -88,8 +88,8 @@ def verify_deployment(
         raise DeploymentVerificationError("expected deployment SHA is malformed")
     if expected_runtime not in {BASELINE_RUNTIME, RUNTIME_V2_RUNTIME}:
         raise DeploymentVerificationError("runtime requirement is invalid")
-    base_url = validate_base_url(_required_env(active_env, "QA_FEEDLING_BASE_URL"))
-    token = _required_env(active_env, "QA_TEST_ADMIN_TOKEN")
+    base_url = validate_base_url(_required_env(active_env, "IO_E2E_BASE_URL"))
+    token = _required_env(active_env, "IO_E2E_ADMIN_TOKEN")
     client = admin_client or AdminClient(base_url, token)
 
     try:

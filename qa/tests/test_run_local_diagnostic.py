@@ -141,7 +141,7 @@ def _options(
     preflight_only: bool,
     env_text: str = (
         "QA_GEMINI_API_KEY=gemini-sensitive-value\n"
-        "FEEDLING_ADMIN_TOKEN=test-admin-token\n"
+        "IO_E2E_ADMIN_TOKEN=test-admin-token\n"
     ),
 ) -> local.DiagnosticOptions:
     source = tmp_path / "checkout"
@@ -222,8 +222,8 @@ def _deployment_verification(
     env,
     expected_runtime,
 ) -> dict:
-    assert env["QA_FEEDLING_BASE_URL"] == "https://test-api.feedling.app"
-    assert env["QA_TEST_ADMIN_TOKEN"]
+    assert env["IO_E2E_BASE_URL"] == "https://test-api.feedling.app"
+    assert env["IO_E2E_ADMIN_TOKEN"]
     sha = expected_sha or "a" * 40
     receipt = {
         "schema_version": 1,
@@ -461,7 +461,7 @@ def test_repo_local_dotenv_is_excluded_from_worker_source_snapshot(tmp_path):
     repo_env = _write_private(
         source / ".env.test",
         "QA_GEMINI_API_KEY=repo-local-provider-secret\n"
-        "FEEDLING_ADMIN_TOKEN=test-admin-token\n",
+        "IO_E2E_ADMIN_TOKEN=test-admin-token\n",
     )
     (source / ".env.example").write_text(
         "QA_GEMINI_API_KEY=example-only\n", encoding="utf-8"
@@ -526,7 +526,7 @@ def test_subset_run_scans_every_loaded_provider_credential(tmp_path, monkeypatch
         env_text=(
             "QA_GEMINI_API_KEY=selected-gemini-provider-secret\n"
             f"QA_OPENAI_PROVIDER_API_KEY={unselected_secret}\n"
-            f"QA_TEST_ADMIN_TOKEN={admin_secret}\n"
+            f"IO_E2E_ADMIN_TOKEN={admin_secret}\n"
             f"QA_GEMINI_MODEL={expected_model}\n"
             f"QA_KONGBEIQIE_BASE_URL={expected_base_url}\n"
         ),
@@ -623,7 +623,7 @@ def test_failed_public_artifact_scan_quarantines_original_files(
         preflight_only=True,
         env_text=(
             f"QA_GEMINI_API_KEY={provider_secret}\n"
-            "FEEDLING_ADMIN_TOKEN=test-admin-token\n"
+            "IO_E2E_ADMIN_TOKEN=test-admin-token\n"
         ),
     )
     dependencies = local.DiagnosticDependencies(
@@ -688,7 +688,7 @@ def test_unselected_key_leak_is_rejected_but_model_and_base_url_are_allowed(
         (
             "QA_GEMINI_API_KEY=selected-provider-key\n"
             f"QA_OPENAI_PROVIDER_API_KEY={unselected_secret}\n"
-            f"QA_TEST_ADMIN_TOKEN={admin_secret}\n"
+            f"IO_E2E_ADMIN_TOKEN={admin_secret}\n"
             f"QA_GEMINI_MODEL={expected_model}\n"
             f"QA_KONGBEIQIE_BASE_URL={expected_base_url}\n"
         ),
@@ -868,8 +868,8 @@ def test_prepare_environment_validates_only_selected_key_names_and_adds_defaults
 
     assert names == ("QA_GEMINI_API_KEY",)
     assert env["QA_GEMINI_MODEL"] == "gemini-2.5-flash"
-    assert env["QA_FEEDLING_BASE_URL"] == local.LOCKED_BASE_URL
-    assert "QA_TEST_ADMIN_TOKEN" not in env
+    assert env["IO_E2E_BASE_URL"] == local.LOCKED_BASE_URL
+    assert "IO_E2E_ADMIN_TOKEN" not in env
     assert "QA_DEEPSEEK_API_KEY" not in env
     assert "QA_DEEPSEEK_MODEL" not in env
     assert "QA_CODEX_MODEL" not in env
@@ -1273,7 +1273,7 @@ def test_headless_preflight_uses_isolated_oauth_model_and_forbids_tools(
     assert "Do not call any tool" in observed["prompt"]
     assert observed["environment"]["CODEX_HOME"] == str(paths.codex_home)
     assert "QA_GEMINI_API_KEY" not in observed["environment"]
-    assert "QA_FEEDLING_BASE_URL" not in observed["environment"]
+    assert "IO_E2E_BASE_URL" not in observed["environment"]
     assert receipt["headless_exec_completed"] is True
     assert receipt["tool_calls_observed"] is False
     assert receipt["worker_runtime_valid"] is True
@@ -1285,7 +1285,7 @@ def test_headless_preflight_uses_isolated_oauth_model_and_forbids_tools(
         "-p",
         "profile_official_gemini",
         "-P",
-        "feedling-e2e-official-gemini",
+        "io-e2e-agent-driven-test-official-gemini",
     )
     assert sandbox_command[-1].endswith("/qa/cot_delivery_probe.py")
     assert 'exec "$QA_PYTHON_BIN" -I -B "$2" --help' in sandbox_command[-4]
@@ -1298,7 +1298,7 @@ def test_headless_preflight_uses_isolated_oauth_model_and_forbids_tools(
         "-p",
         "profile_official_gemini",
         "-P",
-        "feedling-e2e-official-gemini",
+        "io-e2e-agent-driven-test-official-gemini",
     )
     assert network_command[-1] == "https://test-api.feedling.app/healthz"
     assert "urllib.request.urlopen" in network_command[-2]
@@ -1419,8 +1419,8 @@ def test_preflight_discovers_authoritative_deployment_sha_before_codex(tmp_path)
         order.append("deployment")
         assert expected_sha is None
         assert env == {
-            "QA_FEEDLING_BASE_URL": "https://test-api.feedling.app",
-            "QA_TEST_ADMIN_TOKEN": "test-admin-token",
+            "IO_E2E_BASE_URL": "https://test-api.feedling.app",
+            "IO_E2E_ADMIN_TOKEN": "test-admin-token",
         }
         receipt = {
             "schema_version": 1,
@@ -1487,7 +1487,7 @@ def test_candidate_sha_mismatch_aborts_before_codex_or_provisioning(tmp_path):
 
     def reject_mismatch(expected_sha, _receipt_path, *, env, expected_runtime):
         assert expected_sha == "a" * 40
-        assert env["QA_TEST_ADMIN_TOKEN"] == "test-admin-token"
+        assert env["IO_E2E_ADMIN_TOKEN"] == "test-admin-token"
         assert expected_runtime == "deployed_current"
         raise local.deployment_verifier.DeploymentVerificationError(
             "deployed backend build does not match the candidate"
@@ -1581,7 +1581,7 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
         assert profile_ids == ("official-gemini",)
         assert runtime_requirement == "deployed_current"
         assert env["QA_GEMINI_API_KEY"] == "gemini-sensitive-value"
-        assert "QA_TEST_ADMIN_TOKEN" not in env
+        assert "IO_E2E_ADMIN_TOKEN" not in env
         assert "FEEDLING_ADMIN_TOKEN" not in env
         manifest = {
             "schema_version": 1,
@@ -1915,7 +1915,7 @@ def test_nonpassing_worker_retains_only_credential_scrubbed_debug_evidence(tmp_p
     assert summary["private_cleanup_retry_retained"] is False
     assert not any(options.private_base.iterdir())
 
-    debug_root = options.private_base.parent / "feedling-e2e-debug" / summary["run_id"]
+    debug_root = options.private_base.parent / "io-e2e-agent-driven-test-debug" / summary["run_id"]
     debug_manifest = json.loads((debug_root / "debug-manifest.json").read_text())
     assert debug_manifest["oauth_material_retained"] is False
     assert debug_manifest["credential_material_retained"] is False

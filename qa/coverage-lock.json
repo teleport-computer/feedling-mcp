@@ -1,13 +1,13 @@
 {
   "version": 1,
-  "suite_id": "feedling-api-key-p0",
+  "suite_id": "io-e2e-agent-driven-test-p0",
   "scope": "api_key_only",
   "target": {
     "environment": "test",
-    "base_url_env": "QA_FEEDLING_BASE_URL",
+    "base_url_env": "IO_E2E_BASE_URL",
     "expected_deployment_sha_env": "QA_EXPECTED_DEPLOYMENT_SHA",
     "expected_runtime": "deployed_current",
-    "runtime_admin_token_env": "QA_TEST_ADMIN_TOKEN"
+    "runtime_admin_token_env": "IO_E2E_ADMIN_TOKEN"
   },
   "execution": {
     "required_profile_count": 8,

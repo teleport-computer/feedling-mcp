@@ -24,7 +24,7 @@ BUILD_SHA = "a" * 40
 
 @pytest.fixture()
 def qa_client(client, monkeypatch):
-    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", ADMIN_TOKEN)
+    monkeypatch.setenv("IO_E2E_ADMIN_TOKEN", ADMIN_TOKEN)
     monkeypatch.setenv(synthetic.ENABLED_ENV, "true")
     monkeypatch.setenv(synthetic.MAX_TTL_ENV, "3600")
     monkeypatch.setenv(synthetic.REAPER_INTERVAL_ENV, "30")
@@ -132,7 +132,30 @@ def test_admin_auth_status_and_registration_contract(qa_client):
     )
 
 
-def test_absence_endpoint_uses_database_not_process_registry(qa_client):
+def test_legacy_admin_token_cannot_authorize_io_e2e_routes(client, monkeypatch):
+    monkeypatch.delenv("IO_E2E_ADMIN_TOKEN", raising=False)
+    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "legacy-admin-token")
+
+    response = client.get(
+        "/v1/admin/qa/build-identity",
+        headers={"X-Admin-Token": "legacy-admin-token"},
+    )
+
+    assert response.status_code == 503
+
+
+def test_io_e2e_token_cannot_authorize_general_admin_routes(qa_client, monkeypatch):
+    monkeypatch.delenv("FEEDLING_ADMIN_TOKEN", raising=False)
+
+    response = qa_client.get(
+        "/v1/admin/data-track/summary",
+        headers=_admin_headers(),
+    )
+
+    assert response.status_code == 503
+
+
+def test_absence_endpoint_uses_database_not_process_registry(qa_client, monkeypatch):
     account = _register_direct("agent-e2e-authoritative-absence", now=1_000, ttl=1)
     user_id = account["user_id"]
 
@@ -165,8 +188,11 @@ def test_absence_endpoint_uses_database_not_process_registry(qa_client):
             entry for entry in registry._users if entry.get("user_id") != user_id
         ]
         registry._rebuild_key_cache()
+    legacy_admin_token = "legacy-data-track-admin-token"
+    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", legacy_admin_token)
     stale_lookup = qa_client.get(
-        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+        f"/v1/admin/data-track/users/{user_id}",
+        headers={"X-Admin-Token": legacy_admin_token},
     )
     assert stale_lookup.status_code == 404
     assert stale_lookup.get_json() == {"error": "user_not_found"}
@@ -295,15 +321,11 @@ def test_cleanup_run_is_authoritative_aggregate_only_and_idempotent(qa_client):
 
     late_registration = qa_client.post(
         "/v1/admin/qa/synthetic-accounts/register",
-        json=_synthetic_payload(
-            "agent-e2e-cleanup-run-late-account", run_id=run_id
-        ),
+        json=_synthetic_payload("agent-e2e-cleanup-run-late-account", run_id=run_id),
         headers=_admin_headers(),
     )
     assert late_registration.status_code == 409
-    assert late_registration.get_json() == {
-        "error": "synthetic_account_run_closed"
-    }
+    assert late_registration.get_json() == {"error": "synthetic_account_run_closed"}
 
     repeated = qa_client.post(
         "/v1/admin/qa/synthetic-accounts/cleanup-run",
@@ -381,9 +403,7 @@ def test_cleanup_run_fails_closed_when_authoritative_store_is_unavailable(
         headers=_admin_headers(),
     )
     assert response.status_code == 503
-    assert response.get_json() == {
-        "error": "synthetic_account_store_unavailable"
-    }
+    assert response.get_json() == {"error": "synthetic_account_store_unavailable"}
 
 
 def test_protected_test_build_identity_requires_matching_full_shas(qa_client):
@@ -394,9 +414,7 @@ def test_protected_test_build_identity_requires_matching_full_shas(qa_client):
     )
     assert wrong.status_code == 401
 
-    response = qa_client.get(
-        "/v1/admin/qa/build-identity", headers=_admin_headers()
-    )
+    response = qa_client.get("/v1/admin/qa/build-identity", headers=_admin_headers())
     assert response.status_code == 200
     assert response.get_json() == {
         "schema_version": 1,
@@ -420,9 +438,7 @@ def test_test_build_identity_fails_closed_when_unavailable(
 ):
     monkeypatch.setenv(name, value)
 
-    response = qa_client.get(
-        "/v1/admin/qa/build-identity", headers=_admin_headers()
-    )
+    response = qa_client.get("/v1/admin/qa/build-identity", headers=_admin_headers())
 
     assert response.status_code == 503
     assert response.get_json() == {"error": "qa_build_identity_unavailable"}

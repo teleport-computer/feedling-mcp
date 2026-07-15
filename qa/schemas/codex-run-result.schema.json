@@ -27,7 +27,7 @@
     "suite_id": {
       "type": "string",
       "enum": [
-        "feedling-api-key-p0"
+        "io-e2e-agent-driven-test-p0"
       ]
     },
     "run_id": {

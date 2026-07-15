@@ -9,9 +9,12 @@ PG_DEPLOY = (ROOT / ".github" / "workflows" / "pg-deploy.yml").read_text(
     encoding="utf-8"
 )
 E2E = (ROOT / ".github" / "workflows" / "api-key-e2e.yml").read_text(encoding="utf-8")
-REAPER = (
-    ROOT / ".github" / "workflows" / "api-key-e2e-runner-reaper.yml"
-).read_text(encoding="utf-8")
+REAPER = (ROOT / ".github" / "workflows" / "api-key-e2e-runner-reaper.yml").read_text(
+    encoding="utf-8"
+)
+TEST_COMPOSE = (ROOT / "deploy" / "docker-compose.phala.test.yaml").read_text(
+    encoding="utf-8"
+)
 
 
 def _job(name: str, next_name: str) -> str:
@@ -75,7 +78,7 @@ def test_e2e_pins_secret_bearing_code_and_treats_deployment_sha_as_metadata():
     qualify = E2E[E2E.index("  qualify-api-key-runtime:\n") :]
 
     assert "expected_deployment_sha" not in trigger
-    assert "group: feedling-test-environment" in E2E
+    assert "group: io-e2e-agent-driven-test" in E2E
     assert 'if [ "$DISPATCH_REF" != "refs/heads/main" ]' in E2E
     assert "runs-on: ubuntu-24.04" in resolver
     assert "environment:" not in resolver
@@ -125,8 +128,7 @@ def test_e2e_uses_pinned_jit_app_and_oidc_actions_with_hosted_cleanup():
         "fee1f7d63c2ff003460e3d139729b119787bc349" in provision
     )
     oidc_pin = (
-        "aws-actions/configure-aws-credentials@"
-        "61815dcd50bd041e203e49132bacad1fd04d2708"
+        "aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708"
     )
     assert oidc_pin in provision
     assert "/actions/runners/generate-jitconfig" in provision
@@ -169,7 +171,7 @@ def test_e2e_uses_pinned_jit_app_and_oidc_actions_with_hosted_cleanup():
     assert "GitHub JIT runner was not bound to the dedicated runner group" in provision
     assert "runs-on: ubuntu-24.04" in account_cleanup
     assert "qa/provision_profiles.py cleanup-run" in account_cleanup
-    assert "secrets.QA_TEST_ADMIN_TOKEN" in account_cleanup
+    assert "secrets.IO_E2E_ADMIN_TOKEN" in account_cleanup
     assert "cleanup-synthetic-accounts" in cleanup.split("    steps:\n", 1)[0]
     assert (
         "if: ${{ always() && needs.validate-dispatch.result == 'success' && "
@@ -180,7 +182,10 @@ def test_e2e_uses_pinned_jit_app_and_oidc_actions_with_hosted_cleanup():
     assert "python3 qa/aws/terminate.py" in cleanup
     assert "Mint fresh GitHub App token for registration cleanup" in cleanup
     assert "Delete exact stale JIT runner registration" in cleanup
-    assert "if: ${{ always() && steps.github_cleanup_app.outcome == 'success' }}" in cleanup
+    assert (
+        "if: ${{ always() && steps.github_cleanup_app.outcome == 'success' }}"
+        in cleanup
+    )
     assert 'runner_id="$EXPECTED_RUNNER_ID"' in cleanup
     assert cleanup.index('runner_id="$EXPECTED_RUNNER_ID"') < cleanup.index(
         "/actions/runners/${runner_id}"
@@ -199,7 +204,7 @@ def test_expired_runner_reaper_is_hourly_hosted_oidc_and_protected_main_only():
     assert "workflow_call:" not in trigger
     assert "github.repository == 'teleport-computer/feedling-mcp'" in REAPER
     assert "github.ref == 'refs/heads/main'" in REAPER
-    assert "environment: feedling-e2e-test" in REAPER
+    assert "environment: io-e2e-agent-driven-test" in REAPER
     assert "runs-on: ubuntu-24.04" in REAPER
     assert "self-hosted" not in REAPER
     assert "id-token: write" in REAPER
@@ -214,7 +219,7 @@ def test_expired_runner_reaper_is_hourly_hosted_oidc_and_protected_main_only():
     assert '--repository "$GITHUB_REPOSITORY"' in REAPER
     assert "secrets." not in REAPER
     for forbidden_secret in (
-        "QA_TEST_ADMIN_TOKEN",
+        "IO_E2E_ADMIN_TOKEN",
         "QA_CODEX_AUTH_JSON_B64",
         "QA_DEEPSEEK_API_KEY",
         "QA_ANTHROPIC_API_KEY",
@@ -236,32 +241,36 @@ def test_backend_qualification_regressions_run_with_postgres_dependencies():
     assert "backend/requirements.lock" in backend_job
 
 
-def test_test_admin_credential_is_distinct_from_the_production_secret():
+def test_io_e2e_admin_credential_is_narrow_and_not_deployed_to_production():
     test_deploy = _job("deploy-test-cvm", "deploy-test-runner-cvm")
     production_deploy = _job("deploy-cvm", "deploy-test-cvm")
 
-    assert "secrets.TEST_FEEDLING_ADMIN_TOKEN" in test_deploy
-    assert "secrets.FEEDLING_ADMIN_TOKEN" not in test_deploy
+    assert "secrets.IO_E2E_ADMIN_TOKEN" in test_deploy
+    assert "secrets.FEEDLING_ADMIN_TOKEN" in test_deploy
     assert "secrets.FEEDLING_ADMIN_TOKEN" in production_deploy
-    assert "secrets.TEST_FEEDLING_ADMIN_TOKEN" not in production_deploy
+    assert "secrets.IO_E2E_ADMIN_TOKEN" not in production_deploy
+    assert 'IO_E2E_ADMIN_TOKEN: "${IO_E2E_ADMIN_TOKEN:-}"' in TEST_COMPOSE
+    assert 'FEEDLING_ADMIN_TOKEN: "${FEEDLING_ADMIN_TOKEN:-}"' in TEST_COMPOSE
 
 
 def test_test_deploy_enables_bounded_synthetic_account_reaper():
     test_deploy = _job("deploy-test-cvm", "deploy-test-runner-cvm")
     production_deploy = _job("deploy-cvm", "deploy-test-cvm")
 
-    assert 'FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED: "true"' in test_deploy
-    assert 'FEEDLING_QA_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS: "14400"' in test_deploy
-    assert 'FEEDLING_QA_SYNTHETIC_REAPER_INTERVAL_SECONDS: "60"' in test_deploy
+    assert 'IO_E2E_SYNTHETIC_ACCOUNTS_ENABLED: "true"' in test_deploy
+    assert 'IO_E2E_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS: "14400"' in test_deploy
+    assert 'IO_E2E_SYNTHETIC_REAPER_INTERVAL_SECONDS: "60"' in test_deploy
     for variable in (
-        "FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED",
-        "FEEDLING_QA_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS",
-        "FEEDLING_QA_SYNTHETIC_REAPER_INTERVAL_SECONDS",
+        "IO_E2E_SYNTHETIC_ACCOUNTS_ENABLED",
+        "IO_E2E_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS",
+        "IO_E2E_SYNTHETIC_REAPER_INTERVAL_SECONDS",
     ):
         assert f'-e "{variable}=${variable}"' in test_deploy
+        assert f'{variable}: "${{{variable}:-' in TEST_COMPOSE
         assert variable not in production_deploy
-    assert 'if [ -z "$FEEDLING_ADMIN_TOKEN" ]' in test_deploy
-    assert "TEST_FEEDLING_ADMIN_TOKEN secret is not set" in test_deploy
+    assert 'IO_E2E_TEST_DEPLOY_SHA: "${IO_E2E_TEST_DEPLOY_SHA:-}"' in TEST_COMPOSE
+    assert 'if [ -z "$IO_E2E_ADMIN_TOKEN" ]' in test_deploy
+    assert "IO_E2E_ADMIN_TOKEN secret is not set" in test_deploy
 
 
 def test_every_test_environment_mutator_uses_the_qualification_lock():
@@ -269,7 +278,7 @@ def test_every_test_environment_mutator_uses_the_qualification_lock():
     test_runner_deploy = _job("deploy-test-runner-cvm", "deploy-prod-runner-cvm")
 
     for source in (test_deploy, test_runner_deploy, PG_DEPLOY, E2E):
-        assert "feedling-test-environment" in source
+        assert "io-e2e-agent-driven-test" in source
     assert "options: [test]" in PG_DEPLOY
 
 

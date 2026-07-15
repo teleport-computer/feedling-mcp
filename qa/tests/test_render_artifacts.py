@@ -238,7 +238,7 @@ def test_junit_contains_only_fixed_attributes_and_no_output_or_error_bodies(tmp_
 
     root = ElementTree.parse(artifacts / "junit.xml").getroot()
     assert root.attrib == {
-        "name": "feedling-api-key-p0",
+        "name": "io-e2e-agent-driven-test-p0",
         "tests": "104",
         "failures": "1",
         "errors": "0",

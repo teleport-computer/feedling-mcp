@@ -303,7 +303,7 @@ def _render_junit(profiles: Sequence[Mapping[str, Any]]) -> str:
     suites = ElementTree.Element(
         "testsuites",
         {
-            "name": "feedling-api-key-p0",
+            "name": "io-e2e-agent-driven-test-p0",
             "tests": str(total_tests),
             "failures": str(failures),
             "errors": str(errors),

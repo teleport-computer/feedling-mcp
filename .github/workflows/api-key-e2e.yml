@@ -37,7 +37,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: feedling-test-environment
+  group: io-e2e-agent-driven-test
   cancel-in-progress: false
 
 jobs:
@@ -141,7 +141,7 @@ jobs:
     needs: [validate-dispatch, resolve-test-deployment]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    environment: feedling-e2e-test
+    environment: io-e2e-agent-driven-test
     permissions:
       contents: read
       id-token: write
@@ -182,7 +182,7 @@ jobs:
             exit 1
           fi
           run_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          runner_identity="feedling-e2e-${run_key}"
+          runner_identity="io-e2e-agent-driven-test-${run_key}"
           echo "group=$RUNNER_GROUP_NAME" >> "$GITHUB_OUTPUT"
           echo "run_key=$run_key" >> "$GITHUB_OUTPUT"
           echo "name=$runner_identity" >> "$GITHUB_OUTPUT"
@@ -209,11 +209,11 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          request_path="${RUNNER_TEMP}/feedling-jit-request-${RUN_KEY}.json"
-          group_response_path="${RUNNER_TEMP}/feedling-runner-group-${RUN_KEY}.json"
-          group_runners_prefix="${RUNNER_TEMP}/feedling-runner-group-members-${RUN_KEY}"
-          response_path="${RUNNER_TEMP}/feedling-jit-response-${RUN_KEY}.json"
-          jit_config_file="${RUNNER_TEMP}/feedling-jit-config-${RUN_KEY}"
+          request_path="${RUNNER_TEMP}/io-e2e-jit-request-${RUN_KEY}.json"
+          group_response_path="${RUNNER_TEMP}/io-e2e-runner-group-${RUN_KEY}.json"
+          group_runners_prefix="${RUNNER_TEMP}/io-e2e-runner-group-members-${RUN_KEY}"
+          response_path="${RUNNER_TEMP}/io-e2e-jit-response-${RUN_KEY}.json"
+          jit_config_file="${RUNNER_TEMP}/io-e2e-jit-config-${RUN_KEY}"
           group_page_paths=()
 
           remove_group_pages() {
@@ -241,12 +241,12 @@ jobs:
               raise SystemExit("runner group id must be a positive integer")
           identity = os.environ["RUNNER_NAME"]
           label = os.environ["RUNNER_LABEL"]
-          if identity != label or not identity.startswith("feedling-e2e-"):
+          if identity != label or not identity.startswith("io-e2e-agent-driven-test-"):
               raise SystemExit("runner identity is invalid")
           payload = {
               "name": identity,
               "runner_group_id": runner_group_id,
-              "labels": ["self-hosted", "linux", "x64", "feedling-e2e", label],
+              "labels": ["self-hosted", "linux", "x64", "io-e2e-agent-driven-test", label],
               "work_folder": "_work",
           }
           path = sys.argv[1]
@@ -529,7 +529,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.QA_AWS_ROLE_ARN }}
           aws-region: ${{ vars.QA_AWS_REGION }}
-          role-session-name: feedling-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          role-session-name: io-e2e-agent-driven-test-${{ github.run_id }}-${{ github.run_attempt }}
           role-duration-seconds: 1800
           mask-aws-account-id: true
 
@@ -572,7 +572,7 @@ jobs:
           RUN_KEY: ${{ steps.runner_identity.outputs.run_key }}
         run: |
           set -euo pipefail
-          response_path="${RUNNER_TEMP}/feedling-runner-status-${RUN_KEY}.json"
+          response_path="${RUNNER_TEMP}/io-e2e-runner-status-${RUN_KEY}.json"
           trap 'rm -f -- "$response_path"' EXIT
           ready=0
           for attempt in $(seq 1 60); do
@@ -648,7 +648,7 @@ jobs:
           RUN_KEY: ${{ steps.runner_identity.outputs.run_key }}
         run: |
           set -euo pipefail
-          expected="${RUNNER_TEMP}/feedling-jit-config-${RUN_KEY}"
+          expected="${RUNNER_TEMP}/io-e2e-jit-config-${RUN_KEY}"
           if [ -n "$JIT_CONFIG_FILE" ] && [ "$JIT_CONFIG_FILE" != "$expected" ]; then
             echo "::error::refusing unexpected JIT cleanup path"
             exit 1
@@ -676,7 +676,7 @@ jobs:
   qualify-api-key-runtime:
     name: qualify eight API-key profiles
     needs: [validate-dispatch, resolve-test-deployment, provision-aws-runner]
-    environment: feedling-e2e-test
+    environment: io-e2e-agent-driven-test
     runs-on:
       group: ${{ needs.provision-aws-runner.outputs.runner_group }}
       labels: ${{ needs.provision-aws-runner.outputs.runner_label }}
@@ -830,8 +830,8 @@ jobs:
       - name: Verify deployed endpoint and selected runtime target before qualification
         id: deployment_pre
         env:
-          QA_FEEDLING_BASE_URL: https://test-api.feedling.app
-          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+          IO_E2E_BASE_URL: https://test-api.feedling.app
+          IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
           QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
           QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
         run: |
@@ -978,7 +978,7 @@ jobs:
             LANG="C.UTF-8" \
             TMPDIR="$worker_tmp" \
             "$codex_bin" sandbox -p profile_official_deepseek \
-              -P feedling-e2e-official-deepseek \
+              -P io-e2e-agent-driven-test-official-deepseek \
               --include-managed-config -C "$worker_work" -- \
               /bin/sh -eu -c '
                 test -r "$1"
@@ -1013,7 +1013,7 @@ jobs:
             LANG="C.UTF-8" \
             TMPDIR="$worker_tmp" \
             "$codex_bin" sandbox -p profile_official_deepseek \
-              -P feedling-e2e-official-deepseek \
+              -P io-e2e-agent-driven-test-official-deepseek \
               --include-managed-config -C "$worker_work" -- \
               /bin/sh -eu -c '
                 curl --silent --show-error --proto "=https" --max-redirs 0 \
@@ -1041,7 +1041,7 @@ jobs:
             LANG="C.UTF-8" \
             TMPDIR="$worker_tmp" \
             "$codex_bin" sandbox -p profile_official_deepseek \
-              -P feedling-e2e-official-deepseek \
+              -P io-e2e-agent-driven-test-official-deepseek \
               --include-managed-config -C "$worker_work" -- \
               /bin/sh -eu -c '
                 test "$QA_PYTHON_BIN" = "$1"
@@ -1085,7 +1085,7 @@ jobs:
             TMPDIR="$worker_tmp" \
             "$codex_bin" exec \
               -p profile_official_deepseek \
-              -c 'default_permissions="feedling-e2e-official-deepseek"' \
+              -c 'default_permissions="io-e2e-agent-driven-test-official-deepseek"' \
               --ignore-rules \
               --strict-config \
               --skip-git-repo-check \
@@ -1135,7 +1135,7 @@ jobs:
             LANG="C.UTF-8" \
             TMPDIR="$judge_tmp" \
             "$codex_bin" sandbox -p persona_memory_judge \
-              -P feedling-e2e-persona-memory-judge \
+              -P io-e2e-agent-driven-test-persona-memory-judge \
               --include-managed-config -C "$judge_work" -- \
               /bin/sh -eu -c '
                 printf "judge\n" > "$1"
@@ -1169,9 +1169,9 @@ jobs:
       - name: Provision eight isolated API-key profiles
         id: provision
         env:
-          QA_FEEDLING_BASE_URL: https://test-api.feedling.app
+          IO_E2E_BASE_URL: https://test-api.feedling.app
           QA_RUN_ID: ${{ steps.context.outputs.run_id }}
-          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+          IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
           QA_DEEPSEEK_API_KEY: ${{ secrets.QA_DEEPSEEK_API_KEY }}
           QA_ANTHROPIC_API_KEY: ${{ secrets.QA_ANTHROPIC_API_KEY }}
           QA_OPENAI_PROVIDER_API_KEY: ${{ secrets.QA_OPENAI_PROVIDER_API_KEY }}
@@ -1276,7 +1276,7 @@ jobs:
               LANG="C.UTF-8" \
               TMPDIR="$own_tmp" \
               "$CODEX_BIN" sandbox -p "$agent_type" \
-                -P "feedling-e2e-${profile_id}" \
+                -P "io-e2e-agent-driven-test-${profile_id}" \
                 --include-managed-config -C "$own_work" -- \
                 /bin/sh -eu -c '
                   own="$1"
@@ -1389,9 +1389,9 @@ jobs:
         if: inputs.runtime_target == 'hosted_resident' && steps.orchestration.outcome == 'success'
         timeout-minutes: 60
         env:
-          QA_FEEDLING_BASE_URL: https://test-api.feedling.app
+          IO_E2E_BASE_URL: https://test-api.feedling.app
           QA_RUN_ID: ${{ steps.context.outputs.run_id }}-persona-memory
-          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+          IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
           QA_OPENAI_PROVIDER_API_KEY: ${{ secrets.QA_OPENAI_PROVIDER_API_KEY }}
           QA_OPENAI_MODEL: ${{ vars.QA_OPENAI_MODEL }}
           QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
@@ -1464,7 +1464,7 @@ jobs:
             TMPDIR="${QA_PERSONA_JUDGE_ROOT}/tmp" \
             PYTHONDONTWRITEBYTECODE="1" \
             PYTHONPATH="$GITHUB_WORKSPACE" \
-            QA_FEEDLING_BASE_URL="https://test-api.feedling.app" \
+            IO_E2E_BASE_URL="https://test-api.feedling.app" \
             QA_RUN_ID="$QA_RUN_ID" \
             python qa/run_persona_memory_regression.py run-live \
               --target-id "current-test-${QA_EXPECTED_DEPLOYMENT_SHA}" \
@@ -1483,7 +1483,7 @@ jobs:
               --judge-id codex-oauth-persona-memory-v1 \
               --judge-configuration-id persona-memory-rubric-v1 \
               --judge-codex-profile persona_memory_judge \
-              --judge-permission-profile feedling-e2e-persona-memory-judge \
+              --judge-permission-profile io-e2e-agent-driven-test-persona-memory-judge \
               --judge-reasoning-effort medium \
               --judge-timeout 180 \
               --allow-private-judge-egress \
@@ -1515,8 +1515,8 @@ jobs:
         id: deployment_post
         if: always() && steps.orchestration.outcome == 'success'
         env:
-          QA_FEEDLING_BASE_URL: https://test-api.feedling.app
-          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+          IO_E2E_BASE_URL: https://test-api.feedling.app
+          IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
           QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
           QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
         run: |
@@ -1605,7 +1605,7 @@ jobs:
             QA_ORCHESTRATION_RECEIPT="$QA_ORCHESTRATION_RECEIPT" \
             QA_EXPECTED_DEPLOYMENT_SHA="$QA_EXPECTED_DEPLOYMENT_SHA" \
             QA_EXPECTED_RUNTIME="$QA_EXPECTED_RUNTIME" \
-            QA_FEEDLING_BASE_URL="https://test-api.feedling.app" \
+            IO_E2E_BASE_URL="https://test-api.feedling.app" \
             "$CODEX_BIN" exec \
               --ignore-rules \
               --strict-config \
@@ -1666,7 +1666,7 @@ jobs:
         if: always()
         env:
           QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
-          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+          IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
           python qa/provision_profiles.py cleanup \
@@ -1684,8 +1684,8 @@ jobs:
         if: always() && inputs.runtime_target == 'hosted_resident' && steps.persona_prepare.outcome != 'skipped'
         timeout-minutes: 30
         env:
-          QA_FEEDLING_BASE_URL: https://test-api.feedling.app
-          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+          IO_E2E_BASE_URL: https://test-api.feedling.app
+          IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
           QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
           PERSONA_POOL_MANIFEST: ${{ steps.context.outputs.persona_pool_manifest }}
           PERSONA_RUN_POST_RECEIPT: ${{ steps.context.outputs.persona_run_post_receipt }}
@@ -1782,7 +1782,7 @@ jobs:
           QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
           QA_PRIVATE_MANIFEST: ${{ steps.context.outputs.manifest }}
           QA_MEMORY_MANIFEST: ${{ steps.context.outputs.memory_manifest }}
-          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+          IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
           QA_DEEPSEEK_API_KEY: ${{ secrets.QA_DEEPSEEK_API_KEY }}
           QA_ANTHROPIC_API_KEY: ${{ secrets.QA_ANTHROPIC_API_KEY }}
           QA_OPENAI_PROVIDER_API_KEY: ${{ secrets.QA_OPENAI_PROVIDER_API_KEY }}
@@ -1804,7 +1804,7 @@ jobs:
         if: always() && steps.secret_scan.outcome == 'success' && steps.cleanup.outcome == 'success' && steps.cleanup_receipt.outcome == 'success' && (inputs.runtime_target != 'hosted_resident' || (steps.persona_cleanup.outcome == 'success' && steps.persona_finalize.outcome == 'success'))
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: feedling-api-key-e2e-${{ steps.context.outputs.run_id }}
+          name: io-e2e-agent-driven-test-${{ steps.context.outputs.run_id }}
           path: ${{ steps.context.outputs.artifact_dir }}
           if-no-files-found: error
           include-hidden-files: false
@@ -1965,7 +1965,7 @@ jobs:
     needs: [validate-dispatch, qualify-api-key-runtime]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    environment: feedling-e2e-test
+    environment: io-e2e-agent-driven-test
     permissions:
       contents: read
     steps:
@@ -2000,12 +2000,12 @@ jobs:
       - name: Sweep exact base and persona run IDs with bounded retries
         id: sweep
         env:
-          QA_FEEDLING_BASE_URL: https://test-api.feedling.app
-          QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
+          IO_E2E_BASE_URL: https://test-api.feedling.app
+          IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
           umask 077
-          cleanup_root="${RUNNER_TEMP}/feedling-account-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup_root="${RUNNER_TEMP}/io-e2e-account-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -m 700 "$cleanup_root"
 
           remove_cleanup_root() {
@@ -2019,7 +2019,7 @@ jobs:
           expected_parent = Path(os.environ["RUNNER_TEMP"]).resolve()
           if (
               root.parent.resolve() != expected_parent
-              or not root.name.startswith("feedling-account-cleanup-")
+              or not root.name.startswith("io-e2e-account-cleanup-")
           ):
               raise SystemExit("refusing unsafe hosted cleanup scratch path")
           if root.is_symlink():
@@ -2194,7 +2194,7 @@ jobs:
         if: ${{ success() && steps.sweep.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: feedling-synthetic-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          name: io-e2e-synthetic-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ github.workspace }}/hosted-cleanup-artifacts
           if-no-files-found: error
           include-hidden-files: false
@@ -2237,7 +2237,7 @@ jobs:
     needs: [validate-dispatch, provision-aws-runner, qualify-api-key-runtime, cleanup-synthetic-accounts]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    environment: feedling-e2e-test
+    environment: io-e2e-agent-driven-test
     permissions:
       contents: read
       id-token: write
@@ -2267,7 +2267,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.QA_AWS_ROLE_ARN }}
           aws-region: ${{ vars.QA_AWS_REGION }}
-          role-session-name: feedling-e2e-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          role-session-name: io-e2e-agent-driven-test-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
           role-duration-seconds: 1800
           mask-aws-account-id: true
 
@@ -2308,7 +2308,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          derived_name="feedling-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          derived_name="io-e2e-agent-driven-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           if [ -n "$EXPECTED_RUNNER_NAME" ] && [ "$EXPECTED_RUNNER_NAME" != "$derived_name" ]; then
             echo "::error::refusing unexpected runner cleanup name"
             exit 1
@@ -2326,7 +2326,7 @@ jobs:
             exit 1
           fi
 
-          response_path="${RUNNER_TEMP}/feedling-runner-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          response_path="${RUNNER_TEMP}/io-e2e-runner-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
           delete_response_path="${response_path}.delete"
           trap 'rm -f -- "$response_path" "$delete_response_path"' EXIT
           if [ -n "$EXPECTED_RUNNER_ID" ]; then
@@ -2358,7 +2358,7 @@ jobs:
           runners = response.get("runners")
           if not isinstance(runners, list) or any(not isinstance(item, dict) for item in runners):
               raise SystemExit("GitHub returned an invalid runner cleanup response")
-          expected_name = f"feedling-e2e-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+          expected_name = f"io-e2e-agent-driven-test-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
           matches = [runner for runner in runners if runner.get("name") == expected_name]
           if len(matches) > 1:
               raise SystemExit("GitHub returned duplicate exact-name runners")

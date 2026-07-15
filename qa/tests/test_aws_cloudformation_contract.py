@@ -106,6 +106,6 @@ def test_termination_is_limited_to_managed_repository_instances():
     terminate = _statement("TerminateOnlyManagedRepositoryRunners")
 
     assert "Action: ec2:TerminateInstances" in terminate
-    assert '"ec2:ResourceTag/ManagedBy": feedling-agentic-e2e' in terminate
+    assert '"ec2:ResourceTag/ManagedBy": io-e2e-agent-driven-test' in terminate
     assert '"ec2:ResourceTag/Purpose": api-key-e2e' in terminate
     assert '"ec2:ResourceTag/Repository": !Ref Repository' in terminate

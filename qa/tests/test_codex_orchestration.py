@@ -729,7 +729,7 @@ def _scenario_command_rows() -> list[dict[str, Any]]:
         "P0-06": (
             "QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=CAPTURE "
             '"$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/tools/genesis_e2e.py" '
-            "distill-existing-session --api-url \"$QA_FEEDLING_BASE_URL\" "
+            "distill-existing-session --api-url \"$IO_E2E_BASE_URL\" "
             '--session-manifest "$QA_PRIVATE_MANIFEST" '
             '--profile-id "$QA_PROFILE_ID" '
             '--fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" '
@@ -1050,7 +1050,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
     )
     paths = _setup(tmp_path)
     for name in (
-        "QA_TEST_ADMIN_TOKEN",
+        "IO_E2E_ADMIN_TOKEN",
         "FEEDLING_ADMIN_TOKEN",
         "QA_DEEPSEEK_API_KEY",
         "QA_ANTHROPIC_API_KEY",
@@ -1078,7 +1078,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
         PROFILE_AGENT_TYPES
     )
     assert [row["permission_profile"] for row in receipt["workers"]] == [
-        f"feedling-e2e-{profile_id}" for profile_id, _ in PROFILE_AGENT_TYPES
+        f"io-e2e-agent-driven-test-{profile_id}" for profile_id, _ in PROFILE_AGENT_TYPES
     ]
     assert all(len(row["cot_receipt_sha256"]) == 64 for row in receipt["workers"])
     assert all(len(row["live_receipt_sha256"]) == 64 for row in receipt["workers"])
@@ -1097,7 +1097,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
             "-p",
             spec.agent_type,
             "-c",
-            f'default_permissions="feedling-e2e-{spec.profile_id}"',
+            f'default_permissions="io-e2e-agent-driven-test-{spec.profile_id}"',
         )
         assert "--ephemeral" not in spec.command
         assert "spawn_agent" not in spec.prompt
@@ -1138,7 +1138,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
         assert not any(
             name in spec.environment
             for name in (
-                "QA_TEST_ADMIN_TOKEN",
+                "IO_E2E_ADMIN_TOKEN",
                 "FEEDLING_ADMIN_TOKEN",
                 "QA_DEEPSEEK_API_KEY",
                 "QA_ANTHROPIC_API_KEY",
@@ -2276,7 +2276,7 @@ def test_persona_review_program_rejects_prefilled_judgment(tmp_path):
         (
             "QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=CAPTURE "
             '"$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/tools/genesis_e2e.py" '
-            "distill-existing-session --api-url \"$QA_FEEDLING_BASE_URL\" "
+            "distill-existing-session --api-url \"$IO_E2E_BASE_URL\" "
             '--session-manifest "$QA_PRIVATE_MANIFEST" '
             '--profile-id "$QA_PROFILE_ID" '
             '--fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" '

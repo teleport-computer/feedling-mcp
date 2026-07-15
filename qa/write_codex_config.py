@@ -29,10 +29,10 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
     from orchestration_contract import MEMORY_CONTRACT_PROFILE_ID, PROFILE_AGENT_TYPES
 
 
-SUPERVISOR_PERMISSION_PROFILE = "feedling-e2e-supervisor"
+SUPERVISOR_PERMISSION_PROFILE = "io-e2e-agent-driven-test-supervisor"
 PROFILE_NAME = SUPERVISOR_PERMISSION_PROFILE  # Stable public constant.
 PERSONA_MEMORY_JUDGE_PROFILE_NAME = "persona_memory_judge"
-PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE = "feedling-e2e-persona-memory-judge"
+PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE = "io-e2e-agent-driven-test-persona-memory-judge"
 _DNS_NAME = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
@@ -52,7 +52,7 @@ _COMMON_ENV = (
     "QA_RUN_ID",
     "QA_EXPECTED_DEPLOYMENT_SHA",
     "QA_EXPECTED_RUNTIME",
-    "QA_FEEDLING_BASE_URL",
+    "IO_E2E_BASE_URL",
 )
 
 
@@ -67,7 +67,7 @@ class CodexConfigBundle:
 
 
 def worker_permission_profile(profile_id: str) -> str:
-    return f"feedling-e2e-{profile_id}"
+    return f"io-e2e-agent-driven-test-{profile_id}"
 
 
 def _directory(path: Path, name: str) -> Path:

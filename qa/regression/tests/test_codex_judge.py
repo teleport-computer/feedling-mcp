@@ -82,7 +82,7 @@ def _write_codex_configs(
     description: str = "Offline semantic judge",
     developer_instructions: str = "Grade only blinded evidence and never use tools.",
 ) -> None:
-    permission = "feedling-e2e-persona-memory-judge"
+    permission = "io-e2e-agent-driven-test-persona-memory-judge"
     main = f"""
 [features]
 multi_agent = false
@@ -222,7 +222,7 @@ def test_codex_judge_uses_oauth_minimal_env_fresh_process_and_cleans_scratch(
 ):
     observed = _install_fake_codex(monkeypatch)
     codex_bin, codex_home, work_root = _runtime(tmp_path)
-    monkeypatch.setenv("QA_TEST_ADMIN_TOKEN", "must-not-leak")
+    monkeypatch.setenv("IO_E2E_ADMIN_TOKEN", "must-not-leak")
     monkeypatch.setenv("QA_OPENAI_PROVIDER_API_KEY", "must-not-leak")
     request = _request()
     judge = CodexExecJudge(
@@ -250,7 +250,7 @@ def test_codex_judge_uses_oauth_minimal_env_fresh_process_and_cleans_scratch(
     }
     assert process.command[process.command.index("-p") + 1] == "persona_memory_judge"
     assert (
-        'default_permissions="feedling-e2e-persona-memory-judge"'
+        'default_permissions="io-e2e-agent-driven-test-persona-memory-judge"'
         in process.command
     )
     assert process.command[process.command.index("-m") + 1] == "gpt-5.6"

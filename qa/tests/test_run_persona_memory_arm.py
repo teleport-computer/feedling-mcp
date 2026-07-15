@@ -67,7 +67,7 @@ def _args(tmp_path: Path):
         judge_id="persona-memory-judge-v1",
         judge_configuration_id="rubric-v1",
         judge_codex_profile="persona_memory_judge",
-        judge_permission_profile="feedling-e2e-persona-memory-judge",
+        judge_permission_profile="io-e2e-agent-driven-test-persona-memory-judge",
         judge_reasoning_effort="medium",
         judge_timeout=180.0,
         allow_private_judge_egress=True,
@@ -173,7 +173,7 @@ def test_product_regression_still_post_verifies_cleans_and_finalizes(
     args = _args(tmp_path)
     runner, seen = _fake_runner([], run_code=1)
     env = {
-        "QA_TEST_ADMIN_TOKEN": "admin-secret",
+        "IO_E2E_ADMIN_TOKEN": "admin-secret",
         "QA_OPENAI_PROVIDER_API_KEY": "provider-secret",
         "CODEX_HOME": str(args.codex_home),
         "QA_CODEX_MODEL": args.judge_model,
@@ -191,7 +191,7 @@ def test_product_regression_still_post_verifies_cleans_and_finalizes(
     )
     assert scripts[-1] == ("run_persona_memory_regression.py", "finalize-arm")
     run_env = seen[run_index][1]
-    assert "QA_TEST_ADMIN_TOKEN" not in run_env
+    assert "IO_E2E_ADMIN_TOKEN" not in run_env
     assert "QA_OPENAI_PROVIDER_API_KEY" not in run_env
     assert run_env["CODEX_HOME"] == str(args.codex_home)
     assert run_env["QA_CODEX_MODEL"] == args.judge_model
@@ -441,7 +441,7 @@ def test_supervisor_never_passes_admin_or_provider_keys_to_oauth_judge_runner(
         supervisor.run_arm(
             args,
             env={
-                "QA_TEST_ADMIN_TOKEN": "admin-secret",
+                "IO_E2E_ADMIN_TOKEN": "admin-secret",
                 "QA_OPENAI_PROVIDER_API_KEY": "provider-secret",
             },
             step_runner=runner,
@@ -454,7 +454,7 @@ def test_supervisor_never_passes_admin_or_provider_keys_to_oauth_judge_runner(
         if Path(command[1]).name == "run_persona_memory_regression.py"
         and command[2] == "run-live"
     )
-    assert "QA_TEST_ADMIN_TOKEN" not in run_env
+    assert "IO_E2E_ADMIN_TOKEN" not in run_env
     assert "QA_OPENAI_PROVIDER_API_KEY" not in run_env
     assert "QA_EVAL_JUDGE_API_KEY" not in run_env
     capsys.readouterr()

@@ -89,8 +89,8 @@ def _write_coverage(tmp_path: Path, rows=None) -> Path:
 
 def _env() -> dict[str, str]:
     env = {
-        "QA_FEEDLING_BASE_URL": provisioner.ALLOWED_BASE_URL,
-        "QA_TEST_ADMIN_TOKEN": "admin-sensitive-value",
+        "IO_E2E_BASE_URL": provisioner.ALLOWED_BASE_URL,
+        "IO_E2E_ADMIN_TOKEN": "admin-sensitive-value",
         "QA_DEEPSEEK_API_KEY": "deepseek-sensitive-value",
         "QA_ANTHROPIC_API_KEY": "anthropic-sensitive-value",
         "QA_OPENAI_PROVIDER_API_KEY": "openai-sensitive-value",
@@ -414,7 +414,7 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
 
     raw = manifest_path.read_text()
     for name, value in env.items():
-        if name.endswith("API_KEY") or name == "QA_TEST_ADMIN_TOKEN":
+        if name.endswith("API_KEY") or name == "IO_E2E_ADMIN_TOKEN":
             assert value not in raw
     persisted = json.loads(raw)
     assert {p["profile_id"] for p in persisted["profiles"]} == set(
@@ -457,7 +457,7 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
 
 def test_adminless_diagnostic_subset_uses_user_runtime_readback(tmp_path):
     env = _env()
-    env.pop("QA_TEST_ADMIN_TOKEN")
+    env.pop("IO_E2E_ADMIN_TOKEN")
     for profile_id, spec in provisioner.PROFILE_SPECS.items():
         if profile_id == "official-gemini":
             continue
@@ -507,7 +507,7 @@ def test_adminless_diagnostic_subset_uses_user_runtime_readback(tmp_path):
 
 def test_baseline_diagnostic_records_non_v2_runtime_without_selecting_it(tmp_path):
     env = _env()
-    env.pop("QA_TEST_ADMIN_TOKEN")
+    env.pop("IO_E2E_ADMIN_TOKEN")
     smoke = FakeSmokeClient()
     smoke.runtime_mode = "resident_cli"
     smoke.runtime_version = 1
@@ -543,7 +543,7 @@ def test_adminless_diagnostic_blocks_runtime_readback_mismatch(
     tmp_path, runtime_field, runtime_value
 ):
     env = _env()
-    env.pop("QA_TEST_ADMIN_TOKEN")
+    env.pop("IO_E2E_ADMIN_TOKEN")
     smoke = FakeSmokeClient()
     setattr(smoke, runtime_field, runtime_value)
 
@@ -570,7 +570,7 @@ def test_adminless_strict_v2_blocks_non_v2_runtime(
     tmp_path, runtime_field, runtime_value
 ):
     env = _env()
-    env.pop("QA_TEST_ADMIN_TOKEN")
+    env.pop("IO_E2E_ADMIN_TOKEN")
     smoke = FakeSmokeClient()
     setattr(smoke, runtime_field, runtime_value)
 
@@ -626,7 +626,7 @@ def test_invalid_diagnostic_profile_selection_fails_before_external_state(
             _write_coverage(tmp_path),
             tmp_path / "diagnostic.json",
             env={
-                "QA_FEEDLING_BASE_URL": provisioner.ALLOWED_BASE_URL,
+                "IO_E2E_BASE_URL": provisioner.ALLOWED_BASE_URL,
             },
             client=smoke,
             diagnostic=True,
@@ -1462,7 +1462,7 @@ def test_valid_key_response_must_not_echo_submitted_secret(tmp_path):
     }
     raw = manifest.read_text()
     for name, secret in env.items():
-        if name.endswith("API_KEY") or name == "QA_TEST_ADMIN_TOKEN":
+        if name.endswith("API_KEY") or name == "IO_E2E_ADMIN_TOKEN":
             assert secret not in raw
     assert smoke.reset_calls == []
 
@@ -2271,7 +2271,7 @@ def test_provision_cli_supports_adminless_diagnostic_canary(
     coverage = _write_coverage(tmp_path)
     manifest = tmp_path / "diagnostic.json"
     env = _env()
-    env.pop("QA_TEST_ADMIN_TOKEN")
+    env.pop("IO_E2E_ADMIN_TOKEN")
     smoke = FakeSmokeClient()
     original_provision = provisioner.provision
 
@@ -2503,7 +2503,7 @@ def test_provision_pool_creates_strict_same_route_accounts(tmp_path, count):
     assert live_pool.profile_id == profile_id
     raw = manifest_path.read_text()
     assert env[selected_spec.credential_env] not in raw
-    assert env["QA_TEST_ADMIN_TOKEN"] not in raw
+    assert env["IO_E2E_ADMIN_TOKEN"] not in raw
 
 
 def test_pool_cleanup_emits_per_account_authoritative_sanitized_evidence(
@@ -2898,4 +2898,4 @@ def test_provision_pool_cli_emits_sanitized_summary(tmp_path, monkeypatch, capsy
         "manifest": str(manifest),
     }
     assert env["QA_OPENAI_PROVIDER_API_KEY"] not in captured.out
-    assert env["QA_TEST_ADMIN_TOKEN"] not in captured.out
+    assert env["IO_E2E_ADMIN_TOKEN"] not in captured.out

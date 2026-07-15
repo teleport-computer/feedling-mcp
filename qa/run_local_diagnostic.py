@@ -77,7 +77,7 @@ MISSING_STRICT_EVIDENCE = (
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 _SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _CODEX_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_DOTENV_ADMIN_SECRET_NAMES = ("QA_TEST_ADMIN_TOKEN", "FEEDLING_ADMIN_TOKEN")
+_DOTENV_ADMIN_SECRET_NAMES = ("IO_E2E_ADMIN_TOKEN",)
 _MAX_ENV_BYTES = 1024 * 1024
 _MAX_AUTH_BYTES = 128 * 1024
 _MAX_PUBLIC_FILES = 64
@@ -715,19 +715,13 @@ def prepare_environment(
                 )
             env[spec.base_url_env] = spec.allowed_base_url
 
-    env["QA_FEEDLING_BASE_URL"] = LOCKED_BASE_URL
+    env["IO_E2E_BASE_URL"] = LOCKED_BASE_URL
     env["QA_RUN_ID"] = run_id
     return env, tuple(validated_credentials)
 
 
 def _deployment_environment(loaded: Mapping[str, str]) -> dict[str, str]:
-    qa_token = str(loaded.get("QA_TEST_ADMIN_TOKEN") or "").strip()
-    backend_token = str(loaded.get("FEEDLING_ADMIN_TOKEN") or "").strip()
-    if qa_token and backend_token and qa_token != backend_token:
-        raise LocalDiagnosticError(
-            "QA_TEST_ADMIN_TOKEN and FEEDLING_ADMIN_TOKEN do not match"
-        )
-    token = qa_token or backend_token
+    token = str(loaded.get("IO_E2E_ADMIN_TOKEN") or "").strip()
     if (
         not token
         or len(token) < 8
@@ -738,8 +732,8 @@ def _deployment_environment(loaded: Mapping[str, str]) -> dict[str, str]:
             "missing or invalid test admin credential for deployment verification"
         )
     return {
-        "QA_FEEDLING_BASE_URL": LOCKED_BASE_URL,
-        "QA_TEST_ADMIN_TOKEN": token,
+        "IO_E2E_BASE_URL": LOCKED_BASE_URL,
+        "IO_E2E_ADMIN_TOKEN": token,
     }
 
 
@@ -1220,7 +1214,7 @@ def _verify_worker_network(
         "import sys, urllib.request; "
         "u=sys.argv[1]; "
         "r=urllib.request.urlopen(urllib.request.Request(u, headers={"
-        "'User-Agent':'feedling-e2e-network-preflight'}), timeout=15); "
+        "'User-Agent':'io-e2e-agent-driven-test-network-preflight'}), timeout=15); "
         "assert r.status == 200 and r.geturl() == u; "
         "r.read(4097); r.close()"
     )
@@ -1689,7 +1683,7 @@ def _retain_debug_quarantine(
 ) -> Path:
     """Copy bounded worker diagnostics without manifests or known credentials."""
 
-    parent = options.private_base.parent / "feedling-e2e-debug"
+    parent = options.private_base.parent / "io-e2e-agent-driven-test-debug"
     try:
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         parent_metadata = parent.lstat()
@@ -2519,7 +2513,7 @@ def execute(
             shutil.rmtree(paths.private_root)
     except Exception as exc:
         shutil.rmtree(
-            options.private_base.parent / "feedling-e2e-debug" / run_id,
+            options.private_base.parent / "io-e2e-agent-driven-test-debug" / run_id,
             ignore_errors=True,
         )
         private_failure = _safe_failure(exc)
@@ -2663,7 +2657,7 @@ def _options(args: argparse.Namespace) -> DiagnosticOptions:
         preflight_only=args.preflight_only,
         source_root=source_root,
         auth_file=Path.home() / ".codex" / "auth.json",
-        private_base=Path.home() / ".codex" / "feedling-e2e-runs",
+        private_base=Path.home() / ".codex" / "io-e2e-agent-driven-test-runs",
         codex_bin=_resolve_trusted_codex_binary(args.codex_bin),
         worker_python=args.worker_python,
         runtime_requirement=(

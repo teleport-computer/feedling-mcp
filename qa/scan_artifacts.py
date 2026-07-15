@@ -20,7 +20,7 @@ from typing import Mapping, Sequence
 
 SECRET_ENV_NAMES = (
     "QA_CODEX_AUTH_JSON_B64",
-    "QA_TEST_ADMIN_TOKEN",
+    "IO_E2E_ADMIN_TOKEN",
     "QA_DEEPSEEK_API_KEY",
     "QA_ANTHROPIC_API_KEY",
     "QA_OPENAI_PROVIDER_API_KEY",

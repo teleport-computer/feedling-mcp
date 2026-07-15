@@ -711,7 +711,7 @@ jobs:
       contents: write
       packages: read
     concurrency:
-      group: feedling-test-environment
+      group: io-e2e-agent-driven-test
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
@@ -796,15 +796,17 @@ jobs:
           APNS_KEY_ID:         ${{ secrets.APNS_KEY_ID }}
           APNS_TEAM_ID:        ${{ secrets.APNS_TEAM_ID }}
           OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
-          # The test admin credential must never equal the production credential.
-          FEEDLING_ADMIN_TOKEN: ${{ secrets.TEST_FEEDLING_ADMIN_TOKEN }}
+          # Existing application-admin credential for non-QA admin surfaces.
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          # Narrow credential accepted only by the test-only /v1/admin/qa/* routes.
+          IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
           FEEDLING_ADMIN_PASSWORD: ${{ secrets.TEST_FEEDLING_ADMIN_PASSWORD }}
           # Test-only synthetic-account lifecycle used by protected qualification.
           # These values are non-secret and are never wired into production.
-          FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED: "true"
-          FEEDLING_QA_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS: "14400"
-          FEEDLING_QA_SYNTHETIC_REAPER_INTERVAL_SECONDS: "60"
-          FEEDLING_TEST_DEPLOY_SHA: ${{ github.sha }}
+          IO_E2E_SYNTHETIC_ACCOUNTS_ENABLED: "true"
+          IO_E2E_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS: "14400"
+          IO_E2E_SYNTHETIC_REAPER_INTERVAL_SECONDS: "60"
+          IO_E2E_TEST_DEPLOY_SHA: ${{ github.sha }}
           DATABASE_URL:        ${{ secrets.TEST_DATABASE_URL }}
           # TEE 明文影子库双写（feedling-io-db-test 独立 pg CVM）。best-effort
           # 镜像，mirror 永不 raise。两个都空 = OFF。app 角色 DSN、sslmode=require。
@@ -842,8 +844,8 @@ jobs:
             echo "::error::TEST_DATABASE_URL secret is not set — backend has no datastore"
             exit 1
           fi
-          if [ -z "$FEEDLING_ADMIN_TOKEN" ]; then
-            echo "::error::TEST_FEEDLING_ADMIN_TOKEN secret is not set — protected qualification cannot administer synthetic accounts"
+          if [ -z "$IO_E2E_ADMIN_TOKEN" ]; then
+            echo "::error::IO_E2E_ADMIN_TOKEN secret is not set — protected qualification cannot administer synthetic accounts"
             exit 1
           fi
           phala deploy \
@@ -861,11 +863,12 @@ jobs:
             -e "APNS_TEAM_ID=$APNS_TEAM_ID" \
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
+            -e "IO_E2E_ADMIN_TOKEN=$IO_E2E_ADMIN_TOKEN" \
             -e "FEEDLING_ADMIN_PASSWORD=$FEEDLING_ADMIN_PASSWORD" \
-            -e "FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED=$FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED" \
-            -e "FEEDLING_QA_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS=$FEEDLING_QA_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS" \
-            -e "FEEDLING_QA_SYNTHETIC_REAPER_INTERVAL_SECONDS=$FEEDLING_QA_SYNTHETIC_REAPER_INTERVAL_SECONDS" \
-            -e "FEEDLING_TEST_DEPLOY_SHA=$FEEDLING_TEST_DEPLOY_SHA" \
+            -e "IO_E2E_SYNTHETIC_ACCOUNTS_ENABLED=$IO_E2E_SYNTHETIC_ACCOUNTS_ENABLED" \
+            -e "IO_E2E_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS=$IO_E2E_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS" \
+            -e "IO_E2E_SYNTHETIC_REAPER_INTERVAL_SECONDS=$IO_E2E_SYNTHETIC_REAPER_INTERVAL_SECONDS" \
+            -e "IO_E2E_TEST_DEPLOY_SHA=$IO_E2E_TEST_DEPLOY_SHA" \
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
@@ -965,7 +968,7 @@ jobs:
       contents: write
       packages: read
     concurrency:
-      group: feedling-test-environment
+      group: io-e2e-agent-driven-test
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4

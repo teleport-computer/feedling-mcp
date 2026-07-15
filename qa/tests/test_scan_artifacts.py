@@ -343,7 +343,7 @@ def test_missing_scan_secret_fails_closed(tmp_path):
     artifacts, manifest, memory_manifest, codex_auth, fixture, env = _write_inputs(
         tmp_path
     )
-    del env["QA_TEST_ADMIN_TOKEN"]
+    del env["IO_E2E_ADMIN_TOKEN"]
     with pytest.raises(scanner.ArtifactScanError, match="inputs are incomplete"):
         scanner.scan_artifacts(
             artifacts, manifest, memory_manifest, codex_auth, fixture, env=env

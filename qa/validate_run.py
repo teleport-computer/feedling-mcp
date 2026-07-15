@@ -375,10 +375,10 @@ _EXECUTION_CONTRACT = {
 }
 _COVERAGE_TARGET = {
     "environment": "test",
-    "base_url_env": "QA_FEEDLING_BASE_URL",
+    "base_url_env": "IO_E2E_BASE_URL",
     "expected_deployment_sha_env": "QA_EXPECTED_DEPLOYMENT_SHA",
     "expected_runtime": EXPECTED_RUNTIME,
-    "runtime_admin_token_env": "QA_TEST_ADMIN_TOKEN",
+    "runtime_admin_token_env": "IO_E2E_ADMIN_TOKEN",
 }
 _REASONING_CONTRACT = {
     "capability_enabled_required_when_expected": True,
@@ -647,7 +647,7 @@ def _validate_coverage(coverage: Any, expected_runtime: str) -> list[str]:
         errors.append("coverage lock top-level fields do not match the release gate")
     if (
         coverage.get("version") != 1
-        or coverage.get("suite_id") != "feedling-api-key-p0"
+        or coverage.get("suite_id") != "io-e2e-agent-driven-test-p0"
         or coverage.get("scope") != "api_key_only"
     ):
         errors.append("coverage lock identity does not match the release gate")
@@ -905,7 +905,7 @@ def _validate_orchestration_receipt(
         profile_id, agent_type = expected_pairs[index]
         if row.get("profile_id") != profile_id or row.get("agent_type") != agent_type:
             errors.append("trusted orchestration receipt worker matrix is invalid")
-        if row.get("permission_profile") != f"feedling-e2e-{profile_id}":
+        if row.get("permission_profile") != f"io-e2e-agent-driven-test-{profile_id}":
             errors.append("trusted orchestration receipt worker permission is invalid")
         if row.get("attempt") != 1 or row.get("process_exit_code") != 0:
             errors.append("trusted orchestration receipt worker process is invalid")

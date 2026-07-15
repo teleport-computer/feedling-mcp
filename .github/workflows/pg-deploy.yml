@@ -19,7 +19,7 @@ jobs:
     concurrency:
       # Only the test database shares the qualification lock. Production keeps
       # its original environment-specific deployment group.
-      group: ${{ github.event.inputs.environment == 'test' && 'feedling-test-environment' || format('pg-deploy-{0}', github.event.inputs.environment) }}
+      group: ${{ github.event.inputs.environment == 'test' && 'io-e2e-agent-driven-test' || format('pg-deploy-{0}', github.event.inputs.environment) }}
       cancel-in-progress: false
     steps:
       - name: Typo guard

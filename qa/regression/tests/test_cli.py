@@ -170,7 +170,7 @@ def test_codex_oauth_judge_cli_configuration_is_validated_before_live_mutation(
         judge_model="judge-model-v1",
         judge_timeout=30.0,
         judge_codex_profile="persona_memory_judge",
-        judge_permission_profile="feedling-e2e-persona-memory-judge",
+        judge_permission_profile="io-e2e-agent-driven-test-persona-memory-judge",
         judge_reasoning_effort="medium",
     )
 
@@ -186,7 +186,7 @@ def test_codex_oauth_judge_cli_configuration_is_validated_before_live_mutation(
         "reasoning_effort": "medium",
         "timeout_seconds": 30.0,
         "codex_profile": "persona_memory_judge",
-        "permission_profile": "feedling-e2e-persona-memory-judge",
+        "permission_profile": "io-e2e-agent-driven-test-persona-memory-judge",
         "configuration_id": "prompt-rubric-v1",
     }
 

@@ -1,7 +1,7 @@
 """Test-only authoritative backend build identity for qualification gates.
 
 The container image already bakes ``FEEDLING_GIT_COMMIT`` at build time.  The
-test deploy separately injects ``FEEDLING_TEST_DEPLOY_SHA`` through Phala's
+test deploy separately injects ``IO_E2E_TEST_DEPLOY_SHA`` through Phala's
 encrypted environment channel.  A qualification may trust the identity only
 when both full SHAs are valid and equal, and only while the test-only synthetic
 account feature is enabled.  Production compose files expose neither switch.
@@ -13,8 +13,8 @@ import os
 import re
 
 IMAGE_SHA_ENV = "FEEDLING_GIT_COMMIT"
-DEPLOY_SHA_ENV = "FEEDLING_TEST_DEPLOY_SHA"
-SYNTHETIC_ENABLED_ENV = "FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED"
+DEPLOY_SHA_ENV = "IO_E2E_TEST_DEPLOY_SHA"
+SYNTHETIC_ENABLED_ENV = "IO_E2E_SYNTHETIC_ACCOUNTS_ENABLED"
 _SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 
 

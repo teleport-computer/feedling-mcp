@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -171,7 +170,7 @@ def test_bootstrap_is_locked_non_root_injection_safe_and_self_terminating():
     assert "set -x" not in script
     assert "./run.sh --jitconfig" in script
     assert "config.sh --jitconfig" not in script
-    assert "runuser -u feedling-runner" in script
+    assert "runuser -u io-e2e-runner" in script
     assert "shutdown -h now" in script
     assert "--on-active=3600s" in script
     assert script.index("systemd-run") < script.index("apt-get update")
@@ -181,7 +180,7 @@ def test_bootstrap_is_locked_non_root_injection_safe_and_self_terminating():
     assert "| grep -q" not in script
     assert "-print -quit" in script
     assert script.index("useradd --create-home") < script.index(
-        "install -d -m 0700 -o feedling-runner"
+        "install -d -m 0700 -o io-e2e-runner"
     )
     assert runtime.actions_runner.url in script
     assert runtime.actions_runner.digest in script
@@ -218,7 +217,7 @@ def test_run_request_enforces_exact_ec2_shape_and_imdsv2_only():
         root_device_name="/dev/sda1",
         user_data="#!/bin/bash\ntrue\n",
         tags=_tags(),
-        client_token="feedling-e2e-token",
+        client_token="io-e2e-agent-driven-test-token",
     )
 
     assert request["InstanceType"] == "m7i.xlarge"

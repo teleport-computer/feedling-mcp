@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: feedling-e2e-runner-reaper
+  group: io-e2e-agent-driven-test-runner-reaper
   cancel-in-progress: false
 
 jobs:
@@ -18,7 +18,7 @@ jobs:
     if: github.repository == 'teleport-computer/feedling-mcp' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    environment: feedling-e2e-test
+    environment: io-e2e-agent-driven-test
     permissions:
       contents: read
       id-token: write
@@ -60,7 +60,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.QA_AWS_ROLE_ARN }}
           aws-region: ${{ vars.QA_AWS_REGION }}
-          role-session-name: feedling-e2e-reaper-${{ github.run_id }}-${{ github.run_attempt }}
+          role-session-name: io-e2e-agent-driven-test-reaper-${{ github.run_id }}-${{ github.run_attempt }}
           role-duration-seconds: 1800
           mask-aws-account-id: true
 

@@ -31,12 +31,12 @@ def test_workflow_is_manual_only_and_uses_protected_jit_runner():
         "needs: [validate-dispatch, resolve-test-deployment, provision-aws-runner]"
         in WORKFLOW
     )
-    assert "environment: feedling-e2e-test" in WORKFLOW
+    assert "environment: io-e2e-agent-driven-test" in WORKFLOW
     assert "runs-on:\n      group: ${{ needs.provision-aws-runner.outputs.runner_group }}" in WORKFLOW
     assert "labels: ${{ needs.provision-aws-runner.outputs.runner_label }}" in WORKFLOW
     assert "timeout-minutes: 330" in WORKFLOW
     assert "--ttl-seconds 21600" in WORKFLOW
-    assert "group: feedling-test-environment" in WORKFLOW
+    assert "group: io-e2e-agent-driven-test" in WORKFLOW
     assert "persist-credentials: false" in WORKFLOW
     assert "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5" in WORKFLOW
     assert "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065" in WORKFLOW
@@ -54,7 +54,7 @@ def test_github_hosted_controller_provisions_private_jit_aws_runner():
 
     assert "needs: [validate-dispatch, resolve-test-deployment]" in provision
     assert "runs-on: ubuntu-24.04" in provision
-    assert "environment: feedling-e2e-test" in provision
+    assert "environment: io-e2e-agent-driven-test" in provision
     assert "id-token: write" in provision
     assert "ref: ${{ github.sha }}" in provision
     assert "persist-credentials: false" in provision
@@ -85,8 +85,8 @@ def test_github_hosted_controller_provisions_private_jit_aws_runner():
         "qualification runner group must select only the protected main workflow"
         in provision
     )
-    assert 'runner_identity="feedling-e2e-${run_key}"' in provision
-    assert '"labels": ["self-hosted", "linux", "x64", "feedling-e2e", label]' in provision
+    assert 'runner_identity="io-e2e-agent-driven-test-${run_key}"' in provision
+    assert '"labels": ["self-hosted", "linux", "x64", "io-e2e-agent-driven-test", label]' in provision
     assert 'echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"' in provision
     assert provision.index(
         'echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"'
@@ -253,7 +253,7 @@ def test_deployment_target_is_metadata_and_controller_code_is_immutable():
     )
 
     assert "expected_deployment_sha" not in trigger
-    assert "group: feedling-test-environment" in WORKFLOW
+    assert "group: io-e2e-agent-driven-test" in WORKFLOW
     assert "ref: ${{ github.sha }}" in checkout
     assert "fetch-depth: 1" in checkout
     assert "persist-credentials: false" in checkout
@@ -310,7 +310,7 @@ def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
     assert "unset QA_CODEX_AUTH_JSON_B64" in preflight
     assert "mcp list --json" in preflight
     assert "sandbox -p profile_official_deepseek" in preflight
-    assert "-P feedling-e2e-official-deepseek" in preflight
+    assert "-P io-e2e-agent-driven-test-official-deepseek" in preflight
     assert 'test "$QA_PYTHON_BIN" = "$1"' in preflight
     assert 'test "$QA_QUALIFICATION_MODE" = "release"' in preflight
     assert 'exec "$QA_PYTHON_BIN" -I -B "$2" --help' in preflight
@@ -320,7 +320,7 @@ def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
     assert "--noproxy" in preflight
     assert "-p profile_official_deepseek" in preflight
     assert "sandbox -p persona_memory_judge" in preflight
-    assert "-P feedling-e2e-persona-memory-judge" in preflight
+    assert "-P io-e2e-agent-driven-test-persona-memory-judge" in preflight
     assert "QA_PERSONA_JUDGE_ROOT" in preflight
     assert "feedling-persona-judge-preflight" in preflight
     assert 'test ! -r "$denied"' in preflight
@@ -371,12 +371,12 @@ def test_persona_judge_profile_is_private_offline_and_reuses_codex_oauth():
     assert "secrets.QA_CODEX_AUTH_JSON_B64" in preflight
     assert 'CODEX_HOME="$QA_CODEX_HOME"' in judge_probe
     assert "sandbox -p persona_memory_judge" in judge_probe
-    assert "-P feedling-e2e-persona-memory-judge" in judge_probe
+    assert "-P io-e2e-agent-driven-test-persona-memory-judge" in judge_probe
     assert "$QA_CODEX_HOME/auth.json" in judge_probe
     assert "$QA_PERSONA_JUDGE_SCRATCH_ROOT" in judge_probe
     assert "https://test-api.feedling.app/" in judge_probe
     for forbidden in (
-        "QA_TEST_ADMIN_TOKEN",
+        "IO_E2E_ADMIN_TOKEN",
         "QA_DEEPSEEK_API_KEY",
         "QA_ANTHROPIC_API_KEY",
         "QA_OPENAI_PROVIDER_API_KEY",
@@ -418,10 +418,10 @@ def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
         assert WORKFLOW.count(f"secrets.{secret_name}") == expected_count
         assert secret_name not in workers
         assert secret_name not in supervisor
-    assert WORKFLOW.count("secrets.QA_TEST_ADMIN_TOKEN") == 8
+    assert WORKFLOW.count("secrets.IO_E2E_ADMIN_TOKEN") == 8
     assert WORKFLOW.count("secrets.QA_CODEX_AUTH_JSON_B64") == 2
-    assert "QA_TEST_ADMIN_TOKEN" not in workers
-    assert "QA_TEST_ADMIN_TOKEN" not in supervisor
+    assert "IO_E2E_ADMIN_TOKEN" not in workers
+    assert "IO_E2E_ADMIN_TOKEN" not in supervisor
     assert "QA_CODEX_AUTH_JSON_B64" not in workers
     assert "QA_CODEX_AUTH_JSON_B64" not in supervisor
     assert "env -i" in supervisor
@@ -449,7 +449,7 @@ def test_manifest_isolation_is_probed_for_all_eight_profiles():
     assert "agent_types=(" in isolation
     assert 'own_manifest="${QA_PROFILE_MANIFEST_DIR}/${profile_id}.json"' in isolation
     assert 'sandbox -p "$agent_type"' in isolation
-    assert '-P "feedling-e2e-${profile_id}"' in isolation
+    assert '-P "io-e2e-agent-driven-test-${profile_id}"' in isolation
     assert "stat -c" in isolation
     assert "os.O_WRONLY | os.O_APPEND" in isolation
     assert "denied_paths=(" in isolation
@@ -501,7 +501,7 @@ def test_real_codex_preflight_binds_the_locked_permission_profile():
         "Provision eight isolated API-key profiles",
     )
     assert "-p profile_official_deepseek" in preflight
-    assert "-c 'default_permissions=\"feedling-e2e-official-deepseek\"'" in preflight
+    assert "-c 'default_permissions=\"io-e2e-agent-driven-test-official-deepseek\"'" in preflight
 
 
 def test_raw_worker_output_is_verified_but_not_exposed_to_aggregator():
@@ -532,7 +532,7 @@ def test_aggregator_preserves_semantic_and_cot_evidence_and_writes_privately():
         "Publish canonical result without following agent-created links",
     )
     for secret_name in (
-        "QA_TEST_ADMIN_TOKEN",
+        "IO_E2E_ADMIN_TOKEN",
         "QA_DEEPSEEK_API_KEY",
         "QA_ANTHROPIC_API_KEY",
         "QA_OPENAI_PROVIDER_API_KEY",
@@ -574,7 +574,7 @@ def test_selected_runtime_target_is_checked_before_and_after_live_profile_agents
     )
     for deployment in (deployment_pre, deployment_post):
         assert "qa/verify_deployment.py" in deployment
-        assert "secrets.QA_TEST_ADMIN_TOKEN" in deployment
+        assert "secrets.IO_E2E_ADMIN_TOKEN" in deployment
         assert "deployment_receipt" in deployment
     assert "steps.orchestration.outcome == 'success'" in deployment_post
     assert "--deployment-receipt" in validate
@@ -657,7 +657,7 @@ def test_persona_live_judge_reuses_codex_oauth_without_admin_or_provider_secrets
         "Validate persona-memory cleanup and finalize arm evidence",
     )
 
-    assert "secrets.QA_TEST_ADMIN_TOKEN" in prepare
+    assert "secrets.IO_E2E_ADMIN_TOKEN" in prepare
     assert "secrets.QA_OPENAI_PROVIDER_API_KEY" in prepare
     assert "qa/provision_profiles.py provision-pool" in prepare
     assert "qa/prepare_persona_memory_accounts.py prepare" in prepare
@@ -676,12 +676,12 @@ def test_persona_live_judge_reuses_codex_oauth_without_admin_or_provider_secrets
     assert '--judge-work-root "$QA_PERSONA_JUDGE_SCRATCH_ROOT"' not in live
     assert '--judge-model "$QA_CODEX_MODEL"' in live
     assert "--judge-codex-profile persona_memory_judge" in live
-    assert "--judge-permission-profile feedling-e2e-persona-memory-judge" in live
+    assert "--judge-permission-profile io-e2e-agent-driven-test-persona-memory-judge" in live
     assert "--judge-reasoning-effort medium" in live
     assert "--allow-private-judge-egress" in live
     assert "secrets." not in live
     for forbidden in (
-        "QA_TEST_ADMIN_TOKEN",
+        "IO_E2E_ADMIN_TOKEN",
         "QA_DEEPSEEK_API_KEY",
         "QA_ANTHROPIC_API_KEY",
         "QA_OPENAI_PROVIDER_API_KEY",
@@ -693,7 +693,7 @@ def test_persona_live_judge_reuses_codex_oauth_without_admin_or_provider_secrets
         assert forbidden not in live
 
     assert "if: always()" in cleanup
-    assert "secrets.QA_TEST_ADMIN_TOKEN" in cleanup
+    assert "secrets.IO_E2E_ADMIN_TOKEN" in cleanup
     assert "qa/prepare_persona_memory_accounts.py cleanup" in cleanup
     assert "qa/provision_profiles.py cleanup" in cleanup
     assert "cleanup-pending" in cleanup
@@ -790,13 +790,13 @@ def test_github_hosted_run_wide_cleanup_is_durable_bounded_and_manifest_free():
     assert "needs: [validate-dispatch, qualify-api-key-runtime]" in header
     assert "runs-on: ubuntu-24.04" in header
     assert "timeout-minutes: 20" in header
-    assert "environment: feedling-e2e-test" in header
+    assert "environment: io-e2e-agent-driven-test" in header
     assert "self-hosted" not in header
     assert "ref: ${{ github.sha }}" in hosted_cleanup
     assert "persist-credentials: false" in hosted_cleanup
     assert "python qa/provision_profiles.py cleanup-run" in sweep
-    assert "QA_FEEDLING_BASE_URL: https://test-api.feedling.app" in sweep
-    assert "vars.QA_FEEDLING_BASE_URL" not in hosted_cleanup
+    assert "IO_E2E_BASE_URL: https://test-api.feedling.app" in sweep
+    assert "vars.IO_E2E_BASE_URL" not in hosted_cleanup
     assert 'base_run_id="api-key-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in sweep
     assert 'persona_run_id="${base_run_id}-persona-memory"' in sweep
     assert "for attempt in 1 2" in sweep
@@ -833,10 +833,10 @@ def test_github_hosted_run_wide_cleanup_is_durable_bounded_and_manifest_free():
         )
     ]
     assert '"run_id":' not in public_projection
-    assert "QA_TEST_ADMIN_TOKEN" not in public_projection
+    assert "IO_E2E_ADMIN_TOKEN" not in public_projection
     assert "GITHUB_STEP_SUMMARY" in sweep
     assert "Upload sanitized authoritative account cleanup proof" in hosted_cleanup
-    assert "feedling-synthetic-cleanup-${{ github.run_id }}-${{ github.run_attempt }}" in hosted_cleanup
+    assert "io-e2e-synthetic-cleanup-${{ github.run_id }}-${{ github.run_attempt }}" in hosted_cleanup
     assert "retention-days: 14" in hosted_cleanup
     artifact_cleanup = _step(
         "Remove hosted cleanup artifact scratch",
@@ -845,7 +845,7 @@ def test_github_hosted_run_wide_cleanup_is_durable_bounded_and_manifest_free():
     assert "if: always()" in artifact_cleanup
     assert 'root.name != "hosted-cleanup-artifacts"' in artifact_cleanup
     assert "if root.is_symlink():\n              root.unlink()" in artifact_cleanup
-    assert "secrets.QA_TEST_ADMIN_TOKEN" in sweep
+    assert "secrets.IO_E2E_ADMIN_TOKEN" in sweep
     for forbidden in (
         "QA_DEEPSEEK_API_KEY",
         "QA_ANTHROPIC_API_KEY",
@@ -944,7 +944,7 @@ def test_memory_contract_uses_isolated_account_and_deterministic_gate_policy():
         "Verify deployed endpoint and selected runtime target after profile testing"
     )
     for secret_name in (
-        "QA_TEST_ADMIN_TOKEN",
+        "IO_E2E_ADMIN_TOKEN",
         "QA_DEEPSEEK_API_KEY",
         "QA_ANTHROPIC_API_KEY",
         "QA_OPENAI_PROVIDER_API_KEY",
@@ -969,7 +969,7 @@ def test_secret_scan_includes_credentials_oauth_and_persona_privacy_fixture():
     assert "--codex-auth" in scan
     assert "--fixture qa/fixtures/persona-import-v1.json" in scan
     for secret_name in (
-        "QA_TEST_ADMIN_TOKEN",
+        "IO_E2E_ADMIN_TOKEN",
         "QA_DEEPSEEK_API_KEY",
         "QA_ANTHROPIC_API_KEY",
         "QA_OPENAI_PROVIDER_API_KEY",

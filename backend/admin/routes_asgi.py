@@ -26,7 +26,12 @@ import time
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 
 from admin import admin_core
 from admin import qa_build_identity
@@ -57,7 +62,9 @@ def _sign_admin_session(*, expires_at: int | None = None) -> str | None:
     secret = _admin_session_secret()
     if secret is None:
         return None
-    expiry = int(expires_at if expires_at is not None else time.time() + _ADMIN_SESSION_MAX_AGE)
+    expiry = int(
+        expires_at if expires_at is not None else time.time() + _ADMIN_SESSION_MAX_AGE
+    )
     payload = f"v1.{expiry}"
     signature = hmac.new(secret, payload.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{payload}.{signature}"
@@ -113,6 +120,16 @@ def _require_admin(request: Request) -> None:
         raise HTTPException(status_code=401)
 
 
+def _require_io_e2e_admin(request: Request) -> None:
+    """Authorize only the test-only agent-driven E2E control surface."""
+    configured = os.environ.get("IO_E2E_ADMIN_TOKEN", "").strip()
+    if not configured:
+        raise HTTPException(status_code=503)
+    supplied = _extract_admin_token(request)
+    if not supplied or not hmac.compare_digest(supplied, configured):
+        raise HTTPException(status_code=401)
+
+
 @router.get("/admin/login")
 async def admin_login_page(request: Request):
     next_url = _safe_admin_next(request.query_params.get("next") or "")
@@ -132,7 +149,9 @@ async def admin_login(request: Request):
     valid_password = bool(configured) and hmac.compare_digest(supplied, configured)
     session = _sign_admin_session() if valid_password else None
     if session is None:
-        return HTMLResponse(admin_core.login_page(error=True, next_url=next_url), status_code=401)
+        return HTMLResponse(
+            admin_core.login_page(error=True, next_url=next_url), status_code=401
+        )
 
     response = RedirectResponse(next_url, status_code=303)
     response.set_cookie(
@@ -191,7 +210,9 @@ async def data_track_debug(request: Request):
 @router.get("/v1/admin/data-track/users/{user_id}")
 async def data_track_user(user_id: str, request: Request):
     _require_admin(request)
-    body, status = await threadpool.run_db(admin_core.user_payload, request.url.query, user_id)
+    body, status = await threadpool.run_db(
+        admin_core.user_payload, request.url.query, user_id
+    )
     return JSONResponse(body, status_code=status)
 
 
@@ -205,7 +226,9 @@ async def data_track_page(request: Request):
 @router.get("/admin/data-track/users/{user_id}")
 async def data_track_user_page(user_id: str, request: Request):
     _require_admin(request)
-    kind, body, status = await threadpool.run_db(admin_core.user_page, request.url.query, user_id)
+    kind, body, status = await threadpool.run_db(
+        admin_core.user_page, request.url.query, user_id
+    )
     if kind == "text":
         return PlainTextResponse(body, status_code=status)
     return HTMLResponse(body, status_code=status)
@@ -215,7 +238,9 @@ async def data_track_user_page(user_id: str, request: Request):
 async def store_evict(request: Request):
     _require_admin(request)
     payload = (await read_json_silent(request)) or {}
-    user_id = str(payload.get("user_id") or request.query_params.get("user_id") or "").strip()
+    user_id = str(
+        payload.get("user_id") or request.query_params.get("user_id") or ""
+    ).strip()
     if not user_id:
         return JSONResponse({"error": "user_id required"}, status_code=400)
     result = await threadpool.run_db(admin_core.store_evict, user_id)
@@ -262,14 +287,14 @@ async def tee_replication_status(request: Request):
 
 @router.get("/v1/admin/qa/synthetic-account-reaper")
 async def qa_synthetic_account_reaper_status(request: Request):
-    _require_admin(request)
+    _require_io_e2e_admin(request)
     payload = await threadpool.run_db(qa_synthetic_accounts.status_payload)
     return JSONResponse(payload)
 
 
 @router.get("/v1/admin/qa/build-identity")
 async def qa_build_identity_status(request: Request):
-    _require_admin(request)
+    _require_io_e2e_admin(request)
     try:
         payload = qa_build_identity.status_payload()
     except qa_build_identity.BuildIdentityUnavailable:
@@ -279,7 +304,7 @@ async def qa_build_identity_status(request: Request):
 
 @router.post("/v1/admin/qa/synthetic-accounts/register")
 async def qa_synthetic_account_register(request: Request):
-    _require_admin(request)
+    _require_io_e2e_admin(request)
     payload = (await read_json_silent(request)) or {}
     try:
         result = await threadpool.run_db(
@@ -291,17 +316,13 @@ async def qa_synthetic_account_register(request: Request):
             status_code=400,
         )
     except qa_synthetic_accounts.SyntheticAccountDisabled:
-        return JSONResponse(
-            {"error": "synthetic_accounts_disabled"}, status_code=503
-        )
+        return JSONResponse({"error": "synthetic_accounts_disabled"}, status_code=503)
     except qa_synthetic_accounts.SyntheticAccountNotReady:
         return JSONResponse(
             {"error": "synthetic_account_reaper_not_ready"}, status_code=503
         )
     except qa_synthetic_accounts.SyntheticAccountRunClosed:
-        return JSONResponse(
-            {"error": "synthetic_account_run_closed"}, status_code=409
-        )
+        return JSONResponse({"error": "synthetic_account_run_closed"}, status_code=409)
     except qa_synthetic_accounts.SyntheticAccountStoreUnavailable:
         return JSONResponse(
             {"error": "synthetic_account_store_unavailable"}, status_code=503
@@ -312,7 +333,7 @@ async def qa_synthetic_account_register(request: Request):
 @router.post("/v1/admin/qa/synthetic-accounts/absence")
 async def qa_synthetic_account_absence(request: Request):
     """Verify an attested QA lease against the authoritative users table."""
-    _require_admin(request)
+    _require_io_e2e_admin(request)
     payload = (await read_json_silent(request)) or {}
     try:
         result = await threadpool.run_db(
@@ -334,16 +355,14 @@ async def qa_synthetic_account_absence(request: Request):
 @router.post("/v1/admin/qa/synthetic-accounts/cleanup-run")
 async def qa_synthetic_account_cleanup_run(request: Request):
     """Authoritatively sweep signed QA accounts for one normalized run ID."""
-    _require_admin(request)
+    _require_io_e2e_admin(request)
     payload = (await read_json_silent(request)) or {}
     try:
         result = await threadpool.run_db(
             qa_synthetic_accounts.cleanup_synthetic_run, payload
         )
     except qa_synthetic_accounts.SyntheticAccountBadRequest:
-        return JSONResponse(
-            {"error": "invalid_synthetic_account_run"}, status_code=400
-        )
+        return JSONResponse({"error": "invalid_synthetic_account_run"}, status_code=400)
     except qa_synthetic_accounts.SyntheticAccountStoreUnavailable:
         return JSONResponse(
             {"error": "synthetic_account_store_unavailable"}, status_code=503

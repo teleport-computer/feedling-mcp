@@ -55,7 +55,7 @@ DIAGNOSTIC_RUNTIME_MODE = RUNTIME_V2_REQUIREMENT
 DIAGNOSTIC_RUNTIME_VERSION = RUNTIME_V2_VERSION
 QUALIFICATION_MODE_DIAGNOSTIC = "diagnostic"
 EXPECTED_REASONING_EFFORT = "medium"
-INVALID_PROVIDER_KEY = "feedling-e2e-intentionally-invalid"
+INVALID_PROVIDER_KEY = "io-e2e-agent-driven-test-intentionally-invalid"
 MANIFEST_SCHEMA_VERSION = 1
 PERSONA_MEMORY_POOL_MANIFEST_KIND = "persona_memory_account_pool"
 MAX_PERSONA_MEMORY_POOL_COUNT = 24
@@ -256,7 +256,7 @@ def validate_base_url(raw: str) -> str:
         port = parsed.port
     except ValueError:
         raise ProvisionError(
-            "QA_FEEDLING_BASE_URL is not the approved test endpoint"
+            "IO_E2E_BASE_URL is not the approved test endpoint"
         ) from None
     if (
         parsed.scheme != "https"
@@ -268,7 +268,7 @@ def validate_base_url(raw: str) -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise ProvisionError("QA_FEEDLING_BASE_URL is not the approved test endpoint")
+        raise ProvisionError("IO_E2E_BASE_URL is not the approved test endpoint")
     return ALLOWED_BASE_URL
 
 
@@ -1809,7 +1809,7 @@ def cleanup_manifest_snapshot(
     active_env = os.environ if env is None else env
     verification_admin = admin_client
     if verification_admin is None:
-        admin_token = str(active_env.get("QA_TEST_ADMIN_TOKEN") or "").strip()
+        admin_token = str(active_env.get("IO_E2E_ADMIN_TOKEN") or "").strip()
         if admin_token:
             verification_admin = AdminClient(
                 base_url,
@@ -1959,8 +1959,8 @@ def cleanup_run(
     if normalized_run_id != run_id and len(str(run_id)) <= MAX_SYNTHETIC_RUN_ID_LENGTH:
         raise ProvisionError("synthetic cleanup run ID must already be normalized")
     active_env = os.environ if env is None else env
-    base_url = validate_base_url(_required_env(active_env, "QA_FEEDLING_BASE_URL"))
-    admin_token = _required_env(active_env, "QA_TEST_ADMIN_TOKEN")
+    base_url = validate_base_url(_required_env(active_env, "IO_E2E_BASE_URL"))
+    admin_token = _required_env(active_env, "IO_E2E_ADMIN_TOKEN")
     receipt_path = _validate_new_private_manifest_path(receipt_path)
     active_admin = admin_client or AdminClient(base_url, admin_token)
     receipt = active_admin.cleanup_synthetic_run(normalized_run_id)
@@ -1986,8 +1986,8 @@ def provision(
     )
     if requirement not in {BASELINE_RUNTIME_REQUIREMENT, RUNTIME_V2_REQUIREMENT}:
         raise ProvisionError("runtime requirement is invalid")
-    base_url = validate_base_url(_required_env(active_env, "QA_FEEDLING_BASE_URL"))
-    admin_token = "" if diagnostic else _required_env(active_env, "QA_TEST_ADMIN_TOKEN")
+    base_url = validate_base_url(_required_env(active_env, "IO_E2E_BASE_URL"))
+    admin_token = "" if diagnostic else _required_env(active_env, "IO_E2E_ADMIN_TOKEN")
     profiles = _select_profiles(
         _load_coverage(coverage_path),
         diagnostic=diagnostic,
@@ -2243,8 +2243,8 @@ def provision_pool(
     )
     spec = PROFILE_SPECS[selected_profile_id]
     active_env = os.environ if env is None else env
-    base_url = validate_base_url(_required_env(active_env, "QA_FEEDLING_BASE_URL"))
-    admin_token = _required_env(active_env, "QA_TEST_ADMIN_TOKEN")
+    base_url = validate_base_url(_required_env(active_env, "IO_E2E_BASE_URL"))
+    admin_token = _required_env(active_env, "IO_E2E_ADMIN_TOKEN")
 
     # Validate every selected-route input before checking the reaper or creating
     # external state. Unrelated provider credentials are deliberately not read.

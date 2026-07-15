@@ -56,7 +56,7 @@ Deploy the checked-in stack from a trusted checkout:
 ```bash
 aws cloudformation deploy \
   --region "$AWS_REGION" \
-  --stack-name feedling-agentic-e2e \
+  --stack-name io-e2e-agent-driven-test \
   --template-file qa/aws/cloudformation/runner-controller.yml \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
@@ -67,7 +67,7 @@ aws cloudformation deploy \
 ```
 
 The role can inspect EC2 launch inputs, launch only the stack's AMI/subnet/
-security group with the required Feedling tags, and terminate only matching
+security group with the required IO E2E tags, and terminate only matching
 managed instances. It cannot pass an IAM role, create ingress, or operate an
 untagged instance. Record the four stack outputs without placing them in a
 repository file.
@@ -88,7 +88,7 @@ so the controller can fail closed if the configured runner-group ID, name, or
 workflow restriction drifts, and verify that the generated runner is listed in
 that exact group. Do not grant code or secret permissions.
 
-Generate one App private key. Store the PEM only as the `feedling-e2e-test`
+Generate one App private key. Store the PEM only as the `io-e2e-agent-driven-test`
 Environment secret `QA_RUNNER_GITHUB_APP_PRIVATE_KEY`; store the numeric App ID
 as the Environment variable `QA_RUNNER_GITHUB_APP_ID`.
 
@@ -99,11 +99,11 @@ repository-only access is too broad because another workflow could race for a
 new runner through its generic `self-hosted` label. Record the group's positive
 numeric ID as `QA_RUNNER_GROUP_ID` and its exact name as
 `QA_RUNNER_GROUP_NAME`. The qualification job selects both that group and its
-unique `feedling-e2e-<run>-<attempt>` label.
+unique `io-e2e-agent-driven-test-<run>-<attempt>` label.
 
 ## 3. GitHub Environment configuration
 
-The `feedling-e2e-test` Environment must allow only protected `main` and must
+The `io-e2e-agent-driven-test` Environment must allow only protected `main` and must
 not require a reviewer. This makes runs self-service while keeping changes to
 the secret-bearing controller behind normal branch protection.
 
@@ -122,13 +122,14 @@ Add the App PEM as the one new infrastructure secret:
 
 - `QA_RUNNER_GITHUB_APP_PRIVATE_KEY`
 
-The provider, model, admin, and Codex variables/secrets are listed in the
-parent [`qa/README.md`](../README.md). Store a complete refreshable ChatGPT
+The provider, model, repository-scoped IO E2E admin secret, and Codex
+variables/secrets are listed in the parent [`qa/README.md`](../README.md).
+Store a complete refreshable ChatGPT
 `auth.json` as base64 without printing it:
 
 ```bash
 openssl base64 -A -in "$HOME/.codex/auth.json" |
-  gh secret set QA_CODEX_AUTH_JSON_B64 --env feedling-e2e-test
+  gh secret set QA_CODEX_AUTH_JSON_B64 --env io-e2e-agent-driven-test
 ```
 
 Routine runs do not require signing out other devices. Rotate the copied OAuth
@@ -161,7 +162,7 @@ Provisioning waits for an exact-name, exact-label, online, idle runner before
 the secret-bearing job is queued. Startup failure triggers immediate hosted
 rollback. Final hosted cleanup runs even when qualification fails or is
 cancelled. Before instance cleanup, a separate GitHub-hosted job uses only
-`QA_TEST_ADMIN_TOKEN` to sweep both exact synthetic-account run IDs with bounded
+`IO_E2E_ADMIN_TOKEN` to sweep both exact synthetic-account run IDs with bounded
 retries and requires database-authoritative `remaining_count=0`; this path does
 not depend on a JIT manifest. Tag-based instance discovery still works if the
 instance-ID output was lost.

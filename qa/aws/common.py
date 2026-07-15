@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-MANAGED_BY = "feedling-agentic-e2e"
+MANAGED_BY = "io-e2e-agent-driven-test"
 INSTANCE_TYPE = "m7i.xlarge"
 CANONICAL_OWNER_ID = "099720109477"
 MAX_USER_DATA_BYTES = 16_384

@@ -110,9 +110,9 @@ umask 077
 mkdir -m 700 "$PRIVATE_ROOT" "$WORK_ROOT"
 mkdir -p "$ARTIFACT_SCRATCH"
 
-export QA_FEEDLING_BASE_URL=https://test-api.feedling.app
+export IO_E2E_BASE_URL=https://test-api.feedling.app
 export QA_RUN_ID="persona-memory-${TARGET_LABEL}-${BUILD_SHA}"
-# Also set QA_TEST_ADMIN_TOKEN plus only the selected route's provider/model
+# Also set IO_E2E_ADMIN_TOKEN plus only the selected route's provider/model
 # variables, for example QA_OPENAI_PROVIDER_API_KEY and QA_OPENAI_MODEL.
 # CODEX_HOME must be the run-scoped owner-only directory prepared by the
 # qualification workflow. It contains a copied ChatGPT OAuth auth.json and the
@@ -133,7 +133,7 @@ python qa/run_persona_memory_arm.py \
   --judge-id codex-oauth-persona-memory-v1 \
   --judge-configuration-id persona-memory-rubric-v1 \
   --judge-codex-profile persona_memory_judge \
-  --judge-permission-profile feedling-e2e-persona-memory-judge \
+  --judge-permission-profile io-e2e-agent-driven-test-persona-memory-judge \
   --judge-reasoning-effort medium \
   --allow-private-judge-egress
 ```
@@ -145,7 +145,7 @@ only the later baseline/candidate comparison can establish a regression. Exit
 arm uses `--repetitions 1` and eight accounts; the release arm uses three
 repetitions and 24 accounts.
 
-The manual arm supervisor removes `QA_TEST_ADMIN_TOKEN` and all
+The manual arm supervisor removes `IO_E2E_ADMIN_TOKEN` and all
 provisioning-provider credentials from the conversation-runner subprocess. The
 formal GitHub workflow is stricter: provisioning, Codex execution, and cleanup
 are separate steps; the Codex step receives no admin/provider secret variables
@@ -214,7 +214,7 @@ python qa/run_persona_memory_regression.py run-live \
   --judge-id codex-oauth-persona-memory-v1 \
   --judge-configuration-id persona-memory-rubric-v1 \
   --judge-codex-profile persona_memory_judge \
-  --judge-permission-profile feedling-e2e-persona-memory-judge \
+  --judge-permission-profile io-e2e-agent-driven-test-persona-memory-judge \
   --judge-reasoning-effort medium \
   --allow-private-judge-egress \
   --output "$PRIVATE_ROOT/result.json"
@@ -317,7 +317,7 @@ run_one_arm() {
     --judge-id codex-oauth-persona-memory-v1 \
     --judge-configuration-id persona-memory-rubric-v1 \
     --judge-codex-profile persona_memory_judge \
-    --judge-permission-profile feedling-e2e-persona-memory-judge \
+    --judge-permission-profile io-e2e-agent-driven-test-persona-memory-judge \
     --judge-reasoning-effort medium \
     --allow-private-judge-egress
 }
@@ -380,7 +380,7 @@ Formal GitHub CI also has a manifest-independent durability sweep on a separate
 GitHub-hosted job. After the JIT qualification attempt, it calls
 `qa/provision_profiles.py cleanup-run` for the exact base run ID and its
 `-persona-memory` suffix with bounded retries, using only
-`QA_TEST_ADMIN_TOKEN`. Its aggregate receipt must be database-authoritative,
+`IO_E2E_ADMIN_TOKEN`. Its aggregate receipt must be database-authoritative,
 complete, and report both `operation_failure_count=0` and `remaining_count=0`.
 This catches a registration response lost before a local manifest checkpoint;
 runner-private manifests are therefore deleted even when local cleanup fails.

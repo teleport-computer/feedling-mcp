@@ -153,7 +153,7 @@ P0 suite. Read $QA_SOURCE_ROOT/qa/SOP.md,
 $QA_SOURCE_ROOT/qa/coverage-lock.json, and
 $QA_SOURCE_ROOT/qa/scenarios/api-key-journey.md before acting. QA_PRIVATE_MANIFEST is an
 owner-only one-row manifest for exactly your assigned profile. Test only that
-profile against QA_FEEDLING_BASE_URL and execute all locked scenarios in order.
+profile against IO_E2E_BASE_URL and execute all locked scenarios in order.
 Copy QA_EXPECTED_RUNTIME exactly into `expected_runtime`. Copy the authenticated
 manifest readback into `observed_runtime` and `observed_runtime_version`; never
 turn a `deployed_current` requirement into `hosted_resident` merely because the
@@ -188,7 +188,7 @@ the parent receipt are rejected. P0-01, P0-12, and P0-13 have separate parent-
 owned evidence.
 P0-06 requires exactly three ordered, successful phase-marker commands. Run
 these exact commands in separate Codex tool calls:
-QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=CAPTURE "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/tools/genesis_e2e.py" distill-existing-session --api-url "$QA_FEEDLING_BASE_URL" --session-manifest "$QA_PRIVATE_MANIFEST" --profile-id "$QA_PROFILE_ID" --fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" --private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" --artifact-dir "$QA_ARTIFACT_DIR"
+QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=CAPTURE "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/tools/genesis_e2e.py" distill-existing-session --api-url "$IO_E2E_BASE_URL" --session-manifest "$QA_PRIVATE_MANIFEST" --profile-id "$QA_PROFILE_ID" --fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" --private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" --artifact-dir "$QA_ARTIFACT_DIR"
 QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=REVIEW "$QA_PYTHON_BIN" -I -B -c 'import pathlib,sys;j=pathlib.Path(sys.argv[2]);j.exists() and sys.exit(17);print(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))' "$QA_WORK_ROOT/p0-06-private-evidence.json" "$QA_WORK_ROOT/p0-06-semantic-judgment.json"
 After observing REVIEW output, make the semantic decisions and write the bounded
 owner-only judgment to exactly
@@ -1091,7 +1091,7 @@ def _worker_environment(
         "QA_EXPECTED_DEPLOYMENT_SHA": expected_sha,
         "QA_EXPECTED_RUNTIME": expected_runtime,
         "QA_QUALIFICATION_MODE": qualification_mode,
-        "QA_FEEDLING_BASE_URL": base_url,
+        "IO_E2E_BASE_URL": base_url,
     }
 
 

@@ -35,7 +35,7 @@ The protected workflow is deliberately split across explicit trust zones:
   admin, or OAuth secrets and derives the currently deployed backend SHA from
   the serialized compose image pin. The resolved SHA is data passed into
   qualification, never code executed by the secret-bearing runner.
-- Only the ephemeral evaluator job enters `feedling-e2e-test`. It checks out
+- Only the ephemeral evaluator job enters `io-e2e-agent-driven-test`. It checks out
   the immutable controller SHA from `main`, receives the Environment secrets,
   and verifies the live backend against the resolver's expected SHA before
   provisioning any account or using any provider key. The reusable workflow is
@@ -218,7 +218,7 @@ owner-only directory. After verified account cleanup, a passing run removes that
 directory. A non-passing worker run first copies a bounded,
 credential-scanned subset of raw
 worker events, stderr, scratch files, and Codex session evidence to the owner-only
-`~/.codex/feedling-e2e-debug/<run-id>/` quarantine, explicitly excluding the
+`~/.codex/io-e2e-agent-driven-test-debug/<run-id>/` quarantine, explicitly excluding the
 provisioning manifests and any file containing known provider, synthetic-user,
 content, or OAuth credentials; it then removes the original private run. The
 summary records only `private_debug_retained` and its run ID. If account cleanup
@@ -311,11 +311,10 @@ runtime roots, and proves `"$QA_PYTHON_BIN" -I -B` can load the probe inside the
 real sandbox before any synthetic account is provisioned. Workers may not build
 their own virtual environments or install dependencies during qualification.
 
-## `QA_TEST_ADMIN_TOKEN`
+## `IO_E2E_ADMIN_TOKEN`
 
-`QA_TEST_ADMIN_TOKEN` is the client-side name for the credential accepted by
-the **test** backend's admin routes. Its value must match that deployment's
-`FEEDLING_ADMIN_TOKEN`. This is not issued by Feedling: the operator chooses one
+`IO_E2E_ADMIN_TOKEN` is the single credential accepted only by the **test**
+backend's `/v1/admin/qa/*` routes. This is not issued by the application: the operator chooses one
 strong random value, for example with `openssl rand -hex 32`, and stores it only
 in secret managers. Protected self-service qualification uses it to read the
 test build identity before Codex, verify the synthetic-account reaper, register
@@ -343,24 +342,14 @@ not admin operations. The bounded QA admin calls include:
   only aggregate hashes and counts. This manifest-independent zero-remaining
   proof covers a lost registration response or a destroyed runner.
 
-This token has broader test-admin authority because the backend shares one
-admin credential across admin routes. Keep it in the protected
-`feedling-e2e-test` GitHub Environment, never use the production token, and
-never expose it to Codex, prompts, logs, or uploaded artifacts.
-
-The same random **test-only** value has three names at three boundaries:
-
-- `TEST_FEEDLING_ADMIN_TOKEN`: repository or organization Actions secret used
-  by the `test` deployment job;
-- `FEEDLING_ADMIN_TOKEN`: environment variable injected into the deployed test
-  backend; and
-- `QA_TEST_ADMIN_TOKEN`: protected `feedling-e2e-test` Environment secret used
-  by deterministic qualification steps.
-
-The production deployment continues to use the separate Actions secret named
-`FEEDLING_ADMIN_TOKEN`. Its value MUST differ from the test value. Configure
-`TEST_FEEDLING_ADMIN_TOKEN` before merging the CI change or the next test deploy
-will intentionally fail closed.
+It does not authorize the application's ordinary admin routes or admin login.
+Store it once as the repository or organization Actions secret
+`IO_E2E_ADMIN_TOKEN`. Both the `test` deployment and trusted qualification
+workflow reference that one secret and pass the same variable name into the
+backend/client boundary. Never expose it to Codex, prompts, logs, or uploaded
+artifacts. The application's existing legacy admin credential is unchanged and
+is not accepted by these QA routes. Configure `IO_E2E_ADMIN_TOKEN` before merging
+the CI change or the next test deploy will intentionally fail closed.
 
 ## Test backend and runner infrastructure
 
@@ -375,13 +364,13 @@ single-job JIT GitHub Actions runner on AWS with a unique per-run label, gives i
 the Codex OAuth bundle only for that job, and destroys it afterward. It does not
 host Feedling or replace a Runtime V2 worker. The test app deploy, test runner
 deploy, test Postgres deploy, and qualification workflow share the
-`feedling-test-environment` concurrency lock. Pre/post build receipts still
+`io-e2e-agent-driven-test` concurrency lock. Pre/post build receipts still
 catch a deployment made outside those workflows. The complete on-demand AWS
 setup is documented in [`qa/aws/README.md`](aws/README.md).
 
 ## One-time GitHub setup
 
-Create a protected GitHub Environment named `feedling-e2e-test`. Configure its
+Create a protected GitHub Environment named `io-e2e-agent-driven-test`. Configure its
 deployment branch policy to allow only protected `main`. Do **not** configure a
 required reviewer: every collaborator with repository write access is meant to
 be able to run this evaluation without waiting for a particular person. The
@@ -390,10 +379,26 @@ to the controller/harness must pass the repository's normal protected-branch
 review, while a workflow dispatch can only use an already trusted immutable
 `main` revision. The workflow also rejects any controller ref other than
 `refs/heads/main`; that in-repository guard is defense in depth and does not
-replace the Environment branch restriction. Add these environment **secrets**:
+replace the Environment branch restriction.
+
+First add the one repository or organization Actions secret used by both test
+deployment and qualification:
+
+- `IO_E2E_ADMIN_TOKEN`
+
+Create it once, without `--env`, so both the protected `test` deployment and
+the trusted `main` qualification controller read the same repository secret:
+
+```bash
+token="$(openssl rand -hex 32)"
+printf '%s' "$token" |
+  gh secret set IO_E2E_ADMIN_TOKEN --repo teleport-computer/feedling-mcp
+unset token
+```
+
+Then add these protected environment **secrets**:
 
 - `QA_CODEX_AUTH_JSON_B64`
-- `QA_TEST_ADMIN_TOKEN`
 - `QA_DEEPSEEK_API_KEY`
 - `QA_ANTHROPIC_API_KEY`
 - `QA_OPENAI_PROVIDER_API_KEY`
@@ -547,8 +552,8 @@ uploaded. Raw conversations, judge rationales, evidence IDs, and account
 fingerprints remain private and are deleted with the disposable runner.
 
 An independent `cleanup-synthetic-accounts` job then runs on GitHub-hosted
-infrastructure under the same protected `feedling-e2e-test` environment. It
-uses only `QA_TEST_ADMIN_TOKEN`, derives the exact base and `-persona-memory`
+infrastructure under the same protected `io-e2e-agent-driven-test` environment. It
+uses only `IO_E2E_ADMIN_TOKEN`, derives the exact base and `-persona-memory`
 run IDs, and retries the idempotent `cleanup-run` admin operation at most two
 times per ID. The workflow fails unless the database-authoritative receipts
 prove zero operation failures and zero remaining accounts. Because this sweep
@@ -559,7 +564,7 @@ The backend closes each run ID under the same cross-worker database lock used by
 registration before it scans, so an in-flight registration either commits in
 time to be swept or is rejected after closure.
 On success, the hosted job uploads a separate 14-day
-`feedling-synthetic-cleanup-<run>-<attempt>` artifact and writes the same exact
+`io-e2e-synthetic-cleanup-<run>-<attempt>` artifact and writes the same exact
 aggregate counts and hashes to the GitHub step summary; neither output contains
 run IDs, account identities, credentials, or response text.
 
@@ -580,7 +585,7 @@ For a baseline local run, the deployed endpoint needs the existing API-key
 onboarding, chat, persona, trace, and authenticated runtime-status contracts. It
 also needs the test-only `GET /v1/admin/qa/build-identity` route, with the image's
 full `FEEDLING_GIT_COMMIT` equal to the serialized deploy's
-`FEEDLING_TEST_DEPLOY_SHA`. This branch must therefore be deployed to `test` once
+`IO_E2E_TEST_DEPLOY_SHA`. This branch must therefore be deployed to `test` once
 before the hardened local driver can run; absence or mismatch fails before any
 provider key is used. This baseline path does not require the deployed target to
 identify itself as Hosted Runtime V2.
@@ -610,7 +615,7 @@ gh workflow run ci.yml --ref main -f runtime_target=deployed_current
 
 The manual-only `api-key-e2e-manual` job calls the reusable E2E workflow from
 that selected immutable `main` revision and does not inherit caller secrets. A
-separate GitHub-hosted job, outside `feedling-e2e-test`, checks out `test`
+separate GitHub-hosted job, outside `io-e2e-agent-driven-test`, checks out `test`
 without QA Environment secrets, reads the backend image tag pinned in
 `deploy/docker-compose.phala.test.yaml`, and resolves the short tag to a full Git
 commit. The secret-bearing evaluator then checks out only the trusted `main`

@@ -183,7 +183,7 @@ def _profile(profile_id: str, index: int) -> dict:
 def _valid_result() -> dict:
     return {
         "schema_version": "1.0",
-        "suite_id": "feedling-api-key-p0",
+        "suite_id": "io-e2e-agent-driven-test-p0",
         "run_id": "unit-run-0001",
         "started_at": STAMP,
         "finished_at": STAMP,
@@ -580,7 +580,7 @@ def _write_orchestration_receipt(
                 "worker_id": assignment["worker_id"],
                 "thread_id": assignment["worker_id"],
                 "session_id": None,
-                "permission_profile": f"feedling-e2e-{profile_id}",
+                "permission_profile": f"io-e2e-agent-driven-test-{profile_id}",
                 "started_at": f"2026-07-13T12:00:{start_second:02d}.000001Z",
                 "stopped_at": f"2026-07-13T12:00:{stop_second:02d}.000001Z",
                 "profile_result_sha256": hashlib.sha256(canonical_profile).hexdigest(),
