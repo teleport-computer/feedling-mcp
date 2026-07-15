@@ -2897,7 +2897,49 @@ def _generate_model_api_onboarding_greeting(
     return text[:1200], warnings
 
 
+def _persisted_onboarding_greeting_row(store: UserStore) -> dict | None:
+    """DB-level lookup of the user's onboarding greeting row. Deliberately NOT
+    the in-memory ring: db.chat_append swallows PostgreSQL failures, so only a
+    row readable back from the DB counts as delivered."""
+    try:
+        rows = db.chat_load(store.user_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[history_import:{store.user_id}] greeting durable check failed: {type(e).__name__}:{str(e)[:160]}")
+        return None
+    for row in rows or []:
+        if isinstance(row, dict) and row.get("model_api_kind") == "onboarding_greeting":
+            return row
+    return None
+
+
+def _mark_introduced_after_greeting(store: UserStore) -> None:
+    # The onboarding greeting IS this user's introduction — record the durable
+    # introduced marker (the same one agent_runtime.introduction dedups on) so
+    # the resident introduction job does not greet again after a route switch.
+    # Only ever called with a DB-confirmed greeting row. Best-effort in the
+    # OTHER direction only: db.set_blob also swallows write failures, so a
+    # missing marker after mark risks one duplicate resident greeting (benign)
+    # — the reverse (marker without a durable greeting) is what must never
+    # happen, and the durable check before this call guarantees that.
+    try:
+        store.mark_introduced()
+        if not store.introduction_done():
+            print(f"[history_import:{store.user_id}] introduced marker did not persist; resident may re-greet once")
+    except Exception as e:  # noqa: BLE001
+        print(f"[history_import:{store.user_id}] mark_introduced after greeting failed: {type(e).__name__}:{str(e)[:160]}")
+
+
 def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
+    # Exactly one onboarding greeting per user, across genesis job re-runs
+    # (crash between append and job-complete → the app re-POSTs the same
+    # client_job_id and the whole job re-executes). introduced_at cannot serve
+    # as this idempotency key — it guards the resident introduction job, and a
+    # lost marker write must not permit a second greeting row. The persisted
+    # row itself is the key; finding one also heals a missing marker.
+    existing = _persisted_onboarding_greeting_row(store)
+    if existing is not None:
+        _mark_introduced_after_greeting(store)
+        return existing
     envelope, err = core_envelope._build_shared_envelope_for_store(store, text.encode("utf-8"))
     if envelope is None:
         raise RuntimeError(f"onboarding_greeting_envelope_failed:{err}")
@@ -2908,20 +2950,14 @@ def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
         extra={"model_api_kind": "onboarding_greeting"},
     )
     store.notify_chat_waiters()
+    # Durable acknowledgement: append_chat always returns the in-memory row,
+    # even when the underlying db.chat_append swallowed a PostgreSQL failure.
+    # A greeting that only exists in this process's ring disappears on restart
+    # — marking it introduced would suppress every future recovery, so refuse.
+    if _persisted_onboarding_greeting_row(store) is None:
+        raise RuntimeError("onboarding_greeting_append_not_durable")
     boot_gates._log_bootstrap_event(store, "model_api_onboarding_greeting_written", success=True)
-    # The onboarding greeting IS this user's introduction — record the durable
-    # introduced marker (the same one agent_runtime.introduction dedups on) so
-    # the resident introduction job can never double-greet, e.g. after a later
-    # route switch to resident. Anchored HERE, after the append the user
-    # actually receives, never at identity-write time: a greeting that failed
-    # to land must stay eligible for a future introduction. Best-effort — the
-    # greeting row is already delivered, so a marker write hiccup must not fail
-    # the job (residual crash window between the two stores is accepted; no
-    # cross-store transaction exists).
-    try:
-        store.mark_introduced()
-    except Exception as e:  # noqa: BLE001
-        print(f"[history_import:{store.user_id}] mark_introduced after greeting failed: {type(e).__name__}:{str(e)[:160]}")
+    _mark_introduced_after_greeting(store)
     return row
 
 

@@ -1411,6 +1411,49 @@ def test_onboarding_greeting_append_marks_introduced(client):
     assert store.introduction_done() is True
 
 
+def test_onboarding_greeting_append_is_idempotent_across_retries(client):
+    # Genesis job retries (crash between greeting append and job-complete, then
+    # the app re-POSTs the same client_job_id and the job re-runs) must not
+    # append a second greeting: the check is DB-level, keyed on the existing
+    # onboarding_greeting row, not on the in-memory ring or introduced_at.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    first = history_import._append_model_api_onboarding_greeting(store, "hello one")
+    second = history_import._append_model_api_onboarding_greeting(store, "hello two")
+    assert second["id"] == first["id"]
+    rows = [m for m in db.chat_load(user_id)
+            if isinstance(m, dict) and m.get("model_api_kind") == "onboarding_greeting"]
+    assert len(rows) == 1
+
+
+def test_onboarding_greeting_swallowed_db_failure_does_not_mark(client, monkeypatch):
+    # db.chat_append swallows PostgreSQL failures (log + return), so append_chat
+    # "succeeds" in memory while the row never persists. The marker must NOT be
+    # set in that case — it would permanently suppress a greeting that vanishes
+    # on the next restart.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    monkeypatch.setattr(db, "chat_append", lambda *a, **k: None)
+    with pytest.raises(RuntimeError):
+        history_import._append_model_api_onboarding_greeting(store, "never durable")
+    assert store.introduction_done() is False
+
+
+def test_onboarding_greeting_existing_row_heals_missing_marker(client):
+    # Crash window: greeting row persisted but the marker write was lost. A
+    # retry must reuse the existing row AND backfill introduced_at.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    first = history_import._append_model_api_onboarding_greeting(store, "hello")
+    cur = store.load_proactive_settings()
+    cur["introduced_at"] = ""
+    db.set_blob(user_id, "proactive_settings", cur)
+    assert store.introduction_done() is False
+    retry = history_import._append_model_api_onboarding_greeting(store, "retry text")
+    assert retry["id"] == first["id"]
+    assert store.introduction_done() is True
+
+
 def test_onboarding_greeting_envelope_failure_leaves_introduced_unset(client, monkeypatch):
     # Marker must anchor on the greeting the user actually RECEIVES: an append
     # that failed (no chat row) must not mark introduced, or the failure would
