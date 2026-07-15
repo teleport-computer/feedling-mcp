@@ -558,6 +558,52 @@ def recent_tee_sync_runs(limit: int = 50) -> list[dict]:
     return out
 
 
+# --- TEE reconcile resume cursors (see alembic 0018) ------------------------ #
+# A per-table keyset checkpoint so a backfill interrupted by a worker recycle /
+# deploy / crash resumes where it left off instead of restarting from row 1.
+# All three are best-effort: a cursor read/write failure only forfeits
+# resumability for that pass, it must never break the reconcile itself.
+
+def save_reconcile_cursor(table: str, cursor_pk: list) -> None:
+    """Persist ``cursor_pk`` (a JSON-serializable list = the last-copied pk) as
+    the resume point for ``table``'s reconcile backfill."""
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO tee_reconcile_cursors (table_name, cursor_pk, updated_at) "
+                "VALUES (%s, %s::jsonb, now()) ON CONFLICT (table_name) DO UPDATE SET "
+                "cursor_pk = EXCLUDED.cursor_pk, updated_at = now()",
+                (table, json.dumps(cursor_pk)),
+            )
+    except Exception as e:  # noqa: BLE001 — resume is an optimization, never a gate
+        log.warning("[db] save_reconcile_cursor(%s) failed: %s", table, e)
+
+
+def load_reconcile_cursor(table: str) -> list | None:
+    """The persisted last-copied pk for ``table`` (a list), or None to start from
+    the top. Read failure degrades to None = current restart-from-scratch."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT cursor_pk FROM tee_reconcile_cursors WHERE table_name = %s",
+                (table,)).fetchone()
+        return list(row[0]) if row and row[0] is not None else None
+    except Exception as e:  # noqa: BLE001
+        log.warning("[db] load_reconcile_cursor(%s) failed: %s", table, e)
+        return None
+
+
+def clear_reconcile_cursor(table: str) -> None:
+    """Drop ``table``'s resume cursor once its backfill pass completes, so the
+    next periodic reconcile starts fresh (and re-catches any missed updates)."""
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM tee_reconcile_cursors WHERE table_name = %s", (table,))
+    except Exception as e:  # noqa: BLE001
+        log.warning("[db] clear_reconcile_cursor(%s) failed: %s", table, e)
+
+
 def user_exists(user_id: str) -> bool:
     """Authoritative membership check against the users table. The push path uses
     it to close the sub-second window where another worker committed a delete but

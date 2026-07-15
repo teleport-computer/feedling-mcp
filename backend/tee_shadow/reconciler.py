@@ -103,6 +103,21 @@ def _wrap_jsonb(row: tuple) -> tuple:
     return tuple(Jsonb(v) if isinstance(v, (dict, list)) else v for v in row)
 
 
+def _json_safe_cursor(vals: tuple) -> list | None:
+    """The pk tuple as a JSON-serializable list for the resume cursor, or None if
+    any component isn't natively JSON (e.g. perception_daily's DATE pk). None ⇒
+    skip cursor persistence for that table — it reconciles from the top each
+    window, which is fine for the small non-text/number-pk tables. bool is a JSON
+    scalar (and an int subclass) so copytext_meta's boolean pk is fine."""
+    out: list = []
+    for v in vals:
+        if v is None or isinstance(v, (str, int, float, bool)):
+            out.append(v)
+        else:
+            return None
+    return out
+
+
 def reconcile_table(table: str, *, prune: bool = True) -> dict:
     pk, cols = TABLES[table]
     col_list = [c.strip() for c in cols.split(",")]
@@ -135,7 +150,17 @@ def reconcile_table(table: str, *, prune: bool = True) -> dict:
         # pools run autocommit=True, and named cursors need an explicit
         # transaction wrapper under autocommit — plain LIMIT/keyset avoids
         # that entirely and handles composite pks via row-value comparison.
-        last: tuple | None = None
+        #
+        # Resume from a persisted cursor if one exists (db.save/load_reconcile_
+        # cursor): the scheduler lives in a max_requests-recycled worker, so a
+        # large table's backfill spans several worker lifetimes — without this it
+        # restarted from row 1 every recycle and never finished (see alembic 0018).
+        # Already-copied rows before the cursor stay in TEE; we just skip re-scanning
+        # them. (rds_rows below then counts only THIS window's rows, not the whole
+        # table — an informational metric; convergence is checked by verify, and
+        # prune still does a full two-sided keyset diff regardless.)
+        saved = db.load_reconcile_cursor(table)
+        last: tuple | None = tuple(saved) if saved else None
         skipped = 0
         while True:
             if last is None:
@@ -167,6 +192,14 @@ def reconcile_table(table: str, *, prune: bool = True) -> dict:
                     except pg_errors.ForeignKeyViolation:
                         skipped += 1
             last = tuple(rows[-1][i] for i in pk_idx)
+            # Persist progress AFTER the TEE write committed, so the cursor never
+            # points past rows that aren't in TEE; an interrupted backfill resumes
+            # from here, not row 1. Skipped orphans don't matter (prune reconciles
+            # them). Non-JSON-safe pk (perception_daily DATE) ⇒ no cursor, table
+            # just re-scans from the top next window (it's small).
+            cur_json = _json_safe_cursor(last)
+            if cur_json is not None:
+                db.save_reconcile_cursor(table, cur_json)
         if skipped:
             log.warning("[reconcile] %s: 跳过 %d 条孤儿行(parent 并发删除)", table, skipped)
 
@@ -197,6 +230,12 @@ def reconcile_table(table: str, *, prune: bool = True) -> dict:
         # rds_rows == tee_rows 才不会被辖区外的 identity 行数差打破。
         tee_rows = dst.execute(
             f"SELECT count(*) FROM {table}{scope_where}").fetchone()[0]
+
+    # This table's backfill pass finished (copy loop exhausted + prune done) —
+    # drop the resume cursor so the NEXT periodic reconcile starts from the top,
+    # re-catching updates the incremental resume would otherwise skip. Best-effort;
+    # a stale cursor at worst costs one redundant re-scan on the next pass.
+    db.clear_reconcile_cursor(table)
 
     report = {"table": table, "copied": copied, "pruned": pruned,
               "skipped": skipped, "rds_rows": rds_rows, "tee_rows": tee_rows}
