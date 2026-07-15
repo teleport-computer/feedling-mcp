@@ -302,8 +302,8 @@ def verify_identity(store) -> tuple[dict, int]:
             "written": False,
             "passing": False,
             "suggestions": [
-                "Identity not yet written. Call feedling_identity_init "
-                "after Pass 4 (memory verification with user)."
+                "Identity not yet written. Call feedling_identity_init — "
+                "identity comes first and requires no memory (no floor, no pass to clear)."
             ],
         }, 200
 

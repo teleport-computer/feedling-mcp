@@ -5807,9 +5807,9 @@ def _handle_post_reply_response(resp) -> dict:
             log.error(
                 "chat_response rejected: bootstrap_incomplete stage=%s "
                 "memory_count=%s identity_written=%s — the upstream agent "
-                "skipped Pass 1-3 / Step 5. Have the user re-run "
-                "bootstrap from the start prompt; until then this user's "
-                "Feedling chat is dead-ended.",
+                "hasn't completed onboarding (identity + live chat). Have the "
+                "user re-run onboarding from the start prompt; until then this "
+                "user's Feedling chat is dead-ended.",
                 body.get("stage"),
                 body.get("memory_count"),
                 body.get("identity_written"),

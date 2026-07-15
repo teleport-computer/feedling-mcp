@@ -1,4 +1,4 @@
-"""Memory Garden storage: typed moments, change log, per-tab floors."""
+"""Memory Garden storage: memories, change log, days-scaled guidance floor (advisory only)."""
 
 import json
 import os
