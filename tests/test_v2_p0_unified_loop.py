@@ -94,9 +94,19 @@ def _reset(uid):
 def _clean_agent_jobs_table():
     """claim_next_job() is a global claim, not filtered by user_id — a stray row from
     another test module would otherwise get claimed here instead of this file's own row
-    (same rationale as tests/test_v2_worker.py's identical fixture)."""
+    (same rationale as tests/test_v2_worker.py's identical fixture).
+
+    The effect-outbox tables are cleaned for the same cross-module reason: a prior
+    module (e.g. test_v2_p0_exactly_once) leaves pending/applied effect rows behind
+    (its pg_clean only TRUNCATEs at each test's START, not end), and this file's
+    per-uid ``_reset`` does not cover the sink-applied dedup guard — a stale
+    ``v2_effect_sink_applied`` row can make a fresh reply effect look already-applied
+    and silently drop the bubble. Truncating here makes the module order-independent."""
     with db.get_pool().connection() as conn:
-        conn.execute("DELETE FROM agent_jobs")
+        conn.execute(
+            "TRUNCATE agent_jobs, v2_effect_outbox, v2_effect_sink_applied, "
+            "v2_runtime_state CASCADE"
+        )
     yield
 
 
