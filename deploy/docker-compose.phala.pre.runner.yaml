@@ -86,7 +86,7 @@ services:
   # + chat checkpoint always live in one place, so a lease that re-acquires here
   # resumes from a consistent cursor (no cross-runner stale-checkpoint wedge).
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:bc843a6   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:3a4ae8ff90b5   # CI pins the sha
     container_name: agent-runner
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
@@ -106,7 +106,7 @@ services:
   # deploy/DEPLOYMENTS.md). Until deployed, chat_send_core 503s workers_unavailable
   # for db_action_v2 users.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:bc843a6   # CI pins the sha (same image as agent-runner)
+    image: ghcr.io/teleport-computer/feedling-agent-runner:3a4ae8ff90b5   # CI pins the sha (same image as agent-runner)
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
