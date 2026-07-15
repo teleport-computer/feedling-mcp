@@ -99,7 +99,9 @@ def test_bundle_isolates_workers_aggregation_and_persona_judge(tmp_path):
     assert document["approval_policy"] == "never"
     assert document["features"]["multi_agent"] is False
     assert document["features"]["hooks"] is False
+    assert supervisor["network"]["enabled"] is False
     assert supervisor["network"]["allow_local_binding"] is False
+    assert "domains" not in supervisor["network"]
     assert "agents" not in document
     assert filesystem[":minimal"] == "read"
     assert filesystem[str(Path(values["source_root"]).resolve())] == "read"
@@ -230,7 +232,10 @@ def test_local_binding_is_explicit_and_applies_to_every_locked_profile(tmp_path)
     document = tomllib.loads(writer.build_config_bundle(**values).main)
 
     for name, permission in document["permissions"].items():
-        if name == writer.PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE:
+        if name in {
+            writer.SUPERVISOR_PERMISSION_PROFILE,
+            writer.PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE,
+        }:
             assert permission["network"]["enabled"] is False
             assert permission["network"]["allow_local_binding"] is False
             assert "domains" not in permission["network"]

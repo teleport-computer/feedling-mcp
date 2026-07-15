@@ -229,11 +229,11 @@ def _network_lines(
 
 
 def _disabled_network_lines(profile: str) -> list[str]:
-    """Explicitly deny shell/tool network for an offline semantic judge.
+    """Explicitly deny shell/tool network for an offline reasoning profile.
 
     Codex's own authenticated model transport is outside the tool sandbox.  The
-    judge therefore does not need access to either the Feedling deployment or
-    arbitrary egress in order to grade a blinded trajectory received on stdin.
+    profile therefore does not need deployment or arbitrary egress in order to
+    grade already-collected evidence received through its private inputs.
     """
 
     key = _quoted(profile)
@@ -688,13 +688,12 @@ def build_config_bundle(
     lines.extend(
         f"{_quoted(path)} = {_quoted(access)}" for path, access in supervisor_filesystem
     )
-    lines.extend(
-        _network_lines(
-            SUPERVISOR_PERMISSION_PROFILE,
-            host,
-            allow_local_binding=allow_local_binding,
-        )
-    )
+    # The aggregator consumes untrusted model/application evidence but never
+    # performs live probes.  Keep its tool network disabled so prompt-injected
+    # evidence cannot turn it into a second deployment client or exfiltration
+    # path.  Authenticated Codex model transport remains available outside the
+    # tool sandbox, as it does for the offline persona judge.
+    lines.extend(_disabled_network_lines(SUPERVISOR_PERMISSION_PROFILE))
 
     for profile_id, agent_type in PROFILE_AGENT_TYPES:
         permission = worker_permission_profile(profile_id)

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import time
 from urllib.parse import parse_qs
 
@@ -44,6 +45,7 @@ router = APIRouter()
 
 _ADMIN_SESSION_COOKIE = "admin_session"
 _ADMIN_SESSION_MAX_AGE = 7 * 24 * 60 * 60
+_IO_E2E_ADMIN_TOKEN_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
 def _admin_session_secret() -> bytes | None:
@@ -106,6 +108,17 @@ def _extract_admin_token(request: Request) -> str:
     return (request.query_params.get("admin_key") or "").strip()
 
 
+def _extract_io_e2e_admin_token(request: Request) -> str:
+    """Read the narrow QA credential only from non-URL authorization headers."""
+    key = (request.headers.get("X-Admin-Token") or "").strip()
+    if key:
+        return key
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
 def _require_admin(request: Request) -> None:
     # Mirror admin.data_track.require_admin: 503 when unconfigured, 401 on
     # missing/mismatched token. The exception handler maps these to the same
@@ -123,9 +136,9 @@ def _require_admin(request: Request) -> None:
 def _require_io_e2e_admin(request: Request) -> None:
     """Authorize only the test-only agent-driven E2E control surface."""
     configured = os.environ.get("IO_E2E_ADMIN_TOKEN", "").strip()
-    if not configured:
+    if _IO_E2E_ADMIN_TOKEN_RE.fullmatch(configured) is None:
         raise HTTPException(status_code=503)
-    supplied = _extract_admin_token(request)
+    supplied = _extract_io_e2e_admin_token(request)
     if not supplied or not hmac.compare_digest(supplied, configured):
         raise HTTPException(status_code=401)
 

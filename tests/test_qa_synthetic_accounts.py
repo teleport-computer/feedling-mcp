@@ -18,7 +18,7 @@ from admin import qa_synthetic_accounts as synthetic
 from content import content_core
 
 
-ADMIN_TOKEN = "qa-reaper-admin-token"
+ADMIN_TOKEN = "a1" * 32
 BUILD_SHA = "a" * 40
 
 
@@ -130,6 +130,40 @@ def test_admin_auth_status_and_registration_contract(qa_client):
         stored[synthetic.METADATA_FIELD]["api_key_hash"]
         == stored["api_keys"][0]["api_key_hash"]
     )
+
+
+def test_io_e2e_admin_token_is_header_only_and_bearer_is_supported(qa_client):
+    query = qa_client.get(
+        f"/v1/admin/qa/build-identity?admin_key={ADMIN_TOKEN}"
+    )
+    assert query.status_code == 401
+
+    bearer = qa_client.get(
+        "/v1/admin/qa/build-identity",
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+    )
+    assert bearer.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "configured",
+    (
+        "x",
+        "a" * 63,
+        "A" * 64,
+        "g" * 64,
+        "a" * 65,
+    ),
+)
+def test_io_e2e_admin_token_configuration_fails_closed(
+    client, monkeypatch, configured
+):
+    monkeypatch.setenv("IO_E2E_ADMIN_TOKEN", configured)
+    response = client.get(
+        "/v1/admin/qa/build-identity",
+        headers={"X-Admin-Token": configured},
+    )
+    assert response.status_code == 503
 
 
 def test_legacy_admin_token_cannot_authorize_io_e2e_routes(client, monkeypatch):

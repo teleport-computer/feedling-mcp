@@ -396,6 +396,11 @@ printf '%s' "$token" |
 unset token
 ```
 
+The backend deliberately accepts this credential only when it is exactly the
+64-character lowercase hexadecimal value produced above. It is authorized only
+through `X-Admin-Token` or `Authorization: Bearer`; query-string and cookie
+authentication are rejected so the credential cannot enter URL logs.
+
 Then add these protected environment **secrets**:
 
 - `QA_CODEX_AUTH_JSON_B64`
