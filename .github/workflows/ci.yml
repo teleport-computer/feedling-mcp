@@ -317,7 +317,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
           echo "waiting for ${IMAGE}:$SHA_SHORT"
@@ -338,7 +338,7 @@ jobs:
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
 
           # Sync to latest main FIRST. Rerun case (e.g. a previous deploy-
           # cvm partially failed after the prior run already pushed the
@@ -658,7 +658,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
           echo "waiting for ${IMAGE}:$SHA_SHORT"
@@ -679,7 +679,7 @@ jobs:
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
           git fetch origin test
           git reset --hard origin/test
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
@@ -897,7 +897,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
@@ -915,7 +915,7 @@ jobs:
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
           # deploy-test-cvm already pushed the main test bump; sync to it so this
           # push fast-forwards (no race — the two deploy jobs are serialized).
           git fetch origin test
@@ -1062,7 +1062,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
@@ -1080,7 +1080,7 @@ jobs:
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
           # deploy-cvm already pushed the main prod bump; sync to it so this push
           # fast-forwards (the two prod deploy jobs are serialized by needs:).
           git fetch origin main
