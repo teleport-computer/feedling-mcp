@@ -1426,6 +1426,73 @@ def test_onboarding_greeting_append_is_idempotent_across_retries(client):
     assert len(rows) == 1
 
 
+def test_onboarding_greeting_concurrent_appends_yield_one_row(client):
+    # Two genesis jobs for the same user (different client_job_ids; the active
+    # lock is (user_id, job_id)-grained) can race the greeting append. The
+    # stable msg_id upsert key must collapse them to ONE persisted row against
+    # the real database, whichever thread wins.
+    import threading as _threading
+
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    results: list = [None, None]
+
+    def _run(i):
+        try:
+            results[i] = history_import._append_model_api_onboarding_greeting(store, f"hello {i}")
+        except Exception as e:  # noqa: BLE001
+            results[i] = e
+
+    threads = [_threading.Thread(target=_run, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(isinstance(r, dict) for r in results), results
+    assert results[0]["id"] == results[1]["id"]
+    rows = [m for m in db.chat_load(user_id)
+            if isinstance(m, dict) and m.get("model_api_kind") == "onboarding_greeting"]
+    assert len(rows) == 1
+    assert store.introduction_done() is True
+
+
+def test_onboarding_greeting_cross_process_same_key_upserts_one_row(client):
+    # Cross-process simulation: the in-process lock can't help there, so the
+    # guarantee must come from the DB upsert key alone. Two direct chat_append
+    # calls with the stable greeting msg_id (what two workers would issue)
+    # must leave exactly one row.
+    user_id, _api_key = _register(client)
+    msg_id = history_import._onboarding_greeting_msg_id(user_id)
+    doc_a = {"id": msg_id, "role": "openclaw", "source": "model_api",
+             "model_api_kind": "onboarding_greeting", "ts": 1.0}
+    doc_b = dict(doc_a, ts=2.0)
+    db.chat_append(user_id, msg_id, 1.0, doc_a, 500)
+    db.chat_append(user_id, msg_id, 2.0, doc_b, 500)
+    rows = [m for m in db.chat_load(user_id)
+            if isinstance(m, dict) and m.get("model_api_kind") == "onboarding_greeting"]
+    assert len(rows) == 1
+
+
+def test_onboarding_greeting_lookup_failure_propagates(client, monkeypatch):
+    # "Could not look" must never be treated as "absent": a transient DB read
+    # failure at the precheck would otherwise bypass an existing greeting and
+    # insert a duplicate. The raising lookup must propagate and nothing may be
+    # appended or marked.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+
+    def _boom(_user_id):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(db, "chat_onboarding_greeting_row", _boom)
+    monkeypatch.setattr(store, "append_chat",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not append on lookup failure")))
+    with pytest.raises(RuntimeError):
+        history_import._append_model_api_onboarding_greeting(store, "never appended")
+    assert store.introduction_done() is False
+
+
 def test_onboarding_greeting_swallowed_db_failure_does_not_mark(client, monkeypatch):
     # db.chat_append swallows PostgreSQL failures (log + return), so append_chat
     # "succeeds" in memory while the row never persists. The marker must NOT be
@@ -1463,7 +1530,7 @@ def test_onboarding_greeting_envelope_failure_leaves_introduced_unset(client, mo
     monkeypatch.setattr(
         core_envelope,
         "_build_shared_envelope_for_store",
-        lambda _store, _body: (None, "forced_envelope_failure"),
+        lambda _store, _body, **_kwargs: (None, "forced_envelope_failure"),
     )
     with pytest.raises(RuntimeError):
         history_import._append_model_api_onboarding_greeting(store, "never lands")

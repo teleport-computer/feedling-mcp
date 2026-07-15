@@ -481,6 +481,52 @@ def test_v2_fresh_start_with_empty_core_still_greets(monkeypatch):
     assert "bg_write_identity" not in calls
 
 
+def test_v2_fresh_start_with_combined_map_flag_never_touches_voice_persona(monkeypatch):
+    # test compose sets FEEDLING_GENESIS_COMBINED_MAP=1: with the flag on, the
+    # foreground loop must not even extract voice candidates from the sentinel
+    # (include_voice_candidates stays off) and build_voice_persona_output_...
+    # must never run — same "never derive anything from the sentinel" rule as
+    # the identity skip. The effective combined_map is disabled for
+    # fresh_start_only input, so the flow still ends nameless greeting+done.
+    calls = {}
+    captured = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "genesis_combined_map_enabled", lambda: True)
+
+    def fake_fg(**kwargs):
+        captured["include_voice_candidates"] = kwargs.get("include_voice_candidates")
+        return {"memories": [], "identity": {"agent_name": ""},
+                "core_fact_candidates": [], "all_fact_candidates": []}
+
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", fake_fg)
+    monkeypatch.setattr(worker, "build_voice_persona_output_from_candidates",
+                        lambda **k: (_ for _ in ()).throw(AssertionError("sentinel must not reach persona/voice build")))
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: (_ for _ in ()).throw(AssertionError("fresh_start must not call the identity LLM")))
+    monkeypatch.setattr(service, "mark_failed",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fresh_start must not fail")))
+    monkeypatch.setattr(service, "apply_reducer_output",
+                        lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting",
+                        lambda *a, **k: ("", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
+                        lambda store, text: calls.__setitem__("greeting", text))
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
+                        lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
+
+    handled = plaintext._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 0},
+        analysis_messages=[plaintext._plaintext_fresh_start_message()])
+
+    assert handled is True
+    assert captured["include_voice_candidates"] is False
+    assert calls.get("used_apply_reducer") is True
+    assert "greeting" in calls
+    assert "bg_write_identity" not in calls
+
+
 def test_v2_fresh_start_predicate_rejects_non_dict_messages(monkeypatch):
     # all(...) with an `if isinstance` filter would vacuously pass on non-dict
     # junk (["bad"] -> all([]) is True) and mis-route it as fresh_start. Junk

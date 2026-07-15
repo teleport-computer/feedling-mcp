@@ -675,7 +675,26 @@ def _run_plaintext_genesis_v2(
         store.user_id, job_id, status="processing",
         output={"stage": "genesis_v2_foreground", "source_family": fg_family}, processed_chunks=0,
     )
-    combined_map = worker.genesis_combined_map_enabled()
+    msgs = analysis_messages if isinstance(analysis_messages, list) else []
+    # fresh_start-only = every analysis message is the synthetic sentinel (routed
+    # into the history bucket by _plaintext_route_family, so group source_kind
+    # can't tell it apart from real history — the message `source` can).
+    # isinstance INSIDE the all() condition, never as an `if` filter — filtering
+    # would make non-dict junk (["bad"]) vacuously pass as all([]) is True and
+    # mis-route it into the fresh_start carve-out.
+    fresh_start_only = bool(msgs) and all(
+        isinstance(m, dict)
+        and str(m.get("source") or "") == history_import._FRESH_START_SOURCE
+        for m in msgs
+    )
+    # Computed BEFORE the foreground loop, and combined-map is disabled outright
+    # for sentinel-only input: with the flag on (test compose sets it), the loop
+    # would otherwise extract voice candidates from the sentinel and
+    # build_voice_persona_output_from_candidates would distill persona from
+    # synthetic text — the same "never derive anything from the sentinel" rule
+    # the identity skip below enforces. Gating the flag here also keeps
+    # include_voice_candidates off, not just the final artifact write.
+    combined_map = worker.genesis_combined_map_enabled() and not fresh_start_only
     foreground_reduces: list[dict] = []
     primary_reduce: dict | None = None
     voice_candidates: list[dict] = []
@@ -711,18 +730,6 @@ def _run_plaintext_genesis_v2(
         all_fact_candidates.extend([c for c in candidates if isinstance(c, dict)])
 
     core = primary_reduce.get("core_fact_candidates") or foreground.select_core_for_foreground(all_fact_candidates)
-    msgs = analysis_messages if isinstance(analysis_messages, list) else []
-    # fresh_start-only = every analysis message is the synthetic sentinel (routed
-    # into the history bucket by _plaintext_route_family, so group source_kind
-    # can't tell it apart from real history — the message `source` can).
-    # isinstance INSIDE the all() condition, never as an `if` filter — filtering
-    # would make non-dict junk (["bad"]) vacuously pass as all([]) is True and
-    # mis-route it into the fresh_start carve-out.
-    fresh_start_only = bool(msgs) and all(
-        isinstance(m, dict)
-        and str(m.get("source") or "") == history_import._FRESH_START_SOURCE
-        for m in msgs
-    )
     if not core and not fresh_start_only:
         return False  # nothing to work with -> let the v1 full path handle it
     # fresh_start has no material BY DEFINITION, so `core` is always empty for it.

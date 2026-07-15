@@ -2609,6 +2609,25 @@ def chat_load(user_id: str) -> list[dict]:
         return []
 
 
+def chat_onboarding_greeting_row(user_id: str) -> dict | None:
+    """Single-row lookup of the user's onboarding greeting
+    (``model_api_kind='onboarding_greeting'``), oldest first.
+
+    Deliberately RAISES on database failure instead of the swallow-and-default
+    used elsewhere in this module: the caller uses this as the exactly-once
+    guard for the greeting append, and collapsing "could not look" into
+    "absent" would let a transient read failure bypass an existing greeting
+    and insert a duplicate."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT doc FROM chat_messages WHERE user_id = %s "
+            "AND doc->>'model_api_kind' = 'onboarding_greeting' "
+            "ORDER BY seq ASC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return row[0] if row else None
+
+
 # Content types whose body_ct is heavy enough to live in R2 rather than inline in
 # the chat_messages row. Images join files here: a single photo's ciphertext runs
 # 1-2MB, which TOASTs the row and is then carried through every WAL record, WAL-G
