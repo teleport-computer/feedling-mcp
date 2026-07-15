@@ -47,6 +47,8 @@ jobs:
     with:
       runtime_target: ${{ inputs.runtime_target }}
       persona_repetitions: ${{ inputs.persona_repetitions }}
+    secrets:
+      IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
 
   # -------------------------------------------------------------------------
   # Solidity — FeedlingAppAuth contract tests

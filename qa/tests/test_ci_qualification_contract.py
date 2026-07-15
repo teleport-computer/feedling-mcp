@@ -57,8 +57,24 @@ def test_existing_default_branch_ci_dispatches_trusted_e2e_without_inheriting_se
     assert "contents: read" in manual_job
     assert "id-token: write" in manual_job
     assert "secrets: inherit" not in manual_job
-    assert "secrets:" not in manual_job
+    assert "secrets:" in manual_job
+    assert "IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}" in manual_job
+    for forbidden_secret in (
+        "QA_CODEX_AUTH_JSON_B64",
+        "QA_DEEPSEEK_API_KEY",
+        "QA_ANTHROPIC_API_KEY",
+        "QA_OPENAI_PROVIDER_API_KEY",
+        "QA_OPENROUTER_API_KEY",
+        "QA_GEMINI_API_KEY",
+        "QA_KONGBEIQIE_API_KEY",
+        "QA_RUNNER_GITHUB_APP_PRIVATE_KEY",
+    ):
+        assert forbidden_secret not in manual_job
     assert "workflow_call:" in E2E
+    workflow_call = E2E[E2E.index("  workflow_call:\n") : E2E.index("permissions:\n")]
+    assert "secrets:" in workflow_call
+    assert "IO_E2E_ADMIN_TOKEN:" in workflow_call
+    assert "required: true" in workflow_call
     assert "group: ci-${{ github.event_name }}-${{ github.ref }}" in CI
     assert "cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}" in CI
 
