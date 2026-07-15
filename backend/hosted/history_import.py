@@ -2938,6 +2938,43 @@ def _mark_introduced_after_greeting(store: UserStore) -> None:
         print(f"[history_import:{store.user_id}] mark_introduced after greeting failed: {type(e).__name__}:{str(e)[:160]}")
 
 
+def _onboarding_greeting_msg(store: UserStore, envelope: dict) -> dict:
+    """The greeting's chat-row doc. Mirrors UserStore.append_chat's
+    text-message shape (kept in sync manually) — the greeting bypasses
+    append_chat because its DB write must be first-writer-wins DO NOTHING,
+    not the generic upsert."""
+    msg = {
+        "id": envelope["id"],
+        "role": "openclaw",
+        "ts": time.time(),
+        "source": "model_api",
+        "v": envelope.get("v", 1),
+        "body_ct": envelope["body_ct"],
+        "nonce": envelope["nonce"],
+        "K_user": envelope["K_user"],
+        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "visibility": envelope.get("visibility", "shared"),
+        "owner_user_id": envelope.get("owner_user_id", store.user_id),
+        "content_type": "text",
+        "model_api_kind": "onboarding_greeting",
+    }
+    if envelope.get("K_enclave") is not None:
+        msg["K_enclave"] = envelope["K_enclave"]
+    return msg
+
+
+def _sync_ring_with_greeting(store: UserStore, winner: dict) -> None:
+    """Make this process's in-memory ring agree with the DB winner row —
+    replace by id if present, else append. A loser process's locally-built
+    envelope must never shadow the authoritative ciphertext."""
+    with store.chat_lock:
+        for i, m in enumerate(store.chat_messages):
+            if isinstance(m, dict) and str(m.get("id") or "") == str(winner.get("id") or ""):
+                store.chat_messages[i] = dict(winner)
+                return
+        store.chat_messages.append(dict(winner))
+
+
 def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
     # Exactly one onboarding greeting per user, across genesis job re-runs
     # (crash between append and job-complete → the app re-POSTs the same
@@ -2945,14 +2982,16 @@ def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
     # (two client_job_ids; the active-job lock is (user_id, job_id)-grained).
     # introduced_at cannot serve as this idempotency key — it guards the
     # resident introduction job, and a lost marker write must not permit a
-    # second greeting row. Three layers, outermost first: a per-user in-process
-    # lock (ring hygiene), the stable msg_id upsert key (cross-process, the
-    # authoritative one), and a RAISING single-row lookup — db.chat_load's
-    # swallow-to-[] would collapse "could not look" into "absent" and let a
-    # transient read failure insert a duplicate past an existing row.
+    # second greeting row. Layers, outermost first: a per-user in-process lock
+    # (ring hygiene), then the FIRST-WRITER-WINS insert on the stable msg_id
+    # (db.chat_insert_onboarding_greeting_once — the authoritative,
+    # cross-process guard; both the insert and the precheck RAISE on DB
+    # failure, never collapsing "could not look" into "absent"). Whatever this
+    # call built locally, the DB winner row is the only truth returned.
     with _greeting_append_lock(store.user_id):
         existing = db.chat_onboarding_greeting_row(store.user_id)  # raises on DB failure
         if existing is not None:
+            _sync_ring_with_greeting(store, existing)
             _mark_introduced_after_greeting(store)
             return existing
         msg_id = _onboarding_greeting_msg_id(store.user_id)
@@ -2961,26 +3000,29 @@ def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
         )
         if envelope is None:
             raise RuntimeError(f"onboarding_greeting_envelope_failed:{err}")
-        row = store.append_chat(
-            "openclaw",
-            "model_api",
-            envelope,
-            extra={"model_api_kind": "onboarding_greeting"},
+        msg = _onboarding_greeting_msg(store, envelope)
+        winner, inserted = db.chat_insert_onboarding_greeting_once(
+            store.user_id, msg_id, msg["ts"], msg,
         )
-        store.notify_chat_waiters()
-        # Durable acknowledgement: append_chat always returns the in-memory row,
-        # even when the underlying db.chat_append swallowed a PostgreSQL failure.
-        # A greeting that only exists in this process's ring disappears on
-        # restart — marking it introduced would suppress every future recovery,
-        # so refuse. The lookup also returns the exact persisted WINNER: if a
-        # cross-process racer landed a different row first (legacy random-id
-        # greeting), that row is the truth and ours was the upsert loser.
-        persisted = db.chat_onboarding_greeting_row(store.user_id)  # raises on DB failure
-        if not isinstance(persisted, dict):
-            raise RuntimeError("onboarding_greeting_append_not_durable")
-        boot_gates._log_bootstrap_event(store, "model_api_onboarding_greeting_written", success=True)
+        _sync_ring_with_greeting(store, winner)
+        if inserted:
+            # New-message side effects for the actual inserter only (parity
+            # with append_chat's chokepoint: local waiters, cross-worker wake,
+            # capture cadence). A loser adds no new content — sync only.
+            store.notify_chat_waiters()
+            try:
+                import wake_bus
+                wake_bus.notify("chat", store.user_id)
+            except Exception as e:  # noqa: BLE001
+                print(f"[history_import:{store.user_id}] greeting wake notify failed: {type(e).__name__}")
+            try:
+                from proactive import capture_scheduler
+                capture_scheduler.record_chat_append(store, winner)
+            except Exception as e:  # noqa: BLE001
+                print(f"[history_import:{store.user_id}] greeting capture record failed: {type(e).__name__}")
+            boot_gates._log_bootstrap_event(store, "model_api_onboarding_greeting_written", success=True)
         _mark_introduced_after_greeting(store)
-        return persisted if str(persisted.get("id") or "") != str(row.get("id") or "") else row
+        return winner
 
 
 def _process_history_import_sync(

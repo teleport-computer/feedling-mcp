@@ -1450,28 +1450,55 @@ def test_onboarding_greeting_concurrent_appends_yield_one_row(client):
         t.join()
 
     assert all(isinstance(r, dict) for r in results), results
+    # First-writer-wins: BOTH callers must return the identical winner doc
+    # (same ciphertext), not merely the same id — and the DB row IS that doc.
     assert results[0]["id"] == results[1]["id"]
+    assert results[0]["body_ct"] == results[1]["body_ct"]
+    assert results[0]["nonce"] == results[1]["nonce"]
     rows = [m for m in db.chat_load(user_id)
             if isinstance(m, dict) and m.get("model_api_kind") == "onboarding_greeting"]
     assert len(rows) == 1
+    assert rows[0]["body_ct"] == results[0]["body_ct"]
+    assert rows[0]["nonce"] == results[0]["nonce"]
     assert store.introduction_done() is True
 
 
-def test_onboarding_greeting_cross_process_same_key_upserts_one_row(client):
-    # Cross-process simulation: the in-process lock can't help there, so the
-    # guarantee must come from the DB upsert key alone. Two direct chat_append
-    # calls with the stable greeting msg_id (what two workers would issue)
-    # must leave exactly one row.
+def test_onboarding_greeting_cross_process_insert_is_first_writer_wins(client):
+    # Cross-process: two workers race the greeting DB primitive concurrently on
+    # separate pool connections with DIFFERENT envelopes (different ciphertext
+    # and ts). Exactly one may insert; both must get back the identical winner
+    # doc; the winner's ciphertext must never be rewritten (a same-PK rewrite
+    # could also slip behind the TEE replicator's (ts, msg_id) forward cursor).
+    import threading as _threading
+
     user_id, _api_key = _register(client)
     msg_id = history_import._onboarding_greeting_msg_id(user_id)
     doc_a = {"id": msg_id, "role": "openclaw", "source": "model_api",
-             "model_api_kind": "onboarding_greeting", "ts": 1.0}
-    doc_b = dict(doc_a, ts=2.0)
-    db.chat_append(user_id, msg_id, 1.0, doc_a, 500)
-    db.chat_append(user_id, msg_id, 2.0, doc_b, 500)
+             "model_api_kind": "onboarding_greeting", "ts": 2.0,
+             "body_ct": "cipher-A", "nonce": "nonce-A"}
+    doc_b = {"id": msg_id, "role": "openclaw", "source": "model_api",
+             "model_api_kind": "onboarding_greeting", "ts": 1.0,
+             "body_ct": "cipher-B", "nonce": "nonce-B"}
+    outcomes: list = [None, None]
+
+    def _run(i, doc):
+        outcomes[i] = db.chat_insert_onboarding_greeting_once(user_id, msg_id, doc["ts"], doc)
+
+    threads = [_threading.Thread(target=_run, args=(0, doc_a)),
+               _threading.Thread(target=_run, args=(1, doc_b))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    (win_a, ins_a), (win_b, ins_b) = outcomes
+    assert sorted([ins_a, ins_b]) == [False, True]               # exactly one inserter
+    assert win_a == win_b                                        # identical winner doc, not just id
     rows = [m for m in db.chat_load(user_id)
             if isinstance(m, dict) and m.get("model_api_kind") == "onboarding_greeting"]
     assert len(rows) == 1
+    assert rows[0]["body_ct"] == win_a["body_ct"]                # DB row == returned winner
+    assert rows[0]["nonce"] == win_a["nonce"]
 
 
 def test_onboarding_greeting_lookup_failure_propagates(client, monkeypatch):
@@ -1493,14 +1520,19 @@ def test_onboarding_greeting_lookup_failure_propagates(client, monkeypatch):
     assert store.introduction_done() is False
 
 
-def test_onboarding_greeting_swallowed_db_failure_does_not_mark(client, monkeypatch):
-    # db.chat_append swallows PostgreSQL failures (log + return), so append_chat
-    # "succeeds" in memory while the row never persists. The marker must NOT be
-    # set in that case — it would permanently suppress a greeting that vanishes
-    # on the next restart.
+def test_onboarding_greeting_insert_failure_does_not_mark(client, monkeypatch):
+    # The greeting write path must never mark introduced when the row did not
+    # durably land: the insert primitive RAISES on DB failure (unlike
+    # chat_append's swallow) and the exception must propagate un-marked —
+    # a marker without a persisted greeting would suppress every future
+    # recovery.
     user_id, _api_key = _register(client)
     store = core_store.get_store(user_id)
-    monkeypatch.setattr(db, "chat_append", lambda *a, **k: None)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("db write failed")
+
+    monkeypatch.setattr(db, "chat_insert_onboarding_greeting_once", _boom)
     with pytest.raises(RuntimeError):
         history_import._append_model_api_onboarding_greeting(store, "never durable")
     assert store.introduction_done() is False

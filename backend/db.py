@@ -2628,6 +2628,54 @@ def chat_onboarding_greeting_row(user_id: str) -> dict | None:
     return row[0] if row else None
 
 
+def chat_insert_onboarding_greeting_once(
+    user_id: str, msg_id: str, ts: float, doc: dict
+) -> tuple[dict, bool]:
+    """First-writer-wins insert for the onboarding greeting row.
+
+    Greeting-specific by design — generic ``chat_append`` upserts
+    (ON CONFLICT DO UPDATE), which under the stable greeting msg_id would let
+    a concurrent second writer REWRITE the winner's ciphertext/ts: the two
+    processes' rings would hold different envelopes, and a same-PK rewrite
+    that lowers ``ts`` can slip behind the TEE replicator's (ts, msg_id)
+    forward cursor, leaving RDS and TEE on different documents forever.
+    DO NOTHING freezes the first legal greeting; a loser gets the
+    authoritative winner row back and must treat it as the truth.
+
+    RAISES on database failure (this is the exactly-once guard — never
+    collapse "could not write/look" into an answer). Returns
+    ``(winner_doc, inserted_by_this_call)``."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (user_id, msg_id) DO NOTHING RETURNING doc",
+                (user_id, msg_id, ts, Jsonb(doc)),
+            ).fetchone()
+            inserted = row is not None
+            if not inserted:
+                # ON CONFLICT waits out an in-flight conflicting insert, so by
+                # here the winner is committed and visible to this statement.
+                row = conn.execute(
+                    "SELECT doc FROM chat_messages WHERE user_id = %s AND msg_id = %s",
+                    (user_id, msg_id),
+                ).fetchone()
+    if row is None:
+        # Conflict fired yet the row is gone (deleted between statements, e.g.
+        # a concurrent chat clear) — surface it rather than invent an answer.
+        raise RuntimeError("onboarding_greeting_row_vanished_after_conflict")
+    if inserted:
+        from tee_shadow import mirror
+        # DO NOTHING is idempotent, so the mirror replay is race-safe too.
+        mirror.execute(
+            "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (user_id, msg_id) DO NOTHING",
+            (user_id, msg_id, ts, Jsonb(doc)),
+        )
+    return row[0], inserted
+
+
 # Content types whose body_ct is heavy enough to live in R2 rather than inline in
 # the chat_messages row. Images join files here: a single photo's ciphertext runs
 # 1-2MB, which TOASTs the row and is then carried through every WAL record, WAL-G
