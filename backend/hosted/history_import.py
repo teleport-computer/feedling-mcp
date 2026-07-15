@@ -2404,27 +2404,6 @@ def _memory_counts_for_cards(cards: list[dict]) -> dict:
     return counts
 
 
-def _ensure_import_memory_floors(
-    cards: list[dict],
-    messages: list[dict],
-    relationship_start: date,
-    floors: dict,
-    language: str = "en",
-) -> list[dict]:
-    counts = _memory_counts_for_cards(cards)
-    story_needed = max(0, int(floors.get("story", 1)) - counts["story"])
-    about_needed = max(0, int(floors.get("about_me", 1)) - counts["about_me"])
-    if story_needed or about_needed:
-        cards = cards + _fallback_memory_cards(
-            messages,
-            relationship_start,
-            story_needed=story_needed,
-            about_needed=about_needed,
-            language=language,
-        )
-    return _sort_memory_cards_newest_first(_dedupe_memory_cards(cards))
-
-
 def _ensure_import_minimum_cards(
     cards: list[dict],
     messages: list[dict],
@@ -3063,7 +3042,6 @@ def _process_history_import_sync(
     if relationship_start is None:
         raise ValueError(rel_err)
     days = max(0, (date.today() - relationship_start).days)
-    floors = memory_service._per_tab_floors_for_days(days)
     profile = _history_import_profile(
         history_messages,
         support_messages,
@@ -3120,7 +3098,6 @@ def _process_history_import_sync(
         "import_language": language,
         "relationship_started_at": relationship_start.isoformat(),
         "relationship_days": days,
-        "floors": floors,
         "import_targets": import_targets,
         "history_profile": profile,
         "history_tier": profile["tier"],
