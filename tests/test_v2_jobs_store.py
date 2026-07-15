@@ -838,6 +838,31 @@ def test_genesis_worker_alive_false_when_nothing_beats():
     assert jobs_store.genesis_worker_alive() is False
 
 
+def test_recent_worker_heartbeats_returns_identity_kind_capacity_and_db_age():
+    _clear_heartbeats()
+    jobs_store.record_worker_heartbeat("v2-worker-new-deadbeef1234", capacity=4)
+    jobs_store.record_worker_heartbeat(
+        "v2-worker-new-deadbeef1234:genesis", kind="genesis", capacity=0)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_worker_heartbeats (worker_id, beat_at, kind, capacity) "
+            "VALUES ('v2-worker-stale', now() - interval '10 minutes', 'turn', 4)"
+        )
+
+    rows = jobs_store.recent_worker_heartbeats(within_sec=300)
+
+    assert {row["worker_id"] for row in rows} == {
+        "v2-worker-new-deadbeef1234",
+        "v2-worker-new-deadbeef1234:genesis",
+    }
+    turn = next(row for row in rows if row["kind"] == "turn")
+    genesis = next(row for row in rows if row["kind"] == "genesis")
+    assert turn["capacity"] == 4
+    assert genesis["capacity"] == 0
+    assert turn["age_sec"] >= 0
+    assert isinstance(turn["beat_at_epoch"], float)
+
+
 def test_enqueue_stamps_expected_generation():
     seed_user("u_jobgen")
     gen = db.get_runtime_generation("u_jobgen")  # 1

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import random
 import threading
 import time
@@ -34,6 +35,7 @@ class ProviderError(Exception):
 _RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 422})
+_MAX_PG_BIGINT = (1 << 63) - 1
 
 
 def classify_provider_error(exc: BaseException) -> str:
@@ -520,19 +522,34 @@ def _normalize_usage(provider: str, raw: dict | None) -> dict:
     raw = raw if isinstance(raw, dict) else {}
 
     def _int(value: Any) -> int | None:
-        try:
-            return None if value is None else max(0, int(value))
-        except (TypeError, ValueError):
+        if value is None or isinstance(value, bool):
             return None
+        if isinstance(value, float) and (
+            not math.isfinite(value) or not value.is_integer()
+        ):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed < 0:
+            return 0
+        if parsed > _MAX_PG_BIGINT:
+            return None
+        return parsed
+
+    def _sum_ints(*values: int | None) -> int | None:
+        present = [value for value in values if value is not None]
+        if not present:
+            return None
+        total = sum(present)
+        return total if total <= _MAX_PG_BIGINT else None
 
     if provider == "anthropic":
         uncached = _int(raw.get("input_tokens"))
         cache_read = _int(raw.get("cache_read_input_tokens"))
         cache_write = _int(raw.get("cache_creation_input_tokens"))
-        if uncached is None and cache_read is None and cache_write is None:
-            pt = None
-        else:
-            pt = (uncached or 0) + (cache_read or 0) + (cache_write or 0)
+        pt = _sum_ints(uncached, cache_read, cache_write)
         ct = _int(raw.get("output_tokens"))
         tt = _int(raw.get("total_tokens"))
         cache_reported = (
@@ -540,7 +557,7 @@ def _normalize_usage(provider: str, raw: dict | None) -> dict:
         # Provider-neutral miss semantics: every effective input token not read
         # from cache. Anthropic reports newly-created cache tokens separately
         # from its uncached suffix, so both belong in the miss count.
-        cache_miss = ((uncached or 0) + (cache_write or 0)) if cache_reported else None
+        cache_miss = _sum_ints(uncached, cache_write) if cache_reported else None
     elif provider == "gemini":
         pt = _int(raw.get("promptTokenCount"))
         ct = _int(raw.get("candidatesTokenCount"))
@@ -574,8 +591,8 @@ def _normalize_usage(provider: str, raw: dict | None) -> dict:
         cache_miss = _int(raw.get("prompt_cache_miss_tokens"))
         if cache_miss is None and pt is not None and cache_read is not None:
             cache_miss = max(0, pt - (cache_read or 0))
-    if tt is None and (pt is not None or ct is not None):
-        tt = (pt or 0) + (ct or 0)
+    if tt is None and pt is not None and ct is not None:
+        tt = _sum_ints(pt, ct)
     return {
         "prompt_tokens": pt,
         "completion_tokens": ct,

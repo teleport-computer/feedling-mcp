@@ -158,6 +158,29 @@ jobs:
             tests/test_dream_prompt_v1.py \
             -v
 
+      - name: Run Hosted Runtime V2 safety and prompt-cache suites
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_ci_image_tag_width.py \
+            tests/test_provider_prompt_cache.py \
+            tests/test_provider_usage_normalize.py \
+            tests/test_v2_prompt_cache_key.py \
+            tests/test_v2_metrics_endpoint.py \
+            tests/test_v2_turn_metrics.py \
+            tests/test_v2_whole_turn_metric.py \
+            tests/test_v2_jobs_migration.py \
+            tests/test_v2_jobs_store.py \
+            tests/test_v2_serve_worker.py \
+            tests/test_v2_p0_unified_loop.py \
+            tests/test_v2_p0_history_safety.py \
+            tests/test_v2_p0_pool_safety.py \
+            tests/test_v2_atomic_reply_cursor.py \
+            tests/test_v2_effect_outbox.py \
+            tests/test_v2_watchdog.py \
+            -v
+
   # -------------------------------------------------------------------------
   # Docker — confirm the hash-pinned build stays reproducible
   # -------------------------------------------------------------------------
@@ -1092,7 +1115,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml COMMIT_SHORT (CI #906)
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
           echo "waiting for ${IMAGE}:$SHA_SHORT"
@@ -1113,7 +1136,7 @@ jobs:
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml COMMIT_SHORT (CI #906)
           git fetch origin pre
           git reset --hard origin/pre
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
@@ -1285,15 +1308,13 @@ jobs:
   # DEPLOY — standalone runner CVM (pre, multi-node Form B)
   #
   # Deploys deploy/docker-compose.phala.pre.runner.yaml to a SEPARATE Phala CVM that
-  # runs only agent-runner supervisors (see deploy/DEPLOYMENTS.md “横向扩展”). It
-  # reuses the same feedling-agent-runner:<sha> image, shares the main CVM's
-  # Postgres + token secret, and reaches the main CVM's backend/enclave over their
-  # public ingress + gateway-passthrough URLs.
+  # runs one resident agent-runner plus a sibling Hosted Runtime V2 serve-worker
+  # (see deploy/DEPLOYMENTS.md “横向扩展”). Both reuse the same
+  # feedling-agent-runner:<sha> image, share the main CVM's Postgres + token
+  # secret, and reach the main backend/enclave over public ingress +
+  # gateway-passthrough URLs.
   #
-  # DORMANT BY DEFAULT: skipped unless the repo var DEPLOY_PRE_RUNNER_CVM == 'true'
-  # AND deploy/pre-runner-cvm-id.txt names a provisioned runner CVM. So merging
-  # this is a no-op until you (1) provision the runner dstack app, (2) put its CVM
-  # id in that file, (3) set the runner secrets/vars below, (4) flip the var. Runs
+  # Controlled by DEPLOY_PRE_RUNNER_CVM and deploy/pre-runner-cvm-id.txt. Runs
   # AFTER deploy-pre-cvm (serialized: shares the branch push + the main CVM must
   # be up for the runner to reach it).
   # =========================================================================
@@ -1322,7 +1343,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml COMMIT_SHORT (CI #906)
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
@@ -1340,7 +1361,7 @@ jobs:
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml COMMIT_SHORT (CI #906)
           # deploy-pre-cvm already pushed the main pre bump; sync to it so this
           # push fast-forwards (no race — the two deploy jobs are serialized).
           git fetch origin pre
@@ -1395,6 +1416,7 @@ jobs:
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
+          FEEDLING_V2_MAX_WORKERS:       ${{ vars.PRE_FEEDLING_V2_MAX_WORKERS || '4' }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -1418,6 +1440,7 @@ jobs:
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
             --wait
 
       - name: Publish live runner compose_hash on Sepolia (pre contract)
@@ -1447,6 +1470,102 @@ jobs:
             fi
           done
           exit "$publish_status"
+
+      - name: Post-deploy Runtime V2 liveness gate (pre)
+        env:
+          FEEDLING_API_URL:      ${{ vars.PRE_API_URL || 'https://pre-api.feedling.app' }}
+          FEEDLING_ADMIN_TOKEN:  ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.request
+
+          base_url = os.environ.get("FEEDLING_API_URL", "").rstrip("/")
+          admin_token = os.environ.get("FEEDLING_ADMIN_TOKEN", "")
+          expected_commit = os.environ.get("GITHUB_SHA", "")[:12]
+          if not base_url or not admin_token:
+              raise SystemExit("FEEDLING_API_URL / FEEDLING_ADMIN_TOKEN is required")
+          if len(expected_commit) != 12:
+              raise SystemExit("GITHUB_SHA must provide a 12-character build identity")
+
+          endpoint = f"{base_url}/v1/admin/v2-metrics"
+          last_error = "no response"
+          # Outlive the turn heartbeat's normal 30-second freshness window so
+          # an old container cannot make the first post-deploy query false-green.
+          time.sleep(35)
+
+          def heartbeat_age(row):
+              try:
+                  value = row.get("age_sec")
+                  return float(value) if value is not None else float("inf")
+              except (TypeError, ValueError):
+                  return float("inf")
+
+          for _ in range(30):
+              request = urllib.request.Request(
+                  endpoint,
+                  headers={"X-Admin-Token": admin_token},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=10) as response:
+                      payload = json.load(response)
+                  live_workers = int(payload.get("live_workers") or 0)
+                  capacity = int(payload.get("live_worker_capacity") or 0)
+                  genesis_alive = payload.get("genesis_alive") is True
+                  heartbeats = payload.get("worker_heartbeats") or []
+                  turns = [
+                      row for row in heartbeats
+                      if row.get("kind") == "turn"
+                      and str(row.get("worker_id") or "").endswith(
+                          f"-{expected_commit}"
+                      )
+                      and int(row.get("capacity") or 0) > 0
+                      and heartbeat_age(row) <= 20
+                  ]
+                  genesis_ids = {
+                      str(row.get("worker_id") or "")
+                      for row in heartbeats
+                      if row.get("kind") == "genesis"
+                      and str(row.get("worker_id") or "").endswith(
+                          f"-{expected_commit}:genesis"
+                      )
+                      and heartbeat_age(row) <= 60
+                  }
+                  matched_identity = next(
+                      (
+                          str(row["worker_id"])
+                          for row in turns
+                          if f'{row["worker_id"]}:genesis' in genesis_ids
+                      ),
+                      None,
+                  )
+                  if (
+                      live_workers >= 1
+                      and capacity > 0
+                      and genesis_alive
+                      and matched_identity is not None
+                  ):
+                      print(
+                          "Runtime V2 healthy: "
+                          f"live_workers={live_workers} capacity={capacity} "
+                          f"genesis_alive=true worker={matched_identity}"
+                      )
+                      raise SystemExit(0)
+                  last_error = (
+                      f"live_workers={live_workers} capacity={capacity} "
+                      f"genesis_alive={genesis_alive} "
+                      f"expected_build={expected_commit} matched={matched_identity}"
+                  )
+              except Exception as exc:  # transient deploy/startup window
+                  last_error = f"{type(exc).__name__}: {exc}"
+              time.sleep(5)
+
+          print(f"Runtime V2 liveness gate failed: {last_error}", file=sys.stderr)
+          raise SystemExit(1)
+          PY
 
   # =========================================================================
   # DEPLOY — standalone prod runner CVM(s) (Form B, multi-node)

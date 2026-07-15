@@ -85,3 +85,28 @@ def test_cache_telemetry_and_provider_identity_are_persisted(pg_clean_metrics):
     assert row == (
         70, 10, 30, 2, 2, "anthropic", "claude-test", "feedling-v2-route-test"
     )
+
+
+def test_token_metrics_accept_values_above_legacy_integer_range(pg_clean_metrics):
+    uid = "u_wtm_bigint"
+    jid = _seed_job(uid)
+    prompt_tokens = (1 << 31) + 7
+
+    jobs_store.record_whole_turn_metric(
+        jid, uid, "chat",
+        prompt_tokens=prompt_tokens,
+        completion_tokens=1,
+        latency_ms=50,
+        model_calls=1,
+        retries=0,
+        failed=False,
+        status="ok",
+    )
+
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT prompt_tokens, completion_tokens FROM v2_turn_metrics "
+            "WHERE job_id=%s",
+            (jid,),
+        ).fetchone()
+    assert row == (prompt_tokens, 1)

@@ -103,12 +103,15 @@ def test_positive_loop_intervals_fail_closed(monkeypatch, raw):
 def test_default_worker_id_is_unique_across_same_pid_replica_calls(monkeypatch):
     monkeypatch.setattr(serve_worker.socket, "gethostname", lambda: "pod")
     monkeypatch.setattr(serve_worker.os, "getpid", lambda: 1)
+    monkeypatch.setenv("FEEDLING_GIT_COMMIT", "abcdef1234567890")
 
     first = serve_worker._default_worker_id()
     second = serve_worker._default_worker_id()
 
     assert first.startswith("v2-worker-pod-1-")
     assert second.startswith("v2-worker-pod-1-")
+    assert first.endswith("-abcdef123456")
+    assert second.endswith("-abcdef123456")
     assert first != second
 
 
@@ -119,6 +122,7 @@ def test_build_production_deps_returns_turndeps():
     assert callable(deps.read_messages_after_seq)
     assert callable(deps.resolve_provider)
     assert not hasattr(deps, "is_official")
+    assert not hasattr(deps, "record_turn_metric")
     assert callable(deps.mint_enclave_token)
     assert callable(deps.read_tail_after_seq)
     assert callable(deps.read_compaction_tail_after_seq)

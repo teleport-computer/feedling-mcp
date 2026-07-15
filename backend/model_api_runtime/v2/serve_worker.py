@@ -110,7 +110,12 @@ def _positive_float_env(name: str, default: str) -> float:
 
 def _default_worker_id() -> str:
     """Replica-unique identity even when every container runs as PID 1."""
-    return f"v2-worker-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    raw_commit = os.environ.get("FEEDLING_GIT_COMMIT", "dev")
+    build_commit = "".join(ch for ch in raw_commit if ch.isalnum())[:12] or "dev"
+    return (
+        f"v2-worker-{socket.gethostname()}-{os.getpid()}-"
+        f"{uuid.uuid4().hex[:8]}-{build_commit}"
+    )
 
 _ASSISTANT_ROLES = ("openclaw", "assistant", "agent")
 _EXTRACTION_ENABLED = os.environ.get(
@@ -1512,7 +1517,6 @@ def build_production_deps() -> v2_worker.TurnDeps:
         ),
         resolve_provider=_resolve_provider,
         mint_enclave_token=_mint_runtime_token,
-        record_turn_metric=jobs_store.record_turn_metric,
         read_tail=_read_tail,
         read_compaction_tail=_read_compaction_tail,
         read_tail_after_seq=_read_tail_after_seq,
@@ -2097,12 +2101,11 @@ _RELAUNCH_BACKOFF_MAX_SEC = 30.0
 def _run_forever(worker_id: str, poll_interval: float) -> None:
     """Run ``_serve``, relaunching it in-process after a fatal Python crash.
 
-    dstack CVMs do not honor Docker's restart policy for this container, so an
-    exception escaping ``_serve`` would otherwise leave the V2 worker pool dead
-    until a manual restart. A clean SIGTERM/SIGINT drain returns normally and
-    exits without relaunching. This cannot recover a hard interpreter death such
-    as OOM-kill/SIGKILL; the rollout still needs an external liveness repair for
-    that process-level failure mode.
+    Relaunching here recovers faster than tearing down the whole container when
+    an exception escapes ``_serve``. A clean SIGTERM/SIGINT drain returns
+    normally and exits without relaunching. This cannot recover a hard
+    interpreter death such as OOM-kill/SIGKILL; the rollout must separately
+    prove that the container restart policy handles that process-level failure.
     """
     backoff = _RELAUNCH_BACKOFF_MIN_SEC
     while True:
@@ -2112,7 +2115,7 @@ def _run_forever(worker_id: str, poll_interval: float) -> None:
         except Exception:  # noqa: BLE001 — fatal loop escapes must relaunch
             log.exception(
                 "[v2.serve_worker] _serve crashed; relaunching in %.0fs "
-                "(dstack does not auto-restart the container)",
+                "(in-process recovery)",
                 backoff,
             )
             time.sleep(backoff)

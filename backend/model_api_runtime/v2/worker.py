@@ -254,14 +254,6 @@ class TurnDeps:
     # same-timestamp message during rollout.
     read_messages_after_seq: Callable[[str, int], list[dict]] | None = None
     runtime_mode_enabled: Callable[[str], bool] | None = None
-    # (job_id, user_id, lane, prompt_tokens, completion_tokens, latency_ms) -> None
-    # （kwargs-only，见 jobs_store.record_turn_metric）：**已废弃/不再被 process_job 调用**
-    # ——spec B5 把逐次 per-call INSERT 换成了一个 per-job 的 `TurnMetrics` 累加器，终态时
-    # 直接调 `jobs_store.record_whole_turn_metric`（worker.py 内部完成，不再需要经这个
-    # 注入回调）。字段留着只是不破坏既有装配/测试（`serve_worker.build_production_deps`
-    # 仍会注入 `jobs_store.record_turn_metric`，但 worker.py 不再读它）；新代码不要依赖
-    # 这个回调被调用。
-    record_turn_metric: Callable[..., None] | None = None
     # (user_id, after_ts, limit) -> [{"id","ts","role","content"}]：最近窗口，BOTH
     # roles，ts>after_ts，enclave 解密明文（D1：让 turn 能看见真实对话上下文，不再局限于
     # "上次回复之后的 user 消息"那一批）。默认 None：worker.py 自身不 import hosted，
@@ -384,11 +376,18 @@ class TurnMetrics:
     def _sum_optional(current: int | None, value: Any) -> int | None:
         if value is None:
             return current
+        if isinstance(value, bool):
+            return current
+        if isinstance(value, float) and (
+            not math.isfinite(value) or not value.is_integer()
+        ):
+            return current
         try:
             parsed = max(0, int(value))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return current
-        return (current or 0) + parsed
+        total = (current or 0) + parsed
+        return total if total <= (1 << 63) - 1 else current
 
     def bind_provider(self, provider_config: Any) -> None:
         """Record non-secret provider/model/cache-route identity after BYOK resolution."""

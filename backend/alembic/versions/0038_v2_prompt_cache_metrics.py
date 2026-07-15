@@ -1,4 +1,4 @@
-"""Add provider prompt-cache telemetry to whole-turn metrics.
+"""Add provider prompt-cache telemetry and widen token counters.
 
 Revision ID: 0038_v2_prompt_cache_metrics
 Revises: 0037_v2_terminal_failure_outbox
@@ -15,6 +15,8 @@ depends_on = None
 
 _UP = """
 ALTER TABLE v2_turn_metrics
+  ALTER COLUMN prompt_tokens TYPE BIGINT USING prompt_tokens::BIGINT,
+  ALTER COLUMN completion_tokens TYPE BIGINT USING completion_tokens::BIGINT,
   ADD COLUMN IF NOT EXISTS provider TEXT,
   ADD COLUMN IF NOT EXISTS model TEXT,
   ADD COLUMN IF NOT EXISTS cache_route_fingerprint TEXT,
@@ -44,7 +46,15 @@ ALTER TABLE v2_turn_metrics
   DROP COLUMN IF EXISTS cache_read_tokens,
   DROP COLUMN IF EXISTS cache_route_fingerprint,
   DROP COLUMN IF EXISTS model,
-  DROP COLUMN IF EXISTS provider;
+  DROP COLUMN IF EXISTS provider,
+  ALTER COLUMN prompt_tokens TYPE INTEGER USING (
+    CASE WHEN prompt_tokens BETWEEN 0 AND 2147483647
+      THEN prompt_tokens::INTEGER ELSE NULL END
+  ),
+  ALTER COLUMN completion_tokens TYPE INTEGER USING (
+    CASE WHEN completion_tokens BETWEEN 0 AND 2147483647
+      THEN completion_tokens::INTEGER ELSE NULL END
+  );
 """
 
 

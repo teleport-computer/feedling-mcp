@@ -116,6 +116,11 @@ def test_prompt_cache_metric_columns_and_recent_window_index_exist():
         indexes = conn.execute(
             "SELECT indexname FROM pg_indexes WHERE tablename='v2_turn_metrics'"
         ).fetchall()
+        token_types = conn.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name='v2_turn_metrics' "
+            "AND column_name IN ('prompt_tokens','completion_tokens')"
+        ).fetchall()
     assert {row[0] for row in columns} == {
         "provider",
         "model",
@@ -128,6 +133,10 @@ def test_prompt_cache_metric_columns_and_recent_window_index_exist():
     }
     assert "ix_v2_turn_metrics_lane_created_at" in {row[0] for row in indexes}
     assert "ix_v2_turn_metrics_cache_proof" in {row[0] for row in indexes}
+    assert dict(token_types) == {
+        "prompt_tokens": "bigint",
+        "completion_tokens": "bigint",
+    }
 
 
 def test_terminal_failure_outbox_schema_and_error_event_idempotency_guard_exist():

@@ -142,8 +142,8 @@ Mirror of the test runner CVM for the pre environment.
 | Compose | `deploy/docker-compose.phala.pre.runner.yaml` (`feedling-pre-runner`, volume `feedling_agent_runtime_pre_runner`) |
 | Shares w/ main pre CVM | pre RDS (`PRE_DATABASE_URL`), `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` (same secret as test — reuse is deliberate), Sepolia FeedlingAppAuth `0x6584…` (runner publishes its own compose_hash there) |
 | Cross-CVM reach | `FEEDLING_API_URL=https://pre-api.feedling.app` (`PRE_MAIN_API_URL`); `FEEDLING_ENCLAVE_URL=https://7d18a1f2…-5003s.dstack-pha-prod9.phala.network` (`PRE_MAIN_ENCLAVE_URL`) |
-| Deploy path | CI `deploy-pre-runner-cvm` job — DORMANT until repo var `DEPLOY_PRE_RUNNER_CVM=true`. |
-| Status | Provisioned 2026-07-07, idle shell (no DB env yet). Flip `DEPLOY_PRE_RUNNER_CVM=true` + push `pre` → CI does the first real deploy. |
+| Deploy path | CI `deploy-pre-runner-cvm` job; `DEPLOY_PRE_RUNNER_CVM=true` is enabled, so qualifying `pre` pushes update this CVM after the main pre deploy. |
+| Status | Provisioned and CI-managed. The compose runs resident `agent-runner` plus Hosted Runtime V2 `serve-worker`; every qualifying deploy must pass the post-runner `live_workers`, capacity, and Genesis liveness gate. |
 
 ### agent-runner (hosted agent-runtime) — 4th CVM service
 

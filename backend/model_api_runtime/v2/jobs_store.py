@@ -1039,6 +1039,40 @@ def genesis_worker_alive(*, within_sec: int = 60) -> bool:
             return bool(cur.fetchone()[0])
 
 
+def recent_worker_heartbeats(*, within_sec: int = 300, limit: int = 50) -> list[dict]:
+    """Recent turn/Genesis identities for authenticated deploy verification.
+
+    Aggregate liveness alone can be satisfied briefly by the old container's
+    still-fresh row. The deploy gate uses the build suffix in ``worker_id`` and
+    the DB-clock age here to prove the newly published image is beating.
+    """
+    safe_window = max(1, min(int(within_sec), 3600))
+    safe_limit = max(1, min(int(limit), 200))
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT worker_id, kind, capacity, "
+                "EXTRACT(EPOCH FROM beat_at) AS beat_at_epoch, "
+                "GREATEST(0, EXTRACT(EPOCH FROM (now() - beat_at))) AS age_sec "
+                "FROM v2_worker_heartbeats "
+                "WHERE kind IN ('turn','genesis') "
+                "AND beat_at > now() - make_interval(secs => %s) "
+                "ORDER BY beat_at DESC LIMIT %s",
+                (safe_window, safe_limit),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "worker_id": str(row["worker_id"]),
+            "kind": str(row["kind"]),
+            "capacity": int(row["capacity"] or 0),
+            "beat_at_epoch": float(row["beat_at_epoch"]),
+            "age_sec": float(row["age_sec"]),
+        }
+        for row in rows
+    ]
+
+
 def inflight_job_count() -> int:
     """在飞 job 数（pending/claimed/running）。单飞唯一索引 → 约等活跃用户数。"""
     with _pool().connection() as conn:

@@ -46,6 +46,17 @@ def env(monkeypatch):
     monkeypatch.setattr(jobs_store, "pending_job_count", lambda: 1)
     monkeypatch.setattr(jobs_store, "live_worker_count", lambda **kw: 2)
     monkeypatch.setattr(jobs_store, "live_worker_capacity", lambda **kw: 8)
+    monkeypatch.setattr(
+        jobs_store,
+        "recent_worker_heartbeats",
+        lambda **kw: [{
+            "worker_id": "v2-worker-pod-1-abcd-deadbeef1234",
+            "kind": "turn",
+            "capacity": 8,
+            "beat_at_epoch": 1234.0,
+            "age_sec": 2.0,
+        }],
+    )
     monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: 4.5)
     monkeypatch.setattr(jobs_store, "recent_mean_tokens_per_turn", lambda **kw: 123.0)
     monkeypatch.setattr(
@@ -126,6 +137,13 @@ def test_v2_metrics_returns_every_field(env):
         "pending": 1,
         "live_workers": 2,
         "live_worker_capacity": 8,
+        "worker_heartbeats": [{
+            "worker_id": "v2-worker-pod-1-abcd-deadbeef1234",
+            "kind": "turn",
+            "capacity": 8,
+            "beat_at_epoch": 1234.0,
+            "age_sec": 2.0,
+        }],
         "mean_service_sec": 4.5,
         "recent_mean_tokens_per_turn": 123.0,
         "prompt_cache": {

@@ -33,3 +33,43 @@ def test_empty_usage_yields_nones():
         "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
         "cache_read_tokens": None, "cache_write_tokens": None,
         "cache_miss_tokens": None}
+
+
+def test_usage_rejects_nonfinite_fractional_boolean_and_bigint_overflow():
+    raw = {
+        "prompt_tokens": float("inf"),
+        "completion_tokens": 1.5,
+        "total_tokens": (1 << 63),
+        "prompt_tokens_details": {
+            "cached_tokens": True,
+            "cache_write_tokens": float("nan"),
+        },
+        "prompt_cache_miss_tokens": "not-a-number",
+    }
+
+    assert pc._normalize_usage("openai", raw) == {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "cache_miss_tokens": None,
+    }
+
+
+def test_usage_derived_totals_never_overflow_postgres_bigint():
+    maximum = (1 << 63) - 1
+    usage = pc._normalize_usage(
+        "anthropic",
+        {
+            "input_tokens": maximum,
+            "cache_creation_input_tokens": 1,
+            "cache_read_input_tokens": 0,
+            "output_tokens": maximum,
+        },
+    )
+
+    assert usage["prompt_tokens"] is None
+    assert usage["completion_tokens"] == maximum
+    assert usage["total_tokens"] is None
+    assert usage["cache_miss_tokens"] is None

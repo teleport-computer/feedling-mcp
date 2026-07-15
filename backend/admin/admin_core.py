@@ -183,6 +183,7 @@ def v2_metrics(
         "pending": jobs_store.pending_job_count(),
         "live_workers": jobs_store.live_worker_count(),
         "live_worker_capacity": jobs_store.live_worker_capacity(),
+        "worker_heartbeats": jobs_store.recent_worker_heartbeats(),
         "mean_service_sec": jobs_store.recent_mean_service_sec(lane="chat"),
         "recent_mean_tokens_per_turn": jobs_store.recent_mean_tokens_per_turn(lane="chat"),
         "prompt_cache": jobs_store.recent_prompt_cache_stats(

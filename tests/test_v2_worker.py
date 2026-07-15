@@ -1336,14 +1336,11 @@ def test_compaction_rollback_during_llm_blocks_summary_write(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# spec B5 (Hosted Runtime V2 PR B, Task 8): the OLD per-call `TurnDeps.
-# record_turn_metric` callback firing after a successful respond() (D0 Task 4)
-# is superseded by a per-job `TurnMetrics` whole-turn accumulator that upserts
+# spec B5 (Hosted Runtime V2 PR B, Task 8): the old per-call metric callback is
+# superseded by a per-job `TurnMetrics` whole-turn accumulator that upserts
 # ONE idempotent `v2_turn_metrics` row per job_id at the turn's single terminal
 # point — success AND every mark_failed path (not just responder success).
-# `record_turn_metric` itself is left wired as a dead-but-harmless TurnDeps
-# field/serve_worker injection (see worker.TurnDeps docstring); these tests now
-# assert the real DB row instead of the old callback firing.
+# These tests assert the real DB row rather than a compatibility callback.
 # ------------------------------------------------------------------
 
 def test_process_job_records_whole_turn_metric_after_successful_respond(monkeypatch):
@@ -1604,24 +1601,22 @@ def test_turn_metrics_keep_unknown_usage_nullable_and_count_coverage(monkeypatch
     assert captured["kwargs"]["cache_route_fingerprint"] == "feedling-v2-route-test"
 
 
-def test_process_job_tolerates_missing_record_turn_metric_callback(monkeypatch):
-    """record_turn_metric defaults to None like the other optional TurnDeps
-    callbacks — the happy path must not crash when it's absent."""
-    uid = "u_w_turnmetric_none"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w")
+def test_turn_metrics_ignore_malformed_or_bigint_overflow_usage():
+    tm = worker.TurnMetrics(job_id=123, user_id="u", lane="chat")
+    tm.add_call({
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "cache_read_tokens": 4,
+    })
+    tm.add_call({
+        "prompt_tokens": float("inf"),
+        "completion_tokens": (1 << 63),
+        "cache_read_tokens": True,
+    })
 
-    _script_provider(monkeypatch, [_text_round("R")])
-    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
-    deps = _deps(messages=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
-    assert deps.record_turn_metric is None
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
-
-    assert status == "completed"
+    assert tm.prompt_tokens == 10
+    assert tm.completion_tokens == 2
+    assert tm.cache_read_tokens == 4
 
 
 def test_run_compaction_under_keep_threshold_completes_as_noop(monkeypatch):

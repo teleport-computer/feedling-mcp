@@ -19,9 +19,14 @@ RAM and process count become a function of the worker-pool size, not the user co
 - **Prove process recovery, not only Python recovery.** `_run_forever` relaunches
   `_serve` after an escaping Python exception, and the send heartbeat/deadline
   guards turn a dead pool into a visible error. A SIGKILL/OOM of the worker PID
-  cannot relaunch itself, and the pre CVM has demonstrated that its Docker
-  restart policy is not sufficient. Install and test an external liveness
-  repair (or an equivalent parent supervisor) before the first canary; an alert
+  cannot relaunch itself. The prior `docker kill serve-worker` observation is
+  not evidence against the compose restart policy: Docker treats that as a
+  manual stop and suppresses policy-driven restart. Before the first canary,
+  cause an unexpected PID-1 death from inside the container (for example,
+  `docker exec serve-worker sh -c 'kill -KILL 1'`) and require the container to
+  restart, a fresh worker identity/heartbeat to appear, and pending work to
+  terminalize or resume exactly once. If that drill fails, install and retest
+  an external liveness repair (or equivalent parent supervisor); an alert
   without automatic repair is not a completed availability gate.
 - Capture/dream producers are currently default-off. Any early infrastructure soak is capability-incomplete and is not evidence that V2 can replace resident.
 - Web results are untrusted: after `web_search`/`web_fetch` returns, the native loop removes every durable-write tool and blocks new searches/fresh outbound URLs for the remainder of that turn. A `web_search` result may be fetched once only by its exact returned URL; search-and-save still needs a fresh user turn. Do not widen that boundary without per-result taint tracking, outbound data-loss controls, and an explicit confirmation protocol.
