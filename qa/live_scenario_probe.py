@@ -13,6 +13,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -33,8 +34,10 @@ from qa.validate_live_scenario_receipts import (  # noqa: E402
     RECEIPT_SCHEMA_VERSION,
     SEMANTIC_ASSERTIONS,
     canonical_json_sha256,
+    latency_projection,
     validate_receipt_object,
 )
+from tools import genesis_e2e  # noqa: E402
 from tools.provider_smoke import assertions as smoke_assertions  # noqa: E402
 from tools.provider_smoke.client import Session, SmokeClient, SmokeError  # noqa: E402
 
@@ -49,6 +52,8 @@ CHAT_SETTLE_INTERVAL_SECONDS = 0.25
 CHAT_SETTLE_READ_TIMEOUT_SECONDS = 5.0
 _ASSISTANT_ROLES = frozenset({"openclaw", "assistant", "agent"})
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_TRACE_STAGES = ("routing", "queue", "provider", "persistence", "delivery")
+_DELIVERY_CONFIRMATION_EVENT = "chat.delivery.confirmed"
 
 
 class LiveScenarioProbeError(RuntimeError):
@@ -417,6 +422,7 @@ def _chat_turn(
         "trace_id": request_id,
         "ack_latency_ms": ack_latency,
         "reply_latency_ms": reply_latency,
+        "stage_latency_ms": {stage: None for stage in _TRACE_STAGES},
         "reply_count": settled["reply_count"],
         "content_assertion_passed": content_passed,
         "fallback_detected": fallback,
@@ -456,6 +462,458 @@ def _route_candidates(value: object, *, depth: int = 0) -> list[str]:
         for child in value[:100]:
             results.extend(_route_candidates(child, depth=depth + 1))
     return list(dict.fromkeys(results))[:64]
+
+
+def _run_persona_capture(
+    *,
+    profile: Mapping[str, Any],
+    session: Session,
+    fixture_path: Path,
+    private_evidence_path: Path,
+    artifact_dir: Path,
+) -> tuple[dict[str, bool], dict[str, Any], dict[str, Any]]:
+    """Run P0-06 network capture in the trusted parent process."""
+
+    fixture = genesis_e2e._load_fixture(str(fixture_path))
+    capture = genesis_e2e.capture_existing_session_distill_evidence(
+        api_url=LOCKED_BASE_URL,
+        api_key=session.api_key,
+        user_id=session.user_id,
+        content_private_key=session.sk,
+        fixture=fixture,
+        private_evidence_path=str(private_evidence_path),
+        artifact_dir=str(artifact_dir),
+    )
+    checks = capture.get("capture_checks")
+    transport = capture.get("transport")
+    if not isinstance(checks, Mapping) or not isinstance(transport, Mapping):
+        raise LiveScenarioProbeError("persona capture receipt is invalid")
+    archive_receipts_verified = checks.get("archive_receipts_verified") is True
+    genesis_metadata_verified = (
+        checks.get("genesis_upload_metadata_verified") is True
+    )
+    assertions = {
+        "persona_files_archived": bool(
+            archive_receipts_verified
+            and transport.get("archive_upload_count") == 4
+        ),
+        "persona_source_metadata_verified": genesis_metadata_verified,
+        "persona_import_done": bool(
+            capture.get("ok") is True
+            and capture.get("phase") == "CAPTURED"
+            and transport.get("job_status") == "done"
+        ),
+    }
+    projection = {
+        "kind": "persona_capture",
+        "evidence_sha256": str(capture.get("evidence_sha256") or ""),
+        "job_id": str(capture.get("job_id") or ""),
+        "archive_upload_count": transport.get("archive_upload_count"),
+        "archive_receipts_verified": archive_receipts_verified,
+        "genesis_upload_metadata_verified": genesis_metadata_verified,
+    }
+    return assertions, {"capture_receipt": capture}, projection
+
+
+def _load_prior_turn_context(
+    path: Path, *, run_id: str, profile_id: str
+) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(
+            _owned_private_file(
+                path, "trace-cleanup turn context", max_bytes=2 * 1024 * 1024
+            )
+        )
+    except (UnicodeError, json.JSONDecodeError, RecursionError):
+        raise LiveScenarioProbeError("trace-cleanup turn context is invalid") from None
+    rows = payload.get("turns") if isinstance(payload, Mapping) else None
+    scenario_order = {
+        scenario_id: index
+        for index, scenario_id in enumerate(
+            ("P0-08", "P0-09", "P0-10", "P0-11", "P0-12")
+        )
+    }
+    scenario_limits = {
+        "P0-08": 1,
+        "P0-09": 10,
+        "P0-10": 2,
+        "P0-11": 1,
+        "P0-12": 1,
+    }
+    expected_keys = {
+        "scenario_id",
+        "turn_index",
+        "request_id",
+        "turn_id",
+        "trace_id",
+        "ack_latency_ms",
+        "reply_latency_ms",
+        "reply_count",
+        "content_assertion_passed",
+        "fallback_detected",
+        "duplicate_detected",
+        "out_of_order_detected",
+    }
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schema_version") != 1
+        or payload.get("run_id") != run_id
+        or payload.get("profile_id") != profile_id
+        or not isinstance(rows, list)
+        or len(rows) > 15
+    ):
+        raise LiveScenarioProbeError("trace-cleanup turn context is invalid")
+    validated: list[dict[str, Any]] = []
+    scenario_indexes: dict[str, int] = {}
+    last_scenario_order = -1
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != expected_keys:
+            raise LiveScenarioProbeError("trace-cleanup turn context is invalid")
+        scenario_id = str(row["scenario_id"])
+        current_scenario_order = scenario_order.get(scenario_id, -1)
+        scenario_indexes[scenario_id] = scenario_indexes.get(scenario_id, 0) + 1
+        if (
+            current_scenario_order < last_scenario_order
+            or scenario_indexes[scenario_id] > scenario_limits.get(scenario_id, 0)
+            or row.get("turn_index") != scenario_indexes[scenario_id]
+            or any(
+                not isinstance(row.get(field), str)
+                or _SAFE_ID_RE.fullmatch(row[field]) is None
+                for field in ("request_id", "turn_id", "trace_id")
+            )
+            or any(
+                row.get(field) is not None
+                and (
+                    not isinstance(row.get(field), (int, float))
+                    or isinstance(row.get(field), bool)
+                    or not math.isfinite(float(row[field]))
+                    or float(row[field]) < 0
+                )
+                for field in ("ack_latency_ms", "reply_latency_ms")
+            )
+            or (
+                row["ack_latency_ms"] is not None
+                and row["reply_latency_ms"] is not None
+                and row["reply_latency_ms"] < row["ack_latency_ms"]
+            )
+            or type(row.get("reply_count")) is not int
+            or row["reply_count"] < 0
+            or row.get("content_assertion_passed") not in (True, False, None)
+            or any(
+                type(row.get(field)) is not bool
+                for field in (
+                    "fallback_detected",
+                    "duplicate_detected",
+                    "out_of_order_detected",
+                )
+            )
+        ):
+            raise LiveScenarioProbeError("trace-cleanup turn context is invalid")
+        validated.append(dict(row))
+        last_scenario_order = current_scenario_order
+    if len({row["trace_id"] for row in validated}) != len(validated):
+        raise LiveScenarioProbeError("trace-cleanup turn context is invalid")
+    return validated
+
+
+def _event_timestamp(event: Mapping[str, Any] | None) -> float | None:
+    if not isinstance(event, Mapping):
+        return None
+    try:
+        value = float(event.get("ts"))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def _duration_between(
+    start: Mapping[str, Any] | None, finish: Mapping[str, Any] | None
+) -> float | None:
+    started = _event_timestamp(start)
+    finished = _event_timestamp(finish)
+    if started is None or finished is None or finished < started:
+        return None
+    return round((finished - started) * 1000.0, 3)
+
+
+def _first_event(
+    events: Sequence[Mapping[str, Any]], event_type: str
+) -> Mapping[str, Any] | None:
+    candidates = [event for event in events if event.get("type") == event_type]
+    return (
+        min(
+            candidates,
+            key=_event_order,
+        )
+        if candidates
+        else None
+    )
+
+
+def _event_order(event: Mapping[str, Any]) -> tuple[bool, float]:
+    timestamp = _event_timestamp(event)
+    return timestamp is None, timestamp or 0.0
+
+
+def _provider_latency(
+    start: Mapping[str, Any] | None, finish: Mapping[str, Any] | None
+) -> float | None:
+    if isinstance(finish, Mapping):
+        value = finish.get("dur_ms")
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and value >= 0
+        ):
+            return round(float(value), 3)
+    return _duration_between(start, finish)
+
+
+def _delivery_latency(
+    response: Mapping[str, Any] | None,
+    confirmation: Mapping[str, Any] | None,
+) -> float | None:
+    """Return delivery latency only from an explicit correlated trace event.
+
+    A reply becoming visible in server-side chat history proves persistence, not
+    delivery to the user.  Until the deployed runtime emits the locked
+    ``chat.delivery.confirmed`` event, the delivery stage must remain unknown
+    and P0-13 must fail closed rather than manufacture a green latency value.
+    """
+
+    if not isinstance(confirmation, Mapping):
+        return None
+    value = confirmation.get("dur_ms")
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and value >= 0
+    ):
+        return round(float(value), 3)
+    return _duration_between(response, confirmation)
+
+
+def _delete_provider_config(
+    client: SmokeClient, session: Session
+) -> bool:
+    for attempt in range(3):
+        try:
+            delete_status, _ = client._req(
+                "DELETE", "/v1/model_api/delete", api_key=session.api_key
+            )
+            get_status, body = client._req(
+                "GET", "/v1/model_api/get", api_key=session.api_key
+            )
+            config = body.get("config") if isinstance(body, Mapping) else None
+            envelope_status, _ = client._req(
+                "GET", "/v1/model_api/key_envelope", api_key=session.api_key
+            )
+            if (
+                delete_status == 200
+                and get_status == 200
+                and isinstance(config, Mapping)
+                and config.get("configured") is False
+                and envelope_status == 404
+            ):
+                return True
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(float(attempt + 1))
+    return False
+
+
+def _old_credential_rejected(client: SmokeClient, api_key: str) -> bool:
+    for attempt in range(5):
+        try:
+            status, _ = client._req("GET", "/v1/users/whoami", api_key=api_key)
+            if status == 401:
+                return True
+        except Exception:
+            pass
+        if attempt < 4:
+            time.sleep(1.0)
+    return False
+
+
+def _perform_account_cleanup(
+    client: SmokeClient, session: Session, *, perform_cleanup: bool
+) -> tuple[dict[str, Any], bool]:
+    """Attempt every destructive cleanup check without propagating failures."""
+
+    cleanup: dict[str, Any] = {
+        "attempted": bool(perform_cleanup),
+        "provider_config_deleted": False,
+        "account_reset": False,
+        "old_credential_rejected": False,
+        "status": "PRODUCT_FAIL" if perform_cleanup else "BLOCKED_EVIDENCE",
+    }
+    if not perform_cleanup:
+        return cleanup, False
+    try:
+        cleanup["provider_config_deleted"] = _delete_provider_config(client, session)
+    except Exception:
+        cleanup["provider_config_deleted"] = False
+    try:
+        reset = client.reset_account(session)
+        cleanup["account_reset"] = reset.get("deleted") is True
+    except Exception:
+        cleanup["account_reset"] = False
+    try:
+        cleanup["old_credential_rejected"] = _old_credential_rejected(
+            client, session.api_key
+        )
+    except Exception:
+        cleanup["old_credential_rejected"] = False
+    cleanup_ok = all(
+        cleanup[field]
+        for field in (
+            "attempted",
+            "provider_config_deleted",
+            "account_reset",
+            "old_credential_rejected",
+        )
+    )
+    cleanup["status"] = "PASS" if cleanup_ok else "PRODUCT_FAIL"
+    return cleanup, cleanup_ok
+
+
+def _run_trace_cleanup(
+    *,
+    profile: Mapping[str, Any],
+    session: Session,
+    client: SmokeClient,
+    prior_turns: Sequence[Mapping[str, Any]],
+    perform_cleanup: bool,
+) -> tuple[
+    dict[str, bool],
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    """Correlate all earlier turns, attribute latency, then reset the account."""
+
+    events: list[Mapping[str, Any]] = []
+    trace_error = False
+    try:
+        trace = client.read_trace(session, limit=500)
+        raw_events = trace.get("events") if isinstance(trace, Mapping) else None
+        if not isinstance(raw_events, list):
+            raise SmokeError("trace", "trace events are unavailable")
+        events = [event for event in raw_events if isinstance(event, Mapping)]
+    except Exception:
+        trace_error = True
+    # Capture trace material first because reset can delete it, then perform
+    # cleanup before parsing any untrusted trace fields.  Malformed timestamps,
+    # incomplete prior turns, or later projection bugs therefore cannot skip
+    # provider deletion/account reset/old-credential verification.
+    cleanup, cleanup_ok = _perform_account_cleanup(
+        client, session, perform_cleanup=perform_cleanup
+    )
+    projected_turns: list[dict[str, Any]] = []
+    correlated_event_count = 0
+    correlated_trace_ids: set[str] = set()
+    try:
+        for index, source_turn in enumerate(prior_turns, start=1):
+            trace_id = str(source_turn["trace_id"])
+            matching = sorted(
+                [
+                    event
+                    for event in events
+                    if trace_id
+                    in {
+                        str(event.get("trace_id") or ""),
+                        str(event.get("turn_id") or ""),
+                    }
+                ],
+                key=_event_order,
+            )
+            if matching:
+                correlated_trace_ids.add(trace_id)
+                correlated_event_count += len(matching)
+            chat_message = _first_event(matching, "chat.message")
+            route_decided = _first_event(matching, "route.decided")
+            model_start = _first_event(matching, "agent.model.call.start")
+            model_done = _first_event(matching, "agent.model.call.done")
+            agent_reply = _first_event(matching, "agent.reply")
+            chat_response = _first_event(matching, "chat.response")
+            delivery_confirmed = _first_event(
+                matching, _DELIVERY_CONFIRMATION_EVENT
+            )
+            projected_turns.append(
+                {
+                    "turn_index": index,
+                    "request_id": source_turn["request_id"],
+                    "turn_id": source_turn["turn_id"],
+                    "trace_id": trace_id,
+                    "ack_latency_ms": source_turn["ack_latency_ms"],
+                    "reply_latency_ms": source_turn["reply_latency_ms"],
+                    "stage_latency_ms": {
+                        "routing": _duration_between(chat_message, route_decided),
+                        "queue": _duration_between(route_decided, model_start),
+                        "provider": _provider_latency(model_start, model_done),
+                        "persistence": _duration_between(agent_reply, chat_response),
+                        "delivery": _delivery_latency(
+                            chat_response, delivery_confirmed
+                        ),
+                    },
+                    "reply_count": source_turn["reply_count"],
+                    "content_assertion_passed": source_turn[
+                        "content_assertion_passed"
+                    ],
+                    "fallback_detected": source_turn["fallback_detected"],
+                    "duplicate_detected": source_turn["duplicate_detected"],
+                    "out_of_order_detected": source_turn[
+                        "out_of_order_detected"
+                    ],
+                }
+            )
+    except Exception:
+        # Cleanup has already run.  Discard the untrustworthy projection and
+        # emit explicit blocked evidence instead of losing the cleanup receipt.
+        trace_error = True
+        projected_turns = []
+        correlated_event_count = 0
+        correlated_trace_ids.clear()
+
+    latency = latency_projection(projected_turns)
+    missing_stages = list(latency["missing_stages"])
+    trace_projection = {
+        "enabled": profile.get("trace_enabled") is True,
+        "deploy_enabled": profile.get("trace_enabled") is True,
+        "correlated_event_count": correlated_event_count,
+        "observed_event_types": [
+            stage for stage in _TRACE_STAGES if stage not in missing_stages
+        ],
+        "missing_required_event_types": missing_stages,
+        "raw_trace_stored": False,
+    }
+    trace_correlated = bool(
+        not trace_error
+        and len(correlated_trace_ids) == 15
+        and len({turn["trace_id"] for turn in projected_turns}) == 15
+    )
+    trace_complete = not missing_stages
+    assertions = {
+        "trace_stages_complete": trace_complete,
+        "trace_correlation_confirmed": trace_correlated,
+        "latency_attributed": trace_complete,
+        "cleanup_confirmed": cleanup_ok,
+    }
+    projection = {
+        "kind": "trace_cleanup",
+        "latency": latency,
+        "trace": trace_projection,
+        "cleanup": cleanup,
+    }
+    observations = {
+        "trace_error": trace_error,
+        "correlated_trace_count": len(correlated_trace_ids),
+        "projection": projection,
+    }
+    return assertions, projected_turns, observations, projection
 
 
 def _run_actions(
@@ -775,6 +1233,11 @@ def run_probe(
     attempt: int,
     nonce: str,
     client: SmokeClient | None = None,
+    persona_fixture_path: Path | None = None,
+    persona_private_evidence_path: Path | None = None,
+    artifact_dir: Path | None = None,
+    prior_turn_context_path: Path | None = None,
+    qualification_mode: str = "release",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if (
         not _SAFE_ID_RE.fullmatch(run_id)
@@ -782,6 +1245,7 @@ def run_probe(
         or not _SAFE_ID_RE.fullmatch(nonce)
         or scenario_id not in LIVE_SCENARIO_IDS
         or attempt not in (1, 2)
+        or qualification_mode not in {"release", "diagnostic"}
     ):
         raise LiveScenarioProbeError("live probe identity is invalid")
     profile, session = load_profile(manifest_path, profile_id)
@@ -791,6 +1255,7 @@ def run_probe(
     turn_ids: list[str] = []
     trace_ids: list[str] = []
     turns: list[dict[str, Any]] = []
+    result_projection: dict[str, Any] | None = None
     assertions = {key: False for key in DETERMINISTIC_ASSERTIONS[scenario_id]}
     private_facts: dict[str, Any] = {
         "schema_version": 1,
@@ -803,22 +1268,87 @@ def run_probe(
     status = "BLOCKED_EVIDENCE"
     failure_code = "LIVE_PROBE_ERROR"
     try:
-        assertions, turns, observations = _run_actions(
-            scenario_id,
-            nonce=nonce,
-            profile=profile,
-            session=session,
-            client=active_client,
-        )
+        if scenario_id == "P0-06":
+            if (
+                persona_fixture_path is None
+                or persona_private_evidence_path is None
+                or artifact_dir is None
+                or prior_turn_context_path is not None
+            ):
+                raise LiveScenarioProbeError("persona capture inputs are invalid")
+            assertions, observations, result_projection = _run_persona_capture(
+                profile=profile,
+                session=session,
+                fixture_path=persona_fixture_path,
+                private_evidence_path=persona_private_evidence_path,
+                artifact_dir=artifact_dir,
+            )
+            request_ids = [_probe_request_id(nonce)]
+        elif scenario_id == "P0-13":
+            if (
+                prior_turn_context_path is None
+                or persona_fixture_path is not None
+                or persona_private_evidence_path is not None
+                or artifact_dir is not None
+            ):
+                raise LiveScenarioProbeError("trace-cleanup inputs are invalid")
+            prior_turns = _load_prior_turn_context(
+                prior_turn_context_path, run_id=run_id, profile_id=profile_id
+            )
+            (
+                assertions,
+                turns,
+                observations,
+                result_projection,
+            ) = _run_trace_cleanup(
+                profile=profile,
+                session=session,
+                client=active_client,
+                prior_turns=prior_turns,
+                perform_cleanup=qualification_mode == "release",
+            )
+            request_ids = [_probe_request_id(nonce)]
+            turn_ids = [str(turn["turn_id"]) for turn in turns]
+            trace_ids = [str(turn["trace_id"]) for turn in turns]
+        else:
+            if any(
+                path is not None
+                for path in (
+                    persona_fixture_path,
+                    persona_private_evidence_path,
+                    artifact_dir,
+                    prior_turn_context_path,
+                )
+            ):
+                raise LiveScenarioProbeError("unrelated live probe inputs are present")
+            assertions, turns, observations = _run_actions(
+                scenario_id,
+                nonce=nonce,
+                profile=profile,
+                session=session,
+                client=active_client,
+            )
         private_facts["observations"] = observations
-        if turns:
+        if turns and scenario_id != "P0-13":
             request_ids = [turn["request_id"] for turn in turns]
             turn_ids = list(request_ids)
             trace_ids = list(request_ids)
-        else:
+        elif not request_ids:
             request_ids = [_probe_request_id(nonce)]
-        status = "PASS" if all(assertions.values()) else "PRODUCT_FAIL"
-        failure_code = "NONE" if status == "PASS" else "ASSERTION_FAILED"
+        if scenario_id == "P0-13":
+            if qualification_mode == "diagnostic":
+                status, failure_code = "BLOCKED_EVIDENCE", "PRECONDITION_MISSING"
+            elif all(assertions.values()):
+                status, failure_code = "PASS", "NONE"
+            elif assertions.get("cleanup_confirmed") is not True:
+                status, failure_code = "PRODUCT_FAIL", "CLEANUP_FAILED"
+            elif assertions.get("trace_correlation_confirmed") is not True:
+                status, failure_code = "BLOCKED_EVIDENCE", "TRACE_UNAVAILABLE"
+            else:
+                status, failure_code = "BLOCKED_EVIDENCE", "TRACE_INCOMPLETE"
+        else:
+            status = "PASS" if all(assertions.values()) else "PRODUCT_FAIL"
+            failure_code = "NONE" if status == "PASS" else "ASSERTION_FAILED"
     except SmokeError as exc:
         private_facts["observations"] = {"error_stage": str(exc.stage)[:64]}
         status, failure_code = _classify_smoke_error(scenario_id, exc)
@@ -843,6 +1373,7 @@ def run_probe(
         "turn_ids": turn_ids,
         "trace_ids": trace_ids,
         "turns": turns,
+        "result_projection": result_projection,
         "private_facts_sha256": canonical_json_sha256(private_facts),
         "raw_content_stored": False,
     }
@@ -868,6 +1399,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenario", choices=LIVE_SCENARIO_IDS, required=True)
     parser.add_argument("--attempt", type=int, choices=(1, 2), required=True)
     parser.add_argument("--nonce", required=True)
+    parser.add_argument("--persona-fixture", type=Path)
+    parser.add_argument("--persona-private-evidence", type=Path)
+    parser.add_argument("--artifact-dir", type=Path)
+    parser.add_argument("--prior-turn-context", type=Path)
+    parser.add_argument(
+        "--qualification-mode", choices=("release", "diagnostic"), default="release"
+    )
     return parser
 
 
@@ -883,6 +1421,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             scenario_id=args.scenario,
             attempt=args.attempt,
             nonce=args.nonce,
+            persona_fixture_path=args.persona_fixture,
+            persona_private_evidence_path=args.persona_private_evidence,
+            artifact_dir=args.artifact_dir,
+            prior_turn_context_path=args.prior_turn_context,
+            qualification_mode=args.qualification_mode,
         )
     except LiveScenarioProbeError as exc:
         print(str(exc), file=sys.stderr)

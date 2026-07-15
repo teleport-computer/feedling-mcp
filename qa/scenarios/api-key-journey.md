@@ -27,19 +27,35 @@ binds those receipts to result status, attempts, assertions, identifiers,
 turns, duplicate/order observations, and latency. Only P0-08–P0-11 may retry,
 only after an `AGENT_ERROR` receipt with `CHAT_TIMEOUT` or `MISSING_REPLY`, and
 both attempts must remain visible. P0-01, P0-12, and P0-13 have separate
-parent-owned evidence.
+parent-owned evidence. For P0-13 the worker runs the exact request helper once;
+the parent reads the trace, derives all five stage timings, performs release
+cleanup (or diagnostic cleanup deferral), and publishes only bounded facts for
+offline agent review.
 
 P0-06 is the exception to the one-command minimum: it requires exactly three
 ordered, successful tool calls prefixed with `QA_SCENARIO_ID=P0-06` and distinct
 `QA_SCENARIO_PHASE=CAPTURE`, `REVIEW`, and `FINALIZE` assignments, using the
 exact commands embedded in the profile-agent prompt. CAPTURE and FINALIZE
-directly invoke the checked-in Genesis tool against the fixed private evidence
-path `$QA_WORK_ROOT/p0-06-private-evidence.json`; REVIEW directly reads that
-file in its own tool call and aborts if the fixed judgment path already exists.
-Only after observing REVIEW output may the agent write its own semantic judgment to the fixed
+have different trust owners: CAPTURE invokes only
+`request_live_scenario_probe.py`, after which the deterministic parent performs
+the deployed upload/Genesis capture, retains an authoritative copy outside the
+worker-readable roots, and writes a byte-identical review copy to
+`$QA_WORK_ROOT/p0-06-private-evidence.json`; REVIEW reads that copy offline in
+its own tool call and aborts if the fixed judgment path already exists; and
+FINALIZE invokes the checked-in Genesis finalizer locally with no product
+network. After the worker exits, the parent independently finalizes the
+authoritative copy with the same judgment and binds only that projection. Only
+after observing REVIEW output may the agent write its own
+semantic judgment to the fixed
 `$QA_WORK_ROOT/p0-06-semantic-judgment.json` path and invoke FINALIZE. Never
 generate a script that derives an all-true judgment from `expected_fact_ids`
 without reviewing the decrypted evidence surfaces.
+
+Every profile worker and the aggregation supervisor run with tool/shell network
+fully disabled: no allowed domains, no local binding, and no network proxy. The
+Codex OAuth model transport is outside that tool sandbox. All Feedling and
+provider I/O below is performed by deterministic parent code after a fixed local
+request marker; the agent reads bounded facts and supplies semantic judgment.
 
 ## P0-01 — Test-target and credential preflight
 
@@ -68,10 +84,12 @@ without reviewing the decrypted evidence surfaces.
 
 **Act**
 
-- Load this profile's synthetic account session from the private manifest.
-- Verify `whoami`, the generated `agent-e2e-<run-id>-<profile-id>` label, and
-  the provisioner's registration/fresh-state receipt.
-- Clear the account's user-owned debug trace before semantic scenarios begin.
+- Load this profile's one-row manifest and run the exact P0-02 request helper.
+- The deterministic parent verifies `whoami`, the generated
+  `agent-e2e-<run-id>-<profile-id>` label, and the provisioner's
+  registration/fresh-state receipt.
+- The deterministic parent clears the account's user-owned debug trace before
+  semantic scenarios begin and writes the bounded result to the facts file.
 
 **Pass**
 
@@ -130,42 +148,54 @@ without reviewing the decrypted evidence surfaces.
 
 **Act**
 
-- On this same account, load the four authoritative files declared by
-  `qa/fixtures/persona-import-v1.json`: chat history, AI persona, personal profile,
-  and memory summary. Before Genesis starts, upload each exact UTF-8 file once as
-  multipart `file` data to `POST /v1/onboarding/archive`, using its locked filename
-  and content type plus one shared `client_job_id`. Require four distinct `201`
-  upload-acceptance receipts, and require each returned storage key to be scoped
+- Run the exact P0-06 CAPTURE request helper. The deterministic parent—not the
+  worker—loads the four authoritative files declared by
+  `qa/fixtures/persona-import-v1.json`: chat history, AI persona, personal
+  profile, and memory summary. Before Genesis starts, it uploads each exact
+  UTF-8 file once as multipart `file` data to
+  `POST /v1/onboarding/archive`, using its locked filename and content type plus
+  one shared `client_job_id`. It requires four distinct `201`
+  upload-acceptance receipts and requires each returned storage key to be scoped
   exactly to the authenticated user, returned archive ID, and locked filename.
-  Evidence may retain the archive ID, filename, byte count, content SHA-256, and a
-  bounded key-scope boolean, but never the returned storage key or plaintext file
-  content. There is no authenticated archive readback endpoint, so do not claim
-  that these receipts independently verify R2 persistence, stored bytes, or the
-  archive-side `client_job_id` index.
-- Submit those same exact file contents to `POST /v1/genesis/imports/plaintext`
-  with `history_filename`, `ai_persona_filename`, `personal_profile_filename`, and
-  `memory_summary_filename` set to the uploaded filenames. Require the job status
-  API to expose the exact shared `client_job_id`, `file_count=4`, and positive history,
-  AI-persona, user-profile, and memory-summary source counts.
-- Use `tools/genesis_e2e.py distill-existing-session` with this profile's
-  one-row `QA_PRIVATE_MANIFEST`, the fixed `0600` evidence path
-  `$QA_WORK_ROOT/p0-06-private-evidence.json`, and `QA_ARTIFACT_DIR` only as the
-  denied public-artifact boundary. The agent cannot read or write that
-  directory. Do not provision a second user, consume a provider secret, or
-  replace/delete the provisioned provider configuration.
-- After capture reaches `done`, read the decrypted private evidence and write a
-  separate owner-mode `0600` semantic judgment at
+  Bounded evidence may retain the archive ID, filename, byte count, content
+  SHA-256, and key-scope boolean, but never the returned storage key or plaintext
+  file content. There is no authenticated archive readback endpoint, so do not
+  claim that these receipts independently verify R2 persistence, stored bytes,
+  or the archive-side `client_job_id` index.
+- The parent submits those same exact file contents to
+  `POST /v1/genesis/imports/plaintext` with `history_filename`,
+  `ai_persona_filename`, `personal_profile_filename`, and
+  `memory_summary_filename` set to the uploaded filenames. It requires the job
+  status API to expose the exact shared `client_job_id`, `file_count=4`, and
+  positive history, AI-persona, user-profile, and memory-summary source counts.
+  It uses the existing-session capture implementation with this profile's
+  session, retains the authoritative decrypted evidence outside every
+  worker-readable root, and writes a byte-identical review copy only to the fixed
+  owner-mode `0600` `$QA_WORK_ROOT/p0-06-private-evidence.json`. The worker does not provision a
+  second user, consume a provider secret, or replace/delete the provisioned
+  provider configuration.
+- Run the exact offline REVIEW command. After capture reaches `done`, read the
+  decrypted private evidence and write a separate owner-mode `0600` semantic
+  judgment at
   `$QA_WORK_ROOT/p0-06-semantic-judgment.json` containing exactly
   `schema_version: 1`, `judge: qualification_agent`, the capture's exact
   `evidence_sha256`, all three reviewed surfaces, the exact locked fact IDs,
   and true/false consistency, support, and contradiction decisions.
-- Run `distill-existing-session-finalize` with the fixture, evidence, judgment,
-  and artifact boundary. It must verify the hash binding, sanitize its bounded
-  result, and delete the plaintext evidence. Any optional helper report must
-  remain beneath private `QA_WORK_ROOT` or `TMPDIR`; only the trusted renderer
-  may later create public artifacts. Lexical matches are extraction evidence
-  only and can never produce PASS by themselves. Record bounded check/evidence
-  codes, never decrypted content or the forbidden fixture value.
+- Run the exact offline `qa/finalize_persona_review.py` command with the
+  fixture, review copy, judgment, and artifact boundary. It must verify the hash
+  binding, sanitize its bounded result, and delete that plaintext review copy.
+  A schema-valid negative verdict is completed evidence and exits zero; only an
+  operational or input-contract failure exits nonzero.
+  After the worker exits, the parent repeats finalization against its
+  worker-inaccessible authoritative copy and the same judgment. The parent
+  projection—not the worker's local report—is authoritative, so tampering with
+  the review copy or inventing a greener finalizer result fails closed. Both
+  copies and the judgment are removed on every terminal path. Any
+  optional helper report must remain beneath private `QA_WORK_ROOT` or `TMPDIR`;
+  only the trusted renderer may later create public artifacts. Lexical matches
+  are extraction evidence only and can never produce PASS by themselves.
+  Record bounded check/evidence codes, never decrypted content or the forbidden
+  fixture value.
 - Bind the canonical scenario evidence to that exact finalizer receipt. The
   scenario's sole `request_id` must equal `persona_finalizer.request_id`, and
   `persona_finalizer` must record fixture `persona-import-v1`, the verified
@@ -358,25 +388,36 @@ Map deterministic delivery failures without inventing evidence:
 
 **Act**
 
-- Read the final user-owned trace and correlate evidence to this profile's turn
-  and trace IDs.
-- Record available queue, model/provider, persistence, delivery, acknowledgement,
-  and total durations; explicitly list unavailable stages.
-- Capture sanitized evidence, disable/delete provider hosting, reset this synthetic
-  account using `{"confirm":"delete-all-data"}`, and verify the old Feedling
-  credential is rejected.
+- Run the exact P0-13 request helper once. The deterministic parent reads the
+  final user-owned trace and correlates it to the exact 15 prior chat/reasoning
+  turns for this profile. The worker never calls the trace endpoint.
+- The parent records acknowledgement and total duration plus the exact internal
+  stage set `routing`, `queue`, `provider`, `persistence`, and `delivery` for
+  every turn. A stage is present only when its correlated trace event yields a
+  numeric duration. Reply visibility in chat history proves persistence, not
+  delivery, and MUST NOT be used to synthesize a delivery duration.
+- In protected qualification the parent captures sanitized evidence,
+  disables/deletes provider hosting, resets this synthetic account using
+  `{"confirm":"delete-all-data"}`, and verifies the old Feedling credential is
+  rejected. The worker copies the parent facts; it never performs these network
+  mutations itself.
+- If an earlier chat or P0-12 request failed before producing a correlated turn,
+  project only the real remaining turns and block trace correlation; never
+  manufacture an identifier to reach 15. Cleanup still runs. The parent captures
+  raw trace rows first, performs cleanup, and only then parses untrusted trace
+  timestamps, so malformed trace data cannot skip or erase cleanup evidence.
 - Local adminless diagnostic exception: when
-  `QA_QUALIFICATION_MODE=diagnostic`, do not call account reset from the agent.
-  The deterministic parent performs the sole reset after collecting the worker
-  result and COT receipt. Emit the fixed deferral: P0-13 and its sole attempt are
-  `BLOCKED_EVIDENCE` with `CLEANUP / PRECONDITION_MISSING` and
-  `reproducible=true`; trace stages, correlation, and latency are true while
-  `cleanup_confirmed=false`; evidence includes `TRACE_CORRELATION_CONFIRMED` and
-  `LATENCY_ATTRIBUTED`; top-level cleanup has all four booleans false and status
-  `BLOCKED_EVIDENCE`; diagnostics include `CLEANUP_FALLBACK_USED`. If P0-01
-  through P0-12 pass, top-level profile status is `BLOCKED_EVIDENCE`. The parent
-  preserves this evidence and records cleanup separately. This exception can
-  never produce a release PASS.
+  `QA_QUALIFICATION_MODE=diagnostic`, the in-worker parent probe records
+  trace/latency but defers mutation. The outer deterministic parent performs the
+  sole reset after collecting the worker result and COT receipt. Emit the fixed
+  cleanup deferral: P0-13 and its sole attempt are `BLOCKED_EVIDENCE` with
+  `CLEANUP / PRECONDITION_MISSING` and `reproducible=true`,
+  `cleanup_confirmed=false`, top-level cleanup has all four booleans false and
+  status `BLOCKED_EVIDENCE`, and diagnostics include
+  `CLEANUP_FALLBACK_USED`. Copy the parent receipt's trace assertions exactly:
+  `TRACE_CORRELATION_CONFIRMED`, `LATENCY_ATTRIBUTED`, and their booleans are
+  present/true only when all required evidence exists. A missing trace or stage
+  remains blocked after outer cleanup and cannot become a diagnostic PASS.
 
 **Pass**
 
@@ -394,7 +435,13 @@ Map deterministic delivery failures without inventing evidence:
 
 **Classify**
 
-- Correct user behavior but unavailable required trace: `BLOCKED_EVIDENCE`.
-- Reproducible missing/duplicate stage or cleanup endpoint failure:
-  `PRODUCT_FAIL`.
-- Worker omitted cleanup or produced malformed evidence: `AGENT_ERROR`.
+- Unavailable or uncorrelatable required trace:
+  `BLOCKED_EVIDENCE / TRACE_UNAVAILABLE`.
+- A correlated trace with any missing or null `routing`, `queue`, `provider`,
+  `persistence`, or `delivery` stage:
+  `BLOCKED_EVIDENCE / TRACE_INCOMPLETE`.
+- Observed parent cleanup endpoint failure:
+  `PRODUCT_FAIL / CLEANUP_FAILED`.
+- Worker omitted the required P0-13 request or produced malformed/mismatched
+  evidence: `AGENT_ERROR` (or the fixed parent-receipt evidence blocker when the
+  receipt itself is unavailable).

@@ -31,11 +31,13 @@ LIVE_SCENARIO_IDS = (
     "P0-03",
     "P0-04",
     "P0-05",
+    "P0-06",
     "P0-07",
     "P0-08",
     "P0-09",
     "P0-10",
     "P0-11",
+    "P0-13",
 )
 RETRYABLE_SCENARIO_IDS = frozenset({"P0-08", "P0-09", "P0-10", "P0-11"})
 REQUEST_SCHEMA_VERSION = 1

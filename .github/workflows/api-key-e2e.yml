@@ -1021,15 +1021,18 @@ jobs:
               -P io-e2e-agent-driven-test-official-deepseek \
               --include-managed-config -C "$worker_work" -- \
               /bin/sh -eu -c '
-                curl --silent --show-error --proto "=https" --max-redirs 0 \
-                  --connect-timeout 10 --max-time 20 --output /dev/null \
-                  https://test-api.feedling.app/
-                if curl --fail --silent --show-error --proto "=https" \
+                command -v curl >/dev/null 2>&1
+                if curl --silent --show-error --proto "=https" \
+                  --max-redirs 0 --connect-timeout 5 --max-time 10 \
+                  --output /dev/null https://test-api.feedling.app/; then
+                  exit 1
+                fi
+                if curl --silent --show-error --proto "=https" \
                   --max-redirs 0 --connect-timeout 5 --max-time 10 \
                   --output /dev/null https://example.com/; then
                   exit 1
                 fi
-                if curl --noproxy "*" --insecure --fail --silent --show-error \
+                if curl --noproxy "*" --insecure --silent --show-error \
                   --proto "=https" --max-redirs 0 --connect-timeout 5 --max-time 10 \
                   --output /dev/null https://1.1.1.1/; then
                   exit 1
@@ -1143,13 +1146,14 @@ jobs:
               -P io-e2e-agent-driven-test-persona-memory-judge \
               --include-managed-config -C "$judge_work" -- \
               /bin/sh -eu -c '
+                command -v curl >/dev/null 2>&1
                 printf "judge\n" > "$1"
                 test -r "$1"
                 rm -f "$1"
                 for denied in "$2" "$3" "$4" "$5" "$6" "$7" "$8"; do
                   test ! -r "$denied"
                 done
-                if curl --fail --silent --show-error --proto "=https" \
+                if curl --silent --show-error --proto "=https" \
                   --max-redirs 0 --connect-timeout 5 --max-time 10 \
                   --output /dev/null https://test-api.feedling.app/; then
                   exit 1

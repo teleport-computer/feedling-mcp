@@ -225,23 +225,16 @@ def test_bundle_isolates_workers_aggregation_and_persona_judge(tmp_path):
         assert judge_policy[str((judge_root / leaf).resolve())] == "write"
 
 
-def test_local_binding_is_explicit_and_applies_to_every_locked_profile(tmp_path):
+def test_local_binding_request_cannot_enable_any_agent_profile(tmp_path):
     values = _paths(tmp_path)
     values["allow_local_binding"] = True
 
     document = tomllib.loads(writer.build_config_bundle(**values).main)
 
-    for name, permission in document["permissions"].items():
-        if name in {
-            writer.SUPERVISOR_PERMISSION_PROFILE,
-            writer.PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE,
-        }:
-            assert permission["network"]["enabled"] is False
-            assert permission["network"]["allow_local_binding"] is False
-            assert "domains" not in permission["network"]
-            continue
-        assert permission["network"]["allow_local_binding"] is True
-        assert permission["network"]["domains"] == {"test-api.feedling.app": "allow"}
+    for permission in document["permissions"].values():
+        assert permission["network"]["enabled"] is False
+        assert permission["network"]["allow_local_binding"] is False
+        assert "domains" not in permission["network"]
 
 
 def test_writer_creates_private_bundle_once(tmp_path):

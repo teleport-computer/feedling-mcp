@@ -31,6 +31,12 @@ from typing import Any, Callable, Mapping, Sequence
 
 from jsonschema import Draft202012Validator
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools import genesis_e2e  # noqa: E402
+
 try:
     from qa.atomic_private_file import AtomicPrivateFileError, create_private_file
     from qa.codex_output_schema import validate_authoring_schema
@@ -127,6 +133,7 @@ _MAX_SCHEMA_BYTES = 8 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 _MAX_RESULT_BYTES = 32 * 1024 * 1024
 _MAX_EVENTS_BYTES = 64 * 1024 * 1024
+_MAX_PERSONA_JUDGMENT_BYTES = 64 * 1024
 _REQUEST_PUBLICATION_GRACE_SECONDS = 2.0
 _AMBIENT_READ_ROOTS = tuple(
     dict.fromkeys(Path(value).resolve() for value in ("/tmp", "/var/tmp", "/dev/shm"))
@@ -186,15 +193,24 @@ in SOP order. Generic markers, alternate executables, `python -c`, extra shell
 tokens, wrong paths, duplicate/out-of-order attempts, or a result greener than
 the parent receipt are rejected. P0-01, P0-12, and P0-13 have separate parent-
 owned evidence.
-P0-06 requires exactly three ordered, successful phase-marker commands. Run
+P0-06 requires exactly three ordered, successful phase-marker commands. The
+CAPTURE command only requests the parent-owned network mutation; REVIEW and
+FINALIZE remain offline semantic steps. Run
 these exact commands in separate Codex tool calls:
-QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=CAPTURE "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/tools/genesis_e2e.py" distill-existing-session --api-url "$IO_E2E_BASE_URL" --session-manifest "$QA_PRIVATE_MANIFEST" --profile-id "$QA_PROFILE_ID" --fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" --private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" --artifact-dir "$QA_ARTIFACT_DIR"
+QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=CAPTURE "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/qa/request_live_scenario_probe.py" --scenario P0-06 --attempt 1 --request "$QA_WORK_ROOT/.live-probe-P0-06-1.request" --facts "$QA_WORK_ROOT/live-probe-P0-06-1.facts.json"
 QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=REVIEW "$QA_PYTHON_BIN" -I -B -c 'import pathlib,sys;j=pathlib.Path(sys.argv[2]);j.exists() and sys.exit(17);print(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))' "$QA_WORK_ROOT/p0-06-private-evidence.json" "$QA_WORK_ROOT/p0-06-semantic-judgment.json"
 After observing REVIEW output, make the semantic decisions and write the bounded
 owner-only judgment to exactly
 `$QA_WORK_ROOT/p0-06-semantic-judgment.json` in a separate unmarked tool call.
 Then run:
-QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=FINALIZE "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/tools/genesis_e2e.py" distill-existing-session-finalize --fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" --private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" --semantic-judgment "$QA_WORK_ROOT/p0-06-semantic-judgment.json" --artifact-dir "$QA_ARTIFACT_DIR"
+QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=FINALIZE "$QA_PYTHON_BIN" -I -B "$QA_SOURCE_ROOT/qa/finalize_persona_review.py" --fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" --private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" --semantic-judgment "$QA_WORK_ROOT/p0-06-semantic-judgment.json" --artifact-dir "$QA_ARTIFACT_DIR"
+This local finalizer operates only on the review copy so you can author the
+bounded result. It exits zero for either a schema-valid positive or negative
+verdict, and nonzero only for an operational/input error; never change your
+judgment to make the command green. After your process exits, the parent independently applies the
+same judgment to its worker-inaccessible authoritative capture and binds that
+sanitized finalizer projection to the receipt set. A changed review copy,
+changed judgment hash, or invented finalizer result therefore cannot pass.
 Bind the finalizer's exact `transport.archive_upload_count`,
 `checks.archive_receipts_verified`, and
 `checks.genesis_upload_metadata_verified` values into the correspondingly named
@@ -237,14 +253,22 @@ in the reasoning object even when configuration evidence determines P0-12.
 Missing provider reasoning-token evidence remains BLOCKED_EVIDENCE; do not infer
 reasoning tokens from ordinary input/output token totals. Always leave the
 trusted handshake files in place for launcher validation.
+For P0-13, request the final parent-owned trace/latency/cleanup probe exactly
+once after P0-12 with:
+QA_SCENARIO_ID=P0-13 "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/qa/request_live_scenario_probe.py" --scenario P0-13 --attempt 1 --request "$QA_WORK_ROOT/.live-probe-P0-13-1.request" --facts "$QA_WORK_ROOT/live-probe-P0-13-1.facts.json"
+Read the resulting facts and copy its exact P0-13 identifiers, assertions,
+turn stage latencies, profile latency/trace summary, and cleanup projection.
+The parent owns every product network call. Never call trace, hosting, model
+configuration, registration, or account-reset endpoints yourself.
 When QA_QUALIFICATION_MODE is diagnostic, do not call /v1/account/reset in
-P0-13: the deterministic parent owns the only account reset so it can verify
-cleanup without an admin token. Emit the fixed diagnostic deferral exactly:
+P0-13: the in-worker parent probe records trace/latency but defers mutation, and
+the post-worker deterministic parent owns the only account reset so it can
+verify cleanup without an admin token. Emit the fixed diagnostic deferral exactly:
 P0-13 and its sole attempt use BLOCKED_EVIDENCE with CLEANUP /
-PRECONDITION_MISSING / reproducible=true; its trace-stages, correlation, and
-latency assertions are true, cleanup_confirmed is false, and its evidence codes
-include TRACE_CORRELATION_CONFIRMED and LATENCY_ATTRIBUTED. The top-level status
-is BLOCKED_EVIDENCE when P0-01 through P0-12 pass, and cleanup status is
+PRECONDITION_MISSING / reproducible=true; preserve the parent receipt's exact
+trace-stage, correlation, and latency assertions, keep cleanup_confirmed false,
+and include only evidence codes whose bound assertions are true. The top-level
+status is BLOCKED_EVIDENCE when P0-01 through P0-12 pass, and cleanup status is
 BLOCKED_EVIDENCE; cleanup attempted/provider-config
 deleted/account-reset/old-credential-rejected are all false; diagnostic_codes
 includes CLEANUP_FALLBACK_USED. The deterministic parent preserves this result,
@@ -257,8 +281,8 @@ scenario. A blocked preflight assertion MUST NOT short-circuit P0-02 through
 P0-13.
 Never seek provider/admin credentials, the full provisioning manifest, another
 profile manifest, public artifacts, raw output from another process, or nested
-agents. Always attempt cleanup except for the fixed diagnostic-only P0-13
-parent deferral above. Return exactly one profileResult JSON object
+agents. Always request parent cleanup except for the fixed diagnostic-only P0-13
+deferral above. Return exactly one profileResult JSON object
 matching the supplied output schema; include only sanitized structured evidence.
 """
 
@@ -319,7 +343,11 @@ class WorkerAttempt:
 ProcessRunner = Callable[[WorkerSpec, int], int]
 CotProbeRunner = Callable[[WorkerSpec], Mapping[str, Any]]
 LiveProbeRunner = Callable[
-    [WorkerSpec, str, int, str], tuple[Mapping[str, Any], Mapping[str, Any]]
+    [WorkerSpec, str, int, str, Sequence[Mapping[str, Any]]],
+    tuple[Mapping[str, Any], Mapping[str, Any]],
+]
+PersonaFinalizeRunner = Callable[
+    [WorkerSpec, Mapping[str, Any]], Mapping[str, Any]
 ]
 
 
@@ -461,6 +489,100 @@ def _write_private_json(path: Path, payload: Mapping[str, Any]) -> None:
     _create_private_file(path, content)
 
 
+def _redact_persona_review_event_output(path: Path) -> None:
+    """Remove decrypted P0-06 REVIEW stdout from the private Codex event log."""
+
+    if not path.exists():
+        return
+    temporary = path.with_name(f".{path.name}.persona-redacted")
+    try:
+        with open_owned_regular(
+            path, "Codex worker event stream", max_bytes=_MAX_EVENTS_BYTES
+        ) as handle:
+            raw_lines = handle.readlines()
+        rows: list[dict[str, Any]] = []
+        review_item_ids: set[str] = set()
+        for raw in raw_lines:
+            if len(raw) > 16 * 1024 * 1024:
+                raise WorkerLaunchError("Codex worker event stream is invalid")
+            try:
+                row = json.loads(raw)
+            except (UnicodeError, json.JSONDecodeError, RecursionError):
+                raise WorkerLaunchError("Codex worker event stream is invalid") from None
+            if not isinstance(row, dict):
+                raise WorkerLaunchError("Codex worker event stream is invalid")
+            item = row.get("item")
+            if isinstance(item, Mapping):
+                command = item.get("command")
+                if (
+                    isinstance(command, str)
+                    and "QA_SCENARIO_ID=P0-06" in command
+                    and "QA_SCENARIO_PHASE=REVIEW" in command
+                    and isinstance(item.get("id"), str)
+                ):
+                    review_item_ids.add(str(item["id"]))
+            rows.append(row)
+        changed = False
+        rendered: list[bytes] = []
+        for row in rows:
+            item = row.get("item")
+            if isinstance(item, Mapping):
+                command = item.get("command")
+                review_row = bool(
+                    (
+                        isinstance(command, str)
+                        and "QA_SCENARIO_ID=P0-06" in command
+                        and "QA_SCENARIO_PHASE=REVIEW" in command
+                    )
+                    or (
+                        isinstance(item.get("id"), str)
+                        and str(item["id"]) in review_item_ids
+                    )
+                )
+                if review_row:
+                    safe_item = {
+                        key: item[key]
+                        for key in ("type", "id", "command", "status", "exit_code")
+                        if key in item
+                    }
+                    safe_item["output_redacted"] = True
+                    row = {
+                        key: row[key]
+                        for key in ("type", "thread_id", "turn_id", "timestamp")
+                        if key in row
+                    }
+                    row["item"] = safe_item
+                    changed = True
+            rendered.append(
+                (
+                    json.dumps(
+                        row,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+        if not changed:
+            return
+        _unlink_private_path(temporary)
+        _create_private_file(temporary, b"".join(rendered))
+        os.replace(temporary, path)
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        RecursionError,
+        OrchestrationError,
+        WorkerLaunchError,
+    ):
+        _unlink_private_path(temporary)
+        _unlink_private_path(path)
+        raise WorkerLaunchError("unable to redact persona review evidence") from None
+
+
 def _trusted_cot_nonce(spec: WorkerSpec) -> str:
     run_id = str(spec.environment.get("QA_RUN_ID") or "")
     digest = hashlib.sha256(
@@ -510,8 +632,197 @@ def _run_trusted_cot_probe(spec: WorkerSpec) -> Mapping[str, Any]:
     return receipt
 
 
+def _persona_authoritative_evidence_path(spec: WorkerSpec) -> Path:
+    return spec.output_dir / ".p0-06-authoritative-evidence.json"
+
+
+def _persona_worker_evidence_path(spec: WorkerSpec) -> Path:
+    return spec.work / "p0-06-private-evidence.json"
+
+
+def _persona_judgment_path(spec: WorkerSpec) -> Path:
+    return spec.work / "p0-06-semantic-judgment.json"
+
+
+def _unlink_private_path(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _run_trusted_persona_finalize(
+    spec: WorkerSpec, capture_receipt: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Re-finalize the immutable parent capture against Codex's judgment.
+
+    The worker may finalize its review copy to understand the bounded result,
+    but only this independent finalization of the parent-owned copy is trusted
+    by the receipt/result binder.  Every plaintext copy and the bounded
+    judgment are removed after the worker exits, including failure paths.
+    """
+
+    authoritative = _persona_authoritative_evidence_path(spec)
+    worker_copy = _persona_worker_evidence_path(spec)
+    judgment = _persona_judgment_path(spec)
+    fixture_path = Path(spec.environment["QA_SOURCE_ROOT"]) / "qa" / "fixtures" / "persona-import-v1.json"
+    try:
+        # The judgment is worker-authored. Bound it before handing it to the
+        # legacy Genesis reader (which otherwise reads the entire file) so a
+        # prompt-injected worker cannot OOM the trusted parent. The worker has
+        # already exited, so this owned-regular-file check also closes the
+        # replacement race for the subsequent finalization call.
+        _private_file(
+            judgment,
+            "persona semantic judgment",
+            max_bytes=_MAX_PERSONA_JUDGMENT_BYTES,
+        )
+        report = genesis_e2e.finalize_existing_session_distill_acceptance(
+            private_evidence_path=str(authoritative),
+            semantic_judgment_path=str(judgment),
+            fixture=genesis_e2e._load_fixture(str(fixture_path)),
+            artifact_dir=str(spec.environment["QA_ARTIFACT_DIR"]),
+        )
+        capture = capture_receipt.get("result_projection")
+        evidence = report.get("evidence") if isinstance(report, Mapping) else None
+        checks = report.get("checks") if isinstance(report, Mapping) else None
+        transport = report.get("transport") if isinstance(report, Mapping) else None
+        privacy = report.get("privacy") if isinstance(report, Mapping) else None
+        request_ids = capture_receipt.get("request_ids")
+        if (
+            capture_receipt.get("scenario_id") != "P0-06"
+            or capture_receipt.get("status") != "PASS"
+            or not isinstance(capture, Mapping)
+            or not isinstance(evidence, Mapping)
+            or not isinstance(checks, Mapping)
+            or not isinstance(transport, Mapping)
+            or not isinstance(privacy, Mapping)
+            or not isinstance(request_ids, list)
+            or len(request_ids) != 1
+            or evidence.get("sha256") != capture.get("evidence_sha256")
+            or report.get("job_id") != capture.get("job_id")
+            or transport.get("archive_upload_count")
+            != capture.get("archive_upload_count")
+            or checks.get("archive_receipts_verified")
+            != capture.get("archive_receipts_verified")
+            or checks.get("genesis_upload_metadata_verified")
+            != capture.get("genesis_upload_metadata_verified")
+            or evidence.get("semantic_judgment_bound") is not True
+            or evidence.get("private_evidence_deleted") is not True
+            or type(privacy.get("violation_count")) is not int
+            or privacy.get("violation_count", -1) < 0
+        ):
+            raise WorkerLaunchError(
+                "trusted persona finalizer does not match capture"
+            )
+        finalizer = {
+            "fixture_id": "persona-import-v1",
+            "evidence_sha256": evidence["sha256"],
+            "request_id": request_ids[0],
+            "job_id": report["job_id"],
+            "semantic_judgment_bound": True,
+            "finalizer_ok": report.get("ok") is True,
+            "private_evidence_deleted": True,
+            "archive_upload_count": transport["archive_upload_count"],
+            "archive_receipts_verified": checks[
+                "archive_receipts_verified"
+            ],
+            "genesis_upload_metadata_verified": checks[
+                "genesis_upload_metadata_verified"
+            ],
+            "privacy_violation_count": privacy["violation_count"],
+        }
+        return {
+            "kind": "persona_finalizer",
+            "semantic_assertions": {
+                "persona_acceptance_passed": report.get("ok") is True,
+                "privacy_canary_absent": privacy["violation_count"] == 0,
+            },
+            "persona_finalizer": finalizer,
+        }
+    except (
+        genesis_e2e.ExistingSessionDistillError,
+        OrchestrationError,
+        OSError,
+        KeyError,
+        TypeError,
+    ):
+        raise WorkerLaunchError("trusted persona finalizer failed") from None
+    finally:
+        for path in (authoritative, worker_copy, judgment):
+            _unlink_private_path(path)
+
+
+def _trace_cleanup_turn_context(
+    spec: WorkerSpec, prior_receipts: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for receipt in prior_receipts:
+        scenario_id = str(receipt.get("scenario_id") or "")
+        if scenario_id not in {"P0-08", "P0-09", "P0-10", "P0-11"}:
+            continue
+        for turn in receipt.get("turns", []):
+            if not isinstance(turn, Mapping):
+                raise WorkerLaunchError("trusted trace-cleanup context is invalid")
+            rows.append(
+                {
+                    "scenario_id": scenario_id,
+                    "turn_index": turn.get("turn_index"),
+                    "request_id": turn.get("request_id"),
+                    "turn_id": turn.get("turn_id"),
+                    "trace_id": turn.get("trace_id"),
+                    "ack_latency_ms": turn.get("ack_latency_ms"),
+                    "reply_latency_ms": turn.get("reply_latency_ms"),
+                    "reply_count": turn.get("reply_count"),
+                    "content_assertion_passed": turn.get(
+                        "content_assertion_passed"
+                    ),
+                    "fallback_detected": turn.get("fallback_detected"),
+                    "duplicate_detected": turn.get("duplicate_detected"),
+                    "out_of_order_detected": turn.get("out_of_order_detected"),
+                }
+            )
+    try:
+        cot, _ = validate_cot_receipt(spec.cot_receipt_path, spec.profile_id)
+    except (CotReceiptError, OSError):
+        raise WorkerLaunchError("trusted trace-cleanup COT context is invalid") from None
+    # A valid negative COT receipt can legitimately have no correlated turn
+    # identifiers (for example CHAT_REQUEST_FAILED).  Preserve every real turn
+    # that exists, but never invent identifiers merely to make the latency
+    # projection look complete.  P0-13 will still perform account cleanup and
+    # will fail closed as BLOCKED_EVIDENCE for the missing trace context.
+    cot_ids = tuple(cot.get(field) for field in ("request_id", "turn_id", "trace_id"))
+    if all(isinstance(value, str) and value for value in cot_ids):
+        rows.append(
+            {
+                "scenario_id": "P0-12",
+                "turn_index": 1,
+                "request_id": cot_ids[0],
+                "turn_id": cot_ids[1],
+                "trace_id": cot_ids[2],
+                "ack_latency_ms": cot.get("ack_latency_ms"),
+                "reply_latency_ms": cot.get("reply_latency_ms"),
+                "reply_count": cot.get("chat_response_match_count"),
+                "content_assertion_passed": cot.get("final_answer_correct"),
+                "fallback_detected": False,
+                "duplicate_detected": cot.get("chat_response_count") != 1,
+                "out_of_order_detected": cot.get("chat_response_match_count") != 1,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "run_id": str(spec.environment["QA_RUN_ID"]),
+        "profile_id": spec.profile_id,
+        "turns": rows,
+    }
+
+
 def _run_trusted_live_probe(
-    spec: WorkerSpec, scenario_id: str, attempt: int, nonce: str
+    spec: WorkerSpec,
+    scenario_id: str,
+    attempt: int,
+    nonce: str,
+    prior_receipts: Sequence[Mapping[str, Any]],
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     """Execute one allowlisted scenario in a fixed parent-owned subprocess."""
 
@@ -519,9 +830,19 @@ def _run_trusted_live_probe(
     worker_python = Path(spec.environment["QA_PYTHON_BIN"])
     receipt_path = spec.output_dir / f".live-{scenario_id}-{attempt}.receipt.json"
     private_facts_path = spec.output_dir / f".live-{scenario_id}-{attempt}.private.json"
-    if receipt_path.exists() or private_facts_path.exists():
+    context_path = spec.output_dir / f".live-{scenario_id}-{attempt}.context.json"
+    authoritative_persona = _persona_authoritative_evidence_path(spec)
+    worker_persona = _persona_worker_evidence_path(spec)
+    preserve_persona_capture = False
+    if (
+        receipt_path.exists()
+        or private_facts_path.exists()
+        or context_path.exists()
+        or (scenario_id == "P0-06" and authoritative_persona.exists())
+        or (scenario_id == "P0-06" and worker_persona.exists())
+    ):
         raise WorkerLaunchError("trusted live probe paths are not pristine")
-    command = (
+    command: tuple[str, ...] = (
         str(worker_python),
         "-I",
         "-B",
@@ -542,8 +863,24 @@ def _run_trusted_live_probe(
         str(attempt),
         "--nonce",
         nonce,
+        "--qualification-mode",
+        str(spec.environment["QA_QUALIFICATION_MODE"]),
     )
     try:
+        if scenario_id == "P0-06":
+            command += (
+                "--persona-fixture",
+                str(source_root / "qa" / "fixtures" / "persona-import-v1.json"),
+                "--persona-private-evidence",
+                str(authoritative_persona),
+                "--artifact-dir",
+                str(spec.environment["QA_ARTIFACT_DIR"]),
+            )
+        elif scenario_id == "P0-13":
+            _write_private_json(
+                context_path, _trace_cleanup_turn_context(spec, prior_receipts)
+            )
+            command += ("--prior-turn-context", str(context_path))
         completed = subprocess.run(
             command,
             cwd=source_root,
@@ -573,6 +910,13 @@ def _run_trusted_live_probe(
         )
         if live_json_sha256(private_facts) != receipt["private_facts_sha256"]:
             raise WorkerLaunchError("trusted live probe facts are inconsistent")
+        if scenario_id == "P0-06":
+            _copy_private_file(
+                authoritative_persona,
+                worker_persona,
+                max_bytes=8 * 1024 * 1024,
+            )
+            preserve_persona_capture = True
         return receipt, private_facts
     except (
         LiveScenarioReceiptError,
@@ -582,11 +926,11 @@ def _run_trusted_live_probe(
     ):
         raise WorkerLaunchError("trusted live probe could not execute") from None
     finally:
-        for path in (receipt_path, private_facts_path):
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        for path in (receipt_path, private_facts_path, context_path):
+            _unlink_private_path(path)
+        if scenario_id == "P0-06" and not preserve_persona_capture:
+            for path in (authoritative_persona, worker_persona):
+                _unlink_private_path(path)
 
 
 def _live_handshake_paths(
@@ -692,7 +1036,7 @@ def _perform_trusted_live_handshake(
             raise WorkerLaunchError("trusted live probe request is out of order")
         nonce = f"live_{secrets.token_hex(16)}"
         returned_receipt, private_facts = live_probe_runner(
-            spec, scenario_id, attempt, nonce
+            spec, scenario_id, attempt, nonce, tuple(receipts)
         )
         receipt = validate_live_receipt_object(
             returned_receipt,
@@ -730,7 +1074,9 @@ def _perform_trusted_live_handshake(
 
 
 def _write_live_receipt_aggregate(
-    spec: WorkerSpec, receipts: Sequence[Mapping[str, Any]]
+    spec: WorkerSpec,
+    receipts: Sequence[Mapping[str, Any]],
+    persona_finalizer: Mapping[str, Any] | None,
 ) -> None:
     payload = {
         "schema_version": 1,
@@ -738,6 +1084,9 @@ def _write_live_receipt_aggregate(
         "run_id": str(spec.environment["QA_RUN_ID"]),
         "profile_id": spec.profile_id,
         "receipts": [dict(row) for row in receipts],
+        "persona_finalizer": (
+            dict(persona_finalizer) if persona_finalizer is not None else None
+        ),
     }
     # Validate complete successful sets before persistence.  Partial/error sets
     # are still persisted so release verification fails closed with a bounded
@@ -834,6 +1183,7 @@ def _run_process_with_trusted_cot(
     process_runner: ProcessRunner,
     cot_probe_runner: CotProbeRunner,
     live_probe_runner: LiveProbeRunner,
+    persona_finalize_runner: PersonaFinalizeRunner,
 ) -> int:
     """Coordinate one Codex process with all parent-owned live probes.
 
@@ -885,7 +1235,37 @@ def _run_process_with_trusted_cot(
     # Close the race where markers and process completion become visible in the
     # opposite order, then freeze the parent-owned aggregate exactly once.
     handle_visible_requests()
-    _write_live_receipt_aggregate(spec, live_receipts)
+    persona_finalizer: Mapping[str, Any] | None = None
+    capture_receipts = [
+        receipt
+        for receipt in live_receipts
+        if receipt.get("scenario_id") == "P0-06"
+    ]
+    try:
+        if len(capture_receipts) == 1:
+            try:
+                persona_finalizer = persona_finalize_runner(
+                    spec, capture_receipts[0]
+                )
+            except Exception:
+                # Preserve the worker's actual exit/tool-use diagnostic.  The
+                # persisted null projection makes downstream evidence validation
+                # fail closed without misclassifying it as a launcher invocation
+                # failure.
+                persona_finalizer = None
+    finally:
+        try:
+            _write_live_receipt_aggregate(
+                spec, live_receipts, persona_finalizer
+            )
+        finally:
+            if persona_finalizer is None:
+                for path in (
+                    _persona_authoritative_evidence_path(spec),
+                    _persona_worker_evidence_path(spec),
+                    _persona_judgment_path(spec),
+                ):
+                    _unlink_private_path(path)
     if result["failed"]:
         raise WorkerLaunchError("Codex worker process runner failed")
     exit_code = result["exit_code"]
@@ -1017,6 +1397,8 @@ def _validate_config_profiles(
         except (OSError, UnicodeError, tomllib.TOMLDecodeError, OrchestrationError):
             raise WorkerLaunchError("Codex worker profile is invalid") from None
         expected_permission = worker_permission_profile(profile_id)
+        permission = permissions.get(expected_permission)
+        network = permission.get("network") if isinstance(permission, dict) else None
         shell_policy = profile.get("shell_environment_policy")
         fixed_environment = (
             shell_policy.get("set") if isinstance(shell_policy, dict) else None
@@ -1038,6 +1420,9 @@ def _validate_config_profiles(
         if (
             profile.get("default_permissions") != expected_permission
             or expected_permission not in permissions
+            or not isinstance(network, dict)
+            or network.get("enabled") is not False
+            or "domains" in network
             or "agents" in profile
             or "permissions" in profile
             or not isinstance(fixed_environment, dict)
@@ -1191,7 +1576,7 @@ def _prepare_specs(
             f'default_permissions="{worker_permission_profile(profile_id)}"',
             "--ignore-rules",
             "--strict-config",
-            "--enable",
+            "--disable",
             "network_proxy",
             "--skip-git-repo-check",
             "--cd",
@@ -1580,6 +1965,7 @@ def launch(
     process_runner: ProcessRunner = _run_process,
     cot_probe_runner: CotProbeRunner = _run_trusted_cot_probe,
     live_probe_runner: LiveProbeRunner = _run_trusted_live_probe,
+    persona_finalize_runner: PersonaFinalizeRunner = _run_trusted_persona_finalize,
     diagnostic: bool = False,
     profile_ids: Sequence[str] | None = None,
     expected_runtime: str = LOCKED_RUNTIME,
@@ -1759,6 +2145,7 @@ def launch(
                 process_runner,
                 cot_probe_runner,
                 live_probe_runner,
+                persona_finalize_runner,
             )
             if not isinstance(exit_code, int) or isinstance(exit_code, bool):
                 failed = True
@@ -1767,6 +2154,11 @@ def launch(
             failed = True
             exit_code = 125
         finally:
+            try:
+                _redact_persona_review_event_output(spec.events_path)
+            except WorkerLaunchError:
+                failed = True
+                exit_code = 125
             with lock:
                 stopped_at = _utc_now()
                 active -= 1

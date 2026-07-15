@@ -337,12 +337,15 @@ def test_codex_preflight_network_denial_probe_has_balanced_conditionals():
         "Install and verify isolated headless Codex runtime",
         "Provision eight isolated API-key profiles",
     )
-    start = preflight.index("https://test-api.feedling.app/")
+    first_url = preflight.index("https://test-api.feedling.app/")
+    start = preflight.rindex("command -v curl", 0, first_url)
     end = preflight.index("# Prove the fixed interpreter", start)
     network_probe = preflight[start:end]
 
-    assert network_probe.count("if curl") == 2
-    assert sum(line.strip() == "fi" for line in network_probe.splitlines()) == 2
+    assert "command -v curl >/dev/null 2>&1" in network_probe
+    assert network_probe.count("if curl") == 3
+    assert sum(line.strip() == "fi" for line in network_probe.splitlines()) == 3
+    assert "--fail" not in network_probe
 
 
 def test_persona_judge_profile_is_private_offline_and_reuses_codex_oauth():
@@ -375,6 +378,13 @@ def test_persona_judge_profile_is_private_offline_and_reuses_codex_oauth():
     assert "$QA_CODEX_HOME/auth.json" in judge_probe
     assert "$QA_PERSONA_JUDGE_SCRATCH_ROOT" in judge_probe
     assert "https://test-api.feedling.app/" in judge_probe
+    assert "command -v curl >/dev/null 2>&1" in judge_probe
+    judge_network_probe = judge_probe[
+        judge_probe.index("command -v curl") : judge_probe.index(
+            "' feedling-persona-judge-preflight"
+        )
+    ]
+    assert "--fail" not in judge_network_probe
     for forbidden in (
         "IO_E2E_ADMIN_TOKEN",
         "QA_DEEPSEEK_API_KEY",

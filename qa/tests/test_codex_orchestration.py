@@ -561,35 +561,147 @@ def _passing_live_probe(
     scenario_id: str,
     attempt: int,
     nonce: str,
+    prior_receipts: tuple[Mapping[str, Any], ...],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     turn_count = {
         "P0-02": 0,
         "P0-03": 0,
         "P0-04": 0,
         "P0-05": 0,
+        "P0-06": 0,
         "P0-07": 0,
         "P0-08": 1,
         "P0-09": 10,
         "P0-10": 2,
         "P0-11": 1,
+        "P0-13": 15,
     }[scenario_id]
     semantic = scenario_id in {"P0-10", "P0-11"}
-    turns = [
-        {
-            "turn_index": index,
-            "request_id": f"req-{scenario_id.lower()}-{attempt}-{index}",
-            "turn_id": f"req-{scenario_id.lower()}-{attempt}-{index}",
-            "trace_id": f"req-{scenario_id.lower()}-{attempt}-{index}",
-            "ack_latency_ms": float(index * 10),
-            "reply_latency_ms": float(index * 100),
-            "reply_count": 1,
-            "content_assertion_passed": None if semantic else True,
-            "fallback_detected": False,
-            "duplicate_detected": False,
-            "out_of_order_detected": False,
+    stage_latency = {
+        "routing": 1.0,
+        "queue": 2.0,
+        "provider": 3.0,
+        "persistence": 4.0,
+        "delivery": 5.0,
+    }
+    if scenario_id == "P0-13":
+        turns = []
+        for receipt in prior_receipts:
+            if receipt.get("scenario_id") not in {
+                "P0-08",
+                "P0-09",
+                "P0-10",
+                "P0-11",
+            }:
+                continue
+            for prior_turn in receipt.get("turns", []):
+                turns.append(
+                    {
+                        key: prior_turn[key]
+                        for key in (
+                            "request_id",
+                            "turn_id",
+                            "trace_id",
+                            "ack_latency_ms",
+                            "reply_latency_ms",
+                            "reply_count",
+                            "content_assertion_passed",
+                            "fallback_detected",
+                            "duplicate_detected",
+                            "out_of_order_detected",
+                        )
+                    }
+                )
+        cot = _passing_cot_receipt(spec.profile_id)
+        turns.append(
+            {
+                "request_id": cot["request_id"],
+                "turn_id": cot["turn_id"],
+                "trace_id": cot["trace_id"],
+                "ack_latency_ms": cot["ack_latency_ms"],
+                "reply_latency_ms": cot["reply_latency_ms"],
+                "reply_count": cot["chat_response_match_count"],
+                "content_assertion_passed": cot["final_answer_correct"],
+                "fallback_detected": False,
+                "duplicate_detected": False,
+                "out_of_order_detected": False,
+            }
+        )
+        assert len(turns) == turn_count
+        turns = [
+            {
+                "turn_index": index,
+                **turn,
+                "stage_latency_ms": dict(stage_latency),
+            }
+            for index, turn in enumerate(turns, start=1)
+        ]
+    else:
+        turns = [
+            {
+                "turn_index": index,
+                "request_id": f"req-{scenario_id.lower()}-{attempt}-{index}",
+                "turn_id": f"req-{scenario_id.lower()}-{attempt}-{index}",
+                "trace_id": f"req-{scenario_id.lower()}-{attempt}-{index}",
+                "ack_latency_ms": float(index * 10),
+                "reply_latency_ms": float(index * 100),
+                "stage_latency_ms": dict(stage_latency),
+                "reply_count": 1,
+                "content_assertion_passed": None if semantic else True,
+                "fallback_detected": False,
+                "duplicate_detected": False,
+                "out_of_order_detected": False,
+            }
+            for index in range(1, turn_count + 1)
+        ]
+    diagnostic_cleanup = (
+        scenario_id == "P0-13"
+        and spec.environment["QA_QUALIFICATION_MODE"] == "diagnostic"
+    )
+    status = "BLOCKED_EVIDENCE" if diagnostic_cleanup else "PASS"
+    failure_code = "PRECONDITION_MISSING" if diagnostic_cleanup else "NONE"
+    assertions = {
+        key: True
+        for key in live_receipts.DETERMINISTIC_ASSERTIONS[scenario_id]
+    }
+    if diagnostic_cleanup:
+        assertions["cleanup_confirmed"] = False
+    projection: dict[str, Any] | None = None
+    if scenario_id == "P0-06":
+        projection = {
+            "kind": "persona_capture",
+            "evidence_sha256": "1" * 64,
+            "job_id": "persona-job-1",
+            "archive_upload_count": 4,
+            "archive_receipts_verified": True,
+            "genesis_upload_metadata_verified": True,
         }
-        for index in range(1, turn_count + 1)
-    ]
+    elif scenario_id == "P0-13":
+        projection = {
+            "kind": "trace_cleanup",
+            "latency": live_receipts.latency_projection(turns),
+            "trace": {
+                "enabled": True,
+                "deploy_enabled": True,
+                "correlated_event_count": len(turns) * 5,
+                "observed_event_types": [
+                    "routing",
+                    "queue",
+                    "provider",
+                    "persistence",
+                    "delivery",
+                ],
+                "missing_required_event_types": [],
+                "raw_trace_stored": False,
+            },
+            "cleanup": {
+                "attempted": not diagnostic_cleanup,
+                "provider_config_deleted": not diagnostic_cleanup,
+                "account_reset": not diagnostic_cleanup,
+                "old_credential_rejected": not diagnostic_cleanup,
+                "status": status,
+            },
+        }
     private_facts = {
         "schema_version": 1,
         "run_id": spec.environment["QA_RUN_ID"],
@@ -611,19 +723,21 @@ def _passing_live_probe(
         "nonce": nonce,
         "started_at": "2026-01-01T00:00:00.000000Z",
         "finished_at": "2026-01-01T00:00:01.000000Z",
-        "status": "PASS",
-        "failure_code": "NONE",
-        "assertions": {
-            key: True
-            for key in live_receipts.DETERMINISTIC_ASSERTIONS[scenario_id]
-        },
+        "status": status,
+        "failure_code": failure_code,
+        "assertions": assertions,
         "semantic_assertions": list(
             live_receipts.SEMANTIC_ASSERTIONS[scenario_id]
         ),
-        "request_ids": ids or [f"probe-{scenario_id.lower()}-{attempt}"],
+        "request_ids": (
+            [f"probe-{scenario_id.lower()}-{attempt}"]
+            if scenario_id == "P0-13"
+            else ids or [f"probe-{scenario_id.lower()}-{attempt}"]
+        ),
         "turn_ids": ids,
         "trace_ids": ids,
         "turns": turns,
+        "result_projection": projection,
         "private_facts_sha256": live_receipts.canonical_json_sha256(private_facts),
         "raw_content_stored": False,
     }
@@ -631,9 +745,45 @@ def _passing_live_probe(
 
 
 def _live_probe_runner(
-    spec: launcher.WorkerSpec, scenario_id: str, attempt: int, nonce: str
+    spec: launcher.WorkerSpec,
+    scenario_id: str,
+    attempt: int,
+    nonce: str,
+    prior_receipts: tuple[Mapping[str, Any], ...],
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-    return _passing_live_probe(spec, scenario_id, attempt, nonce)
+    return _passing_live_probe(
+        spec, scenario_id, attempt, nonce, prior_receipts
+    )
+
+
+def _persona_finalize_runner(
+    _spec: launcher.WorkerSpec, capture_receipt: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    capture = capture_receipt["result_projection"]
+    return {
+        "kind": "persona_finalizer",
+        "semantic_assertions": {
+            "persona_acceptance_passed": True,
+            "privacy_canary_absent": True,
+        },
+        "persona_finalizer": {
+            "fixture_id": "persona-import-v1",
+            "evidence_sha256": capture["evidence_sha256"],
+            "request_id": capture_receipt["request_ids"][0],
+            "job_id": capture["job_id"],
+            "semantic_judgment_bound": True,
+            "finalizer_ok": True,
+            "private_evidence_deleted": True,
+            "archive_upload_count": capture["archive_upload_count"],
+            "archive_receipts_verified": capture[
+                "archive_receipts_verified"
+            ],
+            "genesis_upload_metadata_verified": capture[
+                "genesis_upload_metadata_verified"
+            ],
+            "privacy_violation_count": 0,
+        },
+    }
 
 
 def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
@@ -665,24 +815,86 @@ def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
     bound_turns: list[dict[str, Any]] = []
     for receipt in receipts:
         scenario = scenarios[receipt["scenario_id"]]
+        scenario_status = receipt["status"]
+        scenario_failure = (
+            None
+            if scenario_status == "PASS"
+            else {
+                "category": scenario_status,
+                "stage_code": (
+                    "CLEANUP"
+                    if receipt["failure_code"] == "PRECONDITION_MISSING"
+                    else "TRACE_LATENCY_CLEANUP"
+                ),
+                "failure_code": receipt["failure_code"],
+                "reproducible": True,
+            }
+        )
         scenario.update(
             {
-                "status": "PASS",
+                "status": scenario_status,
                 "started_at": receipt["started_at"],
                 "finished_at": receipt["finished_at"],
                 "attempts": 1,
                 "attempt_results": [
-                    {"attempt": 1, "status": "PASS", "failure": None}
+                    {
+                        "attempt": 1,
+                        "status": scenario_status,
+                        "failure": scenario_failure,
+                    }
                 ],
                 "request_ids": receipt["request_ids"],
                 "turn_ids": receipt["turn_ids"],
                 "trace_ids": receipt["trace_ids"],
-                "failure": None,
+                "failure": scenario_failure,
             }
         )
         for key, value in receipt["assertions"].items():
             if key in scenario["assertions"]:
                 scenario["assertions"][key] = value
+        if receipt["scenario_id"] == "P0-06":
+            projection = receipt["result_projection"]
+            scenario["assertions"] = {
+                **receipt["assertions"],
+                "persona_acceptance_passed": True,
+                "privacy_canary_absent": True,
+            }
+            scenario["evidence_codes"] = [
+                "PERSONA_FILES_ARCHIVED",
+                "PERSONA_SOURCE_METADATA_VERIFIED",
+                "PERSONA_IMPORT_DONE",
+                "PERSONA_ACCEPTANCE_PASSED",
+                "PRIVACY_CANARY_ABSENT",
+            ]
+            scenario["persona_finalizer"] = {
+                "fixture_id": "persona-import-v1",
+                "evidence_sha256": projection["evidence_sha256"],
+                "request_id": receipt["request_ids"][0],
+                "job_id": projection["job_id"],
+                "semantic_judgment_bound": True,
+                "finalizer_ok": True,
+                "private_evidence_deleted": True,
+                "archive_upload_count": projection["archive_upload_count"],
+                "archive_receipts_verified": projection[
+                    "archive_receipts_verified"
+                ],
+                "genesis_upload_metadata_verified": projection[
+                    "genesis_upload_metadata_verified"
+                ],
+                "privacy_violation_count": 0,
+            }
+        if receipt["scenario_id"] == "P0-13":
+            scenario["assertions"] = dict(receipt["assertions"])
+            scenario["evidence_codes"] = [
+                code
+                for assertion, code in (
+                    ("trace_correlation_confirmed", "TRACE_CORRELATION_CONFIRMED"),
+                    ("latency_attributed", "LATENCY_ATTRIBUTED"),
+                    ("cleanup_confirmed", "CLEANUP_CONFIRMED"),
+                )
+                if receipt["assertions"][assertion]
+            ]
+            continue
         for turn in receipt["turns"]:
             bound_turns.append(
                 {
@@ -693,16 +905,7 @@ def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
                     "trace_id": turn["trace_id"],
                     "ack_latency_ms": turn["ack_latency_ms"],
                     "reply_latency_ms": turn["reply_latency_ms"],
-                    "stage_latency_ms": {
-                        stage: None
-                        for stage in (
-                            "routing",
-                            "queue",
-                            "provider",
-                            "persistence",
-                            "delivery",
-                        )
-                    },
+                    "stage_latency_ms": turn["stage_latency_ms"],
                     "reply_count": turn["reply_count"],
                     "content_assertion_passed": (
                         True
@@ -714,7 +917,36 @@ def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
                     "out_of_order_detected": turn["out_of_order_detected"],
                 }
             )
+    trace_cleanup_receipt = next(
+        receipt for receipt in receipts if receipt["scenario_id"] == "P0-13"
+    )
+    trace_cleanup_projection = trace_cleanup_receipt["result_projection"]
+    projected_by_trace = {
+        turn["trace_id"]: turn for turn in trace_cleanup_receipt["turns"]
+    }
+    for turn in bound_turns:
+        turn["stage_latency_ms"] = projected_by_trace[turn["trace_id"]][
+            "stage_latency_ms"
+        ]
+    existing_trace_ids = {turn["trace_id"] for turn in bound_turns}
+    cot_turn = next(
+        turn
+        for turn in trace_cleanup_receipt["turns"]
+        if turn["trace_id"] not in existing_trace_ids
+    )
+    bound_turns.append(
+        {
+            "scenario_id": "P0-12",
+            **cot_turn,
+            "content_assertion_passed": bool(
+                cot_turn["content_assertion_passed"]
+            ),
+        }
+    )
     result["turns"] = bound_turns
+    result["latency"] = trace_cleanup_projection["latency"]
+    result["trace"] = trace_cleanup_projection["trace"]
+    result["cleanup"] = trace_cleanup_projection["cleanup"]
     if spec.environment["QA_QUALIFICATION_MODE"] == "diagnostic":
         _apply_diagnostic_parent_cleanup_deferral(result)
     spec.result_path.write_text(json.dumps(result) + "\n")
@@ -728,21 +960,19 @@ def _scenario_command_rows() -> list[dict[str, Any]]:
     commands = {
         "P0-06": (
             "QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=CAPTURE "
-            '"$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/tools/genesis_e2e.py" '
-            "distill-existing-session --api-url \"$IO_E2E_BASE_URL\" "
-            '--session-manifest "$QA_PRIVATE_MANIFEST" '
-            '--profile-id "$QA_PROFILE_ID" '
-            '--fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" '
-            '--private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" '
-            '--artifact-dir "$QA_ARTIFACT_DIR"',
+            '"$QA_PYTHON_BIN" '
+            '"$QA_SOURCE_ROOT/qa/request_live_scenario_probe.py" '
+            "--scenario P0-06 --attempt 1 "
+            '--request "$QA_WORK_ROOT/.live-probe-P0-06-1.request" '
+            '--facts "$QA_WORK_ROOT/live-probe-P0-06-1.facts.json"',
             "QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=REVIEW "
             '"$QA_PYTHON_BIN" -I -B -c '
             f"{shlex.quote(verifier.P0_06_REVIEW_PROGRAM)} "
             '"$QA_WORK_ROOT/p0-06-private-evidence.json" '
             '"$QA_WORK_ROOT/p0-06-semantic-judgment.json"',
             "QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=FINALIZE "
-            '"$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/tools/genesis_e2e.py" '
-            "distill-existing-session-finalize "
+            '"$QA_PYTHON_BIN" -I -B '
+            '"$QA_SOURCE_ROOT/qa/finalize_persona_review.py" '
             '--fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" '
             '--private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" '
             '--semantic-judgment "$QA_WORK_ROOT/p0-06-semantic-judgment.json" '
@@ -967,6 +1197,7 @@ def _launch(
     *,
     cot_probe_runner: launcher.CotProbeRunner | None = None,
     live_probe_runner: launcher.LiveProbeRunner | None = None,
+    persona_finalize_runner: launcher.PersonaFinalizeRunner | None = None,
 ) -> dict[str, Any]:
     def traced_runner(spec: launcher.WorkerSpec, timeout: int) -> int:
         try:
@@ -998,6 +1229,9 @@ def _launch(
         process_runner=traced_runner,
         cot_probe_runner=cot_probe_runner or _cot_probe_runner(),
         live_probe_runner=live_probe_runner or _live_probe_runner,
+        persona_finalize_runner=(
+            persona_finalize_runner or _persona_finalize_runner
+        ),
         worker_python=paths["worker_python"],
     )
 
@@ -1009,6 +1243,7 @@ def _launch_diagnostic(
     profile_ids: tuple[str, ...] = ("official-gemini",),
     cot_probe_runner: launcher.CotProbeRunner | None = None,
     live_probe_runner: launcher.LiveProbeRunner | None = None,
+    persona_finalize_runner: launcher.PersonaFinalizeRunner | None = None,
 ) -> dict[str, Any]:
     return launcher.launch(
         codex_bin=paths["codex_bin"],
@@ -1028,6 +1263,9 @@ def _launch_diagnostic(
         process_runner=runner,
         cot_probe_runner=cot_probe_runner or _cot_probe_runner(),
         live_probe_runner=live_probe_runner or _live_probe_runner,
+        persona_finalize_runner=(
+            persona_finalize_runner or _persona_finalize_runner
+        ),
         diagnostic=True,
         profile_ids=profile_ids,
         expected_runtime="hosted_resident",
@@ -1099,6 +1337,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
             "-c",
             f'default_permissions="io-e2e-agent-driven-test-{spec.profile_id}"',
         )
+        assert spec.command[8:10] == ("--disable", "network_proxy")
         assert "--ephemeral" not in spec.command
         assert "spawn_agent" not in spec.prompt
         assert "first response action MUST be a shell command execution" in spec.prompt
@@ -1129,6 +1368,19 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
             profile_id=spec.profile_id,
         )
         assert len(live_set["receipts"]) == len(live_request.LIVE_SCENARIO_IDS)
+        receipts_by_scenario = {
+            row["scenario_id"]: row for row in live_set["receipts"]
+        }
+        assert receipts_by_scenario["P0-06"]["result_projection"]["kind"] == (
+            "persona_capture"
+        )
+        assert receipts_by_scenario["P0-13"]["result_projection"]["kind"] == (
+            "trace_cleanup"
+        )
+        assert len(receipts_by_scenario["P0-13"]["turns"]) == 15
+        assert live_set["persona_finalizer"] == _persona_finalize_runner(
+            spec, receipts_by_scenario["P0-06"]
+        )
         assert len(live_sha) == 64
         facts = json.loads(spec.cot_facts_path.read_text())
         assert facts["profile_id"] == spec.profile_id
@@ -1160,14 +1412,16 @@ def test_fake_worker_completion_is_not_coupled_to_slowest_peer(tmp_path):
     paths = _setup(tmp_path)
     delayed = False
 
-    def slow_probe(spec, scenario_id, attempt, nonce):
+    def slow_probe(spec, scenario_id, attempt, nonce, prior_receipts):
         nonlocal delayed
         if spec.profile_id == "official-gemini" and not delayed:
             delayed = True
             # The old completion barrier expired at five seconds even though
             # every individual request was still inside its valid deadline.
             time.sleep(5.1)
-        return _live_probe_runner(spec, scenario_id, attempt, nonce)
+        return _live_probe_runner(
+            spec, scenario_id, attempt, nonce, prior_receipts
+        )
 
     receipt = _launch(
         paths,
@@ -1240,10 +1494,12 @@ def test_transient_request_publication_invokes_each_trusted_probe_once(
             )
         return original(path, **identity)
 
-    def counting_probe(spec, scenario_id, attempt, nonce):
+    def counting_probe(spec, scenario_id, attempt, nonce, prior_receipts):
         key = (spec.profile_id, scenario_id, attempt)
         invocations[key] = invocations.get(key, 0) + 1
-        return _live_probe_runner(spec, scenario_id, attempt, nonce)
+        return _live_probe_runner(
+            spec, scenario_id, attempt, nonce, prior_receipts
+        )
 
     monkeypatch.setattr(launcher, "load_request_marker", transient_load)
     receipt = _launch(
@@ -1442,6 +1698,31 @@ def test_release_rejects_nonzero_scenario_probe(tmp_path):
         _launch(
             paths,
             _successful_runner([], failed_scenario_command="P0-02"),
+        )
+
+    assert not paths["receipt"].exists()
+
+
+def test_release_rejects_parent_persona_finalizer_not_bound_to_capture(
+    tmp_path,
+):
+    paths = _setup(tmp_path)
+
+    def tampered_finalizer(spec, capture_receipt):
+        projection = json.loads(
+            json.dumps(_persona_finalize_runner(spec, capture_receipt))
+        )
+        projection["persona_finalizer"]["evidence_sha256"] = "0" * 64
+        return projection
+
+    with pytest.raises(
+        launcher.WorkerLaunchError,
+        match="live scenario receipt does not match worker result",
+    ):
+        _launch(
+            paths,
+            _successful_runner([]),
+            persona_finalize_runner=tampered_finalizer,
         )
 
     assert not paths["receipt"].exists()
@@ -1747,7 +2028,7 @@ def test_diagnostic_keeps_valid_worker_when_peer_uses_fallback(tmp_path):
     assert workers["official-gemini"]["result_source"] == "codex_worker"
     assert workers["official-gemini"]["fallback_reason"] is None
     assert workers["official-gemini"]["cot_evidence_failure"] is None
-    assert workers["official-gemini"]["completed_command_execution_count"] == 13
+    assert workers["official-gemini"]["completed_command_execution_count"] == 14
     assert workers["official-gemini"]["completed_scenario_command_ids"] == list(
         verifier.AGENT_LIVE_SCENARIO_IDS
     )
@@ -1829,7 +2110,7 @@ def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
     assert worker["thread_id"] is not None
     assert worker["session_id"] is not None
     assert len(worker["exec_events_sha256"]) == 64
-    assert worker["completed_command_execution_count"] == 13
+    assert worker["completed_command_execution_count"] == 14
     assert worker["completed_scenario_command_ids"] == list(
         verifier.AGENT_LIVE_SCENARIO_IDS
     )
@@ -2060,7 +2341,7 @@ def test_completed_command_evidence_unwraps_real_codex_shell_commands(tmp_path):
         p0_06_phases,
     ) = verifier.completed_command_evidence(path.resolve())
 
-    assert count == 13
+    assert count == 14
     assert scenario_ids == verifier.AGENT_LIVE_SCENARIO_IDS
     assert sop_read_first is True
     assert scenario_counts == verifier.MIN_SCENARIO_COMMAND_COUNTS
@@ -2258,6 +2539,91 @@ def test_persona_review_program_rejects_prefilled_judgment(tmp_path):
     assert clean.stdout == '{"safe":"review-me"}\n\n'
 
 
+def test_persona_review_plaintext_is_redacted_from_codex_events(tmp_path):
+    path = tmp_path / "events.jsonl"
+    command = _wrapped_codex_command(
+        "QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=REVIEW "
+        '"$QA_PYTHON_BIN" -I -B -c '
+        f"{shlex.quote(verifier.P0_06_REVIEW_PROGRAM)} "
+        '"$QA_WORK_ROOT/p0-06-private-evidence.json" '
+        '"$QA_WORK_ROOT/p0-06-semantic-judgment.json"'
+    )
+    rows = [
+        {
+            "type": "item.started",
+            "item": {
+                "type": "command_execution",
+                "id": "review-command",
+                "command": command,
+                "aggregated_output": "decrypted-persona-canary",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "id": "review-command",
+                "command": command,
+                "status": "completed",
+                "exit_code": 0,
+                "aggregated_output": "decrypted-persona-canary",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "id": "other-command",
+                "command": "pwd",
+                "status": "completed",
+                "exit_code": 0,
+                "aggregated_output": "safe-output",
+            },
+        },
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    launcher._redact_persona_review_event_output(path.resolve())
+
+    raw = path.read_text(encoding="utf-8")
+    assert "decrypted-persona-canary" not in raw
+    assert "safe-output" in raw
+    redacted = [json.loads(line) for line in raw.splitlines()]
+    review_rows = [
+        row
+        for row in redacted
+        if row.get("item", {}).get("id") == "review-command"
+    ]
+    assert len(review_rows) == 2
+    assert all(row["item"]["output_redacted"] is True for row in review_rows)
+    assert review_rows[-1]["item"]["exit_code"] == 0
+
+
+def test_schema_valid_negative_persona_verdict_counts_as_completed_phase(tmp_path):
+    path = tmp_path / "events.jsonl"
+    rows = _scenario_command_rows()
+    finalize = next(
+        row
+        for row in rows
+        if "QA_SCENARIO_PHASE=FINALIZE" in row["item"]["command"]
+    )
+    finalize["item"]["aggregated_output"] = '{"ok":false}'
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    (
+        _count,
+        _ids,
+        _sop_first,
+        scenario_counts,
+        p0_06_phases,
+    ) = verifier.completed_command_evidence(path.resolve())
+
+    assert scenario_counts["P0-06"] == 3
+    assert p0_06_phases == verifier.P0_06_COMMAND_PHASES
+
+
 @pytest.mark.parametrize(
     "command",
     (
@@ -2269,8 +2635,8 @@ def test_persona_review_program_rejects_prefilled_judgment(tmp_path):
         (
             "QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=FINALIZE "
             '"$QA_PYTHON_BIN" -c \'print(1)\' '
-            '"$QA_SOURCE_ROOT/tools/genesis_e2e.py" '
-            "distill-existing-session-finalize --private-evidence "
+            '"$QA_SOURCE_ROOT/qa/finalize_persona_review.py" '
+            "--private-evidence "
             '"$QA_WORK_ROOT/p0-06-private-evidence.json"'
         ),
         (

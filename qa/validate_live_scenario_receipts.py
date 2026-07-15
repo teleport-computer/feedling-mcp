@@ -46,12 +46,18 @@ _TURN_COUNTS = {
     "P0-03": 0,
     "P0-04": 0,
     "P0-05": 0,
+    "P0-06": 0,
     "P0-07": 0,
     "P0-08": 1,
     "P0-09": 10,
     "P0-10": 2,
     "P0-11": 1,
+    # P0-13 does not create new product turns.  Its parent-owned receipt
+    # projects the fifteen earlier chat/COT turns so their five-stage latency
+    # evidence can be bound without giving the profile worker network access.
+    "P0-13": 15,
 }
+_TRACE_STAGES = ("routing", "queue", "provider", "persistence", "delivery")
 DETERMINISTIC_ASSERTIONS = {
     "P0-02": frozenset(
         {"synthetic_account_is_fresh", "whoami_matches", "trace_cleared"}
@@ -67,6 +73,13 @@ DETERMINISTIC_ASSERTIONS = {
             "runtime_status_readback_succeeds",
             "runtime_configured",
             "runtime_metadata_recorded",
+        }
+    ),
+    "P0-06": frozenset(
+        {
+            "persona_files_archived",
+            "persona_source_metadata_verified",
+            "persona_import_done",
         }
     ),
     "P0-07": frozenset(
@@ -98,12 +111,21 @@ DETERMINISTIC_ASSERTIONS = {
     "P0-11": frozenset(
         {"transport_correlated", "provider_config_matches", "trace_route_correlated"}
     ),
+    "P0-13": frozenset(
+        {
+            "trace_stages_complete",
+            "trace_correlation_confirmed",
+            "latency_attributed",
+            "cleanup_confirmed",
+        }
+    ),
 }
 SEMANTIC_ASSERTIONS = {
     "P0-02": (),
     "P0-03": (),
     "P0-04": (),
     "P0-05": (),
+    "P0-06": ("persona_acceptance_passed", "privacy_canary_absent"),
     "P0-07": (),
     "P0-08": (),
     "P0-09": (),
@@ -113,6 +135,7 @@ SEMANTIC_ASSERTIONS = {
         "contradictory_facts_absent",
     ),
     "P0-11": ("agent_identity_confirmed", "model_route_confirmed"),
+    "P0-13": (),
 }
 _RECEIPT_KEYS = frozenset(
     {
@@ -133,6 +156,7 @@ _RECEIPT_KEYS = frozenset(
         "turn_ids",
         "trace_ids",
         "turns",
+        "result_projection",
         "private_facts_sha256",
         "raw_content_stored",
     }
@@ -145,6 +169,7 @@ _TURN_KEYS = frozenset(
         "trace_id",
         "ack_latency_ms",
         "reply_latency_ms",
+        "stage_latency_ms",
         "reply_count",
         "content_assertion_passed",
         "fallback_detected",
@@ -197,6 +222,206 @@ def _number_or_none(value: object) -> bool:
         and not isinstance(value, bool)
         and math.isfinite(value)
         and value >= 0
+    )
+
+
+def _nearest_rank(values: Sequence[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    rank = max(1, math.ceil(percentile * len(ordered)))
+    return ordered[rank - 1]
+
+
+def latency_projection(turns: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Project the canonical latency summary from parent-owned turn facts."""
+
+    rows = list(turns)
+
+    def complete_percentile(field: str, percentile: float) -> float | None:
+        values = [row.get(field) for row in rows]
+        if len(values) != len(rows) or any(not _number_or_none(value) for value in values):
+            return None
+        if any(value is None for value in values):
+            return None
+        return _nearest_rank([float(value) for value in values], percentile)
+
+    stage_values: dict[str, float | None] = {}
+    missing: list[str] = []
+    for stage in _TRACE_STAGES:
+        values: list[float] = []
+        complete = True
+        for row in rows:
+            stage_latency = row.get("stage_latency_ms")
+            value = stage_latency.get(stage) if isinstance(stage_latency, Mapping) else None
+            if not _number_or_none(value) or value is None:
+                complete = False
+                break
+            values.append(float(value))
+        if rows and complete and len(values) == len(rows):
+            stage_values[stage] = _nearest_rank(values, 0.5)
+        else:
+            stage_values[stage] = None
+            missing.append(stage)
+    return {
+        "sample_count": len(rows),
+        "ack_p50_ms": complete_percentile("ack_latency_ms", 0.5),
+        "reply_p50_ms": complete_percentile("reply_latency_ms", 0.5),
+        "reply_p95_ms": complete_percentile("reply_latency_ms", 0.95),
+        "stage_p50_ms": stage_values,
+        "missing_stages": missing,
+    }
+
+
+def _valid_persona_projection(value: object) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "kind",
+            "evidence_sha256",
+            "job_id",
+            "archive_upload_count",
+            "archive_receipts_verified",
+            "genesis_upload_metadata_verified",
+        }
+        and value.get("kind") == "persona_capture"
+        and isinstance(value.get("evidence_sha256"), str)
+        and _SHA256_RE.fullmatch(value["evidence_sha256"]) is not None
+        and _safe_id(value.get("job_id"))
+        and value.get("archive_upload_count") == 4
+        and value.get("archive_receipts_verified") is True
+        and value.get("genesis_upload_metadata_verified") is True
+    )
+
+
+def _valid_parent_persona_finalizer(
+    value: object, capture_receipt: Mapping[str, Any]
+) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "semantic_assertions",
+        "persona_finalizer",
+    }:
+        return False
+    semantic = value.get("semantic_assertions")
+    finalizer = value.get("persona_finalizer")
+    capture = capture_receipt.get("result_projection")
+    request_ids = capture_receipt.get("request_ids")
+    if (
+        value.get("kind") != "persona_finalizer"
+        or not isinstance(semantic, dict)
+        or set(semantic)
+        != {"persona_acceptance_passed", "privacy_canary_absent"}
+        or any(type(item) is not bool for item in semantic.values())
+        or not isinstance(finalizer, dict)
+        or set(finalizer)
+        != {
+            "fixture_id",
+            "evidence_sha256",
+            "request_id",
+            "job_id",
+            "semantic_judgment_bound",
+            "finalizer_ok",
+            "private_evidence_deleted",
+            "archive_upload_count",
+            "archive_receipts_verified",
+            "genesis_upload_metadata_verified",
+            "privacy_violation_count",
+        }
+        or not isinstance(capture, Mapping)
+        or not isinstance(request_ids, list)
+        or len(request_ids) != 1
+    ):
+        return False
+    privacy_count = finalizer.get("privacy_violation_count")
+    return bool(
+        finalizer.get("fixture_id") == "persona-import-v1"
+        and finalizer.get("evidence_sha256") == capture.get("evidence_sha256")
+        and finalizer.get("request_id") == request_ids[0]
+        and finalizer.get("job_id") == capture.get("job_id")
+        and finalizer.get("semantic_judgment_bound") is True
+        and type(finalizer.get("finalizer_ok")) is bool
+        and finalizer.get("private_evidence_deleted") is True
+        and finalizer.get("archive_upload_count")
+        == capture.get("archive_upload_count")
+        and finalizer.get("archive_receipts_verified")
+        == capture.get("archive_receipts_verified")
+        and finalizer.get("genesis_upload_metadata_verified")
+        == capture.get("genesis_upload_metadata_verified")
+        and type(privacy_count) is int
+        and privacy_count >= 0
+        and semantic.get("persona_acceptance_passed")
+        is finalizer.get("finalizer_ok")
+        and semantic.get("privacy_canary_absent") is (privacy_count == 0)
+    )
+
+
+def _valid_trace_cleanup_projection(
+    value: object, turns: Sequence[Mapping[str, Any]]
+) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "latency",
+        "trace",
+        "cleanup",
+    }:
+        return False
+    latency = value.get("latency")
+    trace = value.get("trace")
+    cleanup = value.get("cleanup")
+    if value.get("kind") != "trace_cleanup" or latency != latency_projection(turns):
+        return False
+    if not isinstance(trace, dict) or set(trace) != {
+        "enabled",
+        "deploy_enabled",
+        "correlated_event_count",
+        "observed_event_types",
+        "missing_required_event_types",
+        "raw_trace_stored",
+    }:
+        return False
+    observed = trace.get("observed_event_types")
+    missing = trace.get("missing_required_event_types")
+    if (
+        type(trace.get("enabled")) is not bool
+        or type(trace.get("deploy_enabled")) is not bool
+        or type(trace.get("correlated_event_count")) is not int
+        or trace["correlated_event_count"] < 0
+        or not isinstance(observed, list)
+        or not isinstance(missing, list)
+        or any(not isinstance(item, str) for item in observed + missing)
+        or any(item not in _TRACE_STAGES for item in observed + missing)
+        or observed != [stage for stage in _TRACE_STAGES if stage in observed]
+        or missing != [stage for stage in _TRACE_STAGES if stage in missing]
+        or len(observed) != len(set(observed))
+        or len(missing) != len(set(missing))
+        or set(observed).intersection(missing)
+        or set(observed).union(missing) != set(_TRACE_STAGES)
+        or trace.get("raw_trace_stored") is not False
+    ):
+        return False
+    if not isinstance(cleanup, dict) or set(cleanup) != {
+        "attempted",
+        "provider_config_deleted",
+        "account_reset",
+        "old_credential_rejected",
+        "status",
+    }:
+        return False
+    cleanup_values = [
+        cleanup.get(field)
+        for field in (
+            "attempted",
+            "provider_config_deleted",
+            "account_reset",
+            "old_credential_rejected",
+        )
+    ]
+    return bool(
+        all(type(item) is bool for item in cleanup_values)
+        and cleanup.get("status") in _STATUSES
+        and ((all(cleanup_values)) is (cleanup.get("status") == "PASS"))
     )
 
 
@@ -321,10 +546,23 @@ def validate_receipt_object(
         if (
             turn.get("turn_index") != index
             or not _safe_id(turn.get("request_id"))
-            or turn.get("turn_id") != turn.get("request_id")
-            or turn.get("trace_id") != turn.get("request_id")
+            or not _safe_id(turn.get("turn_id"))
+            or not _safe_id(turn.get("trace_id"))
+            or (
+                actual_scenario != "P0-13"
+                and (
+                    turn.get("turn_id") != turn.get("request_id")
+                    or turn.get("trace_id") != turn.get("request_id")
+                )
+            )
             or not _number_or_none(turn.get("ack_latency_ms"))
             or not _number_or_none(turn.get("reply_latency_ms"))
+            or not isinstance(turn.get("stage_latency_ms"), dict)
+            or set(turn["stage_latency_ms"]) != set(_TRACE_STAGES)
+            or any(
+                not _number_or_none(value)
+                for value in turn["stage_latency_ms"].values()
+            )
             or type(turn.get("reply_count")) is not int
             or turn["reply_count"] < 0
             or turn.get("content_assertion_passed") not in (True, False, None)
@@ -352,8 +590,12 @@ def validate_receipt_object(
             or turn["duplicate_detected"]
             or turn["out_of_order_detected"]
             or (
-                actual_scenario not in {"P0-10", "P0-11"}
+                actual_scenario not in {"P0-10", "P0-11", "P0-13"}
                 and turn["content_assertion_passed"] is not True
+            )
+            or (
+                actual_scenario == "P0-13"
+                and any(value is None for value in turn["stage_latency_ms"].values())
             )
         ):
             raise LiveScenarioReceiptError("passing live receipt turn is incomplete")
@@ -368,7 +610,16 @@ def validate_receipt_object(
         for values in (request_ids, turn_ids, trace_ids)
     ):
         raise LiveScenarioReceiptError("live scenario identifiers are invalid")
-    if turns:
+    if actual_scenario == "P0-13":
+        if (
+            len(request_ids) != 1
+            or turn_ids != [turn["turn_id"] for turn in turns]
+            or trace_ids != [turn["trace_id"] for turn in turns]
+        ):
+            raise LiveScenarioReceiptError(
+                "trace-cleanup identifiers do not match projected turns"
+            )
+    elif turns:
         expected = [turn["request_id"] for turn in turns]
         if request_ids != expected or turn_ids != expected or trace_ids != expected:
             raise LiveScenarioReceiptError("live scenario identifiers do not match turns")
@@ -382,6 +633,52 @@ def validate_receipt_object(
         or trace_ids
     ):
         raise LiveScenarioReceiptError("live scenario probe identifier is invalid")
+    projection = receipt.get("result_projection")
+    if actual_scenario == "P0-06":
+        if receipt["status"] == "PASS" and not _valid_persona_projection(projection):
+            raise LiveScenarioReceiptError("persona capture projection is invalid")
+        if projection is not None and not _valid_persona_projection(projection):
+            raise LiveScenarioReceiptError("persona capture projection is invalid")
+    elif actual_scenario == "P0-13":
+        if receipt["status"] == "PASS" and not _valid_trace_cleanup_projection(
+            projection, turns
+        ):
+            raise LiveScenarioReceiptError("trace-cleanup projection is invalid")
+        if projection is not None and not _valid_trace_cleanup_projection(
+            projection, turns
+        ):
+            raise LiveScenarioReceiptError("trace-cleanup projection is invalid")
+        if isinstance(projection, Mapping):
+            cleanup = projection["cleanup"]
+            trace = projection["trace"]
+            latency = projection["latency"]
+            expected_trace_complete = not latency["missing_stages"]
+            expected_correlation = bool(
+                len(turns) == 15 and len(set(trace_ids)) == 15
+            )
+            expected_cleanup = all(
+                cleanup[field]
+                for field in (
+                    "attempted",
+                    "provider_config_deleted",
+                    "account_reset",
+                    "old_credential_rejected",
+                )
+            )
+            if (
+                assertions.get("trace_stages_complete") is not expected_trace_complete
+                or assertions.get("trace_correlation_confirmed")
+                is not expected_correlation
+                or assertions.get("latency_attributed") is not expected_trace_complete
+                or assertions.get("cleanup_confirmed") is not expected_cleanup
+                or trace.get("missing_required_event_types")
+                != latency.get("missing_stages")
+            ):
+                raise LiveScenarioReceiptError(
+                    "trace-cleanup projection is inconsistent"
+                )
+    elif projection is not None:
+        raise LiveScenarioReceiptError("unrelated live result projection is present")
     return dict(receipt)
 
 
@@ -394,6 +691,7 @@ def validate_aggregate_object(
         "run_id",
         "profile_id",
         "receipts",
+        "persona_finalizer",
     }:
         raise LiveScenarioReceiptError("live receipt aggregate shape is invalid")
     if (
@@ -436,6 +734,15 @@ def validate_aggregate_object(
             )
     if cursor != len(receipts):
         raise LiveScenarioReceiptError("live receipt scenario order is invalid")
+    capture_rows = [
+        row for row in validated if row.get("scenario_id") == "P0-06"
+    ]
+    if len(capture_rows) != 1 or not _valid_parent_persona_finalizer(
+        payload.get("persona_finalizer"), capture_rows[0]
+    ):
+        raise LiveScenarioReceiptError(
+            "parent persona finalizer is missing or inconsistent"
+        )
     result = dict(payload)
     result["receipts"] = validated
     return result
@@ -469,7 +776,13 @@ def validate_result_binding(
     scenarios = profile_result.get("scenarios")
     turns = profile_result.get("turns")
     receipts = aggregate.get("receipts")
-    if not isinstance(scenarios, list) or not isinstance(turns, list) or not isinstance(receipts, list):
+    parent_persona = aggregate.get("persona_finalizer")
+    if (
+        not isinstance(scenarios, list)
+        or not isinstance(turns, list)
+        or not isinstance(receipts, list)
+        or not isinstance(parent_persona, Mapping)
+    ):
         raise LiveScenarioReceiptError("live receipts do not match worker result")
     by_scenario: dict[str, list[Mapping[str, Any]]] = {
         scenario_id: [] for scenario_id in LIVE_SCENARIO_IDS
@@ -487,6 +800,7 @@ def validate_result_binding(
         raise LiveScenarioReceiptError("live receipts do not match worker result")
 
     expected_turns: list[tuple[str, Mapping[str, Any]]] = []
+    trace_cleanup_receipt: Mapping[str, Any] | None = None
     for scenario_id in LIVE_SCENARIO_IDS:
         scenario = result_scenarios.get(scenario_id)
         rows = by_scenario[scenario_id]
@@ -511,6 +825,10 @@ def validate_result_binding(
                     receipt.get("status") != "PASS"
                     and attempt_result.get("status") != receipt.get("status")
                 )
+                or (
+                    scenario_id == "P0-13"
+                    and attempt_result.get("status") != receipt.get("status")
+                )
             ):
                 raise LiveScenarioReceiptError("worker result is greener than live receipt")
         bounded_retry = [row.get("status") for row in rows] == [
@@ -523,6 +841,10 @@ def validate_result_binding(
             and scenario.get("status") == "PASS"
         ):
             raise LiveScenarioReceiptError("worker result is greener than live receipt")
+        if scenario_id == "P0-13" and scenario.get("status") != rows[-1].get(
+            "status"
+        ):
+            raise LiveScenarioReceiptError("trace-cleanup status does not match receipt")
         assertions = scenario.get("assertions")
         if not isinstance(assertions, Mapping):
             raise LiveScenarioReceiptError("live receipts do not match worker result")
@@ -535,11 +857,87 @@ def validate_result_binding(
             ]
             if scenario.get(field) != expected_ids:
                 raise LiveScenarioReceiptError("live identifiers do not match worker result")
-        expected_turns.extend(
-            (scenario_id, turn)
-            for receipt in rows
-            for turn in receipt.get("turns", [])
-        )
+        if scenario_id == "P0-06":
+            semantic = parent_persona.get("semantic_assertions")
+            finalizer = parent_persona.get("persona_finalizer")
+            if (
+                not _valid_parent_persona_finalizer(parent_persona, rows[-1])
+                or not isinstance(semantic, Mapping)
+                or not isinstance(finalizer, Mapping)
+                or scenario.get("persona_finalizer") != finalizer
+                or any(
+                    assertions.get(key) is not value
+                    for key, value in semantic.items()
+                )
+            ):
+                raise LiveScenarioReceiptError(
+                    "parent persona finalizer does not match worker result"
+                )
+            privacy_ok = semantic.get("privacy_canary_absent") is True
+            acceptance_ok = semantic.get("persona_acceptance_passed") is True
+            if privacy_ok and acceptance_ok:
+                expected_status = "PASS"
+                expected_failure = None
+            elif not privacy_ok:
+                expected_status = "SECURITY_FAIL"
+                expected_failure = {
+                    "category": "SECURITY_FAIL",
+                    "stage_code": "PERSONA_IMPORT",
+                    "failure_code": "REDACTION_ASSERTION_FAILED",
+                    "reproducible": True,
+                }
+            else:
+                expected_status = "PRODUCT_FAIL"
+                expected_failure = {
+                    "category": "PRODUCT_FAIL",
+                    "stage_code": "PERSONA_IMPORT",
+                    "failure_code": "PERSONA_ACCEPTANCE_FAILED",
+                    "reproducible": True,
+                }
+            expected_codes = [
+                code
+                for assertion, code in (
+                    ("persona_files_archived", "PERSONA_FILES_ARCHIVED"),
+                    (
+                        "persona_source_metadata_verified",
+                        "PERSONA_SOURCE_METADATA_VERIFIED",
+                    ),
+                    ("persona_import_done", "PERSONA_IMPORT_DONE"),
+                    (
+                        "persona_acceptance_passed",
+                        "PERSONA_ACCEPTANCE_PASSED",
+                    ),
+                    ("privacy_canary_absent", "PRIVACY_CANARY_ABSENT"),
+                )
+                if assertions.get(assertion) is True
+            ]
+            attempt_failure = (
+                attempt_results[0].get("failure")
+                if isinstance(attempt_results[0], Mapping)
+                else None
+            )
+            if (
+                scenario.get("status") != expected_status
+                or attempt_results[0].get("status") != expected_status
+                or scenario.get("failure") != expected_failure
+                or attempt_failure != expected_failure
+                or scenario.get("evidence_codes") != expected_codes
+                or (
+                    expected_status != "PASS"
+                    and profile_result.get("status") == "PASS"
+                )
+            ):
+                raise LiveScenarioReceiptError(
+                    "parent persona verdict does not match worker result"
+                )
+        if scenario_id == "P0-13":
+            trace_cleanup_receipt = rows[-1]
+        else:
+            expected_turns.extend(
+                (scenario_id, turn)
+                for receipt in rows
+                for turn in receipt.get("turns", [])
+            )
 
     actual_turns = [
         row
@@ -571,3 +969,113 @@ def validate_result_binding(
             )
         ):
             raise LiveScenarioReceiptError("live turns do not match worker result")
+
+    if trace_cleanup_receipt is None:
+        raise LiveScenarioReceiptError("trace-cleanup receipt is missing")
+    projection = trace_cleanup_receipt.get("result_projection")
+    projected_turns = trace_cleanup_receipt.get("turns")
+    if not isinstance(projection, Mapping) or not isinstance(projected_turns, list):
+        raise LiveScenarioReceiptError("trace-cleanup projection is missing")
+    actual_by_trace = {
+        row.get("trace_id"): row
+        for row in turns
+        if isinstance(row, Mapping) and _safe_id(row.get("trace_id"))
+    }
+    if (
+        len(actual_by_trace) != len(turns)
+        or len(projected_turns) != len(actual_by_trace)
+    ):
+        raise LiveScenarioReceiptError("trace-cleanup turns do not match worker result")
+    for expected in projected_turns:
+        actual = actual_by_trace.get(expected.get("trace_id"))
+        if not isinstance(actual, Mapping) or any(
+            actual.get(field) != expected.get(field)
+            for field in (
+                "request_id",
+                "turn_id",
+                "trace_id",
+                "ack_latency_ms",
+                "reply_latency_ms",
+                "stage_latency_ms",
+                "reply_count",
+                "fallback_detected",
+                "duplicate_detected",
+                "out_of_order_detected",
+            )
+        ):
+            raise LiveScenarioReceiptError(
+                "trace-cleanup turns do not match worker result"
+            )
+        if (
+            expected.get("content_assertion_passed") is not None
+            and actual.get("content_assertion_passed")
+            != expected.get("content_assertion_passed")
+        ):
+            raise LiveScenarioReceiptError(
+                "trace-cleanup turns do not match worker result"
+            )
+    if (
+        profile_result.get("latency") != projection.get("latency")
+        or profile_result.get("trace") != projection.get("trace")
+        or profile_result.get("cleanup") != projection.get("cleanup")
+    ):
+        raise LiveScenarioReceiptError(
+            "trace-cleanup profile projection does not match worker result"
+        )
+    p0_13 = result_scenarios.get("P0-13")
+    assertions = p0_13.get("assertions") if isinstance(p0_13, Mapping) else None
+    expected_codes = [
+        code
+        for assertion, code in (
+            ("trace_correlation_confirmed", "TRACE_CORRELATION_CONFIRMED"),
+            ("latency_attributed", "LATENCY_ATTRIBUTED"),
+            ("cleanup_confirmed", "CLEANUP_CONFIRMED"),
+        )
+        if isinstance(assertions, Mapping) and assertions.get(assertion) is True
+    ]
+    if not isinstance(p0_13, Mapping) or p0_13.get("evidence_codes") != expected_codes:
+        raise LiveScenarioReceiptError(
+            "trace-cleanup evidence codes do not match receipt"
+        )
+    receipt_status = trace_cleanup_receipt.get("status")
+    receipt_failure = trace_cleanup_receipt.get("failure_code")
+    expected_failure = None if receipt_status == "PASS" else receipt_failure
+    expected_stage = (
+        "CLEANUP"
+        if receipt_failure == "PRECONDITION_MISSING"
+        else "TRACE_LATENCY_CLEANUP"
+    )
+    scenario_failure = p0_13.get("failure")
+    attempts = p0_13.get("attempt_results")
+    if expected_failure is None:
+        failure_matches = scenario_failure is None
+        attempt_failure_matches = bool(
+            isinstance(attempts, list)
+            and len(attempts) == 1
+            and isinstance(attempts[0], Mapping)
+            and attempts[0].get("failure") is None
+        )
+    else:
+        failure_matches = bool(
+            isinstance(scenario_failure, Mapping)
+            and scenario_failure.get("category") == receipt_status
+            and scenario_failure.get("stage_code") == expected_stage
+            and scenario_failure.get("failure_code") == expected_failure
+        )
+        attempt_failure = (
+            attempts[0].get("failure")
+            if isinstance(attempts, list)
+            and len(attempts) == 1
+            and isinstance(attempts[0], Mapping)
+            else None
+        )
+        attempt_failure_matches = bool(
+            isinstance(attempt_failure, Mapping)
+            and attempt_failure.get("category") == receipt_status
+            and attempt_failure.get("stage_code") == expected_stage
+            and attempt_failure.get("failure_code") == expected_failure
+        )
+    if not failure_matches or not attempt_failure_matches:
+        raise LiveScenarioReceiptError(
+            "trace-cleanup failure does not match receipt"
+        )

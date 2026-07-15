@@ -69,15 +69,27 @@ The protected workflow is deliberately split across explicit trust zones:
    independent top-level `codex exec` processes in three fixed batches (3+3+2),
    with at most three running concurrently. Each selected Codex profile exposes
    only its matching row and isolated home/temp/work roots; no process receives
-   provider or admin credentials.
+   provider or admin credentials. Every profile worker and the aggregation
+   supervisor have tool/shell network fully disabled—no allowed domains, no
+   local binding, and no network proxy. Codex's authenticated OAuth model
+   transport remains a separate trusted process boundary. All Feedling/provider
+   I/O is performed by deterministic parent code after fixed local request
+   markers; workers only review bounded facts and make semantic judgments.
 4. Every profile agent returns one structured `profileResult`. For P0-02–P0-05
    and P0-07–P0-11, trusted launcher code accepts only the exact
    `request_live_scenario_probe.py` command and scenario/attempt-bound paths.
    The unprivileged helper creates a one-shot request; the parent performs the
    fixed live mutation, owns a sanitized `live-scenario-receipts.json`, and
    binds its status, IDs, turns, duplicate/order observations, and latencies to
-   the result. P0-06 retains separate exact capture, evidence-review, and
-   finalization calls. The launcher validates the result against a
+   the result. For P0-06, the agent's CAPTURE command only requests work; the
+   parent performs uploads and Genesis capture, keeps an authoritative copy
+   outside the worker-readable roots, and gives the agent a byte-identical
+   review copy. The agent runs an offline REVIEW and local Genesis FINALIZE;
+   after it exits, the parent independently finalizes the authoritative copy
+   with the same judgment and binds only that projection. P0-13 is also parent-owned: the
+   parent reads/correlates trace evidence, derives five-stage latency, and owns
+   cleanup while the worker copies and judges the bounded projection. The
+   launcher validates the result against a
    profile-locked Structured Outputs schema, validates and binds the private
    P0-12 receipt to the result's exact
    request/turn/trace IDs and bounded reasoning fields, and binds the result
@@ -118,15 +130,21 @@ The protected workflow is deliberately split across explicit trust zones:
    the trusted process/thread/hash receipt, unchanged trusted pre/post liveness
    receipts, strict Runtime V2 user-path evidence when selected, exact binding
    to the owner-only read-only provisioning manifest, PASS statuses, and required
-   artifact paths.
+   artifact paths. A missing or uncorrelatable trace is
+   `BLOCKED_EVIDENCE / TRACE_UNAVAILABLE`; a correlated turn missing any numeric
+   `routing`, `queue`, `provider`, `persistence`, or `delivery` duration is
+   `BLOCKED_EVIDENCE / TRACE_INCOMPLETE`. Neither can be inferred from history
+   or agent prose.
 9. The workflow always runs deterministic cleanup across all nine synthetic
    accounts. For every provider profile it proves the configured route existed,
    deletes the route when it is still authenticated, verifies the public
    projection and encrypted key envelope are gone, resets the account, confirms
    lease-attested PostgreSQL absence, and confirms the old Feedling key returns
-   `401`. An account already reset by its profile worker is accepted only after
-   the same database-authoritative proof; provider cleanup is then bound to the
-   account deletion cascade. `validate_cleanup_receipt.py` requires the exact
+   `401`. Profile workers never call cleanup endpoints. The P0-13 parent probe
+   owns release cleanup; in the local adminless diagnostic it defers mutation so
+   the outer deterministic parent can perform the sole reset. In both modes the
+   same database-authoritative proof binds provider cleanup to the account
+   deletion cascade. `validate_cleanup_receipt.py` requires the exact
    locked matrix and binds this sanitized receipt to the agent's cleanup
    fields. The private manifests remain available for the final secret scan,
    and only a scanned, cleanup-bound public artifact directory is uploaded.
@@ -241,11 +259,14 @@ receipt to prove the correct final answer, one correlated reasoning event,
 reasoning metadata, and a delivered user-visible disclosure. A profile agent
 cannot override a missing, failed, or mismatched receipt with a PASS judgment.
 For P0-13, the profile artifact deliberately remains `BLOCKED_EVIDENCE` with the
-fixed parent-cleanup deferral; it is never rewritten. The diagnostic becomes
-green only after the deterministic parent publishes a separate exact cleanup
-verification and a parent-finalized per-profile projection. Attempted and
-cleaned counts must equal the selected profile count, failed IDs must be empty,
-and the provisioning manifest must be deleted and not missing.
+fixed parent-cleanup deferral; it is never rewritten. The worker must also copy
+the parent probe's actual trace assertions and five-stage timing. The diagnostic
+becomes green only when all five stages are correlated and numeric and the
+deterministic parent publishes a separate exact cleanup verification plus a
+parent-finalized per-profile projection. Missing trace evidence remains blocked
+after cleanup. Attempted and cleaned counts must equal the selected profile
+count, failed IDs must be empty, and the provisioning manifest must be deleted
+and not missing.
 When an otherwise valid receipt disagrees with the agent-authored projection,
 the matrix reports the gate failure (`COT_RESULT_BINDING_MISMATCH`) separately
 from the receipt's trusted observation status/code, so the underlying product
@@ -260,18 +281,26 @@ validation, four-part persona import/distillation, basic and ten-turn chat,
 memory/persona consistency, model identity, reasoning disclosure, latency
 attribution, trace correlation, and cleanup.
 
-Persona qualification is deliberately two-phase. The existing-session capture
-imports once and writes decrypted live evidence only to an isolated worker's
-owner-mode `0600` temp file. That profile agent reads it and writes a bounded
-semantic judgment tied to the capture SHA-256; deterministic finalization checks
-the hash and judgment contracts, emits only sanitized evidence, and deletes the
-plaintext on every exit path.
+Persona qualification deliberately separates network capture from semantic
+review. The worker's CAPTURE helper writes only a local request; deterministic
+parent code imports once, keeps the authoritative decrypted evidence under the
+worker-inaccessible output root, and writes a byte-identical owner-mode `0600`
+review copy into the worker root. The profile agent reads that copy offline and
+writes a bounded semantic judgment tied to the capture SHA-256. Its local
+Genesis finalizer provides the bounded result needed for authoring, while the
+parent independently applies the same judgment to the authoritative copy and
+binds that sanitized projection into the receipt set. Both plaintext copies and
+the judgment are deleted on every terminal path. Because the REVIEW tool prints
+the copy for offline model inspection, the deterministic launcher also scrubs
+that command's output from `events.jsonl` immediately after the worker exits,
+before event hashing or any private diagnostic retention.
 
 Codex is intentionally the semantic-judgment trust boundary, not an adversarial
 program being cryptographically proved to have "thought." Deterministic code
 proves ordered successful evidence access, rejects a fixed-path persona judgment
-that already exists at REVIEW, binds the reviewed capture hash through the
-Genesis finalizer, and validates the resulting schema/evidence. It cannot prove
+that already exists at REVIEW, independently finalizes an immutable parent copy,
+binds the reviewed capture hash through the Genesis finalizer, and validates the
+resulting schema/evidence. It cannot prove
 the model's internal reasoning or defeat a deliberately deceptive judge that
 manufactures an alternate prefill and copies it later; that would require a
 second independent judge or a different trust model.
@@ -507,17 +536,19 @@ checkout access, read-only access to exactly one one-row synthetic-account
 manifest, writes only to that worker's disposable roots, denial of public
 artifacts, sibling manifests, raw worker outputs, aggregation inputs, the full
 cleanup manifest, and the lifecycle receipt, disabled web/browser/apps/plugins
-and login shells, and managed-proxy traffic only to `test-api.feedling.app`.
-The aggregation supervisor has no manifest or raw-output access and runs with
-network proxying disabled. Before provisioning, the workflow verifies OAuth,
-strict profile selection, no configured MCP server, filesystem boundaries,
-allowed test-API egress, and denied external/raw-IP bypasses. After provisioning,
-it probes all eight exact mode-`0600` rows for own-read/other-deny isolation.
+and login shells, and fully disabled tool/shell networking. There is no domain
+allowlist and local binding is false. The aggregation supervisor has no manifest
+or raw-output access and the same disabled-network boundary. Before
+provisioning, the workflow verifies OAuth, strict profile selection, no
+configured MCP server, filesystem boundaries, and that a real worker sandbox
+cannot reach either the test API or a public endpoint. After provisioning, it
+probes all eight exact mode-`0600` rows for own-read/other-deny isolation.
 
 Keep an independent runner/VPC egress policy as a second boundary: the Codex
-parent needs OpenAI/ChatGPT service access, while model-driven subprocesses should
-reach only `test-api.feedling.app`. Prompt rules and artifact scanning are not
-credential-isolation controls.
+parent needs OpenAI/ChatGPT service access and deterministic parent probes need
+the test API, while model-driven tool subprocesses must have no network path.
+Codex's authenticated model transport is separate from that tool sandbox.
+Prompt rules and artifact scanning are not credential-isolation controls.
 
 ### Scope of self-service branch testing
 
@@ -677,7 +708,11 @@ assertions, evidence codes, required IDs, and preserved attempt history; pre/pos
 endpoint liveness and backend candidate identity are proven in every mode, with
 worker identity explicitly unavailable and strict V2 per-profile user-path
 evidence required when that target is selected; all chat turns have the
-five required trace stages and numeric per-turn stage timing; deterministic
+five required trace stages and numeric per-turn stage timing; every parent-owned
+P0-13 receipt binds the exact 15 prior turns and matches the profile's bounded
+trace/latency/cleanup projection; missing correlation is
+`BLOCKED_EVIDENCE / TRACE_UNAVAILABLE` and any absent or null stage is
+`BLOCKED_EVIDENCE / TRACE_INCOMPLETE`; deterministic
 cleanup proves all nine accounts absent and all old keys rejected, and its exact
 receipt agrees with the eight agent cleanup projections;
 each worker has a completed qualification-tool event and a valid, passing,

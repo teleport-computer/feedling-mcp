@@ -17,12 +17,15 @@ _TURN_COUNTS = {
     "P0-03": 0,
     "P0-04": 0,
     "P0-05": 0,
+    "P0-06": 0,
     "P0-07": 0,
     "P0-08": 1,
     "P0-09": 10,
     "P0-10": 2,
     "P0-11": 1,
+    "P0-13": 15,
 }
+_TRACE_STAGES = ("routing", "queue", "provider", "persistence", "delivery")
 
 
 def _history(*, duplicate: bool = False, reversed_order: bool = False) -> list[dict]:
@@ -107,26 +110,31 @@ def _receipt(
     attempt: int = 1,
     *,
     status: str = "PASS",
+    projected_turns: list[dict] | None = None,
 ) -> dict:
-    turn_count = _TURN_COUNTS[scenario_id] if status == "PASS" else 0
-    turns = [
-        {
-            "turn_index": index,
-            "request_id": f"request-{scenario_id.lower()}-{attempt}-{index}",
-            "turn_id": f"request-{scenario_id.lower()}-{attempt}-{index}",
-            "trace_id": f"request-{scenario_id.lower()}-{attempt}-{index}",
-            "ack_latency_ms": float(index * 10),
-            "reply_latency_ms": float(index * 100),
-            "reply_count": 1,
-            "content_assertion_passed": (
-                None if scenario_id in {"P0-10", "P0-11"} else True
-            ),
-            "fallback_detected": False,
-            "duplicate_detected": False,
-            "out_of_order_detected": False,
-        }
-        for index in range(1, turn_count + 1)
-    ]
+    if scenario_id == "P0-13" and projected_turns is not None:
+        turns = [dict(turn) for turn in projected_turns]
+    else:
+        turn_count = _TURN_COUNTS[scenario_id] if status == "PASS" else 0
+        turns = [
+            {
+                "turn_index": index,
+                "request_id": f"request-{scenario_id.lower()}-{attempt}-{index}",
+                "turn_id": f"request-{scenario_id.lower()}-{attempt}-{index}",
+                "trace_id": f"request-{scenario_id.lower()}-{attempt}-{index}",
+                "ack_latency_ms": float(index * 10),
+                "reply_latency_ms": float(index * 100),
+                "stage_latency_ms": {stage: None for stage in _TRACE_STAGES},
+                "reply_count": 1,
+                "content_assertion_passed": (
+                    None if scenario_id in {"P0-10", "P0-11"} else True
+                ),
+                "fallback_detected": False,
+                "duplicate_detected": False,
+                "out_of_order_detected": False,
+            }
+            for index in range(1, turn_count + 1)
+        ]
     private_facts = {
         "schema_version": 1,
         "scenario_id": scenario_id,
@@ -134,6 +142,37 @@ def _receipt(
         "raw_reply": "private-only" if scenario_id in {"P0-10", "P0-11"} else "",
     }
     ids = [turn["request_id"] for turn in turns]
+    result_projection = None
+    if scenario_id == "P0-06" and status == "PASS":
+        result_projection = {
+            "kind": "persona_capture",
+            "evidence_sha256": "a" * 64,
+            "job_id": "genesis-job-p0-06",
+            "archive_upload_count": 4,
+            "archive_receipts_verified": True,
+            "genesis_upload_metadata_verified": True,
+        }
+    elif scenario_id == "P0-13" and turns:
+        latency = receipts.latency_projection(turns)
+        result_projection = {
+            "kind": "trace_cleanup",
+            "latency": latency,
+            "trace": {
+                "enabled": True,
+                "deploy_enabled": True,
+                "correlated_event_count": len(turns) * 6,
+                "observed_event_types": list(_TRACE_STAGES),
+                "missing_required_event_types": [],
+                "raw_trace_stored": False,
+            },
+            "cleanup": {
+                "attempted": True,
+                "provider_config_deleted": True,
+                "account_reset": True,
+                "old_credential_rejected": True,
+                "status": "PASS",
+            },
+        }
     return {
         "schema_version": 1,
         "kind": "live_scenario_probe",
@@ -158,15 +197,18 @@ def _receipt(
         },
         "semantic_assertions": list(receipts.SEMANTIC_ASSERTIONS[scenario_id]),
         "request_ids": (
-            ids
+            [f"probe-{scenario_id.lower()}-{attempt}"]
+            if scenario_id == "P0-13" and status == "PASS"
+            else ids
             if ids
             else [f"probe-{scenario_id.lower()}-{attempt}"]
             if status == "PASS"
             else []
         ),
-        "turn_ids": ids,
-        "trace_ids": ids,
+        "turn_ids": [turn["turn_id"] for turn in turns],
+        "trace_ids": [turn["trace_id"] for turn in turns],
         "turns": turns,
+        "result_projection": result_projection,
         "private_facts_sha256": receipts.canonical_json_sha256(private_facts),
         "raw_content_stored": False,
     }
@@ -175,17 +217,80 @@ def _receipt(
 def _aggregate(*, retry_statuses: tuple[str, str] | None = None) -> dict:
     rows: list[dict] = []
     for scenario_id in request.LIVE_SCENARIO_IDS:
+        if scenario_id == "P0-13":
+            source_turns = [
+                turn
+                for row in rows
+                if row["scenario_id"] in {"P0-08", "P0-09", "P0-10", "P0-11"}
+                and row["status"] == "PASS"
+                for turn in row["turns"]
+            ]
+            source_turns.append(
+                {
+                    "turn_index": 1,
+                    "request_id": "request-p0-12-1",
+                    "turn_id": "turn-p0-12-1",
+                    "trace_id": "trace-p0-12-1",
+                    "ack_latency_ms": 15.0,
+                    "reply_latency_ms": 150.0,
+                    "stage_latency_ms": {stage: None for stage in _TRACE_STAGES},
+                    "reply_count": 1,
+                    "content_assertion_passed": True,
+                    "fallback_detected": False,
+                    "duplicate_detected": False,
+                    "out_of_order_detected": False,
+                }
+            )
+            projected = []
+            for index, turn in enumerate(source_turns, start=1):
+                projected.append(
+                    {
+                        **turn,
+                        "turn_index": index,
+                        "stage_latency_ms": {
+                            "routing": float(index),
+                            "queue": float(index + 1),
+                            "provider": float(index + 2),
+                            "persistence": float(index + 3),
+                            "delivery": float(index + 4),
+                        },
+                    }
+                )
+            rows.append(_receipt(scenario_id, projected_turns=projected))
+            continue
         if scenario_id == "P0-08" and retry_statuses is not None:
             rows.append(_receipt(scenario_id, 1, status=retry_statuses[0]))
             rows.append(_receipt(scenario_id, 2, status=retry_statuses[1]))
         else:
             rows.append(_receipt(scenario_id))
+    p0_06 = next(row for row in rows if row["scenario_id"] == "P0-06")
+    capture = p0_06["result_projection"]
     return {
         "schema_version": 1,
         "kind": "live_scenario_receipt_set",
         "run_id": "run-123",
         "profile_id": "official-gemini",
         "receipts": rows,
+        "persona_finalizer": {
+            "kind": "persona_finalizer",
+            "semantic_assertions": {
+                "persona_acceptance_passed": True,
+                "privacy_canary_absent": True,
+            },
+            "persona_finalizer": {
+                "fixture_id": "persona-import-v1",
+                "evidence_sha256": capture["evidence_sha256"],
+                "request_id": p0_06["request_ids"][0],
+                "job_id": capture["job_id"],
+                "semantic_judgment_bound": True,
+                "finalizer_ok": True,
+                "private_evidence_deleted": True,
+                "archive_upload_count": 4,
+                "archive_receipts_verified": True,
+                "genesis_upload_metadata_verified": True,
+                "privacy_violation_count": 0,
+            },
+        },
     }
 
 
@@ -195,8 +300,37 @@ def _profile_projection(aggregate: dict) -> dict:
         grouped[receipt["scenario_id"]].append(receipt)
     scenarios = []
     turns = []
+    parent_persona = aggregate["persona_finalizer"]
+    trace_receipt = grouped["P0-13"][-1]
+    trace_projection = trace_receipt["result_projection"]
+    projected_by_trace = {
+        turn["trace_id"]: turn for turn in trace_receipt["turns"]
+    }
     for scenario_id, rows in grouped.items():
         final = rows[-1]
+        semantic_assertions = {
+            key: True for key in final["semantic_assertions"]
+        }
+        if scenario_id == "P0-06":
+            semantic_assertions.update(parent_persona["semantic_assertions"])
+        evidence_codes = []
+        persona_finalizer = None
+        failure = None
+        if scenario_id == "P0-06":
+            persona_finalizer = parent_persona["persona_finalizer"]
+            evidence_codes = [
+                "PERSONA_FILES_ARCHIVED",
+                "PERSONA_SOURCE_METADATA_VERIFIED",
+                "PERSONA_IMPORT_DONE",
+                "PERSONA_ACCEPTANCE_PASSED",
+                "PRIVACY_CANARY_ABSENT",
+            ]
+        elif scenario_id == "P0-13":
+            evidence_codes = [
+                "TRACE_CORRELATION_CONFIRMED",
+                "LATENCY_ATTRIBUTED",
+                "CLEANUP_CONFIRMED",
+            ]
         scenarios.append(
             {
                 "scenario_id": scenario_id,
@@ -214,26 +348,44 @@ def _profile_projection(aggregate: dict) -> dict:
                 ],
                 "assertions": {
                     **final["assertions"],
-                    **{
-                        key: True for key in final["semantic_assertions"]
-                    },
+                    **semantic_assertions,
                 },
+                "evidence_codes": evidence_codes,
                 "request_ids": [
                     value for row in rows for value in row["request_ids"]
                 ],
                 "turn_ids": [value for row in rows for value in row["turn_ids"]],
                 "trace_ids": [value for row in rows for value in row["trace_ids"]],
+                "persona_finalizer": persona_finalizer,
+                "failure": failure,
             }
         )
+        if scenario_id == "P0-13":
+            continue
         for row in rows:
             for turn in row["turns"]:
+                projected = projected_by_trace.get(turn["trace_id"], turn)
                 turns.append(
                     {
                         "scenario_id": scenario_id,
                         **turn,
+                        "stage_latency_ms": projected["stage_latency_ms"],
                     }
                 )
-    return {"scenarios": scenarios, "turns": turns}
+    p0_12 = next(
+        turn
+        for turn in trace_receipt["turns"]
+        if turn["trace_id"] == "trace-p0-12-1"
+    )
+    turns.append({"scenario_id": "P0-12", **p0_12, "turn_index": 1})
+    return {
+        "status": "PASS",
+        "scenarios": scenarios,
+        "turns": turns,
+        "latency": trace_projection["latency"],
+        "trace": trace_projection["trace"],
+        "cleanup": trace_projection["cleanup"],
+    }
 
 
 @pytest.mark.parametrize(
@@ -636,6 +788,161 @@ def test_result_cannot_be_greener_than_parent_receipt():
     scenario["assertions"]["nonce_echo_confirmed"] = True
     with pytest.raises(receipts.LiveScenarioReceiptError):
         receipts.validate_result_binding(result, aggregate)
+
+
+def test_parent_persona_finalizer_hash_must_match_capture():
+    aggregate = _aggregate()
+    aggregate["persona_finalizer"]["persona_finalizer"][
+        "evidence_sha256"
+    ] = "b" * 64
+
+    with pytest.raises(
+        receipts.LiveScenarioReceiptError,
+        match="parent persona finalizer",
+    ):
+        receipts.validate_aggregate_object(
+            aggregate, run_id="run-123", profile_id="official-gemini"
+        )
+
+
+def test_agent_cannot_green_a_failed_parent_persona_verdict():
+    aggregate = _aggregate()
+    green_result = _profile_projection(aggregate)
+    aggregate["persona_finalizer"]["semantic_assertions"][
+        "persona_acceptance_passed"
+    ] = False
+    aggregate["persona_finalizer"]["persona_finalizer"]["finalizer_ok"] = False
+    aggregate = receipts.validate_aggregate_object(
+        aggregate, run_id="run-123", profile_id="official-gemini"
+    )
+
+    with pytest.raises(
+        receipts.LiveScenarioReceiptError,
+        match="persona finalizer|persona verdict",
+    ):
+        receipts.validate_result_binding(green_result, aggregate)
+
+
+def test_agent_cannot_green_missing_delivery_stage():
+    aggregate = _aggregate()
+    green_result = _profile_projection(aggregate)
+    trace_receipt = next(
+        row for row in aggregate["receipts"] if row["scenario_id"] == "P0-13"
+    )
+    trace_receipt["turns"][0]["stage_latency_ms"]["delivery"] = None
+    latency = receipts.latency_projection(trace_receipt["turns"])
+    trace_receipt["result_projection"]["latency"] = latency
+    trace_receipt["result_projection"]["trace"]["observed_event_types"] = [
+        "routing",
+        "queue",
+        "provider",
+        "persistence",
+    ]
+    trace_receipt["result_projection"]["trace"][
+        "missing_required_event_types"
+    ] = ["delivery"]
+    trace_receipt["assertions"]["trace_stages_complete"] = False
+    trace_receipt["assertions"]["latency_attributed"] = False
+    trace_receipt["status"] = "BLOCKED_EVIDENCE"
+    trace_receipt["failure_code"] = "TRACE_INCOMPLETE"
+    aggregate = receipts.validate_aggregate_object(
+        aggregate, run_id="run-123", profile_id="official-gemini"
+    )
+
+    with pytest.raises(
+        receipts.LiveScenarioReceiptError,
+        match="greener|trace-cleanup",
+    ):
+        receipts.validate_result_binding(green_result, aggregate)
+
+
+def test_partial_prior_turns_preserve_cleanup_and_bind_as_blocked_evidence():
+    aggregate = _aggregate()
+    p0_09_index = next(
+        index
+        for index, row in enumerate(aggregate["receipts"])
+        if row["scenario_id"] == "P0-09"
+    )
+    aggregate["receipts"][p0_09_index] = _receipt(
+        "P0-09", status="PRODUCT_FAIL"
+    )
+    trace_receipt = next(
+        row for row in aggregate["receipts"] if row["scenario_id"] == "P0-13"
+    )
+    p0_12 = next(
+        turn
+        for turn in trace_receipt["turns"]
+        if turn["trace_id"] == "trace-p0-12-1"
+    )
+    available = [
+        turn
+        for row in aggregate["receipts"]
+        if row["scenario_id"] in {"P0-08", "P0-10", "P0-11"}
+        for turn in row["turns"]
+    ] + [p0_12]
+    projected = [
+        {
+            **turn,
+            "turn_index": index,
+            "stage_latency_ms": {
+                stage: float(index + offset)
+                for offset, stage in enumerate(_TRACE_STAGES)
+            },
+        }
+        for index, turn in enumerate(available, start=1)
+    ]
+    trace_receipt["turns"] = projected
+    trace_receipt["turn_ids"] = [turn["turn_id"] for turn in projected]
+    trace_receipt["trace_ids"] = [turn["trace_id"] for turn in projected]
+    latency = receipts.latency_projection(projected)
+    trace_receipt["result_projection"] = {
+        "kind": "trace_cleanup",
+        "latency": latency,
+        "trace": {
+            "enabled": True,
+            "deploy_enabled": True,
+            "correlated_event_count": len(projected) * 6,
+            "observed_event_types": list(_TRACE_STAGES),
+            "missing_required_event_types": [],
+            "raw_trace_stored": False,
+        },
+        "cleanup": {
+            "attempted": True,
+            "provider_config_deleted": True,
+            "account_reset": True,
+            "old_credential_rejected": True,
+            "status": "PASS",
+        },
+    }
+    trace_receipt["assertions"] = {
+        "trace_stages_complete": True,
+        "trace_correlation_confirmed": False,
+        "latency_attributed": True,
+        "cleanup_confirmed": True,
+    }
+    trace_receipt["status"] = "BLOCKED_EVIDENCE"
+    trace_receipt["failure_code"] = "TRACE_UNAVAILABLE"
+    aggregate = receipts.validate_aggregate_object(
+        aggregate, run_id="run-123", profile_id="official-gemini"
+    )
+    result = _profile_projection(aggregate)
+    result["status"] = "BLOCKED_EVIDENCE"
+    scenario = next(
+        row for row in result["scenarios"] if row["scenario_id"] == "P0-13"
+    )
+    failure = {
+        "category": "BLOCKED_EVIDENCE",
+        "stage_code": "TRACE_LATENCY_CLEANUP",
+        "failure_code": "TRACE_UNAVAILABLE",
+        "reproducible": True,
+    }
+    scenario["failure"] = failure
+    scenario["attempt_results"][0]["failure"] = failure
+    scenario["evidence_codes"] = ["LATENCY_ATTRIBUTED", "CLEANUP_CONFIRMED"]
+
+    receipts.validate_result_binding(result, aggregate)
+    assert result["cleanup"]["status"] == "PASS"
+    assert len(result["turns"]) == len(projected)
 
 
 def test_authoritative_receipt_never_contains_private_semantic_text():

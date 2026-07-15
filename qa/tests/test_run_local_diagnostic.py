@@ -199,6 +199,8 @@ def _codex_preflight_receipt(
         "structured_output_valid": True,
         "event_stream_valid": True,
         "tool_calls_observed": False,
+        "worker_runtime_valid": True,
+        "worker_tool_network_disabled": True,
         "profile_id": options.profile_ids[0],
         "model": options.codex_model,
     }
@@ -1277,7 +1279,7 @@ def test_headless_preflight_uses_isolated_oauth_model_and_forbids_tools(
     assert receipt["headless_exec_completed"] is True
     assert receipt["tool_calls_observed"] is False
     assert receipt["worker_runtime_valid"] is True
-    assert receipt["worker_network_valid"] is True
+    assert receipt["worker_tool_network_disabled"] is True
     assert len(observed["sandbox_commands"]) == 2
     sandbox_command = observed["sandbox_commands"][0]
     assert sandbox_command[1:6] == (
@@ -1300,8 +1302,12 @@ def test_headless_preflight_uses_isolated_oauth_model_and_forbids_tools(
         "-P",
         "io-e2e-agent-driven-test-official-gemini",
     )
-    assert network_command[-1] == "https://test-api.feedling.app/healthz"
-    assert "urllib.request.urlopen" in network_command[-2]
+    assert network_command[-2:] == (
+        "https://test-api.feedling.app/healthz",
+        "https://example.com/",
+    )
+    assert "urllib.request.urlopen" in network_command[-3]
+    assert "worker tool network unexpectedly enabled" in network_command[-3]
 
 
 def test_benchmark_fake_ip_detection_is_narrow(monkeypatch):
@@ -1389,6 +1395,14 @@ def test_preflight_creates_sanitized_non_release_artifact_and_calls_cleanup(
     assert summary["validated_credential_names"] == ["QA_GEMINI_API_KEY"]
     assert summary["missing_strict_evidence"]
     assert summary["codex_preflight"]["headless_exec_completed"] is True
+    network_profile = dict(summary["codex_network_profile"])
+    assert type(network_profile.pop("benchmark_fake_ip_detected")) is bool
+    assert network_profile == {
+        "tool_network_enabled": False,
+        "allowed_hosts": [],
+        "codex_model_transport_separate": True,
+        "allow_local_binding": False,
+    }
     assert cleanup_calls
     assert stat.S_IMODE(summary_path.stat().st_mode) == 0o600
     artifacts = summary_path.parent

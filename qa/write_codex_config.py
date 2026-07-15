@@ -729,13 +729,11 @@ def build_config_bundle(
         lines.extend(
             f"{_quoted(path)} = {_quoted(access)}" for path, access in filesystem
         )
-        lines.extend(
-            _network_lines(
-                permission,
-                host,
-                allow_local_binding=allow_local_binding,
-            )
-        )
+        # All product network actions are executed by deterministic parent
+        # probes.  Profile workers only request fixed operations and judge the
+        # returned facts, so prompt-injected content cannot register accounts,
+        # mutate arbitrary users, or escape signed-run cleanup.
+        lines.extend(_disabled_network_lines(permission))
 
     if judge_paths is not None:
         judge_root, judge_home, judge_tmp, judge_work, judge_scratch = judge_paths

@@ -4,33 +4,81 @@
   "title": "Parent-owned live scenario receipt set",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "kind", "run_id", "profile_id", "receipts"],
+  "required": ["schema_version", "kind", "run_id", "profile_id", "receipts", "persona_finalizer"],
   "properties": {
     "schema_version": {"const": 1},
     "kind": {"const": "live_scenario_receipt_set"},
     "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"},
     "profile_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"},
+    "persona_finalizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "semantic_assertions", "persona_finalizer"],
+      "properties": {
+        "kind": {"const": "persona_finalizer"},
+        "semantic_assertions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["persona_acceptance_passed", "privacy_canary_absent"],
+          "properties": {
+            "persona_acceptance_passed": {"type": "boolean"},
+            "privacy_canary_absent": {"type": "boolean"}
+          }
+        },
+        "persona_finalizer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fixture_id", "evidence_sha256", "request_id", "job_id", "semantic_judgment_bound", "finalizer_ok", "private_evidence_deleted", "archive_upload_count", "archive_receipts_verified", "genesis_upload_metadata_verified", "privacy_violation_count"],
+          "properties": {
+            "fixture_id": {"const": "persona-import-v1"},
+            "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "request_id": {"$ref": "#/$defs/id"},
+            "job_id": {"$ref": "#/$defs/id"},
+            "semantic_judgment_bound": {"const": true},
+            "finalizer_ok": {"type": "boolean"},
+            "private_evidence_deleted": {"const": true},
+            "archive_upload_count": {"const": 4},
+            "archive_receipts_verified": {"const": true},
+            "genesis_upload_metadata_verified": {"const": true},
+            "privacy_violation_count": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
     "receipts": {
       "type": "array",
-      "minItems": 9,
-      "maxItems": 18,
+      "minItems": 11,
+      "maxItems": 15,
       "items": {"$ref": "#/$defs/receipt"}
     }
   },
   "$defs": {
     "id": {"type": "string", "pattern": "^[A-Za-z0-9._:/-]{1,256}$"},
     "latency": {"type": ["number", "null"], "minimum": 0},
+    "stage_latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["routing", "queue", "provider", "persistence", "delivery"],
+      "properties": {
+        "routing": {"$ref": "#/$defs/latency"},
+        "queue": {"$ref": "#/$defs/latency"},
+        "provider": {"$ref": "#/$defs/latency"},
+        "persistence": {"$ref": "#/$defs/latency"},
+        "delivery": {"$ref": "#/$defs/latency"}
+      }
+    },
     "turn": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["turn_index", "request_id", "turn_id", "trace_id", "ack_latency_ms", "reply_latency_ms", "reply_count", "content_assertion_passed", "fallback_detected", "duplicate_detected", "out_of_order_detected"],
+      "required": ["turn_index", "request_id", "turn_id", "trace_id", "ack_latency_ms", "reply_latency_ms", "stage_latency_ms", "reply_count", "content_assertion_passed", "fallback_detected", "duplicate_detected", "out_of_order_detected"],
       "properties": {
-        "turn_index": {"type": "integer", "minimum": 1, "maximum": 10},
+        "turn_index": {"type": "integer", "minimum": 1, "maximum": 15},
         "request_id": {"$ref": "#/$defs/id"},
         "turn_id": {"$ref": "#/$defs/id"},
         "trace_id": {"$ref": "#/$defs/id"},
         "ack_latency_ms": {"$ref": "#/$defs/latency"},
         "reply_latency_ms": {"$ref": "#/$defs/latency"},
+        "stage_latency_ms": {"$ref": "#/$defs/stage_latency"},
         "reply_count": {"type": "integer", "minimum": 0},
         "content_assertion_passed": {"type": ["boolean", "null"]},
         "fallback_detected": {"type": "boolean"},
@@ -41,13 +89,13 @@
     "receipt": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "kind", "run_id", "profile_id", "scenario_id", "attempt", "nonce", "started_at", "finished_at", "status", "failure_code", "assertions", "semantic_assertions", "request_ids", "turn_ids", "trace_ids", "turns", "private_facts_sha256", "raw_content_stored"],
+      "required": ["schema_version", "kind", "run_id", "profile_id", "scenario_id", "attempt", "nonce", "started_at", "finished_at", "status", "failure_code", "assertions", "semantic_assertions", "request_ids", "turn_ids", "trace_ids", "turns", "result_projection", "private_facts_sha256", "raw_content_stored"],
       "properties": {
         "schema_version": {"const": 1},
         "kind": {"const": "live_scenario_probe"},
         "run_id": {"type": "string"},
         "profile_id": {"type": "string"},
-        "scenario_id": {"enum": ["P0-02", "P0-03", "P0-04", "P0-05", "P0-07", "P0-08", "P0-09", "P0-10", "P0-11"]},
+        "scenario_id": {"enum": ["P0-02", "P0-03", "P0-04", "P0-05", "P0-06", "P0-07", "P0-08", "P0-09", "P0-10", "P0-11", "P0-13"]},
         "attempt": {"type": "integer", "minimum": 1, "maximum": 2},
         "nonce": {"$ref": "#/$defs/id"},
         "started_at": {"type": "string", "format": "date-time"},
@@ -59,7 +107,8 @@
         "request_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
         "turn_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
         "trace_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
-        "turns": {"type": "array", "maxItems": 10, "items": {"$ref": "#/$defs/turn"}},
+        "turns": {"type": "array", "maxItems": 15, "items": {"$ref": "#/$defs/turn"}},
+        "result_projection": {"type": ["object", "null"]},
         "private_facts_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "raw_content_stored": {"const": false}
       }

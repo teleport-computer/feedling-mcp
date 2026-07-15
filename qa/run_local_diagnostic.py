@@ -1189,14 +1189,19 @@ def _verify_worker_runtime(
         )
 
 
-def _verify_worker_network(
+def _verify_worker_network_disabled(
     options: DiagnosticOptions,
     paths: RunPaths,
     *,
     profile_id: str,
     agent_type: str,
 ) -> None:
-    """Prove the real worker sandbox can reach only the locked test endpoint."""
+    """Prove the real worker sandbox cannot use tool or shell networking.
+
+    Codex's authenticated model transport is outside this sandbox boundary.  A
+    profile worker therefore remains able to reason over parent-authored facts
+    while every network attempt made by a model-controlled tool must fail.
+    """
 
     worker_python, _runtime_roots = _canonical_worker_runtime(options)
     agent_root = paths.worker_root / agent_type
@@ -1210,14 +1215,30 @@ def _verify_worker_network(
         "CODEX_HOME": str(paths.codex_home),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    script = (
-        "import sys, urllib.request; "
-        "u=sys.argv[1]; "
-        "r=urllib.request.urlopen(urllib.request.Request(u, headers={"
-        "'User-Agent':'io-e2e-agent-driven-test-network-preflight'}), timeout=15); "
-        "assert r.status == 200 and r.geturl() == u; "
-        "r.read(4097); r.close()"
-    )
+    script = """\
+import sys
+import urllib.error
+import urllib.request
+
+for url in sys.argv[1:]:
+    try:
+        response = urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                headers={"User-Agent": "io-e2e-agent-driven-test-network-preflight"},
+            ),
+            timeout=10,
+        )
+    except urllib.error.HTTPError:
+        raise SystemExit("worker tool network unexpectedly enabled")
+    except Exception:
+        continue
+    try:
+        response.read(1)
+    finally:
+        response.close()
+    raise SystemExit("worker tool network unexpectedly enabled")
+"""
     command = (
         str(options.codex_bin),
         "sandbox",
@@ -1235,6 +1256,7 @@ def _verify_worker_network(
         "-c",
         script,
         f"{LOCKED_BASE_URL}/healthz",
+        "https://example.com/",
     )
     try:
         result = subprocess.run(
@@ -1248,11 +1270,11 @@ def _verify_worker_network(
         )
     except (OSError, subprocess.SubprocessError):
         raise LocalDiagnosticError(
-            "locked test endpoint sandbox preflight could not execute"
+            "worker tool-network isolation preflight could not execute"
         ) from None
     if result.returncode != 0:
         raise LocalDiagnosticError(
-            "locked test endpoint is unreachable from the Codex worker sandbox"
+            "worker tool network isolation is not enforced"
         )
 
 
@@ -1272,7 +1294,7 @@ def _verify_codex_exec(options: DiagnosticOptions, paths: RunPaths) -> dict[str,
         profile_id=profile_id,
         agent_type=agent_type,
     )
-    _verify_worker_network(
+    _verify_worker_network_disabled(
         options,
         paths,
         profile_id=profile_id,
@@ -1385,7 +1407,7 @@ def _verify_codex_exec(options: DiagnosticOptions, paths: RunPaths) -> dict[str,
         "event_stream_valid": True,
         "tool_calls_observed": False,
         "worker_runtime_valid": True,
-        "worker_network_valid": True,
+        "worker_tool_network_disabled": True,
         "profile_id": profile_id,
         "model": options.codex_model,
     }
@@ -1849,7 +1871,7 @@ def _uses_benchmark_fake_ip(host: str) -> bool:
 
 def _build_codex_config(options: DiagnosticOptions, paths: RunPaths) -> bool:
     worker_python, runtime_roots = _canonical_worker_runtime(options)
-    allow_local_binding = _uses_benchmark_fake_ip("test-api.feedling.app")
+    benchmark_fake_ip_detected = _uses_benchmark_fake_ip("test-api.feedling.app")
     bundle = write_codex_config.build_config_bundle(
         output=paths.codex_home / "config.toml",
         source_root=paths.worker_source_root,
@@ -1868,10 +1890,10 @@ def _build_codex_config(options: DiagnosticOptions, paths: RunPaths) -> bool:
         runtime_read_roots=runtime_roots,
         worker_python=worker_python,
         qualification_mode="diagnostic",
-        allow_local_binding=allow_local_binding,
+        allow_local_binding=False,
     )
     write_codex_config.write_bundle(paths.codex_home / "config.toml", bundle)
-    return allow_local_binding
+    return benchmark_fake_ip_detected
 
 
 def _provision_diagnostic(
@@ -2338,11 +2360,13 @@ def execute(
             )
         harness["worker_snapshot_sha256"] = snapshot_sha256
         secret_values.extend(_fixture_privacy_values(paths.worker_source_root))
-        local_binding_enabled = _build_codex_config(options, paths)
+        benchmark_fake_ip_detected = _build_codex_config(options, paths)
         summary["codex_network_profile"] = {
-            "allowed_host": "test-api.feedling.app",
-            "benchmark_fake_ip_detected": local_binding_enabled,
-            "allow_local_binding": local_binding_enabled,
+            "tool_network_enabled": False,
+            "allowed_hosts": [],
+            "codex_model_transport_separate": True,
+            "benchmark_fake_ip_detected": benchmark_fake_ip_detected,
+            "allow_local_binding": False,
         }
         login_check = dependencies.verify_login or _verify_login
         login_check(

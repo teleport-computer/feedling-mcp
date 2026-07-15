@@ -53,17 +53,19 @@ _MAX_RESULT_BYTES = 32 * 1024 * 1024
 _MAX_SCHEMA_BYTES = 8 * 1024 * 1024
 _MAX_STDERR_BYTES = 64 * 1024 * 1024
 _MAX_JSON_LINE_BYTES = 16 * 1024 * 1024
-AGENT_LIVE_SCENARIO_IDS = tuple(f"P0-{index:02d}" for index in range(2, 12))
+AGENT_LIVE_SCENARIO_IDS = tuple(f"P0-{index:02d}" for index in range(2, 12)) + (
+    "P0-13",
+)
 MIN_SCENARIO_COMMAND_COUNTS = {
     scenario_id: (3 if scenario_id == "P0-06" else 1)
     for scenario_id in AGENT_LIVE_SCENARIO_IDS
 }
 MANDATORY_SOP_READ_COMMAND = 'sed -n \'1,999p\' "$QA_SOURCE_ROOT/qa/SOP.md"'
 _SCENARIO_COMMAND_RE = re.compile(
-    r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[01]))(?:[ \t]|$)"
+    r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[013]))(?:[ \t]|$)"
 )
 _RAW_SCENARIO_COMMAND_RE = re.compile(
-    r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[01]))(?:[ \t]|$)"
+    r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[013]))(?:[ \t]|$)"
 )
 P0_06_COMMAND_PHASES = ("CAPTURE", "REVIEW", "FINALIZE")
 _CODEX_SHELLS = frozenset(("/bin/bash", "/bin/sh", "/bin/zsh"))
@@ -76,20 +78,15 @@ P0_06_REVIEW_PROGRAM = (
 _P0_06_EVIDENCE_PATH = "$QA_WORK_ROOT/p0-06-private-evidence.json"
 _P0_06_JUDGMENT_PATH = "$QA_WORK_ROOT/p0-06-semantic-judgment.json"
 _P0_06_CAPTURE_TOKENS = (
-    "$QA_SOURCE_ROOT/tools/genesis_e2e.py",
-    "distill-existing-session",
-    "--api-url",
-    "$IO_E2E_BASE_URL",
-    "--session-manifest",
-    "$QA_PRIVATE_MANIFEST",
-    "--profile-id",
-    "$QA_PROFILE_ID",
-    "--fixture",
-    "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json",
-    "--private-evidence",
-    _P0_06_EVIDENCE_PATH,
-    "--artifact-dir",
-    "$QA_ARTIFACT_DIR",
+    "$QA_SOURCE_ROOT/qa/request_live_scenario_probe.py",
+    "--scenario",
+    "P0-06",
+    "--attempt",
+    "1",
+    "--request",
+    "$QA_WORK_ROOT/.live-probe-P0-06-1.request",
+    "--facts",
+    "$QA_WORK_ROOT/live-probe-P0-06-1.facts.json",
 )
 _P0_06_REVIEW_TOKENS = (
     "-I",
@@ -100,8 +97,9 @@ _P0_06_REVIEW_TOKENS = (
     _P0_06_JUDGMENT_PATH,
 )
 _P0_06_FINALIZE_TOKENS = (
-    "$QA_SOURCE_ROOT/tools/genesis_e2e.py",
-    "distill-existing-session-finalize",
+    "-I",
+    "-B",
+    "$QA_SOURCE_ROOT/qa/finalize_persona_review.py",
     "--fixture",
     "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json",
     "--private-evidence",
