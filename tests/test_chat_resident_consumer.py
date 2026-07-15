@@ -679,13 +679,94 @@ def test_enclave_fetch_logs_response_body_on_http_error(monkeypatch, caplog):
     mock_client.get.return_value = resp
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+    # 503 is transient (retried); don't actually sleep the backoff in the test.
+    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
 
     with caplog.at_level("WARNING"):
         result = crc._fetch_from_enclave(since=0.0, limit=20)
 
     assert result is None
+    # the body must still be logged on the FINAL give-up, not only on the first try
     assert "503" in caplog.text
     assert "key_derivation_unavailable" in caplog.text
+
+
+def test_fetch_from_enclave_retries_transient_502(monkeypatch):
+    # Prod (2026-07-15): the enclave decrypt proxy (single-threaded, shared by ~295
+    # users) intermittently 502s under load. Before this fix a single 502 skipped the
+    # WHOLE poll cycle ("all decrypt sources failed"), deferring a waiting user message
+    # to the next 30 s+ cycle and stacking into 6-13 min tails. A transient 502 must be
+    # retried within the cycle instead.
+    import httpx as _httpx
+    url = "https://enc/v1/chat/history"
+    ok = _httpx.Response(200, json={"messages": [{"ts": 5.0, "id": "m1"}]},
+                         request=_httpx.Request("GET", url))
+    err = _httpx.Response(502, json={"error": "backend_unreachable"},
+                          request=_httpx.Request("GET", url))
+    mock_client = MagicMock()
+    mock_client.get.side_effect = [err, ok]
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+
+    result = crc._fetch_from_enclave(since=0.0, limit=20)
+
+    assert result == [{"ts": 5.0, "id": "m1"}]
+    assert mock_client.get.call_count == 2, "transient 502 was not retried"
+
+
+def test_fetch_from_enclave_retries_transient_network_error(monkeypatch):
+    import httpx as _httpx
+    url = "https://enc/v1/chat/history"
+    ok = _httpx.Response(200, json={"messages": [{"ts": 9.0, "id": "m9"}]},
+                         request=_httpx.Request("GET", url))
+    mock_client = MagicMock()
+    mock_client.get.side_effect = [_httpx.ConnectError("boom"), ok]
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+
+    result = crc._fetch_from_enclave(since=0.0, limit=20)
+
+    assert result == [{"ts": 9.0, "id": "m9"}]
+    assert mock_client.get.call_count == 2, "transient connect error was not retried"
+
+
+def test_fetch_from_enclave_no_retry_on_permanent_4xx(monkeypatch):
+    # 404/400 are not transient — retrying only wastes a cycle. Return None at once.
+    import httpx as _httpx
+    url = "https://enc/v1/chat/history"
+    mock_client = MagicMock()
+    mock_client.get.return_value = _httpx.Response(
+        404, json={"error": "not_found"}, request=_httpx.Request("GET", url))
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+    slept: list = []
+    monkeypatch.setattr(crc.time, "sleep", lambda d: slept.append(d))
+
+    result = crc._fetch_from_enclave(since=0.0, limit=20)
+
+    assert result is None
+    assert mock_client.get.call_count == 1, "permanent 4xx must not be retried"
+    assert slept == []
+
+
+def test_fetch_from_enclave_gives_up_after_max_attempts(monkeypatch):
+    # A persistent 502 must be BOUNDED — return None after ENCLAVE_FETCH_MAX_ATTEMPTS
+    # so the poll loop is never hung by a wedged enclave.
+    import httpx as _httpx
+    url = "https://enc/v1/chat/history"
+    mock_client = MagicMock()
+    mock_client.get.return_value = _httpx.Response(
+        502, json={"error": "backend_unreachable"}, request=_httpx.Request("GET", url))
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+
+    result = crc._fetch_from_enclave(since=0.0, limit=20)
+
+    assert result is None
+    assert mock_client.get.call_count == crc.ENCLAVE_FETCH_MAX_ATTEMPTS
 
 
 def test_image_message_passes_image_context_to_agent(monkeypatch, tmp_path):
@@ -4741,16 +4822,146 @@ def test_turn_content_bytes_does_not_charge_image_pixels(monkeypatch):
     assert counted > crc._PI_IMAGE_CONTEXT_BYTES
 
 
-def test_turn_content_bytes_keeps_transport_accounting_for_non_pi(monkeypatch):
-    # codex/claude scrape a fresh session id every turn, so their meta is rebuilt each
-    # turn and the byte bound can never fire for them — re-measuring them would be a
-    # behavior change with no benefit. hermes/self-hosted stream shapes are unverified.
-    # All of them keep the old transport accounting, stderr included.
+def test_turn_content_bytes_keeps_transport_accounting_for_unknown_drivers(monkeypatch):
+    # pi/claude/codex now charge session CONTENT (see the driver-specific tests). Only
+    # drivers whose stream shape we have NOT verified (hermes / self-hosted templates)
+    # keep the old raw-transport accounting, stderr included — the safe default.
     out, err = "some stdout", "some stderr"
     expected = len((out + "\n" + err).encode("utf-8"))
 
-    for cmd in (["codex", "exec", "--json"], ["claude", "-p"], ["hermes", "chat"]):
+    for cmd in (["hermes", "chat"], ["some-self-hosted-agent", "run"]):
         assert crc._turn_content_bytes(cmd, out, err) == expected
+
+
+# --- claude / codex session-content accounting (mirror of the pi fix) --------
+# The prod bug that killed pi sessions (charging streaming-delta TRANSPORT to the
+# 250 KB session-byte bound) also hit claude: it reuses a bounded --session-id, so
+# its meta accumulates, and `claude -p --output-format stream-json
+# --include-partial-messages` emits one `stream_event` per token — ~90 KB of
+# transport per turn measured on the prod runner 2026-07-15 (usr_6bb689 rotating at
+# `turns=2 bytes=502874`). Delta frames are transport, never context.
+
+def _claude_stream_lines(*events) -> str:
+    return "\n".join(json.dumps(e) for e in events)
+
+
+def _claude_chatty_stream(reply: str, thinking: str = "", *, tokens: int = 120,
+                          session_id: str = "c-sess-1") -> str:
+    """A ``claude -p --output-format stream-json --include-partial-messages`` stream:
+    a per-token ``stream_event`` delta storm (transport that grows with reply length),
+    then the COMPLETE ``assistant`` message object (the real content that persists in
+    claude's session and is re-sent on the next --resume turn), then the terminal
+    ``result``. The deltas dominate transport; the content stays tiny — that ratio is
+    the whole point."""
+    events: list = [{"type": "system", "subtype": "init", "session_id": session_id}]
+    for i in range(1, tokens + 1):
+        partial = reply[:max(1, len(reply) * i // tokens)]
+        events.append({"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": partial}}})
+    content: list = []
+    if thinking:
+        content.append({"type": "thinking", "thinking": thinking})
+    content.append({"type": "text", "text": reply})
+    events.append({"type": "assistant",
+                   "message": {"role": "assistant", "content": content}})
+    events.append({"type": "result", "subtype": "success",
+                   "result": reply, "session_id": session_id})
+    return _claude_stream_lines(*events)
+
+
+def test_turn_content_bytes_excludes_claude_delta_frames(monkeypatch):
+    raw = _claude_chatty_stream("好的，我记住了", thinking="用户在说他的猫")
+
+    counted = crc._turn_content_bytes(["claude", "-p", "--output-format", "stream-json"], raw)
+
+    # the per-token stream_event deltas dominate transport and must NOT be charged
+    assert counted < len(raw.encode("utf-8")) / 20
+    # but the assistant content itself (text + thinking) IS charged
+    assert counted > len("好的，我记住了用户在说他的猫".encode("utf-8"))
+
+
+def test_turn_content_bytes_charges_claude_tool_calls_and_results(monkeypatch):
+    # tool_use blocks + tool_result user messages are re-sent to the model every
+    # subsequent --resume turn, so they must be charged or the bound never fires.
+    big_tool_output = "x" * 50_000
+    raw = _claude_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "c1"},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "我查一下"},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "big.log"}}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": big_tool_output}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "找到了"}]}},
+        {"type": "result", "subtype": "success", "result": "找到了", "session_id": "c1"},
+    )
+
+    counted = crc._turn_content_bytes(["claude", "-p"], raw)
+
+    assert counted > 50_000, "claude tool output not charged — the byte bound cannot fire"
+
+
+def test_turn_content_bytes_does_not_charge_claude_image_pixels(monkeypatch):
+    # An Anthropic image block carries inline base64 pixels
+    # ({type:image, source:{type:base64, data:<base64>}}) — a 1 MB photo is ~1.4 MB of
+    # base64 but only ~1-2k tokens of context. Charging it would rotate on every image.
+    photo_b64 = "A" * 1_400_000
+    raw = _claude_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "c1"},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64",
+                                          "media_type": "image/jpeg", "data": photo_b64}},
+            {"type": "text", "text": "这是我的猫"}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "好可爱"}]}},
+        {"type": "result", "subtype": "success", "result": "好可爱", "session_id": "c1"},
+    )
+
+    counted = crc._turn_content_bytes(["claude", "-p"], raw)
+
+    assert counted < 10_000, "image base64 charged as context — one photo kills the session"
+    assert counted < crc.AGENT_SESSION_MAX_BYTES / 10
+
+
+def test_turn_content_bytes_claude_json_single_object_falls_back_to_transport(monkeypatch):
+    # The NON-thinking default builder (_default_cli_cmd) runs claude with no
+    # --output-format, which _prepare_cli_command forces to `json` — a SINGLE result
+    # object with no assistant/user stream messages. Charging 0 there would let a
+    # resumed json-mode session ignore AGENT_SESSION_MAX_BYTES entirely, so when no
+    # stream message content is found we fall back to transport accounting.
+    single = json.dumps({"type": "result", "subtype": "success",
+                         "result": "你好呀", "session_id": "c1",
+                         "usage": {"input_tokens": 1200, "output_tokens": 40}})
+
+    counted = crc._turn_content_bytes(["claude", "-p", "--output-format", "json"], single, "")
+
+    assert counted == len((single + "\n").encode("utf-8"))
+
+
+def _codex_stream_lines(*events) -> str:
+    return "\n".join(json.dumps(e) for e in events)
+
+
+def test_turn_content_bytes_charges_codex_message_and_tool_content(monkeypatch):
+    # codex exec --json (0.142 flat protocol): agent_message / agent_reasoning /
+    # command output are the context that would be re-sent if the session accumulated.
+    # A big command output MUST be charged so the bound can fire.
+    big_output = "y" * 50_000
+    raw = _codex_stream_lines(
+        {"type": "session.created", "session_id": "cx1"},
+        {"type": "agent_reasoning", "text": "先看日志"},
+        {"type": "item.completed", "item": {"type": "command_execution",
+                                            "aggregated_output": big_output}},
+        {"type": "agent_message", "message": "找到了"},
+        {"type": "token_count", "info": {"input_tokens": 1200, "output_tokens": 40}},
+    )
+
+    counted = crc._turn_content_bytes(["codex", "exec", "--json"], raw)
+
+    assert counted > 50_000, "codex tool output not charged — the byte bound cannot fire"
+    # the tiny token_count / session events are noise and must not dominate
+    assert counted < len(raw.encode("utf-8")) + 1_000
 
 
 def test_call_agent_cli_pi_charges_session_content_not_transport(monkeypatch, tmp_path):
@@ -4797,6 +5008,37 @@ def test_call_agent_cli_pi_session_survives_many_turns(monkeypatch, tmp_path):
         assert sid == first_sid, "session rotated early — byte accounting regressed"
 
     assert crc._load_agent_session_meta(check_bounds=False)["turns"] == 10
+
+
+def test_call_agent_cli_claude_session_survives_many_turns(monkeypatch, tmp_path):
+    # Prod bug (2026-07-15, usr_6bb689 rotating at turns=2 bytes=502874): claude reuses
+    # its bounded --session-id so meta accumulates, but received_bytes was fed the raw
+    # stream-json transport (~90 KB of per-token deltas/turn), blowing the 250 KB cap
+    # every 2 turns → cold cache + a 26 KB transcript re-injected every couple turns.
+    # With content accounting the session must live to its turns bound.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_claude_longlived")
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_BYTES", 250_000)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_TURNS", 24)
+    raw = _claude_chatty_stream("嗯", session_id="c-longlived")
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        "claude -p --output-format stream-json --include-partial-messages --session-id {session_id}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=""))
+
+    transport_len = len(raw.encode("utf-8"))
+    first_sid = None
+    for _ in range(10):
+        crc.call_agent_cli("在吗")
+        sid = crc._load_agent_session_id()
+        first_sid = first_sid or sid
+        assert sid == first_sid, "claude session rotated early — byte accounting regressed"
+
+    meta = crc._load_agent_session_meta(check_bounds=False)
+    assert meta["turns"] == 10
+    # 10 turns of content still nowhere near ONE turn of transport
+    assert meta["bytes"] < transport_len
 
 
 def test_call_agent_cli_pi_folds_thinking_and_prefers_command_sid(monkeypatch, tmp_path):

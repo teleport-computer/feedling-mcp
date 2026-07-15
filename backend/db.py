@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -116,6 +117,29 @@ def healthcheck() -> bool:
     except Exception as e:
         log.error("[db] healthcheck failed: %s", e)
         return False
+
+
+def health_probe(timeout: float = 2.0) -> dict:
+    """Fast liveness probe for /healthz.
+
+    Acquire a pooled connection within ``timeout`` seconds and run ``SELECT 1``.
+    Returns ``{"ok", "latency_ms", "error"}`` and NEVER raises. The short
+    timeout is deliberate: the pool's default acquire wait is 10s, so a
+    saturated/hung pool would otherwise block the health endpoint for that whole
+    window. With a 2s cap, a pool that can't hand out a connection surfaces as
+    ``ok=False`` fast, letting the caller report unhealthy instead of hanging.
+    """
+    t0 = time.perf_counter()
+    try:
+        with get_pool().connection(timeout=timeout) as conn:
+            conn.execute("SELECT 1")
+        return {"ok": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1), "error": None}
+    except Exception as e:  # noqa: BLE001 — health must never raise
+        return {
+            "ok": False,
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "error": str(e)[:200],
+        }
 
 
 # ---------------------------------------------------------------------------
