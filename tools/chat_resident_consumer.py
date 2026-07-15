@@ -343,6 +343,15 @@ VERIFY_PROBE_MESSAGE = os.environ.get("VERIFY_PROBE_MESSAGE", "（连接自检�
 VERIFY_PROBE_TIMEOUT_SEC = float(os.environ.get("VERIFY_PROBE_TIMEOUT_SEC", "20"))
 SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", True)
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
+# Enclave decrypt-fetch resilience. The enclave is a single-threaded decrypt proxy
+# shared by every user + the main backend; under load it intermittently maps a
+# reentrant dependency failure to HTTP 502/503. A foreground poll that hits one used
+# to skip the WHOLE cycle ("all decrypt sources failed"), deferring the waiting user
+# message to the next 30 s+ cycle — the mechanism behind prod's 6-13 min reply tails.
+# Retry transient failures in-cycle with a short bounded backoff instead.
+ENCLAVE_FETCH_MAX_ATTEMPTS = max(1, int(os.environ.get("FEEDLING_ENCLAVE_FETCH_ATTEMPTS", "3")))
+ENCLAVE_FETCH_BACKOFF_SEC = float(os.environ.get("FEEDLING_ENCLAVE_FETCH_BACKOFF_SEC", "0.5"))
+_RETRYABLE_ENCLAVE_STATUS = frozenset({429, 502, 503, 504})
 WHOAMI_STARTUP_RETRIES = int(os.environ.get("WHOAMI_STARTUP_RETRIES", "8"))
 WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
     os.environ.get("WHOAMI_STARTUP_RETRY_DELAY_SEC", "5")
@@ -1286,31 +1295,59 @@ def _fetch_from_enclave(
     params: dict = {"limit": limit, "since": since}
     if not include_image_body:
         params["include_image_body"] = "false"
-    try:
-        resp = _ENCLAVE_CLIENT.get(
-            f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-            params=params,
-            headers=_HEADERS,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        msgs = data.get("messages") or data.get("history") or []
-        return _filter_since(msgs, since)
-    except httpx.HTTPStatusError as e:
-        # The enclave maps transient dependency failures to self-describing
-        # codes (502 backend_unreachable / 503 key_derivation_unavailable).
-        # httpx's str(e) carries the status + URL but NOT the body, so log the
-        # body explicitly — it's the only field that tells the operator WHICH
-        # dependency broke without shelling into the CVM.
-        body = (e.response.text or "").strip().replace("\n", " ")[:300]
-        log.warning(
-            "enclave history fetch failed: HTTP %d — %s",
-            e.response.status_code, body or "(empty body)",
-        )
-        return None
-    except Exception as e:
-        log.warning("enclave history fetch failed: %s", e)
-        return None
+    for attempt in range(ENCLAVE_FETCH_MAX_ATTEMPTS):
+        last = attempt == ENCLAVE_FETCH_MAX_ATTEMPTS - 1
+        try:
+            resp = _ENCLAVE_CLIENT.get(
+                f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
+                params=params,
+                headers=_HEADERS,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            msgs = data.get("messages") or data.get("history") or []
+            return _filter_since(msgs, since)
+        except httpx.HTTPStatusError as e:
+            # The enclave maps transient dependency failures to self-describing
+            # codes (502 backend_unreachable / 503 key_derivation_unavailable).
+            # httpx's str(e) carries the status + URL but NOT the body, so log the
+            # body explicitly — it's the only field that tells the operator WHICH
+            # dependency broke without shelling into the CVM.
+            status = e.response.status_code
+            body = (e.response.text or "").strip().replace("\n", " ")[:300]
+            if status in _RETRYABLE_ENCLAVE_STATUS and not last:
+                delay = ENCLAVE_FETCH_BACKOFF_SEC * (2 ** attempt)
+                log.warning(
+                    "enclave history fetch HTTP %d (attempt %d/%d) — retrying in "
+                    "%.1fs: %s",
+                    status, attempt + 1, ENCLAVE_FETCH_MAX_ATTEMPTS, delay,
+                    body or "(empty body)",
+                )
+                time.sleep(delay)
+                continue
+            log.warning(
+                "enclave history fetch failed: HTTP %d — %s",
+                status, body or "(empty body)",
+            )
+            return None
+        except httpx.TransportError as e:
+            # Connection / timeout blips (single-threaded enclave, slow CVM egress)
+            # are transient too — retry rather than skip the whole poll cycle.
+            if not last:
+                delay = ENCLAVE_FETCH_BACKOFF_SEC * (2 ** attempt)
+                log.warning(
+                    "enclave history fetch transient error (attempt %d/%d) — "
+                    "retrying in %.1fs: %s",
+                    attempt + 1, ENCLAVE_FETCH_MAX_ATTEMPTS, delay, e,
+                )
+                time.sleep(delay)
+                continue
+            log.warning("enclave history fetch failed: %s", e)
+            return None
+        except Exception as e:
+            log.warning("enclave history fetch failed: %s", e)
+            return None
+    return None
 
 
 def _verify_decrypt_sources() -> bool:
@@ -4245,31 +4282,114 @@ def _pi_session_content_bytes(raw: str) -> int:
     return total
 
 
+def _claude_session_content_bytes(raw: str) -> int:
+    """Context bytes a claude turn appends to its resumed ``--session-id`` session.
+
+    ``claude -p --output-format stream-json --include-partial-messages`` emits one
+    ``stream_event`` per token (transport that grows with reply length — the prod
+    bug measured 2026-07-15: usr_6bb689 rotating at ``turns=2 bytes=502874``), any
+    number of COMPLETE ``assistant`` / ``user`` message objects (the real content
+    claude persists and re-sends on the next ``--resume`` turn), then a terminal
+    ``result`` echo. Charge only the message content blocks; skip the per-token
+    ``stream_event`` deltas (transport), the ``result`` echo (a duplicate of the
+    final assistant text), and ``system`` / init noise. Anthropic image blocks carry
+    inline base64 pixels (``{type:image, source:{type:base64, data:<base64>}}``) —
+    charge a flat context-equivalent, never the base64 length (mirror
+    ``_PI_IMAGE_CONTEXT_BYTES``), or one photo blows the whole session budget.
+
+    Over-counting costs a re-ground; under-counting is bounded by the turns cap.
+    """
+    total = 0
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("type") or "").strip() not in ("assistant", "user"):
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if content is None:
+            continue
+        if not isinstance(content, list):
+            total += len(json.dumps(content, ensure_ascii=False).encode("utf-8"))
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                total += _PI_IMAGE_CONTEXT_BYTES
+            else:
+                total += len(json.dumps(block, ensure_ascii=False).encode("utf-8"))
+    return total
+
+
+# codex event types that carry real conversation content (vs. token counters and
+# session banners). Both the 0.136 (``item.completed`` wrappers) and 0.142 (flat
+# ``agent_message`` / ``agent_reasoning``) protocols are covered.
+_CODEX_CONTENT_EVENT_TYPES = frozenset({
+    "agent_message", "agent_reasoning", "reasoning",
+    "item.started", "item.completed", "item.updated",
+})
+
+
+def _codex_session_content_bytes(raw: str) -> int:
+    """Context bytes a codex turn would append to a resumed session.
+
+    codex ``exec --json`` emits discrete item events (no per-token delta storm, so
+    its transport is already close to its content) plus ``token_count`` / session
+    envelopes that are pure noise. Charge the substance — agent messages, reasoning,
+    and completed items (tool calls + their output) — and skip the counters. Image
+    items carry base64 pixels, charged flat like pi/claude. Conservative: over-count
+    rotates a turn early; under-count is bounded by the turns cap.
+    """
+    total = 0
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        etype = str(obj.get("type") or "").strip()
+        if etype not in _CODEX_CONTENT_EVENT_TYPES:
+            continue
+        item = obj.get("item") if isinstance(obj.get("item"), dict) else None
+        item_type = str((item or {}).get("type") or etype).strip()
+        if item_type in ("image", "input_image"):
+            total += _PI_IMAGE_CONTEXT_BYTES
+            continue
+        total += len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+    return total
+
+
 def _turn_content_bytes(cmd: list[str], stdout: str, stderr: str = "") -> int:
     """Bytes this turn adds to the agent's session, for the AGENT_SESSION_MAX_BYTES bound.
 
     That bound exists to rotate a session before its accumulated conversation blows the
     model's context window, so it must be fed the conversation. For a long time it was fed
-    ``len(stdout + stderr)`` instead — the raw CLI transport, which for pi is streaming
-    delta framing (one JSON envelope per token). Measured on the prod runner (2026-07-15,
-    301 rotations over 11h across 79 users): a median 225 KB of transport per turn against
-    a 250 KB cap, so 34% of sessions were destroyed after a SINGLE turn and 70% within two
-    — while the turns bound of 24 never fired once. pi's native --session-id resume was
-    therefore dead code in production, and since pi (unlike codex/claude) skips the
-    per-turn history injection, pi users were talking to a context-free agent every message.
+    ``len(stdout + stderr)`` instead — the raw CLI transport, which for pi AND claude is
+    streaming delta framing (one JSON envelope per token). Measured on the prod runner
+    (2026-07-15): a median 225 KB of transport per pi turn against a 250 KB cap, and claude
+    (which reuses a bounded ``--session-id``, so its meta accumulates) rotating every ~2
+    turns at ``bytes>500 KB`` — cold cache plus a ~26 KB transcript re-injected every couple
+    turns, burning the user's BYOK tokens. The earlier claim that claude "scrapes a fresh
+    session id every turn so the bound can never fire" was simply false in prod.
 
-    Only pi is corrected here. codex and claude scrape a FRESH session id out of every
-    turn's stream, so _record_agent_session_turn rebuilds their meta each turn and their
-    byte counter never accumulates — the bound cannot fire for them and re-measuring them
-    would be a behavior change with no benefit. They and any unknown driver (hermes /
-    self-hosted templates, whose stream shape we have not verified) keep the transport
-    accounting exactly as it was, stderr included."""
-    if _is_pi_cmd(cmd):
-        try:
+    pi, claude and codex now charge session CONTENT (the message blocks re-sent to the
+    model next turn), not transport — see the driver-specific helpers. Any unknown driver
+    (hermes / self-hosted templates, whose stream shape we have not verified) keeps the raw
+    transport accounting, stderr included — the safe default.
+
+    Fallback: the content helpers return 0 when the stream carries no message objects —
+    e.g. claude's ``--output-format json`` path (the non-thinking default builder) emits a
+    single ``result`` object, not ``assistant``/``user`` stream events. Charging 0 there
+    would let a resumed session ignore the byte cap, so a 0 falls back to transport."""
+    transport = len(((stdout or "") + "\n" + (stderr or "")).encode("utf-8"))
+    try:
+        if _is_pi_cmd(cmd):
             return _pi_session_content_bytes(stdout or "")
-        except Exception as e:  # noqa: BLE001 — accounting must never break a turn
-            log.warning("pi session content accounting failed, charging transport: %s", e)
-    return len(((stdout or "") + "\n" + (stderr or "")).encode("utf-8"))
+        if _is_claude_code_cmd(cmd):
+            return _claude_session_content_bytes(stdout or "") or transport
+        if _is_codex_cmd(cmd):
+            return _codex_session_content_bytes(stdout or "") or transport
+    except Exception as e:  # noqa: BLE001 — accounting must never break a turn
+        log.warning("session content accounting failed, charging transport: %s", e)
+    return transport
 
 
 def call_agent_cli(

@@ -439,6 +439,135 @@ def test_v2_foreground_salvages_identity_from_support_card(monkeypatch):
     assert calls.get("completed") is True
 
 
+def test_v2_fresh_start_with_empty_core_still_greets(monkeypatch):
+    # REAL fresh_start shape: the sentinel message yields ZERO core candidates
+    # (there is nothing to extract from the synthetic 113-byte marker), unlike
+    # the _greetable_fg stub below. v2 must NOT bail to the v1 full path here —
+    # v1 never writes the onboarding greeting, so the apikey fresh user lands
+    # on an empty chat with no first message.
+    calls = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts",
+                        lambda **k: {"memories": [], "identity": {"agent_name": ""},
+                                     "core_fact_candidates": [], "all_fact_candidates": []})
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    # fresh_start has no material by definition -> deriving identity from the
+    # sentinel is meaningless (and a provider hiccup there must not fail the job).
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: (_ for _ in ()).throw(AssertionError("fresh_start must not call the identity LLM")))
+    monkeypatch.setattr(service, "mark_failed",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fresh_start must not fail")))
+    monkeypatch.setattr(service, "apply_reducer_output",
+                        lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting",
+                        lambda *a, **k: ("", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
+                        lambda store, text: calls.__setitem__("greeting", text))
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
+                        lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
+
+    handled = plaintext._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 0},
+        analysis_messages=[plaintext._plaintext_fresh_start_message()])
+
+    assert handled is True                                       # never v1-fallback (v1 doesn't greet)
+    assert calls["greeting"] == "你好，很高兴认识你。我现在还没有名字，你想以后怎么称呼我？"
+    assert calls.get("used_apply_reducer") is True               # nameless done
+    # No material by definition -> background enrichment must NOT run: it would
+    # re-reduce the pure sentinel as history with write_identity=True (prod runs
+    # WITHOUT FEEDLING_GENESIS_COMBINED_MAP, so that path is reachable there)
+    # and could invent persona/identity from synthetic text.
+    assert "bg_write_identity" not in calls
+
+
+def test_v2_fresh_start_with_combined_map_flag_never_touches_voice_persona(monkeypatch):
+    # test compose sets FEEDLING_GENESIS_COMBINED_MAP=1: with the flag on, the
+    # foreground loop must not even extract voice candidates from the sentinel
+    # (include_voice_candidates stays off) and build_voice_persona_output_...
+    # must never run — same "never derive anything from the sentinel" rule as
+    # the identity skip. The effective combined_map is disabled for
+    # fresh_start_only input, so the flow still ends nameless greeting+done.
+    calls = {}
+    captured = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "genesis_combined_map_enabled", lambda: True)
+
+    def fake_fg(**kwargs):
+        captured["include_voice_candidates"] = kwargs.get("include_voice_candidates")
+        return {"memories": [], "identity": {"agent_name": ""},
+                "core_fact_candidates": [], "all_fact_candidates": []}
+
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", fake_fg)
+    monkeypatch.setattr(worker, "build_voice_persona_output_from_candidates",
+                        lambda **k: (_ for _ in ()).throw(AssertionError("sentinel must not reach persona/voice build")))
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: (_ for _ in ()).throw(AssertionError("fresh_start must not call the identity LLM")))
+    monkeypatch.setattr(service, "mark_failed",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fresh_start must not fail")))
+    monkeypatch.setattr(service, "apply_reducer_output",
+                        lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting",
+                        lambda *a, **k: ("", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
+                        lambda store, text: calls.__setitem__("greeting", text))
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
+                        lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
+
+    handled = plaintext._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 0},
+        analysis_messages=[plaintext._plaintext_fresh_start_message()])
+
+    assert handled is True
+    assert captured["include_voice_candidates"] is False
+    assert calls.get("used_apply_reducer") is True
+    assert "greeting" in calls
+    assert "bg_write_identity" not in calls
+
+
+def test_v2_fresh_start_predicate_rejects_non_dict_messages(monkeypatch):
+    # all(...) with an `if isinstance` filter would vacuously pass on non-dict
+    # junk (["bad"] -> all([]) is True) and mis-route it as fresh_start. Junk
+    # input must keep falling back to v1.
+    applied = {"n": 0}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts",
+                        lambda **k: {"memories": [], "identity": {"agent_name": ""},
+                                     "core_fact_candidates": [], "all_fact_candidates": []})
+    monkeypatch.setattr(service, "apply_reducer_output",
+                        lambda *a, **k: applied.__setitem__("n", applied["n"] + 1))
+
+    handled = plaintext._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor=None,
+        analysis_messages=["bad"])
+
+    assert handled is False and applied["n"] == 0
+
+
+def test_v2_real_material_with_empty_core_still_falls_back_to_v1(monkeypatch):
+    # Guard the OTHER side of the fresh_start carve-out: real user material that
+    # yields no core must keep falling back to the v1 full path (its different
+    # windowing may still extract), exactly as before.
+    applied = {"n": 0}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts",
+                        lambda **k: {"memories": [], "identity": {"agent_name": ""},
+                                     "core_fact_candidates": [], "all_fact_candidates": []})
+    monkeypatch.setattr(service, "apply_reducer_output",
+                        lambda *a, **k: applied.__setitem__("n", applied["n"] + 1))
+
+    handled = plaintext._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor=None,
+        analysis_messages=[plaintext._plaintext_fresh_start_message(),
+                           {"role": "user", "content": "真实历史消息", "source": "history_import"}])
+
+    assert handled is False and applied["n"] == 0
+
+
 def test_v2_foreground_fresh_start_allows_nameless_done(monkeypatch):
     # truly-empty upload (the real fresh_start sentinel message) with no derivable
     # identity must still complete nameless.
@@ -466,8 +595,10 @@ def test_v2_foreground_fresh_start_allows_nameless_done(monkeypatch):
         analysis_messages=[plaintext._plaintext_fresh_start_message()])
 
     assert calls.get("used_apply_reducer") is True               # nameless-done fallback
-    assert calls["greeting"] == "好久不见，很高兴又能和你聊天。"  # fallback branch still greets
-    assert calls["bg_write_identity"] is True                    # background fills identity
+    # first-meet copy, not the import ("好久不见") one — a brand-new user has
+    # never met the agent before.
+    assert calls["greeting"] == "你好，很高兴认识你。我现在还没有名字，你想以后怎么称呼我？"
+    assert "bg_write_identity" not in calls                      # sentinel-only: no enrichment
 
 
 def test_v2_foreground_provider_identity_failure_marks_job_failed(monkeypatch):

@@ -1398,6 +1398,197 @@ def test_onboarding_greeting_uses_reliable_provider_call_with_extended_timeout(m
     assert captured["kwargs"]["timeout"] == history_import.GENESIS_PROVIDER_DERIVE_TIMEOUT_SEC == 120.0
 
 
+def test_onboarding_greeting_append_marks_introduced(client):
+    # The onboarding greeting IS this user's introduction: a successful append
+    # must set the durable introduced marker so the resident introduction job
+    # (agent_runtime.introduction) can never double-greet — e.g. after a later
+    # route switch to resident, or a fast-path widened to model_api.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    assert store.introduction_done() is False
+    row = history_import._append_model_api_onboarding_greeting(store, "hello, first greeting")
+    assert row["model_api_kind"] == "onboarding_greeting"
+    assert store.introduction_done() is True
+
+
+def test_onboarding_greeting_append_is_idempotent_across_retries(client):
+    # Genesis job retries (crash between greeting append and job-complete, then
+    # the app re-POSTs the same client_job_id and the job re-runs) must not
+    # append a second greeting: the check is DB-level, keyed on the existing
+    # onboarding_greeting row, not on the in-memory ring or introduced_at.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    first = history_import._append_model_api_onboarding_greeting(store, "hello one")
+    second = history_import._append_model_api_onboarding_greeting(store, "hello two")
+    assert second["id"] == first["id"]
+    rows = [m for m in db.chat_load(user_id)
+            if isinstance(m, dict) and m.get("model_api_kind") == "onboarding_greeting"]
+    assert len(rows) == 1
+
+
+def test_onboarding_greeting_concurrent_appends_yield_one_row(client):
+    # Two genesis jobs for the same user (different client_job_ids; the active
+    # lock is (user_id, job_id)-grained) can race the greeting append. The
+    # stable msg_id upsert key must collapse them to ONE persisted row against
+    # the real database, whichever thread wins.
+    import threading as _threading
+
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    results: list = [None, None]
+
+    def _run(i):
+        try:
+            results[i] = history_import._append_model_api_onboarding_greeting(store, f"hello {i}")
+        except Exception as e:  # noqa: BLE001
+            results[i] = e
+
+    threads = [_threading.Thread(target=_run, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(isinstance(r, dict) for r in results), results
+    # First-writer-wins: BOTH callers must return the identical winner doc
+    # (same ciphertext), not merely the same id — and the DB row IS that doc.
+    assert results[0]["id"] == results[1]["id"]
+    assert results[0]["body_ct"] == results[1]["body_ct"]
+    assert results[0]["nonce"] == results[1]["nonce"]
+    rows = [m for m in db.chat_load(user_id)
+            if isinstance(m, dict) and m.get("model_api_kind") == "onboarding_greeting"]
+    assert len(rows) == 1
+    assert rows[0]["body_ct"] == results[0]["body_ct"]
+    assert rows[0]["nonce"] == results[0]["nonce"]
+    assert store.introduction_done() is True
+
+
+def test_onboarding_greeting_cross_process_insert_is_first_writer_wins(client):
+    # Cross-process: two workers race the greeting DB primitive concurrently on
+    # separate pool connections with DIFFERENT envelopes (different ciphertext
+    # and ts). Exactly one may insert; both must get back the identical winner
+    # doc; the winner's ciphertext must never be rewritten (a same-PK rewrite
+    # could also slip behind the TEE replicator's (ts, msg_id) forward cursor).
+    import threading as _threading
+
+    user_id, _api_key = _register(client)
+    msg_id = history_import._onboarding_greeting_msg_id(user_id)
+    doc_a = {"id": msg_id, "role": "openclaw", "source": "model_api",
+             "model_api_kind": "onboarding_greeting", "ts": 2.0,
+             "body_ct": "cipher-A", "nonce": "nonce-A"}
+    doc_b = {"id": msg_id, "role": "openclaw", "source": "model_api",
+             "model_api_kind": "onboarding_greeting", "ts": 1.0,
+             "body_ct": "cipher-B", "nonce": "nonce-B"}
+    outcomes: list = [None, None]
+
+    def _run(i, doc):
+        outcomes[i] = db.chat_insert_onboarding_greeting_once(user_id, msg_id, doc["ts"], doc)
+
+    threads = [_threading.Thread(target=_run, args=(0, doc_a)),
+               _threading.Thread(target=_run, args=(1, doc_b))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    (win_a, ins_a), (win_b, ins_b) = outcomes
+    assert sorted([ins_a, ins_b]) == [False, True]               # exactly one inserter
+    assert win_a == win_b                                        # identical winner doc, not just id
+    rows = [m for m in db.chat_load(user_id)
+            if isinstance(m, dict) and m.get("model_api_kind") == "onboarding_greeting"]
+    assert len(rows) == 1
+    assert rows[0]["body_ct"] == win_a["body_ct"]                # DB row == returned winner
+    assert rows[0]["nonce"] == win_a["nonce"]
+
+
+def test_onboarding_greeting_lookup_failure_propagates(client, monkeypatch):
+    # "Could not look" must never be treated as "absent": a transient DB read
+    # failure at the precheck would otherwise bypass an existing greeting and
+    # insert a duplicate. The raising lookup must propagate and nothing may be
+    # appended or marked.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+
+    def _boom(_user_id):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(db, "chat_onboarding_greeting_row", _boom)
+    monkeypatch.setattr(store, "append_chat",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not append on lookup failure")))
+    with pytest.raises(RuntimeError):
+        history_import._append_model_api_onboarding_greeting(store, "never appended")
+    assert store.introduction_done() is False
+
+
+def test_onboarding_greeting_wake_notify_fires_for_inserter_only(client, monkeypatch):
+    # The cross-worker wake must actually fire for the inserter (a broken
+    # import here was once swallowed silently — other workers' long-polls
+    # never woke), and must NOT fire for a loser/idempotent re-call that adds
+    # no new content.
+    from core import wake_bus as core_wake_bus
+
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    notified: list = []
+    monkeypatch.setattr(core_wake_bus, "notify",
+                        lambda kind, *args: notified.append((kind,) + args))
+
+    history_import._append_model_api_onboarding_greeting(store, "hello")
+    assert notified == [("chat", user_id)]
+
+    history_import._append_model_api_onboarding_greeting(store, "retry")
+    assert notified == [("chat", user_id)]
+
+
+def test_onboarding_greeting_insert_failure_does_not_mark(client, monkeypatch):
+    # The greeting write path must never mark introduced when the row did not
+    # durably land: the insert primitive RAISES on DB failure (unlike
+    # chat_append's swallow) and the exception must propagate un-marked —
+    # a marker without a persisted greeting would suppress every future
+    # recovery.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("db write failed")
+
+    monkeypatch.setattr(db, "chat_insert_onboarding_greeting_once", _boom)
+    with pytest.raises(RuntimeError):
+        history_import._append_model_api_onboarding_greeting(store, "never durable")
+    assert store.introduction_done() is False
+
+
+def test_onboarding_greeting_existing_row_heals_missing_marker(client):
+    # Crash window: greeting row persisted but the marker write was lost. A
+    # retry must reuse the existing row AND backfill introduced_at.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    first = history_import._append_model_api_onboarding_greeting(store, "hello")
+    cur = store.load_proactive_settings()
+    cur["introduced_at"] = ""
+    db.set_blob(user_id, "proactive_settings", cur)
+    assert store.introduction_done() is False
+    retry = history_import._append_model_api_onboarding_greeting(store, "retry text")
+    assert retry["id"] == first["id"]
+    assert store.introduction_done() is True
+
+
+def test_onboarding_greeting_envelope_failure_leaves_introduced_unset(client, monkeypatch):
+    # Marker must anchor on the greeting the user actually RECEIVES: an append
+    # that failed (no chat row) must not mark introduced, or the failure would
+    # be permanently papered over and suppress a later introduction.
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, _body, **_kwargs: (None, "forced_envelope_failure"),
+    )
+    with pytest.raises(RuntimeError):
+        history_import._append_model_api_onboarding_greeting(store, "never lands")
+    assert store.introduction_done() is False
+
+
 def test_support_material_sections_split_character_and_personal_profile():
     payload = {
         "persona_filename": "combined.md",

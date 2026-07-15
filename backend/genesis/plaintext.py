@@ -675,7 +675,26 @@ def _run_plaintext_genesis_v2(
         store.user_id, job_id, status="processing",
         output={"stage": "genesis_v2_foreground", "source_family": fg_family}, processed_chunks=0,
     )
-    combined_map = worker.genesis_combined_map_enabled()
+    msgs = analysis_messages if isinstance(analysis_messages, list) else []
+    # fresh_start-only = every analysis message is the synthetic sentinel (routed
+    # into the history bucket by _plaintext_route_family, so group source_kind
+    # can't tell it apart from real history — the message `source` can).
+    # isinstance INSIDE the all() condition, never as an `if` filter — filtering
+    # would make non-dict junk (["bad"]) vacuously pass as all([]) is True and
+    # mis-route it into the fresh_start carve-out.
+    fresh_start_only = bool(msgs) and all(
+        isinstance(m, dict)
+        and str(m.get("source") or "") == history_import._FRESH_START_SOURCE
+        for m in msgs
+    )
+    # Computed BEFORE the foreground loop, and combined-map is disabled outright
+    # for sentinel-only input: with the flag on (test compose sets it), the loop
+    # would otherwise extract voice candidates from the sentinel and
+    # build_voice_persona_output_from_candidates would distill persona from
+    # synthetic text — the same "never derive anything from the sentinel" rule
+    # the identity skip below enforces. Gating the flag here also keeps
+    # include_voice_candidates off, not just the final artifact write.
+    combined_map = worker.genesis_combined_map_enabled() and not fresh_start_only
     foreground_reduces: list[dict] = []
     primary_reduce: dict | None = None
     voice_candidates: list[dict] = []
@@ -711,8 +730,13 @@ def _run_plaintext_genesis_v2(
         all_fact_candidates.extend([c for c in candidates if isinstance(c, dict)])
 
     core = primary_reduce.get("core_fact_candidates") or foreground.select_core_for_foreground(all_fact_candidates)
-    if not core:
+    if not core and not fresh_start_only:
         return False  # nothing to work with -> let the v1 full path handle it
+    # fresh_start has no material BY DEFINITION, so `core` is always empty for it.
+    # Falling back to v1 here would complete the job WITHOUT the onboarding
+    # greeting (the v1 full path never greets) — the user would open an empty
+    # chat. Continue instead: the nameless greeting+done branch below handles an
+    # empty core, and _fact_write short-circuits on zero candidates.
 
     full_fact_write = worker.build_memory_output_from_fact_candidates(
         user_id=store.user_id,
@@ -743,17 +767,22 @@ def _run_plaintext_genesis_v2(
     # explicit relationship_started_at (user typed a date) -> honored verbatim below,
     # per the documented priority; blank -> _store_identity_payload falls back to memory.
     explicit_started_at = str((relationship_anchor or {}).get("relationship_started_at") or "").strip()
-    msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
 
     # Foreground-ready contract: derive identity when the material contains a real
     # signal, but never invent one or make its absence a speaking gate. Greeting and
     # Genesis completion still happen before entry; heavy voice/persona/full-memory
-    # stay in background.
-    identity_payload, id_warnings = foreground_identity.derive_foreground_identity(
-        runtime=runtime, analysis_messages=msgs, core_memories=full_memories,
-        days_with_user=days, language=language,
-    )
+    # stay in background. fresh_start skips the identity LLM entirely: deriving a
+    # name from the synthetic sentinel is meaningless (a hallucinated one would be
+    # wrong), and a provider hiccup there must not push a material-less onboarding
+    # into the retryable-failed path — the greeting below must land regardless.
+    if fresh_start_only:
+        identity_payload, id_warnings = {"agent_name": "", "dimensions": []}, []
+    else:
+        identity_payload, id_warnings = foreground_identity.derive_foreground_identity(
+            runtime=runtime, analysis_messages=msgs, core_memories=full_memories,
+            days_with_user=days, language=language,
+        )
     provider_failure = _provider_identity_failure(id_warnings)
     if provider_failure or not foreground_identity.has_identity_signal(identity_payload):
         # Non-LLM lightweight fallback: try to salvage a name from the uploaded
@@ -796,6 +825,7 @@ def _run_plaintext_genesis_v2(
             identity_payload=identity_payload,
             days=days,
             language=language,
+            fresh_start=fresh_start_only,
         )
         completed = db.genesis_complete_job(
             store.user_id, job_id,
@@ -824,8 +854,18 @@ def _run_plaintext_genesis_v2(
             identity_payload=identity_payload,
             days=days,
             language=language,
+            fresh_start=fresh_start_only,
         )
         service.apply_reducer_output(store, api_key, job_id, fg_merged)
+
+    if fresh_start_only:
+        # No material by definition -> nothing to enrich. Background here would
+        # re-reduce the pure sentinel as history with write_identity=True (prod
+        # runs WITHOUT FEEDLING_GENESIS_COMBINED_MAP, so this path IS reachable
+        # there) — inventing persona/identity from synthetic text the foreground
+        # explicitly refuses to distill, plus wasted provider calls. The greeting
+        # landed and the job is complete; stop here.
+        return True
 
     if combined_map:
         return True
@@ -957,6 +997,7 @@ def _append_plaintext_onboarding_greeting(
     identity_payload: dict,
     days: int,
     language: str,
+    fresh_start: bool = False,
 ) -> str:
     try:
         greeting_text, _warnings = history_import._generate_model_api_onboarding_greeting(
@@ -970,14 +1011,27 @@ def _append_plaintext_onboarding_greeting(
     except Exception:
         greeting_text = ""
     if not str(greeting_text or "").strip():
-        greeting_text = (
-            "好久不见，很高兴又能和你聊天。"
-            if str(language).startswith("zh")
-            else "Good to see you again — I'm glad we can talk."
-        )
+        # Fallback copy must match the relationship: a fresh_start user has
+        # never met the agent — "好久不见" would read as mistaken identity.
+        # Imports keep the reunion copy.
+        if fresh_start:
+            greeting_text = (
+                "你好，很高兴认识你。我现在还没有名字，你想以后怎么称呼我？"
+                if str(language).startswith("zh")
+                else "Hi, it's really nice to meet you. I don't have a name yet — what would you like to call me?"
+            )
+        else:
+            greeting_text = (
+                "好久不见，很高兴又能和你聊天。"
+                if str(language).startswith("zh")
+                else "Good to see you again — I'm glad we can talk."
+            )
     try:
         history_import._append_model_api_onboarding_greeting(store, greeting_text)
-    except Exception:
+    except Exception as e:  # noqa: BLE001 — greeting is best-effort for import
+        # jobs (a distilled import without a greeting beats a failed job); the
+        # durable/idempotent contract lives in _append_model_api_onboarding_greeting.
+        print(f"[genesis:{getattr(store, 'user_id', '')}] onboarding greeting append failed: {type(e).__name__}:{str(e)[:160]}")
         return ""
     return str(greeting_text or "")
 

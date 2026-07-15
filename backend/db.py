@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -116,6 +117,29 @@ def healthcheck() -> bool:
     except Exception as e:
         log.error("[db] healthcheck failed: %s", e)
         return False
+
+
+def health_probe(timeout: float = 2.0) -> dict:
+    """Fast liveness probe for /healthz.
+
+    Acquire a pooled connection within ``timeout`` seconds and run ``SELECT 1``.
+    Returns ``{"ok", "latency_ms", "error"}`` and NEVER raises. The short
+    timeout is deliberate: the pool's default acquire wait is 10s, so a
+    saturated/hung pool would otherwise block the health endpoint for that whole
+    window. With a 2s cap, a pool that can't hand out a connection surfaces as
+    ``ok=False`` fast, letting the caller report unhealthy instead of hanging.
+    """
+    t0 = time.perf_counter()
+    try:
+        with get_pool().connection(timeout=timeout) as conn:
+            conn.execute("SELECT 1")
+        return {"ok": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1), "error": None}
+    except Exception as e:  # noqa: BLE001 — health must never raise
+        return {
+            "ok": False,
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "error": str(e)[:200],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -2649,6 +2673,72 @@ def chat_load(user_id: str) -> list[dict]:
     except Exception as e:
         log.error("[db] chat_load(%s) failed: %s", user_id, e)
         return []
+
+
+def chat_onboarding_greeting_row(user_id: str) -> dict | None:
+    """Single-row lookup of the user's onboarding greeting
+    (``model_api_kind='onboarding_greeting'``), oldest first.
+
+    Deliberately RAISES on database failure instead of the swallow-and-default
+    used elsewhere in this module: the caller uses this as the exactly-once
+    guard for the greeting append, and collapsing "could not look" into
+    "absent" would let a transient read failure bypass an existing greeting
+    and insert a duplicate."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT doc FROM chat_messages WHERE user_id = %s "
+            "AND doc->>'model_api_kind' = 'onboarding_greeting' "
+            "ORDER BY seq ASC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def chat_insert_onboarding_greeting_once(
+    user_id: str, msg_id: str, ts: float, doc: dict
+) -> tuple[dict, bool]:
+    """First-writer-wins insert for the onboarding greeting row.
+
+    Greeting-specific by design — generic ``chat_append`` upserts
+    (ON CONFLICT DO UPDATE), which under the stable greeting msg_id would let
+    a concurrent second writer REWRITE the winner's ciphertext/ts: the two
+    processes' rings would hold different envelopes, and a same-PK rewrite
+    that lowers ``ts`` can slip behind the TEE replicator's (ts, msg_id)
+    forward cursor, leaving RDS and TEE on different documents forever.
+    DO NOTHING freezes the first legal greeting; a loser gets the
+    authoritative winner row back and must treat it as the truth.
+
+    RAISES on database failure (this is the exactly-once guard — never
+    collapse "could not write/look" into an answer). Returns
+    ``(winner_doc, inserted_by_this_call)``."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (user_id, msg_id) DO NOTHING RETURNING doc",
+                (user_id, msg_id, ts, Jsonb(doc)),
+            ).fetchone()
+            inserted = row is not None
+            if not inserted:
+                # ON CONFLICT waits out an in-flight conflicting insert, so by
+                # here the winner is committed and visible to this statement.
+                row = conn.execute(
+                    "SELECT doc FROM chat_messages WHERE user_id = %s AND msg_id = %s",
+                    (user_id, msg_id),
+                ).fetchone()
+    if row is None:
+        # Conflict fired yet the row is gone (deleted between statements, e.g.
+        # a concurrent chat clear) — surface it rather than invent an answer.
+        raise RuntimeError("onboarding_greeting_row_vanished_after_conflict")
+    # Deliberately NO inline TEE mirror: TEE chat rows are produced by the
+    # replicator, which decrypts via the enclave (plaintext body, no
+    # body_ct/K_*) and assigns seq from its own copy pass. An inline mirror of
+    # this ENCRYPTED doc would write the wrong data shape into TEE and allocate
+    # an independent seq that later conflict-updates never repair. The RDS row
+    # is the immutable first-writer winner, so the normal replicator sweep
+    # copies it exactly once.
+    return row[0], inserted
 
 
 # Content types whose body_ct is heavy enough to live in R2 rather than inline in

@@ -85,7 +85,8 @@ def test_small_response_not_compressed(api_key):
     resp = _asgi_get("/healthz", {"Accept-Encoding": "gzip"})
     assert resp.status_code == 200
     assert "content-encoding" not in resp.headers
-    assert resp.json() == {"ok": True, "mode": "multi_tenant"}
+    body = resp.json()
+    assert body["ok"] is True and body["mode"] == "multi_tenant"
 
 
 def test_no_compression_when_client_does_not_accept_gzip(api_key):

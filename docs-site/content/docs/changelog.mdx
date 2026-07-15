@@ -10,6 +10,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+### API
+
+- Expand `GET /healthz` from a fixed liveness stub into a structured
+  liveness-and-dependency probe. Responses now carry a top-level `status`
+  (`healthy`, `degraded`, or `unhealthy`), a `checks` object with per-component
+  detail, and release/uptime metadata, while preserving the legacy `ok` /
+  `mode` / `ready` fields. The backend checks PostgreSQL (`SELECT 1`),
+  connection-pool saturation, the in-memory user registry, and the cross-worker
+  wake-bus listener, and returns HTTP 503 when PostgreSQL is unreachable. The
+  enclave reports readiness, release, and TLS posture from cached boot state
+  without performing any cryptography. The documented response schema is
+  unchanged (a generic JSON object).
+
 ### Documentation and contract
 
 - Add `GET /v1/dream/status` — read-only dream (memory distillation) banner
