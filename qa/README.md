@@ -334,13 +334,14 @@ runtime workers and queues are currently deployed. If that environment is alread
 you do **not** need another Feedling VPS just for this suite. The system under
 test remains the existing test deployment.
 
-The headless test driver is separate infrastructure. This design requires one
-single-job ephemeral GitHub Actions runner VM with the `feedling-e2e` label. It
-holds the configured Codex OAuth bundle only for that job and is destroyed
-afterward; it does not host Feedling or replace a Runtime V2 worker. The test app
-deploy, test runner deploy, test Postgres deploy, and qualification workflow
-share the `feedling-test-environment` concurrency lock. Pre/post build receipts
-still catch a deployment made outside those workflows.
+The headless test driver is separate infrastructure. The workflow creates one
+single-job JIT GitHub Actions runner on AWS with a unique per-run label, gives it
+the Codex OAuth bundle only for that job, and destroys it afterward. It does not
+host Feedling or replace a Runtime V2 worker. The test app deploy, test runner
+deploy, test Postgres deploy, and qualification workflow share the
+`feedling-test-environment` concurrency lock. Pre/post build receipts still
+catch a deployment made outside those workflows. The complete on-demand AWS
+setup is documented in [`qa/aws/README.md`](aws/README.md).
 
 ## One-time GitHub setup
 
@@ -363,6 +364,7 @@ replace the Environment branch restriction. Add these environment **secrets**:
 - `QA_OPENROUTER_API_KEY`
 - `QA_GEMINI_API_KEY`
 - `QA_KONGBEIQIE_API_KEY`
+- `QA_RUNNER_GITHUB_APP_PRIVATE_KEY`
 
 Protect `test` as well as `main`: human code changes must arrive through the
 normal reviewed path, force-push and deletion must be blocked, and only the
@@ -389,6 +391,18 @@ coverage:
 - `QA_KONGBEIQIE_MODEL`
 - `QA_KONGBEIQIE_BASE_URL` (the normalized HTTPS OpenAI-compatible endpoint)
 
+Add the non-secret disposable-runner variables described in
+[`qa/aws/README.md`](aws/README.md):
+
+- `QA_AWS_ROLE_ARN`
+- `QA_AWS_REGION`
+- `QA_AWS_AMI_ID`
+- `QA_AWS_SUBNET_ID`
+- `QA_AWS_SECURITY_GROUP_ID`
+- `QA_RUNNER_GITHUB_APP_ID`
+- `QA_RUNNER_GROUP_ID`
+- `QA_RUNNER_GROUP_NAME`
+
 `QA_CODEX_AUTH_JSON_B64` is the base64 encoding of a complete ChatGPT
 `auth.json`. The initial version may use an operator's regular ChatGPT account;
 a dedicated QA account remains the preferable long-term choice because this
@@ -409,18 +423,19 @@ run-scoped `CODEX_HOME`, and masks each decoded token. The base64 bundle, decode
 JSON, ID token, access token, and refresh token are all included in the post-run
 artifact secret scan.
 
-Register a single-job ephemeral self-hosted runner with the labels `self-hosted`,
-`linux`, `x64`, and `feedling-e2e`. It must pin `codex-cli 0.144.3`, support the
-Codex Linux bubblewrap sandbox, run as a non-root account, and MUST NOT have
-`$HOME/.codex/auth.json` or another persistent ChatGPT login. Destroy the runner
-VM after every job; deleting the work directory alone is not sufficient.
-`actions/setup-python` must install Python 3.12 into a narrow tool-cache runtime
-owned by that same runner account: `sys.prefix`, `sys.base_prefix`, the runtime
-`bin` directory, and the resolved executable must be owner-controlled and not
-group/world writable, and the executable must resolve directly beneath a
-runtime `bin`. A root-owned system Python or broad `/usr` prefix is unsupported.
-The workflow validates this boundary before decoding the QA OAuth bundle or
-provisioning synthetic accounts, so a misconfigured runner fails safely.
+Do not register or keep a persistent runner. The GitHub-hosted controller mints
+a one-job JIT configuration and launches the checked-in AWS controller. That
+controller pins `codex-cli 0.144.3` and the GitHub runner archives by digest,
+supports the Codex Linux bubblewrap sandbox, creates an unprivileged runner
+account without a persistent ChatGPT login, and gives the instance no SSH key
+or IAM role. `actions/setup-python` installs Python 3.12 into a narrow tool-cache
+runtime owned by that runner account: `sys.prefix`, `sys.base_prefix`, the
+runtime `bin` directory, and the resolved executable must be owner-controlled
+and not group/world writable, and the executable must resolve directly beneath
+a runtime `bin`. A root-owned system Python or broad `/usr` prefix is
+unsupported. The workflow validates this boundary before decoding the QA OAuth
+bundle or provisioning synthetic accounts, so a misconfigured runner fails
+safely.
 
 The runner VM is ephemeral, and the workflow creates a fresh owner-only
 `CODEX_HOME` for every run. Pinned Codex 0.144.3 does not reliably apply a
@@ -518,8 +533,9 @@ There is deliberately no free-form deployment-SHA or candidate-branch input.
 Use `runtime_target=deployed_current` for today's runtime and reserve
 `hosted_resident` for the future strict Runtime V2 proof. Any controller ref
 other than protected `main` fails before the Environment or its secrets are
-reached. Manual mode is intentional for the first stabilization phase; there is
-no push, schedule, or deployment trigger yet.
+reached. Manual mode is intentional for the first stabilization phase; the
+qualification itself has no push, schedule, or deployment trigger. Only the
+secretless AWS expiry reaper runs hourly.
 
 The baseline target requires authoritative backend image identity plus the
 currently deployed API-key/user contracts. The optional strict Runtime V2 target
@@ -527,11 +543,11 @@ additionally fails before semantic testing unless worker build identity and all
 strict control-plane receipts exist. Those strict requirements are future
 product/deployment prerequisites, not claims made by this testing branch.
 
-The workflow's `always()` cleanup covers ordinary step failures, not runner loss,
-job cancellation, or infrastructure termination. The single-job runner MUST be
-ephemeral so its copied OAuth bundle is destroyed after the job, and the backend
-still needs a server-side TTL/reaper for `agent-e2e-*` synthetic accounts so an
-abruptly lost runner cannot strand test users indefinitely.
+Runner cleanup has four independent paths: normal one-job shutdown with EC2
+terminate-on-shutdown, a GitHub-hosted `always()` cleanup job, a root-owned
+five-hour hard-expiry timer, and an hourly GitHub-hosted AWS tag reaper. The
+backend still needs its separate server-side TTL/reaper for `agent-e2e-*`
+synthetic accounts so an abruptly lost runner cannot strand test users.
 
 ## Artifacts and qualification result
 

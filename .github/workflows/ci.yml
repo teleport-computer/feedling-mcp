@@ -32,6 +32,9 @@ jobs:
   api-key-e2e-manual:
     name: agentic API-key E2E (self-service trusted controller)
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/api-key-e2e.yml
     with:
       runtime_target: ${{ inputs.runtime_target }}

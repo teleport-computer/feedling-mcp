@@ -14,7 +14,7 @@ def _step(name: str, next_name: str) -> str:
     return WORKFLOW[start:end]
 
 
-def test_workflow_is_manual_only_and_uses_protected_ephemeral_runner():
+def test_workflow_is_manual_only_and_uses_protected_jit_runner():
     trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
     assert "workflow_dispatch:" in trigger
     assert "workflow_call:" in trigger
@@ -24,9 +24,13 @@ def test_workflow_is_manual_only_and_uses_protected_ephemeral_runner():
     assert "  deployment:" not in trigger
     assert "validate-dispatch:" in WORKFLOW
     assert 'if [ "$DISPATCH_REF" != "refs/heads/main" ]' in WORKFLOW
-    assert "needs: [validate-dispatch, resolve-test-deployment]" in WORKFLOW
+    assert (
+        "needs: [validate-dispatch, resolve-test-deployment, provision-aws-runner]"
+        in WORKFLOW
+    )
     assert "environment: feedling-e2e-test" in WORKFLOW
-    assert "runs-on: [self-hosted, linux, x64, feedling-e2e]" in WORKFLOW
+    assert "runs-on:\n      group: ${{ needs.provision-aws-runner.outputs.runner_group }}" in WORKFLOW
+    assert "labels: ${{ needs.provision-aws-runner.outputs.runner_label }}" in WORKFLOW
     assert "timeout-minutes: 240" in WORKFLOW
     assert "group: feedling-test-environment" in WORKFLOW
     assert "persist-credentials: false" in WORKFLOW
@@ -37,11 +41,168 @@ def test_workflow_is_manual_only_and_uses_protected_ephemeral_runner():
     )
 
 
+def test_github_hosted_controller_provisions_private_jit_aws_runner():
+    provision = WORKFLOW[
+        WORKFLOW.index("  provision-aws-runner:\n") : WORKFLOW.index(
+            "  qualify-api-key-runtime:\n"
+        )
+    ]
+
+    assert "needs: [validate-dispatch, resolve-test-deployment]" in provision
+    assert "runs-on: ubuntu-24.04" in provision
+    assert "environment: feedling-e2e-test" in provision
+    assert "id-token: write" in provision
+    assert "ref: ${{ github.sha }}" in provision
+    assert "persist-credentials: false" in provision
+    assert (
+        "actions/create-github-app-token@"
+        "fee1f7d63c2ff003460e3d139729b119787bc349" in provision
+    )
+    assert (
+        "aws-actions/configure-aws-credentials@"
+        "61815dcd50bd041e203e49132bacad1fd04d2708" in provision
+    )
+    assert "/actions/runners/generate-jitconfig" in provision
+    assert "RUNNER_GROUP_NAME: ${{ vars.QA_RUNNER_GROUP_NAME }}" in provision
+    assert 'echo "group=$RUNNER_GROUP_NAME" >> "$GITHUB_OUTPUT"' in provision
+    assert "runner group name is invalid" in provision
+    assert (
+        "/orgs/${GITHUB_REPOSITORY_OWNER}/actions/runner-groups/"
+        "${RUNNER_GROUP_ID}" in provision
+    )
+    assert "runner group id and name do not identify the same group" in provision
+    assert "qualification runners require a dedicated non-default group" in provision
+    assert 'group.get("allows_public_repositories") is not False' in provision
+    assert 'group.get("restricted_to_workflows") is not True' in provision
+    assert 'selected_workflows = group.get("selected_workflows")' in provision
+    assert 'selected_workflows != [expected_workflow]' in provision
+    assert '"api-key-e2e.yml@refs/heads/main"' in provision
+    assert (
+        "qualification runner group must select only the protected main workflow"
+        in provision
+    )
+    assert 'runner_identity="feedling-e2e-${run_key}"' in provision
+    assert '"labels": ["self-hosted", "linux", "x64", "feedling-e2e", label]' in provision
+    assert 'echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"' in provision
+    assert 'runner_group_id = runner.get("runner_group_id")' in provision
+    assert 'runner_group_id != int(os.environ["RUNNER_GROUP_ID"])' in provision
+    assert "python3 qa/aws/launch.py" in provision
+    assert '--jit-config-file "$JIT_CONFIG_FILE"' in provision
+    assert 'rm -f -- "$JIT_CONFIG_FILE"' in provision
+    assert '--run-id "$GITHUB_RUN_ID"' in provision
+    assert '--run-attempt "$GITHUB_RUN_ATTEMPT"' in provision
+    assert "TARGET_SHA: ${{ needs.resolve-test-deployment.outputs.sha }}" in provision
+    assert '--target-sha "$TARGET_SHA"' in provision
+    assert '--controller-sha "$CONTROLLER_SHA"' in provision
+    assert '--github-output "$GITHUB_OUTPUT"' in provision
+    assert 'echo "runner-label=' not in provision
+    assert 'echo "encoded_jit_config=' not in provision
+    assert 'cat "$jit_config_file"' not in provision
+    assert 'echo "$GH_APP_TOKEN"' not in provision
+
+
+def test_qualification_waits_for_exact_online_idle_jit_runner():
+    provision = WORKFLOW[
+        WORKFLOW.index("  provision-aws-runner:\n") : WORKFLOW.index(
+            "  qualify-api-key-runtime:\n"
+        )
+    ]
+    readiness = _step(
+        "Wait for exact JIT evaluator to become ready",
+        "Remove local JIT configuration",
+    )
+    qualify_header = WORKFLOW[
+        WORKFLOW.index("  qualify-api-key-runtime:\n") : WORKFLOW.index(
+            "    steps:\n", WORKFLOW.index("  qualify-api-key-runtime:\n")
+        )
+    ]
+
+    assert "id: runner_ready" in readiness
+    assert "/actions/runners/${RUNNER_ID}" in readiness
+    assert 'runner.get("id") != expected_id' in readiness
+    assert 'runner.get("name") != expected_name' in readiness
+    assert 'os.environ["RUNNER_LABEL"] not in label_names' in readiness
+    assert 'runner.get("status") == "online"' in readiness
+    assert 'runner.get("busy") is False' in readiness
+    assert "for attempt in $(seq 1 60)" in readiness
+    assert "python3 qa/aws/terminate.py" in readiness
+    assert 'echo "ready=true" >> "$GITHUB_OUTPUT"' in readiness
+    assert provision.index("id: launch") < provision.index("id: runner_ready")
+    assert "provision-aws-runner" in qualify_header
+    assert "needs.provision-aws-runner.outputs.runner_group" in qualify_header
+    assert "needs.provision-aws-runner.outputs.runner_label" in qualify_header
+
+
+def test_failed_provisioning_rolls_back_by_exact_attempt_even_without_instance_output():
+    rollback = WORKFLOW[
+        WORKFLOW.index("      - name: Roll back failed AWS provisioning attempt\n") :
+        WORKFLOW.index("  qualify-api-key-runtime:\n")
+    ]
+
+    assert "if: ${{ always()" in rollback
+    assert "steps.launch.outcome == 'failure'" in rollback
+    assert "steps.runner_ready.outcome == 'failure'" in rollback
+    assert "steps.jit_cleanup.outcome == 'failure'" in rollback
+    assert "python3 qa/aws/terminate.py" in rollback
+    assert '--repository "$GITHUB_REPOSITORY"' in rollback
+    assert '--run-id "$GITHUB_RUN_ID"' in rollback
+    assert '--run-attempt "$GITHUB_RUN_ATTEMPT"' in rollback
+    assert 'if [ -n "$INSTANCE_ID" ]' in rollback
+
+
+def test_github_hosted_cleanup_always_terminates_exact_managed_attempt():
+    cleanup = WORKFLOW[WORKFLOW.index("  cleanup-aws-runner:\n") :]
+    cleanup_header = cleanup[: cleanup.index("    steps:\n")]
+
+    assert (
+        "if: ${{ always() && needs.validate-dispatch.result == 'success' && "
+        "needs.provision-aws-runner.result != 'skipped' }}" in cleanup
+    )
+    assert "needs.provision-aws-runner.result == 'success'" not in cleanup_header
+    assert (
+        "needs: [validate-dispatch, provision-aws-runner, qualify-api-key-runtime]"
+        in cleanup
+    )
+    assert "runs-on: ubuntu-24.04" in cleanup
+    assert "id-token: write" in cleanup
+    assert "ref: ${{ github.sha }}" in cleanup
+    assert "persist-credentials: false" in cleanup
+    assert (
+        "aws-actions/configure-aws-credentials@"
+        "61815dcd50bd041e203e49132bacad1fd04d2708" in cleanup
+    )
+    assert "python3 qa/aws/terminate.py" in cleanup
+    assert '--repository "$GITHUB_REPOSITORY"' in cleanup
+    assert '--run-id "$GITHUB_RUN_ID"' in cleanup
+    assert '--run-attempt "$GITHUB_RUN_ATTEMPT"' in cleanup
+    assert 'args+=(--instance-id "$INSTANCE_ID")' in cleanup
+    assert (
+        "actions/create-github-app-token@"
+        "fee1f7d63c2ff003460e3d139729b119787bc349" in cleanup
+    )
+    assert "Mint fresh GitHub App token for registration cleanup" in cleanup
+    assert "Delete exact stale JIT runner registration" in cleanup
+    assert "if: ${{ always() && steps.verify_cleanup.outcome == 'success' }}" in cleanup
+    assert (
+        "if: ${{ always() && steps.github_cleanup_app.outcome == 'success' }}"
+        in cleanup
+    )
+    assert "needs.provision-aws-runner.outputs.runner_id" in cleanup
+    assert "needs.provision-aws-runner.outputs.runner_name" in cleanup
+    assert "len(matches) > 1" in cleanup
+    assert "?name=${derived_name}&per_page=100" in cleanup
+    assert "runner_id != int(supplied_id)" in cleanup
+    assert "/actions/runners/${runner_id}" in cleanup
+    assert "204)" in cleanup
+    assert "404)" in cleanup
+    assert "self-hosted" not in cleanup
+
+
 def test_deployment_target_is_metadata_and_controller_code_is_immutable():
     trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
     resolver = WORKFLOW[
         WORKFLOW.index("  resolve-test-deployment:\n") : WORKFLOW.index(
-            "  qualify-api-key-runtime:\n"
+            "  provision-aws-runner:\n"
         )
     ]
     qualify = WORKFLOW[WORKFLOW.index("  qualify-api-key-runtime:\n") :]
@@ -75,7 +236,10 @@ def test_deployment_target_is_metadata_and_controller_code_is_immutable():
     assert 'if [ "${#images[@]}" -ne 2 ]' in resolver
     assert "git merge-base --is-ancestor" in resolver
     assert "ref: test" not in qualify
-    assert "needs: [validate-dispatch, resolve-test-deployment]" in qualify
+    assert (
+        "needs: [validate-dispatch, resolve-test-deployment, provision-aws-runner]"
+        in qualify
+    )
     assert (
         "EXPECTED_DEPLOYMENT_SHA: ${{ needs.resolve-test-deployment.outputs.sha }}"
         in context

@@ -9,6 +9,9 @@ PG_DEPLOY = (ROOT / ".github" / "workflows" / "pg-deploy.yml").read_text(
     encoding="utf-8"
 )
 E2E = (ROOT / ".github" / "workflows" / "api-key-e2e.yml").read_text(encoding="utf-8")
+REAPER = (
+    ROOT / ".github" / "workflows" / "api-key-e2e-runner-reaper.yml"
+).read_text(encoding="utf-8")
 
 
 def _job(name: str, next_name: str) -> str:
@@ -42,6 +45,9 @@ def test_existing_default_branch_ci_dispatches_trusted_e2e_without_inheriting_se
     assert "uses: ./.github/workflows/api-key-e2e.yml" in manual_job
     assert "expected_deployment_sha" not in manual_job
     assert "runtime_target: ${{ inputs.runtime_target }}" in manual_job
+    assert "permissions:" in manual_job
+    assert "contents: read" in manual_job
+    assert "id-token: write" in manual_job
     assert "secrets: inherit" not in manual_job
     assert "secrets:" not in manual_job
     assert "workflow_call:" in E2E
@@ -58,7 +64,7 @@ def test_e2e_pins_secret_bearing_code_and_treats_deployment_sha_as_metadata():
     trigger = E2E[E2E.index("on:\n") : E2E.index("permissions:\n")]
     resolver = E2E[
         E2E.index("  resolve-test-deployment:\n") : E2E.index(
-            "  qualify-api-key-runtime:\n"
+            "  provision-aws-runner:\n"
         )
     ]
     qualify = E2E[E2E.index("  qualify-api-key-runtime:\n") :]
@@ -74,7 +80,10 @@ def test_e2e_pins_secret_bearing_code_and_treats_deployment_sha_as_metadata():
     assert "Resolve current serialized test deployment target" in resolver
     assert 'if [ "${#images[@]}" -ne 2 ]' in resolver
     assert "git merge-base --is-ancestor" in resolver
-    assert "needs: [validate-dispatch, resolve-test-deployment]" in qualify
+    assert (
+        "needs: [validate-dispatch, resolve-test-deployment, provision-aws-runner]"
+        in qualify
+    )
     assert "ref: ${{ github.sha }}" in qualify
     assert "fetch-depth: 1" in qualify
     assert 'checked_out_sha="$(git rev-parse --verify HEAD)"' in qualify
@@ -84,6 +93,102 @@ def test_e2e_pins_secret_bearing_code_and_treats_deployment_sha_as_metadata():
         in qualify
     )
     assert 'echo "expected_sha=$EXPECTED_DEPLOYMENT_SHA"' in qualify
+
+
+def test_e2e_uses_pinned_jit_app_and_oidc_actions_with_hosted_cleanup():
+    provision = E2E[
+        E2E.index("  provision-aws-runner:\n") : E2E.index(
+            "  qualify-api-key-runtime:\n"
+        )
+    ]
+    qualify_header = E2E[
+        E2E.index("  qualify-api-key-runtime:\n") : E2E.index(
+            "    steps:\n", E2E.index("  qualify-api-key-runtime:\n")
+        )
+    ]
+    cleanup = E2E[E2E.index("  cleanup-aws-runner:\n") :]
+
+    assert "runs-on: ubuntu-24.04" in provision
+    assert "id-token: write" in provision
+    assert (
+        "actions/create-github-app-token@"
+        "fee1f7d63c2ff003460e3d139729b119787bc349" in provision
+    )
+    oidc_pin = (
+        "aws-actions/configure-aws-credentials@"
+        "61815dcd50bd041e203e49132bacad1fd04d2708"
+    )
+    assert oidc_pin in provision
+    assert "/actions/runners/generate-jitconfig" in provision
+    assert "python3 qa/aws/launch.py" in provision
+    assert "needs: [validate-dispatch, resolve-test-deployment]" in provision
+    assert "TARGET_SHA: ${{ needs.resolve-test-deployment.outputs.sha }}" in provision
+    assert '--target-sha "$TARGET_SHA"' in provision
+    assert '--controller-sha "$CONTROLLER_SHA"' in provision
+    assert "Wait for exact JIT evaluator to become ready" in provision
+    assert 'runner.get("status") == "online"' in provision
+    assert 'runner.get("busy") is False' in provision
+    assert "provision-aws-runner" in qualify_header
+    assert "needs.provision-aws-runner.outputs.runner_group" in qualify_header
+    assert "needs.provision-aws-runner.outputs.runner_label" in qualify_header
+    assert "QA_RUNNER_GROUP_NAME" in provision
+    assert "/actions/runner-groups/${RUNNER_GROUP_ID}" in provision
+    assert "runner group id and name do not identify the same group" in provision
+    assert "allows_public_repositories" in provision
+    assert "restricted_to_workflows" in provision
+    assert "selected_workflows != [expected_workflow]" in provision
+    assert '"api-key-e2e.yml@refs/heads/main"' in provision
+    assert 'runner_group_id = runner.get("runner_group_id")' in provision
+    assert 'runner_group_id != int(os.environ["RUNNER_GROUP_ID"])' in provision
+    assert (
+        "if: ${{ always() && needs.validate-dispatch.result == 'success' && "
+        "needs.provision-aws-runner.result != 'skipped' }}" in cleanup
+    )
+    assert "runs-on: ubuntu-24.04" in cleanup
+    assert oidc_pin in cleanup
+    assert "python3 qa/aws/terminate.py" in cleanup
+    assert "Mint fresh GitHub App token for registration cleanup" in cleanup
+    assert "Delete exact stale JIT runner registration" in cleanup
+    assert "if: ${{ always() && steps.github_cleanup_app.outcome == 'success' }}" in cleanup
+    assert "/actions/runners/${runner_id}" in cleanup
+
+
+def test_expired_runner_reaper_is_hourly_hosted_oidc_and_protected_main_only():
+    trigger = REAPER[REAPER.index("on:\n") : REAPER.index("permissions:\n")]
+
+    assert "schedule:" in trigger
+    assert 'cron: "37 * * * *"' in trigger
+    assert "workflow_dispatch:" in trigger
+    assert "push:" not in trigger
+    assert "pull_request:" not in trigger
+    assert "workflow_call:" not in trigger
+    assert "github.repository == 'teleport-computer/feedling-mcp'" in REAPER
+    assert "github.ref == 'refs/heads/main'" in REAPER
+    assert "environment: feedling-e2e-test" in REAPER
+    assert "runs-on: ubuntu-24.04" in REAPER
+    assert "self-hosted" not in REAPER
+    assert "id-token: write" in REAPER
+    assert "ref: ${{ github.sha }}" in REAPER
+    assert "persist-credentials: false" in REAPER
+    assert (
+        "aws-actions/configure-aws-credentials@"
+        "61815dcd50bd041e203e49132bacad1fd04d2708" in REAPER
+    )
+    assert "python3 qa/aws/reap.py" in REAPER
+    assert '--region "$AWS_REGION"' in REAPER
+    assert '--repository "$GITHUB_REPOSITORY"' in REAPER
+    assert "secrets." not in REAPER
+    for forbidden_secret in (
+        "QA_TEST_ADMIN_TOKEN",
+        "QA_CODEX_AUTH_JSON_B64",
+        "QA_DEEPSEEK_API_KEY",
+        "QA_ANTHROPIC_API_KEY",
+        "QA_OPENAI_PROVIDER_API_KEY",
+        "QA_OPENROUTER_API_KEY",
+        "QA_GEMINI_API_KEY",
+        "QA_KONGBEIQIE_API_KEY",
+    ):
+        assert forbidden_secret not in REAPER
 
 
 def test_backend_qualification_regressions_run_with_postgres_dependencies():

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "actions_runner": {
+    "version": "2.335.1",
+    "url": "https://github.com/actions/runner/releases/download/v2.335.1/actions-runner-linux-x64-2.335.1.tar.gz",
+    "sha256": "4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf"
+  },
+  "codex": {
+    "version": "0.144.3",
+    "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.144.3-linux-x64.tgz",
+    "sha512": "c6d0d8e6c5903db6018f694b59926f7348c1aded1743b66637855b484bdacdb4365fbb87866d43ff4a19ec023e4a00bf55f66b521bf1447778dff0265d2680cc",
+    "members": [
+      "README.md",
+      "package.json",
+      "vendor/x86_64-unknown-linux-musl/bin/codex",
+      "vendor/x86_64-unknown-linux-musl/bin/codex-code-mode-host",
+      "vendor/x86_64-unknown-linux-musl/codex-package.json",
+      "vendor/x86_64-unknown-linux-musl/codex-path/rg",
+      "vendor/x86_64-unknown-linux-musl/codex-resources/bwrap",
+      "vendor/x86_64-unknown-linux-musl/codex-resources/zsh/bin/zsh"
+    ]
+  }
+}

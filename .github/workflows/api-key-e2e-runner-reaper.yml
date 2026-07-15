@@ -1,0 +1,74 @@
+name: Reap expired agentic E2E runners
+
+on:
+  schedule:
+    - cron: "37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feedling-e2e-runner-reaper
+  cancel-in-progress: false
+
+jobs:
+  reap-expired-runners:
+    name: terminate expired managed AWS evaluators
+    if: github.repository == 'teleport-computer/feedling-mcp' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: feedling-e2e-test
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out immutable trusted reaper controller
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify protected-main reaper controller
+        env:
+          CONTROLLER_REF: ${{ github.ref }}
+          CONTROLLER_REPOSITORY: ${{ github.repository }}
+          CONTROLLER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$CONTROLLER_REPOSITORY" != "teleport-computer/feedling-mcp" ]; then
+            echo "::error::runner reaper repository is not trusted"
+            exit 1
+          fi
+          if [ "$CONTROLLER_REF" != "refs/heads/main" ]; then
+            echo "::error::runner reaper must execute from protected main"
+            exit 1
+          fi
+          if [[ ! "$CONTROLLER_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::runner reaper revision must be an immutable full Git SHA"
+            exit 1
+          fi
+          checked_out_sha="$(git rev-parse --verify HEAD)"
+          if [ "$checked_out_sha" != "$CONTROLLER_SHA" ]; then
+            echo "::error::runner reaper checkout moved"
+            exit 1
+          fi
+
+      - name: Configure short-lived AWS credentials for reaping
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.0
+        with:
+          role-to-assume: ${{ vars.QA_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.QA_AWS_REGION }}
+          role-session-name: feedling-e2e-reaper-${{ github.run_id }}-${{ github.run_attempt }}
+          role-duration-seconds: 1800
+          mask-aws-account-id: true
+
+      - name: Reap only expired fully tagged evaluators
+        env:
+          AWS_REGION: ${{ vars.QA_AWS_REGION }}
+        run: |
+          set -euo pipefail
+          python3 qa/aws/reap.py \
+            --region "$AWS_REGION" \
+            --repository "$GITHUB_REPOSITORY"

@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Least-privilege controller role and no-ingress security group for disposable
+  Feedling agentic-E2E GitHub Actions runners.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing the public runner subnet.
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Public IPv4 subnet with MapPublicIpOnLaunch enabled and one Internet
+      Gateway default route. The runtime controller verifies this contract.
+  CanonicalAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Region-local Canonical Ubuntu Server 24.04 amd64 AMI. The runtime
+      controller verifies Canonical ownership and image metadata before launch.
+  GitHubOidcProviderArn:
+    Type: String
+    AllowedPattern: '^arn:aws:iam::[0-9]{12}:oidc-provider/token[.]actions[.]githubusercontent[.]com$'
+    Description: Existing AWS IAM OIDC provider for token.actions.githubusercontent.com.
+  Repository:
+    Type: String
+    Default: teleport-computer/feedling-mcp
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  GitHubEnvironment:
+    Type: String
+    Default: feedling-e2e-test
+    AllowedPattern: '^[A-Za-z0-9_.-]+$'
+
+Resources:
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Feedling E2E disposable runner - no ingress and HTTPS egress only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - Description: HTTPS only
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: ManagedBy
+          Value: feedling-agentic-e2e
+        - Key: Purpose
+          Value: api-key-e2e
+
+  RunnerControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: >-
+        GitHub OIDC role that may launch and terminate only tagged Feedling E2E
+        instances. It cannot pass an instance role or create ingress rules.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !Sub repo:${Repository}:environment:${GitHubEnvironment}
+      Policies:
+        - PolicyName: disposable-runner-control-plane
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InspectRunnerInputsAndState
+                Effect: Allow
+                Action:
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                Resource: "*"
+              - Sid: LaunchWithFixedInfrastructure
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}::image/${CanonicalAmiId}
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PublicSubnetId}
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${RunnerSecurityGroup}
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+              - Sid: LaunchOnlyTaggedDisposableResources
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    "aws:RequestTag/ManagedBy": feedling-agentic-e2e
+                    "aws:RequestTag/Purpose": api-key-e2e
+                    "aws:RequestTag/Repository": !Ref Repository
+                    "ec2:InstanceType": m7i.xlarge
+                    "ec2:MetadataHttpEndpoint": enabled
+                    "ec2:MetadataHttpTokens": required
+                    "ec2:MetadataTags": disabled
+                  NumericEquals:
+                    "ec2:MetadataHttpPutResponseHopLimit": 1
+                  ForAllValues:StringEquals:
+                    "aws:TagKeys":
+                      - ManagedBy
+                      - Purpose
+                      - Repository
+                      - RunId
+                      - RunAttempt
+                      - TargetSHA
+                      - ControllerSHA
+                      - ExpiresAt
+                  "Null":
+                    "aws:RequestTag/ManagedBy": "false"
+                    "aws:RequestTag/Purpose": "false"
+                    "aws:RequestTag/Repository": "false"
+                    "aws:RequestTag/RunId": "false"
+                    "aws:RequestTag/RunAttempt": "false"
+                    "aws:RequestTag/TargetSHA": "false"
+                    "aws:RequestTag/ControllerSHA": "false"
+                    "aws:RequestTag/ExpiresAt": "false"
+              - Sid: LaunchOnlyTaggedDisposableVolumes
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                Condition:
+                  StringEquals:
+                    "aws:RequestTag/ManagedBy": feedling-agentic-e2e
+                    "aws:RequestTag/Purpose": api-key-e2e
+                    "aws:RequestTag/Repository": !Ref Repository
+                    "ec2:VolumeType": gp3
+                  Bool:
+                    "ec2:Encrypted": "true"
+                  NumericEquals:
+                    "ec2:VolumeSize": 40
+                  ForAllValues:StringEquals:
+                    "aws:TagKeys":
+                      - ManagedBy
+                      - Purpose
+                      - Repository
+                      - RunId
+                      - RunAttempt
+                      - TargetSHA
+                      - ControllerSHA
+                      - ExpiresAt
+                  "Null":
+                    "aws:RequestTag/ManagedBy": "false"
+                    "aws:RequestTag/Purpose": "false"
+                    "aws:RequestTag/Repository": "false"
+                    "aws:RequestTag/RunId": "false"
+                    "aws:RequestTag/RunAttempt": "false"
+                    "aws:RequestTag/TargetSHA": "false"
+                    "aws:RequestTag/ControllerSHA": "false"
+                    "aws:RequestTag/ExpiresAt": "false"
+              - Sid: TagOnlyAsPartOfLaunch
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                Condition:
+                  StringEquals:
+                    "ec2:CreateAction": RunInstances
+                    "aws:RequestTag/ManagedBy": feedling-agentic-e2e
+                    "aws:RequestTag/Purpose": api-key-e2e
+                    "aws:RequestTag/Repository": !Ref Repository
+                  ForAllValues:StringEquals:
+                    "aws:TagKeys":
+                      - ManagedBy
+                      - Purpose
+                      - Repository
+                      - RunId
+                      - RunAttempt
+                      - TargetSHA
+                      - ControllerSHA
+                      - ExpiresAt
+                  "Null":
+                    "aws:RequestTag/ManagedBy": "false"
+                    "aws:RequestTag/Purpose": "false"
+                    "aws:RequestTag/Repository": "false"
+                    "aws:RequestTag/RunId": "false"
+                    "aws:RequestTag/RunAttempt": "false"
+                    "aws:RequestTag/TargetSHA": "false"
+                    "aws:RequestTag/ControllerSHA": "false"
+                    "aws:RequestTag/ExpiresAt": "false"
+              - Sid: TerminateOnlyManagedRepositoryRunners
+                Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    "ec2:ResourceTag/ManagedBy": feedling-agentic-e2e
+                    "ec2:ResourceTag/Purpose": api-key-e2e
+                    "ec2:ResourceTag/Repository": !Ref Repository
+
+Outputs:
+  AwsRoleArn:
+    Description: Set this as the feedling-e2e-test variable QA_AWS_ROLE_ARN.
+    Value: !GetAtt RunnerControllerRole.Arn
+  SecurityGroupId:
+    Description: Set this as the feedling-e2e-test variable QA_AWS_SECURITY_GROUP_ID.
+    Value: !Ref RunnerSecurityGroup
+  SubnetId:
+    Description: Set this as the feedling-e2e-test variable QA_AWS_SUBNET_ID.
+    Value: !Ref PublicSubnetId
+  AmiId:
+    Description: Set this as the feedling-e2e-test variable QA_AWS_AMI_ID.
+    Value: !Ref CanonicalAmiId
