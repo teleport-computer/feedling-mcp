@@ -766,6 +766,10 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     # Stage D zero-roster entries carry no api_key — the consumer authenticates
     # with the runtime-token file instead (FEEDLING_RUNTIME_TOKEN_FILE below).
     env["FEEDLING_API_KEY"] = entry.get("api_key", "")
+    # Hosted consumers must never poll the resident genesis-distill lane (cloud
+    # genesis runs in the server-side worker); the consumer's flag defaults ON
+    # for self-hosted VPS installs, so the hosted spawn path opts out explicitly.
+    env["FEEDLING_GENESIS_RESIDENT_ENABLED"] = "0"
     env["AGENT_MODE"] = entry.get("agent_mode", "cli")
     cli_cmd = entry.get("cli_cmd")
     if not cli_cmd and driver == "claude" and _claude_cli_should_stream_thinking(entry):
@@ -949,6 +953,7 @@ _CONSUMER_ENV_KEYS = (
     "FEEDLING_API_KEY", "FEEDLING_API_URL", "FEEDLING_ENCLAVE_URL",
     "AGENT_MODE", "AGENT_CLI_CMD", "CHECKPOINT_FILE", "AGENT_SESSION_FILE",
     "IMAGE_TEMP_DIR", "FILE_TEMP_DIR", "CONSUMER_ID", "FEEDLING_RUNTIME_TOKEN_FILE",
+    "FEEDLING_GENESIS_RESIDENT_ENABLED",
     "ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
     # Per-user ambient timezone so the containerized agent's clock isn't the
     # container's default UTC (the process-spawn path sets it in consumer_env;
