@@ -266,6 +266,11 @@ services:
       # background. Validated on test; flip to "false" to revert to the v1
       # one-shot path. Read in worker.genesis_v2_enabled().
       FEEDLING_GENESIS_V2_ENABLED: "true"
+      # Genesis Round2 combined-map — one per-chunk call extracts fact+voice
+      # together (fewer LLM calls) + voice/persona to foreground. Validated on
+      # test (real-device quality comparison); flip off to revert to the exact
+      # old split-map path. Read in worker.genesis_combined_map_enabled().
+      FEEDLING_GENESIS_COMBINED_MAP: "true"
       # Host-all: every configured user is served by the agent-runner. The send
       # routing here must agree with the supervisor's host_all discovery. Defaults
       # to "true": the cutover routes all fit-provider users to agent-runner with

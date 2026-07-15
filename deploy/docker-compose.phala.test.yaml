@@ -259,15 +259,15 @@ services:
       # to the background. Prod compose deliberately omits this (keeps the v1
       # one-shot path) until test validation. Read in worker.genesis_v2_enabled().
       FEEDLING_GENESIS_V2_ENABLED: "true"
-      # TEST-ONLY: genesis Round2 combined-map — one per-chunk call extracts fact+voice
+      # Genesis Round2 combined-map — one per-chunk call extracts fact+voice
       # together (fewer LLM calls) + voice/persona to foreground. Read in
       # worker.genesis_combined_map_enabled(). Flip off to revert to the exact old
-      # split-map path (hard rollback). On test for real-device quality comparison.
+      # split-map path (hard rollback). Enabled on both test and prod.
       FEEDLING_GENESIS_COMBINED_MAP: "true"
       # Host-all: every configured user is served by the agent-runner (the send
-      # routing must agree with the supervisor's host_all discovery). Empty = off
-      # (per-user flag still required). Mirror the agent-runner's value.
-      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      # routing must agree with the supervisor's host_all discovery). Defaults to
+      # "true" to match prod; mirror the agent-runner's value.
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-true}"
       # Legacy memory migration is opt-in. Empty = off; set to 1 only after
       # seeded real-device Garden verification passes. Mirror agent-runner.
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
