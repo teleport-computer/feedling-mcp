@@ -5681,6 +5681,140 @@ def test_resident_claude_auto_keeps_resume_and_skips_transcript(monkeypatch):
     assert cmd[:3] == ["claude", "--resume", sid]
 
 
+# --- stale claude --resume self-heal -----------------------------------------
+# With resident claude back on --resume (see above), a sid can go stale when
+# something OUTSIDE the consumer wipes claude's local session store (cache
+# cleanup, moved home, reinstalled CLI). Without healing, EVERY turn then dies
+# on the same dead --resume. call_agent_cli clears the sid and retries the turn
+# once — strictly on the missing-session signature and only for our own sid.
+
+_CLAUDE_OK_TURN = json.dumps({
+    "type": "result", "subtype": "success",
+    "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000",
+    "result": "ok",
+})
+_STALE_SID = "11111111-1111-1111-1111-111111111111"
+
+
+def _stale_resume_env(monkeypatch, tmp_path, user_id):
+    _bridge_session_env(monkeypatch, tmp_path, user_id)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    crc._save_agent_session_id(_STALE_SID)
+
+
+def test_call_agent_cli_heals_stale_claude_resume_once(monkeypatch, tmp_path):
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_heal")
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        if len(runs) == 1:
+            assert cmd[:3] == ["claude", "--resume", _STALE_SID]
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="",
+                stderr=f"No conversation found with session ID: {_STALE_SID}",
+            )
+        assert "--resume" not in cmd            # retry must be a fresh session
+        return subprocess.CompletedProcess(cmd, 0, stdout=_CLAUDE_OK_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    assert crc.call_agent_cli("hello") == "ok"
+    assert len(runs) == 2
+    # the fresh session from the retry is persisted for the NEXT turn's --resume
+    assert crc._load_agent_session_id() == "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000"
+
+
+def test_call_agent_cli_stale_resume_retry_fails_raises_no_loop(monkeypatch, tmp_path):
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_fail")
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="",
+            stderr=f"No conversation found with session ID: {_STALE_SID}",
+        )
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 2                        # single retry, never a loop
+    assert crc._load_agent_session_id() == ""    # dead sid stays cleared
+
+
+def test_call_agent_cli_failed_retry_with_sid_in_error_does_not_repersist(monkeypatch, tmp_path):
+    # codex2 R1 P2: claude's FAILURE result JSON can still carry a session_id.
+    # A failed retry must not save it — otherwise the sid we just cleared is
+    # re-persisted for a dead/failed session and the next turn resumes into it.
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_repersist")
+    failed_with_sid = json.dumps({
+        "type": "result", "subtype": "error_during_execution", "is_error": True,
+        "session_id": "bbbbbbbb-2222-3333-4444-555555550000",
+        "result": "something broke",
+    })
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        if len(runs) == 1:
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="",
+                stderr=f"No conversation found with session ID: {_STALE_SID}",
+            )
+        return subprocess.CompletedProcess(cmd, 1, stdout=failed_with_sid, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 2
+    assert crc._load_agent_session_id() == ""    # failed-retry sid NOT persisted
+
+
+def test_call_agent_cli_non_session_error_does_not_heal(monkeypatch, tmp_path):
+    # A 401/500/etc must not eat the (valid) session: no retry, sid retained.
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_401")
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="API Error: 401 unauthorized",
+        )
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 1
+    assert crc._load_agent_session_id() == _STALE_SID
+
+
+def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
+    # An operator-pinned --resume with a sid that is NOT ours is their config —
+    # never rotate it, even on a missing-session error.
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_foreign")
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        'claude --resume 99999999-9999-9999-9999-999999999999 -p "{message}"',
+    )
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="",
+            stderr="No conversation found with session ID: 99999999-9999-9999-9999-999999999999",
+        )
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 1
+    assert crc._load_agent_session_id() == _STALE_SID
+
+
 def test_foreground_injection_bridges_pi_on_cold_start(monkeypatch, tmp_path):
     # No session at all (fresh consumer / session file lost / just switched driver):
     # pi opens a blank session, so this turn MUST carry the transcript.
