@@ -85,6 +85,12 @@ def test_classify_upstream_mirrors_consumer_on_samples():
         "400 unsupported parameter 'tool_choice'",
         "maximum context length exceeded",
         "blocked by content policy",
+        # provider_http_<code> slug shape (genesis/import worker errors): the
+        # underscore defeats \b<code>\b, so the slug rules must catch these.
+        "plaintext_import_failed:ProviderError:provider_http_504: <!DOCTYPE html>",
+        "provider_http_402: payment page html",
+        "provider_http_401: relay auth html",
+        "provider_http_429: relay throttle html",
     ]
     for s in samples:
         assert catalog.classify_upstream(s) == classify_agent_error(RuntimeError(s)).error_class, s
