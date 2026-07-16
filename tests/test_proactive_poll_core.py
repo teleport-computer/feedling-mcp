@@ -176,6 +176,207 @@ def test_grace_window_is_env_tunable(store, monkeypatch):
     assert "pj_intro" in [j.get("job_id") for j in _poll(store)]
 
 
+def _append_pending_job(
+    store,
+    *,
+    job_id: str,
+    job_kind: str,
+    ts: float,
+    status: str = "pending",
+    **extra,
+):
+    job = {
+        "job_id": job_id,
+        "source": proactive_service.PROACTIVE_JOB_SOURCE,
+        "job_kind": job_kind,
+        "ts": ts,
+        "status": status,
+    }
+    job.update(extra)
+    store.append_proactive_job(job)
+
+
+def _proactive_jobs_by_id(store) -> dict[str, dict]:
+    return {
+        str(job.get("job_id") or ""): job
+        for job in store.list_proactive_jobs(limit=0)
+    }
+
+
+# --------------------------------------------------------------------------- #
+# stale wake expiry
+# --------------------------------------------------------------------------- #
+
+def test_stale_wake_expires_before_wake_control(store, monkeypatch):
+    now = 10_000.0
+    monkeypatch.setattr(poll_core.time, "time", lambda: now)
+    gate_calls = []
+    monkeypatch.setattr(
+        poll_core,
+        "_resident_wake_control_decision_v2",
+        lambda *_args: gate_calls.append(True),
+    )
+    _append_pending_job(
+        store,
+        job_id="pj_stale_wake",
+        job_kind="heartbeat",
+        ts=now - (16 * 60),
+    )
+
+    assert _poll(store) == []
+    assert gate_calls == []
+    job = _proactive_jobs_by_id(store)["pj_stale_wake"]
+    assert job["status"] == "expired"
+    assert job["status_reason"] == "stale_wake_expired"
+    assert job["wake_result"] == "stale_wake_expired"
+
+    updates = []
+    monkeypatch.setattr(
+        store,
+        "update_proactive_job",
+        lambda *_args, **_kwargs: updates.append(True),
+    )
+    assert _poll(store) == []
+    assert updates == []
+
+
+def test_fresh_wake_is_still_pollable(store, monkeypatch):
+    now = 10_000.0
+    monkeypatch.setattr(poll_core.time, "time", lambda: now)
+    monkeypatch.setattr(poll_core, "_resident_wake_control_decision_v2", lambda *_args: None)
+    _append_pending_job(
+        store,
+        job_id="pj_fresh_wake",
+        job_kind="heartbeat",
+        ts=now - (14 * 60),
+    )
+
+    assert [job["job_id"] for job in _poll(store)] == ["pj_fresh_wake"]
+    assert _proactive_jobs_by_id(store)["pj_fresh_wake"]["status"] == "pending"
+
+
+def test_wake_max_age_is_env_tunable(store, monkeypatch):
+    now = 10_000.0
+    monkeypatch.setattr(poll_core.time, "time", lambda: now)
+    monkeypatch.setenv("FEEDLING_WAKE_JOB_MAX_AGE_SEC", "60")
+    _append_pending_job(
+        store,
+        job_id="pj_env_stale_wake",
+        job_kind="heartbeat",
+        ts=now - 61,
+    )
+
+    assert _poll(store) == []
+    assert _proactive_jobs_by_id(store)["pj_env_stale_wake"]["status"] == "expired"
+
+
+def test_old_watermark_exempt_jobs_do_not_expire(store, monkeypatch):
+    now = 10_000.0
+    monkeypatch.setattr(poll_core.time, "time", lambda: now)
+    old_ts = now - (16 * 60)
+    _append_intro_job(store, job_id="pj_old_intro", ts=old_ts)
+    for job_id, job_kind in (
+        ("pj_old_capture", "memory_capture"),
+        ("pj_old_dream", "memory_dream"),
+        ("pj_old_migrate", "memory_migrate"),
+    ):
+        _append_pending_job(store, job_id=job_id, job_kind=job_kind, ts=old_ts)
+
+    assert {job["job_id"] for job in _poll(store)} == {
+        "pj_old_intro",
+        "pj_old_capture",
+        "pj_old_dream",
+        "pj_old_migrate",
+    }
+    assert all(job["status"] == "pending" for job in _proactive_jobs_by_id(store).values())
+
+
+# --------------------------------------------------------------------------- #
+# memory maintenance latest-only selection
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("job_kind", ["memory_dream", "memory_migrate"])
+def test_dream_and_migrate_only_poll_latest_pending_by_ts(store, job_kind):
+    # Append out of timestamp order so selection cannot accidentally rely on seq.
+    _append_pending_job(store, job_id=f"{job_kind}_newest", job_kind=job_kind, ts=300.0)
+    _append_pending_job(
+        store,
+        job_id=f"{job_kind}_oldest",
+        job_kind=job_kind,
+        ts=100.0,
+        claimed_at="9999.0",
+    )
+    _append_pending_job(store, job_id=f"{job_kind}_middle", job_kind=job_kind, ts=200.0)
+
+    assert [job["job_id"] for job in _poll(store)] == [f"{job_kind}_newest"]
+    jobs = _proactive_jobs_by_id(store)
+    assert jobs[f"{job_kind}_newest"]["status"] == "pending"
+    for suffix in ("oldest", "middle"):
+        old = jobs[f"{job_kind}_{suffix}"]
+        assert old["status"] == "skipped"
+        assert old["status_reason"] == "superseded_by_newer"
+
+
+def test_all_pending_memory_capture_jobs_remain_pollable(store):
+    for index in range(3):
+        _append_pending_job(
+            store,
+            job_id=f"memory_capture_{index}",
+            job_kind="memory_capture",
+            ts=100.0 + index,
+        )
+
+    assert [job["job_id"] for job in _poll(store)] == [
+        "memory_capture_0",
+        "memory_capture_1",
+        "memory_capture_2",
+    ]
+    assert all(job["status"] == "pending" for job in _proactive_jobs_by_id(store).values())
+
+
+def test_latest_only_selection_is_independent_per_maintenance_kind(store):
+    for job_id, job_kind, ts in (
+        ("dream_old", "memory_dream", 100.0),
+        ("migrate_new", "memory_migrate", 400.0),
+        ("capture_fixed", "memory_capture", 150.0),
+        ("dream_new", "memory_dream", 300.0),
+        ("migrate_old", "memory_migrate", 200.0),
+    ):
+        _append_pending_job(store, job_id=job_id, job_kind=job_kind, ts=ts)
+
+    assert {job["job_id"] for job in _poll(store)} == {
+        "dream_new",
+        "migrate_new",
+        "capture_fixed",
+    }
+    jobs = _proactive_jobs_by_id(store)
+    assert jobs["dream_old"]["status_reason"] == "superseded_by_newer"
+    assert jobs["migrate_old"]["status_reason"] == "superseded_by_newer"
+
+
+def test_latest_only_selection_does_not_touch_claimed_or_realizing(store):
+    _append_pending_job(store, job_id="dream_pending", job_kind="memory_dream", ts=100.0)
+    _append_pending_job(
+        store,
+        job_id="dream_claimed",
+        job_kind="memory_dream",
+        ts=200.0,
+        status="claimed",
+    )
+    _append_pending_job(
+        store,
+        job_id="dream_realizing",
+        job_kind="memory_dream",
+        ts=300.0,
+        status="realizing",
+    )
+
+    assert [job["job_id"] for job in _poll(store)] == ["dream_pending"]
+    jobs = _proactive_jobs_by_id(store)
+    assert jobs["dream_claimed"]["status"] == "claimed"
+    assert jobs["dream_realizing"]["status"] == "realizing"
+
+
 # --------------------------------------------------------------------------- #
 # stale-claim reclaim
 # --------------------------------------------------------------------------- #

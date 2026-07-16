@@ -23,6 +23,7 @@ from proactive import capture_jobs, resident_runtime_v2, service
 # survivor consumer can pick it up (hosted consumers are exempt — they manage
 # their own lease).
 RESIDENT_WAKE_LEASE_SEC = 600.0
+WAKE_JOB_MAX_AGE_SEC = 900.0
 
 # How long the resident one-shot introduction job waits for the agent to post its
 # OWN greeting before firing as a deadlock fallback. The io-onboarding skill makes
@@ -107,6 +108,14 @@ def _intro_fallback_grace_sec() -> float:
         return RESIDENT_INTRO_FALLBACK_GRACE_SEC
 
 
+def _wake_job_max_age_sec() -> float:
+    try:
+        return max(0.0, float(os.environ.get(
+            "FEEDLING_WAKE_JOB_MAX_AGE_SEC", str(WAKE_JOB_MAX_AGE_SEC))))
+    except (TypeError, ValueError):
+        return WAKE_JOB_MAX_AGE_SEC
+
+
 def _agent_already_greeted(store) -> bool:
     """True once the agent has posted a real, user-visible chat message.
 
@@ -162,12 +171,55 @@ def _cancel_introduction_job(store, job: dict) -> None:
     )
 
 
+def _supersedable_maintenance_kind(job: dict) -> str:
+    if capture_jobs.is_memory_dream_job(job):
+        return capture_jobs.CAPTURE_JOB_KIND_DREAM
+    if capture_jobs.is_memory_migrate_job(job):
+        return capture_jobs.CAPTURE_JOB_KIND_MIGRATE
+    return ""
+
+
+def _job_ts_epoch(job: dict) -> float:
+    try:
+        return float(job.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _resident_pending_watermark_exempt_jobs(store, *, limit: int, runtime_profile: dict) -> list[dict]:
-    out: list[dict] = []
-    for job in store.list_proactive_jobs(since_epoch=0, limit=0):
-        if str(job.get("status") or "pending") != "pending":
+    pending = [
+        job
+        for job in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if str(job.get("status") or "pending") == "pending"
+        and _is_ts_watermark_exempt_job(job)
+    ]
+    latest_by_kind: dict[str, tuple[float, int]] = {}
+    for index, job in enumerate(pending):
+        kind = _supersedable_maintenance_kind(job)
+        if not kind:
             continue
-        if not _is_ts_watermark_exempt_job(job):
+        candidate = (_job_ts_epoch(job), index)
+        if candidate >= latest_by_kind.get(kind, (float("-inf"), -1)):
+            latest_by_kind[kind] = candidate
+
+    for index, job in enumerate(pending):
+        kind = _supersedable_maintenance_kind(job)
+        if kind and latest_by_kind[kind][1] != index:
+            job_id = str(job.get("job_id") or "")
+            if job_id:
+                store.update_proactive_job(
+                    job_id,
+                    {
+                        "status": "skipped",
+                        "status_reason": "superseded_by_newer",
+                    },
+                    only_if_status="pending",
+                )
+
+    out: list[dict] = []
+    for index, job in enumerate(pending):
+        kind = _supersedable_maintenance_kind(job)
+        if kind and latest_by_kind[kind][1] != index:
             continue
         if _is_introduction_job(job):
             decision = _introduction_serve_decision(store, job)
@@ -223,6 +275,8 @@ def resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_p
     if len(out) >= limit:
         return out
     read_limit = max(limit, 100)
+    poll_now = time.time()
+    wake_job_max_age_sec = _wake_job_max_age_sec()
     for job in store.list_proactive_jobs(since_epoch=since, limit=read_limit):
         job_id = str(job.get("job_id") or "")
         if job_id and job_id in seen:
@@ -233,6 +287,19 @@ def resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_p
         # (status-based, ts-watermark-exempt); skip them here so they aren't
         # wake-gated by the v2 controls below.
         if _is_ts_watermark_exempt_job(job):
+            continue
+        age_ref = _job_age_ref_epoch(job)
+        if age_ref and poll_now - age_ref > wake_job_max_age_sec:
+            if job_id:
+                store.update_proactive_job(
+                    job_id,
+                    {
+                        "status": "expired",
+                        "status_reason": "stale_wake_expired",
+                        "wake_result": "stale_wake_expired",
+                    },
+                    only_if_status="pending",
+                )
             continue
         decision = _resident_wake_control_decision_v2(store, job)
         if decision is not None and not decision.accepted:

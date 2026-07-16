@@ -5794,6 +5794,283 @@ def test_call_agent_cli_non_session_error_does_not_heal(monkeypatch, tmp_path):
     assert crc._load_agent_session_id() == _STALE_SID
 
 
+def test_maintenance_jobs_wait_for_conversation_lull(monkeypatch):
+    # Soft idle: the user talked 1 min ago → memory maintenance (capture/dream/
+    # migrate) waits for a lull; wake-class jobs are NOT affected. Distinct from
+    # the user-pending defer: no flag, no break — later jobs still run this pass.
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    monkeypatch.setattr(crc, "_last_user_message_wall", time.time() - 60)
+    now = time.time()
+    jobs = [
+        {"job_id": "c1", "ts": now - 30, "source": "memory_capture"},
+        {"job_id": "d1", "ts": now - 30, "source": "memory_dream"},
+        {"job_id": "m1", "ts": now - 30, "source": "memory_migrate"},
+        {"job_id": "p1", "ts": now - 20, "source": crc.PROACTIVE_JOB_SOURCE},
+    ]
+    out = crc._process_resident_jobs(jobs, chat_since=10.0)
+    assert ran == [("proactive", "p1")]            # maintenance deferred, wake ran
+    assert out == pytest.approx(now - 20)
+    assert crc._resident_jobs_deferred_for_user is False   # soft idle ≠ defer flag
+
+
+def test_maintenance_soft_idle_respects_max_defer_cap(monkeypatch):
+    # A heavy chatter must not starve memory upkeep forever: jobs older than the
+    # MAX_DEFER cap run even mid-conversation.
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    monkeypatch.setattr(crc, "_last_user_message_wall", time.time() - 60)
+    old_ts = time.time() - crc.MAINTENANCE_MAX_DEFER_SEC - 60
+    crc._process_resident_jobs(
+        [{"job_id": "c1", "ts": old_ts, "source": "memory_capture"}], chat_since=10.0
+    )
+    assert ran == [("capture", "c1")]
+
+
+def test_maintenance_runs_after_lull_and_on_fresh_process(monkeypatch):
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    # lull: last user message longer than IDLE_SEC ago → maintenance proceeds
+    monkeypatch.setattr(
+        crc, "_last_user_message_wall", time.time() - crc.MAINTENANCE_IDLE_SEC - 5
+    )
+    crc._process_resident_jobs(
+        [{"job_id": "d1", "ts": time.time() - 30, "source": "memory_dream"}],
+        chat_since=10.0,
+    )
+    # fresh process: wall == 0.0 (no user message this lifetime) → never waits
+    monkeypatch.setattr(crc, "_last_user_message_wall", 0.0)
+    crc._process_resident_jobs(
+        [{"job_id": "c1", "ts": time.time(), "source": "memory_capture"}],
+        chat_since=10.0,
+    )
+    assert ran == [("dream", "d1"), ("capture", "c1")]
+
+
+# --- resident distill: chat preemption + resumable in-memory progress --------
+
+def _patch_memory_distill(monkeypatch, *, windows=3):
+    """Memory-mode distill harness: fake genesis worker/LLM modules injected into
+    sys.modules (so the lazy imports never pull real backend code), fake transport
+    helpers, REAL state machine under test. Returns the call ledger."""
+    import types as _types
+
+    calls = {"pending": 0, "map": [], "write": [], "recheck": 0,
+             "actions": [], "complete": [], "heartbeat": [], "lease": []}
+    job = {"job_id": "jobm", "mode": "add_memory", "material_kind": "",
+           "sealed": {"envelope": {"body_ct": "x"}}}
+
+    def fake_pending():
+        calls["pending"] += 1
+        return [dict(job)] if calls["pending"] == 1 else []
+
+    monkeypatch.setattr(crc, "_distill_in_progress", None)
+    monkeypatch.setattr(crc, "genesis_resident_pending", fake_pending)
+    monkeypatch.setattr(crc, "_decrypt_sealed_material", lambda env: b"doc")
+    monkeypatch.setattr(
+        crc, "_window_document",
+        lambda text, **kw: [f"w{i}" for i in range(1, windows + 1)],
+    )
+    monkeypatch.setattr(crc, "_resident_memory_snapshot", lambda: ("terms", ["known"]))
+    monkeypatch.setattr(crc, "_resident_floor_note", lambda: "")
+    monkeypatch.setattr(
+        crc, "genesis_resident_heartbeat", lambda jid: calls["heartbeat"].append(jid)
+    )
+    monkeypatch.setattr(
+        crc, "_genesis_resident_lease_alive",
+        lambda jid: calls["lease"].append(jid) or True,
+    )
+    monkeypatch.setattr(
+        crc, "_capture_build_envelope",
+        lambda card, *, occurred_at, source: {"card": card},
+    )
+    monkeypatch.setattr(
+        crc, "execute_memory_actions", lambda actions: calls["actions"].append(len(actions))
+    )
+    monkeypatch.setattr(
+        crc, "genesis_resident_complete",
+        lambda jid, *, memory_action_count, identity_status:
+            calls["complete"].append((jid, memory_action_count, identity_status)),
+    )
+
+    def fake_map(**kw):
+        calls["map"].append(kw["key_prefix"])
+        return {"all_fact_candidates": [{"summary": kw["key_prefix"]}]}
+
+    def fake_write(**kw):
+        calls["write"].append(len(kw["fact_candidates"]))
+        return {"memories": [{"summary": "m1"}, {"summary": "m2"}]}
+
+    def fake_recheck(**kw):
+        calls["recheck"] += 1
+        return {"memories": []}
+
+    fake_genesis = _types.ModuleType("genesis")
+    fake_genesis.worker = _types.SimpleNamespace(
+        build_foreground_output_from_texts=fake_map,
+        build_memory_output_from_fact_candidates=fake_write,
+        build_memory_recheck_from_material=fake_recheck,
+    )
+    fake_llm_mod = _types.ModuleType("genesis.llm_client")
+
+    class _FakeLLM:
+        def __init__(self, **kw):
+            pass
+
+    fake_llm_mod.GenesisLLMClient = _FakeLLM
+    fake_provider = _types.ModuleType("provider_client")
+
+    class _FakeProviderConfig:
+        def __init__(self, **kw):
+            pass
+
+    fake_provider.ProviderConfig = _FakeProviderConfig
+    monkeypatch.setitem(sys.modules, "genesis", fake_genesis)
+    monkeypatch.setitem(sys.modules, "genesis.llm_client", fake_llm_mod)
+    monkeypatch.setitem(sys.modules, "provider_client", fake_provider)
+    return calls
+
+
+def test_distill_yields_to_user_between_chunks_and_resumes_without_rerun(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=3)
+    pending = {"flag": False}
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: pending["flag"])
+    real_map = sys.modules["genesis"].worker.build_foreground_output_from_texts
+
+    def map_then_user_arrives(**kw):
+        out = real_map(**kw)
+        pending["flag"] = True          # user message lands DURING chunk 1's turn
+        return out
+
+    sys.modules["genesis"].worker.build_foreground_output_from_texts = map_then_user_arrives
+
+    crc._process_resident_distill_once(chat_since=1.0)
+    # yielded after chunk 1: progress held, nothing written, job NOT completed
+    assert calls["map"] == ["jobm:resident:map:1"]
+    assert calls["write"] == [] and calls["actions"] == [] and calls["complete"] == []
+    held = crc._distill_in_progress
+    assert held is not None and held["active"]["next_window_idx"] == 2
+    assert held["active"]["phase"] == "map"
+
+    # user handled → resume: chunk 1 NOT re-run, pipeline finishes end-to-end
+    pending["flag"] = False
+    sys.modules["genesis"].worker.build_foreground_output_from_texts = real_map
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert calls["lease"] == ["jobm"]              # held lease re-checked on resume
+    assert calls["map"] == [f"jobm:resident:map:{i}" for i in (1, 2, 3)]
+    assert calls["write"] == [3]                   # all 3 windows' candidates, once
+    assert calls["recheck"] == 1
+    assert calls["actions"] == [2]                 # one batched memory.add
+    assert calls["complete"] == [("jobm", 2, "skipped")]
+    assert crc._distill_in_progress is None
+    assert calls["pending"] == 1                   # resume never re-claims
+
+
+def test_distill_drops_progress_when_lease_lost_while_yielded(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=2)
+    pending = {"flag": False}
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: pending["flag"])
+    real_map = sys.modules["genesis"].worker.build_foreground_output_from_texts
+
+    def map_then_user_arrives(**kw):
+        out = real_map(**kw)
+        pending["flag"] = True
+        return out
+
+    sys.modules["genesis"].worker.build_foreground_output_from_texts = map_then_user_arrives
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert crc._distill_in_progress is not None
+
+    # while the user kept chatting, the backend reaper re-queued the job
+    monkeypatch.setattr(crc, "_genesis_resident_lease_alive", lambda jid: False)
+    pending["flag"] = False
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert crc._distill_in_progress is None        # local progress dropped
+    assert calls["complete"] == []                 # never completes a lost job
+    assert calls["map"] == ["jobm:resident:map:1"]  # and never touched chunk 2
+
+
+def test_distill_yields_before_write_phase_and_resumes(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    seq = iter([False, True])                       # map peek ok → write peek yields
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: next(seq, False))
+    crc._process_resident_distill_once(chat_since=1.0)
+    held = crc._distill_in_progress
+    assert calls["map"] == ["jobm:resident:map:1"] and calls["write"] == []
+    assert held is not None and held["active"]["phase"] == "write"
+
+    crc._process_resident_distill_once(chat_since=1.0)  # peek now False
+    assert calls["write"] == [1] and calls["recheck"] == 1
+    assert calls["complete"] == [("jobm", 2, "skipped")]
+    assert crc._distill_in_progress is None
+
+
+def test_distill_identity_job_postpones_whole_job_when_user_pending(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch)
+    job = {"job_id": "jobi", "mode": "update_identity", "material_kind": "",
+           "base_identity_replaced_at": "", "sealed": {"envelope": {"body_ct": "x"}}}
+    monkeypatch.setattr(crc, "genesis_resident_pending", lambda: [job])
+    derives = []
+    monkeypatch.setattr(crc, "_resident_derive_identity",
+                        lambda document, job_id: derives.append(job_id) or None)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: True)
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert derives == []                            # zero model turns spent
+    assert crc._distill_in_progress is not None     # job held for the next pass
+
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert derives == ["jobi"]
+    assert calls["complete"] == [("jobi", 0, "skipped")]
+    assert crc._distill_in_progress is None
+
+
+def test_distill_lease_alive_only_4xx_means_lost(monkeypatch):
+    # codex2 R1 P2: a 5xx is a backend transient — dropping held map progress on it
+    # would throw away completed chunks for nothing. Only 4xx = reclaimed/foreign.
+    class _Resp:
+        def __init__(self, code):
+            self.status_code = code
+
+    def http_with(code):
+        class _H:
+            def post(self, url, json=None, headers=None, timeout=None):
+                return _Resp(code)
+        return _H()
+
+    monkeypatch.setattr(crc, "_HTTP", http_with(200))
+    assert crc._genesis_resident_lease_alive("j") is True
+    monkeypatch.setattr(crc, "_HTTP", http_with(409))
+    assert crc._genesis_resident_lease_alive("j") is False
+    monkeypatch.setattr(crc, "_HTTP", http_with(404))
+    assert crc._genesis_resident_lease_alive("j") is False
+    monkeypatch.setattr(crc, "_HTTP", http_with(500))
+    assert crc._genesis_resident_lease_alive("j") is True   # transient ≠ lost
+    monkeypatch.setattr(crc, "_HTTP", http_with(503))
+    assert crc._genesis_resident_lease_alive("j") is True
+
+    class _Boom:
+        def post(self, *a, **kw):
+            raise RuntimeError("network down")
+
+    monkeypatch.setattr(crc, "_HTTP", _Boom())
+    assert crc._genesis_resident_lease_alive("j") is True   # transport error ≠ lost
+
+
+def test_distill_without_chat_since_never_peeks_and_runs_to_completion(monkeypatch):
+    # legacy call shape (no gate): must run the whole pipeline in one call and
+    # never touch the chat-peek path at all.
+    calls = _patch_memory_distill(monkeypatch, windows=2)
+    monkeypatch.setattr(
+        crc, "_user_chat_pending",
+        lambda since: (_ for _ in ()).throw(AssertionError("peeked without chat_since")),
+    )
+    crc._process_resident_distill_once()
+    assert calls["map"] == [f"jobm:resident:map:{i}" for i in (1, 2)]
+    assert calls["complete"] == [("jobm", 2, "skipped")]
+    assert crc._distill_in_progress is None
+
+
 def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
     # An operator-pinned --resume with a sid that is NOT ours is their config —
     # never rotate it, even on a missing-session error.

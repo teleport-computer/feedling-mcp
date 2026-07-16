@@ -1275,7 +1275,7 @@ def test_resident_poll_includes_per_user_runtime_v2_profile(tmp_path, monkeypatc
     job = store.append_proactive_job({
         "job_id": "pj_runtime_profile",
         "source": proactive_service.PROACTIVE_JOB_SOURCE,
-        "ts": 1000.0,
+        "ts": time.time(),
         "status": "pending",
         "trigger": "heartbeat_broadcast_on",
     })
@@ -1311,17 +1311,18 @@ def test_resident_poll_applies_v2_wake_controls_to_legacy_jobs(tmp_path, monkeyp
         "reminders_delivery": False,
         "photo_wake_enabled": False,
     })
+    now = time.time()
     store.append_proactive_job({
         "job_id": "pj_photo",
         "source": proactive_service.PROACTIVE_JOB_SOURCE,
-        "ts": 1000.0,
+        "ts": now - 2,
         "status": "pending",
         "trigger": "photo_added",
     })
     store.append_proactive_job({
         "job_id": "pj_scheduled",
         "source": proactive_service.PROACTIVE_JOB_SOURCE,
-        "ts": 1001.0,
+        "ts": now - 1,
         "status": "pending",
         "trigger": "scheduled_wake",
         "scheduled_note": "check in",
@@ -1329,7 +1330,7 @@ def test_resident_poll_applies_v2_wake_controls_to_legacy_jobs(tmp_path, monkeyp
     store.append_proactive_job({
         "job_id": "pj_manual",
         "source": proactive_service.PROACTIVE_JOB_SOURCE,
-        "ts": 1002.0,
+        "ts": now,
         "status": "pending",
         "trigger": "manual_dynamic_island",
     })

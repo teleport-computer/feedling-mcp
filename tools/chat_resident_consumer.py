@@ -287,6 +287,12 @@ PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", 
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
 PROACTIVE_CHAT_FRESH_WINDOW_SEC = int(os.environ.get("PROACTIVE_CHAT_FRESH_WINDOW_SEC", "21600"))
 PROACTIVE_STALE_CHAT_FALLBACK_LIMIT = int(os.environ.get("PROACTIVE_STALE_CHAT_FALLBACK_LIMIT", "2"))
+# Maintenance soft-idle: memory maintenance jobs (capture/dream/migrate) wait for a
+# lull in the conversation — don't start a maintenance model turn within IDLE_SEC of
+# the user's last message ("the user just came back and wants to TALK"), but never
+# defer a job past MAX_DEFER_SEC (a heavy chatter must still get memory upkeep).
+MAINTENANCE_IDLE_SEC = int(os.environ.get("FEEDLING_MAINTENANCE_IDLE_SEC", "300"))
+MAINTENANCE_MAX_DEFER_SEC = int(os.environ.get("FEEDLING_MAINTENANCE_MAX_DEFER_SEC", "7200"))
 CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "160"))
 CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
 CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
@@ -8254,6 +8260,11 @@ def _process_migrate_jobs(jobs: list) -> float:
 
 _resident_jobs_deferred_for_user = False
 
+# Wall-clock time of the last REAL user message this process routed to the agent
+# (verify pings and re-seen duplicates excluded). Drives the maintenance soft-idle:
+# 0.0 = no user message this process lifetime → maintenance never waits.
+_last_user_message_wall = 0.0
+
 
 def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float:
     """Dispatch background jobs (capture → dream → migrate → proactive) one at
@@ -8284,13 +8295,31 @@ def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float
             ordered.append((3, _process_proactive_jobs, job))
     ordered.sort(key=lambda entry: entry[0])  # stable: keeps arrival order within a class
     latest = 0.0
-    for _, processor, job in ordered:
+    now = time.time()
+    for class_idx, processor, job in ordered:
         if chat_since is not None and _user_chat_pending(chat_since):
             _resident_jobs_deferred_for_user = True
             log.info(
                 "deferring remaining background job(s): user message pending (user-turn priority)"
             )
             break
+        # Maintenance soft-idle: the per-job peek above covers "a message is WAITING";
+        # this covers "the user JUST talked" — don't burn the single-flight turn lock
+        # on memory upkeep in the middle of an active conversation. Skipped jobs are
+        # simply not claimed: maintenance jobs are status-recovered (watermark-exempt)
+        # on the server, so they re-serve on a later poll — no defer flag, no break,
+        # wake-class jobs after them still run this pass. The MAX_DEFER cap stops a
+        # heavy chatter from starving memory maintenance forever.
+        if class_idx < 3 and _last_user_message_wall > 0:
+            job_ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
+            recently_chatting = (now - _last_user_message_wall) < MAINTENANCE_IDLE_SEC
+            deferrable = not job_ts or (now - job_ts) < MAINTENANCE_MAX_DEFER_SEC
+            if recently_chatting and deferrable:
+                log.debug(
+                    "deferring maintenance job (user active %.0fs ago): kind=%s",
+                    now - _last_user_message_wall, job.get("job_kind") or job.get("source"),
+                )
+                continue
         latest = max(latest, processor([job]))
     return latest
 
@@ -8328,6 +8357,7 @@ def _quoted_memory_context(msg: dict) -> str:
 
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
+    global _last_user_message_wall
     latest = 0.0
     for msg in messages:
         # Tolerate both "ts" and "timestamp" key names across API versions.
@@ -8346,10 +8376,12 @@ def _process_messages(messages: list) -> float:
 
         # A genuine, newly-seen user message (verify_ping liveness probes
         # excluded) means the loop is not idle and the user is engaged — clear the
-        # proactive idle-loop guard and any failure backoff so proactive resumes.
+        # proactive idle-loop guard and any failure backoff so proactive resumes,
+        # and stamp the maintenance soft-idle clock (memory upkeep waits for a lull).
         if msg.get("source") != "verify_ping":
             _reset_proactive_idle_guard()
             _clear_proactive_failure()
+            _last_user_message_wall = time.time()
 
         # Synthetic liveness probe from /v1/chat/verify_loop. Identified ONLY
         # by `source`, which the server stamps as "verify_ping" across all
@@ -8728,6 +8760,30 @@ def genesis_resident_heartbeat(job_id: str) -> None:
         log.debug("resident distill heartbeat failed job=%s: %s", job_id, e)
 
 
+def _genesis_resident_lease_alive(job_id: str) -> bool:
+    """STRICT heartbeat, used when resuming a distill job after yielding to chat.
+
+    Yielding can outlast the resident lease if the user keeps chatting; the backend
+    reaper then re-queues the job (or fails it at the attempt cap) — ONLY a 4xx here
+    means our in-memory progress is no longer ours to finish and must be dropped.
+    5xx / network errors are backend transients and report alive: dropping on those
+    would throw away completed map chunks for nothing (best-effort optimism, the
+    reaper stays the backstop — same posture as genesis_resident_heartbeat — and
+    completing a lost job is the same pre-existing race the one-shot pipeline
+    always had)."""
+    try:
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/heartbeat",
+            json={"consumer_id": _RESIDENT_CONSUMER_ID},
+            headers=_HEADERS,
+            timeout=15,
+        )
+        return not (400 <= resp.status_code < 500)
+    except Exception as e:
+        log.debug("resident distill lease check failed job=%s: %s", job_id, e)
+        return True
+
+
 def genesis_resident_complete(job_id: str, *, memory_action_count: int, identity_status: str) -> None:
     resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/complete",
@@ -8881,50 +8937,125 @@ def _resident_memory_snapshot() -> tuple[str, list[str]]:
         return "", []
 
 
-def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = False) -> list[dict]:
-    """Reuse the CLOUD genesis memory engine on the VPS: window → fact_map (per window) →
-    fact_write, driven by the local agent (persist_output=False = no backend DB). Returns
-    cloud-shaped memory dicts {type,bucket,threads,summary,content,importance,pulse} — the
-    SAME code + prompts cloud's add_memory path uses, so the two stay in lockstep.
+def _distill_user_waiting(chat_since: float | None) -> bool:
+    """① user-turn priority for the distill lane: claim-free, non-blocking peek between
+    distill model turns (same _user_chat_pending as the background-job gate). A waiting
+    user message preempts the pipeline at the next turn boundary — the user waits at most
+    ONE model turn, never a whole document. ``chat_since=None`` never yields (legacy)."""
+    return chat_since is not None and _user_chat_pending(chat_since)
+
+
+def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> str:
+    """Advance one memory-mode distill job through the CLOUD genesis engine, one model
+    turn at a time: window → fact_map (per window) → fact_write → recheck → memory.add.
+    Same code + prompts as cloud's add_memory path (persist_output=False = no backend DB),
+    so the two stay in lockstep; returns cloud-shaped memory dicts.
+
+    Resumable: all progress (windows, next window index, accumulated candidates, the
+    one-shot garden snapshot, written memories, phase) lives in ``state`` — when a user
+    message is pending we return "yielded" BETWEEN turns and the caller re-enters here
+    on a later loop iteration, continuing exactly where we stopped: no chunk re-runs,
+    no lost candidates, no duplicate memory writes. Returns "yielded" | "done"; raises
+    on hard errors (caller keeps the legacy leave-to-reaper semantics).
 
     keep_all (A): long-term-memory archive uploads keep facts thoroughly; chat logs stay
     selective. The app entry passes material_kind → we translate it to keep_all here."""
+    from datetime import datetime, timezone as _tzmod
     from genesis import worker as genesis_worker  # lazy: heavy import only when a job runs
     from genesis.llm_client import GenesisLLMClient
     import provider_client
     llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
     runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
     uid = str(_whoami_cache.get("user_id") or "resident")
-    terms_note, known_memories = _resident_memory_snapshot()  # one-shot: fetch once, reuse for whole job
-    candidates: list[dict] = []
-    for idx, window in enumerate(_window_document(document), start=1):
-        out = genesis_worker.build_foreground_output_from_texts(
-            user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:map:{idx}",
-            runtime=runtime, chunk_texts=[window], write_core=False, llm=llm, keep_all=keep_all,
+    job_id = state["job_id"]
+    keep_all = state["material_kind"] == "memory_summary"
+
+    if state["phase"] == "start":
+        # one-shot: garden snapshot + deterministic windowing (HTTP only, no model turn).
+        # Snapshotted into state so a resumed job reuses the SAME dedup context the
+        # first pass saw — not once per window, and not re-fetched after yielding.
+        state["terms_note"], state["known_memories"] = _resident_memory_snapshot()
+        state["windows"] = _window_document(state["document"])
+        state["phase"] = "map"
+
+    if state["phase"] == "map":
+        while state["next_window_idx"] <= len(state["windows"]):
+            if _distill_user_waiting(chat_since):
+                return "yielded"
+            idx = state["next_window_idx"]
+            out = genesis_worker.build_foreground_output_from_texts(
+                user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:map:{idx}",
+                runtime=runtime, chunk_texts=[state["windows"][idx - 1]],
+                write_core=False, llm=llm, keep_all=keep_all,
+            )
+            state["candidates"].extend(
+                [c for c in (out.get("all_fact_candidates") or []) if isinstance(c, dict)]
+            )
+            # Cursor advances ONLY after the window's candidates are safely accumulated,
+            # so a yield/resume boundary can never skip or double-map a window.
+            state["next_window_idx"] = idx + 1
+            genesis_resident_heartbeat(job_id)  # each window is one agent call — keep the lease alive
+        state["phase"] = "write"
+
+    if state["phase"] == "write":
+        if not state["candidates"]:
+            # Nothing mapped → nothing to write/recheck (legacy: early return []).
+            state["memories"] = []
+            state["phase"] = "actions"
+        else:
+            if _distill_user_waiting(chat_since):
+                return "yielded"
+            mem_out = genesis_worker.build_memory_output_from_fact_candidates(
+                user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
+                runtime=runtime, fact_candidates=state["candidates"], llm=llm, keep_all=keep_all,
+                floor_note=_resident_floor_note(),
+                known_memories=state["known_memories"], terms_note=state["terms_note"],
+            )
+            state["memories"] = [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
+            genesis_resident_heartbeat(job_id)
+            state["phase"] = "recheck"
+
+    if state["phase"] == "recheck":
+        if _distill_user_waiting(chat_since):
+            return "yielded"
+        # 收口二次 pass(仅 VPS resident):把原始素材 + 刚写的卡再给 agent,只补真实遗漏、
+        # 按 known_memories 去重、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
+        try:
+            recheck = genesis_worker.build_memory_recheck_from_material(
+                user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:recheck",
+                runtime=runtime, material=state["document"], written_memories=state["memories"], llm=llm,
+            )
+            genesis_resident_heartbeat(job_id)  # recheck is one more agent call — keep the lease alive
+            state["memories"].extend([m for m in (recheck.get("memories") or []) if isinstance(m, dict)])
+        except Exception:
+            log.exception("resident memory recheck failed (non-fatal; keeping first-pass memories)")
+        state["phase"] = "actions"
+
+    # actions: envelope + memory.add + complete — HTTP writes only, no model turn, so
+    # this tail never yields (yielding here would risk double memory.add on resume).
+    occurred_at = datetime.now(_tzmod.utc).isoformat()
+    actions: list[dict] = []
+    for card in state["memories"]:
+        envelope = _capture_build_envelope(
+            card, occurred_at=occurred_at, source="genesis_resident_distill"
         )
-        candidates.extend([c for c in (out.get("all_fact_candidates") or []) if isinstance(c, dict)])
-        genesis_resident_heartbeat(job_id)  # each window is one agent call — keep the lease alive
-    if not candidates:
-        return []
-    mem_out = genesis_worker.build_memory_output_from_fact_candidates(
-        user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
-        runtime=runtime, fact_candidates=candidates, llm=llm, keep_all=keep_all,
-        floor_note=_resident_floor_note(),
-        known_memories=known_memories, terms_note=terms_note,
+        actions.append({
+            "type": "memory.add",
+            "envelope": envelope,
+            "reason": "Distilled from material the user uploaded.",
+            "capture_mode": "genesis_resident_distill",
+            "source_chat_message_ids": [],
+        })
+    if actions:
+        execute_memory_actions(actions)
+    genesis_resident_complete(
+        job_id, memory_action_count=len(actions), identity_status="skipped"
     )
-    memories = [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
-    # 收口二次 pass(仅 VPS resident):把原始素材 + 刚写的卡再给 agent,只补真实遗漏、
-    # 按 known_memories 去重、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
-    try:
-        recheck = genesis_worker.build_memory_recheck_from_material(
-            user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:recheck",
-            runtime=runtime, material=document, written_memories=memories, llm=llm,
-        )
-        genesis_resident_heartbeat(job_id)  # recheck is one more agent call — keep the lease alive
-        memories.extend([m for m in (recheck.get("memories") or []) if isinstance(m, dict)])
-    except Exception:
-        log.exception("resident memory recheck failed (non-fatal; keeping first-pass memories)")
-    return memories
+    log.info(
+        "resident distill done job=%s mode=%s memories=%d identity=%s",
+        job_id, state["mode"], len(actions), "skipped",
+    )
+    return "done"
 
 
 def _resident_existing_identity() -> dict:
@@ -8988,104 +9119,180 @@ def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     return None
 
 
-def _process_resident_distill_once() -> None:
+def _resident_distill_identity(state: dict) -> None:
+    """update_identity: derive once → identity.replace (single model turn + one bounded
+    conflict re-derive). Not chunked, so it is preempted only BEFORE it starts (see the
+    driver); this body is the legacy pipeline verbatim."""
+    job_id = state["job_id"]
+    document = state["document"]
+    identity_status = "skipped"
+    identity_payload = _resident_derive_identity(document, job_id)
+    # base_identity_replaced_at (Task 4) is the P5 concurrency baseline snapshotted
+    # at job-creation time; "" means no baseline (legacy job / no prior identity) —
+    # the backend then skips the check entirely (back-compat). Only a full
+    # init/replace moves replaced_at, so a signature patch/nudge landing while this
+    # job was pending never looks like a conflict here.
+    base_identity_replaced_at = state["base_identity_replaced_at"]
+    conflict_retried = False
+    while identity_payload is not None:
+        try:
+            execute_identity_actions([{
+                "type": "identity.replace",
+                "source": "genesis_resident_distill",
+                "job_id": job_id,
+                "reason": "Distilled identity from material the user uploaded.",
+                "identity": identity_payload,
+                "base_identity_replaced_at": base_identity_replaced_at,
+            }])
+            identity_status = "replaced"
+            break
+        except RuntimeError as e:
+            if "identity_base_stale" not in str(e):
+                raise
+            if conflict_retried:
+                log.error(
+                    "resident distill: identity_base_stale conflict persisted "
+                    "after re-derive job=%s — giving up, skipping identity update",
+                    job_id,
+                )
+                identity_status = "skipped_conflict"
+                break
+            log.warning(
+                "resident distill: identity_base_stale conflict job=%s — "
+                "re-fetching card + re-deriving once",
+                job_id,
+            )
+            conflict_retried = True
+            # _resident_derive_identity re-fetches the existing card internally
+            # (_resident_existing_identity), so this re-call already merges against
+            # whatever full replace won the race — then resubmit with a refreshed
+            # baseline so the retry itself can't spuriously re-conflict.
+            identity_payload = _resident_derive_identity(document, job_id)
+            base_identity_replaced_at = _resident_current_replaced_at()
+    genesis_resident_complete(
+        job_id, memory_action_count=0, identity_status=identity_status
+    )
+    log.info(
+        "resident distill done job=%s mode=%s memories=%d identity=%s",
+        job_id, state["mode"], 0, identity_status,
+    )
+
+
+def _distill_state_for_job(job: dict) -> dict | None:
+    """Decrypt + shape one claimed distill job into a resumable in-memory state.
+    None for malformed jobs (legacy skip). Raises on decrypt failure (caller keeps
+    the legacy leave-to-reaper semantics)."""
+    job_id = str(job.get("job_id") or "").strip()
+    sealed = job.get("sealed") if isinstance(job.get("sealed"), dict) else {}
+    env = sealed.get("envelope") if isinstance(sealed.get("envelope"), dict) else None
+    if not job_id or not env:
+        log.warning("resident distill: skipping malformed job %r", job_id)
+        return None
+    plaintext = _decrypt_sealed_material(env)
+    genesis_resident_heartbeat(job_id)  # claimed + decrypted; distill can be slow
+    return {
+        "job_id": job_id,
+        "mode": str(job.get("mode") or "").strip().lower(),
+        "material_kind": str(job.get("material_kind") or "").strip().lower(),
+        "document": plaintext.decode("utf-8", errors="replace"),
+        "base_identity_replaced_at": str(job.get("base_identity_replaced_at") or ""),
+        # memory-mode pipeline progress (see _resident_distill_advance_memory)
+        "phase": "start",
+        "windows": [],
+        "next_window_idx": 1,
+        "candidates": [],
+        "terms_note": "",
+        "known_memories": [],
+        "memories": [],
+    }
+
+
+# In-memory progress of the distill lane: {"queue": [raw claimed jobs...],
+# "active": <state dict>|None}. None ⇔ nothing claimed/held. IN-MEMORY ONLY by
+# design: no new plaintext ever touches disk; a consumer crash simply drops it and
+# the backend reaper re-queues under the existing attempt cap (unchanged semantics —
+# the retry's known_memories snapshot then already contains previously written cards,
+# so fact_write's prompt-level dedup absorbs the replay, same as today).
+_distill_in_progress: dict | None = None
+
+
+def _process_resident_distill_once(chat_since: float | None = None) -> None:
     """Claim + realize pending resident-distill jobs by REUSING the cloud genesis engine
     (chunk → fact_map → fact_write) with the local agent as the model. Memory is written
-    client-sealed via memory.add; update_identity derives once → identity.replace."""
-    from datetime import datetime, timezone as _tzmod
-    jobs = genesis_resident_pending()
-    for job in jobs:
-        job_id = str(job.get("job_id") or "").strip()
-        mode = str(job.get("mode") or "").strip().lower()
-        material_kind = str(job.get("material_kind") or "").strip().lower()
-        sealed = job.get("sealed") if isinstance(job.get("sealed"), dict) else {}
-        env = sealed.get("envelope") if isinstance(sealed.get("envelope"), dict) else None
-        if not job_id or not env:
-            log.warning("resident distill: skipping malformed job %r", job_id)
-            continue
+    client-sealed via memory.add; update_identity derives once → identity.replace.
+
+    ① user-turn priority: when ``chat_since`` is given, the memory pipeline yields
+    BETWEEN model turns whenever a user message is pending (claim-free peek) — the
+    user waits at most one turn, never a whole document — and this function returns
+    with the job's progress held in ``_distill_in_progress`` to be resumed on a later
+    main-loop iteration. Distillation is never dropped: on resume the held lease is
+    re-heartbeated first (a 4xx means the reaper re-queued it while the user kept
+    chatting — only then is local progress discarded, and the job re-runs normally
+    later). ``chat_since=None`` keeps the legacy run-to-completion behavior."""
+    global _distill_in_progress
+    state = _distill_in_progress
+    if state is None:
+        jobs = genesis_resident_pending()
+        if not jobs:
+            return
+        # genesis_resident_pending CLAIMS up to 4 jobs at once — hold the extras in a
+        # local queue so a yield on job #1 doesn't leave #2-#4 to go lease-stale.
+        state = {"queue": list(jobs), "active": None}
+        _distill_in_progress = state
+    else:
+        # Resuming after having yielded to the user: renew every held lease FIRST.
+        active = state.get("active")
+        if active is not None and not _genesis_resident_lease_alive(active["job_id"]):
+            log.warning(
+                "resident distill: job %s reclaimed while yielding to chat — "
+                "dropping local progress (it will re-run when re-served)",
+                active["job_id"],
+            )
+            state["active"] = None
+        for qjob in list(state.get("queue") or []):
+            qid = str(qjob.get("job_id") or "")
+            if qid and not _genesis_resident_lease_alive(qid):
+                state["queue"].remove(qjob)
+
+    while True:
+        if state.get("active") is None:
+            queue = state.get("queue") or []
+            if not queue:
+                _distill_in_progress = None
+                return
+            job = queue.pop(0)
+            try:
+                active = _distill_state_for_job(job)
+            except Exception as e:
+                # Leave the job for the backend stale reaper to re-queue (under the
+                # attempt cap) so a transient error never wedges it.
+                log.error("resident distill failed job=%s: %s", str(job.get("job_id") or ""), e)
+                continue
+            if active is None:
+                continue
+            state["active"] = active
+
+        active = state["active"]
         try:
-            plaintext = _decrypt_sealed_material(env)
-            genesis_resident_heartbeat(job_id)  # claimed + decrypted; distill can be slow
-            document = plaintext.decode("utf-8", errors="replace")
-
-            memory_count = 0
-            identity_status = "skipped"
-            if mode == "update_identity":
-                identity_payload = _resident_derive_identity(document, job_id)
-                # base_identity_replaced_at (Task 4) is the P5 concurrency baseline snapshotted
-                # at job-creation time; "" means no baseline (legacy job / no prior identity) —
-                # the backend then skips the check entirely (back-compat). Only a full
-                # init/replace moves replaced_at, so a signature patch/nudge landing while this
-                # job was pending never looks like a conflict here.
-                base_identity_replaced_at = str(job.get("base_identity_replaced_at") or "")
-                conflict_retried = False
-                while identity_payload is not None:
-                    try:
-                        execute_identity_actions([{
-                            "type": "identity.replace",
-                            "source": "genesis_resident_distill",
-                            "job_id": job_id,
-                            "reason": "Distilled identity from material the user uploaded.",
-                            "identity": identity_payload,
-                            "base_identity_replaced_at": base_identity_replaced_at,
-                        }])
-                        identity_status = "replaced"
-                        break
-                    except RuntimeError as e:
-                        if "identity_base_stale" not in str(e):
-                            raise
-                        if conflict_retried:
-                            log.error(
-                                "resident distill: identity_base_stale conflict persisted "
-                                "after re-derive job=%s — giving up, skipping identity update",
-                                job_id,
-                            )
-                            identity_status = "skipped_conflict"
-                            break
-                        log.warning(
-                            "resident distill: identity_base_stale conflict job=%s — "
-                            "re-fetching card + re-deriving once",
-                            job_id,
-                        )
-                        conflict_retried = True
-                        # _resident_derive_identity re-fetches the existing card internally
-                        # (_resident_existing_identity), so this re-call already merges against
-                        # whatever full replace won the race — then resubmit with a refreshed
-                        # baseline so the retry itself can't spuriously re-conflict.
-                        identity_payload = _resident_derive_identity(document, job_id)
-                        base_identity_replaced_at = _resident_current_replaced_at()
-            else:  # add_memory / onboarding → cloud memory engine
-                # long-term-memory archive → keep_all (thorough); chat log → selective.
-                keep_all = material_kind == "memory_summary"
-                memories = _resident_extract_memories(document, job_id, keep_all=keep_all)
-                occurred_at = datetime.now(_tzmod.utc).isoformat()
-                actions: list[dict] = []
-                for card in memories:
-                    envelope = _capture_build_envelope(
-                        card, occurred_at=occurred_at, source="genesis_resident_distill"
-                    )
-                    actions.append({
-                        "type": "memory.add",
-                        "envelope": envelope,
-                        "reason": "Distilled from material the user uploaded.",
-                        "capture_mode": "genesis_resident_distill",
-                        "source_chat_message_ids": [],
-                    })
-                if actions:
-                    execute_memory_actions(actions)
-                memory_count = len(actions)
-
-            genesis_resident_complete(
-                job_id, memory_action_count=memory_count, identity_status=identity_status
-            )
-            log.info(
-                "resident distill done job=%s mode=%s memories=%d identity=%s",
-                job_id, mode, memory_count, identity_status,
-            )
+            if active["mode"] == "update_identity":
+                # Single-turn job: the cheapest preemption point is before it starts —
+                # nothing is computed yet, so the whole job just waits one loop pass.
+                if _distill_user_waiting(chat_since):
+                    return
+                _resident_distill_identity(active)
+                outcome = "done"
+            else:  # add_memory / onboarding → cloud memory engine (chunked, resumable)
+                outcome = _resident_distill_advance_memory(active, chat_since)
         except Exception as e:
-            # Leave the job for the backend stale reaper to re-queue (under the attempt cap)
-            # so a transient error never wedges it.
-            log.error("resident distill failed job=%s: %s", job_id, e)
+            # Leave the job for the backend stale reaper to re-queue (under the attempt
+            # cap) so a transient error never wedges it.
+            log.error("resident distill failed job=%s: %s", active["job_id"], e)
+            state["active"] = None
+            continue
+
+        if outcome == "yielded":
+            return  # progress stays in _distill_in_progress; resume next iteration
+        state["active"] = None  # done → next queued job (if any)
 
 
 def run() -> None:
@@ -9323,7 +9530,7 @@ def run() -> None:
 
             if resident_distill_enabled:
                 try:
-                    _process_resident_distill_once()
+                    _process_resident_distill_once(chat_since=last_ts)
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 404:
                         resident_distill_enabled = False

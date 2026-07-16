@@ -95,12 +95,12 @@ def test_genesis_stats_surfaces_state_and_recent_jobs(monkeypatch):
     assert stats["latest_job"]["metadata"]["history_count"] == 42
 
 
-def test_fast_proactive_snapshot_exposes_failed_reason_distribution():
+def test_fast_proactive_snapshot_keeps_expired_out_of_failed_count():
     proactive = data_track._data_track_proactive_from_snapshot(
         {
-            "logs": {"proactive_jobs": {"count": 3, "last_ts": 100}},
+            "logs": {"proactive_jobs": {"count": 5, "last_ts": 100}},
             "proactive_extra": {
-                "jobs_by_status": {"failed": 3},
+                "jobs_by_status": {"failed": 3, "expired": 2},
                 "jobs_failed_by_reason": {"model_timeout": 2, "unknown": 1},
             },
         },
@@ -108,6 +108,7 @@ def test_fast_proactive_snapshot_exposes_failed_reason_distribution():
     )
 
     assert proactive["failed_jobs"] == 3
+    assert proactive["jobs_by_status"]["expired"] == 2
     assert proactive["job_failed_reasons"] == {"model_timeout": 2, "unknown": 1}
 
 
