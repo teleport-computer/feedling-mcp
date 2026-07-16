@@ -5540,8 +5540,11 @@ def test_load_whoami_defaults_archive_language_to_empty_when_absent(monkeypatch)
 
 def test_reply_language_line_prefers_presence_locale(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    # presence locale (zh) must win over archive_language (en): the shared helper
+    # returns the 简体中文 policy line, confirming locale precedence.
     line = crc._reply_language_line({"locale": "zh-Hans"})
-    assert "zh-Hans" in line
+    assert "简体中文" in line
+    assert "English" not in line
 
 
 def test_reply_language_line_falls_back_to_archive_language(monkeypatch):
@@ -6874,3 +6877,36 @@ def test_max_empty_zero_disables_idle_guard(monkeypatch):
     monkeypatch.setattr(crc, "MAX_EMPTY_PROACTIVE_TURNS", 0)
     crc._proactive_empty_streak = 99
     assert crc._proactive_idle_guard_tripped() is False
+
+
+# --- resident reply-language wiring (Seven 2026-07-16) ------------------------
+
+def test_local_time_anchor_english_under_en_policy(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "America/New_York")
+    anchor = crc._local_time_anchor(since_sec=7200)
+    assert anchor.startswith("current_time:")
+    for zh in ("凌晨", "上午", "中午", "下午", "晚上", "周一", "周日", "距上次互动", "默认"):
+        assert zh not in anchor
+    assert any(d in anchor for d in (
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+    assert "last interaction" in anchor  # localized gap wording
+
+
+def test_local_time_anchor_chinese_under_default_policy(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": ""})
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    anchor = crc._local_time_anchor()
+    assert anchor.startswith("current_time:")
+    assert any(s in anchor for s in ("凌晨", "上午", "中午", "下午", "晚上"))
+    assert any(d in anchor for d in ("周一", "周二", "周三", "周四", "周五", "周六", "周日"))
+
+
+def test_foreground_prepend_includes_language_line_and_time(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "America/New_York")
+    crc._last_interaction_unix = 0.0
+    out = crc._prepend_time_anchor_foreground("hello", 1000.0)
+    assert "current_time:" in out
+    assert "Reply language policy" in out  # language line now wired into foreground
+    assert out.rstrip().endswith("hello")

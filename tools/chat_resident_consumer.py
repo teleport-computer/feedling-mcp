@@ -129,6 +129,11 @@ except ImportError:
 from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
 from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
 from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
+from chat.reply_language import (
+    format_time_anchor,
+    infer_reply_language_policy,
+    reply_language_system_line,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -6562,7 +6567,7 @@ def _message_for_proactive_job(
             f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
             f"- screen_context_available: {str(screen_available).lower()}"
         ),
-        _local_time_anchor(since_sec=chat_context.last_user_message_age_sec),
+        _local_time_anchor(since_sec=chat_context.last_user_message_age_sec, presence=presence),
         _proactive_attention_facts(chat_context),
         _native_reachout_tool_instructions(),
     ]
@@ -6604,19 +6609,22 @@ def _reply_protocol_block() -> str:
     ])
 
 
-def _reply_language_line(presence: dict | None = None) -> str:
-    """Anchor the reply language to the user — a proactive wake may have no recent
-    user message to infer it from, so an English prompt must not leak English.
-    Fallback chain: device locale → stored archive_language → 简体中文 (product default)."""
+def _resident_reply_language_policy(presence: dict | None = None):
+    """Resident-side reply-language policy via the shared helper. Resident has no
+    identity-card/memory text in hand (only whoami archive_language + presence
+    locale), so it degrades to the helper's locale → archive_language → default
+    tier — same wording, mirror rule, and time-anchor localization as model_api."""
     locale = str((presence or {}).get("locale") or "").strip()
-    if locale:
-        return f"Always reply in the user's own language (their locale is {locale})."
     archive_language = str(_whoami_cache.get("archive_language") or "").strip()
-    if archive_language:
-        return f"Always reply in the user's own language (their language is {archive_language})."
-    # 既无设备 locale 也无存储的语言偏好（空语境/刚铸的新号）——裸的
-    # "user's own language" 会让模型默认英文。产品主用户群为中文，默认简体中文。
-    return "默认用简体中文回复，除非用户明显在使用其它语言。"
+    return infer_reply_language_policy({}, [], locale=locale, archive_language=archive_language)
+
+
+def _reply_language_line(presence: dict | None = None) -> str:
+    """The shared zh/en reply-language policy line (a default language + a soft
+    mirror of the user's latest-message language). Wired into both the proactive
+    wakes and the foreground reply so the model stops drifting to Chinese when the
+    user is in an English context."""
+    return reply_language_system_line(_resident_reply_language_policy(presence))
 
 
 def _native_reachout_tool_instructions() -> str:
@@ -6750,32 +6758,23 @@ def _user_timezone() -> str:
 _DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
 
 
-def _local_time_anchor(since_sec: float | None = None) -> str:
+def _local_time_anchor(since_sec: float | None = None, presence: dict | None = None) -> str:
     """A reliable 'current local time' line for the agent. Uses the consumer's
     real clock (never stale) + the user's timezone, falling back to the China
     default when the zone is unknown (never a silent UTC clock). The zone is
-    ALWAYS labelled, and marked (默认) on the fallback so the agent knows to
-    trust the user's stated time on any mismatch. Optionally appends how long
-    since the last interaction so the agent notices an overnight gap."""
+    ALWAYS labelled, and marked (默认 / default) on the fallback. Optionally appends
+    how long since the last interaction so the agent notices an overnight gap.
+    Localized (zh/en) via the shared reply-language policy — an English-mode user
+    must not get a Chinese time line as the first block of every turn."""
     from datetime import datetime, timezone as _tzmod
     tzs = _user_timezone()
     is_default = not tzs
     zone = tzs or _DEFAULT_TIMEZONE
-    local = datetime.now(_tzmod.utc)
-    try:
-        from zoneinfo import ZoneInfo
-        local = local.astimezone(ZoneInfo(zone))
-    except Exception:
-        zone = "UTC"  # zoneinfo missing / bad zone — degrade transparently, still labelled
-    h = local.hour
-    seg = "凌晨" if h < 6 else "上午" if h < 12 else "中午" if h < 14 else "下午" if h < 18 else "晚上"
-    body = f"{local.strftime('%Y-%m-%d')} {_WEEKDAYS_ZH[local.weekday()]} {local.strftime('%H:%M')} {seg}"
-    body += f" {zone}" + ("（默认·未获取到设备时区）" if is_default else "")
-    line = f"current_time: {body}"
-    if since_sec is not None and since_sec >= 1800:  # only note gaps >= 30 min
-        gap = _format_age(since_sec).replace(" ago", " 前")
-        line += f" (距上次互动 {gap})"
-    return line
+    policy = _resident_reply_language_policy(presence)
+    return format_time_anchor(
+        datetime.now(_tzmod.utc), zone, policy,
+        since_sec=since_sec, timezone_default=is_default,
+    )
 
 
 def _prepend_time_anchor_foreground(content: str, msg_unix_ts: float) -> str:
@@ -6788,7 +6787,9 @@ def _prepend_time_anchor_foreground(content: str, msg_unix_ts: float) -> str:
         since = msg_unix_ts - _last_interaction_unix
     if msg_unix_ts > _last_interaction_unix:
         _last_interaction_unix = msg_unix_ts
-    return f"[{_local_time_anchor(since_sec=since)}]\n\n{content}"
+    # Time anchor + reply-language policy line (both from the same policy, so they
+    # never disagree). The language line was previously wired only into proactive.
+    return f"[{_local_time_anchor(since_sec=since)}]\n\n{_reply_language_line()}\n\n{content}"
 
 
 def _resident_perception_digest_board() -> tuple[list, dict]:
