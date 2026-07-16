@@ -23,6 +23,7 @@ CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
     "photo_recent": lambda store, **kw: photo.recent(store, **kw),
     "photo_read": lambda store, **kw: photo.read(store, **kw),
     "chat_image_read": lambda store, **kw: chat.image_read(store, **kw),
+    "chat_file_read": lambda store, **kw: chat.file_read(store, **kw),
     "web_search": lambda store, **kw: web.search(store, **kw),
     "web_fetch": lambda store, **kw: web.fetch(store, **kw),
     "schedule_wake": lambda store, **kw: wake.schedule(store, **kw),

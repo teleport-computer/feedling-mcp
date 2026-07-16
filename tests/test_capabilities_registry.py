@@ -12,6 +12,7 @@ def test_all_action_types_registered():
         "memory_search",
         "perception_snapshot", "perception_trend", "perception_history",
         "screen_recent", "screen_read", "photo_recent", "photo_read", "chat_image_read",
+        "chat_file_read",
         "web_search", "web_fetch",
         "schedule_wake", "cancel_wake",
     }
@@ -34,14 +35,15 @@ def test_run_capability_unknown():
 
 
 def test_capabilities_is_a_real_populated_dict():
-    assert len(registry.CAPABILITIES) == 18
+    assert len(registry.CAPABILITIES) == 19
     assert set(registry.CAPABILITIES.keys()) == {
         "identity_get", "identity_patch", "memory_index", "memory_fetch", "memory_write",
         "memory_search",
         "perception_snapshot", "perception_trend", "perception_history",
         "screen_recent", "screen_read", "photo_recent", "photo_read", "chat_image_read",
+        "chat_file_read",
         "web_search", "web_fetch",
         "schedule_wake", "cancel_wake",
     }
-    assert len(list(registry.CAPABILITIES.items())) == 18
+    assert len(list(registry.CAPABILITIES.items())) == 19
     assert bool(registry.CAPABILITIES) is True

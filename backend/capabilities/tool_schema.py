@@ -17,7 +17,7 @@ from capabilities import registry
 
 REPLY_TOOL = "reply"
 
-_EXCLUDED = frozenset({"chat_image_read"})
+_EXCLUDED = frozenset({"chat_image_read", "chat_file_read"})
 
 _STR = {"type": "string"}
 _INT = {"type": "integer"}

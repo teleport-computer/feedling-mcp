@@ -10,8 +10,9 @@ def test_catalog_covers_capabilities_plus_reply_minus_chat_image():
     names = {s.name for s in specs}
     assert "reply" in names
     assert "chat_image_read" not in names   # BUG-1 mitigation
+    assert "chat_file_read" not in names    # internal-only, never offered to the model
     for cap in registry.CAPABILITIES:
-        if cap == "chat_image_read":
+        if cap in ("chat_image_read", "chat_file_read"):
             continue
         assert cap in names, f"missing tool: {cap}"
     assert all(isinstance(s, ToolSpec) for s in specs)

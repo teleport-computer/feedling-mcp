@@ -162,6 +162,9 @@ _TAIL_IMAGE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2"))
 # 硬编码（取 2_700_000，略高于 2_666_668 留余量）；跨模块不变量由 test_v2_worker_images
 # .test_injection_cap_covers_any_image_ingestion_accepts 守护。
 _IMAGE_MAX_B64_CHARS = int(os.environ.get("FEEDLING_V2_IMAGE_MAX_B64_CHARS", "2700000"))
+# 每回合最多注入最近 N 个文件的抽取文本。每个文件一次 enclave 解密往返 + 抽取，且文本每
+# 回合都随 tail 重发；文档全文比图片更占 token，故默认更保守。
+_TAIL_FILE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_FILE_LIMIT", "2"))
 
 # 单个 native tool loop 的 provider 调用硬闸。最后一次调用会禁用
 # tools 来强制收口，使模型无法用无限工具链烧穿用户的 BYOK key。
@@ -287,6 +290,12 @@ class TurnDeps:
     # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
     # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
     read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
+    # (user_id, message_ids) -> {message_id: {"file_name","file_mime","text","truncated"}}：
+    # 对指定的文件消息做 enclave 解密 + 服务端文本抽取（docx/xlsx/pdf/txt，见
+    # serve_worker._read_files → hosted.file_text）。与 read_images 同理**不能**并进 read_tail
+    # （compaction 用大 limit 复用 read_tail，抽出的全文会灌爆摘要器 prompt）。默认 None：
+    # worker.py 不 import hosted/capabilities，生产装配见 serve_worker。
+    read_files: Callable[[str, list[str]], dict[str, dict]] | None = None
     # —— capture/dream 记忆抽取 lane 的三个注入回调（Task 3）——
     # 全部默认 None：worker.py 不 import `hosted`/`memory_core`/`core.envelope`-for-memory
     # （否则违反 CONTRIBUTING §2 的依赖方向），所以记忆上下文读取、信封加密、落库都作为
@@ -1546,6 +1555,8 @@ async def _run_wake(
                 summary, tail = "", []
             tail = await asyncio.to_thread(
                 _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images)
+            tail = await asyncio.to_thread(
+                _inject_tail_files, tail, user_id=user_id, read_files=deps.read_files)
         if seq_context:
             await _assert_prompt_tail_exact(
                 user_id,
@@ -1939,6 +1950,39 @@ def _inject_tail_images(tail: list[dict], *, user_id: str, read_images) -> list[
     return out
 
 
+def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[dict]:
+    """把 tail 里最近 `_TAIL_FILE_LIMIT` 个文件行的 content 换成「文件名 + 服务端抽取的
+    纯文本」，让 tool-less 模型能真读到 docx/xlsx/pdf/txt 的内容。返回**新列表**，绝不原地
+    改输入行（compaction 共用 read_tail 产出的 dict）。
+
+    任何失败（无 reader / 解密抛错 / 抽取为空 / 缺字段）都静默降级成原来的 `[file: name]`
+    文本行：用户拿到一条读不到文件的回复，好过拿到 error chip（no-filler 铁律）。
+    """
+    if read_files is None:
+        return tail
+    targets = [r for r in tail if r.get("has_file") and r.get("id")]
+    if not targets:
+        return tail
+    wanted = [str(r["id"]) for r in targets[-_TAIL_FILE_LIMIT:]]
+    try:
+        fetched = read_files(user_id, wanted) or {}
+    except Exception as e:  # noqa: BLE001
+        log.warning("[v2.worker] read_files failed for %s: %s", user_id, e)
+        return tail
+
+    out: list[dict] = []
+    for row in tail:
+        got = fetched.get(str(row.get("id"))) if row.get("has_file") else None
+        text = str((got or {}).get("text") or "")
+        if not text:
+            out.append(row)
+            continue
+        name = str(got.get("file_name") or row.get("file_name") or "file")
+        note = "\n（文件内容较长，已截断）" if got.get("truncated") else ""
+        out.append({**row, "content": f"[file: {name}]\n{text}{note}"})
+    return out
+
+
 async def process_job(
     job: dict,
     deps: TurnDeps,
@@ -2177,6 +2221,8 @@ async def process_job(
                         deps.read_tail, user_id, watermark, _TAIL_HARD_CAP)
                 tail = await asyncio.to_thread(
                     _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images)
+                tail = await asyncio.to_thread(
+                    _inject_tail_files, tail, user_id=user_id, read_files=deps.read_files)
             # Post-assembly hard assertion (D6): independent re-derivation,
             # not a reuse of `_ensure_prompt_coverage`'s return — see
             # `_assert_prompt_covers`'s docstring for why.

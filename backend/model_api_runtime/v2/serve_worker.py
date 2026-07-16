@@ -31,6 +31,7 @@ sinks are assembled here.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -70,6 +71,7 @@ from core import store as core_store
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
+from hosted import file_text
 from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import cursor as v2_cursor
@@ -757,6 +759,40 @@ def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
         if data.get("image_b64"):
             out[str(mid)] = {"image_mime": data.get("image_mime") or "image/jpeg",
                              "image_b64": data["image_b64"]}
+    return out
+
+
+def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
+    """按 id 取上传文件的解密字节 + 抽取的纯文本。复用内部 `chat_file_read`
+    capability（对标 `_read_images`，同样不暴露给模型），再经 `hosted.file_text`
+    把 docx/xlsx/pdf/文本抽成 prompt 可 inline 的文字。V2 是纯 HTTP、无 CLI/文件系统，
+    这是让 tool-less 模型「读文件」的唯一途径。
+
+    单条失败/抽取为空只跳过那一条，绝不抛——调用方 `worker._inject_tail_files` 会把缺失
+    的文件行原样留成 `[file: name]` 标记。返回 {mid: {file_name, file_mime, text, truncated}}。
+    """
+    store = core_store.get_store(user_id)
+    token = _mint_runtime_token(user_id)
+    out: dict[str, dict] = {}
+    for mid in message_ids:
+        try:
+            res = cap_registry.run_capability(
+                "chat_file_read", store, api_key=None, runtime_token=token,
+                params={"message_id": mid})
+            data = (res.to_dict() or {}).get("data") or {}
+            b64 = data.get("file_b64")
+            if not b64:
+                continue
+            raw = base64.b64decode(b64)
+            name = data.get("file_name") or "file"
+            extracted = file_text.extract_file_text(raw, name=name, mime=data.get("file_mime") or "")
+        except Exception as e:  # noqa: BLE001
+            log.warning("[v2.serve_worker] file read failed msg=%s: %s", mid, e)
+            continue
+        if extracted.text:
+            out[str(mid)] = {"file_name": name,
+                             "file_mime": data.get("file_mime") or "application/octet-stream",
+                             "text": extracted.text, "truncated": extracted.truncated}
     return out
 
 
@@ -1529,6 +1565,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,
         read_images=_read_images,
+        read_files=_read_files,
         read_memory_context=_read_memory_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
