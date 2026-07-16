@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,20 @@ from proactive import service as proactive_service  # noqa: E402
 
 def _b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
+
+
+def _chat_envelope(user_id: str, msg_id: str) -> dict:
+    return {
+        "v": 1,
+        "id": msg_id,
+        "body_ct": f"ct_{msg_id}",
+        "nonce": f"nonce_{msg_id}",
+        "K_user": f"k_user_{msg_id}",
+        "K_enclave": f"k_enclave_{msg_id}",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+        "enclave_pk_fpr": "test",
+    }
 
 
 @pytest.fixture()
@@ -94,6 +109,71 @@ def test_pollable_respects_limit(store):
         })
     jobs = poll_core.resident_pollable_pending_jobs(store, since=0.0, limit=2, runtime_profile={})
     assert len(jobs) == 2
+
+
+# --------------------------------------------------------------------------- #
+# introduction = self-cancelling deadlock fallback, not the primary greeting
+#
+# The io-onboarding skill has the resident agent post its OWN Step 6 greeting.
+# 976f180/ebe3c52 wired an unconditional backend introduction onto
+# chat_loop_verified, which double-greeted every skill-compliant resident (and
+# routed that greeting through the proactive→agent→parse path). The job now waits
+# out a grace window and retires itself the moment the agent greets.
+# --------------------------------------------------------------------------- #
+
+def _append_intro_job(store, *, job_id: str = "pj_intro", ts: float) -> None:
+    store.append_proactive_job({
+        "job_id": job_id,
+        "source": proactive_service.PROACTIVE_JOB_SOURCE,
+        "job_kind": "introduction",
+        "ts": ts,
+        "status": "pending",
+    })
+
+
+def _poll(store):
+    return poll_core.resident_pollable_pending_jobs(
+        store, since=0.0, limit=20, runtime_profile={})
+
+
+def test_intro_deferred_inside_grace_window_so_agent_can_greet_first(store):
+    # Fresh job + agent hasn't greeted yet: hold it, don't double-greet.
+    _append_intro_job(store, ts=time.time())
+    assert [j.get("job_id") for j in _poll(store)] == []
+
+
+def test_intro_fires_after_grace_when_agent_never_greets(store):
+    # The deadlock fallback that 976f180 was protecting must survive.
+    _append_intro_job(store, ts=time.time() - poll_core.RESIDENT_INTRO_FALLBACK_GRACE_SEC - 1)
+    assert "pj_intro" in [j.get("job_id") for j in _poll(store)]
+
+
+def test_intro_cancelled_once_agent_posts_its_own_greeting(store):
+    _append_intro_job(store, ts=time.time() - poll_core.RESIDENT_INTRO_FALLBACK_GRACE_SEC - 1)
+    store.append_chat("agent", "chat", _chat_envelope(store.user_id, "greeting-1"))
+
+    assert [j.get("job_id") for j in _poll(store)] == []
+    # durable: never enqueue another introduction for this user
+    assert store.introduction_done() is True
+    job = next(j for j in store.list_proactive_jobs(limit=100) if j.get("job_id") == "pj_intro")
+    assert job["status"] == "skipped"
+    assert job["status_reason"] == "agent_greeted"
+
+
+def test_verify_ping_reply_does_not_count_as_the_agent_greeting(store):
+    # Load-bearing: verify_loop's synthetic ping reply must NOT retire the
+    # fallback, or a resident whose agent never really greets stays wedged.
+    _append_intro_job(store, ts=time.time() - poll_core.RESIDENT_INTRO_FALLBACK_GRACE_SEC - 1)
+    store.append_chat("agent", "verify_ping", _chat_envelope(store.user_id, "ping-reply-1"))
+
+    assert "pj_intro" in [j.get("job_id") for j in _poll(store)]
+    assert store.introduction_done() is False
+
+
+def test_grace_window_is_env_tunable(store, monkeypatch):
+    monkeypatch.setenv("FEEDLING_RESIDENT_INTRO_FALLBACK_GRACE_SEC", "0")
+    _append_intro_job(store, ts=time.time())
+    assert "pj_intro" in [j.get("job_id") for j in _poll(store)]
 
 
 # --------------------------------------------------------------------------- #
