@@ -51,6 +51,17 @@ except ModuleNotFoundError:
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
 
+@pytest.fixture(autouse=True)
+def _reset_proactive_guard_state_between_tests():
+    """The proactive idle-loop guard + failure backoff are module-global state
+    that accumulates across proactive realizations. Reset before each test so a
+    prior test's proactive turns don't trip the guard and skip this one's."""
+    crc._proactive_empty_streak = 0
+    crc._proactive_fail_streak = 0
+    crc._proactive_backoff_until = 0.0
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -6437,3 +6448,118 @@ def test_foreground_transcript_closed_by_explicit_separator(monkeypatch):
     assert out.endswith("新消息")
     assert out.startswith(crc.FOREGROUND_CHAT_CONTEXT_HEADER)
     assert crc._message_has_injected_history(out)
+
+
+# --- _strip_missing_mcp_config: Windows/self-host --mcp-config heal ---------
+
+def test_strip_missing_mcp_config_drops_nonexistent_path():
+    """A hard-coded --mcp-config pointing at a missing file is dropped so the
+    CLI agent can start (would otherwise exit 1: 'MCP config file not found')."""
+    cmd = ["claude", "--mcp-config", "/no/such/feedling_mcp.json", "--print", "{message}"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped == "/no/such/feedling_mcp.json"
+    assert out == ["claude", "--print", "{message}"]
+
+
+def test_strip_missing_mcp_config_keeps_existing_file(tmp_path):
+    """An operator-managed --mcp-config that actually exists is left untouched."""
+    real = tmp_path / "user-mcp.json"
+    real.write_text('{"mcpServers": {}}')
+    cmd = ["claude", "--mcp-config", str(real), "--print"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped is None
+    assert out == cmd
+
+
+def test_strip_missing_mcp_config_noop_without_flag():
+    cmd = ["claude", "--print", "--output-format", "json", "{message}"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped is None
+    assert out == cmd
+
+
+def test_strip_missing_mcp_config_trailing_flag_is_safe():
+    """--mcp-config as the last token (no value) must not crash or over-strip."""
+    cmd = ["claude", "--print", "--mcp-config"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped is None
+    assert out == cmd
+
+
+def test_strip_missing_mcp_config_handles_equals_form():
+    """--mcp-config=<path> single-token form is stripped when the file is gone."""
+    cmd = ["claude", "--mcp-config=/no/such/x.json", "--print"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped == "/no/such/x.json"
+    assert out == ["claude", "--print"]
+
+
+def test_strip_missing_mcp_config_keeps_existing_equals_form(tmp_path):
+    real = tmp_path / "m.json"
+    real.write_text("{}")
+    cmd = ["claude", f"--mcp-config={real}", "--print"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped is None
+    assert out == cmd
+
+
+def test_prepare_cli_command_heals_incident_windows_mcp_path(monkeypatch):
+    """End-to-end through _prepare_cli_command: an incident-shaped hard-coded
+    Windows --mcp-config to a missing file is healed so claude can start
+    (quoted/forward-slash path so shlex keeps it intact, matching doc guidance)."""
+    tmpl = 'claude --mcp-config "C:/Users/Administrator/feedling_user_mcp.json" -p {message}'
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", tmpl)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    cmd = crc._prepare_cli_command("hi", lane="chat")
+    assert "--mcp-config" not in cmd
+    assert not any("feedling_user_mcp.json" in t for t in cmd)
+    assert os.path.basename(cmd[0]) == "claude"
+
+
+# --- Proactive idle-loop guard + failure backoff (Seven 2026-07-16) ----------
+
+def _reset_proactive_guard_state():
+    crc._proactive_empty_streak = 0
+    crc._proactive_fail_streak = 0
+    crc._proactive_backoff_until = 0.0
+
+
+def test_proactive_idle_guard_trips_after_max_empty_turns():
+    _reset_proactive_guard_state()
+    assert not crc._proactive_idle_guard_tripped()
+    for _ in range(crc.MAX_EMPTY_PROACTIVE_TURNS):
+        crc._note_idle_proactive_send()
+    assert crc._proactive_idle_guard_tripped()
+
+
+def test_proactive_idle_guard_reset_clears_streak():
+    _reset_proactive_guard_state()
+    for _ in range(crc.MAX_EMPTY_PROACTIVE_TURNS + 2):
+        crc._note_idle_proactive_send()
+    assert crc._proactive_idle_guard_tripped()
+    crc._reset_proactive_idle_guard()
+    assert not crc._proactive_idle_guard_tripped()
+    assert crc._proactive_empty_streak == 0
+
+
+def test_proactive_failure_backoff_grows_and_clears(monkeypatch):
+    _reset_proactive_guard_state()
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 1000.0)
+    assert not crc._proactive_backing_off()
+    crc._note_proactive_failure()
+    assert crc._proactive_backing_off()
+    assert (crc._proactive_backoff_until - 1000.0) == crc.PROACTIVE_FAIL_BACKOFF_BASE_SEC
+    crc._note_proactive_failure()
+    assert (crc._proactive_backoff_until - 1000.0) == crc.PROACTIVE_FAIL_BACKOFF_BASE_SEC * 2
+    crc._clear_proactive_failure()
+    assert not crc._proactive_backing_off()
+    assert crc._proactive_fail_streak == 0
+
+
+def test_proactive_failure_backoff_caps(monkeypatch):
+    _reset_proactive_guard_state()
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 0.0)
+    for _ in range(20):
+        crc._note_proactive_failure()
+    assert crc._proactive_backoff_until <= crc.PROACTIVE_FAIL_BACKOFF_CAP_SEC
+    _reset_proactive_guard_state()

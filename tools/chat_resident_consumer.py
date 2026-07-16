@@ -391,6 +391,66 @@ def _clear_provider_payment_cooldown() -> None:
     global _provider_payment_cooldown_until
     _provider_payment_cooldown_until = 0.0
 
+
+# --- Proactive idle-loop guard + failure backoff (Seven 2026-07-16) -----------
+# The agent can self-schedule wakes ("check on them again soon"); a self-
+# sustaining loop (schedule -> wake -> post "(在)" -> schedule -> ...) floods the
+# user with no new input. Two consumer-side brakes, on top of the backend's
+# schedule_wake min-lead floor:
+#   1. Idle-loop guard: after N consecutive proactive (non-user-driven) sends
+#      with NO intervening user message, stand down — tell the gate via
+#      loop_guard_blocked (blocks the heartbeat tick enqueue) AND skip realizing
+#      further idle proactive jobs (covers the scheduled-wake fire lane, which
+#      does not pass through the tick gate) — until the user speaks again.
+#   2. Failure backoff: any consecutive proactive realization failure backs off
+#      exponentially (the 402 payment cooldown stays as its own special case for
+#      messaging, but also feeds this general backoff).
+# A blunt hourly cap was deliberately NOT used (Seven): users who want frequent
+# proactive messages are legitimate; only a genuinely input-less loop is stopped.
+MAX_EMPTY_PROACTIVE_TURNS = int(os.environ.get("FEEDLING_MAX_EMPTY_PROACTIVE_TURNS", "2"))
+PROACTIVE_FAIL_BACKOFF_BASE_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60"))
+PROACTIVE_FAIL_BACKOFF_CAP_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600"))
+_proactive_empty_streak: int = 0
+_proactive_fail_streak: int = 0
+_proactive_backoff_until: float = 0.0
+
+
+def _proactive_idle_guard_tripped() -> bool:
+    return MAX_EMPTY_PROACTIVE_TURNS > 0 and _proactive_empty_streak >= MAX_EMPTY_PROACTIVE_TURNS
+
+
+def _note_idle_proactive_send() -> None:
+    """An idle proactive turn was realized with no new user input since the last
+    one — advance the empty streak toward the guard."""
+    global _proactive_empty_streak
+    _proactive_empty_streak += 1
+
+
+def _reset_proactive_idle_guard() -> None:
+    """The user spoke (new input) — the loop is not idle; allow proactive again."""
+    global _proactive_empty_streak
+    _proactive_empty_streak = 0
+
+
+def _proactive_backing_off() -> bool:
+    return PROACTIVE_FAIL_BACKOFF_BASE_SEC > 0 and _proactive_backoff_until > time.monotonic()
+
+
+def _note_proactive_failure() -> None:
+    global _proactive_fail_streak, _proactive_backoff_until
+    _proactive_fail_streak += 1
+    delay = min(
+        PROACTIVE_FAIL_BACKOFF_BASE_SEC * (2 ** (_proactive_fail_streak - 1)),
+        PROACTIVE_FAIL_BACKOFF_CAP_SEC,
+    )
+    _proactive_backoff_until = time.monotonic() + delay
+
+
+def _clear_proactive_failure() -> None:
+    global _proactive_fail_streak, _proactive_backoff_until
+    _proactive_fail_streak = 0
+    _proactive_backoff_until = 0.0
+
 # --- agent turn error classification (spec: docs/superpowers/specs/
 # 2026-07-06-upstream-error-surfacing-design.md) ---------------------------
 # error_class → 用户话术；blame 决定话术能不能给行动指引：
@@ -4073,6 +4133,42 @@ def _strip_cli_option_value(cmd: list[str], flags: set[str]) -> tuple[list[str],
     return out, removed
 
 
+def _strip_missing_mcp_config(cmd: list[str]) -> tuple[list[str], str | None]:
+    """Drop a ``--mcp-config <path>`` pair when ``<path>`` does not exist.
+
+    A hard-coded ``--mcp-config`` pointing at a file the consumer never
+    materialized — e.g. an operator wrote a literal ``C:\\Users\\...`` path
+    instead of the ``{mcp}`` placeholder and has no enabled MCP servers — makes
+    claude exit 1 on every foreground turn ("Invalid MCP configuration: MCP
+    config file not found"), which silently kills chat replies while background
+    proactive turns (which omit ``--mcp-config``) keep running. ``{mcp}`` is the
+    sanctioned mechanism (empty when there are no servers, a materialized file
+    when there are). When the referenced file is genuinely absent we drop the
+    flag so the agent starts with no user MCP servers, and warn the operator to
+    switch to ``{mcp}``. A present, operator-managed file is left untouched.
+    """
+    out: list[str] = []
+    stripped: str | None = None
+    i = 0
+    while i < len(cmd):
+        token = cmd[i]
+        if token == "--mcp-config" and i + 1 < len(cmd):
+            path = cmd[i + 1]
+            if not path.startswith("-") and not os.path.exists(path):
+                stripped = path
+                i += 2
+                continue
+        elif token.startswith("--mcp-config="):
+            path = token[len("--mcp-config="):]
+            if path and not os.path.exists(path):
+                stripped = path
+                i += 1
+                continue
+        out.append(token)
+        i += 1
+    return out, stripped
+
+
 def _strip_cli_flags(cmd: list[str], flags: set[str]) -> tuple[list[str], bool]:
     out: list[str] = []
     removed = False
@@ -4158,6 +4254,16 @@ def _prepare_cli_command(
         rendered_message = _message_for_agent(message, image_paths)
     cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths, lane=lane)
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
+
+    cmd, missing_mcp = _strip_missing_mcp_config(cmd)
+    if missing_mcp:
+        log.warning(
+            "dropped --mcp-config %s from AGENT_CLI_CMD: file not found, so the "
+            "CLI agent would exit 1 ('Invalid MCP configuration'). Use the {mcp} "
+            "placeholder instead of a hard-coded path — it resolves to empty when "
+            "you have no MCP servers and to the materialized file when you do.",
+            missing_mcp,
+        )
 
     if _is_hermes_chat_cmd(cmd):
         cmd, removed_continue = _strip_hermes_continue(cmd)
@@ -7621,6 +7727,28 @@ def _process_proactive_jobs(jobs: list) -> float:
             len(frame_ids),
         )
 
+        # Idle-loop guard + failure backoff apply only to genuine idle proactive
+        # turns — never to the first-greeting introduction or the screen-watch
+        # lane (the latter is user-activity-driven and gated separately).
+        is_idle_proactive = not is_introduction and not _is_screen_watch_job(job)
+        if is_idle_proactive and _proactive_backing_off():
+            log.warning(
+                "proactive job skipped — backing off after failures; job_id=%s", job_id
+            )
+            update_proactive_job_status(
+                job_id, "skipped", "proactive_backoff: cooling down after failures"
+            )
+            continue
+        if is_idle_proactive and _proactive_idle_guard_tripped():
+            log.info(
+                "proactive job skipped — idle loop guard (no new user input); job_id=%s",
+                job_id,
+            )
+            update_proactive_job_status(
+                job_id, "skipped", "proactive_idle_loop: no new user input"
+            )
+            continue
+
         if _provider_payment_cooling_down():
             log.warning(
                 "proactive job skipped — provider payment required (cooling down); job_id=%s",
@@ -7640,6 +7768,7 @@ def _process_proactive_jobs(jobs: list) -> float:
         except Exception as e:
             if _is_provider_payment_error(e):
                 _note_provider_payment_failure()
+                _note_proactive_failure()
                 log.error(
                     "proactive agent call failed — provider payment required; "
                     "cooling down %.0fs: %s",
@@ -7652,10 +7781,12 @@ def _process_proactive_jobs(jobs: list) -> float:
                 _notify_agent_turn_failure(e, foreground=False)
                 continue
             log.error("proactive agent call failed; not posting fallback: %s", e)
+            _note_proactive_failure()
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
             _notify_agent_turn_failure(e, foreground=False)
             continue
         _clear_provider_payment_cooldown()
+        _clear_proactive_failure()
         if _consume_reply_parse_failed():
             # Parse failure means call_agent already swapped agent_result for
             # FALLBACK_REPLY — a foreground-only line ("你稍后再发一次…") that
@@ -7670,6 +7801,8 @@ def _process_proactive_jobs(jobs: list) -> float:
             update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
             continue
         _note_agent_turn_success()
+        if is_idle_proactive:
+            _note_idle_proactive_send()
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
@@ -8126,6 +8259,13 @@ def _process_messages(messages: list) -> float:
             log.debug("skipping already-processed message key=%s", key)
             latest = max(latest, ts)
             continue
+
+        # A genuine, newly-seen user message (verify_ping liveness probes
+        # excluded) means the loop is not idle and the user is engaged — clear the
+        # proactive idle-loop guard and any failure backoff so proactive resumes.
+        if msg.get("source") != "verify_ping":
+            _reset_proactive_idle_guard()
+            _clear_proactive_failure()
 
         # Synthetic liveness probe from /v1/chat/verify_loop. Identified ONLY
         # by `source`, which the server stamps as "verify_ping" across all
@@ -9014,6 +9154,13 @@ def run() -> None:
                         }
                         if last_broadcast_state:
                             tick_payload["broadcast_state"] = last_broadcast_state
+                        # Idle-loop guard: tell the gate to skip enqueuing the
+                        # heartbeat presence wake once we've sent N proactive
+                        # turns with no intervening user input (contract shared
+                        # with backend/proactive/gate.py).
+                        if _proactive_idle_guard_tripped():
+                            tick_payload["loop_guard_blocked"] = True
+                            tick_payload["loop_guard_reason"] = "no_new_input"
                         tick = post_proactive_tick(tick_payload)
                         decision = tick.get("decision") or {}
                         last_broadcast_state = str(
