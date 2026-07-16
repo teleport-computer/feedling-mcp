@@ -5,14 +5,17 @@ never rebind (tests and the wake-bus reload rely on the objects' identity).
 Persistence is PostgreSQL (db.save_all_users / db.upsert_user).
 """
 
+import copy
 import hashlib
 import hmac
 import re
 import secrets
 import threading
+import time
 from datetime import datetime
 
 import db
+from core import util as core_util
 from core import wake_bus
 
 _users_lock = threading.Lock()
@@ -498,6 +501,68 @@ def _upsert_access_binding_locked(
     }
     bindings.append(binding)
     return binding
+
+
+def _touch_resident_binding_seen(
+    user_id: str,
+    *,
+    min_interval_sec: float = 60.0,
+    now_epoch: float | None = None,
+) -> bool:
+    """Persist a throttled heartbeat on one user's resident binding.
+
+    ``/v1/chat/poll`` is a 30-second hot path, so the binding row must not be
+    rewritten on every poll. The persisted ``last_seen_at`` is the throttle
+    source, which also keeps the behavior stable after a worker restart. Returns
+    True only when this call actually persisted an update.
+
+    The single-row upsert stays under ``_users_lock`` because the in-memory user
+    dict is the registry's source of truth; releasing the lock before persisting
+    a snapshot could let a concurrent edit land first and then be overwritten by
+    this stale heartbeat snapshot. At most one call per user per interval reaches
+    the DB. A failed persist rolls the binding back so the next poll retries.
+    """
+    try:
+        interval = max(0.0, float(min_interval_sec))
+    except (TypeError, ValueError):
+        interval = 60.0
+    try:
+        now = float(time.time() if now_epoch is None else now_epoch)
+    except (TypeError, ValueError):
+        now = time.time()
+    now_iso = datetime.fromtimestamp(now).isoformat()
+
+    with _users_lock:
+        user_entry = _find_user_entry_locked(user_id)
+        if not user_entry:
+            return False
+        resident = next(
+            (
+                binding
+                for binding in user_entry.get("access_bindings") or []
+                if isinstance(binding, dict)
+                and _normalize_access_mode(str(binding.get("access_mode") or "")) == "resident"
+            ),
+            None,
+        )
+        last_seen_epoch = core_util._to_epoch((resident or {}).get("last_seen_at"))
+        if last_seen_epoch > 0 and now - last_seen_epoch < interval:
+            return False
+
+        bindings_before = copy.deepcopy(user_entry.get("access_bindings"))
+        binding = _upsert_access_binding_locked(user_entry, "resident")
+        binding["last_seen_at"] = now_iso
+        binding["updated_at"] = now_iso
+        try:
+            persist_user(user_entry)
+        except Exception as e:
+            user_entry["access_bindings"] = bindings_before
+            print(
+                f"[resident-seen] persist failed for {user_id}, "
+                f"rolled back for retry: {e}"
+            )
+            return False
+    return True
 
 
 def _issue_api_key_for_user_locked(
