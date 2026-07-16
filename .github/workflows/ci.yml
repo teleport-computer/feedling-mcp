@@ -277,6 +277,25 @@ jobs:
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
 
+  # The inline prod runner has been removed. Updating either production CVM
+  # while only one standalone runner exists recreates the 2026-07-15 outage:
+  # main deploy interrupts ingress, then runner deploy removes the only hosting
+  # path. Fail before either deployment mutates live state.
+  validate-prod-runner-topology:
+    name: validate prod runner topology
+    needs: [detect-cvm-changes]
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      needs.detect-cvm-changes.outputs.cvm == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require two independent prod runner CVMs
+        env:
+          DEPLOY_PROD_RUNNER_CVM: ${{ vars.DEPLOY_PROD_RUNNER_CVM }}
+        run: ./deploy/check-prod-runner-topology.sh deploy/prod-runner-cvm-ids.txt "$DEPLOY_PROD_RUNNER_CVM"
+
   # =========================================================================
   # DEPLOY — CVM (compose_hash on-chain + phala deploy)
   #
@@ -293,7 +312,7 @@ jobs:
   # =========================================================================
   deploy-cvm:
     name: deploy CVM
-    needs: [forge-test, python-tests, docker-build, lint, dcap-python, detect-cvm-changes]
+    needs: [forge-test, python-tests, docker-build, lint, dcap-python, detect-cvm-changes, validate-prod-runner-topology]
     if: |
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&
@@ -1031,12 +1050,10 @@ jobs:
   # deploy/docker-compose.phala.prod.runner.yaml to each, sharing the main prod
   # CVM's Postgres + secrets via the encrypted env channel. See deploy/DEPLOYMENTS.md.
   #
-  # DORMANT BY DEFAULT: skipped unless repo var DEPLOY_PROD_RUNNER_CVM == 'true'
-  # AND prod-runner-cvm-ids.txt names >=1 provisioned runner CVM. So merging this is
-  # a no-op until you (1) provision N runner dstack apps on the PROD phala account,
-  # (2) put their ids in that file, (3) set PROD_MAIN_* vars, (4) flip the var. The
-  # runner secrets reuse the main prod CVM's (DATABASE_URL / FEEDLING_RUNTIME_TOKEN_
-  # SECRET — MUST match — / AGENT_RUNTIME_USERS).
+  # Active only when repo var DEPLOY_PROD_RUNNER_CVM == 'true'. The topology
+  # preflight above requires >=2 distinct provisioned IDs before either the main
+  # or runner CVMs may be changed. Runner secrets reuse the main prod CVM's
+  # DATABASE_URL / FEEDLING_RUNTIME_TOKEN_SECRET (MUST match) / AGENT_RUNTIME_USERS.
   deploy-prod-runner-cvm:
     name: deploy runner CVM (prod)
     needs: [deploy-cvm, detect-cvm-changes]
@@ -1112,9 +1129,11 @@ jobs:
         id: ids
         run: |
           # one id per line; ignore blank lines and # comments
-          IDS=$(grep -vE '^[[:space:]]*(#|$)' deploy/prod-runner-cvm-ids.txt | tr -d '[:space:]' | grep . || true)
+          IDS=$(grep -vE '^[[:space:]]*(#|$)' deploy/prod-runner-cvm-ids.txt \
+            | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+            | grep . || true)
           if [ -z "$IDS" ]; then
-            echo "::error::deploy/prod-runner-cvm-ids.txt has no CVM ids — provision >=1 prod runner CVM first"
+            echo "::error::deploy/prod-runner-cvm-ids.txt has no CVM ids — provision >=2 prod runner CVMs first"
             exit 1
           fi
           echo "count=$(printf '%s\n' "$IDS" | wc -l)"

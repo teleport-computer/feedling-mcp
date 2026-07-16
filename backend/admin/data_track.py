@@ -198,6 +198,7 @@ def _proactive_stats(store: UserStore) -> dict:
         ]
     decision_true = sum(1 for d in decisions if bool(d.get("should_reach_out")))
     status_counts = _count_rows(jobs, "status")
+    failed_reasons: dict[str, int] = {}
     kind_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
     fail_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
     for j in jobs:
@@ -208,6 +209,8 @@ def _proactive_stats(store: UserStore) -> dict:
         kind_lanes[lane] += 1
         if str(j.get("status") or "") in ("failed", "skipped"):
             fail_lanes[lane] += 1
+            reason = str(j.get("status_reason") or "").strip() or "unknown"
+            failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
     live_status_counts = _count_rows(proactive_messages, "live_activity_status")
     alert_status_counts = _count_rows(proactive_messages, "alert_status")
     job_epochs = [core_util._to_epoch(j.get("ts") or j.get("created_at") or j.get("updated_at")) for j in jobs]
@@ -235,6 +238,9 @@ def _proactive_stats(store: UserStore) -> dict:
         "pending_jobs": status_counts.get("pending", 0),
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
+        # Matches the existing failure-lane lifecycle: skipped is terminal and
+        # grouped with failed, even though jobs_by_status keeps them distinct.
+        "job_failed_reasons": failed_reasons,
         "proactive_messages": len(proactive_messages),
         "delivery_signals": delivered,
         "live_activity_status": live_status_counts,
@@ -651,6 +657,9 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "pending_jobs": status_counts.get("pending", 0),
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
+        # Includes failed + skipped proactive jobs; delivery failures are not
+        # job reasons and remain in live_activity_status / alert_status.
+        "job_failed_reasons": _data_track_count_dict(extra.get("jobs_failed_by_reason")),
         "proactive_messages": int(chat.get("proactive_messages") or 0),
         "delivery_signals": delivered,
         "live_activity_status": live_status_counts,
@@ -1357,8 +1366,11 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     return payload
 
 
-def _debug_trace_events_for_user(user_id: str) -> tuple[bool, list[dict]]:
-    enabled_raw = db.get_blob(user_id, "v1_flow_trace_enabled")
+def _debug_trace_events_from_blobs(
+    user_id: str,
+    enabled_raw,
+    raw,
+) -> tuple[bool, list[dict]]:
     if debug_trace._hard_disabled():
         enabled = False
     elif isinstance(enabled_raw, dict) and "enabled" in enabled_raw:
@@ -1367,7 +1379,7 @@ def _debug_trace_events_for_user(user_id: str) -> tuple[bool, list[dict]]:
         enabled = debug_trace._default_enabled()
     else:
         enabled = bool(enabled_raw)
-    raw = db.get_blob(user_id, "v1_flow_trace") or {}
+    raw = raw or {}
     events = raw.get("events") if isinstance(raw, dict) and isinstance(raw.get("events"), list) else []
     out = []
     for e in events:
@@ -1381,6 +1393,14 @@ def _debug_trace_events_for_user(user_id: str) -> tuple[bool, list[dict]]:
             ev["ts"] = 0.0
         out.append(ev)
     return enabled, out
+
+
+def _debug_trace_events_for_user(user_id: str) -> tuple[bool, list[dict]]:
+    return _debug_trace_events_from_blobs(
+        user_id,
+        db.get_blob(user_id, "v1_flow_trace_enabled"),
+        db.get_blob(user_id, "v1_flow_trace"),
+    )
 
 
 def _debug_trace_stem(event_type: str) -> str:
@@ -1564,12 +1584,22 @@ def _data_track_debug_payload() -> dict:
     if user_filter:
         users = [u for u in users if str(u.get("user_id") or "") == user_filter]
 
+    user_ids = [str(user.get("user_id") or "") for user in users]
+    trace_blobs = db.get_blobs_for_users(
+        user_ids,
+        ["v1_flow_trace_enabled", "v1_flow_trace"],
+    )
+
     all_events_raw: list[dict] = []
     all_events: list[dict] = []
     user_rows: dict[str, dict] = {}
     for user in users:
         uid = str(user.get("user_id") or "")
-        enabled, events = _debug_trace_events_for_user(uid)
+        enabled, events = _debug_trace_events_from_blobs(
+            uid,
+            trace_blobs.get((uid, "v1_flow_trace_enabled")),
+            trace_blobs.get((uid, "v1_flow_trace")),
+        )
         all_events_raw.extend(events)
         matching = []
         for ev in events:

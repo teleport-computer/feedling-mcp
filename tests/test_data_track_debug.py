@@ -35,6 +35,20 @@ def _event(ts: float, user_id: str, typ: str, *, trace_id: str, status: str = "o
     }
 
 
+def _patch_blob_reads(monkeypatch, blobs: dict) -> None:
+    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    monkeypatch.setattr(
+        data_track.db,
+        "get_blobs_for_users",
+        lambda user_ids, kinds: {
+            (uid, kind): blobs[(uid, kind)]
+            for uid in user_ids
+            for kind in kinds
+            if (uid, kind) in blobs
+        },
+    )
+
+
 def test_genesis_stats_surfaces_state_and_recent_jobs(monkeypatch):
     state = {
         "status": "processing",
@@ -81,6 +95,22 @@ def test_genesis_stats_surfaces_state_and_recent_jobs(monkeypatch):
     assert stats["latest_job"]["metadata"]["history_count"] == 42
 
 
+def test_fast_proactive_snapshot_exposes_failed_reason_distribution():
+    proactive = data_track._data_track_proactive_from_snapshot(
+        {
+            "logs": {"proactive_jobs": {"count": 3, "last_ts": 100}},
+            "proactive_extra": {
+                "jobs_by_status": {"failed": 3},
+                "jobs_failed_by_reason": {"model_timeout": 2, "unknown": 1},
+            },
+        },
+        {},
+    )
+
+    assert proactive["failed_jobs"] == 3
+    assert proactive["job_failed_reasons"] == {"model_timeout": 2, "unknown": 1}
+
+
 def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
     with registry._users_lock:
         registry._users[:] = [
@@ -120,7 +150,7 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
         },
     }
 
-    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    _patch_blob_reads(monkeypatch, blobs)
 
     with bind("view=debug"):
         payload = data_track._data_track_debug_payload()
@@ -145,7 +175,7 @@ def test_debug_payload_treats_missing_trace_flag_as_enabled_by_default(monkeypat
     blobs = {}
     monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE", raising=False)
     monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE_DEFAULT", raising=False)
-    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    _patch_blob_reads(monkeypatch, blobs)
 
     with bind("view=debug"):
         payload = data_track._data_track_debug_payload()
@@ -176,7 +206,7 @@ def test_debug_payload_paginates_filtered_events(monkeypatch):
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
         ("user_a", "v1_flow_trace"): {"events": events},
     }
-    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    _patch_blob_reads(monkeypatch, blobs)
 
     with bind("view=debug&limit=2&offset=1"):
         payload = data_track._data_track_debug_payload()
@@ -214,7 +244,7 @@ def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeyp
             ]
         },
     }
-    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    _patch_blob_reads(monkeypatch, blobs)
 
     html = admin_core.page_html("view=debug&mode=flat&user_id=user_a&q=reply")
 
@@ -247,7 +277,7 @@ def test_debug_page_renders_load_more_when_paginated(monkeypatch):
             ]
         },
     }
-    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    _patch_blob_reads(monkeypatch, blobs)
 
     html = admin_core.page_html("view=debug&mode=flat&user_id=user_a&limit=2&offset=0")
 
@@ -270,7 +300,7 @@ def test_debug_page_renders_numbered_pagination_controls(monkeypatch):
             ]
         },
     }
-    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    _patch_blob_reads(monkeypatch, blobs)
 
     html = admin_core.page_html("view=debug&user_id=user_a&limit=10&offset=10")
 
@@ -299,7 +329,7 @@ def test_debug_reveal_and_timeline_links_reset_pagination(monkeypatch):
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
         ("user_a", "v1_flow_trace"): {"events": events},
     }
-    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    _patch_blob_reads(monkeypatch, blobs)
 
     key = data_track._debug_event_key(target)
     html = admin_core.page_html("view=debug&user_id=user_a&limit=1&offset=1")
@@ -320,7 +350,7 @@ def test_debug_timeline_event_rows_have_event_anchors(monkeypatch):
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
         ("user_a", "v1_flow_trace"): {"events": [event]},
     }
-    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    _patch_blob_reads(monkeypatch, blobs)
 
     key = data_track._debug_event_key(event)
     html = admin_core.page_html("view=debug&mode=timeline&user_id=user_a")
@@ -344,7 +374,7 @@ def test_debug_page_reveals_plaintext_for_one_event(monkeypatch):
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
         ("user_a", "v1_flow_trace"): {"events": [event]},
     }
-    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    _patch_blob_reads(monkeypatch, blobs)
 
     key = data_track._debug_event_key(event)
     html = admin_core.page_html(f"view=debug&user_id=user_a&trace_id=t-reply&reveal={key}")
@@ -370,7 +400,7 @@ def test_debug_page_can_render_timeline_mode(monkeypatch):
             ]
         },
     }
-    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    _patch_blob_reads(monkeypatch, blobs)
 
     html = admin_core.page_html("view=debug&mode=timeline&user_id=user_a")
 
