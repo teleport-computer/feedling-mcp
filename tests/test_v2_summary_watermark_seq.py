@@ -80,7 +80,13 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0038_v2_prompt_cache_metrics").down_revision == (
         "0037_v2_terminal_failure_outbox"
     )
-    assert script.get_current_head() == "0038_v2_prompt_cache_metrics"
+    # 0039 no-op-merges test's tee-shadow extension (0019_tee_reconcile_state)
+    # into the V2 head when pre is rebased onto test — see test_v2_jobs_migration.
+    assert set(script.get_revision("0039_merge_tee_recon_state").down_revision) == {
+        "0038_v2_prompt_cache_metrics",
+        "0019_tee_reconcile_state",
+    }
+    assert script.get_current_head() == "0039_merge_tee_recon_state"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

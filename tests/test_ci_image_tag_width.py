@@ -7,8 +7,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parent.parent
+# Capture ONLY the quoted GITHUB_SHA slice, ignoring any trailing inline comment
+# (the mainline CI #906 lines carry a `# fixed 7-char slice…` note).
 ASSIGNMENT = re.compile(
-    r'^\s*(?:COMMIT_SHORT|SHA_SHORT|TRIGGER_SHA_SHORT)=(.+)$',
+    r'^\s*(?:COMMIT_SHORT|SHA_SHORT|TRIGGER_SHA_SHORT)=("\$\{GITHUB_SHA:0:\d+\}")',
     re.MULTILINE,
 )
 
@@ -28,7 +30,7 @@ def test_image_tags_use_one_fixed_width_github_sha_prefix():
     # and pin assignment. A variable-length `git rev-parse --short` can produce
     # different widths in the publisher's shallow clone and deploy's full clone.
     assert len(assignments) == 13
-    assert set(assignments) == {'"${GITHUB_SHA:0:12}"'}
+    assert set(assignments) == {'"${GITHUB_SHA:0:7}"'}
 
 
 def test_pre_runner_deploy_forwards_pool_size_and_gates_liveness():
@@ -41,7 +43,7 @@ def test_pre_runner_deploy_forwards_pool_size_and_gates_liveness():
     assert 'payload.get("live_worker_capacity")' in workflow
     assert 'payload.get("genesis_alive") is True' in workflow
     assert 'payload.get("worker_heartbeats")' in workflow
-    assert 'expected_commit = os.environ.get("GITHUB_SHA", "")[:12]' in workflow
+    assert 'expected_commit = os.environ.get("GITHUB_SHA", "")[:7]' in workflow
     assert "time.sleep(35)" in workflow
     assert "def heartbeat_age(row):" in workflow
     assert 'row.get("age_sec") or 9999' not in workflow

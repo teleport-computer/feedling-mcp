@@ -1485,11 +1485,11 @@ jobs:
 
           base_url = os.environ.get("FEEDLING_API_URL", "").rstrip("/")
           admin_token = os.environ.get("FEEDLING_ADMIN_TOKEN", "")
-          expected_commit = os.environ.get("GITHUB_SHA", "")[:12]
+          expected_commit = os.environ.get("GITHUB_SHA", "")[:7]  # 7-char, matches the image tag slice (CI #906)
           if not base_url or not admin_token:
               raise SystemExit("FEEDLING_API_URL / FEEDLING_ADMIN_TOKEN is required")
-          if len(expected_commit) != 12:
-              raise SystemExit("GITHUB_SHA must provide a 12-character build identity")
+          if len(expected_commit) != 7:
+              raise SystemExit("GITHUB_SHA must provide a 7-character build identity")
 
           endpoint = f"{base_url}/v1/admin/v2-metrics"
           last_error = "no response"

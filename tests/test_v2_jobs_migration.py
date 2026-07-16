@@ -101,7 +101,15 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0038_v2_prompt_cache_metrics").down_revision == (
         "0037_v2_terminal_failure_outbox"
     )
-    assert script.get_current_head() == "0038_v2_prompt_cache_metrics"
+    # Rebasing pre onto test picked up test's tee-shadow extension
+    # 0019_tee_reconcile_state (forked off 0018_tee_reconcile_cursors, already
+    # joined to the V2 lineage at 0033/0035). 0039 no-op-merges it into the V2
+    # head without reparenting either deployed lineage.
+    assert set(script.get_revision("0039_merge_tee_recon_state").down_revision) == {
+        "0038_v2_prompt_cache_metrics",
+        "0019_tee_reconcile_state",
+    }
+    assert script.get_current_head() == "0039_merge_tee_recon_state"
 
 
 def test_prompt_cache_metric_columns_and_recent_window_index_exist():
