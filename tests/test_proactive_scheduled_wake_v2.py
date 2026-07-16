@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import sys
 from pathlib import Path
 
@@ -19,9 +20,15 @@ from proactive.scheduled_wake_v2 import (
 )
 
 
-def _service(*, cap: int = 20, claim_ttl: float = 60.0):
+def _service(*, cap: int = 20, claim_ttl: float = 60.0, self_wake_min_lead: float = 300.0):
     store = InMemoryScheduledWakeStoreV2()
-    return store, ScheduledWakeServiceV2(store, pending_cap=cap, claim_ttl_sec=claim_ttl, owner_id="worker-a")
+    return store, ScheduledWakeServiceV2(
+        store,
+        pending_cap=cap,
+        claim_ttl_sec=claim_ttl,
+        self_wake_min_lead_sec=self_wake_min_lead,
+        owner_id="worker-a",
+    )
 
 
 def test_schedule_action_persists_wall_time_timezone_note_and_origin_refs():
@@ -60,6 +67,45 @@ def test_schedule_instant_keeps_event_timezone_wall_clock_across_dst():
     assert wall == "2026-11-01T01:30:00"
     assert tz == "America/New_York"
     assert due_at > 0
+
+
+def test_schedule_action_clamps_near_self_wake_to_min_lead():
+    store, service = _service(self_wake_min_lead=300.0)
+    now = 1_800_000_000.0
+    requested = datetime.fromtimestamp(now + 60.0, timezone.utc).isoformat()
+
+    result = service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": requested, "tz": "UTC"}],
+        now=now,
+    )[0]
+    record = store.list_records("u1")[0]
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+
+    assert result.status == "scheduled"
+    assert result.reason == "self_wake_min_lead_clamped"
+    assert result.as_dict()["reason"] == "self_wake_min_lead_clamped"
+    assert record.due_at == now + 300.0
+    assert record.at == datetime.fromtimestamp(now + 300.0, timezone.utc).replace(tzinfo=None).isoformat()
+    assert service.fire_due_timers("u1", settings={}, now=now + 299.0, submit_wake=spine.submit) == ()
+
+
+def test_schedule_action_keeps_future_self_wake_unchanged():
+    store, service = _service(self_wake_min_lead=300.0)
+    now = 1_800_000_000.0
+    requested = datetime.fromtimestamp(now + 600.0, timezone.utc).isoformat()
+
+    result = service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": requested, "tz": "UTC"}],
+        now=now,
+    )[0]
+    record = store.list_records("u1")[0]
+
+    assert result.status == "scheduled"
+    assert result.reason == ""
+    assert record.due_at == now + 600.0
+    assert record.at == datetime.fromtimestamp(now + 600.0, timezone.utc).replace(tzinfo=None).isoformat()
 
 
 def test_pending_cap_eviction_is_reported_and_visible_to_agent():

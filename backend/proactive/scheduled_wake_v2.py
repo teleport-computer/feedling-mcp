@@ -40,6 +40,7 @@ SCHEDULED_BLOCKED = "blocked"
 
 DEFAULT_PENDING_TIMER_CAP_V2 = int(os.environ.get("FEEDLING_SCHEDULED_WAKE_PENDING_CAP_V2", "20"))
 DEFAULT_CLAIM_TTL_SEC_V2 = float(os.environ.get("FEEDLING_SCHEDULED_WAKE_CLAIM_TTL_SEC_V2", "60"))
+MIN_SELF_WAKE_LEAD_SEC_V2 = float(os.environ.get("FEEDLING_SELF_WAKE_MIN_LEAD_SEC_V2", "300"))
 
 
 def _new_timer_id() -> str:
@@ -99,6 +100,11 @@ def schedule_instant_v2(at: Any, tz: Any) -> tuple[str, str, float]:
     wall_time = local.replace(tzinfo=None).isoformat()
     due_at = local.astimezone(timezone.utc).timestamp()
     return wall_time, zone.key, due_at
+
+
+def _wall_time_for_due_at(due_at: float, tz_name: str) -> str:
+    local = datetime.fromtimestamp(float(due_at), timezone.utc).astimezone(_zone(tz_name))
+    return local.replace(tzinfo=None).isoformat()
 
 
 @dataclass(frozen=True)
@@ -503,11 +509,13 @@ class ScheduledWakeServiceV2:
         *,
         pending_cap: int = DEFAULT_PENDING_TIMER_CAP_V2,
         claim_ttl_sec: float = DEFAULT_CLAIM_TTL_SEC_V2,
+        self_wake_min_lead_sec: float = MIN_SELF_WAKE_LEAD_SEC_V2,
         owner_id: str = "scheduled_wake_v2",
     ) -> None:
         self.store = store or InMemoryScheduledWakeStoreV2()
         self.pending_cap = max(1, int(pending_cap))
         self.claim_ttl_sec = float(claim_ttl_sec)
+        self.self_wake_min_lead_sec = max(0.0, float(self_wake_min_lead_sec))
         self.owner_id = owner_id
 
     def agent_context_for_user(self, user_id: str) -> dict[str, Any]:
@@ -606,6 +614,12 @@ class ScheduledWakeServiceV2:
             wall_time, tz_name, due_at = schedule_instant_v2(action.get("at"), action.get("tz") or settings.timezone)
         except ValueError as exc:
             return ScheduledWakeActionResultV2("schedule_wake", "invalid", reason=str(exc))
+        clamped = False
+        min_due_at = now + self.self_wake_min_lead_sec
+        if self.self_wake_min_lead_sec > 0 and due_at < min_due_at:
+            due_at = min_due_at
+            wall_time = _wall_time_for_due_at(due_at, tz_name)
+            clamped = True
         timer_id = _new_timer_id()
         refs = _coerce_origin_refs(action.get("origin_refs"), origin_refs or wake_ids)
         record = ScheduledWakeRecordV2(
@@ -628,6 +642,7 @@ class ScheduledWakeServiceV2:
             "schedule_wake",
             "scheduled",
             timer_id=timer_id,
+            reason="self_wake_min_lead_clamped" if clamped else "",
             evicted_timer_ids=tuple(record.timer_id for record in evicted),
         )
 
