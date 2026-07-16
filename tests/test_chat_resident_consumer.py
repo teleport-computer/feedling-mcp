@@ -5550,13 +5550,13 @@ def test_reply_language_line_prefers_presence_locale(monkeypatch):
 def test_reply_language_line_falls_back_to_archive_language(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
     line = crc._reply_language_line(None)
-    assert "en" in line
+    assert "Default reply language: English" in line
 
 
 def test_reply_language_line_treats_empty_locale_as_missing(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
     line = crc._reply_language_line({"locale": ""})
-    assert "en" in line
+    assert "Default reply language: English" in line
 
 
 def test_reply_language_line_defaults_to_chinese_with_no_locale_or_archive(monkeypatch):
