@@ -59,6 +59,7 @@ def _reset_proactive_guard_state_between_tests():
     crc._proactive_empty_streak = 0
     crc._proactive_fail_streak = 0
     crc._proactive_backoff_until = 0.0
+    crc._provider_payment_cooldown_until = 0.0
     yield
 
 
