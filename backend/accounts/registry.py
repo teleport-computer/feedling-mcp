@@ -214,6 +214,46 @@ def _normalize_all_users() -> bool:
     return changed
 
 
+def _normalize_all_users_cas() -> bool:
+    """Normalize loaded rows without ever rewriting a stale registry snapshot.
+
+    ``load_users`` runs asynchronously in every process after ``users`` NOTIFY
+    and LISTEN reconnects. Another process can register or edit an account
+    after this process read its snapshot. Persist each changed row with a JSONB
+    compare-and-swap so normalization can neither delete a missing new account
+    nor overwrite a newer version of the same account.
+    """
+    originals = {
+        str(user_entry.get("user_id")): copy.deepcopy(user_entry)
+        for user_entry in _users
+        if isinstance(user_entry, dict) and user_entry.get("user_id")
+    }
+    changed = _normalize_all_users()
+    if not changed:
+        return False
+    authoritative_users: list[dict] = []
+    for user_entry in _users:
+        if not isinstance(user_entry, dict):
+            continue
+        user_id = str(user_entry.get("user_id") or "")
+        expected = originals.get(user_id)
+        if expected is not None and expected != user_entry:
+            read_ok, authoritative = db.normalize_user_cas(
+                user_id, expected, user_entry
+            )
+            if read_ok:
+                if authoritative is not None:
+                    authoritative_users.append(authoritative)
+                continue
+            # Do not serve generated IDs that failed to persist. Keep the exact
+            # row this process read; a later reconnect/NOTIFY can retry safely.
+            authoritative_users.append(expected)
+            continue
+        authoritative_users.append(user_entry)
+    _users[:] = authoritative_users
+    return True
+
+
 def _rebuild_key_cache() -> None:
     _key_to_user.clear()
     for user_entry in _users:
@@ -247,22 +287,17 @@ def load_users():
     lock (the two callers — startup assembly and the listener — don't)."""
     with _users_lock:
         _users[:] = db.load_all_users()
-        changed = _normalize_all_users()
+        _normalize_all_users_cas()
         _rebuild_key_cache()
-        if changed:
-            _save_users()
     print(f"[users] loaded {len(_users)} user(s)")
 
 
 def _save_users():
     """Persist the WHOLE in-memory user registry to PostgreSQL (full rewrite via
-    db.save_all_users). Now used only for normalization-on-read and test resets —
-    paths that rewrite this worker's own freshly-read/owned snapshot. Genuine,
-    user-initiated single-user edits must NOT use this under -w N (a stale
-    snapshot's full rewrite would wipe another worker's concurrent edit); they go
-    through ``persist_user`` (per-row upsert + cross-worker ``users`` broadcast).
-    This path deliberately does NOT broadcast — a normalization reload firing a
-    NOTIFY would ping-pong with the load_users handler."""
+    db.save_all_users). This destructive helper remains for explicit test resets
+    and offline whole-snapshot tooling only. Production normalization uses
+    per-row JSONB compare-and-swap; genuine user edits use ``persist_user``.
+    Never call this from a request, startup, or wake-bus reload path."""
     db.save_all_users(_users)
 
 
@@ -294,23 +329,17 @@ def _resolve_user(api_key: str) -> str | None:
     if uid:
         return uid
     with _users_lock:
-        changed = _normalize_all_users()
+        _normalize_all_users_cas()
         for u in _users:
             if u.get("api_key_hash") == h:
                 _key_to_user[h] = u["user_id"]
-                if changed:
-                    _save_users()
                 return u["user_id"]
             for key_entry in u.get("api_keys") or []:
                 if not isinstance(key_entry, dict) or key_entry.get("revoked_at"):
                     continue
                 if key_entry.get("api_key_hash") == h:
                     _key_to_user[h] = u["user_id"]
-                    if changed:
-                        _save_users()
                     return u["user_id"]
-        if changed:
-            _save_users()
     return None
 
 

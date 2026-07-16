@@ -37,6 +37,12 @@ from asgi import threadpool
 from asgi.settings import settings
 
 
+def _reload_accounts_registry(_user_id: str) -> None:
+    from accounts import registry as accounts_registry
+
+    accounts_registry.load_users()
+
+
 def _start_wake_bus() -> None:
     """Cross-worker wake bus (per-worker LISTEN). Mirrors app.py's assembly:
     the "users" cache-evict handler is injected here (core may not import
@@ -45,7 +51,7 @@ def _start_wake_bus() -> None:
     from accounts import registry as accounts_registry
     from core import wake_bus as core_wake_bus
 
-    core_wake_bus.register_handler("users", lambda _uid: accounts_registry.load_users())
+    core_wake_bus.register_handler("users", _reload_accounts_registry)
     core_wake_bus.start_listener()
 
 

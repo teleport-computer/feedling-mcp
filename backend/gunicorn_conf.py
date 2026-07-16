@@ -83,7 +83,8 @@ def on_starting(server):
     # WorkingDirectory=backend 的 path 注入时序不保证在此时完成，故自插 backend 目录
     # 到 sys.path，使 hosted 包在任何启动方式（容器 WORKDIR /app + --chdir backend、
     # systemd WorkingDirectory=backend）下均可解析。
-    import os, sys
+    import os
+    import sys
     here = os.path.dirname(os.path.abspath(__file__))  # .../backend
     if here not in sys.path:
         sys.path.insert(0, here)
@@ -94,4 +95,16 @@ def on_starting(server):
     # place the schema is upgraded under FastAPI. Idempotent for the Flask path.
     import db
     db.init_schema()
-    print("[gunicorn] on_starting: hosting ready + schema init done", flush=True)
+    from hosted import config_store
+    try:
+        policy_result = config_store.reconcile_hosted_runtime_policy()
+    finally:
+        # Policy reconciliation opens db.py's process-local psycopg pool in the
+        # Gunicorn master. Stop its threads/connections before workers fork;
+        # every child will lazily create a clean pool on first use.
+        db.close_pool()
+    print(
+        "[gunicorn] on_starting: hosting ready + schema init + runtime policy "
+        f"done ({policy_result})",
+        flush=True,
+    )

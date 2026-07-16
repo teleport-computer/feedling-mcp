@@ -396,7 +396,7 @@ Handy filters (append to a `phala cvms logs ... -c feedling-enclave-backend-1` p
 | GET | `/v1/chat/poll` | Long-poll: blocks until user message |
 | GET | `/v1/memory/verify` | Bootstrap memory quality/count verification |
 | GET | `/v1/identity/verify` | Bootstrap identity verification |
-| POST | `/v1/chat/verify_loop` | Synthetic ping that proves the resident reply loop is alive |
+| POST | `/v1/chat/verify_loop` | Runtime connection check: resident uses a synthetic reply ping; Hosted Runtime V2 checks the live turn-worker heartbeat without creating a chat/job |
 | GET | `/healthz` | Process health check |
 
 All write endpoints that take content enforce v1 envelope shape and

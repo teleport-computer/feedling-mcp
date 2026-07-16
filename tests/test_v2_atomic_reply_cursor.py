@@ -573,8 +573,14 @@ def test_atomic_reply_trim_mirrors_exact_tee_evictions(monkeypatch):
         }
     assert remaining == {"old-3", "reply-row"}
     assert len(mirrored) == 1
-    assert mirrored[0][0][1] == (uid, ["old-1", "old-2"])
-    assert mirrored[0][1][1] == (uid, ["old-1", "old-2"])
+    mirrored_user_id, mirrored_ids = mirrored[0][0][1]
+    assert mirrored_user_id == uid
+    # PostgreSQL does not guarantee DELETE ... RETURNING row order; only the
+    # exact eviction set is part of the mirror contract.
+    assert set(mirrored_ids) == {"old-1", "old-2"}
+    mirrored_body_user_id, mirrored_body_ids = mirrored[0][1][1]
+    assert mirrored_body_user_id == uid
+    assert set(mirrored_body_ids) == {"old-1", "old-2"}
 
 
 def test_reply_effect_payload_contains_ciphertext_not_model_text(monkeypatch):

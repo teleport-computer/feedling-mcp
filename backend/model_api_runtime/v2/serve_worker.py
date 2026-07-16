@@ -1600,6 +1600,10 @@ def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
     return seeded
 
 
+def _reload_accounts_registry(_user_id: str) -> None:
+    accounts_registry.load_users()
+
+
 def wire_assembly() -> None:
     """复刻 asgi/lifespan.py 的关键接线（本进程无 lifespan）：注入 envelope pubkey getter、
     载入内存 registry、起 wake-bus listener、接上 "v2_jobs" 即时唤醒（FIX 3）。幂等
@@ -1610,7 +1614,7 @@ def wire_assembly() -> None:
     经 `v2_worker.set_job_wake_context` 设置——这里只负责注册 handler，不依赖 running loop）。"""
     core_envelope.get_user_public_key = accounts_registry._get_user_public_key
     accounts_registry.load_users()
-    core_wake_bus.register_handler("users", lambda _uid: accounts_registry.load_users())
+    core_wake_bus.register_handler("users", _reload_accounts_registry)
     core_wake_bus.register_handler("v2_jobs", v2_worker.on_v2_job_notify)
     core_wake_bus.start_listener()
 

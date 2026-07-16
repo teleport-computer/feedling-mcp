@@ -82,6 +82,18 @@ def env(monkeypatch):
     )
     monkeypatch.setattr(jobs_store, "genesis_worker_alive", lambda **kw: True)
     monkeypatch.setattr(
+        admin_core.config_store,
+        "hosted_runtime_policy_status",
+        lambda: {
+            "policy": "v2_only",
+            "target_mode": "db_action_v2",
+            "eligible_count": 3,
+            "ready_count": 3,
+            "inconsistent_count": 0,
+            "inconsistent_user_ids": [],
+        },
+    )
+    monkeypatch.setattr(
         admin_core.db,
         "effect_outbox_health",
         lambda: {
@@ -144,6 +156,14 @@ def test_v2_metrics_returns_every_field(env):
             "beat_at_epoch": 1234.0,
             "age_sec": 2.0,
         }],
+        "runtime_policy": {
+            "policy": "v2_only",
+            "target_mode": "db_action_v2",
+            "eligible_count": 3,
+            "ready_count": 3,
+            "inconsistent_count": 0,
+            "inconsistent_user_ids": [],
+        },
         "mean_service_sec": 4.5,
         "recent_mean_tokens_per_turn": 123.0,
         "prompt_cache": {

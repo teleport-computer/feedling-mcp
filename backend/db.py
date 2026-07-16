@@ -17,7 +17,8 @@ Concurrency: ``-w N`` workers, ``--threads 32`` each in production compose. Each
 worker has its own ``psycopg_pool.ConnectionPool`` (default max_size=16,
 overridable with ``FEEDLING_DB_POOL_MAX_SIZE``) shared across its threads, plus
 one pool-external connection for the LISTEN wake bus (see
-``listen_connection`` / ``pg_notify`` and ``core/wake_bus.py``). The long-poll
+``listen_connection`` / ``pg_notify`` and ``core/wake_bus.py``) and at most one
+bounded pool-external config-lock connection. The long-poll
 endpoints block on in-memory ``threading.Event``s, NOT on a held DB connection,
 so they don't starve the pool; cross-worker wakes ride the NOTIFY channel.
 
@@ -101,6 +102,22 @@ def get_pool() -> ConnectionPool:
                 open=True,
             )
     return _pool
+
+
+def close_pool() -> None:
+    """Close and forget this process's pool.
+
+    Gunicorn's master performs schema/policy startup work before forking. Any
+    pool opened there must be fully stopped first: psycopg pool worker threads
+    do not survive ``fork()``, and inheriting their connection objects into web
+    workers can hang the first request. Each child lazily creates its own pool.
+    """
+    global _pool
+    with _pool_lock:
+        pool = _pool
+        _pool = None
+    if pool is not None:
+        pool.close()
 
 
 # ---------------------------------------------------------------------------
@@ -456,9 +473,55 @@ def upsert_user(entry: dict) -> None:
     mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
 
 
+def normalize_user_cas(
+    user_id: str,
+    expected: dict,
+    normalized: dict,
+) -> tuple[bool, dict | None]:
+    """Persist startup normalization without overwriting a concurrent edit.
+
+    Registry reloads run in every web/turn process. A stale process must neither
+    full-rewrite the users table (deleting a just-registered account absent from
+    its snapshot) nor replace a row changed after it was read. JSONB equality is
+    the compare-and-swap boundary. Return ``(read_ok, authoritative_doc)`` so a
+    CAS loser immediately replaces its randomly normalized local copy with the
+    winning row. ``authoritative_doc=None`` means the row was concurrently
+    deleted; ``read_ok=False`` means the database operation itself failed.
+    """
+    sql = (
+        "UPDATE users SET created_at=%s, doc=%s "
+        "WHERE user_id=%s AND doc=%s RETURNING doc"
+    )
+    params = (
+        normalized.get("created_at"),
+        Jsonb(normalized),
+        str(user_id),
+        Jsonb(expected),
+    )
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                row = conn.execute(sql, params).fetchone()
+                applied = row is not None
+                if row is None:
+                    row = conn.execute(
+                        "SELECT doc FROM users WHERE user_id=%s",
+                        (str(user_id),),
+                    ).fetchone()
+    except Exception as exc:
+        log.error("[db] normalize_user_cas(%s) failed: %s", user_id, exc)
+        return False, None
+    if applied:
+        from tee_shadow import mirror
+        mirror.execute(sql, params)
+    return True, (row[0] if row is not None else None)
+
+
 def save_all_users(users: list[dict]) -> None:
-    """Persist the whole in-memory user list. The app calls this (via
-    _save_users) for full-list rewrites — startup normalization and test resets.
+    """Persist an explicit whole-registry snapshot for tests/offline tooling.
+
+    Production startup and reconnect normalization must use
+    ``normalize_user_cas`` instead; request-time edits use ``upsert_user``.
 
     Upsert each snapshot user + delete ONLY users absent from the snapshot (genuine
     removals). It deliberately does NOT ``DELETE FROM users`` wholesale: under the
@@ -472,8 +535,8 @@ def save_all_users(users: list[dict]) -> None:
     be used for ordinary per-user edits (a stale snapshot missing a user another
     worker just created would delete that user + cascade its data). Genuine
     single-user edits go through ``registry.persist_user`` → ``db.upsert_user``
-    (per-row, non-destructive); the remaining callers here read-then-rewrite their
-    own full snapshot or run pre-fork at startup."""
+    (per-row, non-destructive); the remaining callers here deliberately own the
+    complete snapshot they are replacing."""
     upsert_sql = ("INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
                   "ON CONFLICT (user_id) DO UPDATE SET "
                   "created_at = EXCLUDED.created_at, doc = EXCLUDED.doc")
@@ -2000,6 +2063,7 @@ def patch_blob_strict(
     *,
     remove_keys: tuple[str, ...] | list[str] = (),
     runtime_state_target: str | None = None,
+    require_active_hosted_route: bool = False,
 ):
     """Atomically merge top-level blob keys and optionally remove keys.
 
@@ -2014,6 +2078,9 @@ def patch_blob_strict(
     and generation or the new pair, never a split-brain combination. The
     runtime-state row is locked before the blob, matching the effect applier's
     lock order so an in-flight generation-fenced dispatch drains before cutover.
+    ``require_active_hosted_route`` revalidates V2 eligibility inside that same
+    transaction. It prevents a setup/startup transition that read a route just
+    before concurrent credential deletion from resurrecting V2 afterward.
     """
     clean_patch = dict(patch or {})
     revisioned = kind in _REVISIONED_BLOB_KINDS
@@ -2031,6 +2098,8 @@ def patch_blob_strict(
     }
     if runtime_state_target not in (None, "resident", "v2"):
         raise ValueError("runtime_state_target must be resident or v2")
+    if require_active_hosted_route and runtime_state_target != "v2":
+        raise ValueError("active hosted route may only be required for a v2 target")
     with get_pool().connection() as conn:
         with conn.transaction():
             if runtime_state_target is not None:
@@ -2052,6 +2121,20 @@ def patch_blob_strict(
                 if current_state not in {"resident", "draining", "v2"}:
                     raise RuntimeError(
                         f"invalid hosted runtime state: {current_state!r}")
+                if require_active_hosted_route:
+                    eligible = conn.execute(
+                        "SELECT 1 FROM model_api_routes r "
+                        "JOIN model_api_credentials c ON c.id=r.credential_id "
+                        "WHERE r.user_id=%s AND r.is_active "
+                        "AND r.test_status='ok' "
+                        "AND LOWER(c.provider)=ANY(%s) "
+                        "LIMIT 1 FOR SHARE OF r, c",
+                        (user_id, list(HOSTED_RUNTIME_SUPPORTED_PROVIDERS)),
+                    ).fetchone()
+                    if eligible is None:
+                        raise ValueError(
+                            "cannot enable hosted runtime v2 without an active tested route"
+                        )
                 expected_mode = (
                     "db_action_v2"
                     if runtime_state_target == "v2"
@@ -2278,6 +2361,169 @@ def patch_blob(
         return None
 
 
+HOSTED_RUNTIME_SUPPORTED_PROVIDERS = (
+    "anthropic",
+    "claude",
+    "deepseek",
+    "openai",
+    "gemini",
+    "openrouter",
+    "openai_compatible",
+)
+
+
+_hosted_runtime_config_lock_users: ContextVar[frozenset[str]] = ContextVar(
+    "hosted_runtime_config_lock_users",
+    default=frozenset(),
+)
+_hosted_runtime_config_connection_slots = threading.BoundedSemaphore(1)
+_HOSTED_RUNTIME_CONFIG_LOCK_WAIT_SEC = 5.0
+
+
+class HostedRuntimeConfigBusyError(RuntimeError):
+    """The bounded config-mutation lock could not be acquired in time."""
+
+
+@contextmanager
+def hosted_runtime_config_mutation_lock(user_id: str):
+    """Serialize one user's config mutation and runtime-generation rotation.
+
+    The lock is session-level and pool-external because provider validation can
+    span a network call. A one-slot process-local semaphore is acquired *before*
+    opening that connection, so a burst of settings requests waits in Python
+    rather than consuming one PostgreSQL session per waiter. Both the local and
+    cross-process waits are deadline-bounded. ContextVar reentrancy lets route
+    creation call route activation and lets setup call the runtime transition
+    without trying to acquire the same advisory lock on a second connection.
+    """
+    normalized = str(user_id)
+    held = _hosted_runtime_config_lock_users.get()
+    if normalized in held:
+        yield
+        return
+
+    wait_sec = float(_HOSTED_RUNTIME_CONFIG_LOCK_WAIT_SEC)
+    if not _hosted_runtime_config_connection_slots.acquire(timeout=wait_sec):
+        raise HostedRuntimeConfigBusyError(
+            "hosted runtime config mutation is busy"
+        )
+    conn = None
+    token = None
+    advisory_locked = False
+    try:
+        conn = listen_connection()
+        deadline = time.monotonic() + wait_sec
+        while True:
+            row = conn.execute(
+                "SELECT pg_try_advisory_lock("
+                "hashtextextended('hosted-runtime-config:' || %s, 0))",
+                (normalized,),
+            ).fetchone()
+            if row is not None and bool(row[0]):
+                advisory_locked = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HostedRuntimeConfigBusyError(
+                    "hosted runtime config mutation is busy"
+                )
+            time.sleep(min(0.05, remaining))
+        token = _hosted_runtime_config_lock_users.set(
+            held | frozenset({normalized})
+        )
+        yield
+    finally:
+        if token is not None:
+            _hosted_runtime_config_lock_users.reset(token)
+        if advisory_locked and conn is not None:
+            try:
+                conn.execute(
+                    "SELECT pg_advisory_unlock("
+                    "hashtextextended('hosted-runtime-config:' || %s, 0))",
+                    (normalized,),
+                )
+            except Exception as exc:  # connection close releases it regardless
+                log.error(
+                    "[db] hosted runtime config unlock(%s) failed: %s",
+                    normalized,
+                    exc,
+                )
+        if conn is not None:
+            conn.close()
+        _hosted_runtime_config_connection_slots.release()
+
+
+def list_hosted_runtime_eligible_controls() -> list[tuple[str, str, str, int]]:
+    """Runnable hosted users and their control tuples in one DB snapshot.
+
+    Startup policy reconciliation must see resident users, V2 users, and
+    split-brain rows alike.  Reusing ``list_agent_runtime_enabled_users`` here
+    would miss blob-mode V2 users because that function is intentionally the
+    *resident* roster and excludes them.
+    """
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT r.user_id,
+              COALESCE(mrt.doc->>'hosted_runtime_mode','resident_cli') AS mode,
+              COALESCE(vrs.hosted_runtime_state,'resident') AS runtime_state,
+              COALESCE(vrs.runtime_generation,1) AS runtime_generation
+            FROM model_api_routes r
+            JOIN model_api_credentials c ON c.id = r.credential_id
+            LEFT JOIN user_blobs mrt
+              ON mrt.user_id = r.user_id
+             AND mrt.kind = 'model_api_runtime'
+            LEFT JOIN v2_runtime_state vrs ON vrs.user_id = r.user_id
+            WHERE r.is_active
+              AND r.test_status = 'ok'
+              AND LOWER(c.provider) = ANY(%s)
+            ORDER BY r.user_id
+            """,
+            (list(HOSTED_RUNTIME_SUPPORTED_PROVIDERS),),
+        ).fetchall()
+    return [
+        (str(user_id), str(mode), str(state), int(generation))
+        for user_id, mode, state, generation in rows
+    ]
+
+
+def list_hosted_runtime_eligible_user_ids() -> list[str]:
+    """Every runnable hosted user, independent of the current runtime owner."""
+    return [row[0] for row in list_hosted_runtime_eligible_controls()]
+
+
+def list_hosted_runtime_nonresident_controls() -> list[tuple[str, str, str, int]]:
+    """Every control row that still grants or claims non-resident ownership.
+
+    Emergency fleet rollback cannot use the runnable-route roster alone: a V2
+    user's route may already have been deleted or marked failed while a
+    current-generation job/effect remains. Include those orphan/split controls
+    so ``resident_only`` fences them instead of reporting a false-green rollback.
+    """
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.user_id,
+              COALESCE(mrt.doc->>'hosted_runtime_mode','resident_cli') AS mode,
+              COALESCE(vrs.hosted_runtime_state,'resident') AS runtime_state,
+              COALESCE(vrs.runtime_generation,1) AS runtime_generation
+            FROM users u
+            LEFT JOIN user_blobs mrt
+              ON mrt.user_id = u.user_id
+             AND mrt.kind = 'model_api_runtime'
+            LEFT JOIN v2_runtime_state vrs ON vrs.user_id = u.user_id
+            WHERE COALESCE(mrt.doc->>'hosted_runtime_mode','resident_cli')
+                    = 'db_action_v2'
+               OR COALESCE(vrs.hosted_runtime_state,'resident') <> 'resident'
+            ORDER BY u.user_id
+            """
+        ).fetchall()
+    return [
+        (str(user_id), str(mode), str(state), int(generation))
+        for user_id, mode, state, generation in rows
+    ]
+
+
 def list_agent_runtime_enabled_users() -> list[dict]:
     """有 active route 且该 route test_status='ok'、其 credential 的 provider 能
     fit 的用户都纳入托管（与 hosted/agent_runtime_cutover.resolve_driver 一致——
@@ -2300,8 +2546,6 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     whole fleet. The supervisor's tick loop already wraps this call and skips
     reconciliation (leaving existing children alone) when it raises, so a DB
     blip pauses reconciliation rather than reaping every consumer."""
-    providers = ["anthropic", "claude", "deepseek", "openai",
-                 "gemini", "openrouter", "openai_compatible"]
     with get_pool().connection() as conn:
         rows = conn.execute(
             """
@@ -2337,7 +2581,7 @@ def list_agent_runtime_enabled_users() -> list[dict]:
               )
             ORDER BY r.user_id
             """,
-            (providers,),
+            (list(HOSTED_RUNTIME_SUPPORTED_PROVIDERS),),
         ).fetchall()
     return [{"user_id": uid, "driver": driver, "provider": provider,
              "model": model, "base_url": base_url,
@@ -5214,6 +5458,106 @@ def reconcile_unenqueued_v2_messages() -> int:
             expected_generation=int(runtime_generation),
         )
     return len(candidates)
+
+
+def reconcile_unenqueued_v2_message_for_user(
+    user_id: str,
+    *,
+    reason: str = "runtime_cutover_recovery",
+) -> bool:
+    """Eagerly recover one unanswered chat row after V2 ownership changes.
+
+    The periodic fleet sweeper is a final backstop, but a zero-touch cutover
+    must not make an already-waiting iOS message sit for its next 60-second
+    tick. Use the durable reply cursor rather than the latest chat row: a user
+    message can precede the resident assistant row that lost the cutover race.
+    A terminal job with the same trace id is a durable no-retry marker.
+    """
+    from model_api_runtime.v2 import jobs_store
+    from psycopg.rows import dict_row
+
+    def _attempt() -> bool:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                # Match every ownership writer's runtime-row -> blob-row lock
+                # order. Holding both through the job INSERT prevents a stale
+                # cutover recovery from arriving after a newer generation and
+                # superseding that newer generation's legitimate chat job.
+                state_row = conn.execute(
+                    "SELECT hosted_runtime_state,runtime_generation "
+                    "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                ).fetchone()
+                if state_row is None:
+                    return False
+                state, generation = state_row
+                profile_row = conn.execute(
+                    "SELECT doc FROM user_blobs "
+                    "WHERE user_id=%s AND kind='model_api_runtime' FOR UPDATE",
+                    (user_id,),
+                ).fetchone()
+                profile = profile_row[0] if profile_row is not None else None
+                if (
+                    str(state) != "v2"
+                    or not isinstance(profile, dict)
+                    or profile.get("hosted_runtime_mode") != "db_action_v2"
+                ):
+                    return False
+                raw_cursor = str(profile.get("v2_reply_cursor_seq", 0))
+                if not raw_cursor.isdigit():
+                    raise RuntimeError("invalid persisted V2 reply cursor")
+                cursor_seq = int(raw_cursor)
+                candidate = conn.execute(
+                    "WITH latest AS ("
+                    "  SELECT cm.user_id,cm.msg_id FROM chat_messages cm "
+                    "  WHERE cm.user_id=%s AND cm.seq>%s "
+                    "  AND cm.doc->>'role'='user' "
+                    "  AND COALESCE(cm.doc->>'source','') <> 'verify_ping' "
+                    "  AND (cm.doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                    "  AND COALESCE(cm.doc->>'reply_message_id','')='' "
+                    "  ORDER BY cm.seq DESC LIMIT 1"
+                    ") SELECT latest.msg_id FROM latest WHERE "
+                    "NOT EXISTS ("
+                    "  SELECT 1 FROM agent_jobs active "
+                    "  WHERE active.user_id=latest.user_id AND active.lane='chat' "
+                    "    AND active.status IN ('pending','claimed','running') "
+                    "    AND active.expected_runtime_generation=%s"
+                    ") "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM agent_jobs prior "
+                    "  WHERE prior.user_id=latest.user_id AND prior.lane='chat' "
+                    "    AND prior.trace_id=latest.msg_id "
+                    "    AND prior.status<>'superseded' "
+                    "    AND (prior.status NOT IN "
+                    "      ('pending','claimed','running') "
+                    "      OR prior.expected_runtime_generation "
+                    "        IS NOT DISTINCT FROM %s)"
+                    ")",
+                    (user_id, cursor_seq, int(generation), int(generation)),
+                ).fetchone()
+                if candidate is None:
+                    return False
+                with conn.cursor(row_factory=dict_row) as cur:
+                    jobs_store.coalesce_or_insert_on_cursor(
+                        cur,
+                        user_id,
+                        "chat",
+                        reason=str(reason),
+                        trace_id=str(candidate[0]),
+                        priority=jobs_store.LANE_PRIORITY["chat"],
+                        expected_generation=int(generation),
+                    )
+        return True
+
+    # The independent fleet sweeper can race this targeted recovery without
+    # taking the runtime lock. Let the single-flight unique index pick a winner,
+    # then re-read the whole ownership/candidate decision like normal enqueue.
+    for _ in range(3):
+        try:
+            return _attempt()
+        except psycopg.errors.UniqueViolation:
+            continue
+    return _attempt()
 
 
 def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None:

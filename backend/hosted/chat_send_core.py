@@ -86,6 +86,22 @@ def model_api_chat_send_core(
         _runtime_mode, _runtime_state, _generation = (
             hosted_config_store.get_hosted_runtime_control_strict(store)
         )
+        _forced_mode = hosted_config_store.forced_hosted_runtime_mode()
+        _forced_state = (
+            "v2"
+            if _forced_mode
+            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+            else "resident"
+        )
+        if _forced_mode is not None and (
+            _runtime_mode != _forced_mode or _runtime_state != _forced_state
+        ):
+            # Startup and setup materialize the environment policy. A request
+            # must never repair ownership itself: doing so can race the
+            # credential-delete fence and resurrect V2 after credentials have
+            # disappeared. Refuse before persisting the user message; startup
+            # reconciliation or a successful setup/test will repair the row.
+            return {"error": "runtime_policy_not_ready"}, 503
         _v2_mode = (
             _runtime_mode
             == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2

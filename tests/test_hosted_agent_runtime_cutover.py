@@ -248,6 +248,16 @@ def test_assert_hosting_ready_passes_when_all_set(monkeypatch):
     cutover.assert_hosting_ready()  # 不抛
 
 
+def test_assert_hosting_ready_v2_only_does_not_require_resident_host_all(
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_HOSTED_RUNTIME_POLICY", "v2_only")
+    monkeypatch.delenv("FEEDLING_HOST_ALL", raising=False)
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
+
+    cutover.assert_hosting_ready()
+
+
 # ---- supervisor heartbeat wedge guard ----
 # 收口后 backend 无条件把 fit-provider 用户路由到 agent-runner。若 supervisor 没在
 # 托管（心跳缺失/陈旧，或其 host_all 标志为 false，或 pi 用户要求的 pi 能力位为 false），

@@ -92,24 +92,33 @@ def _env_truthy(name: str) -> bool:
 def assert_hosting_ready() -> None:
     """进程启动时校验托管前置齐全，否则 fail-fast。
 
-    收口后 backend 把配了 fit provider 的用户无条件路由到 agent-runner (resolve_driver)。
-    这些用户只有在 supervisor 的 host-all 发现激活时才会被 spawn consumer——host-all 激活需
-    FEEDLING_HOST_ALL + FEEDLING_RUNTIME_TOKEN_SECRET (supervisor host_all_active)。任一缺失即
-    启动失败，避免请求被路由却无 consumer 而永远卡在 processing。须与 supervisor 的
-    host_all_active 判定保持一致。
+    per-user / resident-only 策略下，backend 仍可能把用户路由到 agent-runner；
+    supervisor 的 host-all 发现需 FEEDLING_HOST_ALL + FEEDLING_RUNTIME_TOKEN_SECRET。
+    v2-only 策略没有 resident child，但 V2 worker 仍需同一 token secret 去 enclave
+    解密 provider key，因此只豁免 FEEDLING_HOST_ALL，不豁免 secret。
 
     LiteLLM 网关已退休：gemini/openrouter/openai_compatible 现在无条件走 pi driver 直连
     中转站，不再有任何 provider 依赖 in-CVM LiteLLM gateway，故这里不再检查网关开关。"""
+    # A V2-only backend does not need the resident supervisor's host-all
+    # discovery, but the V2 worker still needs the shared runtime-token secret
+    # to decrypt each user's provider credential in the enclave.  Other
+    # policies keep the resident fail-fast contract unchanged.
+    from hosted import config_store
+
+    policy = config_store.hosted_runtime_policy()
     missing = []
-    if not _env_truthy("FEEDLING_HOST_ALL"):
+    if (
+        policy != config_store.HOSTED_RUNTIME_POLICY_V2_ONLY
+        and not _env_truthy("FEEDLING_HOST_ALL")
+    ):
         missing.append("FEEDLING_HOST_ALL")
     if not os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip():
         missing.append("FEEDLING_RUNTIME_TOKEN_SECRET")
     if missing:
         raise RuntimeError(
             "托管前置缺失：" + ", ".join(missing) +
-            "。收口后所有用户走 agent-runner；缺这些 supervisor 不会 spawn consumer、"
-            "请求会卡在 processing。请在 backend 与 agent-runner 两侧设置后再启动。"
+            "。缺少运行时前置会让当前托管策略无法安全处理消息；"
+            "请在 backend 与对应 runtime worker 两侧设置后再启动。"
         )
 
 

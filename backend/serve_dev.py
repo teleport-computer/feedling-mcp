@@ -36,6 +36,10 @@ def main() -> None:
 
     db.init_schema()
 
+    from hosted import config_store
+
+    config_store.reconcile_hosted_runtime_policy()
+
     import uvicorn
 
     import asgi_app

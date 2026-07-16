@@ -47,6 +47,36 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-15
+
+### [DONE] Pre becomes automatic Hosted Runtime V2 acceptance environment
+
+- Added a strict Pre-only `v2_only` ownership policy. Backend startup backfills
+  all existing active/tested/supported accounts before serving; fresh setup,
+  successful tests, and route activation persist the same atomic
+  `db_action_v2` + `v2` generation-fenced control. iOS testers no longer need a
+  user id, admin flip, recovery drill, or runtime-service knowledge.
+- Requests fail closed on policy mismatch and worker loss. The Pre deploy now
+  requires the runner job and gates on a build-matched turn worker, capacity,
+  Genesis heartbeat, and complete runtime-policy coverage.
+- Hardened configuration lifetime races: V2 enablement revalidates and locks an
+  active tested route inside the ownership transaction; setup, active-route
+  changes, and active-key rotation generation-fence any pinned provider snapshot;
+  deletion performs a second resident fence; failed/last routes fence current
+  work; config-lock waiters are connection-bounded and deadline-visible; and
+  `resident_only` rollback also discovers orphaned V2 controls with no route.
+- Cutover recovery now chooses the newest unanswered message before consulting
+  its durable terminal marker, so it cannot fall back to an older row and make
+  the worker reread/rebill a terminally failed newer message. Gunicorn also
+  closes the startup reconciliation pool before forking clean worker-local pools.
+- Replaced startup/reconnect account normalization's stale whole-registry rewrite
+  with per-user JSONB compare-and-swap, and made wake-bus handler registration
+  idempotent. A concurrent fresh iOS signup can no longer be deleted by an older
+  worker snapshot while the V2 runner is reconnecting.
+- The resident supervisor stays deployed but has an empty eligible roster on
+  Pre. `PRE_HOSTED_RUNTIME_POLICY=resident_only` is the explicit fleet rollback;
+  test and production remain per-user rollout environments.
+
 ## 2026-07-14
 
 ### [DECISION] deepseek 从 pi 驱动改回 claude（cc）驱动

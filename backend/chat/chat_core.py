@@ -708,6 +708,58 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
         "synthetic_marker": ping_marker,
     }
 
+    # Hosted Runtime V2 does not poll /v1/chat/poll, so a resident synthetic
+    # ping can never prove that path. Read/repair ownership first; V2 uses its
+    # fresh worker heartbeat as the connection proof (real end-to-end behavior
+    # is separately gated by the Hosted Chat step / ordinary chat send).
+    try:
+        from hosted import config_store as hosted_config_store
+
+        runtime_mode, runtime_state, _runtime_generation = (
+            hosted_config_store.get_hosted_runtime_control_strict(store)
+        )
+        forced_mode = hosted_config_store.forced_hosted_runtime_mode()
+        forced_state = (
+            "v2"
+            if forced_mode
+            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+            else "resident"
+        )
+        if forced_mode is not None and (
+            runtime_mode != forced_mode or runtime_state != forced_state
+        ):
+            return {"error": "runtime_policy_not_ready"}, 503
+        v2_mode = (
+            runtime_mode
+            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+        )
+        expected_state = "v2" if v2_mode else "resident"
+        if runtime_state != expected_state:
+            return {"error": "runtime_control_inconsistent"}, 503
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
+
+    if v2_mode:
+        from model_api_runtime.v2 import jobs_store
+
+        alive = jobs_store.workers_alive()
+        if alive:
+            boot_gates._log_bootstrap_event(
+                store, "chat_loop_verified", success=True
+            )
+        return {
+            "loop_alive": alive,
+            "response_time_sec": 0.0 if alive else None,
+            "ping_id": ping_uuid,
+            "timeout_sec": timeout_sec,
+            "suggestions": (
+                []
+                if alive
+                else ["Hosted Runtime V2 workers are not currently available."]
+            ),
+            "passing": alive,
+        }, 200
+
     # append_chat acquires chat_lock internally — don't hold it here or we'd
     # deadlock on the non-reentrant lock.
     ping_msg = store.append_chat("user", "verify_ping", synthetic_env)

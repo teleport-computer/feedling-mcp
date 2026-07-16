@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from functools import wraps
 
 import db
 from core import enclave as core_enclave
@@ -150,6 +151,121 @@ def _emit_responses_support_notice(store, provider: str, supports_responses: boo
     return warnings
 
 
+def _apply_runtime_policy_or_error(store) -> tuple[dict, int] | None:
+    """Apply environment-forced runtime ownership before reporting success."""
+    try:
+        hosted_config_store.apply_hosted_runtime_policy(store)
+    except Exception as exc:  # noqa: BLE001 — control-plane failures fail closed
+        print(
+            f"[model_api:{store.user_id}] runtime policy apply FAILED "
+            f"error={type(exc).__name__}:{str(exc)[:160]}"
+        )
+        return {"error": "runtime_policy_unavailable"}, 503
+    return None
+
+
+def _runtime_should_restore_v2(store) -> bool:
+    """Whether an active-config replacement should resume V2 after fencing."""
+    forced_mode = hosted_config_store.forced_hosted_runtime_mode()
+    if forced_mode is not None:
+        return (
+            forced_mode
+            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+        )
+    return hosted_config_store.hosted_runtime_v2_enabled_strict(store)
+
+
+def _restore_v2_or_error(store, *, required: bool) -> tuple[dict, int] | None:
+    if not required:
+        return None
+    try:
+        hosted_config_store.set_hosted_runtime_mode(
+            store, hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+        )
+    except Exception as exc:  # noqa: BLE001 — fail closed after config mutation
+        print(
+            f"[model_api:{store.user_id}] runtime V2 restore FAILED "
+            f"error={type(exc).__name__}:{str(exc)[:160]}"
+        )
+        return {"error": "runtime_policy_unavailable"}, 503
+    return None
+
+
+def _fence_v2_config_change_or_error(
+    store, *, required: bool
+) -> tuple[dict, int] | None:
+    """Invalidate the provider snapshot of any in-flight V2 turn."""
+    if not required:
+        return None
+    try:
+        hosted_config_store.fence_hosted_runtime_for_config_change(store)
+    except Exception as exc:  # noqa: BLE001 — config mutation must fail closed
+        print(
+            f"[model_api:{store.user_id}] runtime config fence FAILED "
+            f"error={type(exc).__name__}:{str(exc)[:160]}"
+        )
+        return {"error": "model_api_runtime_disable_failed"}, 500
+    return None
+
+
+def _restore_v2_if_runnable_or_error(
+    store, *, required: bool
+) -> tuple[dict, int] | None:
+    """Best-effort rollback of a pre-mutation fence after a write failure."""
+    if not required:
+        return None
+    active = db.model_api_active_route(store.user_id)
+    if not active or active.get("test_status") != "ok":
+        return None
+    return _restore_v2_or_error(store, required=True)
+
+
+def _restore_after_setup_write_failure(
+    store,
+    *,
+    required: bool,
+    active_credential_mutated: bool,
+    credential_id: str,
+) -> tuple[dict, int] | None:
+    """Restore only when setup left the prior active provider identity intact."""
+    if not active_credential_mutated:
+        return _restore_v2_if_runnable_or_error(store, required=required)
+
+    # The replacement key was tested for the requested model, not necessarily
+    # for the previously active model. A later route write failed, so that old
+    # route now points at a key whose own model permission is unproven. Keep the
+    # runtime resident and remove the stale runnable proof; a successful setup
+    # retry will test, mark OK, activate, and restore V2 atomically under the
+    # per-user config lock.
+    active = db.model_api_active_route(store.user_id)
+    if active and active.get("credential_id") == credential_id:
+        if not db.model_api_route_mark_test(
+            store.user_id,
+            active["id"],
+            status="failed",
+            error="config_update_incomplete",
+        ):
+            print(
+                f"[model_api:{store.user_id}] failed to revoke stale active "
+                "route proof after setup write failure"
+            )
+    return None
+
+
+def _serialized_model_api_mutation(fn):
+    """Cross-process per-user critical section for config + runtime ownership."""
+    @wraps(fn)
+    def _wrapped(store, *args, **kwargs):
+        try:
+            with db.hosted_runtime_config_mutation_lock(store.user_id):
+                return fn(store, *args, **kwargs)
+        except db.HostedRuntimeConfigBusyError:
+            return {"error": "model_api_config_busy"}, 503
+
+    return _wrapped
+
+
+@_serialized_model_api_mutation
 def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tuple[dict, int]:
     provider = str(payload.get("provider") or "")
     model = str(payload.get("model") or "")
@@ -210,6 +326,17 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             f"supports={supports_responses} base_url={base_url}"
         )
 
+    try:
+        restore_v2 = _runtime_should_restore_v2(store)
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
+    fence_error = _fence_v2_config_change_or_error(
+        store, required=restore_v2
+    )
+    if fence_error is not None:
+        return fence_error
+
+    active_credential_mutated = False
     if reuse and existing:
         credential_id = existing["id"]
         # Must check: on rotate-key setup this envelope is the NEW key that just
@@ -222,7 +349,13 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
                 store.user_id, credential_id,
                 api_key_envelope=envelope, api_key_hint=api_key_hint,
                 supports_responses=supports_responses):
+            restore_error = _restore_v2_if_runnable_or_error(
+                store, required=restore_v2
+            )
+            if restore_error is not None:
+                return restore_error
             return {"error": "model_api_credential_write_failed"}, 500
+        active_credential_mutated = True
     else:
         credential_id = db.model_api_credential_create(
             store.user_id, provider=provider, base_url=base_url,
@@ -230,11 +363,24 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             api_key_envelope=envelope, api_key_hint=api_key_hint,
             supports_responses=supports_responses)
         if not credential_id:
+            restore_error = _restore_v2_if_runnable_or_error(
+                store, required=restore_v2
+            )
+            if restore_error is not None:
+                return restore_error
             return {"error": "model_api_credential_write_failed"}, 500
 
     route_id = db.model_api_route_upsert(
         store.user_id, credential_id, model, reasoning_effort)
     if not route_id:
+        restore_error = _restore_after_setup_write_failure(
+            store,
+            required=restore_v2,
+            active_credential_mutated=active_credential_mutated,
+            credential_id=credential_id,
+        )
+        if restore_error is not None:
+            return restore_error
         return {"error": "model_api_route_write_failed"}, 500
     # mark_test / activate can each report False — either a DB hiccup (db.py swallows
     # the exception) or a concurrent DELETE /v1/model_api/delete that CASCADE-removed
@@ -242,8 +388,24 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     # write could not hit). Surface 500 instead of a "configured" 200 describing a
     # route that was never activated.
     if not db.model_api_route_mark_test(store.user_id, route_id, status="ok"):
+        restore_error = _restore_after_setup_write_failure(
+            store,
+            required=restore_v2,
+            active_credential_mutated=active_credential_mutated,
+            credential_id=credential_id,
+        )
+        if restore_error is not None:
+            return restore_error
         return {"error": "model_api_route_write_failed"}, 500
     if not db.model_api_route_activate(store.user_id, route_id):
+        restore_error = _restore_after_setup_write_failure(
+            store,
+            required=restore_v2,
+            active_credential_mutated=active_credential_mutated,
+            credential_id=credential_id,
+        )
+        if restore_error is not None:
+            return restore_error
         return {"error": "model_api_route_write_failed"}, 500
 
     # Rollout flags / last_action_trace_* still live in the model_api_runtime blob;
@@ -251,6 +413,12 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     # see a live profile. (This is the ONLY blob setup still writes.)
     hosted_config_store._ensure_model_api_runtime_profile(
         store, {"provider": provider, "model": model}, touch=True)
+    restore_error = _restore_v2_or_error(store, required=restore_v2)
+    if restore_error is not None:
+        return restore_error
+    policy_error = _apply_runtime_policy_or_error(store)
+    if policy_error is not None:
+        return policy_error
     accounts_onboarding._save_onboarding_route(store, "model_api")
     print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
 
@@ -349,18 +517,30 @@ def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, i
     return None
 
 
+@_serialized_model_api_mutation
 def model_api_test(store, *, api_key: str | None) -> tuple[dict, int]:
     route = hosted_config_store.load_active_route(store)
     if not route:
         return {"error": "model_api_not_configured"}, 404
     err = _test_active_route(store, route, api_key)
     if err is not None:
+        # The active route is no longer proven runnable. Fence the current V2
+        # generation before returning the provider error so pending work cannot
+        # survive into a later successful test/reconfiguration.
+        try:
+            hosted_config_store.prepare_model_api_delete(store)
+        except Exception:
+            return {"error": "model_api_runtime_disable_failed"}, 500
         return err
+    policy_error = _apply_runtime_policy_or_error(store)
+    if policy_error is not None:
+        return policy_error
     print(f"[model_api:{store.user_id}] test ok provider={route['provider']} model={route['model']}")
     return {"status": "ok",
             "config": _public_route(hosted_config_store.load_active_route(store))}, 200
 
 
+@_serialized_model_api_mutation
 def model_api_delete(store) -> tuple[dict, int]:
     # Fence V2 and preserve its durable seq cursor BEFORE deleting provider
     # credentials. If this fails, fail closed: removing the credentials while a
@@ -382,6 +562,16 @@ def model_api_delete(store) -> tuple[dict, int]:
         deleted = db.model_api_config_delete_strict(store.user_id)
     except Exception:
         return {"error": "model_api_config_delete_failed"}, 500
+    # Close the gap between the pre-delete fence and the credential transaction.
+    # A concurrent setup/startup transition may have observed the route before it
+    # disappeared and briefly moved the user back to V2. Re-fencing after the
+    # delete invalidates every job/effect from that transient generation. The V2
+    # transition itself revalidates an active tested route under the runtime-row
+    # lock, so it cannot resurrect ownership after this point.
+    try:
+        hosted_config_store.prepare_model_api_delete(store)
+    except Exception:
+        return {"error": "model_api_runtime_disable_failed"}, 500
     # 配置没了,任何 config 期发出的 model_api 警告(如 responses_unsupported)也随之
     # 作废——否则 /v1/notices 会为一个已不存在的 provider 一直显示活跃警告。
     try:
@@ -652,6 +842,7 @@ def model_api_credentials_get(store) -> tuple[dict, int]:
     }, 200
 
 
+@_serialized_model_api_mutation
 def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) -> tuple[dict, int]:
     provider = str(payload.get("provider") or "")
     model = str(payload.get("model") or "")
@@ -744,6 +935,7 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
     return {"route": db.model_api_route_get(store.user_id, route_id)}, 200
 
 
+@_serialized_model_api_mutation
 def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None) -> tuple[dict, int]:
     """先同步测活，通过才切换。测不过 → 400，旧 active 纹丝不动。
 
@@ -759,21 +951,39 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
     if err is not None:
         return err
 
+    try:
+        restore_v2 = _runtime_should_restore_v2(store)
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
+    fence_error = _fence_v2_config_change_or_error(
+        store, required=restore_v2
+    )
+    if fence_error is not None:
+        return fence_error
     if not db.model_api_route_activate(store.user_id, route_id):
+        restore_error = _restore_v2_if_runnable_or_error(
+            store, required=restore_v2
+        )
+        if restore_error is not None:
+            return restore_error
         return {"error": "route_not_found"}, 404
-    # Task 8: in-flight reply claims are NOT released here. Switching the active
-    # route respawns the consumer, but the old consumer doesn't die until the
-    # supervisor's next tick (AGENT_TICK_INTERVAL_SEC) notices _spawn_identity
-    # changed and kills it — a ~15-18s window where it's still running the turn.
-    # Releasing the claim now would let a poll re-hand that same message to a
-    # NEW consumer while the old one is still burning provider quota on it
-    # (chat/service.py:66-70's double-provider-burn risk). The release is done
-    # by the supervisor AFTER kill_fn confirms the old consumer is dead.
+    restore_error = _restore_v2_or_error(store, required=restore_v2)
+    if restore_error is not None:
+        return restore_error
+    policy_error = _apply_runtime_policy_or_error(store)
+    if policy_error is not None:
+        return policy_error
+    # V2 provider config is pinned once per turn. The fence+restore above bumps
+    # its generation around activation, so a turn on the old route can spend
+    # provider quota but cannot commit a reply/tool effect after this endpoint
+    # returns. Resident claim handoff remains owned by the supervisor after it
+    # kills the old per-user consumer, avoiding a double-provider call.
     print(f"[model_api:{store.user_id}] activated route model={route['model']}")
     return {"active_route_id": route_id,
             "route": db.model_api_route_get(store.user_id, route_id)}, 200
 
 
+@_serialized_model_api_mutation
 def model_api_route_test(store, route_id: str, *, api_key: str | None) -> tuple[dict, int]:
     """与 ``DELETE /routes/{id}`` 对称：测的若是当前 active route 且失败了，不能
     让它悬空——它仍 ``is_active=TRUE``（``_test_route_or_error`` 只翻 test_status，
@@ -789,6 +999,10 @@ def model_api_route_test(store, route_id: str, *, api_key: str | None) -> tuple[
     if not route:
         return {"error": "route_not_found"}, 404
     was_active = route["is_active"]
+    try:
+        restore_v2 = _runtime_should_restore_v2(store)
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
     err = _test_route_or_error(store, route, api_key)
     if err is not None:
         if was_active:
@@ -815,25 +1029,66 @@ def model_api_route_test(store, route_id: str, *, api_key: str | None) -> tuple[
                 # model_api_active_route() also carries api_key_envelope
                 # ciphertext; never let that dict itself reach the response.
                 err[0]["active_route_id"] = still_active["id"]
+            # Whichever branch won, the formerly-active route just lost its
+            # runnable proof. Fence its current V2 generation. If an already-ok
+            # replacement was selected, Pre's forced policy may safely re-enter
+            # V2 against that replacement after the fence.
+            try:
+                hosted_config_store.prepare_model_api_delete(store)
+            except Exception:
+                return {"error": "model_api_runtime_disable_failed"}, 500
+            active_after = db.model_api_active_route(store.user_id)
+            if active_after and active_after.get("test_status") == "ok":
+                restore_error = _restore_v2_or_error(
+                    store, required=restore_v2
+                )
+                if restore_error is not None:
+                    return restore_error
         return err
+    if was_active:
+        policy_error = _apply_runtime_policy_or_error(store)
+        if policy_error is not None:
+            return policy_error
     return {"status": "ok", "route": db.model_api_route_get(store.user_id, route_id)}, 200
 
 
+@_serialized_model_api_mutation
 def model_api_route_remove(store, route_id: str) -> tuple[dict, int]:
     route = db.model_api_route_get(store.user_id, route_id)
     if not route:
         return {"error": "route_not_found"}, 404
-    was_active = route["is_active"]
+    try:
+        restore_v2 = _runtime_should_restore_v2(store)
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
     if not db.model_api_route_delete(store.user_id, route_id):
         return {"error": "route_not_found"}, 404
-    # Not checked: autoselect_active returning None is a legitimate outcome (no
-    # ok candidate left), not a write failure — active_id: null is the correct
-    # response, not something to 500 on.
-    active_id = db.model_api_autoselect_active(store.user_id) if was_active else \
-        (db.model_api_active_route(store.user_id) or {}).get("id")
+    # ``route['is_active']`` was only a pre-delete snapshot: a concurrent
+    # activation may have made this route active immediately afterward. Re-read,
+    # autoselect if needed, and fence every successful deletion so that stale
+    # config work can never cross into the replacement lifetime.
+    active_after = db.model_api_active_route(store.user_id)
+    active_id = (
+        active_after["id"]
+        if active_after is not None
+        else db.model_api_autoselect_active(store.user_id)
+    )
+    try:
+        hosted_config_store.fence_hosted_runtime_for_config_change(store)
+        if active_id is None:
+            hosted_config_store.prepare_model_api_delete(store)
+    except Exception:
+        return {"error": "model_api_runtime_disable_failed"}, 500
+    if active_id is not None:
+        restore_error = _restore_v2_or_error(
+            store, required=restore_v2
+        )
+        if restore_error is not None:
+            return restore_error
     return {"status": "deleted", "active_route_id": active_id}, 200
 
 
+@_serialized_model_api_mutation
 def model_api_credential_patch(store, credential_id: str, payload: dict, *,
                                caller_api_key: str | None) -> tuple[dict, int]:
     cred = db.model_api_credential_get(store.user_id, credential_id)
@@ -868,6 +1123,21 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
             return {"error": "provider_test_failed", "detail": str(e),
                     "status_code": e.status_code}, 400
 
+    active_key_change = bool(
+        active and active["credential_id"] == credential_id
+    )
+    restore_v2 = False
+    if active_key_change:
+        try:
+            restore_v2 = _runtime_should_restore_v2(store)
+        except Exception:
+            return {"error": "runtime_control_unavailable"}, 503
+        fence_error = _fence_v2_config_change_or_error(
+            store, required=restore_v2
+        )
+        if fence_error is not None:
+            return fence_error
+
     # 换 key 是安全关键写：假成功会让用户去 provider 后台吊销旧 key，而服务端还
     # 攥着旧 envelope，下个 agent 回合对着作废 key 失败——正是 brief 警告的「打停
     # 托管 agent」，只不过经由一次假 200 而非中途崩溃。所以检查返回值。
@@ -876,6 +1146,11 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
             label=str(label) if label is not None else None,
             api_key_envelope=envelope,
             api_key_hint=provider_client.mask_api_key(raw_key)):
+        restore_error = _restore_v2_if_runnable_or_error(
+            store, required=restore_v2
+        )
+        if restore_error is not None:
+            return restore_error
         return {"error": "model_api_credential_write_failed"}, 500
 
     # 新 key 刚在 active route 上验证过——刷新它的 last_test_at，否则 GET /routes 会
@@ -894,22 +1169,43 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
     for r in db.model_api_routes_list(store.user_id):
         if r["credential_id"] == credential_id and not r["is_active"]:
             db.model_api_route_mark_test(store.user_id, r["id"], status="untested")
+    restore_error = _restore_v2_or_error(store, required=restore_v2)
+    if restore_error is not None:
+        return restore_error
     return {"status": "ok"}, 200
 
 
+@_serialized_model_api_mutation
 def model_api_credential_remove(store, credential_id: str) -> tuple[dict, int]:
     cred = db.model_api_credential_get(store.user_id, credential_id)
     if not cred:
         return {"error": "credential_not_found"}, 404
-    had_active = (db.model_api_active_route(store.user_id) or {}).get("credential_id") == credential_id
+    try:
+        restore_v2 = _runtime_should_restore_v2(store)
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
     # Must check: an unchecked False here (DB hiccup, or a concurrent delete racing
     # this one) would fall through to a "status": "deleted" 200 for a credential
     # that's still sitting in the DB with its key intact — a false success, and
     # mirrors model_api_route_remove's analogous route_delete check below.
     if not db.model_api_credential_delete(store.user_id, credential_id):   # CASCADE 带走 routes
         return {"error": "credential_not_found"}, 404
-    # Not checked: autoselect_active returning None is a legitimate outcome (no
-    # ok candidate left), not a write failure.
-    active_id = db.model_api_autoselect_active(store.user_id) if had_active else \
-        (db.model_api_active_route(store.user_id) or {}).get("id")
+    active_after = db.model_api_active_route(store.user_id)
+    active_id = (
+        active_after["id"]
+        if active_after is not None
+        else db.model_api_autoselect_active(store.user_id)
+    )
+    try:
+        hosted_config_store.fence_hosted_runtime_for_config_change(store)
+        if active_id is None:
+            hosted_config_store.prepare_model_api_delete(store)
+    except Exception:
+        return {"error": "model_api_runtime_disable_failed"}, 500
+    if active_id is not None:
+        restore_error = _restore_v2_or_error(
+            store, required=restore_v2
+        )
+        if restore_error is not None:
+            return restore_error
     return {"status": "deleted", "active_route_id": active_id}, 200

@@ -110,10 +110,11 @@ and the Form B section below for the design.
 
 ### Pre CVM (prod9, `pre` branch)
 
-Third environment, a mirror of test: `pre` branch → `deploy-pre-cvm` CI job →
-this CVM. Shares the test Phala account/key, R2 buckets, runtime-token secret
-and feature-flag vars (all `TEST_*` references in the CI job are deliberate);
-only DB, AppAuth contract, domain and CVM are pre-specific.
+Third environment: `pre` branch → `deploy-pre-cvm` CI job → this CVM. It shares
+the test Phala account/key, R2 buckets, runtime-token secret and most feature-flag
+vars (all `TEST_*` references in the CI job are deliberate), while DB, AppAuth
+contract, domain and CVM are pre-specific. Runtime ownership is intentionally
+different: Pre defaults to fleet `v2_only`; test remains per-user.
 
 | | |
 |---|---|
@@ -121,7 +122,7 @@ only DB, AppAuth contract, domain and CVM are pre-specific.
 | CVM ID | `82485d6f-9c23-48f1-9bdd-5a0d38531c3e` (also in `deploy/pre-cvm-id.txt`) |
 | App ID | `7d18a1f234a0d90e5f643cac8283b6048451b8f7` |
 | Created | 2026-07-07 as `feedling-io-pre`, `tdx.small`, **Phala KMS** (prod9). Provisioned locally via `phala deploy` (no `--cvm-id` ⇒ new app) without secrets, to mint the app_id; the healthy secret-bearing deploy is the CI `deploy-pre-cvm` job. |
-| Compose | `deploy/docker-compose.phala.pre.yaml` — same 3 services as test (`ingress`/`backend`/`enclave`), with `pre-api.feedling.app` + `_pre` volumes. `FEEDLING_IO_ONBOARDING_BRANCH` stays `test` (io-onboarding has no pre branch). |
+| Compose | `deploy/docker-compose.phala.pre.yaml` — same 3 services as test (`ingress`/`backend`/`enclave`), with `pre-api.feedling.app` + `_pre` volumes. `FEEDLING_IO_ONBOARDING_BRANCH` stays `test` (io-onboarding has no pre branch). `FEEDLING_HOSTED_RUNTIME_POLICY` defaults to `v2_only`; `PRE_HOSTED_RUNTIME_POLICY=resident_only` is the encrypted-env fleet rollback. |
 | Public API | `https://pre-api.feedling.app` (dstack-ingress auto-creates the CF DNS records once CI injects `CF_*`) |
 | Attestation | `https://7d18a1f234a0d90e5f643cac8283b6048451b8f7-5003s.dstack-pha-prod9.phala.network/attestation` (repo var `PRE_MAIN_ENCLAVE_URL`) |
 | Database | Dedicated pre RDS, injected via `PRE_DATABASE_URL` — fully isolated from test/prod (pre's enclave content key differs from test's, so sharing a DB would mix mutually-undecryptable ciphertext + double-schedule proactive jobs). |
@@ -142,8 +143,8 @@ Mirror of the test runner CVM for the pre environment.
 | Compose | `deploy/docker-compose.phala.pre.runner.yaml` (`feedling-pre-runner`, volume `feedling_agent_runtime_pre_runner`) |
 | Shares w/ main pre CVM | pre RDS (`PRE_DATABASE_URL`), `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` (same secret as test — reuse is deliberate), Sepolia FeedlingAppAuth `0x6584…` (runner publishes its own compose_hash there) |
 | Cross-CVM reach | `FEEDLING_API_URL=https://pre-api.feedling.app` (`PRE_MAIN_API_URL`); `FEEDLING_ENCLAVE_URL=https://7d18a1f2…-5003s.dstack-pha-prod9.phala.network` (`PRE_MAIN_ENCLAVE_URL`) |
-| Deploy path | CI `deploy-pre-runner-cvm` job; `DEPLOY_PRE_RUNNER_CVM=true` is enabled, so qualifying `pre` pushes update this CVM after the main pre deploy. |
-| Status | Provisioned and CI-managed. The compose runs resident `agent-runner` plus Hosted Runtime V2 `serve-worker`; every qualifying deploy must pass the post-runner `live_workers`, capacity, and Genesis liveness gate. |
+| Deploy path | CI `deploy-pre-runner-cvm` job runs unconditionally after every CVM-affecting `pre` deploy; disabling the runner while the backend is V2-only is not an allowed configuration. |
+| Status | Provisioned and CI-managed. `serve-worker` is the sole owner for every eligible Pre account. The resident `agent-runner` container remains running but has an empty eligible roster (rollback headroom, no per-user child). Every qualifying deploy must pass build-specific turn-worker, capacity, Genesis, and runtime-policy coverage gates. |
 
 ### agent-runner (hosted agent-runtime) — 4th CVM service
 
@@ -155,18 +156,23 @@ is built by `docker-publish.yml` from `deploy/Dockerfile.agent-runner` and pinne
 the same CI step that pins the backend image. The standalone
 `docker-compose.agent-runner.yaml` overlay is **local-dev only** (superseded).
 
-**Where it runs (test vs prod diverge as of 2026-07-02):**
-- **prod** — still defined **inline** in `docker-compose.phala.yaml` (hosting +
-  genesis worker on the main prod CVM). Unchanged until prod adopts Form B.
-- **test** — the inline `agent-runner` was **removed** from
-  `docker-compose.phala.test.yaml`. The main test CVM now runs only
-  backend/enclave/ingress; **all** hosting AND the genesis import worker moved to
-  the standalone runner CVM (`feedling-io-agents-test`, see
-  `docker-compose.phala.runner.yaml`). The backend keeps `FEEDLING_HOST_ALL` etc.
-  and still routes sends to the pool — the runner-CVM consumers drain them; the
-  wedge guard stays live off the runner CVM's heartbeats. **Consequence:** if the
-  runner CVM is fully down, test has NO host → sends 503 (fail-loud, by design) and
-  genesis imports pause until it returns.
+**Where it runs:**
+- **Main CVMs** — `docker-compose.phala.test.yaml` and
+  `docker-compose.phala.yaml` run ingress/backend/enclave only. Neither main CVM
+  contains an inline `agent-runner` or `serve-worker`.
+- **Dedicated runner CVMs** — `docker-compose.phala.runner.yaml` (test) and
+  `docker-compose.phala.prod.runner.yaml` (prod) each run one resident
+  `agent-runner` plus a sibling Hosted Runtime V2 `serve-worker`. The sibling
+  entrypoints share the backend-code image but run on a separate CVM from the
+  main app. Genesis runs inside `serve-worker`.
+- **Pre runner CVM** — `docker-compose.phala.pre.runner.yaml` has the same two
+  containers, but the main backend's `v2_only` policy excludes every eligible
+  account from the resident supervisor roster. Only `serve-worker` executes
+  turns; the idle supervisor is retained for controlled `resident_only` rollback.
+
+There is no main-CVM runtime fallback. If the only runner CVM is fully down,
+resident hosting and V2 turns are unavailable and genesis imports pause until a
+runner is restored or another runner CVM takes over.
 
 **Idle by default = zero behaviour change.** With `AGENT_RUNTIME_USERS` empty and
 `AGENT_RUNTIME_AUTODISCOVER` unset, the supervisor spawns nobody (it idles and
@@ -179,7 +185,7 @@ compose_hash — flipping them on later needs **no on-chain re-auth**.
 | `AGENT_RUNTIME_USERS` | roster JSON `[{"api_key":"…"}]` — who to host (carries per-user keys) | empty → idle |
 | `AGENT_RUNTIME_AUTODISCOVER` | also pull hosted-enabled users from the DB (intersected with the roster's creds) | off |
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Stage-D: mint short-lived per-user runtime tokens (consumer drops the long-term api key) | off → consumer uses api key |
-| `FEEDLING_HOST_ALL` | **zero-touch hosting**: every configured user (tested-ok provider, not opted out) is hosted with NO `AGENT_RUNTIME_USERS` roster — the supervisor mints a runtime token per DB-discovered user and resolves the provider key with it; the backend routes their sends to the agent-runner; a freshly-hosted user's chat gate is auto-opened via verify_loop. **Requires `FEEDLING_RUNTIME_TOKEN_SECRET` set on BOTH services** (backend verifies, agent-runner mints) — inert without it. **Must match the backend's same var.** Per-user opt-out: set that user's `agent_runtime_driver="legacy"`. | off → per-user flag still required |
+| `FEEDLING_HOST_ALL` | **Resident zero-touch hosting (test/prod or Pre rollback only)**: every configured resident-policy user is hosted with no static roster. Under Pre `v2_only`, the backend does not require this flag and eligible users are excluded from the resident roster; `FEEDLING_RUNTIME_TOKEN_SECRET` is still required by V2 for enclave credential unwrap. | off → per-user flag still required |
 
 CI secrets/vars (test job; `TEST_`-prefixed): `secrets.TEST_AGENT_RUNTIME_USERS`,
 `vars.TEST_AGENT_RUNTIME_AUTODISCOVER`, `secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET`,
@@ -199,8 +205,8 @@ test backend CVM; the separate agent-runner does not need it.
    go — prod auto-hosting has only a global kill-switch + per-user opt-out, no
    per-user gradual ramp.
 
-**Wedge guard (cross-service safety).** After the legacy-inline cutover the backend
-routes EVERY fit-provider send to the agent-runner, so a turn wedges in
+**Resident-policy wedge guard (test/prod or Pre `resident_only` rollback).** The
+resident backend routes every fit-provider send to the agent-runner, so a turn wedges in
 `processing` forever if no consumer is hosting. Two layers prevent silent wedges:
 - **Startup** (`assert_hosting_ready`): the backend refuses to boot unless its own
   `FEEDLING_HOST_ALL` + `FEEDLING_RUNTIME_TOKEN_SECRET` are set (validated in
@@ -217,7 +223,7 @@ routes EVERY fit-provider send to the agent-runner, so a turn wedges in
   90s ≈ 6 ticks); a DB read error fails **open** (routes anyway) so the guard never
   becomes its own outage.
 
-**To start real-device testing (recommended order — least → most unvalidated):**
+**To start resident-policy real-device testing (test/prod only):**
 1. Deploy as-is (agent-runner idle). Confirms the 4th service builds + boots
    without disturbing existing users.
 2. Set `TEST_AGENT_RUNTIME_USERS` to a roster with **one** test user whose
@@ -227,10 +233,16 @@ routes EVERY fit-provider send to the agent-runner, so a turn wedges in
 4. Add a **gemini/openrouter/openai_compatible** test user (→ pi driver, direct
    relay — the LiteLLM gateway is retired, no proxy to start).
 
+**Pre V2 iOS testing:** select Pre, sign in or create an account, configure a
+provider/model, and send a message. Startup/setup owns the V2 transition and CI
+owns worker readiness; no roster, user id, runtime flip, or recovery drill is an
+iOS testing step.
+
 **Hosted-cutover deployment prerequisites (两件套，缺一不可):**
 
-收口后，backend cutover 无条件把配了合适 provider 且 `test_ok` 的用户路由到
-agent-runner。以下两个变量必须同时设置；缺任何一个会导致全员 hang 或后端启动失败：
+以下是 resident policy（test/prod 或 Pre `resident_only` 回滚）的前置；正常
+Pre `v2_only` 不把用户路由到 agent-runner，只要求 runtime token secret 供 V2
+worker 在 enclave 内解开 provider key：
 
 | 变量 | 若缺失 |
 |---|---|

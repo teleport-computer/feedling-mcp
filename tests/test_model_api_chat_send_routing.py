@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+import db  # noqa: E402
 import provider_client  # noqa: E402
 from accounts import registry as accounts_registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
@@ -25,7 +26,9 @@ from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
 from chat import chat_core  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
+from hosted import chat_send_core  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 from push import service as push_service  # noqa: E402
 
 
@@ -113,6 +116,97 @@ def _setup_openrouter(client, api_key: str, monkeypatch) -> None:
         headers=_headers(api_key),
     )
     assert res.status_code == 200, res.get_data(as_text=True)
+
+
+def test_pre_v2_only_fresh_setup_sends_through_v2_without_admin_flip(
+    client, monkeypatch
+):
+    """The iOS acceptance path: configure Pre and chat, with no user flip."""
+    monkeypatch.setenv("FEEDLING_HOSTED_RUNTIME_POLICY", "v2_only")
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_envelope_builder(),
+    )
+
+    _setup_openrouter(client, api_key, monkeypatch)
+
+    mode, state, generation = db.get_hosted_runtime_control_strict(user_id)
+    assert (mode, state, generation) == ("db_action_v2", "v2", 3)
+    assert jobs_store.get_wake_schedule(user_id) is not None
+    assert user_id not in {
+        row["user_id"] for row in db.list_agent_runtime_enabled_users()
+    }
+
+    monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
+    monkeypatch.setattr(
+        chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 4
+    )
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
+    monkeypatch.setattr(
+        chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None
+    )
+    monkeypatch.setattr(
+        chat_send_core.kill_switch, "turns_halted", lambda **kw: False
+    )
+    monkeypatch.setattr(
+        agent_runtime_cutover,
+        "handle_send",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("V2-only Pre must never dispatch to resident")
+        ),
+    )
+
+    response = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "hello from iOS pre"},
+        headers=_headers(api_key),
+    )
+
+    assert response.status_code == 202, response.get_data(as_text=True)
+    assert response.get_json()["status"] == "processing"
+    with db.get_pool().connection() as conn:
+        jobs = conn.execute(
+            "SELECT lane,status,reason FROM agent_jobs WHERE user_id=%s",
+            (user_id,),
+        ).fetchall()
+    assert jobs == [("chat", "pending", "chat_send")]
+
+
+def test_v2_only_setup_fails_loud_when_cutover_cannot_persist(
+    client, monkeypatch
+):
+    monkeypatch.setenv("FEEDLING_HOSTED_RUNTIME_POLICY", "v2_only")
+    _user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_envelope_builder(),
+    )
+    monkeypatch.setattr(
+        provider_client,
+        "test_provider_key",
+        lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
+    )
+    monkeypatch.setattr(
+        hosted_config_store,
+        "apply_hosted_runtime_policy",
+        lambda store: (_ for _ in ()).throw(RuntimeError("control plane down")),
+    )
+
+    response = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "openai/gpt-4o-mini",
+            "api_key": "sk-or-test",
+        },
+        headers=_headers(api_key),
+    )
+
+    assert response.status_code == 503
+    assert response.get_json() == {"error": "runtime_policy_unavailable"}
 
 
 @pytest.mark.parametrize("source", ["chat", "model_api"])

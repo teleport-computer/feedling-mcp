@@ -6,6 +6,18 @@
 
 RAM and process count become a function of the worker-pool size, not the user count. That win is only realized at the END of this runbook — when the resident per-user consumers are shut down. Everything before that is making V2 safe to switch on.
 
+### Pre acceptance policy (2026-07-15)
+
+`pre` is now the explicit V2 acceptance environment. Its backend defaults
+`FEEDLING_HOSTED_RUNTIME_POLICY=v2_only`, synchronously backfills every active,
+tested, supported account before serving, and persists V2 ownership after fresh
+setup/test/activation. Requests fail closed on a policy mismatch; they never
+self-repair into a delete race or fall through to resident. The Pre runner deploy
+and its build-specific worker/Genesis/policy-coverage gate are mandatory for every
+CVM-affecting `pre` push. Therefore an iOS tester only selects Pre, configures a
+model, and chats—there is no per-user flip. This is a bounded acceptance soak,
+not permission to apply the same fleet policy to test or production.
+
 ## Prerequisites (must be deployed first)
 
 - **D0 landed**: worker pool container (`serve-worker`) added to the runner compose; discovery exclusivity guard live (`db.list_agent_runtime_enabled_users` excludes `db_action_v2` users); admin mode-setter (`/v1/admin/hosted-runtime-mode` + `io_cli set-/list-runtime-mode`); per-turn metrics (`v2_turn_metrics` + `/v1/admin/v2-metrics`).
@@ -15,8 +27,8 @@ RAM and process count become a function of the worker-pool size, not the user co
   worker image. Old workers ignore the additive columns; the new worker keeps
   cache telemetry nullable so an older relay cannot masquerade as a zero-hit
   provider.
-- **Audit blockers closed first**: the branch now contains the stable cutover cursor, transactional reply boundary, hard wedged-turn recovery, and database-backed live turn-pool kill switch. Do not enroll even an internal user until the deployed image has also passed the fault-injection/rollback drill in `docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md`.
-- **Prove process recovery, not only Python recovery.** `_run_forever` relaunches
+- **Production-promotion gate**: the branch now contains the stable cutover cursor, transactional reply boundary, hard wedged-turn recovery, and database-backed live turn-pool kill switch. Before copying Pre's fleet policy to test or production, the deployed image must also pass the fault-injection/rollback drill in `docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md`. Ordinary Pre iOS use is the bounded acceptance test that gathers evidence; it does not require the tester to run that operator drill.
+- **Before promotion, prove process recovery, not only Python recovery.** `_run_forever` relaunches
   `_serve` after an escaping Python exception, and the send heartbeat/deadline
   guards turn a dead pool into a visible error. A SIGKILL/OOM of the worker PID
   cannot relaunch itself. The prior `docker kill serve-worker` observation is
@@ -27,7 +39,8 @@ RAM and process count become a function of the worker-pool size, not the user co
   restart, a fresh worker identity/heartbeat to appear, and pending work to
   terminalize or resume exactly once. If that drill fails, install and retest
   an external liveness repair (or equivalent parent supervisor); an alert
-  without automatic repair is not a completed availability gate.
+  without automatic repair is not a completed availability gate. This drill is
+  an operator-owned promotion requirement, not an iOS Pre-testing step.
 - Capture/dream producers are currently default-off. Any early infrastructure soak is capability-incomplete and is not evidence that V2 can replace resident.
 - Web results are untrusted: after `web_search`/`web_fetch` returns, the native loop removes every durable-write tool and blocks new searches/fresh outbound URLs for the remainder of that turn. A `web_search` result may be fetched once only by its exact returned URL; search-and-save still needs a fresh user turn. Do not widen that boundary without per-result taint tracking, outbound data-loss controls, and an explicit confirmation protocol.
 
@@ -68,9 +81,9 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 
 ## Step 2 — Gated rollout (evidence-first)
 
-1. **Current state: HOLD.** The remaining gate is deployed operational evidence, not the former P0 code omissions: finish the prerequisites above and the handoff's fault/rollback checks before any user flip. Once they pass, start with one explicitly consented internal user: `io_cli set-runtime-mode <internal_uid> db_action_v2`. Watch `/v1/admin/v2-metrics` (inflight/pending/wake success, whole-turn usage across chat/wake/extraction/compaction, and prompt-cache coverage/hit ratio) + error chips + subjective chat quality for 24–48 h.
+1. **Test/prod state: HOLD.** The remaining gate is deployed operational evidence, not the former P0 code omissions: finish the prerequisites above and the handoff's fault/rollback checks before any test/prod user flip. Once they pass, start with one explicitly consented internal user: `io_cli set-runtime-mode <internal_uid> db_action_v2`. Watch `/v1/admin/v2-metrics` (inflight/pending/wake success, whole-turn usage across chat/wake/extraction/compaction, and prompt-cache coverage/hit ratio) + error chips + subjective chat quality for 24–48 h. **Pre is the exception described above:** it automatically enrolls every eligible account so ordinary iOS testing supplies the operational evidence.
 2. **Ramp cohorts**: 5 → 20 → 50 → all. `io_cli list-runtime-mode` to track who's on what. Each batch: confirm tokens/turn not regressed, queue-wait P95 within SLA, `wake.success_rate` healthy, `stuck_jobs ≈ 0`.
-3. **Mixed-fleet safety**: the D0 exclusivity guard keeps each user on exactly ONE path — only an explicit `db_action_v2` value enrolls V2; missing/invalid values remain resident. A flipped user runs on V2 and their resident consumer is reaped (~15 s, next supervisor tick); an un-flipped user stays resident. A runtime-control read failure must refuse routing, and a resident-discovery query failure must skip reconciliation rather than look like an empty roster. No double-run and no outage-driven fleet teardown.
+3. **Mixed-fleet safety (per-user test/prod policy)**: the D0 exclusivity guard keeps each user on exactly ONE path — only an explicit `db_action_v2` value enrolls V2; missing/invalid values remain resident. A flipped user runs on V2 and their resident consumer is reaped (~15 s, next supervisor tick); an un-flipped user stays resident. Under Pre's `v2_only` policy, startup/setup materializes that same explicit tuple for every eligible account and refuses mismatches. A runtime-control read failure must refuse routing, and a resident-discovery query failure must skip reconciliation rather than look like an empty roster. No double-run and no outage-driven fleet teardown.
 
 ## Step 3 — Kill resident (the actual cost win)
 
@@ -81,7 +94,8 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 
 ## Rollback
 
-- **Fastest** (no on-chain re-auth): revert a user's flag — `io_cli set-runtime-mode <uid> resident_cli`. They fall back to the default path; the supervisor re-spawns their resident next tick.
+- **Per-user test/prod policy:** revert a user's flag with `io_cli set-runtime-mode <uid> resident_cli`; the supervisor re-spawns their resident next tick.
+- **Pre fleet rollback:** set the repository variable `PRE_HOSTED_RUNTIME_POLICY=resident_only` and redeploy `pre`. The value is injected through the encrypted environment channel (no compose-hash change). Startup fences every V2/split control—including users whose route was removed or failed—and the post-deploy gate requires zero policy inconsistencies. The Pre `v2_only` policy deliberately rejects ad-hoc per-user resident flips.
 - **Drain before image rollback.** Stop new V2 admission, move enrolled users to `resident_cli`, wait for claimed/running V2 rows to terminalize, and verify no V2 reply is in flight before deploying an older worker image. The schema keeps separate queue and execution deadlines for mixed-version safety, but an old worker does not have the new ownership/effect fences.
 - **Encrypted write-effect compatibility.** New memory/identity/schedule rows use
   versioned durable types (`*_encrypted_v1`). An older worker cannot interpret
@@ -117,6 +131,6 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
   context limits. Do not "fix" this by truncating the summary or silently
   advancing its watermark: either approach loses the full-conversation
   invariant.
-- **Default flip** — do not infer fleet membership from a missing blob. After every gate is complete, backfill existing users to an explicit mode and make onboarding persist its intended mode transactionally; only then consider changing new-user policy. A missing/invalid value remains a safety fallback, not a cutover signal.
+- **Default flip outside Pre** — Pre now performs an explicit startup backfill and persists the intended mode at setup/test/activation; it does not reinterpret a missing blob at read time. Test and production remain `per_user`: do not infer fleet membership from a missing/invalid value or copy Pre's policy until their rollout gates are complete.
 - **Authoritative 4c/8GB load run** — rerun Step 1 on CVM-class hardware if the local indicative numbers are borderline.
 - **Promoting genesis to its own container.** It is now a dedicated thread inside `serve-worker` rather than inside `agent-runner` — better, but still a thread in someone else's process. Its own service would give it a restart policy and a real crash domain. Costs one more `addComposeHash()`, so it was not bundled here.

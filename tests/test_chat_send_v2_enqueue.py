@@ -113,6 +113,41 @@ def test_runtime_mode_read_failure_refuses_before_persistence(monkeypatch):
     assert body == {"error": "runtime_control_unavailable"}
 
 
+def test_v2_only_policy_mismatch_never_repairs_or_routes_to_resident(monkeypatch):
+    uid = "u_send_v2_policy_mismatch"
+    _seed(uid)
+    store = core_store.get_store(uid)
+    monkeypatch.setenv("FEEDLING_HOSTED_RUNTIME_POLICY", "v2_only")
+    monkeypatch.setattr(
+        hosted_config_store,
+        "apply_hosted_runtime_policy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("request path must not mutate runtime ownership")
+        ),
+    )
+    monkeypatch.setattr(
+        store,
+        "append_chat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("policy mismatch must refuse before persistence")
+        ),
+    )
+    monkeypatch.setattr(
+        agent_runtime_cutover,
+        "handle_send",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("v2-only policy must never fall through to resident")
+        ),
+    )
+
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key="key", runtime_tok="", payload={"message": "hi"},
+    )
+
+    assert status == 503
+    assert body == {"error": "runtime_policy_not_ready"}
+
+
 def test_v2_blob_without_authoritative_v2_state_fails_closed(monkeypatch):
     uid = "u_send_split_runtime_control"
     _seed(uid)

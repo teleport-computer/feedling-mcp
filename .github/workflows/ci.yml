@@ -164,6 +164,12 @@ jobs:
         run: |
           python -m pytest \
             tests/test_ci_image_tag_width.py \
+            tests/test_hosted_runtime_policy.py \
+            tests/test_hosted_runtime_mode.py \
+            tests/test_chat_send_v2_enqueue.py \
+            tests/test_v2_exclusivity_guard.py \
+            tests/test_model_api_chat_send_routing.py \
+            tests/test_model_api_profiles_endpoints.py \
             tests/test_provider_prompt_cache.py \
             tests/test_provider_usage_normalize.py \
             tests/test_v2_prompt_cache_key.py \
@@ -808,16 +814,15 @@ jobs:
           TEE_DATABASE_URL:        ${{ secrets.TEST_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
-          # agent-runner (4th service) knobs — encrypted env channel, NOT baked
-          # into compose_hash (see prod deploy step). Default empty = idle + gateway
-          # off; flip on later with no on-chain re-auth. TEST_-prefixed where a
-          # separate test value is wanted; falls back to the shared secret/var.
+          # Shared runner credentials — encrypted env channel, not baked into
+          # compose_hash. Pre V2 uses the runtime-token secret for enclave BYOK
+          # unwrap; resident discovery knobs stay available only for a deliberate
+          # resident_only rollback. TEST_-prefixed reuse is intentional.
           AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
-          # Host-all: agent-runner hosts every configured user (zero-roster, via
-          # runtime token) + backend routes their sends to it. Needs the token
-          # secret above. Empty = off. Both services read it from the encrypted env.
+          # Resident rollback only. Under normal v2_only operation every eligible
+          # account is excluded from the resident supervisor roster.
           FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
@@ -1208,6 +1213,9 @@ jobs:
           # on-chain re-auth. Gate: the deployed image must contain the leader-
           # election patch (core/leader.py) or N>1 double-binds :9998.
           FEEDLING_BACKEND_WORKERS:     ${{ vars.TEST_FEEDLING_BACKEND_WORKERS }}
+          # v2_only is the normal acceptance mode. An operator may set the repo
+          # variable to resident_only for a generation-fenced fleet rollback.
+          FEEDLING_HOSTED_RUNTIME_POLICY: ${{ vars.PRE_HOSTED_RUNTIME_POLICY || 'v2_only' }}
           # R2 frame-ciphertext offload — TEST_-prefixed secrets, un-prefixed
           # container env. Empty = feature off; token MUST be scoped to the
           # frames bucket. See deploy/DEPLOYMENTS.md.
@@ -1244,6 +1252,7 @@ jobs:
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
+            -e "FEEDLING_HOSTED_RUNTIME_POLICY=$FEEDLING_HOSTED_RUNTIME_POLICY" \
             --wait
 
       - name: Publish live compose_hash on Sepolia (pre contract)
@@ -1314,9 +1323,9 @@ jobs:
   # secret, and reach the main backend/enclave over public ingress +
   # gateway-passthrough URLs.
   #
-  # Controlled by DEPLOY_PRE_RUNNER_CVM and deploy/pre-runner-cvm-id.txt. Runs
-  # AFTER deploy-pre-cvm (serialized: shares the branch push + the main CVM must
-  # be up for the runner to reach it).
+  # Pre is V2-only by default, so this deploy/readiness gate is mandatory for
+  # every CVM-affecting pre push. Runs AFTER deploy-pre-cvm (serialized: shares
+  # the branch push + the main CVM must be up for the runner to reach it).
   # =========================================================================
   deploy-pre-runner-cvm:
     name: deploy runner CVM (pre)
@@ -1324,8 +1333,7 @@ jobs:
     if: |
       github.ref == 'refs/heads/pre' &&
       github.event_name == 'push' &&
-      needs.detect-cvm-changes-pre.outputs.cvm == 'true' &&
-      vars.DEPLOY_PRE_RUNNER_CVM == 'true'
+      needs.detect-cvm-changes-pre.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -1475,6 +1483,7 @@ jobs:
         env:
           FEEDLING_API_URL:      ${{ vars.PRE_API_URL || 'https://pre-api.feedling.app' }}
           FEEDLING_ADMIN_TOKEN:  ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          EXPECTED_RUNTIME_POLICY: ${{ vars.PRE_HOSTED_RUNTIME_POLICY || 'v2_only' }}
         run: |
           python3 - <<'PY'
           import json
@@ -1485,7 +1494,17 @@ jobs:
 
           base_url = os.environ.get("FEEDLING_API_URL", "").rstrip("/")
           admin_token = os.environ.get("FEEDLING_ADMIN_TOKEN", "")
-          expected_commit = os.environ.get("GITHUB_SHA", "")[:7]  # 7-char, matches the image tag slice (CI #906)
+          expected_policy = os.environ.get("EXPECTED_RUNTIME_POLICY", "v2_only")
+          expected_modes = {
+              "v2_only": "db_action_v2",
+              "resident_only": "resident_cli",
+          }
+          if expected_policy not in expected_modes:
+              raise SystemExit(
+                  "EXPECTED_RUNTIME_POLICY must be v2_only or resident_only"
+              )
+          expected_mode = expected_modes[expected_policy]
+          expected_commit = os.environ.get("GITHUB_SHA", "")[:7]
           if not base_url or not admin_token:
               raise SystemExit("FEEDLING_API_URL / FEEDLING_ADMIN_TOKEN is required")
           if len(expected_commit) != 7:
@@ -1515,6 +1534,14 @@ jobs:
                   live_workers = int(payload.get("live_workers") or 0)
                   capacity = int(payload.get("live_worker_capacity") or 0)
                   genesis_alive = payload.get("genesis_alive") is True
+                  runtime_policy = payload.get("runtime_policy") or {}
+                  policy_ready = (
+                      runtime_policy.get("policy") == expected_policy
+                      and runtime_policy.get("target_mode") == expected_mode
+                      and int(runtime_policy.get("eligible_count") or 0)
+                          == int(runtime_policy.get("ready_count") or 0)
+                      and int(runtime_policy.get("inconsistent_count") or 0) == 0
+                  )
                   heartbeats = payload.get("worker_heartbeats") or []
                   turns = [
                       row for row in heartbeats
@@ -1546,17 +1573,22 @@ jobs:
                       live_workers >= 1
                       and capacity > 0
                       and genesis_alive
+                      and policy_ready
                       and matched_identity is not None
                   ):
                       print(
                           "Runtime V2 healthy: "
                           f"live_workers={live_workers} capacity={capacity} "
-                          f"genesis_alive=true worker={matched_identity}"
+                          f"genesis_alive=true policy={expected_policy} "
+                          f"policy_ready=true "
+                          f"eligible={runtime_policy.get('eligible_count')} "
+                          f"worker={matched_identity}"
                       )
                       raise SystemExit(0)
                   last_error = (
                       f"live_workers={live_workers} capacity={capacity} "
                       f"genesis_alive={genesis_alive} "
+                      f"runtime_policy={runtime_policy} "
                       f"expected_build={expected_commit} matched={matched_identity}"
                   )
               except Exception as exc:  # transient deploy/startup window

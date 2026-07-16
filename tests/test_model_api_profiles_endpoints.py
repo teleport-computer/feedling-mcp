@@ -28,6 +28,8 @@ import db  # noqa: E402
 import provider_client  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from core import store as core_store  # noqa: E402
+from hosted import config_store  # noqa: E402
 
 _ENV = {"v": 1, "body_ct": "ct", "nonce": "n"}
 
@@ -304,6 +306,103 @@ def test_activate_untested_route_runs_test_and_switches(
     assert db.model_api_route_get(uid, r2)["test_status"] == "ok"
 
 
+def test_v2_only_route_activation_cannot_bypass_auto_cutover(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch):
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    cid = db.model_api_credentials_list(uid)[0]["id"]
+    r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+
+    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+    config_store.set_hosted_runtime_mode(
+        core_store.get_store(uid), config_store.HOSTED_RUNTIME_MODE_RESIDENT
+    )
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+
+    resp = client.post(f"/v1/model_api/routes/{r2}/activate", headers=headers)
+
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert db.get_hosted_runtime_control_strict(uid)[:2] == (
+        "db_action_v2",
+        "v2",
+    )
+
+
+def test_v2_route_activation_fences_pinned_provider_generation(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch):
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    cid = db.model_api_credentials_list(uid)[0]["id"]
+    r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    config_store.apply_hosted_runtime_policy(core_store.get_store(uid))
+    before = db.get_runtime_generation(uid)
+
+    resp = client.post(f"/v1/model_api/routes/{r2}/activate", headers=headers)
+
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert db.model_api_active_route(uid)["id"] == r2
+    assert db.get_hosted_runtime_control_strict(uid) == (
+        "db_action_v2",
+        "v2",
+        before + 4,
+    )
+
+
+def test_v2_setup_fences_pinned_provider_generation(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch):
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    config_store.apply_hosted_runtime_policy(core_store.get_store(uid))
+    before = db.get_runtime_generation(uid)
+
+    resp = client.post("/v1/model_api/setup", headers=headers, json={
+        "provider": "anthropic",
+        "model": "claude-haiku-4-5",
+        "api_key": "sk-ant-replacement",
+    })
+
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert db.model_api_active_route(uid)["model"] == "claude-haiku-4-5"
+    assert db.get_hosted_runtime_control_strict(uid) == (
+        "db_action_v2",
+        "v2",
+        before + 4,
+    )
+
+
+def test_v2_setup_route_write_failure_does_not_restore_mutated_active_key(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch):
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    config_store.apply_hosted_runtime_policy(core_store.get_store(uid))
+    before = db.get_runtime_generation(uid)
+    monkeypatch.setattr(db, "model_api_route_upsert", lambda *args, **kwargs: None)
+
+    resp = client.post("/v1/model_api/setup", headers=headers, json={
+        "provider": "anthropic",
+        "model": "claude-haiku-4-5",
+        "api_key": "sk-ant-replacement",
+    })
+
+    assert resp.status_code == 500, resp.get_data(as_text=True)
+    assert resp.get_json()["error"] == "model_api_route_write_failed"
+    assert db.get_hosted_runtime_control_strict(uid) == (
+        "resident_cli",
+        "resident",
+        before + 2,
+    )
+    active = db.model_api_active_route(uid)
+    assert active["test_status"] == "failed"
+    assert active["last_test_error"] == "config_update_incomplete"
+
+
 def test_activate_fails_when_provider_test_fails_and_keeps_old_active(
         client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
     uid = registered_user["user_id"]
@@ -519,9 +618,12 @@ def test_route_test_active_route_deactivate_write_failure_no_double_active(
 # ─────────────────────────── DELETE /routes/{id} ───────────────────────────
 
 def test_delete_active_route_autoselects_latest_ok(
-        client, registered_user, fake_provider, fake_envelope, fake_enclave):
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch):
     uid = registered_user["user_id"]
     headers = _setup_one(client, registered_user)
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    config_store.apply_hosted_runtime_policy(core_store.get_store(uid))
     cid = db.model_api_credentials_list(uid)[0]["id"]
     r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
     db.model_api_route_mark_test(uid, r2, status="ok")
@@ -531,6 +633,10 @@ def test_delete_active_route_autoselects_latest_ok(
     assert resp.status_code == 200
     assert resp.get_json()["active_route_id"] == r2
     assert db.model_api_active_route(uid)["id"] == r2
+    assert db.get_hosted_runtime_control_strict(uid)[:2] == (
+        "db_action_v2",
+        "v2",
+    )
 
 
 def test_delete_last_route_leaves_no_active(
@@ -565,6 +671,40 @@ def test_delete_non_active_route_keeps_current_active(
     resp = client.delete(f"/v1/model_api/routes/{r2}", headers=headers)
     assert resp.status_code == 200
     assert resp.get_json()["active_route_id"] == active
+
+
+def test_delete_route_fences_when_stale_snapshot_became_active(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch):
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    active = db.model_api_active_route(uid)["id"]
+    cid = db.model_api_credentials_list(uid)[0]["id"]
+    raced_route = db.model_api_route_upsert(
+        uid, cid, "claude-haiku-4-5", None
+    )
+    db.model_api_route_mark_test(uid, raced_route, status="ok")
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    config_store.apply_hosted_runtime_policy(core_store.get_store(uid))
+    real_delete = db.model_api_route_delete
+
+    def activate_then_delete(user_id, route_id):
+        assert route_id == raced_route
+        assert db.model_api_route_deactivate(user_id, active)
+        assert db.model_api_route_mark_test(user_id, active, status="failed")
+        assert db.model_api_route_activate(user_id, raced_route)
+        return real_delete(user_id, route_id)
+
+    monkeypatch.setattr(db, "model_api_route_delete", activate_then_delete)
+
+    resp = client.delete(f"/v1/model_api/routes/{raced_route}", headers=headers)
+
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["active_route_id"] is None
+    assert db.get_hosted_runtime_control_strict(uid)[:2] == (
+        "resident_cli",
+        "resident",
+    )
 
 
 # ─────────────────────────── GET /credentials ───────────────────────────
@@ -655,6 +795,30 @@ def test_patch_credential_rotating_key_retests_active_route(
     assert creds[0]["label"] == "Key B"
     assert db.model_api_active_route(uid)["test_status"] == "ok"
     assert (active_id, "ok") in marks      # active route 的 last_test_at 被刷新过
+
+
+def test_v2_active_credential_rotation_fences_pinned_provider_generation(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch):
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    cid = db.model_api_credentials_list(uid)[0]["id"]
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    config_store.apply_hosted_runtime_policy(core_store.get_store(uid))
+    before = db.get_runtime_generation(uid)
+
+    resp = client.patch(
+        f"/v1/model_api/credentials/{cid}",
+        headers=headers,
+        json={"api_key": "sk-ant-new"},
+    )
+
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert db.get_hosted_runtime_control_strict(uid) == (
+        "db_action_v2",
+        "v2",
+        before + 4,
+    )
 
 
 def test_patch_credential_keeps_old_key_when_retest_fails(
@@ -766,9 +930,12 @@ def test_patch_credential_rotating_key_marks_non_active_routes_untested(
 # ─────────────────────────── DELETE /credentials/{id} ───────────────────────────
 
 def test_delete_credential_cascades_routes(
-        client, registered_user, fake_provider, fake_envelope, fake_enclave):
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch):
     uid = registered_user["user_id"]
     headers = _setup_one(client, registered_user)
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    config_store.apply_hosted_runtime_policy(core_store.get_store(uid))
     cid = db.model_api_credentials_list(uid)[0]["id"]
     db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
     assert len(db.model_api_routes_list(uid)) == 2
@@ -778,10 +945,15 @@ def test_delete_credential_cascades_routes(
     assert resp.get_json()["active_route_id"] is None
     assert db.model_api_credentials_list(uid) == []
     assert db.model_api_routes_list(uid) == []
+    assert db.get_hosted_runtime_control_strict(uid)[:2] == (
+        "resident_cli",
+        "resident",
+    )
 
 
 def test_delete_credential_with_active_route_autoselects(
-        client, registered_user, fake_provider, fake_envelope, fake_enclave):
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch):
     """删掉持有 active route 的 credential（CASCADE 带走它的 routes）后，若还有
     别的 ok route，自动接管。"""
     uid = registered_user["user_id"]
@@ -794,11 +966,17 @@ def test_delete_credential_with_active_route_autoselects(
     other_route = next(r for r in db.model_api_routes_list(uid)
                        if r["credential_id"] != active_cid)
     db.model_api_route_mark_test(uid, other_route["id"], status="ok")
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    config_store.apply_hosted_runtime_policy(core_store.get_store(uid))
 
     resp = client.delete(f"/v1/model_api/credentials/{active_cid}", headers=headers)
     assert resp.status_code == 200
     assert resp.get_json()["active_route_id"] == other_route["id"]
     assert db.model_api_active_route(uid)["id"] == other_route["id"]
+    assert db.get_hosted_runtime_control_strict(uid)[:2] == (
+        "db_action_v2",
+        "v2",
+    )
 
 
 def test_delete_credential_write_failure_returns_not_found(

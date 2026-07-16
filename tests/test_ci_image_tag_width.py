@@ -42,6 +42,10 @@ def test_pre_runner_deploy_forwards_pool_size_and_gates_liveness():
     assert 'headers={"X-Admin-Token": admin_token}' in workflow
     assert 'payload.get("live_worker_capacity")' in workflow
     assert 'payload.get("genesis_alive") is True' in workflow
+    assert 'runtime_policy.get("policy") == expected_policy' in workflow
+    assert 'runtime_policy.get("target_mode") == expected_mode' in workflow
+    assert 'runtime_policy.get("inconsistent_count") or 0' in workflow
+    assert "vars.DEPLOY_PRE_RUNNER_CVM == 'true'" not in workflow
     assert 'payload.get("worker_heartbeats")' in workflow
     assert 'expected_commit = os.environ.get("GITHUB_SHA", "")[:7]' in workflow
     assert "time.sleep(35)" in workflow

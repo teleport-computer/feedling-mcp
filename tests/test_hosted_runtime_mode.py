@@ -249,6 +249,54 @@ def test_model_api_delete_fences_effects_and_preserves_reply_cursor():
     assert seen == []
 
 
+def test_model_api_delete_refences_concurrent_v2_resurrection(monkeypatch):
+    uid = "u_mode_delete_resurrection"
+    _seed_model_api_user(uid)
+    _reset_runtime_control(uid)
+    store = core_store.get_store(uid)
+    hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+    monkeypatch.setenv(
+        hosted_config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only"
+    )
+    real_delete = db.model_api_config_delete_strict
+    resurrected_generation = []
+
+    def delete_after_interposed_policy_flip(user_id):
+        # Reproduce a startup/setup transition that observed the route between
+        # the endpoint's first resident fence and credential deletion.
+        hosted_config_store.apply_hosted_runtime_policy(store)
+        resurrected_generation.append(db.get_runtime_generation(user_id))
+        return real_delete(user_id)
+
+    monkeypatch.setattr(
+        db, "model_api_config_delete_strict", delete_after_interposed_policy_flip
+    )
+
+    body, status = setup_core.model_api_delete(store)
+
+    assert status == 200 and body == {"deleted": True}
+    assert resurrected_generation
+    mode, state, generation = db.get_hosted_runtime_control_strict(uid)
+    assert (mode, state) == ("resident_cli", "resident")
+    assert generation > resurrected_generation[0]
+
+    # Even a caller holding a stale pre-delete config projection cannot flip
+    # ownership after credentials are gone: eligibility is rechecked inside the
+    # generation-fenced DB transaction.
+    monkeypatch.setattr(
+        hosted_config_store,
+        "_load_model_api_config",
+        lambda _store: {"provider": "anthropic", "model": "m"},
+    )
+    with pytest.raises(ValueError, match="active tested route"):
+        hosted_config_store.apply_hosted_runtime_policy(store)
+    assert db.get_hosted_runtime_control_strict(uid) == (
+        "resident_cli",
+        "resident",
+        generation,
+    )
+
+
 def test_model_api_delete_fails_closed_before_removing_credentials(monkeypatch):
     uid = "u_mode_delete_fence_failure"
     _seed_model_api_user(uid)

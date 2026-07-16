@@ -528,6 +528,19 @@ def test_wire_assembly_registers_v2_jobs_handler():
     assert worker.on_v2_job_notify in core_wake_bus._extra_handlers.get("v2_jobs", [])
 
 
+def test_wire_assembly_handler_registration_is_idempotent():
+    from core import wake_bus as core_wake_bus
+
+    serve_worker.wire_assembly()
+    serve_worker.wire_assembly()
+    assert core_wake_bus._extra_handlers.get("users", []).count(
+        serve_worker._reload_accounts_registry
+    ) == 1
+    assert core_wake_bus._extra_handlers.get("v2_jobs", []).count(
+        worker.on_v2_job_notify
+    ) == 1
+
+
 def test_on_v2_job_notify_bridges_to_event_via_call_soon_threadsafe():
     """set_job_wake_context binds the running loop/event; on_v2_job_notify (the
     wake-bus handler, invoked from a plain OS thread in production) must set
