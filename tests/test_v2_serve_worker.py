@@ -110,8 +110,10 @@ def test_default_worker_id_is_unique_across_same_pid_replica_calls(monkeypatch):
 
     assert first.startswith("v2-worker-pod-1-")
     assert second.startswith("v2-worker-pod-1-")
-    assert first.endswith("-abcdef123456")
-    assert second.endswith("-abcdef123456")
+    # 7-char build-commit prefix — matches the image tag + CI liveness gate
+    # (GITHUB_SHA[:7], CI #906). A wider slice would false-fail the liveness gate.
+    assert first.endswith("-abcdef1")
+    assert second.endswith("-abcdef1")
     assert first != second
 
 

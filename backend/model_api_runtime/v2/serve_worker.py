@@ -111,7 +111,11 @@ def _positive_float_env(name: str, default: str) -> float:
 def _default_worker_id() -> str:
     """Replica-unique identity even when every container runs as PID 1."""
     raw_commit = os.environ.get("FEEDLING_GIT_COMMIT", "dev")
-    build_commit = "".join(ch for ch in raw_commit if ch.isalnum())[:12] or "dev"
+    # 7-char prefix to match the image tag + the CI liveness gate's
+    # ``GITHUB_SHA[:7]`` build identity (CI #906 — the mainline fixed-width slice
+    # the deploy waiters/pin steps use). A wider slice here reports a build id the
+    # gate can't match, false-failing the post-deploy liveness check.
+    build_commit = "".join(ch for ch in raw_commit if ch.isalnum())[:7] or "dev"
     return (
         f"v2-worker-{socket.gethostname()}-{os.getpid()}-"
         f"{uuid.uuid4().hex[:8]}-{build_commit}"
