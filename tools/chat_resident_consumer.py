@@ -404,10 +404,11 @@ _ERROR_CLASS_RULES = (
     ("quota_insufficient", "user_provider",
      "模型服务额度不足，充值后再发消息即可恢复。",
      re.compile(r"余额|额度|insufficient_quota|credit balance|requires more credits"
-                r"|payment required|\b402\b|quota", re.I)),
+                r"|payment required|\b402\b|provider_http_402|quota", re.I)),
     ("auth_invalid", "user_provider",
      "API Key 无效或已过期，请到设置里重新保存。",
-     re.compile(r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b", re.I)),
+     re.compile(r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b"
+                r"|provider_http_40[13]", re.I)),
     ("model_not_found", "user_provider",
      "模型名不可用，请检查设置里的模型名。",
      re.compile(r"invalid model name|model_not_found|no such model", re.I)),
@@ -424,10 +425,11 @@ _ERROR_CLASS_RULES = (
      re.compile(r"content_filter|content policy|safety|blocked by", re.I)),
     ("rate_limited", "provider_transient",
      "模型服务限流了，稍等几分钟再试。",
-     re.compile(r"\b429\b|too many requests|rate.?limit", re.I)),
+     re.compile(r"\b429\b|provider_http_429|too many requests|rate.?limit", re.I)),
     ("upstream_unavailable", "provider_transient",
      "你的模型服务暂时不可用，稍后会自动恢复。",
-     re.compile(r"\b5\d{2}\b|overloaded|timed? ?out|connection (refused|reset|error)"
+     re.compile(r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out"
+                r"|connection (refused|reset|error)"
                 r"|unreachable|stream disconnected", re.I)),
 )
 
