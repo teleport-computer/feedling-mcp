@@ -1716,9 +1716,10 @@ def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(mon
 
 
 def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
-    # Resume is the fallback continuity path, kept only when foreground history
-    # injection is disabled. With injection on (the auto default for claude) the
-    # resident drops --resume — see test_claude_resume_injection_skipped_*.
+    # Resume is claude's primary continuity path on a self-hosted resident (auto
+    # injects only when _HOSTED — see test_resident_claude_auto_keeps_resume_*).
+    # When a turn DOES carry an injected transcript (hosted / forced on),
+    # _prepare_cli_command suppresses --resume for that turn instead.
     sid = "123e4567-e89b-12d3-a456-426614174000"
     monkeypatch.setattr(
         crc,
@@ -5626,10 +5627,57 @@ def test_foreground_injection_enabled_for_codex(monkeypatch):
     assert crc._foreground_history_injection_enabled() is True
 
 
-def test_foreground_injection_enabled_for_claude(monkeypatch):
+def test_foreground_injection_enabled_for_hosted_claude(monkeypatch):
+    # In-CVM (hosted) claude has no durable session store: transcript injection
+    # IS its continuity.
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", True)
     assert crc._foreground_history_injection_enabled() is True
+
+
+def test_foreground_injection_skipped_for_resident_claude(monkeypatch):
+    # A self-hosted resident's local claude has a reliable --resume. Injection
+    # would suppress it (_prepare_cli_command) and cold-start a fresh model
+    # session on EVERY message — boot-ritual personas then replay their arrival
+    # greeting per turn (the "来了" loop, usr_c190 2026-07-16). auto must keep
+    # the persistent-session path for resident claude.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    assert crc._foreground_history_injection_enabled() is False
+
+
+def test_foreground_injection_on_mode_forces_even_resident_claude(monkeypatch):
+    # explicit on outranks the hosted/resident split (operator escape hatch)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "on")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    assert crc._foreground_history_injection_enabled() is True
+
+
+def test_resident_claude_auto_keeps_resume_and_skips_transcript(monkeypatch):
+    # End-to-end shape of the resident-claude fix: in auto the message stays
+    # bare (no transcript header — and no history fetch at all), so
+    # _prepare_cli_command injects the stored --resume. This is the persistent-
+    # session behavior from before 7f3ff266.
+    sid = "123e4567-e89b-12d3-a456-426614174000"
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(
+        crc, "get_decrypted_history",
+        lambda since, limit=20, include_image_body=True: (_ for _ in ()).throw(
+            AssertionError("resident claude in auto must not fetch history")),
+    )
+
+    out = crc._foreground_agent_message("hello", current_ts=time.time())
+    assert out == "hello"                       # bare message, no transcript
+
+    cmd = crc._prepare_cli_command(out)
+    assert cmd[:3] == ["claude", "--resume", sid]
 
 
 def test_foreground_injection_bridges_pi_on_cold_start(monkeypatch, tmp_path):
@@ -6563,3 +6611,128 @@ def test_proactive_failure_backoff_caps(monkeypatch):
         crc._note_proactive_failure()
     assert crc._proactive_backoff_until <= crc.PROACTIVE_FAIL_BACKOFF_CAP_SEC
     _reset_proactive_guard_state()
+
+
+# --- Proactive guard EDGE CASES through the real realize/route paths ----------
+
+def _proactive_guard_harness(monkeypatch, agent_reply=("在。",), raise_exc=None):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    cap = {"agent_called": False, "statuses": [], "posts": []}
+
+    def _agent(message, images=None, image_paths=None, **kw):
+        cap["agent_called"] = True
+        if raise_exc is not None:
+            raise raise_exc
+        return list(agent_reply)
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kw: (cap["posts"].append(reply), {"id": "m"})[1])
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kw: cap["statuses"].append((status, reason)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: None)
+    monkeypatch.setattr(crc, "_consume_reply_parse_failed", lambda: False)
+    return cap
+
+
+def _idle_proactive_job(job_id="pj_idle"):
+    return {"schema_version": 2, "job_id": job_id, "source": crc.PROACTIVE_JOB_SOURCE,
+            "ts": 100.0, "trigger": "heartbeat_broadcast_off", "wake_kind": "presence"}
+
+
+def test_guard_skips_idle_proactive_when_tripped(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert cap["agent_called"] is False
+    assert ("skipped", "proactive_idle_loop: no new user input") in cap["statuses"]
+
+
+def test_guard_realizes_idle_proactive_when_not_tripped(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_empty_streak = 0
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert cap["agent_called"] is True
+    assert crc._proactive_empty_streak == 1  # idle send advanced the streak
+
+
+def test_guard_does_not_skip_screen_watch_when_tripped(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    job = _idle_proactive_job("pj_sw")
+    job["job_kind"] = "screen_watch"
+    job["frame_ids"] = ["f1"]
+    crc._process_proactive_jobs([job])
+    assert cap["agent_called"] is True  # screen-watch is not an idle lane
+    assert crc._proactive_empty_streak == crc.MAX_EMPTY_PROACTIVE_TURNS  # unchanged
+
+
+def test_guard_does_not_skip_introduction_when_tripped(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    job = _idle_proactive_job("pj_intro")
+    job["job_kind"] = "introduction"
+    crc._process_proactive_jobs([job])
+    assert cap["agent_called"] is True  # first-greeting must never be suppressed
+    assert crc._proactive_empty_streak == crc.MAX_EMPTY_PROACTIVE_TURNS  # unchanged
+
+
+def test_backoff_skips_idle_proactive(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_backoff_until = crc.time.monotonic() + 999
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert cap["agent_called"] is False
+    assert any(s == "skipped" and "backoff" in r for s, r in cap["statuses"])
+
+
+def test_generic_failure_sets_backoff(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("cli agent exited 1"))
+    crc._proactive_fail_streak = 0
+    crc._proactive_backoff_until = 0.0
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert cap["agent_called"] is True
+    assert crc._proactive_backing_off() is True
+    assert any(s == "failed" for s, _ in cap["statuses"])
+
+
+def test_402_failure_feeds_both_cooldown_and_general_backoff(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("HTTP 402 payment required"))
+    crc._proactive_backoff_until = 0.0
+    crc._clear_provider_payment_cooldown()
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert crc._provider_payment_cooling_down() is True
+    assert crc._proactive_backing_off() is True
+    crc._clear_provider_payment_cooldown()
+
+
+def test_success_clears_failure_backoff(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_fail_streak = 3
+    crc._proactive_backoff_until = 0.0  # expired, so the job is not skipped
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert cap["agent_called"] is True
+    assert crc._proactive_fail_streak == 0
+
+
+def test_user_message_resets_guard_and_backoff():
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._proactive_fail_streak = 3
+    msg = {"id": "u-reset", "role": "user", "content": "hi", "ts": 2000.0}
+    with patch.object(crc, "call_agent", return_value="hey"), \
+         patch.object(crc, "post_reply", return_value={"id": "r1"}):
+        crc._process_messages([msg])
+    assert crc._proactive_empty_streak == 0
+    assert crc._proactive_fail_streak == 0
+
+
+def test_max_empty_zero_disables_idle_guard(monkeypatch):
+    monkeypatch.setattr(crc, "MAX_EMPTY_PROACTIVE_TURNS", 0)
+    crc._proactive_empty_streak = 99
+    assert crc._proactive_idle_guard_tripped() is False

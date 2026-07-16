@@ -306,12 +306,17 @@ IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_image
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
-# Foreground chat continuity. codex has no --resume and the hosted claude command
-# carries no session, so those drivers otherwise forget everything after the first
-# turn. When active we prepend a short recent-chat transcript to each foreground
-# turn so continuity does not depend on the agent's own (missing/fragile) session.
-#   auto (default) — inject only for codex / claude (drivers with no reliable
-#                    cross-turn memory); pi resumes natively and is skipped.
+# Foreground chat continuity. codex has no --resume and the HOSTED claude command
+# carries no durable session, so those runs otherwise forget everything after the
+# first turn. When active we prepend a short recent-chat transcript to each
+# foreground turn so continuity does not depend on the agent's own session.
+#   auto (default) — inject for codex always, and for claude only when HOSTED
+#                    (in-CVM run, no durable session store). A self-hosted
+#                    resident's local claude has a reliable --resume and keeps
+#                    its persistent session instead — injecting there replaced
+#                    the session with a cold start per turn (7f3ff266 fallout;
+#                    boot-ritual personas then replay their arrival greeting on
+#                    every message). pi resumes natively and is skipped.
 #   on/always      — inject for every driver (escape hatch).
 #   off            — never inject; claude falls back to its --resume path.
 FOREGROUND_CHAT_CONTEXT_MODE = os.environ.get(
@@ -323,7 +328,11 @@ FOREGROUND_CHAT_CONTEXT_MODE = os.environ.get(
 FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "50"))
 FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
     "FEEDLING_FOREGROUND_CHAT_CONTEXT_HEADER",
-    "[最近对话记录 — 仅供你保持连续；最后那条用户消息才是此刻要回应的]",
+    # 反开机仪式护栏:注入路径下每轮都是新模型会话,自带"唤醒仪式"的 persona
+    # (CLAUDE.md 里写了"启动先读记忆/报到")会把每条消息当成重逢报到,只回
+    # "来了/在了"(usr_c190 2026-07-16)。明确告知这是进行中对话,不是开机。
+    "[最近对话记录 — 仅供你保持连续。这是一段进行中对话的下一轮,不是新会话的开始:"
+    "跳过任何启动/读记忆/报到/自我介绍仪式,直接回应最后那条用户消息]",
 )
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
@@ -3896,16 +3905,23 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     """Whether foreground turns get a resident-injected recent-chat transcript.
 
     Gated so we don't double up context for agents that already carry it:
-    codex (no --resume) and claude (hosted command has no session; its scrape +
-    --resume continuity is unreliable) inject every turn in ``auto``. pi resumes
-    natively, so it injects only ONCE per session — on the first foreground turn of
-    a session that has not been bridged yet (see _agent_session_is_bridged).
+    codex (no --resume) injects every turn in ``auto``. claude injects only when
+    HOSTED (in-CVM, no durable session store — its scrape + --resume continuity
+    is unreliable there); a self-hosted resident's local claude has a reliable
+    --resume, so it keeps its persistent session and never injects in ``auto``
+    — injection would suppress --resume (see _prepare_cli_command) and cold-
+    start a fresh model session on EVERY message, which made boot-ritual
+    personas replay their arrival greeting per turn (the "来了" loop,
+    usr_c190 2026-07-16; regression introduced by 7f3ff266). pi resumes
+    natively, so it injects only ONCE per session — on the first foreground turn
+    of a session that has not been bridged yet (see _agent_session_is_bridged).
     ``on``/``always`` forces it for any driver; ``off`` disables.
 
     A claude command that ALREADY carries its own continuity in the operator's
-    template (``--resume`` / ``-r`` / ``--session-id``) is skipped in ``auto`` too:
-    it has native session, so a resident transcript would double-supply context.
-    The hosted default claude command has none of these, so it still injects."""
+    template (``--resume`` / ``-r`` / ``--session-id``) is skipped in ``auto``
+    too: it has native session, so a resident transcript would double-supply
+    context. The hosted default claude command has none of these, so it still
+    injects."""
     mode = FOREGROUND_CHAT_CONTEXT_MODE
     if mode in {"0", "false", "off", "no", "none", "disabled"}:
         return False
@@ -3915,7 +3931,9 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     if _is_codex_cmd(cmd):
         return True
     if _is_claude_code_cmd(cmd):
-        return not (_has_cli_resume(cmd) or _has_claude_session_id(cmd))
+        if _has_cli_resume(cmd) or _has_claude_session_id(cmd):
+            return False
+        return _HOSTED
     if _is_pi_cmd(cmd):
         # pi resumes natively, so inside one session re-feeding the transcript is pure
         # waste. But every NEW session starts blank — rotation (AGENT_SESSION_MAX_TURNS),
@@ -5070,8 +5088,9 @@ def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = No
 
 def _foreground_agent_message(content: str, *, current_ts: float) -> str:
     """Prepend a recent-chat transcript to a foreground turn when the active
-    driver has no reliable session of its own (codex / claude). Returns ``content``
-    unchanged when injection is disabled or no prior context is available."""
+    driver has no reliable session of its own (codex / hosted claude). Returns
+    ``content`` unchanged when injection is disabled or no prior context is
+    available."""
     if not _foreground_history_injection_enabled():
         return content
     transcript = _recent_chat_context_for_foreground(before_ts=current_ts)
