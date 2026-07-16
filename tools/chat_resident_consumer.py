@@ -4640,6 +4640,17 @@ def _turn_content_bytes(cmd: list[str], stdout: str, stderr: str = "") -> int:
     return transport
 
 
+# claude's "the --resume id no longer exists" failure shape. The stored sid can
+# go stale when something OUTSIDE the consumer removes claude's local session
+# store (cache cleanup, moved home, reinstalled CLI) — the consumer's own
+# bounds/cwd rotation can't see that, so without healing EVERY subsequent turn
+# fails on the same dead --resume until someone deletes the sid file by hand.
+_CLAUDE_MISSING_SESSION_RE = re.compile(
+    r"no conversation found|session.{0,24}not found|not found.{0,24}session",
+    re.I,
+)
+
+
 def call_agent_cli(
     message: str,
     image_paths: list[str] | None = None,
@@ -4786,6 +4797,54 @@ def call_agent_cli(
             received_bytes=_turn_content_bytes(cmd, result.stdout or "", result.stderr or ""),
         )
 
+    if result.returncode != 0:
+        # Self-heal a stale claude --resume ONCE per turn: when the local claude
+        # session store lost the sid we resumed into (missing-session signature
+        # + the failing --resume value is OUR stored sid), clear the sid and
+        # retry the same turn fresh — otherwise every turn from here on fails on
+        # the same dead --resume. Strictly scoped: claude only, signature only,
+        # own-sid only (an operator-pinned foreign --resume is their config, not
+        # ours to rotate), single retry (the retry command carries no --resume,
+        # so this branch cannot re-enter).
+        _resume_sid = _cli_flag_value(cmd, "--resume") or _cli_flag_value(cmd, "-r")
+        if (
+            _is_claude_code_cmd(cmd)
+            and _resume_sid
+            and _resume_sid == _load_agent_session_id()
+            and _CLAUDE_MISSING_SESSION_RE.search(raw_transport)
+        ):
+            _clear_agent_session_id(
+                f"claude --resume session missing upstream: "
+                f"{_cli_error_detail(result.stdout or '', result.stderr or '')[:160]}"
+            )
+            log.warning(
+                "stale claude --resume sid=%s: local session store no longer has it; "
+                "retrying this turn once with a fresh session", _resume_sid,
+            )
+            _emit_debug_trace(
+                "agent", "agent.session.stale_resume_retry", trace_id=trace_id,
+                summary="stale --resume cleared; single fresh-session retry",
+                explain="claude 本地会话丢失(--resume 指向不存在的会话)——已清除并用新会话重试本轮",
+            )
+            cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+            command_sid = _cli_flag_value(cmd, "--session-id")
+            result = subprocess.run(cmd, **_run_kwargs)
+            _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
+            raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+            # Persist the fresh session so the NEXT turn resumes it — but ONLY
+            # from a SUCCESSFUL retry: claude's failure result JSON can still
+            # carry a session_id, and saving that would re-persist a sid for a
+            # failed session right after we cleared the stale one — the next
+            # turn would --resume straight back into a dead session.
+            if result.returncode == 0:
+                observed_sid = _extract_session_id(raw_transport) or command_sid
+                if observed_sid:
+                    _save_agent_session_id(observed_sid)
+                    _record_agent_session_turn(
+                        observed_sid,
+                        sent_bytes=len((message or "").encode("utf-8")),
+                        received_bytes=_turn_content_bytes(cmd, result.stdout or "", result.stderr or ""),
+                    )
     if result.returncode != 0:
         raise RuntimeError(
             f"cli agent exited {result.returncode}: "
@@ -5778,6 +5837,11 @@ def execute_scheduled_wake_actions(actions: list[dict], job: dict) -> dict:
         "turn_id": str(job.get("job_id") or ""),
         "wake_ids": _job_wake_ids(job),
         "origin_refs": _job_origin_refs(job),
+        # This path only ever carries the agent's OWN proactive self-wakes
+        # ("check on them again soon"), so the backend min-lead floor applies.
+        # A user-requested reminder would arrive without this marker and must
+        # NOT be clamped (Seven 2026-07-16: floor self-wakes only).
+        "self_wake": True,
     }
     resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/proactive/scheduled/actions",
