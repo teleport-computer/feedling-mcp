@@ -21,6 +21,7 @@ from proactive import capture_jobs as proactive_capture_jobs  # noqa: E402
 from proactive import capture_scheduler as proactive_capture_scheduler  # noqa: E402
 from proactive import dashboard as proactive_dashboard  # noqa: E402
 from proactive import dream_scheduler as proactive_dream_scheduler  # noqa: E402
+from proactive import proactive_core  # noqa: E402
 from proactive import resident_runtime_v2 as proactive_resident_runtime_v2  # noqa: E402
 from perception import service as perception_service  # noqa: E402
 from proactive import gate as proactive_gate  # noqa: E402
@@ -1072,6 +1073,73 @@ def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(t
     assert on_body["decision"]["wake_kind"] == "presence"
     assert on_body["decision"]["screen_context_available"] is False
     assert on_body["job"]["frame_ids"] == []
+
+
+def test_auto_proactive_v2_loop_guard_blocks_presence_but_not_manual():
+    class _Store:
+        user_id = "usr_endpoint_proactive_loop_guard"
+
+        def __init__(self):
+            self.decisions = []
+            self.jobs = []
+
+        def load_proactive_settings(self):
+            return {"first_chat_ok_at": "2026-07-03T00:00:00"}
+
+        def list_device_events(self, since_epoch=0, limit=100):
+            return []
+
+        def append_gate_decision(self, decision):
+            self.decisions.append(decision)
+            return decision
+
+        def append_proactive_job(self, job):
+            self.jobs.append(job)
+            return job
+
+    store = _Store()
+
+    blocked_body = proactive_core.proactive_tick(
+        store,
+        {
+            "trigger": "heartbeat_broadcast_off",
+            "broadcast_state": "off",
+            "loop_guard_blocked": True,
+            "loop_guard_reason": "no_new_input",
+        },
+        api_key="test_key",
+    )
+    assert blocked_body["enqueued"] is False
+    assert blocked_body["job"] is None
+    assert blocked_body["decision"]["reason"] == "proactive_idle_loop"
+    assert blocked_body["decision"]["wake_kind"] == "presence"
+    assert blocked_body["decision"]["gate_input"]["mechanical_block"] == "proactive_idle_loop"
+    assert blocked_body["decision"]["gate_input"]["loop_guard_blocked"] is True
+    assert blocked_body["decision"]["gate_input"]["loop_guard_reason"] == "no_new_input"
+
+    allowed_body = proactive_core.proactive_tick(
+        store,
+        {"trigger": "heartbeat_broadcast_off", "broadcast_state": "off"},
+        api_key="test_key",
+    )
+    assert allowed_body["enqueued"] is True
+    assert allowed_body["decision"]["reason"] == "wake_created"
+    assert allowed_body["decision"]["wake_kind"] == "presence"
+
+    manual_body = proactive_core.proactive_tick(
+        store,
+        {
+            "trigger": "heartbeat_broadcast_off",
+            "broadcast_state": "off",
+            "manual": True,
+            "loop_guard_blocked": True,
+            "loop_guard_reason": "no_new_input",
+        },
+        api_key="test_key",
+    )
+    assert manual_body["enqueued"] is True
+    assert manual_body["decision"]["manual"] is True
+    assert manual_body["decision"]["reason"] == "wake_created"
 
 
 def test_auto_proactive_v2_away_state_does_not_resurrect_legacy_wake_gate(tmp_path, monkeypatch):
