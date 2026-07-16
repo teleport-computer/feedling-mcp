@@ -28,6 +28,17 @@ class PendingDeviceMigration(Exception):
     """local_only / 无 K_enclave：enclave 解不了，转设备重传流程（D1）。"""
 
 
+class PermanentDecryptFailure(Exception):
+    """enclave 确定性拒解（HTTP 403 decrypt_failed：错内容钥/owner 不符/坏信封）。
+
+    与 ``PendingDeviceMigration`` 一样是**终态**——但成因不同：PDM 是「密文本就
+    只有设备端能解」，本类是「密文本该 enclave 能解、但实际解不开」（翻钥后老钥封
+    的密文、owner 绑定不符、结构损坏）。重试/换 token 都是白试（密文与 enclave 钥
+    不变则结果不变）。worker 据此把该行**隔离**（写终态 pending 行 + 游标越过），
+    不再冻结游标——否则整表回填被队头的一条毒行永久卡死。隔离行留在 pending 表里，
+    将来若翻钥使其重新可解，可再驱动重试。"""
+
+
 def _decryptable(env: dict) -> bool:
     """enclave 能解密 ⟺ 非 local_only 且带 K_enclave（否则只有设备端 K_user 能解）。"""
     return env.get("visibility") != "local_only" and bool(env.get("K_enclave"))

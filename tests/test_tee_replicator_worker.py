@@ -428,3 +428,89 @@ def test_text_cursor_composite_has_no_nul_and_persists(backend_env):
         c.execute(worker._CURSOR_UPSERT, ("world_book_entries", wm_ts, wm_id))
     back = _tee("SELECT watermark_id FROM tee_replication_cursors WHERE table_name='world_book_entries'")
     assert back[0][0] == wm_id
+
+
+# --------------------------------------------------------------------------- #
+# Permanent decrypt failure (enclave 403 decrypt_failed) — quarantine + advance.
+# A row whose ciphertext the enclave DEFINITIVELY cannot open (wrong content
+# key after a re-key, owner mismatch, corrupt/short envelope) is terminal, not
+# transient. Freezing the cursor before it (the old behavior) wedges the whole
+# table's backfill forever. Instead it is quarantined (terminal pending row,
+# ``decrypt_failed:`` reason) and the cursor advances past it.
+# --------------------------------------------------------------------------- #
+
+def test_is_permanent_decrypt_failure_classification():
+    f = worker._is_permanent_decrypt_failure
+    assert f(RuntimeError('enclave_http_403:{"error":"decrypt_failed: box_seal tag invalid: "}'))
+    assert f(RuntimeError('enclave_http_403:{"error":"decrypt_failed: owner mismatch: envelope"}'))
+    # bare 403 with no decrypt_failed body = possibly a token/auth blip → NOT
+    # permanent (keep the freeze-and-retry + fresh-token path).
+    assert not f(RuntimeError("enclave_http_403"))
+    assert not f(RuntimeError("enclave_http_401:token_expired"))
+    assert not f(RuntimeError("enclave_http_502:overloaded"))
+    assert not f(RuntimeError("connection reset by peer"))
+
+
+def test_permanent_decrypt_failure_quarantines_and_advances(backend_env, monkeypatch):
+    _reset_cursor("chat_messages")
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    _insert_chat(uid, "a", 10.0, "AAA")
+    _insert_chat(uid, "poison", 20.0, "POISON")
+    _insert_chat(uid, "c", 30.0, "CCC")
+
+    def _poisoned(_user_id):
+        def decrypt(envelope, purpose):
+            if envelope["body_ct"] == "POISON":
+                raise RuntimeError('enclave_http_403:{"error":"decrypt_failed: box_seal tag invalid: "}')
+            return b"PT:" + envelope["body_ct"].encode()
+        return decrypt
+
+    monkeypatch.setattr(worker, "_make_decrypt", _poisoned)
+    worker._decrypt_cache.clear()
+
+    report = worker.run_table("chat_messages", qps=1000)
+
+    # poison row is quarantined (terminal), NOT a hard error, and does NOT freeze.
+    assert report["quarantined"] == 1
+    assert report["errors"] == 0
+    assert report["copied"] == 2  # a + c both replicated
+    # cursor advanced ALL the way past the poison row to the last row "c".
+    cur = _tee("SELECT watermark_id FROM tee_replication_cursors WHERE table_name='chat_messages'")
+    assert cur[0][0] == "c"
+    # poison row recorded as a terminal pending row with a decrypt_failed reason.
+    pend = _tee("SELECT item_id, reason FROM tee_pending_device_migration "
+                "WHERE user_id=%s AND table_name='chat_messages'", (uid,))
+    assert len(pend) == 1 and pend[0][0] == "poison" and pend[0][1].startswith("decrypt_failed:")
+    # poison row NOT written to TEE content; the two good rows are.
+    assert _tee("SELECT count(*) FROM chat_messages WHERE user_id=%s AND msg_id='poison'", (uid,))[0][0] == 0
+    assert _tee("SELECT count(*) FROM chat_messages WHERE user_id=%s", (uid,))[0][0] == 2
+
+    # rerun: the poison row is behind the cursor now — no re-processing, no churn.
+    report2 = worker.run_table("chat_messages", qps=1000)
+    assert report2["quarantined"] == 0 and report2["copied"] == 0
+
+
+def test_permanent_decrypt_failure_not_retried(backend_env, monkeypatch):
+    """A 403 decrypt_failed is deterministic — classify terminal on the FIRST
+    failure, never burn _RETRIES token-remint attempts on it."""
+    _reset_cursor("chat_messages")
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    _insert_chat(uid, "poison", 20.0, "POISON")
+
+    calls = []
+
+    def _poisoned(_user_id):
+        def decrypt(envelope, purpose):
+            calls.append(envelope["body_ct"])
+            raise RuntimeError('enclave_http_403:{"error":"decrypt_failed: AEAD verify: Decryption"}')
+        return decrypt
+
+    monkeypatch.setattr(worker, "_make_decrypt", _poisoned)
+    worker._decrypt_cache.clear()
+
+    report = worker.run_table("chat_messages", qps=1000)
+
+    assert report["quarantined"] == 1
+    assert calls == ["POISON"]  # exactly one decrypt attempt, no retry storm

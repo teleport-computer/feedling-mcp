@@ -363,3 +363,46 @@ def test_world_book_upsert_requeues_inplace_rewrite_and_worker_converges():
                 (uid,)) == [("PT:NEW",)]
     assert _tee("SELECT count(*) FROM tee_pending_device_migration "
                 "WHERE user_id=%s AND table_name='world_book_entries'", (uid,))[0][0] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Permanent decrypt failure in the REQUEUE lane — an in-place rewrite whose new
+# ciphertext the enclave can no longer open (403 decrypt_failed) must be
+# quarantined terminal (delete stale TEE plaintext + decrypt_failed marker),
+# not re-consumed forever nor logged as a recurring hard error.
+# --------------------------------------------------------------------------- #
+
+def test_requeue_permanent_decrypt_failure_quarantines(monkeypatch):
+    uid = _uid()
+    _seed_both(uid)
+    # A prior pass replicated old plaintext into TEE for this identity row.
+    _tee_exec("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s,'identity',%s)",
+              (uid, Jsonb({"body": "PT:V1"})))
+    store = core_store.get_store(uid)
+    # Rewrite in place with new (now-undecryptable) ciphertext → requeue marker.
+    identity_service._save_identity(store, _ct_env(uid, "identity", body_ct="POISON"))
+    _set_cursor("identity", 0.0, uid)  # cursor loop can't see this uid; requeue-only
+
+    def _poisoned(_uid):
+        def decrypt(envelope, purpose):
+            raise RuntimeError('enclave_http_403:{"error":"decrypt_failed: owner mismatch: envelope"}')
+        return decrypt
+
+    monkeypatch.setattr(worker, "_make_decrypt", _poisoned)
+    worker._decrypt_cache.clear()
+
+    report = worker.run_table("identity", qps=1000)
+
+    # Quarantined terminal, not a recurring hard error.
+    assert report["quarantined"] == 1 and report["errors"] == 0
+    # Stale TEE plaintext deleted (can't hold plaintext we can't derive).
+    assert _tee("SELECT count(*) FROM user_blobs WHERE user_id=%s AND kind='identity'",
+                (uid,))[0][0] == 0
+    # Marker flipped to terminal decrypt_failed → no longer re-consumed by requeue lane.
+    pend = _tee("SELECT reason FROM tee_pending_device_migration "
+                "WHERE user_id=%s AND table_name='identity' AND item_id='identity'", (uid,))
+    assert len(pend) == 1 and pend[0][0].startswith("decrypt_failed:")
+
+    # Rerun: terminal marker is not a requeue row → nothing re-consumed.
+    report2 = worker.run_table("identity", qps=1000)
+    assert report2["quarantined"] == 0 and report2["copied"] == 0
