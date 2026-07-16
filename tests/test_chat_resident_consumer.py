@@ -679,13 +679,94 @@ def test_enclave_fetch_logs_response_body_on_http_error(monkeypatch, caplog):
     mock_client.get.return_value = resp
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+    # 503 is transient (retried); don't actually sleep the backoff in the test.
+    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
 
     with caplog.at_level("WARNING"):
         result = crc._fetch_from_enclave(since=0.0, limit=20)
 
     assert result is None
+    # the body must still be logged on the FINAL give-up, not only on the first try
     assert "503" in caplog.text
     assert "key_derivation_unavailable" in caplog.text
+
+
+def test_fetch_from_enclave_retries_transient_502(monkeypatch):
+    # Prod (2026-07-15): the enclave decrypt proxy (single-threaded, shared by ~295
+    # users) intermittently 502s under load. Before this fix a single 502 skipped the
+    # WHOLE poll cycle ("all decrypt sources failed"), deferring a waiting user message
+    # to the next 30 s+ cycle and stacking into 6-13 min tails. A transient 502 must be
+    # retried within the cycle instead.
+    import httpx as _httpx
+    url = "https://enc/v1/chat/history"
+    ok = _httpx.Response(200, json={"messages": [{"ts": 5.0, "id": "m1"}]},
+                         request=_httpx.Request("GET", url))
+    err = _httpx.Response(502, json={"error": "backend_unreachable"},
+                          request=_httpx.Request("GET", url))
+    mock_client = MagicMock()
+    mock_client.get.side_effect = [err, ok]
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+
+    result = crc._fetch_from_enclave(since=0.0, limit=20)
+
+    assert result == [{"ts": 5.0, "id": "m1"}]
+    assert mock_client.get.call_count == 2, "transient 502 was not retried"
+
+
+def test_fetch_from_enclave_retries_transient_network_error(monkeypatch):
+    import httpx as _httpx
+    url = "https://enc/v1/chat/history"
+    ok = _httpx.Response(200, json={"messages": [{"ts": 9.0, "id": "m9"}]},
+                         request=_httpx.Request("GET", url))
+    mock_client = MagicMock()
+    mock_client.get.side_effect = [_httpx.ConnectError("boom"), ok]
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+
+    result = crc._fetch_from_enclave(since=0.0, limit=20)
+
+    assert result == [{"ts": 9.0, "id": "m9"}]
+    assert mock_client.get.call_count == 2, "transient connect error was not retried"
+
+
+def test_fetch_from_enclave_no_retry_on_permanent_4xx(monkeypatch):
+    # 404/400 are not transient — retrying only wastes a cycle. Return None at once.
+    import httpx as _httpx
+    url = "https://enc/v1/chat/history"
+    mock_client = MagicMock()
+    mock_client.get.return_value = _httpx.Response(
+        404, json={"error": "not_found"}, request=_httpx.Request("GET", url))
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+    slept: list = []
+    monkeypatch.setattr(crc.time, "sleep", lambda d: slept.append(d))
+
+    result = crc._fetch_from_enclave(since=0.0, limit=20)
+
+    assert result is None
+    assert mock_client.get.call_count == 1, "permanent 4xx must not be retried"
+    assert slept == []
+
+
+def test_fetch_from_enclave_gives_up_after_max_attempts(monkeypatch):
+    # A persistent 502 must be BOUNDED — return None after ENCLAVE_FETCH_MAX_ATTEMPTS
+    # so the poll loop is never hung by a wedged enclave.
+    import httpx as _httpx
+    url = "https://enc/v1/chat/history"
+    mock_client = MagicMock()
+    mock_client.get.return_value = _httpx.Response(
+        502, json={"error": "backend_unreachable"}, request=_httpx.Request("GET", url))
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+
+    result = crc._fetch_from_enclave(since=0.0, limit=20)
+
+    assert result is None
+    assert mock_client.get.call_count == crc.ENCLAVE_FETCH_MAX_ATTEMPTS
 
 
 def test_image_message_passes_image_context_to_agent(monkeypatch, tmp_path):
@@ -4741,16 +4822,146 @@ def test_turn_content_bytes_does_not_charge_image_pixels(monkeypatch):
     assert counted > crc._PI_IMAGE_CONTEXT_BYTES
 
 
-def test_turn_content_bytes_keeps_transport_accounting_for_non_pi(monkeypatch):
-    # codex/claude scrape a fresh session id every turn, so their meta is rebuilt each
-    # turn and the byte bound can never fire for them — re-measuring them would be a
-    # behavior change with no benefit. hermes/self-hosted stream shapes are unverified.
-    # All of them keep the old transport accounting, stderr included.
+def test_turn_content_bytes_keeps_transport_accounting_for_unknown_drivers(monkeypatch):
+    # pi/claude/codex now charge session CONTENT (see the driver-specific tests). Only
+    # drivers whose stream shape we have NOT verified (hermes / self-hosted templates)
+    # keep the old raw-transport accounting, stderr included — the safe default.
     out, err = "some stdout", "some stderr"
     expected = len((out + "\n" + err).encode("utf-8"))
 
-    for cmd in (["codex", "exec", "--json"], ["claude", "-p"], ["hermes", "chat"]):
+    for cmd in (["hermes", "chat"], ["some-self-hosted-agent", "run"]):
         assert crc._turn_content_bytes(cmd, out, err) == expected
+
+
+# --- claude / codex session-content accounting (mirror of the pi fix) --------
+# The prod bug that killed pi sessions (charging streaming-delta TRANSPORT to the
+# 250 KB session-byte bound) also hit claude: it reuses a bounded --session-id, so
+# its meta accumulates, and `claude -p --output-format stream-json
+# --include-partial-messages` emits one `stream_event` per token — ~90 KB of
+# transport per turn measured on the prod runner 2026-07-15 (usr_6bb689 rotating at
+# `turns=2 bytes=502874`). Delta frames are transport, never context.
+
+def _claude_stream_lines(*events) -> str:
+    return "\n".join(json.dumps(e) for e in events)
+
+
+def _claude_chatty_stream(reply: str, thinking: str = "", *, tokens: int = 120,
+                          session_id: str = "c-sess-1") -> str:
+    """A ``claude -p --output-format stream-json --include-partial-messages`` stream:
+    a per-token ``stream_event`` delta storm (transport that grows with reply length),
+    then the COMPLETE ``assistant`` message object (the real content that persists in
+    claude's session and is re-sent on the next --resume turn), then the terminal
+    ``result``. The deltas dominate transport; the content stays tiny — that ratio is
+    the whole point."""
+    events: list = [{"type": "system", "subtype": "init", "session_id": session_id}]
+    for i in range(1, tokens + 1):
+        partial = reply[:max(1, len(reply) * i // tokens)]
+        events.append({"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": partial}}})
+    content: list = []
+    if thinking:
+        content.append({"type": "thinking", "thinking": thinking})
+    content.append({"type": "text", "text": reply})
+    events.append({"type": "assistant",
+                   "message": {"role": "assistant", "content": content}})
+    events.append({"type": "result", "subtype": "success",
+                   "result": reply, "session_id": session_id})
+    return _claude_stream_lines(*events)
+
+
+def test_turn_content_bytes_excludes_claude_delta_frames(monkeypatch):
+    raw = _claude_chatty_stream("好的，我记住了", thinking="用户在说他的猫")
+
+    counted = crc._turn_content_bytes(["claude", "-p", "--output-format", "stream-json"], raw)
+
+    # the per-token stream_event deltas dominate transport and must NOT be charged
+    assert counted < len(raw.encode("utf-8")) / 20
+    # but the assistant content itself (text + thinking) IS charged
+    assert counted > len("好的，我记住了用户在说他的猫".encode("utf-8"))
+
+
+def test_turn_content_bytes_charges_claude_tool_calls_and_results(monkeypatch):
+    # tool_use blocks + tool_result user messages are re-sent to the model every
+    # subsequent --resume turn, so they must be charged or the bound never fires.
+    big_tool_output = "x" * 50_000
+    raw = _claude_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "c1"},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "我查一下"},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "big.log"}}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": big_tool_output}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "找到了"}]}},
+        {"type": "result", "subtype": "success", "result": "找到了", "session_id": "c1"},
+    )
+
+    counted = crc._turn_content_bytes(["claude", "-p"], raw)
+
+    assert counted > 50_000, "claude tool output not charged — the byte bound cannot fire"
+
+
+def test_turn_content_bytes_does_not_charge_claude_image_pixels(monkeypatch):
+    # An Anthropic image block carries inline base64 pixels
+    # ({type:image, source:{type:base64, data:<base64>}}) — a 1 MB photo is ~1.4 MB of
+    # base64 but only ~1-2k tokens of context. Charging it would rotate on every image.
+    photo_b64 = "A" * 1_400_000
+    raw = _claude_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "c1"},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64",
+                                          "media_type": "image/jpeg", "data": photo_b64}},
+            {"type": "text", "text": "这是我的猫"}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "好可爱"}]}},
+        {"type": "result", "subtype": "success", "result": "好可爱", "session_id": "c1"},
+    )
+
+    counted = crc._turn_content_bytes(["claude", "-p"], raw)
+
+    assert counted < 10_000, "image base64 charged as context — one photo kills the session"
+    assert counted < crc.AGENT_SESSION_MAX_BYTES / 10
+
+
+def test_turn_content_bytes_claude_json_single_object_falls_back_to_transport(monkeypatch):
+    # The NON-thinking default builder (_default_cli_cmd) runs claude with no
+    # --output-format, which _prepare_cli_command forces to `json` — a SINGLE result
+    # object with no assistant/user stream messages. Charging 0 there would let a
+    # resumed json-mode session ignore AGENT_SESSION_MAX_BYTES entirely, so when no
+    # stream message content is found we fall back to transport accounting.
+    single = json.dumps({"type": "result", "subtype": "success",
+                         "result": "你好呀", "session_id": "c1",
+                         "usage": {"input_tokens": 1200, "output_tokens": 40}})
+
+    counted = crc._turn_content_bytes(["claude", "-p", "--output-format", "json"], single, "")
+
+    assert counted == len((single + "\n").encode("utf-8"))
+
+
+def _codex_stream_lines(*events) -> str:
+    return "\n".join(json.dumps(e) for e in events)
+
+
+def test_turn_content_bytes_charges_codex_message_and_tool_content(monkeypatch):
+    # codex exec --json (0.142 flat protocol): agent_message / agent_reasoning /
+    # command output are the context that would be re-sent if the session accumulated.
+    # A big command output MUST be charged so the bound can fire.
+    big_output = "y" * 50_000
+    raw = _codex_stream_lines(
+        {"type": "session.created", "session_id": "cx1"},
+        {"type": "agent_reasoning", "text": "先看日志"},
+        {"type": "item.completed", "item": {"type": "command_execution",
+                                            "aggregated_output": big_output}},
+        {"type": "agent_message", "message": "找到了"},
+        {"type": "token_count", "info": {"input_tokens": 1200, "output_tokens": 40}},
+    )
+
+    counted = crc._turn_content_bytes(["codex", "exec", "--json"], raw)
+
+    assert counted > 50_000, "codex tool output not charged — the byte bound cannot fire"
+    # the tiny token_count / session events are noise and must not dominate
+    assert counted < len(raw.encode("utf-8")) + 1_000
 
 
 def test_call_agent_cli_pi_charges_session_content_not_transport(monkeypatch, tmp_path):
@@ -4797,6 +5008,37 @@ def test_call_agent_cli_pi_session_survives_many_turns(monkeypatch, tmp_path):
         assert sid == first_sid, "session rotated early — byte accounting regressed"
 
     assert crc._load_agent_session_meta(check_bounds=False)["turns"] == 10
+
+
+def test_call_agent_cli_claude_session_survives_many_turns(monkeypatch, tmp_path):
+    # Prod bug (2026-07-15, usr_6bb689 rotating at turns=2 bytes=502874): claude reuses
+    # its bounded --session-id so meta accumulates, but received_bytes was fed the raw
+    # stream-json transport (~90 KB of per-token deltas/turn), blowing the 250 KB cap
+    # every 2 turns → cold cache + a 26 KB transcript re-injected every couple turns.
+    # With content accounting the session must live to its turns bound.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_claude_longlived")
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_BYTES", 250_000)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_TURNS", 24)
+    raw = _claude_chatty_stream("嗯", session_id="c-longlived")
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        "claude -p --output-format stream-json --include-partial-messages --session-id {session_id}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=""))
+
+    transport_len = len(raw.encode("utf-8"))
+    first_sid = None
+    for _ in range(10):
+        crc.call_agent_cli("在吗")
+        sid = crc._load_agent_session_id()
+        first_sid = first_sid or sid
+        assert sid == first_sid, "claude session rotated early — byte accounting regressed"
+
+    meta = crc._load_agent_session_meta(check_bounds=False)
+    assert meta["turns"] == 10
+    # 10 turns of content still nowhere near ONE turn of transport
+    assert meta["bytes"] < transport_len
 
 
 def test_call_agent_cli_pi_folds_thinking_and_prefers_command_sid(monkeypatch, tmp_path):
@@ -5026,7 +5268,7 @@ def test_call_agent_cli_pi_marks_session_bridged_after_injected_turn(monkeypatch
     # A successful foreground turn that actually carried a transcript closes the
     # bridge debt for this session — the next turn rides pi's native continuity.
     _pi_cli_env(monkeypatch, tmp_path, "usr_pi_mark")
-    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
 
     assert crc.call_agent_cli(injected) == "ok"
     assert crc._agent_session_is_bridged() is True
@@ -5052,7 +5294,7 @@ def test_call_agent_cli_pi_failed_turn_does_not_mark_bridged(monkeypatch, tmp_pa
     # test_call_agent_cli_pi_api_error_turn_does_not_mark_bridged below for pi's
     # actual routine failure shape (rc=0, no assistant reply).
     _pi_cli_env(monkeypatch, tmp_path, "usr_pi_fail", returncode=1, stdout="")
-    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
 
     with pytest.raises(RuntimeError):
         crc.call_agent_cli(injected)
@@ -5089,7 +5331,7 @@ def test_call_agent_cli_pi_api_error_turn_does_not_mark_bridged(monkeypatch, tmp
         monkeypatch, tmp_path, "usr_pi_api_fail",
         returncode=0, stdout=_pi_stream_lines(_PI_HEADER),
     )
-    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
 
     with pytest.raises(RuntimeError, match="pi agent produced no reply"):
         crc.call_agent_cli(injected)
@@ -5581,7 +5823,7 @@ def test_claude_resume_skipped_when_transcript_was_injected(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
     cmd = crc._prepare_cli_command(injected)
 
     assert "--resume" not in cmd
@@ -5829,3 +6071,369 @@ def test_resident_jobs_defer_flag_resets_every_batch_even_without_proactive(monk
         [{"job_id": "d1", "ts": 333.0, "source": "memory_dream"}]
     ) == pytest.approx(333.0)
     assert crc._resident_jobs_deferred_for_user is False
+
+
+# ---------------------------------------------------------------------------
+# CLI subprocess hardening: UTF-8 streams + stable Windows cwd. Windows
+# self-hosters hit two failures the POSIX fleet never sees: the consumer's cwd drifting to
+# System32 (claude exits 1 there) and locale (GBK) decoding of the CLI's
+# UTF-8 output crashing the turn.
+# ---------------------------------------------------------------------------
+
+
+def _reset_cli_cwd_cache(monkeypatch):
+    monkeypatch.setattr(crc, "_agent_cli_cwd_cache", crc._AGENT_CLI_CWD_UNSET)
+    monkeypatch.setattr(crc, "_agent_cli_cwd_error", "")
+
+
+def test_agent_cli_cwd_posix_default_inherits(monkeypatch):
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.delenv("FEEDLING_AGENT_CLI_CWD", raising=False)
+    monkeypatch.setattr(crc, "_IS_WINDOWS", False)
+    assert crc._agent_cli_cwd() is None
+
+
+def test_agent_cli_cwd_env_override_creates_dir_and_wins(monkeypatch, tmp_path):
+    _reset_cli_cwd_cache(monkeypatch)
+    target = tmp_path / "custom" / "agent-home"
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(target))
+    assert crc._agent_cli_cwd() == str(target.resolve())
+    assert target.is_dir()
+
+
+def test_agent_cli_cwd_windows_defaults_to_localappdata(monkeypatch, tmp_path):
+    # Default deliberately lives OUTSIDE the repo: an untracked dir inside the
+    # repo would make _git_tree_dirty() refuse self-updates forever.
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.delenv("FEEDLING_AGENT_CLI_CWD", raising=False)
+    monkeypatch.setattr(crc, "_IS_WINDOWS", True)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    out = crc._agent_cli_cwd()
+    assert out == str((tmp_path / "LocalAppData" / "Feedling" / "agent-home").resolve())
+    assert Path(out).is_dir()
+
+
+def test_agent_cli_cwd_windows_without_localappdata_uses_home(monkeypatch, tmp_path):
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.delenv("FEEDLING_AGENT_CLI_CWD", raising=False)
+    monkeypatch.setattr(crc, "_IS_WINDOWS", True)
+    monkeypatch.setenv("LOCALAPPDATA", "")
+    monkeypatch.setattr(crc.Path, "home", lambda: tmp_path)
+    assert crc._agent_cli_cwd() == str((tmp_path / ".feedling" / "agent-home").resolve())
+
+
+def test_agent_cli_cwd_unusable_override_fails_the_turn(monkeypatch, tmp_path):
+    # An explicit override that cannot be created is a config error: the turn
+    # must fail with an actionable message, NOT silently inherit the
+    # consumer's cwd — on Windows that inherited cwd (System32) is the exact
+    # failure this feature exists to fix.
+    _reset_cli_cwd_cache(monkeypatch)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(blocker / "nested"))
+    _generic_cli_env(monkeypatch)
+
+    assert crc._agent_cli_cwd() is None
+    with pytest.raises(RuntimeError, match="FEEDLING_AGENT_CLI_CWD"):
+        crc.call_agent_cli("hi")
+
+
+def test_agent_cli_cwd_windows_localappdata_failure_falls_back_to_home(monkeypatch, tmp_path):
+    # The automatic Windows default probes %LOCALAPPDATA% first and the home
+    # dir second before giving up.
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.delenv("FEEDLING_AGENT_CLI_CWD", raising=False)
+    monkeypatch.setattr(crc, "_IS_WINDOWS", True)
+    blocker = tmp_path / "blocked"
+    blocker.write_text("x")
+    monkeypatch.setenv("LOCALAPPDATA", str(blocker / "LocalAppData"))
+    monkeypatch.setattr(crc.Path, "home", lambda: tmp_path)
+
+    assert crc._agent_cli_cwd() == str((tmp_path / ".feedling" / "agent-home").resolve())
+    assert crc._agent_cli_cwd_error == ""
+
+
+def _generic_cli_env(monkeypatch, *, returncode=0, stdout="ok", stderr=""):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
+    monkeypatch.setattr(
+        crc, "_prepare_cli_command",
+        lambda message, image_paths=None, lane="background": ["mycli", "ask", message],
+    )
+    captured = {}
+
+    class _R:
+        pass
+
+    def _run(cmd, **kw):
+        captured.update(kw)
+        captured["cmd"] = cmd
+        r = _R()
+        r.returncode = returncode
+        r.stdout = stdout
+        r.stderr = stderr
+        return r
+
+    monkeypatch.setattr(crc.subprocess, "run", _run)
+    return captured
+
+
+def test_call_agent_cli_pins_utf8_and_inherits_cwd_by_default(monkeypatch):
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.delenv("FEEDLING_AGENT_CLI_CWD", raising=False)
+    monkeypatch.setattr(crc, "_IS_WINDOWS", False)
+    captured = _generic_cli_env(monkeypatch)
+
+    crc.call_agent_cli("你好")
+
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
+    assert "cwd" not in captured
+    assert "你好" in captured["cmd"]
+
+
+def test_call_agent_cli_uses_configured_cwd(monkeypatch, tmp_path):
+    _reset_cli_cwd_cache(monkeypatch)
+    home = tmp_path / "agent-home"
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(home))
+    captured = _generic_cli_env(monkeypatch)
+
+    crc.call_agent_cli("hi")
+
+    assert captured["cwd"] == str(home)
+
+
+def test_call_agent_cli_pi_stdin_is_utf8(monkeypatch, tmp_path):
+    # pi feeds the message via stdin; encoding= must govern that stream too so
+    # Chinese/emoji survive a GBK-locale Windows host, and the message must
+    # stay out of argv.
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.delenv("FEEDLING_AGENT_CLI_CWD", raising=False)
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_utf8")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    captured = {}
+
+    def _run(cmd, **kw):
+        captured.update(kw)
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=_PI_OK_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", _run)
+
+    assert crc.call_agent_cli("你好🌙") == "ok"
+
+    assert captured["input"] == "你好🌙"
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
+    assert "你好🌙" not in captured["cmd"]
+
+
+def test_cli_decode_replacements_warned_not_silent(monkeypatch, caplog):
+    # errors="replace" keeps the turn alive, but the loss must be visible: a
+    # warning with counts only (never the decoded payload itself).
+    _reset_cli_cwd_cache(monkeypatch)
+    _generic_cli_env(monkeypatch, returncode=2, stdout="坏�字�", stderr="")
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError):
+            crc.call_agent_cli("hi")
+
+    assert "UTF-8 decode replacements" in caplog.text
+    assert "count=2" in caplog.text
+    assert "坏" not in caplog.text
+
+
+def test_env_cwd_change_rotates_stored_session_once(monkeypatch, tmp_path):
+    # claude keys its session store to the cwd, and a failed --resume is not
+    # auto-cleared — without rotation the background lane would retry a dead
+    # sid forever after an operator flips FEEDLING_AGENT_CLI_CWD.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_cwd_rotate")
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.delenv("FEEDLING_AGENT_CLI_CWD", raising=False)
+    monkeypatch.setattr(crc, "_IS_WINDOWS", False)
+
+    crc._save_agent_session_id("sess_posix")  # stamped cli_cwd=None
+
+    # Operator sets an override and restarts the consumer.
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(tmp_path / "agent-home"))
+
+    assert crc._load_agent_session_id() == ""  # rotated exactly once
+
+    # A session created under the new cwd survives reloads.
+    crc._save_agent_session_id("sess_new")
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    assert crc._load_agent_session_id() == "sess_new"
+
+
+def test_legacy_meta_without_cli_cwd_survives_on_posix_default(monkeypatch, tmp_path):
+    # The whole fleet's existing session files predate the cli_cwd field; on
+    # the unchanged POSIX default (no cwd) they must keep resuming untouched.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_cwd_legacy")
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.delenv("FEEDLING_AGENT_CLI_CWD", raising=False)
+    monkeypatch.setattr(crc, "_IS_WINDOWS", False)
+
+    f = crc._agent_session_file_for_user()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(
+        json.dumps({"session_id": "sess_old", "turns": 3, "bytes": 10}),
+        encoding="utf-8",
+    )
+
+    assert crc._load_agent_session_id() == "sess_old"
+
+
+def test_legacy_plain_sid_file_rotates_when_cwd_now_set(monkeypatch, tmp_path):
+    # A bare-sid file has unknown provenance: once a cwd is in force it cannot
+    # be trusted to resume, so it rotates instead of wedging.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_cwd_plain")
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(tmp_path / "agent-home"))
+
+    f = crc._agent_session_file_for_user()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("sess_plain", encoding="utf-8")
+
+    assert crc._load_agent_session_id() == ""
+
+def test_http_mode_sessions_are_never_cwd_rotated(monkeypatch, tmp_path):
+    # Session meta is shared by both transports, but cwd is a CLI-only
+    # concept: a Windows HTTP user upgrading into the new default CLI dir
+    # must not lose their server-side session.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_http_keep")
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(tmp_path / "agent-home"))
+
+    f = crc._agent_session_file_for_user()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({"session_id": "http-existing", "turns": 5}), encoding="utf-8")
+
+    assert crc._load_agent_session_id() == "http-existing"
+
+
+def test_relative_cwd_override_is_canonicalized_and_parent_change_rotates(monkeypatch, tmp_path):
+    # A relative FEEDLING_AGENT_CLI_CWD stored verbatim would compare equal
+    # across consumer restarts from different parent dirs while resolving to
+    # different real directories — the old sid would survive under the wrong
+    # claude project. Canonicalization makes the parent change visible.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_cwd_rel")
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", "agent-home")
+
+    parent_a = tmp_path / "deploy-a"
+    parent_b = tmp_path / "deploy-b"
+    parent_a.mkdir()
+    parent_b.mkdir()
+
+    monkeypatch.chdir(parent_a)
+    _reset_cli_cwd_cache(monkeypatch)
+    assert crc._agent_cli_cwd() == str((parent_a / "agent-home").resolve())
+    crc._save_agent_session_id("sess_rel")
+
+    # Same env, service restarted from a different parent directory.
+    monkeypatch.chdir(parent_b)
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    _reset_cli_cwd_cache(monkeypatch)
+
+    assert crc._agent_cli_cwd() == str((parent_b / "agent-home").resolve())
+    assert crc._load_agent_session_id() == ""  # rotated, not resumed
+
+
+def test_prepare_cli_command_drops_resume_after_cwd_rotation(monkeypatch, tmp_path):
+    # Full chain: the sid recorded under the old cwd must not surface as
+    # --resume in the next prepared command.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_cwd_chain")
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p --output-format json "{message}"')
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.delenv("FEEDLING_AGENT_CLI_CWD", raising=False)
+    monkeypatch.setattr(crc, "_IS_WINDOWS", False)
+
+    crc._save_agent_session_id("sess_old_cwd")
+
+    # Positive control: with the cwd unchanged the sid IS injected — so the
+    # empty assertion below can only come from the rotation, not from the
+    # injection path being inert.
+    control = crc._prepare_cli_command("hello")
+    assert "--resume" in control and "sess_old_cwd" in control
+
+    _reset_cli_cwd_cache(monkeypatch)
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(tmp_path / "agent-home"))
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+
+    cmd = crc._prepare_cli_command("hello")
+
+    assert "--resume" not in cmd
+    assert "sess_old_cwd" not in cmd
+
+
+def test_cwd_resolution_failure_preserves_existing_session(monkeypatch, tmp_path):
+    # A failed resolution is NOT an effective cwd transition. Without the
+    # comparator guard, the load inside _prepare_cli_command rotated the old
+    # sid away BEFORE call_agent_cli raised the config error — so even
+    # reverting the config could not get the session back.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_cwd_err")
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    _reset_cli_cwd_cache(monkeypatch)
+    old_home = tmp_path / "old-home"
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(old_home))
+
+    crc._save_agent_session_id("sess_keep")
+
+    # Operator misconfigures an uncreatable override and restarts.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(blocker / "nested"))
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    _reset_cli_cwd_cache(monkeypatch)
+    _generic_cli_env(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="restart the consumer"):
+        crc.call_agent_cli("hi")
+
+    assert crc._agent_session_file_for_user().exists()
+    assert crc._load_agent_session_id() == "sess_keep"
+
+    # Reverting the config brings the original session back intact.
+    monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(old_home))
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    _reset_cli_cwd_cache(monkeypatch)
+    assert crc._load_agent_session_id() == "sess_keep"
+
+
+def test_foreground_transcript_closed_by_explicit_separator(monkeypatch):
+    # "---" (not a bare blank line) ends the quoted history: weaker
+    # self-hosted models read "\n\n" as another turn boundary inside the
+    # transcript and answer the wrong message.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    now = time.time()
+    hist = [
+        {"role": "user", "content": "昨天的旧消息", "ts": now - 60},
+        {"role": "user", "content": "新消息", "ts": now},
+    ]
+    monkeypatch.setattr(
+        crc, "get_decrypted_history",
+        lambda since, limit=20, include_image_body=True: list(hist),
+    )
+
+    out = crc._foreground_agent_message("新消息", current_ts=now)
+
+    assert "\n---\n新消息" in out
+    assert out.endswith("新消息")
+    assert out.startswith(crc.FOREGROUND_CHAT_CONTEXT_HEADER)
+    assert crc._message_has_injected_history(out)

@@ -2404,27 +2404,6 @@ def _memory_counts_for_cards(cards: list[dict]) -> dict:
     return counts
 
 
-def _ensure_import_memory_floors(
-    cards: list[dict],
-    messages: list[dict],
-    relationship_start: date,
-    floors: dict,
-    language: str = "en",
-) -> list[dict]:
-    counts = _memory_counts_for_cards(cards)
-    story_needed = max(0, int(floors.get("story", 1)) - counts["story"])
-    about_needed = max(0, int(floors.get("about_me", 1)) - counts["about_me"])
-    if story_needed or about_needed:
-        cards = cards + _fallback_memory_cards(
-            messages,
-            relationship_start,
-            story_needed=story_needed,
-            about_needed=about_needed,
-            language=language,
-        )
-    return _sort_memory_cards_newest_first(_dedupe_memory_cards(cards))
-
-
 def _ensure_import_minimum_cards(
     cards: list[dict],
     messages: list[dict],
@@ -2897,19 +2876,132 @@ def _generate_model_api_onboarding_greeting(
     return text[:1200], warnings
 
 
+def _onboarding_greeting_msg_id(user_id: str) -> str:
+    """Stable, per-user greeting message id — the DB-constrained idempotency
+    key. chat_messages' primary key is (user_id, msg_id) and db.chat_append is
+    an upsert on it, so two concurrent appenders (different genesis jobs,
+    different workers) collapse to ONE row no matter who wins; a check-then-
+    insert scan alone cannot guarantee that. Also the envelope ``item_id``, so
+    the AEAD additional-data (owner||v||id) is bound to it AT ENCRYPTION TIME
+    (never assigned after the fact — see the envelope-id/AAD rule)."""
+    return hashlib.sha256(f"onboarding_greeting:{user_id}".encode("utf-8")).hexdigest()[:32]
+
+
+# Per-user in-process serialization of the greeting check+append. The DB upsert
+# key above already makes cross-process races safe (one row); this lock only
+# prevents two threads in the SAME process from both appending to the in-memory
+# ring before either sees the other's row.
+_greeting_append_locks: dict[str, threading.Lock] = {}
+_greeting_append_locks_guard = threading.Lock()
+
+
+def _greeting_append_lock(user_id: str) -> threading.Lock:
+    with _greeting_append_locks_guard:
+        return _greeting_append_locks.setdefault(user_id, threading.Lock())
+
+
+def _mark_introduced_after_greeting(store: UserStore) -> None:
+    # The onboarding greeting IS this user's introduction — record the durable
+    # introduced marker (the same one agent_runtime.introduction dedups on) so
+    # the resident introduction job does not greet again after a route switch.
+    # Only ever called with a DB-confirmed greeting row. Best-effort in the
+    # OTHER direction only: db.set_blob also swallows write failures, so a
+    # missing marker after mark risks one duplicate resident greeting (benign)
+    # — the reverse (marker without a durable greeting) is what must never
+    # happen, and the durable check before this call guarantees that.
+    try:
+        store.mark_introduced()
+        if not store.introduction_done():
+            print(f"[history_import:{store.user_id}] introduced marker did not persist; resident may re-greet once")
+    except Exception as e:  # noqa: BLE001
+        print(f"[history_import:{store.user_id}] mark_introduced after greeting failed: {type(e).__name__}:{str(e)[:160]}")
+
+
+def _onboarding_greeting_msg(store: UserStore, envelope: dict) -> dict:
+    """The greeting's chat-row doc. Mirrors UserStore.append_chat's
+    text-message shape (kept in sync manually) — the greeting bypasses
+    append_chat because its DB write must be first-writer-wins DO NOTHING,
+    not the generic upsert."""
+    msg = {
+        "id": envelope["id"],
+        "role": "openclaw",
+        "ts": time.time(),
+        "source": "model_api",
+        "v": envelope.get("v", 1),
+        "body_ct": envelope["body_ct"],
+        "nonce": envelope["nonce"],
+        "K_user": envelope["K_user"],
+        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "visibility": envelope.get("visibility", "shared"),
+        "owner_user_id": envelope.get("owner_user_id", store.user_id),
+        "content_type": "text",
+        "model_api_kind": "onboarding_greeting",
+    }
+    if envelope.get("K_enclave") is not None:
+        msg["K_enclave"] = envelope["K_enclave"]
+    return msg
+
+
+def _sync_ring_with_greeting(store: UserStore, winner: dict) -> None:
+    """Make this process's in-memory ring agree with the DB winner row —
+    replace by id if present, else append. A loser process's locally-built
+    envelope must never shadow the authoritative ciphertext."""
+    with store.chat_lock:
+        for i, m in enumerate(store.chat_messages):
+            if isinstance(m, dict) and str(m.get("id") or "") == str(winner.get("id") or ""):
+                store.chat_messages[i] = dict(winner)
+                return
+        store.chat_messages.append(dict(winner))
+
+
 def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
-    envelope, err = core_envelope._build_shared_envelope_for_store(store, text.encode("utf-8"))
-    if envelope is None:
-        raise RuntimeError(f"onboarding_greeting_envelope_failed:{err}")
-    row = store.append_chat(
-        "openclaw",
-        "model_api",
-        envelope,
-        extra={"model_api_kind": "onboarding_greeting"},
-    )
-    store.notify_chat_waiters()
-    boot_gates._log_bootstrap_event(store, "model_api_onboarding_greeting_written", success=True)
-    return row
+    # Exactly one onboarding greeting per user, across genesis job re-runs
+    # (crash between append and job-complete → the app re-POSTs the same
+    # client_job_id and the whole job re-executes) AND across concurrent jobs
+    # (two client_job_ids; the active-job lock is (user_id, job_id)-grained).
+    # introduced_at cannot serve as this idempotency key — it guards the
+    # resident introduction job, and a lost marker write must not permit a
+    # second greeting row. Layers, outermost first: a per-user in-process lock
+    # (ring hygiene), then the FIRST-WRITER-WINS insert on the stable msg_id
+    # (db.chat_insert_onboarding_greeting_once — the authoritative,
+    # cross-process guard; both the insert and the precheck RAISE on DB
+    # failure, never collapsing "could not look" into "absent"). Whatever this
+    # call built locally, the DB winner row is the only truth returned.
+    with _greeting_append_lock(store.user_id):
+        existing = db.chat_onboarding_greeting_row(store.user_id)  # raises on DB failure
+        if existing is not None:
+            _sync_ring_with_greeting(store, existing)
+            _mark_introduced_after_greeting(store)
+            return existing
+        msg_id = _onboarding_greeting_msg_id(store.user_id)
+        envelope, err = core_envelope._build_shared_envelope_for_store(
+            store, text.encode("utf-8"), item_id=msg_id,
+        )
+        if envelope is None:
+            raise RuntimeError(f"onboarding_greeting_envelope_failed:{err}")
+        msg = _onboarding_greeting_msg(store, envelope)
+        winner, inserted = db.chat_insert_onboarding_greeting_once(
+            store.user_id, msg_id, msg["ts"], msg,
+        )
+        _sync_ring_with_greeting(store, winner)
+        if inserted:
+            # New-message side effects for the actual inserter only (parity
+            # with append_chat's chokepoint: local waiters, cross-worker wake,
+            # capture cadence). A loser adds no new content — sync only.
+            store.notify_chat_waiters()
+            try:
+                from core import wake_bus
+                wake_bus.notify("chat", store.user_id)
+            except Exception as e:  # noqa: BLE001
+                print(f"[history_import:{store.user_id}] greeting wake notify failed: {type(e).__name__}")
+            try:
+                from proactive import capture_scheduler
+                capture_scheduler.record_chat_append(store, winner)
+            except Exception as e:  # noqa: BLE001
+                print(f"[history_import:{store.user_id}] greeting capture record failed: {type(e).__name__}")
+            boot_gates._log_bootstrap_event(store, "model_api_onboarding_greeting_written", success=True)
+        _mark_introduced_after_greeting(store)
+        return winner
 
 
 def _process_history_import_sync(
@@ -2950,7 +3042,6 @@ def _process_history_import_sync(
     if relationship_start is None:
         raise ValueError(rel_err)
     days = max(0, (date.today() - relationship_start).days)
-    floors = memory_service._per_tab_floors_for_days(days)
     profile = _history_import_profile(
         history_messages,
         support_messages,
@@ -3007,7 +3098,6 @@ def _process_history_import_sync(
         "import_language": language,
         "relationship_started_at": relationship_start.isoformat(),
         "relationship_days": days,
-        "floors": floors,
         "import_targets": import_targets,
         "history_profile": profile,
         "history_tier": profile["tier"],

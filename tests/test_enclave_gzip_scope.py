@@ -101,4 +101,5 @@ def test_small_json_below_threshold_not_compressed(client):
     r = client.get("/healthz", headers={"Accept-Encoding": "gzip"})
     assert r.status_code == 200
     assert r.headers.get("content-encoding") is None
-    assert r.get_json() == {"ok": True, "ready": True}
+    body = r.get_json()
+    assert body["ok"] is True and body["ready"] is True

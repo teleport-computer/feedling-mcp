@@ -1418,9 +1418,17 @@ def main() -> int:
                                         child = sup.children.get(uid)
                                         entry = dict(child["entry"]) if child else None
                                     if entry is not None:
-                                        # Spawn-time introduction can be skipped before
-                                        # verify_loop marks first_chat_ok_at. Retry once
-                                        # right after the gate opens, using a fresh token.
+                                        # Recovery retry, NOT the primary greeting path
+                                        # (that is verify_loop's chat_loop_verified
+                                        # fast-path in chat.chat_core; verify pings never
+                                        # set first_chat_ok_at, so for a brand-new user
+                                        # the activation gate is still closed here and
+                                        # this call no-ops). It exists for the cases the
+                                        # spawn-time attempt cannot cover: the user
+                                        # chatted during the verify window, a returning
+                                        # user whose first_chat_ok_at predates this
+                                        # supervisor, or a transient identity/enclave
+                                        # failure at spawn that has since recovered.
                                         entry["runtime_token"] = mint_token(uid)
                                         sup._enqueue_introduction(uid, entry)
                             finally:

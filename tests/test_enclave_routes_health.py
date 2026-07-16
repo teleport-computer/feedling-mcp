@@ -22,7 +22,25 @@ def client(monkeypatch):
 def test_healthz_ready(client):
     r = client.get("/healthz")
     assert r.status_code == 200
-    assert r.get_json() == {"ok": True, "ready": True}
+    body = r.get_json()
+    # Legacy fields preserved.
+    assert body["ok"] is True and body["ready"] is True
+    assert body["error"] is None
+    # New additive fields.
+    assert body["status"] == "healthy"
+    assert body["tls_enabled"] is False  # fixture leaves TLS off
+    assert body["phase"] == 1
+    assert set(body["release"]) >= {"git_commit", "image_digest", "built_at"}
+    assert "uptime_s" in body and "booted_at" in body
+
+
+def test_healthz_ready_tls_sets_phase3_and_uptime(monkeypatch, client):
+    monkeypatch.setitem(enclave_state._state, "tls_enabled", True)
+    monkeypatch.setitem(enclave_state._state, "booted_at", 123.0)
+    body = client.get("/healthz").get_json()
+    assert body["tls_enabled"] is True
+    assert body["phase"] == 3
+    assert isinstance(body["uptime_s"], (int, float))
 
 
 def test_healthz_not_ready(monkeypatch, client):
@@ -30,7 +48,10 @@ def test_healthz_not_ready(monkeypatch, client):
     monkeypatch.setitem(enclave_state._state, "error", "boom")
     r = client.get("/healthz")
     assert r.status_code == 503
-    assert r.get_json() == {"ok": False, "ready": False, "error": "boom"}
+    body = r.get_json()
+    assert body["ok"] is False and body["ready"] is False
+    assert body["status"] == "unhealthy"
+    assert body["error"] == "boom"
 
 
 def test_attestation_shape_and_cache_header(monkeypatch, client):

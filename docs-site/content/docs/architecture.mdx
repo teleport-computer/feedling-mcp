@@ -180,12 +180,20 @@ policy, secret distribution, backups, monitoring, and incident response.
 
 ## Health and capability readiness
 
-`GET /healthz` currently proves that the API process can answer an HTTP request.
-It does not query PostgreSQL, complete an enclave decrypt, verify a live runner,
-call a model provider, test object storage, start the screen WebSocket, or
-deliver a push notification.
+`GET /healthz` returns a structured liveness and dependency snapshot. It carries
+a top-level `status` of `healthy`, `degraded`, or `unhealthy`, a `checks` object
+with per-component detail, and release/uptime metadata. The backend probe checks
+its own critical dependencies: it runs a short `SELECT 1` against PostgreSQL
+(failure, or a saturated connection pool that cannot hand out a connection in
+time, returns HTTP 503), and reports connection-pool utilization, the in-memory
+user registry size, and the cross-worker wake-bus listener. The enclave probe
+reports readiness, release, and TLS posture from cached boot state without doing
+any cryptography. A `degraded` result still returns HTTP 200.
 
-Readiness should therefore be evaluated per enabled capability:
+`/healthz` still does not, by itself, complete an enclave decrypt, verify a live
+runner, call a model provider, test object storage, start the screen WebSocket,
+or deliver a push notification. Readiness for those must be evaluated per
+enabled capability:
 
 | Capability | Minimum end-to-end readiness evidence |
 | --- | --- |
@@ -197,7 +205,9 @@ Readiness should therefore be evaluated per enabled capability:
 
 There is no single public `/readyz` endpoint that proves all of these
 dependencies. Operators should compose synthetic, non-production probes for the
-capabilities they enable and keep `/healthz` as a lightweight liveness signal.
+capabilities they enable; `/healthz` covers the backend's own critical
+dependencies (process, PostgreSQL, pool, registry, wake bus) but not the
+capability-level checks above.
 
 ## Security boundary summary
 

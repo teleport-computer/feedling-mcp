@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from fastapi import APIRouter
 from starlette.responses import JSONResponse, Response
@@ -12,14 +13,43 @@ from enclave import config, state
 router = APIRouter()
 
 
+def _health_body() -> dict:
+    """Liveness + readiness snapshot, built purely from the in-memory ``_state``.
+
+    The enclave is single-threaded and reentrancy-sensitive, so /healthz does
+    NO crypto and NO backend round-trip — every field here is a plain read of
+    the attestation/bootstrap state cached at process start. Backward compatible:
+    ``ok`` / ``ready`` / ``error`` keep their old meaning; ``status`` /
+    ``release`` / ``uptime_s`` / ``tls_enabled`` / ``phase`` are additive so an
+    external heartbeat can see build + TLS posture without hitting /attestation.
+    """
+    st = state._state
+    ready = bool(st["ready"])
+    booted = st.get("booted_at")
+    uptime = round(time.time() - booted, 1) if booted else None
+    return {
+        "ok": ready,
+        "ready": ready,
+        "status": "healthy" if ready else "unhealthy",
+        # Just the identity triplet — the full RELEASE (build/compose URLs) stays
+        # on /attestation. Keeps /healthz small and parallel to the backend.
+        "release": {
+            "git_commit": config.RELEASE.get("git_commit"),
+            "image_digest": config.RELEASE.get("image_digest"),
+            "built_at": config.RELEASE.get("built_at"),
+        },
+        "uptime_s": uptime,
+        "booted_at": booted,
+        "tls_enabled": st["tls_enabled"],
+        "phase": 3 if st["tls_enabled"] else 1,
+        "error": st["error"],
+    }
+
+
 @router.api_route("/healthz", methods=["GET", "HEAD"])
 async def healthz():
-    if state._state["ready"]:
-        return JSONResponse({"ok": True, "ready": True})
-    return JSONResponse(
-        {"ok": False, "ready": False, "error": state._state["error"]},
-        status_code=503,
-    )
+    body = _health_body()
+    return JSONResponse(body, status_code=200 if body["ready"] else 503)
 
 
 @router.api_route("/attestation", methods=["GET", "HEAD"])

@@ -343,6 +343,15 @@ VERIFY_PROBE_MESSAGE = os.environ.get("VERIFY_PROBE_MESSAGE", "（连接自检�
 VERIFY_PROBE_TIMEOUT_SEC = float(os.environ.get("VERIFY_PROBE_TIMEOUT_SEC", "20"))
 SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", True)
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
+# Enclave decrypt-fetch resilience. The enclave is a single-threaded decrypt proxy
+# shared by every user + the main backend; under load it intermittently maps a
+# reentrant dependency failure to HTTP 502/503. A foreground poll that hits one used
+# to skip the WHOLE cycle ("all decrypt sources failed"), deferring the waiting user
+# message to the next 30 s+ cycle — the mechanism behind prod's 6-13 min reply tails.
+# Retry transient failures in-cycle with a short bounded backoff instead.
+ENCLAVE_FETCH_MAX_ATTEMPTS = max(1, int(os.environ.get("FEEDLING_ENCLAVE_FETCH_ATTEMPTS", "3")))
+ENCLAVE_FETCH_BACKOFF_SEC = float(os.environ.get("FEEDLING_ENCLAVE_FETCH_BACKOFF_SEC", "0.5"))
+_RETRYABLE_ENCLAVE_STATUS = frozenset({429, 502, 503, 504})
 WHOAMI_STARTUP_RETRIES = int(os.environ.get("WHOAMI_STARTUP_RETRIES", "8"))
 WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
     os.environ.get("WHOAMI_STARTUP_RETRY_DELAY_SEC", "5")
@@ -395,10 +404,11 @@ _ERROR_CLASS_RULES = (
     ("quota_insufficient", "user_provider",
      "模型服务额度不足，充值后再发消息即可恢复。",
      re.compile(r"余额|额度|insufficient_quota|credit balance|requires more credits"
-                r"|payment required|\b402\b|quota", re.I)),
+                r"|payment required|\b402\b|provider_http_402|quota", re.I)),
     ("auth_invalid", "user_provider",
      "API Key 无效或已过期，请到设置里重新保存。",
-     re.compile(r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b", re.I)),
+     re.compile(r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b"
+                r"|provider_http_40[13]", re.I)),
     ("model_not_found", "user_provider",
      "模型名不可用，请检查设置里的模型名。",
      re.compile(r"invalid model name|model_not_found|no such model", re.I)),
@@ -415,10 +425,11 @@ _ERROR_CLASS_RULES = (
      re.compile(r"content_filter|content policy|safety|blocked by", re.I)),
     ("rate_limited", "provider_transient",
      "模型服务限流了，稍等几分钟再试。",
-     re.compile(r"\b429\b|too many requests|rate.?limit", re.I)),
+     re.compile(r"\b429\b|provider_http_429|too many requests|rate.?limit", re.I)),
     ("upstream_unavailable", "provider_transient",
      "你的模型服务暂时不可用，稍后会自动恢复。",
-     re.compile(r"\b5\d{2}\b|overloaded|timed? ?out|connection (refused|reset|error)"
+     re.compile(r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out"
+                r"|connection (refused|reset|error)"
                 r"|unreachable|stream disconnected", re.I)),
 )
 
@@ -1286,31 +1297,59 @@ def _fetch_from_enclave(
     params: dict = {"limit": limit, "since": since}
     if not include_image_body:
         params["include_image_body"] = "false"
-    try:
-        resp = _ENCLAVE_CLIENT.get(
-            f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-            params=params,
-            headers=_HEADERS,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        msgs = data.get("messages") or data.get("history") or []
-        return _filter_since(msgs, since)
-    except httpx.HTTPStatusError as e:
-        # The enclave maps transient dependency failures to self-describing
-        # codes (502 backend_unreachable / 503 key_derivation_unavailable).
-        # httpx's str(e) carries the status + URL but NOT the body, so log the
-        # body explicitly — it's the only field that tells the operator WHICH
-        # dependency broke without shelling into the CVM.
-        body = (e.response.text or "").strip().replace("\n", " ")[:300]
-        log.warning(
-            "enclave history fetch failed: HTTP %d — %s",
-            e.response.status_code, body or "(empty body)",
-        )
-        return None
-    except Exception as e:
-        log.warning("enclave history fetch failed: %s", e)
-        return None
+    for attempt in range(ENCLAVE_FETCH_MAX_ATTEMPTS):
+        last = attempt == ENCLAVE_FETCH_MAX_ATTEMPTS - 1
+        try:
+            resp = _ENCLAVE_CLIENT.get(
+                f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
+                params=params,
+                headers=_HEADERS,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            msgs = data.get("messages") or data.get("history") or []
+            return _filter_since(msgs, since)
+        except httpx.HTTPStatusError as e:
+            # The enclave maps transient dependency failures to self-describing
+            # codes (502 backend_unreachable / 503 key_derivation_unavailable).
+            # httpx's str(e) carries the status + URL but NOT the body, so log the
+            # body explicitly — it's the only field that tells the operator WHICH
+            # dependency broke without shelling into the CVM.
+            status = e.response.status_code
+            body = (e.response.text or "").strip().replace("\n", " ")[:300]
+            if status in _RETRYABLE_ENCLAVE_STATUS and not last:
+                delay = ENCLAVE_FETCH_BACKOFF_SEC * (2 ** attempt)
+                log.warning(
+                    "enclave history fetch HTTP %d (attempt %d/%d) — retrying in "
+                    "%.1fs: %s",
+                    status, attempt + 1, ENCLAVE_FETCH_MAX_ATTEMPTS, delay,
+                    body or "(empty body)",
+                )
+                time.sleep(delay)
+                continue
+            log.warning(
+                "enclave history fetch failed: HTTP %d — %s",
+                status, body or "(empty body)",
+            )
+            return None
+        except httpx.TransportError as e:
+            # Connection / timeout blips (single-threaded enclave, slow CVM egress)
+            # are transient too — retry rather than skip the whole poll cycle.
+            if not last:
+                delay = ENCLAVE_FETCH_BACKOFF_SEC * (2 ** attempt)
+                log.warning(
+                    "enclave history fetch transient error (attempt %d/%d) — "
+                    "retrying in %.1fs: %s",
+                    attempt + 1, ENCLAVE_FETCH_MAX_ATTEMPTS, delay, e,
+                )
+                time.sleep(delay)
+                continue
+            log.warning("enclave history fetch failed: %s", e)
+            return None
+        except Exception as e:
+            log.warning("enclave history fetch failed: %s", e)
+            return None
+    return None
 
 
 def _verify_decrypt_sources() -> bool:
@@ -3331,6 +3370,82 @@ def call_agent_http(message: str, images: list[dict[str, str]] | None = None, ra
     raise ValueError(f"unknown AGENT_HTTP_PROTOCOL: {AGENT_HTTP_PROTOCOL!r}")
 
 
+# Working directory for CLI agent subprocesses (claude/codex/pi).
+#
+# POSIX default is None — inherit the consumer's cwd. claude keys its on-disk
+# session store to the cwd, so changing it would orphan every stored --resume
+# session on existing deployments. Windows is the exception: a consumer started
+# from Task Scheduler / a service inherits C:\Windows\System32, where the
+# claude CLI exits 1 on every turn, so there the subprocess gets a stable
+# per-user dir OUTSIDE the repo (an untracked dir inside the repo would make
+# _git_tree_dirty() refuse self-updates forever). FEEDLING_AGENT_CLI_CWD
+# overrides on every platform; any change of the effective cwd rotates the
+# stored session id once (see _load_agent_session_meta) because --resume
+# cannot cross cwds. Paths handed to the CLI (images, --mcp-config) must stay
+# absolute for the same reason — the CLI no longer shares the consumer's cwd.
+_AGENT_CLI_CWD_UNSET = object()
+_agent_cli_cwd_cache: Any = _AGENT_CLI_CWD_UNSET
+_agent_cli_cwd_error: str = ""
+# Module-level so tests can exercise the Windows branch: monkeypatching
+# os.name itself makes pathlib refuse to build paths on a POSIX host.
+_IS_WINDOWS = os.name == "nt"
+
+
+def _agent_cli_cwd() -> str | None:
+    global _agent_cli_cwd_cache, _agent_cli_cwd_error
+    if _agent_cli_cwd_cache is _AGENT_CLI_CWD_UNSET:
+        _agent_cli_cwd_cache, _agent_cli_cwd_error = _resolve_agent_cli_cwd()
+    return _agent_cli_cwd_cache
+
+
+def _mkdir_canonical(path: Path) -> str | None:
+    """mkdir -p and return the CANONICAL absolute path, or None if unusable.
+    Canonical matters: a relative FEEDLING_AGENT_CLI_CWD stored verbatim would
+    compare equal across consumer restarts from different parent directories
+    while resolving to different real directories — letting an old sid survive
+    under the wrong claude project."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path.resolve())
+    except Exception as e:  # noqa: BLE001 — candidate probing, caller decides
+        log.warning("agent cli cwd candidate %s unavailable: %s", path, e)
+        return None
+
+
+def _resolve_agent_cli_cwd() -> tuple[str | None, str]:
+    """(cwd, error). error is non-empty when a cwd SHOULD be in force but no
+    usable one exists — that is a hard config/host failure surfaced per turn
+    in call_agent_cli, never a silent fall-back to inheriting: on Windows the
+    inherited cwd (System32) is the exact known-bad path this exists to avoid."""
+    raw = (os.environ.get("FEEDLING_AGENT_CLI_CWD") or "").strip()
+    if raw:
+        resolved = _mkdir_canonical(Path(raw).expanduser())
+        if resolved:
+            return resolved, ""
+        return None, (
+            f"FEEDLING_AGENT_CLI_CWD={raw!r} is not usable (mkdir failed); "
+            "fix or unset it, then restart the consumer — refusing to run "
+            "the agent CLI in an inherited cwd"
+        )
+    if _IS_WINDOWS:
+        local = (os.environ.get("LOCALAPPDATA") or "").strip()
+        candidates = []
+        if local:
+            candidates.append(Path(local) / "Feedling" / "agent-home")
+        candidates.append(Path.home() / ".feedling" / "agent-home")
+        for candidate in candidates:
+            resolved = _mkdir_canonical(candidate)
+            if resolved:
+                return resolved, ""
+        return None, (
+            "no usable agent CLI cwd on Windows (tried "
+            + ", ".join(str(c) for c in candidates)
+            + "); set FEEDLING_AGENT_CLI_CWD to a writable directory, "
+            "then restart the consumer"
+        )
+    return None, ""
+
+
 def _agent_session_file_for_user() -> Path:
     user_id = _agent_session_user_id()
     path = AGENT_SESSION_FILE_TEMPLATE.replace("{user_id}", user_id)
@@ -3349,6 +3464,10 @@ def _empty_agent_session_meta(session_id: str = "") -> dict[str, Any]:
         "bridged": False,
         "created_at": time.time() if session_id else 0.0,
         "updated_at": time.time() if session_id else 0.0,
+        # New sessions are stamped with the cwd they were created under so a
+        # later cwd change (env edit, Windows upgrade picking up the default)
+        # rotates them instead of resuming into a dead session store.
+        "cli_cwd": _agent_cli_cwd(),
     }
 
 
@@ -3360,7 +3479,12 @@ def _coerce_agent_session_meta(raw: Any) -> dict[str, Any]:
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
-            return _empty_agent_session_meta(text)
+            # Legacy plain-sid file: provenance unknown, so no cwd claim — the
+            # sid survives only where the effective cwd is also None (POSIX
+            # default), and rotates once wherever a cwd is now in force.
+            meta = _empty_agent_session_meta(text)
+            meta["cli_cwd"] = None
+            return meta
         return _coerce_agent_session_meta(parsed)
     if not isinstance(raw, dict):
         return _empty_agent_session_meta()
@@ -3373,6 +3497,8 @@ def _coerce_agent_session_meta(raw: Any) -> dict[str, Any]:
         except (TypeError, ValueError):
             meta[key] = 0
     meta["bridged"] = bool(raw.get("bridged"))
+    stored_cwd = raw.get("cli_cwd")
+    meta["cli_cwd"] = stored_cwd.strip() if isinstance(stored_cwd, str) and stored_cwd.strip() else None
     for key in ("created_at", "updated_at"):
         try:
             meta[key] = float(raw.get(key) or meta[key] or 0.0)
@@ -3389,6 +3515,35 @@ def _agent_session_meta_exceeds_bounds(meta: dict[str, Any]) -> bool:
     if AGENT_SESSION_MAX_BYTES > 0 and int(meta.get("bytes") or 0) >= AGENT_SESSION_MAX_BYTES:
         return True
     return False
+
+
+def _agent_session_meta_cwd_changed(meta: dict[str, Any]) -> bool:
+    """True when the sid was recorded under a different CLI cwd than is in
+    force now. claude's session store is keyed by cwd, so such a sid can never
+    be resumed — and a failed --resume is not auto-cleared, so without this
+    check the background lane would retry a dead sid forever. Legacy meta
+    without the field reads as None, which matches the POSIX default (no cwd)
+    and keeps every existing Linux/macOS session untouched.
+
+    cwd is a CLI-transport concept only: HTTP sessions live server-side and
+    share this meta file, so without the AGENT_MODE gate a Windows HTTP user
+    would lose their session the moment the new default CLI dir appears."""
+    if AGENT_MODE != "cli":
+        return False
+    if not str(meta.get("session_id") or "").strip():
+        return False
+    current = _agent_cli_cwd() or None
+    if current is None and _agent_cli_cwd_error:
+        # A failed resolution is NOT an effective cwd transition: rotating
+        # here would destroy the old session BEFORE call_agent_cli raises the
+        # config error, so even reverting the config could not get it back.
+        return False
+    stored = meta.get("cli_cwd") or None
+    if stored and current:
+        # normcase: Windows paths are case-insensitive; identical dirs must
+        # not read as a rotation just because the casing drifted.
+        return os.path.normcase(stored) != os.path.normcase(current)
+    return stored != current
 
 
 def _clear_agent_session_id(reason: str = "") -> None:
@@ -3422,6 +3577,12 @@ def _load_agent_session_meta(*, check_bounds: bool = True) -> dict[str, Any]:
     if check_bounds and _agent_session_meta_exceeds_bounds(meta):
         reason = f"turns={meta.get('turns')} bytes={meta.get('bytes')}"
         _clear_agent_session_id(reason)
+        return _empty_agent_session_meta()
+
+    if check_bounds and _agent_session_meta_cwd_changed(meta):
+        _clear_agent_session_id(
+            f"cli cwd changed {meta.get('cli_cwd')!r} -> {_agent_cli_cwd()!r}"
+        )
         return _empty_agent_session_meta()
 
     sid = str(meta.get("session_id") or "").strip()
@@ -4245,31 +4406,114 @@ def _pi_session_content_bytes(raw: str) -> int:
     return total
 
 
+def _claude_session_content_bytes(raw: str) -> int:
+    """Context bytes a claude turn appends to its resumed ``--session-id`` session.
+
+    ``claude -p --output-format stream-json --include-partial-messages`` emits one
+    ``stream_event`` per token (transport that grows with reply length — the prod
+    bug measured 2026-07-15: usr_6bb689 rotating at ``turns=2 bytes=502874``), any
+    number of COMPLETE ``assistant`` / ``user`` message objects (the real content
+    claude persists and re-sends on the next ``--resume`` turn), then a terminal
+    ``result`` echo. Charge only the message content blocks; skip the per-token
+    ``stream_event`` deltas (transport), the ``result`` echo (a duplicate of the
+    final assistant text), and ``system`` / init noise. Anthropic image blocks carry
+    inline base64 pixels (``{type:image, source:{type:base64, data:<base64>}}``) —
+    charge a flat context-equivalent, never the base64 length (mirror
+    ``_PI_IMAGE_CONTEXT_BYTES``), or one photo blows the whole session budget.
+
+    Over-counting costs a re-ground; under-counting is bounded by the turns cap.
+    """
+    total = 0
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("type") or "").strip() not in ("assistant", "user"):
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if content is None:
+            continue
+        if not isinstance(content, list):
+            total += len(json.dumps(content, ensure_ascii=False).encode("utf-8"))
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                total += _PI_IMAGE_CONTEXT_BYTES
+            else:
+                total += len(json.dumps(block, ensure_ascii=False).encode("utf-8"))
+    return total
+
+
+# codex event types that carry real conversation content (vs. token counters and
+# session banners). Both the 0.136 (``item.completed`` wrappers) and 0.142 (flat
+# ``agent_message`` / ``agent_reasoning``) protocols are covered.
+_CODEX_CONTENT_EVENT_TYPES = frozenset({
+    "agent_message", "agent_reasoning", "reasoning",
+    "item.started", "item.completed", "item.updated",
+})
+
+
+def _codex_session_content_bytes(raw: str) -> int:
+    """Context bytes a codex turn would append to a resumed session.
+
+    codex ``exec --json`` emits discrete item events (no per-token delta storm, so
+    its transport is already close to its content) plus ``token_count`` / session
+    envelopes that are pure noise. Charge the substance — agent messages, reasoning,
+    and completed items (tool calls + their output) — and skip the counters. Image
+    items carry base64 pixels, charged flat like pi/claude. Conservative: over-count
+    rotates a turn early; under-count is bounded by the turns cap.
+    """
+    total = 0
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        etype = str(obj.get("type") or "").strip()
+        if etype not in _CODEX_CONTENT_EVENT_TYPES:
+            continue
+        item = obj.get("item") if isinstance(obj.get("item"), dict) else None
+        item_type = str((item or {}).get("type") or etype).strip()
+        if item_type in ("image", "input_image"):
+            total += _PI_IMAGE_CONTEXT_BYTES
+            continue
+        total += len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+    return total
+
+
 def _turn_content_bytes(cmd: list[str], stdout: str, stderr: str = "") -> int:
     """Bytes this turn adds to the agent's session, for the AGENT_SESSION_MAX_BYTES bound.
 
     That bound exists to rotate a session before its accumulated conversation blows the
     model's context window, so it must be fed the conversation. For a long time it was fed
-    ``len(stdout + stderr)`` instead — the raw CLI transport, which for pi is streaming
-    delta framing (one JSON envelope per token). Measured on the prod runner (2026-07-15,
-    301 rotations over 11h across 79 users): a median 225 KB of transport per turn against
-    a 250 KB cap, so 34% of sessions were destroyed after a SINGLE turn and 70% within two
-    — while the turns bound of 24 never fired once. pi's native --session-id resume was
-    therefore dead code in production, and since pi (unlike codex/claude) skips the
-    per-turn history injection, pi users were talking to a context-free agent every message.
+    ``len(stdout + stderr)`` instead — the raw CLI transport, which for pi AND claude is
+    streaming delta framing (one JSON envelope per token). Measured on the prod runner
+    (2026-07-15): a median 225 KB of transport per pi turn against a 250 KB cap, and claude
+    (which reuses a bounded ``--session-id``, so its meta accumulates) rotating every ~2
+    turns at ``bytes>500 KB`` — cold cache plus a ~26 KB transcript re-injected every couple
+    turns, burning the user's BYOK tokens. The earlier claim that claude "scrapes a fresh
+    session id every turn so the bound can never fire" was simply false in prod.
 
-    Only pi is corrected here. codex and claude scrape a FRESH session id out of every
-    turn's stream, so _record_agent_session_turn rebuilds their meta each turn and their
-    byte counter never accumulates — the bound cannot fire for them and re-measuring them
-    would be a behavior change with no benefit. They and any unknown driver (hermes /
-    self-hosted templates, whose stream shape we have not verified) keep the transport
-    accounting exactly as it was, stderr included."""
-    if _is_pi_cmd(cmd):
-        try:
+    pi, claude and codex now charge session CONTENT (the message blocks re-sent to the
+    model next turn), not transport — see the driver-specific helpers. Any unknown driver
+    (hermes / self-hosted templates, whose stream shape we have not verified) keeps the raw
+    transport accounting, stderr included — the safe default.
+
+    Fallback: the content helpers return 0 when the stream carries no message objects —
+    e.g. claude's ``--output-format json`` path (the non-thinking default builder) emits a
+    single ``result`` object, not ``assistant``/``user`` stream events. Charging 0 there
+    would let a resumed session ignore the byte cap, so a 0 falls back to transport."""
+    transport = len(((stdout or "") + "\n" + (stderr or "")).encode("utf-8"))
+    try:
+        if _is_pi_cmd(cmd):
             return _pi_session_content_bytes(stdout or "")
-        except Exception as e:  # noqa: BLE001 — accounting must never break a turn
-            log.warning("pi session content accounting failed, charging transport: %s", e)
-    return len(((stdout or "") + "\n" + (stderr or "")).encode("utf-8"))
+        if _is_claude_code_cmd(cmd):
+            return _claude_session_content_bytes(stdout or "") or transport
+        if _is_codex_cmd(cmd):
+            return _codex_session_content_bytes(stdout or "") or transport
+    except Exception as e:  # noqa: BLE001 — accounting must never break a turn
+        log.warning("session content accounting failed, charging transport: %s", e)
+    return transport
 
 
 def call_agent_cli(
@@ -4281,6 +4525,14 @@ def call_agent_cli(
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
+
+    # cwd preflight BEFORE any session side effects (_prepare_cli_command may
+    # mint a pi sid): a cwd should be in force but none is usable. Failing the
+    # turn with an actionable message beats silently inheriting the consumer's
+    # cwd, which on Windows is the System32 failure this feature exists to fix.
+    _cli_cwd = _agent_cli_cwd()
+    if _cli_cwd is None and _agent_cli_cwd_error:
+        raise RuntimeError(_agent_cli_cwd_error)
 
     cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
     command_sid = _cli_flag_value(cmd, "--session-id")
@@ -4302,7 +4554,23 @@ def call_agent_cli(
     # the message via STDIN instead — safe for arbitrary user text. An operator
     # template that kept {message} in argv gets an empty stdin so pi never blocks
     # reading it. Non-pi drivers are unchanged (message stays in argv).
-    _run_kwargs: dict = {"capture_output": True, "text": True, "timeout": 120, "env": child_env}
+    # encoding pins all three CLI streams (stdin for pi, stdout/stderr for
+    # everyone) to UTF-8 regardless of locale — Windows otherwise decodes
+    # claude's UTF-8 output with the ANSI code page (GBK on zh-CN) and strict
+    # errors, so one multibyte reply killed the whole turn. errors="replace"
+    # keeps the JSON stream parseable (backslashreplace would inject \xNN
+    # escapes json.loads rejects); replacements are counted and warned after
+    # the run so the loss is never silent.
+    _run_kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 120,
+        "env": child_env,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if _cli_cwd:
+        _run_kwargs["cwd"] = _cli_cwd
     if _is_pi_cmd(cmd):
         _run_kwargs["input"] = message if "{message}" not in AGENT_CLI_CMD else ""
     try:
@@ -4318,6 +4586,14 @@ def call_agent_cli(
         )
         raise
     _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
+    for _stream_name in ("stdout", "stderr"):
+        _repl = (getattr(result, _stream_name, "") or "").count("\ufffd")
+        if _repl:
+            log.warning(
+                "cli output contained UTF-8 decode replacements: driver=%s stream=%s count=%d",
+                "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
+                _stream_name, _repl,
+            )
     _log_cli_turn_timing(cmd, result, _wall_ms)
     _m = _cli_turn_metrics(cmd, result, _wall_ms)
     _trace_turn = AgentTurn()
@@ -4695,7 +4971,11 @@ def _foreground_agent_message(content: str, *, current_ts: float) -> str:
     transcript = _recent_chat_context_for_foreground(before_ts=current_ts)
     if not transcript:
         return content
-    return f"{FOREGROUND_CHAT_CONTEXT_HEADER}\n{transcript}\n\n{content}"
+    # "---" (not a bare blank line) closes the transcript: weaker self-hosted
+    # models read "\n\n" as just another turn boundary inside the quoted
+    # history and answer the wrong message. Nothing parses this marker back —
+    # _message_has_injected_history keys on the header prefix only.
+    return f"{FOREGROUND_CHAT_CONTEXT_HEADER}\n{transcript}\n---\n{content}"
 
 
 def _message_has_injected_history(message: str) -> bool:
@@ -5529,9 +5809,9 @@ def _handle_post_reply_response(resp) -> dict:
             log.error(
                 "chat_response rejected: bootstrap_incomplete stage=%s "
                 "memory_count=%s identity_written=%s — the upstream agent "
-                "skipped Pass 1-3 / Step 5. Have the user re-run "
-                "bootstrap from the start prompt; until then this user's "
-                "Feedling chat is dead-ended.",
+                "hasn't completed onboarding (identity + live chat). Have the "
+                "user re-run onboarding from the start prompt; until then this "
+                "user's Feedling chat is dead-ended.",
                 body.get("stage"),
                 body.get("memory_count"),
                 body.get("identity_written"),

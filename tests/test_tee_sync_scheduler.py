@@ -259,3 +259,31 @@ def test_restore_last_reconcile_swallows_db_errors(monkeypatch):
         raise RuntimeError("db down")
     monkeypatch.setattr(sched.db, "last_tee_reconcile_age_sec", boom)
     assert sched._restore_last_reconcile() is None
+
+
+# --- reconcile completion stamped immediately (alembic 0019 / option B) ------ #
+
+def test_reconcile_success_marked_on_reconcile_tick_only(calls, monkeypatch):
+    """reconcile 成功 → 立刻 mark_reconcile_success(在 replicate 之前),让被回收的
+    worker 也留下「reconcile 已完成」。replicate-only tick(do_reconcile=False)不 mark。"""
+    marks = []
+    monkeypatch.setattr(sched.db, "mark_reconcile_success", lambda: marks.append(1))
+    sched._sync_tick(do_reconcile=True)
+    assert len(marks) == 1            # 本 tick 真 reconcile 了 → 记一次
+    sched._sync_tick(do_reconcile=False)
+    assert len(marks) == 1            # 只 replicate → 不再 mark
+
+
+def test_reconcile_failure_does_not_mark(monkeypatch):
+    """reconcile 抛错 → 绝不 mark（否则跳过重试、坏基线被当成功),下个 tick 会重试。"""
+    marks = []
+    monkeypatch.setattr(sched.db, "mark_reconcile_success", lambda: marks.append(1))
+
+    def fake(*, action, table=None, **kw):
+        if action == "reconcile":
+            raise RuntimeError("gateway eof")
+        return {"ok": True}
+
+    monkeypatch.setattr(tr, "run_action", fake)
+    sched._sync_tick(do_reconcile=True)
+    assert marks == []
