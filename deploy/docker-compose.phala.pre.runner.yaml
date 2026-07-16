@@ -116,6 +116,13 @@ services:
       # queue via FOR UPDATE SKIP LOCKED. Encrypted env channel → tuning needs no
       # on-chain re-auth (unlike adding the service).
       FEEDLING_V2_MAX_WORKERS: "${FEEDLING_V2_MAX_WORKERS:-4}"
+      # Single-image b64 cap for native multimodal injection. Must cover the
+      # base64 length (ceil(n/3)*4 = 2_666_668) of the ingestion cap
+      # MODEL_API_MAX_IMAGE_BYTES=2_000_000 bytes, else 1.5–2.0MB photos are
+      # accepted at send but silently dropped to text-only at the turn ("没收到
+      # 图片"). Matches worker.py's corrected default; explicit here as the deploy
+      # -layer override so the cap is right even if the image lags the compose.
+      FEEDLING_V2_IMAGE_MAX_B64_CHARS: "${FEEDLING_V2_IMAGE_MAX_B64_CHARS:-2700000}"
 
 volumes:
   # Fresh volume name (was feedling_agent_runtime_r0/r1). A new name gives the

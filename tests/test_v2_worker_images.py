@@ -79,3 +79,22 @@ def test_inject_does_not_mutate_the_input_tail():
         tail, user_id="u",
         read_images=_fake_reader({"m1": {"image_mime": "image/jpeg", "image_b64": "AAAA"}}))
     assert tail[0] == original
+
+
+def test_injection_cap_covers_any_image_ingestion_accepts():
+    """Regression: the V2 injection b64 cap must cover the LARGEST image that
+    ingestion accepts, or images in the ~1.5–2.0MB raw dead zone are stored at
+    send time then silently dropped to text-only at turn time — the model then
+    says "没收到图片". The bug was a unit mismatch: ingestion caps RAW BYTES
+    (MODEL_API_MAX_IMAGE_BYTES), injection caps B64 CHARS (~4/3 larger), and both
+    used the literal 2_000_000. worker.py must not import hosted, so the default
+    is a derived hardcode; this cross-module test is what keeps the two in sync."""
+    from hosted.turn import MODEL_API_MAX_IMAGE_BYTES
+
+    # base64 length of N raw bytes is ceil(N/3)*4.
+    max_ingested_b64_len = ((MODEL_API_MAX_IMAGE_BYTES + 2) // 3) * 4
+    assert worker._IMAGE_MAX_B64_CHARS >= max_ingested_b64_len, (
+        f"injection cap {worker._IMAGE_MAX_B64_CHARS} < b64 length "
+        f"{max_ingested_b64_len} of the ingestion cap "
+        f"{MODEL_API_MAX_IMAGE_BYTES} bytes — images in the dead zone are "
+        f"accepted at send but dropped to text-only at the turn")

@@ -156,7 +156,12 @@ if not math.isfinite(_PROMPT_CATCHUP_DEADLINE_SEC) or _PROMPT_CATCHUP_DEADLINE_S
 # tail 里的图片每个回合都要重发，token 成本随图片数线性上升。
 _TAIL_IMAGE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2"))
 # 单张图 b64 上限；超限跳过注入、退化成文本标记（不引入图像缩放依赖）。
-_IMAGE_MAX_B64_CHARS = int(os.environ.get("FEEDLING_V2_IMAGE_MAX_B64_CHARS", "2000000"))
+# 必须 >= 入库上限 hosted/turn.MODEL_API_MAX_IMAGE_BYTES(=2_000_000 原始字节) 的 base64
+# 长度 ceil(n/3)*4 = 2_666_668，否则 1.5–2.0MB 的图入库放行、却在此被丢成纯文本
+# （单位错配死区，模型回「没收到图片」）。worker.py 刻意不 import hosted，故此处以派生值
+# 硬编码（取 2_700_000，略高于 2_666_668 留余量）；跨模块不变量由 test_v2_worker_images
+# .test_injection_cap_covers_any_image_ingestion_accepts 守护。
+_IMAGE_MAX_B64_CHARS = int(os.environ.get("FEEDLING_V2_IMAGE_MAX_B64_CHARS", "2700000"))
 
 # 单个 native tool loop 的 provider 调用硬闸。最后一次调用会禁用
 # tools 来强制收口，使模型无法用无限工具链烧穿用户的 BYOK key。
