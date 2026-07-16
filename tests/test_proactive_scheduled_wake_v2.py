@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from proactive import proactive_core, scheduled_wake_v2, store_v2
 from proactive.controls_v2 import resolve_settings_v2
 from proactive.runtime_v2 import RuntimeSpineV2, TurnOutcomeV2, TurnRunnerV2, WakeEventV2
 from proactive.scheduled_wake_v2 import (
@@ -20,6 +21,17 @@ from proactive.scheduled_wake_v2 import (
 )
 
 
+class _RouteStore:
+    user_id = "u1"
+
+    def __init__(self):
+        self.jobs = []
+
+    def append_proactive_job(self, job):
+        self.jobs.append(job)
+        return job
+
+
 def _service(*, cap: int = 20, claim_ttl: float = 60.0, self_wake_min_lead: float = 300.0):
     store = InMemoryScheduledWakeStoreV2()
     return store, ScheduledWakeServiceV2(
@@ -29,6 +41,19 @@ def _service(*, cap: int = 20, claim_ttl: float = 60.0, self_wake_min_lead: floa
         self_wake_min_lead_sec=self_wake_min_lead,
         owner_id="worker-a",
     )
+
+
+def _patch_scheduled_route(monkeypatch, *, now: float):
+    scheduled_store = InMemoryScheduledWakeStoreV2()
+
+    class _SettingsStore:
+        def load(self, user_id):
+            return resolve_settings_v2({"timezone": "UTC"})
+
+    monkeypatch.setattr(scheduled_wake_v2, "DBScheduledWakeStoreV2", lambda: scheduled_store)
+    monkeypatch.setattr(store_v2, "DBProactiveSettingsStoreV2", lambda: _SettingsStore())
+    monkeypatch.setattr(scheduled_wake_v2.time, "time", lambda: now)
+    return scheduled_store
 
 
 def test_schedule_action_persists_wall_time_timezone_note_and_origin_refs():
@@ -77,6 +102,7 @@ def test_schedule_action_clamps_near_self_wake_to_min_lead():
     result = service.apply_turn_actions(
         "u1",
         [{"type": "schedule_wake", "at": requested, "tz": "UTC"}],
+        self_wake=True,
         now=now,
     )[0]
     record = store.list_records("u1")[0]
@@ -90,10 +116,10 @@ def test_schedule_action_clamps_near_self_wake_to_min_lead():
     assert service.fire_due_timers("u1", settings={}, now=now + 299.0, submit_wake=spine.submit) == ()
 
 
-def test_schedule_action_keeps_future_self_wake_unchanged():
+def test_schedule_action_does_not_clamp_without_self_wake_flag():
     store, service = _service(self_wake_min_lead=300.0)
     now = 1_800_000_000.0
-    requested = datetime.fromtimestamp(now + 600.0, timezone.utc).isoformat()
+    requested = datetime.fromtimestamp(now + 60.0, timezone.utc).isoformat()
 
     result = service.apply_turn_actions(
         "u1",
@@ -104,8 +130,62 @@ def test_schedule_action_keeps_future_self_wake_unchanged():
 
     assert result.status == "scheduled"
     assert result.reason == ""
+    assert record.due_at == now + 60.0
+    assert record.at == datetime.fromtimestamp(now + 60.0, timezone.utc).replace(tzinfo=None).isoformat()
+
+
+def test_schedule_action_keeps_future_self_wake_unchanged():
+    store, service = _service(self_wake_min_lead=300.0)
+    now = 1_800_000_000.0
+    requested = datetime.fromtimestamp(now + 600.0, timezone.utc).isoformat()
+
+    result = service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": requested, "tz": "UTC"}],
+        self_wake=True,
+        now=now,
+    )[0]
+    record = store.list_records("u1")[0]
+
+    assert result.status == "scheduled"
+    assert result.reason == ""
     assert record.due_at == now + 600.0
     assert record.at == datetime.fromtimestamp(now + 600.0, timezone.utc).replace(tzinfo=None).isoformat()
+
+
+def test_scheduled_actions_route_self_wake_payload_controls_min_lead(monkeypatch):
+    now = 1_800_000_000.0
+    scheduled_store = _patch_scheduled_route(monkeypatch, now=now)
+    requested = datetime.fromtimestamp(now + 60.0, timezone.utc).isoformat()
+
+    body, status = proactive_core.scheduled_actions(
+        _RouteStore(),
+        {
+            "actions": [{"type": "schedule_wake", "at": requested, "tz": "UTC"}],
+            "self_wake": True,
+        },
+    )
+
+    record = scheduled_store.list_records("u1")[0]
+    assert status == 200
+    assert body["results"][0]["reason"] == "self_wake_min_lead_clamped"
+    assert record.due_at == now + 300.0
+
+
+def test_scheduled_actions_route_does_not_clamp_without_self_wake(monkeypatch):
+    now = 1_800_000_000.0
+    scheduled_store = _patch_scheduled_route(monkeypatch, now=now)
+    requested = datetime.fromtimestamp(now + 60.0, timezone.utc).isoformat()
+
+    body, status = proactive_core.scheduled_actions(
+        _RouteStore(),
+        {"actions": [{"type": "schedule_wake", "at": requested, "tz": "UTC"}]},
+    )
+
+    record = scheduled_store.list_records("u1")[0]
+    assert status == 200
+    assert "reason" not in body["results"][0]
+    assert record.due_at == now + 60.0
 
 
 def test_pending_cap_eviction_is_reported_and_visible_to_agent():

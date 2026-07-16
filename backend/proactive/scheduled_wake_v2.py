@@ -545,6 +545,7 @@ class ScheduledWakeServiceV2:
         turn_id: str = "",
         wake_ids: Sequence[str] = (),
         origin_refs: Sequence[str] = (),
+        self_wake: bool = False,
         now: float | None = None,
         submit_wake: WakeSubmitterV2 | None = None,
     ) -> tuple[ScheduledWakeActionResultV2, ...]:
@@ -585,6 +586,7 @@ class ScheduledWakeServiceV2:
                     turn_id=turn_id,
                     wake_ids=wake_ids,
                     origin_refs=origin_refs,
+                    self_wake=self_wake,
                     now=now,
                 ))
             else:
@@ -608,6 +610,7 @@ class ScheduledWakeServiceV2:
         turn_id: str,
         wake_ids: Sequence[str],
         origin_refs: Sequence[str],
+        self_wake: bool,
         now: float,
     ) -> ScheduledWakeActionResultV2:
         try:
@@ -616,7 +619,7 @@ class ScheduledWakeServiceV2:
             return ScheduledWakeActionResultV2("schedule_wake", "invalid", reason=str(exc))
         clamped = False
         min_due_at = now + self.self_wake_min_lead_sec
-        if self.self_wake_min_lead_sec > 0 and due_at < min_due_at:
+        if self_wake and self.self_wake_min_lead_sec > 0 and due_at < min_due_at:
             due_at = min_due_at
             wall_time = _wall_time_for_due_at(due_at, tz_name)
             clamped = True
