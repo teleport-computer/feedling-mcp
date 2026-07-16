@@ -6693,6 +6693,9 @@ def test_prepare_cli_command_heals_incident_windows_mcp_path(monkeypatch):
     tmpl = 'claude --mcp-config "C:/Users/Administrator/feedling_user_mcp.json" -p {message}'
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", tmpl)
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    # Bypass PATH resolution of the 'claude' binary — CI has no claude installed,
+    # and this test is about the --mcp-config heal, not executable resolution.
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     cmd = crc._prepare_cli_command("hi", lane="chat")
     assert "--mcp-config" not in cmd
     assert not any("feedling_user_mcp.json" in t for t in cmd)
