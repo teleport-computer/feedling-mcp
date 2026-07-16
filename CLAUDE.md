@@ -21,6 +21,11 @@ tokens defined at the bottom of `DESIGN.md`.
    writing ANY backend code; PRs are reviewed against it.
 3. `DESIGN.md` — if doing any UI work.
 4. `deploy/DEPLOYMENTS.md` — if doing any enclave/CVM/on-chain work.
+5. `docs/TESTING.md` — the general test standard: a "changed X → run
+   which tests" decision matrix (§2) covering every change class
+   (backend logic, routes, encryption/account link, gateway/driver,
+   consumer, schema, compose, CVM, iOS, docs, contracts). Consult it
+   before declaring ANY change done — it defines the Definition of Done.
 
 There is no longer a separate HANDOFF.md — it was a session-relay doc
 from the v0→v1 strip era and was deleted 2026-05-12. Recent state lives

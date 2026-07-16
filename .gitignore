@@ -38,5 +38,6 @@ ios/vendor/dcap-qvl/target/
 buildServer.json
 deploy/backups/
 
-# Local dev virtualenv (created for running the test suite)
+# Local dev virtualenvs (created for running the test suite / audit sessions)
 .venv/
+.venv-audit/
