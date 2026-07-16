@@ -55,6 +55,7 @@ from content_encryption import build_envelope
 
 from accounts import registry
 from core import util as core_util
+from hosted import image_resize
 from identity import actions as identity_actions_mod
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
@@ -1762,7 +1763,15 @@ def _model_api_maybe_run_memory_capture(
     return job
 
 
+# Stored/injected image cap. Oversized uploads are downscaled to fit this before
+# the size check (see image_resize.downscale_image_if_needed), so a big phone photo
+# is accepted and bounded rather than rejected. The V2 injection cap
+# (worker._IMAGE_MAX_B64_CHARS) covers this via test_injection_cap_covers_any_image_
+# ingestion_accepts.
 MODEL_API_MAX_IMAGE_BYTES = 2_000_000
+# Hard pre-downscale upload ceiling — decode this much before resizing, matching the
+# file cap / iOS client cap. Guards against decompression-bomb-sized uploads.
+MODEL_API_MAX_IMAGE_UPLOAD_BYTES = 26_214_400  # 25 MiB
 
 MODEL_API_MAX_FILE_BYTES = 26_214_400  # 25 MiB — MUST be >= iOS client cap (ChatEmptyStateView 25*1024*1024)
 
@@ -1837,6 +1846,10 @@ def _model_api_file_payload(payload: dict) -> tuple[dict | None, tuple[dict, int
             return None, ({"error": "unsupported_file_type",
                            "detail": f"image type not supported: {mime or ext or 'unknown'}",
                            "hint": "convert to jpeg/png/webp/gif before sending"}, 400)
+        # A file-picker image (up to the 25MB file cap) is bounded here so large
+        # phone photos are stored/injected small instead of dropped to text at the
+        # V2 turn. Small images pass through unchanged.
+        data, img_mime = image_resize.downscale_image_if_needed(data, img_mime)
         return {"kind": "image", "bytes": data, "mime": img_mime, "name": name}, None
 
     if ext in _DOC_EXTS:
@@ -1869,8 +1882,14 @@ def _model_api_image_payload(payload: dict) -> tuple[bytes | None, str, str | No
         return None, "", "image_b64 must be valid base64"
     if not image_bytes:
         return None, "", "image_b64 must not be empty"
+    if len(image_bytes) > MODEL_API_MAX_IMAGE_UPLOAD_BYTES:
+        return None, "", f"image too large; max {MODEL_API_MAX_IMAGE_UPLOAD_BYTES} bytes"
+    # Bound an oversized upload (down to <= MODEL_API_MAX_IMAGE_BYTES) instead of
+    # rejecting it; small images are returned unchanged. Only a genuine encode
+    # failure on a still-huge image trips the post-check below.
+    image_bytes, mime = image_resize.downscale_image_if_needed(image_bytes, mime)
     if len(image_bytes) > MODEL_API_MAX_IMAGE_BYTES:
-        return None, "", f"image too large; max {MODEL_API_MAX_IMAGE_BYTES} bytes"
+        return None, "", f"image too large; max {MODEL_API_MAX_IMAGE_BYTES} bytes after downscale"
     return image_bytes, mime, None
 
 
