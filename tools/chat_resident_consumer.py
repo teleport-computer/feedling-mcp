@@ -8460,14 +8460,22 @@ def _process_messages(messages: list) -> float:
 #   • identity.replace → this consumer sends PLAINTEXT + source/job_id/reason; the
 #                    SERVER builds the envelope (the P3 gate rejects a client envelope).
 #
-# Default ON for self-hosted: a VPS consumer must claim its user's sealed distill jobs
-# or the app's memory import spins forever (the backend keeps them awaiting_resident
-# with no timeout). The hosted agent-runtime spawns THIS SAME consumer per cloud user,
-# and cloud genesis goes through the server-side worker, NOT this lane — so the default
-# flips off under _HOSTED and spawners.py additionally sets
-# FEEDLING_GENESIS_RESIDENT_ENABLED=0 explicitly. A 404 from the pending endpoint also
-# self-disables it for the process lifetime.
-GENESIS_RESIDENT_ENABLED = _env_bool("FEEDLING_GENESIS_RESIDENT_ENABLED", not _HOSTED)
+# Always on — there is no opt-out, by design. A consumer that does not claim its user's
+# sealed distill jobs makes the app's memory import spin forever: the backend leaves them
+# `awaiting_resident` with NO timeout, so the user just watches a spinner with no error,
+# no log and no feedback. That silent-starvation failure mode is strictly worse than
+# anything the old FEEDLING_GENESIS_RESIDENT_ENABLED opt-out bought us, and it has bitten
+# prod before (imports wedged at "开始中" — the reason PR #80 flipped the default ON).
+#
+# The old flag existed to keep hosted consumers off this lane, but the BACKEND's routing
+# already guarantees that: `awaiting_resident` jobs are only ever created by the sealed
+# ingest path (genesis_core._resident_sealed_import). Cloud/hosted uploads are plaintext
+# and go to the server-side worker, so a hosted consumer polling here can only ever find
+# an empty list for its own user — the lanes cannot collide. Polling unconditionally also
+# rescues a stale sealed job left behind by a route switch instead of starving it forever.
+#
+# A 404 from the pending endpoint still self-disables the lane for the process lifetime
+# (that is a runtime capability probe for older backends, not a user-facing switch).
 # Stable per-user claim id (survives restarts; same shape as the chat checkpoint key).
 _RESIDENT_CONSUMER_ID = f"resident-distill-{CHECKPOINT_API_KEY_FINGERPRINT}"
 
@@ -8909,7 +8917,9 @@ def run() -> None:
     wedge_miss_count = 0
     last_job_ts = _load_proactive_checkpoint()
     proactive_enabled = PROACTIVE_POLL_ENABLED
-    resident_distill_enabled = GENESIS_RESIDENT_ENABLED
+    # Unconditional: see the resident-distill contract note above. Only the 404
+    # capability probe below may flip this off for the process lifetime.
+    resident_distill_enabled = True
     if proactive_enabled and last_job_ts == 0.0:
         # Start from "now" on first boot so historical hidden jobs are not
         # replayed after an operator installs the consumer.

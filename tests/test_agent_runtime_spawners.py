@@ -37,18 +37,21 @@ def test_consumer_env_drives_resident_in_cli_mode_for_claude():
     assert env["PATH"] == "/bin" and env["FEEDLING_API_URL"] == "http://b:5001"  # base preserved
 
 
-def test_consumer_env_disables_resident_genesis_distill_for_hosted():
-    # The consumer's FEEDLING_GENESIS_RESIDENT_ENABLED defaults ON (self-hosted
-    # VPS must claim its user's sealed import jobs); hosted spawns go through the
-    # server-side genesis worker instead, so the spawner must opt out explicitly.
+def test_consumer_env_carries_no_resident_genesis_distill_opt_out():
+    # The resident genesis-distill lane has NO opt-out any more: a consumer that
+    # skips it makes the user's import spin forever (backend leaves the job
+    # `awaiting_resident` with no timeout, no error, no log). Hosted spawns are
+    # kept off the lane by the BACKEND's routing instead — `awaiting_resident`
+    # jobs only exist for sealed uploads, and cloud uploads are plaintext — so
+    # the spawner must not reintroduce an env kill-switch.
     env = spawners.consumer_env(
         {"PATH": "/bin"},
         {"api_key": "fk", "provider_key": "sk-ant"},
         user_id="u_1", home="/agent-data/users/u_1",
     )
-    assert env["FEEDLING_GENESIS_RESIDENT_ENABLED"] == "0"
-    # The container strategy passes env by allowlist — the key must be on it.
-    assert "FEEDLING_GENESIS_RESIDENT_ENABLED" in spawners._CONSUMER_ENV_KEYS
+    assert "FEEDLING_GENESIS_RESIDENT_ENABLED" not in env
+    # ...and the container strategy must not smuggle one in via the allowlist.
+    assert "FEEDLING_GENESIS_RESIDENT_ENABLED" not in spawners._CONSUMER_ENV_KEYS
 
 
 def test_consumer_env_sets_tz_china_default_when_user_timezone_unknown():
