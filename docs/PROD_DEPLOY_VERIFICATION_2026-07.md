@@ -69,6 +69,21 @@ docs/ENABLE_PROD_ADMIN_PASSWORD_2026-07-14.md 一并配好,顺带验证 §6)。
 - [ ] `POST /admin/login` 错密码 401、对密码 303;cookie 7 天;API key 通道仍通。
 - [ ] 未配则跳过,不算失败项。
 
+## 7. 后台任务节流三件套(a905db14,test E2E 已过,生产观察项)
+
+- [ ] **wake 15min 过期(A)**:部署后看堆积用户(usr_5ad737403b69e749 191 个 /
+      usr_fcbd9e7ab873371d 145 / usr_cec2150e50cbee15 134 / usr_c190 20)——
+      他们的 consumer 一旦回来 poll,陈年 wake job 应批量转 `expired/
+      stale_wake_expired` 而不是补跑;admin user detail 的 jobs_by_status
+      出现 expired 计数,且不计入失败。consumer 不回来则 job 留 pending,
+      不算失败项(过期发生在出票口)。
+- [ ] **dream/migrate 合并(B-server)**:堆积用户回归后同类维护 job 只跑最新,
+      旧的 `skipped/superseded_by_newer` 可在 admin 看到。
+- [ ] **软空档(B-consumer)+ 蒸馏抢占(C)**:consumer 侧行为,test E2E 已真实
+      验证(蒸馏中插聊天 → 聊天先回 → 续蒸不重跑,5 卡零重复);生产上靠
+      resident 用户 consumer 自更新后生效,无需专项验证,出问题看日志
+      "deferring maintenance job" / "resident distill" 行。
+
 ## 完成后
 
 - 逐项结果表回报 Seven(✅/❌/跳过+原因)。
