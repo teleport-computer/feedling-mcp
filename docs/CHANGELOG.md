@@ -49,6 +49,27 @@
 
 ## 2026-07-17
 
+### [DECISION] prod runner 拓扑闸降级为警告（用户拍板）
+
+- `validate prod runner topology`（ec55ae18 今晨新增，要求 ≥2 台独立 prod
+  runner 才允许任何 prod CVM 变更）在只有 1 台 runner 的现状下拦死了全部
+  prod 部署（PR #84 合并即失败）。用户拍板先解除硬拦截。
+- 改法：`deploy/check-prod-runner-topology.sh` 单 runner 时降级为
+  `::warning::` + exit 0；设 `PROD_RUNNER_TOPOLOGY_ENFORCE=true` 可一键恢复
+  硬闸。机制/job/needs 边均保留，第二台 runner 上线后应立即重新武装。
+- ⚠️ 07-15 事故模式（部署窗口内唯一托管路径短暂消失）在恢复硬闸前依然存在。
+
+### [DONE] runner 部署等待脱离 phala CLI 的 300s 硬顶
+
+- `phala deploy --wait` 的就绪等待在 CLI 里写死 300s（dist/index.js
+  `Xl(e,t=3e5)`），无 flag/env 可调；runner 镜像拉取+启动经常超过它，
+  CI 在更新其实会成功的情况下按 CLI 超时报失败。
+- 改法：test/prod 两个 runner 部署步骤去掉 `--wait`，deploy 后改跑新脚本
+  `deploy/wait-cvm-ready.sh <cvm-id> [timeout]`（轮询 `phala cvms get --json`
+  的 `status==running && progress 为空`，默认 900s，`CVM_READY_TIMEOUT_SEC`
+  可配）。已对 idle 的 feedling-prod-runner-1 实测脚本判定正确。
+- 主 CVM 两处 deploy 未动（未观察到超时）；如需同样处理照抄一行即可。
+
 ### [DONE] usr_f13f 事故①取证 + 信封 fpr 标签校验 + consumer 缓存钥加界
 
 - 取证结论（推翻事故报告的诊断）：身份卡**没有**搁浅在旧钥——07-15 10:16:10
