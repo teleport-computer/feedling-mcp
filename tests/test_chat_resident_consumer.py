@@ -2973,6 +2973,113 @@ def test_process_proactive_degenerate_reply_with_sleep_action_still_sleeps(monke
     assert not [s for s in captured["statuses"] if s[1] == "failed"]
 
 
+def test_proactive_chat_collision_classification(monkeypatch):
+    now = 10_000.0
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_COLLISION_WINDOW_SEC", 90.0)
+
+    def _with_history(rows):
+        monkeypatch.setattr(crc, "get_decrypted_history", lambda **kwargs: rows)
+
+    # Fresh user message → collision.
+    _with_history([{"role": "user", "source": "chat", "ts": now - 10}])
+    assert crc._proactive_chat_collision(now=now)
+    # Fresh non-proactive agent reply → collision.
+    _with_history([{"role": "openclaw", "source": "chat", "ts": now - 30}])
+    assert crc._proactive_chat_collision(now=now)
+    # Fresh proactive-source agent row → NOT this gate's job.
+    _with_history([{"role": "openclaw", "source": crc.PROACTIVE_JOB_SOURCE, "ts": now - 5}])
+    assert not crc._proactive_chat_collision(now=now)
+    # verify_ping is never conversation.
+    _with_history([{"role": "user", "source": "verify_ping", "ts": now - 5}])
+    assert not crc._proactive_chat_collision(now=now)
+    # system rows (upstream-error notices) are not the agent speaking.
+    _with_history([{"role": "system", "source": "chat", "ts": now - 5}])
+    assert not crc._proactive_chat_collision(now=now)
+    # Outside the window → no collision.
+    _with_history([{"role": "user", "source": "chat", "ts": now - 91}])
+    assert not crc._proactive_chat_collision(now=now)
+    # Malformed ts must not raise (fail-open) and must not collide.
+    _with_history([{"role": "user", "source": "chat", "ts": "bad"}])
+    assert not crc._proactive_chat_collision(now=now)
+    # Far-future ts is malformed data, not a fresh message.
+    _with_history([{"role": "user", "source": "chat", "ts": now + 3600}])
+    assert not crc._proactive_chat_collision(now=now)
+    # Slight clock skew ahead of this host still counts as fresh.
+    _with_history([{"role": "user", "source": "chat", "ts": now + 2}])
+    assert crc._proactive_chat_collision(now=now)
+    # Fail-open: unreachable source / fetch error must not silence proactive.
+    _with_history(None)
+    assert not crc._proactive_chat_collision(now=now)
+    monkeypatch.setattr(
+        crc, "get_decrypted_history",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert not crc._proactive_chat_collision(now=now)
+    # window <= 0 disables the gate entirely.
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_COLLISION_WINDOW_SEC", 0.0)
+    _with_history([{"role": "user", "source": "chat", "ts": now - 1}])
+    assert not crc._proactive_chat_collision(now=now)
+
+
+def test_process_proactive_chat_collision_skips_post(monkeypatch):
+    """A wake whose model turn finished while a chat exchange was happening
+    must not post its bubble on top of the conversation (seen live 2026-07-17:
+    wake + chat turn answered the same arrival message with two near-identical
+    replies). The job is skipped with the fixed reason `chat_collision` so the
+    admin failed/skipped-reason aggregation can count it."""
+    captured = _degenerate_test_harness(monkeypatch, {"messages": ["姐姐到了呀"]})
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_COLLISION_WINDOW_SEC", 90.0)
+    monkeypatch.setattr(crc, "_proactive_chat_collision", lambda now=None: True)
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_collision",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 126.0,
+        "trigger": "presence_tick",
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(126.0)
+    assert captured["posted"] == []
+    skipped = [s for s in captured["statuses"] if s[1] == "skipped"]
+    assert skipped and skipped[-1][2] == "chat_collision"
+    assert skipped[-1][3]["extra"]["wake_result"] == "chat_collision"
+
+
+def test_process_proactive_chat_collision_exempts_scheduled_wake(monkeypatch):
+    """A user-requested reminder firing mid-conversation must still deliver."""
+    captured = _degenerate_test_harness(monkeypatch, {"messages": ["提醒:该出发了"]})
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_COLLISION_WINDOW_SEC", 90.0)
+    monkeypatch.setattr(crc, "_proactive_chat_collision", lambda now=None: True)
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_collision_sched",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 126.1,
+        "trigger": "scheduled_wake",
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(126.1)
+    assert captured["posted"] == ["提醒:该出发了"]
+    assert not [s for s in captured["statuses"] if s[1] == "skipped"]
+
+
+def test_process_proactive_no_collision_posts_normally(monkeypatch):
+    captured = _degenerate_test_harness(monkeypatch, {"messages": ["月色不错"]})
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_COLLISION_WINDOW_SEC", 90.0)
+    monkeypatch.setattr(crc, "_proactive_chat_collision", lambda now=None: False)
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_no_collision",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 126.2,
+        "trigger": "presence_tick",
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(126.2)
+    assert captured["posted"] == ["月色不错"]
+    assert [s for s in captured["statuses"] if s[1] == "posted"]
+
+
 def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
