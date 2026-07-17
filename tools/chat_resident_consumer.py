@@ -224,6 +224,12 @@ AGENT_HTTP_SESSION_KEY_HEADER = os.environ.get(
 )
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
+# Per-turn subprocess cap for the CLI agent. 120s suits the managed claude/codex/
+# pi templates; heavy self-hosted stacks (custom wrappers, slow MCP cold starts,
+# long-thinking models — usr_c190's xiake_wrapper+MCP+opus combo, 2026-07-18)
+# legitimately need more. Raise via env; the cap still exists so a hung agent
+# can never wedge the single-flight chat lane forever.
+AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "120")))
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
@@ -521,6 +527,9 @@ _ERROR_CLASS_RULES = (
     ("model_not_found", "user_provider",
      "模型名不可用，请检查设置里的模型名。",
      re.compile(r"invalid model name|model_not_found|no such model", re.I)),
+    ("cli_config_invalid", "user_provider",
+     "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。",
+     re.compile(r"missing the \{message\} placeholder", re.I)),
     ("provider_incompatible", "user_provider",
      "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
      re.compile(r"unknown variant|not supported|unsupported (parameter|tool)"
@@ -4098,6 +4107,13 @@ def _warn_if_agent_entry_may_drift() -> None:
     if AGENT_MODE != "cli" or not AGENT_CLI_CMD:
         return
 
+    if "{message}" not in AGENT_CLI_CMD and not _is_pi_cmd(_cli_cmd_tokens()):
+        log.error(
+            "AGENT_CLI_CMD has NO {message} placeholder — every chat turn will "
+            "FAIL: the consumer substitutes placeholders and never appends the "
+            "message. Fix the template (e.g. claude -p \"{message}\"); custom "
+            "wrappers must accept the message as an argv placeholder."
+        )
     lower_template = AGENT_CLI_CMD.lower()
     if re.search(r"\b(you are|user message|reply naturally|same style|persona)\b", lower_template):
         log.warning(
@@ -4721,6 +4737,17 @@ def call_agent_cli(
     if _cli_cwd is None and _agent_cli_cwd_error:
         raise RuntimeError(_agent_cli_cwd_error)
 
+    # A custom template without {message} can NOT deliver the user's words to
+    # the agent — the render step substitutes placeholders and appends nothing.
+    # This used to fail SILENTLY: the agent ran with no prompt and told the user
+    # "your message never reached me" (usr_c190's xiake_wrapper, 2026-07-18).
+    # pi is exempt (its managed path feeds the message via stdin by design).
+    if message and "{message}" not in AGENT_CLI_CMD and not _is_pi_cmd(_cli_cmd_tokens()):
+        raise RuntimeError(
+            "AGENT_CLI_CMD is missing the {message} placeholder — the user's "
+            "message cannot reach the agent. Add {message} to the command "
+            "template (e.g. claude -p \"{message}\")."
+        )
     cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
@@ -4752,7 +4779,7 @@ def call_agent_cli(
     _run_kwargs: dict = {
         "capture_output": True,
         "text": True,
-        "timeout": 120,
+        "timeout": AGENT_TURN_TIMEOUT_SEC,
         "env": child_env,
         "encoding": "utf-8",
         "errors": "replace",
@@ -4766,11 +4793,13 @@ def call_agent_cli(
     except subprocess.TimeoutExpired:
         _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
                           dur_ms=(time.monotonic() - _turn_t0) * 1000,
-                          summary="cli turn timeout", explain="模型调用超时（120s 上限）— 卡在模型这一步")
+                          summary="cli turn timeout",
+                          explain=f"模型调用超时（{AGENT_TURN_TIMEOUT_SEC}s 上限，FEEDLING_AGENT_TURN_TIMEOUT_SEC 可调）— 卡在模型这一步")
         log.warning(
-            "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit 120s subprocess cap)",
+            "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit %ds subprocess cap)",
             "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
             int((time.monotonic() - _turn_t0) * 1000),
+            AGENT_TURN_TIMEOUT_SEC,
         )
         raise
     _wall_ms = int((time.monotonic() - _turn_t0) * 1000)

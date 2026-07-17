@@ -5347,7 +5347,7 @@ def test_call_agent_cli_claude_session_survives_many_turns(monkeypatch, tmp_path
     raw = _claude_chatty_stream("嗯", session_id="c-longlived")
     monkeypatch.setattr(
         crc, "AGENT_CLI_CMD",
-        "claude -p --output-format stream-json --include-partial-messages --session-id {session_id}")
+        "claude -p \"{message}\" --output-format stream-json --include-partial-messages --session-id {session_id}")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     monkeypatch.setattr(crc.subprocess, "run",
                         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=""))
@@ -7643,3 +7643,54 @@ def test_foreground_prepend_includes_language_line_and_time(monkeypatch):
     assert "current_time:" in out
     assert "Reply language policy" in out  # language line now wired into foreground
     assert out.rstrip().endswith("hello")
+
+
+# --- custom-wrapper guardrails (usr_c190 xiake_wrapper, 2026-07-18) ----------
+
+def test_cli_cmd_without_message_placeholder_fails_loud(monkeypatch, tmp_path):
+    # A template with no {message} used to run the agent WITH NO PROMPT and let
+    # it tell the user "your message never reached me". Now: hard, actionable
+    # error before any subprocess spawns.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_no_placeholder")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "python3 my_wrapper.py")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    ran = []
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda cmd, **kw: ran.append(cmd))
+    with pytest.raises(RuntimeError, match=r"missing the \{message\} placeholder"):
+        crc.call_agent_cli("hello")
+    assert ran == []                             # no blind agent invocation
+
+    # ...and the error classifies as an actionable user-config notice, not
+    # a "our system broke" bubble.
+    n = crc.classify_agent_error(RuntimeError(
+        "AGENT_CLI_CMD is missing the {message} placeholder — the user's ..."))
+    assert n.error_class == "cli_config_invalid"
+    assert n.blame == "user_provider"
+    assert "AGENT_CLI_CMD" in n.user_text
+
+
+def test_pi_without_message_placeholder_is_exempt(monkeypatch, tmp_path):
+    # pi's managed path deliberately omits {message} (stdin feed) — must not trip.
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_no_placeholder")
+    assert crc.call_agent_cli("hello") == "ok"
+
+
+def test_turn_timeout_is_env_tunable(monkeypatch, tmp_path):
+    # Heavy self-hosted stacks (wrapper + MCP cold start + long thinking) need
+    # more than the 120s default; the cap rides AGENT_TURN_TIMEOUT_SEC.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_slow_stack")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "AGENT_TURN_TIMEOUT_SEC", 300)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["timeout"] = kw.get("timeout")
+        return subprocess.CompletedProcess(cmd, 0, stdout=_CLAUDE_OK_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    assert crc.call_agent_cli("hello") == "ok"
+    assert seen["timeout"] == 300
