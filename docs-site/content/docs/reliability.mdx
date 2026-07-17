@@ -99,12 +99,15 @@ otherwise.
 
 Common consequences:
 
-- Retrying `/v1/chat/message`, `/v1/chat/response`, `/v1/memory/add`, a
-  Perception collection upload, or `app_open` can create duplicate effects.
+- Retrying `/v1/chat/response`, `/v1/memory/add`, a Perception collection
+  upload, or `app_open` can create duplicate effects.
 - A client-generated envelope or memory ID helps reconciliation but is not a
   documented create-if-absent guarantee.
-- `POST /v1/model_api/chat/send` can be ambiguous after a client timeout. Search
-  Chat history for the submitted turn before sending it again.
+- `POST /v1/model_api/chat/send` and `POST /v1/chat/message` accept an optional
+  UUID `client_msg_id`. Persist it before sending and reuse it after an ambiguous
+  timeout. For the same user and UUID, retries during the 600-second window
+  return the first stored row and do not enqueue another turn. Omitting the
+  field retains the legacy non-idempotent behavior.
 - Repeating a one-time link-token claim returns a conflict rather than the raw
   API key again.
 - Repeating a delete can return `404` after the first request succeeded.
@@ -112,9 +115,10 @@ Common consequences:
   response followed by `401` requires state-aware handling, not an automatic
   second reset.
 
-Where exactly-once user experience matters, assign a client operation ID in your
-own state, persist it before the call, then reconcile against the resulting
-resource stream. Do not represent this as server-enforced exactly-once delivery.
+Where exactly-once user experience matters outside those two Chat operations,
+assign a client operation ID in your own state, persist it before the call, then
+reconcile against the resulting resource stream. The Chat guarantee is bounded
+to its 600-second server window; it is not unbounded exactly-once delivery.
 
 ## Payload and response evolution
 

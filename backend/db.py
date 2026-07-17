@@ -2857,6 +2857,120 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
         ])
 
 
+def chat_append_idempotent(
+    user_id: str,
+    msg_id: str,
+    ts: float,
+    doc: dict,
+    max_messages: int,
+    *,
+    client_msg_id: str,
+    window_sec: int,
+) -> tuple[dict, bool]:
+    """Atomically insert or recover one client-identified chat send.
+
+    The transaction-scoped advisory lock is shared by every backend process
+    using this PostgreSQL database. It serializes only the same user/key pair;
+    a hash collision merely serializes unrelated sends because the winner query
+    still compares the complete values. Unlike ``chat_append``, failures raise:
+    an idempotency guard must fail closed rather than turn a failed lookup into
+    an accidental second insert.
+    """
+    if not client_msg_id:
+        raise ValueError("client_msg_id is required")
+    if window_sec <= 0:
+        raise ValueError("window_sec must be positive")
+
+    offload = (
+        object_storage.chat_files_enabled()
+        and isinstance(doc, dict)
+        and doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
+        and doc.get("body_ct") is not None
+    )
+    trimmed_docs: list = []
+    trimmed_ids: list[str] = []
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            # Length-prefix the user id so concatenation is unambiguous without
+            # a NUL byte (PostgreSQL text values reject U+0000).
+            lock_key = f"{len(user_id)}:{user_id}{client_msg_id}"
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
+            row = conn.execute(
+                "SELECT doc FROM chat_messages "
+                "WHERE user_id = %s AND doc->>'client_msg_id' = %s "
+                "AND ts >= EXTRACT(EPOCH FROM clock_timestamp()) - %s "
+                "ORDER BY seq DESC LIMIT 1",
+                (user_id, client_msg_id, window_sec),
+            ).fetchone()
+            if row is not None:
+                return row[0], False
+
+            # Keep normal msg-id semantics: an envelope-id collision updates the
+            # same primary-key row, matching chat_append's existing behavior.
+            row = conn.execute(
+                "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (user_id, msg_id) DO UPDATE "
+                "SET ts = EXCLUDED.ts, doc = EXCLUDED.doc RETURNING doc",
+                (user_id, msg_id, ts, Jsonb(doc)),
+            ).fetchone()
+            if max_messages and max_messages > 0:
+                rows = conn.execute(
+                    "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
+                    "  SELECT MIN(seq) FROM ("
+                    "    SELECT seq FROM chat_messages WHERE user_id = %s "
+                    "    ORDER BY seq DESC LIMIT %s"
+                    "  ) t"
+                    ") RETURNING msg_id, doc",
+                    (user_id, user_id, max_messages),
+                ).fetchall()
+                trimmed_ids = [r[0] for r in rows]
+                trimmed_docs = [r[1] for r in rows]
+
+    # Mirror chat_append's crash-safe R2 ordering. Only the transaction winner
+    # reaches this block, so retries neither upload twice nor flip the row twice.
+    if offload:
+        try:
+            body_ct_len = len(doc["body_ct"])
+            key = object_storage.put_chat_body(
+                user_id, msg_id, doc["body_ct"], str(doc.get("content_type") or "file")
+            )
+            pointer = {"body_key": key, "body_ct_len": body_ct_len}
+            with get_pool().connection() as conn:
+                conn.execute(
+                    "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
+                    "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
+                    (Jsonb(pointer), user_id, msg_id),
+                )
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "[db] chat_append_idempotent(%s,%s) R2 offload failed, left inline: %s",
+                user_id,
+                msg_id,
+                e,
+            )
+    if trimmed_docs and object_storage.chat_files_enabled():
+        for trimmed in trimmed_docs:
+            if isinstance(trimmed, dict) and trimmed.get("body_key"):
+                object_storage.delete_chat_body(str(trimmed["body_key"]), user_id)
+    if trimmed_ids:
+        from tee_shadow import mirror
+
+        mirror.execute_many([
+            ("DELETE FROM chat_messages WHERE user_id = %s AND msg_id = ANY(%s)",
+             (user_id, trimmed_ids)),
+            ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+             "AND table_name = 'chat_messages' AND item_id = ANY(%s)",
+             (user_id, trimmed_ids)),
+        ])
+    if row is None:
+        raise RuntimeError("chat_idempotent_insert_returned_no_row")
+    return row[0], True
+
+
 def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None:
     """Shallow-merge ``fields`` into the stored message doc. Returns the merged
     doc, or None if the message was not found."""

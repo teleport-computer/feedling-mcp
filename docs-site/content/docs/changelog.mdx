@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- `POST /v1/model_api/chat/send` and `POST /v1/chat/message` now accept an
+  optional UUID `client_msg_id`. Reusing the same value for the same user within
+  600 seconds returns the first stored user row without appending or waking a
+  second agent turn, including when a retry switches between the two ingest
+  paths. Invalid values return `400 client_msg_id_invalid`; requests that omit
+  the field retain their previous behavior.
 - Encrypted envelopes now carry an optional `content_pk_fpr` label (first
   16 hex chars of SHA-256 of the user public key `K_user` was sealed to);
   server- and consumer-built envelopes set it automatically. `POST
