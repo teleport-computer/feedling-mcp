@@ -3080,6 +3080,104 @@ def test_process_proactive_no_collision_posts_normally(monkeypatch):
     assert [s for s in captured["statuses"] if s[1] == "posted"]
 
 
+def test_capture_transcript_labels_use_real_names():
+    """The capture/dream transcript must never label lines with a literal
+    "user:"/"agent:" — models mirror the label into user-visible cards as
+    "用户" (usr_fee1 complaint 2026-07-17). Known names are used verbatim;
+    unknown fall back to the prompt's own TA/我 framing."""
+    user_msg = {"role": "user", "ts": 1000.0, "content": "我在看攻略"}
+    agent_msg = {"role": "openclaw", "ts": 1001.0, "content": "山路小心"}
+    assert crc._capture_message_role(user_msg, user_label="小雨", agent_label="小舟") == "小雨"
+    assert crc._capture_message_role(agent_msg, user_label="小雨", agent_label="小舟") == "小舟"
+    # Defaults match the prompt framing, not system labels.
+    assert crc._capture_message_role(user_msg) == "TA"
+    assert crc._capture_message_role(agent_msg) == "我"
+    # Empty labels fall back rather than rendering "" as a name.
+    assert crc._capture_message_role(user_msg, user_label="", agent_label="") == "TA"
+
+    text = crc._capture_window_text(
+        [user_msg, agent_msg], user_label="小雨", agent_label="小舟"
+    )
+    assert "小雨: 我在看攻略" in text
+    assert "小舟: 山路小心" in text
+    assert "user:" not in text and "agent:" not in text
+
+
+def test_capture_transcript_labels_reject_reserved_placeholder_names():
+    """A placeholder "name" stored on the identity card (用户/user) must not
+    become a transcript label either — that re-creates the exact "用户: …"
+    line the fix removes."""
+    user_msg = {"role": "user", "ts": 1000.0, "content": "hi"}
+    for reserved in ("用户", "user", "USER", "ta"):
+        assert crc._capture_message_role(user_msg, user_label=reserved) == "TA", repr(reserved)
+    text = crc._capture_window_text([user_msg], user_label="用户", agent_label="小舟")
+    assert "用户:" not in text and "TA: hi" in text
+
+
+def test_capture_identity_context_sanitizes_reserved_user_name(monkeypatch):
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    monkeypatch.setattr(
+        crc,
+        "_capture_get_json",
+        lambda path, **kwargs: {"identity": {"agent_name": "小舟", "user_preferred_name": "用户"}},
+    )
+    _identity, ai_name, user_name, text = crc._capture_identity_context()
+    assert ai_name == "小舟"
+    assert user_name == "TA"
+    # The rendered identity context must not carry the reserved value as a
+    # "name" — it would contradict the naming rule sitting next to it.
+    assert "用户" not in text
+
+
+def test_capture_identity_context_placeholder_does_not_shadow_real_fallback_name(monkeypatch):
+    """user_preferred_name="用户" + user_name="小雨" must resolve to 小雨:
+    per-candidate sanitize, not `or`-then-sanitize (which would collapse the
+    whole chain to TA and violate "use the name when known")."""
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    monkeypatch.setattr(
+        crc,
+        "_capture_get_json",
+        lambda path, **kwargs: {"identity": {
+            "agent_name": "小舟",
+            "user_preferred_name": "用户",
+            "user_name": "小雨",
+        }},
+    )
+    _identity, _ai_name, user_name, text = crc._capture_identity_context()
+    assert user_name == "小雨"
+    assert "小雨" in text
+    assert "用户" not in text
+
+
+def test_capture_empty_window_fails_fast_without_identity_fetch(monkeypatch):
+    """An empty/unavailable capture window must keep the fast-fail path — no
+    identity round-trips (up to two network calls) for a job that cannot run."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    statuses = []
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: statuses.append((job_id, status, reason)),
+    )
+    monkeypatch.setattr(crc, "_capture_window_messages", lambda job: [])
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: (_ for _ in ()).throw(AssertionError("identity fetched for empty window")),
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "cap_empty_window",
+        "job_kind": "memory_capture",
+        "source": "memory_capture",
+        "ts": 321.0,
+    }
+    assert crc._process_capture_jobs([job]) == pytest.approx(321.0)
+    assert ("cap_empty_window", "failed", "capture_window_unavailable") in statuses
+
+
 def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
