@@ -2866,6 +2866,113 @@ def test_process_proactive_v2_sleep_marks_completed_without_post(monkeypatch):
     assert completed[-1][3]["extra"]["wake_result"] == "sleep"
 
 
+def test_is_degenerate_proactive_reply_classification():
+    # Relay-truncated fragments: whitespace/punctuation only → degenerate.
+    for text in (".", "。", "…", "……", "?!", "——", "", "   ", "\n", None, ". .", "、"):
+        assert crc._is_degenerate_proactive_reply(text), repr(text)
+    # Anything with a letter, digit, CJK char or emoji is real content.
+    for text in ("嗯", "在忙吗?", "ok.", "1", "🌙", "好~", "Hi"):
+        assert not crc._is_degenerate_proactive_reply(text), repr(text)
+
+
+def _degenerate_test_harness(monkeypatch, agent_result):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    captured = {"statuses": [], "posted": [], "failures": []}
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: agent_result,
+    )
+    monkeypatch.setattr(
+        crc,
+        "post_reply",
+        lambda reply, **kwargs: (captured["posted"].append(reply), {"id": f"msg_{len(captured['posted'])}"})[1],
+    )
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(
+        crc,
+        "_notify_agent_turn_failure",
+        lambda exc, *, foreground: captured["failures"].append((str(exc), foreground)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    return captured
+
+
+def test_process_proactive_degenerate_only_reply_fails_without_post(monkeypatch):
+    """A relay-truncated turn whose ONLY output is a bare "." must not become
+    an unprompted chat bubble (seen live 2026-07-17: a 2-hour heartbeat
+    posting "." twice). Same posture as agent_reply_parse_failed: report +
+    fail the job, post nothing — and do NOT count as a realized idle send
+    (two truncated wakes in a row must not trip the idle-loop guard)."""
+    captured = _degenerate_test_harness(monkeypatch, {"messages": ["."]})
+    monkeypatch.setattr(crc, "_proactive_empty_streak", 0)
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_degen_only",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.0,
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.0)
+    assert captured["posted"] == []
+    failed = [s for s in captured["statuses"] if s[1] == "failed"]
+    assert failed and failed[-1][2] == "degenerate_reply_suppressed"
+    assert captured["failures"] and captured["failures"][-1][1] is False
+    assert crc._proactive_empty_streak == 0  # suppressed ≠ realized idle send
+
+
+def test_process_proactive_degenerate_fragment_dropped_real_reply_posted(monkeypatch):
+    captured = _degenerate_test_harness(
+        monkeypatch, {"messages": [".", "今晚月色不错"]}
+    )
+    monkeypatch.setattr(crc, "_proactive_empty_streak", 0)
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_degen_mixed",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.1,
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.1)
+    assert captured["posted"] == ["今晚月色不错"]
+    assert [s for s in captured["statuses"] if s[1] == "posted"]
+    assert not [s for s in captured["statuses"] if s[1] == "failed"]
+    assert crc._proactive_empty_streak == 1  # real send keeps its accounting
+
+
+def test_process_proactive_degenerate_reply_with_sleep_action_still_sleeps(monkeypatch):
+    """Before the guard, a sleep action paired with a truncated "." fragment
+    fell through to the posting loop (sleep requires `not replies`) and the
+    fragment shipped as a bubble. The guard empties replies first, so the
+    sleep completes quietly."""
+    captured = _degenerate_test_harness(
+        monkeypatch,
+        {
+            "actions": [{"type": "proactive.sleep", "reason": "nothing to say"}],
+            "messages": ["…"],
+        },
+    )
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_degen_sleep",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.2,
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.2)
+    assert captured["posted"] == []
+    completed = [s for s in captured["statuses"] if s[1] == "completed"]
+    assert completed and completed[-1][3]["extra"]["wake_result"] == "sleep"
+    assert not [s for s in captured["statuses"] if s[1] == "failed"]
+
+
 def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -5285,6 +5392,89 @@ def test_call_agent_cli_pi_marks_session_bridged_after_injected_turn(monkeypatch
 
     assert crc.call_agent_cli(injected) == "ok"
     assert crc._agent_session_is_bridged() is True
+
+
+# The relay-cut stream shape (prod usr_6f5a 2026-07-17): pi exits 0, no usable
+# message_end, "Stream ended without finish_reason" in the final event. One
+# immediate in-turn retry; a second cut still raises (single-shot, no loop).
+_PI_STREAM_CUT_TURN = _pi_stream_lines(
+    _PI_HEADER,
+    {"type": "message_end", "message": {"role": "assistant", "content": []},
+     "stopReason": "error", "errorMessage": "Stream ended without finish_reason"},
+)
+
+
+def test_call_agent_cli_pi_stream_cut_retries_once_and_succeeds(monkeypatch, tmp_path):
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_cut_ok")
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        out = _PI_STREAM_CUT_TURN if len(runs) == 1 else _PI_OK_TURN
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    assert crc.call_agent_cli("hello") == "ok"
+    assert len(runs) == 2                      # exactly one retry
+    assert runs[0] == runs[1]                  # same turn, same command
+
+
+def test_call_agent_cli_pi_stream_cut_twice_raises_no_loop(monkeypatch, tmp_path):
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_cut_fail", stdout=_PI_STREAM_CUT_TURN)
+    runs = []
+    real = subprocess.CompletedProcess
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        return real(cmd, 0, stdout=_PI_STREAM_CUT_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="pi agent produced no reply"):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 2                      # one retry, then surface the error
+
+
+def test_call_agent_cli_pi_stream_cut_retry_nonzero_exit_raises_even_with_reply(monkeypatch, tmp_path):
+    # codex2 R1 P1: the retry runs after the function's original returncode gate.
+    # A crashed retry (rc=1) whose partial stdout still parses to an assistant
+    # message must NOT be returned as success — "all nonzero CLI exits raise"
+    # survives the retry path, and the failed turn never marks the bridge.
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_cut_rc1")
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        if len(runs) == 1:
+            return subprocess.CompletedProcess(cmd, 0, stdout=_PI_STREAM_CUT_TURN, stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout=_PI_OK_TURN, stderr="pi crashed")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="cli agent exited 1"):
+        crc.call_agent_cli(injected)
+    assert len(runs) == 2
+    assert crc._agent_session_is_bridged() is False
+
+
+def test_call_agent_cli_pi_non_stream_cut_no_reply_does_not_retry(monkeypatch, tmp_path):
+    # Other no-reply shapes (relay 429 / out of credit) keep the old single-shot
+    # behavior — retrying those would just double-bill a deterministic failure.
+    quota_turn = _pi_stream_lines(
+        _PI_HEADER,
+        {"type": "message_end", "message": {"role": "assistant", "content": []},
+         "stopReason": "error", "errorMessage": "insufficient_quota: credit balance too low"},
+    )
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_quota")
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout=quota_turn, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="pi agent produced no reply"):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 1                      # no retry for non-transient shapes
 
 
 def test_call_agent_cli_pi_background_turn_does_not_mark_bridged(monkeypatch, tmp_path):

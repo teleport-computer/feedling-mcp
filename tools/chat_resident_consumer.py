@@ -105,6 +105,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as _ET
 import zipfile
@@ -529,9 +530,14 @@ _ERROR_CLASS_RULES = (
      re.compile(r"\b429\b|provider_http_429|too many requests|rate.?limit", re.I)),
     ("upstream_unavailable", "provider_transient",
      "你的模型服务暂时不可用，稍后会自动恢复。",
+     # "ended without finish_reason": an openai-compatible relay cut the SSE
+     # stream mid-turn (pi surfaces it verbatim). Without this signature it
+     # fell to `unknown`/blame=system — "连接模型服务时出了问题" blamed US for
+     # the relay's flakiness (usr_6f5a, 2026-07-17, 24 bubbles).
      re.compile(r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out"
                 r"|connection (refused|reset|error)"
-                r"|unreachable|stream disconnected", re.I)),
+                r"|unreachable|stream disconnected"
+                r"|ended without finish_reason", re.I)),
 )
 
 # 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
@@ -4511,6 +4517,13 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
 # blow the whole session budget on a single snapshot and rotate the session on every image.
 _PI_IMAGE_CONTEXT_BYTES = 2_000
 
+# The relay-cut-the-SSE-stream failure shape: pi exits 0, no usable message_end,
+# and this text rides in the final event / stderr. Transient by nature — worth one
+# immediate in-turn retry (see call_agent_cli's pi branch) before surfacing the
+# error bubble. Same signature also classifies as upstream_unavailable in
+# _ERROR_CLASS_RULES so an exhausted retry blames the provider, not us.
+_PI_STREAM_CUT_RE = re.compile(r"ended without finish_reason|stream disconnected", re.I)
+
 
 def _pi_session_content_bytes(raw: str) -> int:
     """Bytes of everything this pi turn appends to its persistent session: EVERY
@@ -4890,6 +4903,42 @@ def call_agent_cli(
     # through (else the consumer would leak pi's internal handshake noise).
     if _is_pi_cmd(cmd):
         pi_reply, pi_thinking = _pi_turn_from_stream(result.stdout)
+        if not pi_reply and _PI_STREAM_CUT_RE.search(raw_transport):
+            # The relay cut the SSE stream mid-turn (rc=0, no usable message_end
+            # — pi's routine failure shape with flaky openai-compatible relays,
+            # usr_6f5a 2026-07-17). This is transient by nature: one immediate
+            # retry usually lands. Strictly single-shot — the retry result flows
+            # through the SAME parse below, so a second cut still raises and the
+            # error bubble fires as before. Session accounting for the retry is
+            # recorded like any turn (conservative double-count of the prompt).
+            log.warning(
+                "pi stream cut mid-turn (no reply, '%s'); retrying this turn once",
+                _cli_error_detail(result.stdout or "", result.stderr or "")[:120],
+            )
+            _emit_debug_trace(
+                "agent", "agent.model.call.stream_cut_retry", trace_id=trace_id,
+                summary="pi stream cut; single retry",
+                explain="上游把流式回复中途掐断(无 finish_reason)——立即重试本轮一次",
+            )
+            result = subprocess.run(cmd, **_run_kwargs)
+            _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
+            raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+            if observed_sid:
+                _record_agent_session_turn(
+                    observed_sid,
+                    sent_bytes=len((message or "").encode("utf-8")),
+                    received_bytes=_turn_content_bytes(cmd, result.stdout or "", result.stderr or ""),
+                )
+            # The retry runs AFTER the function's original returncode gate — re-check
+            # it here so a crashed retry can never be returned as success just
+            # because its partial stdout happens to parse (the "all nonzero CLI
+            # exits raise" invariant must survive the retry path).
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"cli agent exited {result.returncode}: "
+                    f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
+                )
+            pi_reply, pi_thinking = _pi_turn_from_stream(result.stdout)
         if pi_reply:
             # A pi turn that actually carried a resident transcript closes this
             # session's bridge debt: subsequent turns ride pi's native --session-id
@@ -6535,6 +6584,24 @@ def _proactive_control_reason_from_result(agent_result: Any, replies: list[str])
     ).strip()
 
 
+def _is_degenerate_proactive_reply(text: Any) -> bool:
+    """True when a proactive reply carries no actual content — only
+    whitespace/punctuation/separators (e.g. ".", "。", "…").
+
+    Flaky openai-compatible relays can cut the SSE stream right after the
+    first token; pi still closes the assistant message with that fragment,
+    and without this check the consumer posts it as an unprompted chat
+    bubble (seen live 2026-07-17: a 2-hour heartbeat posting a bare "."
+    twice). Letters, digits, CJK and emoji all count as content — only a
+    reply with none of those is degenerate. Proactive lane only: a
+    foreground turn the user started still surfaces whatever came back."""
+    for ch in str(text or ""):
+        cat = unicodedata.category(ch)
+        if cat[0] in ("L", "N") or cat == "So":
+            return False
+    return True
+
+
 def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict]]:
     proactive: list[dict] = []
     memory_identity: list[dict] = []
@@ -8088,16 +8155,43 @@ def _process_proactive_jobs(jobs: list) -> float:
             )
             update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
             continue
-        _note_agent_turn_success()
-        if is_idle_proactive:
-            _note_idle_proactive_send()
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
         if not replies:
             replies = _send_message_replies_from_actions(actions)
+        # A relay-truncated turn can hand back a bare punctuation fragment as
+        # the whole "reply" — drop those before any branch below sees them, so
+        # a sleep/schedule action still completes quietly instead of posting
+        # the fragment as a chat bubble.
+        degenerate_replies = [r for r in replies if _is_degenerate_proactive_reply(r)]
+        if degenerate_replies:
+            replies = [r for r in replies if not _is_degenerate_proactive_reply(r)]
+            log.warning(
+                "proactive degenerate reply fragment(s) dropped id=%s fragments=%r",
+                job_id,
+                [str(r)[:20] for r in degenerate_replies],
+            )
         proactive_actions, memory_identity_actions = _split_proactive_actions(actions)
         status_actions = [_compact_action_for_status(a) for a in proactive_actions]
+        if degenerate_replies and not replies and not proactive_actions and not memory_identity_actions:
+            # The agent's ONLY output was a degenerate fragment — same posture
+            # as agent_reply_parse_failed above: report + fail the job, post
+            # nothing. Sits BEFORE the success/idle-send accounting below: a
+            # suppressed turn is a failed realization, not a realized idle
+            # send — two truncated wakes in a row must not trip the idle-loop
+            # guard and stall proactive until the user speaks. The failure
+            # reason keys the admin job_failed_reasons aggregation, so
+            # flaky-relay users stay visible.
+            _notify_agent_turn_failure(
+                ValueError("agent produced only a degenerate reply fragment; not posting"),
+                foreground=False,
+            )
+            update_proactive_job_status(job_id, "failed", "degenerate_reply_suppressed")
+            continue
+        _note_agent_turn_success()
+        if is_idle_proactive:
+            _note_idle_proactive_send()
         control_reply_reason = _proactive_control_reason_from_result(agent_result, replies)
         if control_reply_reason and not proactive_actions and not memory_identity_actions:
             update_proactive_job_status(

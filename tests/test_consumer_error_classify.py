@@ -85,6 +85,16 @@ def test_stream_disconnected_is_upstream_unavailable():
     assert n.error_class == "upstream_unavailable"
 
 
+def test_pi_stream_ended_without_finish_reason_is_upstream_unavailable():
+    # prod usr_6f5a 2026-07-17: flaky openai-compatible relay cut the SSE stream;
+    # pi surfaces this verbatim. Used to fall to unknown/blame=system ("连接模型
+    # 服务时出了问题") — blaming US for the relay. It's the provider's transient.
+    n = _cls(RuntimeError("pi agent produced no reply: Stream ended without finish_reason"))
+    assert n.error_class == "upstream_unavailable"
+    assert n.blame == "provider_transient"
+    assert "你的模型服务" in n.user_text
+
+
 def test_timeout_expired_by_type():
     n = _cls(subprocess.TimeoutExpired(cmd="codex", timeout=120))
     assert n.error_class == "turn_timeout"

@@ -140,7 +140,8 @@ _UPSTREAM_RULES = (
     ("upstream_unavailable", re.compile(
         r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out"
         r"|connection (refused|reset|error)"
-        r"|unreachable|stream disconnected", re.I)),
+        r"|unreachable|stream disconnected"
+        r"|ended without finish_reason", re.I)),
 )
 
 
