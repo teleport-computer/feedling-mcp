@@ -68,6 +68,43 @@ def _stub_update_identity_persona(monkeypatch):
     monkeypatch.setattr(plaintext.service, "write_persona_artifact", lambda *_args, **_kwargs: ("user_blob:genesis_persona", "sha-persona"))
 
 
+def test_plaintext_import_missing_material_returns_stable_slug(monkeypatch):
+    client = _client(monkeypatch)
+
+    resp = client.post("/v1/genesis/imports/plaintext", json={"format": "auto", "content": ""})
+
+    assert resp.status_code == 400
+    body = resp.get_json()
+    assert body["error"] == "material_empty"
+    assert "fresh_start=true required" in body["detail"]
+
+
+def test_plaintext_import_normalized_empty_returns_stable_slug(monkeypatch):
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        plaintext.history_import,
+        "_parse_import_history_content",
+        lambda *_args: [{"role": "user", "content": "raw", "source": "history_import"}],
+    )
+    monkeypatch.setattr(plaintext.history_import, "_persona_support_messages", lambda _payload: [])
+    monkeypatch.setattr(
+        plaintext.history_import,
+        "_history_import_profile",
+        lambda *_args, **_kwargs: {"tier": "small", "total_windows": 1, "message_count": 1, "support_count": 0},
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_source_groups",
+        lambda *_args, **_kwargs: [{"source_family": "history", "chunk_texts": ["   "]}],
+    )
+
+    resp = client.post("/v1/genesis/imports/plaintext", json={"format": "auto", "content": "raw"})
+
+    assert resp.status_code == 400
+    body = resp.get_json()
+    assert body == {"error": "material_empty", "detail": "plaintext_import_empty"}
+
+
 def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypatch):
     client = _client(monkeypatch)
     payload = {

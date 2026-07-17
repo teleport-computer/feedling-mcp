@@ -141,6 +141,14 @@ def _bad(error: str, status: int = 400, **extra) -> tuple[dict, int]:
     return {"error": error, **extra}, status
 
 
+def _bad_from_value_error(e: ValueError, status: int = 400) -> tuple[dict, int]:
+    error = str(getattr(e, "error", "") or "")
+    if error == "material_empty":
+        detail = str(getattr(e, "detail", "") or str(e))
+        return _bad("material_empty", status, detail=detail)
+    return _bad(str(e), status)
+
+
 def _is_sealed_body(payload: dict) -> bool:
     """A self-hosted upload is a client-sealed envelope, tagged ``format: sealed_v1``
     (NOT the legacy plaintext body). This tag is the ROUTING signal: sealed → resident
@@ -611,7 +619,7 @@ def plaintext_import(
         prepared = prepare(payload)
     except ValueError as e:
         _log_plaintext_import_rejected(store, mode=mode, reason=str(e), payload=payload)
-        return _bad(str(e), 400)
+        return _bad_from_value_error(e, 400)
 
     if existing:
         existing = db.genesis_set_job_status(
@@ -653,7 +661,7 @@ def plaintext_import(
         })
     except ValueError as e:
         _log_plaintext_import_rejected(store, mode=mode, reason=str(e), payload=payload)
-        return _bad(str(e), 400)
+        return _bad_from_value_error(e, 400)
 
     job = db.genesis_set_job_status(
         store.user_id,
