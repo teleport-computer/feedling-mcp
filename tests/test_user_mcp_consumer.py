@@ -395,7 +395,7 @@ def test_castore_write_failure_fails_open_no_truncated_file(tmp_path, monkeypatc
     monkeypatch.setattr(
         c, "_user_mcp_applied",
         {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
-    env = c._user_mcp_ca_env(["codex", "exec", "hi"])
+    env = c._user_mcp_child_env(["codex", "exec", "hi"])
     assert "SSL_CERT_FILE" not in env
 
 
@@ -428,7 +428,7 @@ def test_ca_file_write_failure_fails_open_no_truncated_file(tmp_path, monkeypatc
     monkeypatch.setattr(
         c, "_user_mcp_applied",
         {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
-    env = c._user_mcp_ca_env(["claude", "-p", "hi"])
+    env = c._user_mcp_child_env(["claude", "-p", "hi"])
     assert "NODE_EXTRA_CA_CERTS" not in env
 
 
@@ -481,13 +481,13 @@ def test_env_injection_per_runtime(tmp_path, monkeypatch,
     castore_file.write_text("SYSTEM\nPEM-USER\n")
     monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
     monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore_file))
-    # _user_mcp_ca_env gates on the in-memory applied state, not just file
+    # _user_mcp_child_env gates on the in-memory applied state, not just file
     # existence (FINAL FIX WAVE ③) — an enabled server must be "applied".
     monkeypatch.setattr(
         c, "_user_mcp_applied",
         {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
 
-    env = c._user_mcp_ca_env(cmd)
+    env = c._user_mcp_child_env(cmd)
 
     expected_path = str(ca_file if expect_file == "ca" else castore_file)
     assert env == {expect_var: expected_path}
@@ -496,15 +496,44 @@ def test_env_injection_per_runtime(tmp_path, monkeypatch,
         assert env["SSL_CERT_FILE"] != str(ca_file)
 
 
-def test_env_injection_skips_pi(tmp_path, monkeypatch):
+def test_env_injection_covers_pi_like_claude(tmp_path, monkeypatch):
+    """pi is a Node process, so NODE_EXTRA_CA_CERTS applies to it exactly as it
+    does to claude.
+
+    This test previously asserted `== {}` with the rationale "pi: route
+    abandoned". That rationale was never true: v2 spec §1 said pi was "本期不涉及"
+    (a scheduling decision), which the 07-16 spec upgraded into "路线已放弃" (a
+    strategy conclusion nobody ever made). pi in fact carries gemini /
+    openrouter / openai_compatible on test and prod. See
+    2026-07-17-pi-user-mcp-bridge-design.md §1.1.
+
+    Asserted as a whole dict on purpose: pi's child env must be exactly the CA
+    plus its own bridge config path — nothing else. A single-key check would not
+    catch a future refactor leaking an extra var into the agent's environment.
+    """
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_text("PEM-USER\n")
+    mcp_file = tmp_path / "user-mcp.json"
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "castore.pem"))
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(mcp_file))
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
+    assert c._user_mcp_child_env(["pi", "--mode", "json"]) == {
+        "NODE_EXTRA_CA_CERTS": str(ca_file),
+        "FEEDLING_USER_MCP_FILE": str(mcp_file),
+    }
+
+
+def test_env_injection_pi_empty_when_no_servers(tmp_path, monkeypatch):
+    """The enabled-server gate applies to pi too — no server, no CA env."""
     ca_file = tmp_path / "ca.pem"
     ca_file.write_text("PEM-USER\n")
     monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
     monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "castore.pem"))
-    monkeypatch.setattr(
-        c, "_user_mcp_applied",
-        {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
-    assert c._user_mcp_ca_env(["pi", "--message"]) == {}
+    monkeypatch.setattr(c, "_user_mcp_applied", {"fingerprint": None, "servers": []})
+    assert c._user_mcp_child_env(["pi", "--mode", "json"]) == {}
 
 
 def test_env_injection_empty_when_no_files(tmp_path, monkeypatch):
@@ -513,8 +542,8 @@ def test_env_injection_empty_when_no_files(tmp_path, monkeypatch):
     monkeypatch.setattr(
         c, "_user_mcp_applied",
         {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
-    assert c._user_mcp_ca_env(["claude", "-p"]) == {}
-    assert c._user_mcp_ca_env(["codex", "exec"]) == {}
+    assert c._user_mcp_child_env(["claude", "-p"]) == {}
+    assert c._user_mcp_child_env(["codex", "exec"]) == {}
 
 
 def test_env_injection_empty_when_no_servers_applied(tmp_path, monkeypatch):
@@ -525,7 +554,7 @@ def test_env_injection_empty_when_no_servers_applied(tmp_path, monkeypatch):
     monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
     monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "castore.pem"))
     monkeypatch.setattr(c, "_user_mcp_applied", {"fingerprint": None, "servers": []})
-    assert c._user_mcp_ca_env(["claude", "-p"]) == {}
+    assert c._user_mcp_child_env(["claude", "-p"]) == {}
 
 
 def test_env_injection_ignores_stale_files_after_restart(tmp_path, monkeypatch):
@@ -550,8 +579,8 @@ def test_env_injection_ignores_stale_files_after_restart(tmp_path, monkeypatch):
     # consumer looks like before its first poll response arrives.
     monkeypatch.setattr(c, "_user_mcp_applied", {"fingerprint": None, "servers": []})
 
-    assert c._user_mcp_ca_env(["claude", "-p", "hi"]) == {}
-    assert c._user_mcp_ca_env(["codex", "exec", "hi"]) == {}
+    assert c._user_mcp_child_env(["claude", "-p", "hi"]) == {}
+    assert c._user_mcp_child_env(["codex", "exec", "hi"]) == {}
 
 
 def test_apply_user_mcp_failure_does_not_raise(monkeypatch):
@@ -633,3 +662,90 @@ def test_apply_user_mcp_clears_to_empty(monkeypatch, tmp_path):
 
 def test_runtime_repo_files_covers_materialize_module():
     assert "tools/user_mcp_materialize.py" in c._runtime_repo_files()
+
+
+def test_runtime_repo_files_covers_pi_bridge_files():
+    files = c._runtime_repo_files()
+    assert "tools/pi_mcp_bridge/index.js" in files
+    assert "tools/pi_mcp_bridge/mcp_client.js" in files
+    assert "tools/pi_mcp_bridge/tool_mapping.js" in files
+
+
+# ---------------------------------------------------------------------------
+# pi: {mcp} → -e <bridge>, and the bridge's config path via env
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_value_pi_injects_extension_on_chat_lane_only(monkeypatch, tmp_path):
+    """pi mirrors claude: inject on the chat lane, nothing on background.
+
+    Structural gating — a background turn simply has no extension loaded, so the
+    MCP tools do not exist that turn (v2 spec §1: never silently spend the
+    user's third-party quota).
+    """
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "sha256:x", "servers": [
+            {"name": "jira", "enabled": True,
+             "url": "https://a.example.com", "headers": {}}]})
+    bridge_file = tmp_path / "index.js"
+    bridge_file.write_text("// bridge")
+    monkeypatch.setattr(c, "PI_MCP_BRIDGE_FILE", str(bridge_file))
+    tpl_pi = "pi --mode json -ne -xt read,edit,write {mcp} --session-id {session_id}"
+    monkeypatch.setattr(c, "AGENT_CLI_CMD", tpl_pi)
+
+    assert c._user_mcp_cli_value(tpl_pi, "chat") == f"-e {bridge_file}"
+    assert c._user_mcp_cli_value(tpl_pi, "background") == ""
+
+
+def test_mcp_value_pi_degrades_to_empty_when_bridge_file_missing(
+        monkeypatch, tmp_path):
+    """Finding 1: pi exits 1 with empty stdout when `-e <path>` points at a
+    missing file — no model call at all — on the chat-only lane. That's the
+    same failure shape _strip_missing_mcp_config guards against for claude's
+    --mcp-config; the chat turn must survive by degrading to no-MCP instead
+    of dying."""
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "sha256:x", "servers": [
+            {"name": "jira", "enabled": True,
+             "url": "https://a.example.com", "headers": {}}]})
+    monkeypatch.setattr(c, "PI_MCP_BRIDGE_FILE", str(tmp_path / "missing" / "index.js"))
+    tpl_pi = "pi --mode json -ne -xt read,edit,write {mcp} --session-id {session_id}"
+    monkeypatch.setattr(c, "AGENT_CLI_CMD", tpl_pi)
+
+    assert c._user_mcp_cli_value(tpl_pi, "chat") == ""
+
+
+def test_mcp_value_pi_empty_without_enabled_servers(monkeypatch):
+    monkeypatch.setattr(c, "_user_mcp_applied", {"fingerprint": None, "servers": []})
+    tpl_pi = "pi --mode json {mcp} --session-id {session_id}"
+    monkeypatch.setattr(c, "AGENT_CLI_CMD", tpl_pi)
+    assert c._user_mcp_cli_value(tpl_pi, "chat") == ""
+
+
+def test_child_env_gives_pi_the_config_path(tmp_path, monkeypatch):
+    """The bridge is one shared static file; the config path is per-user, so it
+    must ride an env var rather than be baked into the extension."""
+    mcp_file = tmp_path / "mcp.json"
+    mcp_file.write_text("{}")
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(mcp_file))
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(tmp_path / "nope.pem"))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "nope2.pem"))
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
+
+    env = c._user_mcp_child_env(["pi", "--mode", "json"])
+    assert env["FEEDLING_USER_MCP_FILE"] == str(mcp_file)
+    # claude/codex have their own config channels and must not get this var
+    assert "FEEDLING_USER_MCP_FILE" not in c._user_mcp_child_env(["claude", "-p"])
+    assert "FEEDLING_USER_MCP_FILE" not in c._user_mcp_child_env(["codex", "exec"])
+
+
+def test_child_env_pi_no_config_path_without_servers(tmp_path, monkeypatch):
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(tmp_path / "nope.pem"))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "nope2.pem"))
+    monkeypatch.setattr(c, "_user_mcp_applied", {"fingerprint": None, "servers": []})
+    assert c._user_mcp_child_env(["pi", "--mode", "json"]) == {}

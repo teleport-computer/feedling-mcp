@@ -455,10 +455,22 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
     if driver == "pi":
         # --mode json: headless JSONL event stream (pi's analogue of codex --json;
         #   auto-selects print mode, no -p needed).
-        # -t bash: builtin-tool whitelist — the hosted tool contract is entirely
-        #   io_cli-via-bash, so this is tighter than codex's bypassed sandbox and
-        #   close to claude's allow-rules posture. pi has no permission prompts in
-        #   headless mode; the CVM/TEE + per-user home stays the isolation boundary.
+        # -ne -xt read,edit,write: tool posture. Equivalent to the old `-t bash`
+        #   for the active set — pi's defaultActiveToolNames is the hardcoded
+        #   ["read","bash","edit","write"] (sdk.js:131), so excluding three
+        #   leaves exactly ["bash"] — but WITHOUT -t's fatal side effect: -t is
+        #   an allowlist that "applies to built-in, extension, and custom tools"
+        #   (pi --help), and agent-session.js:1867 filters extension-registered
+        #   tools through it BEFORE they reach the registry. Under `-t bash` the
+        #   user-MCP bridge's tools would be dropped and setActiveTools() could
+        #   not recover them (they're not in the registry at all).
+        #   -ne closes extension auto-discovery: with no -t, allowedToolNames is
+        #   undefined and includeAllExtensionTools (agent-session.js:145) would
+        #   activate any extension the agent dropped into ~/.pi/agent/extensions/
+        #   via bash. Explicit -e paths still load. This preserves the isolation
+        #   `-t bash` used to provide.
+        # {mcp}: the resident fills this per turn — `-e <bridge>` on the chat
+        #   lane, empty elsewhere. Same shape as claude's --mcp-config.
         # --session-id {session_id}: resident-owned bounded session. pi's semantics
         #   are "use exact id, CREATE if missing", so the resident's generated id
         #   gives resume for free — the gap codex never closed.
@@ -477,7 +489,8 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
         eff = _pi_effort(reasoning_effort)
         thinking_part = f"--thinking {eff} " if eff else ""
         return (
-            f"pi --mode json -t bash --append-system-prompt {prompt_file} "
+            f"pi --mode json -ne -xt read,edit,write {{mcp}} "
+            f"--append-system-prompt {prompt_file} "
             f"{model_part}{thinking_part}"
             "--session-id {session_id}"
         )
