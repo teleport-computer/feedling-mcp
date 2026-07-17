@@ -9455,16 +9455,9 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
 
     # actions: envelope + memory.add + complete — HTTP writes only, no model turn, so
     # this tail never yields (yielding here would risk double memory.add on resume).
-    now_iso = datetime.now(_tzmod.utc).isoformat()
+    occurred_at = datetime.now(_tzmod.utc).isoformat()
     actions: list[dict] = []
     for card in state["memories"]:
-        # Long-term-memory distill (keep_all ← material_kind == "memory_summary") carries the
-        # user's original per-card date through fact_write. Preserve it so decades of uploaded
-        # memories don't all collapse onto today. Chat-history distill keeps the "now" stamp;
-        # an LTM card the model couldn't date also falls back to now() — resident has no
-        # server-side relationship anchor to borrow (cloud path uses one; divergence is documented).
-        card_date = str(card.get("occurred_at") or card.get("date") or "").strip()[:80] if keep_all else ""
-        occurred_at = card_date or now_iso
         envelope = _capture_build_envelope(
             card, occurred_at=occurred_at, source="genesis_resident_distill"
         )
