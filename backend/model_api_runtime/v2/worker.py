@@ -48,6 +48,7 @@ from capabilities import registry as cap_registry
 from core import envelope as core_envelope
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from perception.agent_fields import AGENT_PERCEPTION_SIGNALS
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
@@ -179,6 +180,12 @@ _TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "6"))
 # it would just complete as a no-op), so it's left alone here rather than
 # silently mishandled by this task's scope.
 _WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake", "screen_watch"})
+
+# The full agent-pullable catalog, taken from perception.agent_fields — the single
+# source of truth both the agent routes and this grounding read from ("Add a new
+# agent-pullable signal here ONCE and both paths pick it up"). Re-listing the names
+# here would silently drift the moment a signal is added.
+_PERCEPTION_GROUNDING_SIGNALS = tuple(AGENT_PERCEPTION_SIGNALS)
 # 记忆抽取 lane（capture=一窗对话→记忆卡，dream=现有卡片→合并）。同形：
 # build prompt → BYOK 抽取 → parse → memory actions。永不写气泡、永不弹 error chip。
 _EXTRACTION_LANES = frozenset({"capture", "dream"})
@@ -483,6 +490,38 @@ class TurnMetrics:
             cache_route_fingerprint=self.cache_route_fingerprint,
             latency_ms=latency_ms, model_calls=self.model_calls, retries=self.retries,
             failed=failed, status=status)
+
+
+async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
+    """Prefetch the turn's perception snapshot as static grounding.
+
+    Without this the agent is perception-BLIND on every lane but screen_watch: the
+    chat system prompt never mentions perception, so asked "how many steps today"
+    the model answered "can't get that" while `perception_snapshot(signals=["steps"])`
+    would have returned the count immediately.
+
+    Signals are passed EXPLICITLY over the full catalog: the capability's default is
+    `FAST_AGENT_PERCEPTION_SIGNALS` (now/location/weather/motion/calendar) and every
+    health signal — steps/sleep/vitals/activity/body — lives in the SLOW set, so the
+    default would reproduce the exact blindness this fixes. Signal COUNT is not a
+    latency cost (the read is a fixed 3 store reads regardless); it costs tokens only,
+    and the block lands after the cached prefix (`build_turn_messages` appends
+    action_context LAST), so it does not invalidate prompt caching.
+
+    Disabled/null signals are kept, not filtered: the agent must be told what it
+    CANNOT see ("now: not_permitted") rather than infer from an absence.
+
+    Returns the `action_results` shape `action_context_str` expects, or None when the
+    prefetch came back empty — `_cap_data` degrades to {} on failure and this is
+    never fatal: the model still has the tool and can fetch perception itself.
+    """
+    data = await _cap_data(
+        store, "perception_snapshot", api_key=None, runtime_token=runtime_token,
+        params={"signals": list(_PERCEPTION_GROUNDING_SIGNALS)},
+        enclave_sem=enclave_sem)
+    if not data:
+        return None
+    return {"perception_snapshot": [{"ok": True, "data": data}]}
 
 
 async def _cap_data(store, action_type, *, api_key, runtime_token, params=None, enclave_sem=None) -> dict:
@@ -1617,6 +1656,12 @@ async def _run_wake(
             # _fold_action_results caps each action at _PER_ACTION_CHAR_CAP=2000 chars
             # (the multimodal round's anti-poisoning cap); captions fit.
             screen_results = {"screen_recent": [{"ok": True, "data": data}]}
+        else:
+            # Every OTHER wake lane grounds on the user's perception instead: a
+            # proactive message that cannot see how the user slept / moved / where
+            # they are has nothing real to open with.
+            screen_results = await _perception_grounding_results(
+                store, runtime_token=token, enclave_sem=enclave_sem)
 
         # Pin effects to the generation admitted/claimed for this job, never a
         # fresh read. A resident->v2 ABA during a long provider call can leave
@@ -2308,6 +2353,14 @@ async def process_job(
             mcp_turn = await deps.load_mcp_turn(
                 store, api_key=api_key, runtime_token=runtime_token)
 
+        # Perception grounding for the chat turn. Sits HERE, beside the MCP load and
+        # deliberately OUTSIDE the `async with enclave_sem` block above: `_cap_data`
+        # acquires enclave_sem itself and asyncio.Semaphore is not reentrant (see its
+        # docstring / the wake lane's identical note) — nesting deadlocks at
+        # FEEDLING_V2_ENCLAVE_CONCURRENCY=1.
+        perception_results = await _perception_grounding_results(
+            store, runtime_token=runtime_token, enclave_sem=enclave_sem)
+
         async def _dispatch_tools(tool_calls):
             # Fence once per round before any capability executes (mirrors the
             # old _run_tools's renewal ahead of the read burst); writes get a
@@ -2398,7 +2451,9 @@ async def process_job(
         # share the exact same gate the rest of this turn's enclave-bound calls use.
         fold_new_messages = _make_fold_new_messages(user_id, deps, cursor_box, enclave_sem=enclave_sem)
         build_messages = _make_build_messages_fn(
-            system_prompt=context.CHAT_SYSTEM_PROMPT, summary=summary, tail=tail)
+            system_prompt=context.CHAT_SYSTEM_PROMPT, summary=summary, tail=tail,
+            extra_context=context.action_context_str(perception_results)
+            if perception_results else "")
 
         await _ensure_runtime_mode()
         await _renew_lease()
