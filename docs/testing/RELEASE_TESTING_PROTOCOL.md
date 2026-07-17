@@ -1,6 +1,6 @@
 # Feedling 发版测试方案（Release Testing Protocol）
 
-> 2026-07-17 · Seven 定框架，Claude 落地。与 `docs/TESTING.md`（开发循环的
+> 2026-07-17 · Seven 定框架，Claude 落地。与 `docs/testing/TESTING.md`（开发循环的
 > "改什么测什么"决策矩阵）互补：**TESTING.md 管每次改动，本文档管每次发版
 > 和每个新功能**。
 >
@@ -159,7 +159,7 @@ verify_loop passing → 发消息收回复 → 删号。
 ## 6. L3 生产部署验证
 
 每次 prod deploy 后，从当次发版内容生成验证清单照单跑（模板见
-`docs/PROD_DEPLOY_VERIFICATION_2026-07.md` 的结构：逐项 ✅/❌/跳过+原因、
+`docs/testing/PROD_DEPLOY_VERIFICATION_2026-07.md` 的结构：逐项 ✅/❌/跳过+原因、
 写明"什么不算失败"）。固定项：
 - `/healthz` + attestation/canary 绿；
 - 抽 2-3 个真实活跃用户 admin 页看健康信号（错误气泡增量、proactive 状态分布）；

@@ -6,7 +6,7 @@
 
 > **发版和新功能另有一套**：本文档管**每次改动**（开发循环 L0）；每次
 > test→main 发版的全量回归、新功能的能力矩阵申报与跨环境（driver × route ×
-> provider）E2E，见 **`docs/RELEASE_TESTING_PROTOCOL.md`**（2026-07-17 起）。
+> provider）E2E，见 **`docs/testing/RELEASE_TESTING_PROTOCOL.md`**（2026-07-17 起）。
 
 ---
 
