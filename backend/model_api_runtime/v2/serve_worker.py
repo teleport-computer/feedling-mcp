@@ -1254,6 +1254,19 @@ def _sink_memory(user_id: str, payload: dict, *, runtime_token: str) -> None:
     db.effect_sink_complete(eid)
 
 
+def _capability_effect_error(result, code: str) -> Exception:
+    """Map a failed capability result to the right effect-outbox failure signal.
+
+    A RETRYABLE failure (5xx/429 — transient) keeps the plain-``RuntimeError``
+    retry path. A NON-RETRYABLE failure (4xx — deterministic; the write cannot
+    succeed on replay, e.g. 409 ``identity_not_initialized``) raises
+    ``EffectTerminalError`` so the outbox discards the effect instead of retrying
+    forever and wedging the user's conversation.
+    """
+    retryable = bool((getattr(result, "error", None) or {}).get("retryable"))
+    return RuntimeError(code) if retryable else db.EffectTerminalError(code)
+
+
 def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
     """`identity` sink. Payload keys: ``{"patch": dict}`` OR top-level
     ``self_introduction``/``signature`` keys — mirrors
@@ -1275,9 +1288,11 @@ def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
         )
         if not result.ok:
             # Capability error bodies may contain user/provider details.  Raise
-            # only a stable code; the claim-release path below keeps the effect
-            # pending for a safe retry rather than completing a failed action.
-            raise RuntimeError("identity_patch_failed")
+            # only a stable code.  Honor retryable: a deterministic 4xx (e.g. 409
+            # identity_not_initialized on a fresh-start user) must terminal-discard
+            # so the sweeper stops looping and the reply is not wedged; a retryable
+            # 5xx keeps the claim-release retry path below.
+            raise _capability_effect_error(result, "identity_patch_failed")
     except Exception:
         db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
         raise
@@ -1327,7 +1342,9 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
             result = cap_registry.run_capability(
                 op, store, api_key=None, params=params)
             if not result.ok:
-                raise RuntimeError(f"{op}_failed")
+                # Same retryable-honoring contract as _sink_identity: a
+                # deterministic 4xx terminal-discards instead of wedging.
+                raise _capability_effect_error(result, f"{op}_failed")
         else:
             kwargs = {k: v for k, v in payload.items() if k in _SCHEDULE_PAYLOAD_KEYS}
             jobs_store.upsert_wake_schedule(user_id, **kwargs)

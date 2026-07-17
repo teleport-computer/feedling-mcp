@@ -112,6 +112,62 @@ def _save_identity_action_payload(
     return identity, change, ""
 
 
+def _create_identity_action_payload(
+    store: UserStore,
+    payload: dict,
+    *,
+    audit: dict,
+    event_type: str,
+) -> tuple[dict | None, dict | None, str]:
+    """Fix A: CREATE a brand-new identity card from an agent action.
+
+    ``_save_identity_action_payload`` is UPDATE-ONLY — it 409s when no card
+    exists, which wedges the V2 conversation on a fresh-start user's very first
+    identity write (no persona → no card → agent calls profile_patch → 409 →
+    effect retries forever). This mints the minimal valid card so the agent can
+    establish its own identity. Stamps a fresh relationship anchor (today, or the
+    earliest memory date) — this is NOT a Genesis import, so the anchor source is
+    ``agent_bootstrap``.
+    """
+    from identity import card_policy
+    ok, err = card_policy.validate_full_identity_card(payload)
+    if not ok:
+        return None, None, err
+    envelope, err = core_envelope._build_shared_envelope_for_store(
+        store,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        item_id=None,
+    )
+    if envelope is None:
+        return None, None, err
+    now = core_util._now_iso()
+    identity = {
+        "v": 1,
+        "id": envelope.get("id") or core_util._new_public_id("identity"),
+        "body_ct": envelope["body_ct"],
+        "nonce": envelope["nonce"],
+        "K_user": envelope["K_user"],
+        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "visibility": envelope["visibility"],
+        "owner_user_id": envelope["owner_user_id"],
+        "created_at": now,
+        "updated_at": now,
+        # A create IS a full-card write, so it stamps the replaced_at baseline
+        # (P5 optimistic-concurrency anchor), same as init / replace.
+        "replaced_at": now,
+        "relationship_started_at": identity_service._anchor_from_days(
+            0, store=store, prefer_memory=True),
+        "relationship_anchor_source": "agent_bootstrap",
+        "relationship_anchor_evidence": "identity established by the agent via profile_patch",
+    }
+    if envelope.get("K_enclave"):
+        identity["K_enclave"] = envelope["K_enclave"]
+    identity_service._save_identity(store, identity)
+    boot_gates._log_bootstrap_event(store, event_type, success=True)
+    change = identity_service._append_identity_change(store, audit)
+    return identity, change, ""
+
+
 def _identity_profile_patch(
     store: UserStore,
     api_key: str | None,
@@ -132,8 +188,17 @@ def _identity_profile_patch(
         return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 400
 
     plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
+    bootstrap = False
     if plain is None:
-        return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
+        # Fix A: a fresh-start user (no persona → no identity card) whose agent
+        # calls profile_patch has nothing to UPDATE. Rather than 409-wedging the
+        # V2 conversation on the very first identity write, create the card from
+        # this patch. Only "not initialized" bootstraps — a decrypt failure or any
+        # other error still 409s (do not paper over a broken card).
+        if err != "identity_not_initialized":
+            return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
+        bootstrap = True
+        plain = {}  # empty base: every field comes from the patch
 
     payload = _identity_payload_from_plain(plain)
     changed: list[str] = []
@@ -206,6 +271,11 @@ def _identity_profile_patch(
                 audit_new = ", ".join(values)[:120]
 
     if not changed:
+        if bootstrap:
+            # A non-empty patch that resolves to zero writable fields against an
+            # empty card (e.g. an empty list value) — nothing to bootstrap. Fall
+            # back to the original 409 instead of a misleading no-op "ok".
+            return {"status": "error", "error": "identity_not_initialized", "action": "identity.profile_patch"}, [], 409
         return {
             "status": "ok",
             "action": "identity.profile_patch",
@@ -217,18 +287,19 @@ def _identity_profile_patch(
         action.get("reason") or f"Identity profile updated: {', '.join(changed)}.",
         500,
     )
-    identity, change, err = _save_identity_action_payload(
-        store,
-        payload,
-        audit={
-            "action": "profile_patch",
-            "dimension": "profile",
-            "old_value": audit_old,
-            "new_value": audit_new,
-            "reason": reason,
-        },
-        event_type="identity_action_profile_patch",
-    )
+    audit = {
+        "action": "profile_patch",
+        "dimension": "profile",
+        "old_value": audit_old,
+        "new_value": audit_new,
+        "reason": reason,
+    }
+    if bootstrap:
+        identity, change, err = _create_identity_action_payload(
+            store, payload, audit=audit, event_type="identity_action_bootstrap")
+    else:
+        identity, change, err = _save_identity_action_payload(
+            store, payload, audit=audit, event_type="identity_action_profile_patch")
     if identity is None:
         return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
 

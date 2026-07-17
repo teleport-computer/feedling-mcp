@@ -7178,6 +7178,19 @@ class EffectDeliveryUncertainError(RuntimeError):
     """
 
 
+class EffectTerminalError(RuntimeError):
+    """A sink hit a DETERMINISTIC, non-retryable failure applying this effect.
+
+    Retrying a deterministic capability failure (e.g. a 4xx like 409
+    ``identity_not_initialized`` — the write cannot succeed no matter how many
+    times it runs) only wedges the user's conversation: the reconcile sweeper
+    loops forever on a dead effect and the turn/job never settles. A sink raises
+    this to tell the outbox to mark the effect ``discarded`` (terminal, no retry)
+    instead of scheduling another attempt. It is NOT a delivery-uncertain state:
+    the write provably did not land, so dropping it loses nothing.
+    """
+
+
 def effect_sink_claim(effect_id: str) -> bool:
     """Begin the generic sink delivery protocol for ``effect_id``.
 

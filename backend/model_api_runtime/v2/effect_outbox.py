@@ -41,6 +41,7 @@ def apply_pending_effects(user_id: str, *, dispatch: Callable[[str, dict], None]
         dispatch_failed = False
         dispatch_error_committed = False
         deferred_dispatch_error: Exception | None = None
+        terminal_discard = False
         try:
             with db.get_pool().connection() as conn:
                 # Pool connections are autocommit=True. Without this explicit
@@ -136,17 +137,39 @@ def apply_pending_effects(user_id: str, *, dispatch: Callable[[str, dict], None]
                                 # would let a concurrent sweeper replay an
                                 # ambiguously delivered effect before its
                                 # backoff/terminal marker became visible.
-                                db._effect_record_error_on_cursor(
-                                    cur,
-                                    eid,
-                                    _sanitized_dispatch_error(
-                                        deferred_dispatch_error
-                                    ),
-                                    reconciliation_required=isinstance(
-                                        deferred_dispatch_error,
-                                        db.EffectDeliveryUncertainError,
-                                    ),
-                                )
+                                if isinstance(
+                                    deferred_dispatch_error, db.EffectTerminalError
+                                ):
+                                    # Deterministic, non-retryable failure: the
+                                    # write provably did not land, so retrying it
+                                    # forever only wedges the conversation. Mark it
+                                    # discarded (terminal) and DON'T re-raise — this
+                                    # is a handled outcome, not a delivery failure.
+                                    cur.execute(
+                                        "UPDATE v2_effect_outbox SET status='discarded', "
+                                        "last_error=%s, last_attempt_at=now() "
+                                        "WHERE effect_id=%s AND status='pending'",
+                                        (
+                                            _sanitized_dispatch_error(
+                                                deferred_dispatch_error
+                                            ),
+                                            eid,
+                                        ),
+                                    )
+                                    discarded += 1
+                                    terminal_discard = True
+                                else:
+                                    db._effect_record_error_on_cursor(
+                                        cur,
+                                        eid,
+                                        _sanitized_dispatch_error(
+                                            deferred_dispatch_error
+                                        ),
+                                        reconciliation_required=isinstance(
+                                            deferred_dispatch_error,
+                                            db.EffectDeliveryUncertainError,
+                                        ),
+                                    )
                                 error_staged_in_transaction = True
                             if deferred_dispatch_error is None:
                                 if effect_type in _LEGACY_SENSITIVE_EFFECT_TYPES:
@@ -175,7 +198,10 @@ def apply_pending_effects(user_id: str, *, dispatch: Callable[[str, dict], None]
                             discarded += 1
                 # Reaching here means the transaction commit succeeded.
                 dispatch_error_committed = error_staged_in_transaction
-                if deferred_dispatch_error is not None:
+                if deferred_dispatch_error is not None and not terminal_discard:
+                    # A terminal discard is a handled outcome (row already marked
+                    # 'discarded' above); only a retryable/uncertain failure
+                    # propagates so the sweeper keeps the row visible.
                     raise deferred_dispatch_error
         except Exception as exc:
             if dispatch_failed and not dispatch_error_committed:
