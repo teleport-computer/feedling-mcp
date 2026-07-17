@@ -228,6 +228,24 @@ class E2EClient:
                 return ""
         return ""
 
+    def decrypt_reply(self, msg: dict) -> str:
+        """STRICT decryption-continuity check — what the P0 hard-blocker asserts.
+
+        Unlike ``message_text`` (best-effort, swallows failures, accepts server
+        plaintext), this method proves the USER can actually read the reply with
+        THEIR private key: it decrypts the row's sealed envelope and never falls
+        back to a server-provided ``content`` shortcut. Raises on a missing
+        envelope or a decrypt failure — that IS the usr_f13f922a bug (AI keeps
+        sending, user's screen is garbage). Returns the plaintext on success.
+        """
+        env = msg if (msg.get("body_ct") and msg.get("K_user")) else msg.get("envelope")
+        if not isinstance(env, dict) or not (env.get("body_ct") and env.get("K_user")):
+            # A short text reply must carry its sealed envelope inline. If the body
+            # was offloaded/omitted, the P0 fact message was too large — shrink it,
+            # don't silently pass. Either way, no envelope = cannot prove readability.
+            raise RuntimeError("reply carries no inline sealed envelope to decrypt")
+        return self.open_envelope(env)
+
     def get(self, path: str, **kw) -> httpx.Response:
         return self._request("GET", path, **kw)
 
