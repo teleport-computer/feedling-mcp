@@ -384,7 +384,14 @@ def _plaintext_memory_key(item: dict) -> str:
 def _plaintext_merge_memories(outputs: list[dict]) -> list[dict]:
     seen: set[str] = set()
     merged: list[dict] = []
+    source_families = {
+        str(output.get("source_family") or "").strip()
+        for output in outputs
+        if str(output.get("source_family") or "").strip()
+    }
+    annotate_source_family = len(source_families) > 1
     for output in outputs:
+        source_family = str(output.get("source_family") or "").strip()
         raw_items = output.get("memories")
         if raw_items is None:
             raw_items = output.get("facts")
@@ -397,7 +404,10 @@ def _plaintext_merge_memories(outputs: list[dict]) -> list[dict]:
             if key in seen:
                 continue
             seen.add(key)
-            merged.append(item)
+            merged_item = dict(item)
+            if annotate_source_family and source_family and not str(merged_item.get("_source_family") or "").strip():
+                merged_item["_source_family"] = source_family
+            merged.append(merged_item)
     return merged
 
 
@@ -1053,6 +1063,7 @@ def _run_plaintext_add_memory_job(
     *,
     runtime,
     source_groups: list[dict],
+    relationship_anchor: dict | None = None,
 ) -> None:
     # this add_memory job path bypasses service.apply_reducer_output (which resolves
     # genesis notices for the reducer-driven completion path) -> resolve here too, at
@@ -1107,12 +1118,18 @@ def _run_plaintext_add_memory_job(
         fact_candidates=fact_candidates,
         keep_all=keep_all_job,
     )
-    merged = _plaintext_merge_reducer_outputs([{**first_output, **memory_output}], relationship_anchor={})
+    merged = _plaintext_merge_reducer_outputs([{**first_output, **memory_output}], relationship_anchor=relationship_anchor)
     raw_items = merged.get("memories")
     if raw_items is None:
         raw_items = merged.get("facts")
     raw_count = len(raw_items) if isinstance(raw_items, list) else 0
-    mem_count, _results = service.apply_memory_outputs(store, api_key, merged)
+    mem_count, _results = service.apply_memory_outputs(
+        store,
+        api_key,
+        merged,
+        preserve_dates=keep_all_job,
+        fallback_occurred_at=str((relationship_anchor or {}).get("relationship_started_at") or "").strip(),
+    )
     dropped = raw_count - mem_count
     if dropped > 0:
         notices_core.emit(store, source="genesis", error_class="genesis_partial",
@@ -1283,6 +1300,7 @@ def _run_plaintext_genesis_job(
                 job_id,
                 runtime=runtime,
                 source_groups=source_groups,
+                relationship_anchor=relationship_anchor,
             )
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="add memory job done",
                            detail={"mode": mode}, dur_ms=(time.time() - started_at) * 1000)

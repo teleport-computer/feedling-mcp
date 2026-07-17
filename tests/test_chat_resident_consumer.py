@@ -6466,6 +6466,67 @@ def test_distill_without_chat_since_never_peeks_and_runs_to_completion(monkeypat
     assert crc._distill_in_progress is None
 
 
+def test_distill_preserves_dates_for_long_term_memory_material(monkeypatch):
+    # LTM archive (material_kind == "memory_summary" → keep_all) carries each card's
+    # original date into the envelope, so decades of uploaded memories keep their dates
+    # instead of collapsing onto today. A card the model couldn't date falls back to a
+    # real now() stamp — never empty (resident has no server-side relationship anchor).
+    _patch_memory_distill(monkeypatch, windows=1)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+
+    once = {"n": 0}
+
+    def ltm_pending():
+        once["n"] += 1
+        return [{"job_id": "jobm", "mode": "add_memory",
+                 "material_kind": "memory_summary",
+                 "sealed": {"envelope": {"body_ct": "x"}}}] if once["n"] == 1 else []
+
+    monkeypatch.setattr(crc, "genesis_resident_pending", ltm_pending)
+    sys.modules["genesis"].worker.build_memory_output_from_fact_candidates = lambda **kw: {
+        "memories": [
+            {"summary": "birthday", "occurred_at": "2019-06-01"},
+            {"summary": "graduation", "date": "2020-02-02"},   # alternate key also honored
+            {"summary": "no_date"},
+        ],
+    }
+    seen = {}
+    monkeypatch.setattr(
+        crc, "_capture_build_envelope",
+        lambda card, *, occurred_at, source:
+            seen.__setitem__(card["summary"], occurred_at) or {"card": card},
+    )
+
+    crc._process_resident_distill_once()
+
+    assert seen["birthday"] == "2019-06-01"
+    assert seen["graduation"] == "2020-02-02"
+    assert seen["no_date"] and "T" in seen["no_date"]   # undated → real now() ISO, not empty
+
+
+def test_distill_ignores_dates_for_chat_history_material(monkeypatch):
+    # Chat-history distill (material_kind != memory_summary → keep_all False) is the
+    # normal path: even if a card happens to carry a date, the write stamps now(). Date
+    # preservation is scoped strictly to long-term-memory uploads.
+    _patch_memory_distill(monkeypatch, windows=1)   # base job material_kind is ""
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+
+    sys.modules["genesis"].worker.build_memory_output_from_fact_candidates = lambda **kw: {
+        "memories": [{"summary": "chatty", "occurred_at": "2019-06-01"}],
+    }
+    seen = {}
+    monkeypatch.setattr(
+        crc, "_capture_build_envelope",
+        lambda card, *, occurred_at, source:
+            seen.__setitem__(card["summary"], occurred_at) or {"card": card},
+    )
+
+    crc._process_resident_distill_once()
+
+    assert seen["chatty"] != "2019-06-01"   # date ignored off the LTM path
+    assert "T" in seen["chatty"]            # now() stamp
+
+
 def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
     # An operator-pinned --resume with a sid that is NOT ours is their config —
     # never rotate it, even on a missing-session error.

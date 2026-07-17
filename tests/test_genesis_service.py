@@ -817,6 +817,146 @@ def test_apply_memory_outputs_batches_memory_actions(monkeypatch):
     assert calls[0][0]["memory"]["occurred_at"] == ""
 
 
+def test_apply_memory_outputs_preserves_memory_summary_dates_tags_and_fallback(monkeypatch):
+    calls = []
+
+    def fake_execute(_store, _api_key, actions):
+        calls.append(actions)
+        return {
+            "status": "ok",
+            "results": [{"memory": {"id": f"m{idx}"}} for idx, _action in enumerate(actions)],
+        }, 200
+
+    monkeypatch.setattr(service.memory_actions, "_execute_memory_actions", fake_execute)
+    output = {
+        "source_family": "memory_summary",
+        "relationship_started_at": "2023-01-02",
+        "memories": [
+            {
+                "type": "fact",
+                "summary": "Spring archive",
+                "content": "Spring archive memory.",
+                "threads": ["relationship", "stable"],
+                "tags": ["stable", "archive"],
+                "date": "2024-05-09",
+            },
+            {
+                "type": "moment",
+                "summary": "Undated archive",
+                "content": "Undated archive memory.",
+                "tags": "comfort, archive",
+            },
+        ],
+    }
+
+    count, results = service.apply_memory_outputs(_store(), "api_key", output)
+
+    assert count == 2
+    assert len(results) == 2
+    assert calls[0][0]["memory"]["occurred_at"] == "2024-05-09"
+    assert calls[0][0]["memory"]["threads"] == ["relationship", "stable", "archive"]
+    assert calls[0][1]["memory"]["occurred_at"] == "2023-01-02"
+    assert calls[0][1]["memory"]["threads"] == ["comfort", "archive"]
+
+
+def test_apply_memory_outputs_does_not_preserve_source_date_tags_by_default(monkeypatch):
+    calls = []
+
+    def fake_execute(_store, _api_key, actions):
+        calls.append(actions)
+        return {"status": "ok", "results": [{"memory": {"id": "m1"}}]}, 200
+
+    monkeypatch.setattr(service.memory_actions, "_execute_memory_actions", fake_execute)
+    output = {
+        "memories": [{
+            "type": "fact",
+            "summary": "Regular card",
+            "content": "Regular card content.",
+            "date": "2024-05-09",
+            "tags": ["should_not_seed"],
+        }]
+    }
+
+    count, results = service.apply_memory_outputs(_store(), "api_key", output)
+
+    assert count == 1
+    assert results == [{"memory": {"id": "m1"}}]
+    assert calls[0][0]["memory"]["occurred_at"] == ""
+    assert calls[0][0]["memory"]["threads"] == []
+
+
+def test_apply_memory_outputs_preserve_dates_flag_enables_source_metadata(monkeypatch):
+    calls = []
+
+    def fake_execute(_store, _api_key, actions):
+        calls.append(actions)
+        return {"status": "ok", "results": [{"memory": {"id": "m1"}}]}, 200
+
+    monkeypatch.setattr(service.memory_actions, "_execute_memory_actions", fake_execute)
+    output = {
+        "memories": [{
+            "type": "fact",
+            "summary": "Explicit preserve",
+            "content": "Explicit preserve content.",
+            "tags": ["archive"],
+        }]
+    }
+
+    count, _results = service.apply_memory_outputs(
+        _store(),
+        "api_key",
+        output,
+        preserve_dates=True,
+        fallback_occurred_at="2022-12-31",
+    )
+
+    assert count == 1
+    assert calls[0][0]["memory"]["occurred_at"] == "2022-12-31"
+    assert calls[0][0]["memory"]["threads"] == ["archive"]
+
+
+def test_apply_memory_outputs_preserves_per_item_memory_summary_in_merged_output(monkeypatch):
+    calls = []
+
+    def fake_execute(_store, _api_key, actions):
+        calls.append(actions)
+        return {
+            "status": "ok",
+            "results": [{"memory": {"id": f"m{idx}"}} for idx, _action in enumerate(actions)],
+        }, 200
+
+    monkeypatch.setattr(service.memory_actions, "_execute_memory_actions", fake_execute)
+    output = {
+        "source_family": "merged",
+        "relationship_started_at": "2023-01-02",
+        "memories": [
+            {
+                "_source_family": "history",
+                "type": "fact",
+                "summary": "History card",
+                "content": "History card content.",
+                "date": "2024-05-09",
+                "tags": ["history_tag"],
+            },
+            {
+                "_source_family": "memory_summary",
+                "type": "fact",
+                "summary": "Archive card",
+                "content": "Archive card content.",
+                "tags": ["archive_tag"],
+            },
+        ],
+    }
+
+    count, _results = service.apply_memory_outputs(_store(), "api_key", output)
+
+    assert count == 2
+    assert calls[0][0]["memory"]["occurred_at"] == ""
+    assert calls[0][0]["memory"]["threads"] == []
+    assert calls[0][1]["memory"]["occurred_at"] == "2023-01-02"
+    assert calls[0][1]["memory"]["threads"] == ["archive_tag"]
+
+
 def test_apply_memory_outputs_coerces_unknown_memory_type_to_fact(monkeypatch):
     calls = []
 
