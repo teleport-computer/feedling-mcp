@@ -156,3 +156,40 @@ def test_merge_settings_allow_allow_field_not_a_list():
     base = json.dumps({"permissions": {"allow": "not-a-list"}})
     out = json.loads(m.merge_settings_allow(base, ["mcp__jira__*"], {"jira"}))
     assert out["permissions"]["allow"] == ["mcp__jira__*"]
+
+
+def test_ca_bundle_pem_concatenates_enabled_only():
+    servers = [
+        {"name": "a", "enabled": True, "url": "https://a/", "ca_pem": "PEM-A\n"},
+        {"name": "b", "enabled": False, "url": "https://b/", "ca_pem": "PEM-B\n"},
+        {"name": "c", "enabled": True, "url": "https://c/"},           # 无 CA
+    ]
+    out = m.ca_bundle_pem(servers)
+    assert "PEM-A" in out
+    assert "PEM-B" not in out        # disabled 的不进包
+
+
+def test_ca_bundle_pem_none_when_no_ca():
+    servers = [{"name": "a", "enabled": True, "url": "https://a/"}]
+    assert m.ca_bundle_pem(servers) is None
+
+
+def test_ca_bundle_pem_none_when_empty():
+    assert m.ca_bundle_pem([]) is None
+
+
+def test_ca_bundle_pem_newline_separated():
+    # PEM 块之间必须有换行，否则 -----END-----BEGIN----- 粘连导致整包解析失败
+    servers = [
+        {"name": "a", "enabled": True, "url": "https://a/", "ca_pem": "PEM-A"},
+        {"name": "b", "enabled": True, "url": "https://b/", "ca_pem": "PEM-B"},
+    ]
+    out = m.ca_bundle_pem(servers)
+    assert out == "PEM-A\nPEM-B\n"
+
+
+def test_ca_bundle_pem_skips_unsafe_names():
+    # _enabled 的 name 白名单同样适用（防御一致性）
+    servers = [{"name": "BAD NAME", "enabled": True, "url": "https://a/",
+                "ca_pem": "PEM-X"}]
+    assert m.ca_bundle_pem(servers) is None

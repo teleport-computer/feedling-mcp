@@ -99,6 +99,19 @@ def _strip_managed_block(text: str) -> str:
     return head.rstrip("\n") + ("\n" if head.strip() else "") + tail.lstrip("\n")
 
 
+def ca_bundle_pem(servers: list[dict]) -> str | None:
+    """Concatenated PEM of every enabled server's user-supplied CA, or None.
+
+    None (not "") is the "no CA at all" signal: the caller must then write no
+    file and set no env var. Handing a runtime an empty/partial bundle is worse
+    than handing it nothing — codex's SSL_CERT_FILE REPLACES the trust store.
+    """
+    blocks = [s["ca_pem"].strip() for s in _enabled(servers) if s.get("ca_pem")]
+    if not blocks:
+        return None
+    return "\n".join(blocks) + "\n"
+
+
 def codex_config_merged(existing_text: str | None, servers: list[dict]) -> str:
     base = _strip_managed_block(existing_text or "")
     enabled = _enabled(servers)

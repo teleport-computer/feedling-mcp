@@ -2882,11 +2882,11 @@
         "operationId": "mcp_list_v1_mcp_servers_get",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "The caller's user-configured MCP servers.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/McpServerListResponse"
                 }
               }
             }
@@ -2910,24 +2910,35 @@
             "ApiKeyAuth": []
           }
         ],
-        "x-feedling-contract-level": "documented"
+        "x-feedling-contract-level": "documented",
+        "description": "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only."
       },
       "post": {
         "summary": "Mcp Upsert",
         "operationId": "mcp_upsert_v1_mcp_servers_post",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Server created or updated.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/McpServerRecord"
                 }
               }
             }
           },
           "default": {
             "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "cannot_encrypt — the server-side envelope could not be built; retry.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2946,16 +2957,17 @@
           }
         ],
         "requestBody": {
-          "required": false,
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/FreeFormJsonObject"
+                "$ref": "#/components/schemas/McpServerUpsertRequest"
               }
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "documented",
+        "description": "Create or update a user-configured MCP server (matched by name). http:// and https:// URLs are both accepted, including loopback and private-network hosts and IP literals — this backend never dials the URL at save time (see POST .../test), only your agent runtime does. Hosted (cloud-run) agents cannot reach machines on your home or office network; expose a local MCP server through a tunnel (e.g. Cloudflare Tunnel, Tailscale Funnel, ngrok) to a public address first. To use a self-signed or private-CA server, paste the issuing CA certificate (PEM, max 32768 bytes) into ca_pem — this adds the CA to the trust store used for this server; it does not disable certificate verification, and the server still has to present a certificate chaining to that CA. http:// sends all configured headers, including API keys, in plaintext over the network; this is an explicit, informed choice. Possible 400 error kinds: invalid_name, invalid_url, invalid_headers, too_many_headers, headers_too_large, forbidden_header, invalid_ca, ca_too_large, too_many_servers. A 409 cannot_encrypt means the server-side envelope could not be built."
       }
     },
     "/v1/mcp/servers/{name}": {
@@ -2975,11 +2987,11 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Updated server record.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/McpServerRecord"
                 }
               }
             }
@@ -2996,6 +3008,16 @@
           },
           "default": {
             "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found — no server with that name exists.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3014,16 +3036,17 @@
           }
         ],
         "requestBody": {
-          "required": false,
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/FreeFormJsonObject"
+                "$ref": "#/components/schemas/McpServerPatchRequest"
               }
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "documented",
+        "description": "Toggle a user-configured MCP server's enabled flag. 404 not_found when no server with that name exists."
       },
       "delete": {
         "summary": "Mcp Delete",
@@ -3041,11 +3064,11 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Server deleted.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/McpServerDeleteResponse"
                 }
               }
             }
@@ -3069,6 +3092,16 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "not_found — no server with that name exists.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -3079,7 +3112,8 @@
             "ApiKeyAuth": []
           }
         ],
-        "x-feedling-contract-level": "documented"
+        "x-feedling-contract-level": "documented",
+        "description": "Delete a user-configured MCP server. 404 not_found when no server with that name exists."
       }
     },
     "/v1/mcp/servers/{name}/test": {
@@ -3099,11 +3133,11 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Probe succeeded; the server answered initialize and tools/list.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/McpServerTestResponse"
                 }
               }
             }
@@ -3127,6 +3161,16 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "not_found — no server with that name exists.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -3137,7 +3181,8 @@
             "ApiKeyAuth": []
           }
         ],
-        "x-feedling-contract-level": "documented"
+        "x-feedling-contract-level": "documented",
+        "description": "Best-effort connectivity probe (MCP initialize -> tools/list) run from this backend's own network, offered purely as a convenience for validating publicly reachable https:// servers. A 400 unreachable_from_backend response does NOT mean the server failed to save — it was already saved successfully by POST /v1/mcp/servers. It only means this backend process could not reach the host, typically because it is a loopback/private-network address or a tunnel endpoint that only your agent's environment can reach. For those servers, skip this probe and instead ask your agent to call the MCP server directly in chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS handshake failure — check ca_pem), timeout, http_401/http_403/http_404/http_4xx/http_5xx (server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. 404 not_found when no server with that name exists."
       }
     },
     "/v1/memory/actions": {
@@ -8365,6 +8410,173 @@
           }
         },
         "additionalProperties": false
+      },
+      "McpServerUpsertRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "url"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]{1,32}$",
+            "description": "Stable identifier. Upserting an existing name replaces that server's config."
+          },
+          "url": {
+            "type": "string",
+            "description": "MCP server endpoint. http:// and https:// are both accepted, including loopback and private-network hosts — this backend never dials the URL itself (see POST .../test); only your agent runtime does."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers (e.g. Authorization) sent with every MCP request. Max 20 entries, 8192 bytes combined across names and values. The Host header is forbidden."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "ca_pem": {
+            "type": "string",
+            "maxLength": 32768,
+            "description": "PEM-encoded CA certificate to trust in addition to the public CA store, for a self-signed or private-CA server. This adds trust; it does not disable certificate verification — the server still has to present a certificate chaining to this CA and prove possession of the matching private key. Omit or send empty to clear a previously stored CA."
+          }
+        },
+        "additionalProperties": false,
+        "example": {
+          "name": "search",
+          "url": "https://mcp.example.com/mcp",
+          "headers": {
+            "Authorization": "Bearer sk-..."
+          },
+          "enabled": true
+        }
+      },
+      "McpServerPatchRequest": {
+        "type": "object",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "example": {
+          "enabled": false
+        }
+      },
+      "McpServerRecord": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "url_hint": {
+            "type": "string",
+            "description": "Hostname only (no scheme, path, or credentials), for display."
+          },
+          "header_names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Header names only; values are never returned."
+          },
+          "has_ca": {
+            "type": "boolean",
+            "description": "Whether a CA certificate is currently stored for this server."
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true,
+        "example": {
+          "id": "srv_1a2b3c4d",
+          "name": "search",
+          "enabled": true,
+          "url_hint": "mcp.example.com",
+          "header_names": [
+            "Authorization"
+          ],
+          "has_ca": false,
+          "created_at": "2026-07-16T00:00:00Z",
+          "updated_at": "2026-07-16T00:00:00Z"
+        }
+      },
+      "McpServerListResponse": {
+        "type": "object",
+        "required": [
+          "servers"
+        ],
+        "properties": {
+          "servers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/McpServerRecord"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "McpServerDeleteResponse": {
+        "type": "object",
+        "required": [
+          "deleted"
+        ],
+        "properties": {
+          "deleted": {
+            "type": "string",
+            "description": "Name of the deleted server."
+          }
+        },
+        "additionalProperties": true
+      },
+      "McpServerTestResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "tool_count",
+          "tool_names"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "tool_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "tool_names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": true,
+        "example": {
+          "ok": true,
+          "tool_count": 2,
+          "tool_names": [
+            "search",
+            "fetch"
+          ]
+        }
       }
     },
     "securitySchemes": {

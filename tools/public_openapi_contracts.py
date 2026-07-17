@@ -816,6 +816,103 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": False,
     },
+    "McpServerUpsertRequest": {
+        "type": "object",
+        "required": ["name", "url"],
+        "properties": {
+            "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9_-]{1,32}$",
+                "description": "Stable identifier. Upserting an existing name replaces that server's config.",
+            },
+            "url": {
+                "type": "string",
+                "description": (
+                    "MCP server endpoint. http:// and https:// are both accepted, including "
+                    "loopback and private-network hosts — this backend never dials the URL itself "
+                    "(see POST .../test); only your agent runtime does."
+                ),
+            },
+            "headers": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": "Extra HTTP headers (e.g. Authorization) sent with every MCP request. Max 20 entries, 8192 bytes combined across names and values. The Host header is forbidden.",
+            },
+            "enabled": {"type": "boolean", "default": True},
+            "ca_pem": {
+                "type": "string",
+                "maxLength": 32768,
+                "description": (
+                    "PEM-encoded CA certificate to trust in addition to the public CA store, for a "
+                    "self-signed or private-CA server. This adds trust; it does not disable "
+                    "certificate verification — the server still has to present a certificate "
+                    "chaining to this CA and prove possession of the matching private key. Omit or "
+                    "send empty to clear a previously stored CA."
+                ),
+            },
+        },
+        "additionalProperties": False,
+        "example": {
+            "name": "search",
+            "url": "https://mcp.example.com/mcp",
+            "headers": {"Authorization": "Bearer sk-..."},
+            "enabled": True,
+        },
+    },
+    "McpServerPatchRequest": {
+        "type": "object",
+        "required": ["enabled"],
+        "properties": {"enabled": {"type": "boolean"}},
+        "additionalProperties": False,
+        "example": {"enabled": False},
+    },
+    "McpServerRecord": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "name": {"type": "string"},
+            "enabled": {"type": "boolean"},
+            "url_hint": {"type": "string", "description": "Hostname only (no scheme, path, or credentials), for display."},
+            "header_names": {"type": "array", "items": {"type": "string"}, "description": "Header names only; values are never returned."},
+            "has_ca": {"type": "boolean", "description": "Whether a CA certificate is currently stored for this server."},
+            "created_at": {"type": "string"},
+            "updated_at": {"type": "string"},
+        },
+        "additionalProperties": True,
+        "example": {
+            "id": "srv_1a2b3c4d",
+            "name": "search",
+            "enabled": True,
+            "url_hint": "mcp.example.com",
+            "header_names": ["Authorization"],
+            "has_ca": False,
+            "created_at": "2026-07-16T00:00:00Z",
+            "updated_at": "2026-07-16T00:00:00Z",
+        },
+    },
+    "McpServerListResponse": {
+        "type": "object",
+        "required": ["servers"],
+        "properties": {"servers": {"type": "array", "items": {"$ref": "#/components/schemas/McpServerRecord"}}},
+        "additionalProperties": True,
+    },
+    "McpServerDeleteResponse": {
+        "type": "object",
+        "required": ["deleted"],
+        "properties": {"deleted": {"type": "string", "description": "Name of the deleted server."}},
+        "additionalProperties": True,
+    },
+    "McpServerTestResponse": {
+        "type": "object",
+        "required": ["ok", "tool_count", "tool_names"],
+        "properties": {
+            "ok": {"type": "boolean", "const": True},
+            "tool_count": {"type": "integer", "minimum": 0},
+            "tool_names": {"type": "array", "items": {"type": "string"}},
+        },
+        "additionalProperties": True,
+        "example": {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"]},
+    },
 }
 
 
@@ -837,6 +934,8 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/memory/retype"): "MemoryRetypeRequest",
     ("post", "/v1/perception/report"): "PerceptionReportRequest",
     ("post", "/v1/perception/photo/evaluate"): "PerceptionPhotoEvaluateRequest",
+    ("post", "/v1/mcp/servers"): "McpServerUpsertRequest",
+    ("patch", "/v1/mcp/servers/{name}"): "McpServerPatchRequest",
 }
 
 # These handlers deliberately accept an absent body and apply server defaults.
@@ -911,6 +1010,37 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/account/recover/verify"): "Verify keypair possession and issue an additional API key for the existing account. Existing keys remain active.",
     ("post", "/v1/account/reset"): "Permanently delete the account, its data, and all of its API keys. This is not a per-key revocation endpoint.",
     ("post", "/v1/genesis/imports/plaintext"): "Queue an asynchronous plaintext import. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default. Reusing a completed client_job_id returns the existing job.",
+    ("get", "/v1/mcp/servers"): "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only.",
+    ("post", "/v1/mcp/servers"): (
+        "Create or update a user-configured MCP server (matched by name). http:// and https:// URLs "
+        "are both accepted, including loopback and private-network hosts and IP literals — this "
+        "backend never dials the URL at save time (see POST .../test), only your agent runtime does. "
+        "Hosted (cloud-run) agents cannot reach machines on your home or office network; expose a "
+        "local MCP server through a tunnel (e.g. Cloudflare Tunnel, Tailscale Funnel, ngrok) to a "
+        "public address first. To use a self-signed or private-CA server, paste the issuing CA "
+        "certificate (PEM, max 32768 bytes) into ca_pem — this adds the CA to the trust store used "
+        "for this server; it does not disable certificate verification, and the server still has to "
+        "present a certificate chaining to that CA. http:// sends all configured headers, including "
+        "API keys, in plaintext over the network; this is an explicit, informed choice. Possible 400 "
+        "error kinds: invalid_name, invalid_url, invalid_headers, too_many_headers, "
+        "headers_too_large, forbidden_header, invalid_ca, ca_too_large, too_many_servers. A 409 "
+        "cannot_encrypt means the server-side envelope could not be built."
+    ),
+    ("patch", "/v1/mcp/servers/{name}"): "Toggle a user-configured MCP server's enabled flag. 404 not_found when no server with that name exists.",
+    ("delete", "/v1/mcp/servers/{name}"): "Delete a user-configured MCP server. 404 not_found when no server with that name exists.",
+    ("post", "/v1/mcp/servers/{name}/test"): (
+        "Best-effort connectivity probe (MCP initialize -> tools/list) run from this backend's own "
+        "network, offered purely as a convenience for validating publicly reachable https:// "
+        "servers. A 400 unreachable_from_backend response does NOT mean the server failed to save — "
+        "it was already saved successfully by POST /v1/mcp/servers. It only means this backend "
+        "process could not reach the host, typically because it is a loopback/private-network "
+        "address or a tunnel endpoint that only your agent's environment can reach. For those "
+        "servers, skip this probe and instead ask your agent to call the MCP server directly in "
+        "chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS "
+        "handshake failure — check ca_pem), timeout, http_401/http_403/http_404/http_4xx/http_5xx "
+        "(server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. "
+        "404 not_found when no server with that name exists."
+    ),
 }
 
 
@@ -1079,6 +1209,52 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
                 "text/html": {"schema": {"type": "string"}},
             },
         }
+    },
+    ("get", "/v1/mcp/servers"): {
+        "200": {
+            "description": "The caller's user-configured MCP servers.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/McpServerListResponse"}}},
+        }
+    },
+    ("post", "/v1/mcp/servers"): {
+        "200": {
+            "description": "Server created or updated.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/McpServerRecord"}}},
+        },
+        "409": {
+            "description": "cannot_encrypt — the server-side envelope could not be built; retry.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
+    },
+    ("patch", "/v1/mcp/servers/{name}"): {
+        "200": {
+            "description": "Updated server record.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/McpServerRecord"}}},
+        },
+        "404": {
+            "description": "not_found — no server with that name exists.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
+    },
+    ("delete", "/v1/mcp/servers/{name}"): {
+        "200": {
+            "description": "Server deleted.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/McpServerDeleteResponse"}}},
+        },
+        "404": {
+            "description": "not_found — no server with that name exists.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
+    },
+    ("post", "/v1/mcp/servers/{name}/test"): {
+        "200": {
+            "description": "Probe succeeded; the server answered initialize and tools/list.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/McpServerTestResponse"}}},
+        },
+        "404": {
+            "description": "not_found — no server with that name exists.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
     },
 }
 

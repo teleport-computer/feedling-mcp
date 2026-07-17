@@ -16,6 +16,7 @@ import asyncio
 import ipaddress
 import json
 import socket
+import ssl
 from urllib.parse import urlparse
 
 import httpx
@@ -38,14 +39,22 @@ def _resolve_ips(host: str) -> list[str]:
 
 
 def blocked_url_kind(url: str) -> str | None:
-    """"blocked_url" when the host resolves to any non-global address,
-    "dns" when it doesn't resolve, None when clean."""
+    """"unreachable_from_backend" when the host resolves to any non-global
+    address, "blocked_url" when the URL has no host at all, "dns" when it
+    doesn't resolve, None when clean.
+
+    NOTE: non-global hosts are storable (mcp_core no longer pre-checks — the
+    agent, not the backend, makes the real MCP call). The backend still refuses
+    to CONNECT: this function runs in the backend trust domain and probe()
+    echoes 160 bytes of the upstream body back to the caller, so relaxing it
+    would ship an SSRF-with-echo primitive. Do not remove.
+    """
     host = urlparse(url).hostname or ""
     if not host:
         return "blocked_url"
     try:
         ip = ipaddress.ip_address(host)
-        return None if ip.is_global else "blocked_url"
+        return None if ip.is_global else "unreachable_from_backend"
     except ValueError:
         pass  # hostname, not a literal IP
     try:
@@ -54,7 +63,7 @@ def blocked_url_kind(url: str) -> str | None:
         return "dns"
     for raw in ips:
         if not ipaddress.ip_address(raw).is_global:
-            return "blocked_url"
+            return "unreachable_from_backend"
     return None
 
 
@@ -81,18 +90,20 @@ def _parse_rpc_response(resp: httpx.Response) -> dict:
         raise ProbeError("protocol", f"non-JSON response ({ctype})")
 
 
-def probe(url: str, headers: dict, *, transport=None) -> dict:
+def probe(url: str, headers: dict, *, ca_pem: str | None = None,
+          transport=None) -> dict:
     """Sync entry point (the callers — routes/CLI — are sync). ``httpx.ASGITransport``
     (used by tests to hit an in-process fake server) is async-only in this httpx
     version, so the actual work runs on a throwaway event loop via ``asyncio.run``
     — the same pattern ``backend/asgi_test_client.py`` uses for the same reason."""
     kind = blocked_url_kind(url)
-    if kind in ("blocked_url", "dns"):
+    if kind in ("blocked_url", "dns", "unreachable_from_backend"):
         raise ProbeError(kind, urlparse(url).hostname or "")
-    return asyncio.run(_probe_async(url, headers, transport))
+    return asyncio.run(_probe_async(url, headers, ca_pem, transport))
 
 
-async def _probe_async(url: str, headers: dict, transport) -> dict:
+async def _probe_async(url: str, headers: dict, ca_pem: str | None,
+                       transport) -> dict:
     send_headers = {str(k): str(v) for k, v in (headers or {}).items()}
     send_headers.setdefault("Accept", "application/json, text/event-stream")
     send_headers["Content-Type"] = "application/json"
@@ -109,8 +120,16 @@ async def _probe_async(url: str, headers: dict, transport) -> dict:
             raise ProbeError("tls" if "ssl" in detail.lower() else "dns", detail)
 
     timeout = httpx.Timeout(_TOTAL_TIMEOUT, connect=_CONNECT_TIMEOUT)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False,
-                                 transport=transport) as client:
+    client_kwargs = {"timeout": timeout, "follow_redirects": False,
+                     "transport": transport}
+    if ca_pem:
+        # The user pinned their own CA: verify AGAINST IT rather than certifi.
+        # This is "add trust", not "skip verification" — a self-signed server
+        # still has to prove it holds the matching key.
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(cadata=ca_pem)
+        client_kwargs["verify"] = ctx
+    async with httpx.AsyncClient(**client_kwargs) as client:
         resp = await _post(client, {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": _PROTOCOL_VERSION, "capabilities": {},

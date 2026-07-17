@@ -102,6 +102,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -238,6 +239,19 @@ CHECKPOINT_FILE = Path(
 USER_MCP_FILE = os.environ.get(
     "USER_MCP_FILE",
     f"/tmp/feedling_user_mcp_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
+)
+# Two CA bundles, deliberately DIFFERENT content — the runtimes' semantics are
+# opposite (spec §2.2): claude's NODE_EXTRA_CA_CERTS ADDS to the trust store,
+# codex's SSL_CERT_FILE REPLACES it. Feeding codex the user-only bundle would
+# strip every public root and break its OpenAI calls. Keyed by the same API-key
+# fingerprint as USER_MCP_FILE so two accounts on one host never share a file.
+USER_MCP_CA_FILE = os.environ.get(
+    "USER_MCP_CA_FILE",
+    f"/tmp/feedling_user_mcp_ca_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
+)
+USER_MCP_CASTORE_FILE = os.environ.get(
+    "USER_MCP_CASTORE_FILE",
+    f"/tmp/feedling_user_mcp_castore_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
 )
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
@@ -4689,6 +4703,7 @@ def call_agent_cli(
                       explain="模型调用发起（" + ("pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude")) + "）",
                       content_excerpt={"prompt_head": (message or "")[:1000]})
     child_env = os.environ.copy()
+    child_env.update(_user_mcp_ca_env(cmd))
     if trace_id:
         child_env["FEEDLING_TRACE_ID"] = trace_id
         child_env["FEEDLING_DEBUG_TRACE_ID"] = trace_id
@@ -5508,6 +5523,116 @@ def _decrypt_envelope(envelope: dict) -> bytes:
     return base64.b64decode(resp.json()["plaintext_b64"])
 
 
+def _atomic_write_text(path: str, content: str, mode: int = 0o600) -> None:
+    """Write ``content`` to ``path`` atomically via a same-directory temp file
+    + ``os.replace()``. ``replace()`` is atomic on a single filesystem, so a
+    reader can never observe a half-written file — critical for
+    USER_MCP_CASTORE_FILE, whose REPLACE semantics for codex's SSL_CERT_FILE
+    mean a truncated file kills ALL of codex's outbound TLS, not just the
+    user's MCP server.
+
+    On any failure (disk full, permission, SIGKILL mid-write, two consumers
+    racing the same path) the caller gets the exception and the target path
+    is left exactly as it was before the call — never a partial write. The
+    temp file is best-effort cleaned up either way.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _write_user_mcp_ca(servers: list[dict]) -> None:
+    """Materialize the two CA bundles. See USER_MCP_CA_FILE for why there are two.
+
+    Fail open (spec §9): if the public bundle can't be read, or either file
+    can't be written to disk WITHOUT truncation (ENOSPC, SIGKILL mid-write,
+    two consumers racing the same path — this repo has a split-brain-
+    supervisor history), we leave that file ABSENT rather than risk a partial
+    one landing. Losing one MCP server beats replacing the user's whole trust
+    store with a truncated bundle — codex's SSL_CERT_FILE is REPLACE, not
+    ADD, so a half-written castore kills every outbound TLS connection codex
+    makes, including its calls to OpenAI itself.
+
+    Both files are written via ``_atomic_write_text`` (temp file + rename) so
+    a reader never observes a half-written file, even across a crash.
+    """
+    import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
+    bundle = _m.ca_bundle_pem(servers)
+    if not bundle:
+        for p in (USER_MCP_CA_FILE, USER_MCP_CASTORE_FILE):
+            Path(p).unlink(missing_ok=True)
+        return
+    try:
+        _atomic_write_text(USER_MCP_CA_FILE, bundle)
+    except Exception as e:  # noqa: BLE001 — fail open, never break claude's launch
+        Path(USER_MCP_CA_FILE).unlink(missing_ok=True)
+        log.warning("[user_mcp] ca file write failed, claude gets no user "
+                    "CA: %s: %s", type(e).__name__, e)
+    try:
+        import certifi  # noqa: PLC0415
+        system_ca = Path(certifi.where()).read_text()
+    except Exception as e:  # noqa: BLE001 — fail open, never break agent TLS
+        Path(USER_MCP_CASTORE_FILE).unlink(missing_ok=True)
+        log.warning("[user_mcp] castore skipped, codex keeps native trust "
+                    "store: %s: %s", type(e).__name__, e)
+        return
+    try:
+        _atomic_write_text(
+            USER_MCP_CASTORE_FILE, system_ca.rstrip("\n") + "\n" + bundle)
+    except Exception as e:  # noqa: BLE001 — fail open (spec §9): a truncated
+        # castore is strictly worse than a missing one.
+        Path(USER_MCP_CASTORE_FILE).unlink(missing_ok=True)
+        log.warning("[user_mcp] castore write failed, codex keeps native "
+                    "trust store: %s: %s", type(e).__name__, e)
+
+
+def _user_mcp_ca_env(cmd: list[str]) -> dict:
+    """Per-runtime CA env for one turn. Empty dict = inject nothing.
+
+    Gates on the in-memory ``_user_mcp_applied`` state first — the same
+    source of truth ``_user_mcp_cli_value`` uses — not just on-disk file
+    existence. A stale CA/castore file can outlive the servers it was
+    written for: e.g. the user deletes every MCP server while the consumer
+    is down; on restart ``_user_mcp_applied`` starts fresh/empty but the old
+    files are still sitting in /tmp from the previous run, and
+    ``_maybe_apply_user_mcp`` early-returns without re-materializing because
+    the advertised fingerprint ("") already matches the fresh applied state
+    ("").  ``Path.exists()`` alone can't tell "stale but still correct" from
+    "the user removed this" — the in-memory state can.
+
+    Never set an empty value: an unset var leaves the runtime on its own trust
+    store, which is the correct no-CA behavior.
+    """
+    if _is_pi_cmd(cmd):
+        return {}          # pi: route abandoned (v2 spec §1), no CA surface
+    enabled_servers = [
+        s for s in _user_mcp_applied.get("servers") or [] if s.get("enabled")
+    ]
+    if not enabled_servers:
+        return {}
+    if _is_codex_cmd(cmd):
+        if Path(USER_MCP_CASTORE_FILE).exists():
+            return {"SSL_CERT_FILE": USER_MCP_CASTORE_FILE}   # REPLACES → concat bundle
+        return {}
+    if Path(USER_MCP_CA_FILE).exists():
+        return {"NODE_EXTRA_CA_CERTS": USER_MCP_CA_FILE}      # ADDS → user CA only
+    return {}
+
+
 def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
     """Write the decrypted server list to disk in every shape a runtime might
     read. Bare import (not ``from tools import ...``) because at runtime the
@@ -5540,6 +5665,7 @@ def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
             os.chmod(config_path, 0o600)  # holds plaintext MCP headers/token
         elif config_path.exists():
             config_path.unlink()
+    _write_user_mcp_ca(servers)
 
 
 def _maybe_apply_user_mcp() -> None:
@@ -5559,6 +5685,7 @@ def _maybe_apply_user_mcp() -> None:
                 servers.append({
                     "name": srv["name"], "enabled": bool(srv.get("enabled")),
                     "url": secret["url"], "headers": secret.get("headers") or {},
+                    "ca_pem": secret.get("ca_pem") or "",
                 })
         # Union of the previously-applied and newly-advertised server names:
         # anything just removed still needs its old allow rule pruned, while

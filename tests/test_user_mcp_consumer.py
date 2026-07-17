@@ -257,6 +257,303 @@ def test_apply_user_mcp_skips_when_fingerprint_unchanged(monkeypatch):
     assert calls["n"] == 0
 
 
+# ---------------------------------------------------------------------------
+# Task 5: per-runtime CA bundles (claude adds, codex replaces)
+# ---------------------------------------------------------------------------
+
+
+def test_ca_pem_survives_decrypt_to_materialize(monkeypatch):
+    """回归守卫：ca_pem 必须从解密后的信封一路传到 materialize。
+
+    _maybe_apply_user_mcp 原本只取 url/headers。漏掉 ca_pem 透传 → ca_bundle_pem
+    永远收不到 CA → 两个文件永不生成 → 功能全链路静默失效，**而其它所有测试照样
+    全绿**（它们直接喂 servers dict，绕过了这一段）。这条是唯一能抓住它的测试。
+    """
+    seen = {}
+    monkeypatch.setattr(c, "_fetch_user_mcp_envelopes", lambda: {
+        "fingerprint": "fp1",
+        "servers": [{"name": "s", "enabled": True, "config_envelope": {"x": 1}}],
+    })
+    monkeypatch.setattr(c, "_decrypt_envelope", lambda env: json.dumps(
+        {"url": "https://s/mcp", "headers": {}, "ca_pem": "PEM-USER"}))
+    monkeypatch.setattr(c, "_materialize_user_mcp",
+                        lambda servers, names: seen.update(servers=servers))
+    monkeypatch.setattr(c, "_user_mcp_advertised", {"fingerprint": "fp1"})
+    monkeypatch.setattr(c, "_user_mcp_applied", {"fingerprint": None, "servers": []})
+
+    c._maybe_apply_user_mcp()
+
+    assert seen["servers"][0]["ca_pem"] == "PEM-USER"
+
+
+def test_ca_files_have_different_content(tmp_path, monkeypatch):
+    """claude 拿纯用户 CA，codex 拿 certifi+用户 CA。喂反了 codex 会丢公共根。"""
+    import certifi
+    ca_file = tmp_path / "ca.pem"
+    castore_file = tmp_path / "castore.pem"
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore_file))
+
+    c._write_user_mcp_ca([{"name": "s", "enabled": True, "url": "https://s/",
+                           "ca_pem": "PEM-USER"}])
+
+    system_ca = Path(certifi.where()).read_text()
+    # claude 的包：只有用户 CA，绝不含公共根
+    assert ca_file.read_text() == "PEM-USER\n"
+    # codex 的包：公共根 + 用户 CA 都在
+    castore = castore_file.read_text()
+    assert "PEM-USER" in castore
+    assert castore.startswith(system_ca.rstrip("\n")[:200])
+    assert len(castore) > len(system_ca)
+
+
+def test_no_ca_removes_both_files(tmp_path, monkeypatch):
+    ca_file = tmp_path / "ca.pem"
+    castore_file = tmp_path / "castore.pem"
+    ca_file.write_text("stale")
+    castore_file.write_text("stale")
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore_file))
+
+    c._write_user_mcp_ca([{"name": "s", "enabled": True, "url": "https://s/"}])
+
+    assert not ca_file.exists()
+    assert not castore_file.exists()
+
+
+def test_ca_files_are_0600(tmp_path, monkeypatch):
+    ca_file = tmp_path / "ca.pem"
+    castore_file = tmp_path / "castore.pem"
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore_file))
+    c._write_user_mcp_ca([{"name": "s", "enabled": True, "url": "https://s/",
+                           "ca_pem": "PEM-USER"}])
+    assert oct(ca_file.stat().st_mode)[-3:] == "600"
+    assert oct(castore_file.stat().st_mode)[-3:] == "600"
+
+
+def test_certifi_failure_fails_open(tmp_path, monkeypatch):
+    """读 certifi 失败 → 不写 castore → codex 退回原生信任库。
+    宁可这个 MCP server 不通，也不能把用户整个 agent 的 TLS 弄挂（spec §9）。"""
+    import certifi
+    ca_file = tmp_path / "ca.pem"
+    castore_file = tmp_path / "castore.pem"
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore_file))
+    monkeypatch.setattr(certifi, "where", lambda: "/nonexistent/ca.pem")
+
+    c._write_user_mcp_ca([{"name": "s", "enabled": True, "url": "https://s/",
+                           "ca_pem": "PEM-USER"}])
+
+    assert ca_file.exists()          # claude 仍可用
+    assert not castore_file.exists() # codex 退回原生，不被半个包毒死
+
+
+def test_castore_write_failure_fails_open_no_truncated_file(tmp_path, monkeypatch):
+    """FINAL FIX WAVE ①: a write failure mid-castore-write (ENOSPC, SIGKILL,
+    two consumers racing the same path) must never leave a truncated file on
+    disk. codex's SSL_CERT_FILE has REPLACE semantics — a half-written
+    castore kills ALL of codex's outbound TLS, not just the user's MCP
+    server. ``_write_user_mcp_ca`` must also fail OPEN (not raise), matching
+    the existing certifi-read-failure branch immediately below it.
+
+    The failure is injected at the ``_atomic_write_text`` seam (the actual
+    disk-write primitive `_write_user_mcp_ca` calls) rather than
+    ``Path.write_text``, so this stays a meaningful test of the fixed
+    implementation instead of a dead mock the new code path never touches.
+    Atomicity of ``_atomic_write_text`` itself (no partial file ever reaches
+    the target path) is covered separately by
+    ``test_atomic_write_text_leaves_target_untouched_on_failure``.
+    """
+    ca_file = tmp_path / "ca.pem"
+    castore_file = tmp_path / "castore.pem"
+    castore_file.write_text("STALE-FROM-A-PREVIOUS-RUN")  # must not survive
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore_file))
+
+    real_atomic_write = c._atomic_write_text
+
+    def _boom(path, content, *a, **kw):
+        if str(path) == str(castore_file):
+            raise OSError(28, "No space left on device")
+        return real_atomic_write(path, content, *a, **kw)
+
+    monkeypatch.setattr(c, "_atomic_write_text", _boom)
+
+    # Must not raise — chat must keep working even if CA plumbing breaks.
+    c._write_user_mcp_ca([{"name": "s", "enabled": True, "url": "https://s/",
+                           "ca_pem": "PEM-USER"}])
+
+    # The stale/truncated castore must be gone, not left half-written.
+    assert not castore_file.exists(), \
+        "a truncated/stale castore was left on disk after a write failure"
+    # claude's CA file is an independent write path — one runtime's CA
+    # write failure shouldn't sacrifice the other's.
+    assert ca_file.exists()
+
+    # And the absent file must not get injected into codex's env either.
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
+    env = c._user_mcp_ca_env(["codex", "exec", "hi"])
+    assert "SSL_CERT_FILE" not in env
+
+
+def test_ca_file_write_failure_fails_open_no_truncated_file(tmp_path, monkeypatch):
+    """Symmetric case for claude's CA file: same atomic-write path, same
+    fail-open contract. A truncated PEM makes Node error out at startup."""
+    ca_file = tmp_path / "ca.pem"
+    castore_file = tmp_path / "castore.pem"
+    ca_file.write_text("STALE-FROM-A-PREVIOUS-RUN")  # must not survive
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore_file))
+
+    real_atomic_write = c._atomic_write_text
+
+    def _boom(path, content, *a, **kw):
+        if str(path) == str(ca_file):
+            raise OSError(28, "No space left on device")
+        return real_atomic_write(path, content, *a, **kw)
+
+    monkeypatch.setattr(c, "_atomic_write_text", _boom)
+
+    c._write_user_mcp_ca([{"name": "s", "enabled": True, "url": "https://s/",
+                           "ca_pem": "PEM-USER"}])  # must not raise
+
+    assert not ca_file.exists(), \
+        "a truncated/stale CA file was left on disk after a write failure"
+    # castore is an independent write path — still written normally.
+    assert castore_file.exists()
+
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
+    env = c._user_mcp_ca_env(["claude", "-p", "hi"])
+    assert "NODE_EXTRA_CA_CERTS" not in env
+
+
+def test_atomic_write_text_leaves_target_untouched_on_failure(tmp_path, monkeypatch):
+    """Unit-level coverage for the atomic-write helper itself: a failure
+    partway through (simulated via a failing fsync, e.g. ENOSPC at flush
+    time) must leave the target file exactly as it was before the call —
+    never partially overwritten — and must not leave a stray temp file
+    behind in the directory."""
+    target = tmp_path / "out.pem"
+    target.write_text("PREVIOUS-GOOD-CONTENT")
+
+    def _boom_fsync(*a, **kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(c.os, "fsync", _boom_fsync)
+
+    with pytest.raises(OSError):
+        c._atomic_write_text(str(target), "X" * 1000)
+
+    assert target.read_text() == "PREVIOUS-GOOD-CONTENT"
+    leftovers = [p for p in tmp_path.iterdir() if p.name != "out.pem"]
+    assert leftovers == [], f"stray temp files left behind: {leftovers}"
+
+
+def test_castore_parent_dir_created(tmp_path, monkeypatch):
+    """Both CA files' parent dirs must be created — previously only
+    USER_MCP_CA_FILE's parent got mkdir(parents=True)."""
+    ca_file = tmp_path / "claude_home" / "ca.pem"
+    castore_file = tmp_path / "codex_home" / "castore.pem"
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore_file))
+
+    c._write_user_mcp_ca([{"name": "s", "enabled": True, "url": "https://s/",
+                           "ca_pem": "PEM-USER"}])
+
+    assert ca_file.exists()
+    assert castore_file.exists()
+
+
+@pytest.mark.parametrize("cmd,expect_var,expect_file", [
+    (["claude", "-p", "hi"], "NODE_EXTRA_CA_CERTS", "ca"),
+    (["codex", "exec", "hi"], "SSL_CERT_FILE", "castore"),
+])
+def test_env_injection_per_runtime(tmp_path, monkeypatch,
+                                   cmd, expect_var, expect_file):
+    ca_file = tmp_path / "ca.pem"
+    castore_file = tmp_path / "castore.pem"
+    ca_file.write_text("PEM-USER\n")
+    castore_file.write_text("SYSTEM\nPEM-USER\n")
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore_file))
+    # _user_mcp_ca_env gates on the in-memory applied state, not just file
+    # existence (FINAL FIX WAVE ③) — an enabled server must be "applied".
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
+
+    env = c._user_mcp_ca_env(cmd)
+
+    expected_path = str(ca_file if expect_file == "ca" else castore_file)
+    assert env == {expect_var: expected_path}
+    # 不可指反：codex 绝不能拿到纯用户 CA 的那个文件
+    if expect_var == "SSL_CERT_FILE":
+        assert env["SSL_CERT_FILE"] != str(ca_file)
+
+
+def test_env_injection_skips_pi(tmp_path, monkeypatch):
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_text("PEM-USER\n")
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "castore.pem"))
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
+    assert c._user_mcp_ca_env(["pi", "--message"]) == {}
+
+
+def test_env_injection_empty_when_no_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(tmp_path / "nope.pem"))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "nope2.pem"))
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "x", "servers": [{"name": "s", "enabled": True}]})
+    assert c._user_mcp_ca_env(["claude", "-p"]) == {}
+    assert c._user_mcp_ca_env(["codex", "exec"]) == {}
+
+
+def test_env_injection_empty_when_no_servers_applied(tmp_path, monkeypatch):
+    """No enabled server in ``_user_mcp_applied`` → inject nothing, even if
+    the file check alone would say otherwise (covered separately)."""
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_text("PEM-USER\n")
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "castore.pem"))
+    monkeypatch.setattr(c, "_user_mcp_applied", {"fingerprint": None, "servers": []})
+    assert c._user_mcp_ca_env(["claude", "-p"]) == {}
+
+
+def test_env_injection_ignores_stale_files_after_restart(tmp_path, monkeypatch):
+    """FINAL FIX WAVE ③: reproduces the stale-file-survives-a-restart bug.
+
+    Scenario: the user deletes every MCP server while the consumer is down.
+    On restart, ``_user_mcp_applied`` starts fresh/empty (in-memory state
+    doesn't persist across process restarts) and the advertised fingerprint
+    is also empty, so ``_maybe_apply_user_mcp`` early-returns without ever
+    re-materializing — the OLD CA/castore files from the previous run are
+    still sitting on disk. Gating on ``Path.exists()`` alone would keep
+    injecting them forever; gating on the in-memory applied state (which
+    ``_user_mcp_cli_value`` already does for USER_MCP_FILE) fixes it.
+    """
+    ca_file = tmp_path / "ca.pem"
+    castore_file = tmp_path / "castore.pem"
+    ca_file.write_text("PEM-USER\n")               # stale from before restart
+    castore_file.write_text("SYSTEM\nPEM-USER\n")  # stale from before restart
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca_file))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore_file))
+    # Fresh process state: nothing applied yet, exactly what a just-restarted
+    # consumer looks like before its first poll response arrives.
+    monkeypatch.setattr(c, "_user_mcp_applied", {"fingerprint": None, "servers": []})
+
+    assert c._user_mcp_ca_env(["claude", "-p", "hi"]) == {}
+    assert c._user_mcp_ca_env(["codex", "exec", "hi"]) == {}
+
+
 def test_apply_user_mcp_failure_does_not_raise(monkeypatch):
     """A fetch/decrypt failure logs and returns — never blocks the chat loop —
     and leaves applied state untouched so the next poll retries."""

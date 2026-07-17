@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import ssl
 import uuid
 from urllib.parse import urlparse
 
@@ -24,6 +25,7 @@ USER_MCP_BLOB = "user_mcp"
 MAX_SERVERS = 10
 MAX_HEADERS = 20
 MAX_HEADERS_BYTES = 8192
+MAX_CA_BYTES = 32768
 _NAME_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 # Host header is forged by the client stack; MCP session headers are owned by it.
 _FORBIDDEN_HEADERS = {"host"}
@@ -82,14 +84,30 @@ def validate_url_syntax(url: str) -> str | None:
         hostname = parsed.hostname
     except ValueError:
         return "invalid_url"
-    if scheme != "https":
-        return "https_required"
+    # http is deliberately allowed: the agent — not the backend — makes the
+    # actual MCP call, and v2 spec §6 already judged that path not to be a new
+    # attack surface. Plaintext is the user's informed choice (§8).
+    if scheme not in ("http", "https"):
+        return "invalid_url"
     if not hostname:
         return "invalid_url"
     return None
 
 
-def _validate_payload(name: str, url: str, headers: dict) -> dict | None:
+def _validate_ca_pem(ca_pem: str) -> dict | None:
+    """Hard-validate at write time: a bad bundle would break the user's WHOLE
+    agent TLS (codex's SSL_CERT_FILE replaces the trust store, spec §5), not
+    just this one server. Fail here, not inside the agent."""
+    if len(ca_pem.encode("utf-8")) > MAX_CA_BYTES:
+        return _err("ca_too_large", f"max {MAX_CA_BYTES} bytes")
+    try:
+        ssl.create_default_context().load_verify_locations(cadata=ca_pem)
+    except (ssl.SSLError, ValueError, TypeError) as e:
+        return _err("invalid_ca", str(e)[:160])
+    return None
+
+
+def _validate_payload(name: str, url: str, headers: dict, ca_pem: str = "") -> dict | None:
     if not _NAME_RE.match(name or ""):
         return _err("invalid_name", "name must match ^[a-z0-9_-]{1,32}$")
     kind = validate_url_syntax(url)
@@ -107,13 +125,23 @@ def _validate_payload(name: str, url: str, headers: dict) -> dict | None:
     for k in headers:
         if str(k).strip().lower() in _FORBIDDEN_HEADERS:
             return _err("forbidden_header", str(k))
+    if ca_pem:
+        err = _validate_ca_pem(ca_pem)
+        if err:
+            return err
     return None
 
 
 def _public(srv: dict) -> dict:
-    return {k: srv[k] for k in
-            ("id", "name", "enabled", "url_hint", "header_names",
-             "created_at", "updated_at")}
+    out = {k: srv.get(k) for k in
+           ("id", "name", "enabled", "url_hint", "header_names", "has_ca",
+            "created_at", "updated_at")}
+    # v2 (2026-07-08) records predate the "has_ca" field entirely — .get()
+    # returns None for them, which violates the boolean type this endpoint
+    # declares in the OpenAPI contract. Coerce, don't KeyError: missing means
+    # "no CA was ever set", i.e. False.
+    out["has_ca"] = bool(out["has_ca"])
+    return out
 
 
 def list_servers(store: UserStore) -> tuple[dict, int]:
@@ -125,20 +153,19 @@ def upsert_server(store: UserStore, payload: dict) -> tuple[dict, int]:
     name = str(payload.get("name") or "").strip()
     url = str(payload.get("url") or "").strip()
     headers = payload.get("headers") or {}
-    err = _validate_payload(name, url, headers)
+    ca_pem = str(payload.get("ca_pem") or "").strip()
+    err = _validate_payload(name, url, headers, ca_pem)
     if err:
         return err, 400
-    # deep SSRF pre-check (DNS resolve) — friendly early error; the probe
-    # re-checks at connect time anyway.
-    from hosted import mcp_probe
-    kind = mcp_probe.blocked_url_kind(url)
-    if kind:
-        return _err(kind, urlparse(url).hostname or ""), 400
     servers = _load(store)["servers"]
     existing = next((s for s in servers if s["name"] == name), None)
     if existing is None and len(servers) >= MAX_SERVERS:
         return _err("too_many_servers", f"max {MAX_SERVERS}"), 400
-    secret = json.dumps({"url": url, "headers": {str(k): str(v) for k, v in headers.items()}})
+    secret_doc = {"url": url,
+                  "headers": {str(k): str(v) for k, v in headers.items()}}
+    if ca_pem:
+        secret_doc["ca_pem"] = ca_pem
+    secret = json.dumps(secret_doc)
     envelope, enc_err = core_envelope._build_shared_envelope_for_store(
         store, secret.encode("utf-8"), item_id=f"user_mcp_{uuid.uuid4().hex}")
     if envelope is None:
@@ -151,6 +178,7 @@ def upsert_server(store: UserStore, payload: dict) -> tuple[dict, int]:
         "config_envelope": envelope,
         "url_hint": urlparse(url).hostname or "",
         "header_names": sorted(str(k) for k in headers),
+        "has_ca": bool(ca_pem),
         "created_at": existing["created_at"] if existing else now,
         "updated_at": now,
     }
@@ -192,7 +220,8 @@ def test_server(store: UserStore, name: str, caller_api_key: str | None) -> tupl
     except Exception as e:
         return _err("decrypt_failed", str(e)[:160]), 400
     try:
-        out = mcp_probe.probe(secret["url"], secret.get("headers") or {})
+        out = mcp_probe.probe(secret["url"], secret.get("headers") or {},
+                              ca_pem=secret.get("ca_pem"))
     except mcp_probe.ProbeError as e:
         return _err(e.kind, e.detail), 400
     return out, 200

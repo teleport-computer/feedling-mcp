@@ -263,6 +263,10 @@ An empty long poll is a successful `200` with `messages: []` and
 `timed_out: true`. Immediately start the next poll; do not treat it as an error.
 The requested timeout is capped at 60 seconds.
 
+`user_mcp.fingerprint` changes whenever the account's MCP server list changes;
+see the [MCP servers workflow](/docs/workflows/mcp) for how to manage that list
+and re-materialize local config when the fingerprint moves.
+
 ### 3. The consumer posts the encrypted reply
 
 Decrypt the claimed user turn through the authorized enclave path, invoke the

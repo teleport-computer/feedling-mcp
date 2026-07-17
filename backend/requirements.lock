@@ -38,6 +38,7 @@ certifi==2026.2.25 \
     --hash=sha256:027692e4402ad994f1c42e52a4997a9763c646b73e4096e4d5d6db8af1d6f0fa \
     --hash=sha256:e887ab5cee78ea814d3472169153c2d12cd43b14bd03329a39a9c6e2e80bfba7
     # via
+    #   -r backend/requirements.txt
     #   httpcore
     #   httpx
 cffi==2.0.0 \
