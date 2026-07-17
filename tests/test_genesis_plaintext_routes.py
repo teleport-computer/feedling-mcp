@@ -1032,3 +1032,24 @@ def test_plaintext_import_rejection_logs_breadcrumb(monkeypatch, caplog):
     assert "material_present=True" in msg          # user uploaded material…
     assert "memory_summary_content" in msg         # …and we record which field + its size
     assert "a@b.com" not in msg                     # but never the content itself (lengths only)
+
+
+def test_sealed_import_rejection_logs_breadcrumb(monkeypatch, caplog):
+    # Resident/sealed lane: an incomplete sealed envelope 400s BEFORE a job row is
+    # created (same blind spot the cloud upload 400 had). Assert the always-on
+    # genesis.sealed.rejected breadcrumb fires — with structural facts only, no content.
+    client = _client(monkeypatch)
+    with caplog.at_level("WARNING", logger="feedling.genesis.plaintext_import"):
+        resp = client.post(
+            "/v1/genesis/imports/plaintext",
+            json={"format": "sealed_v1", "mode": "add_memory",
+                  "envelope": {"body_ct": "QUJD", "visibility": "shared"}},  # missing nonce/K_user/...
+        )
+    assert resp.status_code == 400
+    assert resp.get_json().get("error") == "sealed_envelope_incomplete"
+    recs = [r for r in caplog.records if "genesis.sealed.rejected" in r.getMessage()]
+    assert recs, "expected a genesis.sealed.rejected breadcrumb"
+    msg = recs[0].getMessage()
+    assert "reason=sealed_envelope_incomplete" in msg
+    assert "body_ct_bytes" in msg          # structural fact recorded (ciphertext length)
+    assert "QUJD" not in msg               # never the (cipher)payload itself
