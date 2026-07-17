@@ -183,6 +183,66 @@ class LiveScenarioReceiptError(RuntimeError):
     """A live receipt is unsafe, malformed, replayed, or inconsistent."""
 
 
+def failed_persona_result_projection(
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project a bounded diagnostic result when persona capture itself failed.
+
+    No semantic review exists on this path, so both semantic assertions remain
+    false and ``persona_finalizer`` remains null.  The trusted capture receipt,
+    rather than the agent, owns the terminal status and deterministic evidence.
+    """
+
+    status = receipt.get("status")
+    failure_codes = {
+        "PRODUCT_FAIL": "PERSONA_IMPORT_FAILED",
+        "BLOCKED_EVIDENCE": "TRACE_UNAVAILABLE",
+        "AGENT_ERROR": "AGENT_CRASHED",
+        "BLOCKED_CREDENTIAL": "CREDENTIAL_SETUP_FAILED",
+        "BLOCKED_DEPLOYMENT": "WORKER_UNREADY",
+        "SECURITY_FAIL": "REDACTION_ASSERTION_FAILED",
+    }
+    failure_code = failure_codes.get(status)
+    assertions = receipt.get("assertions")
+    if (
+        status == "PASS"
+        or failure_code is None
+        or not isinstance(assertions, Mapping)
+    ):
+        raise LiveScenarioReceiptError(
+            "failed persona capture projection is invalid"
+        )
+    projected_assertions = {
+        **dict(assertions),
+        "persona_acceptance_passed": False,
+        "privacy_canary_absent": False,
+    }
+    failure = {
+        "category": status,
+        "stage_code": "PERSONA_IMPORT",
+        "failure_code": failure_code,
+        "reproducible": True,
+    }
+    return {
+        "status": status,
+        "assertions": projected_assertions,
+        "evidence_codes": [
+            code
+            for assertion, code in (
+                ("persona_files_archived", "PERSONA_FILES_ARCHIVED"),
+                (
+                    "persona_source_metadata_verified",
+                    "PERSONA_SOURCE_METADATA_VERIFIED",
+                ),
+                ("persona_import_done", "PERSONA_IMPORT_DONE"),
+            )
+            if assertions.get(assertion) is True
+        ],
+        "persona_finalizer": None,
+        "failure": failure,
+    }
+
+
 def canonical_json_sha256(value: Any) -> str:
     try:
         payload = json.dumps(
@@ -683,7 +743,11 @@ def validate_receipt_object(
 
 
 def validate_aggregate_object(
-    payload: object, *, run_id: str, profile_id: str
+    payload: object,
+    *,
+    run_id: str,
+    profile_id: str,
+    allow_failed_persona: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version",
@@ -737,8 +801,16 @@ def validate_aggregate_object(
     capture_rows = [
         row for row in validated if row.get("scenario_id") == "P0-06"
     ]
-    if len(capture_rows) != 1 or not _valid_parent_persona_finalizer(
-        payload.get("persona_finalizer"), capture_rows[0]
+    failed_persona = bool(
+        len(capture_rows) == 1
+        and capture_rows[0].get("status") != "PASS"
+        and payload.get("persona_finalizer") is None
+    )
+    if len(capture_rows) != 1 or not (
+        (allow_failed_persona and failed_persona)
+        or _valid_parent_persona_finalizer(
+            payload.get("persona_finalizer"), capture_rows[0]
+        )
     ):
         raise LiveScenarioReceiptError(
             "parent persona finalizer is missing or inconsistent"
@@ -749,7 +821,11 @@ def validate_aggregate_object(
 
 
 def validate_live_scenario_receipts(
-    path: Path, *, run_id: str, profile_id: str
+    path: Path,
+    *,
+    run_id: str,
+    profile_id: str,
+    allow_failed_persona: bool = False,
 ) -> tuple[dict[str, Any], str]:
     try:
         payload = json.loads(
@@ -758,12 +834,20 @@ def validate_live_scenario_receipts(
         )
     except (UnicodeError, json.JSONDecodeError, RecursionError):
         raise LiveScenarioReceiptError("live receipt JSON is invalid") from None
-    result = validate_aggregate_object(payload, run_id=run_id, profile_id=profile_id)
+    result = validate_aggregate_object(
+        payload,
+        run_id=run_id,
+        profile_id=profile_id,
+        allow_failed_persona=allow_failed_persona,
+    )
     return result, canonical_json_sha256(result)
 
 
 def validate_result_binding(
-    profile_result: Mapping[str, Any], aggregate: Mapping[str, Any]
+    profile_result: Mapping[str, Any],
+    aggregate: Mapping[str, Any],
+    *,
+    allow_failed_persona: bool = False,
 ) -> None:
     """Bind agent-authored projections to immutable transport observations.
 
@@ -781,7 +865,10 @@ def validate_result_binding(
         not isinstance(scenarios, list)
         or not isinstance(turns, list)
         or not isinstance(receipts, list)
-        or not isinstance(parent_persona, Mapping)
+        or not (
+            isinstance(parent_persona, Mapping)
+            or (allow_failed_persona and parent_persona is None)
+        )
     ):
         raise LiveScenarioReceiptError("live receipts do not match worker result")
     by_scenario: dict[str, list[Mapping[str, Any]]] = {
@@ -858,6 +945,37 @@ def validate_result_binding(
             if scenario.get(field) != expected_ids:
                 raise LiveScenarioReceiptError("live identifiers do not match worker result")
         if scenario_id == "P0-06":
+            if (
+                allow_failed_persona
+                and parent_persona is None
+                and rows[-1].get("status") != "PASS"
+            ):
+                expected = failed_persona_result_projection(rows[-1])
+                attempt_failure = (
+                    attempt_results[0].get("failure")
+                    if isinstance(attempt_results[0], Mapping)
+                    else None
+                )
+                if (
+                    scenario.get("status") != expected["status"]
+                    or attempt_results[0].get("status")
+                    != expected["status"]
+                    or scenario.get("assertions") != expected["assertions"]
+                    or scenario.get("persona_finalizer") is not None
+                    or scenario.get("failure") != expected["failure"]
+                    or attempt_failure != expected["failure"]
+                    or scenario.get("evidence_codes")
+                    != expected["evidence_codes"]
+                    or profile_result.get("status") == "PASS"
+                ):
+                    raise LiveScenarioReceiptError(
+                        "failed persona capture does not match worker result"
+                )
+                continue
+            if not isinstance(parent_persona, Mapping):
+                raise LiveScenarioReceiptError(
+                    "parent persona finalizer does not match worker result"
+                )
             semantic = parent_persona.get("semantic_assertions")
             finalizer = parent_persona.get("persona_finalizer")
             if (

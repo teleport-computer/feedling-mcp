@@ -142,9 +142,13 @@ def test_authoring_schema_requires_bound_persona_and_reasoning_evidence():
         "type": "boolean"
     }
     assert finalizer["properties"]["semantic_judgment_bound"]["enum"] == [True]
-    assert finalizer["properties"]["finalizer_ok"]["enum"] == [True]
+    # The authoring/diagnostic schema must retain a bounded negative semantic
+    # verdict.  The release validator still requires this field to be true.
+    assert finalizer["properties"]["finalizer_ok"] == {"type": "boolean"}
     assert finalizer["properties"]["private_evidence_deleted"]["enum"] == [True]
-    assert finalizer["properties"]["privacy_violation_count"]["enum"] == [0]
+    assert finalizer["properties"]["privacy_violation_count"] == {
+        "type": "integer"
+    }
 
 
 @pytest.mark.parametrize(

@@ -856,7 +856,7 @@
           "const": true
         },
         "finalizer_ok": {
-          "const": true
+          "type": "boolean"
         },
         "private_evidence_deleted": {
           "const": true
@@ -871,7 +871,8 @@
           "const": true
         },
         "privacy_violation_count": {
-          "const": 0
+          "type": "integer",
+          "minimum": 0
         }
       }
     },

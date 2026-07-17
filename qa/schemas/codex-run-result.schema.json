@@ -1084,10 +1084,7 @@
           ]
         },
         "finalizer_ok": {
-          "type": "boolean",
-          "enum": [
-            true
-          ]
+          "type": "boolean"
         },
         "private_evidence_deleted": {
           "type": "boolean",
@@ -1114,10 +1111,7 @@
           ]
         },
         "privacy_violation_count": {
-          "type": "integer",
-          "enum": [
-            0
-          ]
+          "type": "integer"
         }
       }
     },

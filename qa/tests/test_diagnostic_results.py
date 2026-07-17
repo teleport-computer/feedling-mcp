@@ -19,6 +19,15 @@ def _profile_schema() -> dict:
     return schema
 
 
+def _release_profile_schema() -> dict:
+    document = json.loads(
+        (Path(__file__).resolve().parents[1] / "schemas/run-result.schema.json").read_text()
+    )
+    schema = dict(document["$defs"]["profileResult"])
+    schema["$defs"] = document["$defs"]
+    return schema
+
+
 @pytest.mark.parametrize("profile_id", PROFILE_IDS)
 def test_agent_error_profile_is_schema_valid_and_evidence_negative(profile_id):
     result = diagnostic_results.agent_error_profile(
@@ -47,6 +56,130 @@ def test_agent_error_profile_is_schema_valid_and_evidence_negative(profile_id):
     assert result["reasoning"]["effective_effort"] == "unknown"
     assert result["reasoning"]["raw_private_reasoning_stored"] is False
     assert result["trace"]["correlated_event_count"] == 0
+    assert result["cleanup"]["attempted"] is False
+    serialized = json.dumps(result, sort_keys=True)
+    assert "provider-secret-must-not-escape" not in serialized
+    assert "content-secret-must-not-escape" not in serialized
+
+
+def test_blocked_provision_profile_cannot_validate_as_release_evidence():
+    result = diagnostic_results.blocked_provision_profile(
+        {
+            "profile_id": "relay-kongbeiqie",
+            "configured_model": "model-safe",
+            "user_id": "synthetic-user-123",
+            "provision_status": "blocked",
+            "provision_failure_code": "VALID_KEY_REJECTED",
+            "api_key": "provider-secret-must-not-escape",
+            "secret_key_b64": "content-secret-must-not-escape",
+        },
+        profile_id="relay-kongbeiqie",
+        expected_runtime="hosted_resident",
+        provisioning_failure_code="VALID_KEY_REJECTED",
+    )
+
+    assert list(Draft202012Validator(_profile_schema()).iter_errors(result)) == []
+    release_errors = list(
+        Draft202012Validator(_release_profile_schema()).iter_errors(result)
+    )
+    assert release_errors
+    assert any(
+        list(error.absolute_path)[-1:] == ["attempts"]
+        and "less than the minimum" in error.message
+        for error in release_errors
+    )
+    serialized = json.dumps(result, sort_keys=True)
+    assert "provider-secret-must-not-escape" not in serialized
+    assert "content-secret-must-not-escape" not in serialized
+
+
+@pytest.mark.parametrize(
+    "provisioning_failure_code",
+    ("NONE", "PROVISION_INCOMPLETE", "PROVISIONING_REQUEST_FAILED", ""),
+)
+def test_blocked_provision_profile_rejects_other_provisioning_failures(
+    provisioning_failure_code,
+):
+    with pytest.raises(
+        diagnostic_results.DiagnosticResultError,
+        match="requires VALID_KEY_REJECTED",
+    ):
+        diagnostic_results.blocked_provision_profile(
+            {"profile_id": "relay-kongbeiqie"},
+            profile_id="relay-kongbeiqie",
+            expected_runtime="hosted_resident",
+            provisioning_failure_code=provisioning_failure_code,
+        )
+
+
+@pytest.mark.parametrize(
+    "provision_status,manifest_failure_code",
+    (("ready", "VALID_KEY_REJECTED"), ("blocked", "NONE"), (None, None)),
+)
+def test_blocked_provision_profile_rejects_manifest_classification_mismatch(
+    provision_status,
+    manifest_failure_code,
+):
+    with pytest.raises(
+        diagnostic_results.DiagnosticResultError,
+        match="requires VALID_KEY_REJECTED",
+    ):
+        diagnostic_results.blocked_provision_profile(
+            {
+                "profile_id": "relay-kongbeiqie",
+                "provision_status": provision_status,
+                "provision_failure_code": manifest_failure_code,
+            },
+            profile_id="relay-kongbeiqie",
+            expected_runtime="hosted_resident",
+            provisioning_failure_code="VALID_KEY_REJECTED",
+        )
+
+
+@pytest.mark.parametrize("profile_id", PROFILE_IDS)
+def test_blocked_provision_profile_is_complete_schema_valid_and_not_run(profile_id):
+    result = diagnostic_results.blocked_provision_profile(
+        {
+            "profile_id": profile_id,
+            "configured_model": "model-safe",
+            "user_id": "synthetic-user-123",
+            "provision_status": "blocked",
+            "provision_failure_code": "VALID_KEY_REJECTED",
+            "runtime_mode": "hosted_resident",
+            "runtime_version": 2,
+            "trace_enabled": True,
+            "api_key": "provider-secret-must-not-escape",
+            "secret_key_b64": "content-secret-must-not-escape",
+        },
+        profile_id=profile_id,
+        expected_runtime="hosted_resident",
+        provisioning_failure_code="VALID_KEY_REJECTED",
+    )
+
+    assert list(Draft202012Validator(_profile_schema()).iter_errors(result)) == []
+    assert result["status"] == "BLOCKED_CREDENTIAL"
+    assert result["observed_runtime"] is None
+    assert result["observed_runtime_version"] is None
+    assert result["turns"] == []
+    assert [row["scenario_id"] for row in result["scenarios"]] == [
+        f"P0-{index:02d}" for index in range(1, 14)
+    ]
+    assert all(
+        row["status"] == "BLOCKED_CREDENTIAL"
+        and row["attempts"] == 0
+        and row["attempt_results"] == []
+        and row["request_ids"] == []
+        and row["turn_ids"] == []
+        and row["trace_ids"] == []
+        and row["persona_finalizer"] is None
+        and row["evidence_codes"] == []
+        and set(row["assertions"].values()) == {False}
+        for row in result["scenarios"]
+    )
+    assert result["latency"]["sample_count"] == 0
+    assert result["trace"]["enabled"] is False
+    assert result["trace"]["deploy_enabled"] is False
+    assert result["reasoning"]["reasoning_event_count"] == 0
     assert result["cleanup"]["attempted"] is False
     serialized = json.dumps(result, sort_keys=True)
     assert "provider-secret-must-not-escape" not in serialized

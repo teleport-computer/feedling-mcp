@@ -925,6 +925,12 @@ def _run_actions(
     client: SmokeClient,
 ) -> tuple[dict[str, bool], list[dict[str, Any]], dict[str, Any]]:
     if scenario_id == "P0-02":
+        # Clear provisioning noise before the freshness reads.  Clearing after
+        # those reads leaves the deployed Genesis worker in a state where the
+        # immediately following existing-session distillation job can fail.
+        # The trace baseline remains clean for the later correlated chat turns;
+        # their identifiers, rather than an empty buffer, bind P0-13 evidence.
+        client.clear_trace(session)
         who_status, who = client._req(
             "GET", "/v1/users/whoami", api_key=session.api_key
         )
@@ -934,7 +940,6 @@ def _run_actions(
         memory_status, memory = client._req(
             "GET", "/v1/memory/list?limit=1", api_key=session.api_key
         )
-        client.clear_trace(session)
         assertions = {
             "synthetic_account_is_fresh": bool(
                 profile.get("fresh_state_verified") is True

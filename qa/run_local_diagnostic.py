@@ -31,7 +31,10 @@ from pathlib import Path
 from secrets import token_hex
 from typing import Any, Callable, Mapping, Sequence
 
+from jsonschema import Draft202012Validator
+
 try:
+    from qa import diagnostic_results
     from qa import harness_provenance
     from qa import install_codex_auth
     from qa import provision_profiles
@@ -42,6 +45,7 @@ try:
     from qa.orchestration_contract import PROFILE_AGENT_TYPES, PROFILE_IDS
     from qa.validate_diagnostic_attempts import parent_cleanup_is_deferred
 except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
+    import diagnostic_results  # type: ignore[no-redef]
     import harness_provenance  # type: ignore[no-redef]
     import install_codex_auth  # type: ignore[no-redef]
     import provision_profiles  # type: ignore[no-redef]
@@ -54,6 +58,8 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
 
 
 LOCKED_BASE_URL = "https://test-api.feedling.app"
+PUBLIC_HEALTH_IDENTITY_SOURCE = "public_healthz_release_git_commit"
+PUBLIC_HEALTH_IDENTITY_GAP = "DEPLOYMENT_SHA_NOT_INDEPENDENTLY_ATTESTED"
 BASELINE_RUNTIME = provision_profiles.BASELINE_RUNTIME_REQUIREMENT
 RUNTIME_V2_RUNTIME = provision_profiles.RUNTIME_V2_REQUIREMENT
 DEFAULT_CODEX_MODEL = "gpt-5.4"
@@ -64,7 +70,7 @@ DEFAULT_PROVIDER_MODELS = {
     "official-gemini": "gemini-2.5-flash",
     "openrouter-claude": "anthropic/claude-sonnet-4.5",
     "openrouter-openai": "openai/gpt-4.1-mini",
-    "openrouter-glm": "z-ai/glm-4.5-air:free",
+    "openrouter-glm": "z-ai/glm-4.5-air",
     "relay-kongbeiqie": "[特价纯血]claude-opus-4-6",
 }
 MISSING_STRICT_EVIDENCE = (
@@ -361,6 +367,7 @@ class DiagnosticOptions:
     worker_python: Path | None = None
     worker_runtime_roots: tuple[Path, ...] = ()
     runtime_requirement: str = BASELINE_RUNTIME
+    allow_public_health_identity: bool = False
 
 
 @dataclass(frozen=True)
@@ -384,6 +391,16 @@ class RunPaths:
 
 
 @dataclass(frozen=True)
+class DiagnosticManifestClassification:
+    """Ordered local-only READY/BLOCKED provisioning classification."""
+
+    ready_profile_ids: tuple[str, ...]
+    blocked_profile_ids: tuple[str, ...]
+    provision_statuses: tuple[tuple[str, str], ...]
+    provision_failure_codes: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
 class DiagnosticDependencies:
     provision: Callable[..., dict[str, Any]] = provision_profiles.provision
     cleanup: Callable[..., dict[str, Any]] = provision_profiles.cleanup
@@ -391,6 +408,7 @@ class DiagnosticDependencies:
     verify_deployment: Callable[..., dict[str, Any]] = (
         deployment_verifier.verify_deployment
     )
+    observe_deployment: Callable[..., dict[str, Any]] | None = None
     verify_codex_version: Callable[[Path], None] = (
         run_codex_profile_workers.verify_codex_version
     )
@@ -437,7 +455,7 @@ def _inspect_worker_python(path: Path) -> tuple[Path, tuple[Path, ...]]:
             "qualification Python must be an owner-controlled executable"
         )
     probe = (
-        "import cryptography,json,sys;"
+        "import cryptography,nacl,json,sys;"
         "print(json.dumps([sys.prefix,sys.base_prefix],separators=(',',':')))"
     )
     try:
@@ -453,7 +471,7 @@ def _inspect_worker_python(path: Path) -> tuple[Path, tuple[Path, ...]]:
         raise LocalDiagnosticError("qualification Python could not execute") from None
     if result.returncode != 0:
         raise LocalDiagnosticError(
-            "qualification Python is missing cryptography support"
+            "qualification Python is missing cryptography or PyNaCl support"
         )
     try:
         raw_roots = json.loads(result.stdout)
@@ -516,6 +534,7 @@ def _resolve_worker_python(explicit: Path | None) -> tuple[Path, tuple[Path, ...
     if explicit is not None:
         return _inspect_worker_python(explicit)
     candidates = (
+        Path.home() / ".cache/io-e2e-qa-venv/bin/python",
         Path.home()
         / ".cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3",
         Path(sys.executable),
@@ -1430,6 +1449,95 @@ def _write_private_json(path: Path, payload: Mapping[str, Any]) -> None:
         ) from None
 
 
+def _observe_public_health_deployment(
+    expected_sha: str | None,
+    receipt_path: Path,
+    *,
+    env: Mapping[str, str],
+    expected_runtime: str,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    """Pin a local diagnostic to the image SHA reported by public healthz.
+
+    This is deliberately weaker than the protected QA build-identity receipt:
+    it observes image-baked backend metadata but cannot independently prove the
+    serialized deployment SHA or worker identity.  The protected workflow never
+    calls this helper.
+    """
+
+    base_url = provision_profiles.validate_base_url(
+        str(env.get("IO_E2E_BASE_URL") or "")
+    )
+    if base_url != LOCKED_BASE_URL:
+        raise LocalDiagnosticError("public deployment observation target is invalid")
+    if expected_runtime not in {BASELINE_RUNTIME, RUNTIME_V2_RUNTIME}:
+        raise LocalDiagnosticError("runtime requirement is invalid")
+    expected = str(expected_sha or "").strip().lower()
+    if expected and not _SHA_RE.fullmatch(expected):
+        raise LocalDiagnosticError("candidate SHA must be 40 or 64 lowercase hex characters")
+
+    active_client = client or provision_profiles.SmokeClient(base_url)
+    try:
+        status, body = active_client._req(  # noqa: SLF001 - fixed local QA transport
+            "GET", "/healthz", attempts=3, read_timeout=15
+        )
+    except Exception:
+        raise LocalDiagnosticError(
+            "deployed test health endpoint was unreachable"
+        ) from None
+    release = body.get("release") if isinstance(body, Mapping) else None
+    observed = (
+        str(release.get("git_commit") or "").strip().lower()
+        if isinstance(release, Mapping)
+        else ""
+    )
+    health_status = str(body.get("status") or "") if isinstance(body, Mapping) else ""
+    if (
+        status != 200
+        or not isinstance(body, Mapping)
+        or body.get("ok") is not True
+        or health_status not in {"healthy", "degraded"}
+        or not _SHA_RE.fullmatch(observed)
+    ):
+        raise LocalDiagnosticError("deployed test health identity is invalid")
+    if expected and expected != observed:
+        raise LocalDiagnosticError(
+            "deployed backend health identity does not match the candidate"
+        )
+
+    receipt = {
+        "schema_version": 1,
+        "environment": "test",
+        "base_url": base_url,
+        "expected_runtime": expected_runtime,
+        "expected_deployment_sha": observed,
+        "observed_backend_sha": observed,
+        "observed_deployment_sha": None,
+        "observed_worker_sha": None,
+        "live_worker_count": None,
+        "runtime_evidence_source": (
+            "per_profile_runtime_readback_and_live_scenarios"
+            if expected_runtime == RUNTIME_V2_RUNTIME
+            else "deployed_runtime_readback"
+        ),
+        "liveness_verified": True,
+        "deployment_identity_verified": False,
+        "deployment_identity_observed": True,
+        "identity_evidence_source": PUBLIC_HEALTH_IDENTITY_SOURCE,
+        "identity_gap_code": PUBLIC_HEALTH_IDENTITY_GAP,
+        "health_status": health_status,
+        "verified_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_private_json(receipt_path, receipt)
+    try:
+        receipt_path.chmod(0o400)
+    except OSError:
+        raise LocalDiagnosticError(
+            "deployment observation receipt could not be protected"
+        ) from None
+    return receipt
+
+
 def _write_private_bytes(path: Path, payload: bytes) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -1812,41 +1920,185 @@ def _split_selected_manifest(
         _write_private_json(output_dir / f"{profile_id}.json", isolated)
 
 
-def _validate_diagnostic_manifest(
+def _validate_diagnostic_manifest_structure(
     manifest: Mapping[str, Any],
     profile_ids: Sequence[str],
     runtime_requirement: str,
-) -> None:
+) -> tuple[Mapping[str, Any], ...]:
+    """Validate the exact selected account rows before semantic classification.
+
+    Once this succeeds, the parent has enough trustworthy account bindings to
+    require and credit cleanup for every selected row, even if a later READY or
+    BLOCKED evidence check rejects the manifest.
+    """
+
     rows = manifest.get("profiles")
-    runtime_rows_valid = isinstance(rows, list) and all(
-        isinstance(row, Mapping)
-        and row.get("runtime_mode_readback_verified") is True
-        and isinstance(row.get("runtime_mode"), str)
-        and bool(row.get("runtime_mode"))
-        and type(row.get("runtime_version")) is int
-        and row.get("runtime_version", 0) >= 1
-        and (
-            runtime_requirement != RUNTIME_V2_RUNTIME
-            or (
-                row.get("runtime_mode") == RUNTIME_V2_RUNTIME
-                and row.get("runtime_version") == 2
-            )
-        )
-        for row in rows
-    )
     if (
-        manifest.get("qualification_mode") != "diagnostic"
+        manifest.get("schema_version") != 1
+        or manifest.get("qualification_mode") != "diagnostic"
         or manifest.get("runtime_mode") != runtime_requirement
         or manifest.get("runtime_requirement") != runtime_requirement
         or manifest.get("selected_profile_ids") != list(profile_ids)
         or not isinstance(rows, list)
-        or [row.get("profile_id") for row in rows if isinstance(row, dict)]
-        != list(profile_ids)
-        or not runtime_rows_valid
+        or len(rows) != len(profile_ids)
+        or not all(isinstance(row, Mapping) for row in rows)
+        or [row.get("profile_id") for row in rows] != list(profile_ids)
     ):
         raise LocalDiagnosticError(
             "provisioner returned an invalid diagnostic manifest"
         )
+
+    typed_rows = tuple(row for row in rows if isinstance(row, Mapping))
+    unique_bindings: dict[str, set[str]] = {
+        field: set()
+        for field in ("user_id", "api_key", "secret_key_b64", "public_key_b64")
+    }
+    for profile_id, row in zip(profile_ids, typed_rows, strict=True):
+        spec = provision_profiles.PROFILE_SPECS[profile_id]
+        model = row.get("configured_model")
+        if (
+            row.get("qualification_mode") != "diagnostic"
+            or row.get("profile_id") != profile_id
+            or row.get("provider") != spec.provider
+            or row.get("route_family") != spec.route_family
+            or not isinstance(model, str)
+            or re.fullmatch(spec.allowed_model_regex, model) is None
+            or row.get("configured_base_url")
+            != spec.expected_configured_base_url
+            or row.get("reasoning_effort") != "medium"
+            or row.get("runtime_mode_set_required") is not False
+            or row.get("runtime_mode_set_verified") is not False
+            or type(row.get("trace_enabled")) is not bool
+            or not all(
+                isinstance(row.get(field), str) and bool(row.get(field))
+                for field in (
+                    "label",
+                    "user_id",
+                    "api_key",
+                    "secret_key_b64",
+                    "public_key_b64",
+                )
+            )
+        ):
+            raise LocalDiagnosticError(
+                "provisioner returned an invalid diagnostic profile binding"
+            )
+        for field, observed in unique_bindings.items():
+            value = str(row[field])
+            if value in observed:
+                raise LocalDiagnosticError(
+                    "provisioner returned duplicate diagnostic profile bindings"
+                )
+            observed.add(value)
+    return typed_rows
+
+
+def _classify_diagnostic_manifest(
+    rows: Sequence[Mapping[str, Any]],
+    profile_ids: Sequence[str],
+    runtime_requirement: str,
+) -> DiagnosticManifestClassification:
+    """Return an ordered, fail-closed READY/BLOCKED matrix classification."""
+
+    if len(rows) != len(profile_ids):
+        raise LocalDiagnosticError("diagnostic provisioning classification is invalid")
+
+    ready: list[str] = []
+    blocked: list[str] = []
+    statuses: list[tuple[str, str]] = []
+    failure_codes: list[tuple[str, str]] = []
+    for profile_id, row in zip(profile_ids, rows, strict=True):
+        if row.get("profile_id") != profile_id:
+            raise LocalDiagnosticError(
+                "diagnostic provisioning classification is invalid"
+            )
+        status = row.get("provision_status")
+        failure_code = row.get("provision_failure_code")
+        runtime_mode = row.get("runtime_mode")
+        runtime_version = row.get("runtime_version")
+        runtime_receipt = row.get("runtime_readback_receipt")
+        runtime_readback_valid = (
+            row.get("runtime_mode_readback_verified") is True
+            and isinstance(runtime_mode, str)
+            and bool(runtime_mode)
+            and type(runtime_version) is int
+            and runtime_version >= 1
+            and runtime_receipt
+            == {
+                "configured": True,
+                "runtime_mode": runtime_mode,
+                "runtime_version": runtime_version,
+            }
+        )
+        if status == provision_profiles.PROVISION_STATUS_READY:
+            runtime_requirement_valid = (
+                runtime_requirement != RUNTIME_V2_RUNTIME
+                or (
+                    runtime_mode == RUNTIME_V2_RUNTIME
+                    and runtime_version == 2
+                )
+            )
+            if (
+                failure_code != provision_profiles.PROVISION_FAILURE_NONE
+                or not runtime_readback_valid
+                or not runtime_requirement_valid
+            ):
+                raise LocalDiagnosticError(
+                    "diagnostic READY profile runtime evidence is invalid"
+                )
+            ready.append(profile_id)
+        elif status == provision_profiles.PROVISION_STATUS_BLOCKED:
+            invalid_key_receipt = row.get("invalid_key_receipt")
+            provider_status_code = (
+                invalid_key_receipt.get("provider_status_code")
+                if isinstance(invalid_key_receipt, Mapping)
+                else None
+            )
+            invalid_key_receipt_valid = (
+                isinstance(invalid_key_receipt, Mapping)
+                and set(invalid_key_receipt)
+                == {"http_status", "error", "provider_status_code"}
+                and type(invalid_key_receipt.get("http_status")) is int
+                and invalid_key_receipt.get("http_status") == 400
+                and invalid_key_receipt.get("error") == "provider_test_failed"
+                and type(provider_status_code) is int
+                and provider_status_code in {400, 401, 403}
+            )
+            if (
+                failure_code != "VALID_KEY_REJECTED"
+                or row.get("qualification_mode") != "diagnostic"
+                or row.get("registration_verified") is not True
+                or row.get("fresh_state_verified") is not True
+                or row.get("invalid_key_rejected") is not True
+                or not invalid_key_receipt_valid
+                or row.get("valid_key_configured") is not False
+                or row.get("valid_key_receipt") is not None
+                or row.get("trace_enabled") is not False
+                or runtime_mode != ""
+                or type(runtime_version) is not int
+                or runtime_version != 0
+                or row.get("runtime_mode_set_required") is not False
+                or row.get("runtime_mode_set_verified") is not False
+                or row.get("runtime_mode_readback_verified") is not False
+                or runtime_receipt is not None
+            ):
+                raise LocalDiagnosticError(
+                    "diagnostic BLOCKED profile evidence is invalid"
+                )
+            blocked.append(profile_id)
+        else:
+            raise LocalDiagnosticError(
+                "diagnostic provisioning classification is invalid"
+            )
+        statuses.append((profile_id, str(status)))
+        failure_codes.append((profile_id, str(failure_code)))
+
+    return DiagnosticManifestClassification(
+        ready_profile_ids=tuple(ready),
+        blocked_profile_ids=tuple(blocked),
+        provision_statuses=tuple(statuses),
+        provision_failure_codes=tuple(failure_codes),
+    )
 
 
 def _uses_benchmark_fake_ip(host: str) -> bool:
@@ -1918,8 +2170,11 @@ def _launch_diagnostic(
     dependencies: DiagnosticDependencies,
     options: DiagnosticOptions,
     paths: RunPaths,
+    *,
+    profile_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     worker_python, _runtime_roots = _canonical_worker_runtime(options)
+    selected = tuple(profile_ids) if profile_ids is not None else options.profile_ids
     return dependencies.launch(
         codex_bin=options.codex_bin,
         codex_home=paths.codex_home,
@@ -1938,10 +2193,70 @@ def _launch_diagnostic(
         expected_sha=options.candidate_sha,
         timeout_seconds=2400,
         diagnostic=True,
-        profile_ids=options.profile_ids,
+        profile_ids=selected,
         expected_runtime=options.runtime_requirement,
         worker_python=worker_python,
     )
+
+
+def _blocked_profile_result(
+    manifest_profile: Mapping[str, Any],
+    *,
+    profile_id: str,
+    expected_runtime: str,
+    provisioning_failure_code: str,
+    authoring_schema_path: Path,
+) -> dict[str, Any]:
+    """Create and schema-check one parent-owned blocked profile artifact."""
+
+    try:
+        authoring = json.loads(authoring_schema_path.read_text(encoding="utf-8"))
+        if not isinstance(authoring, dict):
+            raise ValueError
+        schema = run_codex_profile_workers.build_profile_schema(
+            authoring, profile_id, expected_runtime
+        )
+        result = diagnostic_results.blocked_provision_profile(
+            manifest_profile,
+            profile_id=profile_id,
+            expected_runtime=expected_runtime,
+            provisioning_failure_code=provisioning_failure_code,
+        )
+        errors = list(Draft202012Validator(schema).iter_errors(result))
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+        RecursionError,
+        diagnostic_results.DiagnosticResultError,
+        run_codex_profile_workers.WorkerLaunchError,
+    ):
+        raise LocalDiagnosticError(
+            "blocked diagnostic profile artifact is invalid"
+        ) from None
+    if errors:
+        raise LocalDiagnosticError("blocked diagnostic profile artifact is invalid")
+    return result
+
+
+def _blocked_cot_projection(provision_failure_code: str) -> dict[str, Any]:
+    """Return explicit NOT_RUN COT evidence for a profile with no agent launch."""
+
+    return {
+        "status": "NOT_RUN",
+        "failure_code": provision_failure_code,
+        "receipt_status": None,
+        "receipt_failure_code": None,
+        "delivery_qualified": False,
+        "final_answer_correct": None,
+        "reasoning_event_count": None,
+        "metadata_present": None,
+        "token_metadata_status": "UNVERIFIED",
+        "reasoning_token_count": None,
+        "user_visible_disclosure_present": None,
+        "receipt_sha256": None,
+    }
 
 
 def _cot_delivery_projection(
@@ -2115,6 +2430,13 @@ def _profile_passes_before_parent_cleanup(
     """Require every user-path scenario to pass plus the exact P0-13 deferral."""
 
     scenarios = profile_result.get("scenarios")
+    p0_13_assertions = (
+        scenarios[-1].get("assertions")
+        if isinstance(scenarios, list)
+        and len(scenarios) == 13
+        and isinstance(scenarios[-1], Mapping)
+        else None
+    )
     return (
         profile_result.get("profile_id") == profile_id
         and profile_result.get("status") == "BLOCKED_EVIDENCE"
@@ -2129,6 +2451,10 @@ def _profile_passes_before_parent_cleanup(
             isinstance(row, Mapping) and row.get("status") == "PASS"
             for row in scenarios[:12]
         )
+        and isinstance(p0_13_assertions, Mapping)
+        and p0_13_assertions.get("trace_stages_complete") is True
+        and p0_13_assertions.get("trace_correlation_confirmed") is True
+        and p0_13_assertions.get("latency_attributed") is True
         and parent_cleanup_is_deferred(profile_result)
     )
 
@@ -2243,6 +2569,8 @@ def execute(
         raise LocalDiagnosticError("Codex model must be one normalized model ID")
     if options.runtime_requirement not in {BASELINE_RUNTIME, RUNTIME_V2_RUNTIME}:
         raise LocalDiagnosticError("runtime requirement is invalid")
+    if type(options.allow_public_health_identity) is not bool:
+        raise LocalDiagnosticError("deployment identity mode is invalid")
     selected = _selected_profiles(options.profile_ids)
     if selected != options.profile_ids:
         options = replace(options, profile_ids=selected)
@@ -2266,6 +2594,11 @@ def execute(
         "status": "RUNNING",
         "profile_statuses": {},
         "diagnostic_profile_statuses": {},
+        "provisioning": {
+            "profile_statuses": {},
+            "failure_codes": {},
+        },
+        "orchestration": None,
         "validated_credential_names": [],
         "codex_preflight": None,
         "codex_network_profile": None,
@@ -2298,42 +2631,88 @@ def execute(
             loaded, options.profile_ids, run_id
         )
         summary["validated_credential_names"] = list(credential_names)
-        deployment_receipt = dependencies.verify_deployment(
-            options.candidate_sha or None,
-            paths.deployment_receipt,
-            env=_deployment_environment(loaded),
-            expected_runtime=options.runtime_requirement,
-        )
+        if options.allow_public_health_identity:
+            observer = (
+                dependencies.observe_deployment
+                or _observe_public_health_deployment
+            )
+            deployment_receipt = observer(
+                options.candidate_sha or None,
+                paths.deployment_receipt,
+                env={"IO_E2E_BASE_URL": LOCKED_BASE_URL},
+                expected_runtime=options.runtime_requirement,
+            )
+        else:
+            deployment_receipt = dependencies.verify_deployment(
+                options.candidate_sha or None,
+                paths.deployment_receipt,
+                env=_deployment_environment(loaded),
+                expected_runtime=options.runtime_requirement,
+            )
         observed_backend_sha = str(
             deployment_receipt.get("observed_backend_sha") or ""
-        ).lower()
-        observed_deployment_sha = str(
-            deployment_receipt.get("observed_deployment_sha") or ""
         ).lower()
         resolved_candidate_sha = str(
             deployment_receipt.get("expected_deployment_sha") or ""
         ).lower()
         observed_worker_sha = deployment_receipt.get("observed_worker_sha")
-        if (
-            not _SHA_RE.fullmatch(observed_backend_sha)
-            or resolved_candidate_sha != observed_backend_sha
-            or observed_deployment_sha != resolved_candidate_sha
-            or observed_worker_sha is not None
-            or deployment_receipt.get("liveness_verified") is not True
-            or deployment_receipt.get("deployment_identity_verified") is not True
-        ):
-            raise LocalDiagnosticError(
-                "trusted deployment identity receipt is invalid"
+        if options.allow_public_health_identity:
+            observed_deployment_sha = deployment_receipt.get(
+                "observed_deployment_sha"
             )
+            if (
+                not _SHA_RE.fullmatch(observed_backend_sha)
+                or resolved_candidate_sha != observed_backend_sha
+                or observed_deployment_sha is not None
+                or observed_worker_sha is not None
+                or deployment_receipt.get("liveness_verified") is not True
+                or deployment_receipt.get("deployment_identity_verified") is not False
+                or deployment_receipt.get("deployment_identity_observed") is not True
+                or deployment_receipt.get("identity_evidence_source")
+                != PUBLIC_HEALTH_IDENTITY_SOURCE
+                or deployment_receipt.get("identity_gap_code")
+                != PUBLIC_HEALTH_IDENTITY_GAP
+            ):
+                raise LocalDiagnosticError(
+                    "public deployment observation receipt is invalid"
+                )
+        else:
+            observed_deployment_sha = str(
+                deployment_receipt.get("observed_deployment_sha") or ""
+            ).lower()
+            if (
+                not _SHA_RE.fullmatch(observed_backend_sha)
+                or resolved_candidate_sha != observed_backend_sha
+                or observed_deployment_sha != resolved_candidate_sha
+                or observed_worker_sha is not None
+                or deployment_receipt.get("liveness_verified") is not True
+                or deployment_receipt.get("deployment_identity_verified") is not True
+            ):
+                raise LocalDiagnosticError(
+                    "trusted deployment identity receipt is invalid"
+                )
         options = replace(options, candidate_sha=resolved_candidate_sha)
         summary["candidate_sha"] = resolved_candidate_sha
-        summary["deployment_identity"] = {
-            "expected_deployment_sha": resolved_candidate_sha,
-            "observed_backend_sha": observed_backend_sha,
-            "observed_deployment_sha": observed_deployment_sha,
-            "observed_worker_sha": observed_worker_sha,
-            "identity_verified": True,
-        }
+        if options.allow_public_health_identity:
+            summary["deployment_identity"] = {
+                "expected_deployment_sha": resolved_candidate_sha,
+                "observed_backend_sha": observed_backend_sha,
+                "observed_deployment_sha": None,
+                "observed_worker_sha": None,
+                "identity_observed": True,
+                "identity_verified": False,
+                "identity_evidence_source": PUBLIC_HEALTH_IDENTITY_SOURCE,
+                "identity_gap_code": PUBLIC_HEALTH_IDENTITY_GAP,
+                "health_status": deployment_receipt.get("health_status"),
+            }
+        else:
+            summary["deployment_identity"] = {
+                "expected_deployment_sha": resolved_candidate_sha,
+                "observed_backend_sha": observed_backend_sha,
+                "observed_deployment_sha": observed_deployment_sha,
+                "observed_worker_sha": observed_worker_sha,
+                "identity_verified": True,
+            }
         _verify_codex_location_separation(options.codex_bin, options, paths)
         dependencies.verify_codex_provenance(options.codex_bin)
         dependencies.verify_codex_version(options.codex_bin)
@@ -2382,62 +2761,166 @@ def execute(
             summary["status"] = "PREFLIGHT_PASS"
         else:
             manifest = _provision_diagnostic(dependencies, options, paths, active_env)
-            _validate_diagnostic_manifest(
+            manifest_rows = _validate_diagnostic_manifest_structure(
                 manifest, options.profile_ids, options.runtime_requirement
             )
             manifest_profiles_validated = True
-            for row in manifest.get("profiles", []):
-                if isinstance(row, Mapping):
-                    secret_values.extend(
-                        str(row.get(field) or "")
-                        for field in ("api_key", "secret_key_b64")
-                    )
+            classification = _classify_diagnostic_manifest(
+                manifest_rows, options.profile_ids, options.runtime_requirement
+            )
+            provision_statuses = dict(classification.provision_statuses)
+            provision_failure_codes = dict(
+                classification.provision_failure_codes
+            )
+            requested_profile_count = len(options.profile_ids)
+            ready_profile_count = len(classification.ready_profile_ids)
+            blocked_profile_count = len(classification.blocked_profile_ids)
+            accounted_profile_count = ready_profile_count + blocked_profile_count
+            summary["provisioning"] = {
+                "profile_statuses": provision_statuses,
+                "failure_codes": provision_failure_codes,
+                "requested_profile_count": requested_profile_count,
+                "ready_profile_count": ready_profile_count,
+                "blocked_profile_count": blocked_profile_count,
+                "accounted_profile_count": accounted_profile_count,
+            }
+            manifest_by_id = {
+                str(row["profile_id"]): row for row in manifest_rows
+            }
+            for row in manifest_rows:
+                secret_values.extend(
+                    str(row.get(field) or "")
+                    for field in ("api_key", "secret_key_b64")
+                )
             _split_selected_manifest(
                 paths.manifest, paths.profile_manifests, options.profile_ids
             )
-            worker_phase_started = True
-            receipt = _launch_diagnostic(dependencies, options, paths)
+            ready_profile_ids = classification.ready_profile_ids
+            blocked_profile_ids = set(classification.blocked_profile_ids)
+            if ready_profile_ids:
+                worker_phase_started = True
+                receipt = _launch_diagnostic(
+                    dependencies,
+                    options,
+                    paths,
+                    profile_ids=ready_profile_ids,
+                )
+            else:
+                receipt = {
+                    "launch_attempts": 0,
+                    "max_observed_profile_concurrency": 0,
+                    "workers": [],
+                }
+            workers = receipt.get("workers")
+            if (
+                receipt.get("launch_attempts") != len(ready_profile_ids)
+                or not isinstance(workers, list)
+                or len(workers) != len(ready_profile_ids)
+                or not all(isinstance(row, Mapping) for row in workers)
+                or [row.get("profile_id") for row in workers]
+                != list(ready_profile_ids)
+            ):
+                raise LocalDiagnosticError(
+                    "diagnostic agent launch receipt matrix is invalid"
+                )
+            worker_by_id = {
+                str(row["profile_id"]): row
+                for row in workers
+                if isinstance(row, Mapping)
+            }
+            result_sources = {
+                profile_id: (
+                    "provision_blocked"
+                    if profile_id in blocked_profile_ids
+                    else str(worker_by_id[profile_id].get("result_source") or "invalid")
+                )
+                for profile_id in options.profile_ids
+            }
             summary["orchestration"] = {
+                "matrix_profile_attempts": len(options.profile_ids),
                 "launch_attempts": receipt.get("launch_attempts"),
+                "requested_profile_count": requested_profile_count,
+                "ready_profile_count": ready_profile_count,
+                "blocked_profile_count": blocked_profile_count,
+                "accounted_profile_count": accounted_profile_count,
+                "agent_launch_profile_ids": list(ready_profile_ids),
+                "blocked_profile_ids": list(classification.blocked_profile_ids),
+                "result_sources": result_sources,
                 "max_observed_profile_concurrency": receipt.get(
                     "max_observed_profile_concurrency"
                 ),
                 "completed_command_execution_counts": {
-                    str(row.get("profile_id")): row.get(
-                        "completed_command_execution_count"
+                    profile_id: (
+                        worker_by_id[profile_id].get(
+                            "completed_command_execution_count"
+                        )
+                        if profile_id in worker_by_id
+                        else 0
                     )
-                    for row in receipt.get("workers", [])
-                    if isinstance(row, Mapping) and row.get("profile_id")
+                    for profile_id in options.profile_ids
                 },
                 "completed_scenario_command_ids": {
-                    str(row.get("profile_id")): row.get(
-                        "completed_scenario_command_ids"
+                    profile_id: (
+                        worker_by_id[profile_id].get(
+                            "completed_scenario_command_ids"
+                        )
+                        if profile_id in worker_by_id
+                        else []
                     )
-                    for row in receipt.get("workers", [])
-                    if isinstance(row, Mapping) and row.get("profile_id")
+                    for profile_id in options.profile_ids
                 },
                 "completed_scenario_command_counts": {
-                    str(row.get("profile_id")): row.get(
-                        "completed_scenario_command_counts"
+                    profile_id: (
+                        worker_by_id[profile_id].get(
+                            "completed_scenario_command_counts"
+                        )
+                        if profile_id in worker_by_id
+                        else {}
                     )
-                    for row in receipt.get("workers", [])
-                    if isinstance(row, Mapping) and row.get("profile_id")
+                    for profile_id in options.profile_ids
                 },
                 "p0_06_command_phases": {
-                    str(row.get("profile_id")): row.get(
-                        "p0_06_command_phases"
+                    profile_id: (
+                        worker_by_id[profile_id].get("p0_06_command_phases")
+                        if profile_id in worker_by_id
+                        else []
                     )
-                    for row in receipt.get("workers", [])
-                    if isinstance(row, Mapping) and row.get("profile_id")
+                    for profile_id in options.profile_ids
                 },
             }
-            summary["cot_delivery"] = _cot_delivery_projection(
-                receipt, options.profile_ids
+            ready_cot = (
+                _cot_delivery_projection(receipt, ready_profile_ids)
+                if ready_profile_ids
+                else {}
             )
+            summary["cot_delivery"] = {
+                profile_id: (
+                    _blocked_cot_projection(provision_failure_codes[profile_id])
+                    if profile_id in blocked_profile_ids
+                    else ready_cot[profile_id]
+                )
+                for profile_id in options.profile_ids
+            }
             statuses: dict[str, str] = {}
             for profile_id in options.profile_ids:
-                source = paths.aggregation_inputs / f"{profile_id}.json"
-                result = _load_private_json(source, f"{profile_id} result")
+                if profile_id in blocked_profile_ids:
+                    result = _blocked_profile_result(
+                        manifest_by_id[profile_id],
+                        profile_id=profile_id,
+                        expected_runtime=options.runtime_requirement,
+                        provisioning_failure_code=provision_failure_codes[
+                            profile_id
+                        ],
+                        authoring_schema_path=(
+                            paths.worker_source_root
+                            / "qa"
+                            / "schemas"
+                            / "codex-run-result.schema.json"
+                        ),
+                    )
+                else:
+                    source = paths.aggregation_inputs / f"{profile_id}.json"
+                    result = _load_private_json(source, f"{profile_id} result")
                 if _contains_secret(result, secret_values):
                     raise LocalDiagnosticError(
                         "diagnostic worker artifact contains secret material"
@@ -2660,6 +3143,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument(
+        "--allow-public-health-identity",
+        action="store_true",
+        help=(
+            "diagnostic-only: pin the target to /healthz release.git_commit "
+            "without claiming protected deployment attestation"
+        ),
+    )
+    parser.add_argument(
         "--require-runtime-v2",
         action="store_true",
         help=(
@@ -2687,6 +3178,7 @@ def _options(args: argparse.Namespace) -> DiagnosticOptions:
         runtime_requirement=(
             RUNTIME_V2_RUNTIME if args.require_runtime_v2 else BASELINE_RUNTIME
         ),
+        allow_public_health_identity=args.allow_public_health_identity,
     )
 
 

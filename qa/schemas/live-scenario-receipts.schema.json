@@ -11,39 +11,44 @@
     "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"},
     "profile_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"},
     "persona_finalizer": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["kind", "semantic_assertions", "persona_finalizer"],
-      "properties": {
-        "kind": {"const": "persona_finalizer"},
-        "semantic_assertions": {
+      "anyOf": [
+        {
           "type": "object",
           "additionalProperties": false,
-          "required": ["persona_acceptance_passed", "privacy_canary_absent"],
+          "required": ["kind", "semantic_assertions", "persona_finalizer"],
           "properties": {
-            "persona_acceptance_passed": {"type": "boolean"},
-            "privacy_canary_absent": {"type": "boolean"}
+            "kind": {"const": "persona_finalizer"},
+            "semantic_assertions": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["persona_acceptance_passed", "privacy_canary_absent"],
+              "properties": {
+                "persona_acceptance_passed": {"type": "boolean"},
+                "privacy_canary_absent": {"type": "boolean"}
+              }
+            },
+            "persona_finalizer": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fixture_id", "evidence_sha256", "request_id", "job_id", "semantic_judgment_bound", "finalizer_ok", "private_evidence_deleted", "archive_upload_count", "archive_receipts_verified", "genesis_upload_metadata_verified", "privacy_violation_count"],
+              "properties": {
+                "fixture_id": {"const": "persona-import-v1"},
+                "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "request_id": {"$ref": "#/$defs/id"},
+                "job_id": {"$ref": "#/$defs/id"},
+                "semantic_judgment_bound": {"const": true},
+                "finalizer_ok": {"type": "boolean"},
+                "private_evidence_deleted": {"const": true},
+                "archive_upload_count": {"const": 4},
+                "archive_receipts_verified": {"const": true},
+                "genesis_upload_metadata_verified": {"const": true},
+                "privacy_violation_count": {"type": "integer", "minimum": 0}
+              }
+            }
           }
         },
-        "persona_finalizer": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["fixture_id", "evidence_sha256", "request_id", "job_id", "semantic_judgment_bound", "finalizer_ok", "private_evidence_deleted", "archive_upload_count", "archive_receipts_verified", "genesis_upload_metadata_verified", "privacy_violation_count"],
-          "properties": {
-            "fixture_id": {"const": "persona-import-v1"},
-            "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-            "request_id": {"$ref": "#/$defs/id"},
-            "job_id": {"$ref": "#/$defs/id"},
-            "semantic_judgment_bound": {"const": true},
-            "finalizer_ok": {"type": "boolean"},
-            "private_evidence_deleted": {"const": true},
-            "archive_upload_count": {"const": 4},
-            "archive_receipts_verified": {"const": true},
-            "genesis_upload_metadata_verified": {"const": true},
-            "privacy_violation_count": {"type": "integer", "minimum": 0}
-          }
-        }
-      }
+        {"type": "null"}
+      ]
     },
     "receipts": {
       "type": "array",

@@ -627,7 +627,7 @@ def _passing_live_probe(
                 "out_of_order_detected": False,
             }
         )
-        assert len(turns) == turn_count
+        assert len(turns) <= turn_count
         turns = [
             {
                 "turn_index": index,
@@ -666,6 +666,7 @@ def _passing_live_probe(
     }
     if diagnostic_cleanup:
         assertions["cleanup_confirmed"] = False
+        assertions["trace_correlation_confirmed"] = len(turns) == turn_count
     projection: dict[str, Any] | None = None
     if scenario_id == "P0-06":
         projection = {
@@ -816,6 +817,10 @@ def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
     for receipt in receipts:
         scenario = scenarios[receipt["scenario_id"]]
         scenario_status = receipt["status"]
+        canonical_failure_code = {
+            "LIVE_PROBE_ERROR": "TRACE_UNAVAILABLE",
+            "ASSERTION_FAILED": "UNCLASSIFIED_PRODUCT_FAILURE",
+        }.get(receipt["failure_code"], receipt["failure_code"])
         scenario_failure = (
             None
             if scenario_status == "PASS"
@@ -826,7 +831,7 @@ def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
                     if receipt["failure_code"] == "PRECONDITION_MISSING"
                     else "TRACE_LATENCY_CLEANUP"
                 ),
-                "failure_code": receipt["failure_code"],
+                "failure_code": canonical_failure_code,
                 "reproducible": True,
             }
         )
@@ -854,35 +859,50 @@ def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
                 scenario["assertions"][key] = value
         if receipt["scenario_id"] == "P0-06":
             projection = receipt["result_projection"]
-            scenario["assertions"] = {
-                **receipt["assertions"],
-                "persona_acceptance_passed": True,
-                "privacy_canary_absent": True,
-            }
-            scenario["evidence_codes"] = [
-                "PERSONA_FILES_ARCHIVED",
-                "PERSONA_SOURCE_METADATA_VERIFIED",
-                "PERSONA_IMPORT_DONE",
-                "PERSONA_ACCEPTANCE_PASSED",
-                "PRIVACY_CANARY_ABSENT",
-            ]
-            scenario["persona_finalizer"] = {
-                "fixture_id": "persona-import-v1",
-                "evidence_sha256": projection["evidence_sha256"],
-                "request_id": receipt["request_ids"][0],
-                "job_id": projection["job_id"],
-                "semantic_judgment_bound": True,
-                "finalizer_ok": True,
-                "private_evidence_deleted": True,
-                "archive_upload_count": projection["archive_upload_count"],
-                "archive_receipts_verified": projection[
-                    "archive_receipts_verified"
-                ],
-                "genesis_upload_metadata_verified": projection[
-                    "genesis_upload_metadata_verified"
-                ],
-                "privacy_violation_count": 0,
-            }
+            if projection is None:
+                failed = live_receipts.failed_persona_result_projection(receipt)
+                scenario.update(
+                    {
+                        **failed,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+                                "status": failed["status"],
+                                "failure": failed["failure"],
+                            }
+                        ],
+                    }
+                )
+            else:
+                scenario["assertions"] = {
+                    **receipt["assertions"],
+                    "persona_acceptance_passed": True,
+                    "privacy_canary_absent": True,
+                }
+                scenario["evidence_codes"] = [
+                    "PERSONA_FILES_ARCHIVED",
+                    "PERSONA_SOURCE_METADATA_VERIFIED",
+                    "PERSONA_IMPORT_DONE",
+                    "PERSONA_ACCEPTANCE_PASSED",
+                    "PRIVACY_CANARY_ABSENT",
+                ]
+                scenario["persona_finalizer"] = {
+                    "fixture_id": "persona-import-v1",
+                    "evidence_sha256": projection["evidence_sha256"],
+                    "request_id": receipt["request_ids"][0],
+                    "job_id": projection["job_id"],
+                    "semantic_judgment_bound": True,
+                    "finalizer_ok": True,
+                    "private_evidence_deleted": True,
+                    "archive_upload_count": projection["archive_upload_count"],
+                    "archive_receipts_verified": projection[
+                        "archive_receipts_verified"
+                    ],
+                    "genesis_upload_metadata_verified": projection[
+                        "genesis_upload_metadata_verified"
+                    ],
+                    "privacy_violation_count": 0,
+                }
         if receipt["scenario_id"] == "P0-13":
             scenario["assertions"] = dict(receipt["assertions"])
             scenario["evidence_codes"] = [
@@ -921,6 +941,54 @@ def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
         receipt for receipt in receipts if receipt["scenario_id"] == "P0-13"
     )
     trace_cleanup_projection = trace_cleanup_receipt["result_projection"]
+    if trace_cleanup_projection is None:
+        bound_turns = [
+            {
+                **turn,
+                "stage_latency_ms": {
+                    stage: None
+                    for stage in (
+                        "routing",
+                        "queue",
+                        "provider",
+                        "persistence",
+                        "delivery",
+                    )
+                },
+            }
+            for turn in bound_turns
+        ]
+        result["turns"] = bound_turns
+        result["latency"] = live_receipts.latency_projection(bound_turns)
+        result["trace"] = {
+            "enabled": False,
+            "deploy_enabled": False,
+            "correlated_event_count": 0,
+            "observed_event_types": [],
+            "missing_required_event_types": [
+                "routing",
+                "queue",
+                "provider",
+                "persistence",
+                "delivery",
+            ],
+            "raw_trace_stored": False,
+        }
+        result["cleanup"] = {
+            "attempted": False,
+            "provider_config_deleted": False,
+            "account_reset": False,
+            "old_credential_rejected": False,
+            "status": "BLOCKED_EVIDENCE",
+        }
+        result["status"] = "BLOCKED_EVIDENCE"
+        result["diagnostic_codes"] = [
+            "CLEANUP_FALLBACK_USED",
+            "STAGE_TIMING_UNAVAILABLE",
+            "TRACE_PARTIAL",
+        ]
+        spec.result_path.write_text(json.dumps(result) + "\n")
+        return
     projected_by_trace = {
         turn["trace_id"]: turn for turn in trace_cleanup_receipt["turns"]
     }
@@ -1344,6 +1412,10 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
         assert "MUST NOT short-circuit P0-02 through" in spec.prompt
         assert "QA_SCENARIO_ID=P0-XX" in spec.prompt
         assert "request_live_scenario_probe.py" in spec.prompt
+        assert "This is a live qualification run, not a source-code review" in (
+            spec.prompt
+        )
+        assert "Do not inspect QA implementation files or tests" in spec.prompt
         assert "Never invoke qa/cot_delivery_probe.py" in spec.prompt
         assert spec.environment["QA_PRIVATE_MANIFEST"].endswith(
             f"/{spec.profile_id}.json"
@@ -2044,18 +2116,16 @@ def test_diagnostic_keeps_valid_worker_when_peer_uses_fallback(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("cot_mode", "expected_reason", "receipt_is_trusted"),
+    ("cot_mode", "expected_reason"),
     (
-        ("missing", "COT_RECEIPT_MISSING", False),
-        ("malformed", "COT_RECEIPT_INVALID", False),
-        ("binding-mismatch", "COT_RESULT_BINDING_MISMATCH", True),
+        ("missing", "COT_RECEIPT_MISSING"),
+        ("malformed", "COT_RECEIPT_INVALID"),
     ),
 )
 def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
-    tmp_path, cot_mode, expected_reason, receipt_is_trusted
+    tmp_path, cot_mode, expected_reason
 ):
     paths = _setup(tmp_path, qualification_mode="diagnostic")
-    authored_results: dict[str, dict[str, Any]] = {}
 
     def runner(spec: launcher.WorkerSpec, _timeout: int) -> int:
         schema = json.loads(spec.schema_path.read_text())
@@ -2085,18 +2155,13 @@ def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
         )
         _request_passing_cot_probe(spec)
         _request_passing_live_probes(spec)
-        if cot_mode == "binding-mismatch":
-            result = json.loads(spec.result_path.read_text())
-            result["reasoning"]["disclosure_length"] += 1
-            spec.result_path.write_text(json.dumps(result) + "\n")
-        authored_results[spec.profile_id] = json.loads(spec.result_path.read_text())
         return 0
 
     receipt = _launch_diagnostic(
         paths,
         runner,
         cot_probe_runner=_cot_probe_runner(
-            cot_mode if cot_mode in {"missing", "malformed"} else "valid"
+            cot_mode
         ),
     )
     worker = receipt["workers"][0]
@@ -2117,17 +2182,451 @@ def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
     assert worker["completed_scenario_command_counts"] == (
         verifier.MIN_SCENARIO_COMMAND_COUNTS
     )
-    assert result == authored_results["official-gemini"]
-    if receipt_is_trusted:
-        assert len(worker["cot_receipt_sha256"]) == 64
-        assert worker["cot_delivery_status"] == "PASS"
-        assert worker["cot_failure_code"] == "NONE"
-        assert worker["cot_delivery_qualified"] is True
-        assert worker["cot_reasoning_event_count"] == 1
-        assert worker["cot_metadata_present"] is True
-    else:
-        assert worker["cot_receipt_sha256"] is None
-        assert worker["cot_delivery_status"] is None
+    assert result["profile_id"] == "official-gemini"
+    assert result["status"] == "BLOCKED_EVIDENCE"
+    assert next(
+        turn for turn in result["turns"] if turn["scenario_id"] == "P0-12"
+    )["turn_index"] == 1
+    assert worker["cot_receipt_sha256"] is None
+    assert worker["cot_delivery_status"] is None
+
+
+def test_diagnostic_canonicalizes_parent_owned_live_and_cot_evidence(tmp_path):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+
+    def runner(spec: launcher.WorkerSpec, _timeout: int) -> int:
+        schema = json.loads(spec.schema_path.read_text())
+        result = _instance(schema, schema["$defs"])
+        spec.result_path.write_text(json.dumps(result) + "\n")
+        spec.events_path.write_text(
+            "".join(
+                json.dumps(row) + "\n"
+                for row in (
+                    {
+                        "type": "thread.started",
+                        "thread_id": "30000000-0000-4000-8000-000000000004",
+                        "session_id": "40000000-0000-4000-8000-000000000004",
+                    },
+                    {"type": "turn.started"},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": verifier.MANDATORY_SOP_READ_COMMAND,
+                            "status": "completed",
+                            "exit_code": 0,
+                        },
+                    },
+                    *_scenario_command_rows(),
+                    {"type": "turn.completed", "usage": {}},
+                )
+            )
+        )
+        _request_passing_cot_probe(spec)
+        _request_passing_live_probes(spec)
+
+        # Reproduce the canary's harmless model transcription/staleness errors.
+        result = json.loads(spec.result_path.read_text())
+        scenarios = {row["scenario_id"]: row for row in result["scenarios"]}
+        scenarios["P0-02"]["request_ids"] = ["probe-p0-02-typo"]
+        scenarios["P0-06"]["persona_finalizer"]["finalizer_ok"] = False
+        result["reasoning"].update(
+            {
+                "disclosure_length": 999,
+                "source": "agent-transcription",
+                "model": None,
+            }
+        )
+        for turn in result["turns"]:
+            turn["stage_latency_ms"] = {
+                "routing": None,
+                "queue": None,
+                "provider": None,
+                "persistence": None,
+                "delivery": None,
+            }
+        spec.result_path.write_text(json.dumps(result) + "\n")
+        return 0
+
+    receipt = _launch_diagnostic(paths, runner)
+    worker = receipt["workers"][0]
+    result = json.loads(
+        (paths["aggregation"] / "official-gemini.json").read_text()
+    )
+    scenarios = {row["scenario_id"]: row for row in result["scenarios"]}
+
+    assert worker["result_source"] == "codex_worker"
+    assert worker["fallback_reason"] is None
+    assert worker["cot_evidence_failure"] is None
+    assert scenarios["P0-02"]["request_ids"] == ["probe-p0-02-1"]
+    assert scenarios["P0-06"]["persona_finalizer"]["finalizer_ok"] is True
+    assert all(
+        all(value is not None for value in turn["stage_latency_ms"].values())
+        for turn in result["turns"]
+    )
+    assert result["reasoning"]["disclosure_length"] == 24
+    assert result["reasoning"]["source"] == "pi_thinking"
+    assert result["reasoning"]["model"] == "model-safe"
+    assert next(
+        turn for turn in result["turns"] if turn["scenario_id"] == "P0-12"
+    )["turn_index"] == 1
+
+
+def test_diagnostic_preserves_parent_owned_negative_persona_verdict(tmp_path):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+
+    def runner(spec: launcher.WorkerSpec, _timeout: int) -> int:
+        schema = json.loads(spec.schema_path.read_text())
+        spec.result_path.write_text(
+            json.dumps(_instance(schema, schema["$defs"])) + "\n"
+        )
+        spec.events_path.write_text(
+            "".join(
+                json.dumps(row) + "\n"
+                for row in (
+                    {
+                        "type": "thread.started",
+                        "thread_id": "30000000-0000-4000-8000-000000000005",
+                        "session_id": "40000000-0000-4000-8000-000000000005",
+                    },
+                    {"type": "turn.started"},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": verifier.MANDATORY_SOP_READ_COMMAND,
+                            "status": "completed",
+                            "exit_code": 0,
+                        },
+                    },
+                    *_scenario_command_rows(),
+                    {"type": "turn.completed", "usage": {}},
+                )
+            )
+        )
+        _request_passing_cot_probe(spec)
+        _request_passing_live_probes(spec)
+        return 0
+
+    def negative_persona(spec, capture_receipt):
+        projection = _persona_finalize_runner(spec, capture_receipt)
+        projection["semantic_assertions"]["persona_acceptance_passed"] = False
+        projection["persona_finalizer"]["finalizer_ok"] = False
+        return projection
+
+    receipt = _launch_diagnostic(
+        paths,
+        runner,
+        persona_finalize_runner=negative_persona,
+    )
+    worker = receipt["workers"][0]
+    result = json.loads(
+        (paths["aggregation"] / "official-gemini.json").read_text()
+    )
+    persona = result["scenarios"][5]
+
+    assert worker["result_source"] == "codex_worker"
+    assert worker["fallback_reason"] is None
+    assert persona["status"] == "PRODUCT_FAIL"
+    assert persona["assertions"]["persona_acceptance_passed"] is False
+    assert persona["assertions"]["privacy_canary_absent"] is True
+    assert persona["persona_finalizer"]["finalizer_ok"] is False
+    assert persona["failure"]["failure_code"] == "PERSONA_ACCEPTANCE_FAILED"
+
+
+def test_diagnostic_persona_capture_failure_continues_later_scenarios(tmp_path):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+
+    def runner(spec: launcher.WorkerSpec, _timeout: int) -> int:
+        schema = json.loads(spec.schema_path.read_text())
+        spec.result_path.write_text(
+            json.dumps(_instance(schema, schema["$defs"])) + "\n"
+        )
+        commands = [
+            row
+            for row in _scenario_command_rows()
+            if not (
+                "QA_SCENARIO_ID=P0-06" in row["item"]["command"]
+                and any(
+                    phase in row["item"]["command"]
+                    for phase in (
+                        "QA_SCENARIO_PHASE=REVIEW",
+                        "QA_SCENARIO_PHASE=FINALIZE",
+                    )
+                )
+            )
+        ]
+        spec.events_path.write_text(
+            "".join(
+                json.dumps(row) + "\n"
+                for row in (
+                    {
+                        "type": "thread.started",
+                        "thread_id": "30000000-0000-4000-8000-000000000006",
+                        "session_id": "40000000-0000-4000-8000-000000000006",
+                    },
+                    {"type": "turn.started"},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": verifier.MANDATORY_SOP_READ_COMMAND,
+                            "status": "completed",
+                            "exit_code": 0,
+                        },
+                    },
+                    *commands,
+                    {"type": "turn.completed", "usage": {}},
+                )
+            )
+        )
+        _request_passing_cot_probe(spec)
+        _request_passing_live_probes(spec)
+        return 0
+
+    def failed_persona_probe(spec, scenario_id, attempt, nonce, prior_receipts):
+        receipt, facts = _passing_live_probe(
+            spec, scenario_id, attempt, nonce, prior_receipts
+        )
+        if scenario_id == "P0-06":
+            receipt.update(
+                {
+                    "status": "BLOCKED_EVIDENCE",
+                    "failure_code": "LIVE_PROBE_ERROR",
+                    "result_projection": None,
+                }
+            )
+            receipt["assertions"] = {
+                key: False
+                for key in live_receipts.DETERMINISTIC_ASSERTIONS["P0-06"]
+            }
+        return receipt, facts
+
+    def unexpected_finalizer(_spec, _capture):
+        raise AssertionError("failed persona capture must not be finalized")
+
+    receipt = _launch_diagnostic(
+        paths,
+        runner,
+        live_probe_runner=failed_persona_probe,
+        persona_finalize_runner=unexpected_finalizer,
+    )
+    worker = receipt["workers"][0]
+    result = json.loads(
+        (paths["aggregation"] / "official-gemini.json").read_text()
+    )
+    live_set, _ = live_receipts.validate_live_scenario_receipts(
+        paths["raw"] / "official-gemini" / "live-scenario-receipts.json",
+        run_id="diagnostic-123",
+        profile_id="official-gemini",
+        allow_failed_persona=True,
+    )
+
+    assert worker["result_source"] == "codex_worker"
+    assert worker["fallback_reason"] is None
+    assert worker["completed_scenario_command_ids"] == list(
+        verifier.AGENT_LIVE_SCENARIO_IDS
+    )
+    assert worker["p0_06_command_phases"] == ["CAPTURE"]
+    assert [row["scenario_id"] for row in live_set["receipts"]] == list(
+        live_request.LIVE_SCENARIO_IDS
+    )
+    assert live_set["persona_finalizer"] is None
+    assert result["scenarios"][5]["status"] == "BLOCKED_EVIDENCE"
+    assert result["scenarios"][5]["persona_finalizer"] is None
+    assert result["scenarios"][6]["scenario_id"] == "P0-07"
+    assert result["scenarios"][12]["scenario_id"] == "P0-13"
+
+
+def test_diagnostic_trusted_probe_error_is_receipted_and_sequence_continues(
+    tmp_path,
+):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+
+    def runner(spec: launcher.WorkerSpec, _timeout: int) -> int:
+        schema = json.loads(spec.schema_path.read_text())
+        spec.result_path.write_text(
+            json.dumps(_instance(schema, schema["$defs"])) + "\n"
+        )
+        spec.events_path.write_text(
+            "".join(
+                json.dumps(row) + "\n"
+                for row in (
+                    {
+                        "type": "thread.started",
+                        "thread_id": "30000000-0000-4000-8000-000000000007",
+                        "session_id": "40000000-0000-4000-8000-000000000007",
+                    },
+                    {"type": "turn.started"},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": verifier.MANDATORY_SOP_READ_COMMAND,
+                            "status": "completed",
+                            "exit_code": 0,
+                        },
+                    },
+                    *_scenario_command_rows(),
+                    {"type": "turn.completed", "usage": {}},
+                )
+            )
+        )
+        _request_passing_cot_probe(spec)
+        _request_passing_live_probes(spec)
+        return 0
+
+    def crashing_probe(spec, scenario_id, attempt, nonce, prior_receipts):
+        if scenario_id == "P0-09":
+            raise launcher.WorkerLaunchError("simulated trusted probe crash")
+        return _passing_live_probe(
+            spec, scenario_id, attempt, nonce, prior_receipts
+        )
+
+    receipt = _launch_diagnostic(
+        paths,
+        runner,
+        live_probe_runner=crashing_probe,
+    )
+    worker = receipt["workers"][0]
+    result = json.loads(
+        (paths["aggregation"] / "official-gemini.json").read_text()
+    )
+    live_set, _ = live_receipts.validate_live_scenario_receipts(
+        paths["raw"] / "official-gemini" / "live-scenario-receipts.json",
+        run_id="diagnostic-123",
+        profile_id="official-gemini",
+        allow_failed_persona=True,
+    )
+    by_id = {row["scenario_id"]: row for row in live_set["receipts"]}
+
+    assert worker["result_source"] == "codex_worker"
+    assert worker["fallback_reason"] is None
+    assert by_id["P0-09"]["status"] == "BLOCKED_EVIDENCE"
+    assert by_id["P0-09"]["failure_code"] == "LIVE_PROBE_ERROR"
+    assert by_id["P0-09"]["turns"] == []
+    assert by_id["P0-10"]["scenario_id"] == "P0-10"
+    assert by_id["P0-11"]["scenario_id"] == "P0-11"
+    assert by_id["P0-13"]["scenario_id"] == "P0-13"
+    assert result["scenarios"][8]["status"] == "BLOCKED_EVIDENCE"
+
+
+def test_diagnostic_p0_13_probe_error_preserves_agent_result(tmp_path):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+
+    def runner(spec: launcher.WorkerSpec, _timeout: int) -> int:
+        schema = json.loads(spec.schema_path.read_text())
+        spec.result_path.write_text(
+            json.dumps(_instance(schema, schema["$defs"])) + "\n"
+        )
+        spec.events_path.write_text(
+            "".join(
+                json.dumps(row) + "\n"
+                for row in (
+                    {
+                        "type": "thread.started",
+                        "thread_id": "30000000-0000-4000-8000-000000000008",
+                        "session_id": "40000000-0000-4000-8000-000000000008",
+                    },
+                    {"type": "turn.started"},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": verifier.MANDATORY_SOP_READ_COMMAND,
+                            "status": "completed",
+                            "exit_code": 0,
+                        },
+                    },
+                    *_scenario_command_rows(),
+                    {"type": "turn.completed", "usage": {}},
+                )
+            )
+        )
+        _request_passing_cot_probe(spec)
+        _request_passing_live_probes(spec)
+        return 0
+
+    def crashing_probe(spec, scenario_id, attempt, nonce, prior_receipts):
+        if scenario_id == "P0-13":
+            raise launcher.WorkerLaunchError("simulated trace-cleanup probe crash")
+        return _passing_live_probe(
+            spec, scenario_id, attempt, nonce, prior_receipts
+        )
+
+    receipt = _launch_diagnostic(
+        paths,
+        runner,
+        live_probe_runner=crashing_probe,
+    )
+    worker = receipt["workers"][0]
+    result = json.loads(
+        (paths["aggregation"] / "official-gemini.json").read_text()
+    )
+    live_set, _ = live_receipts.validate_live_scenario_receipts(
+        paths["raw"] / "official-gemini" / "live-scenario-receipts.json",
+        run_id="diagnostic-123",
+        profile_id="official-gemini",
+        allow_failed_persona=True,
+    )
+    by_id = {row["scenario_id"]: row for row in live_set["receipts"]}
+
+    assert worker["result_source"] == "codex_worker"
+    assert worker["fallback_reason"] is None
+    assert worker["completed_scenario_command_ids"] == list(
+        verifier.AGENT_LIVE_SCENARIO_IDS
+    )
+    assert worker["completed_scenario_command_counts"] == (
+        verifier.MIN_SCENARIO_COMMAND_COUNTS
+    )
+    assert [row["scenario_id"] for row in live_set["receipts"]] == list(
+        live_request.LIVE_SCENARIO_IDS
+    )
+    assert by_id["P0-13"]["status"] == "BLOCKED_EVIDENCE"
+    assert by_id["P0-13"]["failure_code"] == "LIVE_PROBE_ERROR"
+    assert by_id["P0-13"]["result_projection"] is None
+    assert len(result["scenarios"]) == 13
+    assert result["scenarios"][12]["failure"]["failure_code"] == (
+        "TRACE_UNAVAILABLE"
+    )
+    assert result["reasoning"]["request_id"] == "request-1"
+    assert result["scenarios"][11]["request_ids"] == ["request-1"]
+    assert len(result["turns"]) == 14
+    assert all(row["scenario_id"] != "P0-12" for row in result["turns"])
+    assert all(
+        value is None
+        for row in result["turns"]
+        for value in row["stage_latency_ms"].values()
+    )
+    assert result["latency"]["sample_count"] == 14
+    assert result["latency"]["missing_stages"] == [
+        "routing",
+        "queue",
+        "provider",
+        "persistence",
+        "delivery",
+    ]
+    assert result["trace"] == {
+        "enabled": False,
+        "deploy_enabled": False,
+        "correlated_event_count": 0,
+        "observed_event_types": [],
+        "missing_required_event_types": [
+            "routing",
+            "queue",
+            "provider",
+            "persistence",
+            "delivery",
+        ],
+        "raw_trace_stored": False,
+    }
+    assert result["cleanup"] == {
+        "attempted": False,
+        "provider_config_deleted": False,
+        "account_reset": False,
+        "old_credential_rejected": False,
+        "status": "BLOCKED_EVIDENCE",
+    }
 
 
 def test_launcher_rejects_ambient_readable_private_roots(tmp_path, monkeypatch):
@@ -2494,6 +2993,47 @@ def test_persona_phase_contract_rejects_out_of_order_phases():
             ("CAPTURE", "FINALIZE", "REVIEW"),
         )
         is False
+    )
+
+
+def test_terminal_persona_capture_command_contract_is_diagnostic_only(tmp_path):
+    rows = [
+        row
+        for row in _scenario_command_rows()
+        if not (
+            "QA_SCENARIO_ID=P0-06" in row["item"]["command"]
+            and any(
+                phase in row["item"]["command"]
+                for phase in (
+                    "QA_SCENARIO_PHASE=REVIEW",
+                    "QA_SCENARIO_PHASE=FINALIZE",
+                )
+            )
+        )
+    ]
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    _, strict_ids, _, strict_counts, strict_phases = (
+        verifier.completed_command_evidence(path.resolve())
+    )
+    assert strict_ids == ()
+    assert not verifier.scenario_command_contract_satisfied(
+        strict_counts, strict_phases
+    )
+
+    _, diagnostic_ids, _, diagnostic_counts, diagnostic_phases = (
+        verifier.completed_command_evidence(
+            path.resolve(), allow_failed_persona_capture=True
+        )
+    )
+    assert diagnostic_ids == verifier.AGENT_LIVE_SCENARIO_IDS
+    assert diagnostic_phases == ("CAPTURE",)
+    assert verifier.scenario_command_contract_satisfied(
+        diagnostic_counts,
+        diagnostic_phases,
+        allow_failed_persona_capture=True,
     )
 
 

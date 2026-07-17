@@ -176,6 +176,16 @@ session in `~/.codex/auth.json`. Provider keys remain confined to the
 deterministic provisioner and are never placed in a Codex prompt or worker
 environment.
 
+When the deployed build predates the protected QA build-identity endpoint, pass
+`--allow-public-health-identity`. This explicit diagnostic-only mode pins the run
+to the exact full image commit reported by `/healthz.release.git_commit`, and an
+optional `--candidate-sha` must match that live value. Artifacts label this
+evidence `OBSERVED_UNATTESTED`: it proves which backend image identifies itself
+as serving the requests, but it does not independently prove the serialized
+deployment SHA or worker identity and can never satisfy the protected release
+gate. Without this flag the local driver retains the fail-closed protected
+build-identity check.
+
 The default is baseline qualification: it accepts any configured runtime status,
 records the observed mode/version, and runs the full user-behavior journey. Add
 `--require-runtime-v2` when the deployed target is expected to expose exact
@@ -197,6 +207,21 @@ The dotenv file must be an owner-only regular file:
 chmod 600 /absolute/path/.env.test
 ```
 
+Create the owner-controlled probe runtime once. The local driver checks both
+`cryptography` and PyNaCl before any account is provisioned and automatically
+discovers this fixed path:
+
+```sh
+python3 -m venv "$HOME/.cache/io-e2e-qa-venv"
+"$HOME/.cache/io-e2e-qa-venv/bin/python" -m pip install --require-hashes \
+  -r qa/requirements.lock
+```
+
+The Codex desktop dependency runtime is not a substitute unless it contains the
+complete locked probe dependencies. In particular, checking only
+`cryptography` is insufficient because the encrypted user-session helpers also
+require PyNaCl.
+
 A repository-local `.env.test` is supported, but the live checkout is never a
 Codex read root. Before configuring the workers, the deterministic parent makes
 an owner-only source snapshot containing only `qa/`, `tools/provider_smoke/`,
@@ -216,16 +241,19 @@ python3 qa/run_local_diagnostic.py \
   --env-file /absolute/path/.env.test \
   --codex-model gpt-5.6 \
   --profile official-gemini \
+  --allow-public-health-identity \
   --preflight-only
 ```
 
 Then remove `--preflight-only` to create one fresh synthetic account and run the
 live Gemini canary. Repeat `--profile` to select a bounded subset, or omit it to
-run the locked eight-profile matrix. By default, the driver discovers the full
-source SHA from the protected test-backend identity endpoint before Codex or
+run the locked eight-profile matrix. With the public-health flag, the driver
+discovers the full source SHA from the live health response before Codex or
 provisioning starts. `--candidate-sha <full-sha>` is an optional extra assertion:
-if supplied, it must exactly match that authoritative identity. It is never a
-way to label the live deployment.
+if supplied, it must exactly match that observed health identity. It never
+upgrades public metadata into protected deployment attestation or relabels the
+live deployment. Without the flag, discovery still uses the protected
+test-backend identity endpoint.
 
 For the future strict runtime candidate, append `--require-runtime-v2` to the
 same command.
@@ -276,10 +304,16 @@ source digest, worker-source digest, and exact copied worker-snapshot digest;
 the run aborts before Codex if the snapshot bytes differ from the measured
 source bytes.
 
-Every profile runs `P0-01` through `P0-13`, including fresh onboarding, key
-validation, four-part persona import/distillation, basic and ten-turn chat,
-memory/persona consistency, model identity, reasoning disclosure, latency
-attribution, trace correlation, and cleanup.
+All eight locked io API-key profiles are accounted for in the diagnostic
+matrix. Each `READY` profile launches one headless Codex worker and executes
+`P0-01` through `P0-13`, including fresh onboarding, key validation, four-part
+persona import/distillation, basic and ten-turn chat, memory/persona
+consistency, model identity, reasoning disclosure, latency attribution, trace
+correlation, and cleanup. If deterministic provisioning returns the exact
+`VALID_KEY_REJECTED` outcome, the parent launches no worker for that profile and
+instead emits 13 explicit, evidence-negative `NOT_RUN` rows. The profile remains
+accounted for and fails the matrix; those parent-owned rows never represent an
+agent-executed or release-qualified result.
 
 Persona qualification deliberately separates network capture from semantic
 review. The worker's CAPTURE helper writes only a local request; deterministic

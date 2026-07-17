@@ -69,6 +69,21 @@ def test_accepts_complete_live_attempt_matrix():
     validator.validate_live_attempts(_result())
 
 
+def test_parent_cleanup_deferral_preserves_missing_latency_evidence():
+    result = _result()
+    scenario = result["scenarios"][-1]
+    scenario["assertions"].update(
+        {
+            "trace_stages_complete": False,
+            "trace_correlation_confirmed": True,
+            "latency_attributed": False,
+        }
+    )
+    scenario["evidence_codes"] = ["TRACE_CORRELATION_CONFIRMED"]
+
+    validator.validate_live_attempts(result)
+
+
 @pytest.mark.parametrize("scenario_index", range(1, 12))
 def test_rejects_preflight_block_propagation_for_each_live_scenario(scenario_index):
     result = _result()

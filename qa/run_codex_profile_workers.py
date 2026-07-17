@@ -55,8 +55,12 @@ try:
         request_path as live_request_path,
     )
     from qa.validate_live_scenario_receipts import (
+        DETERMINISTIC_ASSERTIONS,
+        SEMANTIC_ASSERTIONS,
         LiveScenarioReceiptError,
         canonical_json_sha256 as live_json_sha256,
+        failed_persona_result_projection,
+        latency_projection as live_latency_projection,
         validate_aggregate_object,
         validate_live_scenario_receipts,
         validate_receipt_object as validate_live_receipt_object,
@@ -97,8 +101,12 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
         request_path as live_request_path,
     )
     from validate_live_scenario_receipts import (
+        DETERMINISTIC_ASSERTIONS,
+        SEMANTIC_ASSERTIONS,
         LiveScenarioReceiptError,
         canonical_json_sha256 as live_json_sha256,
+        failed_persona_result_projection,
+        latency_projection as live_latency_projection,
         validate_aggregate_object,
         validate_live_scenario_receipts,
         validate_receipt_object as validate_live_receipt_object,
@@ -161,6 +169,13 @@ $QA_SOURCE_ROOT/qa/coverage-lock.json, and
 $QA_SOURCE_ROOT/qa/scenarios/api-key-journey.md before acting. QA_PRIVATE_MANIFEST is an
 owner-only one-row manifest for exactly your assigned profile. Test only that
 profile against IO_E2E_BASE_URL and execute all locked scenarios in order.
+This is a live qualification run, not a source-code review. Complete only the
+required SOP, coverage lock, scenario, manifest, private-facts, and finalizer reads.
+Do not inspect QA implementation files or tests, enumerate the repository, search
+for status precedence, or reverse-engineer the launcher. The supplied commands,
+facts, scenario contract, and output schema are the complete interface. Spend
+the turn budget executing the journey, making the bounded semantic judgments,
+and returning the structured result.
 Copy QA_EXPECTED_RUNTIME exactly into `expected_runtime`. Copy the authenticated
 manifest readback into `observed_runtime` and `observed_runtime_version`; never
 turn a `deployed_current` requirement into `hosted_resident` merely because the
@@ -204,6 +219,11 @@ owner-only judgment to exactly
 `$QA_WORK_ROOT/p0-06-semantic-judgment.json` in a separate unmarked tool call.
 Then run:
 QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=FINALIZE "$QA_PYTHON_BIN" -I -B "$QA_SOURCE_ROOT/qa/finalize_persona_review.py" --fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" --private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" --semantic-judgment "$QA_WORK_ROOT/p0-06-semantic-judgment.json" --artifact-dir "$QA_ARTIFACT_DIR"
+The sole diagnostic exception is a schema-valid non-PASS CAPTURE receipt with
+no private evidence file. In that exact case, do not run REVIEW or FINALIZE:
+record the failed capture and continue directly to P0-07. The trusted parent
+binds this capture-only exception; it is never valid for a PASS receipt or a
+release qualification.
 This local finalizer operates only on the review copy so you can author the
 bounded result. It exits zero for either a schema-valid positive or negative
 verdict, and nonzero only for an operational/input error; never change your
@@ -910,7 +930,7 @@ def _run_trusted_live_probe(
         )
         if live_json_sha256(private_facts) != receipt["private_facts_sha256"]:
             raise WorkerLaunchError("trusted live probe facts are inconsistent")
-        if scenario_id == "P0-06":
+        if scenario_id == "P0-06" and receipt["status"] == "PASS":
             _copy_private_file(
                 authoritative_persona,
                 worker_persona,
@@ -988,6 +1008,69 @@ def _write_live_error_facts(
     )
 
 
+def _diagnostic_probe_error_evidence(
+    spec: WorkerSpec,
+    scenario_id: str,
+    attempt: int,
+    nonce: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Create a fail-closed parent receipt after a trusted probe crashes.
+
+    This is diagnostic-only evidence that the row was attempted but could not
+    be observed.  It never asserts user success and is not accepted by formal
+    release orchestration.
+    """
+
+    private_facts = {
+        "schema_version": 1,
+        "run_id": str(spec.environment["QA_RUN_ID"]),
+        "profile_id": spec.profile_id,
+        "scenario_id": scenario_id,
+        "attempt": attempt,
+        "observations": {"error_stage": "trusted_probe"},
+    }
+    request_ids = (
+        []
+        if scenario_id in {"P0-08", "P0-09", "P0-10", "P0-11"}
+        else [f"probe-{nonce}"]
+    )
+    now = _utc_now()
+    receipt = {
+        "schema_version": 1,
+        "kind": "live_scenario_probe",
+        "run_id": str(spec.environment["QA_RUN_ID"]),
+        "profile_id": spec.profile_id,
+        "scenario_id": scenario_id,
+        "attempt": attempt,
+        "nonce": nonce,
+        "started_at": now,
+        "finished_at": now,
+        "status": "BLOCKED_EVIDENCE",
+        "failure_code": "LIVE_PROBE_ERROR",
+        "assertions": {
+            key: False for key in DETERMINISTIC_ASSERTIONS[scenario_id]
+        },
+        "semantic_assertions": list(SEMANTIC_ASSERTIONS[scenario_id]),
+        "request_ids": request_ids,
+        "turn_ids": [],
+        "trace_ids": [],
+        "turns": [],
+        "result_projection": None,
+        "private_facts_sha256": live_json_sha256(private_facts),
+        "raw_content_stored": False,
+    }
+    return (
+        validate_live_receipt_object(
+            receipt,
+            run_id=str(spec.environment["QA_RUN_ID"]),
+            profile_id=spec.profile_id,
+            scenario_id=scenario_id,
+            attempt=attempt,
+        ),
+        private_facts,
+    )
+
+
 def _load_ready_live_request(
     path: Path,
     *,
@@ -1022,6 +1105,8 @@ def _perform_trusted_live_handshake(
     receipts: list[dict[str, Any]],
 ) -> None:
     request_path, facts_path = _live_handshake_paths(spec, scenario_id, attempt)
+    nonce = ""
+    probe_started = False
     try:
         _load_ready_live_request(
             request_path,
@@ -1035,6 +1120,7 @@ def _perform_trusted_live_handshake(
         ):
             raise WorkerLaunchError("trusted live probe request is out of order")
         nonce = f"live_{secrets.token_hex(16)}"
+        probe_started = True
         returned_receipt, private_facts = live_probe_runner(
             spec, scenario_id, attempt, nonce, tuple(receipts)
         )
@@ -1067,6 +1153,37 @@ def _perform_trusted_live_handshake(
         OSError,
         WorkerLaunchError,
     ):
+        if (
+            probe_started
+            and nonce
+            and spec.environment.get("QA_QUALIFICATION_MODE") == "diagnostic"
+            and not facts_path.exists()
+        ):
+            try:
+                receipt, private_facts = _diagnostic_probe_error_evidence(
+                    spec, scenario_id, attempt, nonce
+                )
+                receipt_sha256 = live_json_sha256(receipt)
+                _write_private_json(
+                    facts_path,
+                    {
+                        "schema_version": 1,
+                        "profile_id": spec.profile_id,
+                        "scenario_id": scenario_id,
+                        "attempt": attempt,
+                        "receipt_sha256": receipt_sha256,
+                        "receipt": receipt,
+                        "private_facts": private_facts,
+                    },
+                )
+                receipts.append(receipt)
+                return
+            except (
+                LiveScenarioReceiptError,
+                OSError,
+                WorkerLaunchError,
+            ):
+                pass
         try:
             _write_live_error_facts(spec, scenario_id, attempt, facts_path)
         except WorkerLaunchError:
@@ -1096,6 +1213,9 @@ def _write_live_receipt_aggregate(
             payload,
             run_id=str(spec.environment["QA_RUN_ID"]),
             profile_id=spec.profile_id,
+            allow_failed_persona=(
+                spec.environment.get("QA_QUALIFICATION_MODE") == "diagnostic"
+            ),
         )
     except LiveScenarioReceiptError:
         pass
@@ -1242,7 +1362,10 @@ def _run_process_with_trusted_cot(
         if receipt.get("scenario_id") == "P0-06"
     ]
     try:
-        if len(capture_receipts) == 1:
+        if (
+            len(capture_receipts) == 1
+            and capture_receipts[0].get("status") == "PASS"
+        ):
             try:
                 persona_finalizer = persona_finalize_runner(
                     spec, capture_receipts[0]
@@ -1675,7 +1798,10 @@ def _completed_command_execution_count(path: Path) -> int:
 
 
 def _validated_worker_evidence(
-    spec: WorkerSpec, identities: set[str]
+    spec: WorkerSpec,
+    identities: set[str],
+    *,
+    allow_failed_persona_capture: bool = False,
 ) -> tuple[
     str,
     str | None,
@@ -1702,7 +1828,10 @@ def _validated_worker_evidence(
             sop_read_first,
             scenario_command_counts,
             p0_06_phases,
-        ) = completed_command_evidence(spec.events_path)
+        ) = completed_command_evidence(
+            spec.events_path,
+            allow_failed_persona_capture=allow_failed_persona_capture,
+        )
     except OrchestrationError:
         raise WorkerLaunchError("Codex worker event stream is invalid") from None
     if completed_commands < 1:
@@ -1713,7 +1842,9 @@ def _validated_worker_evidence(
         not sop_read_first
         or scenario_command_ids != AGENT_LIVE_SCENARIO_IDS
         or not scenario_command_contract_satisfied(
-            scenario_command_counts, p0_06_phases
+            scenario_command_counts,
+            p0_06_phases,
+            allow_failed_persona_capture=allow_failed_persona_capture,
         )
     ):
         raise WorkerScenarioToolUseError(
@@ -1903,17 +2034,717 @@ def _validate_cot_result_binding(
         raise WorkerLaunchError("COT receipt does not match worker result")
 
 
+def _validate_projected_result_shape(
+    spec: WorkerSpec, profile_result: Mapping[str, Any]
+) -> None:
+    """Revalidate a parent-projected diagnostic result against the worker schema."""
+
+    try:
+        schema = load_private_json(
+            spec.schema_path, "Codex worker schema", max_bytes=_MAX_SCHEMA_BYTES
+        )
+        errors = list(Draft202012Validator(schema).iter_errors(profile_result))
+    except (OrchestrationError, TypeError, ValueError, RecursionError):
+        raise WorkerLaunchError("parent-projected worker result is invalid") from None
+    if errors or profile_result.get("profile_id") != spec.profile_id:
+        raise WorkerLaunchError("parent-projected worker result is invalid")
+
+
+def _failure_projection(
+    *, status: str, stage_code: str, failure_code: str
+) -> dict[str, Any] | None:
+    if status == "PASS":
+        return None
+    return {
+        "category": status,
+        "stage_code": stage_code,
+        "failure_code": failure_code,
+        "reproducible": True,
+    }
+
+
+_TRACE_STAGE_NAMES = ("routing", "queue", "provider", "persistence", "delivery")
+
+
+def _failed_trace_cleanup_receipt(
+    aggregate: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Return the one bounded diagnostic P0-13 probe-crash receipt, if present."""
+
+    receipts = aggregate.get("receipts")
+    if not isinstance(receipts, list):
+        return None
+    rows = [
+        row
+        for row in receipts
+        if isinstance(row, Mapping) and row.get("scenario_id") == "P0-13"
+    ]
+    if len(rows) != 1:
+        return None
+    receipt = rows[0]
+    assertions = receipt.get("assertions")
+    if (
+        receipt.get("status") != "BLOCKED_EVIDENCE"
+        or receipt.get("failure_code") != "LIVE_PROBE_ERROR"
+        or receipt.get("result_projection") is not None
+        or receipt.get("turns") != []
+        or receipt.get("turn_ids") != []
+        or receipt.get("trace_ids") != []
+        or not isinstance(assertions, Mapping)
+        or set(assertions) != set(DETERMINISTIC_ASSERTIONS["P0-13"])
+        or any(value is not False for value in assertions.values())
+    ):
+        return None
+    return receipt
+
+
+def _unavailable_trace_cleanup_projection(
+    turns: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Project only evidence that remains trustworthy after P0-13 crashes."""
+
+    return {
+        "kind": "trace_cleanup",
+        "latency": live_latency_projection(turns),
+        "trace": {
+            "enabled": False,
+            "deploy_enabled": False,
+            "correlated_event_count": 0,
+            "observed_event_types": [],
+            "missing_required_event_types": list(_TRACE_STAGE_NAMES),
+            "raw_trace_stored": False,
+        },
+        "cleanup": {
+            "attempted": False,
+            "provider_config_deleted": False,
+            "account_reset": False,
+            "old_credential_rejected": False,
+            "status": "BLOCKED_EVIDENCE",
+        },
+    }
+
+
+def _trusted_prior_turns_with_unavailable_stages(
+    aggregate: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Retain prior receipt-owned turns without inventing final trace timings."""
+
+    receipts = aggregate.get("receipts")
+    if not isinstance(receipts, list):
+        raise WorkerLaunchError("failed trace-cleanup evidence is unavailable")
+    turns: list[dict[str, Any]] = []
+    for receipt in receipts:
+        if not isinstance(receipt, Mapping):
+            raise WorkerLaunchError("failed trace-cleanup evidence is unavailable")
+        if receipt.get("scenario_id") == "P0-13":
+            continue
+        receipt_turns = receipt.get("turns")
+        if not isinstance(receipt_turns, list):
+            raise WorkerLaunchError("failed trace-cleanup evidence is unavailable")
+        for turn in receipt_turns:
+            if not isinstance(turn, Mapping):
+                raise WorkerLaunchError("failed trace-cleanup evidence is unavailable")
+            projected = deepcopy(dict(turn))
+            projected["stage_latency_ms"] = {
+                stage: None for stage in _TRACE_STAGE_NAMES
+            }
+            turns.append(projected)
+    return turns
+
+
+def _validate_diagnostic_live_projection(
+    profile_result: Mapping[str, Any],
+    aggregate: Mapping[str, Any],
+    *,
+    allow_failed_persona: bool,
+) -> None:
+    """Validate normal evidence or the bounded P0-13 probe-crash projection."""
+
+    failed_trace = _failed_trace_cleanup_receipt(aggregate)
+    if failed_trace is None:
+        validate_live_attempts(profile_result)
+        validate_live_result_binding(
+            profile_result,
+            aggregate,
+            allow_failed_persona=allow_failed_persona,
+        )
+        return
+
+    # Reuse the strict attempt validator for P0-02 through P0-12.  Its sole
+    # P0-13 exception models deterministic cleanup deferral, so validate a
+    # private view with that fixed failure while retaining the real trace
+    # failure in the canonical result.
+    attempt_view = deepcopy(dict(profile_result))
+    scenarios = attempt_view.get("scenarios")
+    if not isinstance(scenarios, list) or len(scenarios) != 13:
+        raise WorkerLaunchError("failed trace-cleanup evidence is unavailable")
+    p0_13 = scenarios[-1]
+    if not isinstance(p0_13, dict) or p0_13.get("scenario_id") != "P0-13":
+        raise WorkerLaunchError("failed trace-cleanup evidence is unavailable")
+    deferred_failure = {
+        "category": "BLOCKED_EVIDENCE",
+        "stage_code": "CLEANUP",
+        "failure_code": "PRECONDITION_MISSING",
+        "reproducible": True,
+    }
+    p0_13["failure"] = deferred_failure
+    p0_13["attempt_results"] = [
+        {
+            "attempt": 1,
+            "status": "BLOCKED_EVIDENCE",
+            "failure": dict(deferred_failure),
+        }
+    ]
+    validate_live_attempts(attempt_view)
+
+    # The persisted receipt correctly has no P0-13 projection.  Build a
+    # validation-only derivative from earlier trusted receipts so the existing
+    # binder can still prove every retained identifier and transport fact.  No
+    # trace stage, correlation, or cleanup success is synthesized.
+    trusted_turns = _trusted_prior_turns_with_unavailable_stages(aggregate)
+    binding_aggregate = deepcopy(dict(aggregate))
+    binding_receipts = binding_aggregate.get("receipts")
+    if not isinstance(binding_receipts, list):
+        raise WorkerLaunchError("failed trace-cleanup evidence is unavailable")
+    binding_trace = next(
+        (
+            row
+            for row in binding_receipts
+            if isinstance(row, dict) and row.get("scenario_id") == "P0-13"
+        ),
+        None,
+    )
+    if not isinstance(binding_trace, dict):
+        raise WorkerLaunchError("failed trace-cleanup evidence is unavailable")
+    binding_trace["failure_code"] = "TRACE_UNAVAILABLE"
+    binding_trace["turns"] = trusted_turns
+    binding_trace["result_projection"] = _unavailable_trace_cleanup_projection(
+        trusted_turns
+    )
+    validate_live_result_binding(
+        profile_result,
+        binding_aggregate,
+        allow_failed_persona=allow_failed_persona,
+    )
+
+
+def _project_diagnostic_live_evidence(
+    profile_result: Mapping[str, Any], aggregate: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Install receipt-owned live fields without replacing agent semantics.
+
+    The agent remains the judge for P0-10/P0-11 and authors the P0-06 semantic
+    judgment.  The parent already binds that persona judgment independently.
+    Identifiers, timestamps, transport assertions, stage latencies, cleanup,
+    and the bound persona finalizer are deterministic receipt facts and should
+    never depend on a model copying long opaque values without a typo.
+    """
+
+    result = deepcopy(dict(profile_result))
+    scenarios = result.get("scenarios")
+    turns = result.get("turns")
+    receipts = aggregate.get("receipts")
+    parent_persona = aggregate.get("persona_finalizer")
+    if (
+        not isinstance(scenarios, list)
+        or not isinstance(turns, list)
+        or not isinstance(receipts, list)
+        or not (isinstance(parent_persona, Mapping) or parent_persona is None)
+    ):
+        raise WorkerLaunchError("live diagnostic projection is unavailable")
+    by_scenario = {
+        row.get("scenario_id"): row
+        for row in scenarios
+        if isinstance(row, dict)
+    }
+    if len(by_scenario) != len(scenarios):
+        raise WorkerLaunchError("live diagnostic projection is unavailable")
+    grouped: dict[str, list[Mapping[str, Any]]] = {
+        scenario_id: [] for scenario_id in PARENT_LIVE_SCENARIO_IDS
+    }
+    for receipt in receipts:
+        if (
+            not isinstance(receipt, Mapping)
+            or receipt.get("scenario_id") not in grouped
+        ):
+            raise WorkerLaunchError("live diagnostic projection is unavailable")
+        grouped[str(receipt["scenario_id"])].append(receipt)
+    if any(not grouped[scenario_id] for scenario_id in PARENT_LIVE_SCENARIO_IDS):
+        raise WorkerLaunchError("live diagnostic projection is unavailable")
+
+    prior_turns = {
+        (row.get("scenario_id"), row.get("trace_id")): row
+        for row in turns
+        if isinstance(row, Mapping)
+    }
+    projected_turns: list[dict[str, Any]] = []
+    trace_cleanup_receipt: Mapping[str, Any] | None = None
+    deterministic_scenarios = {
+        "P0-02",
+        "P0-03",
+        "P0-04",
+        "P0-05",
+        "P0-07",
+        "P0-08",
+        "P0-09",
+    }
+
+    for scenario_id in PARENT_LIVE_SCENARIO_IDS:
+        scenario = by_scenario.get(scenario_id)
+        rows = grouped[scenario_id]
+        if not isinstance(scenario, dict):
+            raise WorkerLaunchError("live diagnostic projection is unavailable")
+        scenario.update(
+            {
+                "started_at": rows[0]["started_at"],
+                "finished_at": rows[-1]["finished_at"],
+                "attempts": len(rows),
+                "request_ids": [
+                    value for receipt in rows for value in receipt["request_ids"]
+                ],
+                "turn_ids": [
+                    value for receipt in rows for value in receipt["turn_ids"]
+                ],
+                "trace_ids": [
+                    value for receipt in rows for value in receipt["trace_ids"]
+                ],
+            }
+        )
+        assertions = scenario.get("assertions")
+        if not isinstance(assertions, dict):
+            raise WorkerLaunchError("live diagnostic projection is unavailable")
+        for key, value in rows[-1]["assertions"].items():
+            if key in assertions:
+                assertions[key] = value
+
+        attempt_results = scenario.get("attempt_results")
+        if not isinstance(attempt_results, list) or len(attempt_results) != len(rows):
+            raise WorkerLaunchError("live diagnostic projection is unavailable")
+        for index, (attempt_result, receipt) in enumerate(
+            zip(attempt_results, rows, strict=True), start=1
+        ):
+            if not isinstance(attempt_result, dict):
+                raise WorkerLaunchError("live diagnostic projection is unavailable")
+            attempt_result["attempt"] = index
+            if scenario_id in deterministic_scenarios or receipt["status"] != "PASS":
+                attempt_result["status"] = receipt["status"]
+                if receipt["status"] == "PASS":
+                    attempt_result["failure"] = None
+        if scenario_id in deterministic_scenarios:
+            scenario["status"] = rows[-1]["status"]
+            if scenario["status"] == "PASS":
+                scenario["failure"] = None
+
+        if scenario_id == "P0-06":
+            if parent_persona is None and rows[-1]["status"] != "PASS":
+                capture_failure = failed_persona_result_projection(rows[-1])
+                failure = capture_failure["failure"]
+                scenario.update(
+                    {
+                        **capture_failure,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+                                "status": capture_failure["status"],
+                                "failure": failure,
+                            }
+                        ],
+                    }
+                )
+                if result.get("status") == "PASS":
+                    result["status"] = capture_failure["status"]
+            else:
+                if not isinstance(parent_persona, Mapping):
+                    raise WorkerLaunchError(
+                        "live diagnostic projection is unavailable"
+                    )
+                semantic = parent_persona.get("semantic_assertions")
+                finalizer = parent_persona.get("persona_finalizer")
+                if not isinstance(semantic, Mapping) or not isinstance(
+                    finalizer, Mapping
+                ):
+                    raise WorkerLaunchError(
+                        "live diagnostic projection is unavailable"
+                    )
+                assertions = {**rows[-1]["assertions"], **dict(semantic)}
+                scenario["assertions"] = assertions
+                scenario["persona_finalizer"] = dict(finalizer)
+                privacy_ok = semantic.get("privacy_canary_absent") is True
+                acceptance_ok = semantic.get("persona_acceptance_passed") is True
+                if privacy_ok and acceptance_ok:
+                    status = "PASS"
+                    failure = None
+                elif not privacy_ok:
+                    status = "SECURITY_FAIL"
+                    failure = _failure_projection(
+                        status=status,
+                        stage_code="PERSONA_IMPORT",
+                        failure_code="REDACTION_ASSERTION_FAILED",
+                    )
+                else:
+                    status = "PRODUCT_FAIL"
+                    failure = _failure_projection(
+                        status=status,
+                        stage_code="PERSONA_IMPORT",
+                        failure_code="PERSONA_ACCEPTANCE_FAILED",
+                    )
+                scenario.update(
+                    {
+                        "status": status,
+                        "failure": failure,
+                        "attempt_results": [
+                            {"attempt": 1, "status": status, "failure": failure}
+                        ],
+                        "evidence_codes": [
+                            code
+                            for assertion, code in (
+                                (
+                                    "persona_files_archived",
+                                    "PERSONA_FILES_ARCHIVED",
+                                ),
+                                (
+                                    "persona_source_metadata_verified",
+                                    "PERSONA_SOURCE_METADATA_VERIFIED",
+                                ),
+                                ("persona_import_done", "PERSONA_IMPORT_DONE"),
+                                (
+                                    "persona_acceptance_passed",
+                                    "PERSONA_ACCEPTANCE_PASSED",
+                                ),
+                                ("privacy_canary_absent", "PRIVACY_CANARY_ABSENT"),
+                            )
+                            if assertions.get(assertion) is True
+                        ],
+                    }
+                )
+
+        if scenario_id == "P0-13":
+            receipt = rows[-1]
+            status = str(receipt["status"])
+            failed_trace_cleanup = bool(
+                receipt.get("result_projection") is None
+                and receipt.get("failure_code") == "LIVE_PROBE_ERROR"
+            )
+            failure_code = (
+                "TRACE_UNAVAILABLE"
+                if failed_trace_cleanup
+                else str(receipt["failure_code"])
+            )
+            failure = _failure_projection(
+                status=status,
+                stage_code=(
+                    "CLEANUP"
+                    if failure_code == "PRECONDITION_MISSING"
+                    else "TRACE_LATENCY_CLEANUP"
+                ),
+                failure_code=failure_code,
+            )
+            scenario.update(
+                {
+                    "status": status,
+                    "attempt_results": [
+                        {"attempt": 1, "status": status, "failure": failure}
+                    ],
+                    "assertions": dict(receipt["assertions"]),
+                    "evidence_codes": [
+                        code
+                        for assertion, code in (
+                            (
+                                "trace_correlation_confirmed",
+                                "TRACE_CORRELATION_CONFIRMED",
+                            ),
+                            ("latency_attributed", "LATENCY_ATTRIBUTED"),
+                            ("cleanup_confirmed", "CLEANUP_CONFIRMED"),
+                        )
+                        if receipt["assertions"][assertion] is True
+                    ],
+                    "failure": failure,
+                }
+            )
+            if status != "PASS" and result.get("status") == "PASS":
+                result["status"] = status
+            trace_cleanup_receipt = receipt
+            continue
+
+        for receipt in rows:
+            for turn in receipt["turns"]:
+                content_assertion = turn["content_assertion_passed"]
+                if content_assertion is None:
+                    prior = prior_turns.get((scenario_id, turn["trace_id"]))
+                    prior_value = (
+                        prior.get("content_assertion_passed")
+                        if isinstance(prior, Mapping)
+                        else None
+                    )
+                    content_assertion = (
+                        prior_value if type(prior_value) is bool else False
+                    )
+                projected_turns.append(
+                    {
+                        "scenario_id": scenario_id,
+                        "turn_index": turn["turn_index"],
+                        "request_id": turn["request_id"],
+                        "turn_id": turn["turn_id"],
+                        "trace_id": turn["trace_id"],
+                        "ack_latency_ms": turn["ack_latency_ms"],
+                        "reply_latency_ms": turn["reply_latency_ms"],
+                        "stage_latency_ms": dict(turn["stage_latency_ms"]),
+                        "reply_count": turn["reply_count"],
+                        "content_assertion_passed": content_assertion,
+                        "fallback_detected": turn["fallback_detected"],
+                        "duplicate_detected": turn["duplicate_detected"],
+                        "out_of_order_detected": turn["out_of_order_detected"],
+                    }
+                )
+
+    if trace_cleanup_receipt is None:
+        raise WorkerLaunchError("live diagnostic projection is unavailable")
+    trace_turns = trace_cleanup_receipt.get("turns")
+    projection = trace_cleanup_receipt.get("result_projection")
+    failed_trace_cleanup = _failed_trace_cleanup_receipt(aggregate)
+    if failed_trace_cleanup is not None:
+        projected_turns = [
+            {
+                **turn,
+                "stage_latency_ms": {
+                    stage: None for stage in _TRACE_STAGE_NAMES
+                },
+            }
+            for turn in projected_turns
+        ]
+        projection = _unavailable_trace_cleanup_projection(projected_turns)
+        result["turns"] = projected_turns
+        result["latency"] = deepcopy(projection["latency"])
+        result["trace"] = deepcopy(projection["trace"])
+        result["cleanup"] = deepcopy(projection["cleanup"])
+        return result
+    if not isinstance(trace_turns, list) or not isinstance(projection, Mapping):
+        raise WorkerLaunchError("live diagnostic projection is unavailable")
+    projected_by_trace = {
+        turn.get("trace_id"): turn
+        for turn in trace_turns
+        if isinstance(turn, Mapping)
+    }
+    for turn in projected_turns:
+        projected = projected_by_trace.get(turn["trace_id"])
+        if not isinstance(projected, Mapping):
+            raise WorkerLaunchError("live diagnostic projection is unavailable")
+        turn["stage_latency_ms"] = dict(projected["stage_latency_ms"])
+    existing_trace_ids = {turn["trace_id"] for turn in projected_turns}
+    cot_turns = [
+        turn
+        for turn in trace_turns
+        if isinstance(turn, Mapping) and turn.get("trace_id") not in existing_trace_ids
+    ]
+    if len(cot_turns) != 1:
+        raise WorkerLaunchError("live diagnostic projection is unavailable")
+    cot_turn = cot_turns[0]
+    projected_turns.append(
+        {
+            "scenario_id": "P0-12",
+            # Profile turn indexes are scenario-local.  The trace receipt uses
+            # a global sequence number across all probes, so never copy it
+            # into the canonical profile row.
+            "turn_index": 1,
+            "request_id": cot_turn["request_id"],
+            "turn_id": cot_turn["turn_id"],
+            "trace_id": cot_turn["trace_id"],
+            "ack_latency_ms": cot_turn["ack_latency_ms"],
+            "reply_latency_ms": cot_turn["reply_latency_ms"],
+            "stage_latency_ms": dict(cot_turn["stage_latency_ms"]),
+            "reply_count": cot_turn["reply_count"],
+            "content_assertion_passed": bool(
+                cot_turn["content_assertion_passed"]
+            ),
+            "fallback_detected": cot_turn["fallback_detected"],
+            "duplicate_detected": cot_turn["duplicate_detected"],
+            "out_of_order_detected": cot_turn["out_of_order_detected"],
+        }
+    )
+    result["turns"] = projected_turns
+    result["latency"] = deepcopy(projection["latency"])
+    result["trace"] = deepcopy(projection["trace"])
+    result["cleanup"] = deepcopy(projection["cleanup"])
+    return result
+
+
+def _project_diagnostic_cot_evidence(
+    profile_result: Mapping[str, Any], receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Install the parent-owned P0-12 delivery projection deterministically."""
+
+    result = deepcopy(dict(profile_result))
+    scenarios = result.get("scenarios")
+    reasoning = result.get("reasoning")
+    if not isinstance(scenarios, list) or not isinstance(reasoning, dict):
+        raise WorkerLaunchError("COT diagnostic projection is unavailable")
+    scenario = next(
+        (
+            row
+            for row in scenarios
+            if isinstance(row, dict) and row.get("scenario_id") == "P0-12"
+        ),
+        None,
+    )
+    if not isinstance(scenario, dict):
+        raise WorkerLaunchError("COT diagnostic projection is unavailable")
+
+    token_present = bool(
+        receipt.get("token_metadata_status") == "PRESENT"
+        and isinstance(receipt.get("reasoning_token_count"), int)
+        and not isinstance(receipt.get("reasoning_token_count"), bool)
+        and receipt.get("reasoning_token_count", 0) > 0
+    )
+    capability_enabled = receipt.get("reasoning_event_count") == 1
+    requested_medium = receipt.get("requested_effort") == "medium"
+    configured_medium = bool(
+        receipt.get("configured_effort") == "medium"
+        and receipt.get("configured_effort_attested") is True
+    )
+    configured_route_matches = (
+        receipt.get("configured_route_matches_manifest") is True
+    )
+    effective_not_attested = bool(
+        receipt.get("effective_effort") == "unknown"
+        and receipt.get("effective_effort_attested") is False
+    )
+    receipt_status = receipt.get("status")
+    receipt_code = receipt.get("failure_code")
+    if not requested_medium or receipt.get("configured_effort_attested") is not True:
+        status, failure_code = "BLOCKED_EVIDENCE", "PRECONDITION_MISSING"
+    elif not configured_route_matches:
+        status, failure_code = "PRODUCT_FAIL", "MODEL_ROUTE_MISMATCH"
+    elif not configured_medium:
+        status, failure_code = "PRODUCT_FAIL", "REASONING_EFFORT_CLAMPED"
+    elif receipt_status == "PASS" and not token_present:
+        status, failure_code = "BLOCKED_EVIDENCE", "REASONING_TOKENS_MISSING"
+    elif receipt_status == "PASS":
+        status, failure_code = "PASS", None
+    elif receipt_status == "FAIL":
+        status = "PRODUCT_FAIL"
+        failure_code = {
+            "FINAL_ANSWER_WRONG": "CONTENT_ASSERTION_FAILED",
+            "DOWNSTREAM_PARSE_DROPPED_REASONING": "REASONING_METADATA_MISSING",
+            "THINKING_ENVELOPE_NOT_DELIVERED": "DISCLOSURE_MISSING",
+            "THINKING_ENVELOPE_UNREADABLE": "DISCLOSURE_MISSING",
+            "THINKING_METADATA_INVALID": "REASONING_METADATA_MISSING",
+        }.get(str(receipt_code))
+    else:
+        status = "BLOCKED_EVIDENCE"
+        failure_code = {
+            "CHAT_TIMEOUT": "CHAT_TIMEOUT",
+            "CHAT_REQUEST_FAILED": "TRACE_UNAVAILABLE",
+            "MODEL_REASONING_NOT_OBSERVED": "TRACE_INCOMPLETE",
+            "TRACE_AMBIGUOUS": "TRACE_INCOMPLETE",
+            "TRACE_UNAVAILABLE": "TRACE_UNAVAILABLE",
+        }.get(str(receipt_code))
+    if status != "PASS" and failure_code is None:
+        raise WorkerLaunchError("COT diagnostic projection is unavailable")
+    failure = (
+        None
+        if failure_code is None
+        else _failure_projection(
+            status=status,
+            stage_code="REASONING",
+            failure_code=failure_code,
+        )
+    )
+    request_id = receipt.get("request_id")
+    turn_id = receipt.get("turn_id")
+    trace_id = receipt.get("trace_id")
+    reasoning.update(
+        {
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "trace_id": trace_id,
+            "expected": True,
+            "capability_enabled": capability_enabled,
+            "requested_effort": receipt.get("requested_effort"),
+            "configured_effort": receipt.get("configured_effort"),
+            "effective_effort": receipt.get("effective_effort"),
+            "reasoning_event_count": receipt.get("reasoning_event_count"),
+            "metadata_present": receipt.get("metadata_present"),
+            "token_metadata_present": token_present,
+            "user_visible_disclosure_present": receipt.get(
+                "user_visible_disclosure_present"
+            ),
+            "reasoning_token_count": receipt.get("reasoning_token_count"),
+            "disclosure_length": receipt.get("delivered_thinking_len"),
+            "kind": receipt.get("delivered_thinking_kind") or None,
+            "source": receipt.get("delivered_thinking_source") or None,
+            "model": receipt.get("delivered_thinking_model") or None,
+            "raw_private_reasoning_stored": False,
+        }
+    )
+    scenario.update(
+        {
+            "status": status,
+            "attempts": 1,
+            "attempt_results": [
+                {"attempt": 1, "status": status, "failure": failure}
+            ],
+            "request_ids": [request_id] if request_id else [],
+            "turn_ids": [turn_id] if turn_id else [],
+            "trace_ids": [trace_id] if trace_id else [],
+            "assertions": {
+                "objective_answer_correct": receipt.get("final_answer_correct"),
+                "reasoning_capability_enabled": capability_enabled,
+                "reasoning_requested_effort_medium": requested_medium,
+                "reasoning_configured_effort_medium": configured_medium,
+                "reasoning_effective_effort_not_attested": effective_not_attested,
+                "reasoning_event_observed": capability_enabled,
+                "reasoning_metadata_present": receipt.get("metadata_present"),
+                "reasoning_tokens_present": token_present,
+                "user_disclosure_present": receipt.get(
+                    "user_visible_disclosure_present"
+                ),
+                "raw_private_reasoning_omitted": True,
+            },
+            "failure": failure,
+        }
+    )
+    # A non-passing trusted COT receipt must never leave an otherwise PASS
+    # agent-authored profile looking greener than its authoritative evidence.
+    # Diagnostic profiles normally remain BLOCKED_EVIDENCE until parent
+    # cleanup, so preserve that existing aggregate status.
+    if status != "PASS" and result.get("status") == "PASS":
+        result["status"] = status
+    return result
+
+
+def _load_live_worker_evidence(
+    spec: WorkerSpec, *, allow_failed_persona: bool = False
+) -> tuple[dict[str, Any], str]:
+    try:
+        return validate_live_scenario_receipts(
+            spec.live_receipt_path,
+            run_id=str(spec.environment["QA_RUN_ID"]),
+            profile_id=spec.profile_id,
+            allow_failed_persona=allow_failed_persona,
+        )
+    except (LiveScenarioReceiptError, OSError):
+        raise WorkerLaunchError("live scenario receipt is invalid") from None
+
+
+def _has_failed_persona_capture(aggregate: Mapping[str, Any]) -> bool:
+    receipts = aggregate.get("receipts")
+    if not isinstance(receipts, list) or aggregate.get("persona_finalizer") is not None:
+        return False
+    capture = [
+        row
+        for row in receipts
+        if isinstance(row, Mapping) and row.get("scenario_id") == "P0-06"
+    ]
+    return len(capture) == 1 and capture[0].get("status") != "PASS"
+
+
 def _validate_live_worker_evidence(
     spec: WorkerSpec, profile_result: Mapping[str, Any]
 ) -> tuple[dict[str, Any], str]:
     try:
-        receipts, receipt_sha256 = validate_live_scenario_receipts(
-            spec.live_receipt_path,
-            run_id=str(spec.environment["QA_RUN_ID"]),
-            profile_id=spec.profile_id,
-        )
+        receipts, receipt_sha256 = _load_live_worker_evidence(spec)
         validate_live_result_binding(profile_result, receipts)
-    except (LiveScenarioReceiptError, OSError):
+    except (LiveScenarioReceiptError, OSError, WorkerLaunchError):
         raise WorkerLaunchError(
             "live scenario receipt does not match worker result"
         ) from None
@@ -2218,18 +3049,60 @@ def launch(
             fallback_reason = _DIAGNOSTIC_FALLBACK_PROCESS
         elif diagnostic:
             try:
-                (
-                    thread_id,
-                    session_id,
+                try:
+                    (
+                        thread_id,
+                        session_id,
+                        profile_result,
+                        completed_command_count,
+                        scenario_command_ids,
+                        scenario_command_counts,
+                        p0_06_command_phases,
+                    ) = _validated_worker_evidence(spec, identities)
+                    live_receipts, live_receipt_sha256 = (
+                        _load_live_worker_evidence(
+                            spec, allow_failed_persona=True
+                        )
+                    )
+                    failed_persona_capture = _has_failed_persona_capture(
+                        live_receipts
+                    )
+                except WorkerScenarioToolUseError:
+                    # Only a trusted non-PASS capture with no finalizer may
+                    # relax P0-06 to its single successful CAPTURE command.
+                    # Load that parent evidence after the strict tool gate has
+                    # already preserved no-tool and unrelated tool failures.
+                    live_receipts, live_receipt_sha256 = (
+                        _load_live_worker_evidence(
+                            spec, allow_failed_persona=True
+                        )
+                    )
+                    failed_persona_capture = _has_failed_persona_capture(
+                        live_receipts
+                    )
+                    if not failed_persona_capture:
+                        raise
+                    (
+                        thread_id,
+                        session_id,
+                        profile_result,
+                        completed_command_count,
+                        scenario_command_ids,
+                        scenario_command_counts,
+                        p0_06_command_phases,
+                    ) = _validated_worker_evidence(
+                        spec,
+                        identities,
+                        allow_failed_persona_capture=True,
+                    )
+                profile_result = _project_diagnostic_live_evidence(
+                    profile_result, live_receipts
+                )
+                _validate_projected_result_shape(spec, profile_result)
+                _validate_diagnostic_live_projection(
                     profile_result,
-                    completed_command_count,
-                    scenario_command_ids,
-                    scenario_command_counts,
-                    p0_06_command_phases,
-                ) = _validated_worker_evidence(spec, identities)
-                validate_live_attempts(profile_result)
-                _, live_receipt_sha256 = _validate_live_worker_evidence(
-                    spec, profile_result
+                    live_receipts,
+                    allow_failed_persona=failed_persona_capture,
                 )
                 events_sha256 = file_sha256(
                     spec.events_path,
@@ -2276,10 +3149,16 @@ def launch(
                 else:
                     if fallback_reason is None:
                         try:
-                            _validate_cot_result_binding(
+                            projected = _project_diagnostic_cot_evidence(
                                 profile_result, cot_receipt
                             )
-                        except WorkerLaunchError:
+                            _validate_projected_result_shape(spec, projected)
+                            validate_live_attempts(projected)
+                            _validate_cot_result_binding(
+                                projected, cot_receipt
+                            )
+                            profile_result = projected
+                        except (DiagnosticAttemptError, WorkerLaunchError):
                             # The deterministic receipt remains trustworthy even
                             # when the agent-authored projection disagrees with it.
                             cot_evidence_failure = (

@@ -402,6 +402,8 @@ def _p0_06_phase(tokens: tuple[str, ...]) -> str | None:
 
 def completed_command_evidence(
     path: Path,
+    *,
+    allow_failed_persona_capture: bool = False,
 ) -> tuple[int, tuple[str, ...], bool, dict[str, int], tuple[str, ...]]:
     """Return fail-closed command evidence without retaining command text.
 
@@ -490,13 +492,24 @@ def completed_command_evidence(
     valid_ids: list[str] = []
     for scenario_id in AGENT_LIVE_SCENARIO_IDS:
         if scenario_id == "P0-06":
-            expected_sequence.extend(
-                (scenario_id, phase) for phase in P0_06_COMMAND_PHASES
-            )
-            if (
+            full_persona = (
                 tuple(p0_06_phases) == P0_06_COMMAND_PHASES
                 and scenario_counts[scenario_id] == len(P0_06_COMMAND_PHASES)
-            ):
+            )
+            failed_capture_only = (
+                allow_failed_persona_capture
+                and tuple(p0_06_phases) == ("CAPTURE",)
+                and scenario_counts[scenario_id] == 1
+            )
+            phases = (
+                P0_06_COMMAND_PHASES
+                if full_persona
+                else ("CAPTURE",)
+                if failed_capture_only
+                else P0_06_COMMAND_PHASES
+            )
+            expected_sequence.extend((scenario_id, phase) for phase in phases)
+            if full_persona or failed_capture_only:
                 valid_ids.append(scenario_id)
             continue
         attempts = valid_attempts[scenario_id]
@@ -515,18 +528,32 @@ def completed_command_evidence(
 
 
 def scenario_command_contract_satisfied(
-    counts: Mapping[str, int], p0_06_phases: Sequence[str]
+    counts: Mapping[str, int],
+    p0_06_phases: Sequence[str],
+    *,
+    allow_failed_persona_capture: bool = False,
 ) -> bool:
     """Require every live marker and separate P0-06 capture/review/finalize calls."""
 
+    persona_contract = bool(
+        (
+            tuple(p0_06_phases) == P0_06_COMMAND_PHASES
+            and counts.get("P0-06") == len(P0_06_COMMAND_PHASES)
+        )
+        or (
+            allow_failed_persona_capture
+            and tuple(p0_06_phases) == ("CAPTURE",)
+            and counts.get("P0-06") == 1
+        )
+    )
     return (
-        tuple(p0_06_phases) == P0_06_COMMAND_PHASES
+        persona_contract
         and set(counts) == set(AGENT_LIVE_SCENARIO_IDS)
         and all(
             isinstance(counts[scenario_id], int)
             and not isinstance(counts[scenario_id], bool)
             and (
-                counts[scenario_id] == minimum
+                persona_contract
                 if scenario_id == "P0-06"
                 else (
                     minimum <= counts[scenario_id] <= 2

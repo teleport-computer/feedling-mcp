@@ -39,6 +39,10 @@ TERMINAL_STATUSES = frozenset(
 FAILURE_STATUSES = frozenset(("PRODUCT_FAIL", "SECURITY_FAIL"))
 COT_JUNIT_FAILURE = "COT_DELIVERY_FAIL"
 COT_DELIVERY_STATUSES = frozenset(("PASS", "FAIL", "UNVERIFIED", "NOT_RUN"))
+PROVISION_STATUS_READY = "ready"
+PROVISION_STATUS_BLOCKED = "blocked"
+PROVISION_FAILURE_NONE = "NONE"
+TRUSTED_NOT_RUN_PROVISION_FAILURE_CODES = frozenset({"VALID_KEY_REJECTED"})
 
 
 class DiagnosticRenderError(RuntimeError):
@@ -54,6 +58,51 @@ def _profile(
 ) -> Mapping[str, Any] | None:
     value = profile_results.get(profile_id)
     return value if isinstance(value, Mapping) else None
+
+
+def _provisioning_dispositions(
+    summary: Mapping[str, Any], profile_ids: Sequence[str]
+) -> dict[str, tuple[str, str, str]]:
+    """Return fail-closed ``(status, code, disposition)`` rows.
+
+    Provisioning is a parent-owned trust boundary.  A row is considered
+    ``NOT_RUN`` only when the two summary maps are complete, bind exactly to
+    the selected matrix, and contain one of the fixed operational codes.  Any
+    malformed or incomplete metadata invalidates the whole projection so a
+    forged partial map can never turn a failed agent result into a skip.
+    """
+
+    unverified = {
+        profile_id: ("UNVERIFIED", "UNVERIFIED", "UNVERIFIED")
+        for profile_id in profile_ids
+    }
+    provisioning = summary.get("provisioning")
+    if not isinstance(provisioning, Mapping):
+        return unverified
+    statuses = provisioning.get("profile_statuses")
+    failure_codes = provisioning.get("failure_codes")
+    if not isinstance(statuses, Mapping) or not isinstance(failure_codes, Mapping):
+        return unverified
+
+    expected = set(profile_ids)
+    if set(statuses) != expected or set(failure_codes) != expected:
+        return unverified
+
+    rows: dict[str, tuple[str, str, str]] = {}
+    for profile_id in profile_ids:
+        status = statuses.get(profile_id)
+        code = failure_codes.get(profile_id)
+        if status == PROVISION_STATUS_READY and code == PROVISION_FAILURE_NONE:
+            rows[profile_id] = ("READY", PROVISION_FAILURE_NONE, "RUN")
+        elif (
+            status == PROVISION_STATUS_BLOCKED
+            and isinstance(code, str)
+            and code in TRUSTED_NOT_RUN_PROVISION_FAILURE_CODES
+        ):
+            rows[profile_id] = ("BLOCKED", str(code), "NOT_RUN")
+        else:
+            return unverified
+    return rows
 
 
 def _scenario_statuses(profile: Mapping[str, Any] | None) -> dict[str, str]:
@@ -166,6 +215,7 @@ def render_matrix(
 ) -> str:
     """Return a fixed-field Markdown view of the selected diagnostic matrix."""
 
+    provisioning = _provisioning_dispositions(summary, profile_ids)
     harness = summary.get("qualification_harness")
     if not isinstance(harness, Mapping):
         harness = {}
@@ -181,11 +231,39 @@ def render_matrix(
         if isinstance(finalized_statuses, Mapping)
         else 0
     )
+    deployment_identity_value = summary.get("deployment_identity")
+    identity_present = (
+        isinstance(deployment_identity_value, Mapping)
+        and bool(deployment_identity_value)
+    )
+    deployment_identity = deployment_identity_value if identity_present else {}
+    if deployment_identity.get("identity_verified") is True:
+        identity_status = "VERIFIED"
+    elif deployment_identity.get("identity_observed") is True:
+        identity_status = "OBSERVED_UNATTESTED"
+    else:
+        identity_status = "UNAVAILABLE"
+    identity_source = (
+        str(
+            deployment_identity.get("identity_evidence_source")
+            or "protected_build_identity"
+        )
+        if identity_present
+        else "UNAVAILABLE"
+    )
+    identity_gap = (
+        str(deployment_identity.get("identity_gap_code") or "NONE")
+        if identity_present
+        else "UNAVAILABLE"
+    )
     lines = [
-        "# Feedling local API-key diagnostic",
+        "# io local API-key diagnostic",
         "",
         f"- Run ID: `{summary['run_id']}`",
-        f"- Candidate SHA: `{summary['candidate_sha']}`",
+        f"- Target backend SHA: `{summary['candidate_sha']}`",
+        f"- Deployment identity: `{identity_status}`",
+        f"- Identity evidence source: `{identity_source}`",
+        f"- Identity evidence gap: `{identity_gap}`",
         f"- Harness Git HEAD: `{harness.get('git_head', 'UNAVAILABLE')}`",
         f"- Harness source SHA-256: `{harness.get('source_sha256', 'UNAVAILABLE')}`",
         f"- Worker snapshot SHA-256: `{harness.get('worker_snapshot_sha256', 'UNAVAILABLE')}`",
@@ -199,7 +277,9 @@ def render_matrix(
     ]
     header = (
         "Profile",
-        "Status",
+        "Provisioning",
+        "Provisioning code",
+        "Disposition",
         "Runtime",
         "COT delivery",
         "COT code",
@@ -218,40 +298,91 @@ def render_matrix(
         cot = _cot_row(summary, profile_id)
         scenario_statuses = _scenario_statuses(profile)
         reasoning = profile.get("reasoning") if profile else None
-        profile_status = (
-            _status(profile.get("status"), missing="AGENT_ERROR")
-            if profile
-            else "NOT_RUN"
-        )
-        row = (
-            profile_id,
-            profile_status,
-            _observed_runtime(profile),
-            str(cot.get("status") or "UNVERIFIED") if cot else "UNVERIFIED",
-            str(cot.get("failure_code") or "UNVERIFIED") if cot else "UNVERIFIED",
-            str(cot.get("receipt_status") or "UNVERIFIED") if cot else "UNVERIFIED",
-            (
+        provision_status, provision_code, disposition = provisioning[profile_id]
+        if disposition == "NOT_RUN":
+            profile_status = "NOT_RUN"
+            runtime = "NOT_RUN"
+            cot_status = "NOT_RUN"
+            cot_code = provision_code
+            cot_observation = "NOT_RUN"
+            cot_observation_code = "NOT_RUN"
+            reasoning_event = "NOT_RUN"
+            reasoning_metadata = "NOT_RUN"
+            reasoning_tokens = "NOT_RUN"
+            user_disclosure = "NOT_RUN"
+            rendered_scenarios = ("NOT_RUN",) * len(SCENARIO_IDS)
+        elif disposition == "UNVERIFIED":
+            profile_status = "UNVERIFIED"
+            runtime = "UNVERIFIED"
+            cot_status = "UNVERIFIED"
+            cot_code = "UNVERIFIED"
+            cot_observation = "UNVERIFIED"
+            cot_observation_code = "UNVERIFIED"
+            reasoning_event = "UNVERIFIED"
+            reasoning_metadata = "UNVERIFIED"
+            reasoning_tokens = "UNVERIFIED"
+            user_disclosure = "UNVERIFIED"
+            rendered_scenarios = ("UNVERIFIED",) * len(SCENARIO_IDS)
+        else:
+            profile_status = (
+                _status(profile.get("status"), missing="AGENT_ERROR")
+                if profile
+                else "AGENT_ERROR"
+            )
+            runtime = _observed_runtime(profile)
+            cot_status = (
+                str(cot.get("status") or "UNVERIFIED") if cot else "UNVERIFIED"
+            )
+            cot_code = (
+                str(cot.get("failure_code") or "UNVERIFIED")
+                if cot
+                else "UNVERIFIED"
+            )
+            cot_observation = (
+                str(cot.get("receipt_status") or "UNVERIFIED")
+                if cot
+                else "UNVERIFIED"
+            )
+            cot_observation_code = (
                 str(cot.get("receipt_failure_code") or "UNVERIFIED")
                 if cot
                 else "UNVERIFIED"
-            ),
-            (
+            )
+            reasoning_event = (
                 _reasoning_event(cot)
                 if cot is not None
                 else _reasoning_event(reasoning)
-            ),
-            (
+            )
+            reasoning_metadata = (
                 _boolean_evidence(cot, "metadata_present")
                 if cot is not None
                 else _boolean_evidence(reasoning, "metadata_present")
-            ),
-            _cot_token_evidence(cot),
-            (
+            )
+            reasoning_tokens = _cot_token_evidence(cot)
+            user_disclosure = (
                 _boolean_evidence(cot, "user_visible_disclosure_present")
                 if cot is not None
                 else _boolean_evidence(reasoning, "user_visible_disclosure_present")
-            ),
-            *(scenario_statuses.get(scenario_id, "MISSING") for scenario_id in SCENARIO_IDS),
+            )
+            rendered_scenarios = tuple(
+                scenario_statuses.get(scenario_id, "MISSING")
+                for scenario_id in SCENARIO_IDS
+            )
+        row = (
+            profile_id,
+            provision_status,
+            provision_code,
+            profile_status,
+            runtime,
+            cot_status,
+            cot_code,
+            cot_observation,
+            cot_observation_code,
+            reasoning_event,
+            reasoning_metadata,
+            reasoning_tokens,
+            user_disclosure,
+            *rendered_scenarios,
         )
         lines.append("| " + " | ".join(row) + " |")
 
@@ -324,30 +455,55 @@ def render_junit(
 ) -> str:
     """Return fixed-message JUnit; missing evidence is an error, not a pass."""
 
+    provisioning = _provisioning_dispositions(summary, profile_ids)
     preflight_only = summary.get("preflight_only") is True
-    tests = len(profile_ids) * len(SCENARIO_IDS)
+    tests_per_profile = len(SCENARIO_IDS) + 1
+    tests = len(profile_ids) * tests_per_profile
     failures = 0
     errors = 0
-    skipped = tests if preflight_only else 0
-    rows: list[tuple[str, dict[str, str]]] = []
+    skipped = 0
+    rows: list[tuple[str, dict[str, str], str, str, int, int, int]] = []
     for profile_id in profile_ids:
         statuses = _scenario_statuses(_profile(profile_results, profile_id))
-        rows.append((profile_id, statuses))
+        _, provision_code, disposition = provisioning[profile_id]
+        suite_failures = 0
+        suite_errors = 0
+        suite_skipped = 0
         if preflight_only:
-            continue
-        for scenario_id in SCENARIO_IDS:
-            status = _junit_scenario_status(
-                summary, profile_id, scenario_id, statuses
+            suite_skipped = tests_per_profile
+        elif disposition == "NOT_RUN":
+            suite_errors = 1
+            suite_skipped = len(SCENARIO_IDS)
+        elif disposition == "UNVERIFIED":
+            suite_errors = tests_per_profile
+        else:
+            for scenario_id in SCENARIO_IDS:
+                status = _junit_scenario_status(
+                    summary, profile_id, scenario_id, statuses
+                )
+                if status in FAILURE_STATUSES or status == COT_JUNIT_FAILURE:
+                    suite_failures += 1
+                elif status != "PASS":
+                    suite_errors += 1
+        failures += suite_failures
+        errors += suite_errors
+        skipped += suite_skipped
+        rows.append(
+            (
+                profile_id,
+                statuses,
+                provision_code,
+                disposition,
+                suite_failures,
+                suite_errors,
+                suite_skipped,
             )
-            if status in FAILURE_STATUSES or status == COT_JUNIT_FAILURE:
-                failures += 1
-            elif status != "PASS":
-                errors += 1
+        )
 
     root = ElementTree.Element(
         "testsuites",
         {
-            "name": "feedling-local-api-key-diagnostic",
+            "name": "io-local-api-key-diagnostic",
             "tests": str(tests),
             "failures": str(failures),
             "errors": str(errors),
@@ -355,27 +511,88 @@ def render_junit(
             "release_qualified": "false",
         },
     )
-    for profile_id, statuses in rows:
+    for (
+        profile_id,
+        statuses,
+        provision_code,
+        disposition,
+        suite_failures,
+        suite_errors,
+        suite_skipped,
+    ) in rows:
         suite = ElementTree.SubElement(
             root,
             "testsuite",
             {
-                "name": f"feedling.diagnostic.{profile_id}",
-                "tests": str(len(SCENARIO_IDS)),
+                "name": f"io.diagnostic.{profile_id}",
+                "tests": str(tests_per_profile),
+                "failures": str(suite_failures),
+                "errors": str(suite_errors),
+                "skipped": str(suite_skipped),
             },
         )
+        provisioning_testcase = ElementTree.SubElement(
+            suite,
+            "testcase",
+            {
+                "classname": f"io.diagnostic.{profile_id}",
+                "name": "PROVISIONING",
+            },
+        )
+        if preflight_only:
+            ElementTree.SubElement(
+                provisioning_testcase, "skipped", {"message": "preflight-only"}
+            )
+        elif disposition == "NOT_RUN":
+            ElementTree.SubElement(
+                provisioning_testcase,
+                "error",
+                {
+                    "type": "PROVISIONING_BLOCKED",
+                    "message": f"provisioning:{provision_code}",
+                },
+            )
+        elif disposition == "UNVERIFIED":
+            ElementTree.SubElement(
+                provisioning_testcase,
+                "error",
+                {
+                    "type": "UNVERIFIED",
+                    "message": "provisioning-metadata:UNVERIFIED",
+                },
+            )
         for scenario_id in SCENARIO_IDS:
             testcase = ElementTree.SubElement(
                 suite,
                 "testcase",
                 {
-                    "classname": f"feedling.diagnostic.{profile_id}",
+                    "classname": f"io.diagnostic.{profile_id}",
                     "name": scenario_id,
                 },
             )
             if preflight_only:
                 ElementTree.SubElement(
                     testcase, "skipped", {"message": "preflight-only"}
+                )
+                continue
+            if disposition == "NOT_RUN":
+                ElementTree.SubElement(
+                    testcase,
+                    "skipped",
+                    {
+                        "type": "NOT_RUN",
+                        "message": f"provisioning:{provision_code}",
+                    },
+                )
+                continue
+            if disposition == "UNVERIFIED":
+                ElementTree.SubElement(
+                    testcase,
+                    "error",
+                    {
+                        "type": "UNVERIFIED",
+                        "message": "provisioning-metadata:UNVERIFIED",
+                    },
                 )
                 continue
             status = _junit_scenario_status(

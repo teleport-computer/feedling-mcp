@@ -91,6 +91,55 @@ class _CleanupClient:
         return {"deleted": True}
 
 
+class _FreshnessClient:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def clear_trace(self, _session):
+        self.calls.append("clear-trace")
+        return {"status": "ok"}
+
+    def _req(self, method, path, *, api_key):
+        assert method == "GET"
+        assert api_key == "key"
+        self.calls.append(path)
+        if path == "/v1/users/whoami":
+            return 200, {"user_id": "user"}
+        if path == "/v1/chat/history?limit=1":
+            return 200, {"messages": []}
+        if path == "/v1/memory/list?limit=1":
+            return 200, {"moments": []}
+        raise AssertionError(f"unexpected freshness path: {path}")
+
+
+def test_freshness_clears_trace_before_reading_account_surfaces():
+    client = _FreshnessClient()
+
+    assertions, turns, _observations = probe._run_actions(
+        "P0-02",
+        nonce="nonce",
+        profile={
+            "fresh_state_verified": True,
+            "registration_verified": True,
+        },
+        session=Session("user", "key", b"s" * 32, b"p" * 32),
+        client=client,
+    )
+
+    assert client.calls == [
+        "clear-trace",
+        "/v1/users/whoami",
+        "/v1/chat/history?limit=1",
+        "/v1/memory/list?limit=1",
+    ]
+    assert turns == []
+    assert assertions == {
+        "synthetic_account_is_fresh": True,
+        "whoami_matches": True,
+        "trace_cleared": True,
+    }
+
+
 def test_trace_cleanup_leaves_delivery_unknown_without_explicit_event():
     assertions, turns, _observations, projection = probe._run_trace_cleanup(
         profile={"trace_enabled": True},

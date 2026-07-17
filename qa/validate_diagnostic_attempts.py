@@ -59,9 +59,16 @@ def parent_cleanup_is_deferred(profile_result: Mapping[str, Any]) -> bool:
         scenario.get("status") != PARENT_CLEANUP_DEFERRED_STATUS
         or scenario.get("attempts") != 1
         or not isinstance(assertions, Mapping)
-        or assertions.get("trace_stages_complete") is not True
-        or assertions.get("trace_correlation_confirmed") is not True
-        or assertions.get("latency_attributed") is not True
+        or set(assertions)
+        != {
+            "trace_stages_complete",
+            "trace_correlation_confirmed",
+            "latency_attributed",
+            "cleanup_confirmed",
+        }
+        or any(type(value) is not bool for value in assertions.values())
+        or assertions.get("trace_stages_complete")
+        is not assertions.get("latency_attributed")
         or assertions.get("cleanup_confirmed") is not False
         or scenario.get("failure") != PARENT_CLEANUP_DEFERRED_FAILURE
         or not isinstance(attempts, list)
@@ -71,9 +78,15 @@ def parent_cleanup_is_deferred(profile_result: Mapping[str, Any]) -> bool:
         or attempts[0].get("status") != PARENT_CLEANUP_DEFERRED_STATUS
         or attempts[0].get("failure") != PARENT_CLEANUP_DEFERRED_FAILURE
         or not isinstance(evidence_codes, list)
-        or not {"TRACE_CORRELATION_CONFIRMED", "LATENCY_ATTRIBUTED"}.issubset(
-            evidence_codes
-        )
+        or evidence_codes
+        != [
+            code
+            for assertion, code in (
+                ("trace_correlation_confirmed", "TRACE_CORRELATION_CONFIRMED"),
+                ("latency_attributed", "LATENCY_ATTRIBUTED"),
+            )
+            if assertions.get(assertion) is True
+        ]
     ):
         return False
 

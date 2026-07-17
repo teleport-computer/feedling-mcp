@@ -42,6 +42,47 @@ def _qualification_runtime(tmp_path: Path) -> tuple[Path, Path]:
     return runtime, executable
 
 
+def test_worker_python_preflight_requires_cryptography_and_pynacl(
+    tmp_path, monkeypatch
+):
+    runtime, executable = _qualification_runtime(tmp_path)
+    observed_probe: list[str] = []
+
+    def capture(command, *args, **kwargs):
+        observed_probe.append(str(command[2]))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([str(runtime), str(runtime)]),
+            stderr="",
+        )
+
+    monkeypatch.setattr(local.subprocess, "run", capture)
+
+    resolved, roots = local._inspect_worker_python(executable)
+
+    assert resolved == executable.resolve()
+    assert roots == (runtime.resolve(),)
+    assert len(observed_probe) == 1
+    assert "import cryptography,nacl,json,sys" in observed_probe[0]
+
+
+def test_worker_python_missing_probe_dependencies_is_rejected(tmp_path):
+    runtime = tmp_path / "incomplete-runtime"
+    binary_dir = runtime / "bin"
+    binary_dir.mkdir(parents=True, mode=0o755)
+    runtime.chmod(0o755)
+    binary_dir.chmod(0o755)
+    executable = binary_dir / "python3"
+    executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    with pytest.raises(
+        local.LocalDiagnosticError,
+        match="missing cryptography or PyNaCl support",
+    ):
+        local._inspect_worker_python(executable)
+
+
 def _auth_document() -> dict:
     return {
         "auth_mode": "chatgpt",
@@ -162,6 +203,13 @@ def _options(
         encoding="utf-8",
     )
     (source / "qa" / "coverage-lock.json").write_text("{}\n", encoding="utf-8")
+    (source / "qa" / "schemas").mkdir()
+    (source / "qa" / "schemas" / "codex-run-result.schema.json").write_text(
+        (Path(local.__file__).parent / "schemas" / "codex-run-result.schema.json").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
     (source / "tools" / "provider_smoke").mkdir(parents=True)
     (source / "tools" / "genesis_e2e.py").write_text(
         "# synthetic genesis driver\n", encoding="utf-8"
@@ -215,6 +263,216 @@ def _harness_provenance_receipt(_source_root: Path) -> dict:
             _source_root
         ),
     }
+
+
+def _diagnostic_manifest_profile(
+    profile_id: str,
+    *,
+    provision_status: str = "ready",
+    provision_failure_code: str = "NONE",
+    api_key: str | None = None,
+    secret_key_b64: str | None = None,
+) -> dict:
+    spec = local.provision_profiles.PROFILE_SPECS[profile_id]
+    ready = provision_status == "ready"
+    runtime_mode = "hosted_resident" if ready else ""
+    runtime_version = 2 if ready else 0
+    return {
+        "profile_id": profile_id,
+        "qualification_mode": "diagnostic",
+        "label": f"agent-e2e-local-unit-{profile_id}",
+        "provider": spec.provider,
+        "route_family": spec.route_family,
+        "configured_model": local.DEFAULT_PROVIDER_MODELS[profile_id],
+        "configured_base_url": spec.expected_configured_base_url,
+        "reasoning_effort": "medium",
+        "user_id": f"synthetic-{profile_id}",
+        "api_key": api_key or f"synthetic-account-key-{profile_id}",
+        "secret_key_b64": secret_key_b64 or f"content-key-{profile_id}",
+        "public_key_b64": f"public-key-{profile_id}",
+        "trace_enabled": ready,
+        "runtime_mode": runtime_mode,
+        "runtime_version": runtime_version,
+        "runtime_mode_set_required": False,
+        "runtime_mode_set_verified": False,
+        "runtime_mode_readback_verified": ready,
+        "runtime_readback_receipt": (
+            {
+                "configured": True,
+                "runtime_mode": runtime_mode,
+                "runtime_version": runtime_version,
+            }
+            if ready
+            else None
+        ),
+        "registration_verified": True,
+        "fresh_state_verified": True,
+        "invalid_key_rejected": True,
+        "invalid_key_receipt": {
+            "http_status": 400,
+            "error": "provider_test_failed",
+            "provider_status_code": 401,
+        },
+        "valid_key_configured": ready,
+        "valid_key_receipt": (
+            {
+                "status": "configured",
+                "provider": spec.provider,
+                "model": local.DEFAULT_PROVIDER_MODELS[profile_id],
+                "base_url": spec.expected_configured_base_url,
+                "reasoning_effort": "medium",
+            }
+            if ready
+            else None
+        ),
+        "provision_status": provision_status,
+        "provision_failure_code": provision_failure_code,
+    }
+
+
+def _diagnostic_manifest(
+    profile_ids: tuple[str, ...],
+    profiles: list[dict],
+    *,
+    runtime_requirement: str = "hosted_resident",
+) -> dict:
+    return {
+        "schema_version": 1,
+        "qualification_mode": "diagnostic",
+        "selected_profile_ids": list(profile_ids),
+        "runtime_mode": runtime_requirement,
+        "runtime_requirement": runtime_requirement,
+        "profiles": profiles,
+    }
+
+
+def _matrix_options(tmp_path: Path) -> local.DiagnosticOptions:
+    credential_names = tuple(
+        dict.fromkeys(
+            spec.credential_env
+            for spec in local.provision_profiles.PROFILE_SPECS.values()
+        )
+    )
+    env_text = "".join(
+        f"{name}=provider-secret-{index:02d}\n"
+        for index, name in enumerate(credential_names, start=1)
+    ) + "IO_E2E_ADMIN_TOKEN=test-admin-token\n"
+    return replace(
+        _options(tmp_path, preflight_only=False, env_text=env_text),
+        profile_ids=tuple(local.PROFILE_IDS),
+        runtime_requirement=local.RUNTIME_V2_RUNTIME,
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("user_id", "api_key", "secret_key_b64", "public_key_b64"),
+)
+def test_diagnostic_manifest_structure_rejects_duplicate_account_bindings(field):
+    profile_ids = tuple(local.PROFILE_IDS[:2])
+    profiles = [_diagnostic_manifest_profile(value) for value in profile_ids]
+    profiles[1][field] = profiles[0][field]
+
+    with pytest.raises(
+        local.LocalDiagnosticError,
+        match="duplicate diagnostic profile bindings",
+    ):
+        local._validate_diagnostic_manifest_structure(
+            _diagnostic_manifest(profile_ids, profiles),
+            profile_ids,
+            local.RUNTIME_V2_RUNTIME,
+        )
+
+
+def test_diagnostic_manifest_classifies_exact_valid_key_rejection_as_blocked():
+    profile_id = "relay-kongbeiqie"
+    row = _diagnostic_manifest_profile(
+        profile_id,
+        provision_status="blocked",
+        provision_failure_code="VALID_KEY_REJECTED",
+    )
+    manifest = _diagnostic_manifest((profile_id,), [row])
+    rows = local._validate_diagnostic_manifest_structure(
+        manifest, (profile_id,), local.RUNTIME_V2_RUNTIME
+    )
+
+    classification = local._classify_diagnostic_manifest(
+        rows, (profile_id,), local.RUNTIME_V2_RUNTIME
+    )
+
+    assert classification.ready_profile_ids == ()
+    assert classification.blocked_profile_ids == (profile_id,)
+    assert classification.provision_failure_codes == (
+        (profile_id, "VALID_KEY_REJECTED"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("provision_failure_code", "VALID_KEY_SETUP_FAILED"),
+        ("registration_verified", False),
+        ("fresh_state_verified", False),
+        ("invalid_key_rejected", False),
+        ("invalid_key_receipt", None),
+        (
+            "invalid_key_receipt",
+            {
+                "http_status": 400.0,
+                "error": "provider_test_failed",
+                "provider_status_code": 401,
+            },
+        ),
+        (
+            "invalid_key_receipt",
+            {
+                "http_status": 400,
+                "error": "provider_test_failed",
+                "provider_status_code": True,
+            },
+        ),
+        (
+            "invalid_key_receipt",
+            {
+                "http_status": 400,
+                "error": "provider_test_failed",
+                "provider_status_code": 401,
+                "extra": "must-fail-closed",
+            },
+        ),
+        ("valid_key_configured", True),
+        ("valid_key_receipt", {}),
+        ("trace_enabled", True),
+        ("runtime_mode", "hosted_resident"),
+        ("runtime_version", 2),
+        ("runtime_version", False),
+        ("runtime_mode_readback_verified", True),
+        (
+            "runtime_readback_receipt",
+            {
+                "configured": True,
+                "runtime_mode": "hosted_resident",
+                "runtime_version": 2,
+            },
+        ),
+    ),
+)
+def test_diagnostic_manifest_rejects_nonmonotonic_blocked_evidence(field, value):
+    profile_id = "relay-kongbeiqie"
+    row = _diagnostic_manifest_profile(
+        profile_id,
+        provision_status="blocked",
+        provision_failure_code="VALID_KEY_REJECTED",
+    )
+    row[field] = value
+
+    with pytest.raises(
+        local.LocalDiagnosticError,
+        match="diagnostic BLOCKED profile evidence is invalid",
+    ):
+        local._classify_diagnostic_manifest(
+            (row,), (profile_id,), local.RUNTIME_V2_RUNTIME
+        )
 
 
 def _deployment_verification(
@@ -421,6 +679,21 @@ def test_cli_candidate_sha_is_optional_for_authoritative_discovery(
     args = local._parser().parse_args(["--preflight-only"])
 
     assert local._options(args).candidate_sha == ""
+
+
+def test_cli_public_health_identity_is_explicit_opt_in(tmp_path, monkeypatch):
+    native = tmp_path / "verified-native-codex"
+    monkeypatch.setattr(
+        local, "_resolve_trusted_codex_binary", lambda _explicit: native
+    )
+
+    default_args = local._parser().parse_args(["--preflight-only"])
+    public_args = local._parser().parse_args(
+        ["--preflight-only", "--allow-public-health-identity"]
+    )
+
+    assert local._options(default_args).allow_public_health_identity is False
+    assert local._options(public_args).allow_public_health_identity is True
 
 
 def test_env_loader_requires_owner_only_mode_and_never_echoes_value(tmp_path):
@@ -877,6 +1150,17 @@ def test_prepare_environment_validates_only_selected_key_names_and_adds_defaults
     assert "QA_CODEX_MODEL" not in env
 
 
+def test_prepare_environment_uses_current_nonretired_openrouter_glm_default():
+    env, names = local.prepare_environment(
+        {"QA_OPENROUTER_API_KEY": "openrouter-sensitive-value"},
+        ("openrouter-glm",),
+        "local-unit",
+    )
+
+    assert names == ("QA_OPENROUTER_API_KEY",)
+    assert env["QA_OPENROUTER_GLM_MODEL"] == "z-ai/glm-4.5-air"
+
+
 def test_loaded_credentials_reject_short_unscannable_values():
     with pytest.raises(local.LocalDiagnosticError, match="QA_DEEPSEEK_API_KEY"):
         local._loaded_credential_values({"QA_DEEPSEEK_API_KEY": "abc1234"})
@@ -1168,6 +1452,33 @@ def test_parent_cleanup_projection_rejects_inexact_receipt(field, value):
     assert projection["status"] == "FAIL"
 
 
+def test_parent_cleanup_projection_credits_exact_eight_profile_cleanup():
+    projection = local._parent_cleanup_projection(
+        {
+            "attempted": 8,
+            "cleaned": 8,
+            "failed_profile_ids": [],
+            "manifest_deleted": True,
+            "manifest_missing": False,
+        },
+        tuple(local.PROFILE_IDS),
+        required=True,
+        manifest_profiles_validated=True,
+    )
+
+    assert projection == {
+        "owner": "deterministic_parent",
+        "status": "PASS",
+        "expected_profile_ids": list(local.PROFILE_IDS),
+        "manifest_profiles_validated": True,
+        "attempted": 8,
+        "cleaned": 8,
+        "failed_profile_ids": [],
+        "manifest_deleted": True,
+        "manifest_missing": False,
+    }
+
+
 def test_parent_finalization_rejects_arbitrary_nonpass_or_agent_side_cleanup():
     profile = _parent_cleanup_deferred_profile("official-gemini")
     parent_cleanup = local._parent_cleanup_projection(
@@ -1187,6 +1498,21 @@ def test_parent_finalization_rejects_arbitrary_nonpass_or_agent_side_cleanup():
     ) == {"official-gemini": "PASS"}
 
     profile["scenarios"][-1]["failure"]["failure_code"] = "CLEANUP_FAILED"
+    assert local._diagnostic_profile_projection(
+        {"official-gemini": profile}, ("official-gemini",), parent_cleanup
+    ) == {"official-gemini": "FAIL"}
+
+    profile = _parent_cleanup_deferred_profile("official-gemini")
+    profile["scenarios"][-1]["assertions"].update(
+        {
+            "trace_stages_complete": False,
+            "latency_attributed": False,
+        }
+    )
+    profile["scenarios"][-1]["evidence_codes"] = [
+        "TRACE_CORRELATION_CONFIRMED"
+    ]
+    assert diagnostic_attempts.parent_cleanup_is_deferred(profile) is True
     assert local._diagnostic_profile_projection(
         {"official-gemini": profile}, ("official-gemini",), parent_cleanup
     ) == {"official-gemini": "FAIL"}
@@ -1413,9 +1739,9 @@ def test_preflight_creates_sanitized_non_release_artifact_and_calls_cleanup(
         "junit.xml",
         "profiles",
     }
-    assert "NOT_RUN" in (artifacts / "matrix.md").read_text()
+    assert "UNVERIFIED" in (artifacts / "matrix.md").read_text()
     junit = ElementTree.parse(artifacts / "junit.xml").getroot()
-    assert junit.attrib["skipped"] == "13"
+    assert junit.attrib["skipped"] == "14"
     assert junit.attrib["release_qualified"] == "false"
     assert not any(options.private_base.iterdir())
     assert "gemini-sensitive-value" not in summary_path.read_text()
@@ -1488,6 +1814,214 @@ def test_preflight_discovers_authoritative_deployment_sha_before_codex(tmp_path)
         "observed_worker_sha": None,
         "identity_verified": True,
     }
+
+
+def test_public_health_observer_records_live_sha_without_protected_attestation(
+    tmp_path,
+):
+    observed_sha = "e" * 40
+    receipt_path = tmp_path / "public-health-receipt.json"
+
+    class Client:
+        def _req(self, method, path, *, attempts, read_timeout):
+            assert (method, path) == ("GET", "/healthz")
+            assert attempts == 3
+            assert read_timeout == 15
+            return 200, {
+                "ok": True,
+                "status": "healthy",
+                "release": {"git_commit": observed_sha},
+            }
+
+    receipt = local._observe_public_health_deployment(
+        observed_sha,
+        receipt_path,
+        env={"IO_E2E_BASE_URL": "https://test-api.feedling.app"},
+        expected_runtime="deployed_current",
+        client=Client(),
+    )
+
+    assert receipt["expected_deployment_sha"] == observed_sha
+    assert receipt["observed_backend_sha"] == observed_sha
+    assert receipt["observed_deployment_sha"] is None
+    assert receipt["deployment_identity_verified"] is False
+    assert receipt["deployment_identity_observed"] is True
+    assert receipt["identity_evidence_source"] == (
+        local.PUBLIC_HEALTH_IDENTITY_SOURCE
+    )
+    assert receipt["identity_gap_code"] == local.PUBLIC_HEALTH_IDENTITY_GAP
+    assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o400
+
+
+def test_public_health_observer_rejects_candidate_mismatch(tmp_path):
+    class Client:
+        def _req(self, *_args, **_kwargs):
+            return 200, {
+                "ok": True,
+                "status": "healthy",
+                "release": {"git_commit": "e" * 40},
+            }
+
+    with pytest.raises(local.LocalDiagnosticError, match="does not match"):
+        local._observe_public_health_deployment(
+            "f" * 40,
+            tmp_path / "must-not-exist.json",
+            env={"IO_E2E_BASE_URL": "https://test-api.feedling.app"},
+            expected_runtime="deployed_current",
+            client=Client(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    (
+        (503, {"ok": False, "status": "unhealthy", "release": {}}),
+        (200, {"ok": True, "status": "healthy", "release": {}}),
+        (
+            200,
+            {
+                "ok": True,
+                "status": "healthy",
+                "release": {"git_commit": "dev"},
+            },
+        ),
+    ),
+)
+def test_public_health_observer_rejects_unhealthy_or_unpinned_target(
+    tmp_path, status, body
+):
+    class Client:
+        def _req(self, *_args, **_kwargs):
+            return status, body
+
+    with pytest.raises(local.LocalDiagnosticError, match="identity is invalid"):
+        local._observe_public_health_deployment(
+            None,
+            tmp_path / "must-not-exist.json",
+            env={"IO_E2E_BASE_URL": "https://test-api.feedling.app"},
+            expected_runtime="deployed_current",
+            client=Client(),
+        )
+
+
+def test_public_health_mode_is_required_when_admin_credential_is_absent(tmp_path):
+    options = replace(
+        _options(
+            tmp_path,
+            preflight_only=True,
+            env_text="QA_GEMINI_API_KEY=gemini-sensitive-value\n",
+        ),
+        candidate_sha="",
+        allow_public_health_identity=False,
+    )
+    dependencies = local.DiagnosticDependencies(
+        provision=lambda *_args, **_kwargs: pytest.fail("unexpected provision"),
+        cleanup=lambda *_args, **_kwargs: {
+            "attempted": 0,
+            "cleaned": 0,
+            "failed_profile_ids": [],
+            "manifest_deleted": False,
+            "manifest_missing": True,
+        },
+        launch=lambda *_args, **_kwargs: pytest.fail("unexpected launch"),
+        verify_deployment=lambda *_args, **_kwargs: pytest.fail(
+            "protected verifier must not receive a missing credential"
+        ),
+        observe_deployment=lambda *_args, **_kwargs: pytest.fail(
+            "public observer requires explicit opt-in"
+        ),
+        verify_codex_provenance=lambda _path: pytest.fail("unexpected Codex check"),
+        verify_codex_version=lambda _path: pytest.fail("unexpected Codex check"),
+        verify_login=lambda *_args: pytest.fail("unexpected login check"),
+        verify_codex_exec=lambda *_args: pytest.fail("unexpected exec check"),
+        collect_harness_provenance=_harness_provenance_receipt,
+    )
+
+    with pytest.raises(local.LocalDiagnosticError, match="admin credential"):
+        local.execute(options, dependencies=dependencies)
+
+
+def test_adminless_public_health_preflight_uses_observed_sha_before_codex(tmp_path):
+    discovered_sha = "d" * 40
+    options = replace(
+        _options(
+            tmp_path,
+            preflight_only=True,
+            env_text="QA_GEMINI_API_KEY=gemini-sensitive-value\n",
+        ),
+        candidate_sha="",
+        allow_public_health_identity=True,
+    )
+    order: list[str] = []
+
+    def observe_deployment(expected_sha, receipt_path, *, env, expected_runtime):
+        order.append("public-health")
+        assert expected_sha is None
+        assert env == {"IO_E2E_BASE_URL": "https://test-api.feedling.app"}
+        receipt = {
+            "schema_version": 1,
+            "environment": "test",
+            "base_url": "https://test-api.feedling.app",
+            "expected_runtime": expected_runtime,
+            "expected_deployment_sha": discovered_sha,
+            "observed_backend_sha": discovered_sha,
+            "observed_deployment_sha": None,
+            "observed_worker_sha": None,
+            "live_worker_count": None,
+            "runtime_evidence_source": "deployed_runtime_readback",
+            "liveness_verified": True,
+            "deployment_identity_verified": False,
+            "deployment_identity_observed": True,
+            "identity_evidence_source": local.PUBLIC_HEALTH_IDENTITY_SOURCE,
+            "identity_gap_code": local.PUBLIC_HEALTH_IDENTITY_GAP,
+            "health_status": "healthy",
+            "verified_at": "2026-07-16T00:00:00+00:00",
+        }
+        local._write_private_json(receipt_path, receipt)
+        receipt_path.chmod(0o400)
+        return receipt
+
+    dependencies = local.DiagnosticDependencies(
+        provision=lambda *_args, **_kwargs: pytest.fail("unexpected provision"),
+        cleanup=lambda *_args, **_kwargs: {
+            "attempted": 0,
+            "cleaned": 0,
+            "failed_profile_ids": [],
+            "manifest_deleted": False,
+            "manifest_missing": True,
+        },
+        launch=lambda *_args, **_kwargs: pytest.fail("unexpected launch"),
+        verify_deployment=lambda *_args, **_kwargs: pytest.fail(
+            "protected verifier must not run"
+        ),
+        observe_deployment=observe_deployment,
+        verify_codex_provenance=lambda _path: order.append("codex"),
+        verify_codex_version=lambda _path: None,
+        verify_login=lambda *_args: None,
+        verify_codex_exec=_codex_preflight_receipt,
+        collect_harness_provenance=_harness_provenance_receipt,
+    )
+
+    summary, summary_path = local.execute(options, dependencies=dependencies)
+
+    assert order[:2] == ["public-health", "codex"]
+    assert summary["status"] == "PREFLIGHT_PASS"
+    assert summary["candidate_sha"] == discovered_sha
+    assert summary["deployment_identity"] == {
+        "expected_deployment_sha": discovered_sha,
+        "observed_backend_sha": discovered_sha,
+        "observed_deployment_sha": None,
+        "observed_worker_sha": None,
+        "identity_observed": True,
+        "identity_verified": False,
+        "identity_evidence_source": local.PUBLIC_HEALTH_IDENTITY_SOURCE,
+        "identity_gap_code": local.PUBLIC_HEALTH_IDENTITY_GAP,
+        "health_status": "healthy",
+    }
+    matrix = (summary_path.parent / "matrix.md").read_text(encoding="utf-8")
+    assert "OBSERVED_UNATTESTED" in matrix
+    assert local.PUBLIC_HEALTH_IDENTITY_SOURCE in matrix
+    assert local.PUBLIC_HEALTH_IDENTITY_GAP in matrix
 
 
 def test_candidate_sha_mismatch_aborts_before_codex_or_provisioning(tmp_path):
@@ -1603,14 +2137,7 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
             "selected_profile_ids": ["official-gemini"],
             "runtime_mode": "deployed_current",
             "runtime_requirement": "deployed_current",
-            "profiles": [
-                {
-                    "profile_id": "official-gemini",
-                    "runtime_mode": "hosted_resident",
-                    "runtime_version": 2,
-                    "runtime_mode_readback_verified": True,
-                }
-            ],
+            "profiles": [_diagnostic_manifest_profile("official-gemini")],
         }
         local._write_private_json(manifest_path, manifest)
         return manifest
@@ -1786,8 +2313,8 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
     )
     junit = ElementTree.parse(summary_path.parent / "junit.xml").getroot()
     assert junit.attrib == {
-        "name": "feedling-local-api-key-diagnostic",
-        "tests": "13",
+        "name": "io-local-api-key-diagnostic",
+        "tests": "14",
         "failures": "0",
         "errors": "0",
         "skipped": "0",
@@ -1797,6 +2324,285 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
         if artifact.is_file():
             assert "gemini-sensitive-value" not in artifact.read_text()
     assert not any(options.private_base.iterdir())
+
+
+def test_mixed_matrix_launches_seven_and_accounts_for_blocked_eighth(tmp_path):
+    options = _matrix_options(tmp_path)
+    profile_ids = tuple(local.PROFILE_IDS)
+    ready_ids = profile_ids[:-1]
+    blocked_id = profile_ids[-1]
+    manifest_profiles = [
+        _diagnostic_manifest_profile(profile_id)
+        for profile_id in ready_ids
+    ] + [
+        _diagnostic_manifest_profile(
+            blocked_id,
+            provision_status="blocked",
+            provision_failure_code="VALID_KEY_REJECTED",
+        )
+    ]
+    launched: list[tuple[str, ...]] = []
+
+    def provision(_coverage, manifest_path, **_kwargs):
+        manifest = _diagnostic_manifest(profile_ids, manifest_profiles)
+        local._write_private_json(manifest_path, manifest)
+        return manifest
+
+    def launch(**kwargs):
+        selected = tuple(kwargs["profile_ids"])
+        launched.append(selected)
+        assert selected == ready_ids
+        workers_receipt = []
+        by_id = {row["profile_id"]: row for row in manifest_profiles}
+        for profile_id in selected:
+            local._write_private_json(
+                kwargs["aggregation_input_root"] / f"{profile_id}.json",
+                diagnostic_results.agent_error_profile(
+                    by_id[profile_id],
+                    profile_id=profile_id,
+                    expected_runtime=local.RUNTIME_V2_RUNTIME,
+                ),
+            )
+            workers_receipt.append(
+                {
+                    "profile_id": profile_id,
+                    "result_source": "deterministic_fallback",
+                    "fallback_reason": "COT_RECEIPT_MISSING",
+                    "completed_command_execution_count": 0,
+                    "completed_scenario_command_ids": [],
+                    "completed_scenario_command_counts": {},
+                    "p0_06_command_phases": [],
+                }
+            )
+        return {
+            "launch_attempts": len(selected),
+            "max_observed_profile_concurrency": 3,
+            "workers": workers_receipt,
+        }
+
+    def cleanup(path, **_kwargs):
+        path.unlink()
+        return {
+            "attempted": 8,
+            "cleaned": 8,
+            "failed_profile_ids": [],
+            "manifest_deleted": True,
+            "manifest_missing": False,
+        }
+
+    dependencies = local.DiagnosticDependencies(
+        provision=provision,
+        cleanup=cleanup,
+        launch=launch,
+        verify_deployment=_deployment_verification,
+        verify_codex_provenance=lambda _path: None,
+        verify_codex_version=lambda _path: None,
+        verify_login=lambda *_args: None,
+        verify_codex_exec=_codex_preflight_receipt,
+        collect_harness_provenance=_harness_provenance_receipt,
+    )
+
+    summary, summary_path = local.execute(options, dependencies=dependencies)
+
+    assert summary["status"] == "DIAGNOSTIC_FAIL"
+    assert launched == [ready_ids]
+    assert summary["requested_profile_ids"] == list(profile_ids)
+    expected_counts = {
+        "requested_profile_count": 8,
+        "ready_profile_count": 7,
+        "blocked_profile_count": 1,
+        "accounted_profile_count": 8,
+    }
+    assert {
+        name: summary["provisioning"][name] for name in expected_counts
+    } == expected_counts
+    assert {
+        name: summary["orchestration"][name] for name in expected_counts
+    } == expected_counts
+    assert summary["orchestration"]["launch_attempts"] == 7
+    assert summary["orchestration"]["agent_launch_profile_ids"] == list(
+        ready_ids
+    )
+    assert summary["orchestration"]["blocked_profile_ids"] == [blocked_id]
+    assert list(summary["profile_statuses"]) == list(profile_ids)
+    assert list(summary["cot_delivery"]) == list(profile_ids)
+    assert summary["cot_delivery"][blocked_id] == {
+        "status": "NOT_RUN",
+        "failure_code": "VALID_KEY_REJECTED",
+        "receipt_status": None,
+        "receipt_failure_code": None,
+        "delivery_qualified": False,
+        "final_answer_correct": None,
+        "reasoning_event_count": None,
+        "metadata_present": None,
+        "token_metadata_status": "UNVERIFIED",
+        "reasoning_token_count": None,
+        "user_visible_disclosure_present": None,
+        "receipt_sha256": None,
+    }
+    blocked_profile = json.loads(
+        (summary_path.parent / "profiles" / f"{blocked_id}.json").read_text()
+    )
+    assert blocked_profile["status"] == "BLOCKED_CREDENTIAL"
+    assert len(blocked_profile["scenarios"]) == 13
+    assert {row["attempts"] for row in blocked_profile["scenarios"]} == {0}
+    assert {path.stem for path in (summary_path.parent / "profiles").glob("*.json")} == set(
+        profile_ids
+    )
+    assert summary["cleanup"] == {
+        "attempted": 8,
+        "cleaned": 8,
+        "failed_profile_ids": [],
+        "manifest_deleted": True,
+        "manifest_missing": False,
+    }
+    assert summary["parent_cleanup_verification"]["status"] == "PASS"
+    public_payload = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in summary_path.parent.rglob("*")
+        if path.is_file()
+    )
+    for secret in (
+        *(f"provider-secret-{index:02d}" for index in range(1, 7)),
+        *(row["api_key"] for row in manifest_profiles),
+        *(row["secret_key_b64"] for row in manifest_profiles),
+    ):
+        assert secret not in public_payload
+
+
+def test_all_blocked_matrix_never_launches_agents_and_accounts_for_all_eight(
+    tmp_path,
+):
+    options = _matrix_options(tmp_path)
+    profile_ids = tuple(local.PROFILE_IDS)
+    manifest_profiles = [
+        _diagnostic_manifest_profile(
+            profile_id,
+            provision_status="blocked",
+            provision_failure_code="VALID_KEY_REJECTED",
+        )
+        for profile_id in profile_ids
+    ]
+
+    def provision(_coverage, manifest_path, **_kwargs):
+        manifest = _diagnostic_manifest(profile_ids, manifest_profiles)
+        local._write_private_json(manifest_path, manifest)
+        return manifest
+
+    def cleanup(path, **_kwargs):
+        path.unlink()
+        return {
+            "attempted": 8,
+            "cleaned": 8,
+            "failed_profile_ids": [],
+            "manifest_deleted": True,
+            "manifest_missing": False,
+        }
+
+    dependencies = local.DiagnosticDependencies(
+        provision=provision,
+        cleanup=cleanup,
+        launch=lambda **_kwargs: pytest.fail("blocked profiles must not launch"),
+        verify_deployment=_deployment_verification,
+        verify_codex_provenance=lambda _path: None,
+        verify_codex_version=lambda _path: None,
+        verify_login=lambda *_args: None,
+        verify_codex_exec=_codex_preflight_receipt,
+        collect_harness_provenance=_harness_provenance_receipt,
+    )
+
+    summary, summary_path = local.execute(options, dependencies=dependencies)
+
+    assert summary["status"] == "DIAGNOSTIC_FAIL"
+    assert summary["orchestration"]["launch_attempts"] == 0
+    assert summary["orchestration"]["agent_launch_profile_ids"] == []
+    assert summary["orchestration"]["blocked_profile_ids"] == list(profile_ids)
+    assert {
+        key: summary["orchestration"][key]
+        for key in (
+            "requested_profile_count",
+            "ready_profile_count",
+            "blocked_profile_count",
+            "accounted_profile_count",
+        )
+    } == {
+        "requested_profile_count": 8,
+        "ready_profile_count": 0,
+        "blocked_profile_count": 8,
+        "accounted_profile_count": 8,
+    }
+    assert list(summary["profile_statuses"]) == list(profile_ids)
+    assert list(summary["cot_delivery"]) == list(profile_ids)
+    assert {
+        row["status"] for row in summary["cot_delivery"].values()
+    } == {"NOT_RUN"}
+    assert len(list((summary_path.parent / "profiles").glob("*.json"))) == 8
+    assert summary["cleanup"]["cleaned"] == 8
+    assert summary["cleanup"]["manifest_deleted"] is True
+    assert summary["parent_cleanup_verification"]["status"] == "PASS"
+
+
+def test_malformed_blocker_fails_closed_but_cleanup_is_still_credited(tmp_path):
+    options = _matrix_options(tmp_path)
+    profile_ids = tuple(local.PROFILE_IDS)
+    manifest_profiles = [
+        _diagnostic_manifest_profile(profile_id)
+        for profile_id in profile_ids[:-1]
+    ] + [
+        _diagnostic_manifest_profile(
+            profile_ids[-1],
+            provision_status="blocked",
+            provision_failure_code="VALID_KEY_REJECTED",
+        )
+    ]
+    manifest_profiles[-1]["trace_enabled"] = True
+
+    def provision(_coverage, manifest_path, **_kwargs):
+        manifest = _diagnostic_manifest(profile_ids, manifest_profiles)
+        local._write_private_json(manifest_path, manifest)
+        return manifest
+
+    def cleanup(path, **_kwargs):
+        path.unlink()
+        return {
+            "attempted": 8,
+            "cleaned": 8,
+            "failed_profile_ids": [],
+            "manifest_deleted": True,
+            "manifest_missing": False,
+        }
+
+    dependencies = local.DiagnosticDependencies(
+        provision=provision,
+        cleanup=cleanup,
+        launch=lambda **_kwargs: pytest.fail("malformed matrix must not launch"),
+        verify_deployment=_deployment_verification,
+        verify_codex_provenance=lambda _path: None,
+        verify_codex_version=lambda _path: None,
+        verify_login=lambda *_args: None,
+        verify_codex_exec=_codex_preflight_receipt,
+        collect_harness_provenance=_harness_provenance_receipt,
+    )
+
+    with pytest.raises(
+        local.LocalDiagnosticError,
+        match="diagnostic BLOCKED profile evidence is invalid",
+    ):
+        local.execute(options, dependencies=dependencies)
+
+    summaries = list(
+        options.source_root.glob("qualification-artifacts/*/diagnostic-summary.json")
+    )
+    assert len(summaries) == 1
+    summary = json.loads(summaries[0].read_text())
+    assert summary["status"] == "DIAGNOSTIC_ERROR"
+    assert summary["cleanup"]["attempted"] == 8
+    assert summary["cleanup"]["cleaned"] == 8
+    assert summary["cleanup"]["manifest_deleted"] is True
+    assert summary["parent_cleanup_verification"]["status"] == "PASS"
+    assert summary["parent_cleanup_verification"][
+        "manifest_profiles_validated"
+    ] is True
 
 
 def test_nonpassing_worker_retains_only_credential_scrubbed_debug_evidence(tmp_path):
@@ -1824,16 +2630,13 @@ def test_nonpassing_worker_retains_only_credential_scrubbed_debug_evidence(tmp_p
             "runtime_requirement": "deployed_current",
             "profiles": [
                 {
-                    "profile_id": "official-gemini",
-                    "configured_model": "gemini-2.5-flash",
-                    "runtime_mode": "hosted_resident",
-                    "runtime_version": 2,
-                    "runtime_mode_readback_verified": True,
-                    "trace_enabled": True,
+                    **_diagnostic_manifest_profile(
+                        "official-gemini",
+                        api_key=synthetic_api_key,
+                        secret_key_b64=content_key,
+                    ),
                     "user_id": "synthetic-debug-user",
-                    "api_key": synthetic_api_key,
-                    "secret_key_b64": content_key,
-                }
+                },
             ],
         }
         local._write_private_json(manifest_path, manifest)
@@ -1979,18 +2782,16 @@ def test_cleanup_failure_retains_retry_manifest_but_removes_oauth_material(tmp_p
             "schema_version": 1,
             "qualification_mode": "diagnostic",
             "selected_profile_ids": ["official-gemini"],
-            "runtime_mode": "hosted_resident",
-            "runtime_version": 2,
+            "runtime_mode": "deployed_current",
+            "runtime_requirement": "deployed_current",
             "profiles": [
                 {
-                    "profile_id": "official-gemini",
-                    "configured_model": "gemini-2.5-flash",
-                    "runtime_mode": "hosted_resident",
-                    "runtime_version": 2,
-                    "trace_enabled": True,
+                    **_diagnostic_manifest_profile(
+                        "official-gemini",
+                        api_key=synthetic_api_key,
+                        secret_key_b64="synthetic-content-key-for-cleanup-retry",
+                    ),
                     "user_id": "synthetic-cleanup-retry-user",
-                    "api_key": synthetic_api_key,
-                    "secret_key_b64": "synthetic-content-key-for-cleanup-retry",
                 }
             ],
         }
