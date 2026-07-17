@@ -1007,3 +1007,28 @@ def test_foreground_history_chunks_capped_support_untouched(monkeypatch):
     persona = next(g for g in capped if g["source_family"] == "ai_persona")
     assert len(hist["chunk_texts"]) == 8          # history 采样到 8
     assert len(persona["chunk_texts"]) == 1        # 小桶不动
+
+
+def test_plaintext_import_rejection_logs_breadcrumb(monkeypatch, caplog):
+    # Observability: when an import 400s because uploaded material normalized to
+    # empty, we must leave an always-on breadcrumb (server logs are the only trace
+    # for this failure — no job row is created). The high-signal field is
+    # material_present=True: the user DID upload something, yet it was dropped.
+    client = _client(monkeypatch)
+    # An account-export blob (uuid/email, no real content) is legitimately dropped,
+    # so this still 400s post-fix — perfect to exercise the breadcrumb.
+    blob = json.dumps([{"uuid": "u-1", "email_address": "a@b.com", "full_name": "S"}])
+    with caplog.at_level("WARNING", logger="feedling.genesis.plaintext_import"):
+        resp = client.post(
+            "/v1/genesis/imports/plaintext",
+            json={"format": "auto", "content": "", "mode": "add_memory",
+                  "memory_summary_content": blob,
+                  "memory_summary_filename": "export.json"},
+        )
+    assert resp.status_code == 400
+    recs = [r for r in caplog.records if "genesis.plaintext.rejected" in r.getMessage()]
+    assert recs, "expected a genesis.plaintext.rejected breadcrumb"
+    msg = recs[0].getMessage()
+    assert "material_present=True" in msg          # user uploaded material…
+    assert "memory_summary_content" in msg         # …and we record which field + its size
+    assert "a@b.com" not in msg                     # but never the content itself (lengths only)

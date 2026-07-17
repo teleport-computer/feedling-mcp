@@ -32,6 +32,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 from typing import Any
@@ -43,6 +44,62 @@ from identity import service as identity_service
 from notices import core as notices
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
+
+log = logging.getLogger("feedling.genesis.plaintext_import")
+
+# Material fields a plaintext import can carry. We log only their CHAR LENGTHS
+# (never the content) so a rejected import is diagnosable without leaking plaintext.
+_PLAINTEXT_MATERIAL_FIELDS = (
+    "content",
+    "memory_summary_content",
+    "support_material_content",
+    "character_content",
+    "ai_persona_content",
+    "personal_profile_content",
+)
+
+
+def _plaintext_material_sizes(payload: dict) -> dict:
+    """{field: char_len} for every non-empty material field. Lengths only, no content."""
+    return {
+        k: len(str(payload.get(k) or ""))
+        for k in _PLAINTEXT_MATERIAL_FIELDS
+        if str(payload.get(k) or "").strip()
+    }
+
+
+def _log_plaintext_import_rejected(store, *, mode: str, reason: str, payload: dict) -> None:
+    """Always-on breadcrumb for a 400'd plaintext import. The high-signal case is
+    ``material_present=True`` with a ``..._required`` reason: the user DID upload
+    material but it normalized to empty (e.g. a memory archive whose items use a
+    non-whitelisted narrative key) — the exact silent-drop this endpoint used to
+    surface only as an opaque client-side "invalid request". Grep server logs for
+    ``genesis.plaintext.rejected``. Best-effort; never breaks the request path."""
+    try:
+        sizes = _plaintext_material_sizes(payload)
+        material_present = bool(sizes)
+        uid = getattr(store, "user_id", "") or ""
+        log.warning(
+            "genesis.plaintext.rejected user=%s mode=%s material_present=%s sizes=%s reason=%s",
+            uid, mode or "", material_present, sizes, str(reason)[:120],
+        )
+        try:
+            import debug_trace
+            debug_trace.trace_event(
+                store, subsystem="genesis", type="genesis.plaintext.rejected",
+                actor="backend", status="failed",
+                summary="plaintext import rejected (400)",
+                explain=(
+                    "上传了素材但被判为空（可能是记忆归档用了非白名单正文键 / id 误杀）"
+                    if material_present else "无可用素材"
+                ),
+                detail={"mode": mode or "", "material_present": material_present,
+                        "sizes": sizes, "reason": str(reason)[:160]},
+            )
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def _bad(error: str, status: int = 400, **extra) -> tuple[dict, int]:
@@ -510,6 +567,7 @@ def plaintext_import(
     try:
         prepared = prepare(payload)
     except ValueError as e:
+        _log_plaintext_import_rejected(store, mode=mode, reason=str(e), payload=payload)
         return _bad(str(e), 400)
 
     if existing:
@@ -551,6 +609,7 @@ def plaintext_import(
             "metadata": metadata,
         })
     except ValueError as e:
+        _log_plaintext_import_rejected(store, mode=mode, reason=str(e), payload=payload)
         return _bad(str(e), 400)
 
     job = db.genesis_set_job_status(
