@@ -14,6 +14,7 @@ from screen import frames as screen_frames
 
 SCREEN_WATCH_JOB_KIND = "screen_watch"
 ACTIVATION_PENDING_REASON = "activation_pending"
+LOOP_GUARD_BLOCK_REASON = "proactive_idle_loop"
 
 
 def _clean_runtime_token(raw: object) -> str:
@@ -132,6 +133,8 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
     # enqueue without the screen-heartbeat no-frame gate, but it must not become
     # a user-message/manual wake for downstream contracts.
     manual = False if is_screen_watch else requested_manual
+    loop_guard_blocked = service._proactive_bool(payload, "loop_guard_blocked")
+    loop_guard_reason = _clean_runtime_token(payload.get("loop_guard_reason") or "")
 
     payload_frames = payload.get("frames")
     if explicit_is_heartbeat:
@@ -194,6 +197,8 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
             settings=resolve_settings_v2(settings),
         )
         block_reason = "" if wake_control.accepted else wake_control.reason
+        if not block_reason and not manual and not is_screen_watch and loop_guard_blocked:
+            block_reason = LOOP_GUARD_BLOCK_REASON
         if not block_reason and not manual and not is_screen_watch:
             block_reason = _proactive_v2_auto_wake_block_reason(
                 trigger,
@@ -260,6 +265,8 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
             "llm_error": "",
             "activation_pending": activation_pending,
             "mechanical_block": block_reason,
+            "loop_guard_blocked": loop_guard_blocked,
+            "loop_guard_reason": loop_guard_reason,
             "memory_context": {
                 "identity_loaded": False,
                 "memory_count": 0,

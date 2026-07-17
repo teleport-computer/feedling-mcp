@@ -80,6 +80,7 @@
 | slug | 状态码 | blame | 说明 | 需本地化 |
 |---|---|---|---|---|
 | `already_answered` | 409 | — | 静默处理，不弹窗 | ✅ |
+| `content_pk_fpr_mismatch` | 409 | — | 信封封的钥 ≠ 当前注册内容钥（写手 whoami 缓存陈旧）；带 `current_public_key_fpr`/`envelope_content_pk_fpr`，写手应刷新 whoami 重封重试 | |
 | `message_not_found` | 404 | — | | ✅ |
 | `user_message_envelope_failed` | 409 | — | | ✅ |
 | `confirmation_required` | 400 | — | 清空聊天 / 账号重置缺确认字段 | |

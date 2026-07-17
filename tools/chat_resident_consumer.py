@@ -102,6 +102,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -129,6 +130,11 @@ except ImportError:
 from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
 from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
 from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
+from chat.reply_language import (
+    format_time_anchor,
+    infer_reply_language_policy,
+    reply_language_system_line,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -234,6 +240,19 @@ USER_MCP_FILE = os.environ.get(
     "USER_MCP_FILE",
     f"/tmp/feedling_user_mcp_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
 )
+# Two CA bundles, deliberately DIFFERENT content — the runtimes' semantics are
+# opposite (spec §2.2): claude's NODE_EXTRA_CA_CERTS ADDS to the trust store,
+# codex's SSL_CERT_FILE REPLACES it. Feeding codex the user-only bundle would
+# strip every public root and break its OpenAI calls. Keyed by the same API-key
+# fingerprint as USER_MCP_FILE so two accounts on one host never share a file.
+USER_MCP_CA_FILE = os.environ.get(
+    "USER_MCP_CA_FILE",
+    f"/tmp/feedling_user_mcp_ca_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
+)
+USER_MCP_CASTORE_FILE = os.environ.get(
+    "USER_MCP_CASTORE_FILE",
+    f"/tmp/feedling_user_mcp_castore_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
+)
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
@@ -282,6 +301,12 @@ PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", 
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
 PROACTIVE_CHAT_FRESH_WINDOW_SEC = int(os.environ.get("PROACTIVE_CHAT_FRESH_WINDOW_SEC", "21600"))
 PROACTIVE_STALE_CHAT_FALLBACK_LIMIT = int(os.environ.get("PROACTIVE_STALE_CHAT_FALLBACK_LIMIT", "2"))
+# Maintenance soft-idle: memory maintenance jobs (capture/dream/migrate) wait for a
+# lull in the conversation — don't start a maintenance model turn within IDLE_SEC of
+# the user's last message ("the user just came back and wants to TALK"), but never
+# defer a job past MAX_DEFER_SEC (a heavy chatter must still get memory upkeep).
+MAINTENANCE_IDLE_SEC = int(os.environ.get("FEEDLING_MAINTENANCE_IDLE_SEC", "300"))
+MAINTENANCE_MAX_DEFER_SEC = int(os.environ.get("FEEDLING_MAINTENANCE_MAX_DEFER_SEC", "7200"))
 CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "160"))
 CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
 CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
@@ -306,12 +331,17 @@ IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_image
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
-# Foreground chat continuity. codex has no --resume and the hosted claude command
-# carries no session, so those drivers otherwise forget everything after the first
-# turn. When active we prepend a short recent-chat transcript to each foreground
-# turn so continuity does not depend on the agent's own (missing/fragile) session.
-#   auto (default) — inject only for codex / claude (drivers with no reliable
-#                    cross-turn memory); pi resumes natively and is skipped.
+# Foreground chat continuity. codex has no --resume and the HOSTED claude command
+# carries no durable session, so those runs otherwise forget everything after the
+# first turn. When active we prepend a short recent-chat transcript to each
+# foreground turn so continuity does not depend on the agent's own session.
+#   auto (default) — inject for codex always, and for claude only when HOSTED
+#                    (in-CVM run, no durable session store). A self-hosted
+#                    resident's local claude has a reliable --resume and keeps
+#                    its persistent session instead — injecting there replaced
+#                    the session with a cold start per turn (7f3ff266 fallout;
+#                    boot-ritual personas then replay their arrival greeting on
+#                    every message). pi resumes natively and is skipped.
 #   on/always      — inject for every driver (escape hatch).
 #   off            — never inject; claude falls back to its --resume path.
 FOREGROUND_CHAT_CONTEXT_MODE = os.environ.get(
@@ -323,7 +353,11 @@ FOREGROUND_CHAT_CONTEXT_MODE = os.environ.get(
 FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "50"))
 FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
     "FEEDLING_FOREGROUND_CHAT_CONTEXT_HEADER",
-    "[最近对话记录 — 仅供你保持连续；最后那条用户消息才是此刻要回应的]",
+    # 反开机仪式护栏:注入路径下每轮都是新模型会话,自带"唤醒仪式"的 persona
+    # (CLAUDE.md 里写了"启动先读记忆/报到")会把每条消息当成重逢报到,只回
+    # "来了/在了"(usr_c190 2026-07-16)。明确告知这是进行中对话,不是开机。
+    "[最近对话记录 — 仅供你保持连续。这是一段进行中对话的下一轮,不是新会话的开始:"
+    "跳过任何启动/读记忆/报到/自我介绍仪式,直接回应最后那条用户消息]",
 )
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
@@ -363,6 +397,13 @@ WHOAMI_REFRESH_RETRY_DELAY_SEC = float(os.environ.get("WHOAMI_REFRESH_RETRY_DELA
 # derived and stable across compose rotations), so re-fetching before every
 # reply just adds a reentrant backend round-trip under load. 0 = always refresh.
 WHOAMI_REFRESH_TTL_SEC = float(os.environ.get("WHOAMI_REFRESH_TTL_SEC", "300"))
+# Hard ceiling on how old the cached whoami keys may be when a refresh fails
+# and the encrypted-reply path falls back to them. Unbounded fallback is how
+# usr_f13f's consumer sealed two days of replies to a retired content key
+# (whoami chronically failing → startup-era cache used forever). Past this
+# age the reply write is skipped loudly instead of sealing to a key the
+# device may no longer hold. 3600s ≈ 12 consecutive failed refreshes.
+WHOAMI_STALE_KEYS_MAX_AGE_SEC = float(os.environ.get("WHOAMI_STALE_KEYS_MAX_AGE_SEC", "3600"))
 
 # Provider payment (HTTP 402 / out-of-credits) circuit breaker. After a provider
 # payment failure, pause PROACTIVE agent calls for this window so a broke key
@@ -390,6 +431,66 @@ def _note_provider_payment_failure() -> None:
 def _clear_provider_payment_cooldown() -> None:
     global _provider_payment_cooldown_until
     _provider_payment_cooldown_until = 0.0
+
+
+# --- Proactive idle-loop guard + failure backoff (Seven 2026-07-16) -----------
+# The agent can self-schedule wakes ("check on them again soon"); a self-
+# sustaining loop (schedule -> wake -> post "(在)" -> schedule -> ...) floods the
+# user with no new input. Two consumer-side brakes, on top of the backend's
+# schedule_wake min-lead floor:
+#   1. Idle-loop guard: after N consecutive proactive (non-user-driven) sends
+#      with NO intervening user message, stand down — tell the gate via
+#      loop_guard_blocked (blocks the heartbeat tick enqueue) AND skip realizing
+#      further idle proactive jobs (covers the scheduled-wake fire lane, which
+#      does not pass through the tick gate) — until the user speaks again.
+#   2. Failure backoff: any consecutive proactive realization failure backs off
+#      exponentially (the 402 payment cooldown stays as its own special case for
+#      messaging, but also feeds this general backoff).
+# A blunt hourly cap was deliberately NOT used (Seven): users who want frequent
+# proactive messages are legitimate; only a genuinely input-less loop is stopped.
+MAX_EMPTY_PROACTIVE_TURNS = int(os.environ.get("FEEDLING_MAX_EMPTY_PROACTIVE_TURNS", "2"))
+PROACTIVE_FAIL_BACKOFF_BASE_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60"))
+PROACTIVE_FAIL_BACKOFF_CAP_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600"))
+_proactive_empty_streak: int = 0
+_proactive_fail_streak: int = 0
+_proactive_backoff_until: float = 0.0
+
+
+def _proactive_idle_guard_tripped() -> bool:
+    return MAX_EMPTY_PROACTIVE_TURNS > 0 and _proactive_empty_streak >= MAX_EMPTY_PROACTIVE_TURNS
+
+
+def _note_idle_proactive_send() -> None:
+    """An idle proactive turn was realized with no new user input since the last
+    one — advance the empty streak toward the guard."""
+    global _proactive_empty_streak
+    _proactive_empty_streak += 1
+
+
+def _reset_proactive_idle_guard() -> None:
+    """The user spoke (new input) — the loop is not idle; allow proactive again."""
+    global _proactive_empty_streak
+    _proactive_empty_streak = 0
+
+
+def _proactive_backing_off() -> bool:
+    return PROACTIVE_FAIL_BACKOFF_BASE_SEC > 0 and _proactive_backoff_until > time.monotonic()
+
+
+def _note_proactive_failure() -> None:
+    global _proactive_fail_streak, _proactive_backoff_until
+    _proactive_fail_streak += 1
+    delay = min(
+        PROACTIVE_FAIL_BACKOFF_BASE_SEC * (2 ** (_proactive_fail_streak - 1)),
+        PROACTIVE_FAIL_BACKOFF_CAP_SEC,
+    )
+    _proactive_backoff_until = time.monotonic() + delay
+
+
+def _clear_proactive_failure() -> None:
+    global _proactive_fail_streak, _proactive_backoff_until
+    _proactive_fail_streak = 0
+    _proactive_backoff_until = 0.0
 
 # --- agent turn error classification (spec: docs/superpowers/specs/
 # 2026-07-06-upstream-error-surfacing-design.md) ---------------------------
@@ -3836,16 +3937,23 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     """Whether foreground turns get a resident-injected recent-chat transcript.
 
     Gated so we don't double up context for agents that already carry it:
-    codex (no --resume) and claude (hosted command has no session; its scrape +
-    --resume continuity is unreliable) inject every turn in ``auto``. pi resumes
-    natively, so it injects only ONCE per session — on the first foreground turn of
-    a session that has not been bridged yet (see _agent_session_is_bridged).
+    codex (no --resume) injects every turn in ``auto``. claude injects only when
+    HOSTED (in-CVM, no durable session store — its scrape + --resume continuity
+    is unreliable there); a self-hosted resident's local claude has a reliable
+    --resume, so it keeps its persistent session and never injects in ``auto``
+    — injection would suppress --resume (see _prepare_cli_command) and cold-
+    start a fresh model session on EVERY message, which made boot-ritual
+    personas replay their arrival greeting per turn (the "来了" loop,
+    usr_c190 2026-07-16; regression introduced by 7f3ff266). pi resumes
+    natively, so it injects only ONCE per session — on the first foreground turn
+    of a session that has not been bridged yet (see _agent_session_is_bridged).
     ``on``/``always`` forces it for any driver; ``off`` disables.
 
     A claude command that ALREADY carries its own continuity in the operator's
-    template (``--resume`` / ``-r`` / ``--session-id``) is skipped in ``auto`` too:
-    it has native session, so a resident transcript would double-supply context.
-    The hosted default claude command has none of these, so it still injects."""
+    template (``--resume`` / ``-r`` / ``--session-id``) is skipped in ``auto``
+    too: it has native session, so a resident transcript would double-supply
+    context. The hosted default claude command has none of these, so it still
+    injects."""
     mode = FOREGROUND_CHAT_CONTEXT_MODE
     if mode in {"0", "false", "off", "no", "none", "disabled"}:
         return False
@@ -3855,7 +3963,9 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     if _is_codex_cmd(cmd):
         return True
     if _is_claude_code_cmd(cmd):
-        return not (_has_cli_resume(cmd) or _has_claude_session_id(cmd))
+        if _has_cli_resume(cmd) or _has_claude_session_id(cmd):
+            return False
+        return _HOSTED
     if _is_pi_cmd(cmd):
         # pi resumes natively, so inside one session re-feeding the transcript is pure
         # waste. But every NEW session starts blank — rotation (AGENT_SESSION_MAX_TURNS),
@@ -4073,6 +4183,42 @@ def _strip_cli_option_value(cmd: list[str], flags: set[str]) -> tuple[list[str],
     return out, removed
 
 
+def _strip_missing_mcp_config(cmd: list[str]) -> tuple[list[str], str | None]:
+    """Drop a ``--mcp-config <path>`` pair when ``<path>`` does not exist.
+
+    A hard-coded ``--mcp-config`` pointing at a file the consumer never
+    materialized — e.g. an operator wrote a literal ``C:\\Users\\...`` path
+    instead of the ``{mcp}`` placeholder and has no enabled MCP servers — makes
+    claude exit 1 on every foreground turn ("Invalid MCP configuration: MCP
+    config file not found"), which silently kills chat replies while background
+    proactive turns (which omit ``--mcp-config``) keep running. ``{mcp}`` is the
+    sanctioned mechanism (empty when there are no servers, a materialized file
+    when there are). When the referenced file is genuinely absent we drop the
+    flag so the agent starts with no user MCP servers, and warn the operator to
+    switch to ``{mcp}``. A present, operator-managed file is left untouched.
+    """
+    out: list[str] = []
+    stripped: str | None = None
+    i = 0
+    while i < len(cmd):
+        token = cmd[i]
+        if token == "--mcp-config" and i + 1 < len(cmd):
+            path = cmd[i + 1]
+            if not path.startswith("-") and not os.path.exists(path):
+                stripped = path
+                i += 2
+                continue
+        elif token.startswith("--mcp-config="):
+            path = token[len("--mcp-config="):]
+            if path and not os.path.exists(path):
+                stripped = path
+                i += 1
+                continue
+        out.append(token)
+        i += 1
+    return out, stripped
+
+
 def _strip_cli_flags(cmd: list[str], flags: set[str]) -> tuple[list[str], bool]:
     out: list[str] = []
     removed = False
@@ -4158,6 +4304,16 @@ def _prepare_cli_command(
         rendered_message = _message_for_agent(message, image_paths)
     cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths, lane=lane)
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
+
+    cmd, missing_mcp = _strip_missing_mcp_config(cmd)
+    if missing_mcp:
+        log.warning(
+            "dropped --mcp-config %s from AGENT_CLI_CMD: file not found, so the "
+            "CLI agent would exit 1 ('Invalid MCP configuration'). Use the {mcp} "
+            "placeholder instead of a hard-coded path — it resolves to empty when "
+            "you have no MCP servers and to the materialized file when you do.",
+            missing_mcp,
+        )
 
     if _is_hermes_chat_cmd(cmd):
         cmd, removed_continue = _strip_hermes_continue(cmd)
@@ -4516,6 +4672,17 @@ def _turn_content_bytes(cmd: list[str], stdout: str, stderr: str = "") -> int:
     return transport
 
 
+# claude's "the --resume id no longer exists" failure shape. The stored sid can
+# go stale when something OUTSIDE the consumer removes claude's local session
+# store (cache cleanup, moved home, reinstalled CLI) — the consumer's own
+# bounds/cwd rotation can't see that, so without healing EVERY subsequent turn
+# fails on the same dead --resume until someone deletes the sid file by hand.
+_CLAUDE_MISSING_SESSION_RE = re.compile(
+    r"no conversation found|session.{0,24}not found|not found.{0,24}session",
+    re.I,
+)
+
+
 def call_agent_cli(
     message: str,
     image_paths: list[str] | None = None,
@@ -4543,6 +4710,7 @@ def call_agent_cli(
                       explain="模型调用发起（" + ("pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude")) + "）",
                       content_excerpt={"prompt_head": (message or "")[:1000]})
     child_env = os.environ.copy()
+    child_env.update(_user_mcp_ca_env(cmd))
     if trace_id:
         child_env["FEEDLING_TRACE_ID"] = trace_id
         child_env["FEEDLING_DEBUG_TRACE_ID"] = trace_id
@@ -4662,6 +4830,54 @@ def call_agent_cli(
             received_bytes=_turn_content_bytes(cmd, result.stdout or "", result.stderr or ""),
         )
 
+    if result.returncode != 0:
+        # Self-heal a stale claude --resume ONCE per turn: when the local claude
+        # session store lost the sid we resumed into (missing-session signature
+        # + the failing --resume value is OUR stored sid), clear the sid and
+        # retry the same turn fresh — otherwise every turn from here on fails on
+        # the same dead --resume. Strictly scoped: claude only, signature only,
+        # own-sid only (an operator-pinned foreign --resume is their config, not
+        # ours to rotate), single retry (the retry command carries no --resume,
+        # so this branch cannot re-enter).
+        _resume_sid = _cli_flag_value(cmd, "--resume") or _cli_flag_value(cmd, "-r")
+        if (
+            _is_claude_code_cmd(cmd)
+            and _resume_sid
+            and _resume_sid == _load_agent_session_id()
+            and _CLAUDE_MISSING_SESSION_RE.search(raw_transport)
+        ):
+            _clear_agent_session_id(
+                f"claude --resume session missing upstream: "
+                f"{_cli_error_detail(result.stdout or '', result.stderr or '')[:160]}"
+            )
+            log.warning(
+                "stale claude --resume sid=%s: local session store no longer has it; "
+                "retrying this turn once with a fresh session", _resume_sid,
+            )
+            _emit_debug_trace(
+                "agent", "agent.session.stale_resume_retry", trace_id=trace_id,
+                summary="stale --resume cleared; single fresh-session retry",
+                explain="claude 本地会话丢失(--resume 指向不存在的会话)——已清除并用新会话重试本轮",
+            )
+            cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+            command_sid = _cli_flag_value(cmd, "--session-id")
+            result = subprocess.run(cmd, **_run_kwargs)
+            _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
+            raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+            # Persist the fresh session so the NEXT turn resumes it — but ONLY
+            # from a SUCCESSFUL retry: claude's failure result JSON can still
+            # carry a session_id, and saving that would re-persist a sid for a
+            # failed session right after we cleared the stale one — the next
+            # turn would --resume straight back into a dead session.
+            if result.returncode == 0:
+                observed_sid = _extract_session_id(raw_transport) or command_sid
+                if observed_sid:
+                    _save_agent_session_id(observed_sid)
+                    _record_agent_session_turn(
+                        observed_sid,
+                        sent_bytes=len((message or "").encode("utf-8")),
+                        received_bytes=_turn_content_bytes(cmd, result.stdout or "", result.stderr or ""),
+                    )
     if result.returncode != 0:
         raise RuntimeError(
             f"cli agent exited {result.returncode}: "
@@ -4964,8 +5180,9 @@ def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = No
 
 def _foreground_agent_message(content: str, *, current_ts: float) -> str:
     """Prepend a recent-chat transcript to a foreground turn when the active
-    driver has no reliable session of its own (codex / claude). Returns ``content``
-    unchanged when injection is disabled or no prior context is available."""
+    driver has no reliable session of its own (codex / hosted claude). Returns
+    ``content`` unchanged when injection is disabled or no prior context is
+    available."""
     if not _foreground_history_injection_enabled():
         return content
     transcript = _recent_chat_context_for_foreground(before_ts=current_ts)
@@ -5199,10 +5416,18 @@ def _whoami_cache_has_full_keys(cache: dict | None = None) -> bool:
 def _refresh_whoami_for_encrypted_reply() -> bool:
     previous = dict(_whoami_cache)
     # Skip the network refresh while cached keys are fresh (see WHOAMI_REFRESH_TTL_SEC).
+    # The shortcut must not outlive the stale-keys hard ceiling: with the cap
+    # configured below the TTL, a cache older than the cap needs a real refresh
+    # attempt (and, failing that, the over-age fallback below refuses it).
+    cache_age = time.monotonic() - _whoami_cache_loaded_at
+    within_stale_cap = (
+        WHOAMI_STALE_KEYS_MAX_AGE_SEC <= 0 or cache_age < WHOAMI_STALE_KEYS_MAX_AGE_SEC
+    )
     if (
         WHOAMI_REFRESH_TTL_SEC > 0
+        and within_stale_cap
         and _whoami_cache_has_full_keys()
-        and (time.monotonic() - _whoami_cache_loaded_at) < WHOAMI_REFRESH_TTL_SEC
+        and cache_age < WHOAMI_REFRESH_TTL_SEC
     ):
         return True
     if _load_whoami_with_retries(
@@ -5215,6 +5440,23 @@ def _refresh_whoami_for_encrypted_reply() -> bool:
     if not _whoami_cache_has_encryption_keys() and _whoami_cache_has_encryption_keys(previous):
         _whoami_cache.update(previous)
     if _whoami_cache_has_encryption_keys():
+        # Bounded fallback: a cache this old may predate a key rotation, and
+        # sealing to a retired key stores ciphertext the device can never open
+        # (each row then needs a client-triggered rewrap to repair). Better to
+        # skip the write loudly. loaded_at==0 means the keys never came from a
+        # full whoami success (partial-keys edge) — age unknowable, keep the
+        # historical allow.
+        age = time.monotonic() - _whoami_cache_loaded_at
+        if _whoami_cache_loaded_at > 0 and age > WHOAMI_STALE_KEYS_MAX_AGE_SEC:
+            log.error(
+                "whoami refresh failed and cached keys are %.0fs old (max %s); "
+                "refusing to seal with possibly-rotated keys user_id=%s user_pk=%s",
+                age,
+                WHOAMI_STALE_KEYS_MAX_AGE_SEC,
+                _whoami_cache.get("user_id") or "",
+                _fingerprint_bytes(_whoami_cache.get("user_pk")),
+            )
+            return False
         log.warning(
             "whoami refresh failed before encrypted reply; using cached keys user_id=%s user_pk=%s enclave_pk=%s",
             _whoami_cache.get("user_id") or "",
@@ -5313,6 +5555,116 @@ def _decrypt_envelope(envelope: dict) -> bytes:
     return base64.b64decode(resp.json()["plaintext_b64"])
 
 
+def _atomic_write_text(path: str, content: str, mode: int = 0o600) -> None:
+    """Write ``content`` to ``path`` atomically via a same-directory temp file
+    + ``os.replace()``. ``replace()`` is atomic on a single filesystem, so a
+    reader can never observe a half-written file — critical for
+    USER_MCP_CASTORE_FILE, whose REPLACE semantics for codex's SSL_CERT_FILE
+    mean a truncated file kills ALL of codex's outbound TLS, not just the
+    user's MCP server.
+
+    On any failure (disk full, permission, SIGKILL mid-write, two consumers
+    racing the same path) the caller gets the exception and the target path
+    is left exactly as it was before the call — never a partial write. The
+    temp file is best-effort cleaned up either way.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _write_user_mcp_ca(servers: list[dict]) -> None:
+    """Materialize the two CA bundles. See USER_MCP_CA_FILE for why there are two.
+
+    Fail open (spec §9): if the public bundle can't be read, or either file
+    can't be written to disk WITHOUT truncation (ENOSPC, SIGKILL mid-write,
+    two consumers racing the same path — this repo has a split-brain-
+    supervisor history), we leave that file ABSENT rather than risk a partial
+    one landing. Losing one MCP server beats replacing the user's whole trust
+    store with a truncated bundle — codex's SSL_CERT_FILE is REPLACE, not
+    ADD, so a half-written castore kills every outbound TLS connection codex
+    makes, including its calls to OpenAI itself.
+
+    Both files are written via ``_atomic_write_text`` (temp file + rename) so
+    a reader never observes a half-written file, even across a crash.
+    """
+    import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
+    bundle = _m.ca_bundle_pem(servers)
+    if not bundle:
+        for p in (USER_MCP_CA_FILE, USER_MCP_CASTORE_FILE):
+            Path(p).unlink(missing_ok=True)
+        return
+    try:
+        _atomic_write_text(USER_MCP_CA_FILE, bundle)
+    except Exception as e:  # noqa: BLE001 — fail open, never break claude's launch
+        Path(USER_MCP_CA_FILE).unlink(missing_ok=True)
+        log.warning("[user_mcp] ca file write failed, claude gets no user "
+                    "CA: %s: %s", type(e).__name__, e)
+    try:
+        import certifi  # noqa: PLC0415
+        system_ca = Path(certifi.where()).read_text()
+    except Exception as e:  # noqa: BLE001 — fail open, never break agent TLS
+        Path(USER_MCP_CASTORE_FILE).unlink(missing_ok=True)
+        log.warning("[user_mcp] castore skipped, codex keeps native trust "
+                    "store: %s: %s", type(e).__name__, e)
+        return
+    try:
+        _atomic_write_text(
+            USER_MCP_CASTORE_FILE, system_ca.rstrip("\n") + "\n" + bundle)
+    except Exception as e:  # noqa: BLE001 — fail open (spec §9): a truncated
+        # castore is strictly worse than a missing one.
+        Path(USER_MCP_CASTORE_FILE).unlink(missing_ok=True)
+        log.warning("[user_mcp] castore write failed, codex keeps native "
+                    "trust store: %s: %s", type(e).__name__, e)
+
+
+def _user_mcp_ca_env(cmd: list[str]) -> dict:
+    """Per-runtime CA env for one turn. Empty dict = inject nothing.
+
+    Gates on the in-memory ``_user_mcp_applied`` state first — the same
+    source of truth ``_user_mcp_cli_value`` uses — not just on-disk file
+    existence. A stale CA/castore file can outlive the servers it was
+    written for: e.g. the user deletes every MCP server while the consumer
+    is down; on restart ``_user_mcp_applied`` starts fresh/empty but the old
+    files are still sitting in /tmp from the previous run, and
+    ``_maybe_apply_user_mcp`` early-returns without re-materializing because
+    the advertised fingerprint ("") already matches the fresh applied state
+    ("").  ``Path.exists()`` alone can't tell "stale but still correct" from
+    "the user removed this" — the in-memory state can.
+
+    Never set an empty value: an unset var leaves the runtime on its own trust
+    store, which is the correct no-CA behavior.
+    """
+    if _is_pi_cmd(cmd):
+        return {}          # pi: route abandoned (v2 spec §1), no CA surface
+    enabled_servers = [
+        s for s in _user_mcp_applied.get("servers") or [] if s.get("enabled")
+    ]
+    if not enabled_servers:
+        return {}
+    if _is_codex_cmd(cmd):
+        if Path(USER_MCP_CASTORE_FILE).exists():
+            return {"SSL_CERT_FILE": USER_MCP_CASTORE_FILE}   # REPLACES → concat bundle
+        return {}
+    if Path(USER_MCP_CA_FILE).exists():
+        return {"NODE_EXTRA_CA_CERTS": USER_MCP_CA_FILE}      # ADDS → user CA only
+    return {}
+
+
 def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
     """Write the decrypted server list to disk in every shape a runtime might
     read. Bare import (not ``from tools import ...``) because at runtime the
@@ -5345,6 +5697,7 @@ def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
             os.chmod(config_path, 0o600)  # holds plaintext MCP headers/token
         elif config_path.exists():
             config_path.unlink()
+    _write_user_mcp_ca(servers)
 
 
 def _maybe_apply_user_mcp() -> None:
@@ -5364,6 +5717,7 @@ def _maybe_apply_user_mcp() -> None:
                 servers.append({
                     "name": srv["name"], "enabled": bool(srv.get("enabled")),
                     "url": secret["url"], "headers": secret.get("headers") or {},
+                    "ca_pem": secret.get("ca_pem") or "",
                 })
         # Union of the previously-applied and newly-advertised server names:
         # anything just removed still needs its old allow rule pruned, while
@@ -5653,6 +6007,11 @@ def execute_scheduled_wake_actions(actions: list[dict], job: dict) -> dict:
         "turn_id": str(job.get("job_id") or ""),
         "wake_ids": _job_wake_ids(job),
         "origin_refs": _job_origin_refs(job),
+        # This path only ever carries the agent's OWN proactive self-wakes
+        # ("check on them again soon"), so the backend min-lead floor applies.
+        # A user-requested reminder would arrive without this marker and must
+        # NOT be clamped (Seven 2026-07-16: floor self-wakes only).
+        "self_wake": True,
     }
     resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/proactive/scheduled/actions",
@@ -5704,65 +6063,91 @@ def post_reply(
 
     user_id = _whoami_cache["user_id"]
     user_pk: bytes | None = _whoami_cache["user_pk"]
-    enc_pk: bytes | None = _whoami_cache["enclave_pk"]
 
     if _ENCRYPTION_AVAILABLE and user_id and user_pk:
-        visibility = "shared" if enc_pk else "local_only"
-        envelope = _build_envelope(
-            plaintext=content.encode("utf-8"),
-            owner_user_id=user_id,
-            user_pk_bytes=user_pk,
-            enclave_pk_bytes=enc_pk,
-            visibility=visibility,
-        )
-        thinking_envelope = None
-        safe_thinking = _sanitize_thinking_summary(thinking_summary)
-        if safe_thinking:
-            thinking_envelope = _build_envelope(
-                plaintext=safe_thinking.encode("utf-8"),
-                owner_user_id=user_id,
-                user_pk_bytes=user_pk,
-                enclave_pk_bytes=enc_pk,
+        def _sealed_body() -> dict[str, Any]:
+            # Reads the whoami cache fresh on every call so the fpr-mismatch
+            # retry below re-seals with the just-refreshed key.
+            seal_user_id = _whoami_cache["user_id"]
+            seal_user_pk: bytes = _whoami_cache["user_pk"]
+            seal_enc_pk: bytes | None = _whoami_cache["enclave_pk"]
+            visibility = "shared" if seal_enc_pk else "local_only"
+            envelope = _build_envelope(
+                plaintext=content.encode("utf-8"),
+                owner_user_id=seal_user_id,
+                user_pk_bytes=seal_user_pk,
+                enclave_pk_bytes=seal_enc_pk,
                 visibility=visibility,
             )
-        visible_body = "" if suppress_push else content[:240]
-        body: dict[str, Any] = {
-            "envelope": envelope,
-            "source": source,
-            "alert_body": visible_body,
-        }
-        if thinking_envelope:
-            body["thinking_envelope"] = thinking_envelope
-            kind = _sanitize_thinking_kind(thinking_kind)
-            if kind:
-                body["thinking_kind"] = kind
-            source_label = _sanitize_thinking_meta(thinking_source, max_len=80)
-            if source_label:
-                body["thinking_source"] = source_label
-            model_label = _sanitize_thinking_meta(thinking_model, max_len=96)
-            if model_label:
-                body["thinking_model"] = model_label
-            if thinking_native is not None:
-                body["thinking_native"] = bool(thinking_native)
-        if role:
-            body["role"] = role
-        if notice_kind:
-            body["notice_kind"] = notice_kind
-        if reply_to_message_id:
-            body["reply_to_message_id"] = reply_to_message_id
-        if gate_decision_id:
-            body["gate_decision_id"] = gate_decision_id
-        if proactive_job_id:
-            body["proactive_job_id"] = proactive_job_id
-        if source == PROACTIVE_JOB_SOURCE and not suppress_push:
-            body["push_live_activity"] = True
-            body["push_body"] = visible_body
-            body["data"] = {
-                "source": PROACTIVE_JOB_SOURCE,
-                "gate_decision_id": gate_decision_id,
-                "proactive_job_id": proactive_job_id,
+            thinking_envelope = None
+            safe_thinking = _sanitize_thinking_summary(thinking_summary)
+            if safe_thinking:
+                thinking_envelope = _build_envelope(
+                    plaintext=safe_thinking.encode("utf-8"),
+                    owner_user_id=seal_user_id,
+                    user_pk_bytes=seal_user_pk,
+                    enclave_pk_bytes=seal_enc_pk,
+                    visibility=visibility,
+                )
+            visible_body = "" if suppress_push else content[:240]
+            body: dict[str, Any] = {
+                "envelope": envelope,
+                "source": source,
+                "alert_body": visible_body,
             }
-        resp = _HTTP.post(url, json=body, headers=_HEADERS, timeout=15)
+            if thinking_envelope:
+                body["thinking_envelope"] = thinking_envelope
+                kind = _sanitize_thinking_kind(thinking_kind)
+                if kind:
+                    body["thinking_kind"] = kind
+                source_label = _sanitize_thinking_meta(thinking_source, max_len=80)
+                if source_label:
+                    body["thinking_source"] = source_label
+                model_label = _sanitize_thinking_meta(thinking_model, max_len=96)
+                if model_label:
+                    body["thinking_model"] = model_label
+                if thinking_native is not None:
+                    body["thinking_native"] = bool(thinking_native)
+            if role:
+                body["role"] = role
+            if notice_kind:
+                body["notice_kind"] = notice_kind
+            if reply_to_message_id:
+                body["reply_to_message_id"] = reply_to_message_id
+            if gate_decision_id:
+                body["gate_decision_id"] = gate_decision_id
+            if proactive_job_id:
+                body["proactive_job_id"] = proactive_job_id
+            if source == PROACTIVE_JOB_SOURCE and not suppress_push:
+                body["push_live_activity"] = True
+                body["push_body"] = visible_body
+                body["data"] = {
+                    "source": PROACTIVE_JOB_SOURCE,
+                    "gate_decision_id": gate_decision_id,
+                    "proactive_job_id": proactive_job_id,
+                }
+            return body
+
+        resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
+        if _is_fpr_mismatch_response(resp):
+            # The backend bounced the envelope: our cached user pk is no longer
+            # the registered content key (rotated since the last whoami). Force
+            # a fresh whoami (ignore the TTL) and re-seal + retry ONCE. A second
+            # bounce falls through to _handle_post_reply_response's normal
+            # raise so the caller's error handling applies.
+            log.warning(
+                "chat_response bounced: content_pk_fpr_mismatch (sealed=%s current=%s); "
+                "refreshing whoami and re-sealing once",
+                (resp.json() or {}).get("envelope_content_pk_fpr", ""),
+                (resp.json() or {}).get("current_public_key_fpr", ""),
+            )
+            if _load_whoami_with_retries(
+                attempts=WHOAMI_REFRESH_RETRIES,
+                delay_sec=WHOAMI_REFRESH_RETRY_DELAY_SEC,
+                context="stale-key reseal",
+                backoff_multiplier=2.0,
+            ) and _whoami_cache.get("user_pk"):
+                resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
 
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
@@ -5792,6 +6177,19 @@ def post_reply(
         headers=_HEADERS, timeout=15,
     )
     return _handle_post_reply_response(resp)
+
+
+def _is_fpr_mismatch_response(resp) -> bool:
+    """The backend's stale-key bounce: the envelope was sealed to a key that is
+    no longer the user's registered content key (see chat_core
+    ``content_pk_fpr_mismatch``)."""
+    if resp.status_code != 409:
+        return False
+    try:
+        body = resp.json()
+    except Exception:
+        return False
+    return isinstance(body, dict) and body.get("error") == "content_pk_fpr_mismatch"
 
 
 def _handle_post_reply_response(resp) -> dict:
@@ -6373,7 +6771,7 @@ def _message_for_proactive_job(
             f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
             f"- screen_context_available: {str(screen_available).lower()}"
         ),
-        _local_time_anchor(since_sec=chat_context.last_user_message_age_sec),
+        _local_time_anchor(since_sec=chat_context.last_user_message_age_sec, presence=presence),
         _proactive_attention_facts(chat_context),
         _native_reachout_tool_instructions(),
     ]
@@ -6415,19 +6813,22 @@ def _reply_protocol_block() -> str:
     ])
 
 
-def _reply_language_line(presence: dict | None = None) -> str:
-    """Anchor the reply language to the user — a proactive wake may have no recent
-    user message to infer it from, so an English prompt must not leak English.
-    Fallback chain: device locale → stored archive_language → 简体中文 (product default)."""
+def _resident_reply_language_policy(presence: dict | None = None):
+    """Resident-side reply-language policy via the shared helper. Resident has no
+    identity-card/memory text in hand (only whoami archive_language + presence
+    locale), so it degrades to the helper's locale → archive_language → default
+    tier — same wording, mirror rule, and time-anchor localization as model_api."""
     locale = str((presence or {}).get("locale") or "").strip()
-    if locale:
-        return f"Always reply in the user's own language (their locale is {locale})."
     archive_language = str(_whoami_cache.get("archive_language") or "").strip()
-    if archive_language:
-        return f"Always reply in the user's own language (their language is {archive_language})."
-    # 既无设备 locale 也无存储的语言偏好（空语境/刚铸的新号）——裸的
-    # "user's own language" 会让模型默认英文。产品主用户群为中文，默认简体中文。
-    return "默认用简体中文回复，除非用户明显在使用其它语言。"
+    return infer_reply_language_policy({}, [], locale=locale, archive_language=archive_language)
+
+
+def _reply_language_line(presence: dict | None = None) -> str:
+    """The shared zh/en reply-language policy line (a default language + a soft
+    mirror of the user's latest-message language). Wired into both the proactive
+    wakes and the foreground reply so the model stops drifting to Chinese when the
+    user is in an English context."""
+    return reply_language_system_line(_resident_reply_language_policy(presence))
 
 
 def _native_reachout_tool_instructions() -> str:
@@ -6561,32 +6962,23 @@ def _user_timezone() -> str:
 _DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
 
 
-def _local_time_anchor(since_sec: float | None = None) -> str:
+def _local_time_anchor(since_sec: float | None = None, presence: dict | None = None) -> str:
     """A reliable 'current local time' line for the agent. Uses the consumer's
     real clock (never stale) + the user's timezone, falling back to the China
     default when the zone is unknown (never a silent UTC clock). The zone is
-    ALWAYS labelled, and marked (默认) on the fallback so the agent knows to
-    trust the user's stated time on any mismatch. Optionally appends how long
-    since the last interaction so the agent notices an overnight gap."""
+    ALWAYS labelled, and marked (默认 / default) on the fallback. Optionally appends
+    how long since the last interaction so the agent notices an overnight gap.
+    Localized (zh/en) via the shared reply-language policy — an English-mode user
+    must not get a Chinese time line as the first block of every turn."""
     from datetime import datetime, timezone as _tzmod
     tzs = _user_timezone()
     is_default = not tzs
     zone = tzs or _DEFAULT_TIMEZONE
-    local = datetime.now(_tzmod.utc)
-    try:
-        from zoneinfo import ZoneInfo
-        local = local.astimezone(ZoneInfo(zone))
-    except Exception:
-        zone = "UTC"  # zoneinfo missing / bad zone — degrade transparently, still labelled
-    h = local.hour
-    seg = "凌晨" if h < 6 else "上午" if h < 12 else "中午" if h < 14 else "下午" if h < 18 else "晚上"
-    body = f"{local.strftime('%Y-%m-%d')} {_WEEKDAYS_ZH[local.weekday()]} {local.strftime('%H:%M')} {seg}"
-    body += f" {zone}" + ("（默认·未获取到设备时区）" if is_default else "")
-    line = f"current_time: {body}"
-    if since_sec is not None and since_sec >= 1800:  # only note gaps >= 30 min
-        gap = _format_age(since_sec).replace(" ago", " 前")
-        line += f" (距上次互动 {gap})"
-    return line
+    policy = _resident_reply_language_policy(presence)
+    return format_time_anchor(
+        datetime.now(_tzmod.utc), zone, policy,
+        since_sec=since_sec, timezone_default=is_default,
+    )
 
 
 def _prepend_time_anchor_foreground(content: str, msg_unix_ts: float) -> str:
@@ -6599,7 +6991,9 @@ def _prepend_time_anchor_foreground(content: str, msg_unix_ts: float) -> str:
         since = msg_unix_ts - _last_interaction_unix
     if msg_unix_ts > _last_interaction_unix:
         _last_interaction_unix = msg_unix_ts
-    return f"[{_local_time_anchor(since_sec=since)}]\n\n{content}"
+    # Time anchor + reply-language policy line (both from the same policy, so they
+    # never disagree). The language line was previously wired only into proactive.
+    return f"[{_local_time_anchor(since_sec=since)}]\n\n{_reply_language_line()}\n\n{content}"
 
 
 def _resident_perception_digest_board() -> tuple[list, dict]:
@@ -7621,6 +8015,28 @@ def _process_proactive_jobs(jobs: list) -> float:
             len(frame_ids),
         )
 
+        # Idle-loop guard + failure backoff apply only to genuine idle proactive
+        # turns — never to the first-greeting introduction or the screen-watch
+        # lane (the latter is user-activity-driven and gated separately).
+        is_idle_proactive = not is_introduction and not _is_screen_watch_job(job)
+        if is_idle_proactive and _proactive_backing_off():
+            log.warning(
+                "proactive job skipped — backing off after failures; job_id=%s", job_id
+            )
+            update_proactive_job_status(
+                job_id, "skipped", "proactive_backoff: cooling down after failures"
+            )
+            continue
+        if is_idle_proactive and _proactive_idle_guard_tripped():
+            log.info(
+                "proactive job skipped — idle loop guard (no new user input); job_id=%s",
+                job_id,
+            )
+            update_proactive_job_status(
+                job_id, "skipped", "proactive_idle_loop: no new user input"
+            )
+            continue
+
         if _provider_payment_cooling_down():
             log.warning(
                 "proactive job skipped — provider payment required (cooling down); job_id=%s",
@@ -7640,6 +8056,7 @@ def _process_proactive_jobs(jobs: list) -> float:
         except Exception as e:
             if _is_provider_payment_error(e):
                 _note_provider_payment_failure()
+                _note_proactive_failure()
                 log.error(
                     "proactive agent call failed — provider payment required; "
                     "cooling down %.0fs: %s",
@@ -7652,10 +8069,12 @@ def _process_proactive_jobs(jobs: list) -> float:
                 _notify_agent_turn_failure(e, foreground=False)
                 continue
             log.error("proactive agent call failed; not posting fallback: %s", e)
+            _note_proactive_failure()
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
             _notify_agent_turn_failure(e, foreground=False)
             continue
         _clear_provider_payment_cooldown()
+        _clear_proactive_failure()
         if _consume_reply_parse_failed():
             # Parse failure means call_agent already swapped agent_result for
             # FALLBACK_REPLY — a foreground-only line ("你稍后再发一次…") that
@@ -7670,6 +8089,8 @@ def _process_proactive_jobs(jobs: list) -> float:
             update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
             continue
         _note_agent_turn_success()
+        if is_idle_proactive:
+            _note_idle_proactive_send()
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
@@ -8037,6 +8458,11 @@ def _process_migrate_jobs(jobs: list) -> float:
 
 _resident_jobs_deferred_for_user = False
 
+# Wall-clock time of the last REAL user message this process routed to the agent
+# (verify pings and re-seen duplicates excluded). Drives the maintenance soft-idle:
+# 0.0 = no user message this process lifetime → maintenance never waits.
+_last_user_message_wall = 0.0
+
 
 def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float:
     """Dispatch background jobs (capture → dream → migrate → proactive) one at
@@ -8067,13 +8493,31 @@ def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float
             ordered.append((3, _process_proactive_jobs, job))
     ordered.sort(key=lambda entry: entry[0])  # stable: keeps arrival order within a class
     latest = 0.0
-    for _, processor, job in ordered:
+    now = time.time()
+    for class_idx, processor, job in ordered:
         if chat_since is not None and _user_chat_pending(chat_since):
             _resident_jobs_deferred_for_user = True
             log.info(
                 "deferring remaining background job(s): user message pending (user-turn priority)"
             )
             break
+        # Maintenance soft-idle: the per-job peek above covers "a message is WAITING";
+        # this covers "the user JUST talked" — don't burn the single-flight turn lock
+        # on memory upkeep in the middle of an active conversation. Skipped jobs are
+        # simply not claimed: maintenance jobs are status-recovered (watermark-exempt)
+        # on the server, so they re-serve on a later poll — no defer flag, no break,
+        # wake-class jobs after them still run this pass. The MAX_DEFER cap stops a
+        # heavy chatter from starving memory maintenance forever.
+        if class_idx < 3 and _last_user_message_wall > 0:
+            job_ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
+            recently_chatting = (now - _last_user_message_wall) < MAINTENANCE_IDLE_SEC
+            deferrable = not job_ts or (now - job_ts) < MAINTENANCE_MAX_DEFER_SEC
+            if recently_chatting and deferrable:
+                log.debug(
+                    "deferring maintenance job (user active %.0fs ago): kind=%s",
+                    now - _last_user_message_wall, job.get("job_kind") or job.get("source"),
+                )
+                continue
         latest = max(latest, processor([job]))
     return latest
 
@@ -8111,6 +8555,7 @@ def _quoted_memory_context(msg: dict) -> str:
 
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
+    global _last_user_message_wall
     latest = 0.0
     for msg in messages:
         # Tolerate both "ts" and "timestamp" key names across API versions.
@@ -8126,6 +8571,15 @@ def _process_messages(messages: list) -> float:
             log.debug("skipping already-processed message key=%s", key)
             latest = max(latest, ts)
             continue
+
+        # A genuine, newly-seen user message (verify_ping liveness probes
+        # excluded) means the loop is not idle and the user is engaged — clear the
+        # proactive idle-loop guard and any failure backoff so proactive resumes,
+        # and stamp the maintenance soft-idle clock (memory upkeep waits for a lull).
+        if msg.get("source") != "verify_ping":
+            _reset_proactive_idle_guard()
+            _clear_proactive_failure()
+            _last_user_message_wall = time.time()
 
         # Synthetic liveness probe from /v1/chat/verify_loop. Identified ONLY
         # by `source`, which the server stamps as "verify_ping" across all
@@ -8504,6 +8958,30 @@ def genesis_resident_heartbeat(job_id: str) -> None:
         log.debug("resident distill heartbeat failed job=%s: %s", job_id, e)
 
 
+def _genesis_resident_lease_alive(job_id: str) -> bool:
+    """STRICT heartbeat, used when resuming a distill job after yielding to chat.
+
+    Yielding can outlast the resident lease if the user keeps chatting; the backend
+    reaper then re-queues the job (or fails it at the attempt cap) — ONLY a 4xx here
+    means our in-memory progress is no longer ours to finish and must be dropped.
+    5xx / network errors are backend transients and report alive: dropping on those
+    would throw away completed map chunks for nothing (best-effort optimism, the
+    reaper stays the backstop — same posture as genesis_resident_heartbeat — and
+    completing a lost job is the same pre-existing race the one-shot pipeline
+    always had)."""
+    try:
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/heartbeat",
+            json={"consumer_id": _RESIDENT_CONSUMER_ID},
+            headers=_HEADERS,
+            timeout=15,
+        )
+        return not (400 <= resp.status_code < 500)
+    except Exception as e:
+        log.debug("resident distill lease check failed job=%s: %s", job_id, e)
+        return True
+
+
 def genesis_resident_complete(job_id: str, *, memory_action_count: int, identity_status: str) -> None:
     resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/complete",
@@ -8657,50 +9135,125 @@ def _resident_memory_snapshot() -> tuple[str, list[str]]:
         return "", []
 
 
-def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = False) -> list[dict]:
-    """Reuse the CLOUD genesis memory engine on the VPS: window → fact_map (per window) →
-    fact_write, driven by the local agent (persist_output=False = no backend DB). Returns
-    cloud-shaped memory dicts {type,bucket,threads,summary,content,importance,pulse} — the
-    SAME code + prompts cloud's add_memory path uses, so the two stay in lockstep.
+def _distill_user_waiting(chat_since: float | None) -> bool:
+    """① user-turn priority for the distill lane: claim-free, non-blocking peek between
+    distill model turns (same _user_chat_pending as the background-job gate). A waiting
+    user message preempts the pipeline at the next turn boundary — the user waits at most
+    ONE model turn, never a whole document. ``chat_since=None`` never yields (legacy)."""
+    return chat_since is not None and _user_chat_pending(chat_since)
+
+
+def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> str:
+    """Advance one memory-mode distill job through the CLOUD genesis engine, one model
+    turn at a time: window → fact_map (per window) → fact_write → recheck → memory.add.
+    Same code + prompts as cloud's add_memory path (persist_output=False = no backend DB),
+    so the two stay in lockstep; returns cloud-shaped memory dicts.
+
+    Resumable: all progress (windows, next window index, accumulated candidates, the
+    one-shot garden snapshot, written memories, phase) lives in ``state`` — when a user
+    message is pending we return "yielded" BETWEEN turns and the caller re-enters here
+    on a later loop iteration, continuing exactly where we stopped: no chunk re-runs,
+    no lost candidates, no duplicate memory writes. Returns "yielded" | "done"; raises
+    on hard errors (caller keeps the legacy leave-to-reaper semantics).
 
     keep_all (A): long-term-memory archive uploads keep facts thoroughly; chat logs stay
     selective. The app entry passes material_kind → we translate it to keep_all here."""
+    from datetime import datetime, timezone as _tzmod
     from genesis import worker as genesis_worker  # lazy: heavy import only when a job runs
     from genesis.llm_client import GenesisLLMClient
     import provider_client
     llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
     runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
     uid = str(_whoami_cache.get("user_id") or "resident")
-    terms_note, known_memories = _resident_memory_snapshot()  # one-shot: fetch once, reuse for whole job
-    candidates: list[dict] = []
-    for idx, window in enumerate(_window_document(document), start=1):
-        out = genesis_worker.build_foreground_output_from_texts(
-            user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:map:{idx}",
-            runtime=runtime, chunk_texts=[window], write_core=False, llm=llm, keep_all=keep_all,
+    job_id = state["job_id"]
+    keep_all = state["material_kind"] == "memory_summary"
+
+    if state["phase"] == "start":
+        # one-shot: garden snapshot + deterministic windowing (HTTP only, no model turn).
+        # Snapshotted into state so a resumed job reuses the SAME dedup context the
+        # first pass saw — not once per window, and not re-fetched after yielding.
+        state["terms_note"], state["known_memories"] = _resident_memory_snapshot()
+        state["windows"] = _window_document(state["document"])
+        state["phase"] = "map"
+
+    if state["phase"] == "map":
+        while state["next_window_idx"] <= len(state["windows"]):
+            if _distill_user_waiting(chat_since):
+                return "yielded"
+            idx = state["next_window_idx"]
+            out = genesis_worker.build_foreground_output_from_texts(
+                user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:map:{idx}",
+                runtime=runtime, chunk_texts=[state["windows"][idx - 1]],
+                write_core=False, llm=llm, keep_all=keep_all,
+            )
+            state["candidates"].extend(
+                [c for c in (out.get("all_fact_candidates") or []) if isinstance(c, dict)]
+            )
+            # Cursor advances ONLY after the window's candidates are safely accumulated,
+            # so a yield/resume boundary can never skip or double-map a window.
+            state["next_window_idx"] = idx + 1
+            genesis_resident_heartbeat(job_id)  # each window is one agent call — keep the lease alive
+        state["phase"] = "write"
+
+    if state["phase"] == "write":
+        if not state["candidates"]:
+            # Nothing mapped → nothing to write/recheck (legacy: early return []).
+            state["memories"] = []
+            state["phase"] = "actions"
+        else:
+            if _distill_user_waiting(chat_since):
+                return "yielded"
+            mem_out = genesis_worker.build_memory_output_from_fact_candidates(
+                user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
+                runtime=runtime, fact_candidates=state["candidates"], llm=llm, keep_all=keep_all,
+                floor_note=_resident_floor_note(),
+                known_memories=state["known_memories"], terms_note=state["terms_note"],
+            )
+            state["memories"] = [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
+            genesis_resident_heartbeat(job_id)
+            state["phase"] = "recheck"
+
+    if state["phase"] == "recheck":
+        if _distill_user_waiting(chat_since):
+            return "yielded"
+        # 收口二次 pass(仅 VPS resident):把原始素材 + 刚写的卡再给 agent,只补真实遗漏、
+        # 按 known_memories 去重、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
+        try:
+            recheck = genesis_worker.build_memory_recheck_from_material(
+                user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:recheck",
+                runtime=runtime, material=state["document"], written_memories=state["memories"], llm=llm,
+            )
+            genesis_resident_heartbeat(job_id)  # recheck is one more agent call — keep the lease alive
+            state["memories"].extend([m for m in (recheck.get("memories") or []) if isinstance(m, dict)])
+        except Exception:
+            log.exception("resident memory recheck failed (non-fatal; keeping first-pass memories)")
+        state["phase"] = "actions"
+
+    # actions: envelope + memory.add + complete — HTTP writes only, no model turn, so
+    # this tail never yields (yielding here would risk double memory.add on resume).
+    occurred_at = datetime.now(_tzmod.utc).isoformat()
+    actions: list[dict] = []
+    for card in state["memories"]:
+        envelope = _capture_build_envelope(
+            card, occurred_at=occurred_at, source="genesis_resident_distill"
         )
-        candidates.extend([c for c in (out.get("all_fact_candidates") or []) if isinstance(c, dict)])
-        genesis_resident_heartbeat(job_id)  # each window is one agent call — keep the lease alive
-    if not candidates:
-        return []
-    mem_out = genesis_worker.build_memory_output_from_fact_candidates(
-        user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
-        runtime=runtime, fact_candidates=candidates, llm=llm, keep_all=keep_all,
-        floor_note=_resident_floor_note(),
-        known_memories=known_memories, terms_note=terms_note,
+        actions.append({
+            "type": "memory.add",
+            "envelope": envelope,
+            "reason": "Distilled from material the user uploaded.",
+            "capture_mode": "genesis_resident_distill",
+            "source_chat_message_ids": [],
+        })
+    if actions:
+        execute_memory_actions(actions)
+    genesis_resident_complete(
+        job_id, memory_action_count=len(actions), identity_status="skipped"
     )
-    memories = [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
-    # 收口二次 pass(仅 VPS resident):把原始素材 + 刚写的卡再给 agent,只补真实遗漏、
-    # 按 known_memories 去重、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
-    try:
-        recheck = genesis_worker.build_memory_recheck_from_material(
-            user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:recheck",
-            runtime=runtime, material=document, written_memories=memories, llm=llm,
-        )
-        genesis_resident_heartbeat(job_id)  # recheck is one more agent call — keep the lease alive
-        memories.extend([m for m in (recheck.get("memories") or []) if isinstance(m, dict)])
-    except Exception:
-        log.exception("resident memory recheck failed (non-fatal; keeping first-pass memories)")
-    return memories
+    log.info(
+        "resident distill done job=%s mode=%s memories=%d identity=%s",
+        job_id, state["mode"], len(actions), "skipped",
+    )
+    return "done"
 
 
 def _resident_existing_identity() -> dict:
@@ -8764,104 +9317,180 @@ def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     return None
 
 
-def _process_resident_distill_once() -> None:
+def _resident_distill_identity(state: dict) -> None:
+    """update_identity: derive once → identity.replace (single model turn + one bounded
+    conflict re-derive). Not chunked, so it is preempted only BEFORE it starts (see the
+    driver); this body is the legacy pipeline verbatim."""
+    job_id = state["job_id"]
+    document = state["document"]
+    identity_status = "skipped"
+    identity_payload = _resident_derive_identity(document, job_id)
+    # base_identity_replaced_at (Task 4) is the P5 concurrency baseline snapshotted
+    # at job-creation time; "" means no baseline (legacy job / no prior identity) —
+    # the backend then skips the check entirely (back-compat). Only a full
+    # init/replace moves replaced_at, so a signature patch/nudge landing while this
+    # job was pending never looks like a conflict here.
+    base_identity_replaced_at = state["base_identity_replaced_at"]
+    conflict_retried = False
+    while identity_payload is not None:
+        try:
+            execute_identity_actions([{
+                "type": "identity.replace",
+                "source": "genesis_resident_distill",
+                "job_id": job_id,
+                "reason": "Distilled identity from material the user uploaded.",
+                "identity": identity_payload,
+                "base_identity_replaced_at": base_identity_replaced_at,
+            }])
+            identity_status = "replaced"
+            break
+        except RuntimeError as e:
+            if "identity_base_stale" not in str(e):
+                raise
+            if conflict_retried:
+                log.error(
+                    "resident distill: identity_base_stale conflict persisted "
+                    "after re-derive job=%s — giving up, skipping identity update",
+                    job_id,
+                )
+                identity_status = "skipped_conflict"
+                break
+            log.warning(
+                "resident distill: identity_base_stale conflict job=%s — "
+                "re-fetching card + re-deriving once",
+                job_id,
+            )
+            conflict_retried = True
+            # _resident_derive_identity re-fetches the existing card internally
+            # (_resident_existing_identity), so this re-call already merges against
+            # whatever full replace won the race — then resubmit with a refreshed
+            # baseline so the retry itself can't spuriously re-conflict.
+            identity_payload = _resident_derive_identity(document, job_id)
+            base_identity_replaced_at = _resident_current_replaced_at()
+    genesis_resident_complete(
+        job_id, memory_action_count=0, identity_status=identity_status
+    )
+    log.info(
+        "resident distill done job=%s mode=%s memories=%d identity=%s",
+        job_id, state["mode"], 0, identity_status,
+    )
+
+
+def _distill_state_for_job(job: dict) -> dict | None:
+    """Decrypt + shape one claimed distill job into a resumable in-memory state.
+    None for malformed jobs (legacy skip). Raises on decrypt failure (caller keeps
+    the legacy leave-to-reaper semantics)."""
+    job_id = str(job.get("job_id") or "").strip()
+    sealed = job.get("sealed") if isinstance(job.get("sealed"), dict) else {}
+    env = sealed.get("envelope") if isinstance(sealed.get("envelope"), dict) else None
+    if not job_id or not env:
+        log.warning("resident distill: skipping malformed job %r", job_id)
+        return None
+    plaintext = _decrypt_sealed_material(env)
+    genesis_resident_heartbeat(job_id)  # claimed + decrypted; distill can be slow
+    return {
+        "job_id": job_id,
+        "mode": str(job.get("mode") or "").strip().lower(),
+        "material_kind": str(job.get("material_kind") or "").strip().lower(),
+        "document": plaintext.decode("utf-8", errors="replace"),
+        "base_identity_replaced_at": str(job.get("base_identity_replaced_at") or ""),
+        # memory-mode pipeline progress (see _resident_distill_advance_memory)
+        "phase": "start",
+        "windows": [],
+        "next_window_idx": 1,
+        "candidates": [],
+        "terms_note": "",
+        "known_memories": [],
+        "memories": [],
+    }
+
+
+# In-memory progress of the distill lane: {"queue": [raw claimed jobs...],
+# "active": <state dict>|None}. None ⇔ nothing claimed/held. IN-MEMORY ONLY by
+# design: no new plaintext ever touches disk; a consumer crash simply drops it and
+# the backend reaper re-queues under the existing attempt cap (unchanged semantics —
+# the retry's known_memories snapshot then already contains previously written cards,
+# so fact_write's prompt-level dedup absorbs the replay, same as today).
+_distill_in_progress: dict | None = None
+
+
+def _process_resident_distill_once(chat_since: float | None = None) -> None:
     """Claim + realize pending resident-distill jobs by REUSING the cloud genesis engine
     (chunk → fact_map → fact_write) with the local agent as the model. Memory is written
-    client-sealed via memory.add; update_identity derives once → identity.replace."""
-    from datetime import datetime, timezone as _tzmod
-    jobs = genesis_resident_pending()
-    for job in jobs:
-        job_id = str(job.get("job_id") or "").strip()
-        mode = str(job.get("mode") or "").strip().lower()
-        material_kind = str(job.get("material_kind") or "").strip().lower()
-        sealed = job.get("sealed") if isinstance(job.get("sealed"), dict) else {}
-        env = sealed.get("envelope") if isinstance(sealed.get("envelope"), dict) else None
-        if not job_id or not env:
-            log.warning("resident distill: skipping malformed job %r", job_id)
-            continue
+    client-sealed via memory.add; update_identity derives once → identity.replace.
+
+    ① user-turn priority: when ``chat_since`` is given, the memory pipeline yields
+    BETWEEN model turns whenever a user message is pending (claim-free peek) — the
+    user waits at most one turn, never a whole document — and this function returns
+    with the job's progress held in ``_distill_in_progress`` to be resumed on a later
+    main-loop iteration. Distillation is never dropped: on resume the held lease is
+    re-heartbeated first (a 4xx means the reaper re-queued it while the user kept
+    chatting — only then is local progress discarded, and the job re-runs normally
+    later). ``chat_since=None`` keeps the legacy run-to-completion behavior."""
+    global _distill_in_progress
+    state = _distill_in_progress
+    if state is None:
+        jobs = genesis_resident_pending()
+        if not jobs:
+            return
+        # genesis_resident_pending CLAIMS up to 4 jobs at once — hold the extras in a
+        # local queue so a yield on job #1 doesn't leave #2-#4 to go lease-stale.
+        state = {"queue": list(jobs), "active": None}
+        _distill_in_progress = state
+    else:
+        # Resuming after having yielded to the user: renew every held lease FIRST.
+        active = state.get("active")
+        if active is not None and not _genesis_resident_lease_alive(active["job_id"]):
+            log.warning(
+                "resident distill: job %s reclaimed while yielding to chat — "
+                "dropping local progress (it will re-run when re-served)",
+                active["job_id"],
+            )
+            state["active"] = None
+        for qjob in list(state.get("queue") or []):
+            qid = str(qjob.get("job_id") or "")
+            if qid and not _genesis_resident_lease_alive(qid):
+                state["queue"].remove(qjob)
+
+    while True:
+        if state.get("active") is None:
+            queue = state.get("queue") or []
+            if not queue:
+                _distill_in_progress = None
+                return
+            job = queue.pop(0)
+            try:
+                active = _distill_state_for_job(job)
+            except Exception as e:
+                # Leave the job for the backend stale reaper to re-queue (under the
+                # attempt cap) so a transient error never wedges it.
+                log.error("resident distill failed job=%s: %s", str(job.get("job_id") or ""), e)
+                continue
+            if active is None:
+                continue
+            state["active"] = active
+
+        active = state["active"]
         try:
-            plaintext = _decrypt_sealed_material(env)
-            genesis_resident_heartbeat(job_id)  # claimed + decrypted; distill can be slow
-            document = plaintext.decode("utf-8", errors="replace")
-
-            memory_count = 0
-            identity_status = "skipped"
-            if mode == "update_identity":
-                identity_payload = _resident_derive_identity(document, job_id)
-                # base_identity_replaced_at (Task 4) is the P5 concurrency baseline snapshotted
-                # at job-creation time; "" means no baseline (legacy job / no prior identity) —
-                # the backend then skips the check entirely (back-compat). Only a full
-                # init/replace moves replaced_at, so a signature patch/nudge landing while this
-                # job was pending never looks like a conflict here.
-                base_identity_replaced_at = str(job.get("base_identity_replaced_at") or "")
-                conflict_retried = False
-                while identity_payload is not None:
-                    try:
-                        execute_identity_actions([{
-                            "type": "identity.replace",
-                            "source": "genesis_resident_distill",
-                            "job_id": job_id,
-                            "reason": "Distilled identity from material the user uploaded.",
-                            "identity": identity_payload,
-                            "base_identity_replaced_at": base_identity_replaced_at,
-                        }])
-                        identity_status = "replaced"
-                        break
-                    except RuntimeError as e:
-                        if "identity_base_stale" not in str(e):
-                            raise
-                        if conflict_retried:
-                            log.error(
-                                "resident distill: identity_base_stale conflict persisted "
-                                "after re-derive job=%s — giving up, skipping identity update",
-                                job_id,
-                            )
-                            identity_status = "skipped_conflict"
-                            break
-                        log.warning(
-                            "resident distill: identity_base_stale conflict job=%s — "
-                            "re-fetching card + re-deriving once",
-                            job_id,
-                        )
-                        conflict_retried = True
-                        # _resident_derive_identity re-fetches the existing card internally
-                        # (_resident_existing_identity), so this re-call already merges against
-                        # whatever full replace won the race — then resubmit with a refreshed
-                        # baseline so the retry itself can't spuriously re-conflict.
-                        identity_payload = _resident_derive_identity(document, job_id)
-                        base_identity_replaced_at = _resident_current_replaced_at()
-            else:  # add_memory / onboarding → cloud memory engine
-                # long-term-memory archive → keep_all (thorough); chat log → selective.
-                keep_all = material_kind == "memory_summary"
-                memories = _resident_extract_memories(document, job_id, keep_all=keep_all)
-                occurred_at = datetime.now(_tzmod.utc).isoformat()
-                actions: list[dict] = []
-                for card in memories:
-                    envelope = _capture_build_envelope(
-                        card, occurred_at=occurred_at, source="genesis_resident_distill"
-                    )
-                    actions.append({
-                        "type": "memory.add",
-                        "envelope": envelope,
-                        "reason": "Distilled from material the user uploaded.",
-                        "capture_mode": "genesis_resident_distill",
-                        "source_chat_message_ids": [],
-                    })
-                if actions:
-                    execute_memory_actions(actions)
-                memory_count = len(actions)
-
-            genesis_resident_complete(
-                job_id, memory_action_count=memory_count, identity_status=identity_status
-            )
-            log.info(
-                "resident distill done job=%s mode=%s memories=%d identity=%s",
-                job_id, mode, memory_count, identity_status,
-            )
+            if active["mode"] == "update_identity":
+                # Single-turn job: the cheapest preemption point is before it starts —
+                # nothing is computed yet, so the whole job just waits one loop pass.
+                if _distill_user_waiting(chat_since):
+                    return
+                _resident_distill_identity(active)
+                outcome = "done"
+            else:  # add_memory / onboarding → cloud memory engine (chunked, resumable)
+                outcome = _resident_distill_advance_memory(active, chat_since)
         except Exception as e:
-            # Leave the job for the backend stale reaper to re-queue (under the attempt cap)
-            # so a transient error never wedges it.
-            log.error("resident distill failed job=%s: %s", job_id, e)
+            # Leave the job for the backend stale reaper to re-queue (under the attempt
+            # cap) so a transient error never wedges it.
+            log.error("resident distill failed job=%s: %s", active["job_id"], e)
+            state["active"] = None
+            continue
+
+        if outcome == "yielded":
+            return  # progress stays in _distill_in_progress; resume next iteration
+        state["active"] = None  # done → next queued job (if any)
 
 
 def run() -> None:
@@ -9014,6 +9643,13 @@ def run() -> None:
                         }
                         if last_broadcast_state:
                             tick_payload["broadcast_state"] = last_broadcast_state
+                        # Idle-loop guard: tell the gate to skip enqueuing the
+                        # heartbeat presence wake once we've sent N proactive
+                        # turns with no intervening user input (contract shared
+                        # with backend/proactive/gate.py).
+                        if _proactive_idle_guard_tripped():
+                            tick_payload["loop_guard_blocked"] = True
+                            tick_payload["loop_guard_reason"] = "no_new_input"
                         tick = post_proactive_tick(tick_payload)
                         decision = tick.get("decision") or {}
                         last_broadcast_state = str(
@@ -9092,7 +9728,7 @@ def run() -> None:
 
             if resident_distill_enabled:
                 try:
-                    _process_resident_distill_once()
+                    _process_resident_distill_once(chat_since=last_ts)
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 404:
                         resident_distill_enabled = False

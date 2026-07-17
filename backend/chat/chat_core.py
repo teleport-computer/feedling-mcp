@@ -35,12 +35,45 @@ import debug_trace
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
 from chat import service as chat_service
+from core import envelope as core_envelope
 from core import wake_bus
 from core.store import UserStore
 from proactive import service as proactive_service
 from push import service as push_service
 
 _ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
+
+
+def _stale_key_conflict(store: UserStore, envelope: dict) -> tuple[dict, int] | None:
+    """409 when a LABELED envelope was sealed to a key that is not the user's
+    current registered content key.
+
+    ``content_pk_fpr`` is written by ``build_envelope`` at seal time, so a
+    mismatch means the writer's key cache is stale (e.g. a resident consumer
+    whose whoami refresh has been failing since before a key rotation —
+    usr_f13f 2026-07-16). Storing such a row is worse than bouncing it: the
+    device can never open it, and only a later client-triggered rewrap can
+    repair it. The writer is expected to re-fetch whoami and retry.
+
+    Unlabeled envelopes pass (older clients), as does everything when the user
+    has no registered key to compare against.
+    """
+    labeled = str(envelope.get("content_pk_fpr") or "").strip()
+    if not labeled:
+        return None
+    registered = core_envelope.get_user_public_key(store.user_id)
+    if not registered:
+        return None
+    current = core_envelope._content_public_key_fingerprint(registered)
+    if labeled == current:
+        return None
+    return {
+        "error": "content_pk_fpr_mismatch",
+        "message": "Envelope was sealed to a key that is no longer the user's "
+                   "registered content key. Re-fetch whoami and re-seal.",
+        "current_public_key_fpr": current,
+        "envelope_content_pk_fpr": labeled,
+    }, 409
 
 
 # --------------------------------------------------------------------------- #
@@ -406,6 +439,9 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
     if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
         return {"error": "envelope with visibility=shared requires K_enclave"}, 400
+    conflict = _stale_key_conflict(store, envelope)
+    if conflict is not None:
+        return conflict
     content_type = payload.get("content_type", "text")
     if content_type not in ("text", "image", "file"):
         return {"error": "content_type must be 'text', 'image', or 'file'"}, 400
@@ -507,6 +543,9 @@ def write_response(
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
     if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
         return {"error": "envelope with visibility=shared requires K_enclave"}, 400
+    conflict = _stale_key_conflict(store, envelope)
+    if conflict is not None:
+        return conflict
     content_type = payload.get("content_type", "text")
     if content_type not in ("text", "image"):
         return {"error": "content_type must be 'text' or 'image'"}, 400
@@ -522,6 +561,9 @@ def write_response(
             return {"error": "thinking_envelope.visibility must be 'shared' or 'local_only'"}, 400
         if thinking_envelope["visibility"] == "shared" and not thinking_envelope.get("K_enclave"):
             return {"error": "thinking_envelope with visibility=shared requires K_enclave"}, 400
+        conflict = _stale_key_conflict(store, thinking_envelope)
+        if conflict is not None:
+            return conflict
         thinking_extra = {
             "thinking_v": str(thinking_envelope.get("v", 1)),
             "thinking_id": str(thinking_envelope.get("id") or ""),
@@ -531,6 +573,7 @@ def write_response(
             "thinking_visibility": str(thinking_envelope["visibility"]),
             "thinking_owner_user_id": str(thinking_envelope["owner_user_id"]),
             "thinking_enclave_pk_fpr": str(thinking_envelope.get("enclave_pk_fpr") or ""),
+            "thinking_content_pk_fpr": str(thinking_envelope.get("content_pk_fpr") or ""),
         }
         if thinking_envelope.get("K_enclave"):
             thinking_extra["thinking_K_enclave"] = str(thinking_envelope["K_enclave"])

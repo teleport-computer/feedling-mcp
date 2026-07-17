@@ -1,0 +1,200 @@
+---
+title: MCP servers
+description: Connect your agent to remote MCP tool servers, including plain HTTP, private-network, and self-signed endpoints.
+---
+
+Feedling lets each account register up to 10 remote [MCP](https://modelcontextprotocol.io)
+servers (streamable HTTP transport). Your agent — hosted or self-hosted — reads
+this list and calls the tools those servers expose. This backend stores the
+configuration; it does not proxy MCP traffic. Only your agent dials the URL
+when it actually calls a tool.
+
+Every `/v1/chat/poll` response includes a `user_mcp.fingerprint` that changes
+whenever your server list changes, so a resident consumer can re-materialize
+its local MCP config without polling `/v1/mcp/servers` on every turn. See the
+[Chat workflow](/docs/workflows/chat) for that poll shape.
+
+## Add or update a server
+
+```http
+POST /v1/mcp/servers HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "name": "search",
+  "url": "https://mcp.example.com/mcp",
+  "headers": {
+    "Authorization": "Bearer sk-..."
+  },
+  "enabled": true
+}
+```
+
+`name` (`^[a-z0-9_-]{1,32}$`) is the update key — posting an existing name
+replaces that server's config. `headers` are sent with every MCP request (max
+20 entries, 8192 bytes combined across names and values); `Host` is a
+forbidden header name.
+
+```json
+{
+  "id": "srv_1a2b3c4d",
+  "name": "search",
+  "enabled": true,
+  "url_hint": "mcp.example.com",
+  "header_names": ["Authorization"],
+  "has_ca": false,
+  "created_at": "2026-07-16T00:00:00Z",
+  "updated_at": "2026-07-16T00:00:00Z"
+}
+```
+
+The response never echoes back the URL, header values, or CA certificate.
+`url_hint` is the hostname only; `header_names` lists header keys only;
+`has_ca` reports whether a CA certificate is currently stored.
+
+`GET /v1/mcp/servers` returns `{"servers": [...]}` with the same shape.
+`PATCH /v1/mcp/servers/{name}` with `{"enabled": false}` toggles a server
+without resending the URL, headers, or CA. `DELETE /v1/mcp/servers/{name}`
+removes it.
+
+## Network requirements
+
+`url` accepts `http://` and `https://`, including loopback (`127.0.0.1`,
+`localhost`), private-network (`10.x`, `192.168.x`, `172.16–31.x`), and raw IP
+literal hosts. **This backend never connects to the URL at save time** — only
+your agent does, when it actually calls a tool — so none of those forms are
+rejected at `POST /v1/mcp/servers`.
+
+What reaches the server at call time depends on where your agent runs:
+
+- **Self-hosted / local agent** (you run the resident consumer or CLI agent
+  yourself): it can reach anything your machine can reach, including
+  `localhost` and your LAN.
+- **Hosted agent runtime** (Feedling runs your agent for you, in a managed
+  confidential VM — see [architecture](/docs/architecture)): it runs in the
+  cloud and **cannot reach machines on your home or office network**, the
+  same as any other cloud workload. This is a routing fact, not a permission
+  the backend is withholding.
+
+If you're on the hosted runtime and want to expose a local MCP server, put a
+tunnel in front of it — [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/),
+[Tailscale Funnel](https://tailscale.com/kb/1223/funnel), or [ngrok](https://ngrok.com/) —
+and register the tunnel's public HTTPS address instead of `http://localhost:...`
+or a LAN IP. Registering the raw local address will save without error and
+then simply never be reachable by the hosted agent. **This is the most common
+cause of "I added my MCP server and it doesn't work" for hosted users** — the
+config saved correctly; the cloud agent just has no path to your machine.
+
+### Plaintext `http://`
+
+Choosing `http://` sends every configured header — including any API key in
+`Authorization` — unencrypted over the network to reach your server. This is
+supported as an explicit, informed choice (for example, a server that only
+exists on a network you already trust), not a default recommendation. Prefer
+`https://` whenever the server can offer it.
+
+## Self-signed certificates and private CAs
+
+If your MCP server uses a certificate that isn't publicly trusted (self-signed,
+or issued by a private/internal CA), paste the **issuing CA certificate** —
+not the server's own leaf certificate — in PEM format into `ca_pem` when you
+add or update the server:
+
+```json
+{
+  "name": "search",
+  "url": "https://mcp.internal.example.com/mcp",
+  "ca_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+}
+```
+
+`ca_pem` is limited to 32,768 bytes and is validated as parseable PEM at save
+time (`invalid_ca` if it doesn't parse, `ca_too_large` if it's over the
+limit). Send an empty string to clear a previously stored CA.
+
+**This adds trust; it does not disable verification.** Registering `ca_pem`
+tells your agent's TLS client to also trust certificates issued by that CA —
+the server still has to present a certificate that chains to it, and still
+has to prove it holds the matching private key during the TLS handshake. A
+server that merely claims to be yours, without that key, still fails the
+handshake. This is the same trust model as installing a corporate or personal
+CA in a browser; it is not "skip certificate checking."
+
+Both first-party agent runtimes verified this end-to-end against a real
+self-signed server (a real TLS handshake against a real certificate, not a
+mock):
+
+| Runtime | Self-signed CA support |
+| --- | --- |
+| `claude` | Supported and verified. |
+| `codex` | Supported and verified. |
+
+`has_ca` on the server record tells you whether a CA is currently stored; the
+certificate content itself is never returned by any endpoint.
+
+## Verify a server
+
+```http
+POST /v1/mcp/servers/{name}/test HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+```json
+{
+  "ok": true,
+  "tool_count": 2,
+  "tool_names": ["search", "fetch"]
+}
+```
+
+This runs a best-effort `initialize` → `tools/list` probe **from this
+backend's own network**, as a convenience for validating servers that are
+publicly reachable over `https://`. It is not required before your agent can
+use a server, and it is not authoritative for servers your agent can reach but
+this backend cannot.
+
+**A `400 unreachable_from_backend` response does not mean the server failed to
+save.** The server was already saved successfully by `POST /v1/mcp/servers`.
+It only means this backend process could not reach the host — typically
+because it's a loopback/private-network address, or a tunnel endpoint that
+only your agent's environment is allowed to reach. Do not surface this as a
+configuration failure. For those servers, skip this probe and instead ask
+your agent to call the MCP server directly in a chat turn to verify it.
+
+Other `400` kinds from this endpoint:
+
+| Kind | Meaning |
+| --- | --- |
+| `unreachable_from_backend` | Saved successfully; this backend's network can't reach the host. Verify from your agent instead. |
+| `dns` | The hostname did not resolve. |
+| `tls` | Certificate/TLS handshake failure — check `ca_pem` if the server uses a private CA. |
+| `timeout` | Connect or read timeout. |
+| `http_401` / `http_403` / `http_404` / `http_4xx` / `http_5xx` | The server responded with an HTTP error status. |
+| `protocol` | The response wasn't a valid MCP handshake (bad JSON-RPC envelope, redirect, or empty SSE stream). |
+| `decrypt_failed` | The stored config could not be decrypted for this caller. |
+
+`404 not_found` means no server with that name exists.
+
+## Write-time error kinds
+
+`POST /v1/mcp/servers` returns `400` with one of these `error.kind` values
+when the payload is rejected, or `409 cannot_encrypt` if the server-side
+envelope could not be built (retry):
+
+| Kind | Meaning |
+| --- | --- |
+| `invalid_name` | `name` doesn't match `^[a-z0-9_-]{1,32}$`. |
+| `invalid_url` | `url` isn't `http://` or `https://`, or has no host. |
+| `invalid_headers` | `headers` isn't a JSON object. |
+| `too_many_headers` | More than 20 header entries. |
+| `headers_too_large` | Combined header names and values exceed 8192 bytes. |
+| `forbidden_header` | A header name is `Host` (case-insensitive). |
+| `invalid_ca` | `ca_pem` isn't parseable PEM. |
+| `ca_too_large` | `ca_pem` exceeds 32,768 bytes. |
+| `too_many_servers` | The account already has 10 servers and `name` doesn't match an existing one. |
+
+See the [MCP tag in the API reference](/docs/api-reference) for the full
+request/response schema of every operation.

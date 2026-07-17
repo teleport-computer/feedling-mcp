@@ -34,6 +34,18 @@ def _build(payload, user_message="在吗", recent=None):
     )
 
 
+def _language_system_messages(messages):
+    return [
+        m["content"]
+        for m in messages
+        if m.get("role") == "system"
+        and (
+            str(m.get("content") or "").startswith("Reply language policy:")
+            or str(m.get("content") or "").startswith("回复语言规则：")
+        )
+    ]
+
+
 def test_custom_persona_prompt_precedence_instruction_present():
     # P1b: the system prompt must instruct the model to treat
     # custom_persona_prompt as the highest-priority persona directive.
@@ -81,6 +93,60 @@ def test_empty_persona_does_not_crash_and_omits_nothing_required():
     msgs = _build({"identity": {"agent_name": ""}})
     assert msgs[0]["role"] == "system"
     assert any(m["role"] == "user" for m in msgs)
+
+
+def test_foreground_reply_language_line_is_independent_system_message():
+    payload = {
+        "identity": {
+            "custom_persona_prompt": (
+                "You are a steady English companion with a concise, warm, direct voice."
+            )
+        },
+        "context_memories": [
+            {"summary": "中文记忆", "content": "用户最近记录了很多中文生活片段。"},
+        ],
+    }
+
+    msgs = _build(payload, user_message="今天好累")
+    language_lines = _language_system_messages(msgs)
+
+    assert len(language_lines) == 1
+    assert "Default reply language: English" in language_lines[0]
+    assert "latest message is clearly in another language" in language_lines[0]
+    assert not language_lines[0].startswith("Feedling runtime context JSON:")
+
+
+def test_foreground_reply_language_falls_back_to_archive_language():
+    msgs = _build({
+        "identity": {},
+        "context_memories": [],
+        "archive_language": "en",
+    })
+
+    language_lines = _language_system_messages(msgs)
+
+    assert len(language_lines) == 1
+    assert "Default reply language: English" in language_lines[0]
+
+
+def test_pending_confirmation_includes_reply_language_line():
+    msgs = prompts.build_pending_confirmation_messages({
+        "identity": {
+            "custom_persona_prompt": (
+                "You are a gentle English companion who asks short confirmation questions."
+            )
+        },
+        "archive_language": "zh-Hans",
+        "pending_updates": [
+            {"target": "identity.language_preference", "changes": [{"field": "language_preference", "to": "en"}]},
+        ],
+    })
+
+    language_lines = _language_system_messages(msgs)
+
+    assert len(language_lines) == 1
+    assert "Default reply language: English" in language_lines[0]
+    assert msgs[-1]["role"] == "user"
 
 
 def test_memory_capture_prompt_uses_v1_shape_and_existing_terms():

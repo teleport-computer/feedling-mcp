@@ -4,7 +4,20 @@ import json
 from datetime import date
 from typing import Any
 
+from chat.reply_language import infer_reply_language_policy, reply_language_system_line
 from memory.prompts_v1 import MEMORY_WRITE_GUIDANCE_V1
+
+
+def _reply_language_line_from_context(context_payload: dict[str, Any], *, proactive: bool = False) -> str:
+    context_payload = context_payload if isinstance(context_payload, dict) else {}
+    perception = context_payload.get("perception") if isinstance(context_payload.get("perception"), dict) else {}
+    policy = infer_reply_language_policy(
+        context_payload.get("identity") if isinstance(context_payload.get("identity"), dict) else {},
+        context_payload.get("context_memories") if isinstance(context_payload.get("context_memories"), list) else [],
+        locale=str(context_payload.get("locale") or perception.get("locale") or ""),
+        archive_language=str(context_payload.get("archive_language") or ""),
+    )
+    return reply_language_system_line(policy, proactive=proactive)
 
 
 def build_foreground_chat_messages(
@@ -45,6 +58,10 @@ def build_foreground_chat_messages(
         },
         {
             "role": "system",
+            "content": _reply_language_line_from_context(visible_context_payload),
+        },
+        {
+            "role": "system",
             "content": "Feedling runtime context JSON:\n" + json.dumps(visible_context_payload, ensure_ascii=False)[:12000],
         },
     ]
@@ -65,6 +82,7 @@ def build_foreground_chat_messages(
 
 
 def build_pending_confirmation_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    payload = payload if isinstance(payload, dict) else {}
     return [
         {
             "role": "system",
@@ -79,6 +97,15 @@ def build_pending_confirmation_messages(payload: dict[str, Any]) -> list[dict[st
                 "`context_summary` is optional and should name the confirmation target/action, "
                 "not private reasoning."
             ),
+        },
+        {
+            "role": "system",
+            "content": _reply_language_line_from_context({
+                "identity": payload.get("identity") if isinstance(payload.get("identity"), dict) else {},
+                "context_memories": payload.get("context_memories") if isinstance(payload.get("context_memories"), list) else [],
+                "locale": payload.get("locale") or "",
+                "archive_language": payload.get("archive_language") or "",
+            }),
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:8000]},
     ]

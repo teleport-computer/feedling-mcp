@@ -339,9 +339,14 @@ last image until you `phala cvms stop` it). Because coordination is pure-Postgre
 stopping the runner CVM just lets the main-CVM runner re-acquire its users after
 the lease TTL — no main-CVM change needed.
 
-### prod Form B — standalone runner CVMs (PREPARED, DORMANT as of 2026-07-02)
+### prod Form B — standalone runner CVMs (ACTIVE; redundancy required)
 
-Prod artifacts are staged but **not activated** (no prod runner CVM provisioned yet).
+Production currently uses the standalone runner form and the inline main-CVM
+runner has been removed. The first activation used one runner CVM and exposed a
+fleet-wide single point of failure during its 2026-07-15 in-place update. A CI
+topology gate now blocks any main or runner CVM update while standalone deploys
+are enabled with fewer than two distinct IDs. Provision and validate the second
+runner before the next production deploy.
 Design principle: **one runner per CVM**; scale out by adding more runner CVMs, not
 more containers per CVM.
 
@@ -354,45 +359,41 @@ Moving hosting to dedicated runner CVMs frees ~6.7GB + 70% CPU on the main CVM.
 
 Staged artifacts:
 - `deploy/docker-compose.phala.prod.runner.yaml` — SINGLE `agent-runner` container,
-  genesis worker ON, `AGENT_MAX_CHILDREN` default 120 (sized to hold ALL ~99 users
-  on one runner, so a single CVM covers everyone and any CVM absorbs the fleet on
-  failover). Deployed identically to every prod runner CVM.
-- `deploy/prod-runner-cvm-ids.txt` — one CVM id per line (currently empty). Add a
+  genesis worker ON, `AGENT_MAX_CHILDREN` default 0 (unbounded, so any healthy CVM
+  can absorb the fleet on failover). Deployed identically to every prod runner CVM.
+- `deploy/prod-runner-cvm-ids.txt` — one CVM id per line. Add a
   line per provisioned runner CVM to scale horizontally.
-- CI job `deploy-prod-runner-cvm` (in `ci.yml`) — DORMANT: skipped unless repo var
+- CI job `deploy-prod-runner-cvm` (in `ci.yml`) — skipped unless repo var
   `DEPLOY_PROD_RUNNER_CVM == 'true'` AND the ids file is non-empty. On `main`, it
   pins the sha, then loops every id: `phala deploy --cvm-id` (prod encrypted env) +
   publishes that CVM's compose_hash on the prod contract.
 
-Repo vars already set (dormant): `PROD_MAIN_API_URL=https://api.feedling.app`,
+Repo vars:
+`PROD_MAIN_API_URL=https://api.feedling.app`,
 `PROD_MAIN_ENCLAVE_URL=https://9798850e…-5003s.dstack-pha-prod9.phala.network`,
-`PROD_AGENT_MAX_CHILDREN=120`, `DEPLOY_PROD_RUNNER_CVM=false`. Secrets are **reused**
+`PROD_AGENT_MAX_CHILDREN=0`, `DEPLOY_PROD_RUNNER_CVM=true`. Secrets are **reused**
 from the main prod CVM (no new ones): `PHALA_CLOUD_API_KEY` (prod/sxysun account),
 `DATABASE_URL`, `FEEDLING_RUNTIME_TOKEN_SECRET` (MUST match),
 `AGENT_RUNTIME_USERS`, `ETH_DEPLOYER_KEY`, contract `FEEDLING_APP_AUTH_CONTRACT`.
 
-**Sizing (`AGENT_MAX_CHILDREN=120`, ≈15GB CVMs):** 120 is deliberately ≥ all ~99
-users so it works from ONE runner CVM and scales out unchanged. Σ(max_children over
-live runners) MUST stay ≥ user count or over-capacity users' sends wedge (guard does
-not capacity-gate) — 120 satisfies that at any fleet size ≥1.
+**Sizing (`AGENT_MAX_CHILDREN=0`, ≈15GB CVMs):** zero is unbounded so every runner
+can absorb the fleet during failover. Capacity remains RAM-bound; watch resident
+consumer RSS and add a runner before a surviving CVM approaches its memory limit.
 
-**Starting with ONE runner CVM (then scaling out):** fully supported — put a single
-id in `prod-runner-cvm-ids.txt`. But one runner CVM is a **single point of failure**
-(no peer to take over if that CVM dies → all hosting 503s + genesis pauses until it
-recovers; `restart: unless-stopped` only covers process crashes, not VM loss). So
-while you run just one: **do NOT remove the main prod CVM's inline `agent-runner`** —
-keep it as a fallback (main + 1 runner CVM = 2 runners racing, so either can cover if
-the other dies). Only remove the inline main runner once you run **≥2 runner CVMs**
-(real VM-level fault isolation). Scaling out = add lines to the ids file + provision;
-`max_children=120` needs no change.
+**One runner CVM is unsupported without an inline fallback.** It is a single point
+of failure: a CVM loss or in-place update makes every hosted send return 503 and
+pauses genesis. `deploy/check-prod-runner-topology.sh` enforces two distinct IDs
+before CI can mutate production. Scaling out means provisioning another independent
+CVM and adding its ID; duplicate IDs count as one failure domain.
 
 **Activation (when ready):** provision N prod runner CVMs on the **sxysun** phala
 account (`phala deploy --name feedling-prod-runner-N --instance-type tdx.medium
 --kms phala -c deploy/docker-compose.phala.prod.runner.yaml` — first create WITHOUT
 `--cvm-id`, pin a real sha first; see the test runbook above for the exact shape) →
 put each CVM id on its own line in `deploy/prod-runner-cvm-ids.txt` → `gh variable
-set DEPLOY_PROD_RUNNER_CVM --body true` → push `main`. Verify: N fresh rows in
-`agent_runtime_supervisor_heartbeats` (each `host_all=t gateway=t max=120`), the 99
+set DEPLOY_PROD_RUNNER_CVM --body true` → push `main`. The gate requires N ≥ 2.
+Verify: N fresh rows in
+`agent_runtime_supervisor_heartbeats` (each `host_all=t gateway=t max=0`), the 99
 users redistribute across owners in `agent_runtime_instances`, main prod CVM RAM
 recovers. **Only once you run ≥2 runner CVMs AND it's stable**, remove the inline
 `agent-runner` from `deploy/docker-compose.phala.yaml` (mirror the test change) and

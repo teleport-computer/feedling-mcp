@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- Encrypted envelopes now carry an optional `content_pk_fpr` label (first
+  16 hex chars of SHA-256 of the user public key `K_user` was sealed to);
+  server- and consumer-built envelopes set it automatically. `POST
+  /v1/chat/message` and `POST /v1/chat/response` reject a labeled envelope
+  whose fingerprint no longer matches the user's registered content key with
+  a new `409 content_pk_fpr_mismatch` error (response includes
+  `current_public_key_fpr` and `envelope_content_pk_fpr`) — a writer holding
+  a stale key cache should re-fetch `whoami`, re-seal, and retry once.
+  Unlabeled envelopes are accepted unchanged, so existing clients are
+  unaffected. This closes the failure mode where a writer with a stale key
+  seals messages the owner's device can never decrypt.
 - Expand `GET /healthz` from a fixed liveness stub into a structured
   liveness-and-dependency probe. Responses now carry a top-level `status`
   (`healthy`, `degraded`, or `unhealthy`), a `checks` object with per-component
@@ -22,6 +33,27 @@ change must not be interpreted as an API guarantee.
   enclave reports readiness, release, and TLS posture from cached boot state
   without performing any cryptography. The documented response schema is
   unchanged (a generic JSON object).
+- `POST /v1/mcp/servers` now accepts `http://` URLs and loopback/private-network
+  and raw-IP hosts — this backend never dials the URL itself, only your agent
+  does when it calls a tool, so none of those forms were ever a new attack
+  surface on this backend. Add `ca_pem` (PEM, up to 32,768 bytes) to trust a
+  self-signed or private-CA server; the returned server record now includes
+  `has_ca`. This is "add trust," not "skip verification" — the server still
+  has to present a certificate chaining to that CA and prove it holds the
+  matching private key. Both first-party runtimes (`claude`, `codex`) were
+  verified end-to-end against a real self-signed server.
+  **Hosted-runtime users:** the managed agent runs in a cloud confidential VM
+  and cannot reach machines on your home or office network; put a tunnel
+  (Cloudflare Tunnel, Tailscale Funnel, ngrok) in front of a local MCP server
+  and register its public address instead. See the
+  [MCP servers workflow](/docs/workflows/mcp) for the full guide.
+- Rename the `POST /v1/mcp/servers/{name}/test` error kind previously returned
+  for non-public hosts from `blocked_url` to `unreachable_from_backend` — the
+  backend still refuses to probe non-global addresses itself (that refusal is
+  unrelated to the storage change above), but the old name read as a
+  rejection when the server had, in fact, already saved successfully. Clients
+  matching on the literal string `blocked_url` for this case must update to
+  `unreachable_from_backend`.
 
 ### Documentation and contract
 
