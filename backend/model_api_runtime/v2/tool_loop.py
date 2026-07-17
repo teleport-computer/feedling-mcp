@@ -45,7 +45,7 @@ class LoopOutcome:
 async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_reply,
                         fold_new_messages, add_usage, max_calls: int,
                         fold_before_first: bool = False,
-                        on_progress=None) -> LoopOutcome:
+                        on_progress=None, extra_tool_specs=None) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
     ``build_messages`` receives a single chronological list containing newly folded
@@ -73,6 +73,14 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
     force_text_fallback = False
     external_content_seen = False
     allowed_fetch_urls: set[str] = set()
+    # Per-turn tool surface = the static platform catalog plus any user-MCP tools
+    # injected for this turn (chat lane only). New list, never mutates the memoized
+    # `_catalog()`. `mcp_names` marks the injected tools so their args skip the
+    # platform PARAMS validation (the MCP server validates its own schema); MCP
+    # tools are deliberately NOT external reads, so a call to one does not lock
+    # writes for the rest of the turn.
+    turn_catalog = _catalog() + list(extra_tool_specs or [])
+    mcp_names = {spec.name for spec in (extra_tool_specs or [])}
 
     def _progress(stage: str) -> None:
         # Parent-process wedge detection is observability, never turn logic.
@@ -109,11 +117,11 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
             if not allowed_fetch_urls:
                 blocked_after_external.add("web_fetch")
             tools = [
-                spec for spec in _catalog()
+                spec for spec in turn_catalog
                 if spec.name not in blocked_after_external
             ]
         else:
-            tools = _catalog()
+            tools = turn_catalog
         attempts += 1
         _progress("provider_start")
         try:
@@ -155,7 +163,10 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
                 and tc.name == "web_fetch"
                 and str(tc.args.get("url") or "").strip() not in allowed_fetch_urls
             )
-            or tool_schema.validate_tool_args(tc.name, tc.args) is not None
+            or (
+                tc.name not in mcp_names
+                and tool_schema.validate_tool_args(tc.name, tc.args) is not None
+            )
             for tc in pr.tool_calls
         )
         mixed_reply_write = any(

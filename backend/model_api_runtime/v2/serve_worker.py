@@ -72,6 +72,7 @@ from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
 from hosted import file_text
+from hosted import mcp_tools
 from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import cursor as v2_cursor
@@ -1570,6 +1571,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
         apply_pending_effects=_apply_pending_effects_for_user,
+        load_mcp_turn=mcp_tools.load_turn_mcp,
     )
 
 

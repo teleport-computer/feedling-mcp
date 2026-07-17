@@ -323,6 +323,26 @@ class TurnDeps:
     # of an empty pending set; the field exists so the call site is already wired
     # ahead of the producer landing.
     apply_pending_effects: Callable[[str], dict] | None = None
+    # (store, *, api_key, runtime_token) -> awaitable McpTurn: build this chat
+    # turn's user-MCP tool surface. Implemented in `hosted.mcp_tools.load_turn_mcp`
+    # and injected by `serve_worker.build_production_deps`, because loading a user's
+    # MCP servers needs `hosted` (mcp_core/mcp_client) + enclave decrypt, which the
+    # V2 core must not import (dependency-direction guard). The returned McpTurn is
+    # duck-typed here (`.tool_specs` / `.handles` / `.dispatch`) — no hosted type
+    # crosses the boundary. None (every non-chat/legacy caller) → no MCP tools.
+    load_mcp_turn: Callable[..., Any] | None = None
+
+
+class _EmptyMcpTurn:
+    """The no-MCP turn: offered when `TurnDeps.load_mcp_turn` is unwired (wake
+    lane, legacy callers, tests). No tools, handles nothing."""
+    tool_specs: tuple = ()
+
+    def handles(self, name: str) -> bool:
+        return False
+
+
+_EMPTY_MCP_TURN = _EmptyMcpTurn()
 
 
 @dataclass
@@ -2276,6 +2296,18 @@ async def process_job(
             await _ensure_runtime_mode()
             await _renew_lease()
 
+        # User-MCP tool surface for THIS turn (chat lane only, mirroring the
+        # resident which gives claude `--mcp-config` on the chat lane only). The
+        # loader lives in hosted (needs mcp_core/enclave) and is injected as
+        # `deps.load_mcp_turn`; unwired (tests/legacy) → the empty turn. Loads the
+        # user's enabled servers, decrypts them, and fetches each server's tools
+        # fresh. Zero enabled servers => empty (no network). A down/unreadable server
+        # is skipped, never fatal. Built before dispatch so the closure sees it.
+        mcp_turn = _EMPTY_MCP_TURN
+        if deps.load_mcp_turn is not None:
+            mcp_turn = await deps.load_mcp_turn(
+                store, api_key=api_key, runtime_token=runtime_token)
+
         async def _dispatch_tools(tool_calls):
             # Fence once per round before any capability executes (mirrors the
             # old _run_tools's renewal ahead of the read burst); writes get a
@@ -2284,13 +2316,26 @@ async def process_job(
             await _renew_lease()
             for tc in tool_calls:
                 action_digest.setdefault(tc.name, {"ok": 0, "count": 0})["count"] += 1
-            results = await v2_executor.dispatch_tool_calls(
-                tool_calls, store=store, api_key=api_key, runtime_token=runtime_token,
-                enclave_sem=enclave_sem, turn_authorization=True,
-                enqueue_write_effect=_enqueue_write_effect, before_write=_before_write,
-                read_parallelism=read_parallelism)
-            for tc, r in zip(tool_calls, results):
-                if not r.content.startswith("error"):
+            # Split user-MCP calls (proxy to the user's own server) from platform
+            # capability calls: the executor rejects an mcp__ name as unknown, so it
+            # must never see one. Results are matched back by call_id in the loop,
+            # so order across the two dispatchers does not matter.
+            mcp_calls = [tc for tc in tool_calls if mcp_turn.handles(tc.name)]
+            platform_calls = [tc for tc in tool_calls if not mcp_turn.handles(tc.name)]
+            results = []
+            if platform_calls:
+                results.extend(await v2_executor.dispatch_tool_calls(
+                    platform_calls, store=store, api_key=api_key, runtime_token=runtime_token,
+                    enclave_sem=enclave_sem, turn_authorization=True,
+                    enqueue_write_effect=_enqueue_write_effect, before_write=_before_write,
+                    read_parallelism=read_parallelism))
+            if mcp_calls:
+                results.extend(await asyncio.gather(
+                    *(mcp_turn.dispatch(tc) for tc in mcp_calls)))
+            by_id = {r.call_id: r for r in results}
+            for tc in tool_calls:
+                r = by_id.get(tc.id)
+                if r is not None and not r.content.startswith("error"):
                     action_digest[tc.name]["ok"] += 1
             return results
 
@@ -2363,7 +2408,8 @@ async def process_job(
             dispatch_tools=_dispatch_tools, on_reply=_on_reply,
             fold_new_messages=fold_new_messages, add_usage=tm.add_call,
             max_calls=_TURN_MAX_LLM_CALLS, fold_before_first=seq_native,
-            on_progress=_report_turn_progress)
+            on_progress=_report_turn_progress,
+            extra_tool_specs=mcp_turn.tool_specs)
         if not outcome.replied_intermediate and not (outcome.final_text or "").strip():
             # BUG-4 no-filler class: the loop returned WITHOUT ever producing a
             # bubble — budget_exhausted (max_calls reached with no terminal
