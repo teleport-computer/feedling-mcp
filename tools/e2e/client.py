@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent.parent
@@ -29,6 +32,26 @@ TEST_ENCLAVE = (
     "https://173c7f49aeb54acb424676b17b17f78e5e2b2938-5003s.dstack-pha-prod9.phala.network"
 )
 _ALLOWED_HOSTS = ("test-api.feedling.app",)
+# Credentials of not-yet-torn-down accounts (leak manifest; see provision()).
+_ORPHANS_DIR = Path.home() / ".feedling-e2e-orphans"
+
+
+def _write_orphan_manifest(api_url: str, user_id: str, api_key: str) -> Path:
+    """Atomically create the leak-manifest file with 0o600 FROM BIRTH
+    (O_CREAT|O_EXCL open — never a 0644 window) and fsync it durable."""
+    _ORPHANS_DIR.mkdir(parents=True, exist_ok=True)
+    path = _ORPHANS_DIR / f"{user_id}.json"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"api_url": api_url, "user_id": user_id,
+                                "api_key": api_key}))
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return path
 
 
 def _refuse_prod(api_url: str) -> None:
@@ -56,6 +79,7 @@ class E2EClient:
         self._enclave_pk = enclave_pk
         self._http = httpx.Client(timeout=60, verify=False)
         self._deleted = False
+        self._orphan_file: Path | None = None
 
     # -- lifecycle ----------------------------------------------------------
     @classmethod
@@ -65,6 +89,7 @@ class E2EClient:
         sk = PrivateKey.generate()
         pk_b64 = base64.b64encode(bytes(sk.public_key)).decode()
         api_key = ""
+        manifest: Path | None = None
         with httpx.Client(timeout=30, verify=False) as boot:
             try:
                 r = boot.post(f"{api_url}/v1/users/register", json={
@@ -76,6 +101,14 @@ class E2EClient:
                 r.raise_for_status()
                 body = r.json()
                 user_id, api_key = body["user_id"], body["api_key"]
+                # Leak manifest, written the INSTANT the account exists — before
+                # whoami or anything else can fail — so no crash window can
+                # orphan an undeletable account (the 2026-07-18 shakedown lost
+                # usr_89f65673 exactly that way). 0o600 from birth; removed on
+                # successful teardown; `p0.py --cleanup-orphans` sweeps the
+                # rest. If the manifest itself cannot be written, the except
+                # arm best-effort resets rather than proceeding untracked.
+                manifest = _write_orphan_manifest(api_url, user_id, api_key)
                 who = boot.get(f"{api_url}/v1/users/whoami",
                                headers={"X-API-Key": api_key})
                 who.raise_for_status()
@@ -92,21 +125,28 @@ class E2EClient:
                             json={"confirm": "delete-all-data"},
                         )
                         cleanup.raise_for_status()
-                    except Exception as cleanup_error:  # noqa: BLE001
+                        if manifest is not None:
+                            manifest.unlink(missing_ok=True)
+                    except Exception as cleanup_error:  # noqa: BLE001 — manifest
+                        # stays behind as the recoverable evidence trail
                         print(f"[e2e] WARNING provision cleanup failed: {cleanup_error}",
                               file=sys.stderr)
                 raise
-        return cls(api_url, user_id, api_key, sk, enclave_pk)
+        client = cls(api_url, user_id, api_key, sk, enclave_pk)
+        client._orphan_file = manifest
+        return client
 
     def teardown(self) -> None:
-        """Hard-delete the account (test-account-hygiene: create → use → delete)."""
+        """Hard-delete the account (test-account-hygiene: create → use → delete).
+        Rides the transport-retry wrapper, so a flapping connection gets three
+        chances before we surface a leak."""
         if self._deleted:
             return
-        r = self._http.post(f"{self.api_url}/v1/account/reset",
-                            headers=self._headers,
-                            json={"confirm": "delete-all-data"})
+        r = self.post("/v1/account/reset", json={"confirm": "delete-all-data"})
         r.raise_for_status()
         self._deleted = True
+        if self._orphan_file is not None:
+            self._orphan_file.unlink(missing_ok=True)
 
     def __enter__(self) -> "E2EClient":
         return self
@@ -189,16 +229,47 @@ class E2EClient:
         return ""
 
     def get(self, path: str, **kw) -> httpx.Response:
-        return self._http.get(f"{self.api_url}{path}", headers=self._headers, **kw)
+        return self._request("GET", path, **kw)
 
     def post(self, path: str, **kw) -> httpx.Response:
-        return self._http.post(f"{self.api_url}{path}", headers=self._headers, **kw)
+        return self._request("POST", path, **kw)
+
+    def _request(self, method: str, path: str, *, _retries: int = 3, **kw) -> httpx.Response:
+        """Transport-retry wrapper. This dev/test environment demonstrably flaps
+        (proxy resets, single-CVM deploy windows — the 2026-07-18 shakedown died
+        mid-cell to exactly such a window; genesis_e2e._http carries an 8-retry
+        history for the same reason), and one dropped connection must not fail a
+        whole P0 cell.
+
+        Retrying POSTs is safe for every path this client uses: both send paths
+        carry a client_msg_id minted ONCE per logical send and reused across
+        retries (/v1/chat/message and /v1/model_api/chat/send dedup on it);
+        setup and reset are idempotent; verify_loop is a repeatable probe (each
+        call may post a fresh hidden ping — harmless, GC'd server-side).
+        (register does NOT ride this wrapper — provision uses its own client.)"""
+        last: Exception | None = None
+        for attempt in range(_retries):
+            try:
+                return self._http.request(
+                    method, f"{self.api_url}{path}", headers=self._headers, **kw)
+            except httpx.TransportError as e:
+                last = e
+                if attempt + 1 < _retries:      # no pointless backoff after the final try
+                    time.sleep(3 * (attempt + 1))
+        assert last is not None
+        raise last
 
     # -- chat ---------------------------------------------------------------
     def send_chat(self, text: str) -> float:
-        """Send one sealed user message; return its server timestamp."""
+        """Send one sealed user message; return its server timestamp.
+        client_msg_id is minted once here and rides every transport retry, so a
+        retried POST can never double-ingest (memory ring / wake side effects
+        included — envelope-id dedup alone only covers the DB row)."""
         sent_at = time.time()
-        r = self.post("/v1/chat/message", json={"envelope": self._seal(text)})
+        r = self.post("/v1/chat/message", json={
+            "envelope": self._seal(text),
+            "client_msg_id": str(uuid.uuid4()),
+        })
         r.raise_for_status()
         return float(r.json().get("ts") or sent_at)
 
