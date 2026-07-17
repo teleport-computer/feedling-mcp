@@ -397,6 +397,13 @@ WHOAMI_REFRESH_RETRY_DELAY_SEC = float(os.environ.get("WHOAMI_REFRESH_RETRY_DELA
 # derived and stable across compose rotations), so re-fetching before every
 # reply just adds a reentrant backend round-trip under load. 0 = always refresh.
 WHOAMI_REFRESH_TTL_SEC = float(os.environ.get("WHOAMI_REFRESH_TTL_SEC", "300"))
+# Hard ceiling on how old the cached whoami keys may be when a refresh fails
+# and the encrypted-reply path falls back to them. Unbounded fallback is how
+# usr_f13f's consumer sealed two days of replies to a retired content key
+# (whoami chronically failing → startup-era cache used forever). Past this
+# age the reply write is skipped loudly instead of sealing to a key the
+# device may no longer hold. 3600s ≈ 12 consecutive failed refreshes.
+WHOAMI_STALE_KEYS_MAX_AGE_SEC = float(os.environ.get("WHOAMI_STALE_KEYS_MAX_AGE_SEC", "3600"))
 
 # Provider payment (HTTP 402 / out-of-credits) circuit breaker. After a provider
 # payment failure, pause PROACTIVE agent calls for this window so a broke key
@@ -5409,10 +5416,18 @@ def _whoami_cache_has_full_keys(cache: dict | None = None) -> bool:
 def _refresh_whoami_for_encrypted_reply() -> bool:
     previous = dict(_whoami_cache)
     # Skip the network refresh while cached keys are fresh (see WHOAMI_REFRESH_TTL_SEC).
+    # The shortcut must not outlive the stale-keys hard ceiling: with the cap
+    # configured below the TTL, a cache older than the cap needs a real refresh
+    # attempt (and, failing that, the over-age fallback below refuses it).
+    cache_age = time.monotonic() - _whoami_cache_loaded_at
+    within_stale_cap = (
+        WHOAMI_STALE_KEYS_MAX_AGE_SEC <= 0 or cache_age < WHOAMI_STALE_KEYS_MAX_AGE_SEC
+    )
     if (
         WHOAMI_REFRESH_TTL_SEC > 0
+        and within_stale_cap
         and _whoami_cache_has_full_keys()
-        and (time.monotonic() - _whoami_cache_loaded_at) < WHOAMI_REFRESH_TTL_SEC
+        and cache_age < WHOAMI_REFRESH_TTL_SEC
     ):
         return True
     if _load_whoami_with_retries(
@@ -5425,6 +5440,23 @@ def _refresh_whoami_for_encrypted_reply() -> bool:
     if not _whoami_cache_has_encryption_keys() and _whoami_cache_has_encryption_keys(previous):
         _whoami_cache.update(previous)
     if _whoami_cache_has_encryption_keys():
+        # Bounded fallback: a cache this old may predate a key rotation, and
+        # sealing to a retired key stores ciphertext the device can never open
+        # (each row then needs a client-triggered rewrap to repair). Better to
+        # skip the write loudly. loaded_at==0 means the keys never came from a
+        # full whoami success (partial-keys edge) — age unknowable, keep the
+        # historical allow.
+        age = time.monotonic() - _whoami_cache_loaded_at
+        if _whoami_cache_loaded_at > 0 and age > WHOAMI_STALE_KEYS_MAX_AGE_SEC:
+            log.error(
+                "whoami refresh failed and cached keys are %.0fs old (max %s); "
+                "refusing to seal with possibly-rotated keys user_id=%s user_pk=%s",
+                age,
+                WHOAMI_STALE_KEYS_MAX_AGE_SEC,
+                _whoami_cache.get("user_id") or "",
+                _fingerprint_bytes(_whoami_cache.get("user_pk")),
+            )
+            return False
         log.warning(
             "whoami refresh failed before encrypted reply; using cached keys user_id=%s user_pk=%s enclave_pk=%s",
             _whoami_cache.get("user_id") or "",
@@ -6031,65 +6063,91 @@ def post_reply(
 
     user_id = _whoami_cache["user_id"]
     user_pk: bytes | None = _whoami_cache["user_pk"]
-    enc_pk: bytes | None = _whoami_cache["enclave_pk"]
 
     if _ENCRYPTION_AVAILABLE and user_id and user_pk:
-        visibility = "shared" if enc_pk else "local_only"
-        envelope = _build_envelope(
-            plaintext=content.encode("utf-8"),
-            owner_user_id=user_id,
-            user_pk_bytes=user_pk,
-            enclave_pk_bytes=enc_pk,
-            visibility=visibility,
-        )
-        thinking_envelope = None
-        safe_thinking = _sanitize_thinking_summary(thinking_summary)
-        if safe_thinking:
-            thinking_envelope = _build_envelope(
-                plaintext=safe_thinking.encode("utf-8"),
-                owner_user_id=user_id,
-                user_pk_bytes=user_pk,
-                enclave_pk_bytes=enc_pk,
+        def _sealed_body() -> dict[str, Any]:
+            # Reads the whoami cache fresh on every call so the fpr-mismatch
+            # retry below re-seals with the just-refreshed key.
+            seal_user_id = _whoami_cache["user_id"]
+            seal_user_pk: bytes = _whoami_cache["user_pk"]
+            seal_enc_pk: bytes | None = _whoami_cache["enclave_pk"]
+            visibility = "shared" if seal_enc_pk else "local_only"
+            envelope = _build_envelope(
+                plaintext=content.encode("utf-8"),
+                owner_user_id=seal_user_id,
+                user_pk_bytes=seal_user_pk,
+                enclave_pk_bytes=seal_enc_pk,
                 visibility=visibility,
             )
-        visible_body = "" if suppress_push else content[:240]
-        body: dict[str, Any] = {
-            "envelope": envelope,
-            "source": source,
-            "alert_body": visible_body,
-        }
-        if thinking_envelope:
-            body["thinking_envelope"] = thinking_envelope
-            kind = _sanitize_thinking_kind(thinking_kind)
-            if kind:
-                body["thinking_kind"] = kind
-            source_label = _sanitize_thinking_meta(thinking_source, max_len=80)
-            if source_label:
-                body["thinking_source"] = source_label
-            model_label = _sanitize_thinking_meta(thinking_model, max_len=96)
-            if model_label:
-                body["thinking_model"] = model_label
-            if thinking_native is not None:
-                body["thinking_native"] = bool(thinking_native)
-        if role:
-            body["role"] = role
-        if notice_kind:
-            body["notice_kind"] = notice_kind
-        if reply_to_message_id:
-            body["reply_to_message_id"] = reply_to_message_id
-        if gate_decision_id:
-            body["gate_decision_id"] = gate_decision_id
-        if proactive_job_id:
-            body["proactive_job_id"] = proactive_job_id
-        if source == PROACTIVE_JOB_SOURCE and not suppress_push:
-            body["push_live_activity"] = True
-            body["push_body"] = visible_body
-            body["data"] = {
-                "source": PROACTIVE_JOB_SOURCE,
-                "gate_decision_id": gate_decision_id,
-                "proactive_job_id": proactive_job_id,
+            thinking_envelope = None
+            safe_thinking = _sanitize_thinking_summary(thinking_summary)
+            if safe_thinking:
+                thinking_envelope = _build_envelope(
+                    plaintext=safe_thinking.encode("utf-8"),
+                    owner_user_id=seal_user_id,
+                    user_pk_bytes=seal_user_pk,
+                    enclave_pk_bytes=seal_enc_pk,
+                    visibility=visibility,
+                )
+            visible_body = "" if suppress_push else content[:240]
+            body: dict[str, Any] = {
+                "envelope": envelope,
+                "source": source,
+                "alert_body": visible_body,
             }
-        resp = _HTTP.post(url, json=body, headers=_HEADERS, timeout=15)
+            if thinking_envelope:
+                body["thinking_envelope"] = thinking_envelope
+                kind = _sanitize_thinking_kind(thinking_kind)
+                if kind:
+                    body["thinking_kind"] = kind
+                source_label = _sanitize_thinking_meta(thinking_source, max_len=80)
+                if source_label:
+                    body["thinking_source"] = source_label
+                model_label = _sanitize_thinking_meta(thinking_model, max_len=96)
+                if model_label:
+                    body["thinking_model"] = model_label
+                if thinking_native is not None:
+                    body["thinking_native"] = bool(thinking_native)
+            if role:
+                body["role"] = role
+            if notice_kind:
+                body["notice_kind"] = notice_kind
+            if reply_to_message_id:
+                body["reply_to_message_id"] = reply_to_message_id
+            if gate_decision_id:
+                body["gate_decision_id"] = gate_decision_id
+            if proactive_job_id:
+                body["proactive_job_id"] = proactive_job_id
+            if source == PROACTIVE_JOB_SOURCE and not suppress_push:
+                body["push_live_activity"] = True
+                body["push_body"] = visible_body
+                body["data"] = {
+                    "source": PROACTIVE_JOB_SOURCE,
+                    "gate_decision_id": gate_decision_id,
+                    "proactive_job_id": proactive_job_id,
+                }
+            return body
+
+        resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
+        if _is_fpr_mismatch_response(resp):
+            # The backend bounced the envelope: our cached user pk is no longer
+            # the registered content key (rotated since the last whoami). Force
+            # a fresh whoami (ignore the TTL) and re-seal + retry ONCE. A second
+            # bounce falls through to _handle_post_reply_response's normal
+            # raise so the caller's error handling applies.
+            log.warning(
+                "chat_response bounced: content_pk_fpr_mismatch (sealed=%s current=%s); "
+                "refreshing whoami and re-sealing once",
+                (resp.json() or {}).get("envelope_content_pk_fpr", ""),
+                (resp.json() or {}).get("current_public_key_fpr", ""),
+            )
+            if _load_whoami_with_retries(
+                attempts=WHOAMI_REFRESH_RETRIES,
+                delay_sec=WHOAMI_REFRESH_RETRY_DELAY_SEC,
+                context="stale-key reseal",
+                backoff_multiplier=2.0,
+            ) and _whoami_cache.get("user_pk"):
+                resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
 
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
@@ -6119,6 +6177,19 @@ def post_reply(
         headers=_HEADERS, timeout=15,
     )
     return _handle_post_reply_response(resp)
+
+
+def _is_fpr_mismatch_response(resp) -> bool:
+    """The backend's stale-key bounce: the envelope was sealed to a key that is
+    no longer the user's registered content key (see chat_core
+    ``content_pk_fpr_mismatch``)."""
+    if resp.status_code != 409:
+        return False
+    try:
+        body = resp.json()
+    except Exception:
+        return False
+    return isinstance(body, dict) and body.get("error") == "content_pk_fpr_mismatch"
 
 
 def _handle_post_reply_response(resp) -> dict:

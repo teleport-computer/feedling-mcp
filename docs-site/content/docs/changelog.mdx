@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- Encrypted envelopes now carry an optional `content_pk_fpr` label (first
+  16 hex chars of SHA-256 of the user public key `K_user` was sealed to);
+  server- and consumer-built envelopes set it automatically. `POST
+  /v1/chat/message` and `POST /v1/chat/response` reject a labeled envelope
+  whose fingerprint no longer matches the user's registered content key with
+  a new `409 content_pk_fpr_mismatch` error (response includes
+  `current_public_key_fpr` and `envelope_content_pk_fpr`) — a writer holding
+  a stale key cache should re-fetch `whoami`, re-seal, and retry once.
+  Unlabeled envelopes are accepted unchanged, so existing clients are
+  unaffected. This closes the failure mode where a writer with a stale key
+  seals messages the owner's device can never decrypt.
 - Expand `GET /healthz` from a fixed liveness stub into a structured
   liveness-and-dependency probe. Responses now carry a top-level `status`
   (`healthy`, `degraded`, or `unhealthy`), a `checks` object with per-component
