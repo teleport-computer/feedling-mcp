@@ -14,6 +14,9 @@ from core.store import UserStore
 
 _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
 _CONSUMER_RECENT_SEC = int(os.environ.get("FEEDLING_CONSUMER_RECENT_SEC", "180"))
+_RESIDENT_BINDING_SEEN_INTERVAL_SEC = max(
+    1, int(os.environ.get("FEEDLING_RESIDENT_BINDING_SEEN_INTERVAL_SEC", "60"))
+)
 
 
 def expected_consumer_commit() -> str:
@@ -84,6 +87,39 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
             state["last_response_at"] = now_iso
             state["last_response_epoch"] = now_epoch
         _save_consumer_state(store, state)
+    if event_type == "poll":
+        _touch_resident_binding_seen(store, info=info, now_epoch=now_epoch)
+
+
+def _touch_resident_binding_seen(
+    store: UserStore,
+    *,
+    info: dict | None,
+    now_epoch: float | None = None,
+) -> bool:
+    """Refresh resident access liveness for a real resident-consumer poll.
+
+    The consumer identity header prevents ordinary app/API polling from claiming
+    the resident is online. The active-route check excludes hosted model_api and
+    official_import users even though the hosted runner uses the same consumer
+    binary and identity header. Best-effort: liveness telemetry must never break
+    chat polling when its route read or registry persist is unavailable.
+    """
+    if not isinstance(info, dict) or not info.get("official"):
+        return False
+    try:
+        from accounts import onboarding, registry
+
+        if onboarding._load_onboarding_route(store) != "resident":
+            return False
+        return registry._touch_resident_binding_seen(
+            store.user_id,
+            min_interval_sec=_RESIDENT_BINDING_SEEN_INTERVAL_SEC,
+            now_epoch=now_epoch,
+        )
+    except Exception as e:
+        print(f"[{store.user_id}/resident-seen] heartbeat update failed: {e}")
+        return False
 
 
 def _consumer_validation_state(store: UserStore) -> dict:
@@ -116,4 +152,3 @@ def _consumer_validation_state(store: UserStore) -> dict:
             "X-Feedling-Consumer headers."
         ),
     }
-

@@ -15,6 +15,10 @@ import httpx
 import debug_trace
 
 
+_QUIET_SUCCESS_PURPOSE_PREFIXES = ("tee_replicate:",)
+_SUCCESS_TRACE_EVENT_TYPES = frozenset({"enclave.call.start", "enclave.call.done"})
+
+
 def _trace_store_from_user_id(user_id: str):
     user_id = str(user_id or "").strip()
     if not user_id:
@@ -34,6 +38,12 @@ def _trace_enclave(
     dur_ms: float | None = None,
 ) -> None:
     if store is None:
+        return
+    if (
+        status == "ok"
+        and event_type in _SUCCESS_TRACE_EVENT_TYPES
+        and purpose.startswith(_QUIET_SUCCESS_PURPOSE_PREFIXES)
+    ):
         return
     try:
         debug_trace.trace_event(

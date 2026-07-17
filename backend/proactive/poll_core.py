@@ -13,6 +13,7 @@ unchanged; `routes.py` now calls in here.
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime
 
@@ -22,6 +23,15 @@ from proactive import capture_jobs, resident_runtime_v2, service
 # survivor consumer can pick it up (hosted consumers are exempt — they manage
 # their own lease).
 RESIDENT_WAKE_LEASE_SEC = 600.0
+WAKE_JOB_MAX_AGE_SEC = 900.0
+
+# How long the resident one-shot introduction job waits for the agent to post its
+# OWN greeting before firing as a deadlock fallback. The io-onboarding skill makes
+# the resident agent send the Step 6 greeting itself; this window keeps the
+# backend job from double-greeting a skill-compliant agent while still unwedging a
+# resident whose agent never greets. Tunable via
+# FEEDLING_RESIDENT_INTRO_FALLBACK_GRACE_SEC.
+RESIDENT_INTRO_FALLBACK_GRACE_SEC = 600.0
 _HOSTED_CONSUMER_IDS = frozenset({"hosted_runtime", "hosted_runtime_v2"})
 
 
@@ -90,13 +100,134 @@ def _is_ts_watermark_exempt_job(job: dict) -> bool:
     return _is_introduction_job(job) or capture_jobs.is_memory_maintenance_job(job)
 
 
+def _intro_fallback_grace_sec() -> float:
+    try:
+        return max(0.0, float(os.environ.get(
+            "FEEDLING_RESIDENT_INTRO_FALLBACK_GRACE_SEC", str(RESIDENT_INTRO_FALLBACK_GRACE_SEC))))
+    except (TypeError, ValueError):
+        return RESIDENT_INTRO_FALLBACK_GRACE_SEC
+
+
+def _wake_job_max_age_sec() -> float:
+    try:
+        return max(0.0, float(os.environ.get(
+            "FEEDLING_WAKE_JOB_MAX_AGE_SEC", str(WAKE_JOB_MAX_AGE_SEC))))
+    except (TypeError, ValueError):
+        return WAKE_JOB_MAX_AGE_SEC
+
+
+def _agent_already_greeted(store) -> bool:
+    """True once the agent has posted a real, user-visible chat message.
+
+    The verify_ping reply is excluded: it is synthetic and deliberately does not
+    count as the agent having greeted (mirrors the same exclusion in
+    hosted.onboarding_validation's visible-agent-message count, which proactive
+    may not import — hosted sits ABOVE proactive in the CONTRIBUTING §2 layering).
+    """
+    with store.chat_lock:
+        msgs = list(store.chat_messages)
+    return any(
+        isinstance(m, dict)
+        and m.get("role") in ("agent", "openclaw")
+        and m.get("source") != "verify_ping"
+        for m in msgs
+    )
+
+
+def _introduction_serve_decision(store, job: dict) -> str:
+    """"serve" | "defer" | "cancel" for the resident one-shot introduction job.
+
+    The introduction is a DEADLOCK FALLBACK, not the primary greeting: the
+    io-onboarding skill has the resident agent post its own Step 6 greeting, and
+    this job exists only so a resident whose agent never greets isn't wedged
+    behind the closed-chat gate forever. Serving it unconditionally (as it was
+    from 976f180/ebe3c52) double-greets every skill-compliant resident and routes
+    a greeting through the proactive→agent→parse path.
+    """
+    if _agent_already_greeted(store):
+        return "cancel"
+    ts = float(_job_age_ref_epoch(job) or 0.0)
+    if ts and (time.time() - ts) < _intro_fallback_grace_sec():
+        return "defer"
+    return "serve"
+
+
+def _cancel_introduction_job(store, job: dict) -> None:
+    """The agent greeted on its own: retire the fallback, durably and idempotently."""
+    store.mark_introduced()
+    job_id = str(job.get("job_id") or "")
+    if not job_id:
+        return
+    store.update_proactive_job(
+        job_id,
+        {
+            "status": "skipped",
+            "status_reason": "agent_greeted",
+            "wake_result": "agent_greeted",
+            "agent_action": "agent_greeted",
+            "agent_action_status": "resident_intro_fallback_agent_greeted",
+        },
+        only_if_status="pending",
+    )
+
+
+def _supersedable_maintenance_kind(job: dict) -> str:
+    if capture_jobs.is_memory_dream_job(job):
+        return capture_jobs.CAPTURE_JOB_KIND_DREAM
+    if capture_jobs.is_memory_migrate_job(job):
+        return capture_jobs.CAPTURE_JOB_KIND_MIGRATE
+    return ""
+
+
+def _job_ts_epoch(job: dict) -> float:
+    try:
+        return float(job.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _resident_pending_watermark_exempt_jobs(store, *, limit: int, runtime_profile: dict) -> list[dict]:
+    pending = [
+        job
+        for job in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if str(job.get("status") or "pending") == "pending"
+        and _is_ts_watermark_exempt_job(job)
+    ]
+    latest_by_kind: dict[str, tuple[float, int]] = {}
+    for index, job in enumerate(pending):
+        kind = _supersedable_maintenance_kind(job)
+        if not kind:
+            continue
+        candidate = (_job_ts_epoch(job), index)
+        if candidate >= latest_by_kind.get(kind, (float("-inf"), -1)):
+            latest_by_kind[kind] = candidate
+
+    for index, job in enumerate(pending):
+        kind = _supersedable_maintenance_kind(job)
+        if kind and latest_by_kind[kind][1] != index:
+            job_id = str(job.get("job_id") or "")
+            if job_id:
+                store.update_proactive_job(
+                    job_id,
+                    {
+                        "status": "skipped",
+                        "status_reason": "superseded_by_newer",
+                    },
+                    only_if_status="pending",
+                )
+
     out: list[dict] = []
-    for job in store.list_proactive_jobs(since_epoch=0, limit=0):
-        if str(job.get("status") or "pending") != "pending":
+    for index, job in enumerate(pending):
+        kind = _supersedable_maintenance_kind(job)
+        if kind and latest_by_kind[kind][1] != index:
             continue
-        if not _is_ts_watermark_exempt_job(job):
-            continue
+        if _is_introduction_job(job):
+            decision = _introduction_serve_decision(store, job)
+            if decision == "defer":
+                continue
+            if decision == "cancel":
+                _cancel_introduction_job(store, job)
+                continue
         out.append(_with_resident_runtime_v2(job, runtime_profile))
         if len(out) >= limit:
             break
@@ -144,6 +275,8 @@ def resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_p
     if len(out) >= limit:
         return out
     read_limit = max(limit, 100)
+    poll_now = time.time()
+    wake_job_max_age_sec = _wake_job_max_age_sec()
     for job in store.list_proactive_jobs(since_epoch=since, limit=read_limit):
         job_id = str(job.get("job_id") or "")
         if job_id and job_id in seen:
@@ -154,6 +287,19 @@ def resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_p
         # (status-based, ts-watermark-exempt); skip them here so they aren't
         # wake-gated by the v2 controls below.
         if _is_ts_watermark_exempt_job(job):
+            continue
+        age_ref = _job_age_ref_epoch(job)
+        if age_ref and poll_now - age_ref > wake_job_max_age_sec:
+            if job_id:
+                store.update_proactive_job(
+                    job_id,
+                    {
+                        "status": "expired",
+                        "status_reason": "stale_wake_expired",
+                        "wake_result": "stale_wake_expired",
+                    },
+                    only_if_status="pending",
+                )
             continue
         decision = _resident_wake_control_decision_v2(store, job)
         if decision is not None and not decision.accepted:

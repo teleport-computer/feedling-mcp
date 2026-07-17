@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+from accounts import registry
 import db
 import debug_trace
 from core.reqctx import request
@@ -193,10 +194,13 @@ def _model_api_context_messages(
         "do_not_say": identity.get("do_not_say", []),
         "stable_definitions": identity.get("stable_definitions", []),
     }
+    perception_snapshot = _perception_wake_snapshot(store.user_id)
     context_payload = {
         "agent_profile": hosted_history_import._model_api_agent_profile_context(store, identity),
         "identity": identity_summary,
         "context_memories": context_memories[:8],
+        "archive_language": registry._get_user_archive_language(store.user_id) or "",
+        "locale": str(perception_snapshot.get("locale") or "") if isinstance(perception_snapshot, dict) else "",
         "context_memory_trace": context_memory_trace,
         "world_book": {
             "matched_names": world_book["matched_names"],
@@ -209,7 +213,7 @@ def _model_api_context_messages(
         # Extended Perception: coarse, permission-gated current state (place
         # label, motion, battery, user_state, …). null fields = unauthorized or
         # stale; agent must not infer from null. See backend/perception/.
-        "perception": _perception_wake_snapshot(store.user_id),
+        "perception": perception_snapshot,
         "context_errors": {
             "history": hist_err,
             "identity": identity_err,

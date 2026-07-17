@@ -47,6 +47,40 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-17
+
+### [DONE] usr_f13f 事故①取证 + 信封 fpr 标签校验 + consumer 缓存钥加界
+
+- 取证结论（推翻事故报告的诊断）：身份卡**没有**搁浅在旧钥——07-15 10:16:10
+  既有 rewrap 自愈已把它修到当前钥（TEE 影子库有明文佐证，enclave 可解）；
+  真凶是**写手用陈旧 whoami 缓存钥封新消息**（37/37 条消息落地后秒级被 iOS
+  触发的 rewrap 修复 = 两天 rewrap 风暴）。详见 memory
+  `usr-f13f-identity-decrypt-incident-misdiagnosis`。
+- 修复 1：`build_envelope` 现在给所有信封写 `content_pk_fpr` 标签（此前只有
+  rewrap 会写）；`/v1/chat/message`、`/v1/chat/response`（含 thinking 信封）
+  对带标签但指纹 ≠ 当前注册钥的信封返回 409 `content_pk_fpr_mismatch`
+  （已登记 API_ERRORS.md + 公开 OpenAPI/changelog）。无标签信封放行（旧客户端
+  兼容）。附带收益：rewrap 对已是当前钥的新行能正确 skip，不再全量过 enclave。
+- 修复 2：consumer `_refresh_whoami_for_encrypted_reply` 的 cached-keys 兜底
+  加上限 `WHOAMI_STALE_KEYS_MAX_AGE_SEC`（默认 3600s，超龄拒绝封装、响亮跳过）；
+  `post_reply` 收到 409 fpr 不匹配时强刷 whoami（无视 TTL）重封重试一次。
+- Codex review 补漏 ①：`append_chat` 的字段白名单原本会把 `content_pk_fpr`
+  丢掉（入库即失标签，rewrap 对聊天行的 skip 永远打不中）——已补
+  `content_pk_fpr` / `thinking_content_pk_fpr` / `caption_content_pk_fpr`
+  三处持久化（core/store.py 两层白名单 + chat_core thinking_extra）。
+- Codex review 补漏 ②：TTL 快捷路径可绕过陈旧上限（把
+  `WHOAMI_STALE_KEYS_MAX_AGE_SEC` 配得比 TTL 小时，年龄在两者之间的缓存钥
+  会被 TTL 直接放行）——快捷路径现在同时要求 age < 上限（0 仍表示关闭上限）。
+- 测试：`tests/test_chat_envelope_fpr_guard.py`（11）+
+  `tests/test_consumer_whoami_key_guard.py`（6）全绿；全量 L1 3337 passed，
+  5 个失败在干净 HEAD 上原样复现（历史遗留）；L2 e2e_encryption chat 往返过
+  （memory/identity 段是脚本契约漂移的历史 400，与本改动无关）；OpenAPI 契约
+  测试 12/12；docs-site build/lint/types 过。
+- iOS 侧遗留（转客户端）：iOS 封信封尚未带 fpr 标签；`applyIdentity` 会把
+  解密失败卡的 marker 推进 LiveActivity/widget；rewrap 成功后 throttle 重置
+  导致每 poll 可再 fire。
+- 未提交未部署；部署后按 TESTING.md 行 F 做 L3（重启 resident consumer 验证）。
+
 ## 2026-07-14
 
 ### [DECISION] deepseek 从 pi 驱动改回 claude（cc）驱动

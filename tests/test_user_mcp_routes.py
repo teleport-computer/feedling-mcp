@@ -159,8 +159,8 @@ def test_test_endpoint_decrypts_and_probes(client, monkeypatch):
             {"url": "https://mcp.example.com/mcp", "headers": {}}).encode())
     monkeypatch.setattr(
         mcp_probe, "probe",
-        lambda url, headers, transport=None: {"ok": True, "tool_count": 1,
-                                               "tool_names": ["search"]})
+        lambda url, headers, *, ca_pem=None, transport=None: {
+            "ok": True, "tool_count": 1, "tool_names": ["search"]})
     _, key = _register(client)
     h = {"X-API-Key": key}
     client.post("/v1/mcp/servers", headers=h, json={
@@ -183,7 +183,7 @@ def test_test_endpoint_probe_error_returns_400(client, monkeypatch):
         lambda env, key, *, purpose, runtime_token="": json.dumps(
             {"url": "https://mcp.example.com/mcp", "headers": {}}).encode())
 
-    def _raise(url, headers, transport=None):
+    def _raise(url, headers, *, ca_pem=None, transport=None):
         raise mcp_probe.ProbeError("timeout", "connect timeout")
 
     monkeypatch.setattr(mcp_probe, "probe", _raise)

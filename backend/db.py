@@ -965,6 +965,24 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             rows = conn.execute(
                 """
                 SELECT user_id,
+                       COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown') AS reason,
+                       COUNT(*)::int
+                FROM user_logs
+                WHERE user_id = ANY(%s)
+                  AND stream = 'proactive_jobs'
+                  AND doc->>'status' IN ('failed', 'skipped')
+                GROUP BY user_id, reason
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, reason, count in rows:
+                ensure(out, uid).setdefault("proactive_extra", {}).setdefault(
+                    "jobs_failed_by_reason", {}
+                )[reason] = count
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
                        COALESCE(NULLIF(doc->>'live_activity_status', ''), 'unknown') AS live_status,
                        COUNT(*)::int
                 FROM chat_messages
@@ -1774,6 +1792,36 @@ def get_blob(user_id: str, kind: str):
     except Exception as e:
         log.error("[db] get_blob(%s,%s) failed: %s", user_id, kind, e)
         return None
+
+
+def get_blobs_for_users(
+    user_ids: list[str],
+    kinds: list[str],
+) -> dict[tuple[str, str], object]:
+    """Return singleton blobs for a set of users and kinds in one DB round trip.
+
+    Missing rows are omitted.  This is primarily for admin fan-out views: using
+    ``get_blob`` twice per user made the global debug page perform 2N pool
+    acquisitions and queries (more than 1,100 queries in production).
+    """
+    ids = list(dict.fromkeys(str(uid or "").strip() for uid in user_ids))
+    wanted_kinds = list(dict.fromkeys(str(kind or "").strip() for kind in kinds))
+    ids = [uid for uid in ids if uid]
+    wanted_kinds = [kind for kind in wanted_kinds if kind]
+    if not ids or not wanted_kinds:
+        return {}
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                "SELECT user_id, kind, doc FROM user_blobs "
+                "WHERE user_id = ANY(%s) AND kind = ANY(%s)",
+                (ids, wanted_kinds),
+            ).fetchall()
+        return {(str(user_id), str(kind)): doc for user_id, kind, doc in rows}
+    except Exception as e:
+        log.error("[db] get_blobs_for_users(%d users,%d kinds) failed: %s",
+                  len(ids), len(wanted_kinds), e)
+        return {}
 
 
 def set_blob(user_id: str, kind: str, doc) -> None:

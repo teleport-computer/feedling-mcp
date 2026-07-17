@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from accounts import registry  # noqa: E402
 from core import store as core_store  # noqa: E402
 from hosted import mcp_core  # noqa: E402
-from hosted import mcp_probe as _probe  # noqa: E402
+
+from _ca_helpers import self_signed_ca_pem  # noqa: E402
 
 
 @pytest.fixture()
@@ -34,12 +35,10 @@ def _fake_envelope(monkeypatch):
         core_envelope, "_build_shared_envelope_for_store",
         lambda store, raw, item_id=None: ({"v": 1, "id": item_id, "ct": raw.hex()}, ""),
     )
-    # SSRF guard (Task 2) does a real DNS resolve; these tests use *.example.com
-    # URLs to exercise mcp_core's own validation only, so stub the network-facing
-    # check to always pass — DNS behavior for example.com is environment-dependent
-    # (may NXDOMAIN, may be intercepted) and is exercised for real in
-    # test_user_mcp_probe.py instead.
-    monkeypatch.setattr(_probe, "blocked_url_kind", lambda url: None)
+    # No SSRF/DNS stub needed anymore: upsert_server no longer does a
+    # network-facing pre-check (Task 2 removed the blocked_url_kind call —
+    # http/private-IP URLs are now accepted at the storage layer; SSRF
+    # defense, if any, belongs to mcp_probe's connect-time path, not here).
 
 
 def test_list_empty(store):
@@ -67,14 +66,6 @@ def test_upsert_and_list_masks_secrets(store, monkeypatch):
     assert "config_envelope" not in srv
 
 
-def test_http_url_rejected(store, monkeypatch):
-    _fake_envelope(monkeypatch)
-    body, status = mcp_core.upsert_server(store, {
-        "name": "x", "url": "http://mcp.example.com", "headers": {}})
-    assert status == 400
-    assert body["error"]["kind"] == "https_required"
-
-
 def test_malformed_url_returns_400_not_500(store, monkeypatch):
     # An unterminated IPv6 literal makes urlparse (or .hostname access) raise
     # ValueError; the endpoint must translate that to a clean 400/invalid_url,
@@ -84,17 +75,6 @@ def test_malformed_url_returns_400_not_500(store, monkeypatch):
         "name": "x", "url": "https://[::1", "headers": {}})
     assert status == 400
     assert body["error"]["kind"] == "invalid_url"
-
-
-def test_upsert_rejects_blocked_url(store, monkeypatch):
-    _fake_envelope(monkeypatch)
-    # Override the blanket blocked_url_kind -> None stub from _fake_envelope
-    # to exercise mcp_core's SSRF-guard wiring itself (Task 2 entry point).
-    monkeypatch.setattr(_probe, "blocked_url_kind", lambda url: "blocked_url")
-    body, status = mcp_core.upsert_server(store, {
-        "name": "x", "url": "https://a.example.com", "headers": {}})
-    assert status == 400
-    assert body["error"]["kind"] == "blocked_url"
 
 
 def test_upsert_overwrites_same_name(store, monkeypatch):
@@ -248,3 +228,100 @@ def test_save_wakes_chat_poller_on_delete(store, monkeypatch):
     _, status = mcp_core.delete_server(store, "jira")
     assert status == 200
     assert calls == {"waiters": 1, "wake_bus": 1}
+
+
+def test_http_url_is_accepted(store, monkeypatch):
+    _fake_envelope(monkeypatch)
+    body, status = mcp_core.upsert_server(
+        store, {"name": "img", "url": "http://mcp.example.com/mcp"})
+    assert status == 200, body
+    assert body["name"] == "img"
+
+
+def test_private_ip_url_is_accepted(store, monkeypatch):
+    # 放开后私网地址必须能保存：agent 可能够得着（v2 spec §6 已判定 agent 路径
+    # 不构成新增攻击面）。后端 probe 够不够得着是 probe 的事，不是存储的事。
+    _fake_envelope(monkeypatch)
+    body, status = mcp_core.upsert_server(
+        store, {"name": "lan", "url": "http://192.168.1.5:8080/mcp"})
+    assert status == 200, body
+
+
+def test_bad_scheme_still_rejected(store, monkeypatch):
+    _fake_envelope(monkeypatch)
+    body, status = mcp_core.upsert_server(
+        store, {"name": "x", "url": "ftp://mcp.example.com/mcp"})
+    assert status == 400
+    assert body["error"]["kind"] == "invalid_url"
+
+
+def test_ca_pem_roundtrip_and_has_ca(store, monkeypatch):
+    _fake_envelope(monkeypatch)
+    ca = self_signed_ca_pem()
+    body, status = mcp_core.upsert_server(
+        store, {"name": "sec", "url": "https://mcp.example.com/mcp", "ca_pem": ca})
+    assert status == 200, body
+    assert body["has_ca"] is True
+    # 明文视图永不含证书内容
+    assert "ca_pem" not in body
+    listed, _ = mcp_core.list_servers(store)
+    assert listed["servers"][0]["has_ca"] is True
+
+
+def test_no_ca_means_has_ca_false(store, monkeypatch):
+    _fake_envelope(monkeypatch)
+    body, _ = mcp_core.upsert_server(
+        store, {"name": "plain", "url": "https://mcp.example.com/mcp"})
+    assert body["has_ca"] is False
+
+
+def test_legacy_record_without_has_ca_key_defaults_false(store):
+    """v2 (2026-07-08) 时期写入的老记录没有 ``has_ca`` 键。``_public`` 用
+    ``srv.get("has_ca")`` 透传会输出 ``None``，违反
+    ``tools/public_openapi_contracts.py`` 声明的 ``{"type": "boolean"}``。
+    prod 现存的记录在用户重新保存之前全部是这个形状 —— 必须强制转 bool，
+    同时保留 ``.get()`` 的向后兼容意图（老记录没这个键不能 KeyError）。
+    """
+    import db
+    legacy_record = {
+        "id": "srv_legacy1",
+        "name": "legacy",
+        "enabled": True,
+        "config_envelope": {"v": 1, "id": "x", "ct": "00"},
+        "url_hint": "mcp.example.com",
+        "header_names": [],
+        # deliberately no "has_ca" key — pre-existing-field shape.
+        "created_at": "2026-07-08T00:00:00Z",
+        "updated_at": "2026-07-08T00:00:00Z",
+    }
+    db.set_blob(store.user_id, mcp_core.USER_MCP_BLOB, {
+        "fingerprint": mcp_core.compute_fingerprint([legacy_record]),
+        "servers": [legacy_record],
+    })
+
+    listed, status = mcp_core.list_servers(store)
+    assert status == 200
+    (srv,) = listed["servers"]
+    assert srv["has_ca"] is False
+    assert srv["has_ca"] is not None
+
+    public = mcp_core._public(legacy_record)
+    assert public["has_ca"] is False
+
+
+def test_garbage_ca_rejected(store, monkeypatch):
+    _fake_envelope(monkeypatch)
+    body, status = mcp_core.upsert_server(
+        store, {"name": "bad", "url": "https://mcp.example.com/mcp",
+                "ca_pem": "-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----"})
+    assert status == 400
+    assert body["error"]["kind"] == "invalid_ca"
+
+
+def test_oversized_ca_rejected(store, monkeypatch):
+    _fake_envelope(monkeypatch)
+    body, status = mcp_core.upsert_server(
+        store, {"name": "big", "url": "https://mcp.example.com/mcp",
+                "ca_pem": "x" * (mcp_core.MAX_CA_BYTES + 1)})
+    assert status == 400
+    assert body["error"]["kind"] == "ca_too_large"

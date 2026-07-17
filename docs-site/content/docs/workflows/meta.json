@@ -1,4 +1,4 @@
 {
   "title": "Core workflows",
-  "pages": ["index", "chat", "memory", "perception"]
+  "pages": ["index", "chat", "mcp", "memory", "perception"]
 }

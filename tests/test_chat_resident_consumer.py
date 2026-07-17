@@ -51,6 +51,18 @@ except ModuleNotFoundError:
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
 
+@pytest.fixture(autouse=True)
+def _reset_proactive_guard_state_between_tests():
+    """The proactive idle-loop guard + failure backoff are module-global state
+    that accumulates across proactive realizations. Reset before each test so a
+    prior test's proactive turns don't trip the guard and skip this one's."""
+    crc._proactive_empty_streak = 0
+    crc._proactive_fail_streak = 0
+    crc._proactive_backoff_until = 0.0
+    crc._provider_payment_cooldown_until = 0.0
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1705,9 +1717,10 @@ def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(mon
 
 
 def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
-    # Resume is the fallback continuity path, kept only when foreground history
-    # injection is disabled. With injection on (the auto default for claude) the
-    # resident drops --resume — see test_claude_resume_injection_skipped_*.
+    # Resume is claude's primary continuity path on a self-hosted resident (auto
+    # injects only when _HOSTED — see test_resident_claude_auto_keeps_resume_*).
+    # When a turn DOES carry an injected transcript (hosted / forced on),
+    # _prepare_cli_command suppresses --resume for that turn instead.
     sid = "123e4567-e89b-12d3-a456-426614174000"
     monkeypatch.setattr(
         crc,
@@ -5527,20 +5540,23 @@ def test_load_whoami_defaults_archive_language_to_empty_when_absent(monkeypatch)
 
 def test_reply_language_line_prefers_presence_locale(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    # presence locale (zh) must win over archive_language (en): the shared helper
+    # returns the 简体中文 policy line, confirming locale precedence.
     line = crc._reply_language_line({"locale": "zh-Hans"})
-    assert "zh-Hans" in line
+    assert "简体中文" in line
+    assert "English" not in line
 
 
 def test_reply_language_line_falls_back_to_archive_language(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
     line = crc._reply_language_line(None)
-    assert "en" in line
+    assert "Default reply language: English" in line
 
 
 def test_reply_language_line_treats_empty_locale_as_missing(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
     line = crc._reply_language_line({"locale": ""})
-    assert "en" in line
+    assert "Default reply language: English" in line
 
 
 def test_reply_language_line_defaults_to_chinese_with_no_locale_or_archive(monkeypatch):
@@ -5615,10 +5631,468 @@ def test_foreground_injection_enabled_for_codex(monkeypatch):
     assert crc._foreground_history_injection_enabled() is True
 
 
-def test_foreground_injection_enabled_for_claude(monkeypatch):
+def test_foreground_injection_enabled_for_hosted_claude(monkeypatch):
+    # In-CVM (hosted) claude has no durable session store: transcript injection
+    # IS its continuity.
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", True)
     assert crc._foreground_history_injection_enabled() is True
+
+
+def test_foreground_injection_skipped_for_resident_claude(monkeypatch):
+    # A self-hosted resident's local claude has a reliable --resume. Injection
+    # would suppress it (_prepare_cli_command) and cold-start a fresh model
+    # session on EVERY message — boot-ritual personas then replay their arrival
+    # greeting per turn (the "来了" loop, usr_c190 2026-07-16). auto must keep
+    # the persistent-session path for resident claude.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    assert crc._foreground_history_injection_enabled() is False
+
+
+def test_foreground_injection_on_mode_forces_even_resident_claude(monkeypatch):
+    # explicit on outranks the hosted/resident split (operator escape hatch)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "on")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    assert crc._foreground_history_injection_enabled() is True
+
+
+def test_resident_claude_auto_keeps_resume_and_skips_transcript(monkeypatch):
+    # End-to-end shape of the resident-claude fix: in auto the message stays
+    # bare (no transcript header — and no history fetch at all), so
+    # _prepare_cli_command injects the stored --resume. This is the persistent-
+    # session behavior from before 7f3ff266.
+    sid = "123e4567-e89b-12d3-a456-426614174000"
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(
+        crc, "get_decrypted_history",
+        lambda since, limit=20, include_image_body=True: (_ for _ in ()).throw(
+            AssertionError("resident claude in auto must not fetch history")),
+    )
+
+    out = crc._foreground_agent_message("hello", current_ts=time.time())
+    assert out == "hello"                       # bare message, no transcript
+
+    cmd = crc._prepare_cli_command(out)
+    assert cmd[:3] == ["claude", "--resume", sid]
+
+
+# --- stale claude --resume self-heal -----------------------------------------
+# With resident claude back on --resume (see above), a sid can go stale when
+# something OUTSIDE the consumer wipes claude's local session store (cache
+# cleanup, moved home, reinstalled CLI). Without healing, EVERY turn then dies
+# on the same dead --resume. call_agent_cli clears the sid and retries the turn
+# once — strictly on the missing-session signature and only for our own sid.
+
+_CLAUDE_OK_TURN = json.dumps({
+    "type": "result", "subtype": "success",
+    "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000",
+    "result": "ok",
+})
+_STALE_SID = "11111111-1111-1111-1111-111111111111"
+
+
+def _stale_resume_env(monkeypatch, tmp_path, user_id):
+    _bridge_session_env(monkeypatch, tmp_path, user_id)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    crc._save_agent_session_id(_STALE_SID)
+
+
+def test_call_agent_cli_heals_stale_claude_resume_once(monkeypatch, tmp_path):
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_heal")
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        if len(runs) == 1:
+            assert cmd[:3] == ["claude", "--resume", _STALE_SID]
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="",
+                stderr=f"No conversation found with session ID: {_STALE_SID}",
+            )
+        assert "--resume" not in cmd            # retry must be a fresh session
+        return subprocess.CompletedProcess(cmd, 0, stdout=_CLAUDE_OK_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    assert crc.call_agent_cli("hello") == "ok"
+    assert len(runs) == 2
+    # the fresh session from the retry is persisted for the NEXT turn's --resume
+    assert crc._load_agent_session_id() == "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000"
+
+
+def test_call_agent_cli_stale_resume_retry_fails_raises_no_loop(monkeypatch, tmp_path):
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_fail")
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="",
+            stderr=f"No conversation found with session ID: {_STALE_SID}",
+        )
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 2                        # single retry, never a loop
+    assert crc._load_agent_session_id() == ""    # dead sid stays cleared
+
+
+def test_call_agent_cli_failed_retry_with_sid_in_error_does_not_repersist(monkeypatch, tmp_path):
+    # codex2 R1 P2: claude's FAILURE result JSON can still carry a session_id.
+    # A failed retry must not save it — otherwise the sid we just cleared is
+    # re-persisted for a dead/failed session and the next turn resumes into it.
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_repersist")
+    failed_with_sid = json.dumps({
+        "type": "result", "subtype": "error_during_execution", "is_error": True,
+        "session_id": "bbbbbbbb-2222-3333-4444-555555550000",
+        "result": "something broke",
+    })
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        if len(runs) == 1:
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="",
+                stderr=f"No conversation found with session ID: {_STALE_SID}",
+            )
+        return subprocess.CompletedProcess(cmd, 1, stdout=failed_with_sid, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 2
+    assert crc._load_agent_session_id() == ""    # failed-retry sid NOT persisted
+
+
+def test_call_agent_cli_non_session_error_does_not_heal(monkeypatch, tmp_path):
+    # A 401/500/etc must not eat the (valid) session: no retry, sid retained.
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_401")
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="API Error: 401 unauthorized",
+        )
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 1
+    assert crc._load_agent_session_id() == _STALE_SID
+
+
+def test_maintenance_jobs_wait_for_conversation_lull(monkeypatch):
+    # Soft idle: the user talked 1 min ago → memory maintenance (capture/dream/
+    # migrate) waits for a lull; wake-class jobs are NOT affected. Distinct from
+    # the user-pending defer: no flag, no break — later jobs still run this pass.
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    monkeypatch.setattr(crc, "_last_user_message_wall", time.time() - 60)
+    now = time.time()
+    jobs = [
+        {"job_id": "c1", "ts": now - 30, "source": "memory_capture"},
+        {"job_id": "d1", "ts": now - 30, "source": "memory_dream"},
+        {"job_id": "m1", "ts": now - 30, "source": "memory_migrate"},
+        {"job_id": "p1", "ts": now - 20, "source": crc.PROACTIVE_JOB_SOURCE},
+    ]
+    out = crc._process_resident_jobs(jobs, chat_since=10.0)
+    assert ran == [("proactive", "p1")]            # maintenance deferred, wake ran
+    assert out == pytest.approx(now - 20)
+    assert crc._resident_jobs_deferred_for_user is False   # soft idle ≠ defer flag
+
+
+def test_maintenance_soft_idle_respects_max_defer_cap(monkeypatch):
+    # A heavy chatter must not starve memory upkeep forever: jobs older than the
+    # MAX_DEFER cap run even mid-conversation.
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    monkeypatch.setattr(crc, "_last_user_message_wall", time.time() - 60)
+    old_ts = time.time() - crc.MAINTENANCE_MAX_DEFER_SEC - 60
+    crc._process_resident_jobs(
+        [{"job_id": "c1", "ts": old_ts, "source": "memory_capture"}], chat_since=10.0
+    )
+    assert ran == [("capture", "c1")]
+
+
+def test_maintenance_runs_after_lull_and_on_fresh_process(monkeypatch):
+    ran = _install_resident_job_gate_harness(monkeypatch)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    # lull: last user message longer than IDLE_SEC ago → maintenance proceeds
+    monkeypatch.setattr(
+        crc, "_last_user_message_wall", time.time() - crc.MAINTENANCE_IDLE_SEC - 5
+    )
+    crc._process_resident_jobs(
+        [{"job_id": "d1", "ts": time.time() - 30, "source": "memory_dream"}],
+        chat_since=10.0,
+    )
+    # fresh process: wall == 0.0 (no user message this lifetime) → never waits
+    monkeypatch.setattr(crc, "_last_user_message_wall", 0.0)
+    crc._process_resident_jobs(
+        [{"job_id": "c1", "ts": time.time(), "source": "memory_capture"}],
+        chat_since=10.0,
+    )
+    assert ran == [("dream", "d1"), ("capture", "c1")]
+
+
+# --- resident distill: chat preemption + resumable in-memory progress --------
+
+def _patch_memory_distill(monkeypatch, *, windows=3):
+    """Memory-mode distill harness: fake genesis worker/LLM modules injected into
+    sys.modules (so the lazy imports never pull real backend code), fake transport
+    helpers, REAL state machine under test. Returns the call ledger."""
+    import types as _types
+
+    calls = {"pending": 0, "map": [], "write": [], "recheck": 0,
+             "actions": [], "complete": [], "heartbeat": [], "lease": []}
+    job = {"job_id": "jobm", "mode": "add_memory", "material_kind": "",
+           "sealed": {"envelope": {"body_ct": "x"}}}
+
+    def fake_pending():
+        calls["pending"] += 1
+        return [dict(job)] if calls["pending"] == 1 else []
+
+    monkeypatch.setattr(crc, "_distill_in_progress", None)
+    monkeypatch.setattr(crc, "genesis_resident_pending", fake_pending)
+    monkeypatch.setattr(crc, "_decrypt_sealed_material", lambda env: b"doc")
+    monkeypatch.setattr(
+        crc, "_window_document",
+        lambda text, **kw: [f"w{i}" for i in range(1, windows + 1)],
+    )
+    monkeypatch.setattr(crc, "_resident_memory_snapshot", lambda: ("terms", ["known"]))
+    monkeypatch.setattr(crc, "_resident_floor_note", lambda: "")
+    monkeypatch.setattr(
+        crc, "genesis_resident_heartbeat", lambda jid: calls["heartbeat"].append(jid)
+    )
+    monkeypatch.setattr(
+        crc, "_genesis_resident_lease_alive",
+        lambda jid: calls["lease"].append(jid) or True,
+    )
+    monkeypatch.setattr(
+        crc, "_capture_build_envelope",
+        lambda card, *, occurred_at, source: {"card": card},
+    )
+    monkeypatch.setattr(
+        crc, "execute_memory_actions", lambda actions: calls["actions"].append(len(actions))
+    )
+    monkeypatch.setattr(
+        crc, "genesis_resident_complete",
+        lambda jid, *, memory_action_count, identity_status:
+            calls["complete"].append((jid, memory_action_count, identity_status)),
+    )
+
+    def fake_map(**kw):
+        calls["map"].append(kw["key_prefix"])
+        return {"all_fact_candidates": [{"summary": kw["key_prefix"]}]}
+
+    def fake_write(**kw):
+        calls["write"].append(len(kw["fact_candidates"]))
+        return {"memories": [{"summary": "m1"}, {"summary": "m2"}]}
+
+    def fake_recheck(**kw):
+        calls["recheck"] += 1
+        return {"memories": []}
+
+    fake_genesis = _types.ModuleType("genesis")
+    fake_genesis.worker = _types.SimpleNamespace(
+        build_foreground_output_from_texts=fake_map,
+        build_memory_output_from_fact_candidates=fake_write,
+        build_memory_recheck_from_material=fake_recheck,
+    )
+    fake_llm_mod = _types.ModuleType("genesis.llm_client")
+
+    class _FakeLLM:
+        def __init__(self, **kw):
+            pass
+
+    fake_llm_mod.GenesisLLMClient = _FakeLLM
+    fake_provider = _types.ModuleType("provider_client")
+
+    class _FakeProviderConfig:
+        def __init__(self, **kw):
+            pass
+
+    fake_provider.ProviderConfig = _FakeProviderConfig
+    monkeypatch.setitem(sys.modules, "genesis", fake_genesis)
+    monkeypatch.setitem(sys.modules, "genesis.llm_client", fake_llm_mod)
+    monkeypatch.setitem(sys.modules, "provider_client", fake_provider)
+    return calls
+
+
+def test_distill_yields_to_user_between_chunks_and_resumes_without_rerun(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=3)
+    pending = {"flag": False}
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: pending["flag"])
+    real_map = sys.modules["genesis"].worker.build_foreground_output_from_texts
+
+    def map_then_user_arrives(**kw):
+        out = real_map(**kw)
+        pending["flag"] = True          # user message lands DURING chunk 1's turn
+        return out
+
+    sys.modules["genesis"].worker.build_foreground_output_from_texts = map_then_user_arrives
+
+    crc._process_resident_distill_once(chat_since=1.0)
+    # yielded after chunk 1: progress held, nothing written, job NOT completed
+    assert calls["map"] == ["jobm:resident:map:1"]
+    assert calls["write"] == [] and calls["actions"] == [] and calls["complete"] == []
+    held = crc._distill_in_progress
+    assert held is not None and held["active"]["next_window_idx"] == 2
+    assert held["active"]["phase"] == "map"
+
+    # user handled → resume: chunk 1 NOT re-run, pipeline finishes end-to-end
+    pending["flag"] = False
+    sys.modules["genesis"].worker.build_foreground_output_from_texts = real_map
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert calls["lease"] == ["jobm"]              # held lease re-checked on resume
+    assert calls["map"] == [f"jobm:resident:map:{i}" for i in (1, 2, 3)]
+    assert calls["write"] == [3]                   # all 3 windows' candidates, once
+    assert calls["recheck"] == 1
+    assert calls["actions"] == [2]                 # one batched memory.add
+    assert calls["complete"] == [("jobm", 2, "skipped")]
+    assert crc._distill_in_progress is None
+    assert calls["pending"] == 1                   # resume never re-claims
+
+
+def test_distill_drops_progress_when_lease_lost_while_yielded(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=2)
+    pending = {"flag": False}
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: pending["flag"])
+    real_map = sys.modules["genesis"].worker.build_foreground_output_from_texts
+
+    def map_then_user_arrives(**kw):
+        out = real_map(**kw)
+        pending["flag"] = True
+        return out
+
+    sys.modules["genesis"].worker.build_foreground_output_from_texts = map_then_user_arrives
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert crc._distill_in_progress is not None
+
+    # while the user kept chatting, the backend reaper re-queued the job
+    monkeypatch.setattr(crc, "_genesis_resident_lease_alive", lambda jid: False)
+    pending["flag"] = False
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert crc._distill_in_progress is None        # local progress dropped
+    assert calls["complete"] == []                 # never completes a lost job
+    assert calls["map"] == ["jobm:resident:map:1"]  # and never touched chunk 2
+
+
+def test_distill_yields_before_write_phase_and_resumes(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    seq = iter([False, True])                       # map peek ok → write peek yields
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: next(seq, False))
+    crc._process_resident_distill_once(chat_since=1.0)
+    held = crc._distill_in_progress
+    assert calls["map"] == ["jobm:resident:map:1"] and calls["write"] == []
+    assert held is not None and held["active"]["phase"] == "write"
+
+    crc._process_resident_distill_once(chat_since=1.0)  # peek now False
+    assert calls["write"] == [1] and calls["recheck"] == 1
+    assert calls["complete"] == [("jobm", 2, "skipped")]
+    assert crc._distill_in_progress is None
+
+
+def test_distill_identity_job_postpones_whole_job_when_user_pending(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch)
+    job = {"job_id": "jobi", "mode": "update_identity", "material_kind": "",
+           "base_identity_replaced_at": "", "sealed": {"envelope": {"body_ct": "x"}}}
+    monkeypatch.setattr(crc, "genesis_resident_pending", lambda: [job])
+    derives = []
+    monkeypatch.setattr(crc, "_resident_derive_identity",
+                        lambda document, job_id: derives.append(job_id) or None)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: True)
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert derives == []                            # zero model turns spent
+    assert crc._distill_in_progress is not None     # job held for the next pass
+
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert derives == ["jobi"]
+    assert calls["complete"] == [("jobi", 0, "skipped")]
+    assert crc._distill_in_progress is None
+
+
+def test_distill_lease_alive_only_4xx_means_lost(monkeypatch):
+    # codex2 R1 P2: a 5xx is a backend transient — dropping held map progress on it
+    # would throw away completed chunks for nothing. Only 4xx = reclaimed/foreign.
+    class _Resp:
+        def __init__(self, code):
+            self.status_code = code
+
+    def http_with(code):
+        class _H:
+            def post(self, url, json=None, headers=None, timeout=None):
+                return _Resp(code)
+        return _H()
+
+    monkeypatch.setattr(crc, "_HTTP", http_with(200))
+    assert crc._genesis_resident_lease_alive("j") is True
+    monkeypatch.setattr(crc, "_HTTP", http_with(409))
+    assert crc._genesis_resident_lease_alive("j") is False
+    monkeypatch.setattr(crc, "_HTTP", http_with(404))
+    assert crc._genesis_resident_lease_alive("j") is False
+    monkeypatch.setattr(crc, "_HTTP", http_with(500))
+    assert crc._genesis_resident_lease_alive("j") is True   # transient ≠ lost
+    monkeypatch.setattr(crc, "_HTTP", http_with(503))
+    assert crc._genesis_resident_lease_alive("j") is True
+
+    class _Boom:
+        def post(self, *a, **kw):
+            raise RuntimeError("network down")
+
+    monkeypatch.setattr(crc, "_HTTP", _Boom())
+    assert crc._genesis_resident_lease_alive("j") is True   # transport error ≠ lost
+
+
+def test_distill_without_chat_since_never_peeks_and_runs_to_completion(monkeypatch):
+    # legacy call shape (no gate): must run the whole pipeline in one call and
+    # never touch the chat-peek path at all.
+    calls = _patch_memory_distill(monkeypatch, windows=2)
+    monkeypatch.setattr(
+        crc, "_user_chat_pending",
+        lambda since: (_ for _ in ()).throw(AssertionError("peeked without chat_since")),
+    )
+    crc._process_resident_distill_once()
+    assert calls["map"] == [f"jobm:resident:map:{i}" for i in (1, 2)]
+    assert calls["complete"] == [("jobm", 2, "skipped")]
+    assert crc._distill_in_progress is None
+
+
+def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
+    # An operator-pinned --resume with a sid that is NOT ours is their config —
+    # never rotate it, even on a missing-session error.
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_foreign")
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        'claude --resume 99999999-9999-9999-9999-999999999999 -p "{message}"',
+    )
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="",
+            stderr="No conversation found with session ID: 99999999-9999-9999-9999-999999999999",
+        )
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 1
+    assert crc._load_agent_session_id() == _STALE_SID
 
 
 def test_foreground_injection_bridges_pi_on_cold_start(monkeypatch, tmp_path):
@@ -6437,3 +6911,279 @@ def test_foreground_transcript_closed_by_explicit_separator(monkeypatch):
     assert out.endswith("新消息")
     assert out.startswith(crc.FOREGROUND_CHAT_CONTEXT_HEADER)
     assert crc._message_has_injected_history(out)
+
+
+# --- _strip_missing_mcp_config: Windows/self-host --mcp-config heal ---------
+
+def test_strip_missing_mcp_config_drops_nonexistent_path():
+    """A hard-coded --mcp-config pointing at a missing file is dropped so the
+    CLI agent can start (would otherwise exit 1: 'MCP config file not found')."""
+    cmd = ["claude", "--mcp-config", "/no/such/feedling_mcp.json", "--print", "{message}"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped == "/no/such/feedling_mcp.json"
+    assert out == ["claude", "--print", "{message}"]
+
+
+def test_strip_missing_mcp_config_keeps_existing_file(tmp_path):
+    """An operator-managed --mcp-config that actually exists is left untouched."""
+    real = tmp_path / "user-mcp.json"
+    real.write_text('{"mcpServers": {}}')
+    cmd = ["claude", "--mcp-config", str(real), "--print"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped is None
+    assert out == cmd
+
+
+def test_strip_missing_mcp_config_noop_without_flag():
+    cmd = ["claude", "--print", "--output-format", "json", "{message}"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped is None
+    assert out == cmd
+
+
+def test_strip_missing_mcp_config_trailing_flag_is_safe():
+    """--mcp-config as the last token (no value) must not crash or over-strip."""
+    cmd = ["claude", "--print", "--mcp-config"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped is None
+    assert out == cmd
+
+
+def test_strip_missing_mcp_config_handles_equals_form():
+    """--mcp-config=<path> single-token form is stripped when the file is gone."""
+    cmd = ["claude", "--mcp-config=/no/such/x.json", "--print"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped == "/no/such/x.json"
+    assert out == ["claude", "--print"]
+
+
+def test_strip_missing_mcp_config_keeps_existing_equals_form(tmp_path):
+    real = tmp_path / "m.json"
+    real.write_text("{}")
+    cmd = ["claude", f"--mcp-config={real}", "--print"]
+    out, stripped = crc._strip_missing_mcp_config(cmd)
+    assert stripped is None
+    assert out == cmd
+
+
+def test_prepare_cli_command_heals_incident_windows_mcp_path(monkeypatch):
+    """End-to-end through _prepare_cli_command: an incident-shaped hard-coded
+    Windows --mcp-config to a missing file is healed so claude can start
+    (quoted/forward-slash path so shlex keeps it intact, matching doc guidance)."""
+    tmpl = 'claude --mcp-config "C:/Users/Administrator/feedling_user_mcp.json" -p {message}'
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", tmpl)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    # Bypass PATH resolution of the 'claude' binary — CI has no claude installed,
+    # and this test is about the --mcp-config heal, not executable resolution.
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    cmd = crc._prepare_cli_command("hi", lane="chat")
+    assert "--mcp-config" not in cmd
+    assert not any("feedling_user_mcp.json" in t for t in cmd)
+    assert os.path.basename(cmd[0]) == "claude"
+
+
+# --- Proactive idle-loop guard + failure backoff (Seven 2026-07-16) ----------
+
+def _reset_proactive_guard_state():
+    crc._proactive_empty_streak = 0
+    crc._proactive_fail_streak = 0
+    crc._proactive_backoff_until = 0.0
+
+
+def test_proactive_idle_guard_trips_after_max_empty_turns():
+    _reset_proactive_guard_state()
+    assert not crc._proactive_idle_guard_tripped()
+    for _ in range(crc.MAX_EMPTY_PROACTIVE_TURNS):
+        crc._note_idle_proactive_send()
+    assert crc._proactive_idle_guard_tripped()
+
+
+def test_proactive_idle_guard_reset_clears_streak():
+    _reset_proactive_guard_state()
+    for _ in range(crc.MAX_EMPTY_PROACTIVE_TURNS + 2):
+        crc._note_idle_proactive_send()
+    assert crc._proactive_idle_guard_tripped()
+    crc._reset_proactive_idle_guard()
+    assert not crc._proactive_idle_guard_tripped()
+    assert crc._proactive_empty_streak == 0
+
+
+def test_proactive_failure_backoff_grows_and_clears(monkeypatch):
+    _reset_proactive_guard_state()
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 1000.0)
+    assert not crc._proactive_backing_off()
+    crc._note_proactive_failure()
+    assert crc._proactive_backing_off()
+    assert (crc._proactive_backoff_until - 1000.0) == crc.PROACTIVE_FAIL_BACKOFF_BASE_SEC
+    crc._note_proactive_failure()
+    assert (crc._proactive_backoff_until - 1000.0) == crc.PROACTIVE_FAIL_BACKOFF_BASE_SEC * 2
+    crc._clear_proactive_failure()
+    assert not crc._proactive_backing_off()
+    assert crc._proactive_fail_streak == 0
+
+
+def test_proactive_failure_backoff_caps(monkeypatch):
+    _reset_proactive_guard_state()
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 0.0)
+    for _ in range(20):
+        crc._note_proactive_failure()
+    assert crc._proactive_backoff_until <= crc.PROACTIVE_FAIL_BACKOFF_CAP_SEC
+    _reset_proactive_guard_state()
+
+
+# --- Proactive guard EDGE CASES through the real realize/route paths ----------
+
+def _proactive_guard_harness(monkeypatch, agent_reply=("在。",), raise_exc=None):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    cap = {"agent_called": False, "statuses": [], "posts": []}
+
+    def _agent(message, images=None, image_paths=None, **kw):
+        cap["agent_called"] = True
+        if raise_exc is not None:
+            raise raise_exc
+        return list(agent_reply)
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kw: (cap["posts"].append(reply), {"id": "m"})[1])
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kw: cap["statuses"].append((status, reason)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: None)
+    monkeypatch.setattr(crc, "_consume_reply_parse_failed", lambda: False)
+    return cap
+
+
+def _idle_proactive_job(job_id="pj_idle"):
+    return {"schema_version": 2, "job_id": job_id, "source": crc.PROACTIVE_JOB_SOURCE,
+            "ts": 100.0, "trigger": "heartbeat_broadcast_off", "wake_kind": "presence"}
+
+
+def test_guard_skips_idle_proactive_when_tripped(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert cap["agent_called"] is False
+    assert ("skipped", "proactive_idle_loop: no new user input") in cap["statuses"]
+
+
+def test_guard_realizes_idle_proactive_when_not_tripped(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_empty_streak = 0
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert cap["agent_called"] is True
+    assert crc._proactive_empty_streak == 1  # idle send advanced the streak
+
+
+def test_guard_does_not_skip_screen_watch_when_tripped(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    job = _idle_proactive_job("pj_sw")
+    job["job_kind"] = "screen_watch"
+    job["frame_ids"] = ["f1"]
+    crc._process_proactive_jobs([job])
+    assert cap["agent_called"] is True  # screen-watch is not an idle lane
+    assert crc._proactive_empty_streak == crc.MAX_EMPTY_PROACTIVE_TURNS  # unchanged
+
+
+def test_guard_does_not_skip_introduction_when_tripped(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    job = _idle_proactive_job("pj_intro")
+    job["job_kind"] = "introduction"
+    crc._process_proactive_jobs([job])
+    assert cap["agent_called"] is True  # first-greeting must never be suppressed
+    assert crc._proactive_empty_streak == crc.MAX_EMPTY_PROACTIVE_TURNS  # unchanged
+
+
+def test_backoff_skips_idle_proactive(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_backoff_until = crc.time.monotonic() + 999
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert cap["agent_called"] is False
+    assert any(s == "skipped" and "backoff" in r for s, r in cap["statuses"])
+
+
+def test_generic_failure_sets_backoff(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("cli agent exited 1"))
+    crc._proactive_fail_streak = 0
+    crc._proactive_backoff_until = 0.0
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert cap["agent_called"] is True
+    assert crc._proactive_backing_off() is True
+    assert any(s == "failed" for s, _ in cap["statuses"])
+
+
+def test_402_failure_feeds_both_cooldown_and_general_backoff(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("HTTP 402 payment required"))
+    crc._proactive_backoff_until = 0.0
+    crc._clear_provider_payment_cooldown()
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert crc._provider_payment_cooling_down() is True
+    assert crc._proactive_backing_off() is True
+    crc._clear_provider_payment_cooldown()
+
+
+def test_success_clears_failure_backoff(monkeypatch):
+    cap = _proactive_guard_harness(monkeypatch)
+    crc._proactive_fail_streak = 3
+    crc._proactive_backoff_until = 0.0  # expired, so the job is not skipped
+    crc._process_proactive_jobs([_idle_proactive_job()])
+    assert cap["agent_called"] is True
+    assert crc._proactive_fail_streak == 0
+
+
+def test_user_message_resets_guard_and_backoff():
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._proactive_fail_streak = 3
+    msg = {"id": "u-reset", "role": "user", "content": "hi", "ts": 2000.0}
+    with patch.object(crc, "call_agent", return_value="hey"), \
+         patch.object(crc, "post_reply", return_value={"id": "r1"}):
+        crc._process_messages([msg])
+    assert crc._proactive_empty_streak == 0
+    assert crc._proactive_fail_streak == 0
+
+
+def test_max_empty_zero_disables_idle_guard(monkeypatch):
+    monkeypatch.setattr(crc, "MAX_EMPTY_PROACTIVE_TURNS", 0)
+    crc._proactive_empty_streak = 99
+    assert crc._proactive_idle_guard_tripped() is False
+
+
+# --- resident reply-language wiring (Seven 2026-07-16) ------------------------
+
+def test_local_time_anchor_english_under_en_policy(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "America/New_York")
+    anchor = crc._local_time_anchor(since_sec=7200)
+    assert anchor.startswith("current_time:")
+    for zh in ("凌晨", "上午", "中午", "下午", "晚上", "周一", "周日", "距上次互动", "默认"):
+        assert zh not in anchor
+    assert any(d in anchor for d in (
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+    assert "last interaction" in anchor  # localized gap wording
+
+
+def test_local_time_anchor_chinese_under_default_policy(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": ""})
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    anchor = crc._local_time_anchor()
+    assert anchor.startswith("current_time:")
+    assert any(s in anchor for s in ("凌晨", "上午", "中午", "下午", "晚上"))
+    assert any(d in anchor for d in ("周一", "周二", "周三", "周四", "周五", "周六", "周日"))
+
+
+def test_foreground_prepend_includes_language_line_and_time(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "America/New_York")
+    crc._last_interaction_unix = 0.0
+    out = crc._prepend_time_anchor_foreground("hello", 1000.0)
+    assert "current_time:" in out
+    assert "Reply language policy" in out  # language line now wired into foreground
+    assert out.rstrip().endswith("hello")

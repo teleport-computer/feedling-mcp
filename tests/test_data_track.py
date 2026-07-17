@@ -171,6 +171,17 @@ def test_admin_data_track_aggregates_counts_without_content(client):
         "onboarding_connection_copied",
         {"payload": {"screen": "chat_empty", "prompt": "private copied prompt"}},
     ))
+    store.append_proactive_job({
+        "job_id": "pj_failed_timeout",
+        "status": "failed",
+        "status_reason": "model_timeout",
+        "job_kind": "presence",
+    })
+    store.append_proactive_job({
+        "job_id": "pj_failed_unknown",
+        "status": "failed",
+        "job_kind": "scheduled_wake",
+    })
 
     res = client.get("/v1/admin/data-track/users", headers=_admin_headers())
 
@@ -186,6 +197,7 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     assert row["memory"]["by_tab"]["story"] == 1
     assert row["memory"]["by_tab"]["about_me"] == 1
     assert row["proactive"]["proactive_messages"] == 1
+    assert row["proactive"]["job_failed_reasons"] == {"model_timeout": 1, "unknown": 1}
     dumped = json.dumps(body)
     assert "ciphertext-that-must-not-leak" not in dumped
     assert "private alert preview" not in dumped

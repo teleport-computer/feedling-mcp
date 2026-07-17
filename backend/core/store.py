@@ -366,6 +366,9 @@ class UserStore:
             "nonce": envelope["nonce"],
             "K_user": envelope["K_user"],
             "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+            # Seal-time label of the user pk K_user was wrapped to; rewrap's
+            # skip logic reads it off the stored row (empty for old clients).
+            "content_pk_fpr": envelope.get("content_pk_fpr", ""),
             "visibility": envelope.get("visibility", "shared"),
             "owner_user_id": envelope.get("owner_user_id", self.user_id),
             "content_type": ct,
@@ -412,6 +415,7 @@ class UserStore:
                 "caption_K_user",
                 "caption_K_enclave",
                 "caption_enclave_pk_fpr",
+                "caption_content_pk_fpr",
                 "caption_visibility",
                 "caption_owner_user_id",
                 "thinking_v",
@@ -421,6 +425,7 @@ class UserStore:
                 "thinking_K_user",
                 "thinking_K_enclave",
                 "thinking_enclave_pk_fpr",
+                "thinking_content_pk_fpr",
                 "thinking_visibility",
                 "thinking_owner_user_id",
                 "thinking_kind",

@@ -5,6 +5,13 @@ httpx[http2]>=0.27.0
 PyJWT>=2.8.0
 cryptography>=42.0.0
 
+# Public CA bundle. Already present transitively (httpx pulls it), but the
+# consumer reads certifi.where() directly to build codex's SSL_CERT_FILE
+# bundle (user_mcp CA injection) — SSL_CERT_FILE REPLACES the trust store, so
+# the public roots must be concatenated in by us. Explicit so a future httpx
+# swap can't silently drop it.
+certifi>=2024.2.2
+
 # Production server (process manager) for both the backend and the enclave.
 # The dev server in app.run() (Werkzeug) is single-process and stalls on large
 # responses under the TDX CVM; gunicorn gives worker timeouts + better

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,24 @@ def _route_events(client, api_key: str) -> list[dict]:
     return res.get_json()["events"]
 
 
+def _wait_for_route_events(
+    client,
+    api_key: str,
+    expected_types: tuple[str, ...],
+    *,
+    timeout: float = 1.0,
+) -> list[dict]:
+    deadline = time.monotonic() + timeout
+    while True:
+        events = _route_events(client, api_key)
+        actual_types = tuple(event["type"] for event in events[:len(expected_types)])
+        if actual_types == expected_types:
+            return events
+        if time.monotonic() >= deadline:
+            pytest.fail(f"timed out waiting for route events {expected_types}; saw {actual_types}")
+        time.sleep(0.01)
+
+
 def test_resident_chat_message_and_poll_emit_route_trace(client):
     user_id, api_key = _register(client)
     _enable_trace(client, api_key)
@@ -89,7 +108,11 @@ def test_resident_chat_message_and_poll_emit_route_trace(client):
     assert poll.status_code == 200, poll.get_data(as_text=True)
     assert len(poll.get_json()["messages"]) == 1
 
-    events = _route_events(client, api_key)
+    events = _wait_for_route_events(
+        client,
+        api_key,
+        ("chat.poll.delivered", "chat.message"),
+    )
     assert [event["type"] for event in events[:2]] == ["chat.poll.delivered", "chat.message"]
     assert events[0]["actor"] == "consumer"
     assert events[0]["detail"]["count"] == 1
@@ -121,7 +144,7 @@ def test_resident_chat_response_emits_route_trace(client, monkeypatch):
     )
     assert res.status_code == 200, res.get_data(as_text=True)
 
-    event = _route_events(client, api_key)[0]
+    event = _wait_for_route_events(client, api_key, ("chat.response",))[0]
     assert event["type"] == "chat.response"
     assert event["actor"] == "agent"
     assert event["detail"]["source"] == "chat"
@@ -145,7 +168,7 @@ def test_resident_chat_response_gate_emits_route_trace(client, monkeypatch):
     )
     assert res.status_code == 409, res.get_data(as_text=True)
 
-    event = _route_events(client, api_key)[0]
+    event = _wait_for_route_events(client, api_key, ("chat.response.gated",))[0]
     assert event["type"] == "chat.response.gated"
     assert event["status"] == "blocked"
     assert event["trace_id"] == "user-msg-gated"

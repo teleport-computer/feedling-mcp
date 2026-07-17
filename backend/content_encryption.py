@@ -132,6 +132,11 @@ def build_envelope(
         "nonce": _b64(body_nonce),
         "K_user": _b64(k_user),
         "enclave_pk_fpr": "",
+        # Which user pk K_user was sealed to. Lets the rewrap endpoint skip
+        # already-current envelopes and lets chat ingest bounce a writer whose
+        # cached key is stale (2026-07-16 usr_f13f: a consumer sealed two days
+        # of replies to a retired key; unlabeled rows can't be told apart).
+        "content_pk_fpr": hashlib.sha256(user_pk_bytes).hexdigest()[:16],
     }
     if visibility == "shared":
         env["K_enclave"] = _b64(box_seal(K, enclave_pk_bytes))

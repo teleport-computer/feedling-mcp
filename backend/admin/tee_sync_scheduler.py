@@ -166,10 +166,12 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
             summary["replicate_skipped"] += rep.get("skipped") or 0
             summary["report"].setdefault("replicate", {})[table] = {
                 k: rep.get(k) for k in
-                ("copied", "pending", "errors", "skipped", "watermark_ts", "watermark_id")}
-            if rep.get("copied") or rep.get("pending") or rep.get("errors"):
-                log.info("[tee-sync] replicate %s: copied=%s pending=%s errors=%s",
-                         table, rep.get("copied"), rep.get("pending"), rep.get("errors"))
+                ("copied", "pending", "errors", "skipped", "quarantined",
+                 "watermark_ts", "watermark_id")}
+            if rep.get("copied") or rep.get("pending") or rep.get("errors") or rep.get("quarantined"):
+                log.info("[tee-sync] replicate %s: copied=%s pending=%s errors=%s quarantined=%s",
+                         table, rep.get("copied"), rep.get("pending"), rep.get("errors"),
+                         rep.get("quarantined"))
         except tr.AlreadyRunning:
             # 手动 run 持锁 → 本 tick 的活由它在干,不落一行半吊子指标(会污染趋势)。
             log.info("[tee-sync] 手动复制 run 持锁中 — 跳过本 tick")

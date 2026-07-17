@@ -3,8 +3,11 @@ import os
 import sys
 import time
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
+from core import enclave as core_enclave  # noqa: E402
 import db  # noqa: E402
 import debug_trace  # noqa: E402
 
@@ -158,3 +161,94 @@ def test_verbose_ring_cap(monkeypatch):
     for i in range(260):
         debug_trace.trace_event(store, subsystem="route", type=f"t{i}")
     assert len(debug_trace.read_trace(store, limit=1000)) == 200  # verbose cap
+
+
+class _FakeEnclaveResponse:
+    def __init__(self, status_code=200, body=None, text=""):
+        self.status_code = status_code
+        self._body = body
+        self.text = text
+
+    def json(self):
+        return self._body
+
+
+def _install_enclave_client(monkeypatch, outcome):
+    class _FakeEnclaveClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, *_args, **_kwargs):
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(core_enclave.httpx, "Client", lambda **_kwargs: _FakeEnclaveClient())
+
+
+def _capture_enclave_events(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        core_enclave.debug_trace,
+        "trace_event",
+        lambda _store, **event: events.append(event),
+    )
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://enclave.test")
+    return events
+
+
+def test_tee_replicate_success_does_not_write_enclave_trace(monkeypatch):
+    events = _capture_enclave_events(monkeypatch)
+    response = _FakeEnclaveResponse(body={"plaintext_b64": "cGxhaW50ZXh0"})
+    _install_enclave_client(monkeypatch, response)
+
+    plaintext = core_enclave._decrypt_envelope_via_enclave(
+        {"owner_user_id": "usr_replicate", "body_ct": "ciphertext"},
+        "api-key",
+        purpose="tee_replicate:chat:msg_1",
+    )
+
+    assert plaintext == b"plaintext"
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_type"),
+    [
+        (_FakeEnclaveResponse(status_code=503, text="unavailable"), "enclave.call.error"),
+        (core_enclave.httpx.ReadTimeout("timed out"), "enclave.call.timeout"),
+    ],
+)
+def test_tee_replicate_failure_keeps_enclave_error_trace(monkeypatch, outcome, expected_type):
+    events = _capture_enclave_events(monkeypatch)
+    _install_enclave_client(monkeypatch, outcome)
+
+    with pytest.raises(RuntimeError):
+        core_enclave._decrypt_envelope_via_enclave(
+            {"owner_user_id": "usr_replicate", "body_ct": "ciphertext"},
+            "api-key",
+            purpose="tee_replicate:memory",
+        )
+
+    assert [event["type"] for event in events] == [expected_type]
+    assert events[0]["status"] == "error"
+    assert events[0]["detail"]["purpose"] == "tee_replicate:memory"
+
+
+def test_normal_decrypt_keeps_enclave_start_and_done_traces(monkeypatch):
+    events = _capture_enclave_events(monkeypatch)
+    response = _FakeEnclaveResponse(body={"plaintext_b64": "cGxhaW50ZXh0"})
+    _install_enclave_client(monkeypatch, response)
+
+    plaintext = core_enclave._decrypt_envelope_via_enclave(
+        {"owner_user_id": "usr_chat", "body_ct": "ciphertext"},
+        "api-key",
+        purpose="chat:history",
+    )
+
+    assert plaintext == b"plaintext"
+    assert [event["type"] for event in events] == ["enclave.call.start", "enclave.call.done"]
+    assert all(event["detail"]["purpose"] == "chat:history" for event in events)

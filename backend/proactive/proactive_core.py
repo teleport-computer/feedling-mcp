@@ -458,6 +458,7 @@ def scheduled_actions(store, payload: dict):
         turn_id=str(payload.get("turn_id") or ""),
         wake_ids=tuple(str(item) for item in (payload.get("wake_ids") or ()) if str(item)),
         origin_refs=tuple(str(item) for item in (payload.get("origin_refs") or ()) if str(item)),
+        self_wake=service._proactive_bool(payload, "self_wake"),
         submit_wake=_submit,
     )
     return {"results": [result.as_dict() for result in results]}, 200

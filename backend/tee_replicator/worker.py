@@ -91,10 +91,23 @@ _PENDING_UPDATE_REASON = (
 # and get wrongly picked up (and "consumed") by _consume_requeue as if it were
 # an in-place-rewrite marker, instead of staying terminal.
 _PDM_REASON_PREFIX = "pdm:"
+# Terminal-reason prefix for permanently-undecryptable rows (enclave 403
+# decrypt_failed — wrong content key/owner mismatch/corrupt envelope). Like
+# _PDM_REASON_PREFIX it is a fixed marker that never starts with "requeue", so a
+# quarantined row is not falsely picked up by _REQUEUE_SELECT. verify counts it
+# as terminal pending (NOT LIKE 'requeue%') → keeps rds == tee + pending
+# balanced and skips it in sampling.
+_DECRYPT_FAILED_REASON_PREFIX = "decrypt_failed:"
 
 
 def _pdm_reason(exc: Exception) -> str:
     return f"{_PDM_REASON_PREFIX}{str(exc) or 'local_only_or_no_k_enclave'}"
+
+
+def _decrypt_failed_reason(exc: Exception) -> str:
+    # Truncate: the enclave body can be long; the prefix + a short detail is all
+    # a later re-drive / audit needs, and the pending.reason column is TEXT.
+    return f"{_DECRYPT_FAILED_REASON_PREFIX}{str(exc)[:200] or 'undecryptable'}"
 
 
 @dataclass(frozen=True)
@@ -321,6 +334,17 @@ def _is_auth_error(exc: Exception) -> bool:
             or "token_expired" in msg or "TokenError" in msg)
 
 
+def _is_permanent_decrypt_failure(exc: Exception) -> bool:
+    """enclave 明确「解不开这段密文」——HTTP 403 且错误体含 ``decrypt_failed``。
+
+    这是**确定性**失败（错内容钥/owner 不符/坏信封）：密文与 enclave 钥不变，重试
+    多少次、换多少枚 token 都是同一个结果。据此把它与「值得换 token 再试」的一般
+    401/403（``_is_auth_error``）区分开——毒行走隔离 lane，不再空转重试也不冻结游标。
+    """
+    msg = str(exc)
+    return "enclave_http_403" in msg and "decrypt_failed" in msg
+
+
 def _transform_with_retry(cfg: _Table, doc: dict, user_id: str) -> dict:
     """PendingDeviceMigration 是确定性的，立即上抛不重试；其余（网络/enclave）重试。
 
@@ -335,6 +359,11 @@ def _transform_with_retry(cfg: _Table, doc: dict, user_id: str) -> dict:
         except transforms.PendingDeviceMigration:
             raise
         except Exception as e:  # noqa: BLE001
+            # 确定性解密失败：立即终态上抛，不浪费重试/换 token（也早于下面的
+            # _is_auth_error——bare 403 与 403 decrypt_failed 都命中 auth 判据，
+            # 必须先分流出永久毒行）。
+            if _is_permanent_decrypt_failure(e):
+                raise transforms.PermanentDecryptFailure(str(e)) from e
             last = e
             if _is_auth_error(e):
                 decrypt = _get_decrypt(user_id, fresh=True)
@@ -351,6 +380,10 @@ def _reencrypt_with_retry(user_id: str, envelope: dict) -> dict:
         try:
             return fn(envelope, "v1")
         except Exception as e:  # noqa: BLE001
+            # frames 存储层重加密先要 enclave 解开源密文——同 _transform_with_retry，
+            # 确定性 decrypt_failed 立即终态上抛（frames 毒行占比最高，见 prod 观测）。
+            if _is_permanent_decrypt_failure(e):
+                raise transforms.PermanentDecryptFailure(str(e)) from e
             last = e
             if _is_auth_error(e):
                 fn = _get_reencrypt(user_id, fresh=True)
@@ -461,7 +494,7 @@ def _log_row_error(table: str, user_id: str, item_id: str, exc: Exception) -> No
         log.warning("[tee-replicate] failed to log row error for %s/%s: %s", table, item_id, e)
 
 
-def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int]:
+def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int, int]:
     """Drain the requeue lane before the cursor loop (non-dry-run only).
 
     requeue rows (``reason LIKE 'requeue%'``) mark same-PK in-place rewrites
@@ -476,19 +509,23 @@ def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int]:
         any stale TEE plaintext row (privacy — see the twin cursor-loop branch
         in run_table) + UPDATE the pending reason to that terminal state (the
         requeue is consumed).
+      - PermanentDecryptFailure → the new ciphertext is undecryptable (403
+        decrypt_failed); DELETE any stale TEE plaintext row + UPDATE the pending
+        reason to the terminal ``decrypt_failed:`` state so it is no longer
+        re-consumed as a requeue (mirrors the cursor-loop quarantine branch).
       - any other failure → log/count, LEAVE the pending row so the next pass
         retries (never freezes the cursor — requeue rows are independent).
 
-    Returns (copied, pending, errors) deltas folded into the run report.
+    Returns (copied, pending, errors, quarantined) deltas folded into the run report.
     """
     if cfg.requeue_fetch_sql is None:
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
     with mirror.get_tee_pool().connection() as dst:
         pend = dst.execute(_REQUEUE_SELECT, (table, "requeue%")).fetchall()
     if not pend:
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
 
-    copied = pending = errors = 0
+    copied = pending = errors = quarantined = 0
     with db.get_pool().connection() as src:
         for user_id, item_id in pend:
             key = (user_id,) if cfg.requeue_by_user_only else (user_id, item_id)
@@ -516,6 +553,17 @@ def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int]:
                                     (_pdm_reason(e), user_id, table, item_id))
                     pending += 1
                     continue
+                except transforms.PermanentDecryptFailure as e:
+                    # New ciphertext is permanently undecryptable — quarantine
+                    # terminal (delete stale TEE plaintext + flip the marker to
+                    # decrypt_failed so the requeue lane stops re-consuming it).
+                    with dst.transaction():
+                        if cfg.requeue_delete_tee_sql is not None:
+                            dst.execute(cfg.requeue_delete_tee_sql, key)
+                        dst.execute(_PENDING_UPDATE_REASON,
+                                    (_decrypt_failed_reason(e), user_id, table, item_id))
+                    quarantined += 1
+                    continue
                 except Exception as e:  # noqa: BLE001
                     errors += 1
                     _log_row_error(table, uid, iid, e)
@@ -525,7 +573,7 @@ def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int]:
                         dst.execute(cfg.upsert_sql, args)
                     dst.execute(_PENDING_DELETE, (user_id, table, item_id))
                 copied += 1
-    return (copied, pending, errors)
+    return (copied, pending, errors, quarantined)
 
 
 # Tables with a GENERATED ALWAYS AS IDENTITY column whose RDS values we carry
@@ -628,23 +676,28 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
     """把 RDS ``table`` 的密文增量解密复制进 TEE 明文库。
 
     失败语义（brief）：
-      - 单行 decrypt 重试 2 次仍败 → 记 errors + 落 user_logs → **游标冻结在失败行之前**
-        （本批后续行照常写入 TEE，但游标不越过失败行；本 run 到此批为止，下次重跑重试）。
+      - 单行 decrypt **暂态**失败（网络/502/token）重试 2 次仍败 → 记 errors + 落
+        user_logs → **游标冻结在失败行之前**（本批后续行照常写入 TEE，但游标不越过
+        失败行；本 run 到此批为止，下次重跑重试）。
+      - 单行 decrypt **永久**失败（enclave 403 decrypt_failed：错钥/owner 不符/坏信封）
+        → PermanentDecryptFailure → 隔离（终态 pending 行 ``decrypt_failed:`` reason）
+        → **游标照常越过**（否则整表回填被队头毒行永久卡死）→ 记 quarantined。
       - local_only / 无 K_enclave → PendingDeviceMigration → upsert pending 表 → 游标照常推进。
       - dry_run：零 TEE 写入（含游标），report 给出 would_copy 计数。
       - 幂等：ON CONFLICT upsert，同水位重放不重不丢。
     """
     cfg = _TABLES[table]
     wm_ts, wm_id = _read_cursor(table)
-    copied = pending = errors = skipped = 0
+    copied = pending = errors = skipped = quarantined = 0
     # Requeue lane first (non-dry-run): drain same-PK in-place rewrites the
     # append-only cursor can't see. Independent of the cursor — its failures
     # never freeze it.
     if not dry_run:
-        rq_copied, rq_pending, rq_errors = _consume_requeue(cfg, table)
+        rq_copied, rq_pending, rq_errors, rq_quarantined = _consume_requeue(cfg, table)
         copied += rq_copied
         pending += rq_pending
         errors += rq_errors
+        quarantined += rq_quarantined
     remaining = limit
 
     with db.get_pool().connection() as src:
@@ -669,6 +722,14 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
                 except transforms.PendingDeviceMigration as e:
                     pend_rows.append((user_id, item_id, _pdm_reason(e)))
                     pending += 1
+                    if not frozen:
+                        adv_ts, adv_id = _encode_cursor(cfg, sort_val, item_id)
+                    continue
+                except transforms.PermanentDecryptFailure as e:
+                    # 永久毒行：终态隔离（同 PDM 走 pend_rows→pending 表），游标越过它，
+                    # **不** frozen/batch_failed——否则整表被队头毒行永久卡死。
+                    pend_rows.append((user_id, item_id, _decrypt_failed_reason(e)))
+                    quarantined += 1
                     if not frozen:
                         adv_ts, adv_id = _encode_cursor(cfg, sort_val, item_id)
                     continue
@@ -716,6 +777,7 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
                     (table, seq_col))
 
     report = {"table": table, "copied": copied, "pending": pending, "errors": errors,
-              "skipped": skipped, "watermark_ts": wm_ts, "watermark_id": wm_id}
+              "skipped": skipped, "quarantined": quarantined,
+              "watermark_ts": wm_ts, "watermark_id": wm_id}
     log.info("[tee-replicate] %s", report)
     return report

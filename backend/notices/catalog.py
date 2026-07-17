@@ -117,11 +117,14 @@ def user_text_for(error_class: str, **ctx) -> str:
 # tests/test_catalog_consumer_parity.py::test_classify_upstream_mirrors_consumer
 # 用代表串锁两份不漂移。次序即优先级。
 _UPSTREAM_RULES = (
+    # genesis/import worker 的 provider 错误把状态码编在 ``provider_http_<code>``
+    # slug 里（下划线是 \w，\b<code>\b 形态永远打不中），按类补 slug 匹配。
     ("quota_insufficient", re.compile(
         r"余额|额度|insufficient_quota|credit balance|requires more credits"
-        r"|payment required|\b402\b|quota", re.I)),
+        r"|payment required|\b402\b|provider_http_402|quota", re.I)),
     ("auth_invalid", re.compile(
-        r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b", re.I)),
+        r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b"
+        r"|provider_http_40[13]", re.I)),
     ("model_not_found", re.compile(
         r"invalid model name|model_not_found|no such model", re.I)),
     ("provider_incompatible", re.compile(
@@ -132,9 +135,11 @@ _UPSTREAM_RULES = (
         r"|prompt is too long", re.I)),
     ("content_filtered", re.compile(
         r"content_filter|content policy|safety|blocked by", re.I)),
-    ("rate_limited", re.compile(r"\b429\b|too many requests|rate.?limit", re.I)),
+    ("rate_limited", re.compile(
+        r"\b429\b|provider_http_429|too many requests|rate.?limit", re.I)),
     ("upstream_unavailable", re.compile(
-        r"\b5\d{2}\b|overloaded|timed? ?out|connection (refused|reset|error)"
+        r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out"
+        r"|connection (refused|reset|error)"
         r"|unreachable|stream disconnected", re.I)),
 )
 

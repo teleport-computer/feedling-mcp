@@ -522,15 +522,23 @@ def _pending_state_confirmation_messages(
     user_message: str,
     pending: list[dict],
     identity: dict,
+    *,
+    archive_language: str = "",
+    locale: str = "",
 ) -> list[dict]:
     payload = {
         "latest_user_message": user_message[:2000],
         "identity": {
             "agent_name": str(identity.get("agent_name") or ""),
+            "self_introduction": str(identity.get("self_introduction") or ""),
+            "custom_persona_prompt": str(identity.get("custom_persona_prompt") or ""),
             "tone_style": str(identity.get("tone_style") or ""),
+            "boundaries": identity.get("boundaries") if isinstance(identity.get("boundaries"), list) else [],
             "signature": identity.get("signature") if isinstance(identity.get("signature"), list) else [],
             "language_preference": str(identity.get("language_preference") or ""),
         },
+        "archive_language": str(archive_language or ""),
+        "locale": str(locale or ""),
         "pending_updates": [_state_pending_public_summary(item) for item in pending[:5]],
         "allowed_user_replies": ["确认", "取消", "confirm", "cancel", "or a natural correction"],
     }
@@ -542,13 +550,22 @@ def _model_api_pending_confirmation_reply(
     user_message: str,
     pending: list[dict],
     identity: dict,
+    *,
+    archive_language: str = "",
+    locale: str = "",
 ) -> tuple[str, str]:
     if not pending:
         return "", ""
     try:
         result = provider_client.chat_completion(
             runtime,
-            _pending_state_confirmation_messages(user_message, pending, identity),
+            _pending_state_confirmation_messages(
+                user_message,
+                pending,
+                identity,
+                archive_language=archive_language,
+                locale=locale,
+            ),
             max_tokens=700,
             temperature=0.7,
             timeout=45.0,
@@ -652,6 +669,7 @@ def _run_model_api_state_action_job(
                 user_message,
                 pending_items,
                 identity_for_plan,
+                archive_language=registry._get_user_archive_language(store.user_id) or "",
             )
             if reply:
                 followup_row = _append_model_api_runtime_followup_message(

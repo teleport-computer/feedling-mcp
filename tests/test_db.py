@@ -120,6 +120,25 @@ def test_blob_get_set():
     assert db.get_blob(uid, "tokens") == [{"token": "abc", "status": "active"}]
 
 
+def test_get_blobs_for_users_batches_and_omits_missing_rows():
+    uid_a = _uid()
+    uid_b = _uid()
+    seed_user(uid_a)
+    seed_user(uid_b)
+    db.set_blob(uid_a, "trace", {"events": [1]})
+    db.set_blob(uid_b, "enabled", {"enabled": True})
+
+    rows = db.get_blobs_for_users(
+        [uid_a, uid_b, uid_a, ""],
+        ["trace", "enabled", "trace", ""],
+    )
+
+    assert rows == {
+        (uid_a, "trace"): {"events": [1]},
+        (uid_b, "enabled"): {"enabled": True},
+    }
+
+
 def test_blob_delete_and_list_by_prefix():
     uid = _uid()
     seed_user(uid)
