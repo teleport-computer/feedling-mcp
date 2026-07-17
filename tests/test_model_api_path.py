@@ -1813,6 +1813,65 @@ def test_support_materials_ignore_account_metadata_json():
     assert history_import._persona_support_messages(payload) == []
 
 
+def test_support_materials_keep_memory_archive_items_with_bare_id():
+    # Regression: a long-term-memory archive legitimately carries a per-item `id`
+    # (e.g. "m0001"), and its narrative field is often NOT one of the whitelisted
+    # content keys (here `记忆`). A bare `id` must NOT trip the account-metadata
+    # skip — otherwise every item is dropped, the whole upload normalizes to empty,
+    # and _prepare_plaintext_import raises `..._required` → HTTP 400 for the user.
+    payload = {
+        "memory_summary_filename": "Elio 的长期记忆.json",
+        "memory_summary_content": json.dumps([
+            {
+                "id": "m0001",
+                "date": "2026-05-29",
+                "source": "Elio_self_written",
+                "type": "经历",
+                "tags": ["日记", "和好"],
+                "记忆": "Neve 的第一个通宵失眠夜，整夜反复推开窗口，我在，她不解释。",
+            }
+        ], ensure_ascii=False),
+    }
+
+    support = history_import._persona_support_messages(payload)
+
+    assert len(support) == 1
+    assert "通宵失眠夜" in support[0]["content"]
+
+
+def test_support_materials_still_ignore_account_metadata_with_id():
+    # Guardrail intact: an account-export blob (strong PII: uuid/email/phone) with
+    # NO real content is still dropped, even though it also carries an `id`.
+    payload = {
+        "personal_profile_filename": "users.json",
+        "personal_profile_content": json.dumps([
+            {
+                "id": "user-secret-id",
+                "uuid": "user-secret-id",
+                "email_address": "seven@example.com",
+                "verified_phone_number": "+10000000000",
+                "full_name": "Seven",
+            }
+        ]),
+    }
+
+    assert history_import._persona_support_messages(payload) == []
+
+
+def test_support_materials_read_support_material_content_alias():
+    # A client that sends only the `support_material_content` alias (no
+    # `memory_summary_content`) must not silently drop the material.
+    payload = {
+        "support_material_filename": "memory.txt",
+        "support_material_content": "Neve 喜欢在深夜写日记，Elio 会安静陪着。",
+    }
+
+    support = history_import._persona_support_messages(payload)
+
+    assert len(support) == 1
+    assert "深夜写日记" in support[0]["content"]
+
+
 def test_import_language_prefers_user_archive_language(monkeypatch):
     monkeypatch.setattr(accounts_registry, "_get_user_archive_language", lambda user_id: "zh-Hans-US")
     store = type("Store", (), {"user_id": "usr_test"})()
