@@ -86,7 +86,9 @@ def test_migration_head_and_watermark_seq_column():
         "0038_v2_prompt_cache_metrics",
         "0019_tee_reconcile_state",
     }
-    assert script.get_current_head() == "0039_merge_tee_recon_state"
+    # 0040 (genesis serve-worker claim attribution) chains linearly off 0039 and is
+    # the current single head.
+    assert script.get_current_head() == "0040_genesis_worker_claim"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

@@ -26,10 +26,14 @@ def test_genesis_thread_starts_and_stops(monkeypatch):
 
     ran = threading.Event()
     beats: list[tuple] = []
+    seen = {}
 
-    def _fake_run_loop(*, api_url, enclave_url, mint_genesis, interval, stop_event, on_beat=None):
+    def _fake_run_loop(*, api_url, enclave_url, mint_genesis, interval, stop_event,
+                       worker_id="", list_live_workers=None, on_beat=None):
         assert api_url == "https://api"
         assert enclave_url == "https://enclave"
+        seen["worker_id"] = worker_id
+        seen["live_callable"] = callable(list_live_workers)
         if on_beat:
             on_beat()
         ran.set()
@@ -43,7 +47,13 @@ def test_genesis_thread_starts_and_stops(monkeypatch):
     assert started is not None
     thread, stop = started
     assert ran.wait(5)
-    assert beats == [("w1:genesis", "genesis")]
+    # run_loop receives the genesis worker id (for claim attribution) + an injected
+    # live-workers callable (for the orphan reclaim)
+    assert seen["worker_id"] == "w1:genesis"
+    assert seen["live_callable"] is True
+    # every heartbeat is the genesis kind under the genesis id; there may be >1 now
+    # (the independent heartbeat thread beats too, not just the before/after-tick beat)
+    assert beats and all(b == ("w1:genesis", "genesis") for b in beats)
 
     stop.set()
     thread.join(timeout=5)

@@ -2044,6 +2044,11 @@ def _start_genesis_thread(worker_id: str):
     # Read at CALL time (not a module-level constant) — see the comment beside
     # _GENESIS_TOKEN_SCOPE above for why.
     interval = _positive_float_env("FEEDLING_GENESIS_WORKER_INTERVAL_SEC", "10")
+    hb_interval = _positive_float_env("FEEDLING_GENESIS_HEARTBEAT_SEC", "15")
+    # Live-worker liveness window for the orphan reclaim. >= dead cutoff so a
+    # heartbeating worker is reliably "live"; a worker dead longer than this drops
+    # out and its claims become reclaimable.
+    dead_sec = max(60, int(os.environ.get("FEEDLING_GENESIS_WORKER_DEAD_SEC", "120") or "120"))
 
     def _beat() -> None:
         jobs_store.record_worker_heartbeat(genesis_worker_id, kind="genesis", capacity=0)
@@ -2052,11 +2057,32 @@ def _start_genesis_thread(worker_id: str):
         target=genesis_daemon.run_loop, daemon=True, name="v2-genesis",
         kwargs={"api_url": api_url, "enclave_url": enclave_url,
                 "mint_genesis": _mint_genesis_token, "interval": interval,
-                "stop_event": stop_event, "on_beat": _beat},
+                "stop_event": stop_event, "worker_id": genesis_worker_id,
+                "list_live_workers": lambda: jobs_store.live_genesis_worker_ids(within_sec=dead_sec),
+                "on_beat": _beat},
     )
     thread.start()
-    log.info("[v2.serve_worker] genesis worker enabled — interval=%.0fs worker_id=%s",
-             interval, genesis_worker_id)
+
+    # Independent heartbeat: a tick blocks for the whole LLM reduce (minutes), so
+    # the before/after-tick beats above freeze during a distill — making a LIVE
+    # worker look dead to the orphan reclaim and risking a false reclaim of its own
+    # in-flight job. This timer beats every hb_interval regardless of the tick, so
+    # a mid-distill worker stays truthfully alive. It gates on the run_loop thread
+    # being alive: if that thread dies (e.g. a lazy-import failure — the very
+    # "thread dies while the process lives" mode the heartbeat exists to expose),
+    # the timer stops beating so the worker correctly reads as dead and its jobs
+    # get reclaimed instead of being masked as alive.
+    def _heartbeat_loop() -> None:
+        while not stop_event.is_set():
+            if not thread.is_alive():
+                break
+            _beat()
+            stop_event.wait(hb_interval)
+
+    threading.Thread(target=_heartbeat_loop, daemon=True, name="v2-genesis-hb").start()
+
+    log.info("[v2.serve_worker] genesis worker enabled — interval=%.0fs hb=%.0fs "
+             "dead=%ds worker_id=%s", interval, hb_interval, dead_sec, genesis_worker_id)
     return thread, stop_event
 
 

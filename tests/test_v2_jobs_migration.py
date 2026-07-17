@@ -109,7 +109,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
         "0038_v2_prompt_cache_metrics",
         "0019_tee_reconcile_state",
     }
-    assert script.get_current_head() == "0039_merge_tee_recon_state"
+    # 0040 chains linearly off 0039 (genesis serve-worker claim attribution for the
+    # deploy-orphan fast reclaim); it is the current single head.
+    assert script.get_revision("0040_genesis_worker_claim").down_revision == "0039_merge_tee_recon_state"
+    assert script.get_current_head() == "0040_genesis_worker_claim"
 
 
 def test_prompt_cache_metric_columns_and_recent_window_index_exist():

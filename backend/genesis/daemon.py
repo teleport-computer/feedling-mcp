@@ -48,21 +48,31 @@ def _beat(on_beat: Callable[[], None] | None) -> None:
         print(f"[genesis:daemon] heartbeat write failed: {type(e).__name__}:{str(e)[:120]}")
 
 
-def run_loop(*, api_url, enclave_url, mint_genesis, interval, stop_event, on_beat=None) -> None:
+def run_loop(*, api_url, enclave_url, mint_genesis, interval, stop_event,
+             worker_id="", list_live_workers=None, on_beat=None) -> None:
     """Poll ``genesis.worker.tick``. Blocking — the caller owns the thread.
 
     Beats before AND after each tick: a tick can block for minutes on the user's
     LLM, and a beat only at the top of the loop would look dead for that whole
-    window. Reaps jobs wedged in 'processing' before claiming new work, so a
-    crashed job cannot block the user's onboarding forever.
+    window.
+
+    Two recovery passes run before claiming new work: (1) a fast death-detected
+    reclaim of jobs whose claiming worker is gone (esp. a container deploy) —
+    ``list_live_workers`` is injected because genesis/ is framework-neutral and
+    cannot read the model_api_runtime heartbeat store itself; (2) the 30-min
+    time-based reaper as the alive-but-wedged backstop. ``worker_id`` attributes
+    this worker's claims so the reclaim can tell whose claim went stale.
     """
     from genesis import worker as genesis_worker
     while not stop_event.is_set():
         _beat(on_beat)
         try:
-            genesis_worker.reap_stale_processing_jobs()
+            live = list(list_live_workers() or []) if list_live_workers else []
+            genesis_worker.reclaim_orphaned_processing_jobs(live)  # fast death-detected reclaim
+            genesis_worker.reap_stale_processing_jobs()            # 30-min backstop (unchanged)
             genesis_worker.tick(api_url=api_url, enclave_url=enclave_url,
-                                mint_runtime_token=mint_genesis, max_jobs=1)
+                                mint_runtime_token=mint_genesis,
+                                worker_id=worker_id, max_jobs=1)
         except Exception as e:  # noqa: BLE001
             print(f"[genesis:daemon] tick failed: {type(e).__name__}:{str(e)[:200]}")
         _beat(on_beat)

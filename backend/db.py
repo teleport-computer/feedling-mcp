@@ -2827,14 +2827,21 @@ def genesis_latest_done_job(user_id: str) -> dict | None:
         return _genesis_row(cur, cur.fetchone())
 
 
-def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
+def genesis_claim_uploaded_jobs(*, worker_id: str = "", limit: int = 1) -> list[dict]:
     """Atomically claim uploaded genesis jobs for the CVM worker.
 
     Uses SKIP LOCKED so multiple worker loops can poll without double-processing
     the same import. Claimed jobs move uploaded -> processing in the same
     transaction; genesis_state is updated by the worker service layer.
+
+    ``worker_id`` attributes the claim (``worker_claimed_by``/``worker_claimed_at``)
+    so the death-detected reclaim (genesis_reclaim_orphaned_processing_jobs) can
+    tell whose claim went stale when a worker is killed. It MUST be the same id the
+    worker heartbeats under (``<worker_id>:genesis``). Default ``""`` keeps the
+    pre-attribution behavior for any caller/test that does not pass it.
     """
     safe_limit = max(1, min(int(limit or 1), 16))
+    wid = str(worker_id or "")
     with get_pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
@@ -2851,12 +2858,14 @@ def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
                     status = 'processing',
                     error = '',
                     output = jsonb_build_object('stage', 'worker_claimed'),
+                    worker_claimed_by = %s,
+                    worker_claimed_at = now(),
                     updated_at = now()
                 FROM picked
                 WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
                 RETURNING j.*
                 """,
-                (safe_limit,),
+                (safe_limit, wid),
             )
             rows = cur.fetchall()
             cols = [d[0] for d in cur.description]
@@ -2875,10 +2884,88 @@ def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
         placeholders = ", ".join(["(%s, %s)"] * len(out))
         mirror_sql = (
             "UPDATE genesis_import_jobs SET status = 'processing', error = '', "
-            "output = jsonb_build_object('stage', 'worker_claimed'), updated_at = now() "
+            "output = jsonb_build_object('stage', 'worker_claimed'), "
+            "worker_claimed_by = %s, worker_claimed_at = now(), updated_at = now() "
             f"WHERE (user_id, job_id) IN ({placeholders})"
         )
-        mirror_params = tuple(v for item in out for v in (item["user_id"], item["job_id"]))
+        mirror_params = (wid, *(v for item in out for v in (item["user_id"], item["job_id"])))
+        from tee_shadow import mirror
+        mirror.execute(mirror_sql, mirror_params)
+    return out
+
+
+def genesis_reclaim_orphaned_processing_jobs(
+    live_worker_ids: list[str], *, dead_sec: int, error: str, limit: int = 50,
+) -> list[dict]:
+    """Fast-recover 'processing' genesis jobs whose claiming worker is dead.
+
+    A job whose ``worker_claimed_by`` is not among the live ``kind='genesis'``
+    heartbeats (and was claimed more than ``dead_sec`` ago) was left behind by a
+    killed/replaced worker — most often a container deploy. Instead of waiting out
+    the 30-min time reaper (genesis_reap_stale_processing_jobs, the backstop),
+    recover it now:
+
+    - **resumable** (``received_chunks > 0`` — encrypted chunks are stored) → reset
+      to ``uploaded`` and clear the attribution so a live worker re-claims + re-runs
+      the distill. Auto-recovery, no user action.
+    - **non-resumable** (``received_chunks = 0`` — plaintext onboarding, which is
+      never persisted) → ``failed`` with ``error`` so the client retries in seconds.
+
+    Atomic + ``FOR UPDATE SKIP LOCKED`` so it can't race a live reducer. Rows with a
+    blank ``worker_claimed_by`` (pre-attribution / legacy) are intentionally NOT
+    eligible — the time reaper owns those. Returns the changed rows with an added
+    ``_reclaim_action`` (``"requeued"`` | ``"failed"``) so the caller can sync the
+    genesis_state blob.
+    """
+    safe_sec = max(60, int(dead_sec or 0))
+    safe_limit = max(1, min(int(limit or 1), 200))
+    live = list(dict.fromkeys(str(w) for w in (live_worker_ids or []) if str(w)))
+    _UPDATE_SET = (
+        "status = CASE WHEN {j}.received_chunks > 0 THEN 'uploaded' ELSE 'failed' END, "
+        "error = CASE WHEN {j}.received_chunks > 0 THEN '' ELSE %s END, "
+        "worker_claimed_by = CASE WHEN {j}.received_chunks > 0 THEN '' ELSE {j}.worker_claimed_by END, "
+        "worker_claimed_at = CASE WHEN {j}.received_chunks > 0 THEN NULL ELSE {j}.worker_claimed_at END, "
+        "updated_at = now()"
+    )
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            f"""
+            WITH picked AS (
+                SELECT user_id, job_id FROM genesis_import_jobs
+                WHERE status = 'processing'
+                  AND COALESCE(worker_claimed_by, '') <> ''
+                  AND NOT (worker_claimed_by = ANY(%s))
+                  AND worker_claimed_at < now() - make_interval(secs => %s)
+                ORDER BY worker_claimed_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE genesis_import_jobs AS j SET {_UPDATE_SET.format(j='j')}
+            FROM picked
+            WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+            RETURNING j.*
+            """,
+            (live, safe_sec, safe_limit, error[:1000]),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        item["_reclaim_action"] = "requeued" if str(item.get("status")) == "uploaded" else "failed"
+        out.append(item)
+    if out:
+        # Same TEE-mirror discipline as the claim / time-reaper: pin to the exact
+        # (user_id, job_id) pairs the primary changed, no re-selection drift.
+        placeholders = ", ".join(["(%s, %s)"] * len(out))
+        mirror_sql = (
+            f"UPDATE genesis_import_jobs AS j SET {_UPDATE_SET.format(j='j')} "
+            f"WHERE (j.user_id, j.job_id) IN ({placeholders})"
+        )
+        mirror_params = (error[:1000], *(v for item in out for v in (item["user_id"], item["job_id"])))
         from tee_shadow import mirror
         mirror.execute(mirror_sql, mirror_params)
     return out

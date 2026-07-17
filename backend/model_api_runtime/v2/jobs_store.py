@@ -1009,6 +1009,23 @@ def live_worker_count(*, within_sec: int = 30) -> int:
             return int(cur.fetchone()[0])
 
 
+def live_genesis_worker_ids(*, within_sec: int = 30) -> list[str]:
+    """worker_ids with a fresh ``kind='genesis'`` heartbeat. Sibling to
+    ``workers_alive``/``live_worker_count`` (which read ``kind='turn'`` only, to
+    gate chat admission): this reads the genesis heartbeats to gate the genesis
+    orphan reclaim — a ``processing`` job whose claiming worker id is absent here
+    was left behind by a dead/replaced worker."""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT worker_id FROM v2_worker_heartbeats "
+                "WHERE kind = 'genesis' "
+                "AND beat_at > now() - make_interval(secs => %s)",
+                (max(1, int(within_sec)),),
+            )
+            return [str(r[0]) for r in cur.fetchall()]
+
+
 def live_worker_capacity(*, within_sec: int = 30) -> int:
     """Sum executable turn slots, not heartbeat processes."""
     with _pool().connection() as conn:

@@ -27,6 +27,10 @@ def test_run_loop_beats_before_and_after_each_tick(monkeypatch):
 
     class _FakeWorker:
         @staticmethod
+        def reclaim_orphaned_processing_jobs(live):
+            return []
+
+        @staticmethod
         def reap_stale_processing_jobs():
             calls.append("reap")
 
@@ -68,6 +72,10 @@ def test_run_loop_survives_a_beat_failure(monkeypatch):
 
     class _FakeWorker:
         @staticmethod
+        def reclaim_orphaned_processing_jobs(live):
+            return []
+
+        @staticmethod
         def reap_stale_processing_jobs():
             pass
 
@@ -93,6 +101,10 @@ def test_run_loop_survives_a_tick_failure(monkeypatch):
     beats = []
 
     class _FakeWorker:
+        @staticmethod
+        def reclaim_orphaned_processing_jobs(live):
+            return []
+
         @staticmethod
         def reap_stale_processing_jobs():
             raise RuntimeError("pg gone")
