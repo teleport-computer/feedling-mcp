@@ -916,6 +916,12 @@ def _runtime_repo_files() -> set[str]:
             # explicitly so a user_mcp materialization change still triggers a
             # self-update on self-hosted residents.
             "tools/user_mcp_materialize.py",
+            # Same story: imported lazily inside _enrich_with_fetched_ca, so it
+            # may not yet be in sys.modules when a release-diff check runs. This
+            # module is the gate that keeps a bad CA out of SSL_CERT_FILE (the
+            # public-roots check + the double self-verification) — a release
+            # that only touches this file must still trigger a self-update.
+            "tools/user_mcp_ca_fetch.py",
             "tools/chat_resident_requirements.txt",
             "backend/requirements.txt",
         }
@@ -5636,6 +5642,47 @@ def _atomic_write_text(path: str, content: str, mode: int = 0o600) -> None:
         raise
 
 
+def _enrich_with_fetched_ca(servers: list[dict], *, budget_s: float = 15.0,
+                            now=time.monotonic, fetch=None) -> list[dict]:
+    """Fill in a trust anchor for servers that lack a manual ca_pem.
+
+    Manual ca_pem always wins. Disabled servers are never fetched — they
+    don't reach ``ca_bundle_pem`` (``_enabled()`` in user_mcp_materialize.py
+    drops them), so spending budget on them would only starve the enabled
+    servers that actually need it: ``_maybe_apply_user_mcp`` passes the FULL
+    server list here (enabled and disabled alike), and disabled servers are
+    the common case (an old/retired local server left in the list). Fetching
+    is best-effort and bounded in TOTAL by ``budget_s``: materialization runs
+    inside the poll loop BEFORE messages are handled, so a stalled fetch
+    stalls chat — and the worst case (a hosted user with private-IP servers
+    the CVM can't route to) burns the full timeout per server for nothing.
+    Once the budget is spent the rest keep an empty ca_pem this round and are
+    retried on the next fingerprint change.
+
+    ``now``/``fetch`` are injected so the budget and failure branches are
+    testable without real clocks or sockets.
+
+    Never raises: one server's fetch failure just means that server has no
+    anchor.
+    """
+    if fetch is None:
+        import user_mcp_ca_fetch  # noqa: PLC0415 — sibling on tools/ path
+        fetch = user_mcp_ca_fetch.fetch_trust_anchor
+    deadline = now() + budget_s
+    out = []
+    for s in servers:
+        ca = s.get("ca_pem") or ""
+        if not ca and s.get("enabled") and now() < deadline:
+            try:
+                ca = fetch(s.get("url") or "") or ""
+            except Exception as e:  # noqa: BLE001 — never wedge materialization
+                log.warning("[user_mcp] ca fetch failed for %s: %s: %s",
+                            s.get("name"), type(e).__name__, e)
+                ca = ""
+        out.append({**s, "ca_pem": ca})
+    return out
+
+
 def _write_user_mcp_ca(servers: list[dict]) -> None:
     """Materialize the two CA bundles. See USER_MCP_CA_FILE for why there are two.
 
@@ -5652,7 +5699,7 @@ def _write_user_mcp_ca(servers: list[dict]) -> None:
     a reader never observes a half-written file, even across a crash.
     """
     import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
-    bundle = _m.ca_bundle_pem(servers)
+    bundle = _m.ca_bundle_pem(_enrich_with_fetched_ca(servers))
     if not bundle:
         for p in (USER_MCP_CA_FILE, USER_MCP_CASTORE_FILE):
             Path(p).unlink(missing_ok=True)

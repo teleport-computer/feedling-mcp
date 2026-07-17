@@ -633,3 +633,115 @@ def test_apply_user_mcp_clears_to_empty(monkeypatch, tmp_path):
 
 def test_runtime_repo_files_covers_materialize_module():
     assert "tools/user_mcp_materialize.py" in c._runtime_repo_files()
+
+
+def test_runtime_repo_files_covers_ca_fetch_module():
+    assert "tools/user_mcp_ca_fetch.py" in c._runtime_repo_files()
+
+
+# ---------------------------------------------------------------------------
+# _enrich_with_fetched_ca — budgeted trust-anchor auto-fetch (Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_enrich_prefers_manual_ca_over_fetch():
+    """手动 ca_pem 优先：给了就不该发起任何抓取。"""
+    called = []
+
+    def _fetch(url):
+        called.append(url)
+        return "FETCHED"
+
+    out = c._enrich_with_fetched_ca(
+        [{"name": "m", "enabled": True, "url": "https://m/", "ca_pem": "MANUAL"}],
+        fetch=_fetch)
+    assert out[0]["ca_pem"] == "MANUAL"
+    assert called == []          # 没有抓取发生
+
+
+def test_enrich_fetches_when_no_manual_ca():
+    out = c._enrich_with_fetched_ca(
+        [{"name": "a", "enabled": True, "url": "https://a/"}],
+        fetch=lambda url: "FETCHED")
+    assert out[0]["ca_pem"] == "FETCHED"
+
+
+def test_enrich_one_failure_does_not_affect_others():
+    def _fetch(url):
+        if "bad" in url:
+            raise OSError("boom")
+        return "FETCHED"
+
+    out = c._enrich_with_fetched_ca([
+        {"name": "bad", "enabled": True, "url": "https://bad/"},
+        {"name": "ok", "enabled": True, "url": "https://ok/"},
+    ], fetch=_fetch)
+    assert out[0]["ca_pem"] == ""        # 失败者拿到空，不抛
+    assert out[1]["ca_pem"] == "FETCHED" # 其它不受影响
+
+
+def test_enrich_fetch_returning_none_yields_empty():
+    out = c._enrich_with_fetched_ca(
+        [{"name": "a", "enabled": True, "url": "https://a/"}],
+        fetch=lambda url: None)
+    assert out[0]["ca_pem"] == ""
+
+
+def test_enrich_skips_disabled_servers_entirely():
+    """disabled server 不该触发抓取——它反正到不了 ca_bundle_pem
+    （user_mcp_materialize._enabled() 会把它筛掉），花预算抓它纯属浪费。"""
+    called = []
+    out = c._enrich_with_fetched_ca(
+        [{"name": "old", "enabled": False, "url": "https://old/"}],
+        fetch=lambda url: called.append(url) or "FETCHED")
+    assert called == []
+    assert out[0]["ca_pem"] == ""
+
+
+def test_enrich_disabled_servers_do_not_starve_enabled_ones_budget():
+    """回归测试：两台 disabled 的旧 server 排在前面，且各自的抓取都会把预算耗尽
+    （如果 disabled 也被抓的话）；启用的那台必须仍然拿到锚，budget 不能被
+    disabled server 白白烧光。这条直接守住"迭代域 != 消费域"那个静默失效——
+    修复前，disabled server 会消耗预算，导致排在后面的 enabled server 被跳过、
+    ca_pem 变成空字符串，最终两个 CA 文件被静默删除。"""
+    called = []
+
+    def _fetch(url):
+        called.append(url)
+        return "FETCHED"
+
+    # now() 序列只给 3 次调用的余地：一次算 deadline，两次判断。如果 disabled
+    # 也走判断+抓取分支，budget 会在到达 enabled server 之前被耗尽（或 now()
+    # 序列耗尽报错），从而暴露回归。
+    ticks = iter([0.0, 1.0, 1.0])
+    out = c._enrich_with_fetched_ca(
+        [{"name": "disabled-a", "enabled": False, "url": "https://a/"},
+         {"name": "disabled-b", "enabled": False, "url": "https://b/"},
+         {"name": "enabled-c", "enabled": True, "url": "https://c/"}],
+        budget_s=15.0, now=lambda: next(ticks), fetch=_fetch)
+    assert called == ["https://c/"]           # 只抓了 enabled 的那台
+    assert out[0]["ca_pem"] == ""             # disabled 原样传下去（未抓取）
+    assert out[1]["ca_pem"] == ""
+    assert out[2]["ca_pem"] == "FETCHED"      # enabled 仍然拿到锚
+
+
+def test_enrich_stops_fetching_once_budget_spent():
+    """预算耗尽后不再抓 —— 注入假 now 驱动，不要真等 15 秒。
+
+    materialize 跑在 poll 循环里、在处理消息之前：抓取阻塞即聊天停摆。最坏情况是
+    托管用户配了一串私网 IP，consumer 够不着、每个都卡满超时且一无所获。
+    """
+    called = []
+    # 第一次 now() 算 deadline(0+15=15)，之后每个 server 判一次：
+    # 5 < 15 → 抓；99 > 15 → 停；99 > 15 → 停
+    ticks = iter([0.0, 5.0, 99.0, 99.0])
+    out = c._enrich_with_fetched_ca(
+        [{"name": "a", "enabled": True, "url": "https://a/"},
+         {"name": "b", "enabled": True, "url": "https://b/"},
+         {"name": "d", "enabled": True, "url": "https://d/"}],
+        budget_s=15.0, now=lambda: next(ticks),
+        fetch=lambda url: called.append(url) or "FETCHED")
+    assert called == ["https://a/"]        # 只抓了第一个
+    assert out[0]["ca_pem"] == "FETCHED"
+    assert out[1]["ca_pem"] == ""          # 超预算 → 空，留待下次 fingerprint 变更
+    assert out[2]["ca_pem"] == ""

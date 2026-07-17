@@ -143,6 +143,7 @@ if not _provisioned:
         "test_chat_resident_consumer_file.py",
         "test_user_mcp_probe.py",
         "test_user_mcp_materialize.py",
+        "test_user_mcp_ca_fetch.py",
     }
     collect_ignore = sorted(
         f
