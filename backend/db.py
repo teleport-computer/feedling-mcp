@@ -2323,6 +2323,59 @@ def genesis_reap_stale_resident_jobs(
     return out
 
 
+def genesis_reap_stale_unclaimed_jobs(
+    older_than_sec: int, *, error: str, limit: int = 50
+) -> list[dict]:
+    """Fail sealed resident-distill jobs wedged in 'awaiting_resident' past a generous
+    cutoff — no consumer ever claimed them (consumer running stale code that never opened
+    the distill lane, offline, or never started). Nothing else times these out: the cloud
+    reaper only touches un-owned 'processing' rows and genesis_reap_stale_resident_jobs
+    only touches claimed 'processing' rows, so an unclaimed row would otherwise sit forever
+    and the app spins 'processing' with no error.
+
+    Atomic (FOR UPDATE SKIP LOCKED, status re-checked INSIDE the UPDATE) so a consumer that
+    claims the row between SELECT and UPDATE is never clobbered — a just-claimed job is
+    'processing', no longer 'awaiting_resident', and is skipped. ``updated_at`` is the row's
+    last state change (job creation, or a reaper re-queue), so a freshly re-queued job
+    restarts the cutoff clock rather than being reaped immediately. Returns the rows flipped
+    so the caller can sync each one's genesis_state blob."""
+    safe_sec = max(60, int(older_than_sec or 0))
+    safe_limit = max(1, min(int(limit or 1), 200))
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            WITH picked AS (
+                SELECT user_id, job_id
+                FROM genesis_import_jobs
+                WHERE status = 'awaiting_resident'
+                  AND updated_at < now() - make_interval(secs => %s)
+                ORDER BY updated_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE genesis_import_jobs AS j SET
+                status = 'failed',
+                error = %s,
+                updated_at = now()
+            FROM picked
+            WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+              AND j.status = 'awaiting_resident'
+            RETURNING j.*
+            """,
+            (safe_sec, safe_limit, error[:1000]),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
 def genesis_put_chunk(
     user_id: str,
     job_id: str,
