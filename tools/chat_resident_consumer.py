@@ -452,6 +452,13 @@ def _clear_provider_payment_cooldown() -> None:
 MAX_EMPTY_PROACTIVE_TURNS = int(os.environ.get("FEEDLING_MAX_EMPTY_PROACTIVE_TURNS", "2"))
 PROACTIVE_FAIL_BACKOFF_BASE_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60"))
 PROACTIVE_FAIL_BACKOFF_CAP_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600"))
+# Post-time chat-collision window: a visible proactive bubble must not land
+# within this many seconds of the agent's own chat reply or of a fresh user
+# message (whose chat turn is imminent). Checked right before post_reply — the
+# colliding chat turn typically lands WHILE the wake's model turn is running,
+# so any earlier check (enqueue gate, realize-time peek, prompt-side "prefer
+# silence" advisory) can miss it. 0 disables the gate.
+PROACTIVE_CHAT_COLLISION_WINDOW_SEC = float(os.environ.get("PROACTIVE_CHAT_COLLISION_WINDOW_SEC", "90"))
 _proactive_empty_streak: int = 0
 _proactive_fail_streak: int = 0
 _proactive_backoff_until: float = 0.0
@@ -6497,6 +6504,61 @@ def recent_chat_context_for_proactive(limit: int | None = None) -> ProactiveChat
     return _proactive_chat_context_from_history(history, limit=limit, now=time.time())
 
 
+# Roles that count as the agent speaking in chat. system rows (upstream-error
+# notices) are NOT conversation — same exclusion as _clean_messages_for_
+# proactive_context — and must not silence proactive for 90s.
+_COLLISION_AGENT_ROLES = {"openclaw", "assistant", "agent", "model"}
+# Server-stamped rows can sit a breath ahead of this host's clock; anything
+# further in the future is malformed data, not a fresh message.
+_COLLISION_CLOCK_SKEW_SEC = 5.0
+
+
+def _proactive_chat_collision(now: float | None = None) -> bool:
+    """Post-time hard gate against proactive/chat double-speak.
+
+    True when a fresh (≤ PROACTIVE_CHAT_COLLISION_WINDOW_SEC) user message or
+    agent chat reply exists — a visible proactive bubble posted now would
+    duplicate a conversation that is already happening. Runs right before
+    post_reply, AFTER the wake's model turn, because the colliding chat reply
+    typically lands while that turn is running: the enqueue gate and the
+    prompt-side "prefer silence" advisory both fire too early, and the advisory
+    is model-discretionary anyway (seen live 2026-07-17: a wake and the chat
+    turn answered the same arrival message with two near-identical bubbles).
+
+    Fail-open: a transient fetch error or a malformed row must not silence
+    proactive. Proactive-source agent rows do NOT trip the gate — spacing
+    between wakes is the idle-loop guard's and the delivery gate's job.
+    """
+    window = PROACTIVE_CHAT_COLLISION_WINDOW_SEC
+    if window <= 0:
+        return False
+    try:
+        history = get_decrypted_history(since=0, limit=10, include_image_body=False)
+    except Exception as e:  # noqa: BLE001 — gate is best-effort, never fatal
+        log.warning("chat-collision check fetch failed (fail-open): %s", e)
+        return False
+    if not history:
+        return False
+    ts_now = time.time() if now is None else now
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("source") or "") == "verify_ping":
+            continue
+        ts = _message_ts_for_context(msg)  # defensive: malformed ts → 0.0
+        if ts <= 0:
+            continue
+        age = ts_now - ts
+        if age > window or age < -_COLLISION_CLOCK_SKEW_SEC:
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        if role == "user":
+            return True
+        if role in _COLLISION_AGENT_ROLES and str(msg.get("source") or "") != PROACTIVE_JOB_SOURCE:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -8380,6 +8442,38 @@ def _process_proactive_jobs(jobs: list) -> float:
                 },
             )
             log.info("proactive wake completed scheduled actions id=%s", job_id)
+            continue
+
+        # Chat-collision hard gate, at the last moment before posting. Exempt:
+        # introductions (one-shot onboarding greeting — losing it is worse than
+        # a collision) and scheduled wakes (a user-requested reminder firing
+        # mid-conversation must still be delivered, not silently dropped).
+        _job_trigger = str(job.get("trigger") or "").strip().lower()
+        if (
+            replies
+            and not is_introduction
+            and _job_trigger not in {"scheduled_wake", "scheduled_transparency"}
+            and _proactive_chat_collision()
+        ):
+            update_proactive_job_status(
+                job_id,
+                "skipped",
+                "chat_collision",
+                extra={
+                    "agent_action": "sleep",
+                    "agent_action_status": (
+                        "chat_collision: fresh chat activity within "
+                        f"{int(PROACTIVE_CHAT_COLLISION_WINDOW_SEC)}s at post time"
+                    ),
+                    "agent_actions": status_actions,
+                    "wake_result": "chat_collision",
+                },
+            )
+            log.info(
+                "proactive reply suppressed — fresh chat activity within %.0fs id=%s",
+                PROACTIVE_CHAT_COLLISION_WINDOW_SEC,
+                job_id,
+            )
             continue
 
         posted_any = False

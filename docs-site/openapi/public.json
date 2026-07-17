@@ -7629,6 +7629,11 @@
       "HostedChatSendRequest": {
         "type": "object",
         "properties": {
+          "client_msg_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional logical-send identifier. Reusing it for the same user within 600 seconds returns the first stored user message without starting another turn."
+          },
           "message": {
             "type": "string",
             "maxLength": 12000,
@@ -7771,6 +7776,11 @@
         "properties": {
           "envelope": {
             "$ref": "#/components/schemas/EncryptedEnvelope"
+          },
+          "client_msg_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional logical-send identifier. Reusing it for the same user within 600 seconds returns the first stored row and emits no second consumer wake."
           },
           "content_type": {
             "type": "string",

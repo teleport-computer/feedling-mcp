@@ -34,6 +34,7 @@ import db
 import debug_trace
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
+from chat import idempotency as chat_idempotency
 from chat import service as chat_service
 from core import envelope as core_envelope
 from core import wake_bus
@@ -429,6 +430,9 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
     decrypts the envelope — it is stored verbatim and later surfaced by the
     enclave's /v1/* handlers.
     """
+    client_msg_id, client_msg_id_err = chat_idempotency.parse_client_msg_id(payload)
+    if client_msg_id_err is not None:
+        return client_msg_id_err
     envelope = payload.get("envelope")
     if envelope is None:
         return {"error": "envelope required"}, 400
@@ -453,25 +457,38 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
             file_extra["file_name"] = fname[:120]
         if fmime:
             file_extra["file_mime"] = fmime[:120]
-    msg = store.append_chat(
-        "user", "chat", envelope,
-        content_type=content_type,
-        extra=file_extra or None,
-    )
-    store.notify_chat_waiters()
-    debug_trace.trace_event(
-        store,
-        subsystem="route",
-        type="chat.message",
-        actor="ios",
-        trace_id=msg["id"],
-        turn_id=msg["id"],
-        summary=f"user message stored id={msg['id']}",
-        explain="收到用户消息，已入库并唤醒 resident consumer",
-        detail={"content_type": content_type, "msg_id": msg["id"]},
-        content_excerpt={"user_message": _plaintext_for_trace(payload, envelope)} if content_type == "text" else None,
-    )
-    print(f"[chat:{store.user_id}] user(v1, visibility={envelope['visibility']}, type={content_type}) id={msg['id']}")
+    inserted = True
+    if client_msg_id is not None:
+        msg, inserted = store.append_chat_idempotent(
+            "user",
+            "chat",
+            envelope,
+            client_msg_id=client_msg_id,
+            window_sec=chat_idempotency.CLIENT_MSG_ID_WINDOW_SEC,
+            content_type=content_type,
+            extra=file_extra or None,
+        )
+    else:
+        msg = store.append_chat(
+            "user", "chat", envelope,
+            content_type=content_type,
+            extra=file_extra or None,
+        )
+    if inserted:
+        store.notify_chat_waiters()
+        debug_trace.trace_event(
+            store,
+            subsystem="route",
+            type="chat.message",
+            actor="ios",
+            trace_id=msg["id"],
+            turn_id=msg["id"],
+            summary=f"user message stored id={msg['id']}",
+            explain="收到用户消息，已入库并唤醒 resident consumer",
+            detail={"content_type": content_type, "msg_id": msg["id"]},
+            content_excerpt={"user_message": _plaintext_for_trace(payload, envelope)} if content_type == "text" else None,
+        )
+        print(f"[chat:{store.user_id}] user(v1, visibility={envelope['visibility']}, type={content_type}) id={msg['id']}")
     return {"id": msg["id"], "ts": msg["ts"], "v": msg["v"]}, 200
 
 

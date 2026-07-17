@@ -21,7 +21,7 @@ tokens defined at the bottom of `DESIGN.md`.
    writing ANY backend code; PRs are reviewed against it.
 3. `DESIGN.md` — if doing any UI work.
 4. `deploy/DEPLOYMENTS.md` — if doing any enclave/CVM/on-chain work.
-5. `docs/TESTING.md` — the general test standard: a "changed X → run
+5. `docs/testing/TESTING.md` — the general test standard: a "changed X → run
    which tests" decision matrix (§2) covering every change class
    (backend logic, routes, encryption/account link, gateway/driver,
    consumer, schema, compose, CVM, iOS, docs, contracts). Consult it

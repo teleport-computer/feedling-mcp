@@ -42,6 +42,16 @@ _PLAINTEXT_SUPPORT_SOURCE_FAMILIES = {
     history_import._MEMORY_SUMMARY_SOURCE,
 }
 _PLAINTEXT_MODES = {"onboarding", "add_memory", "update_identity"}
+MATERIAL_EMPTY_ERROR = "material_empty"
+
+
+class MaterialEmptyError(ValueError):
+    """No usable plaintext import material survived parsing/normalization."""
+
+    def __init__(self, detail: str = "plaintext_import_empty"):
+        super().__init__(detail)
+        self.error = MATERIAL_EMPTY_ERROR
+        self.detail = detail
 
 
 def _trace_genesis(store, event_type: str, *, job_id: str = "", status: str = "ok",
@@ -221,7 +231,7 @@ def _prepare_plaintext_import(payload: dict) -> dict:
     support_messages = history_import._persona_support_messages(payload)
     if not history_messages and not support_messages:
         if not bool(payload.get("fresh_start")):
-            raise ValueError(
+            raise MaterialEmptyError(
                 "content, ai_persona_content, character_content, personal_profile_content, "
                 "memory_summary_content, persona_content, or fresh_start=true required"
             )
@@ -243,7 +253,7 @@ def _prepare_plaintext_import(payload: dict) -> dict:
         if str(text or "").strip()
     ]
     if not chunk_texts:
-        raise ValueError("plaintext_import_empty")
+        raise MaterialEmptyError("plaintext_import_empty")
     timeline_span_days = _plaintext_timeline_span_days(history_messages)
     relationship_anchor = _plaintext_relationship_anchor(payload, messages=history_messages)
     return {
@@ -1242,7 +1252,7 @@ def _run_plaintext_genesis_job(
             if isinstance(group, dict) and group.get("chunk_texts")
         ]
         if not source_groups:
-            raise ValueError("plaintext_import_empty")
+            raise MaterialEmptyError("plaintext_import_empty")
 
         job = db.genesis_set_job_status(
             store.user_id,
