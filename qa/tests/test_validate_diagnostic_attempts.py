@@ -114,6 +114,58 @@ def test_allows_known_local_gaps_only_at_preflight_and_parent_cleanup():
     validator.validate_live_attempts(result)
 
 
+def test_parent_bound_unattested_cot_requires_explicit_trusted_context():
+    result = _result()
+    row = result["scenarios"][11]
+    failure = dict(validator.PARENT_BOUND_COT_UNATTESTED_FAILURE)
+    row.update(
+        {
+            "status": "BLOCKED_EVIDENCE",
+            "attempts": 1,
+            "attempt_results": [
+                {
+                    "attempt": 1,
+                    "status": "BLOCKED_EVIDENCE",
+                    "failure": dict(failure),
+                }
+            ],
+            "failure": failure,
+        }
+    )
+
+    with pytest.raises(validator.DiagnosticAttemptError, match="P0-12"):
+        validator.validate_live_attempts(result)
+
+    validator.validate_live_attempts(
+        result, allow_parent_bound_cot_unattested=True
+    )
+
+
+def test_parent_bound_unattested_cot_exception_is_exactly_scoped():
+    result = _result()
+    row = result["scenarios"][10]
+    failure = dict(validator.PARENT_BOUND_COT_UNATTESTED_FAILURE)
+    row.update(
+        {
+            "status": "BLOCKED_EVIDENCE",
+            "attempts": 1,
+            "attempt_results": [
+                {
+                    "attempt": 1,
+                    "status": "BLOCKED_EVIDENCE",
+                    "failure": dict(failure),
+                }
+            ],
+            "failure": failure,
+        }
+    )
+
+    with pytest.raises(validator.DiagnosticAttemptError, match="P0-11"):
+        validator.validate_live_attempts(
+            result, allow_parent_bound_cot_unattested=True
+        )
+
+
 @pytest.mark.parametrize(
     ("mutation", "value"),
     (

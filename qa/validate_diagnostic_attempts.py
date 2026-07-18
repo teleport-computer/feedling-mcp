@@ -15,6 +15,12 @@ PARENT_CLEANUP_DEFERRED_FAILURE = {
     "failure_code": "PRECONDITION_MISSING",
     "reproducible": True,
 }
+PARENT_BOUND_COT_UNATTESTED_FAILURE = {
+    "category": "BLOCKED_EVIDENCE",
+    "stage_code": "REASONING",
+    "failure_code": "PRECONDITION_MISSING",
+    "reproducible": True,
+}
 
 
 class DiagnosticAttemptError(RuntimeError):
@@ -99,14 +105,40 @@ def parent_cleanup_is_deferred(profile_result: Mapping[str, Any]) -> bool:
     )
 
 
-def validate_live_attempts(profile_result: Mapping[str, Any]) -> None:
+def _parent_bound_cot_is_unattested(row: Mapping[str, Any]) -> bool:
+    """Recognize the exact trusted-parent P0-12 configuration gap."""
+
+    return bool(
+        row.get("scenario_id") == "P0-12"
+        and row.get("status") == "BLOCKED_EVIDENCE"
+        and row.get("attempts") == 1
+        and row.get("failure") == PARENT_BOUND_COT_UNATTESTED_FAILURE
+        and row.get("attempt_results")
+        == [
+            {
+                "attempt": 1,
+                "status": "BLOCKED_EVIDENCE",
+                "failure": PARENT_BOUND_COT_UNATTESTED_FAILURE,
+            }
+        ]
+    )
+
+
+def validate_live_attempts(
+    profile_result: Mapping[str, Any],
+    *,
+    allow_parent_bound_cot_unattested: bool = False,
+) -> None:
     """Require ordered per-scenario attempts, not propagated preflight blockers.
 
     P0-01 may lack protected deployment evidence in a local diagnostic, and P0-13
     deliberately defers account reset to the deterministic parent. P0-02 through
     P0-12 must still contain a real outcome for their own live operation. An agent
     that copies ``PRECONDITION_MISSING`` through the remaining matrix has not run
-    the requested SOP and is rejected as invalid worker evidence.
+    the requested SOP and is rejected as invalid worker evidence. The sole narrow
+    exception is an exact P0-12 projection that the caller has already bound to a
+    valid trusted-parent receipt proving the probe ran but configured effort could
+    not be attested.
     """
 
     scenarios = profile_result.get("scenarios")
@@ -125,6 +157,10 @@ def validate_live_attempts(profile_result: Mapping[str, Any]) -> None:
         scenario_id = str(row.get("scenario_id") or "")
         attempts = row.get("attempts")
         attempt_results = row.get("attempt_results")
+        parent_bound_cot_unattested = bool(
+            allow_parent_bound_cot_unattested
+            and _parent_bound_cot_is_unattested(row)
+        )
         if (
             not isinstance(attempts, int)
             or isinstance(attempts, bool)
@@ -148,12 +184,19 @@ def validate_live_attempts(profile_result: Mapping[str, Any]) -> None:
                     "AGENT_ERROR",
                     "SECURITY_FAIL",
                 )
-                or _failure_code(attempt.get("failure")) == "PRECONDITION_MISSING"
+                or (
+                    _failure_code(attempt.get("failure"))
+                    == "PRECONDITION_MISSING"
+                    and not parent_bound_cot_unattested
+                )
             ):
                 raise DiagnosticAttemptError(
                     f"diagnostic scenario {scenario_id} did not execute its live operation"
                 )
-        if _failure_code(row.get("failure")) == "PRECONDITION_MISSING":
+        if (
+            _failure_code(row.get("failure")) == "PRECONDITION_MISSING"
+            and not parent_bound_cot_unattested
+        ):
             raise DiagnosticAttemptError(
                 f"diagnostic scenario {scenario_id} propagated a preflight blocker"
             )

@@ -2625,12 +2625,18 @@ def _validate_diagnostic_live_projection(
     aggregate: Mapping[str, Any],
     *,
     allow_failed_persona: bool,
+    allow_parent_bound_cot_unattested: bool,
 ) -> None:
     """Validate normal evidence or the bounded P0-13 probe-crash projection."""
 
     failed_trace = _failed_trace_cleanup_receipt(aggregate)
     if failed_trace is None:
-        validate_live_attempts(profile_result)
+        validate_live_attempts(
+            profile_result,
+            allow_parent_bound_cot_unattested=(
+                allow_parent_bound_cot_unattested
+            ),
+        )
         validate_live_result_binding(
             profile_result,
             aggregate,
@@ -2663,7 +2669,10 @@ def _validate_diagnostic_live_projection(
             "failure": dict(deferred_failure),
         }
     ]
-    validate_live_attempts(attempt_view)
+    validate_live_attempts(
+        attempt_view,
+        allow_parent_bound_cot_unattested=allow_parent_bound_cot_unattested,
+    )
 
     # The persisted receipt correctly has no P0-13 projection.  Build a
     # validation-only derivative from earlier trusted receipts so the existing
@@ -3248,6 +3257,95 @@ def _project_diagnostic_cot_evidence(
     return result
 
 
+def _project_unavailable_diagnostic_cot_evidence(
+    profile_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Erase untrusted P0-12 claims when no valid parent receipt exists."""
+
+    result = deepcopy(dict(profile_result))
+    scenarios = result.get("scenarios")
+    reasoning = result.get("reasoning")
+    if not isinstance(scenarios, list) or not isinstance(reasoning, dict):
+        raise WorkerLaunchError("COT unavailable projection is unavailable")
+    cot_scenarios = [
+        row
+        for row in scenarios
+        if isinstance(row, dict) and row.get("scenario_id") == "P0-12"
+    ]
+    if len(cot_scenarios) != 1:
+        raise WorkerLaunchError("COT unavailable projection is unavailable")
+    scenario = cot_scenarios[0]
+    failure = _failure_projection(
+        status="BLOCKED_EVIDENCE",
+        stage_code="REASONING",
+        failure_code="TRACE_UNAVAILABLE",
+    )
+    if failure is None:
+        raise WorkerLaunchError("COT unavailable projection is unavailable")
+
+    reasoning.clear()
+    reasoning.update(
+        {
+            "expected": True,
+            "capability_enabled": False,
+            "requested_effort": "unknown",
+            "configured_effort": "unknown",
+            "effective_effort": "unknown",
+            "reasoning_event_count": 0,
+            "metadata_present": False,
+            "token_metadata_present": False,
+            "user_visible_disclosure_present": False,
+            "request_id": "",
+            "turn_id": "",
+            "trace_id": "",
+            "kind": None,
+            "source": None,
+            "model": None,
+            "reasoning_token_count": None,
+            "disclosure_length": None,
+            "raw_private_reasoning_stored": False,
+        }
+    )
+    scenario.clear()
+    scenario.update(
+        {
+            "scenario_id": "P0-12",
+            "status": "BLOCKED_EVIDENCE",
+            "started_at": "",
+            "finished_at": "",
+            "attempts": 1,
+            "attempt_results": [
+                {
+                    "attempt": 1,
+                    "status": "BLOCKED_EVIDENCE",
+                    "failure": dict(failure),
+                }
+            ],
+            "assertions": {
+                "objective_answer_correct": False,
+                "reasoning_capability_enabled": False,
+                "reasoning_requested_effort_medium": False,
+                "reasoning_configured_effort_medium": False,
+                "reasoning_effective_effort_not_attested": False,
+                "reasoning_event_observed": False,
+                "reasoning_metadata_present": False,
+                "reasoning_tokens_present": False,
+                "user_disclosure_present": False,
+                "raw_private_reasoning_omitted": True,
+            },
+            "evidence_codes": [],
+            "request_ids": [],
+            "turn_ids": [],
+            "trace_ids": [],
+            "persona_finalizer": None,
+            "failure": failure,
+        }
+    )
+    if result.get("status") == "PASS":
+        result["status"] = "BLOCKED_EVIDENCE"
+    return result
+
+
 def _load_live_worker_evidence(
     spec: WorkerSpec, *, allow_failed_persona: bool = False
 ) -> tuple[dict[str, Any], str]:
@@ -3674,13 +3772,32 @@ def launch(
                         "LIVE_RECEIPT_PROJECTION",
                         "LIVE_RECEIPT_PROJECTION_INVALID",
                     ) from None
+                allow_parent_bound_cot_unattested = False
                 if cot_receipt is not None:
                     try:
                         profile_result = _project_diagnostic_cot_evidence(
                             profile_result, cot_receipt
                         )
+                        _validate_cot_result_binding(
+                            profile_result, cot_receipt
+                        )
                     except WorkerLaunchError:
                         cot_evidence_failure = _DIAGNOSTIC_COT_BINDING_MISMATCH
+                        raise DiagnosticWorkerEvidenceError(
+                            "COT_BINDING",
+                            _DIAGNOSTIC_COT_BINDING_MISMATCH,
+                        ) from None
+                    allow_parent_bound_cot_unattested = bool(
+                        cot_receipt.get("configured_effort_attested") is False
+                    )
+                else:
+                    try:
+                        profile_result = (
+                            _project_unavailable_diagnostic_cot_evidence(
+                                profile_result
+                            )
+                        )
+                    except WorkerLaunchError:
                         raise DiagnosticWorkerEvidenceError(
                             "COT_BINDING",
                             _DIAGNOSTIC_COT_BINDING_MISMATCH,
@@ -3696,20 +3813,14 @@ def launch(
                         profile_result,
                         live_receipts,
                         allow_failed_persona=failed_persona_capture,
+                        allow_parent_bound_cot_unattested=(
+                            allow_parent_bound_cot_unattested
+                        ),
                     )
                 except (WorkerLaunchError, DiagnosticAttemptError, OSError):
                     raise DiagnosticWorkerEvidenceError(
                         "LIVE_RECEIPT_BINDING", "LIVE_RECEIPT_BINDING_INVALID"
                     ) from None
-                if cot_receipt is not None:
-                    try:
-                        _validate_cot_result_binding(profile_result, cot_receipt)
-                    except WorkerLaunchError:
-                        cot_evidence_failure = _DIAGNOSTIC_COT_BINDING_MISMATCH
-                        raise DiagnosticWorkerEvidenceError(
-                            "COT_BINDING",
-                            _DIAGNOSTIC_COT_BINDING_MISMATCH,
-                        ) from None
                 try:
                     events_sha256 = file_sha256(
                         spec.events_path,

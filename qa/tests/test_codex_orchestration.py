@@ -588,6 +588,12 @@ def _cot_probe_runner(mode: str = "valid") -> launcher.CotProbeRunner:
             receipt = _request_failed_cot_receipt(
                 spec.profile_id, after_ack=mode == "request-failed-after-ack"
             )
+        elif mode == "unattested":
+            receipt.update(
+                configured_effort="unknown",
+                configured_effort_attested=False,
+                configured_route_matches_manifest=False,
+            )
         if mode == "missing":
             return receipt
         if mode == "malformed":
@@ -599,6 +605,7 @@ def _cot_probe_runner(mode: str = "valid") -> launcher.CotProbeRunner:
             "failed",
             "request-failed",
             "request-failed-after-ack",
+            "unattested",
         }:
             raise AssertionError(f"unknown trusted COT fixture mode: {mode}")
         spec.cot_receipt_path.write_text(
@@ -1386,6 +1393,12 @@ def _successful_runner(
                 spec.profile_id,
                 after_ack=cot_mode == "request-failed-after-ack",
             )
+        elif cot_mode == "unattested":
+            expected_receipt.update(
+                configured_effort="unknown",
+                configured_effort_attested=False,
+                configured_route_matches_manifest=False,
+            )
         _request_passing_live_probes(
             spec,
             before_p0_13=lambda: _request_passing_cot_probe(
@@ -1415,6 +1428,7 @@ def _successful_runner(
             "failed",
             "request-failed",
             "request-failed-after-ack",
+            "unattested",
         }:
             raise AssertionError(f"unknown COT fixture mode: {cot_mode}")
         staged_final_events = spec.events_path.with_name(
@@ -3066,8 +3080,114 @@ def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
     assert len(result["turns"]) == 14
     assert all(turn["scenario_id"] != "P0-12" for turn in result["turns"])
     assert result["latency"]["sample_count"] == 14
+    scenario = next(
+        row for row in result["scenarios"] if row["scenario_id"] == "P0-12"
+    )
+    unavailable_failure = {
+        "category": "BLOCKED_EVIDENCE",
+        "stage_code": "REASONING",
+        "failure_code": "TRACE_UNAVAILABLE",
+        "reproducible": True,
+    }
+    assert scenario == {
+        "scenario_id": "P0-12",
+        "status": "BLOCKED_EVIDENCE",
+        "started_at": "",
+        "finished_at": "",
+        "attempts": 1,
+        "attempt_results": [
+            {
+                "attempt": 1,
+                "status": "BLOCKED_EVIDENCE",
+                "failure": unavailable_failure,
+            }
+        ],
+        "assertions": {
+            "objective_answer_correct": False,
+            "reasoning_capability_enabled": False,
+            "reasoning_requested_effort_medium": False,
+            "reasoning_configured_effort_medium": False,
+            "reasoning_effective_effort_not_attested": False,
+            "reasoning_event_observed": False,
+            "reasoning_metadata_present": False,
+            "reasoning_tokens_present": False,
+            "user_disclosure_present": False,
+            "raw_private_reasoning_omitted": True,
+        },
+        "evidence_codes": [],
+        "request_ids": [],
+        "turn_ids": [],
+        "trace_ids": [],
+        "persona_finalizer": None,
+        "failure": unavailable_failure,
+    }
+    assert result["reasoning"] == {
+        "expected": True,
+        "capability_enabled": False,
+        "requested_effort": "unknown",
+        "configured_effort": "unknown",
+        "effective_effort": "unknown",
+        "reasoning_event_count": 0,
+        "metadata_present": False,
+        "token_metadata_present": False,
+        "user_visible_disclosure_present": False,
+        "request_id": "",
+        "turn_id": "",
+        "trace_id": "",
+        "kind": None,
+        "source": None,
+        "model": None,
+        "reasoning_token_count": None,
+        "disclosure_length": None,
+        "raw_private_reasoning_stored": False,
+    }
     assert worker["cot_receipt_sha256"] is None
     assert worker["cot_delivery_status"] is None
+
+
+def test_diagnostic_accepts_executed_parent_bound_unattested_cot(tmp_path):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+    runner = _successful_runner(
+        [], cot_mode="unattested", synchronize=False
+    )
+
+    receipt = _launch_diagnostic(
+        paths,
+        runner,
+        cot_probe_runner=_cot_probe_runner("unattested"),
+    )
+    worker = receipt["workers"][0]
+    result = json.loads(
+        (paths["aggregation"] / "official-gemini.json").read_text()
+    )
+    scenario = next(
+        row for row in result["scenarios"] if row["scenario_id"] == "P0-12"
+    )
+
+    assert worker["result_source"] == "codex_worker", worker
+    assert worker["fallback_reason"] is None
+    assert worker["cot_evidence_failure"] is None
+    assert worker["cot_delivery_status"] == "PASS"
+    assert worker["cot_failure_code"] == "NONE"
+    assert scenario["status"] == "BLOCKED_EVIDENCE"
+    assert scenario["failure"] == {
+        "category": "BLOCKED_EVIDENCE",
+        "stage_code": "REASONING",
+        "failure_code": "PRECONDITION_MISSING",
+        "reproducible": True,
+    }
+    assert scenario["attempt_results"] == [
+        {
+            "attempt": 1,
+            "status": "BLOCKED_EVIDENCE",
+            "failure": scenario["failure"],
+        }
+    ]
+    assert scenario["request_ids"] == ["request-1"]
+    assert result["reasoning"]["request_id"] == "request-1"
+    assert result["reasoning"]["configured_effort"] == "unknown"
+    assert result["reasoning"]["reasoning_event_count"] == 1
+    assert len(result["turns"]) == 15
 
 
 @pytest.mark.parametrize(
