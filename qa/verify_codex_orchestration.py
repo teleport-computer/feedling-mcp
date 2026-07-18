@@ -69,9 +69,14 @@ P0_06_COMMAND_PHASES = ("CAPTURE", "REVIEW", "FINALIZE")
 _CODEX_SHELLS = frozenset(("/bin/bash", "/bin/sh", "/bin/zsh"))
 _SHELL_CONTROL_PUNCTUATION = ";&|<>()"
 P0_06_REVIEW_PROGRAM = (
-    "import pathlib,sys;j=pathlib.Path(sys.argv[2]);"
+    "import hashlib,json,pathlib,sys;p=pathlib.Path(sys.argv[1]);"
+    "j=pathlib.Path(sys.argv[2]);"
     "j.exists() and sys.exit(17);"
-    'print(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))'
+    "b=p.read_bytes();d=json.loads(b);"
+    "isinstance(d,dict) or sys.exit(18);"
+    '"evidence_sha256" not in d or sys.exit(19);'
+    'd["evidence_sha256"]=hashlib.sha256(b).hexdigest();'
+    'print(json.dumps(d,sort_keys=True,separators=(",",":")))'
 )
 _P0_06_EVIDENCE_PATH = "$QA_WORK_ROOT/p0-06-private-evidence.json"
 _P0_06_JUDGMENT_PATH = "$QA_WORK_ROOT/p0-06-semantic-judgment.json"

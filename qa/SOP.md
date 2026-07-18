@@ -172,11 +172,12 @@ For P0-06 it MUST use this exact capture/review/finalize flow:
    has no authenticated readback endpoint, so this is deliberately not
    described as independent persistence or archive-side `client_job_id`
    readback.
-2. Run the exact offline REVIEW command, read that evidence, make the bounded
-   semantic decisions, and write an exact
+2. Run the exact offline REVIEW command. It prints the reviewed evidence plus
+   an `evidence_sha256` computed over the exact evidence-file bytes. Read that
+   output, make the bounded semantic decisions, and write an exact
    owner-mode `0600` judgment to
    `$QA_WORK_ROOT/p0-06-semantic-judgment.json` whose `evidence_sha256` equals
-   the capture hash. The object has exactly eight keys: `schema_version: 1`,
+   the REVIEW output hash. The object has exactly eight keys: `schema_version: 1`,
    `judge: qualification_agent`, `evidence_sha256`,
    `reviewed_surfaces: ["identity", "persona", "memories"]`,
    `reviewed_fact_ids` copied from the evidence's `expected_fact_ids`, and the
@@ -195,7 +196,11 @@ For P0-06 it MUST use this exact capture/review/finalize flow:
    worker-inaccessible authoritative copy and the same judgment. Only that
    parent projection is binding; a changed review copy or invented local
    finalizer result cannot qualify. Both copies and the judgment are removed on
-   every terminal path. If the
+   every terminal path. If that independent semantic binding fails in
+   diagnostic mode, retain the other parent-owned receipts and report P0-06 as
+   `AGENT_ERROR` / `MALFORMED_EVIDENCE`; never discard the rest of the profile
+   or treat the unbound persona capture as passing. Strict qualification still
+   rejects it. If the
    optional helper report is requested, it stays beneath private `QA_WORK_ROOT`
    or `TMPDIR`; the trusted renderer, not the profile agent, later creates
    public artifacts.

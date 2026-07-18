@@ -183,10 +183,12 @@ request marker; the agent reads bounded facts and supplies semantic judgment.
   second user, consume a provider secret, or replace/delete the provisioned
   provider configuration.
 - Run the exact offline REVIEW command. After capture reaches `done`, read the
-  decrypted private evidence and write a separate owner-mode `0600` semantic
+  decrypted private evidence together with the REVIEW command's
+  `evidence_sha256` (computed over the exact evidence-file bytes), and write a
+  separate owner-mode `0600` semantic
   judgment at
   `$QA_WORK_ROOT/p0-06-semantic-judgment.json` containing exactly
-  `schema_version: 1`, `judge: qualification_agent`, the capture's exact
+  `schema_version: 1`, `judge: qualification_agent`, the REVIEW output's exact
   `evidence_sha256`, `reviewed_surfaces: ["identity", "persona", "memories"]`,
   `reviewed_fact_ids` copied from the reviewed evidence's `expected_fact_ids`,
   and the three true/false decisions `persona_identity_consistent`,

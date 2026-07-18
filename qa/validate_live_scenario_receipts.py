@@ -137,6 +137,9 @@ SEMANTIC_ASSERTIONS = {
     "P0-11": ("agent_identity_confirmed", "model_route_confirmed"),
     "P0-13": (),
 }
+_PERSONA_FINALIZER_FAILURE_CODES = frozenset(
+    {"SEMANTIC_JUDGMENT_INVALID", "PERSONA_FINALIZER_FAILED"}
+)
 _RECEIPT_KEYS = frozenset(
     {
         "schema_version",
@@ -240,6 +243,74 @@ def failed_persona_result_projection(
         ],
         "persona_finalizer": None,
         "failure": failure,
+    }
+
+
+def persona_finalizer_failure(code: str) -> dict[str, Any]:
+    """Return the sole diagnostic sentinel for a failed parent re-finalization."""
+
+    if code not in _PERSONA_FINALIZER_FAILURE_CODES:
+        raise LiveScenarioReceiptError("persona finalizer failure code is invalid")
+    return {"kind": "persona_finalizer_failure", "failure_code": code}
+
+
+def _valid_persona_finalizer_failure(value: object) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and set(value) == {"kind", "failure_code"}
+        and value.get("kind") == "persona_finalizer_failure"
+        and value.get("failure_code") in _PERSONA_FINALIZER_FAILURE_CODES
+    )
+
+
+def unfinalized_persona_result_projection(
+    receipt: Mapping[str, Any], failure: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Project a PASS capture whose independent semantic binding failed.
+
+    Transport/import assertions remain receipt-owned.  Semantic assertions are
+    false and the row is an agent error, so diagnostic evidence is retained
+    without ever allowing the profile or release gate to become green.
+    """
+
+    assertions = receipt.get("assertions")
+    if (
+        receipt.get("scenario_id") != "P0-06"
+        or receipt.get("status") != "PASS"
+        or not isinstance(assertions, Mapping)
+        or not _valid_persona_finalizer_failure(failure)
+    ):
+        raise LiveScenarioReceiptError(
+            "unfinalized persona projection is invalid"
+        )
+    projected_assertions = {
+        **dict(assertions),
+        "persona_acceptance_passed": False,
+        "privacy_canary_absent": False,
+    }
+    projected_failure = {
+        "category": "AGENT_ERROR",
+        "stage_code": "PERSONA_IMPORT",
+        "failure_code": "MALFORMED_EVIDENCE",
+        "reproducible": True,
+    }
+    return {
+        "status": "AGENT_ERROR",
+        "assertions": projected_assertions,
+        "evidence_codes": [
+            code
+            for assertion, code in (
+                ("persona_files_archived", "PERSONA_FILES_ARCHIVED"),
+                (
+                    "persona_source_metadata_verified",
+                    "PERSONA_SOURCE_METADATA_VERIFIED",
+                ),
+                ("persona_import_done", "PERSONA_IMPORT_DONE"),
+            )
+            if projected_assertions.get(assertion) is True
+        ],
+        "persona_finalizer": None,
+        "failure": projected_failure,
     }
 
 
@@ -806,8 +877,16 @@ def validate_aggregate_object(
         and capture_rows[0].get("status") != "PASS"
         and payload.get("persona_finalizer") is None
     )
+    failed_persona_finalizer = bool(
+        len(capture_rows) == 1
+        and capture_rows[0].get("status") == "PASS"
+        and _valid_persona_finalizer_failure(payload.get("persona_finalizer"))
+    )
     if len(capture_rows) != 1 or not (
-        (allow_failed_persona and failed_persona)
+        (
+            allow_failed_persona
+            and (failed_persona or failed_persona_finalizer)
+        )
         or _valid_parent_persona_finalizer(
             payload.get("persona_finalizer"), capture_rows[0]
         )
@@ -970,7 +1049,36 @@ def validate_result_binding(
                 ):
                     raise LiveScenarioReceiptError(
                         "failed persona capture does not match worker result"
+                    )
+                continue
+            if (
+                allow_failed_persona
+                and rows[-1].get("status") == "PASS"
+                and _valid_persona_finalizer_failure(parent_persona)
+            ):
+                expected = unfinalized_persona_result_projection(
+                    rows[-1], parent_persona
                 )
+                attempt_failure = (
+                    attempt_results[0].get("failure")
+                    if isinstance(attempt_results[0], Mapping)
+                    else None
+                )
+                if (
+                    scenario.get("status") != expected["status"]
+                    or attempt_results[0].get("status")
+                    != expected["status"]
+                    or scenario.get("assertions") != expected["assertions"]
+                    or scenario.get("persona_finalizer") is not None
+                    or scenario.get("failure") != expected["failure"]
+                    or attempt_failure != expected["failure"]
+                    or scenario.get("evidence_codes")
+                    != expected["evidence_codes"]
+                    or profile_result.get("status") == "PASS"
+                ):
+                    raise LiveScenarioReceiptError(
+                        "unfinalized persona review does not match worker result"
+                    )
                 continue
             if not isinstance(parent_persona, Mapping):
                 raise LiveScenarioReceiptError(

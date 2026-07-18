@@ -907,6 +907,58 @@ def test_failed_persona_capture_rejects_fabricated_finalizer():
         )
 
 
+def test_failed_parent_persona_review_retains_diagnostic_receipts_only():
+    raw = _aggregate()
+    result = _profile_projection(raw)
+    capture = next(
+        row for row in raw["receipts"] if row["scenario_id"] == "P0-06"
+    )
+    failure = receipts.persona_finalizer_failure(
+        "SEMANTIC_JUDGMENT_INVALID"
+    )
+    raw["persona_finalizer"] = failure
+
+    with pytest.raises(
+        receipts.LiveScenarioReceiptError,
+        match="parent persona finalizer",
+    ):
+        receipts.validate_aggregate_object(
+            raw, run_id="run-123", profile_id="official-gemini"
+        )
+
+    aggregate = receipts.validate_aggregate_object(
+        raw,
+        run_id="run-123",
+        profile_id="official-gemini",
+        allow_failed_persona=True,
+    )
+    projected = receipts.unfinalized_persona_result_projection(
+        capture, failure
+    )
+    persona = next(
+        row for row in result["scenarios"] if row["scenario_id"] == "P0-06"
+    )
+    persona.update(
+        {
+            **projected,
+            "attempt_results": [
+                {
+                    "attempt": 1,
+                    "status": projected["status"],
+                    "failure": projected["failure"],
+                }
+            ],
+        }
+    )
+    result["status"] = "AGENT_ERROR"
+
+    receipts.validate_result_binding(
+        result, aggregate, allow_failed_persona=True
+    )
+    with pytest.raises(receipts.LiveScenarioReceiptError):
+        receipts.validate_result_binding(result, aggregate)
+
+
 def test_agent_cannot_green_missing_delivery_stage():
     aggregate = _aggregate()
     green_result = _profile_projection(aggregate)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -2509,6 +2510,47 @@ def test_diagnostic_preserves_parent_owned_negative_persona_verdict(tmp_path):
     assert persona["failure"]["failure_code"] == "PERSONA_ACCEPTANCE_FAILED"
 
 
+def test_diagnostic_retains_matrix_when_parent_persona_review_fails(tmp_path):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+
+    def failed_persona_review(_spec, _capture_receipt):
+        raise launcher.PersonaFinalizeError("SEMANTIC_JUDGMENT_INVALID")
+
+    receipt = _launch_diagnostic(
+        paths,
+        _successful_runner([]),
+        persona_finalize_runner=failed_persona_review,
+        profile_ids=tuple(profile_id for profile_id, _ in PROFILE_AGENT_TYPES),
+    )
+    worker = next(
+        row
+        for row in receipt["workers"]
+        if row["profile_id"] == "official-gemini"
+    )
+    result = json.loads(
+        (paths["aggregation"] / "official-gemini.json").read_text()
+    )
+    scenarios = {row["scenario_id"]: row for row in result["scenarios"]}
+    live_set, _ = live_receipts.validate_live_scenario_receipts(
+        paths["raw"] / "official-gemini" / "live-scenario-receipts.json",
+        run_id="diagnostic-123",
+        profile_id="official-gemini",
+        allow_failed_persona=True,
+    )
+
+    assert worker["result_source"] == "codex_worker"
+    assert worker["fallback_reason"] is None
+    assert live_set["persona_finalizer"] == {
+        "kind": "persona_finalizer_failure",
+        "failure_code": "SEMANTIC_JUDGMENT_INVALID",
+    }
+    assert scenarios["P0-06"]["status"] == "AGENT_ERROR"
+    assert scenarios["P0-06"]["failure"]["failure_code"] == "MALFORMED_EVIDENCE"
+    assert scenarios["P0-06"]["persona_finalizer"] is None
+    assert scenarios["P0-07"]["status"] == "PASS"
+    assert scenarios["P0-13"]["scenario_id"] == "P0-13"
+
+
 def test_diagnostic_persona_capture_failure_continues_later_scenarios(tmp_path):
     paths = _setup(tmp_path, qualification_mode="diagnostic")
 
@@ -3331,7 +3373,11 @@ def test_persona_review_program_rejects_prefilled_judgment(tmp_path):
     assert prefilled.returncode == 17
     assert prefilled.stdout == ""
     assert clean.returncode == 0
-    assert clean.stdout == '{"safe":"review-me"}\n\n'
+    evidence_sha256 = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    assert json.loads(clean.stdout) == {
+        "safe": "review-me",
+        "evidence_sha256": evidence_sha256,
+    }
 
 
 def test_persona_review_plaintext_is_redacted_from_codex_events(tmp_path):

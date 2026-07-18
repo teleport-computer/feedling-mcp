@@ -47,6 +47,17 @@
             }
           }
         },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "failure_code"],
+          "properties": {
+            "kind": {"const": "persona_finalizer_failure"},
+            "failure_code": {
+              "enum": ["SEMANTIC_JUDGMENT_INVALID", "PERSONA_FINALIZER_FAILED"]
+            }
+          }
+        },
         {"type": "null"}
       ]
     },

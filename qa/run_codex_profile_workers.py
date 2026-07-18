@@ -61,6 +61,8 @@ try:
         canonical_json_sha256 as live_json_sha256,
         failed_persona_result_projection,
         latency_projection as live_latency_projection,
+        persona_finalizer_failure,
+        unfinalized_persona_result_projection,
         validate_aggregate_object,
         validate_live_scenario_receipts,
         validate_receipt_object as validate_live_receipt_object,
@@ -107,6 +109,8 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
         canonical_json_sha256 as live_json_sha256,
         failed_persona_result_projection,
         latency_projection as live_latency_projection,
+        persona_finalizer_failure,
+        unfinalized_persona_result_projection,
         validate_aggregate_object,
         validate_live_scenario_receipts,
         validate_receipt_object as validate_live_receipt_object,
@@ -271,7 +275,7 @@ CAPTURE command only requests the parent-owned network mutation; REVIEW and
 FINALIZE remain offline semantic steps. Run
 these exact commands in separate Codex tool calls:
 QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=CAPTURE "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/qa/request_live_scenario_probe.py" --scenario P0-06 --attempt 1 --request "$QA_WORK_ROOT/.live-probe-P0-06-1.request" --facts "$QA_WORK_ROOT/live-probe-P0-06-1.facts.json"
-QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=REVIEW "$QA_PYTHON_BIN" -I -B -c 'import pathlib,sys;j=pathlib.Path(sys.argv[2]);j.exists() and sys.exit(17);print(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))' "$QA_WORK_ROOT/p0-06-private-evidence.json" "$QA_WORK_ROOT/p0-06-semantic-judgment.json"
+QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=REVIEW "$QA_PYTHON_BIN" -I -B -c 'import hashlib,json,pathlib,sys;p=pathlib.Path(sys.argv[1]);j=pathlib.Path(sys.argv[2]);j.exists() and sys.exit(17);b=p.read_bytes();d=json.loads(b);isinstance(d,dict) or sys.exit(18);"evidence_sha256" not in d or sys.exit(19);d["evidence_sha256"]=hashlib.sha256(b).hexdigest();print(json.dumps(d,sort_keys=True,separators=(",",":")))' "$QA_WORK_ROOT/p0-06-private-evidence.json" "$QA_WORK_ROOT/p0-06-semantic-judgment.json"
 After observing REVIEW output, make the semantic decisions and write the bounded
 owner-only judgment to exactly
 `$QA_WORK_ROOT/p0-06-semantic-judgment.json` in a separate unmarked tool call.
@@ -280,8 +284,9 @@ That JSON object MUST contain exactly these eight keys and no aliases:
 `reviewed_fact_ids`, `persona_identity_consistent`,
 `ground_truth_facts_supported`, and `contradictions_absent`. Set
 `schema_version` to `1`, `judge` to `qualification_agent`,
-`reviewed_surfaces` to exactly `["identity","persona","memories"]`, copy
-`evidence_sha256` and `expected_fact_ids` from the reviewed evidence into the
+`reviewed_surfaces` to exactly `["identity","persona","memories"]`, copy the
+REVIEW command's computed `evidence_sha256` and the reviewed evidence's
+`expected_fact_ids` into the
 judgment's `evidence_sha256` and `reviewed_fact_ids` fields, and set the three
 boolean fields from your actual semantic review. In particular, do not write
 `expected_fact_ids`, `consistency`, `support`, or `contradiction` as judgment
@@ -381,6 +386,19 @@ matching the supplied output schema; include only sanitized structured evidence.
 
 class WorkerLaunchError(RuntimeError):
     """Sanitized fixed failure from the deterministic process boundary."""
+
+
+class PersonaFinalizeError(WorkerLaunchError):
+    """A fixed diagnostic code for independent persona re-finalization."""
+
+    def __init__(self, failure_code: str) -> None:
+        if failure_code not in {
+            "SEMANTIC_JUDGMENT_INVALID",
+            "PERSONA_FINALIZER_FAILED",
+        }:
+            raise WorkerLaunchError("persona finalizer failure code is invalid")
+        super().__init__("trusted persona finalizer failed")
+        self.failure_code = failure_code
 
 
 class DiagnosticWorkerEvidenceError(WorkerLaunchError):
@@ -816,8 +834,8 @@ def _run_trusted_persona_finalize(
             or type(privacy.get("violation_count")) is not int
             or privacy.get("violation_count", -1) < 0
         ):
-            raise WorkerLaunchError(
-                "trusted persona finalizer does not match capture"
+            raise PersonaFinalizeError(
+                "PERSONA_FINALIZER_FAILED"
             )
         finalizer = {
             "fixture_id": "persona-import-v1",
@@ -844,14 +862,23 @@ def _run_trusted_persona_finalize(
             },
             "persona_finalizer": finalizer,
         }
+    except PersonaFinalizeError:
+        raise
+    except genesis_e2e.ExistingSessionDistillError as exc:
+        raise PersonaFinalizeError(
+            "SEMANTIC_JUDGMENT_INVALID"
+            if exc.stage == "semantic"
+            else "PERSONA_FINALIZER_FAILED"
+        ) from None
+    except WorkerLaunchError:
+        raise PersonaFinalizeError("SEMANTIC_JUDGMENT_INVALID") from None
     except (
-        genesis_e2e.ExistingSessionDistillError,
         OrchestrationError,
         OSError,
         KeyError,
         TypeError,
     ):
-        raise WorkerLaunchError("trusted persona finalizer failed") from None
+        raise PersonaFinalizeError("PERSONA_FINALIZER_FAILED") from None
     finally:
         for path in (authoritative, worker_copy, judgment):
             _unlink_private_path(path)
@@ -1520,19 +1547,26 @@ def _run_process_with_trusted_cot(
                 persona_finalizer = persona_finalize_runner(
                     spec, capture_receipts[0]
                 )
+            except PersonaFinalizeError as exc:
+                persona_finalizer = persona_finalizer_failure(
+                    exc.failure_code
+                )
             except Exception:
                 # Preserve the worker's actual exit/tool-use diagnostic.  The
-                # persisted null projection makes downstream evidence validation
-                # fail closed without misclassifying it as a launcher invocation
-                # failure.
-                persona_finalizer = None
+                # bounded diagnostic sentinel retains all other parent-owned
+                # receipts while strict release validation still fails closed.
+                persona_finalizer = persona_finalizer_failure(
+                    "PERSONA_FINALIZER_FAILED"
+                )
     finally:
         try:
             _write_live_receipt_aggregate(
                 spec, live_receipts, persona_finalizer
             )
         finally:
-            if persona_finalizer is None:
+            if persona_finalizer is None or persona_finalizer.get(
+                "kind"
+            ) == "persona_finalizer_failure":
                 for path in (
                     _persona_authoritative_evidence_path(spec),
                     _persona_worker_evidence_path(spec),
@@ -2520,6 +2554,30 @@ def _project_diagnostic_live_evidence(
                 )
                 if result.get("status") == "PASS":
                     result["status"] = capture_failure["status"]
+            elif (
+                rows[-1]["status"] == "PASS"
+                and isinstance(parent_persona, Mapping)
+                and parent_persona.get("kind")
+                == "persona_finalizer_failure"
+            ):
+                review_failure = unfinalized_persona_result_projection(
+                    rows[-1], parent_persona
+                )
+                failure = review_failure["failure"]
+                scenario.update(
+                    {
+                        **review_failure,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+                                "status": review_failure["status"],
+                                "failure": failure,
+                            }
+                        ],
+                    }
+                )
+                if result.get("status") == "PASS":
+                    result["status"] = review_failure["status"]
             else:
                 if not isinstance(parent_persona, Mapping):
                     raise WorkerLaunchError(
@@ -2897,14 +2955,24 @@ def _load_live_worker_evidence(
 
 def _has_failed_persona_capture(aggregate: Mapping[str, Any]) -> bool:
     receipts = aggregate.get("receipts")
-    if not isinstance(receipts, list) or aggregate.get("persona_finalizer") is not None:
+    if not isinstance(receipts, list):
         return False
     capture = [
         row
         for row in receipts
         if isinstance(row, Mapping) and row.get("scenario_id") == "P0-06"
     ]
-    return len(capture) == 1 and capture[0].get("status") != "PASS"
+    if len(capture) != 1:
+        return False
+    finalizer = aggregate.get("persona_finalizer")
+    return bool(
+        (capture[0].get("status") != "PASS" and finalizer is None)
+        or (
+            capture[0].get("status") == "PASS"
+            and isinstance(finalizer, Mapping)
+            and finalizer.get("kind") == "persona_finalizer_failure"
+        )
+    )
 
 
 def _validate_live_worker_evidence(
