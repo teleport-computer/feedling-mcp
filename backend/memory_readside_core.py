@@ -36,11 +36,6 @@ def _status(moment: dict) -> str:
     return str(moment.get("status") or "active").strip().lower() or "active"
 
 
-def _salience(moment: dict) -> str:
-    salience = str(moment.get("salience") or "medium").strip().lower()
-    return salience if salience in _SALIENCE_WEIGHT else "medium"
-
-
 def _float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -144,10 +139,6 @@ def _env_int(name: str, default: int) -> int:
 def readside_hard_max() -> int:
     hard_max = _env_int("FEEDLING_MEMORY_READSIDE_HARD_MAX", MEMORY_READSIDE_DEFAULT_HARD_MAX)
     return max(1, hard_max)
-
-
-def configured_readside_limit() -> int:
-    return MEMORY_READSIDE_DEFAULT_LIMIT
 
 
 def effective_readside_limit(value: Any | None = None) -> int:

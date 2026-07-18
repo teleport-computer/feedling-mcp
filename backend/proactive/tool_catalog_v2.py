@@ -135,31 +135,9 @@ def default_tool_catalog_v2() -> ToolCatalogV2:
     return ToolCatalogV2(DEFAULT_TOOL_SPECS_V2)
 
 
-def foreground_chat_tool_catalog_v2() -> ToolCatalogV2:
-    """Fast-only additive tools for foreground chat.
-
-    This surface intentionally excludes memory and action tools. Memory recall
-    stays on the existing chat path; foreground perception is a pure add-on.
-    Screen tools are also held back for now because the same screen.read name
-    can become a slow full-frame read.
-    """
-    return ToolCatalogV2(tuple(
-        spec for spec in DEFAULT_TOOL_SPECS_V2
-        if spec.name in FOREGROUND_CHAT_TOOL_NAMES_V2
-    ))
-
-
-def foreground_chat_tool_context_v2() -> list[dict[str, Any]]:
-    return foreground_chat_tool_catalog_v2().context_tools()
-
-
 def tool_catalog_v2_for_runtime(runtime: str) -> ToolCatalogV2:
     """Return the shared V2 catalog for hosted/resident runtime surfaces."""
     normalized = str(runtime or "").strip().lower()
     if normalized not in {"hosted", "resident"}:
         raise ValueError(f"unknown v2 runtime surface: {runtime}")
     return default_tool_catalog_v2()
-
-
-def tool_context_v2_for_runtime(runtime: str) -> list[dict[str, Any]]:
-    return tool_catalog_v2_for_runtime(runtime).context_tools()

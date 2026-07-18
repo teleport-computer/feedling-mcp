@@ -18,7 +18,7 @@ agent only ever sees labels.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -211,17 +211,3 @@ UNLOCK_BACK_THRESHOLD_SEC = 1800.0  # 30 min
 # Recent app-open events surfaced in the snapshot (folds the standalone
 # /app_usage read; capped to keep the wake-attached snapshot small).
 RECENT_APPS_LIMIT = 10
-
-
-def signals_for_capability(cap_key: str) -> list[Signal]:
-    return [s for s in SIGNALS.values() if s.capability == cap_key]
-
-
-def context_field_names() -> list[str]:
-    """All state field names that belong to context_field capabilities."""
-    out: list[str] = []
-    for s in SIGNALS.values():
-        cap = CAPABILITIES.get(s.capability)
-        if cap and cap.context_field:
-            out.extend(s.outputs)
-    return out

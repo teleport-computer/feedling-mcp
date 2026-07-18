@@ -1,24 +1,16 @@
 """Hosted turn parsing + background jobs: state actions, memory capture, recap, repair."""
 
 import base64
-import copy
-import hashlib
-import io
 import json
 import os
 import re
-import secrets
 import threading
 import time
-import uuid
-from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
-import httpx
 
 import db
-from core import envelope as core_envelope
 from core import enclave as core_enclave
 from chat import service as chat_service
 from core.store import UserStore
@@ -26,40 +18,26 @@ from core.store import UserStore
 from hosted_runtime import (
     ACTION_RESPONSE_FORMAT as HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
     ACTION_METHOD as HOSTED_RUNTIME_ACTION_METHOD,
-    BACKGROUND_METHOD as HOSTED_RUNTIME_BACKGROUND_METHOD,
-    BACKGROUND_NOT_STARTED_METHOD as HOSTED_RUNTIME_BACKGROUND_NOT_STARTED_METHOD,
     NOOP_METHOD as HOSTED_RUNTIME_NOOP_METHOD,
     PENDING_CONFIRM_METHOD as HOSTED_RUNTIME_PENDING_CONFIRM_METHOD,
     PENDING_REJECT_METHOD as HOSTED_RUNTIME_PENDING_REJECT_METHOD,
-    RUNTIME_ENGINE_NATIVE as HOSTED_RUNTIME_ENGINE_NATIVE,
     build_background_execution_messages as build_hosted_runtime_background_execution_messages,
-    background_execution_trace as hosted_runtime_background_trace,
-    companion_turn_contract_message as hosted_runtime_companion_turn_contract_message,
     coerce_pending_decision as coerce_hosted_runtime_pending_decision,
     coerce_runtime_action as coerce_hosted_runtime_action,
 )
 from model_api_runtime.prompts import (
-    build_foreground_chat_messages as build_model_api_foreground_chat_messages,
     build_memory_capture_messages as build_model_api_memory_capture_messages,
-    build_pending_confirmation_messages as build_model_api_pending_confirmation_messages,
-    build_web_search_results_message as build_model_api_web_search_results_message,
-    web_search_followup_message as model_api_web_search_followup_message,
 )
 from model_api_runtime.tools import (
     extract_web_search_requests as extract_model_api_web_search_requests,
-    run_web_searches as run_model_api_web_searches,
-    web_search_trace as model_api_web_search_trace,
 )
 from context_memory_selection import memory_relevance_details
-from content_encryption import build_envelope
 
 from accounts import registry
 from core import util as core_util
-from identity import actions as identity_actions_mod
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
 from memory import service as memory_service
-from push import service as push_service
 import provider_client
 from hosted import config_store as hosted_config_store
 from hosted import history_import as hosted_history_import
@@ -109,10 +87,6 @@ def _model_api_turn_count(store: UserStore) -> int:
         )
 
 
-def _state_lang_zh(text: str) -> bool:
-    return any("\u4e00" <= ch <= "\u9fff" for ch in (text or ""))
-
-
 def _state_pending_items(store: UserStore) -> list[dict]:
     data = db.get_blob(store.user_id, _STATE_PENDING_BLOB)
     items = data.get("items") if isinstance(data, dict) else []
@@ -130,49 +104,11 @@ def _state_save_pending_items(store: UserStore, items: list[dict]) -> None:
     db.set_blob(store.user_id, _STATE_PENDING_BLOB, {"items": items[:10], "updated_at": core_util._now_iso()})
 
 
-def _state_add_pending(store: UserStore, runtime_actions: list[dict], *, user_message_id: str, prompt: str) -> list[dict]:
-    existing = _state_pending_items(store)
-    now = time.time()
-    pending: list[dict] = []
-    for runtime_action in runtime_actions[:5]:
-        item = {
-            "id": f"rta_{uuid.uuid4().hex[:12]}",
-            "created_at": core_util._now_iso(),
-            "expires_at": now + 86400,
-            "source": "model_api_chat",
-            "user_message_id": user_message_id,
-            "prompt": prompt[:1000],
-            "runtime_action": runtime_action,
-        }
-        pending.append(item)
-    _state_save_pending_items(store, pending + existing)
-    return pending
-
-
 def _state_clear_pending(store: UserStore, pending_ids: set[str]) -> None:
     if not pending_ids:
         return
     items = [item for item in _state_pending_items(store) if str(item.get("id") or "") not in pending_ids]
     _state_save_pending_items(store, items)
-
-
-def _append_state_receipt(store: UserStore, receipt: dict) -> dict:
-    record = {
-        "id": receipt.get("id") or f"sr_{uuid.uuid4().hex[:14]}",
-        "ts": time.time(),
-        "created_at": core_util._now_iso(),
-        "source": "model_api_chat",
-        "status": str(receipt.get("status") or "ok")[:80],
-    }
-    for key in (
-        "background_execution", "results", "effects", "pending", "error",
-        "user_message_id", "assistant_message_id", "summary",
-    ):
-        if key in receipt:
-            record[key] = receipt[key]
-    db.log_append(store.user_id, "state_receipts", record, ts=record["ts"], item_key=record["id"])
-    db.log_trim(store.user_id, "state_receipts", STATE_RECEIPT_MAX)
-    return record
 
 
 def _load_state_receipts(store: UserStore, limit: int = 30) -> list[dict]:
@@ -345,100 +281,6 @@ def _model_api_plan_state_actions(
     }
 
 
-def _execute_model_api_state_plan(
-    store: UserStore,
-    api_key: str | None,
-    plan: dict,
-    *,
-    user_message_id: str,
-    user_message: str,
-) -> tuple[list[dict], list[dict], list[dict], dict | None]:
-    runtime_actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
-    if not runtime_actions and not plan.get("pending_ids"):
-        return [], [], [], None
-
-    direct = [a for a in runtime_actions if not a.get("requires_confirmation")]
-    needs_confirm = [a for a in runtime_actions if a.get("requires_confirmation")]
-    pending = _state_add_pending(
-        store,
-        needs_confirm,
-        user_message_id=user_message_id,
-        prompt=user_message,
-    ) if needs_confirm else []
-
-    identity_actions: list[dict] = []
-    memory_actions: list[dict] = []
-    for planned in direct:
-        executor_action = planned.get("executor_action") if isinstance(planned.get("executor_action"), dict) else {}
-        if not executor_action:
-            continue
-        executor_action = dict(executor_action)
-        executor_action.setdefault("state_action_id", planned.get("action_id", ""))
-        if planned.get("domain") == "identity":
-            identity_actions.append(executor_action)
-        elif planned.get("domain") == "memory":
-            executor_action.setdefault("source_chat_message_ids", [user_message_id])
-            memory_actions.append(executor_action)
-
-    effects: list[dict] = []
-    identity_results: list[dict] = []
-    memory_results: list[dict] = []
-    status = "ok"
-    error = ""
-    if identity_actions:
-        body, action_status = identity_actions_mod._execute_identity_actions(store, api_key, identity_actions)
-        identity_results = body.get("results") or []
-        effects.extend(body.get("effects") or [])
-        if action_status >= 400:
-            status = "failed"
-            error = body.get("error", "identity_action_failed")
-    if status == "ok" and memory_actions:
-        body, action_status = memory_actions_mod._execute_memory_actions(store, api_key, memory_actions)
-        memory_results = body.get("results") or []
-        effects.extend(body.get("effects") or [])
-        if action_status >= 400:
-            status = "failed"
-            error = body.get("error", "memory_action_failed")
-
-    background_execution = hosted_runtime_background_trace(
-        status=status,
-        method=str(plan.get("method") or ""),
-        triggered=bool(plan.get("triggered")),
-        error=str(plan.get("error") or ""),
-    )
-    receipt = _append_state_receipt(store, {
-        "status": status,
-        "background_execution": {
-            **background_execution,
-            "pending_decision": plan.get("method", "") if "pending_" in str(plan.get("method", "")) else "",
-        },
-        "results": {
-            "identity": identity_results,
-            "memory": memory_results,
-        },
-        "effects": effects,
-        "pending": [
-            _state_pending_public_summary(item)
-            for item in pending
-        ],
-        "error": error,
-        "user_message_id": user_message_id,
-    })
-    return effects, identity_results, memory_results, receipt
-
-
-def _state_receipt_prompt_payload(receipt: dict | None) -> dict:
-    if not receipt:
-        return {}
-    return {
-        "status": receipt.get("status", ""),
-        "results": receipt.get("results", {}),
-        "effects": receipt.get("effects", []),
-        "pending": receipt.get("pending", []),
-        "error": receipt.get("error", ""),
-    }
-
-
 def _state_preview_value(value, max_chars: int = 260):
     if isinstance(value, list):
         out = []
@@ -516,304 +358,6 @@ def _state_pending_public_summary(item: dict) -> dict:
         for k, v in patch.items()
     ][:8]
     return result
-
-
-def _pending_state_confirmation_messages(
-    user_message: str,
-    pending: list[dict],
-    identity: dict,
-    *,
-    archive_language: str = "",
-    locale: str = "",
-) -> list[dict]:
-    payload = {
-        "latest_user_message": user_message[:2000],
-        "identity": {
-            "agent_name": str(identity.get("agent_name") or ""),
-            "self_introduction": str(identity.get("self_introduction") or ""),
-            "custom_persona_prompt": str(identity.get("custom_persona_prompt") or ""),
-            "tone_style": str(identity.get("tone_style") or ""),
-            "boundaries": identity.get("boundaries") if isinstance(identity.get("boundaries"), list) else [],
-            "signature": identity.get("signature") if isinstance(identity.get("signature"), list) else [],
-            "language_preference": str(identity.get("language_preference") or ""),
-        },
-        "archive_language": str(archive_language or ""),
-        "locale": str(locale or ""),
-        "pending_updates": [_state_pending_public_summary(item) for item in pending[:5]],
-        "allowed_user_replies": ["确认", "取消", "confirm", "cancel", "or a natural correction"],
-    }
-    return build_model_api_pending_confirmation_messages(payload)
-
-
-def _model_api_pending_confirmation_reply(
-    runtime: provider_client.ProviderConfig,
-    user_message: str,
-    pending: list[dict],
-    identity: dict,
-    *,
-    archive_language: str = "",
-    locale: str = "",
-) -> tuple[str, str]:
-    if not pending:
-        return "", ""
-    try:
-        result = provider_client.chat_completion(
-            runtime,
-            _pending_state_confirmation_messages(
-                user_message,
-                pending,
-                identity,
-                archive_language=archive_language,
-                locale=locale,
-            ),
-            max_tokens=700,
-            temperature=0.7,
-            timeout=45.0,
-            response_format=HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
-        )
-        reply, thinking = _model_api_parse_turn_reply(str(result.get("reply") or ""))
-        reply = reply.strip()
-        if not reply:
-            return "", ""
-        banned = (
-            "我找到了可能要修改",
-            "可能要修改的身份或记忆",
-            "需要你确认",
-            "I found a likely identity or memory update",
-            "I found a possible identity or memory change",
-        )
-        if any(phrase in reply for phrase in banned):
-            return "", ""
-        return reply, thinking
-    except Exception:
-        return "", ""
-
-
-def _append_model_api_runtime_followup_message(
-    store: UserStore,
-    *,
-    reply: str,
-    thinking_summary: str = "",
-    push_data: dict | None = None,
-) -> dict | None:
-    text = str(reply or "").strip()
-    if not text:
-        return None
-    assistant_env, env_err = core_envelope._build_shared_envelope_for_store(store, text.encode("utf-8"))
-    if assistant_env is None:
-        print(f"[model_api_state:{store.user_id}] followup_envelope_failed detail={env_err}")
-        return None
-    extra: dict = {}
-    thinking = str(thinking_summary or "").strip()
-    if thinking:
-        thinking_env, thinking_err = core_envelope._build_shared_envelope_for_store(store, thinking.encode("utf-8"))
-        if thinking_env is not None:
-            extra.update(chat_service._chat_thinking_extra_from_envelope(thinking_env))
-        else:
-            print(f"[model_api_state:{store.user_id}] followup_thinking_envelope_failed detail={thinking_err}")
-    row = store.append_chat("openclaw", "model_api", assistant_env, extra=extra)
-    store.notify_chat_waiters()
-    delivery_fields = push_service._deliver_ai_message_push_if_background(
-        store,
-        body=text,
-        title="IO",
-        data=push_data or {"source": "model_api_state"},
-        visual_state="reply",
-    )
-    updated = store.update_chat_message_metadata(row["id"], delivery_fields)
-    return updated or row
-
-
-def _run_model_api_state_action_job(
-    store: UserStore,
-    api_key: str | None,
-    runtime: provider_client.ProviderConfig,
-    trace_id: str,
-    *,
-    user_message: str,
-    user_message_id: str,
-    assistant_message_id: str,
-    context_refs: list[dict],
-) -> None:
-    started = time.time()
-    try:
-        hosted_config_store._patch_model_api_action_trace(store, trace_id, {
-            "status": "processing",
-            "progress": 20,
-        })
-        identity_for_plan = {}
-        identity_plan_data, _ = core_enclave._enclave_get_json_for_gate("/v1/identity/get", api_key)
-        if isinstance(identity_plan_data, dict) and isinstance(identity_plan_data.get("identity"), dict):
-            identity_for_plan = identity_plan_data["identity"]
-        state_plan = _model_api_plan_state_actions(
-            store,
-            api_key,
-            runtime,
-            user_message,
-            context_refs,
-            identity_for_plan,
-        )
-        effects, identity_results, memory_results, state_receipt = _execute_model_api_state_plan(
-            store,
-            api_key,
-            state_plan,
-            user_message_id=user_message_id,
-            user_message=user_message,
-        )
-        pending_items = _state_pending_items(store)
-        just_pending = bool(state_receipt and (state_receipt.get("pending") or []) and not effects)
-        followup_row = None
-        if just_pending:
-            reply, thinking_summary = _model_api_pending_confirmation_reply(
-                runtime,
-                user_message,
-                pending_items,
-                identity_for_plan,
-                archive_language=registry._get_user_archive_language(store.user_id) or "",
-            )
-            if reply:
-                followup_row = _append_model_api_runtime_followup_message(
-                    store,
-                    reply=reply,
-                    thinking_summary=thinking_summary,
-                    push_data={"source": "model_api_state", "kind": "pending_confirmation"},
-                )
-        if state_receipt and state_receipt.get("status") == "failed":
-            background_execution = hosted_runtime_background_trace(
-                status="failed",
-                method=str(state_plan.get("method") or ""),
-                triggered=bool(state_plan.get("triggered")),
-                error=str(state_plan.get("error") or state_receipt.get("error") or ""),
-            )
-            hosted_config_store._patch_model_api_action_trace(store, trace_id, {
-                "status": "failed",
-                "progress": 100,
-                "provider": runtime.provider,
-                "model": runtime.model,
-                "user_message_id": user_message_id,
-                "assistant_message_id": assistant_message_id,
-                "state_receipt_id": state_receipt.get("id", ""),
-                "background_execution": background_execution,
-                "effects": effects,
-                "identity_actions": identity_results,
-                "memory_actions": memory_results,
-                "error": state_receipt.get("error", "state_action_failed"),
-                "duration_ms": int((time.time() - started) * 1000),
-            })
-            return
-        if not effects and not just_pending and not state_plan.get("pending_ids"):
-            status = "skipped"
-            reason = "no_state_action"
-        elif just_pending:
-            status = "pending_confirmation"
-            reason = "needs_user_confirmation"
-        else:
-            status = "completed"
-            reason = "state_actions_applied"
-        background_execution = hosted_runtime_background_trace(
-            status=status,
-            method=str(state_plan.get("method") or ""),
-            triggered=bool(state_plan.get("triggered")),
-            error=str(state_plan.get("error") or ""),
-        )
-        hosted_config_store._patch_model_api_action_trace(store, trace_id, {
-            "status": status,
-            "progress": 100,
-            "provider": runtime.provider,
-            "model": runtime.model,
-            "user_message_id": user_message_id,
-            "assistant_message_id": assistant_message_id,
-            "state_receipt_id": (state_receipt or {}).get("id", ""),
-            "background_execution": background_execution,
-            "effects": effects,
-            "identity_actions": identity_results,
-            "memory_actions": memory_results,
-            "context": {"context_refs": len(context_refs)},
-            "reason": reason,
-            "duration_ms": int((time.time() - started) * 1000),
-        })
-        if followup_row:
-            hosted_config_store._patch_model_api_action_trace(store, trace_id, {
-                "assistant_message_id": followup_row.get("id", assistant_message_id),
-            })
-    except Exception as e:
-        hosted_config_store._patch_model_api_action_trace(store, trace_id, {
-            "status": "failed",
-            "progress": 100,
-            "provider": runtime.provider,
-            "model": runtime.model,
-            "user_message_id": user_message_id,
-            "assistant_message_id": assistant_message_id,
-            "error": f"{type(e).__name__}:{str(e)[:300]}",
-            "duration_ms": int((time.time() - started) * 1000),
-        })
-    finally:
-        with _model_api_state_active_lock:
-            _model_api_state_active_users.discard(store.user_id)
-
-
-def _start_model_api_state_action_job(
-    store: UserStore,
-    api_key: str | None,
-    runtime: provider_client.ProviderConfig,
-    *,
-    user_message: str,
-    user_message_id: str,
-    assistant_message_id: str,
-    context_refs: list[dict],
-    run_sync: bool = False,
-) -> dict:
-    with _model_api_state_active_lock:
-        if store.user_id in _model_api_state_active_users:
-            return {
-                "status": "skipped",
-                "reason": "background_execution_already_running",
-                "actions_written": 0,
-            }
-        _model_api_state_active_users.add(store.user_id)
-    trace = hosted_config_store._append_model_api_action_trace(store, {
-        "status": "queued",
-        "provider": runtime.provider,
-        "model": runtime.model,
-        "user_message_id": user_message_id,
-        "assistant_message_id": assistant_message_id,
-        "background_execution": hosted_runtime_background_trace(
-            status="queued",
-            method=HOSTED_RUNTIME_BACKGROUND_METHOD,
-        ),
-        "context": {"context_refs": len(context_refs)},
-        "reason": "queued_after_foreground_reply",
-        "progress": 0,
-    })
-    args = (store, api_key, runtime, trace["trace_id"])
-    kwargs = {
-        "user_message": user_message,
-        "user_message_id": user_message_id,
-        "assistant_message_id": assistant_message_id,
-        "context_refs": context_refs,
-    }
-    if run_sync:
-        _run_model_api_state_action_job(*args, **kwargs)
-        latest = db.log_patch_item(
-            store.user_id,
-            hosted_config_store.MODEL_API_ACTION_TRACE_STREAM,
-            trace["trace_id"],
-            {},
-        )
-        return latest or trace
-    thread = threading.Thread(
-        target=_run_model_api_state_action_job,
-        args=args,
-        kwargs=kwargs,
-        daemon=True,
-    )
-    thread.start()
-    return trace
-
-
-def _model_api_turn_contract_message() -> dict:
-    return hosted_runtime_companion_turn_contract_message()
-
 
 
 def _model_api_extract_web_search_requests(parsed: Any) -> list[dict]:
@@ -1872,41 +1416,3 @@ def _model_api_image_payload(payload: dict) -> tuple[bytes | None, str, str | No
     if len(image_bytes) > MODEL_API_MAX_IMAGE_BYTES:
         return None, "", f"image too large; max {MODEL_API_MAX_IMAGE_BYTES} bytes"
     return image_bytes, mime, None
-
-
-def _model_api_user_content(message: str, images: list[dict[str, str]]) -> Any:
-    text = message.strip() or "User sent an image."
-    if not images:
-        return text
-    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
-    for image in images:
-        image_b64 = str(image.get("b64") or "").strip()
-        if not image_b64:
-            continue
-        image_mime = str(image.get("mime") or "image/jpeg")
-        parts.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{image_mime};base64,{image_b64}"},
-        })
-    return parts
-
-
-def _run_model_api_web_searches(requests_in: list[dict]) -> dict:
-    return run_model_api_web_searches(
-        requests_in,
-        enabled=MODEL_API_WEB_SEARCH_ENABLED,
-        max_queries=MODEL_API_WEB_SEARCH_MAX_QUERIES,
-        max_results=MODEL_API_WEB_SEARCH_MAX_RESULTS,
-        timeout_sec=MODEL_API_WEB_SEARCH_TIMEOUT_SEC,
-    )
-
-
-def _model_api_web_search_results_message(web_search: dict) -> dict:
-    return build_model_api_web_search_results_message(web_search)
-
-
-def _model_api_web_search_trace(web_search: dict) -> dict:
-    return model_api_web_search_trace(
-        web_search,
-        max_queries=MODEL_API_WEB_SEARCH_MAX_QUERIES,
-    )

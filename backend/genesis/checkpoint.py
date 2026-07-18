@@ -36,10 +36,6 @@ from typing import Any, Iterable, Mapping
 CHECKPOINT_BLOB_PREFIX = "genesis_checkpoint"  # blob key = f"{prefix}:{job_id}"
 
 
-def checkpoint_blob_key(job_id: str) -> str:
-    return f"{CHECKPOINT_BLOB_PREFIX}:{str(job_id)}"
-
-
 # --- stable candidate_id / source_ref (Codex rule #2: the dedup anchor) -------
 # THE critical dedup rule: foreground and background must derive the SAME id for
 # the SAME fact, or contract #1/#2 dedup drifts and a card gets written twice.

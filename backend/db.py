@@ -2068,16 +2068,6 @@ def genesis_list_jobs(user_id: str, *, limit: int = 20) -> list[dict]:
     return out
 
 
-def genesis_latest_done_job(user_id: str) -> dict | None:
-    with get_pool().connection() as conn:
-        cur = conn.execute(
-            "SELECT * FROM genesis_import_jobs WHERE user_id = %s AND status = 'done' "
-            "ORDER BY completed_at DESC NULLS LAST, updated_at DESC LIMIT 1",
-            (user_id,),
-        )
-        return _genesis_row(cur, cur.fetchone())
-
-
 def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
     """Atomically claim uploaded genesis jobs for the CVM worker.
 
@@ -2618,16 +2608,6 @@ def genesis_upsert_output(
     from tee_shadow import mirror
     mirror.execute(sql, (user_id, job_id, output_type, ref, status, Jsonb(doc)))
     return result
-
-
-def genesis_get_output(user_id: str, job_id: str, output_type: str) -> dict | None:
-    with get_pool().connection() as conn:
-        cur = conn.execute(
-            "SELECT * FROM genesis_import_outputs "
-            "WHERE user_id = %s AND job_id = %s AND output_type = %s",
-            (user_id, job_id, output_type),
-        )
-        return _genesis_row(cur, cur.fetchone())
 
 
 def genesis_complete_job(

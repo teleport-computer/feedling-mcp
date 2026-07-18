@@ -449,11 +449,6 @@ def _user_entry_snapshot(user_id: str) -> dict | None:
         return dict(user_entry) if user_entry else None
 
 
-def _principal_id_for_user(user_id: str) -> str:
-    snapshot = _user_entry_snapshot(user_id) or {}
-    return str(snapshot.get("principal_id") or "")
-
-
 def _upsert_access_binding_locked(
     user_entry: dict,
     access_mode: str,

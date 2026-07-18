@@ -145,30 +145,3 @@ def build_memory_capture_messages(
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:12000]},
     ]
-
-
-def build_web_search_results_message(web_search: dict[str, Any]) -> dict[str, str]:
-    payload = {
-        "tool": "web_search",
-        "status": web_search.get("status", ""),
-        "result_count": web_search.get("result_count", 0),
-        "results": web_search.get("results", []),
-        "errors": web_search.get("errors", []),
-    }
-    return {
-        "role": "system",
-        "content": (
-            "Backend web_search tool results JSON:\n"
-            + json.dumps(payload, ensure_ascii=False)[:12000]
-        ),
-    }
-
-
-def web_search_followup_message() -> dict[str, str]:
-    return {
-        "role": "user",
-        "content": (
-            "Use the backend web_search results above to answer the original user message. "
-            "Return the normal Feedling chat turn JSON only."
-        ),
-    }

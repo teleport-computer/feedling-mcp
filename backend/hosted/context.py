@@ -1,59 +1,16 @@
 """Hosted chat context assembly (history + identity + memories + screen)."""
 
-import base64
-import copy
-import hashlib
-import io
-import json
-import os
-import re
-import secrets
-import threading
-import time
-import uuid
-from collections import defaultdict
-from datetime import date, datetime, timedelta
-from typing import Any
-
-import httpx
 
 from accounts import registry
-import db
 import debug_trace
 from core.reqctx import request
 from core import enclave as core_enclave
 from perception import snapshot_for_wake as _perception_wake_snapshot
 from core.store import UserStore
 
-from hosted_runtime import (
-    ACTION_RESPONSE_FORMAT as HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
-    ACTION_METHOD as HOSTED_RUNTIME_ACTION_METHOD,
-    BACKGROUND_METHOD as HOSTED_RUNTIME_BACKGROUND_METHOD,
-    BACKGROUND_NOT_STARTED_METHOD as HOSTED_RUNTIME_BACKGROUND_NOT_STARTED_METHOD,
-    NOOP_METHOD as HOSTED_RUNTIME_NOOP_METHOD,
-    PENDING_CONFIRM_METHOD as HOSTED_RUNTIME_PENDING_CONFIRM_METHOD,
-    PENDING_REJECT_METHOD as HOSTED_RUNTIME_PENDING_REJECT_METHOD,
-    RUNTIME_ENGINE_NATIVE as HOSTED_RUNTIME_ENGINE_NATIVE,
-    build_background_execution_messages as build_hosted_runtime_background_execution_messages,
-    background_execution_trace as hosted_runtime_background_trace,
-    companion_turn_contract_message as hosted_runtime_companion_turn_contract_message,
-    coerce_pending_decision as coerce_hosted_runtime_pending_decision,
-    coerce_runtime_action as coerce_hosted_runtime_action,
-)
 from model_api_runtime.prompts import (
     build_foreground_chat_messages as build_model_api_foreground_chat_messages,
-    build_memory_capture_messages as build_model_api_memory_capture_messages,
-    build_pending_confirmation_messages as build_model_api_pending_confirmation_messages,
-    build_web_search_results_message as build_model_api_web_search_results_message,
-    web_search_followup_message as model_api_web_search_followup_message,
 )
-from model_api_runtime.tools import (
-    extract_web_search_requests as extract_model_api_web_search_requests,
-    run_web_searches as run_model_api_web_searches,
-    web_search_trace as model_api_web_search_trace,
-)
-from context_memory_selection import memory_relevance_details
-from content_encryption import build_envelope
 
 from screen import frames as screen_frames
 from hosted import history_import as hosted_history_import
@@ -259,57 +216,6 @@ def _model_api_context_messages(
         user_message=user_message,
     )
     return messages, context_payload, screen_images
-
-
-def _model_api_context_trace_summary(context_payload: dict) -> dict:
-    trace = context_payload.get("context_memory_trace") if isinstance(context_payload, dict) else {}
-    if not isinstance(trace, dict):
-        return {}
-    selected = trace.get("selected") if isinstance(trace.get("selected"), list) else []
-    rejected = trace.get("rejected_sample") if isinstance(trace.get("rejected_sample"), list) else []
-    summary: dict = {}
-    if selected:
-        summary["selected"] = selected[:8]
-    if rejected:
-        summary["rejected_sample"] = rejected[:8]
-    query_units = trace.get("query_units") if isinstance(trace.get("query_units"), list) else []
-    query_strong = trace.get("query_strong_phrases") if isinstance(trace.get("query_strong_phrases"), list) else []
-    if query_units:
-        summary["query_units"] = query_units[:20]
-    if query_strong:
-        summary["query_strong_phrases"] = query_strong[:20]
-    if trace.get("mode"):
-        summary["mode"] = str(trace.get("mode") or "")[:40]
-    return summary
-
-
-def _model_api_context_trace_for_action(
-    context_payload: dict,
-    *,
-    context_refs: list[dict],
-    web_search: dict,
-    provider_reasoning: str | None = None,
-) -> dict:
-    info = {
-        "memories": len(context_payload.get("context_memories") or []),
-        "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
-        "screen_context": bool(context_payload.get("screen_context")),
-        "context_refs": len(context_refs),
-        "web_search": hosted_turn._model_api_web_search_trace(web_search),
-    }
-    memory_selection = _model_api_context_trace_summary(context_payload)
-    if memory_selection:
-        info["memory_selection"] = memory_selection
-    if provider_reasoning is not None:
-        info["provider_reasoning"] = {
-            "enabled": hosted_turn.MODEL_API_PROVIDER_REASONING_ENABLED,
-            "present": bool(provider_reasoning),
-            "chars": len(provider_reasoning),
-        }
-    memory_tools = context_payload.get("memory_tools") if isinstance(context_payload.get("memory_tools"), dict) else {}
-    if memory_tools:
-        info["memory_tools"] = memory_tools
-    return info
 
 
 def _context_refs_from_payload(payload: dict) -> list[dict]:

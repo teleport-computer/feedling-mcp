@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from memory.prompts_v1 import MEMORY_CONTEXT_FRAMING_V1
@@ -142,10 +141,3 @@ def execute_memory_tool(store, api_key: str | None, name: str, args: dict | None
             "capped": capped,
         }
     return _result_for_error(name, "unknown_memory_tool", trace=tr)
-
-
-def render_memory_tool_results(results: list[dict]) -> str:
-    return (
-        "Tool results (JSON). Use them to continue; call more tools or finish with a final reply:\n"
-        + json.dumps(results, ensure_ascii=False, default=str)
-    )

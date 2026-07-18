@@ -27,19 +27,6 @@ from cryptography.hazmat.primitives import serialization
 TLS_KEY_PATH = "feedling-tls-v1"
 
 
-def derive_key_only(dstack, path: str) -> "ec.EllipticCurvePrivateKey":
-    """Derive a stable EC P-256 private key from dstack-KMS at *path*.
-
-    Used by acme_dns01.py (cert key + account key) and enclave_app.py
-    (MCP cert pubkey fingerprint for the attestation bundle).
-    """
-    seed_resp = dstack.get_key(path, "")
-    seed = bytes.fromhex(seed_resp.key) if isinstance(seed_resp.key, str) else seed_resp.key
-    scalar_bytes = hashlib.sha256(path.encode() + b"|" + seed[:32]).digest()
-    scalar = int.from_bytes(scalar_bytes, "big")
-    return ec.derive_private_key(scalar, ec.SECP256R1())
-
-
 def derive_tls_cert_and_key(dstack) -> dict[str, Any]:
     """Return {'cert_pem', 'key_pem', 'cert_der', 'fingerprint'}.
 
