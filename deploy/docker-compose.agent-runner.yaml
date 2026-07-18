@@ -1,56 +1,26 @@
-# agent-runner — the 4th Phala service (plan §Runtime 拓扑).
+# Local Hosted Runtime V2 worker overlay.
 #
-# ⚠️ SUPERSEDED for prod/test deploys: the `agent-runner` service + the
-# `feedling_agent_runtime` volume are now defined INLINE in
-# deploy/docker-compose.phala.yaml and deploy/docker-compose.phala.test.yaml
-# (folded in so CI builds + deploys them; the image tag is pinned by the same CI
-# step that pins the backend). Those inline definitions are the source of truth —
-# edit them, not this file. This overlay is kept ONLY as a local-dev convenience
-# for running the agent-runner against a non-phala compose; it is NOT used by CI.
-#
-# Local dev (against the plain dev compose, NOT the phala ones which already carry
-# the service):
-#   docker compose -f deploy/docker-compose.yaml \
-#     -f deploy/docker-compose.agent-runner.yaml up
-#
-# The agent-runner image is built from deploy/Dockerfile.agent-runner (publish
-# to ghcr.io/teleport-computer/feedling-agent-runner:<digest>).
+# This overlay is intentionally NOT a resident supervisor. Managed and local
+# hosted model-API accounts use the same pooled Runtime V2 queue. Operators who
+# want an independently controlled resident agent use the documented
+# `feedling-chat-resident` consumer with the `/v1/chat/*` protocol instead.
 
 name: feedling-enclave
 
 services:
-  agent-runner:
+  serve-worker:
     image: ghcr.io/teleport-computer/feedling-agent-runner:dev
-    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
+    command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
     environment:
       FEEDLING_API_URL: "http://backend:5001"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
-      AGENT_DATA_ROOT: "/agent-data"
-      AGENT_LEASE_TTL_SEC: "60"
-      AGENT_TICK_INTERVAL_SEC: "15"
-      # Isolation strategy: process (default, v1) | container (opt-in strong
-      # isolation — see docs/AGENT_RUNTIME_ISOLATION.md; not fully wired).
-      AGENT_RUNTIME_ISOLATION: "process"
-      # Lease table (same external Postgres as the backend). Encrypted env
-      # channel — carries DB creds, must include sslmode=require.
       DATABASE_URL: "${DATABASE_URL:-}"
-      # Stage-D runtime token signing secret — mints short-lived per-user tokens.
-      # Encrypted env channel; NOT baked. (Var name must match what supervisor.py
-      # reads: FEEDLING_RUNTIME_TOKEN_SECRET.)
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-      # Roster of users to service (JSON: [{"api_key":...,"provider_key":...}]).
-      # Encrypted env channel — carries per-user keys, never baked into the hash.
-      AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
-      AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
-    volumes:
-      - feedling_agent_runtime:/agent-data
+      FEEDLING_V2_MAX_WORKERS: "${FEEDLING_V2_MAX_WORKERS:-4}"
+      FEEDLING_GENESIS_WORKER_ENABLED: "${FEEDLING_GENESIS_WORKER_ENABLED:-1}"
     depends_on:
       backend:
         condition: service_started
       enclave:
         condition: service_healthy
-
-volumes:
-  feedling_agent_runtime:
-    name: feedling_agent_runtime

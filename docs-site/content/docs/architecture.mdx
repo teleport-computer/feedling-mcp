@@ -54,8 +54,9 @@ or diagnostic upload is encrypted.
    `POST /v1/model_api/chat/send`.
 2. Inside the managed main VM, the API validates the request, creates a shared
    encrypted envelope, appends the user turn, and wakes the hosted queue.
-3. A per-user runner process polls with a scoped runtime token. It requests only
-   the Chat, Memory, and Perception context authorized for that user.
+3. A bounded Runtime V2 worker pool claims the durable job and mints a scoped
+   runtime token for that turn. It requests only the Chat, Memory, and Perception
+   context authorized for that user.
 4. The decrypt service opens the required shared envelopes. The runner sends the
    plaintext prompt and selected context to the configured model provider.
 5. The runner encrypts the assistant result into a new user-owned envelope before
@@ -139,7 +140,7 @@ inference each have an explicit plaintext boundary.
 | --- | --- | --- |
 | User API key | Long-lived, full access to one user's public control and data plane | User-owned apps, integrations, and control-plane operations |
 | Runtime token | Short-lived, user-bound, and scope-limited | Hosted runner processes and background workers |
-| Provider credential | Belongs to the configured external inference provider | Encrypted at rest, then decrypted for the authorized per-user runner process that calls the provider |
+| Provider credential | Belongs to the configured external inference provider | Encrypted at rest, then decrypted for the authorized Runtime V2 turn that calls the provider |
 
 Runtime tokens do not replace API keys. Key issuance, account reset, MCP
 management, and other designated control-plane operations require the user API
@@ -153,12 +154,11 @@ The public API resolves each credential to one user, scopes storage queries by
 that user, and checks envelope ownership before protected reads and writes. This
 is the primary multi-tenant boundary for API and persistence access.
 
-Managed hosted runners additionally use per-user homes, sessions, checkpoints,
-leases, and child processes. The current process runner is an operational
-separation mechanism, not a strong sandbox for mutually hostile code. Child
-processes share the runner container and kernel, inherit the supervisor's base
-environment, and receive the provider credential needed for their configured
-agent.
+Managed Hosted Runtime V2 uses a bounded worker pool. Durable jobs, conversation
+state, reply cursors, deadlines, and terminal errors live in PostgreSQL; there is
+no resident process, per-user home, CLI checkpoint, or lease to keep alive. A
+turn can run in a watchdog-controlled child process, but that is a failure and
+resource boundary rather than a strong sandbox for mutually hostile code.
 
 Feedling does not represent this as per-user microVM or per-user hardware-enclave
 isolation. Keep hosted execution restricted to supported agent entry points, and
@@ -224,7 +224,7 @@ enabled capability:
 | --- | --- |
 | Account and storage API | Authenticated request plus a successful write/read round trip through PostgreSQL |
 | Memory index and fetch | Storage round trip plus a successful authorized decrypt projection |
-| Hosted Chat | Database, decrypt service, fresh supervisor heartbeat, queue processing, provider call, and encrypted assistant result |
+| Hosted Chat | Database, decrypt service, fresh Runtime V2 worker heartbeat and capacity, queue processing, provider call, and encrypted assistant result |
 | Screen ingestion | Authenticated WebSocket ingest plus frame persistence and, when needed, decrypt retrieval |
 | Push delivery | Valid device token and a confirmed provider delivery attempt |
 
@@ -245,6 +245,6 @@ Feedling's architecture is designed to provide:
 - explicit handoff to user-selected external inference and delivery services.
 
 It does not claim that every field or compatibility upload is encrypted, that a
-shared runner child process is a hostile-code sandbox, that external model
+Runtime V2 turn process is a hostile-code sandbox, that external model
 providers cannot see inference plaintext, or that process liveness proves full
 service readiness.

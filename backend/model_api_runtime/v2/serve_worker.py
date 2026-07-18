@@ -1,8 +1,8 @@
 """V2 worker 进程入口 + 生产依赖装配（子项目 B，Task 8 扩到全流程）。
 
-部署目标（已钉死，见 spec §2.1）：这是**同一 backend 镜像的兄弟入口**，运行在独立
-runner CVM 的 `serve-worker` service；它与 resident `agent-runner` service 并列，而不是
-由 supervisor 托管。Genesis 已在 2026-07-10 rehome 到本进程的 dedicated thread。
+部署目标（已钉死，见 spec §2.1）：这是 backend 代码的 worker 镜像入口，运行在独立
+runner CVM 的唯一 `serve-worker` service；hosted resident supervisor 已退役。
+Genesis 已在 2026-07-10 rehome 到本进程的 dedicated thread。
 它**不是**独立 repo，也**不**贴着主 app CVM 的 FastAPI backend 跑。HTTP 化会把
 backend→enclave→backend 的 reentrant 502 根因请回来；贴主 app 跑则与 backend 争 CPU/内存。
 
@@ -2326,10 +2326,9 @@ def _start_genesis_thread(worker_id: str):
 
     Rehomed here from `agent_runtime.supervisor` (2026-07-10): genesis never depended
     on the resident CLI runtime — it needed an enclave URL, a token secret, and a
-    long-running loop, and supervisor merely happened to be the only process in the
-    CVM that had one. Deleting agent-runner would have silently stopped draining
-    `genesis_import_jobs`, stalling every new user's onboarding distillation with no
-    error surfaced anywhere.
+    long-running loop, and the former supervisor merely happened to be the only
+    process in the CVM that had one. Keeping it here ensures resident retirement
+    cannot stop draining `genesis_import_jobs`.
 
     NOT `asyncio.to_thread`: a tick blocks for the whole LLM reduce (minutes), and
     `to_thread` would park that in the loop's default executor — `min(32, cpu+4)`, i.e.

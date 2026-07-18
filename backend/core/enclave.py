@@ -68,8 +68,7 @@ def _trace_enclave(
 def _enclave_get_json_for_gate(path: str, api_key: str | None, params: dict | None = None,
                                *, runtime_token: str = "") -> tuple[dict | None, str]:
     """Auth = api_key (``X-API-Key``) or a runtime token (``X-Feedling-Runtime-Token``,
-    Stage-D zero-roster host-all). The enclave accepts either; mirrors
-    agent_runtime.supervisor._auth_headers / _decrypt_envelope_via_enclave."""
+    used by pooled V2 and other trusted background workers)."""
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         return None, "enclave_unavailable"
@@ -177,9 +176,8 @@ def _reencrypt_frame_via_enclave(envelope: dict, api_key: str | None, *,
 def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpose: str,
                                   runtime_token: str = "") -> bytes:
     """Decrypt an envelope via the enclave. Auth = api_key (``X-API-Key``) or a
-    runtime token (``X-Feedling-Runtime-Token``, Stage-D zero-roster host-all where
-    the supervisor has no per-user api_key). The enclave accepts either; mirrors
-    agent_runtime.supervisor._auth_headers."""
+    runtime token (``X-Feedling-Runtime-Token``) when a trusted background worker
+    has no per-user api_key."""
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         raise RuntimeError("enclave_unavailable")

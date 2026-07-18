@@ -14,6 +14,9 @@ Agent 是大脑，Feedling 是身体。
 > only where they describe past milestones.
 
 1. **HTTP backend** (FastAPI/ASGI, `backend/asgi_app.py`) — iOS, resident-consumer, and proactive APIs
+2. **Hosted Runtime V2 workers** (`backend/model_api_runtime/v2/`) — a bounded,
+   PostgreSQL-backed native agent/tool loop deployed as pooled `serve-worker`
+   processes; hosted resident supervisors and per-user CLI processes are retired
 3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + backend + enclave services running inside one Phala TDX CVM
 4. **Enclave app** (`backend/enclave_app.py`) — owns the content private key, serves `/attestation` on its own pinnable TLS port, and runs the decrypt proxy
 5. **iOS app** — now lives in the companion repo <https://github.com/teleport-computer/feedling-mcp-ios>. It owns Chat · Identity · Garden · Settings, Live Activity / Dynamic Island, Broadcast Extension for screen capture, and the live audit card.
@@ -406,7 +409,7 @@ reject plaintext with `400 plaintext_write_rejected`.
 
 The FastMCP SSE server and its `feedling_*` tool set (23 tools mapping
 onto the HTTP endpoints above) were removed on 2026-06-12; users now
-connect through the iOS app + agent-runner paths instead. For the
+connect through the iOS app + Hosted Runtime V2 or independent resident paths instead. For the
 historical tool table and the SSE `?key=` session-pinning details, see
 git history and `deploy/DEPLOYMENTS.md`.
 
@@ -491,7 +494,7 @@ The public iOS onboarding now starts by asking the user which route they need:
 The MCP import route — `claude mcp add feedling --transport sse
 "https://mcp.feedling.app/sse?key=<api_key>"` against the FastMCP SSE
 server — was removed on 2026-06-12 together with that server. Users of
-official apps are now served through the iOS app + agent-runner paths.
+official apps are now served through the iOS app + Hosted Runtime V2 paths.
 The historical setup instructions live in git history and
 `deploy/DEPLOYMENTS.md`.
 

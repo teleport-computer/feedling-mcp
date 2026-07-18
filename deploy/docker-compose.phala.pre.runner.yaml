@@ -1,132 +1,39 @@
-# docker-compose.phala.runner.yaml — STANDALONE agent-runner CVM (test, Form B)
+# docker-compose.phala.pre.runner.yaml — Pre Hosted Runtime V2 worker CVM
 #
-# A SEPARATE Phala CVM that runs ONLY an agent-runner supervisor — no backend, no
-# enclave, no ingress. It scales the hosted agent-runtime off the main CVM: if this
-# CVM dies, the main CVM's ingress/backend/enclave are untouched, and the per-user
-# Postgres lease lets a surviving runner (here or on the main CVM) take over.
+# This separate Phala CVM runs only the pooled Runtime V2 worker.  The retired
+# hosted resident supervisor is deliberately absent: Pre has no per-user CLI
+# child processes, leases, homes, checkpoints, static roster, or resident
+# rollback service.  All turn state lives in PostgreSQL and the worker calls the
+# main CVM's API/decrypt service with short-lived, user-bound runtime tokens.
 #
-# SINGLE runner per CVM (mirrors the prod runner compose). Earlier this file ran
-# TWO runners (agent-runner-0/1) with SEPARATE data volumes; because the per-user
-# chat checkpoint (poll cursor) lives in the volume's checkpoint.json and NOT in the
-# lease row, a lease that drifted from one runner to the other resumed from the
-# other volume's STALE checkpoint and wedged (poll claims a message the enclave
-# decrypt-history no longer returns → infinite retry, no progress). One runner + one
-# volume keeps a user's checkpoint in a single place, so lease drift can't stale it.
-# Test's user count is tiny; a single runner (AGENT_MAX_CHILDREN) is ample. Scale
-# back to multiple runners only alongside a shared/consolidated checkpoint.
-#
-# Lease coordination needs NO per-runner index: the lease owner is
-# "<hostname>:<pid>", the per-owner heartbeat table (migration 0010) records the
-# runner, and AGENT_MAX_CHILDREN bounds how many users it takes.
-#
-# ── How a runner CVM reaches the main CVM ──────────────────────────────────────
-#   FEEDLING_API_URL     → the main CVM backend via its PUBLIC ingress domain
-#                          (e.g. https://test-api.feedling.app). NOT the
-#                          compose-internal http://backend:5001 — that DNS name
-#                          does not exist in this CVM.
-#   FEEDLING_ENCLAVE_URL → the main CVM enclave via the dstack-gateway passthrough
-#                          that already carries its in-enclave TLS + attestation
-#                          (e.g. https://<main-app-id>-5003s.dstack-pha-prod9.phala.network).
-#                          This is the SAME authenticated decrypt endpoint clients
-#                          already use; the runner authenticates per-user with a
-#                          short-lived Stage-D runtime token (no api key, no
-#                          long-term secret), so this widens nothing beyond the
-#                          existing exposure. Confirm /v1/envelope/decrypt accepts
-#                          the runtime token over this path before rollout.
-#
-# ── Deploy ─────────────────────────────────────────────────────────────────────
-#   This is its OWN dstack app (own app-id, own compose_hash, own on-chain auth).
-#   Adding/redeploying this CVM = a NEW compose_hash → addComposeHash() on-chain
-#   (see deploy/DEPLOYMENTS.md “How to re-run the deploy”). All secrets below flow
-#   through the ENCRYPTED env channel (`phala deploy -e …`) — never baked.
-#
-#   Required encrypted env (must match the main CVM where noted):
-#     DATABASE_URL                  same external Postgres as the backend
-#     FEEDLING_RUNTIME_TOKEN_SECRET MUST equal the main backend's value (token auth)
-#     FEEDLING_API_URL              main CVM public ingress URL
-#     FEEDLING_ENCLAVE_URL          main CVM enclave gateway-passthrough URL
-#     FEEDLING_HOST_ALL=1           mirror the backend
-#     AGENT_MAX_CHILDREN            per-runner capacity ceiling (must cover the user
-#                                   count or some users go unserved)
+# Required encrypted env (must match the main Pre CVM where noted):
+#   DATABASE_URL                  same external PostgreSQL as the backend
+#   FEEDLING_RUNTIME_TOKEN_SECRET same value as the main backend
+#   FEEDLING_API_URL              main CVM public ingress URL
+#   FEEDLING_ENCLAVE_URL          main CVM enclave gateway-passthrough URL
 
 name: feedling-pre-runner
 
-x-agent-runner-env: &agent-runner-env
-  FEEDLING_API_URL: "${FEEDLING_API_URL:-}"          # main CVM ingress URL
-  FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"  # main CVM enclave passthrough URL
-  AGENT_DATA_ROOT: "/agent-data"
-  AGENT_LEASE_TTL_SEC: "${AGENT_LEASE_TTL_SEC:-300}"
-  AGENT_TICK_INTERVAL_SEC: "${AGENT_TICK_INTERVAL_SEC:-15}"
-  AGENT_ENVELOPE_REFETCH_SEC: "${AGENT_ENVELOPE_REFETCH_SEC:-300}"
-  AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
-  AGENT_RUNTIME_ISOLATION: "process"
+x-serve-worker-env: &serve-worker-env
+  FEEDLING_API_URL: "${FEEDLING_API_URL:-}"
+  FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"
   DATABASE_URL: "${DATABASE_URL:-}"
-  AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
-  AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-  FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
-  FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-  # Genesis import worker: this runner is the only place genesis import jobs get
-  # drained (the main CVM no longer runs an agent-runner). Claim is FOR UPDATE
-  # SKIP LOCKED, so it stays correct if more runners are ever added back.
-  #
-  # 2026-07-10: rehomed from agent-runner into serve-worker. These keys live in a
-  # shared anchor consumed by BOTH containers, so nothing moves here — supervisor.py
-  # simply no longer reads them, and serve_worker.py now does. (In the prod compose
-  # the two services have separate env blocks, so there the keys did move.) Genesis
-  # never depended on the resident CLI runtime; it was a daemon thread in supervisor
-  # only because supervisor was the CVM's one long-running process. Liveness is now
-  # v2_worker_heartbeats kind='genesis' → `genesis_alive` on /v1/admin/v2-metrics.
+  # Genesis import is a queue worker hosted by Runtime V2. It never depended on
+  # the resident CLI process; claim uses FOR UPDATE SKIP LOCKED and has its own
+  # heartbeat kind on /v1/admin/v2-metrics.
   FEEDLING_GENESIS_WORKER_ENABLED: "1"
   FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "${FEEDLING_GENESIS_WORKER_INTERVAL_SEC:-10}"
   FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "${FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC:-7200}"
 
 services:
-  # Single runner per CVM (mirrors prod). One data volume → a user's per-user home
-  # + chat checkpoint always live in one place, so a lease that re-acquires here
-  # resumes from a consistent cursor (no cross-runner stale-checkpoint wedge).
-  agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:9721b22   # CI pins the sha
-    container_name: agent-runner
-    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
-    restart: unless-stopped
-    environment:
-      <<: *agent-runner-env
-      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-16}"
-    volumes:
-      - feedling_agent_runtime_pre_runner:/agent-data
-
-  # Hosted Runtime V2 worker pool (subproject D). Sibling to the resident
-  # supervisor: SAME image, runs the serve_worker entrypoint, holds NO data volume
-  # (all V2 state in Postgres: agent_jobs / v2_worker_heartbeats / v2_turn_metrics /
-  # v2_conversation_summary). Turns are pure async HTTP provider calls (no per-user
-  # home, no codex subprocess). Also hosts the genesis import worker on a dedicated
-  # thread (see the shared anchor's genesis env above). Adding this service changes
-  # compose_hash → on-chain addComposeHash() re-auth on the pre FeedlingAppAuth (see
-  # deploy/DEPLOYMENTS.md). Until deployed, chat_send_core 503s workers_unavailable
-  # for db_action_v2 users.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:9721b22   # CI pins the sha (same image as agent-runner)
+    image: ghcr.io/teleport-computer/feedling-agent-runner:9721b22   # CI pins the sha
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
     environment:
-      <<: *agent-runner-env
-      # V2 worker pool sizing. N in-process asyncio job slots share the agent_jobs
-      # queue via FOR UPDATE SKIP LOCKED. Encrypted env channel → tuning needs no
-      # on-chain re-auth (unlike adding the service).
+      <<: *serve-worker-env
       FEEDLING_V2_MAX_WORKERS: "${FEEDLING_V2_MAX_WORKERS:-4}"
-      # Single-image b64 cap for native multimodal injection. Must cover the
-      # base64 length (ceil(n/3)*4 = 2_666_668) of the ingestion cap
-      # MODEL_API_MAX_IMAGE_BYTES=2_000_000 bytes, else 1.5–2.0MB photos are
-      # accepted at send but silently dropped to text-only at the turn ("没收到
-      # 图片"). Matches worker.py's corrected default; explicit here as the deploy
-      # -layer override so the cap is right even if the image lags the compose.
+      # Must cover base64 length ceil(n/3)*4 for the 2,000,000-byte ingest cap.
       FEEDLING_V2_IMAGE_MAX_B64_CHARS: "${FEEDLING_V2_IMAGE_MAX_B64_CHARS:-2700000}"
-
-volumes:
-  # Fresh volume name (was feedling_agent_runtime_r0/r1). A new name gives the
-  # single runner a clean /agent-data, dropping the stale per-user checkpoints that
-  # wedged under the old two-volume layout.
-  feedling_agent_runtime_pre_runner:
-    name: feedling_agent_runtime_pre_runner

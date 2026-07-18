@@ -1,16 +1,9 @@
-"""Shared one-shot post-spawn introduction machinery.
+"""One-shot introduction machinery for the independent resident chat product.
 
-Extracted so BOTH paths that can open a fresh resident's first greeting enqueue
-the SAME introduction through ONE atomic enqueue-once entry — never a parallel
-field or a second state machine:
-
-- ``agent_runtime.supervisor`` — spawn / autoverify recovery path, gated on
-  ``proactive_activation_ready()`` (a user who has had a real conversation).
-- ``chat.chat_core`` — the resident ``chat_loop_verified`` fast-path, which is
-  what actually breaks the fresh-resident deadlock: a brand-new resident user
-  cannot send a real message until the greeting opens Chat, and ``verify_loop``
-  deliberately does NOT count as the user's First message, so gating the
-  greeting on ``first_chat_ok_at`` wedges it forever.
+The hosted supervisor path is retired. ``chat.chat_core`` remains the single
+caller for explicitly separate `/v1/chat/*` consumers and uses this atomic
+enqueue-once helper so a fresh external resident can open Chat without a
+parallel marker or state machine.
 
 The durable dedup marker stays ``store.introduced_at`` / ``introduction_done()``
 (unchanged from the existing system — no ``introduction_enqueued_at`` parallel
@@ -82,9 +75,8 @@ def _has_active_introduction_job(store) -> bool:
 def enqueue_introduction_once(store, *, now=None) -> dict | None:
     """Enqueue EXACTLY ONE introduction job for this user.
 
-    Trigger-agnostic: the CALLER decides *when* (supervisor: a recovered
-    activation; chat_core: ``chat_loop_verified``). Exactly-once across both
-    triggers AND across processes is enforced authoritatively by the SINGLE DB
+    The caller decides when ``chat_loop_verified`` is ready. Exactly-once across
+    processes is enforced authoritatively by the SINGLE DB
     transaction in ``store.claim_and_enqueue_introduction`` (guarded marker
     UPSERT + job INSERT together — see Codex P1); a lost race or a rolled-back
     job write simply returns ``None`` and leaves no orphan marker.

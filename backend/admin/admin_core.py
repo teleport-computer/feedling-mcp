@@ -100,21 +100,21 @@ def store_evict(user_id: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# hosted_runtime_mode control plane (Hosted Runtime V2 D0 rollout — gated flip
-# between resident_cli and db_action_v2 without a direct DB write).
+# Hosted Runtime V2 ownership repair/status surface. Resident selection is
+# retired; this endpoint may only materialize/repair V2 ownership.
 # --------------------------------------------------------------------------- #
 
 def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
+    if mode != config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        return {"error": "hosted resident runtime is retired"}, 400
     store = core_store.get_store(user_id)
-    if mode == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
-        try:
-            # Seed first. If profile persistence subsequently fails this row is
-            # dormant because every producer is mode-filtered; the reverse order
-            # creates a real window where the resident is reaped but no V2 wake
-            # schedule exists.
-            jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=time.time())
-        except Exception as e:  # noqa: BLE001 — do not report a half-ready flip
-            return {"error": "v2_schedule_seed_failed", "detail": str(e)[:160]}, 503
+    try:
+        # Seed first. If profile persistence subsequently fails this row is
+        # dormant because every producer is mode-filtered; the reverse order
+        # creates a real window where V2 ownership has no durable wake schedule.
+        jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=time.time())
+    except Exception as e:  # noqa: BLE001 — do not report a half-ready repair
+        return {"error": "v2_schedule_seed_failed", "detail": str(e)[:160]}, 503
     try:
         persisted_mode = config_store.set_hosted_runtime_mode(store, mode)
     except ValueError as e:

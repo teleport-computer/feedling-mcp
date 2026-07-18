@@ -311,12 +311,9 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
         return {"error": "provider_test_failed", "detail": str(e),
                 "status_code": e.status_code}, 400
 
-    # For openai_compatible relays, probe once whether the relay implements the
-    # OpenAI Responses API. codex speaks the Responses wire; the in-CVM LiteLLM
-    # gateway passes that straight through when the relay supports /v1/responses
-    # (preserving codex's tool loop) and otherwise forces the chat-completions
-    # bridge. We persist the answer so the supervisor picks the right transport
-    # without re-probing every tick. Only openai_compatible uses the flag.
+    # For openai_compatible relays, probe the Responses capability once and
+    # persist it for the native provider client. This is transport metadata for
+    # the unified V2 loop, not a runtime selector.
     supports_responses = False
     if provider == "openai_compatible":
         supports_responses = provider_client.probe_responses_support(
@@ -457,10 +454,10 @@ def model_api_set_hosting(store) -> tuple[dict, int]:
 def model_api_key_envelope(store) -> tuple[dict, int]:
     """Return the caller's OWN ``api_key_envelope`` ciphertext (active credential).
 
-    Lets the agent-runner supervisor (authenticating with the user's API key)
-    self-fetch the provider-key envelope and enclave-decrypt it JIT, instead of a
-    static roster carrying per-user secrets. The envelope is ciphertext the server
-    cannot decrypt; only the enclave can — so this never exposes the provider key.
+    Compatibility endpoint for explicitly independent consumers that need to
+    fetch the provider-key envelope and enclave-decrypt it JIT. Hosted Runtime
+    V2 reads the active route directly and does not use a static roster. The
+    envelope is ciphertext the API process cannot decrypt; only the enclave can.
 
     An unconfigured user (no active route) collapses to the same
     ``model_api_key_envelope_missing`` 404 the legacy blob path returned, keeping the
@@ -887,18 +884,8 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
             store, raw_key.encode("utf-8"), item_id=f"model_api_key_{uuid.uuid4().hex}")
         if envelope is None:
             return {"error": "cannot_encrypt_provider_key", "detail": err}, 409
-        # Mirrors model_api_setup's probe above: for openai_compatible relays, find
-        # out once whether the relay implements POST /v1/responses so the supervisor
-        # picks native Responses (preserving codex's tool loop) instead of forcing
-        # every route through the LiteLLM chat-completions bridge. Without this the
-        # credential defaults to supports_responses=False even when the relay does
-        # support it, silently degrading memory/tools for the user.
-        # Mirrors model_api_setup's probe above: for openai_compatible relays, find
-        # out once whether the relay implements POST /v1/responses so the supervisor
-        # picks native Responses (preserving codex's tool loop) instead of forcing
-        # every route through the LiteLLM chat-completions bridge. Without this the
-        # credential defaults to supports_responses=False even when the relay does
-        # support it, silently degrading memory/tools for the user.
+        # Mirror model_api_setup's one-time openai_compatible Responses probe so
+        # the native provider client does not silently lose the relay capability.
         supports_responses = False
         if provider == "openai_compatible":
             supports_responses = provider_client.probe_responses_support(
@@ -939,9 +926,9 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
 def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None) -> tuple[dict, int]:
     """先同步测活，通过才切换。测不过 → 400，旧 active 纹丝不动。
 
-    为什么必须 gate：db.list_agent_runtime_enabled_users 只收 is_active AND
-    test_status='ok' 的用户。激活一条未测活的 route 会让该用户下个 tick 从 roster
-    消失，supervisor 走「用户离开 roster」分支杀掉 consumer 且不会自愈。
+    为什么必须 gate：Runtime V2 ownership 只接受 is_active AND
+    test_status='ok' 的 supported route；未测活 route 不能成为 job executor 的
+    provider config。
     """
     route = db.model_api_route_get(store.user_id, route_id)
     if not route:
@@ -976,8 +963,7 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
     # V2 provider config is pinned once per turn. The fence+restore above bumps
     # its generation around activation, so a turn on the old route can spend
     # provider quota but cannot commit a reply/tool effect after this endpoint
-    # returns. Resident claim handoff remains owned by the supervisor after it
-    # kills the old per-user consumer, avoiding a double-provider call.
+    # returns. No resident process participates in the handoff.
     print(f"[model_api:{store.user_id}] activated route model={route['model']}")
     return {"active_route_id": route_id,
             "route": db.model_api_route_get(store.user_id, route_id)}, 200
@@ -987,9 +973,9 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
 def model_api_route_test(store, route_id: str, *, api_key: str | None) -> tuple[dict, int]:
     """与 ``DELETE /routes/{id}`` 对称：测的若是当前 active route 且失败了，不能
     让它悬空——它仍 ``is_active=TRUE``（``_test_route_or_error`` 只翻 test_status，
-    从不碰 is_active），而 roster 只收 ``is_active AND test_status='ok'``，用户会
-    立刻从 roster 消失、consumer 被杀且不自愈。一次用户主动点的「测试连接」不该
-    有这种副作用，尤其是上游只是一次瞬时 429/超时。
+    从不碰 is_active），但 V2 eligibility 只收 ``is_active AND
+    test_status='ok'``。一次用户主动点的「测试连接」不应把 control tuple 留在
+    看似 V2-ready、实际没有 runnable provider 的状态。
 
     陷阱：``model_api_autoselect_active`` 只挑 ``NOT is_active`` 的候选——对着仍
     active 的这条失败 route 直接 autoselect 会试图让第二行也变 active，撞

@@ -2525,27 +2525,18 @@ def list_hosted_runtime_nonresident_controls() -> list[tuple[str, str, str, int]
 
 
 def list_agent_runtime_enabled_users() -> list[dict]:
-    """有 active route 且该 route test_status='ok'、其 credential 的 provider 能
-    fit 的用户都纳入托管（与 hosted/agent_runtime_cutover.resolve_driver 一致——
-    不再有 per-user ``agent_runtime_driver`` 开关；kill switch 改用删/换 active
-    route 或改 test_status）。发现无条件进行——没有 gateway proxy 要避让，所有
-    fit provider 都直连（pi 走 openai-completions wire，不经 LiteLLM 网关）。
-    AGENT 由 provider 派生（保持 CASE 与 cutover.driver_for_provider 同步）：
-    anthropic/deepseek → claude（deepseek 走其 /anthropic 兼容层，Anthropic wire）；
-    openai → codex (native)；其余 fit provider
-    （gemini/openrouter/openai_compatible）→ pi。
-    Returns [{"user_id","driver","provider","model","base_url","supports_responses",
-    "reasoning_effort"}]
-    sorted by user_id (``supports_responses`` is the openai_compatible relay's
-    /v1/responses capability, set at setup; selects native passthrough vs the
-    LiteLLM chat-completions bridge)。
+    """Compatibility roster for explicitly external resident consumers.
 
-    This is authoritative desired-state input for the resident supervisor: a
-    genuine empty result means "stop every resident". Database failures must
-    therefore PROPAGATE — coercing a read outage to ``[]`` would tear down the
-    whole fleet. The supervisor's tick loop already wraps this call and skips
-    reconciliation (leaving existing children alone) when it raises, so a DB
-    blip pauses reconciliation rather than reaping every consumer."""
+    Managed hosted execution does not call this function: Runtime V2 eligibility
+    uses its own ownership controls and worker queue. The historical labels are
+    retained only for out-of-process/self-hosted consumers that deliberately use
+    the separate ``/v1/chat/*`` product path.
+
+    Returns [{"user_id","driver","provider","model","base_url","supports_responses",
+    "reasoning_effort"}] sorted by user_id.
+
+    Database failures propagate rather than being coerced to an authoritative
+    empty external roster."""
     with get_pool().connection() as conn:
         rows = conn.execute(
             """
@@ -5504,17 +5495,26 @@ def chat_append_and_enqueue(
     *, reason=None, trace_id=None, expected_generation: int | None = None,
     expected_runtime_state: str | None = None,
     expected_runtime_mode: str | None = None,
-) -> tuple[int, int]:
+    client_msg_id: str | None = None,
+    idempotency_window_sec: int | None = None,
+) -> tuple[int, int | None]:
     """Atomically persist one chat message AND enqueue/coalesce its job in ONE
     transaction. Either both commit or neither does — closes the orphan-message
     gap where the message persisted but the process died before the job insert
-    (spec A7). Returns ``(seq, job_id)``.
+    (spec A7). Returns ``(seq, job_id)``. ``job_id`` is ``None`` only when a
+    supplied ``client_msg_id`` recovers an existing logical send; that retry
+    neither inserts another message nor enqueues/coalesces another job.
+
+    The optional client idempotency guard runs inside this same transaction and
+    uses the same cross-process advisory lock as ``chat_append_idempotent``.
+    This preserves the iOS retry contract after hosted resident execution is
+    retired: a lost HTTP response cannot cause a duplicate V2 turn.
 
     Heavy file/image bodies follow the same crash-safe post-commit offload as
     other chat writes. The inline message and job still commit atomically; only
-    after that transaction succeeds do we upload and flip the row to a pointer,
-    while retention evictions commit durable cleanup tombstones for the isolated
-    R2 worker and mirror their row deletions to the TEE shadow.
+    after that transaction succeeds do we upload and flip the row to a pointer.
+    ``max_messages`` bounds only process-local hot caches; durable source rows
+    are never automatically trimmed here.
 
     One pool connection, one transaction, two cursors (a default cursor for
     the message INSERT, a ``dict_row`` cursor for the job coalesce-or-insert)
@@ -5538,6 +5538,17 @@ def chat_append_and_enqueue(
 
     if lane not in jobs_store.LANES:
         raise ValueError(f"unknown lane: {lane!r}")
+    if (client_msg_id is None) != (idempotency_window_sec is None):
+        raise ValueError(
+            "client_msg_id and idempotency_window_sec must be supplied together"
+        )
+    if client_msg_id is not None:
+        if not str(client_msg_id):
+            raise ValueError("client_msg_id is required")
+        if int(idempotency_window_sec or 0) <= 0:
+            raise ValueError("idempotency_window_sec must be positive")
+        if str(doc.get("client_msg_id") or "") != str(client_msg_id):
+            raise ValueError("chat doc client_msg_id does not match guard key")
     fenced = expected_runtime_state is not None or expected_runtime_mode is not None
     if fenced and (
         expected_runtime_state is None
@@ -5548,7 +5559,7 @@ def chat_append_and_enqueue(
             "runtime-control CAS requires expected state, mode, and generation")
     priority = jobs_store.LANE_PRIORITY.get(lane, 0)
 
-    def _attempt() -> tuple[int, int, int]:
+    def _attempt() -> tuple[int, int | None, int, bool]:
         with get_pool().connection() as conn:
             with conn.transaction():
                 with conn.cursor() as fence_cur:
@@ -5581,6 +5592,26 @@ def chat_append_and_enqueue(
                     ):
                         raise RuntimeControlChangedError(
                             "hosted runtime control changed before enqueue")
+                if client_msg_id is not None:
+                    # Length-prefix the user id so concatenation is unambiguous
+                    # without a NUL byte (PostgreSQL text rejects U+0000). This
+                    # is deliberately identical to chat_append_idempotent so a
+                    # retry crossing /model_api/chat/send and /chat/message
+                    # still serializes on one logical-operation key.
+                    lock_key = f"{len(user_id)}:{user_id}{client_msg_id}"
+                    conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (lock_key,),
+                    )
+                    duplicate = conn.execute(
+                        "SELECT seq FROM chat_messages "
+                        "WHERE user_id=%s AND doc->>'client_msg_id'=%s "
+                        "AND ts >= EXTRACT(EPOCH FROM clock_timestamp()) - %s "
+                        "ORDER BY seq DESC LIMIT 1",
+                        (user_id, client_msg_id, idempotency_window_sec),
+                    ).fetchone()
+                    if duplicate is not None:
+                        return int(duplicate[0]), None, 0, False
                 with conn.cursor() as mc:
                     seq, storage_generation = _chat_insert_on_cursor(
                         mc, user_id, msg_id, ts, doc, max_messages,
@@ -5592,12 +5623,14 @@ def chat_append_and_enqueue(
                         priority=priority, deadline_at=None,
                         expected_generation=expected_generation,
                     )
-        return seq, job_id, storage_generation
+        return seq, job_id, storage_generation, True
 
     def _finish(
-        result: tuple[int, int, int],
-    ) -> tuple[int, int]:
-        seq, job_id, storage_generation = result
+        result: tuple[int, int | None, int, bool],
+    ) -> tuple[int, int | None]:
+        seq, job_id, storage_generation, inserted = result
+        if not inserted:
+            return seq, None
         # The primary message+job transaction is already committed. Offload the
         # new row's body without touching any older durable source row.
         _offload_chat_body_after_commit(
@@ -5612,6 +5645,16 @@ def chat_append_and_enqueue(
             continue  # 并发 racer 抢先建了 active job；重跑整个事务并 coalesce
         return _finish(result)
     return _finish(_attempt())
+
+
+def chat_doc_for_seq(user_id: str, seq: int) -> dict | None:
+    """Strictly load one persisted chat document by its per-user sequence."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT doc FROM chat_messages WHERE user_id=%s AND seq=%s",
+            (user_id, int(seq)),
+        ).fetchone()
+    return row[0] if row is not None else None
 
 
 def reconcile_unenqueued_v2_messages() -> int:

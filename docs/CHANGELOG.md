@@ -47,6 +47,29 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-18
+
+### [DONE] Hosted resident fleet retired; all managed hosting is Runtime V2-only
+
+- Local, test, pre, and production backend manifests now force literal
+  `v2_only`; every runner manifest contains only the pooled `serve-worker`.
+  Test/pre/prod worker-CVM deploy jobs are mandatory and fail when their
+  topology is missing.
+- Removed the hosted resident supervisor, spawners, leases, token helper,
+  per-user CLI homes/checkpoints/volumes, roster/host-all controls, and resident
+  rollback/admin selector. The historical `feedling-agent-runner` package name
+  remains, but its image now contains only the Python Runtime V2 worker.
+- Hosted send requires the exact V2 ownership tuple and fails before persistence
+  on stale ownership, dead workers, kill switch, or admission rejection. The
+  independent user-operated `/v1/chat/*` resident consumer remains separate and
+  cannot claim hosted accounts.
+- Preserved iOS retry correctness during the cutover: `client_msg_id` duplicate
+  detection now runs inside the same transaction as V2 message append and job
+  enqueue, so a lost `202` cannot create a second row or execute a second turn.
+- Replaced the resident rollback guide with V2 scale/recovery procedures and
+  added structural tests that reject any return of hosted resident services,
+  selectors, CLI toolchains, or optional worker deploys.
+
 ## 2026-07-15
 
 ### [DONE] Pre becomes automatic Hosted Runtime V2 acceptance environment

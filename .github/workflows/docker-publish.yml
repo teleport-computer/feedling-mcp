@@ -40,8 +40,8 @@ jobs:
           # lowercase owner to satisfy ghcr's naming rules
           IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          # the agent-runner (4th CVM service) ships as a sibling image built from
-          # deploy/Dockerfile.agent-runner, tagged with the same commit sha.
+          # Historical package name retained; the sibling image is now the
+          # pooled Runtime V2 worker and contains no resident CLI runtime.
           AR_IMAGE="${IMAGE}-agent-runner"
           echo "ar_image=$AR_IMAGE" >> "$GITHUB_OUTPUT"
           # :latest only tracks main; test (and other branches) only get :<sha>
@@ -70,7 +70,7 @@ jobs:
             FEEDLING_GIT_COMMIT=${{ steps.meta.outputs.git_commit }}
             FEEDLING_BUILT_AT=${{ steps.meta.outputs.built_at }}
 
-      - name: Build + push agent-runner image
+      - name: Build + push Runtime V2 worker image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -107,8 +107,8 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "/user/packages/container/feedling" \
             -f visibility=public 2>&1 | tail -5 || true
-          # agent-runner image — same public-visibility requirement (CVM pull +
-          # reproducible-build verification).
+          # Runtime V2 worker image (historical package name) — same public
+          # visibility requirement for CVM pulls and reproducible verification.
           gh api --method PATCH \
             -H "Accept: application/vnd.github+json" \
             "/orgs/${{ github.repository_owner }}/packages/container/feedling-agent-runner" \

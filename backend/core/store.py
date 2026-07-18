@@ -492,7 +492,9 @@ class UserStore:
         Shape: `{"lane": str, "reason": str | None, "trace_id": str | None,
         "expected_generation": int | None, "expected_runtime_state": str | None,
         "expected_runtime_mode": str | None}`. The three expected runtime
-        values form the send-time ownership CAS. `None` (the default) preserves
+        values form the send-time ownership CAS. Optional ``client_msg_id`` and
+        ``idempotency_window_sec`` preserve logical-send idempotency inside the
+        same atomic transaction. `None` (the default) preserves
         today's `chat_append_strict`/`chat_append` behavior byte-for-byte —
         the in-memory cache append, trim, `wake_bus.notify`, and
         `capture_scheduler.record_chat_append` side effects are unaffected
@@ -668,11 +670,27 @@ class UserStore:
                     expected_generation=enqueue.get("expected_generation"),
                     expected_runtime_state=enqueue.get("expected_runtime_state"),
                     expected_runtime_mode=enqueue.get("expected_runtime_mode"),
+                    client_msg_id=enqueue.get("client_msg_id"),
+                    idempotency_window_sec=enqueue.get(
+                        "idempotency_window_sec"
+                    ),
                 )
+                if _job_id is None:
+                    winner = db.chat_doc_for_seq(self.user_id, _seq)
+                    if not isinstance(winner, dict):
+                        raise RuntimeError(
+                            "idempotent V2 chat winner disappeared after commit"
+                        )
+                    msg = dict(winner)
+                    persisted_new = False
             elif strict:
                 db.chat_append_strict(
                     self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
-            if not any(str(existing.get("id") or "") == msg_id for existing in self.chat_messages):
+            persisted_msg_id = str(msg.get("id") or msg_id)
+            if not any(
+                str(existing.get("id") or "") == persisted_msg_id
+                for existing in self.chat_messages
+            ):
                 self.chat_messages.append(msg)
             if len(self.chat_messages) > MAX_CHAT_MESSAGES:
                 self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
@@ -694,6 +712,10 @@ class UserStore:
             if resident_runtime_fenced:
                 replayed = dict(msg)
                 replayed["_resident_replayed"] = True
+                return replayed
+            if strict and enqueue is not None and enqueue.get("client_msg_id"):
+                replayed = dict(msg)
+                replayed["_client_msg_replayed"] = True
                 return replayed
             return msg
         wake_bus.notify("chat", self.user_id)
@@ -876,8 +898,8 @@ class UserStore:
             # marker, INDEPENDENT of the identity card (identity-card-never-gates,
             # 2026-07). A no-card / empty-card user has no `self_introduction`
             # field to write, so the intro's one-shot dedup can't live in the card
-            # — it lives here. Set once the introduction job is enqueued; see
-            # agent_runtime.supervisor._enqueue_introduction_job_if_needed.
+            # — it lives here. Set once the introduction job is atomically
+            # enqueued by agent_runtime.introduction.
             "introduced_at": "",
             "updated_at": datetime.now().isoformat(),
         }

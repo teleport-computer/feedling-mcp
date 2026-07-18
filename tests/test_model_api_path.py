@@ -23,9 +23,10 @@ from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
-from hosted import agent_runtime_cutover  # noqa: E402
+from hosted import chat_send_core  # noqa: E402
 from hosted import history_import  # noqa: E402
 from identity import service as identity_service  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -44,10 +45,12 @@ def client(tmp_path, monkeypatch):
         "_get_enclave_info",
         lambda: {"content_pk_hex": ("22" * 32), "compose_hash": "test"},
     )
-    # Seed a fresh supervisor heartbeat so the send wedge guard sees a live
-    # hosting runtime (these are full-path tests that route to the agent-runner).
-    db.set_supervisor_heartbeat({"ts": time.time(), "owner": "test",
-                                 "host_all": True, "gateway": True})
+    # Full-path hosted sends enter the pooled V2 worker lane.
+    monkeypatch.setattr(jobs_store, "workers_alive", lambda **kw: True)
+    monkeypatch.setattr(jobs_store, "live_worker_capacity", lambda **kw: 4)
+    monkeypatch.setattr(jobs_store, "inflight_job_count", lambda: 0)
+    monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: None)
+    monkeypatch.setattr(chat_send_core.kill_switch, "turns_halted", lambda **kw: False)
     with make_client() as c:
         yield c
 
@@ -281,9 +284,9 @@ def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatc
 
 
 def test_model_api_setup_persists_reasoning_effort(client, monkeypatch):
-    # LiteLLM gateway retired: reasoning_effort is still persisted at setup and
-    # surfaced through discovery (the pi driver consumes it); the old gateway
-    # budget translation (build_model_entry) is gone.
+    # reasoning_effort is persisted on the provider route for the unified native
+    # V2 loop; it must not make the account eligible for the external resident
+    # consumer roster.
     user_id, api_key = _register(client)
     monkeypatch.setattr(provider_client, "test_provider_key",
                         lambda cfg: {"reply": "ok", "usage": {}})
@@ -304,7 +307,9 @@ def test_model_api_setup_persists_reasoning_effort(client, monkeypatch):
     assert route["reasoning_effort"] == "medium"
 
     rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users()}
-    assert rows[user_id]["reasoning_effort"] == "medium"
+    assert user_id not in rows
+    mode, state, _generation = db.get_hosted_runtime_control_strict(user_id)
+    assert (mode, state) == ("db_action_v2", "v2")
 
 
 def test_model_api_setup_reasoning_effort_off_and_default(client, monkeypatch):
@@ -801,15 +806,6 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
 
     monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
 
-    monkeypatch.setattr(
-        agent_runtime_cutover, "check_supervisor_live",
-        lambda **kw: (True, "ok"),
-    )
-    monkeypatch.setattr(
-        agent_runtime_cutover, "handle_send",
-        lambda store, user_row, driver, **kw: ({"status": "processing"}, 202),
-    )
-
     chat = client.post(
         "/v1/model_api/chat/send",
         json={"message": "Can you reply using my imported history?"},
@@ -937,15 +933,7 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
 
-    # 图片 turn 现在路由到 agent-runner（不再走 inline）
-    monkeypatch.setattr(
-        agent_runtime_cutover, "check_supervisor_live",
-        lambda **kw: (True, "ok"),
-    )
-    monkeypatch.setattr(
-        agent_runtime_cutover, "handle_send",
-        lambda store, user_row, driver, **kw: ({"status": "processing"}, 202),
-    )
+    # 图片 turn 和文本 turn 一样进入 pooled V2 lane。
     chat = client.post(
         "/v1/model_api/chat/send",
         json={

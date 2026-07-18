@@ -206,12 +206,9 @@ services:
       # Proactive wake is native-only after P2-2b and no longer uses this flag.
       # See core/util.runtime_v2_default_on().
       FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
-      # Pre is the Hosted Runtime V2 acceptance environment. The backend
-      # materializes this policy for existing accounts before serving and for
-      # every newly configured route, so iOS users never need an admin flip.
-      # Operators can inject resident_only for a fenced fleet rollback without
-      # changing the compose hash; v2_only remains the fail-safe Pre default.
-      FEEDLING_HOSTED_RUNTIME_POLICY: "${FEEDLING_HOSTED_RUNTIME_POLICY:-v2_only}"
+      # Hosted model-API accounts have one runtime: pooled Runtime V2. This is a
+      # literal measured-compose value, not an encrypted-env rollback selector.
+      FEEDLING_HOSTED_RUNTIME_POLICY: "v2_only"
       # TEST-ONLY: genesis v2 (foreground-fast onboarding). Greet on 3-5 core +
       # identity baseline, push the heavy reduce (the ~37% prod failure surface)
       # to the background. Prod compose deliberately omits this (keeps the v1
@@ -222,16 +219,10 @@ services:
       # worker.genesis_combined_map_enabled(). Flip off to revert to the exact old
       # split-map path (hard rollback). On test for real-device quality comparison.
       FEEDLING_GENESIS_COMBINED_MAP: "true"
-      # Resident rollback only: v2_only ignores host-all for routing and excludes
-      # every eligible account from the resident supervisor roster. Keep the
-      # value mirrored so resident_only can fail-fast and recover deliberately.
-      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
       # Legacy memory migration is opt-in. Empty = off; set to 1 only after
-      # seeded real-device Garden verification passes. Mirror agent-runner.
+      # seeded real-device Garden verification passes. Mirror the pooled V2 worker.
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-      # Stage-D runtime token secret — the BACKEND is the verifier (enclave whoami
-      # falls back here), so it MUST share the agent-runner's secret or token auth
-      # 401s. Empty = off. Encrypted env, not baked into compose_hash.
+      # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
     ports:
       - "5001:5001"

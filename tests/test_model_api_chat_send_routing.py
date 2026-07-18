@@ -1,11 +1,4 @@
-"""路由测试: /v1/model_api/chat/send 收口后的行为。
-
-Task 3 删掉 inline 运行时后，每次 send 若 driver 能 resolve，则走
-agent_runtime_cutover.handle_send；否则 409 provider_not_configured。
-图片 turn 不再被 should_route 拦在 legacy 路径。
-
-测试用 monkeypatch 替换 handle_send，不真正启动 consumer。
-"""
+"""Hosted ``/v1/model_api/chat/send`` Runtime V2 routing contracts."""
 from __future__ import annotations
 
 import base64
@@ -30,6 +23,7 @@ from hosted import chat_send_core  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 from push import service as push_service  # noqa: E402
+from conftest import configure_model_api_route  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -48,9 +42,11 @@ def client(tmp_path, monkeypatch):
         "_get_enclave_info",
         lambda: {"content_pk_hex": ("22" * 32), "compose_hash": "test"},
     )
-    # Default: a live supervisor so the wedge guard lets sends through. Tests that
-    # exercise the guard's 503 path re-monkeypatch this to return not-live.
-    monkeypatch.setattr(agent_runtime_cutover, "check_supervisor_live", lambda **kw: (True, ""))
+    monkeypatch.setattr(jobs_store, "workers_alive", lambda **kw: True)
+    monkeypatch.setattr(jobs_store, "live_worker_capacity", lambda **kw: 4)
+    monkeypatch.setattr(jobs_store, "inflight_job_count", lambda: 0)
+    monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: None)
+    monkeypatch.setattr(chat_send_core.kill_switch, "turns_halted", lambda **kw: False)
     with make_client() as c:
         yield c
 
@@ -150,14 +146,6 @@ def test_pre_v2_only_fresh_setup_sends_through_v2_without_admin_flip(
     monkeypatch.setattr(
         chat_send_core.kill_switch, "turns_halted", lambda **kw: False
     )
-    monkeypatch.setattr(
-        agent_runtime_cutover,
-        "handle_send",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("V2-only Pre must never dispatch to resident")
-        ),
-    )
-
     response = client.post(
         "/v1/model_api/chat/send",
         json={"message": "hello from iOS pre"},
@@ -355,30 +343,13 @@ def test_chat_response_does_not_mark_first_chat_ok_for_verify_ping(client, monke
     assert store.proactive_activation_ready() is False
 
 
-def test_send_configured_routes_to_agent_runner(client, monkeypatch):
-    """配了 openrouter 的用户，send 应托管到 agent-runner，返回 202，
-    且 handle_send 收到 driver=='pi'（openrouter 现在无条件走 pi driver，LiteLLM
-    gateway 已退休）。"""
+def test_send_configured_routes_to_v2_worker_pool(client, monkeypatch):
+    """A configured OpenRouter turn is durably queued for Runtime V2."""
     user_id, api_key = _register(client)
 
     # 假 envelope 用于 setup（加密 api_key）和 chat/send（加密用户消息）
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
     _setup_openrouter(client, api_key, monkeypatch)
-
-    # 让 _load_runtime_provider_config 成功（绕过真实 enclave 解密）
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-or-test",
-    )
-
-    calls: list[str] = []
-
-    def fake_handle_send(store, user_row, driver, **kwargs):
-        calls.append(driver)
-        return {"status": "processing"}, 202
-
-    monkeypatch.setattr(agent_runtime_cutover, "handle_send", fake_handle_send)
 
     res = client.post(
         "/v1/model_api/chat/send",
@@ -388,7 +359,11 @@ def test_send_configured_routes_to_agent_runner(client, monkeypatch):
     assert res.status_code == 202, res.get_data(as_text=True)
     body = res.get_json()
     assert body["status"] == "processing"
-    assert calls == ["pi"], f"expected driver='pi', got {calls}"
+    assert body["runtime"]["driver"] == "pi"
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (user_id,)
+        ).fetchone()[0] == 1
 
 
 def test_send_client_msg_id_deduplicates_hosted_and_cross_route_retry(client, monkeypatch):
@@ -399,14 +374,6 @@ def test_send_client_msg_id_deduplicates_hosted_and_cross_route_retry(client, mo
         core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder()
     )
     _setup_openrouter(client, api_key, monkeypatch)
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-or-test",
-    )
-    monkeypatch.setattr(
-        agent_runtime_cutover, "wait_for_reply", lambda *args, **kwargs: None
-    )
     key = "5968A42D-D06A-4B9B-B183-8BCB47E44CB4"
 
     first = client.post(
@@ -462,25 +429,12 @@ def test_send_rejects_invalid_client_msg_id_before_append(client):
     ]
 
 
-def test_send_duplicate_reports_assistant_that_already_exists(client, monkeypatch):
+def test_send_duplicate_stays_poll_based_after_assistant_exists(client, monkeypatch):
     user_id, api_key = _register(client)
     monkeypatch.setattr(
         core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder()
     )
     _setup_openrouter(client, api_key, monkeypatch)
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-or-test",
-    )
-    # Keep the test fast while exercising the real ready/processing builders.
-    monkeypatch.setattr(
-        agent_runtime_cutover,
-        "wait_for_reply",
-        lambda store, message_id, **_kwargs: agent_runtime_cutover.find_reply_row(
-            store, message_id
-        ),
-    )
     key = "13fc8cc4-45f8-4867-8e98-bcfcc89e3b1f"
     first = client.post(
         "/v1/model_api/chat/send",
@@ -508,31 +462,21 @@ def test_send_duplicate_reports_assistant_that_already_exists(client, monkeypatc
 
     assert duplicate.status_code == 202
     body = duplicate.get_json()
-    assert body["reply_ready"] is True
+    assert body["reply_ready"] is False
     assert body["user_message"]["id"] == parent_id
-    assert body["assistant_message"]["id"] == reply["id"]
+    assert "assistant_message" not in body
+    assert len([
+        row for row in store.chat_messages
+        if row.get("client_msg_id") == key
+    ]) == 1
 
 
 def test_send_image_turn_also_routes(client, monkeypatch):
-    """图片 turn 不再被 should_route 拦在 legacy，也走 agent-runner（返回 202）。"""
+    """Image turns enter the same Runtime V2 queue."""
     user_id, api_key = _register(client)
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
     _setup_openrouter(client, api_key, monkeypatch)
-
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-or-test",
-    )
-
-    calls: list[str] = []
-
-    def fake_handle_send(store, user_row, driver, **kwargs):
-        calls.append(driver)
-        return {"status": "processing"}, 202
-
-    monkeypatch.setattr(agent_runtime_cutover, "handle_send", fake_handle_send)
 
     # 最小 JPEG 头（2 字节），不需要完整图片，只要能通过 base64 解码即可
     tiny_image_b64 = _b64(b"\xff\xd8\xff\xe0" + b"\x00" * 10)
@@ -548,7 +492,10 @@ def test_send_image_turn_also_routes(client, monkeypatch):
     )
     # 以前会被 should_route(has_image=True) 拦住走 inline → 现在直接 202
     assert res.status_code == 202, res.get_data(as_text=True)
-    assert len(calls) == 1, f"handle_send 应被调用一次，实际 calls={calls}"
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (user_id,)
+        ).fetchone()[0] == 1
 
 
 def test_send_image_turn_persists_real_mime(client, monkeypatch):
@@ -558,20 +505,6 @@ def test_send_image_turn_persists_real_mime(client, monkeypatch):
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
     _setup_openrouter(client, api_key, monkeypatch)
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-or-test",
-    )
-
-    captured: dict = {}
-
-    def fake_handle_send(store, user_row, driver, **kwargs):
-        captured["row"] = user_row
-        return {"status": "processing"}, 202
-
-    monkeypatch.setattr(agent_runtime_cutover, "handle_send", fake_handle_send)
-
     tiny_png_b64 = _b64(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)
     res = client.post(
         "/v1/model_api/chat/send",
@@ -579,16 +512,19 @@ def test_send_image_turn_persists_real_mime(client, monkeypatch):
         headers=_headers(api_key),
     )
     assert res.status_code == 202, res.get_data(as_text=True)
+    row_id = res.get_json()["user_message"]["id"]
+    captured = next(
+        row for row in core_store.get_store(user_id).chat_messages
+        if row.get("id") == row_id
+    )
     # chat row 必须带上真实 MIME（白名单透传），而非默认 jpeg。
-    assert captured["row"].get("image_mime") == "image/png", (
-        f"chat row 应持久化真实 MIME，实际 {captured['row'].get('image_mime')!r}"
+    assert captured.get("image_mime") == "image/png", (
+        f"chat row 应持久化真实 MIME，实际 {captured.get('image_mime')!r}"
     )
 
 
-def test_send_503_when_supervisor_not_live(client, monkeypatch):
-    """配置正常，但 supervisor 心跳缺失/陈旧（其 consumer 不会接这条）时，
-    send 必须 503 hosting_runtime_unavailable，且 **不** 调 handle_send、
-    **不** 写孤儿用户消息（守卫在 append_chat 之前）。"""
+def test_send_503_when_v2_workers_not_live(client, monkeypatch):
+    """A dead pooled worker fleet fails before persisting the user turn."""
     user_id, api_key = _register(client)
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
@@ -597,16 +533,7 @@ def test_send_503_when_supervisor_not_live(client, monkeypatch):
         core_enclave, "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-or-test",
     )
-    # supervisor down → guard must short-circuit before routing
-    monkeypatch.setattr(
-        agent_runtime_cutover, "check_supervisor_live",
-        lambda **kw: (False, "stale_supervisor_heartbeat_120s"),
-    )
-    calls: list[str] = []
-    monkeypatch.setattr(
-        agent_runtime_cutover, "handle_send",
-        lambda *a, **k: (calls.append("x"), ({"status": "processing"}, 202))[1],
-    )
+    monkeypatch.setattr(jobs_store, "workers_alive", lambda **kw: False)
 
     res = client.post(
         "/v1/model_api/chat/send",
@@ -615,9 +542,10 @@ def test_send_503_when_supervisor_not_live(client, monkeypatch):
     )
     assert res.status_code == 503, res.get_data(as_text=True)
     body = res.get_json()
-    assert body["error"] == "hosting_runtime_unavailable"
-    assert body["reason"].startswith("stale_supervisor_heartbeat")
-    assert calls == [], "supervisor down 时不应路由到 handle_send"
+    assert body == {
+        "error": "workers_unavailable",
+        "reason": "no_live_v2_worker_heartbeat",
+    }
     # 守卫早于 append_chat，store 里不应有任何用户消息（无孤儿 turn）
     store = core_store._stores.get(user_id)
     if store:
@@ -639,14 +567,6 @@ def test_send_image_with_caption_persists_caption_envelope(client, monkeypatch):
         lambda envelope, key, purpose: b"sk-or-test",
     )
 
-    captured: dict = {}
-
-    def fake_handle_send(store, user_row, driver, **kwargs):
-        captured["row"] = user_row
-        return {"status": "processing"}, 202
-
-    monkeypatch.setattr(agent_runtime_cutover, "handle_send", fake_handle_send)
-
     tiny_png_b64 = _b64(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)
     res = client.post(
         "/v1/model_api/chat/send",
@@ -658,7 +578,11 @@ def test_send_image_with_caption_persists_caption_envelope(client, monkeypatch):
         headers=_headers(api_key),
     )
     assert res.status_code == 202, res.get_data(as_text=True)
-    row = captured["row"]
+    row_id = res.get_json()["user_message"]["id"]
+    row = next(
+        item for item in core_store.get_store(user_id).chat_messages
+        if item.get("id") == row_id
+    )
     # caption envelope 字段必须持久化到 chat row
     assert row.get("caption_body_ct"), (
         f"chat row 应含 caption_body_ct，实际 row keys={list(row.keys())}"
@@ -679,27 +603,19 @@ def test_send_unsupported_provider_returns_409(client, monkeypatch):
     user_id, api_key = _register(client)
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
-
-    # 让 _load_runtime_provider_config 返回成功（绕过 400 检查）
-    fake_runtime = provider_client.ProviderConfig(
-        provider="bogus", model="x", api_key="k"
+    configure_model_api_route(
+        user_id, provider="openrouter", model="openai/gpt-4o-mini", test_status="ok"
     )
-    monkeypatch.setattr(
-        hosted_config_store,
-        "_load_runtime_provider_config",
-        lambda store, api_key, **kwargs: fake_runtime,
+    hosted_config_store.set_hosted_runtime_mode(
+        core_store.get_store(user_id), "db_action_v2"
     )
-    # _ensure_model_api_runtime_profile 在 line 355 调用，接受假 config 即可
-    monkeypatch.setattr(
-        hosted_config_store,
-        "_ensure_model_api_runtime_profile",
-        lambda store, config=None, **kwargs: None,
-    )
-    # 让 _load_model_api_config 返回一个 resolve_driver 会 raise 的 config
+    # Ownership can only be materialized for a supported active route. Model a
+    # corrupt/unknown provider read after that fence to exercise the request's
+    # fail-before-persist behavior.
     monkeypatch.setattr(
         hosted_config_store,
         "_load_model_api_config",
-        lambda store: {"provider": "bogus", "model": "x", "test_status": "ok"},
+        lambda _store: {"provider": "bogus", "model": "x"},
     )
 
     res = client.post(
@@ -726,78 +642,16 @@ def _setup_anthropic(client, api_key: str, monkeypatch) -> None:
     assert res.status_code == 200, res.get_data(as_text=True)
 
 
-def test_pi_runner_off_does_not_block_anthropic_user(client, monkeypatch):
-    """LiteLLM gateway 已退休，唯一剩下的按-provider 送达门是 require_pi（防
-    backend-pi-on/runner-pi-off 漂移）。anthropic 走 claude driver，require_pi
-    应为 False，不受 runner 的 pi 状态影响——runner pi 关时 chat/send **不** 被 503。"""
+def test_unified_v2_pool_accepts_anthropic_without_provider_tier_gate(client, monkeypatch):
+    """All providers share one V2 loop; no resident CLI capability tier exists."""
     user_id, api_key = _register(client)
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
     _setup_anthropic(client, api_key, monkeypatch)
-    monkeypatch.setattr(
-        core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-ant-test",
-    )
-    # 模拟 "heartbeat 存在但 runner pi 关" 的情形：
-    # check_supervisor_live 收到 require_pi=False → live；require_pi=True → not-live。
-    monkeypatch.setattr(
-        agent_runtime_cutover, "check_supervisor_live",
-        lambda *, require_pi=False, **kw: (
-            (True, "") if not require_pi else (False, "supervisor_pi_disabled")
-        ),
-    )
-    calls: list[str] = []
-
-    def fake_handle_send(store, user_row, driver, **kwargs):
-        calls.append(driver)
-        return {"status": "processing"}, 202
-
-    monkeypatch.setattr(agent_runtime_cutover, "handle_send", fake_handle_send)
-
     res = client.post(
         "/v1/model_api/chat/send",
         json={"message": "hello"},
         headers=_headers(api_key),
     )
-    assert res.status_code == 202, (
-        f"anthropic 用户在 runner pi 关时不应 503，实际: {res.status_code} {res.get_data(as_text=True)}"
-    )
-    assert calls == ["claude"], f"anthropic 用户应路由到 claude driver，实际 calls={calls}"
-
-
-def test_pi_runner_off_blocks_openrouter_user(client, monkeypatch):
-    """openrouter 现在无条件走 pi driver（require_pi=True）。supervisor 心跳存在
-    但 runner 未跑 pi 时，chat/send 必须返回 503 supervisor_pi_disabled。"""
-    user_id, api_key = _register(client)
-
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
-    _setup_openrouter(client, api_key, monkeypatch)
-    monkeypatch.setattr(
-        core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-or-test",
-    )
-    # 模拟 "heartbeat 存在但 runner pi 关"：require_pi=True → not-live。
-    monkeypatch.setattr(
-        agent_runtime_cutover, "check_supervisor_live",
-        lambda *, require_pi=False, **kw: (
-            (True, "") if not require_pi else (False, "supervisor_pi_disabled")
-        ),
-    )
-    calls: list[str] = []
-    monkeypatch.setattr(
-        agent_runtime_cutover, "handle_send",
-        lambda *a, **k: (calls.append("x"), ({"status": "processing"}, 202))[1],
-    )
-
-    res = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "hello"},
-        headers=_headers(api_key),
-    )
-    assert res.status_code == 503, (
-        f"openrouter 用户在 runner pi 关时应 503，实际: {res.status_code} {res.get_data(as_text=True)}"
-    )
-    body = res.get_json()
-    assert body["error"] == "hosting_runtime_unavailable"
-    assert body["reason"] == "supervisor_pi_disabled"
-    assert calls == [], "pi 阻断时不应路由到 handle_send"
+    assert res.status_code == 202, res.get_data(as_text=True)
+    assert res.get_json()["runtime"]["driver"] == "claude"

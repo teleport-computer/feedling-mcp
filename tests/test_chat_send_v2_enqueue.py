@@ -1,4 +1,4 @@
-"""chat/send 在 db_action_v2 模式下入队 agent_job 而非走 resident handle_send."""
+"""Hosted chat/send always enters the Runtime V2 durable job path."""
 import sys
 from pathlib import Path
 
@@ -59,13 +59,6 @@ def test_db_action_v2_enqueues_job_and_skips_resident(monkeypatch):
         chat_send_core.core_wake_bus, "notify",
         lambda channel, user_id="": notified.update(channel=channel, user_id=user_id),
     )
-    # 若错误地走 resident，会调用 handle_send —— 断言它没被调用。
-    called = {"handle_send": False}
-    monkeypatch.setattr(
-        chat_send_core.agent_runtime_cutover, "handle_send",
-        lambda *a, **k: called.update(handle_send=True) or ({"status": "resident"}, 202),
-    )
-
     body, status = chat_send_core.model_api_chat_send_core(
         store, api_key="key", runtime_tok="", payload={"message": "hi"},
     )
@@ -73,7 +66,6 @@ def test_db_action_v2_enqueues_job_and_skips_resident(monkeypatch):
     assert status == 202
     assert body["status"] == "processing"
     assert notified["channel"] == "v2_jobs" and notified["user_id"] == "u_send_v2"
-    assert called["handle_send"] is False
     # A7: the enqueue no longer rides a separate jobs_store.enqueue_job call —
     # it happens atomically inside store.append_chat via db.chat_append_and_enqueue.
     # Verify the real effect: exactly one pending chat job row for this user,
@@ -132,14 +124,6 @@ def test_v2_only_policy_mismatch_never_repairs_or_routes_to_resident(monkeypatch
             AssertionError("policy mismatch must refuse before persistence")
         ),
     )
-    monkeypatch.setattr(
-        agent_runtime_cutover,
-        "handle_send",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("v2-only policy must never fall through to resident")
-        ),
-    )
-
     body, status = chat_send_core.model_api_chat_send_core(
         store, api_key="key", runtime_tok="", payload={"message": "hi"},
     )
@@ -171,7 +155,7 @@ def test_v2_blob_without_authoritative_v2_state_fails_closed(monkeypatch):
     )
 
     assert status == 503
-    assert body == {"error": "runtime_control_inconsistent"}
+    assert body == {"error": "runtime_policy_not_ready"}
 
 
 def test_db_action_v2_input_write_failure_never_enqueues(monkeypatch):
@@ -206,60 +190,6 @@ def test_db_action_v2_input_write_failure_never_enqueues(monkeypatch):
         chat_send_core.model_api_chat_send_core(
             store, api_key="key", runtime_tok="", payload={"message": "hi"},
         )
-
-
-def test_resident_cli_default_still_routes_old_way_and_skips_enqueue(monkeypatch):
-    """Regression: a hosted user with no hosted_runtime_mode set (the default,
-    resident_cli) must hit the exact same resident dispatch as before Task 9 —
-    the v2 gate must be a no-op for them. No enqueue_job call, no wake_bus
-    notify on the "v2_jobs" channel, and handle_send (the pre-existing resident
-    delegation) still runs."""
-    _seed("u_send_resident")
-    store = core_store.get_store("u_send_resident")
-    # Deliberately NOT calling set_hosted_runtime_mode — proves the untouched
-    # default (resident_cli) path, matching existing hosted users today.
-    assert hosted_config_store.get_hosted_runtime_mode(store) == "resident_cli"
-
-    monkeypatch.setattr(
-        chat_send_core.core_envelope, "_build_shared_envelope_for_store",
-        lambda s, pt, **kw: ({"id": "u-msg-1", "body_ct": "c", "nonce": "n", "K_user": "k"}, ""),
-    )
-    monkeypatch.setattr(
-        core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose, **kw: b"sk-or-test",
-    )
-    monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
-    # Same wedge-guard live-supervisor stub the pre-existing resident tests use
-    # (test_asgi_hosted_chat_send.py's `env` fixture) — resident_cli still
-    # depends on this check, unlike db_action_v2.
-    monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "check_supervisor_live", lambda **kw: (True, ""))
-
-    enqueue_called = {"n": 0}
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "enqueue_job",
-        lambda *a, **k: enqueue_called.update(n=enqueue_called["n"] + 1) or (0, False),
-    )
-    notified = {"channels": []}
-    monkeypatch.setattr(
-        chat_send_core.core_wake_bus, "notify",
-        lambda channel, user_id="": notified["channels"].append(channel),
-    )
-    called = {"handle_send": False}
-    monkeypatch.setattr(
-        chat_send_core.agent_runtime_cutover, "handle_send",
-        lambda *a, **k: called.update(handle_send=True) or (
-            {"status": "processing", "reply_ready": False}, 202,
-        ),
-    )
-
-    body, status = chat_send_core.model_api_chat_send_core(
-        store, api_key="key", runtime_tok="", payload={"message": "hi"},
-    )
-
-    assert status == 202
-    assert called["handle_send"] is True
-    assert enqueue_called["n"] == 0
-    assert "v2_jobs" not in notified["channels"]
 
 
 def test_db_action_v2_with_no_live_workers_refuses_before_persist(monkeypatch):

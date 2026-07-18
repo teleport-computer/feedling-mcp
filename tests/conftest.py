@@ -23,10 +23,8 @@ from pathlib import Path
 
 import pytest
 
-# Let hosting-ready check pass in tests by default. Tests that specifically
-# test the assert_hosting_ready() raise path (test_hosted_agent_runtime_cutover.py)
-# use monkeypatch.delenv to explicitly unset these, overriding setdefault.
-os.environ.setdefault("FEEDLING_HOST_ALL", "1")
+# Hosted execution is V2-only. Tests that exercise the runtime-token prerequisite
+# explicitly unset this secret with monkeypatch.
 os.environ.setdefault("FEEDLING_RUNTIME_TOKEN_SECRET", "test-runtime-token-secret")
 
 _ADMIN_URL = os.environ.get("FEEDLING_TEST_PG", "postgresql://postgres:test@127.0.0.1:55432/postgres")
@@ -131,10 +129,6 @@ if not _provisioned:
         "test_screen_caption_backend.py",
         "test_screen_caption_flag.py",
         "test_agent_perception_route.py",
-        "test_agent_runtime_tokens.py",
-        "test_agent_runtime_resolve_cache.py",
-        "test_agent_runtime_spawners.py",
-        "test_agent_runtime_resident_contract.py",
         "test_hosted_agent_runtime_cutover.py",
         "test_worldbook_match.py",
         "test_worldbook_readside_core.py",

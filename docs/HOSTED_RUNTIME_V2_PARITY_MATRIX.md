@@ -1,7 +1,8 @@
 # Hosted Runtime V2 — Current Parity and Completion Matrix
 
-> **CURRENT SOURCE OF TRUTH — 2026-07-18.** This page describes the runtime
-> deployed to Pre by `b79943a9` (runtime source `de0ec00e`). Use
+> **CURRENT SOURCE OF TRUTH — 2026-07-18.** This page describes the current
+> Runtime V2 source and managed deployment manifests. A live environment changes
+> only after this source is deployed. Use
 > [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)
 > for operational gates and
 > [`docs/superpowers/specs/runtime-v2-parity-matrix.md`](superpowers/specs/runtime-v2-parity-matrix.md)
@@ -27,13 +28,13 @@
 | Reply inside the loop; eager late-message folding | ✅ | `reply` is a loop tool, so the model may acknowledge the user and continue working. New user messages are claimed without debounce and folded at every round boundary. |
 | Parallel tool use | ✅ | A provider turn may request a batch of tools. Independent read tools execute with bounded parallelism; writes and externally mutating MCP calls remain ordered/serialized for safety. |
 | Executable action vocabulary | ✅ | The exposed native catalog maps to registered executable capabilities. Scheduling, web search/fetch, and exact memory search are present; obsolete planner-only `sleep`/`capture_memory` vocabulary is absent. |
-| One deployment topology | ✅ | Hosted V2 runs as a bounded `serve-worker` pool in the runner CVM, separate from the main backend/enclave CVM. Pre is `v2_only`; there is no per-account runtime flip for an iOS Pre tester. |
+| One deployment topology | ✅ | Local, test, pre, and production hosted model-API deployments are `v2_only`. A bounded `serve-worker` pool runs in the runner CVM, separate from the main backend/enclave CVM; there is no hosted per-account runtime flip. |
 | Prompt caching and cache telemetry | ✅ | Provider-aware caching and per-turn cache-token telemetry are live. A route-bound two-request cache-hit canary has succeeded on Pre. |
 | Tokens/turn and admission ceiling | ✅ | Whole-turn token/call/latency metrics and an admission ceiling are implemented. The offline token regression gate is live. |
 | Concurrent CVM-class load proof | ⚠️ | The harness exists, but the authoritative concurrent run on the target CVM class remains an operational gate. |
 | Typing-signal pre-warm | ❌ | Not implemented. See the definition below. |
 | Encrypted full trajectories and failure replay | ❌ | Aggregate telemetry and durable effects exist, but the complete ordered model/tool execution is not persisted. See the distinction below. |
-| Fleet-wide resident-process retirement | ⚠️ | Pre's eligible users already run only on V2 and have no per-user resident children. The idle rollback supervisor/container remains, and test/production are not fully migrated. |
+| Fleet-wide resident-process retirement | ✅ | Hosted resident source, supervisor services, per-user homes/leases/CLI toolchain, rollout selectors, and the admin rollback flip are removed. Every managed environment can launch only the pooled V2 worker. The independent user-operated `/v1/chat/*` resident consumer remains a separate product path and cannot be selected for hosted accounts. |
 
 ## Current turn shape
 
@@ -184,18 +185,21 @@ memory/identity/schedules, or repeat remote MCP mutations.
 
 ### Fleet-wide resident-process retirement
 
-Pre is already `v2_only`: eligible accounts have no resident per-user child
-process and an iOS tester simply uses Pre. The runner still carries an idle
-`agent-runner` supervisor/container with an empty eligible roster so operators
-can roll back. Test and production still support per-user resident routing.
+Fleet-wide hosted retirement is complete in source and deployment topology.
+Local, test, pre, and production backend manifests force literal `v2_only`;
+their runner manifests contain one `serve-worker` service and no resident
+supervisor, per-user child, home, checkpoint, lease, roster, or data volume. The
+historically named `feedling-agent-runner` image package now contains only the
+Python Runtime V2 worker, so an old hosted process cannot be relaunched from the
+new image. Test, pre, and production worker-CVM deploy jobs are mandatory for
+hosted changes, and structural tests fail if a retired selector or service
+returns.
 
-Fleet-wide retirement means completing capture/Dream lifecycle rollout and the
-wake fault-injection, real-CVM load, recovery, cohort-soak, and no-dual-route gates;
-migrating every hosted eligible test/production account; observing an empty
-resident roster through the rollback window; then stopping and removing the
-supervisor container, its deployment configuration, and eventually its legacy
-consumer code. That final operator step is when hosted RAM/process count becomes
-a function of the bounded worker pool rather than user count.
+`resident_cli` remains only as a dormant database fence while a model route is
+deleted or replaced and for explicitly independent `/v1/chat/*` consumers. A
+hosted send requires the exact `db_action_v2` + `v2` ownership tuple and fails
+before persistence otherwise. Deploying the new manifests to each live fleet is
+a release operation, not an alternate runtime implementation or rollback path.
 
 ## Remaining work, in order
 
@@ -209,8 +213,6 @@ a function of the bounded worker pool rather than user count.
    consent, and access controls.
 5. Add the side-effect-disabled failure-replay evaluation lane on top of those
    trajectories.
-6. Finish capture/Dream lifecycle rollout, migrate test/production, and retire
-   the hosted resident supervisor fleet after rollback gates pass.
 
 Generic local file/bash access, remote artifact download, and an on-demand
 artifact sandbox are separate harness-expansion decisions, not unfinished
@@ -241,6 +243,7 @@ At minimum, current-status changes should remain covered by:
 - `tests/test_v2_worker_files.py`
 - `tests/test_v2_atomic_reply_cursor.py`
 - `tests/test_hosted_runtime_policy.py`
+- `tests/test_hosted_resident_retirement.py`
 - `tests/test_no_litellm_anywhere.py`
 
 When architecture or rollout state changes, update this page in the same commit.

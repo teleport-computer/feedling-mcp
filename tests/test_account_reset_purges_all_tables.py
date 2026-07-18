@@ -226,5 +226,8 @@ def test_reset_stops_hosted_agent(client):
     discovered_after = {u["user_id"] for u in _db.list_agent_runtime_enabled_users()}
     assert uid not in discovered_after, "删账号后用户仍被托管发现 → supervisor 会重新拉起 agent"
 
-    from agent_runtime import leases
-    assert leases.get(uid) is None, "删账号后 lease 行仍在"
+    with _db.get_pool().connection() as conn:
+        lease = conn.execute(
+            "SELECT 1 FROM agent_runtime_instances WHERE user_id=%s", (uid,)
+        ).fetchone()
+    assert lease is None, "删账号后历史 lease 行仍在"

@@ -1,3 +1,4 @@
-# One prod runner CVM id per line (UUID or app_id). Empty = job stays dormant.
+# One prod Runtime V2 worker CVM id per line (UUID or app_id). At least two
+# independent CVMs are mandatory because hosted Chat has no resident fallback.
 # Add a line per provisioned runner CVM to scale out horizontally.
 130fdfc6-5736-4cdc-9d0f-a35af8957cf2
