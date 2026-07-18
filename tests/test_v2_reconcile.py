@@ -175,11 +175,18 @@ def test_user_whose_newest_message_is_already_replied_is_not_orphan():
     seed_user(uid)
     _mark_db_action_v2(uid)
     _insert_user_message(uid, "m-user-1")
+    user_seq = db.chat_seq_for_msg_id(uid, "m-user-1")
+    assert user_seq is not None
     with db.get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO chat_messages (user_id, msg_id, ts, doc) VALUES (%s,%s,%s,%s)",
             (uid, "m-reply-1", time.time() + 1,
              db.Jsonb({"id": "m-reply-1", "role": "assistant", "ts": time.time() + 1})),
+        )
+        conn.execute(
+            "UPDATE user_blobs SET doc=jsonb_set(doc,'{v2_reply_cursor_seq}',%s) "
+            "WHERE user_id=%s AND kind='model_api_runtime'",
+            (db.Jsonb(user_seq), uid),
         )
 
     assert db.reconcile_unenqueued_v2_messages() == 0

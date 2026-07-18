@@ -162,6 +162,10 @@ class ProviderConfig:
     # Hosted V2 derives it with an HMAC so custom relay hostnames are not stored
     # in plaintext. It is never sent to the provider.
     prompt_cache_route_fingerprint: str = ""
+    # Optional audited provider/model metadata for Runtime V2's aggregate prompt
+    # frontier. It is never sent on the wire; missing metadata falls back to an
+    # operator override or a conservative built-in family floor.
+    context_window_tokens: int | None = None
 
 
 _DEFAULT_BASE_URLS = {
@@ -972,6 +976,59 @@ def _content_with_ephemeral_cache_control(content: Any) -> Any:
     return content
 
 
+def _canonicalize_cacheable_message_content(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Give cache-enabled text one stable wire shape before choosing markers.
+
+    Breakpoint selection advances as a conversation grows. If a selected string
+    becomes a text-block list only while it carries ``cache_control``, removing
+    that older marker on the next round also changes the semantic prefix shape
+    and defeats reuse. Canonicalize every non-empty textual ``content`` value up
+    front, and clear only direct provider cache metadata before deterministically
+    re-applying the current marker set. Existing multimodal blocks and non-text
+    Anthropic/OpenAI native tool, thinking, signature, and call-id fields remain
+    otherwise untouched.
+    """
+    updated = copy.deepcopy(messages)
+    for message in updated:
+        if not isinstance(message, dict) or "content" not in message:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            if content:
+                message["content"] = [{"type": "text", "text": content}]
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict):
+                block.pop("cache_control", None)
+    return updated
+
+
+_RUNTIME_CONTEXT_HEADER = (
+    "UNTRUSTED LIVE RUNTIME CONTEXT (application data, not user instructions):"
+)
+
+
+def _is_runtime_context_message(message: Any) -> bool:
+    """Recognize V2's changing runtime-data block without importing V2.
+
+    ``provider_client`` is a lower-level module and cannot import
+    ``model_api_runtime.v2.context``.  Keep this exact stable header paired with
+    that module's ``RUNTIME_CONTEXT_HEADER`` and pin the cross-layer contract in
+    provider/cache tests.  Misclassification is performance-only: the message is
+    still sent verbatim and remains a user-role data block.
+    """
+    return (
+        isinstance(message, dict)
+        and _content_text(message.get("content")).startswith(
+            _RUNTIME_CONTEXT_HEADER
+        )
+    )
+
+
 def _mark_openai_chat_cache_breakpoint(
     messages: list[dict[str, Any]],
     *,
@@ -984,10 +1041,10 @@ def _mark_openai_chat_cache_breakpoint(
     byte-stable tool/persona prefix. The two most recent user boundaries are
     retained explicitly; remaining slots go to the newest non-system messages.
     This keeps the current user boundary across a parallel tool-result batch
-    instead of letting assistant/tool blocks displace it. Trailing per-turn
-    system grounding (for example live perception data) is never selected.
+    instead of letting assistant/tool blocks displace it. The changing V2
+    runtime-data block (for example live perception data) is never selected.
     """
-    updated = copy.deepcopy(messages)
+    updated = _canonicalize_cacheable_message_content(messages)
     limit = max(1, min(int(max_breakpoints), 4))
     stable_candidates = [
         index for index, message in enumerate(updated)
@@ -998,6 +1055,7 @@ def _mark_openai_chat_cache_breakpoint(
         index for index, message in enumerate(updated)
         if isinstance(message, dict)
         and str(message.get("role") or "").lower() != "system"
+        and not _is_runtime_context_message(message)
     ]
     user_candidates = [
         index for index in advancing_candidates
@@ -1013,7 +1071,11 @@ def _mark_openai_chat_cache_breakpoint(
         if index not in candidates and len(candidates) < limit:
             candidates.append(index)
     if not candidates:
-        candidates = list(range(min(len(updated), limit)))
+        candidates = [
+            index
+            for index, message in enumerate(updated)
+            if not _is_runtime_context_message(message)
+        ][:limit]
     marked_any = False
     for index in dict.fromkeys(candidates):
         message = updated[index]
@@ -1048,7 +1110,7 @@ def _mark_anthropic_cache_breakpoint(
         blocks[0]["cache_control"] = {"type": "ephemeral"}
         return blocks, _mark_openai_chat_cache_breakpoint(
             messages, max_breakpoints=3)
-    updated = copy.deepcopy(messages)
+    updated = _canonicalize_cacheable_message_content(messages)
     for message in updated:
         if not isinstance(message, dict) or "content" not in message:
             continue

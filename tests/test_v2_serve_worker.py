@@ -100,6 +100,32 @@ def test_positive_loop_intervals_fail_closed(monkeypatch, raw):
         serve_worker._positive_float_env("TEST_V2_INTERVAL", "1")
 
 
+def test_mcp_call_timeout_must_leave_watchdog_stall_margin():
+    serve_worker._validate_mcp_timeout_below_stall(
+        mcp_call_timeout_sec=45.0,
+        turn_stall_timeout_sec=240.0,
+    )
+
+    for unsafe_timeout in (210.0, 211.0, 240.0, 300.0):
+        with pytest.raises(RuntimeError, match="at least 30s below"):
+            serve_worker._validate_mcp_timeout_below_stall(
+                mcp_call_timeout_sec=unsafe_timeout,
+                turn_stall_timeout_sec=240.0,
+            )
+
+
+def test_chat_absolute_budget_includes_bounded_mcp_turn_allowance():
+    expected = (
+        worker._PROMPT_CATCHUP_DEADLINE_SEC
+        + worker._TURN_MAX_LLM_CALLS * (2.0 * 60.0)
+        + worker.MCP_TURN_WALL_BUDGET_SEC
+        + 120.0
+    )
+
+    assert serve_worker._CHAT_TURN_BUDGET_SEC == expected
+    assert serve_worker._MIN_TURN_ABSOLUTE_TIMEOUT_SEC >= expected
+
+
 def test_default_worker_id_is_unique_across_same_pid_replica_calls(monkeypatch):
     monkeypatch.setattr(serve_worker.socket, "gethostname", lambda: "pod")
     monkeypatch.setattr(serve_worker.os, "getpid", lambda: 1)

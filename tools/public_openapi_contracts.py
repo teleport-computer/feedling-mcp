@@ -847,12 +847,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "string",
                 "description": (
                     "MCP server endpoint. http:// and https:// are both accepted, including "
-                    "loopback and private-network hosts — this backend never dials the URL itself "
-                    "(see POST .../test); only your agent runtime does."
+                    "loopback and private-network hosts. Saving the config does not dial it. "
+                    "POST .../test dials public endpoints from the API backend on request, and "
+                    "Hosted Runtime V2 contacts each enabled server at turn start for tools/list "
+                    "before any later tool calls."
                 ),
             },
             "headers": {
                 "type": "object",
+                "maxProperties": 20,
                 "additionalProperties": {"type": "string"},
                 "description": "Extra HTTP headers (e.g. Authorization) sent with every MCP request. Max 20 entries, 8192 bytes combined across names and values. The Host header is forbidden.",
             },
@@ -868,6 +871,27 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "send empty to clear a previously stored CA."
                 ),
             },
+            "read_only_tool_fingerprints": {
+                "type": "object",
+                "maxProperties": 64,
+                "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": r"^[^\u0000-\u001f\u007f]{1,256}$",
+                },
+                "additionalProperties": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$",
+                },
+                "description": (
+                    "Exact tool-name to catalog-fingerprint approvals returned by POST "
+                    ".../test. Runtime V2 treats a tool as a parallel read only while the "
+                    "remote catalog still has strict readOnlyHint=true and its current "
+                    "fingerprint exactly matches this encrypted approval; missing or stale "
+                    "entries fail closed to serialized mutation semantics."
+                ),
+            },
         },
         "additionalProperties": False,
         "example": {
@@ -879,10 +903,34 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "McpServerPatchRequest": {
         "type": "object",
-        "required": ["enabled"],
-        "properties": {"enabled": {"type": "boolean"}},
+        "minProperties": 1,
+        "properties": {
+            "enabled": {"type": "boolean"},
+            "read_only_tool_fingerprints": {
+                "type": "object",
+                "maxProperties": 64,
+                "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": r"^[^\u0000-\u001f\u007f]{1,256}$",
+                },
+                "additionalProperties": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$",
+                },
+                "description": (
+                    "Replace the encrypted read-only approval map without resending URL, "
+                    "headers, or CA. Send {} to revoke every approval."
+                ),
+            },
+        },
         "additionalProperties": False,
-        "example": {"enabled": False},
+        "example": {
+            "read_only_tool_fingerprints": {
+                "search": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        },
     },
     "McpServerRecord": {
         "type": "object",
@@ -922,14 +970,46 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "McpServerTestResponse": {
         "type": "object",
-        "required": ["ok", "tool_count", "tool_names"],
+        "required": [
+            "ok",
+            "tool_count",
+            "tool_names",
+            "read_only_tool_fingerprints",
+        ],
         "properties": {
             "ok": {"type": "boolean", "const": True},
             "tool_count": {"type": "integer", "minimum": 0},
             "tool_names": {"type": "array", "items": {"type": "string"}},
+            "read_only_tool_fingerprints": {
+                "type": "object",
+                "maxProperties": 64,
+                "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": r"^[^\u0000-\u001f\u007f]{1,256}$",
+                },
+                "additionalProperties": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$",
+                },
+                "description": (
+                    "Approval candidates for tools whose current MCP catalog has strict "
+                    "readOnlyHint=true. The response contains at most 64 candidates and omits "
+                    "names that PATCH cannot accept. These are not active until the user "
+                    "explicitly sends selected entries to PATCH /v1/mcp/servers/{name}."
+                ),
+            },
         },
         "additionalProperties": True,
-        "example": {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"]},
+        "example": {
+            "ok": True,
+            "tool_count": 2,
+            "tool_names": ["search", "fetch"],
+            "read_only_tool_fingerprints": {
+                "search": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+        },
     },
 }
 
@@ -1034,7 +1114,9 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/mcp/servers"): (
         "Create or update a user-configured MCP server (matched by name). http:// and https:// URLs "
         "are both accepted, including loopback and private-network hosts and IP literals — this "
-        "backend never dials the URL at save time (see POST .../test), only your agent runtime does. "
+        "backend does not dial the URL at save time. POST .../test dials public endpoints from the "
+        "API backend on request. Hosted Runtime V2 contacts each enabled server at the start of "
+        "every turn for tools/list, before any later tool calls. "
         "Hosted (cloud-run) agents cannot reach machines on your home or office network; expose a "
         "local MCP server through a tunnel (e.g. Cloudflare Tunnel, Tailscale Funnel, ngrok) to a "
         "public address first. To use a self-signed or private-CA server, paste the issuing CA "
@@ -1042,24 +1124,41 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "for this server; it does not disable certificate verification, and the server still has to "
         "present a certificate chaining to that CA. http:// sends all configured headers, including "
         "API keys, in plaintext over the network; this is an explicit, informed choice. Possible 400 "
-        "error kinds: invalid_name, invalid_url, invalid_headers, too_many_headers, "
-        "headers_too_large, forbidden_header, invalid_ca, ca_too_large, too_many_servers. A 409 "
+        "error kinds: invalid_request, invalid_name, invalid_url, invalid_headers, invalid_enabled, "
+        "too_many_headers, headers_too_large, forbidden_header, invalid_ca, ca_too_large, "
+        "invalid_read_only_tool_fingerprints, invalid_read_only_tool_name, "
+        "invalid_read_only_tool_fingerprint, too_many_read_only_tool_fingerprints, and "
+        "too_many_servers. A 409 "
         "cannot_encrypt means the server-side envelope could not be built."
     ),
-    ("patch", "/v1/mcp/servers/{name}"): "Toggle a user-configured MCP server's enabled flag. 404 not_found when no server with that name exists.",
+    ("patch", "/v1/mcp/servers/{name}"): (
+        "Toggle a user-configured MCP server and/or replace its encrypted read-only tool "
+        "fingerprint approvals without resending URL, headers, or CA. Send an empty approval "
+        "object to revoke all read-only approvals. Unknown fields are rejected and enabled must "
+        "be a JSON boolean. Possible 400 errors include invalid_patch, invalid_enabled, "
+        "invalid_read_only_tool_fingerprints, invalid_read_only_tool_name, "
+        "invalid_read_only_tool_fingerprint, too_many_read_only_tool_fingerprints, and "
+        "decrypt_failed. A 409 cannot_encrypt leaves the old config unchanged. 404 not_found "
+        "when no server with that name exists."
+    ),
     ("delete", "/v1/mcp/servers/{name}"): "Delete a user-configured MCP server. 404 not_found when no server with that name exists.",
     ("post", "/v1/mcp/servers/{name}/test"): (
         "Best-effort connectivity probe (MCP initialize -> tools/list) run from this backend's own "
-        "network, offered purely as a convenience for validating publicly reachable https:// "
+        "network, offered purely as a convenience for validating publicly reachable http:// or "
+        "https:// "
         "servers. A 400 unreachable_from_backend response does NOT mean the server failed to save — "
         "it was already saved successfully by POST /v1/mcp/servers. It only means this backend "
         "process could not reach the host, typically because it is a loopback/private-network "
         "address or a tunnel endpoint that only your agent's environment can reach. For those "
         "servers, skip this probe and instead ask your agent to call the MCP server directly in "
-        "chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS "
-        "handshake failure — check ca_pem), timeout, http_401/http_403/http_404/http_4xx/http_5xx "
-        "(server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. "
-        "404 not_found when no server with that name exists."
+        "chat to verify it. Other 400 kinds: dns (hostname did not resolve), dns_busy (resolver "
+        "capacity exhausted), tls (certificate/TLS handshake failure — check ca_pem), transport "
+        "(connection failure), timeout, response_too_large, "
+        "http_401/http_403/http_404/http_4xx/http_5xx (server responded with an HTTP error), "
+        "protocol (malformed MCP handshake), decrypt_failed. "
+        "404 not_found when no server with that name exists. A successful response also returns "
+        "at most 64 PATCH-compatible read_only_tool_fingerprints for strict readOnlyHint=true "
+        "tools; those candidates are inactive until explicitly approved through PATCH."
     ),
 }
 
@@ -1250,6 +1349,10 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         "200": {
             "description": "Updated server record.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/McpServerRecord"}}},
+        },
+        "409": {
+            "description": "cannot_encrypt — the old config is unchanged; retry.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
         },
         "404": {
             "description": "not_found — no server with that name exists.",

@@ -23,6 +23,13 @@ from provider_types import ToolExchange, ToolResult
 from model_api_runtime.v2 import tool_loop
 
 
+_TEST_PROVIDER_CONFIG = provider_client.ProviderConfig(
+    provider="anthropic",
+    model="claude-sonnet-4-test",
+    api_key="test-key",
+)
+
+
 class _ScriptedProvider:
     """Records every chat_completion_async call and returns the next scripted dict."""
 
@@ -105,7 +112,7 @@ def test_empty_tool_calls_is_final_reply_no_dispatch(monkeypatch):
     progress = []
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=build_messages,
         dispatch_tools=dispatch,
         on_reply=on_reply,
@@ -122,6 +129,130 @@ def test_empty_tool_calls_is_final_reply_no_dispatch(monkeypatch):
     assert outcome.stop_reason == "final_text"
     assert outcome.replied_intermediate is False
     assert progress == ["round_boundary", "provider_start", "provider_complete"]
+
+
+def test_superseded_final_folds_new_input_and_retries_without_stale_transcript(
+    monkeypatch,
+):
+    """A final candidate rejected at the durable publish CAS is not visible and
+    is not fed back as an assistant turn. The next boundary folds B and asks the
+    provider for one revised answer over the actual conversation."""
+    provider = _ScriptedProvider([
+        {"reply": "stale answer to A", "tool_calls": [], "usage": {}},
+        {"reply": "revised answer to A and B", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    class _AtomicReply:
+        def __init__(self):
+            self.attempts = []
+            self.visible = []
+
+        async def __call__(self, text, *, final):
+            self.attempts.append((text, final))
+            if text == "stale answer to A":
+                raise tool_loop.FinalReplySuperseded()
+            self.visible.append((text, final))
+
+    reply = _AtomicReply()
+    build_messages = _RecordingBuildMessages()
+    late = {"id": "B", "role": "user", "content": "new input B"}
+    fold = _RecordingFold([[], [late]])
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=build_messages,
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=reply,
+        fold_new_messages=fold,
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        fold_before_first=True,
+    ))
+
+    assert len(provider.calls) == 2
+    assert reply.visible == [("revised answer to A and B", True)]
+    assert reply.attempts == [
+        ("stale answer to A", True),
+        ("revised answer to A and B", True),
+    ]
+    assert build_messages.calls[0] == []
+    assert build_messages.calls[1] == [late]
+    assert all(
+        "stale answer to A" not in str(item)
+        for item in build_messages.calls[1]
+    )
+    assert outcome.final_text == "revised answer to A and B"
+    assert outcome.stop_reason == "final_text"
+
+
+def test_superseded_final_at_budget_returns_clean_handoff_outcome(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "stale terminal", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    async def reject_final(_text, *, final):
+        assert final is True
+        raise tool_loop.FinalReplySuperseded()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=reject_final,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=1,
+    ))
+
+    assert len(provider.calls) == 1
+    assert outcome.final_text == ""
+    assert outcome.rounds == 1
+    assert outcome.stop_reason == "input_advanced"
+    assert outcome.replied_intermediate is False
+
+
+def test_intermediate_reply_remains_visible_when_later_final_is_superseded(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "r1", "name": "reply", "args": {"text": "I am checking"}}
+            ],
+            "usage": {},
+        },
+        {"reply": "stale final", "tool_calls": [], "usage": {}},
+        {"reply": "fresh final with B", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    visible = []
+
+    async def publish(text, *, final):
+        if final and text == "stale final":
+            raise tool_loop.FinalReplySuperseded()
+        visible.append((text, final))
+
+    late = {"id": "B", "role": "user", "content": "one more thing"}
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=publish,
+        fold_new_messages=_RecordingFold([[], [late]]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    assert visible == [
+        ("I am checking", False),
+        ("fresh final with B", True),
+    ]
+    assert outcome.replied_intermediate is True
+    assert outcome.final_text == "fresh final with B"
 
 
 def test_preamble_text_with_tool_calls_is_not_a_bubble(monkeypatch):
@@ -144,7 +275,7 @@ def test_preamble_text_with_tool_calls_is_not_a_bubble(monkeypatch):
     fold = _RecordingFold([])
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=build_messages,
         dispatch_tools=dispatch,
         on_reply=on_reply,
@@ -181,7 +312,7 @@ def test_reply_special_tool_is_immediate_and_continues(monkeypatch):
     fold = _RecordingFold([])
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=build_messages,
         dispatch_tools=dispatch,
         on_reply=on_reply,
@@ -224,7 +355,7 @@ def test_budget_bound_last_call_omits_tools_and_terminates(monkeypatch):
     fold = _RecordingFold([])
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=build_messages,
         dispatch_tools=dispatch,
         on_reply=on_reply,
@@ -264,7 +395,7 @@ def test_fold_at_every_round_boundary_feeds_chronological_transcript(monkeypatch
     fold = _RecordingFold([[], [new_msg]])
 
     asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=build_messages,
         dispatch_tools=dispatch,
         on_reply=on_reply,
@@ -298,7 +429,7 @@ def test_native_tool_exchange_keeps_calls_results_and_midturn_user_order(monkeyp
     new_msg = {"id": "m2", "role": "user", "content": "also check y"}
 
     asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=build_messages,
         dispatch_tools=_RecordingDispatch("found x"),
         on_reply=_RecordingReply(),
@@ -329,7 +460,7 @@ def test_reply_tool_also_gets_call_id_matched_result(monkeypatch):
     build_messages = _RecordingBuildMessages()
 
     asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(), build_messages=build_messages,
+        provider_config=_TEST_PROVIDER_CONFIG, build_messages=build_messages,
         dispatch_tools=_RecordingDispatch(), on_reply=_RecordingReply(),
         fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
         max_calls=5,
@@ -354,7 +485,7 @@ def test_malformed_args_gets_one_tools_disabled_fallback_without_dispatch(monkey
     reply = _RecordingReply()
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(), build_messages=_RecordingBuildMessages(),
+        provider_config=_TEST_PROVIDER_CONFIG, build_messages=_RecordingBuildMessages(),
         dispatch_tools=dispatch, on_reply=reply,
         fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
         max_calls=5,
@@ -383,7 +514,7 @@ def test_duplicate_call_ids_fall_back_before_any_side_effect(monkeypatch):
     reply = _RecordingReply()
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(), build_messages=_RecordingBuildMessages(),
+        provider_config=_TEST_PROVIDER_CONFIG, build_messages=_RecordingBuildMessages(),
         dispatch_tools=dispatch, on_reply=reply,
         fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
         max_calls=5,
@@ -393,6 +524,148 @@ def test_duplicate_call_ids_fall_back_before_any_side_effect(monkeypatch):
     assert [call["tools"] is None for call in provider.calls] == [False, True]
     assert reply.calls == [("safe fallback", True)]
     assert outcome.rounds == 2
+
+
+def test_per_round_tool_call_ceiling_is_all_or_nothing(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": f"c{i}", "name": "memory_index", "args": {}}
+                for i in range(3)
+            ],
+            "usage": {},
+        },
+        {"reply": "bounded fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG, build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch, on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
+        max_calls=5, max_tool_calls_per_round=2,
+    ))
+
+    assert dispatch.calls == []
+    assert [call["tools"] is None for call in provider.calls] == [False, True]
+    assert outcome.final_text == "bounded fallback"
+
+
+def test_per_turn_tool_call_ceiling_rejects_only_the_overflow_batch(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [
+            {"id": "c1", "name": "memory_index", "args": {}}], "usage": {}},
+        {"reply": "", "tool_calls": [
+            {"id": "c2", "name": "memory_index", "args": {}}], "usage": {}},
+        {"reply": "", "tool_calls": [
+            {"id": "c3", "name": "memory_index", "args": {}}], "usage": {}},
+        {"reply": "turn fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG, build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch, on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], [], []]), add_usage=_noop_add_usage,
+        max_calls=5, max_tool_calls_per_turn=2,
+    ))
+
+    assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["c1"], ["c2"]]
+    assert [call["tools"] is None for call in provider.calls] == [False, False, False, True]
+    assert outcome.final_text == "turn fallback"
+
+
+@pytest.mark.parametrize("oversized_part", ["args", "native_turn", "assistant_text"])
+def test_oversized_tool_exchange_falls_back_before_dispatch(
+    monkeypatch,
+    oversized_part,
+):
+    tool_call = {"id": "c1", "name": "memory_index", "args": {}}
+    first = {
+        "reply": "",
+        "tool_calls": [tool_call],
+        "usage": {},
+    }
+    kwargs = {
+        "max_tool_args_chars": 32,
+        "max_tool_batch_args_chars": 64,
+        "max_native_assistant_turn_chars": 64,
+        "max_assistant_tool_text_chars": 32,
+    }
+    if oversized_part == "args":
+        tool_call["args"] = {"query": "x" * 100}
+    elif oversized_part == "native_turn":
+        first["assistant_turn"] = {
+            "wire": "openai_chat",
+            "payload": {"role": "assistant", "opaque": "x" * 100},
+        }
+    else:
+        first["reply"] = "x" * 100
+
+    provider = _ScriptedProvider([
+        first,
+        {"reply": "bounded fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+        **kwargs,
+    ))
+
+    assert dispatch.calls == []
+    assert [call["tools"] is None for call in provider.calls] == [False, True]
+    assert outcome.final_text == "bounded fallback"
+
+
+def test_all_tool_results_share_per_call_and_aggregate_prompt_budgets(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": f"c{i}", "name": "memory_index", "args": {}}
+                for i in range(5)
+            ],
+            "usage": {},
+        },
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    build_messages = _RecordingBuildMessages()
+
+    async def _dispatch(calls):
+        return [
+            ToolResult(call_id=calls[0].id, content="error: denied"),
+            *[
+                ToolResult(call_id=tc.id, content=str(index) * 3000)
+                for index, tc in enumerate(calls[1:], start=1)
+            ],
+        ]
+
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG, build_messages=build_messages,
+        dispatch_tools=_dispatch, on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    exchange = build_messages.calls[1][0]
+    assert isinstance(exchange, ToolExchange)
+    assert [result.call_id for result in exchange.results] == [f"c{i}" for i in range(5)]
+    assert exchange.results[0].content == "error: denied"
+    assert all(len(result.content) <= 2000 for result in exchange.results)
+    assert sum(len(result.content) for result in exchange.results) <= 8000
+    assert all(result.content.endswith("...[truncated]") for result in exchange.results[1:])
 
 
 @pytest.mark.parametrize("status_code", [400, 422])
@@ -413,7 +686,7 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     reply = _RecordingReply()
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(), build_messages=_RecordingBuildMessages(),
+        provider_config=_TEST_PROVIDER_CONFIG, build_messages=_RecordingBuildMessages(),
         dispatch_tools=_RecordingDispatch(), on_reply=reply,
         fold_new_messages=_RecordingFold([[]]), add_usage=usage.append,
         max_calls=5,
@@ -453,7 +726,7 @@ def test_provider_call_exception_still_counts_a_model_call(monkeypatch):
 
     with pytest.raises(RuntimeError, match="boom"):
         asyncio.run(tool_loop.run_tool_loop(
-            provider_config=object(),
+            provider_config=_TEST_PROVIDER_CONFIG,
             build_messages=build_messages,
             dispatch_tools=dispatch,
             on_reply=on_reply,
@@ -485,7 +758,7 @@ def test_budget_exhausted_with_zero_max_calls_produces_no_reply(monkeypatch):
     fold = _RecordingFold([])
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=build_messages,
         dispatch_tools=dispatch,
         on_reply=on_reply,

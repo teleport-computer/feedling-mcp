@@ -23,7 +23,7 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import worker
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="")
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
 
 
 @pytest.fixture(autouse=True)
@@ -88,7 +88,10 @@ def test_migration_head_and_watermark_seq_column():
     }
     # 0040 (genesis serve-worker claim attribution) chains linearly off 0039 and is
     # the current single head.
-    assert script.get_current_head() == "0040_genesis_worker_claim"
+    assert script.get_revision("0041_v2_mcp_mutation_attempts").down_revision == (
+        "0040_genesis_worker_claim"
+    )
+    assert script.get_current_head() == "0041_v2_mcp_mutation_attempts"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

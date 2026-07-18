@@ -23,10 +23,18 @@ not permission to apply the same fleet policy to test or production.
 - **D0 landed**: worker pool container (`serve-worker`) added to the runner compose; discovery exclusivity guard live (`db.list_agent_runtime_enabled_users` excludes `db_action_v2` users); admin mode-setter (`/v1/admin/hosted-runtime-mode` + `io_cli set-/list-runtime-mode`); per-turn metrics (`v2_turn_metrics` + `/v1/admin/v2-metrics`).
 - **D3 landed**: proactive/wake migrated to lanes (scheduler + wake handler). **Full kill-resident cannot happen until D3 is deployed** — before that, `db_action_v2` only reroutes interactive chat; a flipped user's proactive wakes would be lost.
 - Both runner composes carry the `serve-worker` service (`deploy/docker-compose.phala.runner.yaml`, `deploy/docker-compose.phala.prod.runner.yaml`).
-- Apply Alembic through `0038_v2_prompt_cache_metrics` before starting the new
-  worker image. Old workers ignore the additive columns; the new worker keeps
-  cache telemetry nullable so an older relay cannot masquerade as a zero-hit
-  provider.
+- Apply Alembic through `0041_v2_mcp_mutation_attempts` before starting the new
+  worker image. The migration takes a short claim-writer lock, installs a
+  protocol gate, and seeds one conservative unknown mutation barrier for every
+  chat job already `claimed`/`running`. An old worker may keep producing
+  pending jobs, but its unmarked `pending`→`claimed` UPDATE is rejected; only a
+  0041-capable worker can claim after migration. Late input raises the reserved
+  barrier for a legacy-owned active job. Old effect sweepers still select only
+  `status='pending'`; another trigger stores new source-fenced reply types as
+  `pending_fenced_v1`, so an overlap cannot publish them without the new atomic
+  reply/cursor/job boundary. Current workers drain both pending states in one
+  enqueue order. The new worker keeps cache telemetry nullable so an older
+  relay cannot masquerade as a zero-hit provider.
 - **Production-promotion gate**: the branch now contains the stable cutover cursor, transactional reply boundary, hard wedged-turn recovery, and database-backed live turn-pool kill switch. Before copying Pre's fleet policy to test or production, the deployed image must also pass the fault-injection/rollback drill in `docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md`. Ordinary Pre iOS use is the bounded acceptance test that gathers evidence; it does not require the tester to run that operator drill.
 - **Before promotion, prove process recovery, not only Python recovery.** `_run_forever` relaunches
   `_serve` after an escaping Python exception, and the send heartbeat/deadline
@@ -42,13 +50,36 @@ not permission to apply the same fleet policy to test or production.
   without automatic repair is not a completed availability gate. This drill is
   an operator-owned promotion requirement, not an iOS Pre-testing step.
 - Capture/dream producers are currently default-off. Any early infrastructure soak is capability-incomplete and is not evidence that V2 can replace resident.
-- Web results are untrusted: after `web_search`/`web_fetch` returns, the native loop removes every durable-write tool and blocks new searches/fresh outbound URLs for the remainder of that turn. A `web_search` result may be fetched once only by its exact returned URL; search-and-save still needs a fresh user turn. Do not widen that boundary without per-result taint tracking, outbound data-loss controls, and an explicit confirmation protocol.
+- Web and user-MCP results are untrusted: after either enters the transcript, the native loop removes every durable-write and mutating user-MCP tool and blocks new searches/fresh outbound URLs for the remainder of that turn. Fingerprint-approved read-only MCP tools may remain available. A `web_search` result may be fetched once only by its exact returned URL; search-and-save still needs a fresh user turn. Do not widen that boundary without per-result taint tracking, outbound data-loss controls, and an explicit confirmation protocol.
 
 ## Step 0 — Deploy the worker pool
 
 1. Adding the `serve-worker` service is a **compose change** → new `compose_hash` → **on-chain `addComposeHash()` re-auth** (pre `FeedlingAppAuth 0x6584…`, prod `0x6c8A…`). See `deploy/DEPLOYMENTS.md` "How to re-run the deploy".
 2. Build `feedling-agent-runner:<sha>`, bump the compose tag, `phala deploy --cvm-id <runner>`, `deploy/publish-compose-hash.sh`.
-3. Env (encrypted channel, no re-auth): `FEEDLING_V2_MAX_WORKERS` (default 4), `FEEDLING_V2_CHAT_RESERVED_SLOTS` (default `max(1, MAX_WORKERS//2)`, clamped so at least one slot remains unrestricted), `FEEDLING_V2_SCHEDULER_INTERVAL_SEC` (default 30). Watchdog budgets are deliberately split: `FEEDLING_V2_TURN_STALL_TIMEOUT_SEC` defaults to 240s (minimum 210s), `FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC` defaults to 1500s and must cover the configured prompt-catch-up/provider envelope (1440s minimum at current defaults), `FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC` defaults to 45s, and `FEEDLING_V2_WATCHDOG_DB_TIMEOUT_SEC` defaults to 5s. **Remove any existing `FEEDLING_V2_TURN_HARD_TIMEOUT_SEC=180` override before deploy**: the legacy key is now only a stall-timeout alias, and values below 210s intentionally fail startup. Do not set the absolute budget back to 180s; legitimate `FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=600` catch-up plus bounded provider rounds can exceed it while still making progress. `serve-worker` automatically sizes its process-local `FEEDLING_DB_POOL_MAX_SIZE` floor to `max(16, 2*MAX_WORKERS+4)` because every generation-fenced effect drain may hold one outer transaction while its sink borrows a second connection; an explicit lower override fails startup instead of deadlocking all slots. Non-positive/invalid worker, pool, enclave, TTL, poll, scheduler, and watchdog settings fail startup.
+3. Env (encrypted channel, no re-auth): `FEEDLING_V2_MAX_WORKERS` (default 4), `FEEDLING_V2_CHAT_RESERVED_SLOTS` (default `max(1, MAX_WORKERS//2)`, clamped so at least one slot remains unrestricted), `FEEDLING_V2_SCHEDULER_INTERVAL_SEC` (default 30). Watchdog budgets are deliberately split: `FEEDLING_V2_TURN_STALL_TIMEOUT_SEC` defaults to 240s (minimum 210s), `FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC` defaults to 1800s and must cover the configured prompt-catch-up/provider/MCP envelope (1620s minimum at current defaults), `FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC` defaults to 45s, and `FEEDLING_V2_WATCHDOG_DB_TIMEOUT_SEC` defaults to 5s. **Remove any existing `FEEDLING_V2_TURN_HARD_TIMEOUT_SEC=180` override before deploy**: the legacy key is now only a stall-timeout alias, and values below 210s intentionally fail startup. Do not set the absolute budget back to 180s; legitimate `FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=600` catch-up plus bounded provider and MCP rounds can exceed it while still making progress. `serve-worker` automatically sizes its process-local `FEEDLING_DB_POOL_MAX_SIZE` floor to `max(16, 2*MAX_WORKERS+4)` because every generation-fenced effect drain may hold one outer transaction while its sink borrows a second connection; an explicit lower override fails startup instead of deadlocking all slots. Native-tool fan-out defaults to 8 calls/round and 24/turn; observations are capped at 2,000 chars/call and 8,000/batch, raw args/native assistant turns have separate ingress caps, each MCP call has a 45s total wall deadline, and all MCP calls in one chat turn share a cumulative 180s wall budget (`FEEDLING_V2_MCP_TURN_WALL_BUDGET_SEC`). The single-call MCP deadline must remain at least 30s below the stall timeout. The corresponding `FEEDLING_V2_*` overrides are positive-only and fail startup/turn validation when internally inconsistent. Non-positive/invalid worker, pool, enclave, TTL, poll, scheduler, watchdog, and tool-budget settings fail closed.
+   Every provider round also passes one aggregate prompt frontier before network
+   I/O. The exact system/history/tail/late-input message payload, native
+   call/result transcript, and exact offered schemas share the selected model's
+   context window with `FEEDLING_V2_PROMPT_OUTPUT_RESERVE_TOKENS` (default 4096)
+   and `FEEDLING_V2_PROMPT_SAFETY_MARGIN_TOKENS` (default 1024). Audited
+   first-party model families use conservative floors; route/model corrections
+   use `FEEDLING_V2_PROMPT_CONTEXT_WINDOWS_JSON`, a JSON object such as
+   `{"openrouter:openai/gpt-4.1-mini":1047576,"openai_compatible:*":65536}`.
+   Unknown models and custom destinations have no safe numeric default: without
+   audited `ProviderConfig.context_window_tokens` metadata or a matching
+   deployment override, the turn fails with
+   `prompt_context_limit_unconfigured` before provider I/O. Override keys do not
+   include the destination, so each value must be a safe lower bound for every
+   route it matches; do not copy a larger relay's limit onto a smaller one.
+   Accounting defaults to one estimated token per UTF-8 byte
+   (`FEEDLING_V2_PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN=1`) plus 8192 tokens per
+   image (`FEEDLING_V2_PROMPT_IMAGE_RESERVE_TOKENS`); change either only from
+   route-specific measurements. Required conversation/native
+   transcript overflow fails visibly before a provider call. If only the tool
+   catalog cannot fit, the whole catalog is omitted for one text-only terminal
+   call; no summary, tail message, late input, or half tool exchange is clipped.
+   Budgeting never rewrites/reorders the prompt, so the stable cache prefix stays
+   byte-identical.
 4. **Verify**: `v2_worker_heartbeats` has fresh rows (`jobs_store.workers_alive()` True); `GET /v1/admin/v2-metrics` returns live_workers ≥ 1.
 5. **Verify prompt caching with a real provider**: record a start epoch, send
    exactly two canary-user requests whose exact shared prefix is comfortably
@@ -79,8 +110,17 @@ not permission to apply the same fleet policy to test or production.
    retry cannot false-green. It probes both an automatic OpenAI cache route and
    an OpenRouter-Anthropic route with explicit content-block breakpoints.
    The account is deleted in `finally`; only the content-free turn metrics
-   survive for audit. Override the low-cost canary model with the repository
-   variables `PRE_PROMPT_CACHE_CANARY_MODEL` and
+   survive for audit. **Live Pre proof completed on 2026-07-18** at commit
+   [`80a178ef`](https://github.com/teleport-computer/feedling-mcp/commit/80a178ef550255ce7f842cac23f7afffd48e921b)
+   in CI run
+   [`29639081436`](https://github.com/teleport-computer/feedling-mcp/actions/runs/29639081436):
+   `openai/gpt-4.1-mini` reported 2,048 second-turn cache-read tokens with
+   `hit_ratio=0.3765398051112337`, and
+   `anthropic/claude-sonnet-4.6` reported 5,257 with
+   `hit_ratio=0.4979634365823624`. Both proofs were route-bound and contained
+   exactly two turns/two model calls, zero retries, and 100% usage, cache, and
+   route-identity telemetry coverage. Override the canary models with the
+   repository variables `PRE_PROMPT_CACHE_CANARY_MODEL` and
    `PRE_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL` when provider availability changes.
 6. **Verify genesis rehome** (2026-07-10): the genesis import worker now runs inside `serve-worker`, not `agent-runner` — `genesis_import_jobs` has exactly one drain in the codebase, so if this container is unhealthy, every new user's onboarding distillation stalls silently. Confirm `GET /v1/admin/v2-metrics` returns `genesis_alive: true`, then drive **one real genesis import end-to-end** and confirm it decrypts (the runner CVM reaches the main enclave over the passthrough URL with `verify=False`; `deploy/DEPLOYMENTS.md` has always flagged this as a post-cutover check). A `genesis_alive: false` with `live_workers ≥ 1` means the genesis thread died while the turn loops kept beating — check the serve-worker logs for `[genesis:daemon]`.
 
@@ -110,7 +150,25 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
 
 - **Per-user test/prod policy:** revert a user's flag with `io_cli set-runtime-mode <uid> resident_cli`; the supervisor re-spawns their resident next tick.
 - **Pre fleet rollback:** set the repository variable `PRE_HOSTED_RUNTIME_POLICY=resident_only` and redeploy `pre`. The value is injected through the encrypted environment channel (no compose-hash change). Startup fences every V2/split control—including users whose route was removed or failed—and the post-deploy gate requires zero policy inconsistencies. The Pre `v2_only` policy deliberately rejects ad-hoc per-user resident flips.
-- **Drain before image rollback.** Stop new V2 admission, move enrolled users to `resident_cli`, wait for claimed/running V2 rows to terminalize, and verify no V2 reply is in flight before deploying an older worker image. The schema keeps separate queue and execution deadlines for mixed-version safety, but an old worker does not have the new ownership/effect fences.
+- **Drain before image rollback.** Stop new V2 admission, move enrolled users to
+  `resident_cli`, wait for claimed/running V2 rows to terminalize, and verify no
+  V2 reply is in flight before deploying an older worker image. In particular,
+  require zero `v2_effect_outbox` rows with `status='pending_fenced_v1'` and
+  zero mutation frontiers ahead of each user's durable reply cursor. Check the
+  latter across both `v2_mcp_mutation_attempts.input_frontier_seq` and non-null
+  `v2_effect_outbox.input_frontier_seq`; any row greater than
+  `user_blobs(kind='model_api_runtime').doc.v2_reply_cursor_seq` blocks the
+  rollback until the current worker resolves or advances it.
+  **Retain the 0041 schema during an image rollback; do not run `alembic
+  downgrade`.** The additive trigger/status/frontier evidence is what prevents
+  an old sweeper or a recovered chat turn from replaying a partially published
+  reply/mutation. The 0041 downgrade itself preserves those two diagnostics and
+  is permanently unsupported even when both are clear. **An old V2 image cannot
+  claim jobs while the retained 0041 protocol gate is installed**; image
+  rollback is therefore resident-only. Resume V2 only with an 0041-capable
+  image. The schema keeps separate queue and execution deadlines for
+  mixed-version safety, but an old worker does not have the new
+  ownership/effect fences.
 - **Encrypted write-effect compatibility.** New memory/identity/schedule rows use
   versioned durable types (`*_encrypted_v1`). An older worker cannot interpret
   them and therefore leaves them pending instead of applying an empty payload;
@@ -127,24 +185,39 @@ Runs locally; RSS/latency are **indicative** on a dev box, not CVM-authoritative
   provider prompt caching and cache telemetry are implemented (OpenAI/OpenRouter
   affinity, Anthropic automatic ephemeral caching, Gemini/DeepSeek implicit
   caching, and cache-off compatibility fallback), and whole-turn usage now
-  includes extraction/compaction calls. A real two-request cache-hit proof and
-  a concurrent CVM load run still remain;
+  includes extraction/compaction calls. The real route-bound two-request
+  cache-hit proof is complete on Pre (see Step 0); a concurrent CVM load run
+  still remains;
   admission ceiling is implemented; typing-signal pre-warm is not implemented;
   encrypted full-trajectory storage plus side-effect-disabled dream-lane failure
   replay is not implemented; and fleet-wide resident retirement is an operator
   outcome only after wake/capture/dream parity and the rollout gates above pass.
-- **Long-horizon conversation frontier is not implemented.** The current
-  encrypted itemized summary is append-only and is sent in full on every turn,
-  so it preserves coverage and fails visibly rather than dropping history, but
-  its prompt footprint still grows without bound until a BYOK model's context
-  limit is reached. This is acceptable for bounded test soaking, not a
-  fleet-wide production cutover claim. Before broad rollout, add immutable
-  encrypted summary segments plus append-only higher-level checkpoints and a
-  CAS-managed non-overlapping active frontier, then budget the complete rendered
-  prompt (system + frontier + verbatim tail + tool transcript) against provider
-  context limits. Do not "fix" this by truncating the summary or silently
-  advancing its watermark: either approach loses the full-conversation
-  invariant.
+- **Long-horizon summary hierarchy is not implemented.** The current encrypted
+  itemized summary is append-only and is sent in full on every turn, so it
+  preserves coverage but eventually reaches the now-enforced model-aware
+  **total prompt frontier**. That frontier is recalculated every round over the
+  complete rendered messages, images, exact tool schemas, newly folded input,
+  accumulated native exchanges, output reserve, and safety headroom; it fails
+  visibly instead of dropping required content. Before broad rollout, add
+  immutable encrypted summary segments plus append-only higher-level checkpoints
+  and a CAS-managed non-overlapping active summary frontier. Do not "fix" this
+  by truncating the summary or silently advancing its watermark: either approach
+  loses the full-conversation invariant.
+- **Remote MCP mutation crashes recover locally without replaying the remote
+  write.** Runtime V2 durably records a mutation attempt before network I/O;
+  live-process timeout/transport ambiguity is explicit, disables every later
+  mutation, and platform outbox writes are exact-effect applied before a later
+  inline MCP mutation can overtake them. If the process dies after the remote
+  server committed but before the response reached the local transcript, the
+  lease expires visibly and periodic recovery detects the durable frontier. The
+  next chat turn is mutation-free (reads plus reply only), so it can explain the
+  uncertainty and advance beyond the barrier without automatically replaying
+  the call. This recovers the local conversation/job lifecycle; it does **not**
+  prove or reconcile remote state, and an operator/user may still need to inspect
+  the remote system. Generic MCP has no mandatory idempotency key or
+  reconciliation API. Production-grade exactly-once claims require
+  server-specific idempotency/receipts plus tool-specific reconciliation; do not
+  describe arbitrary remote MCP writes as exactly once.
 - **Default flip outside Pre** — Pre now performs an explicit startup backfill and persists the intended mode at setup/test/activation; it does not reinterpret a missing blob at read time. Test and production remain `per_user`: do not infer fleet membership from a missing/invalid value or copy Pre's policy until their rollout gates are complete.
 - **Authoritative 4c/8GB load run** — rerun Step 1 on CVM-class hardware if the local indicative numbers are borderline.
 - **Promoting genesis to its own container.** It is now a dedicated thread inside `serve-worker` rather than inside `agent-runner` — better, but still a thread in someone else's process. Its own service would give it a restart policy and a real crash domain. Costs one more `addComposeHash()`, so it was not bundled here.

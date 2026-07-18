@@ -43,7 +43,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="")
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
 
 
 def _reset(uid: str) -> None:

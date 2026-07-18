@@ -201,7 +201,8 @@ def test_build_messages_appends_folded_inputs_and_tool_results():
 
     messages = build_messages([exchange, *folded_inputs])
 
-    assert messages[0] == {"role": "system", "content": "sys"}
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"].startswith("sys\n\n")
     roles = [m["role"] for m in messages if isinstance(m, dict)]
     assert "user" in roles
     joined = " ".join(str(m.get("content", "")) for m in messages if isinstance(m, dict))
@@ -216,7 +217,6 @@ def test_build_messages_with_no_folded_inputs_or_results_is_stable():
         system_prompt="sys", summary="", tail=[{"role": "user", "content": "hello"}]
     )
     messages = build_messages([])
-    assert messages == [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "hello"},
-    ]
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"].startswith("sys\n\n")
+    assert messages[1:] == [{"role": "user", "content": "hello"}]

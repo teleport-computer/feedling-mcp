@@ -1142,6 +1142,82 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     db.effect_sink_complete(eid)
 
 
+def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
+    """Persist an encrypted V2 reply on the outbox transaction's connection.
+
+    Only SQL runs before the caller's outer commit.  The returned thunk refreshes
+    process-local cache and performs best-effort mirror/R2/capture work after
+    commit, so none of those auxiliary systems can turn a durably published
+    reply/job/effect into a reported failure.
+    """
+    envelope = payload.get("envelope")
+    if not isinstance(envelope, dict):
+        raise RuntimeError("transactional reply requires encrypted envelope")
+    store = core_store.get_store(user_id)
+    msg = store._build_chat_message("openclaw", "model_api", envelope)
+    msg_id = str(msg["id"])
+    seq, inserted, finish_db_post_commit = db.chat_append_effect_with_cursor(
+        user_id,
+        msg_id,
+        float(msg["ts"]),
+        msg,
+        core_store.MAX_CHAT_MESSAGES,
+        payload.get("reply_through_seq"),
+        connection=connection,
+        defer_post_commit=True,
+    )
+    msg["seq"] = int(seq)
+
+    # PostgreSQL delivers NOTIFY only if the surrounding outbox transaction
+    # commits.  This closes the commit->process-crash wake gap for other backend
+    # workers without opening a second connection.
+    wake_payload = json.dumps(
+        {"u": user_id, "c": "chat", "o": core_wake_bus.WORKER_ID},
+        separators=(",", ":"),
+    )
+    connection.execute(
+        "SELECT pg_notify(%s, %s)",
+        (core_wake_bus.PG_CHANNEL, wake_payload),
+    )
+
+    def post_commit() -> None:
+        try:
+            finish_db_post_commit()
+        except Exception as exc:  # noqa: BLE001 — committed primary is authoritative
+            log.warning(
+                "[v2.reply] post-commit mirror/offload failed user=%s code=%s",
+                user_id,
+                type(exc).__name__.lower(),
+            )
+        try:
+            store.reload_chat_strict()
+        except Exception as exc:  # noqa: BLE001 — cross-worker reload/poll is fallback
+            log.warning(
+                "[v2.reply] local chat cache refresh failed user=%s code=%s",
+                user_id,
+                type(exc).__name__.lower(),
+            )
+        if inserted:
+            try:
+                capture_scheduler.record_chat_append(store, msg)
+            except Exception as exc:  # noqa: BLE001 — auxiliary capture only
+                log.warning(
+                    "[v2.reply] capture scheduling failed user=%s code=%s",
+                    user_id,
+                    type(exc).__name__.lower(),
+                )
+        try:
+            store.notify_chat_waiters()
+        except Exception as exc:  # noqa: BLE001 — long-poll timeout remains fallback
+            log.warning(
+                "[v2.reply] local waiter wake failed user=%s code=%s",
+                user_id,
+                type(exc).__name__.lower(),
+            )
+
+    return post_commit
+
+
 def _sink_status(user_id: str, payload: dict) -> None:
     """`status` sink. Payload keys: ``{"kind": str, "job_id"?: any, "label"?: str,
     "detail"?: dict}``. Reuses `jobs_store.append_status_event` — the same
@@ -1561,7 +1637,14 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
             effect_type = logical_effect_type
         production_dispatch(effect_type, payload)
 
-    return v2_effect_outbox.apply_pending_effects(user_id, dispatch=dispatch)
+    return v2_effect_outbox.apply_pending_effects(
+        user_id,
+        dispatch=dispatch,
+        dispatch_reply_in_transaction=(
+            lambda _effect_type, payload, connection:
+            _sink_reply_in_transaction(user_id, payload, connection)
+        ),
+    )
 
 
 def build_production_deps() -> v2_worker.TurnDeps:
@@ -1847,13 +1930,44 @@ if _TURN_STALL_TIMEOUT_SEC < _MIN_TURN_STALL_TIMEOUT_SEC:
         "FEEDLING_V2_TURN_HARD_TIMEOUT_SEC) must be at least 210s"
     )
 
+
+# An MCP call only refreshes the per-turn stall clock after its bounded async
+# dispatch settles. Leave explicit room for cancellation, child->parent progress
+# propagation, and watchdog polling instead of accepting a call deadline right
+# on the kill threshold.
+_MCP_STALL_SAFETY_MARGIN_SEC = 30.0
+
+
+def _validate_mcp_timeout_below_stall(
+    *,
+    mcp_call_timeout_sec: float,
+    turn_stall_timeout_sec: float,
+    safety_margin_sec: float = _MCP_STALL_SAFETY_MARGIN_SEC,
+) -> None:
+    if mcp_call_timeout_sec + safety_margin_sec >= turn_stall_timeout_sec:
+        raise RuntimeError(
+            "FEEDLING_V2_MCP_TOOL_CALL_TIMEOUT_SEC must be at least "
+            f"{safety_margin_sec:.0f}s below "
+            "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC"
+        )
+
+
+_validate_mcp_timeout_below_stall(
+    mcp_call_timeout_sec=v2_worker.MCP_TOOL_CALL_TIMEOUT_SEC,
+    turn_stall_timeout_sec=_TURN_STALL_TIMEOUT_SEC,
+)
+
 _TURN_ABSOLUTE_TIMEOUT_SEC = _positive_float_env(
-    "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC", "1500")
+    "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC", "1800")
 _CHAT_TURN_BUDGET_SEC = (
     float(v2_worker._PROMPT_CATCHUP_DEADLINE_SEC)
     # One OpenAI-compatible provider attempt may make a second full-timeout
     # wire request for a bounded reasoning/temperature compatibility fallback.
     + float(v2_worker._TURN_MAX_LLM_CALLS) * (2.0 * 60.0)
+    # One cumulative allowance shared by every serial user-MCP call across all
+    # provider rounds. The worker enforces this budget, so this is a real upper
+    # bound rather than MAX_TOOL_CALLS_PER_TURN * the per-call timeout.
+    + float(v2_worker.MCP_TURN_WALL_BUDGET_SEC)
     + 120.0
 )
 # capture/dream use three 90s reliable attempts plus bounded retry backoff;
@@ -1865,7 +1979,8 @@ _MIN_TURN_ABSOLUTE_TIMEOUT_SEC = max(
 if _TURN_ABSOLUTE_TIMEOUT_SEC < _MIN_TURN_ABSOLUTE_TIMEOUT_SEC:
     raise RuntimeError(
         "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC must cover prompt catch-up, "
-        "all provider rounds, and 120s setup/write margin "
+        "all provider rounds, the MCP turn wall budget, and 120s "
+        "setup/write margin "
         f"(minimum {_MIN_TURN_ABSOLUTE_TIMEOUT_SEC:.0f}s)"
     )
 if _TURN_ABSOLUTE_TIMEOUT_SEC <= _TURN_STALL_TIMEOUT_SEC:

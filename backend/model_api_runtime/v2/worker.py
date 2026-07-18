@@ -43,7 +43,7 @@ from typing import Any, Awaitable, Callable
 
 import db
 import provider_client
-from provider_types import ToolExchange
+from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from core import envelope as core_envelope
 from core import store as core_store
@@ -59,6 +59,7 @@ from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
+from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
@@ -67,6 +68,10 @@ from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
 from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
 
 log = logging.getLogger("feedling.runtime_v2.worker")
+
+_MUTATION_RECOVERY_BLOCKED_ERROR = (
+    "error: mutation_disabled_during_recovery"
+)
 
 # `_slot_loop` installs one callback in this task-local context for the duration
 # of an active turn.  Deep helpers can report real progress without threading a
@@ -104,11 +109,105 @@ def _positive_int_env(name: str, default: str) -> int:
         raise RuntimeError(f"{name} must be a positive integer")
     return value
 
+
+def _nonnegative_int_env(name: str, default: str) -> int:
+    raw = os.environ.get(name, default)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be a non-negative integer") from exc
+    if value < 0:
+        raise RuntimeError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _positive_float_env(name: str, default: str) -> float:
+    raw = os.environ.get(name, default)
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be positive and finite") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"{name} must be positive and finite")
+    return value
+
 # —— 三个有界闸 ——（spec §6）
 # 每进程并发 job 数（= 并发回合数）。线上多进程 × CVM 共抢同一张 agent_jobs → 线性扩容。
 MAX_WORKERS = _positive_int_env("FEEDLING_V2_MAX_WORKERS", "4")
 # 单 job 内 executor 并行读上限。
 MAX_READ_ACTION_PARALLELISM = _positive_int_env("FEEDLING_V2_MAX_READ_PARALLELISM", "4")
+# A provider/relay can return an arbitrarily large native tool-call array. The
+# loop rejects an oversized batch before any read or durable effect executes.
+MAX_TOOL_CALLS_PER_ROUND = _positive_int_env(
+    "FEEDLING_V2_MAX_TOOL_CALLS_PER_ROUND", "8")
+MAX_TOOL_CALLS_PER_TURN = _positive_int_env(
+    "FEEDLING_V2_MAX_TOOL_CALLS_PER_TURN", "24")
+TOOL_RESULT_CHAR_CAP = _positive_int_env(
+    "FEEDLING_V2_TOOL_RESULT_CHAR_CAP", "2000")
+TOOL_BATCH_RESULT_CHAR_CAP = _positive_int_env(
+    "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP", "8000")
+MAX_TOOL_ARGS_CHARS = _positive_int_env(
+    "FEEDLING_V2_MAX_TOOL_ARGS_CHARS", "16000")
+MAX_TOOL_BATCH_ARGS_CHARS = _positive_int_env(
+    "FEEDLING_V2_MAX_TOOL_BATCH_ARGS_CHARS", "64000")
+MAX_NATIVE_ASSISTANT_TURN_CHARS = _positive_int_env(
+    "FEEDLING_V2_MAX_NATIVE_ASSISTANT_TURN_CHARS", "65536")
+MAX_ASSISTANT_TOOL_TEXT_CHARS = _positive_int_env(
+    "FEEDLING_V2_MAX_ASSISTANT_TOOL_TEXT_CHARS", "8192")
+try:
+    PROMPT_CONTEXT_WINDOW_OVERRIDES = (
+        v2_prompt_frontier.parse_deployment_overrides(
+            os.environ.get("FEEDLING_V2_PROMPT_CONTEXT_WINDOWS_JSON")
+        )
+    )
+except ValueError as exc:
+    raise RuntimeError(
+        "FEEDLING_V2_PROMPT_CONTEXT_WINDOWS_JSON is invalid"
+    ) from exc
+PROMPT_OUTPUT_RESERVE_TOKENS = _positive_int_env(
+    "FEEDLING_V2_PROMPT_OUTPUT_RESERVE_TOKENS", "4096")
+PROMPT_SAFETY_MARGIN_TOKENS = _nonnegative_int_env(
+    "FEEDLING_V2_PROMPT_SAFETY_MARGIN_TOKENS", "1024")
+PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN = _positive_float_env(
+    "FEEDLING_V2_PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN", "1")
+PROMPT_IMAGE_RESERVE_TOKENS = _positive_int_env(
+    "FEEDLING_V2_PROMPT_IMAGE_RESERVE_TOKENS", "8192")
+if any(
+    context_window
+    <= PROMPT_OUTPUT_RESERVE_TOKENS + PROMPT_SAFETY_MARGIN_TOKENS
+    for context_window in PROMPT_CONTEXT_WINDOW_OVERRIDES.values()
+):
+    raise RuntimeError(
+        "FEEDLING_V2_PROMPT_CONTEXT_WINDOWS_JSON contains a window no larger "
+        "than the configured output reserve plus safety margin"
+    )
+if TOOL_RESULT_CHAR_CAP < v2_tool_loop.MIN_TOOL_RESULT_ERROR_QUOTA:
+    raise RuntimeError(
+        "FEEDLING_V2_TOOL_RESULT_CHAR_CAP is too small for stable errors")
+if (
+    TOOL_BATCH_RESULT_CHAR_CAP
+    < MAX_TOOL_CALLS_PER_ROUND * v2_tool_loop.MIN_TOOL_RESULT_ERROR_QUOTA
+):
+    raise RuntimeError(
+        "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP is too small for stable errors")
+# This is a true wall deadline around the whole async MCP call, including time
+# waiting for the per-round read gate. Unlike synchronous platform capabilities,
+# MCP's httpx coroutine is cancellable and therefore safe to wrap in wait_for.
+MCP_TOOL_CALL_TIMEOUT_SEC = float(
+    os.environ.get("FEEDLING_V2_MCP_TOOL_CALL_TIMEOUT_SEC", "45"))
+if not math.isfinite(MCP_TOOL_CALL_TIMEOUT_SEC) or MCP_TOOL_CALL_TIMEOUT_SEC <= 0:
+    raise RuntimeError("FEEDLING_V2_MCP_TOOL_CALL_TIMEOUT_SEC must be positive and finite")
+# The per-call deadline alone is not a whole-turn bound: all user-MCP tools are
+# deliberately serialized, so a model could otherwise spend the 45s allowance
+# 24 times while still crossing a progress boundary after every call. Keep one
+# cumulative remote-call wall budget across provider rounds.  Three minutes is
+# enough for all 24 calls when servers are responsive, but bounds a chain of
+# repeatedly slow servers well below 24 * 45s.
+MCP_TURN_WALL_BUDGET_SEC = float(
+    os.environ.get("FEEDLING_V2_MCP_TURN_WALL_BUDGET_SEC", "180"))
+if not math.isfinite(MCP_TURN_WALL_BUDGET_SEC) or MCP_TURN_WALL_BUDGET_SEC <= 0:
+    raise RuntimeError(
+        "FEEDLING_V2_MCP_TURN_WALL_BUDGET_SEC must be positive and finite")
 # 跨所有 job 共享的 enclave 并发闸（provider-key 解密 + chat 解密 + capability 调用都过它）。治 R3。
 ENCLAVE_CONCURRENCY = _positive_int_env("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")
 ENCLAVE_SEMAPHORE = asyncio.Semaphore(ENCLAVE_CONCURRENCY)
@@ -240,6 +339,17 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             # Keep the established persisted code stable across the internal
             # responder-module removal; dashboards and clients may group by it.
             kind = "responder_error"
+    elif isinstance(
+        exc,
+        (
+            v2_prompt_frontier.PromptContextLimitUnconfigured,
+            v2_prompt_frontier.PromptFrontierExhausted,
+        ),
+    ):
+        # Frontier errors expose explicit, content-free protocol codes. Preserve
+        # those codes instead of leaking Python class-name formatting into the
+        # persisted status/error surface.
+        kind = exc.code
     else:
         kind = type(exc).__name__.lower() or "error"
     return f"{scope}:{kind}"[:120]
@@ -330,13 +440,16 @@ class TurnDeps:
     # of an empty pending set; the field exists so the call site is already wired
     # ahead of the producer landing.
     apply_pending_effects: Callable[[str], dict] | None = None
-    # (store, *, api_key, runtime_token) -> awaitable McpTurn: build this chat
+    # (store, *, api_key, runtime_token, enclave_sem) -> awaitable McpTurn: build this chat
     # turn's user-MCP tool surface. Implemented in `hosted.mcp_tools.load_turn_mcp`
     # and injected by `serve_worker.build_production_deps`, because loading a user's
     # MCP servers needs `hosted` (mcp_core/mcp_client) + enclave decrypt, which the
     # V2 core must not import (dependency-direction guard). The returned McpTurn is
     # duck-typed here (`.tool_specs` / `.handles` / `.dispatch`) — no hosted type
-    # crosses the boundary. None (every non-chat/legacy caller) → no MCP tools.
+    # crosses the boundary. A server-authored readOnlyHint alone is ignored;
+    # only the loader's exact user-approved catalog fingerprint can classify an
+    # MCP tool as a parallel read. None (every non-chat/legacy caller) means no
+    # MCP tools.
     load_mcp_turn: Callable[..., Any] | None = None
 
 
@@ -348,8 +461,245 @@ class _EmptyMcpTurn:
     def handles(self, name: str) -> bool:
         return False
 
+    def is_read_only(self, name: str) -> bool:
+        return False
+
+    @property
+    def mutating_tool_names(self) -> frozenset[str]:
+        return frozenset()
+
 
 _EMPTY_MCP_TURN = _EmptyMcpTurn()
+MCP_TURN_WALL_BUDGET_EXHAUSTED_ERROR = "error: mcp_turn_wall_budget_exhausted"
+
+
+@dataclass
+class _McpTurnWallBudget:
+    """Cumulative remote MCP-call wall time shared by one chat turn.
+
+    Approved MCP reads may overlap. Charging every call's elapsed time is
+    deliberately conservative under overlap: concurrent reads may consume the
+    allowance faster than wall clock, but can never extend the real turn beyond
+    the configured bound.
+    """
+
+    limit_sec: float
+    clock: Callable[[], float] = time.monotonic
+    used_sec: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.limit_sec = float(self.limit_sec)
+        if not math.isfinite(self.limit_sec) or self.limit_sec <= 0:
+            raise ValueError("MCP turn wall budget must be positive and finite")
+
+    def timeout_for_call(self, per_call_timeout_sec: float) -> float:
+        return min(
+            float(per_call_timeout_sec),
+            max(0.0, self.limit_sec - self.used_sec),
+        )
+
+    def start_call(self) -> float:
+        return float(self.clock())
+
+    def finish_call(self, started_at: float) -> None:
+        elapsed = max(0.0, float(self.clock()) - float(started_at))
+        self.used_sec = min(self.limit_sec, self.used_sec + elapsed)
+
+
+def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
+    """Use only the loader's independently approved read classification.
+
+    The production loader fingerprints the exact remote name/schema/hint and
+    compares it to a user-stored encrypted approval. A missing/malformed policy
+    fails closed to every offered MCP tool being a mutation.
+    """
+    offered = frozenset(
+        name
+        for spec in (getattr(mcp_turn, "tool_specs", ()) or ())
+        if (name := str(getattr(spec, "name", "") or ""))
+    )
+    try:
+        mutating = frozenset(
+            str(name)
+            for name in getattr(mcp_turn, "mutating_tool_names")
+        )
+    except Exception:  # noqa: BLE001 — duck-typed seam fails closed
+        return offered
+    return offered & mutating
+
+
+async def _dispatch_mixed_tool_calls(
+    tool_calls,
+    *,
+    mcp_turn,
+    mutating_mcp_names,
+    dispatch_platform_one,
+    before_mcp_mutation,
+    mcp_mutation_started=None,
+    mcp_mutation_finished=None,
+    read_parallelism: int,
+    mcp_timeout_sec: float,
+    mcp_wall_budget: _McpTurnWallBudget | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> list[ToolResult]:
+    """Run one provider batch with mixed-read overlap and ordered mutations.
+
+    Platform reads and MCP reads with an exact user-approved catalog fingerprint
+    share one per-round semaphore. Every read settles before the first mutation.
+    Platform writes continue through executor/outbox; MCP mutations are fenced
+    immediately before their cancellable remote call. Results are always
+    reconstructed in the provider's original order.
+    """
+    try:
+        timeout = float(mcp_timeout_sec)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("mcp_timeout_sec must be positive and finite") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("mcp_timeout_sec must be positive and finite")
+
+    def _progress(stage: str) -> None:
+        # Watchdog observation is never allowed to alter tool semantics.
+        if on_progress is None:
+            return
+        try:
+            on_progress(stage)
+        except Exception:  # noqa: BLE001
+            pass
+
+    read_gate = asyncio.Semaphore(max(1, int(read_parallelism)))
+    mutating_mcp_names = frozenset(str(name) for name in mutating_mcp_names)
+    reads: list[tuple[str, Any]] = []
+    mutations: list[tuple[str, Any]] = []
+    for tc in tool_calls:
+        # Mutation policy is authoritative even if a broken duck-typed turn's
+        # `handles` metadata disagrees with the tool specs it offered.
+        if tc.name in mutating_mcp_names:
+            mutations.append(("mcp", tc))
+        elif mcp_turn.handles(tc.name):
+            reads.append(("mcp", tc))
+        elif tc.name in cap_registry.WRITE_ACTIONS:
+            mutations.append(("platform", tc))
+        else:
+            # The tool loop already validates platform names. Keeping defensive
+            # unknown/bad calls in the read phase lets executor return its stable
+            # error without ever routing one through a write fence.
+            reads.append(("platform", tc))
+
+    async def _mcp_result(tc, *, mutating: bool, use_read_gate: bool) -> ToolResult:
+        async def _invoke():
+            if use_read_gate:
+                async with read_gate:
+                    return await mcp_turn.dispatch(tc)
+            return await mcp_turn.dispatch(tc)
+
+        call_timeout = (
+            timeout
+            if mcp_wall_budget is None
+            else mcp_wall_budget.timeout_for_call(timeout)
+        )
+        if call_timeout <= 0:
+            # No remote call started, so this is a known-safe rejection even
+            # for a mutation (unlike timing out an in-flight mutation).
+            return ToolResult(
+                call_id=tc.id,
+                content=MCP_TURN_WALL_BUDGET_EXHAUSTED_ERROR,
+            )
+        started_at = (
+            None if mcp_wall_budget is None else mcp_wall_budget.start_call()
+        )
+        try:
+            result = await asyncio.wait_for(_invoke(), timeout=call_timeout)
+        except asyncio.TimeoutError:
+            content = (
+                v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR
+                if mutating
+                else "error: mcp_deadline_exceeded"
+            )
+            return ToolResult(call_id=tc.id, content=content)
+        except Exception:  # noqa: BLE001 — one flaky user server never sinks siblings
+            content = (
+                v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR
+                if mutating
+                else "error: mcp_call_failed"
+            )
+            return ToolResult(call_id=tc.id, content=content)
+        finally:
+            if mcp_wall_budget is not None and started_at is not None:
+                mcp_wall_budget.finish_call(started_at)
+        if not isinstance(result, ToolResult) or result.call_id != tc.id:
+            content = (
+                v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR
+                if mutating
+                else "error: mcp_result_mismatch"
+            )
+            return ToolResult(call_id=tc.id, content=content)
+        if mutating and (
+            result.content == MCP_TRANSPORT_FAILURE_ERROR
+            or str(result.content).startswith("error:")
+        ):
+            return ToolResult(
+                call_id=tc.id,
+                content=v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR,
+            )
+        return result
+
+    async def _read(kind: str, tc) -> ToolResult:
+        if kind == "mcp":
+            # wait_for encloses admission as well as transport: this is a total
+            # wall deadline, not another per-socket idle timeout.
+            return await _mcp_result(tc, mutating=False, use_read_gate=True)
+        async with read_gate:
+            return await dispatch_platform_one(tc)
+
+    results_by_id: dict[str, ToolResult] = {}
+    if reads:
+        read_results = await asyncio.gather(*[
+            _read(kind, tc) for kind, tc in reads
+        ])
+        for (_kind, tc), result in zip(reads, read_results):
+            results_by_id[tc.id] = result
+        _progress("tool_read_phase_complete")
+
+    # One serial sequence across BOTH mutation domains preserves model order.
+    # Platform write fence/enqueue failures intentionally propagate; an uncertain
+    # durable platform effect must never be converted into an ordinary tool error.
+    mutation_outcome_unknown = False
+    for kind, tc in mutations:
+        if mutation_outcome_unknown:
+            result = ToolResult(
+                call_id=tc.id,
+                content=v2_tool_loop.MUTATION_BLOCKED_AFTER_UNKNOWN_OUTCOME_ERROR,
+            )
+        elif kind == "platform":
+            result = await dispatch_platform_one(tc)
+        else:
+            await before_mcp_mutation()
+            if mcp_mutation_started is not None:
+                await mcp_mutation_started(tc)
+            result = await _mcp_result(
+                tc, mutating=True, use_read_gate=False)
+            outcome = (
+                "unknown"
+                if result.content
+                == v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR
+                else "known"
+            )
+            if mcp_mutation_finished is not None:
+                try:
+                    await mcp_mutation_finished(tc, outcome)
+                except Exception:  # durable receipt failure is itself ambiguous
+                    result = ToolResult(
+                        call_id=tc.id,
+                        content=(
+                            v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR
+                        ),
+                    )
+            if result.content == v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR:
+                mutation_outcome_unknown = True
+        results_by_id[tc.id] = result
+        _progress("tool_mutation_complete")
+
+    return [results_by_id[tc.id] for tc in tool_calls]
 
 
 @dataclass
@@ -518,16 +868,15 @@ async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
     health signal — steps/sleep/vitals/activity/body — lives in the SLOW set, so the
     default would reproduce the exact blindness this fixes. Signal COUNT is not a
     latency cost (the read is a fixed 3 store reads regardless); it costs tokens only,
-    and the block lands after the cached prefix (`build_turn_messages` appends
-    action_context LAST), so it does not invalidate prompt caching.
+    and the block lands after the reusable conversation prefix (at the end of
+    the base context, before any same-turn transcript), so it does not invalidate
+    prompt caching.
 
     Disabled/null signals are kept, not filtered: the agent must be told what it
-    CANNOT see ("now: not_permitted") rather than infer from an absence. A
-    ``_reading_guide`` rides along so the model reads those gaps correctly — a null
-    reading is "no current data" (e.g. steps not logged yet today, or a sample that
-    aged out of the freshness window), NOT a malfunction. Without it the agent
-    phrases an absent signal as "获取不到/没检测到", which reads to the user as a
-    broken system rather than "nothing recorded yet".
+    CANNOT see ("now: not_permitted") rather than infer from an absence. Their
+    interpretation guidance lives in ``context._RUNTIME_CONTEXT_POLICY`` so the
+    changing runtime-data payload remains observations only and cannot smuggle
+    app-authored instructions across the untrusted-data boundary.
 
     Returns the `action_results` shape `action_context_str` expects, or None when the
     prefetch came back empty — `_cap_data` degrades to {} on failure and this is
@@ -539,16 +888,7 @@ async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
         enclave_sem=enclave_sem)
     if not data:
         return None
-    annotated = dict(data)
-    annotated["_reading_guide"] = (
-        "Each signal is this turn's live reading. A null field, or a signal marked "
-        "'disabled', is simply unavailable this turn — nothing recorded/reported "
-        "recently, a sample that aged out, or a capability this device/iOS version "
-        "can't provide — NOT a malfunction. If the user asks about one, say there's "
-        "no current reading (e.g. 'no steps logged yet today'); never imply the "
-        "sensor or app is broken, and don't read a null as zero."
-    )
-    return {"perception_snapshot": [{"ok": True, "data": annotated}]}
+    return {"perception_snapshot": [{"ok": True, "data": dict(data)}]}
 
 
 async def _cap_data(store, action_type, *, api_key, runtime_token, params=None, enclave_sem=None) -> dict:
@@ -740,7 +1080,12 @@ def _make_fold_new_messages(
 
 
 def _make_build_messages_fn(
-    *, system_prompt: str, summary: str, tail: list[dict], extra_context: str = ""
+    *,
+    system_prompt: str,
+    summary: str,
+    tail: list[dict],
+    extra_context: str = "",
+    mutation_recovery_active: bool = False,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -757,9 +1102,10 @@ def _make_build_messages_fn(
     invalid native tool conversation on every supported wire.
 
     `extra_context` (optional, spec C8) is STATIC grounding resolved once before the
-    loop starts (e.g. the wake lane's `screen_recent` prefetch for the `screen_watch` lane,
-    rendered via `context.action_context_str`). It remains in the base system context;
-    dynamic tool results remain native exchanges.
+    loop starts (e.g. the wake lane's `screen_recent` prefetch for the `screen_watch`
+    lane, rendered via `context.action_context_str`). It is serialized as an explicitly
+    untrusted user-role runtime-data block after the base conversation, never as system
+    authority. Dynamic tool results remain native exchanges after that base block.
     """
 
     base_messages = context.build_turn_messages(
@@ -767,6 +1113,7 @@ def _make_build_messages_fn(
         summary=summary,
         tail=tail,
         action_context=extra_context,
+        mutation_recovery_active=mutation_recovery_active,
     )
 
     def build_messages(transcript: list) -> list:
@@ -1586,6 +1933,27 @@ async def _run_wake(
     """
     try:
         store = core_store.get_store(user_id)
+        seq_native = deps.read_messages_after_seq is not None
+        observed_generation = 0
+        wake_reply_cursor_seq = 0
+        if seq_native:
+            observed = await asyncio.to_thread(
+                jobs_store.get_input_generation,
+                job_id,
+                claimed_by=claimed_by,
+            )
+            if observed is None:
+                raise LostJobLease("wake job ownership lost before input read")
+            observed_generation = int(observed)
+            # Bind the answered boundary before freezing the wake prompt.  A
+            # concurrent final-reply recovery may advance the durable cursor
+            # after this read; retaining the earlier value makes us yield
+            # conservatively instead of replying from a snapshot that omitted
+            # that final assistant row.
+            wake_reply_cursor_seq = await asyncio.to_thread(
+                v2_cursor.load_seq,
+                store,
+            )
 
         async def _fence_wake_effect(effect: str) -> None:
             if not await asyncio.to_thread(
@@ -1650,6 +2018,37 @@ async def _run_wake(
                 through_seq=wake_snapshot_seq,
                 tail=tail,
             )
+            # A wake is proactive work only while there is no unanswered user
+            # input.  Keep the frozen prompt snapshot boundary separate from
+            # the durable reply cursor: a send can commit after this wake was
+            # claimed but before ``wake_snapshot_seq`` was taken.  That row is
+            # already represented in the frozen prompt (verbatim in ``tail`` or
+            # behind its encrypted-summary watermark), so seeding the first fold
+            # after the snapshot prevents a duplicate prompt entry; it must NOT
+            # also make the row look previously answered.  Query the authoritative
+            # user-row interval rather than inferring membership from the tail.
+            # Yield before any provider/tool work and let the atomically enqueued
+            # chat job own the response.
+            base_prompt_user_frontier = await asyncio.to_thread(
+                db.chat_max_user_seq_between,
+                user_id,
+                wake_reply_cursor_seq,
+                wake_snapshot_seq,
+            )
+            if base_prompt_user_frontier > wake_reply_cursor_seq:
+                completed = await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                )
+                if not completed:
+                    raise LostJobLease(
+                        "wake job ownership lost while yielding to chat input"
+                    )
+                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+                if tm is not None:
+                    tm.flush(failed=False, status="yielded_to_chat")
+                return "completed"
         elif legacy_context:
             # Post-assembly hard assertion (D6): independent re-derivation,
             # not a reuse of `_ensure_prompt_coverage`'s return — see
@@ -1757,13 +2156,27 @@ async def _run_wake(
             # before the round began.
             await _fence_wake_effect("reply")
             ordinal_value = next(ordinal)
+            consumed_seq = None
+            if final and seq_native and cursor_box["seq"] > wake_start_seq:
+                consumed_seq = int(cursor_box["seq"])
+            reply_effect_type = "reply"
+            if seq_native:
+                reply_effect_type = (
+                    v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE
+                    if consumed_seq is not None
+                    else (
+                        v2_effect_outbox.TERMINAL_REPLY_EFFECT_TYPE
+                        if final
+                        else v2_effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE
+                    )
+                )
             payload = {"text": text}
-            if deps.read_messages_after_seq is not None:
+            if seq_native:
                 eid = v2_effect_id.derive(
-                    job_id=job_id, effect_type="reply", ordinal=ordinal_value)
-                consumed_seq = None
-                if final and cursor_box["seq"] > wake_start_seq:
-                    consumed_seq = cursor_box["seq"]
+                    job_id=job_id,
+                    effect_type=reply_effect_type,
+                    ordinal=ordinal_value,
+                )
                 payload = await asyncio.to_thread(
                     _build_encrypted_reply_effect_payload,
                     store,
@@ -1771,11 +2184,27 @@ async def _run_wake(
                     effect_id=eid,
                     reply_through_seq=consumed_seq,
                 )
+                if consumed_seq is not None:
+                    payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
+                        "claimed_by": claimed_by,
+                        "input_generation": observed_generation,
+                        "through_seq": consumed_seq,
+                    }
+                elif final:
+                    payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
+                        "claimed_by": claimed_by,
+                        "input_generation": observed_generation,
+                        "observed_user_seq": int(cursor_box["seq"]),
+                    }
+                else:
+                    payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
+                        "claimed_by": claimed_by,
+                    }
             await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,
                 user_id=user_id,
-                effect_type="reply",
+                effect_type=reply_effect_type,
                 ordinal=ordinal_value,
                 expected_generation=gen,
                 payload=payload,
@@ -1786,6 +2215,46 @@ async def _run_wake(
             # below and the already-fixed per-round fold offload).
             if deps.apply_pending_effects is not None:
                 await asyncio.to_thread(deps.apply_pending_effects, user_id)
+            if seq_native:
+                disposition = await asyncio.to_thread(
+                    v2_effect_outbox.get_effect_disposition,
+                    eid,
+                    user_id=user_id,
+                    job_id=job_id,
+                    effect_type=reply_effect_type,
+                )
+                if disposition is None:
+                    raise RuntimeError("wake reply effect disappeared")
+                status = disposition["status"]
+                last_error = disposition["last_error"]
+                if status == "applied":
+                    if final:
+                        source_status = await asyncio.to_thread(
+                            jobs_store.get_job_status,
+                            job_id,
+                            user_id=user_id,
+                            claimed_by=claimed_by,
+                        )
+                        if source_status != "completed":
+                            raise RuntimeError(
+                                "wake final applied without completing source job"
+                            )
+                    return
+                if (
+                    status == "discarded"
+                    and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
+                ):
+                    raise v2_tool_loop.FinalReplySuperseded()
+                if (
+                    status == "discarded"
+                    and last_error == v2_effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE
+                ):
+                    raise LostJobLease(
+                        "wake source job became inactive before reply publication"
+                    )
+                raise RuntimeError(
+                    "wake reply effect not durably applied: " + status
+                )
 
         def _add_usage(usage) -> None:
             if tm is not None:
@@ -1817,7 +2286,24 @@ async def _run_wake(
                 fold_new_messages=fold_new_messages, add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
                 fold_before_first=deps.read_messages_after_seq is not None,
-                on_progress=_report_turn_progress)
+                on_progress=_report_turn_progress,
+                max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
+                max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
+                tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
+                tool_batch_result_char_cap=TOOL_BATCH_RESULT_CHAR_CAP,
+                max_tool_args_chars=MAX_TOOL_ARGS_CHARS,
+                max_tool_batch_args_chars=MAX_TOOL_BATCH_ARGS_CHARS,
+                max_native_assistant_turn_chars=(
+                    MAX_NATIVE_ASSISTANT_TURN_CHARS),
+                max_assistant_tool_text_chars=MAX_ASSISTANT_TOOL_TEXT_CHARS,
+                prompt_context_window_overrides=(
+                    PROMPT_CONTEXT_WINDOW_OVERRIDES),
+                prompt_output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
+                prompt_safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
+                prompt_estimator_utf8_bytes_per_token=(
+                    PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN),
+                prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
+            )
         except Exception as e:  # noqa: BLE001 — classify below, then let it fall to the outer silent mark_failed
             if provider_client.classify_provider_error(e) == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
@@ -2133,37 +2619,17 @@ async def process_job(
             ):
                 raise LostJobLease("job lease expired or ownership changed")
 
-        async def _ensure_runtime_mode() -> None:
-            # D4 live kill switch: checked first, same fence as runtime-mode-disabled
-            # below (mark_failed + tm.flush + raise RuntimeModeChanged) — this closure
-            # is what _before_write/_dispatch_tools/the turn-start check all call, so
-            # gating here fences every active write and tool-dispatch round while
-            # halted without a second bare-raise path that would skip the bookkeeping.
-            if await asyncio.to_thread(kill_switch.turns_halted):
-                owned = await asyncio.to_thread(
-                    jobs_store.mark_failed,
-                    job_id,
-                    "turns_halted",
-                    claimed_by=claimed_by,
-                )
-                if owned and lane == "chat":
-                    await asyncio.to_thread(
-                        _surface_terminal_error,
-                        deps,
-                        user_id,
-                        job_id,
-                        "turns_halted",
-                    )
-                tm.flush(failed=True, status="turns_halted")
-                raise RuntimeModeChanged("v2 turns halted")
-            if deps.runtime_mode_enabled is None or await asyncio.to_thread(
-                deps.runtime_mode_enabled, user_id
-            ):
-                return
+        async def _fail_runtime_fence(code: str, detail: str) -> None:
+            """Own terminal bookkeeping before raising ``RuntimeModeChanged``.
+
+            The outer handler deliberately does no writes because every runtime
+            fence path must settle the job, user-visible failure obligation, and
+            metric exactly once here.
+            """
             owned = await asyncio.to_thread(
                 jobs_store.mark_failed,
                 job_id,
-                "runtime_mode_changed",
+                code,
                 claimed_by=claimed_by,
             )
             if owned and lane == "chat":
@@ -2172,10 +2638,27 @@ async def process_job(
                     deps,
                     user_id,
                     job_id,
-                    "runtime_mode_changed",
+                    code,
                 )
-            tm.flush(failed=True, status="runtime_mode_changed")
-            raise RuntimeModeChanged("user is no longer assigned to V2")
+            tm.flush(failed=True, status=code)
+            raise RuntimeModeChanged(detail)
+
+        async def _ensure_runtime_mode() -> None:
+            # D4 live kill switch: checked first, same fence as runtime-mode-disabled
+            # below (mark_failed + tm.flush + raise RuntimeModeChanged) — this closure
+            # is what _before_write/_dispatch_tools/the turn-start check all call, so
+            # gating here fences every active write and tool-dispatch round while
+            # halted without a second bare-raise path that would skip the bookkeeping.
+            if await asyncio.to_thread(kill_switch.turns_halted):
+                await _fail_runtime_fence("turns_halted", "v2 turns halted")
+            if deps.runtime_mode_enabled is None or await asyncio.to_thread(
+                deps.runtime_mode_enabled, user_id
+            ):
+                return
+            await _fail_runtime_fence(
+                "runtime_mode_changed",
+                "user is no longer assigned to V2",
+            )
 
         await _ensure_runtime_mode()
 
@@ -2224,14 +2707,113 @@ async def process_job(
             # draining it; generating another answer first would duplicate the turn.
             if deps.apply_pending_effects is not None:
                 await asyncio.to_thread(deps.apply_pending_effects, user_id)
+            recovered_status = await asyncio.to_thread(
+                jobs_store.get_job_status,
+                job_id,
+                user_id=user_id,
+                claimed_by=claimed_by,
+            )
+            if recovered_status == "completed":
+                # The recovery drain (or an independent sweeper) published the
+                # final reply and consumed this source job in one transaction.
+                # Do not enter the provider loop or attempt a second lifecycle
+                # transition; only finish producer-local visibility/metrics.
+                try:
+                    await asyncio.to_thread(
+                        _emit_status, user_id, job_id, "done")
+                except Exception as exc:  # noqa: BLE001 — reply already committed
+                    log.warning(
+                        "[v2.worker] recovered-reply done status failed "
+                        "user=%s job=%s: %s",
+                        user_id,
+                        job_id,
+                        type(exc).__name__,
+                    )
+                try:
+                    await asyncio.to_thread(
+                        core_wake_bus.notify, "chat", user_id)
+                except Exception as exc:  # noqa: BLE001 — transactional notify won
+                    log.warning(
+                        "[v2.worker] recovered-reply chat notify failed "
+                        "user=%s job=%s: %s",
+                        user_id,
+                        job_id,
+                        type(exc).__name__,
+                    )
+                try:
+                    tm.flush(failed=False, status="recovered_final_reply")
+                except Exception as exc:  # noqa: BLE001 — post-commit telemetry
+                    log.warning(
+                        "[v2.worker] recovered-reply metric flush failed "
+                        "user=%s job=%s: %s",
+                        user_id,
+                        job_id,
+                        type(exc).__name__,
+                    )
+                return "completed"
+            if recovered_status != "running":
+                raise LostJobLease(
+                    "job ownership changed during final-effect recovery")
         # The migrated durable cursor is authoritative.  In particular, do not
         # reinterpret a legitimate zero via last_replied_ts here: replaying a
         # conservative boundary is safe, while a <= timestamp bootstrap can
         # permanently classify the exact same-ts stranded message as answered.
         since_seq = await asyncio.to_thread(v2_cursor.load_seq, store)
+        mutation_recovery_barrier = None
+        if seq_native:
+            # Any write attempt from an older chat job remains a durable replay
+            # barrier until one mutation-free reply consumes that exact input
+            # frontier. This covers known-success MCP calls just as strongly as
+            # unknown outcomes, and platform effects in every outbox disposition
+            # (including one the startup drain immediately above just applied).
+            mutation_recovery_barrier = await asyncio.to_thread(
+                jobs_store.get_chat_mutation_recovery_barrier,
+                user_id,
+                after_seq=int(since_seq),
+                exclude_job_id=job_id,
+            )
         generation = await asyncio.to_thread(
             jobs_store.get_input_generation, job_id, claimed_by=claimed_by)
         if generation is None:
+            if await asyncio.to_thread(
+                jobs_store.get_job_status,
+                job_id,
+                user_id=user_id,
+                claimed_by=claimed_by,
+            ) == "completed":
+                try:
+                    await asyncio.to_thread(
+                        _emit_status, user_id, job_id, "done")
+                except Exception as exc:  # noqa: BLE001 — reply already committed
+                    log.warning(
+                        "[v2.worker] recovered-reply done status failed "
+                        "user=%s job=%s: %s",
+                        user_id,
+                        job_id,
+                        type(exc).__name__,
+                    )
+                try:
+                    await asyncio.to_thread(
+                        core_wake_bus.notify, "chat", user_id)
+                except Exception as exc:  # noqa: BLE001 — transactional notify won
+                    log.warning(
+                        "[v2.worker] recovered-reply chat notify failed "
+                        "user=%s job=%s: %s",
+                        user_id,
+                        job_id,
+                        type(exc).__name__,
+                    )
+                try:
+                    tm.flush(failed=False, status="recovered_final_reply")
+                except Exception as exc:  # noqa: BLE001 — post-commit telemetry
+                    log.warning(
+                        "[v2.worker] recovered-reply metric flush failed "
+                        "user=%s job=%s: %s",
+                        user_id,
+                        job_id,
+                        type(exc).__name__,
+                    )
+                return "completed"
             raise LostJobLease("job ownership lost before input read")
         observed_generation = generation
         coalesced, cursor_seq, cursor_ts = await _coalesce_inputs(
@@ -2330,7 +2912,9 @@ async def process_job(
         else:
             summary, tail = "", []
 
-        async def _enqueue_write_effect(tc) -> None:
+        platform_effects_by_call: dict[str, tuple[str, str]] = {}
+
+        async def _enqueue_write_effect(tc) -> str:
             """WRITE tool_call -> PR A effect (spec C6). Mapping lives in the shared
             `_write_tool_effect_payload` (also used by `_run_wake` — Task 8)."""
             logical_effect_type, payload = _write_tool_effect_payload(tc)
@@ -2355,9 +2939,15 @@ async def process_job(
                 ordinal=ordinal_value,
                 expected_generation=gen,
                 payload=encrypted_payload,
+                # Commit the replay frontier atomically with the encrypted
+                # effect row. Only a non-sensitive seq is plaintext; model
+                # arguments remain exclusively inside the envelope.
+                input_frontier_seq=int(cursor_box["seq"]),
             )
             if enqueued_id != effect_id:
                 raise RuntimeError("tool effect id derivation mismatch")
+            platform_effects_by_call[str(tc.id)] = (enqueued_id, effect_type)
+            return enqueued_id
 
         async def _before_write() -> None:
             # Recheck runtime mode and lease before each serialized write in
@@ -2367,6 +2957,31 @@ async def process_job(
             # runtime-mode-disabled case, not a bare raise that would skip it.
             await _ensure_runtime_mode()
             await _renew_lease()
+
+        async def _mcp_mutation_started(tc) -> None:
+            started = await asyncio.to_thread(
+                jobs_store.start_mcp_mutation_attempt,
+                job_id,
+                user_id=user_id,
+                claimed_by=claimed_by,
+                call_id=str(tc.id),
+                tool_name=str(tc.name),
+                input_frontier_seq=int(cursor_box["seq"]),
+            )
+            if not started:
+                raise RuntimeError(
+                    "MCP mutation intent was not durably recorded")
+
+        async def _mcp_mutation_finished(tc, outcome: str) -> None:
+            finished = await asyncio.to_thread(
+                jobs_store.finish_mcp_mutation_attempt,
+                job_id,
+                call_id=str(tc.id),
+                outcome=str(outcome),
+            )
+            if not finished:
+                raise RuntimeError(
+                    "MCP mutation outcome was not durably recorded")
 
         # User-MCP tool surface for THIS turn (chat lane only, mirroring the
         # resident which gives claude `--mcp-config` on the chat lane only). The
@@ -2378,7 +2993,27 @@ async def process_job(
         mcp_turn = _EMPTY_MCP_TURN
         if deps.load_mcp_turn is not None:
             mcp_turn = await deps.load_mcp_turn(
-                store, api_key=api_key, runtime_token=runtime_token)
+                store,
+                api_key=api_key,
+                runtime_token=runtime_token,
+                enclave_sem=enclave_sem,
+            )
+        mcp_mutating_names = _mcp_mutating_names_for_turn(mcp_turn)
+        disabled_mutation_tool_names = frozenset()
+        offered_mcp_tool_specs = tuple(mcp_turn.tool_specs)
+        if mutation_recovery_barrier is not None:
+            disabled_mutation_tool_names = frozenset(
+                set(cap_registry.WRITE_ACTIONS) | set(mcp_mutating_names)
+            )
+            offered_mcp_tool_specs = tuple(
+                spec
+                for spec in mcp_turn.tool_specs
+                if spec.name not in mcp_mutating_names
+            )
+        # Shared across every provider round in this chat turn. A per-dispatch
+        # budget would reset whenever the model asks for another tool batch and
+        # would therefore fail to bound the whole-turn MCP contribution.
+        mcp_wall_budget = _McpTurnWallBudget(MCP_TURN_WALL_BUDGET_SEC)
 
         # Perception grounding for the chat turn. Sits HERE, beside the MCP load and
         # deliberately OUTSIDE the `async with enclave_sem` block above: `_cap_data`
@@ -2396,30 +3031,107 @@ async def process_job(
             await _renew_lease()
             for tc in tool_calls:
                 action_digest.setdefault(tc.name, {"ok": 0, "count": 0})["count"] += 1
-            # Split user-MCP calls (proxy to the user's own server) from platform
-            # capability calls: the executor rejects an mcp__ name as unknown, so it
-            # must never see one. Results are matched back by call_id in the loop,
-            # so order across the two dispatchers does not matter.
-            mcp_calls = [tc for tc in tool_calls if mcp_turn.handles(tc.name)]
-            platform_calls = [tc for tc in tool_calls if not mcp_turn.handles(tc.name)]
-            results = []
-            if platform_calls:
-                results.extend(await v2_executor.dispatch_tool_calls(
-                    platform_calls, store=store, api_key=api_key, runtime_token=runtime_token,
-                    enclave_sem=enclave_sem, turn_authorization=True,
-                    enqueue_write_effect=_enqueue_write_effect, before_write=_before_write,
-                    read_parallelism=read_parallelism))
-            if mcp_calls:
-                results.extend(await asyncio.gather(
-                    *(mcp_turn.dispatch(tc) for tc in mcp_calls)))
-            by_id = {r.call_id: r for r in results}
+
+            async def _dispatch_platform_one(tc) -> ToolResult:
+                # One call per coroutine lets platform reads share the exact same
+                # worker-level gate as MCP reads. Executor still owns validation,
+                # provenance, encrypted outbox writes, and terminal write failures.
+                (result,) = await v2_executor.dispatch_tool_calls(
+                    [tc], store=store, api_key=api_key,
+                    runtime_token=runtime_token, enclave_sem=enclave_sem,
+                    turn_authorization=(mutation_recovery_barrier is None),
+                    enqueue_write_effect=_enqueue_write_effect,
+                    before_write=_before_write,
+                    read_parallelism=1,
+                )
+                if (
+                    tc.name in cap_registry.WRITE_ACTIONS
+                    and not str(result.content).startswith("error")
+                    and deps.apply_pending_effects is not None
+                ):
+                    # Platform writes use our durable generation-fenced outbox,
+                    # while user-MCP mutations commit inline at a remote server.
+                    # Confirm this exact platform effect before returning its
+                    # result, so a later MCP mutation—even in the next provider
+                    # round—cannot overtake a merely queued local write.
+                    effect_ref = platform_effects_by_call.pop(str(tc.id), None)
+                    if effect_ref is None:
+                        raise RuntimeError(
+                            "platform write effect identity was not recorded")
+                    effect_id, effect_type = effect_ref
+                    await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                    disposition = await asyncio.to_thread(
+                        v2_effect_outbox.get_effect_disposition,
+                        effect_id,
+                        user_id=user_id,
+                        job_id=job_id,
+                        effect_type=effect_type,
+                    )
+                    if disposition is None or disposition["status"] != "applied":
+                        status = (
+                            "missing" if disposition is None
+                            else disposition["status"]
+                        )
+                        raise RuntimeError(
+                            "platform write was not durably applied: " + status)
+                    return ToolResult(
+                        call_id=tc.id,
+                        content=f"ok: {tc.name} applied",
+                    )
+                return result
+
+            # Schema omission is the provider-facing control; this runtime
+            # gate is the independent fail-closed boundary. A broken relay or
+            # direct caller that invents an omitted mutating MCP call must not
+            # reach the durable-attempt marker or the remote network.
+            blocked_by_id: dict[str, ToolResult] = {}
+            dispatchable_calls = list(tool_calls)
+            if mutation_recovery_barrier is not None:
+                blocked_by_id = {
+                    str(tc.id): ToolResult(
+                        call_id=tc.id,
+                        content=_MUTATION_RECOVERY_BLOCKED_ERROR,
+                    )
+                    for tc in tool_calls
+                    if tc.name in mcp_mutating_names
+                    or tc.name in cap_registry.WRITE_ACTIONS
+                }
+                dispatchable_calls = [
+                    tc for tc in tool_calls if str(tc.id) not in blocked_by_id
+                ]
+
+            dispatched = await _dispatch_mixed_tool_calls(
+                dispatchable_calls,
+                mcp_turn=mcp_turn,
+                mutating_mcp_names=mcp_mutating_names,
+                dispatch_platform_one=_dispatch_platform_one,
+                before_mcp_mutation=_before_write,
+                mcp_mutation_started=_mcp_mutation_started,
+                mcp_mutation_finished=_mcp_mutation_finished,
+                read_parallelism=read_parallelism,
+                mcp_timeout_sec=MCP_TOOL_CALL_TIMEOUT_SEC,
+                mcp_wall_budget=mcp_wall_budget,
+                on_progress=_report_turn_progress,
+            )
+            dispatched_by_id = {
+                str(result.call_id): result for result in dispatched
+            }
+            results = [
+                blocked_by_id.get(str(tc.id))
+                or dispatched_by_id[str(tc.id)]
+                for tc in tool_calls
+            ]
+            by_id = {result.call_id: result for result in results}
             for tc in tool_calls:
                 r = by_id.get(tc.id)
-                if r is not None and not r.content.startswith("error"):
+                if r is not None and not str(r.content).startswith("error"):
                     action_digest[tc.name]["ok"] += 1
             return results
 
+        final_job_completed_atomically = False
+
         async def _on_reply(text: str, *, final: bool) -> None:
+            nonlocal final_job_completed_atomically
             text = str(text or "").strip()
             if final and not text:
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
@@ -2434,26 +3146,54 @@ async def process_job(
             await _ensure_runtime_mode()
             await _renew_lease()
             ordinal_value = next(ordinal)
+            reply_effect_type = "reply"
+            if seq_native:
+                reply_effect_type = (
+                    v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE
+                    if final
+                    else v2_effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE
+                )
+            effect_id = v2_effect_id.derive(
+                job_id=job_id,
+                effect_type=reply_effect_type,
+                ordinal=ordinal_value,
+            )
             payload = {"text": text}
             if seq_native:
-                eid = v2_effect_id.derive(
-                    job_id=job_id, effect_type="reply", ordinal=ordinal_value)
                 payload = await asyncio.to_thread(
                     _build_encrypted_reply_effect_payload,
                     store,
                     text,
-                    effect_id=eid,
+                    effect_id=effect_id,
                     reply_through_seq=(cursor_box["seq"] if final else None),
                 )
-            await asyncio.to_thread(
+                if final:
+                    # Reply content is encrypted; the owner id and two integers
+                    # are only non-sensitive routing metadata. The outbox
+                    # validates them while holding the source job lock across
+                    # sink dispatch.
+                    # Intermediate reply-tool bubbles deliberately carry no
+                    # fence and remain immediately visible mid-turn.
+                    payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
+                        "claimed_by": claimed_by,
+                        "input_generation": int(observed_generation),
+                        "through_seq": int(cursor_box["seq"]),
+                    }
+                else:
+                    payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
+                        "claimed_by": claimed_by,
+                    }
+            enqueued_id = await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,
                 user_id=user_id,
-                effect_type="reply",
+                effect_type=reply_effect_type,
                 ordinal=ordinal_value,
                 expected_generation=gen,
                 payload=payload,
             )
+            if enqueued_id != effect_id:
+                raise RuntimeError("reply effect id derivation mismatch")
             # C6: drain immediately so an intermediate bubble is visible mid-loop,
             # not only at end-of-turn. Offloaded — the reply sink's
             # `_write_encrypted_reply` does an enclave envelope round-trip and must
@@ -2463,6 +3203,83 @@ async def process_job(
             # offload above).
             if deps.apply_pending_effects is not None:
                 await asyncio.to_thread(deps.apply_pending_effects, user_id)
+            if seq_native:
+                # The background reconciliation sweeper can win this row before
+                # the producer-owned drain.  Only the durable disposition of this
+                # exact effect is an acknowledgement; a drain result describes
+                # only rows changed by that particular applier invocation.
+                disposition = await asyncio.to_thread(
+                    v2_effect_outbox.get_effect_disposition,
+                    effect_id,
+                    user_id=user_id,
+                    job_id=job_id,
+                    effect_type=reply_effect_type,
+                )
+                if disposition is None:
+                    raise RuntimeError("final reply effect disappeared")
+                status = disposition["status"]
+                last_error = disposition["last_error"]
+                if status == "applied" and not final:
+                    return
+                if status == "applied":
+                    source_status = await asyncio.to_thread(
+                        jobs_store.get_job_status,
+                        job_id,
+                        user_id=user_id,
+                        claimed_by=claimed_by,
+                    )
+                    if source_status != "completed":
+                        raise RuntimeError(
+                            "final reply applied without completing source job")
+                    final_job_completed_atomically = True
+                    return
+                if (
+                    status == "discarded"
+                    and last_error
+                    == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
+                ):
+                    # The candidate never reached the reply sink. Signal the
+                    # loop to fold/retry (or cleanly hand off at its hard budget)
+                    # without exposing or transcripting stale text.
+                    raise v2_tool_loop.FinalReplySuperseded()
+                if (
+                    status == "discarded"
+                    and last_error
+                    == v2_effect_outbox.FINAL_REPLY_INVALID_FENCE
+                ):
+                    # This worker just constructed the fence itself.  A malformed
+                    # candidate is therefore an internal/storage invariant failure,
+                    # not evidence of newer user input.  Retrying through successor
+                    # jobs could burn provider calls forever on the same bug; fail
+                    # visibly while the outbox remains terminally fail-closed.
+                    raise RuntimeError("invalid final reply fence")
+                if (
+                    status == "discarded"
+                    and last_error
+                    == v2_effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE
+                ):
+                    raise LostJobLease(
+                        "source job became inactive before final publication")
+                if status == "discarded" and last_error in {
+                    v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED,
+                    v2_effect_outbox.EFFECT_RUNTIME_GENERATION_CHANGED,
+                }:
+                    code = (
+                        "runtime_mode_changed"
+                        if last_error
+                        == v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED
+                        else "runtime_generation_changed"
+                    )
+                    await _fail_runtime_fence(
+                        code,
+                        "runtime ownership changed before final publication",
+                    )
+                # pending/missing/reconciliation and unknown terminal states are
+                # explicitly NOT delivery. Let the ordinary terminal-failure
+                # path surface a stable invariant error instead of silently
+                # completing a turn whose bubble was never committed.
+                raise RuntimeError(
+                    "final reply effect not durably applied: " + status)
 
         # The strict production path seeds after the exact prompt snapshot so a
         # user row already present in the verbatim tail is not folded twice.
@@ -2476,11 +3293,37 @@ async def process_job(
         # default) — process_job may have been called with an injected/test semaphore
         # (e.g. tests/test_v2_worker.py's _CountingSemaphore), and the per-round fold must
         # share the exact same gate the rest of this turn's enclave-bound calls use.
-        fold_new_messages = _make_fold_new_messages(user_id, deps, cursor_box, enclave_sem=enclave_sem)
+        base_fold_new_messages = _make_fold_new_messages(
+            user_id, deps, cursor_box, enclave_sem=enclave_sem)
+
+        async def fold_new_messages() -> list[dict]:
+            nonlocal observed_generation
+            # Pin admission BEFORE the message read. If a send commits between
+            # these two operations, the prompt may already contain it but the
+            # deliberately older generation makes the final apply fence miss,
+            # causing one harmless extra fold/retry rather than a stale reply.
+            boundary_generation = await asyncio.to_thread(
+                jobs_store.get_input_generation,
+                job_id,
+                claimed_by=claimed_by,
+            )
+            if boundary_generation is None:
+                raise LostJobLease("job ownership lost at round boundary")
+            observed_generation = int(boundary_generation)
+            return await base_fold_new_messages()
+
+        turn_extra_context = (
+            context.action_context_str(perception_results)
+            if perception_results
+            else ""
+        )
         build_messages = _make_build_messages_fn(
-            system_prompt=context.CHAT_SYSTEM_PROMPT, summary=summary, tail=tail,
-            extra_context=context.action_context_str(perception_results)
-            if perception_results else "")
+            system_prompt=context.CHAT_SYSTEM_PROMPT,
+            summary=summary,
+            tail=tail,
+            extra_context=turn_extra_context,
+            mutation_recovery_active=(mutation_recovery_barrier is not None),
+        )
 
         await _ensure_runtime_mode()
         await _renew_lease()
@@ -2491,7 +3334,43 @@ async def process_job(
             fold_new_messages=fold_new_messages, add_usage=tm.add_call,
             max_calls=_TURN_MAX_LLM_CALLS, fold_before_first=seq_native,
             on_progress=_report_turn_progress,
-            extra_tool_specs=mcp_turn.tool_specs)
+            extra_tool_specs=offered_mcp_tool_specs,
+            extra_mutating_tool_names=mcp_mutating_names,
+            disabled_tool_names=disabled_mutation_tool_names,
+            max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
+            max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
+            tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
+            tool_batch_result_char_cap=TOOL_BATCH_RESULT_CHAR_CAP,
+            max_tool_args_chars=MAX_TOOL_ARGS_CHARS,
+            max_tool_batch_args_chars=MAX_TOOL_BATCH_ARGS_CHARS,
+            max_native_assistant_turn_chars=MAX_NATIVE_ASSISTANT_TURN_CHARS,
+            max_assistant_tool_text_chars=MAX_ASSISTANT_TOOL_TEXT_CHARS,
+            prompt_context_window_overrides=PROMPT_CONTEXT_WINDOW_OVERRIDES,
+            prompt_output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
+            prompt_safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
+            prompt_estimator_utf8_bytes_per_token=(
+                PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN),
+            prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
+        )
+        if outcome.stop_reason == "input_advanced":
+            # The hard provider-call budget remains authoritative. The stale
+            # final effect was already terminally discarded without dispatch;
+            # atomically hand all still-unconsumed inputs to one fresh job and
+            # leave the user-visible status open for that successor. No error
+            # chip and no misleading terminal `done` for this superseded turn.
+            completed, successor_id = await asyncio.to_thread(
+                jobs_store.finish_chat_job,
+                job_id,
+                claimed_by=claimed_by,
+                observed_generation=observed_generation,
+                force_successor=True,
+            )
+            if not completed or successor_id is None:
+                raise LostJobLease("job ownership lost during late-input handoff")
+            await asyncio.to_thread(
+                core_wake_bus.notify, "v2_jobs", user_id)
+            tm.flush(failed=False, status="input_advanced_handoff")
+            return "completed"
         if not outcome.replied_intermediate and not (outcome.final_text or "").strip():
             # BUG-4 no-filler class: the loop returned WITHOUT ever producing a
             # bubble — budget_exhausted (max_calls reached with no terminal
@@ -2505,6 +3384,17 @@ async def process_job(
             # mark_failed + terminal error status + tm.flush(failed=True).
             raise TurnError("empty_reply")
         if seq_native:
+            if not final_job_completed_atomically:
+                source_status = await asyncio.to_thread(
+                    jobs_store.get_job_status,
+                    job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                )
+                if source_status != "completed":
+                    raise RuntimeError(
+                        "final reply did not atomically complete source job")
+                final_job_completed_atomically = True
             durable_seq = await asyncio.to_thread(v2_cursor.load_seq, store)
             if durable_seq < cursor_box["seq"]:
                 raise RuntimeError("final reply cursor was not durably committed")
@@ -2545,23 +3435,84 @@ async def process_job(
         except (TypeError, ValueError):
             _prev_ts = 0.0
         new_last_replied = cursor_box["ts"] if cursor_box["ts"] > _prev_ts else _prev_ts
-        await asyncio.to_thread(
-            jobs_store.upsert_runtime_state, user_id,
-            {"last_replied_ts": new_last_replied, "action_digest": action_digest})
-        await _ensure_runtime_mode()
-        completed, successor_id = await asyncio.to_thread(
-            jobs_store.finish_chat_job,
-            job_id,
-            claimed_by=claimed_by,
-            observed_generation=observed_generation,
-        )
-        if not completed:
-            raise LostJobLease("job ownership lost during finalization")
-        await asyncio.to_thread(_emit_status, user_id, job_id, "done")
+        successor_id = None
+        if final_job_completed_atomically:
+            # Reply/cursor/job completion is already the authoritative terminal
+            # commit. Runtime-state telemetry is useful but must not let a
+            # cutover or transient DB failure rewrite that delivered success.
+            try:
+                await asyncio.to_thread(
+                    jobs_store.upsert_runtime_state, user_id,
+                    {
+                        "last_replied_ts": new_last_replied,
+                        "action_digest": action_digest,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 — post-commit telemetry only
+                log.warning(
+                    "[v2.worker] post-reply runtime-state update failed "
+                    "user=%s job=%s: %s",
+                    user_id,
+                    job_id,
+                    type(exc).__name__,
+                )
+        else:
+            # Compatibility path without the seq-native compound reply sink.
+            await asyncio.to_thread(
+                jobs_store.upsert_runtime_state, user_id,
+                {
+                    "last_replied_ts": new_last_replied,
+                    "action_digest": action_digest,
+                },
+            )
+            await _ensure_runtime_mode()
+            completed, successor_id = await asyncio.to_thread(
+                jobs_store.finish_chat_job,
+                job_id,
+                claimed_by=claimed_by,
+                observed_generation=observed_generation,
+            )
+            if not completed:
+                raise LostJobLease("job ownership lost during finalization")
+        # The reply/cursor/job lifecycle transition above is authoritative.  In
+        # the seq-native path it is one transaction; in the compatibility path
+        # ``finish_chat_job`` has already committed before we get here.  Status
+        # rows, redundant wake notifications, and metrics are observability only:
+        # a transient failure in any of them must not make the child report
+        # ``failed`` after the user can already see a committed final reply.
+        try:
+            await asyncio.to_thread(_emit_status, user_id, job_id, "done")
+        except Exception as exc:  # noqa: BLE001 — post-commit visibility hint
+            log.warning(
+                "[v2.worker] post-reply done status failed user=%s job=%s: %s",
+                user_id,
+                job_id,
+                type(exc).__name__,
+            )
         # 跨进程唤醒 web 层 parked 的 chat long-poll（worker 与 web 是不同进程/CVM，origin 不同）。
-        await asyncio.to_thread(core_wake_bus.notify, "chat", user_id)
+        # The primary reply transaction already emitted its own PG NOTIFY; this
+        # call is a redundant low-latency nudge and is therefore best-effort.
+        try:
+            await asyncio.to_thread(core_wake_bus.notify, "chat", user_id)
+        except Exception as exc:  # noqa: BLE001 — committed reply is authoritative
+            log.warning(
+                "[v2.worker] post-reply chat notify failed user=%s job=%s: %s",
+                user_id,
+                job_id,
+                type(exc).__name__,
+            )
         if successor_id is not None:
-            await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            try:
+                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            except Exception as exc:  # noqa: BLE001 — durable queue polling recovers
+                log.warning(
+                    "[v2.worker] post-reply successor notify failed "
+                    "user=%s job=%s successor=%s: %s",
+                    user_id,
+                    job_id,
+                    successor_id,
+                    type(exc).__name__,
+                )
         # End-of-turn effect-outbox drain (Task 6 / spec A6): apply any pending
         # generation-fenced effects for this user with the real dispatch sinks.
         # Best-effort — the turn's own reply/runtime-state/job transition above
@@ -2585,7 +3536,15 @@ async def process_job(
                     _surface_terminal_error, deps, user_id, job_id, message)
             except Exception as e:  # noqa: BLE001 — see comment above
                 log.warning("[v2.worker] apply_pending_effects failed user=%s: %s", user_id, e)
-        tm.flush(failed=False, status="ok")
+        try:
+            tm.flush(failed=False, status="ok")
+        except Exception as exc:  # noqa: BLE001 — post-commit telemetry only
+            log.warning(
+                "[v2.worker] post-reply metric flush failed user=%s job=%s: %s",
+                user_id,
+                job_id,
+                type(exc).__name__,
+            )
         return "completed"
     except LostJobLease as e:
         # The winning lifecycle transition (normally the reaper) owns terminal

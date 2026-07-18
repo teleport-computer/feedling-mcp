@@ -1,8 +1,10 @@
 """jobs_store：single-flight coalesce、SKIP LOCKED 独占 claim、job 生命周期。"""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -193,6 +195,13 @@ def test_claim_moves_pending_to_claimed_and_returns_row():
     assert row["status"] == "claimed"
     assert row["claimed_by"] == "worker-A"
     assert row["trace_id"] == "t1"
+    with db.get_pool().connection() as conn:
+        protocol = conn.execute(
+            "SELECT current_setting('feedling.v2_worker_protocol',true)"
+        ).fetchone()[0]
+    # Claim success proves the trigger observed 0041 inside the transaction;
+    # the pooled connection must not retain that authority after commit.
+    assert protocol != jobs_store._WORKER_CLAIM_PROTOCOL
 
 
 def test_claim_converts_pending_deadline_to_active_lease():
@@ -628,9 +637,19 @@ def test_reap_expires_legacy_active_job_using_deadline_fallback():
 def test_owner_fence_and_late_input_successor():
     seed_user("u_js_successor"); _reset("u_js_successor")
     job_id, _ = jobs_store.enqueue_job("u_js_successor", "chat")
-    job = jobs_store.claim_next_job("owner-a")
+    jobs_store.claim_next_job("owner-a")
     assert jobs_store.mark_running(job_id, claimed_by="owner-a") is True
     assert jobs_store.mark_completed(job_id, claimed_by="owner-b") is False
+    assert jobs_store.get_job_status(
+        job_id,
+        user_id="u_js_successor",
+        claimed_by="owner-a",
+    ) == "running"
+    assert jobs_store.get_job_status(
+        job_id,
+        user_id="u_js_successor",
+        claimed_by="owner-b",
+    ) is None
 
     observed = jobs_store.get_input_generation(job_id, claimed_by="owner-a")
     assert observed == 0
@@ -647,6 +666,168 @@ def test_owner_fence_and_late_input_successor():
             ("u_js_successor",),
         ).fetchall()
     assert rows == [(job_id, "completed"), (successor_id, "pending")]
+    assert jobs_store.get_job_status(
+        job_id,
+        user_id="u_js_successor",
+        claimed_by="owner-a",
+    ) == "completed"
+
+
+def test_forced_successor_is_generation_pinned_singleflight_and_preserves_error():
+    uid = "u_js_forced_successor"
+    seed_user(uid)
+    _reset(uid)
+    _seed_active_route(uid, error="previous_runtime_failure")
+    generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(
+        uid, "chat", expected_generation=generation)
+    claimed = jobs_store.claim_next_job("force-owner")
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by="force-owner")
+
+    start = threading.Barrier(8)
+
+    def finish_once():
+        start.wait(timeout=3)
+        return jobs_store.finish_chat_job(
+            job_id,
+            claimed_by="force-owner",
+            observed_generation=0,
+            force_successor=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _i: finish_once(), range(8)))
+
+    winners = [result for result in results if result[0]]
+    assert len(winners) == 1
+    successor_id = winners[0][1]
+    assert successor_id is not None
+    assert all(result == (False, None) for result in results if not result[0])
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT id,status,reason,expected_runtime_generation "
+            "FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+        route_error = conn.execute(
+            "SELECT last_runtime_error FROM model_api_routes "
+            "WHERE user_id=%s AND is_active",
+            (uid,),
+        ).fetchone()[0]
+    assert rows == [
+        (job_id, "completed", None, generation),
+        (successor_id, "pending", "coalesced_followup", generation),
+    ]
+    # A superseded candidate was not a successful user-visible turn, so it must
+    # not erase the most recent diagnostic while handing input to the successor.
+    assert route_error == "previous_runtime_failure"
+
+
+@pytest.mark.parametrize(
+    ("state", "generation"),
+    [("draining", 1), ("v2", 2)],
+)
+def test_forced_successor_declines_after_runtime_ownership_changes(
+    state, generation,
+):
+    uid = f"u_js_forced_successor_fenced_{state}_{generation}"
+    seed_user(uid)
+    _reset(uid)
+    original_generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(
+        uid, "chat", expected_generation=original_generation)
+    claimed = jobs_store.claim_next_job("force-fenced-owner")
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by="force-fenced-owner")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_runtime_state SET hosted_runtime_state=%s,"
+            "runtime_generation=%s WHERE user_id=%s",
+            (state, generation, uid),
+        )
+
+    assert jobs_store.finish_chat_job(
+        job_id,
+        claimed_by="force-fenced-owner",
+        observed_generation=0,
+        force_successor=True,
+    ) == (False, None)
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT id,status FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+    assert rows == [(job_id, "running")]
+
+
+def test_finish_chat_job_blocked_past_lease_expiry_fails_closed():
+    uid = "u_js_finish_lease_expires_while_blocked"
+    seed_user(uid)
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(
+        uid, "chat", expected_generation=generation)
+    claimed = jobs_store.claim_next_job("expiry-owner")
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by="expiry-owner")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET lease_expires_at="
+            "clock_timestamp() + interval '1 second' WHERE id=%s",
+            (job_id,),
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with db.get_pool().connection() as blocker:
+            with blocker.transaction():
+                blocker.execute(
+                    "SELECT 1 FROM agent_jobs WHERE id=%s FOR UPDATE",
+                    (job_id,),
+                )
+                future = pool.submit(
+                    jobs_store.finish_chat_job,
+                    job_id,
+                    claimed_by="expiry-owner",
+                    observed_generation=0,
+                    force_successor=True,
+                )
+
+                # Prove the finisher started before expiry and is specifically
+                # sleeping on the held job-row lock; this makes the regression
+                # distinguish transaction-start now() from clock_timestamp().
+                deadline = time.monotonic() + 3
+                waiting = False
+                while time.monotonic() < deadline:
+                    waiting = bool(blocker.execute(
+                        "SELECT EXISTS ("
+                        " SELECT 1 FROM pg_stat_activity "
+                        " WHERE datname=current_database() "
+                        " AND wait_event_type='Lock' "
+                        " AND query LIKE '%%expected_runtime_generation%%' "
+                        " AND query LIKE '%%FROM agent_jobs%%FOR UPDATE%%'"
+                        ")"
+                    ).fetchone()[0])
+                    if waiting:
+                        break
+                    time.sleep(0.01)
+                assert waiting, "finisher never reached the blocked lease check"
+                remaining = float(blocker.execute(
+                    "SELECT GREATEST(EXTRACT(EPOCH FROM "
+                    "(lease_expires_at-clock_timestamp())),0) "
+                    "FROM agent_jobs WHERE id=%s",
+                    (job_id,),
+                ).fetchone()[0])
+                time.sleep(remaining + 0.1)
+        result = future.result(timeout=3)
+
+    assert result == (False, None)
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT id,status FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+    assert rows == [(job_id, "running")]
 
 
 def test_claim_serializes_all_lanes_per_user():

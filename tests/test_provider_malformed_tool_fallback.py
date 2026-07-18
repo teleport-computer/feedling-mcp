@@ -15,6 +15,13 @@ from capabilities import registry as cap_registry
 from model_api_runtime.v2 import tool_loop
 
 
+_TEST_PROVIDER_CONFIG = provider_client.ProviderConfig(
+    provider="anthropic",
+    model="claude-sonnet-4-test",
+    api_key="test-key",
+)
+
+
 _CASES = (
     (
         "openai_chat",
@@ -108,7 +115,7 @@ def test_malformed_wire_uses_exactly_one_tools_disabled_fallback(
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=lambda _transcript: [{"role": "user", "content": "hello"}],
         dispatch_tools=_dispatch,
         on_reply=_on_reply,
@@ -169,7 +176,7 @@ def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=lambda _transcript: [{"role": "user", "content": "look this up"}],
         dispatch_tools=_dispatch,
         on_reply=_on_reply,
@@ -241,7 +248,7 @@ def test_web_search_allows_only_exact_returned_url_for_followup_fetch(monkeypatc
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=lambda _transcript: [{"role": "user", "content": "look this up"}],
         dispatch_tools=_dispatch,
         on_reply=_on_reply,
@@ -302,7 +309,7 @@ def test_web_search_result_cannot_redirect_model_to_fresh_fetch_url(monkeypatch)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=lambda _transcript: [{"role": "user", "content": "search"}],
         dispatch_tools=_dispatch,
         on_reply=_on_reply,
@@ -350,7 +357,7 @@ def test_reply_and_durable_write_same_batch_fail_closed(monkeypatch):
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
     outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=lambda _transcript: [{"role": "user", "content": "remember this"}],
         dispatch_tools=_dispatch,
         on_reply=_on_reply,

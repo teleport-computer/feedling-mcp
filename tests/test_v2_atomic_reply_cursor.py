@@ -22,6 +22,13 @@ from model_api_runtime.v2 import worker
 from provider_types import ToolExchange
 
 
+_TEST_PROVIDER_CONFIG = provider_client.ProviderConfig(
+    provider="anthropic",
+    model="claude-sonnet-4-test",
+    api_key="test-key",
+)
+
+
 def _envelope(item_id: str, *, body: str = "ciphertext") -> dict:
     return {
         "v": 1,
@@ -632,6 +639,11 @@ def test_pending_final_reply_recovers_before_any_new_provider_call(monkeypatch):
         payload={
             "envelope": _envelope("b" * 32, body="recovered-ciphertext"),
             "reply_through_seq": input_seq,
+            effect_outbox.FINAL_REPLY_FENCE_KEY: {
+                "claimed_by": "recovery-worker",
+                "input_generation": 0,
+                "through_seq": input_seq,
+            },
         },
     )
 
@@ -654,16 +666,13 @@ def test_pending_final_reply_recovers_before_any_new_provider_call(monkeypatch):
         read_messages_after_seq=_read_after_seq,
         resolve_provider=lambda _uid: (None, {}),
         mint_enclave_token=lambda _uid: "rt",
-        apply_pending_effects=lambda user_id: effect_outbox.apply_pending_effects(
-            user_id,
-            dispatch=serve_worker.build_production_effect_dispatch(user_id),
-        ),
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
     )
 
     status = asyncio.run(worker.process_job(
         job,
         deps,
-        provider_config=object(),
+        provider_config=_TEST_PROVIDER_CONFIG,
         api_key=None,
         runtime_token="rt",
     ))
@@ -684,6 +693,221 @@ def test_pending_final_reply_recovers_before_any_new_provider_call(monkeypatch):
         ).fetchone()[0]
     assert replies == 1
     assert effect_status == "applied"
+
+
+@pytest.mark.parametrize("advance_cursor_after_snapshot", [False, True])
+def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
+    monkeypatch,
+    advance_cursor_after_snapshot,
+):
+    """A send that lands after wake claim but before its tail snapshot is chat work.
+
+    A concurrent compaction watermark can put the row only in the encrypted
+    summary, so tail membership is not enough.  The durable reply cursor still
+    proves it was unanswered: wake retires without calling the model and the
+    pending chat lane consumes the row exactly once.
+    """
+    uid = (
+        "u_atomic_wake_presnapshot_yield_"
+        f"{int(bool(advance_cursor_after_snapshot))}"
+    )
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    wake_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    wake_job = jobs_store.claim_next_job("wake-snapshot-worker")
+    assert wake_job is not None and wake_job["id"] == wake_id
+
+    plaintext: dict[str, str] = {}
+    input_seq_box = {"value": 0}
+
+    def _append_racing_send() -> None:
+        if input_seq_box["value"]:
+            return
+        message_id = "wake-presnapshot-user"
+        plaintext[message_id] = "answer this in the chat lane"
+        db.chat_append_strict(
+            uid,
+            message_id,
+            100.0,
+            {
+                "id": message_id,
+                "role": "user",
+                "ts": 100.0,
+                "body_ct": "cipher-user",
+                "nonce": "n",
+                "K_user": "k",
+                "K_enclave": "e",
+            },
+            5000,
+        )
+        input_seq_box["value"] = int(db.chat_seq_for_msg_id(uid, message_id))
+        # Production chat/send persists the row and this job atomically.  The
+        # test hook performs both synchronously at the same race boundary.
+        jobs_store.enqueue_job(uid, "chat")
+
+    def _summary_with_send_race(_uid: str):
+        _append_racing_send()
+        return (
+            "- user: answer this in the chat lane",
+            100.0,
+            1,
+            input_seq_box["value"],
+        )
+
+    def _plain_rows(after_seq: int, *, limit=None, oldest_first=True, through_seq=None):
+        rows = db.chat_messages_after_seq(
+            uid,
+            after_seq,
+            limit=limit,
+            oldest_first=oldest_first,
+            through_seq=through_seq,
+        )
+        return [
+            {
+                "id": row["id"],
+                "seq": row["seq"],
+                "ts": row["ts"],
+                "role": row.get("role", "user"),
+                "content": plaintext.get(row["id"], "[assistant reply]"),
+            }
+            for row in rows
+        ]
+
+    def _messages_after(_uid: str, after_seq: int):
+        return [
+            row
+            for row in _plain_rows(after_seq)
+            if row["role"] in {"user", "human"}
+        ]
+
+    def _tail_after(_uid: str, after_seq: int, limit: int, *, through_seq=None):
+        return _plain_rows(
+            after_seq,
+            limit=limit,
+            oldest_first=False,
+            through_seq=through_seq,
+        )
+
+    provider_calls: list[list[dict]] = []
+
+    async def _provider(_config, messages, *, tools=None):
+        provider_calls.append(messages)
+        return {"reply": "chat answered once", "tool_calls": [], "usage": {}}
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    monkeypatch.setattr(
+        worker,
+        "_perception_grounding_results",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+    )
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, _text, *, item_id=None: (_envelope(str(item_id)), ""),
+    )
+    if advance_cursor_after_snapshot:
+        original_assert = worker._assert_prompt_tail_exact
+        advanced = {"done": False}
+
+        async def _assert_then_finish_concurrent_chat(*args, **kwargs):
+            await original_assert(*args, **kwargs)
+            if advanced["done"]:
+                return
+            advanced["done"] = True
+            # Model a final-effect recovery that commits immediately after the
+            # wake froze its prompt.  Wake must retain its earlier cursor read;
+            # reloading the advanced cursor here would let it reply from a
+            # snapshot that omitted this assistant row.
+            db.chat_append_strict(
+                uid,
+                "concurrent-chat-reply",
+                101.0,
+                {
+                    "id": "concurrent-chat-reply",
+                    "role": "openclaw",
+                    "ts": 101.0,
+                    "body_ct": "cipher-reply",
+                    "nonce": "n",
+                    "K_user": "k",
+                    "K_enclave": "e",
+                },
+                5000,
+            )
+            db.patch_blob(
+                uid,
+                "model_api_runtime",
+                {"v2_reply_cursor_seq": input_seq_box["value"]},
+            )
+
+        monkeypatch.setattr(
+            worker,
+            "_assert_prompt_tail_exact",
+            _assert_then_finish_concurrent_chat,
+        )
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        read_messages_after_seq=_messages_after,
+        read_tail_after_seq=_tail_after,
+        read_compaction_tail_after_seq=_tail_after,
+        read_summary_with_seq=_summary_with_send_race,
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        write_summary=lambda *_args: True,
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+
+    assert asyncio.run(
+        worker.process_job(
+            wake_job,
+            deps,
+            provider_config=_TEST_PROVIDER_CONFIG,
+            api_key=None,
+            runtime_token="rt",
+        )
+    ) == "completed"
+    assert provider_calls == []
+    assert cursor.load_seq(core_store.get_store(uid)) == (
+        input_seq_box["value"] if advance_cursor_after_snapshot else 0
+    )
+    assert jobs_store.get_job_status(
+        wake_id,
+        user_id=uid,
+        claimed_by=str(wake_job["claimed_by"]),
+    ) == "completed"
+
+    chat_job = jobs_store.claim_next_job("chat-after-wake-yield")
+    assert chat_job is not None and chat_job["lane"] == "chat"
+    assert asyncio.run(
+        worker.process_job(
+            chat_job,
+            deps,
+            provider_config=_TEST_PROVIDER_CONFIG,
+            api_key=None,
+            runtime_token="rt",
+        )
+    ) == "completed"
+
+    input_seq = input_seq_box["value"]
+    assert input_seq > 0
+    assert cursor.load_seq(core_store.get_store(uid)) == input_seq
+    if advance_cursor_after_snapshot:
+        assert provider_calls == []
+    else:
+        assert len(provider_calls) == 1
+        assert sum(
+            "answer this in the chat lane" in str(message.get("content") or "")
+            for message in provider_calls[0]
+            if isinstance(message, dict)
+        ) == 1
+    with db.get_pool().connection() as conn:
+        reply_count = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role'='openclaw'",
+            (uid,),
+        ).fetchone()[0]
+    assert reply_count == 1
 
 
 def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(monkeypatch):
@@ -772,8 +996,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
 
     def _apply(user_id: str):
-        return effect_outbox.apply_pending_effects(
-            user_id, dispatch=serve_worker.build_production_effect_dispatch(user_id))
+        return serve_worker._apply_pending_effects_for_user(user_id)
 
     deps = worker.TurnDeps(
         read_messages=lambda _uid: [],
@@ -790,7 +1013,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("same-ts-worker")
     assert asyncio.run(worker.process_job(
-        job, deps, provider_config=object(),
+        job, deps, provider_config=_TEST_PROVIDER_CONFIG,
         api_key=None, runtime_token="rt",
     )) == "completed"
 
@@ -815,7 +1038,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     jobs_store.enqueue_job(uid, "chat")
     empty_job = jobs_store.claim_next_job("same-ts-empty")
     assert asyncio.run(worker.process_job(
-        empty_job, deps, provider_config=object(),
+        empty_job, deps, provider_config=_TEST_PROVIDER_CONFIG,
         api_key=None, runtime_token="rt",
     )) == "completed"
 
@@ -831,7 +1054,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     jobs_store.enqueue_job(uid, "chat")
     fourth_job = jobs_store.claim_next_job("same-ts-fourth")
     assert asyncio.run(worker.process_job(
-        fourth_job, deps, provider_config=object(),
+        fourth_job, deps, provider_config=_TEST_PROVIDER_CONFIG,
         api_key=None, runtime_token="rt",
     )) == "completed"
     assert calls_after

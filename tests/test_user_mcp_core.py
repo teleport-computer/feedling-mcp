@@ -8,6 +8,7 @@ whatever the envelope builder hands back and never leaks plaintext secrets
 into the public (masked) view.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -153,6 +154,111 @@ def test_patch_enabled_keeps_envelope(store, monkeypatch):
     after = mcp_core.envelopes_payload(store)[0]["servers"][0]
     assert after["config_envelope"] == before and after["enabled"] is False
     assert mcp_core.fingerprint_for_store(store) != fp_before
+
+
+def test_patch_read_only_approvals_preserves_encrypted_connection_config(
+    store, monkeypatch,
+):
+    _fake_envelope(monkeypatch)
+    from core import enclave as core_enclave
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, api_key, *, purpose, runtime_token="": bytes.fromhex(
+            envelope["ct"]
+        ),
+    )
+    mcp_core.upsert_server(store, {
+        "name": "jira",
+        "url": "https://mcp.example.com/rpc",
+        "headers": {"Authorization": "Bearer secret"},
+        "ca_pem": self_signed_ca_pem(),
+    })
+    before = mcp_core.envelopes_payload(store)[0]["servers"][0]["config_envelope"]
+    fingerprint = "a" * 64
+
+    body, status = mcp_core.set_enabled(
+        store,
+        "jira",
+        {"read_only_tool_fingerprints": {"search": fingerprint}},
+        "api-key",
+    )
+
+    assert status == 200, body
+    assert body["enabled"] is True
+    after = mcp_core.envelopes_payload(store)[0]["servers"][0]["config_envelope"]
+    assert after != before
+    secret = json.loads(bytes.fromhex(after["ct"]))
+    assert secret["url"] == "https://mcp.example.com/rpc"
+    assert secret["headers"] == {"Authorization": "Bearer secret"}
+    assert "BEGIN CERTIFICATE" in secret["ca_pem"]
+    assert secret["read_only_tool_fingerprints"] == {"search": fingerprint}
+
+
+def test_patch_read_only_approvals_fails_without_changing_enabled(
+    store, monkeypatch,
+):
+    _fake_envelope(monkeypatch)
+    from core import enclave as core_enclave
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("secret")),
+    )
+    mcp_core.upsert_server(
+        store,
+        {"name": "jira", "url": "https://mcp.example.com", "headers": {}},
+    )
+
+    body, status = mcp_core.set_enabled(
+        store,
+        "jira",
+        {
+            "enabled": False,
+            "read_only_tool_fingerprints": {"search": "a" * 64},
+        },
+        "api-key",
+    )
+
+    assert status == 400
+    assert body == {"error": {"kind": "decrypt_failed", "detail": ""}}
+    listed, _ = mcp_core.list_servers(store)
+    assert listed["servers"][0]["enabled"] is True
+
+
+def test_patch_empty_read_only_approvals_revokes_existing_map(
+    store, monkeypatch,
+):
+    _fake_envelope(monkeypatch)
+    from core import enclave as core_enclave
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, api_key, *, purpose, runtime_token="": bytes.fromhex(
+            envelope["ct"]
+        ),
+    )
+    mcp_core.upsert_server(store, {
+        "name": "jira",
+        "url": "https://mcp.example.com",
+        "headers": {},
+        "read_only_tool_fingerprints": {"search": "a" * 64},
+    })
+
+    _, status = mcp_core.set_enabled(
+        store,
+        "jira",
+        {"read_only_tool_fingerprints": {}},
+        "api-key",
+    )
+
+    assert status == 200
+    envelope = mcp_core.envelopes_payload(store)[0]["servers"][0]["config_envelope"]
+    secret = json.loads(bytes.fromhex(envelope["ct"]))
+    assert "read_only_tool_fingerprints" not in secret
 
 
 def test_delete_server(store, monkeypatch):

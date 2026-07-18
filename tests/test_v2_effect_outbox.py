@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
-from model_api_runtime.v2 import effect_outbox, effect_id
+from model_api_runtime.v2 import effect_outbox, effect_id, jobs_store
 
 from conftest import seed_user
 
@@ -29,6 +30,30 @@ def _set_v2_owner(user_id: str) -> None:
             "UPDATE v2_runtime_state SET hosted_runtime_state='v2' "
             "WHERE user_id=%s",
             (user_id,),
+        )
+
+
+def _seed_active_route(
+    user_id: str,
+    *,
+    error: str = "",
+    error_class: str = "",
+) -> None:
+    credential_id = str(uuid.uuid4())
+    route_id = str(uuid.uuid4())
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO model_api_credentials "
+            "(id,user_id,provider,label,base_url,api_key_envelope) "
+            "VALUES (%s,%s,'anthropic','test','','{}'::jsonb)",
+            (credential_id, user_id),
+        )
+        conn.execute(
+            "INSERT INTO model_api_routes "
+            "(id,user_id,credential_id,model,is_active,test_status,"
+            "last_runtime_error,last_runtime_error_class) "
+            "VALUES (%s,%s,%s,'claude-test',true,'ok',%s,%s)",
+            (route_id, user_id, credential_id, error, error_class),
         )
 
 
@@ -75,6 +100,610 @@ def test_apply_dispatches_when_generation_matches(pg_clean):
     assert payload["text"] == "keep"
     assert payload["effect_id"] == eid
     assert db.effect_pending("u_ob2") == []
+
+
+def _running_chat_job(uid: str, generation: int, *, owner: str = "owner") -> int:
+    job_id, coalesced = jobs_store.enqueue_job(
+        uid, "chat", expected_generation=generation)
+    assert coalesced is False
+    job = jobs_store.claim_next_job(owner)
+    assert job is not None and int(job["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=owner) is True
+    return job_id
+
+
+def _final_fence_payload(
+    *, input_generation: int, through_seq: int, claimed_by: str = "owner"
+) -> dict:
+    return {
+        "text": "candidate final",
+        "reply_through_seq": through_seq,
+        effect_outbox.FINAL_REPLY_FENCE_KEY: {
+            "claimed_by": claimed_by,
+            "input_generation": input_generation,
+            "through_seq": through_seq,
+        },
+    }
+
+
+def test_fenced_reply_is_hidden_from_old_pending_reader_but_current_drain_sees_it(
+    pg_clean,
+):
+    """A pre-0041 sweeper must not split the new compound reply boundary."""
+    uid = "u_ob_mixed_version_fenced_pending"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_chat_job(uid, generation)
+    effect_type = effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE
+    eid = effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=effect_type,
+        ordinal=0,
+        expected_generation=generation,
+        payload={
+            "text": "still working",
+            effect_outbox.REPLY_SOURCE_FENCE_KEY: {"claimed_by": "owner"},
+        },
+    )
+
+    with db.get_pool().connection() as conn:
+        status = conn.execute(
+            "SELECT status FROM v2_effect_outbox WHERE effect_id=%s",
+            (eid,),
+        ).fetchone()[0]
+        # This is the exact predicate used by the origin/pre applier and its
+        # fleet-wide 60-second sweeper.
+        old_reader = conn.execute(
+            "SELECT effect_id FROM v2_effect_outbox "
+            "WHERE user_id=%s AND status='pending' ORDER BY enqueue_seq",
+            (uid,),
+        ).fetchall()
+    assert status == "pending_fenced_v1"
+    assert old_reader == []
+    assert [row["effect_id"] for row in db.effect_pending(uid)] == [eid]
+    assert uid in db.effect_pending_users()
+    assert db.effect_outbox_health()["pending"] == 1
+
+    seen = []
+    result = effect_outbox.apply_pending_effects(
+        uid,
+        dispatch=lambda kind, payload: seen.append((kind, payload["text"])),
+    )
+
+    assert result == {"applied": 1, "discarded": 0}
+    assert seen == [("reply", "still working")]
+    assert db.effect_pending(uid) == []
+
+
+def test_valid_final_reply_atomically_completes_job_and_clears_route_error(
+    pg_clean,
+):
+    uid = "u_ob_final_atomic_completion"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    _seed_active_route(
+        uid,
+        error="previous_runtime_failure",
+        error_class="provider",
+    )
+    job_id = _running_chat_job(uid, generation)
+    eid = effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
+    assert db.effect_enqueue(
+        eid,
+        uid,
+        job_id,
+        "reply",
+        generation,
+        _final_fence_payload(input_generation=0, through_seq=0),
+    )
+    seen = []
+
+    result = effect_outbox.apply_pending_effects(
+        uid, dispatch=lambda *args: seen.append(args))
+
+    assert result == {
+        "applied": 1,
+        "discarded": 0,
+        effect_outbox.FINALIZED_JOB_IDS_KEY: [job_id],
+    }
+    assert len(seen) == 1
+    with db.get_pool().connection() as conn:
+        job = conn.execute(
+            "SELECT status,finished_at IS NOT NULL FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+        effect = conn.execute(
+            "SELECT status,applied_at IS NOT NULL FROM v2_effect_outbox "
+            "WHERE effect_id=%s",
+            (eid,),
+        ).fetchone()
+        route = conn.execute(
+            "SELECT last_runtime_error,last_runtime_error_class "
+            "FROM model_api_routes WHERE user_id=%s AND is_active",
+            (uid,),
+        ).fetchone()
+    assert job == ("completed", True)
+    assert effect == ("applied", True)
+    assert route == ("", "")
+
+
+def test_final_reply_send_first_is_discarded_before_dispatch(pg_clean):
+    """If B commits while the provider is in flight, its generation bump wins
+    before final-effect apply and the stale A-only answer never reaches a sink."""
+    uid = "u_ob_late_final_send_first"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_chat_job(uid, generation)
+    eid = effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
+    assert db.effect_enqueue(
+        eid,
+        uid,
+        job_id,
+        "reply",
+        generation,
+        _final_fence_payload(input_generation=0, through_seq=0),
+    )
+
+    same_id, coalesced = jobs_store.enqueue_job(
+        uid, "chat", expected_generation=generation)
+    assert (same_id, coalesced) == (job_id, True)
+    seen = []
+
+    result = effect_outbox.apply_pending_effects(
+        uid, dispatch=lambda *args: seen.append(args))
+
+    assert result == {
+        "applied": 0,
+        "discarded": 1,
+        effect_outbox.FINAL_REPLY_SUPERSEDED_EFFECT_IDS_KEY: [eid],
+    }
+    assert seen == []
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,last_error FROM v2_effect_outbox WHERE effect_id=%s",
+            (eid,),
+        ).fetchone()
+    assert row == ("discarded", "input_generation_advanced")
+    assert effect_outbox.get_effect_disposition(
+        eid, user_id=uid, job_id=job_id
+    ) == {
+        "status": "discarded",
+        "last_error": effect_outbox.FINAL_REPLY_INPUT_ADVANCED,
+    }
+    # A producer drain that runs after an independent sweeper sees no changed
+    # rows; the authoritative disposition above remains durable and queryable.
+    assert effect_outbox.apply_pending_effects(
+        uid, dispatch=lambda *_args: pytest.fail("stale reply dispatched")
+    ) == {"applied": 0, "discarded": 0}
+
+
+def test_final_reply_apply_first_serializes_send_after_dispatch(pg_clean):
+    """If final-effect apply locks first, a concurrent send waits until the
+    reply sink has finished. This is the other legal linearization ordering."""
+    uid = "u_ob_late_final_apply_first"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_chat_job(uid, generation)
+    eid = effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
+    assert db.effect_enqueue(
+        eid,
+        uid,
+        job_id,
+        "reply",
+        generation,
+        _final_fence_payload(input_generation=0, through_seq=0),
+    )
+
+    dispatch_entered = threading.Event()
+    release_dispatch = threading.Event()
+
+    def blocking_dispatch(_effect_type, payload):
+        assert effect_outbox.FINAL_REPLY_FENCE_KEY not in payload
+        dispatch_entered.set()
+        assert release_dispatch.wait(timeout=3)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        apply_future = pool.submit(
+            effect_outbox.apply_pending_effects,
+            uid,
+            dispatch=blocking_dispatch,
+        )
+        assert dispatch_entered.wait(timeout=3)
+        send_future = pool.submit(
+            db.chat_append_and_enqueue,
+            uid,
+            "B",
+            20.0,
+            {"id": "B", "role": "user", "body_ct": "ciphertext-B"},
+            5000,
+            "chat",
+            expected_generation=generation,
+        )
+        try:
+            # Final publication owns the runtime/source-job transaction through
+            # dispatch, so B cannot persist or choose an active job yet.
+            with pytest.raises(FutureTimeoutError):
+                send_future.result(timeout=0.25)
+        finally:
+            release_dispatch.set()
+
+        assert apply_future.result(timeout=3) == {
+            "applied": 1,
+            "discarded": 0,
+            effect_outbox.FINALIZED_JOB_IDS_KEY: [job_id],
+        }
+        b_seq, fresh_job_id = send_future.result(timeout=3)
+
+    assert b_seq == db.chat_seq_for_msg_id(uid, "B")
+    assert fresh_job_id != job_id
+    with db.get_pool().connection() as conn:
+        jobs = conn.execute(
+            "SELECT id,status,input_generation,expected_runtime_generation "
+            "FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+        message = conn.execute(
+            "SELECT doc->>'role',doc->>'body_ct' FROM chat_messages "
+            "WHERE user_id=%s AND msg_id='B'",
+            (uid,),
+        ).fetchone()
+    assert jobs == [
+        (job_id, "completed", 0, generation),
+        (fresh_job_id, "pending", 0, generation),
+    ]
+    assert message == ("user", "ciphertext-B")
+
+
+def test_exact_disposition_waits_for_concurrent_applier_commit(pg_clean):
+    """A producer querying its exact effect must not observe the old pending
+    snapshot while an independent sweeper is already publishing that row."""
+    uid = "u_ob_exact_disposition_waits"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_chat_job(uid, generation)
+    eid = effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
+    assert db.effect_enqueue(
+        eid,
+        uid,
+        job_id,
+        "reply",
+        generation,
+        _final_fence_payload(input_generation=0, through_seq=0),
+    )
+    dispatch_entered = threading.Event()
+    release_dispatch = threading.Event()
+
+    def blocking_dispatch(_effect_type, _payload):
+        dispatch_entered.set()
+        assert release_dispatch.wait(timeout=3)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        apply_future = pool.submit(
+            effect_outbox.apply_pending_effects,
+            uid,
+            dispatch=blocking_dispatch,
+        )
+        assert dispatch_entered.wait(timeout=3)
+        disposition_future = pool.submit(
+            effect_outbox.get_effect_disposition,
+            eid,
+            user_id=uid,
+            job_id=job_id,
+        )
+        try:
+            with pytest.raises(FutureTimeoutError):
+                disposition_future.result(timeout=0.25)
+        finally:
+            release_dispatch.set()
+
+        assert apply_future.result(timeout=3) == {
+            "applied": 1,
+            "discarded": 0,
+            effect_outbox.FINALIZED_JOB_IDS_KEY: [job_id],
+        }
+        assert disposition_future.result(timeout=3) == {
+            "status": "applied",
+            "last_error": "",
+        }
+
+
+def test_consumed_seq_frontier_independently_discards_newer_user_row(pg_clean):
+    uid = "u_ob_late_final_seq_belt"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_chat_job(uid, generation)
+    # Simulate a future/broken admission producer that persisted B without the
+    # generation bump. The consumed-seq belt must still refuse the stale final.
+    db.chat_append_strict(
+        uid,
+        "late-user-row",
+        1.0,
+        {"id": "late-user-row", "role": "user", "body_ct": "ciphertext"},
+        5000,
+    )
+    eid = effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
+    assert db.effect_enqueue(
+        eid,
+        uid,
+        job_id,
+        "reply",
+        generation,
+        _final_fence_payload(input_generation=0, through_seq=0),
+    )
+
+    result = effect_outbox.apply_pending_effects(
+        uid, dispatch=lambda *_args: pytest.fail("stale reply dispatched"))
+    assert result[effect_outbox.FINAL_REPLY_SUPERSEDED_EFFECT_IDS_KEY] == [eid]
+
+
+def test_final_reply_from_terminalized_source_job_is_discarded(pg_clean):
+    """A reaper/lifecycle transition that wins after the worker's last lease
+    renewal must fence the not-yet-published final reply at the effect row."""
+    uid = "u_ob_final_source_job_terminal"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_chat_job(uid, generation)
+    eid = effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
+    assert db.effect_enqueue(
+        eid,
+        uid,
+        job_id,
+        "reply",
+        generation,
+        _final_fence_payload(input_generation=0, through_seq=0),
+    )
+    assert jobs_store.mark_failed(
+        job_id, "lease_lost_test", claimed_by="owner") is True
+    seen = []
+
+    result = effect_outbox.apply_pending_effects(
+        uid, dispatch=lambda *args: seen.append(args))
+
+    assert result == {
+        "applied": 0,
+        "discarded": 1,
+        effect_outbox.FINAL_REPLY_SUPERSEDED_EFFECT_IDS_KEY: [eid],
+    }
+    assert seen == []
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,last_error FROM v2_effect_outbox WHERE effect_id=%s",
+            (eid,),
+        ).fetchone()
+    assert row == ("discarded", "source_job_not_active")
+
+
+def test_intermediate_reply_is_not_late_input_fenced(pg_clean):
+    uid = "u_ob_intermediate_unfenced"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_chat_job(uid, generation)
+    jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
+    eid = effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
+    assert db.effect_enqueue(
+        eid, uid, job_id, "reply", generation, {"text": "I am checking"})
+    seen = []
+
+    assert effect_outbox.apply_pending_effects(
+        uid,
+        dispatch=lambda effect_type, payload: seen.append((effect_type, payload)),
+    ) == {"applied": 1, "discarded": 0}
+    assert seen[0][0] == "reply"
+    assert seen[0][1]["text"] == "I am checking"
+    with db.get_pool().connection() as conn:
+        job = conn.execute(
+            "SELECT status,finished_at FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert job == ("running", None)
+
+
+@pytest.mark.parametrize("failure_mode", ["owner_mismatch", "dispatch_failure"])
+def test_final_reply_completion_failure_rolls_back_and_fails_closed(
+    pg_clean, monkeypatch, failure_mode,
+):
+    uid = f"u_ob_final_completion_rollback_{failure_mode}"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    _seed_active_route(
+        uid,
+        error="keep_previous_failure",
+        error_class="provider",
+    )
+    job_id = _running_chat_job(uid, generation)
+    eid = effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
+    assert db.effect_enqueue(
+        eid,
+        uid,
+        job_id,
+        "reply",
+        generation,
+        _final_fence_payload(input_generation=0, through_seq=0),
+    )
+    seen = []
+
+    if failure_mode == "owner_mismatch":
+        real_complete = effect_outbox._complete_final_reply_job_on_cursor
+
+        def lose_owner(cur, **kwargs):
+            kwargs["claimed_by"] = "not-the-owner"
+            return real_complete(cur, **kwargs)
+
+        monkeypatch.setattr(
+            effect_outbox, "_complete_final_reply_job_on_cursor", lose_owner)
+
+        def dispatch(*args):
+            seen.append(args)
+    else:
+        def dispatch(*args):
+            seen.append(args)
+            raise RuntimeError("reply sink failed")
+
+    with pytest.raises(RuntimeError):
+        effect_outbox.apply_pending_effects(uid, dispatch=dispatch)
+
+    # Owner loss is detected before the sink. A sink failure happens after the
+    # tentative completion, whose savepoint must roll back job + route changes.
+    assert len(seen) == (0 if failure_mode == "owner_mismatch" else 1)
+    with db.get_pool().connection() as conn:
+        job = conn.execute(
+            "SELECT status,finished_at FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+        effect = conn.execute(
+            "SELECT status,attempt_count,last_error FROM v2_effect_outbox "
+            "WHERE effect_id=%s",
+            (eid,),
+        ).fetchone()
+        route = conn.execute(
+            "SELECT last_runtime_error,last_runtime_error_class "
+            "FROM model_api_routes WHERE user_id=%s AND is_active",
+            (uid,),
+        ).fetchone()
+    assert job == ("running", None)
+    assert effect == ("pending", 1, "dispatch_failed:RuntimeError")
+    assert route == ("keep_previous_failure", "provider")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing",
+        "null",
+        "fractional_generation",
+        "string_generation",
+        "boolean_generation",
+        "fractional_seq",
+        "nonstr_owner",
+        "frontier_mismatch",
+        "frontier_beyond_input",
+    ],
+)
+def test_malformed_final_reply_fence_is_terminally_discarded(pg_clean, case):
+    uid = f"u_ob_invalid_final_fence_{case}"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_chat_job(uid, generation)
+    payload = _final_fence_payload(input_generation=0, through_seq=0)
+    fence = payload[effect_outbox.FINAL_REPLY_FENCE_KEY]
+    if case == "missing":
+        payload.pop(effect_outbox.FINAL_REPLY_FENCE_KEY)
+    elif case == "null":
+        payload[effect_outbox.FINAL_REPLY_FENCE_KEY] = None
+    elif case == "fractional_generation":
+        fence["input_generation"] = 0.9
+    elif case == "string_generation":
+        fence["input_generation"] = "0"
+    elif case == "boolean_generation":
+        fence["input_generation"] = False
+    elif case == "fractional_seq":
+        fence["through_seq"] = 0.9
+    elif case == "nonstr_owner":
+        fence["claimed_by"] = 123
+    elif case == "frontier_mismatch":
+        fence["through_seq"] = 1
+    elif case == "frontier_beyond_input":
+        fence["through_seq"] = 10
+        payload["reply_through_seq"] = 10
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(case)
+
+    eid = effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
+    assert db.effect_enqueue(
+        eid, uid, job_id, "reply", generation, payload)
+    seen = []
+
+    result = effect_outbox.apply_pending_effects(
+        uid, dispatch=lambda *args: seen.append(args))
+
+    assert result == {
+        "applied": 0,
+        "discarded": 1,
+        effect_outbox.FINAL_REPLY_SUPERSEDED_EFFECT_IDS_KEY: [eid],
+    }
+    assert seen == []
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,last_error,attempt_count FROM v2_effect_outbox "
+            "WHERE effect_id=%s",
+            (eid,),
+        ).fetchone()
+    assert row == ("discarded", effect_outbox.FINAL_REPLY_INVALID_FENCE, 0)
+
+
+def test_final_reply_blocked_past_lease_expiry_is_not_dispatched(
+    pg_clean, monkeypatch,
+):
+    uid = "u_ob_final_lease_expires_while_blocked"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_chat_job(uid, generation)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET lease_expires_at="
+            "clock_timestamp() + interval '0.25 seconds' WHERE id=%s",
+            (job_id,),
+        )
+    eid = effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
+    assert db.effect_enqueue(
+        eid,
+        uid,
+        job_id,
+        "reply",
+        generation,
+        _final_fence_payload(input_generation=0, through_seq=0),
+    )
+
+    apply_entered = threading.Event()
+    real_fence = db._lock_chat_user_fence_on_cursor
+
+    def observed_fence(cur, user_id, *, exclusive=False):
+        real_fence(cur, user_id, exclusive=exclusive)
+        if user_id == uid and not exclusive:
+            apply_entered.set()
+
+    monkeypatch.setattr(db, "_lock_chat_user_fence_on_cursor", observed_fence)
+    seen = []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with db.get_pool().connection() as blocker:
+            with blocker.transaction():
+                blocker.execute(
+                    "SELECT 1 FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                    (uid,),
+                )
+                future = pool.submit(
+                    effect_outbox.apply_pending_effects,
+                    uid,
+                    dispatch=lambda *args: seen.append(args),
+                )
+                assert apply_entered.wait(timeout=3)
+                time.sleep(0.4)
+        result = future.result(timeout=3)
+
+    assert seen == []
+    assert result == {
+        "applied": 0,
+        "discarded": 1,
+        effect_outbox.FINAL_REPLY_SUPERSEDED_EFFECT_IDS_KEY: [eid],
+    }
+    assert effect_outbox.get_effect_disposition(
+        eid, user_id=uid, job_id=job_id
+    ) == {
+        "status": "discarded",
+        "last_error": effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE,
+    }
 
 
 def test_apply_discards_stale_generation_without_dispatch(pg_clean):

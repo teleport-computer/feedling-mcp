@@ -101,9 +101,19 @@ async def dispatch_tool_calls(
 
     async def _read(tc):
         step = {"type": tc.name, "payload": tc.args}
-        _t, data = await _run_one(store, step, api_key=api_key, runtime_token=runtime_token,
-                                   enclave_sem=enclave_sem)
-        content = _summarize_capability_result(data)
+        try:
+            _t, data = await _run_one(
+                store, step, api_key=api_key, runtime_token=runtime_token,
+                enclave_sem=enclave_sem,
+            )
+            content = _summarize_capability_result(data)
+        except Exception:  # noqa: BLE001 — isolate one bad read; never expose its exception
+            # Read calls are independent and side-effect-free.  A capability bug or
+            # adapter failure must not discard successful sibling results or fail the
+            # whole turn.  Keep the error vocabulary stable and privacy-safe: exception
+            # text can contain decrypted data, URLs, or query terms.  Cancellation is a
+            # BaseException on supported Python versions and therefore still propagates.
+            content = "error: capability_failed"
         return tc.id, ToolResult(call_id=tc.id, content=content)
 
     read_sem = asyncio.Semaphore(max(1, int(read_parallelism)))

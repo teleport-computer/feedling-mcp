@@ -5,6 +5,7 @@ executor). Mirrors test_v2_worker_tool_loop.py's real-DB harness."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import sys
 from pathlib import Path
 
@@ -24,7 +25,7 @@ pytestmark = pytest.mark.skipif(
     not __import__("os").environ.get("DATABASE_URL"), reason="needs PG")
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="")
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
 
 _MCP_SPEC = ToolSpec(name="mcp__test__ping", description="ping the test server",
                      parameters={"type": "object", "properties": {}})
@@ -105,15 +106,32 @@ class _FakeMcpTurn:
     def handles(self, name):
         return str(name).startswith("mcp__")
 
+    def is_read_only(self, name):
+        return False
+
+    @property
+    def mutating_tool_names(self):
+        return frozenset(spec.name for spec in self.tool_specs)
+
     async def dispatch(self, call):
         self._rec.append((call.name, dict(call.args or {})))
         return ToolResult(call_id=call.id, content="pong from test server")
 
 
 def _make_load_turn_mcp(turn, seen=None):
-    async def _fake_load(store, *, api_key=None, runtime_token=""):
+    async def _fake_load(
+        store,
+        *,
+        api_key=None,
+        runtime_token="",
+        enclave_sem=None,
+    ):
         if seen is not None:
-            seen.append({"user_id": store.user_id, "runtime_token": runtime_token})
+            seen.append({
+                "user_id": store.user_id,
+                "runtime_token": runtime_token,
+                "enclave_sem": enclave_sem,
+            })
         return turn
     return _fake_load
 
@@ -125,6 +143,8 @@ def test_chat_turn_offers_and_dispatches_configured_mcp_tool(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
     _patch_real_write(monkeypatch)
+    progress = []
+    monkeypatch.setattr(worker, "_report_turn_progress", progress.append)
 
     dispatched = []
     seen_load = []
@@ -146,10 +166,12 @@ def test_chat_turn_offers_and_dispatches_configured_mcp_tool(monkeypatch):
     # load_turn_mcp was called with this turn's user + runtime token
     assert seen_load and seen_load[0]["user_id"] == uid
     assert seen_load[0]["runtime_token"] == "rt-turn"
+    assert seen_load[0]["enclave_sem"] is worker.ENCLAVE_SEMAPHORE
     # the MCP tool was offered to the provider in round 1
     assert any(s.name == "mcp__test__ping" for s in calls[0]["tools"])
     # the mcp__ call was routed to the MCP dispatcher (not the platform executor)
     assert dispatched == [("mcp__test__ping", {})]
+    assert "tool_mutation_complete" in progress
     # the turn produced the model's final reply
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1 and bubbles[0]["body_ct"] == "the server said pong"
@@ -177,3 +199,109 @@ def test_chat_turn_without_mcp_offers_no_mcp_tools(monkeypatch):
     assert status == "completed"
     assert not any(s.name.startswith("mcp__") for s in calls[0]["tools"])
     assert _bubbles(uid)[0]["body_ct"] == "plain answer"
+
+
+def test_platform_write_is_exactly_applied_before_later_round_mcp_mutation(
+    monkeypatch,
+):
+    uid = "u_mcp_platform_order"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    def _fake_build(store, plaintext, *, item_id=None):
+        return ({
+            "id": item_id,
+            "owner_user_id": store.user_id,
+            "body_ct": base64.b64encode(plaintext).decode("ascii"),
+        }, "")
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_build,
+    )
+
+    events = []
+
+    class _OrderingMcpTurn(_FakeMcpTurn):
+        async def dispatch(self, call):
+            events.append("mcp_committed")
+            return await super().dispatch(call)
+
+    turn = _OrderingMcpTurn([_MCP_SPEC], [])
+
+    def _apply(user_id):
+        from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+
+        def dispatch(effect_type, payload):
+            if effect_type == worker.ENCRYPTED_TOOL_EFFECT_TYPES["memory"]:
+                events.append("platform_applied")
+            elif effect_type == "reply":
+                worker._write_encrypted_reply(
+                    core_store.get_store(user_id),
+                    str(payload.get("text") or ""),
+                )
+
+        return v2_effect_outbox.apply_pending_effects(
+            user_id, dispatch=dispatch)
+
+    provider_calls = 0
+
+    async def _provider(config, messages, *, tools=None):
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            return {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "p1",
+                    "name": "memory_write",
+                    "args": {"actions": [{
+                        "op": "add",
+                        "summary": "likes tea",
+                        "content": "likes tea",
+                    }]},
+                }],
+                "usage": {},
+            }
+        if provider_calls == 2:
+            assert events == ["platform_applied"]
+            platform_result = next(
+                result.content
+                for message in messages
+                if hasattr(message, "results")
+                for result in message.results
+                if result.call_id == "p1"
+            )
+            assert platform_result == "ok: memory_write applied"
+            return {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "m1",
+                    "name": _MCP_SPEC.name,
+                    "args": {},
+                }],
+                "usage": {},
+            }
+        return {"reply": "done", "tool_calls": [], "usage": {}}
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "save then ping"}],
+        load_mcp_turn=_make_load_turn_mcp(turn),
+    )
+    deps.apply_pending_effects = _apply
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert events == ["platform_applied", "mcp_committed"]

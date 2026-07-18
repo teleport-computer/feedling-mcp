@@ -38,7 +38,7 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import worker
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="")
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
 
 
 class _FakeCapResult:

@@ -11,6 +11,12 @@ from dataclasses import dataclass
 from typing import Any
 
 
+# Cross-layer stable sentinel for an MCP call whose transport failed after the
+# request may have reached the remote server. Hosted produces it; the dependency-
+# clean V2 worker consumes it and converts mutating calls to outcome-unknown.
+MCP_TRANSPORT_FAILURE_ERROR = "error: mcp_transport_failure"
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     name: str

@@ -250,7 +250,7 @@ def test_production_applier_decrypts_tool_effects_with_one_lazy_token(monkeypatc
         fake_decrypt,
     )
 
-    def fake_apply(user_id, *, dispatch):
+    def fake_apply(user_id, *, dispatch, dispatch_reply_in_transaction=None):
         for logical_type, effect_id in (("memory", "eid-1"), ("identity", "eid-2")):
             dispatch(worker.ENCRYPTED_TOOL_EFFECT_TYPES[logical_type], {
                 "effect_envelope": {
@@ -323,7 +323,7 @@ def test_production_applier_rejects_malformed_encrypted_schedule(monkeypatch):
         lambda *args, **kwargs: b'{}',
     )
 
-    def fake_apply(user_id, *, dispatch):
+    def fake_apply(user_id, *, dispatch, dispatch_reply_in_transaction=None):
         dispatch(worker.ENCRYPTED_TOOL_EFFECT_TYPES["schedule"], {
             "effect_envelope": envelope,
             "effect_id": effect_id,
@@ -356,7 +356,7 @@ def test_production_applier_keeps_legacy_payloads_without_minting_token(monkeypa
         lambda user_id: pytest.fail("legacy payload must not mint a decrypt token"),
     )
 
-    def fake_apply(user_id, *, dispatch):
+    def fake_apply(user_id, *, dispatch, dispatch_reply_in_transaction=None):
         dispatch("memory", {"actions": [], "effect_id": "legacy-id"})
         return {"applied": 1, "discarded": 0}
 

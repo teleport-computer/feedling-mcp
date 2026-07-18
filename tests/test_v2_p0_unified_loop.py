@@ -65,7 +65,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="")
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
 
 
 # ---------------------------------------------------------------------------
@@ -458,11 +458,11 @@ _WIRES = {
     "anthropic": dict(
         decode=provider_client._decode_tool_calls_anthropic, body=_anthropic_body,
         provider_config=provider_client.ProviderConfig(
-            provider="anthropic", model="claude-x", api_key="k", base_url="")),
+            provider="anthropic", model="claude-sonnet-4-test", api_key="k", base_url="")),
     "gemini": dict(
         decode=provider_client._decode_tool_calls_gemini, body=_gemini_body,
         provider_config=provider_client.ProviderConfig(
-            provider="gemini", model="gemini-x", api_key="k", base_url="")),
+            provider="gemini", model="gemini-2-test", api_key="k", base_url="")),
     "openai_chat": dict(
         decode=provider_client._decode_tool_calls_openai_chat, body=_openai_chat_body,
         provider_config=provider_client.ProviderConfig(

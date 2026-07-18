@@ -12,7 +12,7 @@ import provider_client
 from model_api_runtime.v2 import extraction, jobs_store, worker
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user", base_url="")
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user", base_url="")
 
 
 def _seed_v2(uid: str) -> None:
@@ -118,7 +118,9 @@ def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane)
     assert row[3] == 1
     assert row[4] is False
     assert row[5] == "ok"
-    assert row[6:] == (70, 20, 1, 1, "anthropic", "claude-x")
+    assert row[6:] == (
+        70, 20, 1, 1, "anthropic", "claude-sonnet-4-test",
+    )
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])

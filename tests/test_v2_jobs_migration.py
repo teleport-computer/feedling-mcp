@@ -1,4 +1,5 @@
 """0014 迁移落地：四张 V2 表 + single-flight 唯一索引真的存在且生效。"""
+import inspect
 import sys
 from pathlib import Path
 
@@ -19,6 +20,15 @@ def _seed_user(uid):
             "ON CONFLICT (user_id) DO NOTHING",
             (uid,),
         )
+
+
+def _migration_0041_module():
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    return ScriptDirectory.from_config(cfg).get_revision(
+        "0041_v2_mcp_mutation_attempts"
+    ).module
 
 
 def test_v2_tables_exist():
@@ -112,7 +122,237 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     # 0040 chains linearly off 0039 (genesis serve-worker claim attribution for the
     # deploy-orphan fast reclaim); it is the current single head.
     assert script.get_revision("0040_genesis_worker_claim").down_revision == "0039_merge_tee_recon_state"
-    assert script.get_current_head() == "0040_genesis_worker_claim"
+    assert script.get_revision("0041_v2_mcp_mutation_attempts").down_revision == (
+        "0040_genesis_worker_claim"
+    )
+    assert script.get_current_head() == "0041_v2_mcp_mutation_attempts"
+
+
+def test_0041_indexes_and_validated_frontier_constraint_exist():
+    with db.get_pool().connection() as conn:
+        indexes = conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename='v2_effect_outbox'"
+        ).fetchall()
+        constraint = conn.execute(
+            "SELECT convalidated FROM pg_constraint "
+            "WHERE conrelid='v2_effect_outbox'::regclass "
+            "AND conname='ck_v2_effect_input_frontier'"
+        ).fetchone()
+        enqueue_seq_index = conn.execute(
+            "SELECT indisunique FROM pg_index "
+            "WHERE indexrelid='v2_effect_outbox_enqueue_seq_unique'::regclass"
+        ).fetchone()
+    names = {row[0] for row in indexes}
+    assert "ix_v2_effect_user_frontier" in names
+    assert "ix_v2_effect_dispatch_pending_v0041" in names
+    assert constraint == (True,)
+    # 0041's keyset backfill advances on enqueue_seq and therefore relies on
+    # the uniqueness installed by 0033 and retained/repaired by 0034.
+    assert enqueue_seq_index == (True,)
+
+
+def test_0041_claim_gate_is_installed_and_backfill_runs_after_ddl_commit():
+    migration = _migration_0041_module()
+    with db.get_pool().connection() as conn:
+        trigger = conn.execute(
+            "SELECT tgname FROM pg_trigger "
+            "WHERE tgrelid='agent_jobs'::regclass AND NOT tgisinternal "
+            "AND tgname='trg_v2_guard_agent_job_claim_0041'"
+        ).fetchone()
+    assert trigger == ("trg_v2_guard_agent_job_claim_0041",)
+
+    # Structural lock regression: the transaction that takes ALTER/claim-writer
+    # locks contains no historical outbox UPDATE. The keyset backfill starts
+    # only inside the autocommit block, after those locks have been committed.
+    assert "UPDATE v2_effect_outbox effect" not in migration._SCHEMA_UP
+    assert "ALTER TABLE v2_effect_outbox" not in (
+        migration._BACKFILL_EFFECT_FRONTIERS_BATCH
+    )
+    upgrade_source = inspect.getsource(migration.upgrade)
+    assert upgrade_source.index("autocommit_block") < upgrade_source.index(
+        "_backfill_effect_frontiers()"
+    )
+
+
+def test_0041_exact_pre_worker_claim_update_is_fenced():
+    uid = "u_0041_old_claim"
+    _seed_user(uid)
+    try:
+        with db.get_pool().connection() as conn:
+            job_id = conn.execute(
+                "INSERT INTO agent_jobs "
+                "(user_id,lane,status,queue_deadline_at) "
+                "VALUES (%s,'chat','pending',clock_timestamp()+interval '2 minutes') "
+                "RETURNING id",
+                (uid,),
+            ).fetchone()[0]
+            with conn.transaction():
+                # This is the pending->claimed UPDATE issued by origin/pre: it
+                # has no transaction-local 0041 protocol marker. The BEFORE
+                # trigger must return NULL, so UPDATE ... RETURNING yields no row.
+                claimed = conn.execute(
+                    "UPDATE agent_jobs SET status='claimed', claimed_by=%s, "
+                    "claimed_at=now(), expected_runtime_generation="
+                    "COALESCE(expected_runtime_generation,%s), "
+                    "lease_expires_at=now()+make_interval(secs => %s), "
+                    "deadline_at=now()+make_interval(secs => %s) "
+                    "WHERE id=%s RETURNING id",
+                    ("pre-0041-worker", 1, 300.0, 300.0, job_id),
+                ).fetchone()
+            row = conn.execute(
+                "SELECT status,claimed_by,claimed_at FROM agent_jobs WHERE id=%s",
+                (job_id,),
+            ).fetchone()
+        assert claimed is None
+        assert row == ("pending", None, None)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+@pytest.mark.parametrize("status", ["claimed", "running"])
+def test_0041_seeds_and_raises_legacy_active_job_frontier(status):
+    uid = f"u_0041_legacy_active_{status}"
+    migration = _migration_0041_module()
+    _seed_user(uid)
+    try:
+        db.chat_append_strict(
+            uid,
+            "legacy-input-1",
+            1.0,
+            {"id": "legacy-input-1", "role": "user", "body_ct": "ct-1"},
+            5000,
+        )
+        first_seq = db.chat_seq_for_msg_id(uid, "legacy-input-1")
+        with db.get_pool().connection() as conn:
+            job_id = conn.execute(
+                "INSERT INTO agent_jobs "
+                "(user_id,lane,status,claimed_by,input_generation,"
+                " lease_expires_at,deadline_at) "
+                "VALUES (%s,'chat',%s,'pre-0041-worker',0,"
+                " clock_timestamp()+interval '5 minutes',"
+                " clock_timestamp()+interval '5 minutes') RETURNING id",
+                (uid, status),
+            ).fetchone()[0]
+            conn.execute(migration._SEED_LEGACY_ACTIVE_BARRIERS)
+            seeded = conn.execute(
+                "SELECT input_frontier_seq,call_key,tool_fingerprint,outcome "
+                "FROM v2_mcp_mutation_attempts WHERE job_id=%s",
+                (job_id,),
+            ).fetchone()
+        assert seeded == (
+            first_seq,
+            migration.LEGACY_ACTIVE_CALL_KEY,
+            migration.LEGACY_ACTIVE_TOOL_FINGERPRINT,
+            "unknown",
+        )
+
+        # Mirror chat_append_and_enqueue's ordering: the new user row is visible
+        # in the same transaction before input_generation increments. The
+        # agent_jobs trigger must lift the synthetic barrier through that row.
+        db.chat_append_strict(
+            uid,
+            "legacy-input-2",
+            2.0,
+            {"id": "legacy-input-2", "role": "user", "body_ct": "ct-2"},
+            5000,
+        )
+        second_seq = db.chat_seq_for_msg_id(uid, "legacy-input-2")
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE agent_jobs SET input_generation=input_generation+1 "
+                "WHERE id=%s",
+                (job_id,),
+            )
+            raised = conn.execute(
+                "SELECT input_frontier_seq FROM v2_mcp_mutation_attempts "
+                "WHERE job_id=%s AND call_key=%s",
+                (job_id, migration.LEGACY_ACTIVE_CALL_KEY),
+            ).fetchone()[0]
+        assert second_seq > first_seq
+        assert raised == second_seq
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_0041_downgrade_refuses_pending_fenced_reply():
+    uid = "u_0041_down_fenced"
+    _seed_user(uid)
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_effect_outbox "
+                "(effect_id,user_id,effect_type,expected_generation,payload) "
+                "VALUES ('e_0041_down_fenced',%s,'reply_final_fenced_v1',1,'{}')",
+                (uid,),
+            )
+            status = conn.execute(
+                "SELECT status FROM v2_effect_outbox "
+                "WHERE effect_id='e_0041_down_fenced'"
+            ).fetchone()[0]
+            assert status == "pending_fenced_v1"
+            with pytest.raises(
+                psycopg.errors.ObjectNotInPrerequisiteState,
+                match="fenced reply effects are still pending",
+            ):
+                with conn.transaction():
+                    conn.execute(_migration_0041_module()._DOWN_GUARD)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_0041_downgrade_refuses_frontier_ahead_of_reply_cursor():
+    uid = "u_0041_down_frontier"
+    _seed_user(uid)
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO user_blobs (user_id,kind,doc) "
+                "VALUES (%s,'model_api_runtime','{\"v2_reply_cursor_seq\": 3}')",
+                (uid,),
+            )
+            job_id = conn.execute(
+                "INSERT INTO agent_jobs (user_id,lane,status) "
+                "VALUES (%s,'chat','completed') RETURNING id",
+                (uid,),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO v2_effect_outbox "
+                "(effect_id,user_id,job_id,effect_type,expected_generation,payload,"
+                " status,input_frontier_seq) "
+                "VALUES ('e_0041_down_frontier',%s,%s,'memory_encrypted_v1',1,"
+                " '{}','applied',4)",
+                (uid, job_id),
+            )
+            with pytest.raises(
+                psycopg.errors.ObjectNotInPrerequisiteState,
+                match="mutation frontier exceeds durable reply cursor",
+            ):
+                with conn.transaction():
+                    conn.execute(_migration_0041_module()._DOWN_GUARD)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_0041_downgrade_is_unconditionally_unsupported_after_diagnostics():
+    migration = _migration_0041_module()
+    with db.get_pool().connection() as conn:
+        # Keep the cleanup and intentional exception in one transaction. The
+        # exception rolls the deletes back, while proving the complete guard
+        # block parses and executes before downgrade reaches its permanent
+        # unsupported boundary.
+        with pytest.raises(
+            psycopg.errors.ObjectNotInPrerequisiteState,
+            match="worker protocol and replay evidence are permanent",
+        ):
+            with conn.transaction():
+                conn.execute("DELETE FROM v2_mcp_mutation_attempts")
+                conn.execute("DELETE FROM v2_effect_outbox")
+                conn.execute(migration._DOWN_GUARD)
+                conn.execute(migration._DOWN_UNSUPPORTED)
 
 
 def test_prompt_cache_metric_columns_and_recent_window_index_exist():

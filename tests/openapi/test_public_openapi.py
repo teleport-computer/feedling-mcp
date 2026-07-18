@@ -389,6 +389,73 @@ def test_error_response_supports_unified_and_mcp_shapes(
     ]
 
 
+def test_mcp_probe_and_approval_contract_matches_runtime_limits(
+    public_schema: dict[str, Any],
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    from hosted import mcp_approvals, mcp_core
+
+    schemas = public_schema["components"]["schemas"]
+    upsert = schemas["McpServerUpsertRequest"]
+    patch = schemas["McpServerPatchRequest"]
+    probe = schemas["McpServerTestResponse"]
+
+    assert upsert["additionalProperties"] is False
+    assert upsert["properties"]["enabled"]["type"] == "boolean"
+    assert upsert["properties"]["headers"]["maxProperties"] == mcp_core.MAX_HEADERS
+    assert patch["additionalProperties"] is False
+    assert patch["properties"]["enabled"]["type"] == "boolean"
+
+    approval_schemas = [
+        upsert["properties"]["read_only_tool_fingerprints"],
+        patch["properties"]["read_only_tool_fingerprints"],
+        probe["properties"]["read_only_tool_fingerprints"],
+    ]
+    for approval in approval_schemas:
+        assert approval["maxProperties"] == (
+            mcp_approvals.MAX_READ_ONLY_TOOL_APPROVALS)
+        names = approval["propertyNames"]
+        assert names["minLength"] == 1
+        assert names["maxLength"] == 256
+        for sample in ("search", "", "bad\x00name", "x" * 257, "搜索"):
+            assert bool(re.fullmatch(names["pattern"], sample)) is (
+                mcp_approvals.valid_tool_name(sample))
+        fingerprint = approval["additionalProperties"]["pattern"]
+        for sample in ("a" * 64, "A" * 64, "a" * 63):
+            assert bool(re.fullmatch(fingerprint, sample)) is (
+                mcp_approvals.valid_fingerprint(sample))
+
+    post_description = operations[("post", "/v1/mcp/servers")]["description"]
+    for kind in (
+        "invalid_request",
+        "invalid_enabled",
+        "invalid_read_only_tool_fingerprints",
+        "too_many_read_only_tool_fingerprints",
+    ):
+        assert kind in post_description
+
+    patch_operation = operations[("patch", "/v1/mcp/servers/{name}")]
+    assert "invalid_enabled" in patch_operation["description"]
+    assert "409" in patch_operation["responses"]
+    assert "cannot_encrypt" in patch_operation["responses"]["409"]["description"]
+
+    probe_description = operations[
+        ("post", "/v1/mcp/servers/{name}/test")
+    ]["description"]
+    for term in (
+        "http://",
+        "https://",
+        "dns_busy",
+        "transport",
+        "response_too_large",
+    ):
+        assert term in probe_description
+
+    url_description = upsert["properties"]["url"]["description"]
+    assert "tools/list" in url_description
+    assert "never dials the URL itself" not in url_description
+
+
 def test_public_and_api_key_only_security_are_exact(
     public_schema: dict[str, Any],
     operations: dict[tuple[str, str], dict[str, Any]],

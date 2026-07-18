@@ -23,6 +23,7 @@ from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import worker
 
 
@@ -48,8 +49,29 @@ def _reset(uid):
 
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="",
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="",
     prompt_cache_route_fingerprint="feedling-v2-route-test")
+
+
+def test_prompt_frontier_failures_use_stable_content_free_status_codes():
+    unconfigured = v2_prompt_frontier.PromptContextLimitUnconfigured(
+        provider="private-provider",
+        model="private-model",
+    )
+    exhausted = v2_prompt_frontier.PromptFrontierExhausted(
+        required_tokens=9_000,
+        input_budget_tokens=8_000,
+        context_window_tokens=12_000,
+        required_components=("message_context",),
+    )
+
+    assert worker._safe_failure_code("turn_failed", unconfigured) == (
+        "turn_failed:prompt_context_limit_unconfigured"
+    )
+    assert "private" not in worker._safe_failure_code("turn_failed", unconfigured)
+    assert worker._safe_failure_code("turn_failed", exhausted) == (
+        "turn_failed:prompt_frontier_exhausted"
+    )
 
 
 class _FakeCapResult:
@@ -1558,7 +1580,9 @@ def test_run_compaction_records_whole_turn_metric_on_success(monkeypatch):
     assert row[4] is False
     assert row[5] == "ok"
     assert row[6:11] == (60, None, 20, 1, 1)
-    assert row[11:] == ("anthropic", "claude-x", "feedling-v2-route-test")
+    assert row[11:] == (
+        "anthropic", "claude-sonnet-4-test", "feedling-v2-route-test",
+    )
 
 
 def test_turn_metrics_keep_unknown_usage_nullable_and_count_coverage(monkeypatch):
@@ -1597,7 +1621,7 @@ def test_turn_metrics_keep_unknown_usage_nullable_and_count_coverage(monkeypatch
     assert captured["kwargs"]["usage_reported_calls"] == 2
     assert captured["kwargs"]["cache_reported_calls"] == 2
     assert captured["kwargs"]["provider"] == "anthropic"
-    assert captured["kwargs"]["model"] == "claude-x"
+    assert captured["kwargs"]["model"] == "claude-sonnet-4-test"
     assert captured["kwargs"]["cache_route_fingerprint"] == "feedling-v2-route-test"
 
 

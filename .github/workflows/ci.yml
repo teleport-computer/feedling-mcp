@@ -173,7 +173,13 @@ jobs:
             tests/test_provider_prompt_cache.py \
             tests/test_prompt_cache_canary.py \
             tests/test_provider_usage_normalize.py \
+            tests/test_provider_malformed_tool_fallback.py \
+            tests/test_mcp_client.py \
+            tests/test_user_mcp_core.py \
+            tests/test_user_mcp_probe.py \
+            tests/test_user_mcp_routes.py \
             tests/test_v2_prompt_cache_key.py \
+            tests/test_v2_prompt_frontier.py \
             tests/test_v2_metrics_endpoint.py \
             tests/test_v2_turn_metrics.py \
             tests/test_v2_whole_turn_metric.py \
@@ -183,6 +189,16 @@ jobs:
             tests/test_v2_p0_unified_loop.py \
             tests/test_v2_p0_history_safety.py \
             tests/test_v2_p0_pool_safety.py \
+            tests/test_v2_dispatch_tool_calls.py \
+            tests/test_v2_encrypted_effect_payload.py \
+            tests/test_v2_mcp_tools.py \
+            tests/test_v2_mixed_tool_dispatch.py \
+            tests/test_v2_mutation_recovery.py \
+            tests/test_v2_reconcile.py \
+            tests/test_v2_tool_loop.py \
+            tests/test_v2_tool_loop_mcp.py \
+            tests/test_v2_worker_mcp.py \
+            tests/test_v2_worker_tool_loop.py \
             tests/test_v2_atomic_reply_cursor.py \
             tests/test_v2_effect_outbox.py \
             tests/test_v2_watchdog.py \

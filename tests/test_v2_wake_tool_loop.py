@@ -32,6 +32,7 @@ import db
 import provider_client
 from provider_types import ToolExchange
 from core import store as core_store
+from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import serve_worker
@@ -43,7 +44,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="")
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
 
 
 def _reset(uid):
@@ -279,9 +280,16 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
         job_id, uid, "scheduled", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, str(job["claimed_by"])))
 
     assert status == "completed"
-    non_system = [m for m in seen["messages"] if m.get("role") != "system"]
-    assert len(non_system) == 1
-    assert non_system[0]["role"] == "user"
+    conversation_messages = [
+        message
+        for message in seen["messages"]
+        if message.get("role") != "system"
+        and not str(message.get("content") or "").startswith(
+            v2_context.RUNTIME_CONTEXT_HEADER
+        )
+    ]
+    assert len(conversation_messages) == 1
+    assert conversation_messages[0]["role"] == "user"
 
 
 # ------------------------------------------------------------------

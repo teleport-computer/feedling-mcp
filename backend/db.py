@@ -34,7 +34,7 @@ import logging
 import os
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -3667,6 +3667,34 @@ def chat_max_seq(user_id: str) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
+def chat_max_user_seq_between(
+    user_id: str,
+    after_seq: int,
+    through_seq: int,
+) -> int:
+    """Highest user-input seq in one closed prompt frontier, or ``0``.
+
+    This is the metadata-only companion to the decrypted prompt readers.  It
+    lets wake/chat cursor arbitration detect unanswered input even when that
+    row has already moved behind the encrypted-summary watermark and therefore
+    is no longer present in the verbatim tail.
+    """
+    lower = int(after_seq)
+    upper = int(through_seq)
+    if lower < 0 or upper < 0:
+        raise ValueError("chat seq bounds must be >= 0")
+    if upper <= lower:
+        return 0
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT MAX(seq) FROM chat_messages "
+            "WHERE user_id=%s AND seq>%s AND seq<=%s "
+            "AND doc->>'role' IN ('user','human')",
+            (user_id, lower, upper),
+        ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def chat_messages_after_seq(
     user_id: str,
     after_seq: int,
@@ -5161,29 +5189,36 @@ def chat_append_effect_with_cursor(
     ts: float,
     doc: dict,
     max_messages: int,
-    reply_through_seq: int,
-) -> tuple[int, bool]:
-    """Atomically persist one deterministic V2 reply and advance its input cursor.
+    reply_through_seq: int | None,
+    *,
+    connection=None,
+    defer_post_commit: bool = False,
+):
+    """Atomically persist one deterministic V2 reply and optionally advance its cursor.
 
     ``msg_id`` is derived from the outbox effect id, making replay naturally
-    idempotent.  The reply row and ``v2_reply_cursor_seq`` commit in the same
-    PostgreSQL transaction, so no crash can expose the reply while leaving the
-    cursor old (which would generate a duplicate answer on recovery).
+    idempotent.  A non-``None`` ``reply_through_seq`` is a terminal reply: its
+    row, answered-parent markers, and ``v2_reply_cursor_seq`` commit together.
+    ``None`` persists an intermediate reply without consuming any input.
 
-    Runtime-mode/generation ownership is fenced by
-    ``effect_outbox.apply_pending_effects`` around this sink call. That outer
-    transaction intentionally holds ``v2_runtime_state FOR UPDATE`` throughout
-    dispatch; reacquiring it here through another pooled connection would
-    self-deadlock.
+    When ``connection`` is supplied, it is the outbox applier's existing
+    connection.  The nested ``connection.transaction()`` below is only a
+    savepoint, so reply/cursor/job/effect still have exactly one outer commit.
+    ``defer_post_commit`` returns a thunk for R2/mirror work; callers must invoke
+    it only after that outer commit.  The default wrapper behavior is unchanged.
 
-    Returns ``(seq, inserted)``. A replay returns the existing seq and still
-    monotonically advances the cursor, then skips duplicate cache/notification
-    side effects at the Store layer.
+    Returns ``(seq, inserted)`` by default, or
+    ``(seq, inserted, post_commit)`` when ``defer_post_commit`` is true. A
+    replay returns the existing seq and still monotonically advances a terminal
+    cursor, then skips duplicate cache/notification side effects at the Store
+    layer.
     """
     from model_api_runtime.v2 import cursor as v2_cursor
 
-    cursor_seq = int(reply_through_seq)
-    if cursor_seq < 0:
+    cursor_seq = (
+        None if reply_through_seq is None else int(reply_through_seq)
+    )
+    if cursor_seq is not None and cursor_seq < 0:
         raise ValueError("reply_through_seq must be >= 0")
 
     effect_doc = _normalize_chat_body_doc(doc)
@@ -5196,7 +5231,12 @@ def chat_append_effect_with_cursor(
         "replied_by": "hosted_runtime_v2",
         "replied_at": f"{float(ts):.3f}",
     }
-    with get_pool().connection() as conn:
+    connection_scope = (
+        nullcontext(connection)
+        if connection is not None
+        else get_pool().connection()
+    )
+    with connection_scope as conn:
         with conn.transaction():
             with conn.cursor() as cur:
                 _lock_chat_user_fence_on_cursor(cur, user_id)
@@ -5206,44 +5246,47 @@ def chat_append_effect_with_cursor(
                 # inserting another assistant bubble. Conversely, once V2 wins
                 # below it marks those parents replied in this same transaction,
                 # so a late resident response is rejected by its existing CAS.
-                cur.execute(
-                    "INSERT INTO user_blobs (user_id,kind,doc) "
-                    "VALUES (%s,'model_api_runtime','{}'::jsonb) "
-                    "ON CONFLICT (user_id,kind) DO NOTHING",
-                    (user_id,),
-                )
-                cur.execute(
-                    "SELECT doc FROM user_blobs "
-                    "WHERE user_id=%s AND kind='model_api_runtime' FOR UPDATE",
-                    (user_id,),
-                )
-                cursor_row = cur.fetchone()
-                cursor_doc = (
-                    cursor_row["doc"]
-                    if isinstance(cursor_row, dict)
-                    else cursor_row[0]
-                ) if cursor_row else {}
-                raw_previous_cursor = str(
-                    (cursor_doc or {}).get(v2_cursor.CURSOR_KEY, 0)
-                )
-                if not raw_previous_cursor.isdigit():
-                    raise RuntimeError("invalid persisted V2 reply cursor")
-                previous_cursor = int(raw_previous_cursor)
+                previous_cursor = 0
+                if cursor_seq is not None:
+                    cur.execute(
+                        "INSERT INTO user_blobs (user_id,kind,doc) "
+                        "VALUES (%s,'model_api_runtime','{}'::jsonb) "
+                        "ON CONFLICT (user_id,kind) DO NOTHING",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "SELECT doc FROM user_blobs "
+                        "WHERE user_id=%s AND kind='model_api_runtime' FOR UPDATE",
+                        (user_id,),
+                    )
+                    cursor_row = cur.fetchone()
+                    cursor_doc = (
+                        cursor_row["doc"]
+                        if isinstance(cursor_row, dict)
+                        else cursor_row[0]
+                    ) if cursor_row else {}
+                    raw_previous_cursor = str(
+                        (cursor_doc or {}).get(v2_cursor.CURSOR_KEY, 0)
+                    )
+                    if not raw_previous_cursor.isdigit():
+                        raise RuntimeError("invalid persisted V2 reply cursor")
+                    previous_cursor = int(raw_previous_cursor)
                 storage_generation = _lock_chat_r2_lifecycle_on_cursor(
                     cur, user_id,
                 )
-                cur.execute(
-                    "SELECT msg_id FROM chat_messages "
-                    "WHERE user_id=%s AND seq>%s AND seq<=%s "
-                    "  AND doc->>'role'='user' "
-                    "  AND (doc->>'reply_status'='replied' "
-                    "       OR COALESCE(doc->>'reply_message_id','') <> '') "
-                    "LIMIT 1",
-                    (user_id, previous_cursor, cursor_seq),
-                )
-                if cur.fetchone() is not None:
-                    raise RuntimeError(
-                        "V2 reply input was already answered by another runtime")
+                if cursor_seq is not None:
+                    cur.execute(
+                        "SELECT msg_id FROM chat_messages "
+                        "WHERE user_id=%s AND seq>%s AND seq<=%s "
+                        "  AND doc->>'role'='user' "
+                        "  AND (doc->>'reply_status'='replied' "
+                        "       OR COALESCE(doc->>'reply_message_id','') <> '') "
+                        "LIMIT 1",
+                        (user_id, previous_cursor, cursor_seq),
+                    )
+                    if cur.fetchone() is not None:
+                        raise RuntimeError(
+                            "V2 reply input was already answered by another runtime")
 
                 if _is_chat_file_pointer(effect_doc):
                     if not object_storage.chat_key_owned_by(
@@ -5358,50 +5401,61 @@ def chat_append_effect_with_cursor(
                         )
                     persisted_reply_doc = existing_doc
 
-                # V2 -> resident rollback bridge. Link every still-unanswered
-                # user input consumed through this final reply to the
-                # deterministic assistant row. Resident poll/redelivery already
-                # treats these fields as the authoritative answered marker.
-                cur.execute(
-                    "UPDATE chat_messages SET doc=doc || %s "
-                    "WHERE user_id=%s AND seq>%s AND seq<=%s "
-                    "  AND doc->>'role'='user' "
-                    "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
-                    "  AND COALESCE(doc->>'reply_message_id','')='' "
-                    "RETURNING msg_id",
-                    (
-                        Jsonb(replied_fields),
-                        user_id,
-                        previous_cursor,
-                        cursor_seq,
-                    ),
-                )
-                replied_user_ids.extend(
-                    str(updated["msg_id"] if isinstance(updated, dict) else updated[0])
-                    for updated in cur.fetchall()
-                )
+                if cursor_seq is not None:
+                    # V2 -> resident rollback bridge. Link every still-unanswered
+                    # user input consumed through this final reply to the
+                    # deterministic assistant row. Resident poll/redelivery already
+                    # treats these fields as the authoritative answered marker.
+                    cur.execute(
+                        "UPDATE chat_messages SET doc=doc || %s "
+                        "WHERE user_id=%s AND seq>%s AND seq<=%s "
+                        "  AND doc->>'role'='user' "
+                        "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                        "  AND COALESCE(doc->>'reply_message_id','')='' "
+                        "RETURNING msg_id",
+                        (
+                            Jsonb(replied_fields),
+                            user_id,
+                            previous_cursor,
+                            cursor_seq,
+                        ),
+                    )
+                    replied_user_ids.extend(
+                        str(
+                            updated["msg_id"]
+                            if isinstance(updated, dict)
+                            else updated[0]
+                        )
+                        for updated in cur.fetchall()
+                    )
 
-                persisted_runtime_doc = _advance_blob_int_on_cursor(
-                    cur,
-                    user_id,
-                    "model_api_runtime",
-                    v2_cursor.CURSOR_KEY,
-                    cursor_seq,
-                )
-    _offload_chat_body_after_commit(
-        user_id, msg_id, persisted_reply_doc, storage_generation,
-    )
-    _mirror_trimmed_chat_ids(user_id, trimmed_ids)
-    if replied_user_ids:
-        from tee_shadow import mirror
-        mirror.execute(
-            "UPDATE chat_messages SET doc=doc || %s "
-            "WHERE user_id=%s AND msg_id=ANY(%s)",
-            (Jsonb(replied_fields), user_id, replied_user_ids),
+                    persisted_runtime_doc = _advance_blob_int_on_cursor(
+                        cur,
+                        user_id,
+                        "model_api_runtime",
+                        v2_cursor.CURSOR_KEY,
+                        cursor_seq,
+                    )
+
+    def _post_commit() -> None:
+        _offload_chat_body_after_commit(
+            user_id, msg_id, persisted_reply_doc, storage_generation,
         )
-    if persisted_runtime_doc is not None:
-        _mirror_persisted_blob(
-            user_id, "model_api_runtime", persisted_runtime_doc)
+        _mirror_trimmed_chat_ids(user_id, trimmed_ids)
+        if replied_user_ids:
+            from tee_shadow import mirror
+            mirror.execute(
+                "UPDATE chat_messages SET doc=doc || %s "
+                "WHERE user_id=%s AND msg_id=ANY(%s)",
+                (Jsonb(replied_fields), user_id, replied_user_ids),
+            )
+        if persisted_runtime_doc is not None:
+            _mirror_persisted_blob(
+                user_id, "model_api_runtime", persisted_runtime_doc)
+
+    if defer_post_commit:
+        return seq, inserted, _post_commit
+    _post_commit()
     return seq, inserted
 
 
@@ -5541,60 +5595,107 @@ def chat_append_and_enqueue(
 
 def reconcile_unenqueued_v2_messages() -> int:
     """Belt to :func:`chat_append_and_enqueue`'s braces (spec A7): find
-    authoritative V2 users whose newest chat message is an UNANSWERED user
-    message (``doc->>'role' = 'user'``) with NO active (pending/claimed/running)
-    ``chat`` lane job, and single-flight enqueue one catch-up per message.
+    authoritative V2 users with an UNANSWERED user message beyond the durable
+    reply cursor and NO active (pending/claimed/running) ``chat`` lane job,
+    then single-flight enqueue one catch-up per message.
 
-    "Orphan" here means: the user's chat_messages row with the highest ``seq``
-    has ``doc->>'role' = 'user'`` (nothing has replied to it yet) AND there is
-    no ``agent_jobs`` row for that user with ``lane='chat'`` and status in
-    ('pending','claimed','running') that could still pick it up. That is
-    exactly the gap a crash between the message INSERT and the job INSERT
-    could leave behind if ``chat_append_and_enqueue`` were ever bypassed or
-    partially applied outside its own transaction (e.g. a bug, a manual data
-    fix, or a pre-A7 message written before this function existed).
+    The cursor, not the newest row's role, is authoritative. A turn can emit an
+    intermediate assistant bubble, perform a mutation, and crash before its
+    final reply consumes the input. In that state the newest row is assistant,
+    but the original user row is still pending and must enter the mutation-free
+    recovery path. Reply metadata independently excludes a resident-won input.
 
-    A durable ``reason='reconcile', trace_id=<msg_id>`` job is the per-message
-    marker across every terminal status. This is intentionally stronger than
-    active-job single-flight: a provider/config failure must not cause the same
-    unanswered input to be retried and billed every scheduler tick. A later
-    message has a different id and remains eligible for one catch-up.
+    A durable ``reason='reconcile'|'mutation_recovery', trace_id=<msg_id>`` job
+    is the per-message marker across every terminal status. This is
+    intentionally stronger than active-job single-flight: a provider/config
+    failure must not cause the same unanswered input to be retried and billed
+    every scheduler tick. A later message has a different id and remains
+    eligible for one catch-up.
     """
     from model_api_runtime.v2 import jobs_store  # lazy — precedent db.py cutover import
 
     with get_pool().connection() as conn:
         candidates = conn.execute(
-            "WITH latest AS ("
-            "  SELECT DISTINCT ON (cm.user_id) "
-            "         cm.user_id,cm.msg_id,cm.doc->>'role' AS role, "
-            "         rs.runtime_generation "
-            "  FROM chat_messages cm "
-            "  JOIN user_blobs mrt ON mrt.user_id=cm.user_id "
-            "    AND mrt.kind='model_api_runtime' "
-            "  JOIN v2_runtime_state rs ON rs.user_id=cm.user_id "
+            "WITH owned AS ("
+            "  SELECT mrt.user_id,rs.runtime_generation,"
+            "    CASE WHEN COALESCE(mrt.doc->>'v2_reply_cursor_seq','0') "
+            "      ~ '^[0-9]{1,18}$' "
+            "    THEN (COALESCE(mrt.doc->>'v2_reply_cursor_seq','0'))::bigint "
+            "    ELSE NULL END AS reply_cursor_seq "
+            "  FROM user_blobs mrt "
+            "  JOIN v2_runtime_state rs ON rs.user_id=mrt.user_id "
             "    AND rs.hosted_runtime_state='v2' "
-            "  WHERE mrt.doc->>'hosted_runtime_mode'='db_action_v2' "
+            "  WHERE mrt.kind='model_api_runtime' "
+            "    AND mrt.doc->>'hosted_runtime_mode'='db_action_v2'"
+            "), latest AS ("
+            "  SELECT DISTINCT ON (cm.user_id) "
+            "         cm.user_id,cm.msg_id, "
+            "         owned.runtime_generation,owned.reply_cursor_seq "
+            "  FROM chat_messages cm "
+            "  JOIN owned ON owned.user_id=cm.user_id "
+            "  WHERE owned.reply_cursor_seq IS NOT NULL "
+            "    AND cm.seq>owned.reply_cursor_seq "
+            "    AND cm.doc->>'role' IN ('user','human') "
+            "    AND COALESCE(cm.doc->>'source','') <> 'verify_ping' "
+            "    AND (cm.doc->>'reply_status') IS DISTINCT FROM 'replied' "
+            "    AND COALESCE(cm.doc->>'reply_message_id','')='' "
             "  ORDER BY cm.user_id,cm.seq DESC"
+            "), eligible AS MATERIALIZED ("
+            "  SELECT latest.user_id,latest.msg_id,latest.runtime_generation,"
+            "         latest.reply_cursor_seq "
+            "  FROM latest "
+            "  WHERE NOT EXISTS ("
+            "    SELECT 1 FROM agent_jobs active "
+            "    WHERE active.user_id=latest.user_id AND active.lane='chat' "
+            "      AND active.status IN ('pending','claimed','running')"
+            "  ) "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM agent_jobs recovery "
+            "    WHERE recovery.user_id=latest.user_id AND recovery.lane='chat' "
+            "      AND recovery.reason='mutation_recovery' "
+            "      AND recovery.trace_id=latest.msg_id "
+            "      AND recovery.status <> 'superseded'"
+            "  )"
             ") "
-            "SELECT latest.user_id,latest.msg_id,latest.runtime_generation "
-            "FROM latest "
-            "WHERE latest.role='user' "
-            "AND NOT EXISTS ("
-            "  SELECT 1 FROM agent_jobs active "
-            "  WHERE active.user_id=latest.user_id AND active.lane='chat' "
-            "    AND active.status IN ('pending','claimed','running')"
-            ") "
-            "AND NOT EXISTS ("
+            "SELECT eligible.user_id,eligible.msg_id,eligible.runtime_generation,"
+            "       COALESCE(barrier.frontier IS NOT NULL,false) "
+            "FROM eligible "
+            "LEFT JOIN LATERAL ("
+            "  SELECT MAX(source.frontier) AS frontier FROM ("
+            "    SELECT MAX(attempt.input_frontier_seq) AS frontier "
+            "    FROM v2_mcp_mutation_attempts attempt "
+            "    WHERE attempt.user_id=eligible.user_id "
+            "      AND attempt.input_frontier_seq>eligible.reply_cursor_seq "
+            "      AND EXISTS ("
+            "        SELECT 1 FROM agent_jobs job "
+            "        WHERE job.id=attempt.job_id AND job.lane='chat'"
+            "      ) "
+            "    UNION ALL "
+            "    SELECT MAX(effect.input_frontier_seq) AS frontier "
+            "    FROM v2_effect_outbox effect "
+            "    WHERE effect.user_id=eligible.user_id "
+            "      AND effect.input_frontier_seq>eligible.reply_cursor_seq "
+            "      AND EXISTS ("
+            "        SELECT 1 FROM agent_jobs job "
+            "        WHERE job.id=effect.job_id AND job.lane='chat'"
+            "      )"
+            "  ) source"
+            ") barrier ON TRUE "
+            "WHERE (barrier.frontier IS NOT NULL "
+            "OR NOT EXISTS ("
             "  SELECT 1 FROM agent_jobs prior "
-            "  WHERE prior.user_id=latest.user_id AND prior.lane='chat' "
-            "    AND prior.reason='reconcile' AND prior.trace_id=latest.msg_id "
+            "  WHERE prior.user_id=eligible.user_id AND prior.lane='chat' "
+            "    AND prior.reason='reconcile' AND prior.trace_id=eligible.msg_id "
             "    AND prior.status <> 'superseded'"
-            ")"
+            "))"
         ).fetchall()
 
-    for uid, msg_id, runtime_generation in candidates:
+    for uid, msg_id, runtime_generation, mutation_recovery in candidates:
         jobs_store.enqueue_job(
-            str(uid), "chat", reason="reconcile", trace_id=str(msg_id),
+            str(uid),
+            "chat",
+            reason=("mutation_recovery" if mutation_recovery else "reconcile"),
+            trace_id=str(msg_id),
             expected_generation=int(runtime_generation),
         )
     return len(candidates)
@@ -7169,21 +7270,39 @@ def advance_runtime_state(user_id: str, *, from_state: str, to_state: str) -> in
     return int(row[0]) if row else None
 
 
-def effect_enqueue(effect_id, user_id, job_id, effect_type, expected_generation, payload) -> bool:
+def effect_enqueue(
+    effect_id,
+    user_id,
+    job_id,
+    effect_type,
+    expected_generation,
+    payload,
+    *,
+    input_frontier_seq: int | None = None,
+) -> bool:
     """Insert one row into the generation-fenced effect outbox (spec A4). The
     ON CONFLICT (effect_id) DO NOTHING is the idempotency guarantee: re-enqueuing
     the same logical effect (same job_id/effect_type/ordinal, or same
     generation/effect_type/key for control-plane effects) is a no-op. Returns
     True if this call actually inserted the row, False if it already existed."""
     import json
+    if input_frontier_seq is not None and (
+        type(input_frontier_seq) is not int or input_frontier_seq < 0
+    ):
+        raise ValueError(
+            "input_frontier_seq must be a non-negative integer or None"
+        )
+    frontier_seq = input_frontier_seq
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO v2_effect_outbox "
-                "(effect_id, user_id, job_id, effect_type, expected_generation, payload) "
-                "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (effect_id) DO NOTHING",
+                "(effect_id,user_id,job_id,effect_type,expected_generation,payload,"
+                " input_frontier_seq) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (effect_id) DO NOTHING",
                 (effect_id, user_id, job_id, effect_type, int(expected_generation),
-                 json.dumps(payload)),
+                 json.dumps(payload), frontier_seq),
             )
             inserted = cur.rowcount == 1
     return inserted
@@ -7208,7 +7327,8 @@ def effect_pending(user_id, *, due_prefix_only: bool = False) -> list[dict]:
                     "          AND CURRENT ROW"
                     "        ) AS prefix_due "
                     " FROM v2_effect_outbox "
-                    " WHERE user_id=%s AND status='pending'"
+                    " WHERE user_id=%s "
+                    "AND status IN ('pending','pending_fenced_v1')"
                     ") SELECT effect_id,job_id,effect_type,expected_generation,payload "
                     "FROM ordered WHERE prefix_due ORDER BY enqueue_seq",
                     (user_id,),
@@ -7216,7 +7336,8 @@ def effect_pending(user_id, *, due_prefix_only: bool = False) -> list[dict]:
             else:
                 cur.execute(
                     "SELECT effect_id, job_id, effect_type, expected_generation, payload "
-                    "FROM v2_effect_outbox WHERE user_id=%s AND status='pending' "
+                    "FROM v2_effect_outbox WHERE user_id=%s "
+                    "AND status IN ('pending','pending_fenced_v1') "
                     "ORDER BY enqueue_seq ASC",
                     (user_id,),
                 )
@@ -7237,7 +7358,8 @@ def effect_pending_users(*, limit: int = 500) -> list[str]:
         rows = conn.execute(
             "WITH oldest AS ("
             " SELECT DISTINCT ON (user_id) user_id,enqueue_seq,next_attempt_at "
-            " FROM v2_effect_outbox WHERE status='pending' "
+            " FROM v2_effect_outbox "
+            " WHERE status IN ('pending','pending_fenced_v1') "
             " ORDER BY user_id,enqueue_seq"
             ") SELECT user_id FROM oldest WHERE next_attempt_at <= now() "
             "ORDER BY enqueue_seq ASC LIMIT %s",
@@ -7282,7 +7404,8 @@ def _effect_record_error_on_cursor(
         "      (LEAST(3600, 15 * (1 << LEAST(attempt_count, 8))) * interval '1 second'), "
         "    status=CASE WHEN %s OR attempt_count+1 >= %s "
         "                THEN 'needs_reconciliation' ELSE status END "
-        "WHERE effect_id=%s AND status='pending'",
+        "WHERE effect_id=%s "
+        "AND status IN ('pending','pending_fenced_v1')",
         (
             str(error)[:256],
             bool(reconciliation_required),
@@ -7301,7 +7424,10 @@ def effect_record_error(
 ) -> None:
     """Record one sanitized apply failure without terminalizing the effect.
 
-    Transient failures remain ``pending`` with exponential sweeper backoff.
+    Transient failures remain in their original pending state with exponential
+    sweeper backoff. Fenced replies deliberately retain
+    ``pending_fenced_v1`` so a pre-0041 worker can never seize them during a
+    rolling deploy.
     Ambiguous delivery, or a poison row that reaches ``max_attempts``, moves to
     explicit ``needs_reconciliation`` so it cannot hot-loop or block later
     effects forever. Only the caller-provided, already-sanitized summary is
@@ -7323,10 +7449,12 @@ def effect_outbox_health() -> dict:
     with get_pool().connection() as conn:
         row = conn.execute(
             "SELECT "
-            "  count(*) FILTER (WHERE status='pending'), "
+            "  count(*) FILTER "
+            "    (WHERE status IN ('pending','pending_fenced_v1')), "
             "  count(*) FILTER (WHERE status='needs_reconciliation'), "
             "  COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at) FILTER "
-            "    (WHERE status IN ('pending','needs_reconciliation')))), 0) "
+            "    (WHERE status IN "
+            "      ('pending','pending_fenced_v1','needs_reconciliation')))), 0) "
             "FROM v2_effect_outbox"
         ).fetchone()
     return {

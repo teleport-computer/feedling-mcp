@@ -62,7 +62,8 @@ def test_openai_compatible_wire_carries_the_image_block(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_apost)
     cfg = provider_client.ProviderConfig(
-        provider="openai_compatible", model="m", api_key="k", base_url=_LOCAL)
+        provider="openai_compatible", model="m", api_key="k", base_url=_LOCAL,
+        context_window_tokens=128_000)
     outcome = asyncio.run(_run_native_turn(cfg, _BLOCKS))
 
     assert outcome.final_text == "ok"
@@ -84,7 +85,7 @@ def test_anthropic_wire_maps_the_image_block(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_apost)
     cfg = provider_client.ProviderConfig(
-        provider="anthropic", model="claude-x", api_key="k", base_url="")
+        provider="anthropic", model="claude-sonnet-4-test", api_key="k", base_url="")
     outcome = asyncio.run(_run_native_turn(cfg, _BLOCKS))
 
     assert outcome.final_text == "ok"
@@ -104,7 +105,8 @@ def test_caption_only_turn_still_sends_plain_text(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_apost)
     cfg = provider_client.ProviderConfig(
-        provider="openai_compatible", model="m", api_key="k", base_url=_LOCAL)
+        provider="openai_compatible", model="m", api_key="k", base_url=_LOCAL,
+        context_window_tokens=128_000)
     asyncio.run(_run_native_turn(cfg, "just text"))
 
     assert captured[0]["messages"][-1]["content"] == "just text"

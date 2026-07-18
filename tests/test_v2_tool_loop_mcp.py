@@ -1,6 +1,5 @@
-"""run_tool_loop accepts per-turn user-MCP tool specs: they are offered to the
-provider, dispatched (not rejected as malformed despite no PARAMS entry), and —
-per the trusted-MCP decision — do NOT lock durable writes for later rounds."""
+"""run_tool_loop accepts per-turn user-MCP specs while treating every offered
+MCP tool as mutating under the production policy supplied by the worker."""
 from __future__ import annotations
 
 import asyncio
@@ -16,6 +15,15 @@ from model_api_runtime.v2 import tool_loop
 
 MCP_SPEC = ToolSpec(name="mcp__weather__search", description="find weather",
                     parameters={"type": "object", "properties": {"q": {"type": "string"}}})
+MCP_WRITE_SPEC = ToolSpec(
+    name="mcp__tasks__create", description="create task",
+    parameters={"type": "object", "properties": {"title": {"type": "string"}}},
+)
+_TEST_PROVIDER_CONFIG = provider_client.ProviderConfig(
+    provider="anthropic",
+    model="claude-sonnet-4-test",
+    api_key="test-key",
+)
 
 
 async def _on_reply_collect(store):
@@ -24,7 +32,14 @@ async def _on_reply_collect(store):
     return _on_reply
 
 
-def _run(responses, dispatch, *, extra_tool_specs, provider_tools):
+def _run(
+    responses, dispatch, *, extra_tool_specs, provider_tools,
+    extra_mutating_tool_names=None,
+):
+    if extra_mutating_tool_names is None:
+        extra_mutating_tool_names = {
+            spec.name for spec in (extra_tool_specs or ())}
+
     async def _provider(_config, _messages, *, tools=None):
         provider_tools.append(tools)
         return next(responses)
@@ -42,7 +57,7 @@ def _run(responses, dispatch, *, extra_tool_specs, provider_tools):
     provider_client.chat_completion_async = _provider
     try:
         outcome = asyncio.run(tool_loop.run_tool_loop(
-            provider_config=object(),
+            provider_config=_TEST_PROVIDER_CONFIG,
             build_messages=lambda _t: [{"role": "user", "content": "hi"}],
             dispatch_tools=dispatch,
             on_reply=_on_reply,
@@ -50,6 +65,7 @@ def _run(responses, dispatch, *, extra_tool_specs, provider_tools):
             add_usage=lambda _u: None,
             max_calls=4,
             extra_tool_specs=extra_tool_specs,
+            extra_mutating_tool_names=extra_mutating_tool_names,
         ))
     finally:
         provider_client.chat_completion_async = orig
@@ -79,9 +95,8 @@ def test_mcp_tool_is_offered_and_dispatched():
     assert replies == [("it's sunny", True)]
 
 
-def test_writes_stay_available_after_an_mcp_call():
-    """Trusted-MCP decision: an MCP tool result does NOT revoke durable writes for
-    the rest of the turn (contrast with web results, which do)."""
+def test_mcp_result_is_external_content_and_removes_later_mutations():
+    """Remote MCP text cannot prompt-inject a later platform or MCP write."""
     responses = iter([
         {"reply": "", "usage": {}, "tool_calls": [
             {"id": "m1", "name": "mcp__weather__search", "args": {"q": "SF"}}]},
@@ -95,9 +110,116 @@ def test_writes_stay_available_after_an_mcp_call():
     provider_tools = []
     _run(responses, _dispatch, extra_tool_specs=[MCP_SPEC], provider_tools=provider_tools)
     second_names = {s.name for s in provider_tools[1]}
-    assert cap_registry.WRITE_ACTIONS <= second_names           # writes NOT locked
-    assert "mcp__weather__search" in second_names               # mcp tool still offered
-    assert tool_loop.provenance.EXTERNAL_READS <= second_names  # web tools still offered too
+    assert cap_registry.WRITE_ACTIONS.isdisjoint(second_names)
+    assert "mcp__weather__search" not in second_names
+    assert tool_loop.provenance.EXTERNAL_READS.isdisjoint(second_names)
+
+
+def test_reply_plus_mutating_mcp_is_rejected_before_any_side_effect():
+    responses = iter([
+        {"reply": "", "usage": {}, "tool_calls": [
+            {"id": "r1", "name": "reply", "args": {"text": "saved"}},
+            {"id": "m1", "name": "mcp__tasks__create",
+             "args": {"title": "book dentist"}},
+        ]},
+        {"reply": "safe fallback", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _dispatch(_calls):
+        raise AssertionError("reply+mutation batch must execute nothing")
+
+    provider_tools = []
+    outcome, replies = _run(
+        responses,
+        _dispatch,
+        extra_tool_specs=[MCP_WRITE_SPEC],
+        extra_mutating_tool_names={MCP_WRITE_SPEC.name},
+        provider_tools=provider_tools,
+    )
+
+    assert [tools is None for tools in provider_tools] == [False, True]
+    assert replies == [("safe fallback", True)]
+    assert outcome.final_text == "safe fallback"
+
+
+def test_reply_plus_server_claimed_read_only_mcp_is_still_rejected():
+    responses = iter([
+        {"reply": "", "usage": {}, "tool_calls": [
+            {"id": "r1", "name": "reply", "args": {"text": "checking"}},
+            {"id": "m1", "name": MCP_SPEC.name, "args": {"q": "SF"}},
+        ]},
+        {"reply": "safe fallback", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _dispatch(_calls):
+        raise AssertionError("reply+MCP batch must execute nothing")
+
+    provider_tools = []
+    outcome, replies = _run(
+        responses,
+        _dispatch,
+        extra_tool_specs=[MCP_SPEC],
+        provider_tools=provider_tools,
+    )
+
+    assert [tools is None for tools in provider_tools] == [False, True]
+    assert replies == [("safe fallback", True)]
+    assert outcome.final_text == "safe fallback"
+
+
+def test_external_web_content_removes_every_user_mcp_tool():
+    responses = iter([
+        {"reply": "", "usage": {}, "tool_calls": [
+            {"id": "web", "name": "web_search", "args": {"query": "weather"}},
+        ]},
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _dispatch(calls):
+        return [ToolResult(
+            call_id=calls[0].id,
+            content='{"results":[{"url":"https://example.com/weather"}]}',
+        )]
+
+    provider_tools = []
+    _run(
+        responses,
+        _dispatch,
+        extra_tool_specs=[MCP_SPEC, MCP_WRITE_SPEC],
+        provider_tools=provider_tools,
+    )
+    second_names = {spec.name for spec in provider_tools[1]}
+    assert MCP_SPEC.name not in second_names
+    assert MCP_WRITE_SPEC.name not in second_names
+
+
+def test_unknown_mcp_mutation_outcome_disables_all_later_mutations():
+    responses = iter([
+        {"reply": "", "usage": {}, "tool_calls": [
+            {"id": "m1", "name": MCP_WRITE_SPEC.name,
+             "args": {"title": "book dentist"}},
+        ]},
+        {"reply": "could not safely continue writes", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _dispatch(calls):
+        return [ToolResult(
+            call_id=calls[0].id,
+            content=tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR,
+        )]
+
+    provider_tools = []
+    _run(
+        responses,
+        _dispatch,
+        extra_tool_specs=[MCP_SPEC, MCP_WRITE_SPEC],
+        provider_tools=provider_tools,
+    )
+
+    second_names = {spec.name for spec in provider_tools[1]}
+    assert MCP_SPEC.name not in second_names
+    assert MCP_WRITE_SPEC.name not in second_names
+    assert not (cap_registry.WRITE_ACTIONS & second_names)
 
 
 def test_unknown_non_mcp_tool_still_rejected():

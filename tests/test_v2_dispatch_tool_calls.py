@@ -17,6 +17,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from capabilities import registry as cap_registry  # noqa: E402
 from model_api_runtime.v2 import executor as v2_executor  # noqa: E402
@@ -72,6 +74,31 @@ def test_two_reads_dispatch_and_return_results_by_call_id(monkeypatch):
     by_id = {r.call_id: r for r in results}
     assert "result-for-memory_index" in by_id["c1"].content
     assert "result-for-web_search" in by_id["c2"].content
+    assert enqueued == []
+
+
+def test_one_read_exception_is_isolated_from_successful_sibling(monkeypatch):
+    ran = []
+
+    def _run_capability(action_type, store, *, api_key, runtime_token, params):
+        ran.append(action_type)
+        if action_type == "memory_index":
+            raise RuntimeError("sensitive adapter detail must not escape")
+        return _FakeResult(True, {"body": "web result"})
+
+    tool_calls = [
+        ToolCall(id="failed", name="memory_index", args={}),
+        ToolCall(id="succeeded", name="web_search", args={"query": "x"}),
+    ]
+    results, enqueued = _run(
+        tool_calls, turn_authorization=False,
+        run_capability=_run_capability, monkeypatch=monkeypatch)
+
+    assert sorted(ran) == ["memory_index", "web_search"]
+    assert [result.call_id for result in results] == ["failed", "succeeded"]
+    assert results[0].content == "error: capability_failed"
+    assert "sensitive adapter detail" not in results[0].content
+    assert "web result" in results[1].content
     assert enqueued == []
 
 
@@ -193,6 +220,39 @@ def test_async_write_enqueue_is_awaited_without_blocking_event_loop(monkeypatch)
 
     results = asyncio.run(scenario())
     assert results[0].content == "queued: identity_patch"
+
+
+@pytest.mark.parametrize("failure_site", ["fence", "enqueue"])
+def test_write_fence_and_enqueue_failures_remain_terminal(monkeypatch, failure_site):
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("write must not run inline")),
+    )
+
+    async def before_write():
+        if failure_site == "fence":
+            raise RuntimeError("write fence failed")
+
+    async def enqueue_write_effect(_tc):
+        if failure_site == "enqueue":
+            raise RuntimeError("write enqueue failed")
+
+    async def scenario():
+        return await v2_executor.dispatch_tool_calls(
+            [ToolCall(id="w-terminal", name="identity_patch", args={"signature": "new"})],
+            store=_Store(),
+            api_key="k",
+            runtime_token="rt",
+            enclave_sem=asyncio.Semaphore(1),
+            turn_authorization=True,
+            enqueue_write_effect=enqueue_write_effect,
+            before_write=before_write,
+        )
+
+    with pytest.raises(RuntimeError, match=f"write {failure_site} failed"):
+        asyncio.run(scenario())
 
 
 def test_write_without_authorization_is_refused_not_enqueued(monkeypatch):

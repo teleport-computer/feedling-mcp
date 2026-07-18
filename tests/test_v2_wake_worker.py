@@ -40,6 +40,7 @@ import conftest
 import db
 import provider_client
 from core import store as core_store
+from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import coalesce as v2_coalesce
@@ -66,7 +67,7 @@ def _reset(uid):
 
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="")
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
 
 
 def _job_status(job_id):
@@ -229,8 +230,15 @@ def test_run_wake_empty_tail_also_sleeps_silently(monkeypatch):
     assert status == "completed"
     assert write_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
-    non_system = [m for m in seen["messages"] if m.get("role") != "system"]
-    assert len(non_system) == 1  # just the nudge — no real tail rows
+    conversation_messages = [
+        message
+        for message in seen["messages"]
+        if message.get("role") != "system"
+        and not str(message.get("content") or "").startswith(
+            v2_context.RUNTIME_CONTEXT_HEADER
+        )
+    ]
+    assert len(conversation_messages) == 1  # just the nudge — no real tail rows
 
 
 def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
@@ -334,10 +342,18 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
         job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "completed"
-    non_system = [m for m in seen["messages"] if m.get("role") != "system"]
-    # tail should be just the wake nudge (no real tail entries to prepend).
-    assert len(non_system) == 1
-    assert non_system[0]["role"] == "user"
+    conversation_messages = [
+        message
+        for message in seen["messages"]
+        if message.get("role") != "system"
+        and not str(message.get("content") or "").startswith(
+            v2_context.RUNTIME_CONTEXT_HEADER
+        )
+    ]
+    # The conversational tail should be just the wake nudge. Live grounding,
+    # when available, is a separate untrusted user-role runtime-data block.
+    assert len(conversation_messages) == 1
+    assert conversation_messages[0]["role"] == "user"
 
 
 # ------------------------------------------------------------------

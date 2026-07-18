@@ -26,6 +26,7 @@ jobs_store/core_store, stubbed `worker._cap_data` (capability boundary) and
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -38,6 +39,7 @@ import conftest
 import db
 import provider_client
 from core import store as core_store
+from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import worker
@@ -49,7 +51,7 @@ from perception.agent_fields import (
 pytestmark = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="needs PG")
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="")
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
 
 # What a real perception_snapshot returns: live values AND explicit disabled/null
 # signals (the agent must be told what it CANNOT see, not left to infer from a gap).
@@ -136,6 +138,17 @@ def _joined(seen):
     return " ".join(str(m.get("content", "")) for m in seen["messages"])
 
 
+def _runtime_payload(seen):
+    block = next(
+        message
+        for message in seen["messages"]
+        if str(message.get("content") or "").startswith(
+            v2_context.RUNTIME_CONTEXT_HEADER + "\n"
+        )
+    )
+    return json.loads(str(block["content"]).split("\n", 1)[1])
+
+
 def test_chat_turn_injects_perception_grounding(monkeypatch):
     uid = "u_pg_chat"
     conftest.seed_user(uid)
@@ -163,14 +176,23 @@ def test_chat_turn_injects_perception_grounding(monkeypatch):
     joined = _joined(seen)
     assert "step_count" in joined and "365" in joined     # live value reached the prompt
     assert "not_permitted" in joined                       # disabled signals injected too
-    # A reading guide rides along so a null/disabled signal is read as "no current
-    # data", not a malfunction (the "没检测到 sounds broken" UX fix).
-    assert "_reading_guide" in joined and "malfunction" in joined
+    payload = _runtime_payload(seen)
+    assert isinstance(payload["runtime_data"], dict)
+    assert "_reading_guide" not in payload["runtime_data"]["perception_snapshot"]
+    # Interpretation instructions are trusted and byte-stable, not smuggled
+    # inside the changing untrusted observation payload.
+    system = next(
+        message["content"]
+        for message in seen["messages"]
+        if message.get("role") == "system"
+    )
+    assert "no current reading" in system
+    assert "broken or malfunctioning" in system
+    assert "_reading_guide" not in joined
 
 
-def test_reading_guide_present_and_does_not_hide_null_signals(monkeypatch):
-    """The reading guide is added WITHOUT dropping any signal — a null-valued signal
-    (e.g. stale steps) must still be visible, just interpretable."""
+def test_stable_perception_policy_does_not_hide_null_signals(monkeypatch):
+    """Trusted interpretation policy keeps null observations visible as data."""
     uid = "u_pg_guide"
     conftest.seed_user(uid)
     _reset(uid)
@@ -192,9 +214,19 @@ def test_reading_guide_present_and_does_not_hide_null_signals(monkeypatch):
 
     assert status == "completed"
     joined = _joined(seen)
-    assert "_reading_guide" in joined and "malfunction" in joined  # guide text present
-    assert "step_count" in joined                           # the null signal still shown
-    assert "cloudy" in joined                               # live signal still shown
+    payload = _runtime_payload(seen)
+    perception = payload["runtime_data"]["perception_snapshot"]
+    assert "_reading_guide" not in perception
+    assert perception["signals"]["steps"]["step_count"] is None
+    assert perception["signals"]["weather"]["condition"] == "cloudy"
+    system = next(
+        message["content"]
+        for message in seen["messages"]
+        if message.get("role") == "system"
+    )
+    assert "Never interpret that as zero" in system
+    assert "broken or malfunctioning" in system
+    assert "_reading_guide" not in joined
 
 
 def test_wake_turn_injects_perception_grounding(monkeypatch):
@@ -265,4 +297,9 @@ def test_empty_perception_prefetch_is_not_fatal(monkeypatch):
 
     assert status == "completed"
     assert _perception_call(calls) is not None
-    assert "perception_snapshot" not in _joined(seen)   # nothing rendered, no crash
+    assert not any(
+        str(message.get("content") or "").startswith(
+            v2_context.RUNTIME_CONTEXT_HEADER
+        )
+        for message in seen["messages"]
+    )  # no dynamic grounding block, no crash

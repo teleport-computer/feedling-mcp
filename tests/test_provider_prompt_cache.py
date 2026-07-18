@@ -20,7 +20,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client as pc  # noqa: E402
 from model_api_runtime.v2 import context as v2_context  # noqa: E402
-from provider_types import ToolSpec  # noqa: E402
+from provider_types import (  # noqa: E402
+    NativeAssistantTurn,
+    ToolCall,
+    ToolExchange,
+    ToolResult,
+    ToolSpec,
+)
 
 
 MESSAGES = [{"role": "user", "content": "Find the latest result."}]
@@ -51,6 +57,86 @@ def _nested_cache_controls(value) -> list[dict]:
         for child in value:
             found.extend(_nested_cache_controls(child))
     return found
+
+
+def _without_cache_metadata(value):
+    if isinstance(value, dict):
+        return {
+            key: _without_cache_metadata(child)
+            for key, child in value.items()
+            if key != "cache_control"
+        }
+    if isinstance(value, list):
+        return [_without_cache_metadata(child) for child in value]
+    return value
+
+
+def _runtime_turn_messages() -> tuple[list[dict], list[dict], list[dict]]:
+    """Build two growing turns plus the same first turn without live data."""
+    first_tail = [
+        {"role": "user", "content": "first stable request"},
+    ]
+    first = v2_context.build_turn_messages(
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+        summary="",
+        tail=first_tail,
+        action_context=v2_context.action_context_str({
+            "perception_snapshot": [{
+                "ok": True,
+                "data": {"now": "2026-07-18T10:00:01Z"},
+            }],
+        }),
+    )
+    second = v2_context.build_turn_messages(
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+        summary="",
+        tail=[
+            *first_tail,
+            {"role": "assistant", "content": "first stable response"},
+            {"role": "user", "content": "second stable request"},
+        ],
+        action_context=v2_context.action_context_str({
+            "perception_snapshot": [{
+                "ok": True,
+                "data": {"now": "2026-07-18T10:00:02Z"},
+            }],
+        }),
+    )
+    without_runtime_data = v2_context.build_turn_messages(
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+        summary="",
+        tail=first_tail,
+    )
+    return first, second, without_runtime_data
+
+
+def _multimodal_runtime_messages() -> list[dict]:
+    return v2_context.build_turn_messages(
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+        summary="- user asked for visual debugging help",
+        tail=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is wrong in this screenshot?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+            ],
+        }],
+        action_context=v2_context.action_context_str({
+            "perception_snapshot": [{
+                "ok": True,
+                "data": {"now": "2026-07-18T10:00:01Z"},
+            }],
+        }),
+    )
+
+
+def _wire_message_text(message: dict) -> str:
+    if "parts" in message:
+        return pc._content_text(message.get("parts"))
+    return pc._content_text(message.get("content"))
 
 
 def _compat_payload(provider: str, model: str) -> dict:
@@ -190,8 +276,332 @@ def test_v2_cache_breakpoints_exclude_dynamic_perception_grounding() -> None:
         prompt_cache_key=CACHE_KEY,
     )
     assert _nested_cache_controls(anthropic["system"]) == [{"type": "ephemeral"}]
-    assert "live perception" in str(anthropic["system"][-1]["text"])
-    assert "cache_control" not in anthropic["system"][-1]
+    assert "live perception" not in str(anthropic["system"])
+    assert "live perception" in str(anthropic["messages"][-1]["content"])
+    assert _nested_cache_controls(anthropic["messages"][-1]["content"]) == []
+
+
+def test_direct_anthropic_two_turn_runtime_data_preserves_cached_prefix() -> None:
+    first_messages, second_messages, without_data_messages = (
+        _runtime_turn_messages()
+    )
+
+    def build(messages: list[dict]) -> dict:
+        payload, _, _ = pc._build_anthropic_payload(
+            model="claude-sonnet-4-5",
+            base_url="https://api.anthropic.com/v1",
+            key="sk-test",
+            messages=messages,
+            max_tokens=256,
+            temperature=None,
+            response_format=None,
+            tools=TOOLS,
+            prompt_cache_key=CACHE_KEY,
+        )
+        return payload
+
+    first = build(first_messages)
+    second = build(second_messages)
+    without_data = build(without_data_messages)
+
+    assert first["system"] == second["system"] == without_data["system"]
+    assert "2026-07-18T10:00" not in str(first["system"])
+    assert first["messages"][:-1] == second["messages"][:1]
+    assert first["messages"][-1]["role"] == "user"
+    assert _wire_message_text(first["messages"][-1]).startswith(
+        v2_context.RUNTIME_CONTEXT_HEADER
+    )
+    assert _nested_cache_controls(first["messages"][-1]["content"]) == []
+    assert first["tools"] == second["tools"] == without_data["tools"]
+
+
+def test_direct_gemini_two_turn_runtime_data_preserves_implicit_cache_prefix() -> None:
+    first_messages, second_messages, without_data_messages = (
+        _runtime_turn_messages()
+    )
+
+    def build(messages: list[dict]) -> dict:
+        payload, _, _ = pc._build_gemini_payload(
+            model="gemini-2.5-flash",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            key="test-key",
+            messages=messages,
+            max_tokens=256,
+            temperature=None,
+            response_format=None,
+            tools=TOOLS,
+        )
+        return payload
+
+    first = build(first_messages)
+    second = build(second_messages)
+    without_data = build(without_data_messages)
+
+    assert (
+        first["systemInstruction"]
+        == second["systemInstruction"]
+        == without_data["systemInstruction"]
+    )
+    assert "2026-07-18T10:00" not in str(first["systemInstruction"])
+    assert first["contents"][:-1] == second["contents"][:1]
+    assert first["contents"][-1]["role"] == "user"
+    assert _wire_message_text(first["contents"][-1]).startswith(
+        v2_context.RUNTIME_CONTEXT_HEADER
+    )
+    assert first["tools"] == second["tools"] == without_data["tools"]
+
+
+def test_openai_responses_two_turn_runtime_data_preserves_cached_prefix() -> None:
+    first_messages, second_messages, without_data_messages = (
+        _runtime_turn_messages()
+    )
+
+    def build(messages: list[dict]) -> dict:
+        payload, _, _ = pc._build_openai_responses_payload(
+            model="gpt-5",
+            base_url="https://api.openai.com/v1",
+            key="sk-test",
+            messages=messages,
+            max_tokens=256,
+            response_format=None,
+            tools=TOOLS,
+            prompt_cache_key=CACHE_KEY,
+        )
+        return payload
+
+    first = build(first_messages)
+    second = build(second_messages)
+    without_data = build(without_data_messages)
+
+    assert (
+        first["instructions"]
+        == second["instructions"]
+        == without_data["instructions"]
+    )
+    assert "2026-07-18T10:00" not in first["instructions"]
+    assert first["input"][:-1] == second["input"][:1]
+    assert first["input"][-1]["role"] == "user"
+    assert _wire_message_text(first["input"][-1]).startswith(
+        v2_context.RUNTIME_CONTEXT_HEADER
+    )
+    assert first["prompt_cache_key"] == second["prompt_cache_key"] == CACHE_KEY
+    assert first["tools"] == second["tools"] == without_data["tools"]
+
+
+def test_openrouter_two_turn_runtime_data_keeps_existing_cache_boundaries() -> None:
+    first_messages, second_messages, without_data_messages = (
+        _runtime_turn_messages()
+    )
+
+    def build(messages: list[dict]) -> dict:
+        return pc._build_openai_compat_payload(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+            messages=messages,
+            temperature=None,
+            max_tokens=256,
+            response_format=None,
+            extra_body=None,
+            include_reasoning=False,
+            tools=TOOLS,
+            prompt_cache_key=CACHE_KEY,
+        )
+
+    first = build(first_messages)
+    second = build(second_messages)
+    without_data = build(without_data_messages)
+
+    assert first["session_id"] == second["session_id"] == CACHE_KEY
+    assert "prompt_cache_key" not in first
+    assert first["messages"][0] == second["messages"][0]
+    assert first["messages"][0] == without_data["messages"][0]
+    assert "2026-07-18T10:00" not in str(first["messages"][0])
+    assert first["messages"][:-1] == second["messages"][:2]
+    assert _wire_message_text(first["messages"][-1]).startswith(
+        v2_context.RUNTIME_CONTEXT_HEADER
+    )
+    assert _nested_cache_controls(first["messages"][-1]["content"]) == []
+    assert first["tools"] == second["tools"] == without_data["tools"]
+
+
+def test_openai_chat_two_turn_runtime_data_keeps_existing_cache_contract() -> None:
+    first_messages, second_messages, without_data_messages = (
+        _runtime_turn_messages()
+    )
+
+    def build(messages: list[dict]) -> dict:
+        return pc._build_openai_compat_payload(
+            provider="openai",
+            model="gpt-4.1",
+            messages=messages,
+            temperature=None,
+            max_tokens=256,
+            response_format=None,
+            extra_body=None,
+            include_reasoning=False,
+            tools=TOOLS,
+            prompt_cache_key=CACHE_KEY,
+        )
+
+    first = build(first_messages)
+    second = build(second_messages)
+    without_data = build(without_data_messages)
+
+    assert first["prompt_cache_key"] == second["prompt_cache_key"] == CACHE_KEY
+    assert "session_id" not in first
+    assert first["messages"][0] == second["messages"][0]
+    assert first["messages"][0] == without_data["messages"][0]
+    assert "2026-07-18T10:00" not in str(first["messages"][0])
+    assert first["messages"][:-1] == second["messages"][:2]
+    assert _wire_message_text(first["messages"][-1]).startswith(
+        v2_context.RUNTIME_CONTEXT_HEADER
+    )
+    assert _nested_cache_controls(first["messages"]) == []
+    assert first["tools"] == second["tools"] == without_data["tools"]
+
+
+def test_direct_anthropic_native_tool_round_keeps_canonical_cached_prefix() -> None:
+    base_messages = _multimodal_runtime_messages()
+    call = ToolCall("call-1", "web_search", {"query": "traceback"})
+    native = [
+        {"type": "thinking", "thinking": "opaque", "signature": "sig-keep"},
+        {"type": "text", "text": "I will inspect it."},
+        {
+            "type": "tool_use",
+            "id": call.id,
+            "name": call.name,
+            "input": call.args,
+        },
+    ]
+    native_original = copy.deepcopy(native)
+    exchange = ToolExchange(
+        calls=(call,),
+        results=(ToolResult(call.id, "search result"),),
+        assistant_text="I will inspect it.",
+        assistant_turn=NativeAssistantTurn("anthropic", native),
+    )
+
+    def build(messages: list) -> dict:
+        payload, _, _ = pc._build_anthropic_payload(
+            model="claude-sonnet-4-5",
+            base_url="https://api.anthropic.com/v1",
+            key="sk-test",
+            messages=messages,
+            max_tokens=256,
+            temperature=None,
+            response_format=None,
+            tools=TOOLS,
+            prompt_cache_key=CACHE_KEY,
+        )
+        return payload
+
+    first = build(base_messages)
+    second = build([*base_messages, exchange])
+
+    assert native == native_original
+    # The advancing marker set deliberately displaces the old summary marker.
+    assert _nested_cache_controls(first["messages"][0])
+    assert not _nested_cache_controls(second["messages"][0])
+    # Cache metadata may move; the serialized semantic prefix must not.
+    assert _without_cache_metadata(first["system"]) == _without_cache_metadata(
+        second["system"]
+    )
+    assert _without_cache_metadata(first["messages"]) == _without_cache_metadata(
+        second["messages"][:len(first["messages"])]
+    )
+    assert all(
+        isinstance(message.get("content"), list)
+        for message in first["messages"]
+    )
+    first_without_cache = _without_cache_metadata(first["messages"])
+    assert any(
+        block.get("type") == "image"
+        for message in first_without_cache
+        for block in message.get("content", [])
+        if isinstance(block, dict)
+    )
+    second_without_cache = _without_cache_metadata(second["messages"])
+    assert second_without_cache[len(first["messages"])] == {
+        "role": "assistant",
+        "content": native,
+    }
+    assert second_without_cache[len(first["messages"]) + 1] == {
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": call.id,
+            "content": "search result",
+        }],
+    }
+
+
+def test_openrouter_native_tool_round_keeps_canonical_cached_prefix() -> None:
+    base_messages = _multimodal_runtime_messages()
+    call = ToolCall("call-1", "web_search", {"query": "traceback"})
+    native = {
+        "role": "assistant",
+        "content": "I will inspect it.",
+        "reasoning_content": "opaque-provider-state",
+        "tool_calls": [{
+            "id": call.id,
+            "type": "function",
+            "function": {
+                "name": call.name,
+                "arguments": '{"query":"traceback"}',
+            },
+        }],
+    }
+    native_original = copy.deepcopy(native)
+    exchange = ToolExchange(
+        calls=(call,),
+        results=(ToolResult(call.id, "search result"),),
+        assistant_text="I will inspect it.",
+        assistant_turn=NativeAssistantTurn("openai_chat", native),
+    )
+
+    def build(messages: list) -> dict:
+        return pc._build_openai_compat_payload(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+            messages=messages,
+            temperature=None,
+            max_tokens=256,
+            response_format=None,
+            extra_body=None,
+            include_reasoning=False,
+            tools=TOOLS,
+            prompt_cache_key=CACHE_KEY,
+        )
+
+    first = build(base_messages)
+    second = build([
+        *base_messages,
+        exchange,
+        {"role": "user", "content": "One more detail arrived."},
+    ])
+
+    assert native == native_original
+    # A folded user boundary plus the native tool transcript advances all four
+    # OpenRouter markers and deliberately displaces the old summary marker.
+    assert _nested_cache_controls(first["messages"][1])
+    assert not _nested_cache_controls(second["messages"][1])
+    assert _without_cache_metadata(first["messages"]) == _without_cache_metadata(
+        second["messages"][:len(first["messages"])]
+    )
+    assert all(
+        isinstance(message.get("content"), list)
+        for message in first["messages"]
+    )
+    second_without_cache = _without_cache_metadata(second["messages"])
+    assistant = second_without_cache[len(first["messages"])]
+    assert assistant["content"] == [{"type": "text", "text": native["content"]}]
+    assert assistant["reasoning_content"] == native["reasoning_content"]
+    assert assistant["tool_calls"] == native["tool_calls"]
+    assert second_without_cache[len(first["messages"]) + 1] == {
+        "role": "tool",
+        "tool_call_id": call.id,
+        "content": [{"type": "text", "text": "search result"}],
+    }
 
 
 def test_parallel_tool_batch_cannot_displace_user_cache_boundary() -> None:
@@ -323,6 +733,8 @@ def test_async_anthropic_cache_rejection_retries_without_cache_but_keeps_tools(
     assert len(seen) == 2
     assert _nested_cache_controls(seen[0]["messages"]) == [{"type": "ephemeral"}]
     assert _nested_cache_controls(seen[1]["messages"]) == []
+    assert _without_cache_metadata(seen[0]["messages"]) == seen[1]["messages"]
+    assert isinstance(seen[1]["messages"][0]["content"], list)
     assert seen[1]["tools"] == seen[0]["tools"]
     assert result["usage"]["provider_retry_count"] == 1
     assert result["usage"]["cache_hint_sent_on_success"] is False

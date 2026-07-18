@@ -24,9 +24,11 @@ import provider_client
 from provider_types import ToolExchange
 from capabilities import registry as cap_registry
 from core import store as core_store
+from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
 
 pytestmark = pytest.mark.skipif(
@@ -35,7 +37,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-x", api_key="sk-user-byok", base_url="")
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
 
 
 class _FakeCapResult:
@@ -149,6 +151,61 @@ def _turn_metric_row(job_id):
     return row
 
 
+def _user_doc(message_id: str, text: str) -> dict:
+    return {
+        "id": message_id,
+        "role": "user",
+        "ts": 10.0,
+        "source": "model_api",
+        "body_ct": f"cipher-{message_id}",
+        "nonce": "n",
+        "K_user": "k",
+        "K_enclave": "e",
+        # Test-only plaintext lookup; production's injected reader obtains the
+        # same value by decrypting the envelope in the enclave.
+        "test_plaintext": text,
+    }
+
+
+def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
+    def read_after_seq(_user_id: str, after_seq: int):
+        rows = db.chat_messages_after_seq(uid, after_seq, limit=None)
+        return [
+            {
+                "id": row["id"],
+                "seq": row["seq"],
+                "ts": row["ts"],
+                "role": row.get("role"),
+                "content": row.get("test_plaintext", ""),
+            }
+            for row in rows
+            if row.get("role") == "user"
+        ]
+
+    def apply(user_id: str):
+        def dispatch(effect_type, payload):
+            if effect_type != "reply":
+                return
+            written.append(str(payload.get("text") or ""))
+            if payload.get("reply_through_seq") is not None:
+                db.patch_blob_strict(
+                    user_id,
+                    "model_api_runtime",
+                    {"v2_reply_cursor_seq": int(payload["reply_through_seq"])},
+                )
+
+        return v2_effect_outbox.apply_pending_effects(
+            user_id, dispatch=dispatch)
+
+    return worker.TurnDeps(
+        read_messages=lambda _user_id: read_after_seq(uid, 0),
+        read_messages_after_seq=read_after_seq,
+        resolve_provider=lambda _user_id: (_BYOK, {}),
+        mint_enclave_token=lambda _user_id: "rt",
+        apply_pending_effects=apply,
+    )
+
+
 def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     """Round 1: no tool_calls, plain text -> that text IS the final reply
     (Global Constraints)."""
@@ -177,6 +234,572 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False      # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
+    monkeypatch,
+):
+    uid = "u_toolloop_late_final_fold"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs WHERE user_id=%s AND kind='model_api_runtime'",
+            (uid,),
+        )
+    db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
+    generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(
+        uid, "chat", expected_generation=generation)
+    job = jobs_store.claim_next_job("w-late-final")
+
+    # Keep the test focused on the outbox fence rather than enclave crypto: the
+    # production builder also returns a dict whose content is encrypted and to
+    # which worker adds the same non-sensitive fence metadata.
+    monkeypatch.setattr(
+        worker,
+        "_build_encrypted_reply_effect_payload",
+        lambda _store, text, *, effect_id, reply_through_seq=None: {
+            "text": text,
+            "reply_through_seq": reply_through_seq,
+        },
+    )
+    monkeypatch.setattr(
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({}))
+    written: list[str] = []
+    deps = _late_input_deps(uid, written)
+    calls = []
+
+    async def provider(_config, messages, *, tools=None):
+        calls.append(list(messages))
+        if len(calls) == 1:
+            # This is the production send invariant: B and the running job's
+            # generation bump commit in the same transaction.
+            seq, same_job_id = db.chat_append_and_enqueue(
+                uid,
+                "B",
+                20.0,
+                _user_doc("B", "late B"),
+                5000,
+                "chat",
+                expected_generation=generation,
+            )
+            assert seq > 0 and same_job_id == job_id
+            return _text_round("stale A-only final")
+        assert any(
+            isinstance(message, dict) and message.get("content") == "late B"
+            for message in messages
+        )
+        return _text_round("fresh A+B final")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    assert written == ["fresh A+B final"]
+    assert _job_status_row(job_id)[0] == "completed"
+    with db.get_pool().connection() as conn:
+        successors = conn.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE user_id=%s AND id<>%s",
+            (uid, job_id),
+        ).fetchone()[0]
+        effects = conn.execute(
+            "SELECT status,last_error FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type=%s ORDER BY enqueue_seq",
+            (uid, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
+        ).fetchall()
+    assert successors == 0
+    assert effects == [
+        ("discarded", "input_generation_advanced"),
+        ("applied", ""),
+    ]
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == db.chat_seq_for_msg_id(uid, "B")
+
+
+@pytest.mark.parametrize("failed_post_commit_step", ["done_status", "chat_notify", "metric"])
+def test_committed_final_reply_survives_post_commit_bookkeeping_failures(
+    monkeypatch,
+    failed_post_commit_step,
+):
+    """Auxiliary failures cannot rewrite an atomic reply as a failed child.
+
+    The production reply sink commits the encrypted bubble, reply cursor,
+    source-job completion, effect disposition, and PG NOTIFY together.  The
+    status stream, redundant process-level wake, and metric upsert happen only
+    after that transaction and must therefore be best-effort.
+    """
+    uid = f"u_toolloop_post_commit_{failed_post_commit_step}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "A",
+        10.0,
+        _user_doc("A", "answer me"),
+        5000,
+        "chat",
+        expected_generation=db.get_runtime_generation(uid),
+    )
+    job = jobs_store.claim_next_job(f"w-{failed_post_commit_step}")
+    assert job is not None and job["id"] == job_id
+
+    def read_after_seq(_user_id: str, after_seq: int):
+        return [
+            {
+                "id": row["id"],
+                "seq": row["seq"],
+                "ts": row["ts"],
+                "role": row.get("role"),
+                "content": row.get("test_plaintext", ""),
+            }
+            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"
+        ]
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda store, plaintext, *, item_id=None: (
+            {
+                "v": 1,
+                "id": str(item_id),
+                "owner_user_id": store.user_id,
+                "visibility": "shared",
+                "body_ct": plaintext.hex(),
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
+            },
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_perception_grounding_results",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+    )
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0, result=_text_round("durable final")
+        ),
+    )
+    surfaced: list[str] = []
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda *_args, **_kwargs: surfaced.append(str(_args[-1])),
+    )
+
+    if failed_post_commit_step == "done_status":
+        original_emit_status = worker._emit_status
+
+        def fail_done_status(user_id, source_job_id, kind):
+            if kind == "done":
+                raise RuntimeError("injected done status failure")
+            return original_emit_status(user_id, source_job_id, kind)
+
+        monkeypatch.setattr(worker, "_emit_status", fail_done_status)
+    elif failed_post_commit_step == "chat_notify":
+        original_notify = worker.core_wake_bus.notify
+
+        def fail_chat_notify(channel, user_id=""):
+            if channel == "chat":
+                raise RuntimeError("injected chat notify failure")
+            return original_notify(channel, user_id)
+
+        monkeypatch.setattr(worker.core_wake_bus, "notify", fail_chat_notify)
+    else:
+        monkeypatch.setattr(
+            jobs_store,
+            "record_whole_turn_metric",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected metric failure")
+            ),
+        )
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: read_after_seq(uid, 0),
+        read_messages_after_seq=read_after_seq,
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+    result = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert result == "completed"
+    assert surfaced == []
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == input_seq
+    assert _job_status_row(job_id) == ("completed", None)
+    with db.get_pool().connection() as conn:
+        replies = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role'='openclaw'",
+            (uid,),
+        ).fetchone()[0]
+        effect = conn.execute(
+            "SELECT status FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type=%s",
+            (uid, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
+        ).fetchone()
+    assert replies == 1
+    assert effect == ("applied",)
+
+
+def test_pre_commit_status_failure_still_fails_without_reply(monkeypatch):
+    """The best-effort boundary starts only after final-reply publication."""
+    uid = "u_toolloop_pre_commit_status_failure"
+    conftest.seed_user(uid)
+    _reset(uid)
+    _input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "A",
+        10.0,
+        _user_doc("A", "answer me"),
+        5000,
+        "chat",
+        expected_generation=db.get_runtime_generation(uid),
+    )
+    job = jobs_store.claim_next_job("w-pre-commit-status")
+    assert job is not None and job["id"] == job_id
+    original_emit_status = worker._emit_status
+
+    def fail_writing_status(user_id, source_job_id, kind):
+        if kind == "writing_reply":
+            raise RuntimeError("injected pre-commit status failure")
+        return original_emit_status(user_id, source_job_id, kind)
+
+    monkeypatch.setattr(worker, "_emit_status", fail_writing_status)
+    provider_calls: list[int] = []
+
+    async def provider(*_args, **_kwargs):
+        provider_calls.append(1)
+        return _text_round("must not publish")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    def read_after_seq(_user_id: str, after_seq: int):
+        return [
+            {
+                "id": row["id"],
+                "seq": row["seq"],
+                "ts": row["ts"],
+                "role": row.get("role"),
+                "content": row.get("test_plaintext", ""),
+            }
+            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"
+        ]
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: read_after_seq(uid, 0),
+        read_messages_after_seq=read_after_seq,
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+    result = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert result == "failed"
+    assert provider_calls == []
+    assert _job_status_row(job_id)[0] == "failed"
+    with db.get_pool().connection() as conn:
+        replies = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role'='openclaw'",
+            (uid,),
+        ).fetchone()[0]
+    assert replies == 0
+
+
+def test_sweeper_wins_final_effect_before_producer_drain_and_loop_still_retries(
+    monkeypatch,
+):
+    """The worker must acknowledge the durable row, not the drain return.
+
+    Each wrapper call first runs an independent "sweeper" applier and only then
+    returns the producing worker's now-empty drain result. The stale candidate
+    must still retry, and the fresh candidate must still count as delivered.
+    """
+    uid = "u_toolloop_late_final_sweeper_wins"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs WHERE user_id=%s AND kind='model_api_runtime'",
+            (uid,),
+        )
+    db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
+    generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(
+        uid, "chat", expected_generation=generation)
+    job = jobs_store.claim_next_job("w-sweeper-wins")
+    monkeypatch.setattr(
+        worker,
+        "_build_encrypted_reply_effect_payload",
+        lambda _store, text, *, effect_id, reply_through_seq=None: {
+            "text": text,
+            "reply_through_seq": reply_through_seq,
+        },
+    )
+    monkeypatch.setattr(
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({}))
+    written: list[str] = []
+    deps = _late_input_deps(uid, written)
+    real_apply = deps.apply_pending_effects
+    assert real_apply is not None
+    producer_drains = []
+
+    def sweep_before_producer(user_id: str):
+        real_apply(user_id)
+        producer_result = real_apply(user_id)
+        producer_drains.append(producer_result)
+        return producer_result
+
+    deps.apply_pending_effects = sweep_before_producer
+    calls = []
+
+    async def provider(_config, messages, *, tools=None):
+        calls.append(list(messages))
+        if len(calls) == 1:
+            _seq, same_job_id = db.chat_append_and_enqueue(
+                uid,
+                "B",
+                20.0,
+                _user_doc("B", "late B"),
+                5000,
+                "chat",
+                expected_generation=generation,
+            )
+            assert same_job_id == job_id
+            return _text_round("stale A-only final")
+        assert any(
+            isinstance(message, dict) and message.get("content") == "late B"
+            for message in messages
+        )
+        return _text_round("fresh A+B final")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    assert written == ["fresh A+B final"]
+    # Turn-start recovery plus both final publications all return an empty
+    # producer drain because the independent applier got there first.
+    assert producer_drains[:3] == [
+        {"applied": 0, "discarded": 0},
+        {"applied": 0, "discarded": 0},
+        {"applied": 0, "discarded": 0},
+    ]
+    with db.get_pool().connection() as conn:
+        effects = conn.execute(
+            "SELECT status,last_error FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type=%s ORDER BY enqueue_seq",
+            (uid, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
+        ).fetchall()
+    assert effects == [
+        ("discarded", v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED),
+        ("applied", ""),
+    ]
+
+
+def test_last_call_late_input_hands_off_without_reply_or_error_chip(
+    monkeypatch,
+):
+    uid = "u_toolloop_late_final_handoff"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs WHERE user_id=%s AND kind='model_api_runtime'",
+            (uid,),
+        )
+    db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
+    generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(
+        uid, "chat", expected_generation=generation)
+    job = jobs_store.claim_next_job("w-late-handoff")
+    written: list[str] = []
+    deps = _late_input_deps(uid, written)
+    surfaced = []
+    monkeypatch.setattr(worker, "_TURN_MAX_LLM_CALLS", 1)
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda *args, **kwargs: surfaced.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_build_encrypted_reply_effect_payload",
+        lambda _store, text, *, effect_id, reply_through_seq=None: {
+            "text": text,
+            "reply_through_seq": reply_through_seq,
+        },
+    )
+    monkeypatch.setattr(
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({}))
+
+    async def provider(_config, _messages, *, tools=None):
+        _seq, same_job_id = db.chat_append_and_enqueue(
+            uid,
+            "B",
+            20.0,
+            _user_doc("B", "late B"),
+            5000,
+            "chat",
+            expected_generation=generation,
+        )
+        assert same_job_id == job_id
+        return _text_round("must never be visible")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert written == []
+    assert surfaced == []
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == 0
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT id,status,reason,expected_runtime_generation "
+            "FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+    assert rows[0][:2] == (job_id, "completed")
+    assert rows[1][1:] == (
+        "pending", "coalesced_followup", generation)
+
+
+def test_invalid_final_fence_fails_visibly_without_reply_or_retry_loop(monkeypatch):
+    uid = "u_toolloop_invalid_final_fence_handoff"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs WHERE user_id=%s AND kind='model_api_runtime'",
+            (uid,),
+        )
+    db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
+    generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(
+        uid, "chat", expected_generation=generation)
+    job = jobs_store.claim_next_job("w-invalid-fence")
+    written: list[str] = []
+    deps = _late_input_deps(uid, written)
+    real_apply = deps.apply_pending_effects
+    assert real_apply is not None
+    surfaced = []
+    monkeypatch.setattr(worker, "_TURN_MAX_LLM_CALLS", 1)
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda *args, **kwargs: surfaced.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_build_encrypted_reply_effect_payload",
+        lambda _store, text, *, effect_id, reply_through_seq=None: {
+            "text": text,
+            "reply_through_seq": reply_through_seq,
+        },
+    )
+    monkeypatch.setattr(
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({}))
+    corrupted = []
+
+    def corrupt_terminal_before_apply(user_id: str):
+        with db.get_pool().connection() as conn:
+            changed = conn.execute(
+                "UPDATE v2_effect_outbox "
+                "SET payload=payload - %s "
+                "WHERE user_id=%s AND effect_type=%s "
+                "AND status IN ('pending','pending_fenced_v1') "
+                "AND payload ? 'reply_through_seq'",
+                (
+                    v2_effect_outbox.FINAL_REPLY_FENCE_KEY,
+                    user_id,
+                    v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
+                ),
+            ).rowcount
+        if changed:
+            corrupted.append(changed)
+        return real_apply(user_id)
+
+    deps.apply_pending_effects = corrupt_terminal_before_apply
+
+    async def provider(_config, _messages, *, tools=None):
+        return _text_round("must never be visible")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert corrupted == [1]
+    assert written == []
+    assert len(surfaced) == 1
+    assert surfaced[0][0][-1] == "turn_failed:runtimeerror"
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == 0
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT id,status,reason,expected_runtime_generation "
+            "FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+        effect = conn.execute(
+            "SELECT status,last_error,attempt_count FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type=%s",
+            (uid, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
+        ).fetchone()
+    assert rows == [(job_id, "failed", None, generation)]
+    assert effect == (
+        "discarded", v2_effect_outbox.FINAL_REPLY_INVALID_FENCE, 0)
 
 
 def _job_status_row(job_id):
