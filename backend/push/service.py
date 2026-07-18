@@ -140,14 +140,6 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
         return {"status": "error", "reason": str(e)}
 
 
-def _json_body_from_response(resp) -> dict:
-    try:
-        body = resp.get_json(silent=True) or {}
-        return body if isinstance(body, dict) else {}
-    except Exception:
-        return {}
-
-
 def _deliver_ai_message_push_if_background(
     store: UserStore,
     *,

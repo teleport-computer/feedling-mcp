@@ -662,6 +662,67 @@ def test_bootstrap_status_complete_field_includes_loop_verified(backend):
     assert body["is_complete"] is False
 
 
+def _select_onboarding_route(base_url: str, api_key: str, route: str) -> None:
+    r = requests.post(
+        f"{base_url}/v1/onboarding/route",
+        json={"route": route},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+
+def _bootstrap_status(base_url: str, api_key: str) -> dict:
+    r = requests.get(
+        f"{base_url}/v1/bootstrap/status",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_model_api_bootstrap_status_completes_without_resident_loop(backend):
+    """Hosted users complete onboarding with identity + a real agent reply.
+
+    They never run the resident consumer, so its heartbeat and verify_loop are
+    expected to remain false and must stay informational in this route.
+    """
+    user_id, api_key = _register(backend["base_url"])
+    _select_onboarding_route(backend["base_url"], api_key, "model_api")
+    assert _init_identity(backend["base_url"], user_id, api_key).status_code == 201
+    assert _chat_response(backend["base_url"], user_id, api_key).status_code == 200
+
+    body = _bootstrap_status(backend["base_url"], api_key)
+    assert body["identity_written"] is True
+    assert body["agent_messages_count"] == 1
+    assert body["resident_consumer_connected"] is False
+    assert body["chat_loop_verified"] is False
+    assert body["is_complete"] is True
+
+
+def test_model_api_bootstrap_status_requires_identity(backend):
+    user_id, api_key = _register(backend["base_url"])
+    _select_onboarding_route(backend["base_url"], api_key, "model_api")
+    assert _chat_response(backend["base_url"], user_id, api_key).status_code == 200
+
+    body = _bootstrap_status(backend["base_url"], api_key)
+    assert body["identity_written"] is False
+    assert body["agent_messages_count"] == 1
+    assert body["is_complete"] is False
+
+
+def test_model_api_bootstrap_status_requires_agent_reply(backend):
+    user_id, api_key = _register(backend["base_url"])
+    _select_onboarding_route(backend["base_url"], api_key, "model_api")
+    assert _init_identity(backend["base_url"], user_id, api_key).status_code == 201
+
+    body = _bootstrap_status(backend["base_url"], api_key)
+    assert body["identity_written"] is True
+    assert body["agent_messages_count"] == 0
+    assert body["is_complete"] is False
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Verify endpoints — memory_verify / identity_verify /
 # chat_verify_loop. Surface QUALITY signals on top of the existing GATES.

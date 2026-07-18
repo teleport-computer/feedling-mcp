@@ -68,6 +68,43 @@ def _stub_update_identity_persona(monkeypatch):
     monkeypatch.setattr(plaintext.service, "write_persona_artifact", lambda *_args, **_kwargs: ("user_blob:genesis_persona", "sha-persona"))
 
 
+def test_plaintext_import_missing_material_returns_stable_slug(monkeypatch):
+    client = _client(monkeypatch)
+
+    resp = client.post("/v1/genesis/imports/plaintext", json={"format": "auto", "content": ""})
+
+    assert resp.status_code == 400
+    body = resp.get_json()
+    assert body["error"] == "material_empty"
+    assert "fresh_start=true required" in body["detail"]
+
+
+def test_plaintext_import_normalized_empty_returns_stable_slug(monkeypatch):
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        plaintext.history_import,
+        "_parse_import_history_content",
+        lambda *_args: [{"role": "user", "content": "raw", "source": "history_import"}],
+    )
+    monkeypatch.setattr(plaintext.history_import, "_persona_support_messages", lambda _payload: [])
+    monkeypatch.setattr(
+        plaintext.history_import,
+        "_history_import_profile",
+        lambda *_args, **_kwargs: {"tier": "small", "total_windows": 1, "message_count": 1, "support_count": 0},
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_source_groups",
+        lambda *_args, **_kwargs: [{"source_family": "history", "chunk_texts": ["   "]}],
+    )
+
+    resp = client.post("/v1/genesis/imports/plaintext", json={"format": "auto", "content": "raw"})
+
+    assert resp.status_code == 400
+    body = resp.get_json()
+    assert body == {"error": "material_empty", "detail": "plaintext_import_empty"}
+
+
 def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypatch):
     client = _client(monkeypatch)
     payload = {
@@ -499,7 +536,12 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
             return {
                 "source_kind": kwargs["source_kind"],
                 "source_family": "memory_summary",
-                "memories": [{"type": "fact", "summary": "Memory summary", "content": "Memory summary."}],
+                "memories": [{
+                    "type": "fact",
+                    "summary": "Memory summary",
+                    "content": "Memory summary.",
+                    "tags": ["archive"],
+                }],
                 "identity": {"agent_name": "MemoryName", "dimensions": [{"name": "ShouldDrop", "description": "drop"}]},
                 "days_with_user": 22,
             }
@@ -565,6 +607,9 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
         "Memory summary",
         "User profile fact",
     ]
+    assert applied["memories"][0]["_source_family"] == "history"
+    assert applied["memories"][1]["_source_family"] == "memory_summary"
+    assert applied["memories"][2]["_source_family"] == "user_profile"
     serialized = json.dumps(applied, ensure_ascii=False)
     assert "WrongUserName" not in serialized
     assert "bad user persona" not in serialized
@@ -640,7 +685,10 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
     monkeypatch.setattr(
         plaintext.service,
         "apply_memory_outputs",
-        lambda _store, _api_key, output: calls.update({"memory_output": output}) or (1, [{"memory": {"id": "m1"}}]),
+        lambda _store, _api_key, output, **kwargs: calls.update({
+            "memory_output": output,
+            "memory_apply_kwargs": kwargs,
+        }) or (1, [{"memory": {"id": "m1"}}]),
     )
     monkeypatch.setattr(plaintext.service, "init_identity_if_absent", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not touch identity")))
     monkeypatch.setattr(plaintext.service, "write_persona_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not write persona")))
@@ -665,6 +713,10 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
     assert calls["foreground"].get("include_voice_candidates") in (None, False)
     assert calls["fact_write"]["fact_candidates"] == [{"summary": "用户养了一条狗"}]
     assert [item["summary"] for item in calls["memory_output"]["memories"]] == ["用户养了一条狗"]
+    assert calls["memory_apply_kwargs"] == {
+        "preserve_dates": False,
+        "fallback_occurred_at": "2099-01-01",
+    }
     assert calls["completed"]["memory_action_count"] == 1
     assert calls["completed"]["identity_status"] == "skipped"
 
@@ -1007,3 +1059,49 @@ def test_foreground_history_chunks_capped_support_untouched(monkeypatch):
     persona = next(g for g in capped if g["source_family"] == "ai_persona")
     assert len(hist["chunk_texts"]) == 8          # history 采样到 8
     assert len(persona["chunk_texts"]) == 1        # 小桶不动
+
+
+def test_plaintext_import_rejection_logs_breadcrumb(monkeypatch, caplog):
+    # Observability: when an import 400s because uploaded material normalized to
+    # empty, we must leave an always-on breadcrumb (server logs are the only trace
+    # for this failure — no job row is created). The high-signal field is
+    # material_present=True: the user DID upload something, yet it was dropped.
+    client = _client(monkeypatch)
+    # An account-export blob (uuid/email, no real content) is legitimately dropped,
+    # so this still 400s post-fix — perfect to exercise the breadcrumb.
+    blob = json.dumps([{"uuid": "u-1", "email_address": "a@b.com", "full_name": "S"}])
+    with caplog.at_level("WARNING", logger="feedling.genesis.plaintext_import"):
+        resp = client.post(
+            "/v1/genesis/imports/plaintext",
+            json={"format": "auto", "content": "", "mode": "add_memory",
+                  "memory_summary_content": blob,
+                  "memory_summary_filename": "export.json"},
+        )
+    assert resp.status_code == 400
+    recs = [r for r in caplog.records if "genesis.plaintext.rejected" in r.getMessage()]
+    assert recs, "expected a genesis.plaintext.rejected breadcrumb"
+    msg = recs[0].getMessage()
+    assert "material_present=True" in msg          # user uploaded material…
+    assert "memory_summary_content" in msg         # …and we record which field + its size
+    assert "a@b.com" not in msg                     # but never the content itself (lengths only)
+
+
+def test_sealed_import_rejection_logs_breadcrumb(monkeypatch, caplog):
+    # Resident/sealed lane: an incomplete sealed envelope 400s BEFORE a job row is
+    # created (same blind spot the cloud upload 400 had). Assert the always-on
+    # genesis.sealed.rejected breadcrumb fires — with structural facts only, no content.
+    client = _client(monkeypatch)
+    with caplog.at_level("WARNING", logger="feedling.genesis.plaintext_import"):
+        resp = client.post(
+            "/v1/genesis/imports/plaintext",
+            json={"format": "sealed_v1", "mode": "add_memory",
+                  "envelope": {"body_ct": "QUJD", "visibility": "shared"}},  # missing nonce/K_user/...
+        )
+    assert resp.status_code == 400
+    assert resp.get_json().get("error") == "sealed_envelope_incomplete"
+    recs = [r for r in caplog.records if "genesis.sealed.rejected" in r.getMessage()]
+    assert recs, "expected a genesis.sealed.rejected breadcrumb"
+    msg = recs[0].getMessage()
+    assert "reason=sealed_envelope_incomplete" in msg
+    assert "body_ct_bytes" in msg          # structural fact recorded (ciphertext length)
+    assert "QUJD" not in msg               # never the (cipher)payload itself

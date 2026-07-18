@@ -222,7 +222,9 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
     follow_up = memory_readside_text(inner.get("follow_up"), 1000)
     content = "\n".join([
         f"记忆: {description or summary}",
-        f"上下文: {quote or '用户在对话中明确提到。'}",
+        # User-visible fallback: no "用户"/system labels ("TA" is the app
+        # surface's name for the AI). Subject-free reads naturally.
+        f"上下文: {quote or '对话中明确提到。'}",
         f"使用提示: {follow_up or '自然使用这条记忆，不要机械复述。'}",
     ])
     threads = memory_readside_list(inner.get("threads"))
@@ -241,22 +243,6 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
         if key in inner:
             adapted[key] = inner[key]
     return adapted
-
-
-def memory_readside_bucket_refs(inner: dict) -> list[str]:
-    refs = memory_readside_list(inner.get("bucket_refs"))
-    if refs:
-        return refs
-    refs = memory_readside_list(inner.get("bucket_ids"))
-    if refs:
-        return refs
-    linked = memory_readside_text(inner.get("linked_dimension"), 160)
-    return [linked] if linked else []
-
-
-def memory_readside_salience(envelope: dict, inner: dict) -> str:
-    salience = str(envelope.get("salience") or inner.get("salience") or "medium").strip().lower()
-    return salience if salience in {"critical", "high", "medium", "low"} else "medium"
 
 
 def memory_readside_status(envelope: dict, inner: dict) -> str:

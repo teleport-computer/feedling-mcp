@@ -2,11 +2,8 @@
 
 import hashlib
 import json
-import os
 import re
-import time
 import uuid
-from datetime import date, datetime
 
 
 import db
@@ -40,11 +37,6 @@ def _memory_action_float(value, default: float) -> float:
     except (TypeError, ValueError):
         parsed = default
     return max(0.0, min(1.0, parsed))
-
-
-def _memory_action_salience(value) -> str:
-    salience = str(value or "medium").strip().lower()
-    return salience if salience in {"critical", "high", "medium", "low"} else "medium"
 
 
 def _memory_action_list(value, max_items: int = 8, max_chars: int = 80) -> list[str]:
@@ -94,7 +86,9 @@ def _memory_content_from_action(data: dict, summary: str) -> str:
     if quote or context:
         parts.append(f"上下文: {quote or context}")
     else:
-        parts.append("上下文: 用户在对话中明确提到。")
+        # Card text is user-visible: no "用户"/system labels (and "TA" is the
+        # app surface's name for the AI). Subject-free reads naturally.
+        parts.append("上下文: 对话中明确提到。")
     follow_up = str(data.get("follow_up") or "").strip()[:1000]
     parts.append(f"使用提示: {follow_up or '自然使用这条记忆，不要机械复述。'}")
     return "\n".join(parts)
@@ -417,116 +411,6 @@ def _memory_add_envelope_action(store: UserStore, action: dict) -> tuple[dict, l
         },
         "change": change,
     }, [_memory_action_effect("memory.add", moment["id"], ["created"])], 201
-
-
-def _memory_content_patch_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
-    memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
-    patch = action.get("patch") if isinstance(action.get("patch"), dict) else {}
-    if not memory_id:
-        return {"status": "error", "error": "memory_id_required", "action": "memory.content_patch"}, [], 400
-    if not patch:
-        return {"status": "error", "error": "patch_required", "action": "memory.content_patch"}, [], 400
-
-    moments = memory_service._load_moments(store)
-    idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == memory_id), None)
-    if idx is None:
-        return {"status": "error", "error": "not_found", "action": "memory.content_patch"}, [], 404
-    existing = moments[idx]
-    if existing.get("owner_user_id") != store.user_id:
-        return {"status": "error", "error": "not_owned", "action": "memory.content_patch"}, [], 403
-    inner, err = _memory_plain_from_envelope(existing, api_key)
-    if inner is None:
-        return {"status": "error", "error": err, "action": "memory.content_patch"}, [], 409
-
-    merged = dict(inner)
-    changed: list[str] = []
-    for key, max_len in (
-        ("title", 180),
-        ("description", 2000),
-        ("summary", 2000),
-        ("her_quote", 1000),
-        ("verbatim", 1000),
-        ("context", 1000),
-        ("follow_up", 1000),
-        ("linked_dimension", 160),
-    ):
-        if key in patch:
-            new_val = str(patch.get(key) or "").strip()[:max_len]
-            if new_val:
-                merged[key] = new_val
-            else:
-                merged.pop(key, None)
-            if merged.get(key, "") != inner.get(key, ""):
-                changed.append(key)
-
-    mem_type = str(patch.get("type") or existing.get("type") or merged.get("type") or "fact").strip().lower()
-    if mem_type != existing.get("type"):
-        changed.append("type")
-    merged["type"] = mem_type
-    occurred_at = _memory_action_text(patch.get("occurred_at") or existing.get("occurred_at") or core_util._now_iso(), 80)
-    if occurred_at != existing.get("occurred_at"):
-        changed.append("occurred_at")
-    source = _memory_action_text(patch.get("source") or existing.get("source") or "live_conversation", 80)
-    anchor_ids = patch.get("anchor_memory_ids", existing.get("anchor_memory_ids") or [])
-    if not isinstance(anchor_ids, list):
-        return {"status": "error", "error": "anchor_memory_ids_must_be_list", "action": "memory.content_patch"}, [], 400
-    if anchor_ids != (existing.get("anchor_memory_ids") or []):
-        changed.append("anchor_memory_ids")
-
-    ok, validation_err = _memory_validate_write(
-        store,
-        moments,
-        mem_type=mem_type,
-        anchor_ids=anchor_ids,
-        memory_id=memory_id,
-        enforce_reflection_cap=False,
-    )
-    if not ok:
-        return {"status": "error", **(validation_err or {}), "action": "memory.content_patch"}, [], 400
-    if not changed:
-        return {"status": "ok", "action": "memory.content_patch", "changed_fields": [], "noop": True}, [], 200
-
-    envelope, env_err = _build_memory_envelope_for_store(store, _memory_inner_from_action(merged), item_id=memory_id)
-    if envelope is None:
-        return {"status": "error", "error": env_err, "action": "memory.content_patch"}, [], 409
-    envelope["type"] = mem_type
-    envelope["occurred_at"] = occurred_at
-    envelope["source"] = source
-    _memory_apply_v1_metadata(envelope, {**existing, **patch}, source=source, default_status=str(existing.get("status") or "active"))
-    if anchor_ids:
-        envelope["anchor_memory_ids"] = list(anchor_ids)
-    updated = _memory_record_from_envelope(store, envelope, existing=existing)
-    # Re-read + re-find + replace-by-id + save under one memory_lock hold (the
-    # enclave decrypt above stays OUTSIDE the lock) so a concurrent same-user
-    # write is not lost-updated by this stale-snapshot save.
-    with memory_service.mutation_lock(store):
-        moments = memory_service._load_moments(store)
-        fresh_idx = next(
-            (i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == memory_id),
-            None,
-        )
-        if fresh_idx is None:
-            return {"status": "error", "error": "not_found", "action": "memory.content_patch"}, [], 404
-        moments[fresh_idx] = updated
-        memory_service._save_moments(store, moments)
-    boot_gates._log_bootstrap_event(store, "memory_action_patched_v1", success=True)
-    change = memory_service._append_memory_change(store, {
-        "action": "content_patch",
-        "memory_id": memory_id,
-        "old_type": existing.get("type", ""),
-        "new_type": mem_type,
-        "fields": changed,
-        "reason": _memory_action_text(action.get("reason") or "Memory updated from chat.", 500),
-        "source_chat_message_ids": action.get("source_chat_message_ids") or [],
-        "anchor_memory_ids": anchor_ids,
-    })
-    return {
-        "status": "ok",
-        "action": "memory.content_patch",
-        "changed_fields": changed,
-        "memory": {"id": memory_id, "type": mem_type, "occurred_at": occurred_at},
-        "change": change,
-    }, [_memory_action_effect("memory.content_patch", memory_id, changed)], 200
 
 
 def _memory_body_hash(moment: dict | None) -> str:

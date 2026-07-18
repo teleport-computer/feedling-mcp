@@ -14,6 +14,8 @@ import base64
 from datetime import datetime
 import os
 import sys
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -163,6 +165,96 @@ def test_chat_append_order_and_ring_buffer():
     # ring buffer keeps the newest 3, in insertion order
     assert [m["id"] for m in loaded] == ["m2", "m3", "m4"]
     assert loaded[0]["body_ct"] == "ct2"
+
+
+def _idempotent_chat_doc(msg_id: str, client_msg_id: str, ts: float) -> dict:
+    return {
+        "id": msg_id,
+        "role": "user",
+        "source": "chat",
+        "ts": ts,
+        "v": 1,
+        "body_ct": f"ct-{msg_id}",
+        "client_msg_id": client_msg_id,
+    }
+
+
+def test_chat_append_idempotent_same_key_returns_first_row():
+    uid = _uid()
+    seed_user(uid)
+    key = str(uuid.uuid4())
+    now = time.time()
+    first_doc = _idempotent_chat_doc("idem-first", key, now)
+    retry_doc = _idempotent_chat_doc("idem-retry", key, now + 0.01)
+
+    first, first_inserted = db.chat_append_idempotent(
+        uid, first_doc["id"], first_doc["ts"], first_doc, 5000,
+        client_msg_id=key, window_sec=600,
+    )
+    retry, retry_inserted = db.chat_append_idempotent(
+        uid, retry_doc["id"], retry_doc["ts"], retry_doc, 5000,
+        client_msg_id=key, window_sec=600,
+    )
+
+    assert first_inserted is True
+    assert retry_inserted is False
+    assert retry == first
+    assert [row["id"] for row in db.chat_load(uid)] == ["idem-first"]
+
+
+def test_chat_append_idempotent_cross_worker_race_has_one_winner():
+    uid = _uid()
+    seed_user(uid)
+    key = str(uuid.uuid4())
+    barrier = threading.Barrier(2)
+    outcomes: list = [None, None]
+
+    def _run(index: int) -> None:
+        msg_id = f"race-{index}"
+        ts = time.time()
+        doc = _idempotent_chat_doc(msg_id, key, ts)
+        barrier.wait()
+        outcomes[index] = db.chat_append_idempotent(
+            uid, msg_id, ts, doc, 5000,
+            client_msg_id=key, window_sec=600,
+        )
+
+    threads = [threading.Thread(target=_run, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    (winner_a, inserted_a), (winner_b, inserted_b) = outcomes
+    assert sorted([inserted_a, inserted_b]) == [False, True]
+    assert winner_a == winner_b
+    rows = db.chat_load(uid)
+    assert len(rows) == 1
+    assert rows[0] == winner_a
+
+
+def test_chat_append_idempotent_distinct_keys_and_expired_key_insert():
+    uid = _uid()
+    seed_user(uid)
+    now = time.time()
+    old_key = str(uuid.uuid4())
+    fresh_key = str(uuid.uuid4())
+    old_doc = _idempotent_chat_doc("expired-first", old_key, now - 601)
+    replacement = _idempotent_chat_doc("expired-second", old_key, now)
+    distinct = _idempotent_chat_doc("distinct", fresh_key, now + 0.01)
+
+    results = [
+        db.chat_append_idempotent(
+            uid, doc["id"], doc["ts"], doc, 5000,
+            client_msg_id=doc["client_msg_id"], window_sec=600,
+        )
+        for doc in (old_doc, replacement, distinct)
+    ]
+
+    assert [inserted for _winner, inserted in results] == [True, True, True]
+    assert [row["id"] for row in db.chat_load(uid)] == [
+        "expired-first", "expired-second", "distinct",
+    ]
 
 
 def test_chat_update_metadata_merges():

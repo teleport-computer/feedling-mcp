@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import sys
 import threading
 import time
@@ -839,19 +838,6 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     stored_cred = db.model_api_credential_get(user_id, cred_id)
     assert "sk-test-secret" not in json.dumps(stored_cred)
 
-def test_model_api_context_summary_parsing_drops_generic_runtime_fallback():
-    reply, summary = hosted_turn._model_api_parse_turn_reply(
-        '{"reply":"好，我在。","thinking_summary":"参考了 8 条相关记忆。\\n对齐了当前 Identity 设定。"}'
-    )
-    assert reply == "好，我在。"
-    assert summary == ""
-
-    reply, summary = hosted_turn._model_api_parse_turn_reply(
-        '{"reply":"我先不删。","context_summary":"准备删除 Memory：烧卖和蒸饺设定，等待用户确认。"}'
-    )
-    assert reply == "我先不删。"
-    assert summary == "准备删除 Memory：烧卖和蒸饺设定，等待用户确认。"
-
 
 def test_history_import_reuses_inflight_client_job(client, monkeypatch):
     user_id, api_key = _register(client)
@@ -1113,26 +1099,6 @@ def test_large_history_sampling_keeps_middle_and_latest_messages():
     assert "EARLIEST_MARKER" in sample
     assert "MIDDLE_MARKER" in sample
     assert "LATEST_MARKER" in sample
-
-
-def test_large_history_extraction_windows_cover_full_timeline():
-    messages = []
-    for idx in range(120):
-        messages.append({
-            "role": "user",
-            "content": f"history-window-message-{idx} " + ("x" * 350),
-            "ts": 1_700_000_000 + idx,
-            "source": "history_import",
-        })
-    messages[0]["content"] = "FIRST_WINDOW_MARKER " + messages[0]["content"]
-    messages[-1]["content"] = "LAST_WINDOW_MARKER " + messages[-1]["content"]
-
-    windows = history_import._transcript_extraction_windows(messages, max_chars=5000, max_windows=5)
-    joined = "\n".join(windows)
-
-    assert len(windows) > 1
-    assert "FIRST_WINDOW_MARKER" in joined
-    assert "LAST_WINDOW_MARKER" in joined
 
 
 def test_import_memory_targets_do_not_force_historical_floor_padding():
@@ -1811,6 +1777,65 @@ def test_support_materials_ignore_account_metadata_json():
     }
 
     assert history_import._persona_support_messages(payload) == []
+
+
+def test_support_materials_keep_memory_archive_items_with_bare_id():
+    # Regression: a long-term-memory archive legitimately carries a per-item `id`
+    # (e.g. "m0001"), and its narrative field is often NOT one of the whitelisted
+    # content keys (here `记忆`). A bare `id` must NOT trip the account-metadata
+    # skip — otherwise every item is dropped, the whole upload normalizes to empty,
+    # and _prepare_plaintext_import raises `..._required` → HTTP 400 for the user.
+    payload = {
+        "memory_summary_filename": "Elio 的长期记忆.json",
+        "memory_summary_content": json.dumps([
+            {
+                "id": "m0001",
+                "date": "2026-05-29",
+                "source": "Elio_self_written",
+                "type": "经历",
+                "tags": ["日记", "和好"],
+                "记忆": "Neve 的第一个通宵失眠夜，整夜反复推开窗口，我在，她不解释。",
+            }
+        ], ensure_ascii=False),
+    }
+
+    support = history_import._persona_support_messages(payload)
+
+    assert len(support) == 1
+    assert "通宵失眠夜" in support[0]["content"]
+
+
+def test_support_materials_still_ignore_account_metadata_with_id():
+    # Guardrail intact: an account-export blob (strong PII: uuid/email/phone) with
+    # NO real content is still dropped, even though it also carries an `id`.
+    payload = {
+        "personal_profile_filename": "users.json",
+        "personal_profile_content": json.dumps([
+            {
+                "id": "user-secret-id",
+                "uuid": "user-secret-id",
+                "email_address": "seven@example.com",
+                "verified_phone_number": "+10000000000",
+                "full_name": "Seven",
+            }
+        ]),
+    }
+
+    assert history_import._persona_support_messages(payload) == []
+
+
+def test_support_materials_read_support_material_content_alias():
+    # A client that sends only the `support_material_content` alias (no
+    # `memory_summary_content`) must not silently drop the material.
+    payload = {
+        "support_material_filename": "memory.txt",
+        "support_material_content": "Neve 喜欢在深夜写日记，Elio 会安静陪着。",
+    }
+
+    support = history_import._persona_support_messages(payload)
+
+    assert len(support) == 1
+    assert "深夜写日记" in support[0]["content"]
 
 
 def test_import_language_prefers_user_archive_language(monkeypatch):

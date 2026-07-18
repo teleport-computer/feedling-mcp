@@ -90,7 +90,6 @@ import base64
 from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
-import inspect
 import io
 import json
 import logging
@@ -105,6 +104,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as _ET
 import zipfile
@@ -127,7 +127,7 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
-from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
+from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards, sanitize_user_name
 from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
 from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
@@ -223,6 +223,12 @@ AGENT_HTTP_SESSION_KEY_HEADER = os.environ.get(
 )
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
+# Per-turn subprocess cap for the CLI agent. 120s suits the managed claude/codex/
+# pi templates; heavy self-hosted stacks (custom wrappers, slow MCP cold starts,
+# long-thinking models — usr_c190's xiake_wrapper+MCP+opus combo, 2026-07-18)
+# legitimately need more. Raise via env; the cap still exists so a hung agent
+# can never wedge the single-flight chat lane forever.
+AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "120")))
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
@@ -252,6 +258,13 @@ USER_MCP_CA_FILE = os.environ.get(
 USER_MCP_CASTORE_FILE = os.environ.get(
     "USER_MCP_CASTORE_FILE",
     f"/tmp/feedling_user_mcp_castore_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
+)
+# The pi user-MCP bridge extension. ONE shared static file for every user —
+# `COPY tools/ ./tools/` (Dockerfile.agent-runner) puts it here; the per-user
+# config path rides FEEDLING_USER_MCP_FILE instead (see _user_mcp_child_env).
+# Overridable for tests and for the self-hosted VPS layout.
+PI_MCP_BRIDGE_FILE = os.environ.get(
+    "PI_MCP_BRIDGE_FILE", "/app/tools/pi_mcp_bridge/index.js",
 )
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
@@ -451,6 +464,13 @@ def _clear_provider_payment_cooldown() -> None:
 MAX_EMPTY_PROACTIVE_TURNS = int(os.environ.get("FEEDLING_MAX_EMPTY_PROACTIVE_TURNS", "2"))
 PROACTIVE_FAIL_BACKOFF_BASE_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60"))
 PROACTIVE_FAIL_BACKOFF_CAP_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600"))
+# Post-time chat-collision window: a visible proactive bubble must not land
+# within this many seconds of the agent's own chat reply or of a fresh user
+# message (whose chat turn is imminent). Checked right before post_reply — the
+# colliding chat turn typically lands WHILE the wake's model turn is running,
+# so any earlier check (enqueue gate, realize-time peek, prompt-side "prefer
+# silence" advisory) can miss it. 0 disables the gate.
+PROACTIVE_CHAT_COLLISION_WINDOW_SEC = float(os.environ.get("PROACTIVE_CHAT_COLLISION_WINDOW_SEC", "90"))
 _proactive_empty_streak: int = 0
 _proactive_fail_streak: int = 0
 _proactive_backoff_until: float = 0.0
@@ -513,6 +533,9 @@ _ERROR_CLASS_RULES = (
     ("model_not_found", "user_provider",
      "模型名不可用，请检查设置里的模型名。",
      re.compile(r"invalid model name|model_not_found|no such model", re.I)),
+    ("cli_config_invalid", "user_provider",
+     "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。",
+     re.compile(r"missing the \{message\} placeholder", re.I)),
     ("provider_incompatible", "user_provider",
      "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
      re.compile(r"unknown variant|not supported|unsupported (parameter|tool)"
@@ -529,9 +552,14 @@ _ERROR_CLASS_RULES = (
      re.compile(r"\b429\b|provider_http_429|too many requests|rate.?limit", re.I)),
     ("upstream_unavailable", "provider_transient",
      "你的模型服务暂时不可用，稍后会自动恢复。",
+     # "ended without finish_reason": an openai-compatible relay cut the SSE
+     # stream mid-turn (pi surfaces it verbatim). Without this signature it
+     # fell to `unknown`/blame=system — "连接模型服务时出了问题" blamed US for
+     # the relay's flakiness (usr_6f5a, 2026-07-17, 24 bubbles).
      re.compile(r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out"
                 r"|connection (refused|reset|error)"
-                r"|unreachable|stream disconnected", re.I)),
+                r"|unreachable|stream disconnected"
+                r"|ended without finish_reason", re.I)),
 )
 
 # 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
@@ -574,9 +602,13 @@ def _system_notice_body(notice: AgentErrorNotice) -> str:
 # - 后台车道（心跳/主动/capture/dream）一律不进聊天流——用户无法据此行动，天天聊天
 #   的人会被自己根本看不见的后台车道刷屏；可观测性走设置页/admin 腿
 #   （_report_runtime_error）+ debug 日志。
-# - 前台（用户刚发的消息最终没拿到真实回复）才弹，且限流：可行动类
-#   （blame=user_provider，如额度/key/模型名）按 error_class 各一个窗口；瞬时/系统类
-#   合并进同一个 "_transient" 桶——同一波上游抖动打出多个 error_class 也只弹第一条。
+# - 前台（用户刚发的消息最终没拿到真实回复）才弹，且限流，按 blame 分三桶：
+#   · user_provider（额度/key/模型名）——按 error_class 各一个窗口，各自动作不同都要提醒；
+#   · provider_transient（限流/5xx/超时/内容拦截）——合并一个桶，同一波上游抖动只弹第一条；
+#   · system（我们自己的错，turn_timeout/reply_parse_failed/unknown）——单独一个桶。
+#   拆开 system 是因为它以前和 provider_transient 挤在同一个 "_transient" 桶里，3h 窗口内
+#   先来一个上游抖动就会把随后 IO 自己的系统错吞掉（usr_6f5a 类）；system 自成一桶后
+#   既不被上游抖动吞、故障期内多个 system 错也仍只弹一条防刷屏。
 # - 固定窗口（默认 3h），不因成功回合清零——否则上游一抖一恢复（fail→ok→fail）时
 #   每次"恢复后再坏"都重新弹，越抖越刷屏。进程内存态即可——respawn 顶多多发一条。
 FOREGROUND_NOTICE_WINDOW_SEC = float(os.environ.get("FOREGROUND_NOTICE_WINDOW_SEC", "10800"))
@@ -636,8 +668,14 @@ def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
         _report_runtime_error(notice.detail, notice.error_class)
         if not foreground:
             return
-        # 可行动类按 error_class 分桶；瞬时/系统类共享一个桶（同波合并）。
-        key = notice.error_class if notice.blame == "user_provider" else "_transient"
+        # 三桶（见上方块注释）：user_provider 各 error_class 一桶、provider_transient
+        # 合并、system 单独。避免上游抖动把 IO 自己的系统错吞掉。
+        if notice.blame == "user_provider":
+            key = notice.error_class
+        elif notice.blame == "provider_transient":
+            key = "_provider_transient"
+        else:
+            key = "_system"
         last = _system_notice_last_sent.get(key)
         if last is not None and (time.monotonic() - last) < FOREGROUND_NOTICE_WINDOW_SEC:
             return
@@ -910,6 +948,20 @@ def _runtime_repo_files() -> set[str]:
             # explicitly so a user_mcp materialization change still triggers a
             # self-update on self-hosted residents.
             "tools/user_mcp_materialize.py",
+            # Same story: imported lazily inside _enrich_with_fetched_ca, so it
+            # may not yet be in sys.modules when a release-diff check runs. This
+            # module is the gate that keeps a bad CA out of SSL_CERT_FILE (the
+            # public-roots check + the double self-verification) — a release
+            # that only touches this file must still trigger a self-update.
+            "tools/user_mcp_ca_fetch.py",
+            # The pi user-MCP bridge (README:491) is a Node extension shipped
+            # alongside us — it's never imported (not Python, not `.py`) so it
+            # can never land in sys.modules. Register it explicitly so a
+            # self-hosted pi resident restarts on a bridge bugfix instead of
+            # running stale bridge code forever.
+            "tools/pi_mcp_bridge/index.js",
+            "tools/pi_mcp_bridge/mcp_client.js",
+            "tools/pi_mcp_bridge/tool_mapping.js",
             "tools/chat_resident_requirements.txt",
             "backend/requirements.txt",
         }
@@ -3289,22 +3341,6 @@ def _agent_session_key() -> str:
     return f"feedling:{digest}"
 
 
-def _extract_openai_reply(body: dict) -> str:
-    choices = body.get("choices")
-    if isinstance(choices, list) and choices:
-        first = choices[0]
-        if isinstance(first, dict):
-            message = first.get("message")
-            if isinstance(message, dict):
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
-            text = first.get("text")
-            if isinstance(text, str) and text.strip():
-                return text.strip()
-    raise ValueError("OpenAI-compatible response has no usable reply text")
-
-
 def _response_text_len(resp: httpx.Response) -> int:
     try:
         return len((resp.text or "").encode("utf-8"))
@@ -4085,6 +4121,13 @@ def _warn_if_agent_entry_may_drift() -> None:
     if AGENT_MODE != "cli" or not AGENT_CLI_CMD:
         return
 
+    if "{message}" not in AGENT_CLI_CMD and not _is_pi_cmd(_cli_cmd_tokens()):
+        log.error(
+            "AGENT_CLI_CMD has NO {message} placeholder — every chat turn will "
+            "FAIL: the consumer substitutes placeholders and never appends the "
+            "message. Fix the template (e.g. claude -p \"{message}\"); custom "
+            "wrappers must accept the message as an argv placeholder."
+        )
     lower_template = AGENT_CLI_CMD.lower()
     if re.search(r"\b(you are|user message|reply naturally|same style|persona)\b", lower_template):
         log.warning(
@@ -4511,6 +4554,13 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
 # blow the whole session budget on a single snapshot and rotate the session on every image.
 _PI_IMAGE_CONTEXT_BYTES = 2_000
 
+# The relay-cut-the-SSE-stream failure shape: pi exits 0, no usable message_end,
+# and this text rides in the final event / stderr. Transient by nature — worth one
+# immediate in-turn retry (see call_agent_cli's pi branch) before surfacing the
+# error bubble. Same signature also classifies as upstream_unavailable in
+# _ERROR_CLASS_RULES so an exhausted retry blames the provider, not us.
+_PI_STREAM_CUT_RE = re.compile(r"ended without finish_reason|stream disconnected", re.I)
+
 
 def _pi_session_content_bytes(raw: str) -> int:
     """Bytes of everything this pi turn appends to its persistent session: EVERY
@@ -4701,6 +4751,17 @@ def call_agent_cli(
     if _cli_cwd is None and _agent_cli_cwd_error:
         raise RuntimeError(_agent_cli_cwd_error)
 
+    # A custom template without {message} can NOT deliver the user's words to
+    # the agent — the render step substitutes placeholders and appends nothing.
+    # This used to fail SILENTLY: the agent ran with no prompt and told the user
+    # "your message never reached me" (usr_c190's xiake_wrapper, 2026-07-18).
+    # pi is exempt (its managed path feeds the message via stdin by design).
+    if message and "{message}" not in AGENT_CLI_CMD and not _is_pi_cmd(_cli_cmd_tokens()):
+        raise RuntimeError(
+            "AGENT_CLI_CMD is missing the {message} placeholder — the user's "
+            "message cannot reach the agent. Add {message} to the command "
+            "template (e.g. claude -p \"{message}\")."
+        )
     cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
@@ -4710,7 +4771,7 @@ def call_agent_cli(
                       explain="模型调用发起（" + ("pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude")) + "）",
                       content_excerpt={"prompt_head": (message or "")[:1000]})
     child_env = os.environ.copy()
-    child_env.update(_user_mcp_ca_env(cmd))
+    child_env.update(_user_mcp_child_env(cmd))
     if trace_id:
         child_env["FEEDLING_TRACE_ID"] = trace_id
         child_env["FEEDLING_DEBUG_TRACE_ID"] = trace_id
@@ -4732,7 +4793,7 @@ def call_agent_cli(
     _run_kwargs: dict = {
         "capture_output": True,
         "text": True,
-        "timeout": 120,
+        "timeout": AGENT_TURN_TIMEOUT_SEC,
         "env": child_env,
         "encoding": "utf-8",
         "errors": "replace",
@@ -4746,11 +4807,13 @@ def call_agent_cli(
     except subprocess.TimeoutExpired:
         _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
                           dur_ms=(time.monotonic() - _turn_t0) * 1000,
-                          summary="cli turn timeout", explain="模型调用超时（120s 上限）— 卡在模型这一步")
+                          summary="cli turn timeout",
+                          explain=f"模型调用超时（{AGENT_TURN_TIMEOUT_SEC}s 上限，FEEDLING_AGENT_TURN_TIMEOUT_SEC 可调）— 卡在模型这一步")
         log.warning(
-            "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit 120s subprocess cap)",
+            "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit %ds subprocess cap)",
             "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
             int((time.monotonic() - _turn_t0) * 1000),
+            AGENT_TURN_TIMEOUT_SEC,
         )
         raise
     _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
@@ -4890,6 +4953,42 @@ def call_agent_cli(
     # through (else the consumer would leak pi's internal handshake noise).
     if _is_pi_cmd(cmd):
         pi_reply, pi_thinking = _pi_turn_from_stream(result.stdout)
+        if not pi_reply and _PI_STREAM_CUT_RE.search(raw_transport):
+            # The relay cut the SSE stream mid-turn (rc=0, no usable message_end
+            # — pi's routine failure shape with flaky openai-compatible relays,
+            # usr_6f5a 2026-07-17). This is transient by nature: one immediate
+            # retry usually lands. Strictly single-shot — the retry result flows
+            # through the SAME parse below, so a second cut still raises and the
+            # error bubble fires as before. Session accounting for the retry is
+            # recorded like any turn (conservative double-count of the prompt).
+            log.warning(
+                "pi stream cut mid-turn (no reply, '%s'); retrying this turn once",
+                _cli_error_detail(result.stdout or "", result.stderr or "")[:120],
+            )
+            _emit_debug_trace(
+                "agent", "agent.model.call.stream_cut_retry", trace_id=trace_id,
+                summary="pi stream cut; single retry",
+                explain="上游把流式回复中途掐断(无 finish_reason)——立即重试本轮一次",
+            )
+            result = subprocess.run(cmd, **_run_kwargs)
+            _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
+            raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+            if observed_sid:
+                _record_agent_session_turn(
+                    observed_sid,
+                    sent_bytes=len((message or "").encode("utf-8")),
+                    received_bytes=_turn_content_bytes(cmd, result.stdout or "", result.stderr or ""),
+                )
+            # The retry runs AFTER the function's original returncode gate — re-check
+            # it here so a crashed retry can never be returned as success just
+            # because its partial stdout happens to parse (the "all nonzero CLI
+            # exits raise" invariant must survive the retry path).
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"cli agent exited {result.returncode}: "
+                    f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
+                )
+            pi_reply, pi_thinking = _pi_turn_from_stream(result.stdout)
         if pi_reply:
             # A pi turn that actually carried a resident transcript closes this
             # session's bridge debt: subsequent turns ride pi's native --session-id
@@ -5035,13 +5134,6 @@ def _sanitize_reply_text(text: str) -> str:
     return "\n".join(deduped).strip()
 
 
-def _structured_reply_payload(raw_reply: str) -> Any:
-    try:
-        return json.loads(raw_reply)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
 def _cap_agent_replies(replies: list[str], max_items: int | None = None) -> list[str]:
     limit = max(1, max_items if max_items is not None else PROACTIVE_MAX_REPLY_MESSAGES)
     return replies[:limit]
@@ -5066,10 +5158,6 @@ def _normalize_agent_output(raw_reply: Any, max_items: int | None = None) -> tup
 
 def _normalize_agent_replies(raw_reply: str, max_items: int | None = None) -> list[str]:
     return _normalize_agent_output(raw_reply, max_items=max_items)[1]
-
-
-def _split_agent_result(result: Any, max_items: int | None = None) -> tuple[list[dict], list[str]]:
-    return _normalize_agent_output(result, max_items=max_items)
 
 
 def _split_agent_turn(result: Any, max_items: int | None = None) -> AgentTurn:
@@ -5587,6 +5675,47 @@ def _atomic_write_text(path: str, content: str, mode: int = 0o600) -> None:
         raise
 
 
+def _enrich_with_fetched_ca(servers: list[dict], *, budget_s: float = 15.0,
+                            now=time.monotonic, fetch=None) -> list[dict]:
+    """Fill in a trust anchor for servers that lack a manual ca_pem.
+
+    Manual ca_pem always wins. Disabled servers are never fetched — they
+    don't reach ``ca_bundle_pem`` (``_enabled()`` in user_mcp_materialize.py
+    drops them), so spending budget on them would only starve the enabled
+    servers that actually need it: ``_maybe_apply_user_mcp`` passes the FULL
+    server list here (enabled and disabled alike), and disabled servers are
+    the common case (an old/retired local server left in the list). Fetching
+    is best-effort and bounded in TOTAL by ``budget_s``: materialization runs
+    inside the poll loop BEFORE messages are handled, so a stalled fetch
+    stalls chat — and the worst case (a hosted user with private-IP servers
+    the CVM can't route to) burns the full timeout per server for nothing.
+    Once the budget is spent the rest keep an empty ca_pem this round and are
+    retried on the next fingerprint change.
+
+    ``now``/``fetch`` are injected so the budget and failure branches are
+    testable without real clocks or sockets.
+
+    Never raises: one server's fetch failure just means that server has no
+    anchor.
+    """
+    if fetch is None:
+        import user_mcp_ca_fetch  # noqa: PLC0415 — sibling on tools/ path
+        fetch = user_mcp_ca_fetch.fetch_trust_anchor
+    deadline = now() + budget_s
+    out = []
+    for s in servers:
+        ca = s.get("ca_pem") or ""
+        if not ca and s.get("enabled") and now() < deadline:
+            try:
+                ca = fetch(s.get("url") or "") or ""
+            except Exception as e:  # noqa: BLE001 — never wedge materialization
+                log.warning("[user_mcp] ca fetch failed for %s: %s: %s",
+                            s.get("name"), type(e).__name__, e)
+                ca = ""
+        out.append({**s, "ca_pem": ca})
+    return out
+
+
 def _write_user_mcp_ca(servers: list[dict]) -> None:
     """Materialize the two CA bundles. See USER_MCP_CA_FILE for why there are two.
 
@@ -5603,7 +5732,7 @@ def _write_user_mcp_ca(servers: list[dict]) -> None:
     a reader never observes a half-written file, even across a crash.
     """
     import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
-    bundle = _m.ca_bundle_pem(servers)
+    bundle = _m.ca_bundle_pem(_enrich_with_fetched_ca(servers))
     if not bundle:
         for p in (USER_MCP_CA_FILE, USER_MCP_CASTORE_FILE):
             Path(p).unlink(missing_ok=True)
@@ -5632,8 +5761,8 @@ def _write_user_mcp_ca(servers: list[dict]) -> None:
                     "trust store: %s: %s", type(e).__name__, e)
 
 
-def _user_mcp_ca_env(cmd: list[str]) -> dict:
-    """Per-runtime CA env for one turn. Empty dict = inject nothing.
+def _user_mcp_child_env(cmd: list[str]) -> dict:
+    """Per-runtime child-process env for one turn. Empty dict = inject nothing.
 
     Gates on the in-memory ``_user_mcp_applied`` state first — the same
     source of truth ``_user_mcp_cli_value`` uses — not just on-disk file
@@ -5648,21 +5777,31 @@ def _user_mcp_ca_env(cmd: list[str]) -> dict:
 
     Never set an empty value: an unset var leaves the runtime on its own trust
     store, which is the correct no-CA behavior.
+
+    pi is intentionally NOT special-cased for CA: like claude it is a Node
+    process, so it falls through to NODE_EXTRA_CA_CERTS. (A prior version
+    early-returned {} here citing "pi: route abandoned" — that was a misreading
+    of v2 spec §1's "本期不涉及"; see 2026-07-17-pi-user-mcp-bridge-design.md
+    §1.1.) pi additionally gets FEEDLING_USER_MCP_FILE: the bridge extension is
+    one shared static file, so the per-user config path has to ride the env.
     """
-    if _is_pi_cmd(cmd):
-        return {}          # pi: route abandoned (v2 spec §1), no CA surface
     enabled_servers = [
         s for s in _user_mcp_applied.get("servers") or [] if s.get("enabled")
     ]
     if not enabled_servers:
         return {}
+    env: dict = {}
     if _is_codex_cmd(cmd):
         if Path(USER_MCP_CASTORE_FILE).exists():
-            return {"SSL_CERT_FILE": USER_MCP_CASTORE_FILE}   # REPLACES → concat bundle
-        return {}
-    if Path(USER_MCP_CA_FILE).exists():
-        return {"NODE_EXTRA_CA_CERTS": USER_MCP_CA_FILE}      # ADDS → user CA only
-    return {}
+            env["SSL_CERT_FILE"] = USER_MCP_CASTORE_FILE   # REPLACES → concat bundle
+    else:
+        # claude AND pi — both Node, both ADD via NODE_EXTRA_CA_CERTS.
+        if Path(USER_MCP_CA_FILE).exists():
+            env["NODE_EXTRA_CA_CERTS"] = USER_MCP_CA_FILE  # ADDS → user CA only
+    if _is_pi_cmd(cmd):
+        # The bridge is a shared static file; hand it this user's config path.
+        env["FEEDLING_USER_MCP_FILE"] = USER_MCP_FILE
+    return env
 
 
 def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
@@ -5749,6 +5888,9 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
       does NOT work — codex deep-merges ``-c`` overrides onto the config, and an
       empty parent table is a no-op that leaves each ``[mcp_servers.<name>]``
       enabled. Only an explicit ``enabled=false`` per server disables it.
+    - pi     → ``-e <bridge>`` ONLY on the chat lane. pi has no MCP of its own;
+      the extension registers the user's MCP tools as native pi tools. A
+      background turn simply loads no extension, so the tools do not exist.
     Values contain only controlled characters (a filesystem path, or fixed
     literals plus ``_SAFE_NAME``-constrained server names), so pre-split
     substitution into the template is shlex-safe."""
@@ -5759,6 +5901,25 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
     ]
     if not enabled_servers:
         return ""
+    if _cli_template_is_pi():
+        # pi has no built-in MCP (README:491) — the bridge extension registers
+        # each MCP tool as a native pi tool. Same lane rule as claude: chat only.
+        if lane != "chat":
+            return ""
+        # Same failure shape _strip_missing_mcp_config guards against for
+        # claude's --mcp-config: pi exits 1 with empty stdout when `-e <path>`
+        # points at a file that doesn't exist — no model call at all — and
+        # this is the chat-only lane, so a missing bridge silently kills chat
+        # replies while background/proactive turns (which never pass `-e`)
+        # keep running. PI_MCP_BRIDGE_FILE defaults to the hosted `/app` COPY
+        # target but is overridable for the self-hosted VPS layout, where it
+        # may not exist; degrade to no-MCP instead of killing the turn.
+        if not Path(PI_MCP_BRIDGE_FILE).exists():
+            log.warning(
+                "[user_mcp] pi bridge file missing at %s — disabling pi MCP "
+                "tools for this turn", PI_MCP_BRIDGE_FILE)
+            return ""
+        return f"-e {PI_MCP_BRIDGE_FILE}"
     if _cli_template_is_codex():
         if lane == "chat":
             return ""
@@ -5939,22 +6100,6 @@ def update_proactive_job_status(
         resp.raise_for_status()
     except Exception as e:
         log.warning("failed to update proactive job status id=%s status=%s error=%s", job_id, status, e)
-
-
-def update_proactive_state(**patch: Any) -> None:
-    clean = {k: v for k, v in patch.items() if v not in (None, "")}
-    if not clean:
-        return
-    try:
-        resp = _HTTP.post(
-            f"{FEEDLING_API_URL}/v1/proactive/state",
-            json=clean,
-            headers=_HEADERS,
-            timeout=10,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        log.warning("failed to update proactive state patch=%s error=%s", clean, e)
 
 
 def _job_wake_ids(job: dict) -> list[str]:
@@ -6401,6 +6546,61 @@ def recent_chat_context_for_proactive(limit: int | None = None) -> ProactiveChat
     return _proactive_chat_context_from_history(history, limit=limit, now=time.time())
 
 
+# Roles that count as the agent speaking in chat. system rows (upstream-error
+# notices) are NOT conversation — same exclusion as _clean_messages_for_
+# proactive_context — and must not silence proactive for 90s.
+_COLLISION_AGENT_ROLES = {"openclaw", "assistant", "agent", "model"}
+# Server-stamped rows can sit a breath ahead of this host's clock; anything
+# further in the future is malformed data, not a fresh message.
+_COLLISION_CLOCK_SKEW_SEC = 5.0
+
+
+def _proactive_chat_collision(now: float | None = None) -> bool:
+    """Post-time hard gate against proactive/chat double-speak.
+
+    True when a fresh (≤ PROACTIVE_CHAT_COLLISION_WINDOW_SEC) user message or
+    agent chat reply exists — a visible proactive bubble posted now would
+    duplicate a conversation that is already happening. Runs right before
+    post_reply, AFTER the wake's model turn, because the colliding chat reply
+    typically lands while that turn is running: the enqueue gate and the
+    prompt-side "prefer silence" advisory both fire too early, and the advisory
+    is model-discretionary anyway (seen live 2026-07-17: a wake and the chat
+    turn answered the same arrival message with two near-identical bubbles).
+
+    Fail-open: a transient fetch error or a malformed row must not silence
+    proactive. Proactive-source agent rows do NOT trip the gate — spacing
+    between wakes is the idle-loop guard's and the delivery gate's job.
+    """
+    window = PROACTIVE_CHAT_COLLISION_WINDOW_SEC
+    if window <= 0:
+        return False
+    try:
+        history = get_decrypted_history(since=0, limit=10, include_image_body=False)
+    except Exception as e:  # noqa: BLE001 — gate is best-effort, never fatal
+        log.warning("chat-collision check fetch failed (fail-open): %s", e)
+        return False
+    if not history:
+        return False
+    ts_now = time.time() if now is None else now
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("source") or "") == "verify_ping":
+            continue
+        ts = _message_ts_for_context(msg)  # defensive: malformed ts → 0.0
+        if ts <= 0:
+            continue
+        age = ts_now - ts
+        if age > window or age < -_COLLISION_CLOCK_SKEW_SEC:
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        if role == "user":
+            return True
+        if role in _COLLISION_AGENT_ROLES and str(msg.get("source") or "") != PROACTIVE_JOB_SOURCE:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -6535,6 +6735,24 @@ def _proactive_control_reason_from_result(agent_result: Any, replies: list[str])
     ).strip()
 
 
+def _is_degenerate_proactive_reply(text: Any) -> bool:
+    """True when a proactive reply carries no actual content — only
+    whitespace/punctuation/separators (e.g. ".", "。", "…").
+
+    Flaky openai-compatible relays can cut the SSE stream right after the
+    first token; pi still closes the assistant message with that fragment,
+    and without this check the consumer posts it as an unprompted chat
+    bubble (seen live 2026-07-17: a 2-hour heartbeat posting a bare "."
+    twice). Letters, digits, CJK and emoji all count as content — only a
+    reply with none of those is degenerate. Proactive lane only: a
+    foreground turn the user started still surfaces whatever came back."""
+    for ch in str(text or ""):
+        cat = unicodedata.category(ch)
+        if cat[0] in ("L", "N") or cat == "So":
+            return False
+    return True
+
+
 def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict]]:
     proactive: list[dict] = []
     memory_identity: list[dict] = []
@@ -6638,6 +6856,8 @@ def _native_tool_names_compact() -> str:
         "tools_available (names only; you have your full toolset — call any if the screen makes it relevant):",
         "- perception_<signal>: now, location, weather, motion, calendar, focus, audio_route, app, "
         "steps, sleep, workout, vitals, activity, body, metabolic, cycle, mood, reminders",
+        "- perception_recent_apps: which apps the user opened recently (perception_app only "
+        "covers the last 15 minutes)",
         "- perception_trend, perception_history, memory_index, memory_fetch, "
         "screen_recent, screen_read, photo_recent, photo_read",
         "  (Bash/CLI runtimes: same verbs via io_cli.)",
@@ -6843,7 +7063,10 @@ def _native_reachout_tool_instructions() -> str:
         "quoted card's id), don't just say you did.",
         "- You also have native tools to manage your own future wakes: schedule_wake (ask to be woken at a later time) "
         "and cancel_wake.",
-        "- CLI runtimes call all of these via io_cli: perception, perception-trend, perception-history, memory-index, "
+        "- To answer \"what have I been doing / which apps have I used\", call perception_recent_apps: the current-app "
+        "field only covers the last 15 minutes, this returns the app-open history. Empty result means no app data — "
+        "say so, don't guess.",
+        "- CLI runtimes call all of these via io_cli: perception, perception-recent-apps, perception-trend, perception-history, memory-index, "
         "memory-fetch, memory-write, memory-patch, memory-delete, screen-recent, screen-read, photo-recent, "
         "photo-read, schedule-wake, cancel-wake.",
     ])
@@ -6893,23 +7116,6 @@ def _is_memory_dream_job(job: dict) -> bool:
         str((job or {}).get("job_kind") or "").strip() == "memory_dream"
         or str((job or {}).get("source") or "").strip() == "memory_dream"
     )
-
-
-def _resident_perception_trend(signal: str, field: str) -> dict:
-    """Best-effort GET of one signal's rolling baseline/delta (Tier 2 history)."""
-    try:
-        resp = _HTTP.get(
-            f"{FEEDLING_API_URL}/v1/agent/perception/trend",
-            headers=_HEADERS,
-            params={"signal": signal, "field": field, "days": 30},
-            timeout=15,
-        )
-        if resp.status_code >= 400:
-            return {}
-        return resp.json()
-    except Exception as e:
-        log.debug("proactive trend pull failed %s.%s: %s", signal, field, e)
-        return {}
 
 
 def _resident_perception_now() -> dict:
@@ -7198,13 +7404,32 @@ def _capture_identity_context() -> tuple[dict, str, str, str]:
         or identity.get("name")
         or ""
     ).strip() or "我"
-    user_name = str(
-        identity.get("user_preferred_name")
-        or identity.get("user_name")
-        or identity.get("companion_user_name")
-        or ""
-    ).strip() or "TA"
-    return identity, ai_name, user_name, _capture_context_text(identity)
+    # Per-candidate sanitize, then first REAL name wins: `or` before sanitize
+    # would let a stored placeholder ("用户") in the preferred field shadow a
+    # real name in a fallback field and collapse everything to TA.
+    user_name = "TA"
+    for candidate in (
+        identity.get("user_preferred_name"),
+        identity.get("user_name"),
+        identity.get("companion_user_name"),
+    ):
+        name = sanitize_user_name(candidate)
+        if name != "TA":
+            user_name = name
+            break
+    # The rendered identity context must not re-introduce a reserved value as
+    # a "name" either — it would sit right next to the naming rule in the
+    # prompt and contradict it. Drop only placeholder name FIELDS; free prose
+    # elsewhere in the identity is untouched.
+    identity_for_text = {
+        key: value
+        for key, value in identity.items()
+        if not (
+            key in ("user_preferred_name", "user_name", "companion_user_name")
+            and sanitize_user_name(value) == "TA"
+        )
+    }
+    return identity, ai_name, user_name, _capture_context_text(identity_for_text)
 
 
 def _capture_memory_terms_context() -> tuple[str, str]:
@@ -7236,11 +7461,17 @@ def _capture_message_text(msg: dict) -> str:
     return text[:2000]
 
 
-def _capture_message_role(msg: dict) -> str:
+def _capture_message_role(msg: dict, *, user_label: str = "TA", agent_label: str = "我") -> str:
+    """Transcript line label. Real names, not system labels: a literal "user:"
+    prefix is what taught capture models to write "用户" into user-visible
+    cards (usr_fee1 complaint, 2026-07-17) — the model mirrors whatever the
+    transcript calls the speakers."""
     role = str(msg.get("role") or "").strip().lower()
     if role == "user":
-        return "user"
-    return "agent"
+        # sanitize again here (defense in depth): a reserved "name" (用户/user)
+        # passed as a label must never become a "用户: …" line.
+        return sanitize_user_name(user_label)
+    return (agent_label or "").strip() or "我"
 
 
 def _capture_message_id(msg: dict) -> str:
@@ -7309,12 +7540,13 @@ def _capture_window_messages(job: dict) -> list[dict]:
     return selected
 
 
-def _capture_window_text(messages: list[dict]) -> str:
+def _capture_window_text(messages: list[dict], *, user_label: str = "TA", agent_label: str = "我") -> str:
     lines: list[str] = []
     for msg in messages:
         ts = _message_ts_for_context(msg)
         lines.append(
-            f"- [{_format_message_time(ts)}] {_capture_message_role(msg)}: "
+            f"- [{_format_message_time(ts)}] "
+            f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
             f"{msg.get('_capture_text') or _capture_message_text(msg)}"
         )
     text = "\n".join(lines).strip()
@@ -7446,7 +7678,15 @@ def _process_capture_jobs(jobs: list) -> float:
         window = job.get("window") if isinstance(job.get("window"), dict) else {}
         update_proactive_job_status(job_id, "realizing")
         messages = _capture_window_messages(job)
-        window_text = _capture_window_text(messages)
+        window_text = ""
+        if messages:
+            # Names before rendering: the transcript labels use them (never a
+            # literal "user:"). Fetched only when there IS a window — an empty
+            # window keeps the fast-fail path without burning identity calls.
+            identity, ai_name, user_name, identity_text = _capture_identity_context()
+            window_text = _capture_window_text(
+                messages, user_label=user_name, agent_label=ai_name
+            )
         if not window_text:
             update_proactive_job_status(
                 job_id,
@@ -7462,7 +7702,6 @@ def _process_capture_jobs(jobs: list) -> float:
             )
             continue
         buckets_text, threads_text = _capture_memory_terms_context()
-        identity, ai_name, user_name, identity_text = _capture_identity_context()
         prompt = build_capture_prompt(
             ai_name=ai_name,
             user_name=user_name,
@@ -7687,7 +7926,7 @@ def _dream_cards_context() -> tuple[str, dict[str, dict]]:
     return (text or "（暂无卡）")[:20000], by_id
 
 
-def _dream_recent_conversations_context() -> str:
+def _dream_recent_conversations_context(*, user_label: str = "TA", agent_label: str = "我") -> str:
     try:
         # Text only — dream summarizes conversations, not images.
         history = get_decrypted_history(
@@ -7705,7 +7944,8 @@ def _dream_recent_conversations_context() -> str:
     for msg in live[-max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)):]:
         ts = _message_ts_for_context(msg)
         lines.append(
-            f"- [{_format_message_time(ts)}] {_capture_message_role(msg)}: "
+            f"- [{_format_message_time(ts)}] "
+            f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
             f"{msg.get('_capture_text') or _capture_message_text(msg)}"
         )
     text = "\n".join(lines).strip()
@@ -7807,8 +8047,10 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             continue
-        recent_text = _dream_recent_conversations_context()
         _identity, ai_name, user_name, _identity_text = _capture_identity_context()
+        recent_text = _dream_recent_conversations_context(
+            user_label=user_name, agent_label=ai_name
+        )
         prompt = build_dream_prompt(
             ai_name=ai_name,
             user_name=user_name,
@@ -8088,16 +8330,43 @@ def _process_proactive_jobs(jobs: list) -> float:
             )
             update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
             continue
-        _note_agent_turn_success()
-        if is_idle_proactive:
-            _note_idle_proactive_send()
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
         if not replies:
             replies = _send_message_replies_from_actions(actions)
+        # A relay-truncated turn can hand back a bare punctuation fragment as
+        # the whole "reply" — drop those before any branch below sees them, so
+        # a sleep/schedule action still completes quietly instead of posting
+        # the fragment as a chat bubble.
+        degenerate_replies = [r for r in replies if _is_degenerate_proactive_reply(r)]
+        if degenerate_replies:
+            replies = [r for r in replies if not _is_degenerate_proactive_reply(r)]
+            log.warning(
+                "proactive degenerate reply fragment(s) dropped id=%s fragments=%r",
+                job_id,
+                [str(r)[:20] for r in degenerate_replies],
+            )
         proactive_actions, memory_identity_actions = _split_proactive_actions(actions)
         status_actions = [_compact_action_for_status(a) for a in proactive_actions]
+        if degenerate_replies and not replies and not proactive_actions and not memory_identity_actions:
+            # The agent's ONLY output was a degenerate fragment — same posture
+            # as agent_reply_parse_failed above: report + fail the job, post
+            # nothing. Sits BEFORE the success/idle-send accounting below: a
+            # suppressed turn is a failed realization, not a realized idle
+            # send — two truncated wakes in a row must not trip the idle-loop
+            # guard and stall proactive until the user speaks. The failure
+            # reason keys the admin job_failed_reasons aggregation, so
+            # flaky-relay users stay visible.
+            _notify_agent_turn_failure(
+                ValueError("agent produced only a degenerate reply fragment; not posting"),
+                foreground=False,
+            )
+            update_proactive_job_status(job_id, "failed", "degenerate_reply_suppressed")
+            continue
+        _note_agent_turn_success()
+        if is_idle_proactive:
+            _note_idle_proactive_send()
         control_reply_reason = _proactive_control_reason_from_result(agent_result, replies)
         if control_reply_reason and not proactive_actions and not memory_identity_actions:
             update_proactive_job_status(
@@ -8239,6 +8508,38 @@ def _process_proactive_jobs(jobs: list) -> float:
                 },
             )
             log.info("proactive wake completed scheduled actions id=%s", job_id)
+            continue
+
+        # Chat-collision hard gate, at the last moment before posting. Exempt:
+        # introductions (one-shot onboarding greeting — losing it is worse than
+        # a collision) and scheduled wakes (a user-requested reminder firing
+        # mid-conversation must still be delivered, not silently dropped).
+        _job_trigger = str(job.get("trigger") or "").strip().lower()
+        if (
+            replies
+            and not is_introduction
+            and _job_trigger not in {"scheduled_wake", "scheduled_transparency"}
+            and _proactive_chat_collision()
+        ):
+            update_proactive_job_status(
+                job_id,
+                "skipped",
+                "chat_collision",
+                extra={
+                    "agent_action": "sleep",
+                    "agent_action_status": (
+                        "chat_collision: fresh chat activity within "
+                        f"{int(PROACTIVE_CHAT_COLLISION_WINDOW_SEC)}s at post time"
+                    ),
+                    "agent_actions": status_actions,
+                    "wake_result": "chat_collision",
+                },
+            )
+            log.info(
+                "proactive reply suppressed — fresh chat activity within %.0fs id=%s",
+                PROACTIVE_CHAT_COLLISION_WINDOW_SEC,
+                job_id,
+            )
             continue
 
         posted_any = False
@@ -9231,9 +9532,16 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
 
     # actions: envelope + memory.add + complete — HTTP writes only, no model turn, so
     # this tail never yields (yielding here would risk double memory.add on resume).
-    occurred_at = datetime.now(_tzmod.utc).isoformat()
+    now_iso = datetime.now(_tzmod.utc).isoformat()
     actions: list[dict] = []
     for card in state["memories"]:
+        # Long-term-memory distill (keep_all ← material_kind == "memory_summary") carries the
+        # user's original per-card date through fact_write. Preserve it so decades of uploaded
+        # memories don't all collapse onto today. Chat-history distill keeps the "now" stamp;
+        # an LTM card the model couldn't date also falls back to now() — resident has no
+        # server-side relationship anchor to borrow (cloud path uses one; divergence is documented).
+        card_date = str(card.get("occurred_at") or card.get("date") or "").strip()[:80] if keep_all else ""
+        occurred_at = card_date or now_iso
         envelope = _capture_build_envelope(
             card, occurred_at=occurred_at, source="genesis_resident_distill"
         )

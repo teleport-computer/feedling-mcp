@@ -33,12 +33,6 @@ import hashlib
 import time
 from typing import Any, Iterable, Mapping
 
-CHECKPOINT_BLOB_PREFIX = "genesis_checkpoint"  # blob key = f"{prefix}:{job_id}"
-
-
-def checkpoint_blob_key(job_id: str) -> str:
-    return f"{CHECKPOINT_BLOB_PREFIX}:{str(job_id)}"
-
 
 # --- stable candidate_id / source_ref (Codex rule #2: the dedup anchor) -------
 # THE critical dedup rule: foreground and background must derive the SAME id for
@@ -104,7 +98,6 @@ def greeting_allowed(phase: str | None) -> bool:
 # --- per-task checkpoint -----------------------------------------------------
 # One entry per genesis task × chunk: voice_map / fact_map / fact_write / persona_build.
 TASK_PENDING = "pending"
-TASK_PROCESSING = "processing"
 TASK_DONE = "done"
 TASK_TRANSIENT_FAILED = "transient_failed"
 TASK_PROVIDER_CONFIG_BLOCKED = "provider_config_blocked"

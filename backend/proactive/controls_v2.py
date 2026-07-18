@@ -39,7 +39,6 @@ SETTINGS_SCHEMA_VERSION_V2 = 2
 
 SCHEDULED_WAKE_SOURCE_V2 = "scheduled_wake"
 USER_MESSAGE_SOURCE_V2 = "user_message"
-BACKGROUND_RESULT_SOURCE_V2 = "background_result"
 
 
 def default_switches_v2() -> dict[str, bool]:
@@ -219,9 +218,6 @@ class DeliveryDecisionV2:
     reason: str
     settings: ProactiveSettingsV2
 
-    @property
-    def allow_push(self) -> bool:
-        return self.allow_visible_delivery
 
     @property
     def switches(self) -> dict[str, bool]:

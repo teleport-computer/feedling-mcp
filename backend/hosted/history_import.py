@@ -1,55 +1,20 @@
 """History import pipeline: parse → extract candidates → memory cards → identity → greeting. /v1/history_import/*."""
 
-import base64
-import copy
 import hashlib
-import io
 import json
 import os
 import re
-import secrets
 import threading
 import time
 import uuid
-from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any
 
-import httpx
 
 import db
 from core import envelope as core_envelope
 from core.store import UserStore
 
-from hosted_runtime import (
-    ACTION_RESPONSE_FORMAT as HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
-    ACTION_METHOD as HOSTED_RUNTIME_ACTION_METHOD,
-    BACKGROUND_METHOD as HOSTED_RUNTIME_BACKGROUND_METHOD,
-    BACKGROUND_NOT_STARTED_METHOD as HOSTED_RUNTIME_BACKGROUND_NOT_STARTED_METHOD,
-    NOOP_METHOD as HOSTED_RUNTIME_NOOP_METHOD,
-    PENDING_CONFIRM_METHOD as HOSTED_RUNTIME_PENDING_CONFIRM_METHOD,
-    PENDING_REJECT_METHOD as HOSTED_RUNTIME_PENDING_REJECT_METHOD,
-    RUNTIME_ENGINE_NATIVE as HOSTED_RUNTIME_ENGINE_NATIVE,
-    build_background_execution_messages as build_hosted_runtime_background_execution_messages,
-    background_execution_trace as hosted_runtime_background_trace,
-    companion_turn_contract_message as hosted_runtime_companion_turn_contract_message,
-    coerce_pending_decision as coerce_hosted_runtime_pending_decision,
-    coerce_runtime_action as coerce_hosted_runtime_action,
-)
-from model_api_runtime.prompts import (
-    build_foreground_chat_messages as build_model_api_foreground_chat_messages,
-    build_memory_capture_messages as build_model_api_memory_capture_messages,
-    build_pending_confirmation_messages as build_model_api_pending_confirmation_messages,
-    build_web_search_results_message as build_model_api_web_search_results_message,
-    web_search_followup_message as model_api_web_search_followup_message,
-)
-from model_api_runtime.tools import (
-    extract_web_search_requests as extract_model_api_web_search_requests,
-    run_web_searches as run_model_api_web_searches,
-    web_search_trace as model_api_web_search_trace,
-)
-from context_memory_selection import memory_relevance_details
-from content_encryption import build_envelope
 
 from accounts import registry
 from bootstrap import gates as boot_gates
@@ -58,11 +23,8 @@ from identity import service as identity_service
 from memory import service as memory_service
 import provider_client
 from hosted import config_store as hosted_config_store
-from hosted import history_import_core
-from hosted import onboarding_validation as hosted_onboarding_validation
 from notices import core as notices
 from notices import catalog
-
 
 
 def _history_job_kind(job_id: str) -> str:
@@ -592,15 +554,31 @@ _SUPPORT_JSON_PRIVATE_KEYS = {
     "verified_phone_number",
     "id",
 }
+# STRONG account/PII signals: an object carrying one of these (and no real content)
+# is an account-export blob to drop. Deliberately EXCLUDES bare ``id`` / ``user_id`` —
+# a long-term-memory archive legitimately stamps each item with an ``id`` (e.g.
+# "m0001"), so treating a bare id as an account signal false-positives the whole
+# archive into "empty" and 400s the import. ``id`` stays in the wider
+# ``_SUPPORT_JSON_PRIVATE_KEYS`` set only so the fallback extractor never pulls an id
+# value in as memory text.
+_SUPPORT_JSON_PII_KEYS = {
+    "uuid",
+    "account_uuid",
+    "email",
+    "email_address",
+    "phone",
+    "phone_number",
+    "verified_phone_number",
+}
 
 
 def _support_json_is_account_metadata(value: dict) -> bool:
     keys = {str(k).lower() for k in value.keys()}
-    has_private = bool(keys & _SUPPORT_JSON_PRIVATE_KEYS) or any(
+    has_pii = bool(keys & _SUPPORT_JSON_PII_KEYS) or any(
         "email" in key or "phone" in key or "uuid" in key for key in keys
     )
     has_content = any(key in keys for key in _SUPPORT_JSON_TEXT_KEYS)
-    return has_private and not has_content
+    return has_pii and not has_content
 
 
 def _support_json_scalar_text(value) -> str:
@@ -785,6 +763,11 @@ def _persona_support_messages(payload: dict) -> list[dict]:
         or payload.get("memory_summary")
         or payload.get("memory_sample_content")
         or payload.get("memory_sample")
+        # `support_material_content` is the client's alias for the same long-term
+        # memory material (iOS dual-writes both). Read it too so a client that ever
+        # sends only this field doesn't silently drop the whole upload → empty → 400.
+        or payload.get("support_material_content")
+        or payload.get("support_material")
         or ""
     ).strip()
     if memory_summary:
@@ -792,7 +775,12 @@ def _persona_support_messages(payload: dict) -> list[dict]:
             "Memory summary",
             _MEMORY_SUMMARY_SOURCE,
             memory_summary,
-            str(payload.get("memory_summary_filename") or payload.get("memory_sample_filename") or "").strip(),
+            str(
+                payload.get("memory_summary_filename")
+                or payload.get("memory_sample_filename")
+                or payload.get("support_material_filename")
+                or ""
+            ).strip(),
         )
 
     persona = str(payload.get("persona_content") or payload.get("persona") or "").strip()
@@ -971,39 +959,6 @@ def _format_import_message_line(msg: dict) -> str:
     if not text:
         return ""
     return f"{at}{role}: {text}"
-
-
-def _model_api_agent_profile_context(store: UserStore, identity: dict) -> dict:
-    latest_job = None
-    try:
-        latest_job = hosted_onboarding_validation._latest_history_import_job(store)
-    except Exception:
-        latest_job = None
-    latest_job = latest_job if isinstance(latest_job, dict) else {}
-    return {
-        "runtime_boundary": (
-            "Feedling provides the container, iOS context, tools, Identity, and durable memory cards. "
-            "The imported agent materials and chat history own the companion persona."
-        ),
-        "agent_name": str(identity.get("agent_name") or ""),
-        "self_introduction": str(identity.get("self_introduction") or "")[:1200],
-        "category": str(identity.get("category") or "")[:240],
-        "signature": identity.get("signature", []) if isinstance(identity.get("signature"), list) else [],
-        "dimensions": identity.get("dimensions", []) if isinstance(identity.get("dimensions"), list) else [],
-        "import_sources": {
-            "ai_persona": bool(latest_job.get("ai_persona_chars") or latest_job.get("agent_prompt_chars") or latest_job.get("character_chars")),
-            "user_profile": bool(latest_job.get("user_profile_chars") or latest_job.get("persona_chars")),
-            "memory_summary": bool(latest_job.get("memory_summary_chars")),
-            "chat_history": bool(latest_job.get("messages_parsed")),
-        },
-        "source_priority": [
-            "explicit user corrections",
-            "AI persona materials",
-            "Feedling Identity",
-            "candidate memory context",
-            "recent chat",
-        ],
-    }
 
 
 def _append_import_lines(lines: list[str], out: list[str], budget: int, *, reverse: bool = False) -> int:
@@ -1187,15 +1142,6 @@ def _transcript_sample(messages: list[dict], max_chars: int = 18000) -> str:
     if history_text:
         parts.append(history_text)
     return "\n\n".join(parts)[:max_chars].strip()
-
-
-def _transcript_extraction_windows(
-    messages: list[dict],
-    *,
-    max_chars: int = 18000,
-    max_windows: int = 8,
-) -> list[str]:
-    return [w["text"] for w in _build_transcript_windows(messages, max_chars=max_chars, max_windows=max_windows)]
 
 
 def _select_evenly(items: list[Any], limit: int) -> list[Any]:
@@ -1780,10 +1726,6 @@ def _candidate_threads(candidate: dict) -> list[str]:
     return out[:4]
 
 
-def _memory_card_summary(card: dict) -> str:
-    return str(card.get("summary") or card.get("description") or card.get("content") or card.get("title") or "").strip()
-
-
 def _memory_card_content(card: dict) -> str:
     content = str(card.get("content") or "").strip()
     if content:
@@ -1795,28 +1737,6 @@ def _memory_card_content(card: dict) -> str:
         f"上下文: {quote or '来自导入材料。'}",
         "使用提示: 自然使用这条记忆，不要机械复述。",
     ])
-
-
-def _candidate_title(candidate: dict, mem_type: str, language: str) -> str:
-    title = str(candidate.get("title") or "").strip()
-    if title and not _GENERIC_IMPORT_TITLE_RE.match(title):
-        return title[:120]
-    summary = str(candidate.get("summary") or "")
-    if str(language).startswith("zh"):
-        prefix = {
-            "moment": "关系片段",
-            "quote": "原话",
-            "fact": "关于用户",
-            "event": "用户事件",
-            "insight": "TA 的理解",
-            "reflection": "TA 在想",
-        }.get(mem_type, "记忆")
-        natural = _natural_import_title(summary, mem_type, language)
-        if natural and natural != "导入的真实片段":
-            return natural[:120]
-        return prefix
-    natural = _natural_import_title(summary, mem_type, language)
-    return natural[:120] or "Memory"
 
 
 def _render_candidates_to_memory_cards(
@@ -2092,55 +2012,6 @@ def _extract_memory_candidates_with_provider(
     return all_candidates, warnings
 
 
-def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
-    if isinstance(raw, dict):
-        raw_items = raw.get("memories") or raw.get("cards") or raw.get("items") or []
-    else:
-        raw_items = raw
-    if not isinstance(raw_items, list):
-        return []
-
-    cards: list[dict] = []
-    allowed = {"moment", "quote", "fact", "event"}
-    for item in raw_items:
-        if not isinstance(item, dict):
-            continue
-        mem_type = str(item.get("type") or "fact").strip().lower()
-        if mem_type not in allowed:
-            mem_type = "fact"
-        title = str(item.get("title") or "").strip()[:120]
-        desc = str(item.get("description") or item.get("content") or item.get("summary") or "").strip()[:1200]
-        if not desc:
-            continue
-        if not title:
-            title = desc[:72]
-        if _looks_like_low_value_import_card(title, desc, mem_type):
-            continue
-        quote = str(item.get("her_quote") or item.get("quote") or "").strip()
-        context = str(item.get("context") or "").strip()
-        if any(_looks_like_import_artifact(value) for value in (title, desc, quote, context) if value):
-            continue
-        occurred = str(item.get("occurred_at") or item.get("date") or "").strip()
-        if not identity_service._parse_iso_calendar_date(occurred):
-            occurred = ""
-        card = {
-            "summary": title or desc[:120],
-            "content": "\n".join([
-                f"记忆: {desc}",
-                f"上下文: {quote[:500] or context[:600] or '来自导入材料。'}",
-                "使用提示: 自然使用这条记忆，不要机械复述。",
-            ]),
-            "bucket": "我们的关系" if mem_type in {"moment", "quote"} else "用户画像",
-            "threads": [title[:80]] if title else [],
-            "importance": 0.55,
-            "pulse": 0.3,
-            "occurred_at": occurred,
-            "source": "history_import",
-        }
-        cards.append(card)
-    return cards
-
-
 def _dedupe_memory_cards(cards: list[dict]) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
@@ -2339,60 +2210,6 @@ def _import_memory_targets(
         "background": bool(cfg["background"]),
         "source_stats": source_stats,
     }
-
-
-def _extract_memory_cards_with_provider(
-    provider: provider_client.ProviderConfig,
-    messages: list[dict],
-    relationship_start: date,
-    targets: dict,
-    language: str = "en",
-) -> tuple[list[dict], list[str]]:
-    warnings: list[str] = []
-    target_total = int(targets.get("story", 1)) + int(targets.get("about_me", 1))
-    windows = _transcript_extraction_windows(messages, max_chars=18000, max_windows=8)
-    if not windows:
-        return [], ["empty_transcript_sample"]
-    if len(windows) > 1:
-        warnings.append(f"history_import_windows:{len(windows)}")
-
-    all_cards: list[dict] = []
-    per_window_target = max(3, min(8, (target_total + len(windows) - 1) // len(windows) + 2))
-    for idx, sample in enumerate(windows, start=1):
-        prompt = (
-            "Extract high-signal Feedling Memory Garden cards from this onboarding material window. "
-            "Large imports are processed across multiple timeline windows, so use this window's durable details "
-            "without assuming it is the whole relationship. Return JSON only in this shape: "
-            "{\"memories\":[{\"type\":\"moment|quote|fact|event\",\"title\":\"...\","
-            "\"description\":\"...\",\"her_quote\":\"optional exact user quote\","
-            "\"occurred_at\":\"YYYY-MM-DD or empty string\"}]}. "
-            f"Window {idx}/{len(windows)}. Return up to {per_window_target} cards from this window, fewer or zero if the material is repetitive, generic, or not personal. "
-            "moment/quote cards belong to Story and must be specific lived exchanges or exact user wording. "
-            "fact/event cards belong to About me and must be durable user preferences, relationships, habits, projects, dates, or boundaries. "
-            "Do not save generic encyclopedia Q&A, product-copy drafts, assistant filler, empty commands, raw JSON, file delimiters, upload wrappers, or internal field names. "
-            "Do not write one card per message; merge repeated content into one stronger card. "
-            "Use natural, specific titles. Never use titles like Imported exchange, Imported quote, 导入片段, 导入原话, 导入的个人细节, or 导入的事件. "
-            "Character card material describes the AI companion; personal profile material describes the user. Do not confuse the two. "
-            f"{_language_instruction(language)} "
-            "Use YYYY-MM-DD only when the material provides a real date; otherwise leave occurred_at empty."
-            "\n\nMaterial window:\n" + sample
-        )
-        try:
-            result = provider_client.chat_completion(
-                provider,
-                [
-                    {"role": "system", "content": "You are a strict JSON extraction engine for Feedling Memory Garden."},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=1800,
-                temperature=0.1,
-                timeout=45.0,
-            )
-            parsed = core_util._json_from_model_text(result["reply"])
-            all_cards.extend(_coerce_memory_cards(parsed, relationship_start))
-        except Exception as e:
-            warnings.append(f"provider_memory_extraction_failed_window_{idx}:{type(e).__name__}:{str(e)[:160]}")
-    return _dedupe_memory_cards(all_cards), warnings
 
 
 def _memory_counts_for_cards(cards: list[dict]) -> dict:
@@ -3326,14 +3143,45 @@ def _run_history_import_job(
             "job_id": job_id,
             "created_at": core_util._now_iso(),
         }
+        error_text = f"{type(e).__name__}:{str(e)[:500]}"
         job.update({
             "failed_at": core_util._now_iso(),
-            "error": f"{type(e).__name__}:{str(e)[:500]}",
+            "error": error_text,
         })
         _update_history_job_phase(store, job, "failed", status="failed")
-        notices.emit(store, source="history_import", error_class="import_failed",
-                     blame="system", severity="error",
-                     user_text=catalog.user_text_for("import_failed"),
+        # 归责：**先按异常类型确认来源是 provider，再谈分类**。
+        #
+        # 这个 except 捕获整条导入流水线的所有异常——DB、enclave、信封、配置读取
+        # 都在内。直接把 error_text 喂给 classify_upstream 会按文本命中正则，
+        # 于是我们自己的故障被甩给用户（Codex review 实测，全部成立）：
+        #   Postgres "password authentication failed" → auth_invalid/user_provider
+        #     → 我们数据库密码错了，却让用户去重存他的 API Key
+        #   enclave_http_401:unauthorized              → auth_invalid/user_provider
+        #   DB "connection refused"                    → upstream_unavailable
+        #     → 我们的库连不上，却说「你的模型服务不可用」
+        # 这违反本产品的归责红线：provider 的错要抛给用户，**但不是他的错绝不
+        # 能赖给他**（docs/FRONTEND_ERROR_CONTRACT.md §二 / spec 2026-07-18）。
+        #
+        # 故只在 ProviderError（provider_client 的出口异常，语义上必然来自用户
+        # 的模型服务）时才分类。其余一律 import_failed/system——笼统但安全，
+        # 我们自己扛。这条路上的 provider 调用不会被包成别的异常类型（那几处
+        # RuntimeError 是信封失败，本就是我们的锅）。
+        #
+        # ProviderError 但 classify_upstream 认不出（如 "provider network
+        # error: ConnectError"）→ 落 upstream_unavailable 而非 import_failed：
+        # 它确实是用户的 provider 挂了，只是我们没认出具体形态，归 system 会
+        # 变成我们替他背锅的漏报。
+        #
+        # 范围提醒：这只覆盖冒到顶层、真正把 job 判 failed 的失败。余额不足被
+        # 中途吞成 warning、job 仍 completed 的降级路径不经过这里（另一档产品
+        # 策略，spec §3 第二批处理）。
+        if isinstance(e, provider_client.ProviderError):
+            ec = catalog.classify_upstream(error_text) or "upstream_unavailable"
+        else:
+            ec = "import_failed"
+        notices.emit(store, source="history_import", error_class=ec,
+                     blame=catalog.blame_for(ec), severity="error",
+                     user_text=catalog.user_text_for(ec),
                      detail=f"{type(e).__name__}:{str(e)[:200]}",
                      dedupe_key=f"history_import:{job_id}")
         print(f"[history_import:{store.user_id}] job={job_id} failed={type(e).__name__}:{str(e)[:220]}")

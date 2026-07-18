@@ -6,7 +6,6 @@ import time
 import uuid
 from typing import Any, Mapping, Protocol, Sequence
 
-import db
 
 RUNTIME_METRICS_STREAM_V2 = "proactive_runtime_metrics_v2"
 
@@ -61,33 +60,12 @@ class MetricsSinkV2(Protocol):
         ...
 
 
-class NoopMetricsSinkV2:
-    def record(self, event: MetricEventV2) -> None:
-        return None
-
-
 class InMemoryMetricsSinkV2:
     def __init__(self) -> None:
         self.events: list[MetricEventV2] = []
 
     def record(self, event: MetricEventV2) -> None:
         self.events.append(event)
-
-    def list_events(self, user_id: str = "") -> list[MetricEventV2]:
-        if not user_id:
-            return list(self.events)
-        return [event for event in self.events if event.user_id == user_id]
-
-
-class DBRuntimeMetricsSinkV2:
-    def record(self, event: MetricEventV2) -> None:
-        db.log_append(
-            event.user_id,
-            RUNTIME_METRICS_STREAM_V2,
-            event.to_doc(),
-            ts=event.ts,
-            item_key=event.event_id,
-        )
 
 
 def record_metric_v2(

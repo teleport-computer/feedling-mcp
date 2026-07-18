@@ -23,22 +23,10 @@ import hashlib
 _SIGNAL_FIELDS = ("custom_persona_prompt", "tone_style", "self_introduction")
 
 _SOURCE_KIND = "companion_persona_backfill"
-_KEY_VERSION = "v1"
 
 
 def _clean(value) -> str:
     return str(value or "").strip()
-
-
-def has_persona_signal(identity: dict | None) -> bool:
-    """True when the identity record carries any persona/voice signal to backfill.
-
-    No signal → caller leaves the persona empty (Dream grows it from real chat);
-    do NOT enqueue a backfill that would only produce a hollow persona.
-    """
-    if not isinstance(identity, dict):
-        return False
-    return any(_clean(identity.get(f)) for f in _SIGNAL_FIELDS)
 
 
 def assemble_persona_material(identity: dict | None) -> str:
@@ -75,18 +63,6 @@ def material_sha256(material: str) -> str:
     """Stable digest of the assembled material — drives the idempotency key so the
     same identity material is not re-backfilled every supervisor tick."""
     return hashlib.sha256(_clean(material).encode("utf-8")).hexdigest()
-
-
-def backfill_idempotency_key(user_id: str, material_hash: str) -> str:
-    """``persona_backfill:v1:<user_id>:<material_hash>`` — stable across ticks for a
-    given (user, material). Used to dedupe: an existing genesis job with this key
-    (uploaded/processing/done) means backfill is in-flight or done, so skip re-enqueue.
-    """
-    return f"persona_backfill:{_KEY_VERSION}:{_clean(user_id)}:{_clean(material_hash)}"
-
-
-def backfill_source_kind() -> str:
-    return _SOURCE_KIND
 
 
 # Job statuses that mean a backfill for this material is already in-flight or done

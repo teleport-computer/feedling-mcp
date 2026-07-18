@@ -181,6 +181,10 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("signal", _schema("string", minLength=1), "Agent signal key.", required=True, example="motion"),
         _query("days", _schema("integer", minimum=1, maximum=365, default=14), "Lookback window in days.", example=14),
     ],
+    ("get", "/v1/agent/perception/recent_apps"): [
+        _query("limit", _schema("integer", minimum=1, maximum=100, default=20), "Maximum app-open events to return.", example=20),
+        _query("hours", _schema("number", exclusiveMinimum=0), "Only include opens within the last N hours.", example=24),
+    ],
     ("get", "/v1/agent/perception/digest"): [
         _query("days", _schema("integer", minimum=1, maximum=365, default=30), "Lookback window in days.", example=30),
     ],
@@ -531,6 +535,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     "HostedChatSendRequest": {
         "type": "object",
         "properties": {
+            "client_msg_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Optional logical-send identifier. Reusing it for the same user within 600 seconds returns the first stored user message without starting another turn.",
+            },
             "message": {"type": "string", "maxLength": 12000, "example": "Help me plan tomorrow."},
             "content": {"type": "string", "maxLength": 12000, "deprecated": True, "description": "Compatibility alias for message."},
             "context_refs": {"type": "array", "maxItems": 8, "items": {"$ref": "#/components/schemas/ChatContextReference"}},
@@ -577,6 +586,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": ["envelope"],
         "properties": {
             "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "client_msg_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Optional logical-send identifier. Reusing it for the same user within 600 seconds returns the first stored row and emits no second consumer wake.",
+            },
             "content_type": {"type": "string", "enum": ["text", "image", "file"], "default": "text"},
             "file_name": {"type": "string"},
             "file_mime": {"type": "string"},

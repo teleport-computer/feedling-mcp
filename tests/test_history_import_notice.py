@@ -4,6 +4,7 @@ Run:  python -m pytest tests/test_history_import_notice.py -q
 """
 from __future__ import annotations
 
+import pytest
 import sys
 import uuid
 from datetime import datetime, timedelta
@@ -45,6 +46,91 @@ def test_top_level_failure_emits_import_failed():
 
     job = db.get_blob(uid, hi._history_job_kind(job_id))
     assert job["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "exc,label",
+    [
+        (RuntimeError("model_api_key_decrypt_failed enclave_http_401:unauthorized"),
+         "enclave 401"),
+        (RuntimeError("connection to server failed: FATAL: password authentication failed for user"),
+         "postgres 密码错"),
+        (RuntimeError("connection refused"), "DB 连不上"),
+        (ValueError("no_history_messages"), "普通内部错"),
+    ],
+)
+def test_internal_failures_never_blamed_on_user(monkeypatch, exc, label):
+    """归责红线的反向守卫：不是用户的错，绝不能赖给他。
+
+    顶层 except 捕获整条流水线的异常（DB / enclave / 信封 / 配置）。这些文本里
+    含 'unauthorized' / 'authentication failed' / 'connection refused' 等词，
+    若直接跑 classify_upstream 会被正则命中、误归成 user_provider —— 我们数据库
+    密码错了却让用户去重存 API Key。故只有 ProviderError 才进分类器。"""
+    uid = _uid(); seed_user(uid); store = get_store(uid)
+    job_id = "job_" + uuid.uuid4().hex[:10]
+
+    def _boom(*_a, **_k):
+        raise exc
+    monkeypatch.setattr(hi, "_process_history_import_sync", _boom)
+
+    hi._run_history_import_job(store, None, job_id, {"fresh_start": True})
+
+    row = _notices(uid)[f"history_import:{job_id}"]
+    assert row["error_class"] == "import_failed", f"{label} 被误分类成 {row['error_class']}"
+    assert row["blame"] == "system", f"{label} 被甩锅给 {row['blame']}"
+
+
+def test_unclassified_provider_error_stays_with_provider(monkeypatch):
+    """ProviderError 但认不出具体形态 → upstream_unavailable/provider_transient。
+    它确实是用户的 provider 挂了，归 system 会变成我们替他背锅的漏报。"""
+    uid = _uid(); seed_user(uid); store = get_store(uid)
+    job_id = "job_" + uuid.uuid4().hex[:10]
+
+    def _boom(*_a, **_k):
+        raise hi.provider_client.ProviderError("provider network error: ConnectError")
+    monkeypatch.setattr(hi, "_process_history_import_sync", _boom)
+
+    hi._run_history_import_job(store, None, job_id, {"fresh_start": True})
+
+    row = _notices(uid)[f"history_import:{job_id}"]
+    assert row["error_class"] == "upstream_unavailable"
+    assert row["blame"] == "provider_transient"
+
+
+def test_top_level_provider_402_emits_quota_insufficient(monkeypatch):
+    """When a provider failure (out-of-credits) bubbles to the job's top-level
+    except, the notice must blame the user's provider (actionable: 充值), not us.
+    provider_client raises ProviderError carrying a provider_http_402 slug;
+    classify_upstream maps it to quota_insufficient/user_provider."""
+    uid = _uid(); seed_user(uid); store = get_store(uid)
+    job_id = "job_" + uuid.uuid4().hex[:10]
+
+    def _boom(*_a, **_k):
+        raise hi.provider_client.ProviderError("provider_http_402: 预扣费额度失败")
+    monkeypatch.setattr(hi, "_process_history_import_sync", _boom)
+
+    hi._run_history_import_job(store, None, job_id, {"fresh_start": True})
+
+    row = _notices(uid)[f"history_import:{job_id}"]
+    assert row["error_class"] == "quota_insufficient"
+    assert row["blame"] == "user_provider" and row["severity"] == "error"
+
+
+def test_top_level_provider_401_emits_auth_invalid(monkeypatch):
+    """Same top-level path, bad key: provider_http_401 → auth_invalid/user_provider
+    (actionable: 重新保存 Key), not the generic import_failed/system."""
+    uid = _uid(); seed_user(uid); store = get_store(uid)
+    job_id = "job_" + uuid.uuid4().hex[:10]
+
+    def _boom(*_a, **_k):
+        raise hi.provider_client.ProviderError("provider_http_401: invalid api key")
+    monkeypatch.setattr(hi, "_process_history_import_sync", _boom)
+
+    hi._run_history_import_job(store, None, job_id, {"fresh_start": True})
+
+    row = _notices(uid)[f"history_import:{job_id}"]
+    assert row["error_class"] == "auth_invalid"
+    assert row["blame"] == "user_provider"
 
 
 def test_stale_job_emits_import_stale_and_marks_failed():

@@ -599,6 +599,64 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/agent/perception/recent_apps": {
+      "get": {
+        "summary": "Agent Perception Recent Apps",
+        "operationId": "agent_perception_recent_apps_v1_agent_perception_recent_apps_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Agent"
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum app-open events to return.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            },
+            "example": 20
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "required": false,
+            "description": "Only include opens within the last N hours.",
+            "schema": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "example": 24
+          }
+        ],
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/agent/perception/trend": {
       "get": {
         "summary": "Agent Perception Trend",
@@ -7629,6 +7687,11 @@
       "HostedChatSendRequest": {
         "type": "object",
         "properties": {
+          "client_msg_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional logical-send identifier. Reusing it for the same user within 600 seconds returns the first stored user message without starting another turn."
+          },
           "message": {
             "type": "string",
             "maxLength": 12000,
@@ -7771,6 +7834,11 @@
         "properties": {
           "envelope": {
             "$ref": "#/components/schemas/EncryptedEnvelope"
+          },
+          "client_msg_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional logical-send identifier. Reusing it for the same user within 600 seconds returns the first stored row and emits no second consumer wake."
           },
           "content_type": {
             "type": "string",

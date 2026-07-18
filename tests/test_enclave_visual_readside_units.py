@@ -54,6 +54,10 @@ def test_memory_inner_to_v1_passthrough_and_legacy():
     adapted = readside.memory_inner_to_v1(legacy)
     assert adapted["bucket"] == "我们的关系"
     assert "描述" in adapted["content"]
+    # legacy fallback context line is user-visible: subject-free, never "用户"
+    # (usr_fee1 naming complaint 2026-07-17).
+    assert "上下文: 对话中明确提到。" in adapted["content"]
+    assert "用户" not in adapted["content"]
 
 
 def test_memory_index_filter_items():

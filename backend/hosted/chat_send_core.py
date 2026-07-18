@@ -15,12 +15,12 @@ monkeypatch those module attributes keep working unchanged.
 
 from __future__ import annotations
 
-import base64
 import time
 
 from core import envelope as core_envelope
 
 import debug_trace
+from chat import idempotency as chat_idempotency
 from chat import service as chat_service
 from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
@@ -44,10 +44,12 @@ def model_api_chat_send_core(
     JSON body (``request.get_json(silent=True) or {}`` / ``read_json_silent``).
     """
     trace_start = time.time()
+    client_msg_id, client_msg_id_err = chat_idempotency.parse_client_msg_id(payload)
+    if client_msg_id_err is not None:
+        return client_msg_id_err
     image_bytes, image_mime, image_err = hosted_turn._model_api_image_payload(payload)
     if image_err:
         return {"error": "invalid_image", "detail": image_err}, 400
-    image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else ""
     has_image = image_bytes is not None
     file_parse, file_err = hosted_turn._model_api_file_payload(payload)
     if file_err:
@@ -57,7 +59,6 @@ def model_api_chat_send_core(
     if file_parse is not None and file_parse["kind"] == "image":
         image_bytes = file_parse["bytes"]
         image_mime = file_parse["mime"]
-        image_b64 = base64.b64encode(image_bytes).decode("ascii")
         has_image = True
         file_parse = None
     has_file = file_parse is not None
@@ -156,21 +157,40 @@ def model_api_chat_send_core(
     ]
     if quoted_memory_ids:
         extra["quoted_memory_ids"] = ",".join(quoted_memory_ids[:8])
-    user_row = store.append_chat(
-        "user",
-        "model_api",
-        user_env,
-        content_type="image" if has_image else ("file" if has_file else "text"),
-        extra=extra or None,
-    )
-    store.notify_chat_waiters()
+    inserted = True
+    if client_msg_id is not None:
+        user_row, inserted = store.append_chat_idempotent(
+            "user",
+            "model_api",
+            user_env,
+            client_msg_id=client_msg_id,
+            window_sec=chat_idempotency.CLIENT_MSG_ID_WINDOW_SEC,
+            content_type="image" if has_image else ("file" if has_file else "text"),
+            extra=extra or None,
+        )
+    else:
+        user_row = store.append_chat(
+            "user",
+            "model_api",
+            user_env,
+            content_type="image" if has_image else ("file" if has_file else "text"),
+            extra=extra or None,
+        )
+    if inserted:
+        store.notify_chat_waiters()
 
     # image turn 不再被挡在 legacy；consumer 已能处理图片 envelope。
     _turn_id = str(user_row.get("id") or "") if isinstance(user_row, dict) else ""
-    debug_trace.trace_event(
-        store, subsystem="route", type="route.decided", actor="host_agent_runtime",
-        turn_id=_turn_id, summary="agent_runtime",
-        detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
-    )
+    if inserted:
+        debug_trace.trace_event(
+            store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+            turn_id=_turn_id, summary="agent_runtime",
+            detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
+        )
+    else:
+        # The assistant reply may have been posted through another worker since
+        # this store's last wake refresh. Reload before the existing response
+        # builder checks for it; this does not notify or re-run the turn.
+        store.reload()
     body, status = agent_runtime_cutover.handle_send(store, user_row, driver)
     return body, status

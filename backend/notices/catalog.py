@@ -19,6 +19,7 @@ ERROR_CLASSES = frozenset({
     "quota_insufficient",
     "auth_invalid",
     "model_not_found",
+    "cli_config_invalid",
     "provider_incompatible",
     "context_overflow",
     "content_filtered",
@@ -56,6 +57,8 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "user_provider", "API Key 无效或已过期，请到设置里重新保存。"),
     "model_not_found": (
         "user_provider", "模型名不可用，请检查设置里的模型名。"),
+    "cli_config_invalid": (
+        "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。"),
     "provider_incompatible": (
         "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。"),
     "context_overflow": (
@@ -127,6 +130,8 @@ _UPSTREAM_RULES = (
         r"|provider_http_40[13]", re.I)),
     ("model_not_found", re.compile(
         r"invalid model name|model_not_found|no such model", re.I)),
+    ("cli_config_invalid", re.compile(
+        r"missing the \{message\} placeholder", re.I)),
     ("provider_incompatible", re.compile(
         r"unknown variant|not supported|unsupported (parameter|tool)"
         r"|invalid_request_error.*tool", re.I)),
@@ -140,7 +145,8 @@ _UPSTREAM_RULES = (
     ("upstream_unavailable", re.compile(
         r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out"
         r"|connection (refused|reset|error)"
-        r"|unreachable|stream disconnected", re.I)),
+        r"|unreachable|stream disconnected"
+        r"|ended without finish_reason", re.I)),
 )
 
 

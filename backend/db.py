@@ -2068,16 +2068,6 @@ def genesis_list_jobs(user_id: str, *, limit: int = 20) -> list[dict]:
     return out
 
 
-def genesis_latest_done_job(user_id: str) -> dict | None:
-    with get_pool().connection() as conn:
-        cur = conn.execute(
-            "SELECT * FROM genesis_import_jobs WHERE user_id = %s AND status = 'done' "
-            "ORDER BY completed_at DESC NULLS LAST, updated_at DESC LIMIT 1",
-            (user_id,),
-        )
-        return _genesis_row(cur, cur.fetchone())
-
-
 def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
     """Atomically claim uploaded genesis jobs for the CVM worker.
 
@@ -2310,6 +2300,59 @@ def genesis_reap_stale_resident_jobs(
             RETURNING j.*
             """,
             (safe_sec, safe_limit, safe_max, safe_max, error[:1000]),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
+def genesis_reap_stale_unclaimed_jobs(
+    older_than_sec: int, *, error: str, limit: int = 50
+) -> list[dict]:
+    """Fail sealed resident-distill jobs wedged in 'awaiting_resident' past a generous
+    cutoff — no consumer ever claimed them (consumer running stale code that never opened
+    the distill lane, offline, or never started). Nothing else times these out: the cloud
+    reaper only touches un-owned 'processing' rows and genesis_reap_stale_resident_jobs
+    only touches claimed 'processing' rows, so an unclaimed row would otherwise sit forever
+    and the app spins 'processing' with no error.
+
+    Atomic (FOR UPDATE SKIP LOCKED, status re-checked INSIDE the UPDATE) so a consumer that
+    claims the row between SELECT and UPDATE is never clobbered — a just-claimed job is
+    'processing', no longer 'awaiting_resident', and is skipped. ``updated_at`` is the row's
+    last state change (job creation, or a reaper re-queue), so a freshly re-queued job
+    restarts the cutoff clock rather than being reaped immediately. Returns the rows flipped
+    so the caller can sync each one's genesis_state blob."""
+    safe_sec = max(60, int(older_than_sec or 0))
+    safe_limit = max(1, min(int(limit or 1), 200))
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            WITH picked AS (
+                SELECT user_id, job_id
+                FROM genesis_import_jobs
+                WHERE status = 'awaiting_resident'
+                  AND updated_at < now() - make_interval(secs => %s)
+                ORDER BY updated_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE genesis_import_jobs AS j SET
+                status = 'failed',
+                error = %s,
+                updated_at = now()
+            FROM picked
+            WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+              AND j.status = 'awaiting_resident'
+            RETURNING j.*
+            """,
+            (safe_sec, safe_limit, error[:1000]),
         )
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
@@ -2565,16 +2608,6 @@ def genesis_upsert_output(
     from tee_shadow import mirror
     mirror.execute(sql, (user_id, job_id, output_type, ref, status, Jsonb(doc)))
     return result
-
-
-def genesis_get_output(user_id: str, job_id: str, output_type: str) -> dict | None:
-    with get_pool().connection() as conn:
-        cur = conn.execute(
-            "SELECT * FROM genesis_import_outputs "
-            "WHERE user_id = %s AND job_id = %s AND output_type = %s",
-            (user_id, job_id, output_type),
-        )
-        return _genesis_row(cur, cur.fetchone())
 
 
 def genesis_complete_job(
@@ -2855,6 +2888,120 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
              "AND table_name = 'chat_messages' AND item_id = ANY(%s)",
              (user_id, trimmed_ids)),
         ])
+
+
+def chat_append_idempotent(
+    user_id: str,
+    msg_id: str,
+    ts: float,
+    doc: dict,
+    max_messages: int,
+    *,
+    client_msg_id: str,
+    window_sec: int,
+) -> tuple[dict, bool]:
+    """Atomically insert or recover one client-identified chat send.
+
+    The transaction-scoped advisory lock is shared by every backend process
+    using this PostgreSQL database. It serializes only the same user/key pair;
+    a hash collision merely serializes unrelated sends because the winner query
+    still compares the complete values. Unlike ``chat_append``, failures raise:
+    an idempotency guard must fail closed rather than turn a failed lookup into
+    an accidental second insert.
+    """
+    if not client_msg_id:
+        raise ValueError("client_msg_id is required")
+    if window_sec <= 0:
+        raise ValueError("window_sec must be positive")
+
+    offload = (
+        object_storage.chat_files_enabled()
+        and isinstance(doc, dict)
+        and doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
+        and doc.get("body_ct") is not None
+    )
+    trimmed_docs: list = []
+    trimmed_ids: list[str] = []
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            # Length-prefix the user id so concatenation is unambiguous without
+            # a NUL byte (PostgreSQL text values reject U+0000).
+            lock_key = f"{len(user_id)}:{user_id}{client_msg_id}"
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
+            row = conn.execute(
+                "SELECT doc FROM chat_messages "
+                "WHERE user_id = %s AND doc->>'client_msg_id' = %s "
+                "AND ts >= EXTRACT(EPOCH FROM clock_timestamp()) - %s "
+                "ORDER BY seq DESC LIMIT 1",
+                (user_id, client_msg_id, window_sec),
+            ).fetchone()
+            if row is not None:
+                return row[0], False
+
+            # Keep normal msg-id semantics: an envelope-id collision updates the
+            # same primary-key row, matching chat_append's existing behavior.
+            row = conn.execute(
+                "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (user_id, msg_id) DO UPDATE "
+                "SET ts = EXCLUDED.ts, doc = EXCLUDED.doc RETURNING doc",
+                (user_id, msg_id, ts, Jsonb(doc)),
+            ).fetchone()
+            if max_messages and max_messages > 0:
+                rows = conn.execute(
+                    "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
+                    "  SELECT MIN(seq) FROM ("
+                    "    SELECT seq FROM chat_messages WHERE user_id = %s "
+                    "    ORDER BY seq DESC LIMIT %s"
+                    "  ) t"
+                    ") RETURNING msg_id, doc",
+                    (user_id, user_id, max_messages),
+                ).fetchall()
+                trimmed_ids = [r[0] for r in rows]
+                trimmed_docs = [r[1] for r in rows]
+
+    # Mirror chat_append's crash-safe R2 ordering. Only the transaction winner
+    # reaches this block, so retries neither upload twice nor flip the row twice.
+    if offload:
+        try:
+            body_ct_len = len(doc["body_ct"])
+            key = object_storage.put_chat_body(
+                user_id, msg_id, doc["body_ct"], str(doc.get("content_type") or "file")
+            )
+            pointer = {"body_key": key, "body_ct_len": body_ct_len}
+            with get_pool().connection() as conn:
+                conn.execute(
+                    "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
+                    "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
+                    (Jsonb(pointer), user_id, msg_id),
+                )
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "[db] chat_append_idempotent(%s,%s) R2 offload failed, left inline: %s",
+                user_id,
+                msg_id,
+                e,
+            )
+    if trimmed_docs and object_storage.chat_files_enabled():
+        for trimmed in trimmed_docs:
+            if isinstance(trimmed, dict) and trimmed.get("body_key"):
+                object_storage.delete_chat_body(str(trimmed["body_key"]), user_id)
+    if trimmed_ids:
+        from tee_shadow import mirror
+
+        mirror.execute_many([
+            ("DELETE FROM chat_messages WHERE user_id = %s AND msg_id = ANY(%s)",
+             (user_id, trimmed_ids)),
+            ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+             "AND table_name = 'chat_messages' AND item_id = ANY(%s)",
+             (user_id, trimmed_ids)),
+        ])
+    if row is None:
+        raise RuntimeError("chat_idempotent_insert_returned_no_row")
+    return row[0], True
 
 
 def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None:

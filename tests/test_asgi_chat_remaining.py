@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import sys
+import uuid
 from pathlib import Path
 
 import httpx
@@ -143,6 +144,77 @@ def test_message_validation_parity(user, payload):
     f = _flask_client().post("/v1/chat/message", headers=_hk(api_key), json=payload)
     assert (a_status, a_body) == (f.status_code, f.get_json())
     assert a_status == 400
+
+
+def test_message_client_msg_id_validation_parity(user):
+    uid, api_key = user
+    payload = {"envelope": _env(uid, "invalid-key"), "client_msg_id": "not-a-uuid"}
+    a_status, a_body = _asgi(
+        "POST", "/v1/chat/message", headers=_hk(api_key), json=payload
+    )
+    f = _flask_client().post(
+        "/v1/chat/message", headers=_hk(api_key), json=payload
+    )
+    assert (a_status, a_body) == (f.status_code, f.get_json())
+    assert (a_status, a_body) == (
+        400,
+        {
+            "error": "client_msg_id_invalid",
+            "detail": "client_msg_id must be a UUID string",
+        },
+    )
+
+
+def test_message_client_msg_id_deduplicates_across_adapters(user, monkeypatch):
+    uid, api_key = user
+    key = "2B6B5D80-53DA-4AD3-9662-4434959D0505"
+    store = core_store.get_store(uid)
+    local_notifies: list[str] = []
+    monkeypatch.setattr(
+        store, "notify_chat_waiters", lambda: local_notifies.append("notify")
+    )
+
+    a_status, first = _asgi(
+        "POST",
+        "/v1/chat/message",
+        headers=_hk(api_key),
+        json={"envelope": _env(uid, "idem-asgi"), "client_msg_id": key},
+    )
+    f = _flask_client().post(
+        "/v1/chat/message",
+        headers=_hk(api_key),
+        json={"envelope": _env(uid, "idem-flask"), "client_msg_id": key.lower()},
+    )
+
+    assert a_status == f.status_code == 200
+    assert f.get_json() == first
+    user_rows = [
+        row for row in store.chat_messages
+        if row.get("role") == "user" and row.get("client_msg_id") == key.lower()
+    ]
+    assert len(user_rows) == 1
+    assert user_rows[0]["id"] == first["id"] == "idem-asgi"
+    assert local_notifies == ["notify"]
+
+
+def test_message_distinct_and_absent_client_ids_keep_creating_rows(user):
+    uid, api_key = user
+    payloads = [
+        {"envelope": _env(uid, "key-a"), "client_msg_id": str(uuid.uuid4())},
+        {"envelope": _env(uid, "key-b"), "client_msg_id": str(uuid.uuid4())},
+        {"envelope": _env(uid, "legacy-a")},
+        {"envelope": _env(uid, "legacy-b")},
+    ]
+
+    responses = [
+        _asgi("POST", "/v1/chat/message", headers=_hk(api_key), json=payload)
+        for payload in payloads
+    ]
+
+    assert [status for status, _body in responses] == [200, 200, 200, 200]
+    assert [body["id"] for _status, body in responses] == [
+        "key-a", "key-b", "legacy-a", "legacy-b",
+    ]
 
 
 def test_message_success_and_opaque_envelope(user):
