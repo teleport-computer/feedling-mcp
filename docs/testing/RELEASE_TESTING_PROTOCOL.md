@@ -52,11 +52,25 @@
   E2E_KEY_DEEPSEEK=…`。
 - 建池动作（待 Seven/志豪提供 key）：额度各留最低档即可，P0 单轮消耗很小。
 
+**待建（§9）：mock relay** —— key 池的"中转站代表"只能测到当天恰好发生的坏；
+真实故障族（SSE 中断/假模型名/慢首 token/间歇 5xx）要用 `tools/e2e/` 的 mock
+openai_compatible 代理主动注入（见 §4.7 故障注入四连）。
+
 ### 1.3 测试账号纪律（test-account-hygiene）
 
 - 每轮 E2E 现场注册、跑完 **当场 `/v1/account/reset`（confirm=delete-all-data）删除**；
 - keypair 用 `tools/e2e/` 生成并只存本轮临时目录；
 - 绝不复用真实用户账号，绝不在 prod 建号。
+- teardown 失败会打 WARNING——**看到必须手动删**（无 admin 删除口）；
+  崩溃留下的凭据在 `~/.feedling-e2e-orphans/`，`p0.py --cleanup-orphans` 清扫。
+
+### 1.4 harness 已知坑（拿来即用）
+
+- 注册 `public_key` 是 **base64** 不是 hex（传 hex 409）。
+- model slug 会被厂家下线 404——`HostedCell.models` 多给候选按序试。
+- genesis 上传返回的 job_id 在 `body["job"]["job_id"]`（嵌套）。
+- model_api **首轮冷启动可能丢**（per-user spawn）——FIRST_REPLY_TIMEOUT=300s。
+- admin trace 的 stdout excerpt 截断 1000 字节；读 trace 过滤 `ts > 发送时刻`。
 
 ---
 
@@ -81,7 +95,7 @@
 | 主动唤醒（心跳/定时/照片/屏幕） | ✅ | ✅ | ✅ | ❓ |
 | 感知信号（io_cli 18 signals） | ✅ | ✅ | ✅(-t bash) | ❓ |
 | **用户 MCP** | ✅ | ✅ | **❌ 无 pi 桥（志豪修，docs/PI_USER_MCP_GAP）** | ❓ |
-| 云端蒸馏（上传文件） | ✅ | ✅ | ✅ | ❓ |
+| 云端蒸馏（上传文件）※ | ✅ | ✅ | ✅ | ❓ |
 | 错误气泡分类 | ✅ | ✅ | ✅ | ❓ |
 
 **VPS 自托管（resident）**（OpenClaw 暂免——无用户，Seven 定）：
@@ -97,8 +111,28 @@
 
 > ❓ 存量待核（建任务）：deepseek 全列、Hermes 的蒸馏/MCP/图片。核实后改
 > ✅/❌，❌ 的补产品提示。
+>
+> ※ **蒸馏不是一格**——实际是 2 入口（onboarding 首传 / Garden 二次补传）×
+> 2 通道（云端 plaintext / 自托管 sealed）× 行为子表，每格独立坏过。
+> 触碰蒸馏时按 §4.6 行为子表逐格验。
 
 ---
+
+### 2.5 双签范围与 gatekeep 清单（审查是拦截率最高的一道测试）
+
+**必须双签**：用户可见行为变更、共享接缝（§5 表）、并发/存储原语、加密/账号链路、
+prompt 注入文本。单签豁免仅限不改变契约/流程/门禁的说明性 docs 与注释——**改变
+发版规范、测试义务、API 契约的文档照样双签**。（实证：2026-07-17 一天六批，独立
+gatekeep 抓出 10+ 个测试没抓到的真缺陷。）
+
+**gatekeep 最小动作**（审者）：读完整 diff 逐 hunk 问为什么；独立跑测试（别信
+提交者数字，PG 依赖用真 PG）；边界三问（空值/保留值？两个同时到？失败路径
+fail-open 还是 fail-closed？）；用户可见文字的术语/归因/双语义；push 后远端复验
+SHA/文件集/净 diff。
+
+**提交纪律**（提交者）：commit 前 `git diff --cached` 与审定 diff **逐 hunk** 比对
+（文件名一致不够）；进行中工作放专属 worktree；mailbox 脚本从主仓根跑，
+pytest/build 必须在被审的树里跑。
 
 ## 3. P0 冒烟集（全自动，Claude 执行，~30-45 分钟）
 
@@ -113,7 +147,7 @@ upload_material / send_chat / run_consumer / teardown）。
 | 步 | 动作 | 通过标准 |
 |---|---|---|
 | 1 | 注册临时账号（对应 route/driver），配 provider key，`/v1/model_api/setup` test | test_status=ok |
-| 2 | 发一条文字消息 | ≤120s 收到 agent 回复，无协议碎片泄漏 |
+| 2 | 发一条文字消息 | ≤120s 收到 agent 回复，**且用账号私钥解出非空明文**（解不开=硬 fail——usr_f13f 事故：AI 狂发、用户屏幕全乱码，后端毫无感知），无协议碎片泄漏 |
 | 3 | 追问一条（上下文连续性） | 回复能接上文（会话/注入正常） |
 | 4 | 触发一次记忆写入（明确给一个事实） | `/v1/memory/index` 出现对应卡 |
 | 5 | 错误气泡 sanity：故意发超长/停 key 场景跳过，仅检查无 unknown 类气泡出现在本轮 | 聊天里 0 条 system 气泡 |
@@ -144,12 +178,71 @@ verify_loop passing → 发消息收回复 → 删号。
 | 12 | 错误话术抽查 | 停用 key 发消息 → 气泡是 auth 类话术（不是 unknown/怪我们） |
 | 13 | 账号生命周期 | key regenerate（数据保留）/ reset（硬删）/ recover（keypair 找回） |
 | 14 | admin data-track | 用户页各区块渲染正常、时间北京、无 5xx |
+| 14.5 | **重试路径专项** | 每个用户可见"重试"按钮=独立用例：造失败→点重试→断言端点/payload/最终**恰好一份**；同 UUID 双 POST → 1 row；发消息后不读响应直接同 UUID 重发（模拟 lost-202）→ 1 行；known gap：iOS 图片/文件重试尚无幂等键（P1 目标） |
+| 14.6 | **故障注入四连**（待 §1.2 mock relay 落地） | 流断首 token 前→单次重试无感/再败气泡怪 relay；流断首 token 后→无"."退化气泡；tool call 400→降级不循环；慢首 token→打字指示不消失不误标失败。**归因必须对**：上游的错说"你的模型服务"，我们的错才说"连接模型服务时出了问题" |
 | 15 | 【真机·人工】push / Live Activity / 锁屏 | Seven 或真机持有者按 Health Check 页操作 |
 | 16 | 【真机·人工】iOS 端 UI 体感（打字指示、错误展示、进度页） | 同上 |
 
 > 15/16 是仅有的人工项（需要真机）；其余全部 Claude 执行。
 
+### 4.5 体感 Block 回归（全绿也可能是灾难的项，P1 级）
+
+功能测试查"能不能用"，本表查"用起来对不对"。发版回归时在 **claude 官方 +
+pi 中转** 两个代表配置上各扫一遍；每项的通过标准是括号里的体感断言，
+**"聊天有回复"不算过**。❌ 由 Seven 决定阻断或带票。
+
+| 类 | 症状 | 怎么测 |
+|---|---|---|
+| 回复语言漂移 | 设英文人设却冒中文 | 人设+记忆写语言 X → 连发 3 条每条必须 X；发语言 Y 一条 → 该轮镜像 Y；proactive 仍回 X；**两路都测** |
+| 主动刷屏/自激励 | 短时连发、越发越多 | 单位时间发送量有上限；报错退避不重试；self-wake 被 floor clamp；堆积 job 到期转 expired 不补跑 |
+| 消息重复（两族） | 用户看到重复 | 发 1 条 → 恰 1 user row + 1 agent 回复；分诊看"两个 user row"还是"一 row 两回复" |
+| 时间/日期正确性 | 说错时间；LTM 日期塌成今天 | 非-UTC 时区问"几点"答对；带 YYYY-MM-DD 的长期记忆上传后 occurred_at 原样保留 |
+| onboarding 首屏 | 卡进度页/身份卡空/天数错 | fresh 新号直进 app；身份卡逐字段 fallback（初始名"TA"）；天数第 1 天起算 |
+
+（解密连续性原属此类，已升级为 §3 P0 步骤 2 的硬判据。）
+
+### 4.6 蒸馏行为子表（触碰 genesis/distill 时逐格验）
+
+| 行为 | 通过标准 | 易漏点 |
+|---|---|---|
+| LTM 日期保留 | occurred_at == 源卡日期，不塌今天 | 仅 material_kind=memory_summary 开；混合上传逐卡判定（_source_family），别整批开 |
+| 标签→threads | 源卡 tags 播种进 threads，不丢 | 同上 gating |
+| 聊天记录常规蒸馏 | history 素材不触发日期保留 | 全局 schema 的 occurred_at 别泄进 history 卡 |
+| 去重 | 语义去重+保守词法兜底，同模板事实不误并 | 阈值太低误并 |
+| 混合素材分族 | 同批只有 memory_summary 卡拿日期精修 | merge 收敛丢族信息——靠 per-item marker |
+| 空素材话术 | 空文件 → material_empty 具体文案 | iOS 有对应 copy |
+| 蒸馏中插聊天 | 聊天先回、续跑不重不丢 | resident 逐窗游标 |
+| 首轮冷启动 | runner 首轮可能丢——重试/预热 | 别拿首轮失败下结论 |
+
+### 4.7 注入文本审计（喂给模型的每个词都会出现在用户屏幕上）
+
+usr_fee1 教训：模型是复读机——转写标签/prompt 术语/硬编码兜底文案会照搬进用户
+可见产物（"记忆卡叫她'用户'"根因=转写行首写死 `user:`）。规则：
+
+- 新增/修改任何喂给模型的注入段 → grep 禁词表：`user:`、`agent:`、裸"用户"、
+  裸"TA"(指人)——出现即需论证；
+- 用户可见的模型产物（记忆卡/主动消息）E2E 断言不含系统称谓；
+- "名字"类字段写读双端防呆：写入端拒占位词、读取端 sanitize（单一保留词事实源），
+  占位名不得遮蔽后备真名；
+- 保留词双语义（产品面 TA=AI vs prompt 内部 TA=用户）维护小表，prompt 借用必须
+  显式声明"仅指令内标记"；
+- 改称谓/术语时全仓 grep（backend/enclave/consumer/iOS xcstrings）——usr_fee1
+  第一轮就漏了 enclave readside 的 legacy 路径。
+
 ## 5. VPS harness × 功能矩阵 E2E（新功能触碰 consumer 时加跑）
+
+**共享接缝触发器（根治"改 A 坏 B"）**：动了下表任一文件，L2 回归必须
+model_api + resident **两路都跑**，不许一路代表全部。自查话术："这段代码
+只有 model_api 用户会跑到吗？"答不上"是"就双路测。
+
+| 共享接缝 | 文件 |
+|---|---|
+| 蒸馏事实写入 | backend/genesis/worker.py::_fact_write |
+| 上下文/prompt 组装 | backend/hosted/context.py、backend/genesis/prompts.py |
+| 回复语言策略 | backend/chat/reply_language.py |
+| 信封加解密 | content_encryption.py、enclave_app.py |
+| 记忆动作 | backend/memory/actions.py |
+| proactive 核 | backend/proactive/* |
 
 改了 `tools/chat_resident_consumer.py` 或 agent 侧协议 → L2 之外加跑：
 三 harness（Claude Code/Codex/Hermes）各把 §3 VPS P0 + 受影响功能过一遍。
@@ -161,9 +254,22 @@ verify_loop passing → 发消息收回复 → 删号。
 每次 prod deploy 后，从当次发版内容生成验证清单照单跑（模板见
 `docs/testing/PROD_DEPLOY_VERIFICATION_2026-07.md` 的结构：逐项 ✅/❌/跳过+原因、
 写明"什么不算失败"）。固定项：
+- **第 0 步（铁律）**：`curl -sk <api>/healthz` 的 `release.git_commit` 必须
+  == 目标 SHA 才开跑——对不上 = 还没部署完，此刻任何"失败"都是假阴性。
+  runner 镜像看 compose tag `:<sha7>`；resident consumer 看 admin user detail
+  的 consumer commit（随 expected_consumer_commit 自更新）；
 - `/healthz` + attestation/canary 绿；
 - 抽 2-3 个真实活跃用户 admin 页看健康信号（错误气泡增量、proactive 状态分布）；
-- 部署断连窗口投诉核对（单点 CVM 原地部署问题，见 usr_ed21 事故）。
+- 部署断连窗口投诉核对（单点 CVM 原地部署问题，见 usr_ed21 事故）；
+- **发版时间线记录**：deploy 起止 UTC（main CVM / runner CVM 分开）+ 当时 runner
+  拓扑——事后任何"连不上"先对这张表；±分钟级吻合=标记 deploy-window candidate，
+  仍需核 health 时间线才归因，**不许拿时间相关性自动驳回**；
+- **admin 三读性能打表**：单用户 detail <10s、debug trace <5s、users 列表 <30s，
+  记录数值报劣化趋势（排障工具坏了=盲飞：旧 debug 视图事故当天 >400s 超时，
+  修复 get_blobs_for_users 后 2.5s）；trace ring 噪声比 >90% 即信噪比退化要处理；
+- **部署后 30 分钟竞态信号**：`chat_collision`（admin job_failed_reasons 有聚合）
+  与 `already_answered` 409（暂只在 per-user trace，手工抽查，仪表待补）——
+  runner 原地更新的新老共存窗是双 turn 竞态高发期。
 
 ## 7. 事故回归案例库（每案一条永久用例）
 
@@ -178,6 +284,12 @@ verify_loop passing → 发消息收回复 → 删号。
 | DAU 历史缩水 | 快照冻结测试（已入 pytest） |
 | 单点 CVM 部署断连（usr_ed21） | §6 固定项 |
 
+| 重发双份/lost-202（usr_9f5d） | P1 #14.5 重试路径专项（幂等窗 cbecec05 + ios 重试路由 9f33d65 + 幂等键 49afa7a） |
+| 同秒双回复竞态（usr_a0b7） | §2.5 并发自查 + TESTING §2-F 确定性并发测试；reply 侧原子 CAS 仍未完成——"缓解"≠"已修" |
+| debug_trace 写后读竞态 | TESTING §6 flaky 规范（e4b38e39，bounded best-effort 契约） |
+| 注入文本污染（usr_fee1"用户"称谓） | §4.7 注入文本审计 |
+| admin debug 慢查询（>400s 不可用） | §6 admin 三读性能打表（get_blobs_for_users） |
+
 **规则**：以后每个 prod 事故结案时，必须在本表加一行 + 在对应层落一条用例，
 否则不算结案。
 
@@ -187,6 +299,20 @@ verify_loop passing → 发消息收回复 → 删号。
 - **阻断**：P0 任何一格 ❌ → 不许 test→main；P1 的 ❌ → Seven 决定
   （阻断或带票发版）；真机项未跑 → 标注"待真机"不阻断。
 - 所有 E2E 产生的测试账号必须在报告里确认已删除。
+
+## 8.5 发版前六问（快速自检）
+
+1. 体感：语言对吗？会刷屏吗？用户**真能解密**吗？（§4.5 / §3-2）
+2. 蒸馏：日期/标签保住了吗？两入口两通道都验了吗？（§4.6）
+3. 联动：碰共享接缝了吗？两路都跑了吗？（§5）
+4. 生效：/healthz git_commit 对上目标 SHA 了吗？（§6-0）
+5. 分层：模型家族/harness 分层验了吗？（§5）
+6. 收尾：测试账号删干净了吗？事故落回归用例了吗？（§7 / §1.3）
+7. 第二次：每条数据写入，重发/重试一遍还是一份吗？（P1 #14.5）
+8. 同时：两个执行体同时到，防线在服务端持久层吗？（§2.5 / TESTING §2-F）
+9. 喂词：这次改动往模型嘴里塞了什么新词？会照搬到用户屏幕吗？（§4.7）
+10. 工具：现在出事故，admin 读得动、trace 还在窗口内吗？（§6）
+11. 归因：新增错误路径，气泡怪对人了吗？（P1 #14.6）
 
 ## 9. 落地顺序（待办）
 
@@ -198,3 +324,7 @@ verify_loop passing → 发消息收回复 → 删号。
    首个案例 = pi MCP。
 5. 【全员约定】新功能 PR 模板加"能力矩阵已更新 + L1 证据"检查项；
    事故结案必须落 §7 案例行。
+6. 【Claude+codex2】mock relay（openai_compatible 故障注入代理）→ 解锁 P1 #14.6。
+7. 【iOS/排期 Seven 定】iOS 单测 target（最小核：消息发送状态机——先提取
+   choosePreferredCopy / isLikelyOptimisticDuplicate 纯函数 + retryMessage
+   路由决策抽可注入 helper，三处恰是本周三个 bug 的宿主）。

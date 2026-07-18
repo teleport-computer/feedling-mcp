@@ -74,6 +74,50 @@ def test_message_text_accepts_three_history_shapes() -> None:
         client._http.close()
 
 
+def test_decrypt_reply_strict_decrypts_inline_and_nested_envelopes() -> None:
+    # The P0 hard-blocker path: prove the USER can read the reply with THEIR key.
+    client = _client()
+    try:
+        envelope = client._seal("sealed reply 青色")
+        # inline envelope fields (the /v1/chat/history row shape)
+        assert client.decrypt_reply(envelope) == "sealed reply 青色"
+        assert client.decrypt_reply({**envelope, "role": "agent", "content": ""}) \
+            == "sealed reply 青色"
+        # nested envelope
+        assert client.decrypt_reply({"envelope": envelope}) == "sealed reply 青色"
+    finally:
+        client._http.close()
+
+
+def test_decrypt_reply_never_falls_back_to_server_plaintext() -> None:
+    # THE regression guard: unlike message_text, decrypt_reply must NOT accept a
+    # server-provided `content` shortcut — that would mask usr_f13f922a (reply
+    # arrives, user still cannot decrypt it). No envelope ⇒ hard raise.
+    client = _client()
+    try:
+        with pytest.raises(Exception):
+            client.decrypt_reply({"content": "server said it's fine", "role": "agent"})
+        with pytest.raises(Exception):
+            client.decrypt_reply({"role": "agent"})           # nothing to decrypt
+    finally:
+        client._http.close()
+
+
+def test_decrypt_reply_raises_on_undecryptable_envelope() -> None:
+    # A present-but-corrupt envelope (AEAD tag mismatch) must surface as a failure,
+    # not a silent empty string — the user genuinely cannot read this reply.
+    import base64
+
+    client = _client()
+    try:
+        envelope = dict(client._seal("sealed reply"))
+        envelope["body_ct"] = base64.b64encode(b"garbage-ciphertext-not-valid").decode()
+        with pytest.raises(Exception):
+            client.decrypt_reply(envelope)
+    finally:
+        client._http.close()
+
+
 def test_teardown_failure_is_a_hard_failure() -> None:
     class FailingHTTP:
         def __init__(self):
