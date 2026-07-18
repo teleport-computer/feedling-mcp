@@ -169,7 +169,15 @@ For P0-06 it MUST use this exact capture/review/finalize flow:
    semantic decisions, and write an exact
    owner-mode `0600` judgment to
    `$QA_WORK_ROOT/p0-06-semantic-judgment.json` whose `evidence_sha256` equals
-   the capture hash.
+   the capture hash. The object has exactly eight keys: `schema_version: 1`,
+   `judge: qualification_agent`, `evidence_sha256`,
+   `reviewed_surfaces: ["identity", "persona", "memories"]`,
+   `reviewed_fact_ids` copied from the evidence's `expected_fact_ids`, and the
+   three independently judged booleans `persona_identity_consistent`,
+   `ground_truth_facts_supported`, and `contradictions_absent`. The aliases
+   `expected_fact_ids`, `consistency`, `support`, and `contradiction` are not
+   judgment keys and fail closed. The booleans come from the agent's actual
+   review; they are not mechanically defaulted to true.
 3. Run the exact offline `qa/finalize_persona_review.py` command with the
    review copy and judgment. The local deterministic wrapper verifies the
    hash/fixture/judgment contracts, emits only sanitized bounded data, and

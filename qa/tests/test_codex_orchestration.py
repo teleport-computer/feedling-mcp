@@ -1368,6 +1368,11 @@ def test_generated_profile_prompt_requires_one_live_command_until_terminal_exit(
         "poll or wait on that same execution identifier until it reaches terminal exit",
         "do not start another tool call, issue another scenario request, or read any facts file",
         "Only after terminal exit may you read that command's facts",
+        "reviewed_fact_ids",
+        "persona_identity_consistent",
+        "ground_truth_facts_supported",
+        "contradictions_absent",
+        "do not write `expected_fact_ids`, `consistency`, `support`, or `contradiction`",
     )
     for instruction in required_contract:
         assert instruction in " ".join(prompt.split())

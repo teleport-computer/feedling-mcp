@@ -187,8 +187,13 @@ request marker; the agent reads bounded facts and supplies semantic judgment.
   judgment at
   `$QA_WORK_ROOT/p0-06-semantic-judgment.json` containing exactly
   `schema_version: 1`, `judge: qualification_agent`, the capture's exact
-  `evidence_sha256`, all three reviewed surfaces, the exact locked fact IDs,
-  and true/false consistency, support, and contradiction decisions.
+  `evidence_sha256`, `reviewed_surfaces: ["identity", "persona", "memories"]`,
+  `reviewed_fact_ids` copied from the reviewed evidence's `expected_fact_ids`,
+  and the three true/false decisions `persona_identity_consistent`,
+  `ground_truth_facts_supported`, and `contradictions_absent`. These are the
+  exact eight keys; aliases such as `expected_fact_ids`, `consistency`,
+  `support`, or `contradiction` are invalid judgment fields. Judge the three
+  booleans from the reviewed plaintext rather than defaulting them to true.
 - Run the exact offline `qa/finalize_persona_review.py` command with the
   fixture, review copy, judgment, and artifact boundary. It must verify the hash
   binding, sanitize its bounded result, and delete that plaintext review copy.

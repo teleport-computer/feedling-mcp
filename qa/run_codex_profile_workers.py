@@ -275,6 +275,17 @@ QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=REVIEW "$QA_PYTHON_BIN" -I -B -c 'import 
 After observing REVIEW output, make the semantic decisions and write the bounded
 owner-only judgment to exactly
 `$QA_WORK_ROOT/p0-06-semantic-judgment.json` in a separate unmarked tool call.
+That JSON object MUST contain exactly these eight keys and no aliases:
+`schema_version`, `judge`, `evidence_sha256`, `reviewed_surfaces`,
+`reviewed_fact_ids`, `persona_identity_consistent`,
+`ground_truth_facts_supported`, and `contradictions_absent`. Set
+`schema_version` to `1`, `judge` to `qualification_agent`,
+`reviewed_surfaces` to exactly `["identity","persona","memories"]`, copy
+`evidence_sha256` and `expected_fact_ids` from the reviewed evidence into the
+judgment's `evidence_sha256` and `reviewed_fact_ids` fields, and set the three
+boolean fields from your actual semantic review. In particular, do not write
+`expected_fact_ids`, `consistency`, `support`, or `contradiction` as judgment
+keys. Never default the three decisions to true without reviewing the surfaces.
 Then run:
 QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=FINALIZE "$QA_PYTHON_BIN" -I -B "$QA_SOURCE_ROOT/qa/finalize_persona_review.py" --fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" --private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" --semantic-judgment "$QA_WORK_ROOT/p0-06-semantic-judgment.json" --artifact-dir "$QA_ARTIFACT_DIR"
 The sole diagnostic exception is a schema-valid non-PASS CAPTURE receipt with
