@@ -3352,14 +3352,21 @@ def _run_history_import_job(
             "job_id": job_id,
             "created_at": core_util._now_iso(),
         }
+        error_text = f"{type(e).__name__}:{str(e)[:500]}"
         job.update({
             "failed_at": core_util._now_iso(),
-            "error": f"{type(e).__name__}:{str(e)[:500]}",
+            "error": error_text,
         })
         _update_history_job_phase(store, job, "failed", status="failed")
-        notices.emit(store, source="history_import", error_class="import_failed",
-                     blame="system", severity="error",
-                     user_text=catalog.user_text_for("import_failed"),
+        # 归责按真因分类（与 genesis mark_failed 同源）：provider 失败（余额/key/限流/5xx）
+        # 抛出的 ProviderError 里带 provider_http_<code>，classify_upstream 认得，能让
+        # 用户看到「额度不足充值后恢复」这类可行动文案；认不出才落 import_failed/system。
+        # 注意：这只覆盖冒到顶层、真正把 job 判 failed 的失败——余额不足被中途吞成
+        # warning、job 仍 completed 的降级路径不经过这里（那是另一档产品策略，未处理）。
+        ec = catalog.classify_upstream(error_text) or "import_failed"
+        notices.emit(store, source="history_import", error_class=ec,
+                     blame=catalog.blame_for(ec), severity="error",
+                     user_text=catalog.user_text_for(ec),
                      detail=f"{type(e).__name__}:{str(e)[:200]}",
                      dedupe_key=f"history_import:{job_id}")
         print(f"[history_import:{store.user_id}] job={job_id} failed={type(e).__name__}:{str(e)[:220]}")

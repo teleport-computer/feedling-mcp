@@ -47,6 +47,42 @@ def test_top_level_failure_emits_import_failed():
     assert job["status"] == "failed"
 
 
+def test_top_level_provider_402_emits_quota_insufficient(monkeypatch):
+    """When a provider failure (out-of-credits) bubbles to the job's top-level
+    except, the notice must blame the user's provider (actionable: 充值), not us.
+    provider_client raises ProviderError carrying a provider_http_402 slug;
+    classify_upstream maps it to quota_insufficient/user_provider."""
+    uid = _uid(); seed_user(uid); store = get_store(uid)
+    job_id = "job_" + uuid.uuid4().hex[:10]
+
+    def _boom(*_a, **_k):
+        raise hi.provider_client.ProviderError("provider_http_402: 预扣费额度失败")
+    monkeypatch.setattr(hi, "_process_history_import_sync", _boom)
+
+    hi._run_history_import_job(store, None, job_id, {"fresh_start": True})
+
+    row = _notices(uid)[f"history_import:{job_id}"]
+    assert row["error_class"] == "quota_insufficient"
+    assert row["blame"] == "user_provider" and row["severity"] == "error"
+
+
+def test_top_level_provider_401_emits_auth_invalid(monkeypatch):
+    """Same top-level path, bad key: provider_http_401 → auth_invalid/user_provider
+    (actionable: 重新保存 Key), not the generic import_failed/system."""
+    uid = _uid(); seed_user(uid); store = get_store(uid)
+    job_id = "job_" + uuid.uuid4().hex[:10]
+
+    def _boom(*_a, **_k):
+        raise hi.provider_client.ProviderError("provider_http_401: invalid api key")
+    monkeypatch.setattr(hi, "_process_history_import_sync", _boom)
+
+    hi._run_history_import_job(store, None, job_id, {"fresh_start": True})
+
+    row = _notices(uid)[f"history_import:{job_id}"]
+    assert row["error_class"] == "auth_invalid"
+    assert row["blame"] == "user_provider"
+
+
 def test_stale_job_emits_import_stale_and_marks_failed():
     """_history_import_find_reusable_job's stale branch (history_import.py:188)
     driven directly: seed a 'processing' job blob whose updated_at is older than
