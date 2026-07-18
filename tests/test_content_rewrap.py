@@ -280,13 +280,15 @@ def test_rewrap_skips_already_current_items_on_second_pass(client, monkeypatch):
     first_calls = calls["n"]
     assert first_calls == 3  # 首轮解了 3 条
 
-    # 同钥再来一次:全部已是当前钥 → 一次 enclave 解密都不发生。
+    # 同钥再来一次:memory/chat 已是当前钥 → 不再进 enclave;identity 例外,
+    # 每轮固定一次"探测解密"(毒可能在信封里面的明文上,如 usr_f13f 的 0.95
+    # 浮点分值 —— 不解开看不见),明文没毒依旧记 skipped。
     r2 = client.post("/v1/content/rewrap-to-current-key",
                      json={"public_key": new_public_key}, headers=_headers(api_key))
     b2 = r2.get_json()
     assert r2.status_code == 200
     assert b2["status"] == "ok"
-    assert calls["n"] == first_calls  # 未新增解密调用
+    assert calls["n"] == first_calls + 1  # 仅 identity 的探测解密
     assert b2["summary"]["total_skipped"] >= 3
     assert b2["summary"]["total_rewrapped"] == 0
 

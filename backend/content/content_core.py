@@ -396,6 +396,7 @@ def _build_rewrapped_envelope(
     enclave_pk: bytes,
     kind: str,
     current_fpr: str = "",
+    plaintext_filter: Callable[[bytes], tuple[bytes, bool, str]] | None = None,
 ) -> tuple[dict | None, str, str]:
     item_id = str(record.get("id") or "")
     if not _has_encrypted_content_record(record):
@@ -406,7 +407,10 @@ def _build_rewrapped_envelope(
         return None, "skipped_missing_enclave_key", ""
     # 已是当前钥 → 跳过,不进 enclave。content_pk_fpr 由 build_envelope 在
     # seal 时与 K_user 同一 env 原子写入(rewrap 落盘时再盖一次),二者一致可信。
-    if current_fpr and record.get("content_pk_fpr") == current_fpr:
+    # 例外:带 plaintext_filter 的记录(identity)毒可能在信封**里面**的明文上
+    # (usr_f13f:0.95 浮点分值,钥全对却整卡解析失败),必须解开看过才能跳。
+    already_current = bool(current_fpr) and record.get("content_pk_fpr") == current_fpr
+    if already_current and plaintext_filter is None:
         return None, "skipped_already_current", ""
     try:
         plaintext = core_enclave._decrypt_envelope_via_enclave(
@@ -415,7 +419,16 @@ def _build_rewrapped_envelope(
             purpose=f"content_rewrap:{kind}:{item_id or 'unknown'}",
         )
     except Exception as e:
+        if already_current:
+            # 探测性解密失败不升级成 error:记录本就封在当前钥上,报 error 会
+            # 把它塞进 pending 让客户端对一条无需重封的记录无限重试。
+            return None, "skipped_sanitize_probe_failed", f"{type(e).__name__}:{str(e)}"
         return None, "error", f"decrypt_failed:{type(e).__name__}:{str(e)}"
+    filter_reason = ""
+    if plaintext_filter is not None:
+        plaintext, changed, filter_reason = plaintext_filter(plaintext)
+        if already_current and not changed:
+            return None, "skipped_already_current", ""
     try:
         env = build_envelope(
             plaintext=plaintext,
@@ -426,9 +439,28 @@ def _build_rewrapped_envelope(
             item_id=item_id or None,
         )
         env["content_pk_fpr"] = current_fpr
-        return env, "rewrapped", ""
+        return env, "rewrapped", filter_reason
     except Exception as e:
         return None, "error", f"envelope_build_failed:{type(e).__name__}:{str(e)}"
+
+
+def _identity_card_sanitize_filter(plaintext: bytes) -> tuple[bytes, bool, str]:
+    """明文级自愈:身份卡过 card_policy.sanitize,毒值(0.95 浮点/score 键/裸
+    字符串维度)归一到 0–100 int 契约。解析不出 JSON 的明文原样放行——rewrap
+    的职责是换钥,不是拒答。"""
+    from identity import card_policy
+
+    try:
+        card = json.loads(plaintext.decode("utf-8"))
+    except Exception:
+        return plaintext, False, ""
+    if not isinstance(card, dict):
+        return plaintext, False, ""
+    cleaned = card_policy.sanitize_identity_card(card)
+    if cleaned == card:
+        return plaintext, False, ""
+    out = json.dumps(cleaned, ensure_ascii=False).encode("utf-8")
+    return out, True, "identity_plaintext_normalized"
 
 
 # --------------------------------------------------------------------------- #
@@ -604,6 +636,7 @@ def rewrap_to_current_key(
             enclave_pk=enclave_pk,
             kind="identity",
             current_fpr=current_fpr,
+            plaintext_filter=_identity_card_sanitize_filter,
         )
         item_id = str(identity.get("id") or "identity")
         results.append(_rewrap_record_result(summary, "identity", item_id, status, reason=reason))
