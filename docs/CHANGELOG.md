@@ -47,7 +47,24 @@
 
 ## 记录正文（最新的在上面）
 
-## 2026-07-18（第二批：常量/方法维度 + 活文档失实修正）
+## 2026-07-18（第三批：test-only 死模块 + tools 内部死码）
+
+### [DONE] 仓库清理第三轮·第三批
+
+- **删 `model_api_runtime/memory_tools.py` + 其测试**：git 取证确认在本次
+  清理开始前（95decf00）它就已无生产调用方——`execute_memory_tool` /
+  `memory_tool_instruction_message` 只被自己的测试文件引用，测试在给死代码
+  续命（hosted model_api 退役残骸的最后一块）。
+- **tools 内部死符号**：chat_resident_consumer 5 个协议演化残留
+  （_extract_openai_reply / _structured_reply_payload / _split_agent_result /
+  update_proactive_state / _resident_perception_trend）+ e2e_encryption_test
+  的 unb64；consumer 删后 py_compile + 全量 consumer 测试通过。
+- **零发现的维度**（扫了但干净）：无人使用的 pytest fixture、backend 不可达
+  代码（return 后语句）、requirements 未用依赖——唯一"疑似"的
+  python-multipart 是 FastAPI 表单运行时依赖（07-07 有漏装致 500 前科），
+  不可删。
+- 验证：3436 passed（−4 = 被删测试文件的用例数，精确对账）/ 5 pre-existing
+  failed，零新增。
 
 ### [DONE] 仓库清理第三轮·第二批：死常量、死方法、活文档状态复核
 
