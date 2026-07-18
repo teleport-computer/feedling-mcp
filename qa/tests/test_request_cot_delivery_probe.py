@@ -127,3 +127,42 @@ def test_helper_rejects_preexisting_marker_without_reusing_it(tmp_path):
             },
             wait_seconds=0.01,
         )
+
+
+def test_cli_environment_holds_profile_gate_for_p0_12(
+    tmp_path, monkeypatch, capsys
+):
+    work = _private_dir(tmp_path / "work")
+    seen: dict[str, object] = {}
+    monkeypatch.setenv("QA_RUN_ID", "run-123")
+    monkeypatch.setenv("QA_PROFILE_ID", PROFILE_ID)
+    monkeypatch.setenv("QA_WORK_ROOT", str(work))
+
+    def acquire(work_root, **identity):
+        seen.update(work_root=work_root, **identity)
+        return 92
+
+    monkeypatch.setattr(request, "acquire_sequence_phase_gate", acquire)
+    monkeypatch.setattr(
+        request,
+        "request_and_wait",
+        lambda **_kwargs: {
+            "receipt": {"status": "PASS", "failure_code": "NONE"}
+        },
+    )
+
+    assert request.main(
+        [
+            "--request",
+            str(request.request_path(work)),
+            "--facts",
+            str(request.facts_path(work)),
+        ]
+    ) == 0
+    assert seen == {
+        "work_root": work,
+        "run_id": "run-123",
+        "profile_id": PROFILE_ID,
+        "phase": "P0-12",
+    }
+    assert json.loads(capsys.readouterr().out)["scenario_id"] == "P0-12"

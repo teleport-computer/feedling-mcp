@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -22,6 +23,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import genesis_e2e  # noqa: E402
+from qa.request_live_scenario_probe import (  # noqa: E402
+    LiveProbeRequestError,
+    acquire_sequence_phase_gate,
+)
 
 
 def _bounded_report(report: object) -> dict:
@@ -67,7 +72,29 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    gate_descriptor: int | None = None
     try:
+        sequence_identity = (
+            str(os.environ.get("QA_RUN_ID") or ""),
+            str(os.environ.get("QA_PROFILE_ID") or ""),
+            str(os.environ.get("QA_WORK_ROOT") or ""),
+        )
+        if any(sequence_identity):
+            if not all(sequence_identity):
+                raise LiveProbeRequestError(
+                    "persona finalizer sequence identity is incomplete"
+                )
+            work_root = Path(sequence_identity[2])
+            if Path(args.private_evidence).parent != work_root:
+                raise LiveProbeRequestError(
+                    "persona finalizer work root is inconsistent"
+                )
+            gate_descriptor = acquire_sequence_phase_gate(
+                work_root,
+                run_id=sequence_identity[0],
+                profile_id=sequence_identity[1],
+                phase="P0-06-FINALIZE",
+            )
         report = genesis_e2e.finalize_existing_session_distill_acceptance(
             private_evidence_path=args.private_evidence,
             semantic_judgment_path=args.semantic_judgment,
@@ -75,12 +102,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             artifact_dir=args.artifact_dir,
         )
         payload = _bounded_report(report)
+    except LiveProbeRequestError:
+        print(
+            json.dumps(
+                {
+                    "code": "persona_review_sequence_invalid",
+                    "ok": False,
+                    "stage": "sequence",
+                },
+                sort_keys=True,
+            )
+        )
+        return 1
     except genesis_e2e.ExistingSessionDistillError as exc:
         print(json.dumps(exc.as_result(), sort_keys=True))
         return 1
     print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
     # A legitimate negative semantic/security verdict is completed evidence,
     # not an invocation failure. The parent-owned finalizer decides the gate.
+    # Do not close gate_descriptor: the OS releases this advisory lock only as
+    # the exact FINALIZE process exits, before P0-07 may acquire it.
+    _ = gate_descriptor
     return 0
 
 

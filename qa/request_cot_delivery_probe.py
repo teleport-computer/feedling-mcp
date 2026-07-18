@@ -22,12 +22,20 @@ from typing import Any, Mapping, Sequence
 
 try:
     from qa.atomic_private_file import AtomicPrivateFileError, create_private_file
+    from qa.request_live_scenario_probe import (
+        LiveProbeRequestError,
+        acquire_sequence_phase_gate,
+    )
     from qa.validate_cot_receipt import (
         CotReceiptError,
         validate_cot_receipt_document,
     )
 except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
     from atomic_private_file import AtomicPrivateFileError, create_private_file
+    from request_live_scenario_probe import (  # type: ignore[no-redef]
+        LiveProbeRequestError,
+        acquire_sequence_phase_gate,
+    )
     from validate_cot_receipt import CotReceiptError, validate_cot_receipt_document
 
 
@@ -247,8 +255,30 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    gate_descriptor: int | None = None
     try:
+        run_id = str(os.environ.get("QA_RUN_ID") or "")
+        profile_id = str(os.environ.get("QA_PROFILE_ID") or "")
+        raw_work_root = str(os.environ.get("QA_WORK_ROOT") or "")
+        sequence_identity = (run_id, profile_id, raw_work_root)
+        if any(sequence_identity):
+            if not all(sequence_identity):
+                raise LiveProbeRequestError(
+                    "COT sequence identity is incomplete"
+                )
+            work_root = Path(raw_work_root)
+            if args.request.parent != work_root or args.facts.parent != work_root:
+                raise LiveProbeRequestError("COT sequence work root is inconsistent")
+            gate_descriptor = acquire_sequence_phase_gate(
+                work_root,
+                run_id=run_id,
+                profile_id=profile_id,
+                phase="P0-12",
+            )
         payload = request_and_wait(request=args.request, facts=args.facts)
+    except LiveProbeRequestError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     except CotProbeUnavailableError as exc:
         print(str(exc), file=sys.stderr)
         return 3
@@ -268,6 +298,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             separators=(",", ":"),
         )
     )
+    # Intentionally leave the descriptor open until this exact P0-12 process
+    # exits; P0-13 cannot acquire the shared profile gate before then.
+    _ = gate_descriptor
     return 0
 
 

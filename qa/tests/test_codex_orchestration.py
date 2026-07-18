@@ -807,6 +807,14 @@ def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
             facts["receipt"]
         )
         receipts.append(facts["receipt"])
+        if scenario_id == "P0-06" and facts["receipt"]["status"] == "PASS":
+            # The production CAPTURE probe publishes a worker review copy and
+            # the agent's FINALIZE command deletes it after authoring this
+            # judgment.  Fake probes omit plaintext by design, so represent
+            # only that completed, owner-only offline phase boundary.
+            judgment = spec.work / "p0-06-semantic-judgment.json"
+            judgment.write_text("{}\n", encoding="utf-8")
+            judgment.chmod(0o600)
 
     result = json.loads(spec.result_path.read_text())
     scenarios = {
@@ -1579,6 +1587,7 @@ def test_live_request_loader_retries_transient_atomic_publication(
         profile_id="official-deepseek",
         scenario_id="P0-02",
         attempt=1,
+        previous_receipt_sha256=None,
     ) == expected
     assert calls == 2
 
@@ -1662,6 +1671,7 @@ def test_overlapping_live_requests_fail_closed_without_future_probe(tmp_path):
             profile_id=spec.profile_id,
             scenario_id="P0-02",
             attempt=1,
+            previous_receipt_sha256=None,
         )
         assert probe_started.wait(timeout=5)
         live_request.write_request_marker(
@@ -1670,6 +1680,7 @@ def test_overlapping_live_requests_fail_closed_without_future_probe(tmp_path):
             profile_id=spec.profile_id,
             scenario_id="P0-03",
             attempt=1,
+            previous_receipt_sha256="0" * 64,
         )
         release_probe.set()
         facts = (

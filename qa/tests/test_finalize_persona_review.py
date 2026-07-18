@@ -82,3 +82,32 @@ def test_malformed_finalizer_report_is_nonzero(tmp_path: Path, monkeypatch, caps
     assert review.main(_args(tmp_path)) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["code"] == "persona_review_report_invalid"
+
+
+def test_cli_environment_holds_profile_gate_for_finalize(
+    tmp_path: Path, monkeypatch, capsys
+):
+    seen: dict[str, object] = {}
+    monkeypatch.setenv("QA_RUN_ID", "run-123")
+    monkeypatch.setenv("QA_PROFILE_ID", "official-anthropic")
+    monkeypatch.setenv("QA_WORK_ROOT", str(tmp_path))
+
+    def acquire(work_root, **identity):
+        seen.update(work_root=work_root, **identity)
+        return 91
+
+    monkeypatch.setattr(review, "acquire_sequence_phase_gate", acquire)
+    monkeypatch.setattr(
+        review.genesis_e2e,
+        "finalize_existing_session_distill_acceptance",
+        lambda **_kwargs: _report(ok=True),
+    )
+
+    assert review.main(_args(tmp_path)) == 0
+    assert seen == {
+        "work_root": tmp_path,
+        "run_id": "run-123",
+        "profile_id": "official-anthropic",
+        "phase": "P0-06-FINALIZE",
+    }
+    assert json.loads(capsys.readouterr().out)["ok"] is True

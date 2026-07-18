@@ -1228,6 +1228,7 @@ def _load_ready_live_request(
     profile_id: str,
     scenario_id: str,
     attempt: int,
+    previous_receipt_sha256: str | None,
 ) -> Mapping[str, Any]:
     """Allow atomic hard-link publication to settle to one private link."""
 
@@ -1240,6 +1241,7 @@ def _load_ready_live_request(
                 profile_id=profile_id,
                 scenario_id=scenario_id,
                 attempt=attempt,
+                previous_receipt_sha256=previous_receipt_sha256,
             )
         except LiveProbeRequestError:
             if time.monotonic() >= deadline:
@@ -1265,6 +1267,9 @@ def _perform_trusted_live_handshake(
             profile_id=spec.profile_id,
             scenario_id=scenario_id,
             attempt=attempt,
+            previous_receipt_sha256=(
+                live_json_sha256(receipts[-1]) if receipts else None
+            ),
         )
         if facts_path.exists() or not _live_request_is_next(
             receipts, scenario_id, attempt

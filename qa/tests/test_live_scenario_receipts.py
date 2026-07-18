@@ -461,6 +461,7 @@ def test_request_marker_is_exact_one_shot_and_profile_bound(tmp_path: Path):
         profile_id="official-gemini",
         scenario_id="P0-08",
         attempt=1,
+        previous_receipt_sha256=None,
     )
     assert request.load_request_marker(
         marker,
@@ -468,6 +469,7 @@ def test_request_marker_is_exact_one_shot_and_profile_bound(tmp_path: Path):
         profile_id="official-gemini",
         scenario_id="P0-08",
         attempt=1,
+        previous_receipt_sha256=None,
     )["scenario_id"] == "P0-08"
     with pytest.raises(request.LiveProbeRequestError):
         request.write_request_marker(
@@ -476,6 +478,7 @@ def test_request_marker_is_exact_one_shot_and_profile_bound(tmp_path: Path):
             profile_id="official-gemini",
             scenario_id="P0-08",
             attempt=1,
+            previous_receipt_sha256=None,
         )
     with pytest.raises(request.LiveProbeRequestError):
         request.load_request_marker(
@@ -484,6 +487,7 @@ def test_request_marker_is_exact_one_shot_and_profile_bound(tmp_path: Path):
             profile_id="official-gemini",
             scenario_id="P0-08",
             attempt=1,
+            previous_receipt_sha256=None,
         )
 
 
@@ -500,6 +504,7 @@ def test_request_marker_rejects_non_retryable_second_attempt(tmp_path: Path):
             profile_id="official-gemini",
             scenario_id="P0-02",
             attempt=2,
+            previous_receipt_sha256=None,
         )
 
 
@@ -508,8 +513,9 @@ def test_request_marker_rejects_duplicate_json_keys(tmp_path: Path):
     work.mkdir(mode=0o700)
     marker = request.request_path(work, "P0-08", 1)
     marker.write_text(
-        '{"schema_version":1,"run_id":"run-123","run_id":"run-123",'
-        '"profile_id":"official-gemini","scenario_id":"P0-08","attempt":1}\n',
+        '{"schema_version":2,"run_id":"run-123","run_id":"run-123",'
+        '"profile_id":"official-gemini","scenario_id":"P0-08","attempt":1,'
+        '"previous_receipt_sha256":null}\n',
         encoding="utf-8",
     )
     marker.chmod(0o600)
@@ -523,6 +529,7 @@ def test_request_marker_rejects_duplicate_json_keys(tmp_path: Path):
             profile_id="official-gemini",
             scenario_id="P0-08",
             attempt=1,
+            previous_receipt_sha256=None,
         )
 
 
