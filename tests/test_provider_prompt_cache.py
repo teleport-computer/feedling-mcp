@@ -142,8 +142,8 @@ def test_openai_responses_sends_opaque_prompt_cache_key() -> None:
 def test_openrouter_sends_sticky_cache_fields_and_anthropic_cache_control() -> None:
     payload = _compat_payload("openrouter", "anthropic/claude-sonnet-4")
 
-    assert payload["prompt_cache_key"] == CACHE_KEY
     assert payload["session_id"] == CACHE_KEY
+    assert "prompt_cache_key" not in payload
     assert "cache_control" not in payload
     assert _nested_cache_controls(payload["messages"]) == [{"type": "ephemeral"}]
 
@@ -336,7 +336,7 @@ def test_openrouter_walks_cache_reasoning_temperature_fallbacks_in_order(
 ) -> None:
     seen: list[dict] = []
     responses = [
-        _response(400, {"error": {"message": "unknown prompt_cache_key"}}),
+        _response(400, {"error": {"message": "unknown field cache_control"}}),
         _response(400, {"error": {"message": "reasoning is unsupported"}}),
         _response(400, {"error": {"message": "temperature is deprecated"}}),
         _openai_chat_success(),
@@ -366,9 +366,9 @@ def test_openrouter_walks_cache_reasoning_temperature_fallbacks_in_order(
     assert result["reply"] == "done"
     assert len(seen) == 4
     assert not CACHE_FIELDS.isdisjoint(seen[0])
-    assert "prompt_cache_key" not in seen[1]
+    assert "prompt_cache_key" not in seen[0]
     assert seen[1]["session_id"] == CACHE_KEY
-    assert _nested_cache_controls(seen[1]["messages"]) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(seen[1]["messages"]) == []
     assert "reasoning" in seen[1] and "temperature" in seen[1]
     assert "reasoning" not in seen[2] and "temperature" in seen[2]
     assert "reasoning" not in seen[3] and "temperature" not in seen[3]
@@ -376,7 +376,7 @@ def test_openrouter_walks_cache_reasoning_temperature_fallbacks_in_order(
     assert result["usage"]["provider_retry_count"] == 3
     assert result["usage"]["cache_hint_sent_on_success"] is True
     assert result["usage"]["compatibility_fallbacks"] == [
-        "cache_rejected:prompt_cache_key",
+        "cache_rejected:cache_control",
         "reasoning_rejected",
         "temperature_rejected",
     ]
@@ -416,7 +416,7 @@ def test_openrouter_reasoning_rejection_preserves_supported_cache_fields(
     assert len(seen) == 2
     assert "reasoning" in seen[0] and "reasoning" not in seen[1]
     assert seen[1]["session_id"] == CACHE_KEY
-    assert seen[1]["prompt_cache_key"] == CACHE_KEY
+    assert "prompt_cache_key" not in seen[1]
     assert _nested_cache_controls(seen[1]["messages"]) == [{"type": "ephemeral"}]
     assert seen[1]["tools"] == seen[0]["tools"]
 
@@ -453,7 +453,7 @@ def test_openrouter_removes_only_each_named_rejected_cache_field(
     seen: list[dict] = []
     responses = [
         _response(400, {"error": {"message": "unknown field cache_control"}}),
-        _response(400, {"error": {"message": "unknown field prompt_cache_key"}}),
+        _response(400, {"error": {"message": "unknown field session_id"}}),
         _openai_chat_success(),
     ]
 
@@ -477,14 +477,14 @@ def test_openrouter_removes_only_each_named_rejected_cache_field(
     assert len(seen) == 3
     assert _nested_cache_controls(seen[0]["messages"]) == [{"type": "ephemeral"}]
     assert _nested_cache_controls(seen[1]["messages"]) == []
-    assert seen[1]["prompt_cache_key"] == CACHE_KEY
+    assert "prompt_cache_key" not in seen[1]
     assert seen[1]["session_id"] == CACHE_KEY
     assert "prompt_cache_key" not in seen[2]
-    assert seen[2]["session_id"] == CACHE_KEY
-    assert result["usage"]["cache_hint_sent_on_success"] is True
+    assert "session_id" not in seen[2]
+    assert result["usage"]["cache_hint_sent_on_success"] is False
     assert result["usage"]["compatibility_fallbacks"] == [
         "cache_rejected:cache_control",
-        "cache_rejected:prompt_cache_key",
+        "cache_rejected:session_id",
     ]
 
 
@@ -501,7 +501,7 @@ def test_openrouter_reads_wrapped_upstream_cache_rejection(
                     "raw": json.dumps({
                         "type": "error",
                         "error": {
-                            "message": "unknown field prompt_cache_key",
+                            "message": "unknown field session_id",
                         },
                     }),
                 },
@@ -526,11 +526,13 @@ def test_openrouter_reads_wrapped_upstream_cache_rejection(
     result = asyncio.run(pc.chat_completion_async(config, MESSAGES, tools=TOOLS))
 
     assert len(seen) == 2
-    assert "prompt_cache_key" in seen[0]
+    assert seen[0]["session_id"] == CACHE_KEY
+    assert "prompt_cache_key" not in seen[0]
     assert "prompt_cache_key" not in seen[1]
-    assert seen[1]["session_id"] == CACHE_KEY
+    assert "session_id" not in seen[1]
+    assert _nested_cache_controls(seen[1]["messages"]) == [{"type": "ephemeral"}]
     assert result["usage"]["compatibility_fallbacks"] == [
-        "cache_rejected:prompt_cache_key",
+        "cache_rejected:session_id",
     ]
 
 

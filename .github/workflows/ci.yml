@@ -1609,8 +1609,8 @@ jobs:
           FEEDLING_API_URL: ${{ vars.PRE_API_URL || 'https://pre-api.feedling.app' }}
           FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          FEEDLING_PROMPT_CACHE_CANARY_MODEL: ${{ vars.PRE_PROMPT_CACHE_CANARY_MODEL || 'openai/gpt-4o-mini' }}
-          FEEDLING_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL: ${{ vars.PRE_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL || 'anthropic/claude-haiku-4.5' }}
+          FEEDLING_PROMPT_CACHE_CANARY_MODEL: ${{ vars.PRE_PROMPT_CACHE_CANARY_MODEL || 'openai/gpt-4.1-mini' }}
+          FEEDLING_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL: ${{ vars.PRE_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL || 'anthropic/claude-sonnet-4.6' }}
         run: python3 tools/prompt_cache_canary.py
 
   # =========================================================================

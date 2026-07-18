@@ -1649,10 +1649,11 @@ def _build_openai_compat_payload(
         if provider == "openai":
             payload["prompt_cache_key"] = cache_key
         elif provider == "openrouter":
-            # OpenRouter uses session_id for provider/model stickiness and
-            # forwards prompt_cache_key to upstreams which understand it.
+            # OpenRouter documents session_id as the explicit sticky-routing
+            # key. prompt_cache_key is only its fallback when session_id is
+            # absent, so sending both is redundant and can unnecessarily
+            # constrain endpoint selection on older upstream routes.
             payload["session_id"] = cache_key
-            payload["prompt_cache_key"] = cache_key
             if "anthropic" in model.lower() or "claude" in model.lower():
                 payload["messages"] = _mark_openai_chat_cache_breakpoint(
                     encoded_messages)

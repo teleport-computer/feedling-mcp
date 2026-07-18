@@ -133,16 +133,85 @@ def test_env_configs_probe_automatic_and_anthropic_cache_paths(monkeypatch) -> N
     monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "admin")
     monkeypatch.setenv("OPENROUTER_API_KEY", "provider")
     monkeypatch.setenv(
-        "FEEDLING_PROMPT_CACHE_CANARY_MODEL", "openai/gpt-4o-mini")
+        "FEEDLING_PROMPT_CACHE_CANARY_MODEL", "openai/gpt-4.1-mini")
     monkeypatch.setenv(
         "FEEDLING_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL",
-        "anthropic/claude-haiku-4.5",
+        "anthropic/claude-sonnet-4.6",
     )
 
     assert [config.model for config in canary._env_configs()] == [
-        "openai/gpt-4o-mini",
-        "anthropic/claude-haiku-4.5",
+        "openai/gpt-4.1-mini",
+        "anthropic/claude-sonnet-4.6",
     ]
+
+
+def test_wait_for_reply_fails_fast_on_terminal_runtime_metric() -> None:
+    metrics_calls = 0
+
+    def request(method, url, **kwargs):
+        nonlocal metrics_calls
+        path = urllib.parse.urlparse(url).path
+        if path == "/v1/chat/history":
+            return 200, {"messages": []}
+        if path == "/v1/admin/v2-metrics":
+            metrics_calls += 1
+            proof = _proof()
+            proof["sampled_turns"] = 1
+            proof["model_calls"] = 1
+            proof["turns"] = [{
+                "job_id": 1,
+                "failed": True,
+                "status": "turn_failed:providererror",
+            }]
+            return 200, {"prompt_cache": proof}
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    with pytest.raises(
+        canary.CanaryFailure,
+        match=r"runtime turn failed before reply \(turn_failed:providererror\)",
+    ):
+        canary._wait_for_reply(
+            _config(),
+            request,
+            "user-secret",
+            10.0,
+            "u-canary",
+            9.0,
+        )
+
+    assert metrics_calls == 1
+
+
+def test_wait_for_reply_ignores_transient_metrics_outage(monkeypatch) -> None:
+    history_calls = 0
+    metrics_calls = 0
+
+    def request(method, url, **kwargs):
+        nonlocal history_calls, metrics_calls
+        path = urllib.parse.urlparse(url).path
+        if path == "/v1/chat/history":
+            history_calls += 1
+            if history_calls == 1:
+                return 200, {"messages": []}
+            return 200, {"messages": [{"role": "agent", "ts": 12.0}]}
+        if path == "/v1/admin/v2-metrics":
+            metrics_calls += 1
+            return 503, {"error": "temporarily unavailable"}
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    monkeypatch.setattr(canary.time, "sleep", lambda _seconds: None)
+
+    canary._wait_for_reply(
+        _config(),
+        request,
+        "user-secret",
+        10.0,
+        "u-canary",
+        9.0,
+    )
+
+    assert history_calls == 2
+    assert metrics_calls == 1
 
 
 def test_end_to_end_orchestration_resets_throwaway_account(monkeypatch) -> None:

@@ -31,13 +31,17 @@ class CanaryFailure(RuntimeError):
     pass
 
 
+class TransientCanaryFailure(CanaryFailure):
+    """A temporary transport/service failure that a bounded poll may retry."""
+
+
 @dataclass(frozen=True)
 class Config:
     api_url: str
     admin_token: str
     provider_api_key: str
     provider: str = "openrouter"
-    model: str = "openai/gpt-4o-mini"
+    model: str = "openai/gpt-4.1-mini"
     timeout_sec: float = 360.0
     prefix_chars: int = 9000
 
@@ -86,7 +90,7 @@ def _env_config() -> Config:
         admin_token=os.environ.get("FEEDLING_ADMIN_TOKEN", "").strip(),
         provider_api_key=os.environ.get("OPENROUTER_API_KEY", "").strip(),
         model=os.environ.get(
-            "FEEDLING_PROMPT_CACHE_CANARY_MODEL", "openai/gpt-4o-mini").strip(),
+            "FEEDLING_PROMPT_CACHE_CANARY_MODEL", "openai/gpt-4.1-mini").strip(),
         timeout_sec=float(os.environ.get(
             "FEEDLING_PROMPT_CACHE_CANARY_TIMEOUT_SEC", "360")),
         prefix_chars=int(os.environ.get(
@@ -99,7 +103,7 @@ def _env_configs() -> list[Config]:
     primary = _env_config()
     anthropic_model = os.environ.get(
         "FEEDLING_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL",
-        "anthropic/claude-haiku-4.5",
+        "anthropic/claude-sonnet-4.6",
     ).strip()
     configs = [primary]
     if anthropic_model and anthropic_model != primary.model:
@@ -157,7 +161,7 @@ def _http(
             payload = {}
         return int(exc.code), payload if isinstance(payload, dict) else {}
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise CanaryFailure(
+        raise TransientCanaryFailure(
             f"transport failure during {method}: {type(exc).__name__}") from exc
 
 
@@ -216,10 +220,14 @@ def _wait_for_reply(
     request: RequestFn,
     api_key: str,
     since_ts: float,
+    user_id: str,
+    metrics_since_ts: float,
 ) -> None:
     deadline = time.time() + config.timeout_sec
     query = urllib.parse.urlencode({"since": since_ts - 1, "limit": 50})
+    polls = 0
     while time.time() < deadline:
+        polls += 1
         status, body = request(
             "GET",
             f"{config.api_url}/v1/chat/history?{query}",
@@ -234,6 +242,32 @@ def _wait_for_reply(
                 and float(message.get("ts") or 0) > since_ts
             ):
                 return
+        # A terminal provider/runtime failure does not create an assistant chat
+        # row. Inspect the content-free whole-turn metric periodically so the
+        # deployment gate fails promptly instead of waiting the full reply
+        # timeout. Status is fixed-vocabulary/sanitized before printing.
+        if polls == 1 or polls % 5 == 0:
+            try:
+                cache = _metrics(
+                    config,
+                    request,
+                    user_id=user_id,
+                    since_ts=metrics_since_ts,
+                    until_ts=time.time() + 1.0,
+                )
+            except TransientCanaryFailure:
+                # History is the primary success signal. A brief admin-metrics
+                # outage must not reject an otherwise healthy deployment.
+                cache = {}
+            for turn in cache.get("turns") or []:
+                if isinstance(turn, dict) and turn.get("failed") is True:
+                    raw_status = str(turn.get("status") or "runtime_failed")
+                    safe_status = "".join(
+                        char for char in raw_status[:80]
+                        if char.isalnum() or char in "_.:-"
+                    ) or "runtime_failed"
+                    raise CanaryFailure(
+                        f"runtime turn failed before reply ({safe_status})")
         time.sleep(3)
     raise CanaryFailure("assistant reply did not arrive before timeout")
 
@@ -262,6 +296,9 @@ def _metrics(
         admin_token=config.admin_token,
         timeout=30.0,
     )
+    if status in {429, 500, 502, 503, 504}:
+        raise TransientCanaryFailure(
+            f"v2 metrics temporarily unavailable ({status})")
     _require_status(status, 200, "v2 metrics", body)
     cache = body.get("prompt_cache")
     if not isinstance(cache, dict):
@@ -395,7 +432,14 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
         window_start = time.time() - 1.0
         first_sent = _send_until_accepted(
             config, request, api_key, _long_first_prompt(config.prefix_chars))
-        _wait_for_reply(config, request, api_key, first_sent)
+        _wait_for_reply(
+            config,
+            request,
+            api_key,
+            first_sent,
+            user_id,
+            window_start,
+        )
         second_sent = _send_until_accepted(
             config,
             request,
@@ -403,7 +447,14 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
             "Invoke no tools or functions. Return ordinary assistant text "
             "containing exactly CACHE_CANARY_TWO.",
         )
-        _wait_for_reply(config, request, api_key, second_sent)
+        _wait_for_reply(
+            config,
+            request,
+            api_key,
+            second_sent,
+            user_id,
+            window_start,
+        )
 
         # Metrics are flushed at the terminal turn boundary. History can become
         # visible a moment earlier, so poll the bounded proof briefly.
@@ -411,25 +462,39 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
         last_cache: dict[str, Any] = {}
         while time.time() < proof_deadline:
             window_end = time.time() + 1.0
-            last_cache = _metrics(
-                config,
-                request,
-                user_id=user_id,
-                since_ts=window_start,
-                until_ts=window_end,
-            )
+            try:
+                last_cache = _metrics(
+                    config,
+                    request,
+                    user_id=user_id,
+                    since_ts=window_start,
+                    until_ts=window_end,
+                )
+            except TransientCanaryFailure:
+                time.sleep(2)
+                continue
             if int(last_cache.get("sampled_turns") or 0) >= 2:
                 break
             time.sleep(2)
         route = validate_cache_proof(last_cache)
-        route_bound = _metrics(
-            config,
-            request,
-            user_id=user_id,
-            since_ts=window_start,
-            until_ts=time.time() + 1.0,
-            route_fingerprint=route,
-        )
+        route_bound: dict[str, Any] | None = None
+        route_deadline = time.time() + 30.0
+        while time.time() < route_deadline:
+            try:
+                route_bound = _metrics(
+                    config,
+                    request,
+                    user_id=user_id,
+                    since_ts=window_start,
+                    until_ts=time.time() + 1.0,
+                    route_fingerprint=route,
+                )
+                break
+            except TransientCanaryFailure:
+                time.sleep(2)
+        if route_bound is None:
+            raise CanaryFailure(
+                "route-bound v2 metrics unavailable before proof timeout")
         validate_cache_proof(route_bound, expected_route=route)
         cache_read = int(route_bound["turns"][1]["cache_read_tokens"])
         result = {
