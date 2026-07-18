@@ -1,8 +1,8 @@
 # provider 错误可见性 — 阶段二设计 spec
 
 日期：2026-07-18
-状态：**第 2 稿**（第 1 稿经 Codex review 发现 4 个「代码做完但产品目标未达成」的断点，已全部核实成立并修订）
-分支：backend `fix/provider-error-notice-blame-throttle`、iOS `fix/provider-error-preserve-code`（阶段一同分支续做）
+状态：**第 3 稿**（第 1 稿 4 个断点、第 2 稿 3 个生命周期缺口，均由 Codex review 指出并逐条核实成立后修订）
+分支：backend `fix/provider-error-notice-blame-throttle`、iOS `fix/provider-error-preserve-code`
 
 前置：
 - `2026-07-06-upstream-error-surfacing-design.md`（聊天 system 气泡 + 设置页 last_runtime_error）
@@ -14,206 +14,268 @@
 
 > **provider 的错都应该抛出来 —— 那是用户的东西，不是我们服务端的问题，需要他们自己解决。**
 
-推论出的三档纪律（沿用既有 blame 分类）：
-
 | blame | 处理 | 理由 |
 |---|---|---|
 | `user_provider` | 必须抛给用户，给行动指引 | 他不修就永远不好 |
 | `provider_transient` | 也要抛（是他的中转），措辞轻 | 是他的东西，但会自愈 |
 | `system` | 我们兜着，**保留有温度的兜底话术** | 抛给用户他也解决不了 |
 
-**反向纪律同样成立**：不是他的错，别赖给他。
+**反向纪律**：不是他的错，别赖给他。
 
-**验收纪律（第 2 稿新增）**：每块改动都必须指出**用户在哪个屏幕、什么时刻**看到变化。指不出来的，从本期范围移除——这正是第 1 稿的系统性缺陷。
+**验收纪律**：每块改动必须指出**用户在哪个屏幕、什么时刻**看到变化；指不出来的移出本期。前两稿共 7 个缺陷中有 5 个是这一类。
 
-## 背景
+## 目标与范围
 
-阶段一盘点确认：provider 失败时后端**认得出**原因，但到不了用户眼前。典型：用户余额不足 → agent 回合失败 → 写一句 agent 口吻的兜底「我这会儿有点慢，刚刚没接上」→ 用户反复重发始终看到同一句，不知道要充值（prod 案例 usr_0d16bfd4，2026-07-05，最终放弃）。同一句兜底同时覆盖余额不足、key 失效、我们自己崩了——三种归责完全不同，用户看到的字一模一样。
+**§2 聊天失败可见性** —— 用户当场看到真实原因与该做什么。
+**§3 onboarding 降级可见性** —— 用户知道哪些能力没建立、为什么。
 
-## 目标
+**建议分批交付**（见文末「交付建议」）：§2 自成闭环可先行；§3 经两轮 review 后已确认牵动 genesis 的结果持久化与生命周期契约，工作量显著大于 §2。
 
-1. **聊天失败**：用户当场看到真实原因与该做什么。
-2. **onboarding 降级**：用户知道哪些能力没建立、为什么。
+## 非目标
 
-## 非目标（明确不做）
-
-- **不做通知中心**：`/v1/notices` 后端已实现且四条 lane 在写，iOS 从未接入。2026-07-07 spec 原计划 iOS 接入——**本设计反转该计划**。理由：provider 错属于「用户在场」的错，应在触发它的地方当场抛。`/v1/notices` 保持只写不读。
-- **不做重试按钮**：见决策记录。
-- **不做中转能力探测三态（`probe_responses_support`）**：第 1 稿含此项，**第 2 稿移除**。Codex 核实：改完分类更准，但 onboarding 配置调用方以 `let (config, _) = ...` 丢弃 warnings，`/routes` 路径只存 `supports_responses` 不返回 warning，**用户看不到任何变化**。按验收纪律移出本期，待有可见出口时再做。（该问题仍然真实：网络抖动会被说成「你的中转不支持」，误导用户白换中转。）
+- **不做通知中心**：`/v1/notices` 后端已实现且四条 lane 在写，iOS 从未接入。本设计**反转** 2026-07-07 spec 的 iOS 接入计划：provider 错属于「用户在场」的错，应在触发它的地方当场抛。保持只写不读。
+- **不做重试按钮**。
+- **不做中转能力探测三态**：第 1 稿含此项，第 2 稿移除。onboarding 配置调用方以 `let (config, _) = ...` 丢弃 warnings，`/routes` 只存 `supports_responses` 不返回 warning，**用户看不到任何变化**。问题本身仍真实（网络抖动被说成「你的中转不支持」），待有可见出口再做。
 - **不让 system 气泡穿透 iOS 实时轮询**。
-- **不动以下既有机制**（各有设计原因，hx 定「只做加法」）：兜底话术 `FALLBACK_REPLY`（承担人设温度 + 老版 App 兼容）、`reply_status="replied"`（承担 409 双扣防护，见 07-06 spec role 审计表）、前台横幅 3h 节流分桶（Seven 2026-07-11）、`unknown` 分类边界、`content_filtered` 的 blame 归属。
-- **不做设置页 `last_runtime_error` 展示**（状态刷新语义未定，hx 判风险偏高）。
-- **不覆盖 supervisor 层失败**（发生在 consumer 起来之前，沿用 07-06 spec 的 out of scope）。
-- **不改变 job 成败判定**：降级仍标 `completed`，只补可见性。「provider 失败到什么程度该判失败」是独立产品策略，需 Seven 拍板后另议。
+- **不动既有机制**（各有设计原因，hx 定「只做加法」）：`FALLBACK_REPLY`（人设温度 + 老版兼容）、`reply_status="replied"`（409 双扣防护，07-06 spec role 审计表）、前台横幅 3h 节流（Seven 2026-07-11）、`unknown` 分类边界、`content_filtered` blame 归属。
+- **不做设置页 `last_runtime_error` 展示**。
+- **不覆盖 supervisor 层失败**。
+- **不改变 job 成败判定**：降级仍标完成，只补可见性。「provider 失败到什么程度该判失败」需 Seven 另议。
 
 ## 决策记录
 
 | 决策点 | 结论 | 否决项与理由 |
 |---|---|---|
-| 兜底话术去留 | **服务端照发不变**，客户端按 blame 决定是否隐藏 | 否决「provider 错不发兜底」：兜底兼着老版 App 兼容，不发会让未升级用户从「看到一句话」退化成「完全没反应」，比现状更差 |
-| 新旧版差异实现 | 服务端写同一条消息 + 标记，客户端按标记渲染 | 否决「服务端按 App 版本写不同文案」：消息是持久化的，用户升级后翻历史会前后不一致 |
-| 失败态传递载体 | **双载体**：兜底回复消息带实时事件 + 用户消息 metadata 存持久真相 | 否决「仅用户消息 metadata」：**增量轮询按原始 ts 过滤，更新旧消息不改 ts，实时链路根本不通**（第 1 稿致命缺陷，Codex 发现）；否决「复用 system 气泡」：被 3h 节流卡住 |
-| 兜底气泡是否隐藏 | **按 blame 分**：user_provider / provider_transient 隐藏；**system 保留** | 第 1 稿「无条件隐藏」与指导原则和自身测试用例矛盾（Codex 发现） |
-| 重试语义 | **本版不提供重试按钮**，user_provider 给「去设置」 | 否决「清除 replied 标记重新排队」：动 409 双扣防护承重点；否决「重试=发新消息」：留重复用户消息。且余额不足时重试本就无效 |
-| onboarding 目标路径 | **genesis（当前默认路径）** | 第 1 稿只做 `history_import`——但 `useGenesisOnboarding` 默认 `true`，真实用户全走 genesis，legacy 路径仅调试可切。第 1 稿等于「代码做完真实用户看不到」（Codex 发现，hx 定：「肯定做新路」） |
-| degraded 归纳依据 | **最终能力产物 + 未恢复的失败** | 否决「warning 前缀命中即判降级」：三类语义不准（详见 §3.1） |
-| degraded 归纳位置 | 独立纯函数模块，genesis 与 history_import 共用 | 否决「放 notices/catalog」：catalog 只负责 `error_class → blame/user_text`，不应理解 window / 身份卡 / 开场白等业务细节（Codex 建议，采纳） |
+| 兜底话术去留 | 服务端照发，客户端按 blame 决定隐藏 | 否决「不发兜底」：兼着老版兼容，不发会让未升级用户从「看到一句话」退化成「完全没反应」 |
+| 新旧版差异 | 服务端同一条消息 + 标记，客户端按标记渲染 | 否决「按版本写不同文案」：消息持久化，升级后翻历史前后不一致 |
+| 失败态载体 | **双载体**：兜底消息带实时事件 + 用户消息 metadata 存持久真相，**兜底消息为权威** | 否决「仅 metadata」：增量拉取按原始 ts 过滤，更新旧消息不改 ts，**实时链路不通**；否决「复用 system 气泡」：被 3h 节流卡住 |
+| 兜底是否隐藏 | **按 blame 分**（见 §2.3） | 第 1 稿「无条件隐藏」与指导原则第三档及自身测试矛盾 |
+| 重试语义 | 本版不提供重试按钮，user_provider 给「去设置」 | 否决「清 replied 重新排队」：动 409 双扣防护；否决「重试=发新消息」：留重复消息。且余额不足时重试本就无效 |
+| onboarding 目标路径 | **genesis**（`useGenesisOnboarding` 默认 true，真实用户全走这条） | 第 1 稿只做 legacy `history_import`，等于真实用户看不到（hx 定「肯定做新路」） |
+| degraded 权威落点 | **per-job 结果**（`GET /v1/genesis/imports/{job_id}` 直接返回），genesis state 仅镜像 | 否决「只写 genesis state」：iOS 只读 `obj["job"]`，从不读 `state`（已核实）；且 state 是 per-user 最新态、非 per-job，并发 backfill 时可能指向别的 job。否决「塞进现有 output」：`genesis_set_job_status()` 整块替换 output 而非 merge，后台阶段写入会覆盖前景产出 |
+| 降级判据 | **结构化 provenance + 确定性计数器**，不用「显著缺失」阈值 | 否决「记忆条数阈值」：0 条可能只是材料里没有值得存的长期记忆，不代表失败；阈值会变成「2 条算显著、3 条不算」的产品玄学 |
+| degraded 归纳位置 | 独立纯函数模块，genesis 与 history_import 共用 | 否决「放 notices/catalog」：catalog 只负责 `error_class → blame/user_text`，不应理解 window / 身份卡 / 开场白等业务细节 |
 
 ---
 
 ## §2 聊天失败可见性
 
-### 2.1 实时链路（第 1 稿此处是断的）
+### 2.1 双载体
 
-**已核实的断点**：`backend/chat/chat_core.py` 的增量拉取按 `float(m.get("ts",0)) > since` 过滤——用户消息被更新 metadata **不会产生新 ts**，永远不会重新返回；iOS `ChatViewModel` 增量轮询又只取 `m.ts > since && m.isFromAgent`。第 1 稿只写用户消息 metadata 的话，真实效果是：
-
-> 兜底气泡实时出现 → 用户消息仍显示成功 → 杀 App 或全量同步后失败态才出现
-
-与「当场抛给用户」正好相反。
-
-**修订：双载体**
+**已核实的断点**：增量拉取按 `float(m.get("ts",0)) > since` 过滤，用户消息更新 metadata **不产生新 ts**，永不重新返回；iOS 增量轮询又只取 `m.ts > since && m.isFromAgent`。仅写 metadata 的话真实效果是「杀 App 后才看到失败态」，与「当场抛给用户」相反。
 
 | 载体 | 承担 | 为何需要 |
 |---|---|---|
-| **兜底回复消息**（新消息，新 ts） | 实时事件 | 它是新追加的 agent 消息，天然通过增量轮询与 iOS 的 `isFromAgent` 过滤 |
-| **用户消息 metadata** | 持久真相 | 全量 history / 重启后恢复失败态 |
+| **兜底回复消息**（新消息、新 ts） | 实时事件 + 全量解析 | 新追加的 agent 消息，天然过增量轮询与 `isFromAgent` 过滤 |
+| **用户消息 metadata** | 冗余持久化 | 兜底消息缺失时的兜底恢复路径 |
 
-**权威顺序**：两者同时存在时以**兜底回复消息**为准。理由：Codex 核实 `update_chat_message_metadata` 仅在 parent 存在于当前 worker 内存时才落 DB，且调用方忽略返回值——跨 worker 场景下 metadata 可能静默写失败。让实时载体同时也能支撑全量 history 解析，metadata 退化为冗余持久化，则该风险不影响功能正确性。metadata 写入失败须记 log（当前被忽略）。
+**权威顺序：兜底消息优先。** `update_chat_message_metadata` 仅在 parent 存在于当前 worker 内存时才落 DB 且调用方忽略返回值——跨 worker 可能静默写失败。让实时载体同时支撑全量解析，则该风险不影响功能正确性。metadata 写入失败须记 log。
 
 ### 2.2 新增字段
 
-**兜底回复消息**上（随消息体下发）：`reply_to_message_id`（指向用户消息）、`error_class`、`blame`、`user_text`。
+**兜底回复消息**：`reply_to_message_id`、`error_class`、`blame`、`user_text`。
+**用户消息 metadata**（冗余）：`reply_error_class`、`reply_blame`、`reply_user_text`，需加入 `store.py::update_chat_message_metadata` allowlist。
 
-**用户消息 metadata** 上（冗余持久化）：`reply_error_class`、`reply_blame`、`reply_user_text`。需加入 `backend/core/store.py::update_chat_message_metadata` 的 allowlist。
+**为何下发 `user_text`**：后端 `notices/catalog.py` 是文案唯一权威；只发 `error_class` 让 iOS 本地映射会再造一份割裂文案表（`SceneErrorCopy` 已是第三份分类器）。
 
-**为何连 `user_text` 一起下发**：后端 `notices/catalog.py` 是文案唯一权威。只下发 `error_class` 让 iOS 本地映射，会再造一份与后端割裂的文案表（`SceneErrorCopy` 已是第三份分类器，不应加厚）。
+**detail 不下发**：可能夹带 provider HTML、request id、敏感上下文。契约测试固化 `user_text ≤ 500` 且断言不含原始 provider detail。
 
-**detail 不下发**：原始上游报错可能夹带 provider HTML、request id 等噪音甚至敏感上下文。排障走既有设置页 `last_runtime_error` 与 admin 面。**契约测试固化 `user_text ≤ 500` 且禁止写入原始 provider detail**（Codex 建议，采纳；当前 catalog 最长约 80 字符，余量充足）。
-
-### 2.3 显示矩阵（消灭第 1 稿的自相矛盾）
+### 2.3 显示矩阵
 
 | blame | 用户消息 | 兜底气泡 | 行动入口 |
 |---|---|---|---|
-| `user_provider` | 失败态 + `user_text` | **隐藏** | 「去设置」→ 模型配置页 |
-| `provider_transient` | 失败态 + `user_text` | **隐藏** | 无 |
-| `system` | 不变（正常态） | **保留显示** | 无 |
+| `user_provider` | 失败态 + `user_text` | 隐藏 | 「去设置」→ 模型配置页 |
+| `provider_transient` | 失败态 + `user_text` | 隐藏 | 无 |
+| `system` | 不变 | **保留显示** | 无 |
 
-`system` 保留兜底是指导原则第三档的直接落地：我们的锅，用户做不了什么，留住有温度的话。
+### 2.4 归并矩阵（分页 / orphan）
 
-### 2.4 后端改动
+关联归纳必须在**每次 `upsertMessages`、冷缓存恢复、加载 older 之后**重跑，不能只在「实时收到新消息」时执行。
 
-1. `tools/chat_resident_consumer.py`：兜底分支已有 `pending_failure_notice`；写兜底回复时随 `post_reply` 带上 `classify_agent_error` 结果（沿用 07-06 spec 给 `post_reply` 加 `role`/`notice_kind` 的同一模式，加可选参数，不改既有调用）。
-2. `backend/chat/chat_core.py`：写 `reply_status` 的同一处附带写入三个新字段。**`reply_status` 语义与 409 双扣防护逻辑一字不改**；metadata 写入失败改为记 log（原忽略返回值）。
-3. `backend/core/store.py`：metadata allowlist 增三键。
+| 已加载内容 | 行为 |
+|---|---|
+| 兜底事件 + 用户消息 | 事件优先，更新用户消息 reply-outcome，按 blame 隐藏/保留兜底 |
+| 只有用户 metadata | 用 metadata 恢复 reply-outcome |
+| **只有兜底事件，parent 未加载**（分页切割） | **暂不隐藏事件**，作为独立失败提示展示；加载 older 后归并 |
+| 两载体冲突 | 兜底事件优先，记诊断 log |
+| 两者皆无 | 保持旧行为 |
 
-后台车道（heartbeat/proactive/capture/dream）失败**不写**这些字段——不进聊天流（Seven 2026-07-11 决策）。
+第三行是关键：若无条件隐藏，会出现「错误原因和兜底一起消失」。
 
-### 2.5 iOS 改动
+> ring trim 不构成风险：用户消息一定早于其兜底回复，正常 trim 会先淘汰用户消息，不会出现「兜底还在、parent 已删」。
 
-1. `ChatMessage`：解码新字段。
-2. **实时路径**：收到带 `error_class` 的兜底消息 → 按 §2.3 矩阵更新内存中对应用户消息（依 `reply_to_message_id`）→ 决定是否渲染该兜底气泡。
-3. **全量/重启路径**：从兜底消息（优先）或用户消息 metadata 派生失败态。当前解码器第 424 行硬编码 `deliveryState = .sent`，改为仅在服务端明确标失败时覆盖。
-4. 失败态复用现有失败气泡样式，但**不渲染重试按钮**（现有失败气泡默认带重试，需显式抑制）。
+### 2.5 后端改动
 
-**语义澄清**（Codex 提出，采纳）：`deliveryState` 原义是「消息是否发送成功」，本设计引入的是「agent 是否成功回答」——**不同语义**。实现上新增 reply-outcome 概念，仅复用失败态的**视觉样式**，不直接复用 `.failed` 的语义位。
+1. `tools/chat_resident_consumer.py`：兜底分支写回复时随 `post_reply` 带 `classify_agent_error` 结果（沿用 07-06 给 `post_reply` 加 `role`/`notice_kind` 的模式，加可选参数）。
+2. `backend/chat/chat_core.py`：写 `reply_status` 同处附带三字段；**`reply_status` 与 409 双扣防护一字不改**；metadata 写失败改为记 log。
+3. `backend/core/store.py`：allowlist 增三键。
 
-### 2.6 兼容性与契约
+后台车道失败**不写**这些字段（不进聊天流，Seven 2026-07-11）。
 
-- 老版 App：服务端写入完全相同的兜底消息，老版不认识新字段 → **渲染与现状一致**。（第 1 稿写「逐字节一致」不准确：JSON 响应体确实多了字段，一致的是渲染结果。）
-- 新增 history JSON 字段是 **additive public API contract**，须同步 OpenAPI、`FRONTEND_ERROR_CONTRACT.md` 与 changelog（Codex 提出，采纳）。
-- 已知遗留：`system` notice 气泡在全量 history 仍会渲染，重启后可能与失败态并存造成重复。本期不处理（不穿透实时轮询只解决了实时路径），记为已知问题。
+### 2.6 iOS 改动
+
+**语义分离（不复用 `deliveryState`）**：
+
+- `deliveryState` 语义**保持不变**：只表达「用户消息有没有成功发到服务器」。第 424 行的 `deliveryState = .sent` **不动**。
+- **新增** `replyFailure: ReplyFailure?`：表达「agent 是否成功回答」。两者是不同语义，不可混用。
+- 视觉上复用现有失败气泡样式，**不渲染重试按钮**。
+- `retryMessage()` 仅接受真正的 delivery failure；**provider reply failure 永不进入现有 retry 分支**。
+
+**关联层**：reply-outcome 不能只在单条 `ChatMessage.init(from:)` 内推导——assistant 事件必须在**消息列表 reconciliation 层**关联回 user message（见 §2.4 矩阵）。
+
+### 2.7 兼容性与契约
+
+- 老版 App：写入完全相同的兜底消息，不认识新字段 → **渲染结果与现状一致**（响应体确实多了字段，故不称「逐字节一致」）。
+- 新增 history JSON 字段是 **additive public API contract**，须同步 OpenAPI、`FRONTEND_ERROR_CONTRACT.md`、changelog。
+- 已知遗留：`system` notice 气泡在全量 history 仍渲染，重启后可能与失败态并存造成重复。本期不处理。
 
 ---
 
-## §3 onboarding 降级可见性（改打 genesis 主路径）
+## §3 onboarding 降级可见性（genesis 主路径）
 
-### 3.1 为何不能按 warning 前缀归纳
+### 3.1 genesis 的实际失败语义（与 history_import 不同）
 
-第 1 稿列的 8 类 warning 中，至少三类语义不成立（Codex 指出，逐条核实成立）：
+**关键事实（本轮核实，修正前两稿的框定）**：genesis 里 `classify_provider_error(e) == "provider_config"`（402 余额不足 / 401·403 坏 key / 其它 4xx 配置类）在 fact_map 路径上是 **`raise` 硬中断** → job 判 `failed` → 走 `mark_failed` → 已有 notice 与 `job.error`，**本就是大声报错**，不属于静默降级。
 
-| warning | 第 1 稿的错误解读 | 实际语义 |
+静默降级路径**只有 transient 重试耗尽**（429/5xx/网络/坏 JSON）→ `history_windows_failed += 1` → 跳过该窗继续。
+
+**但 genesis 内部不一致（本轮新发现，Codex 未提）**：identity 路径复用 `history_import._derive_identity_with_provider`，该推导器**吞掉所有异常**并返回兜底身份，`foreground_identity` 只按 warning 重试。代码注释自陈：
+
+> NOTE: the deriver hides the status code, so 402/quota also gets a few (capped) retries
+
+即：同一个「余额不足」，走 fact_map 会硬中断判失败，走 identity 却静默降级成通用身份卡。**degraded 归责必须处理这一不一致**，否则 identity 降级会被错误归成 `provider_transient`。实现计划需决定：是让推导器透出状态码（注释里已预告的 refine），还是在归纳层按可得信息保守归责。
+
+### 3.2 为何不能按 warning 前缀归纳
+
+| warning | 错误解读 | 实际语义 |
 |---|---|---|
-| `identity_guard_no_ai_source_used_generic_identity` | 「身份卡降级」 | **不是失败**。触发条件 `not has_ai_persona and not has_assistant_history and not has_ai_memory`——用户材料里本就没有 AI 侧内容，是合法 guard |
+| `identity_guard_no_ai_source_used_generic_identity` | 「身份卡降级」 | **不是失败**。触发条件是用户材料里本就没有 AI 侧内容，是合法 guard |
 | `provider_onboarding_greeting_failed` / `_empty` | 「没有开场白」 | **有开场白**，只是通用兜底文案 |
-| `provider_candidate_json_repair_failed` / `retry_failed` | 「记忆丢失」 | 后续拆分重试**可能已成功**，不能只看 warning 断言 |
+| `provider_candidate_json_repair_failed` / `retry_failed` | 「记忆丢失」 | 后续拆分重试**可能已成功** |
 
-**代码库已有正确判据**：`backend/genesis/foreground_identity.py::_provider_failed()` 已经把 `provider_identity_failed`（真 provider 失败，值得重试）与 `identity_guard_no_ai_source`（合法无信号，不该重试）区分开并写了注释。归纳逻辑**沿用这一既有先例**。
+代码库已有正确判据：`genesis/foreground_identity.py::_provider_failed()` 已区分 `provider_identity_failed`（真失败）与 `identity_guard_no_ai_source`（合法无信号）并写了注释。**沿用之。**
 
-### 3.2 目标路径：genesis
+### 3.3 判据：结构化 provenance + 确定性计数器
 
-`useGenesisOnboarding` 默认 `true`（`ChatEmptyStateView.swift`），真实用户全走 genesis；`history_import` 仅调试可切回。故 degraded 产出**以 genesis 为主**。
+**memory** —— 用 genesis 既有计数器，不用条数阈值：
 
-genesis 与 history_import 天然可共用归纳逻辑：`backend/genesis/foreground_identity.py` 直接 `from hosted import history_import`，复用同一个身份推导器，产出同一套 warning 词汇。
+| 条件 | 判定 |
+|---|---|
+| `history_windows_failed == 0` | **不判降级**，哪怕最终记忆为 0 |
+| `0 < failed < total` | `memory_partial`（部分材料没完成提取） |
+| `failed == total && total > 0` | `memory_unavailable` |
 
-### 3.3 degraded 结构
+最终记忆条数**只用于展示**，不作失败判据。
 
-放入 genesis state（`backend/genesis/service.py::write_genesis_state` 当前为固定形状，需增键；`identity_status` 只表示身份是否初始化，不表示是否降级，**不可复用**）。无降级时不写该键。
+**前置改动**：`worker.py` 当前在 `except` 里只累加计数、**原始异常随即丢弃**，归纳层因此不知该归 user_provider / provider_transient / system。需在该 catch 点保留**脱敏后的结构化未恢复失败**：
+
+```
+capability=memory  stage=fact_map
+error_class=upstream_unavailable  blame=provider_transient  exhausted=true
+```
+
+**不保存原始 detail。**
+
+**greeting** —— 返回结构化 provenance，**不靠比对文案字符串猜是不是兜底**：`generated` / `fallback_provider_error` / `fallback_empty` / `append_failed`。（当前 `plaintext.py` 直接丢弃 `_warnings`。）
+
+**identity** —— 沿用 `_provider_failed()`：仅 `provider_identity_failed` 判降级，合法 guard 不判。归责受 §3.1 不一致影响。
+
+### 3.4 结果存放：per-job 权威
+
+- **权威**：`GET /v1/genesis/imports/{job_id}` 返回的 job/result 必须**直接包含 `degraded`**（iOS 只读 `obj["job"]`，已核实从不读 `state`）。
+- **镜像**：`genesis_state` 可镜像一份供 gate / validation / admin 使用，但**不能是 iOS 唯一数据源**；若读 state，必须先校验 `state.job_id == 请求的 job_id`（state 是 per-user 最新态，并发 persona backfill 时可能指向别的 job）。
+- **不塞现有 `output`**：`genesis_set_job_status()` 整块替换 output 而非 merge，后台阶段写 `{stage, error}` 会覆盖前景产出的 degraded。需给 job 独立持久字段，或定义不被阶段 output 覆盖的专用结果存储。
 
 ```
 degraded: {
-  causes: [ { error_class, blame, user_text } ],       # 允许多因，不压成一条
+  causes: [ { capability, error_class, blame, user_text } ],   # 允许多因，不压成一条
   affected_capabilities: [ "identity" | "memory" | "greeting" ]
 }
 ```
 
-**多因不压缩**（Codex 建议，采纳）：一次 job 可能同时因不同原因降级，单个 `error_class/blame/user_text` 会把多因压成一个。
+### 3.5 生命周期：两套「完成」
 
-**归纳依据 = 最终能力产物 + 未恢复的失败**，而非 warning 前缀命中：
+**已核实**：genesis v2 前景建好基础记忆/身份/greeting 后**立即标 `done`**，之后才跑 background enrichment；而 iOS 一看到 `done` 就**结束轮询并清除 active job**。因此后来才产生的后台失败即使写进 job，**也没人再读**。
 
-- `identity`：最终身份卡是否为兜底产物 **且** 归因于 `provider_identity_failed`（而非合法 guard）
-- `memory`：最终记忆条数为 0 或显著缺失 **且** 存在未被后续重试恢复的抽取失败
-- `greeting`：开场白是否为兜底文案 **且** 归因于 provider 失败
+必须拆成两个状态：
 
-同时纳入 `background_status="failed"` / `background_error`（与 `warnings` 是不同字段，只读 warnings 会漏）。
+| 状态 | 含义 | 用途 |
+|---|---|---|
+| `foreground_done` / `chat_ready` | 可以进入产品 | 放用户进去 |
+| `background_status` = `processing` \| `completed` \| `degraded` | 后台丰富是否终结 | 决定何时停止轮询 |
 
-**归纳位置**：新建独立纯函数模块（如 `backend/onboarding_degraded.py`），genesis 与 history_import 共用。不放 `notices/catalog.py`——catalog 只负责 `error_class → blame/user_text`。
+iOS 在 foreground done 后放用户进入，但**保留一个轻量轮询直到 background terminal**。否则「纳入 background failure」只是纸面支持。
 
-### 3.4 展示位置
+> 注意：`background_status` / `background_error` 是 legacy `history_import` 的现成字段，**genesis 目前没有同名契约**——这是**新增 genesis 字段**，不是复用。
 
-**仅 onboarding 第一现场**（hx 定：记忆花园不加。理由：用户在第一现场仍处于「我在配置这产品」心态，愿意去处理；用两天后才发现已形成「这产品就这样」的判断）。
+### 3.6 展示位置
 
-需覆盖 fresh start 路径：当前 fresh start 提交 genesis 后**立即进入私钥交接、后台继续跑**，失败只记埋点（`ChatEmptyStateView.swift`）。故展示位需明确到「后台完成时用户所在的那个屏幕」，实现计划中定死具体落点。
+**第一展示位**：现有私钥交接完成页（`ChatEmptyStateView.swift`）。
+
+- job 仍在跑 → 「TA 还在后台建立中」
+- 正常结束 → 提示消失或转完成态
+- degraded → 私钥卡下方显示受影响能力与原因
+
+**用户可能在后台完成前离开**。采用：**持久化一条 job-specific、一次性的 onboarding result**，在 Identity 首页首次展示后标记已读。（否决「禁止离开直到 background terminal」：卡用户。）
+
+该一次性结果仍属 onboarding 第一落点，**不是通知中心**，也不会两天后才冒出来（hx 定：记忆花园不加）。
 
 ---
 
 ## 测试
 
-### 后端
+### 后端 · §2
 
 - consumer：兜底分支携带失败元信息；后台车道**不**携带（回归）。
-- `chat_core`：写 `reply_status` 时同写三字段；**`reply_status` 与 409 双扣防护行为不变**（回归断言）；metadata 写失败记 log。
-- metadata allowlist：新键可写、非白名单键仍被拒。
+- `chat_core`：写 `reply_status` 时同写三字段；**409 双扣防护行为不变**（回归断言）；metadata 写失败记 log。
+- allowlist：新键可写、非白名单键仍被拒。
 - **实时链路**：兜底消息带 `reply_to_message_id` + 错误字段出现在 `since` 增量响应中（直击第 1 稿断点）。
-- 契约：`user_text ≤ 500`；断言不含原始 provider detail。
+- 契约：`user_text ≤ 500`、不含原始 provider detail。
+
+### 后端 · §3
+
+- **per-job 权威**：`GET /v1/genesis/imports/{job_id}` 响应含 `degraded`；后台阶段写 output 后 degraded **不被覆盖**（直击第 2 稿断点）。
+- state 镜像：`state.job_id` 与请求 job 不一致时不得被采信。
 - degraded 归纳（纯函数单测，最关键的一组）：
+  - `history_windows_failed == 0` → **不判降级**，即使记忆为 0
+  - `0 < failed < total` → `memory_partial`；`failed == total` → `memory_unavailable`
   - 合法 guard（`identity_guard_no_ai_source`）→ **不产生** degraded
-  - greeting 兜底 → `affected_capabilities` 含 `greeting`，不表述为「没有开场白」
-  - 抽取失败但后续重试成功 → **不产生** memory 降级
+  - greeting provenance = `fallback_provider_error` → 判降级；`generated` → 不判
   - 多因并发 → `causes[]` 多条，不压成一条
-  - `background_status=failed` 单独触发
   - 无降级 → 不写 `degraded` 键
+- provenance 落地：worker catch 点保留结构化未恢复失败且**不含原始 detail**。
+- 生命周期：foreground done 后 `background_status` 仍为 `processing`，terminal 后转 `completed`/`degraded`。
 
-### iOS
-
-无测试 target，**必须真机验证**：
+### iOS（无测试 target，必须真机）
 
 1. **正常聊天零变化**（最高优先级回归）：文字、图片、连续多轮。
-2. **实时性**：配错 key → 发消息 → **不杀 App、不刷新**，确认当场看到失败态与原因（直击第 1 稿断点）。
-3. `user_provider`（余额/key）→ 失败态 + 「去设置」，兜底气泡不出现。
-4. `system`（如 turn_timeout）→ **仍显示兜底话术**，无行动入口（验证 §2.3 矩阵）。
+2. **实时性**：配错 key → 发消息 → **不杀 App、不刷新**，当场看到失败态与原因。
+3. `user_provider` → 失败态 + 「去设置」，兜底气泡不出现。
+4. `system`（turn_timeout）→ **仍显示兜底话术**，无行动入口。
 5. 杀 App 重开 → 失败态仍在。
-6. genesis onboarding 降级 → 第一现场显示 degraded；无降级时不出现任何提示。
+6. **分页 orphan**：滚动到兜底消息在页内、parent 在上一页 → 确认不隐藏、显示为独立失败提示；加载 older 后归并。
+7. genesis 降级：私钥交接页显示；**中途离开再回 Identity 首页仍能看到一次**；已读后不再重复出现。
+8. 无降级时不出现任何提示。
 
 ## 风险与回滚
 
-- **最大风险：影响正常聊天**。缓解：后端改动只在失败分支写入，成功路径不变；新字段缺失时 iOS 退化为现状行为（兜底照显），不会更糟。真机回归以「正常聊天零变化」为第一验收项。
-- 跨 worker metadata 静默写失败：已通过「兜底消息为权威载体」设计消解，metadata 仅作冗余。
-- §2 与 §3 互相独立，可分别回滚。
-- 部署：backend 与 agent-runner 镜像同批（consumer 改动）；iOS 随后任意节奏，后端先行完全兼容。
+- **最大风险：影响正常聊天**。缓解：后端只在失败分支写入，成功路径不变；新字段缺失时 iOS 退化为现状行为，不会更糟。真机回归以「正常聊天零变化」为第一验收项。
+- 跨 worker metadata 静默写失败：已由「兜底消息为权威载体」消解。
+- §3 涉及 genesis 结果持久化与轮询生命周期，**回滚面大于 §2**，故建议分批（见下）。
+- 部署：backend 与 agent-runner 镜像同批；iOS 随后任意节奏，后端先行完全兼容。
+
+## 交付建议
+
+经两轮 review，§2 与 §3 的体量已明显不对等：
+
+- **§2**：自成闭环，改动集中在 consumer / chat_core / store allowlist + iOS 渲染层，可独立交付并验收。
+- **§3**：牵动 genesis 结果持久化（per-job 权威字段）、生命周期契约（foreground/background 两套状态）、多处 provenance 采集（worker catch 点、greeting）、iOS 轮询策略与一次性结果存储。
+
+**建议 §2 先行合入并真机验收，§3 单独一批**（必要时另起 spec）。理由：§2 已可交付用户可见价值；把 §3 绑在一起会让整批的回滚面和验收周期都被放大。
 
 ## 与既有系统的关系
 
 - `/v1/notices` 保持只写不读。
-- 聊天 system 气泡与 3h 节流保持原样，作为后台观测面继续存在。
-- 阶段一已合三项（导入归责、节流分三桶、iOS 保留错误码）不受影响，本设计在其之上叠加。
-- 阶段一分支与远端基线有漂移，相关文件新增漂移基本无冲突；#86/#107 合并后需重跑一次链路 review（Codex 提示）。
+- 聊天 system 气泡与 3h 节流保持原样。
+- 阶段一已合三项不受影响，本设计在其之上叠加。
+- 阶段一分支与远端基线有漂移，#86/#107 合并后需重跑一次链路 review。
