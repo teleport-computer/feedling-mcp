@@ -1860,6 +1860,59 @@ def test_parent_event_cursor_rejects_completion_with_different_item_id(tmp_path)
         verifier.ScenarioCommandEventCursor(path).snapshot()
 
 
+def test_parent_event_cursor_rejects_overlapping_exact_lifecycles(tmp_path):
+    path = tmp_path.resolve() / "events.jsonl"
+    lifecycle = _scenario_command_lifecycle_rows()
+    path.write_text(
+        "".join(
+            json.dumps(row) + "\n"
+            for row in (
+                lifecycle[0],
+                lifecycle[2],
+                lifecycle[1],
+                lifecycle[3],
+            )
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    cursor = verifier.ScenarioCommandEventCursor(path)
+
+    with pytest.raises(verifier.OrchestrationError, match="lifecycle is invalid"):
+        cursor.snapshot()
+    # A consumed invalid row must not let a later poll recover and admit it.
+    with pytest.raises(verifier.OrchestrationError, match="lifecycle is invalid"):
+        cursor.snapshot()
+
+
+def test_parent_gate_rejects_future_start_before_current_completion(tmp_path):
+    path = tmp_path.resolve() / "events.jsonl"
+    lifecycle = _scenario_command_lifecycle_rows()
+    path.write_text(json.dumps(lifecycle[0]) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    cursor = verifier.ScenarioCommandEventCursor(path)
+
+    assert launcher._parent_command_predecessor_ready(
+        cursor,
+        (),
+        current=("P0-02", 1),
+    ) is True
+
+    with path.open("a", encoding="utf-8") as handle:
+        for row in (lifecycle[2], lifecycle[1]):
+            handle.write(json.dumps(row) + "\n")
+
+    with pytest.raises(
+        launcher.WorkerLaunchError,
+        match="live Codex command evidence is invalid",
+    ):
+        launcher._parent_command_predecessor_ready(
+            cursor,
+            ({"scenario_id": "P0-02", "attempt": 1, "status": "PASS"},),
+            current=("P0-03", 1),
+        )
+
+
 def test_parent_rejects_forged_p0_13_cot_terminal_binding(
     tmp_path, monkeypatch
 ):

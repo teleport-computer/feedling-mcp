@@ -509,6 +509,7 @@ class ScenarioCommandEventCursor:
         self._started: list[ScenarioCommandMarker] = []
         self._completed: list[tuple[ScenarioCommandMarker, int]] = []
         self._rows_parsed = 0
+        self._invalid = False
 
     @property
     def bytes_consumed(self) -> int:
@@ -534,7 +535,11 @@ class ScenarioCommandEventCursor:
         if row_type == "item.started":
             if marker is None:
                 return
-            if not _valid_identifier(item_id) or item_id in self._seen_item_ids:
+            if (
+                self._started_items
+                or not _valid_identifier(item_id)
+                or item_id in self._seen_item_ids
+            ):
                 raise OrchestrationError(
                     "live Codex command lifecycle is invalid"
                 )
@@ -573,6 +578,8 @@ class ScenarioCommandEventCursor:
 
     def snapshot(self) -> ScenarioCommandEventSnapshot:
         label = "live Codex worker event stream"
+        if self._invalid:
+            raise OrchestrationError("live Codex command lifecycle is invalid")
         try:
             with open_owned_regular(
                 self.path,
@@ -629,7 +636,11 @@ class ScenarioCommandEventCursor:
                 ) from None
             if not isinstance(row, dict):
                 raise OrchestrationError("live Codex worker event stream is invalid")
-            self._consume_row(row)
+            try:
+                self._consume_row(row)
+            except OrchestrationError:
+                self._invalid = True
+                raise
             self._rows_parsed += 1
         return ScenarioCommandEventSnapshot(
             started=tuple(self._started),
