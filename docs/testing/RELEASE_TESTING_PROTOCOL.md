@@ -57,6 +57,16 @@
 - 每轮 E2E 现场注册、跑完 **当场 `/v1/account/reset`（confirm=delete-all-data）删除**；
 - keypair 用 `tools/e2e/` 生成并只存本轮临时目录；
 - 绝不复用真实用户账号，绝不在 prod 建号。
+- teardown 失败会打 WARNING——**看到必须手动删**（无 admin 删除口）；
+  崩溃留下的凭据在 `~/.feedling-e2e-orphans/`，`p0.py --cleanup-orphans` 清扫。
+
+### 1.4 harness 已知坑（拿来即用）
+
+- 注册 `public_key` 是 **base64** 不是 hex（传 hex 409）。
+- model slug 会被厂家下线 404——`HostedCell.models` 多给候选按序试。
+- genesis 上传返回的 job_id 在 `body["job"]["job_id"]`（嵌套）。
+- model_api **首轮冷启动可能丢**（per-user spawn）——FIRST_REPLY_TIMEOUT=300s。
+- admin trace 的 stdout excerpt 截断 1000 字节；读 trace 过滤 `ts > 发送时刻`。
 
 ---
 
@@ -81,7 +91,7 @@
 | 主动唤醒（心跳/定时/照片/屏幕） | ✅ | ✅ | ✅ | ❓ |
 | 感知信号（io_cli 18 signals） | ✅ | ✅ | ✅(-t bash) | ❓ |
 | **用户 MCP** | ✅ | ✅ | **❌ 无 pi 桥（志豪修，docs/PI_USER_MCP_GAP）** | ❓ |
-| 云端蒸馏（上传文件） | ✅ | ✅ | ✅ | ❓ |
+| 云端蒸馏（上传文件）※ | ✅ | ✅ | ✅ | ❓ |
 | 错误气泡分类 | ✅ | ✅ | ✅ | ❓ |
 
 **VPS 自托管（resident）**（OpenClaw 暂免——无用户，Seven 定）：
@@ -97,6 +107,10 @@
 
 > ❓ 存量待核（建任务）：deepseek 全列、Hermes 的蒸馏/MCP/图片。核实后改
 > ✅/❌，❌ 的补产品提示。
+>
+> ※ **蒸馏不是一格**——实际是 2 入口（onboarding 首传 / Garden 二次补传）×
+> 2 通道（云端 plaintext / 自托管 sealed）× 行为子表，每格独立坏过。
+> 触碰蒸馏时按 §4.6 行为子表逐格验。
 
 ---
 
@@ -113,7 +127,7 @@ upload_material / send_chat / run_consumer / teardown）。
 | 步 | 动作 | 通过标准 |
 |---|---|---|
 | 1 | 注册临时账号（对应 route/driver），配 provider key，`/v1/model_api/setup` test | test_status=ok |
-| 2 | 发一条文字消息 | ≤120s 收到 agent 回复，无协议碎片泄漏 |
+| 2 | 发一条文字消息 | ≤120s 收到 agent 回复，**且用账号私钥解出非空明文**（解不开=硬 fail——usr_f13f 事故：AI 狂发、用户屏幕全乱码，后端毫无感知），无协议碎片泄漏 |
 | 3 | 追问一条（上下文连续性） | 回复能接上文（会话/注入正常） |
 | 4 | 触发一次记忆写入（明确给一个事实） | `/v1/memory/index` 出现对应卡 |
 | 5 | 错误气泡 sanity：故意发超长/停 key 场景跳过，仅检查无 unknown 类气泡出现在本轮 | 聊天里 0 条 system 气泡 |
@@ -149,7 +163,49 @@ verify_loop passing → 发消息收回复 → 删号。
 
 > 15/16 是仅有的人工项（需要真机）；其余全部 Claude 执行。
 
+### 4.5 体感 Block 回归（全绿也可能是灾难的项，P1 级）
+
+功能测试查"能不能用"，本表查"用起来对不对"。发版回归时在 **claude 官方 +
+pi 中转** 两个代表配置上各扫一遍；每项的通过标准是括号里的体感断言，
+**"聊天有回复"不算过**。❌ 由 Seven 决定阻断或带票。
+
+| 类 | 症状 | 怎么测 |
+|---|---|---|
+| 回复语言漂移 | 设英文人设却冒中文 | 人设+记忆写语言 X → 连发 3 条每条必须 X；发语言 Y 一条 → 该轮镜像 Y；proactive 仍回 X；**两路都测** |
+| 主动刷屏/自激励 | 短时连发、越发越多 | 单位时间发送量有上限；报错退避不重试；self-wake 被 floor clamp；堆积 job 到期转 expired 不补跑 |
+| 消息重复（两族） | 用户看到重复 | 发 1 条 → 恰 1 user row + 1 agent 回复；分诊看"两个 user row"还是"一 row 两回复" |
+| 时间/日期正确性 | 说错时间；LTM 日期塌成今天 | 非-UTC 时区问"几点"答对；带 YYYY-MM-DD 的长期记忆上传后 occurred_at 原样保留 |
+| onboarding 首屏 | 卡进度页/身份卡空/天数错 | fresh 新号直进 app；身份卡逐字段 fallback（初始名"TA"）；天数第 1 天起算 |
+
+（解密连续性原属此类，已升级为 §3 P0 步骤 2 的硬判据。）
+
+### 4.6 蒸馏行为子表（触碰 genesis/distill 时逐格验）
+
+| 行为 | 通过标准 | 易漏点 |
+|---|---|---|
+| LTM 日期保留 | occurred_at == 源卡日期，不塌今天 | 仅 material_kind=memory_summary 开；混合上传逐卡判定（_source_family），别整批开 |
+| 标签→threads | 源卡 tags 播种进 threads，不丢 | 同上 gating |
+| 聊天记录常规蒸馏 | history 素材不触发日期保留 | 全局 schema 的 occurred_at 别泄进 history 卡 |
+| 去重 | 语义去重+保守词法兜底，同模板事实不误并 | 阈值太低误并 |
+| 混合素材分族 | 同批只有 memory_summary 卡拿日期精修 | merge 收敛丢族信息——靠 per-item marker |
+| 空素材话术 | 空文件 → material_empty 具体文案 | iOS 有对应 copy |
+| 蒸馏中插聊天 | 聊天先回、续跑不重不丢 | resident 逐窗游标 |
+| 首轮冷启动 | runner 首轮可能丢——重试/预热 | 别拿首轮失败下结论 |
+
 ## 5. VPS harness × 功能矩阵 E2E（新功能触碰 consumer 时加跑）
+
+**共享接缝触发器（根治"改 A 坏 B"）**：动了下表任一文件，L2 回归必须
+model_api + resident **两路都跑**，不许一路代表全部。自查话术："这段代码
+只有 model_api 用户会跑到吗？"答不上"是"就双路测。
+
+| 共享接缝 | 文件 |
+|---|---|
+| 蒸馏事实写入 | backend/genesis/worker.py::_fact_write |
+| 上下文/prompt 组装 | backend/hosted/context.py、backend/genesis/prompts.py |
+| 回复语言策略 | backend/chat/reply_language.py |
+| 信封加解密 | content_encryption.py、enclave_app.py |
+| 记忆动作 | backend/memory/actions.py |
+| proactive 核 | backend/proactive/* |
 
 改了 `tools/chat_resident_consumer.py` 或 agent 侧协议 → L2 之外加跑：
 三 harness（Claude Code/Codex/Hermes）各把 §3 VPS P0 + 受影响功能过一遍。
@@ -161,6 +217,10 @@ verify_loop passing → 发消息收回复 → 删号。
 每次 prod deploy 后，从当次发版内容生成验证清单照单跑（模板见
 `docs/testing/PROD_DEPLOY_VERIFICATION_2026-07.md` 的结构：逐项 ✅/❌/跳过+原因、
 写明"什么不算失败"）。固定项：
+- **第 0 步（铁律）**：`curl -sk <api>/healthz` 的 `release.git_commit` 必须
+  == 目标 SHA 才开跑——对不上 = 还没部署完，此刻任何"失败"都是假阴性。
+  runner 镜像看 compose tag `:<sha7>`；resident consumer 看 admin user detail
+  的 consumer commit（随 expected_consumer_commit 自更新）；
 - `/healthz` + attestation/canary 绿；
 - 抽 2-3 个真实活跃用户 admin 页看健康信号（错误气泡增量、proactive 状态分布）；
 - 部署断连窗口投诉核对（单点 CVM 原地部署问题，见 usr_ed21 事故）。
@@ -187,6 +247,15 @@ verify_loop passing → 发消息收回复 → 删号。
 - **阻断**：P0 任何一格 ❌ → 不许 test→main；P1 的 ❌ → Seven 决定
   （阻断或带票发版）；真机项未跑 → 标注"待真机"不阻断。
 - 所有 E2E 产生的测试账号必须在报告里确认已删除。
+
+## 8.5 发版前六问（快速自检）
+
+1. 体感：语言对吗？会刷屏吗？用户**真能解密**吗？（§4.5 / §3-2）
+2. 蒸馏：日期/标签保住了吗？两入口两通道都验了吗？（§4.6）
+3. 联动：碰共享接缝了吗？两路都跑了吗？（§5）
+4. 生效：/healthz git_commit 对上目标 SHA 了吗？（§6-0）
+5. 分层：模型家族/harness 分层验了吗？（§5）
+6. 收尾：测试账号删干净了吗？事故落回归用例了吗？（§7 / §1.3）
 
 ## 9. 落地顺序（待办）
 

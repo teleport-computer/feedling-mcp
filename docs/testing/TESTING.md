@@ -77,6 +77,8 @@
 
 ## 5. 部署态 E2E 标准动作（L3 展开）
 
+0. **先对版本（铁律）**：`curl -sk <api>/healthz` 的 `release.git_commit`
+   必须 == 目标 SHA 才开跑——对不上 = 还没部署完，此刻任何"失败"都是假阴性。
 1. **复用**（优先）或新建 test model_api 账号。
 2. 拿账号 X25519 keypair；`whoami` 拿 `public_key`。
 3. `backend/content_encryption.py::build_envelope(...)` 构造加密信封。
