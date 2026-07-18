@@ -358,23 +358,29 @@ agent 用 JSON 应答：`{"messages":["…"]}`（说话）或
 
 ---
 
-## 3. Model API 托管：只填 API key 的用户旅程
+## 3. Model API 托管 Runtime V2：只填 API key 的用户旅程
 
 **这条路适合谁**：没有自己 agent 的用户。只需要在 App 里填一把模型
 厂商的 API key（OpenAI / Anthropic / Gemini），剩下全部由后端代办。
 
 **和 consumer 路线的根本区别**：consumer 路线里"大脑"在用户家里，
-平台只递话；这条路里用户给的只是一个裸模型接口，**人格、记忆、规则
-全靠平台每轮重新"装进"提示词**。所以这条路的核心就是提示词工程。
+平台只递话；这条路由独立 runner CVM 上的有界 `serve-worker` 池领取
+PostgreSQL durable job，并在同一个 provider-native tool loop 里执行。所有
+模型走同一条 loop；不存在 official/rule tier 或每用户 CLI resident 进程。
 
-> **现状标注（2026-07）**：本节描述的是 legacy inline 托管路
-> （`hosted_runtime.py` + `model_api_runtime/`），**现已不是主路、仅作
-> fallback**。托管聊天主路是 agent-runner（`backend/agent_runtime/`，
-> 每用户一个 claude/codex driver 的 CLI agent 进程），见
-> `docs/HOSTED_MODEL_API_RETIREMENT_ROADMAP.zh.md`。以下内容勿当现行
-> 主路读。
+现行 prompt 使用加密 append-only itemized summary + 未覆盖的 verbatim tail；
+trusted runtime 在内存中解密后给模型普通明文。5,000 条只约束进程热窗口，
+数据库原始加密消息不会因 compaction 或行数自动删除。每轮可以并行执行
+有界只读工具批次，mutation 保持 durability fence；`reply` 本身是 loop tool，
+新用户输入在 round boundary 即时折入。
 
-### 3.1 一条消息的完整旅程（逐步）
+> **现状标注（2026-07-18）**：下面 §3.1–§3.7 保存的是已经退役的 legacy
+> inline prompt/controller 的历史说明，不是 fallback，也不能被 hosted 账号
+> 重新选择。现行实现与状态以 `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`、
+> `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md` 和
+> `docs/RUNTIME_V2_WORKSPACE.md` 为准。
+
+### 3.1 [历史] legacy inline 一条消息的旅程
 
 入口：iOS `POST /v1/model_api/chat/send`（`backend/hosted/chat_routes_asgi.py`）。
 
@@ -459,7 +465,7 @@ flowchart TD
 > "经 enclave 解密"的两步发生在同一台 CVM 内的 enclave 进程里。
 > 虚线为异步后台任务，不阻塞用户看到回复。
 
-### 3.2 行为总纲 system prompt
+### 3.2 [历史] legacy 行为总纲 system prompt
 
 `model_api_runtime/prompts.py` 的 `build_foreground_chat_messages()`，
 逐句原文：
@@ -499,7 +505,7 @@ flowchart TD
 
 ——实现细节不外泄。
 
-### 3.3 记忆是怎么被挑进上下文的
+### 3.3 [历史] legacy 记忆上下文选择
 
 挑选逻辑在 `backend/context_memory_selection.py`（纯函数），**执行在
 enclave 内**（enclave 解密历史时顺带运行）。托管路线用严格模式，
@@ -516,7 +522,7 @@ enclave 内**（enclave 解密历史时顺带运行）。托管路线用严格�
 3. 总上限 8 张，每张附 `selection`（分数 / 置信度 / 入选理由），模型
    能看到"这张卡为什么在这"，总纲又要求它无视理由牵强的卡。
 
-### 3.4 记忆捕获（对话怎么沉淀成卡片）
+### 3.4 [历史] legacy 记忆捕获
 
 每 24 轮对话触发一次（`MODEL_API_CAPTURE_TURN_INTERVAL`，下限 12）。
 用一个独立的、和聊天人格无关的"工人" prompt（原文节选）：
@@ -531,7 +537,7 @@ enclave 内**（enclave 解密历史时顺带运行）。托管路线用严格�
 输入是最近一问一答（各截 4000 字符）+ 现有候选记忆（防重复）+ 身份
 摘要；输出 JSON 卡片直接落记忆花园。"宁可不写也不写水卡"是基调。
 
-### 3.5 状态动作控制器（"帮我记住X"是怎么真正生效的）
+### 3.5 [历史] legacy 状态动作控制器
 
 每轮聊天后，后台异步跑一个独立的"控制器"调用
 （`hosted_runtime.py` 的 `build_background_execution_messages()`），
@@ -559,7 +565,7 @@ enclave 内**（enclave 解密历史时顺带运行）。托管路线用严格�
 
 破坏性动作（删卡）和指代模糊的修改被刻意压低置信度，走确认流程。
 
-### 3.6 历史导入（第一次接入时记忆从哪来）
+### 3.6 [历史] legacy 历史导入
 
 用户上传旧聊天记录（`POST /v1/history_import/upload`）后，后端起一个**后台
 线程异步跑**整条流水线（`history_import.py:_process_history_import_sync`），
@@ -605,7 +611,7 @@ job 供轮询展示（`_HISTORY_IMPORT_PHASES`）：
 设计要点：**首批就绪即放行、剩余增量补**，让大体量导入也不至于把用户挡在
 进度条后面。
 
-### 3.7 隐私边界（如实说）
+### 3.7 [历史] legacy 隐私边界
 
 - 静态：用户消息、回复、provider key 全部是信封密文。
 - 运行时：**backend 进程在组装提示词和调 provider 的窗口内持有明文**

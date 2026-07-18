@@ -105,10 +105,11 @@ and the current live-verify command is below.
    from the v1 envelopes sealed to `enclave_content_pk`.
 
 6. **Multi-tenant isolation.** Each user is registered via
-   `POST /v1/users/register`, gets an api_key, and lives under
-   `~/feedling-data/<user_id>/`. API keys are stored as
-   **HMAC-SHA256** (32-byte `.pepper`, `chmod 600`). Envelopes
-   carry `owner_user_id`; the backend rejects cross-tenant reads.
+   `POST /v1/users/register` and gets an API key whose verifier is stored as
+   **HMAC-SHA256** in PostgreSQL. Durable records are scoped by `user_id`, and
+   encrypted envelopes also carry `owner_user_id`; the backend rejects
+   cross-tenant reads. Hosted Runtime V2 has no per-user filesystem home: chat,
+   workspace, trajectory, and queue state use tenant-scoped database records.
 
 ---
 

@@ -1,7 +1,7 @@
 # Feedling 项目总览（功能 · 架构 · 信任链）
 
 > 面向第一次接触本项目的工程师 / 审计者 / 合作者的导读文档。
-> 撰写日期 2026-06-10。部署相关的具体数值（镜像 tag、compose_hash、CVM ID）
+> 首次撰写 2026-06-10，现行运行时状态更新至 2026-07-18。部署相关的具体数值（镜像 tag、compose_hash、CVM ID）
 > 会随发布变化，以 `deploy/DEPLOYMENTS.md` 为准。
 
 ---
@@ -75,7 +75,7 @@ feedling-mcp/
 | 路由 | 谁是大脑 | 形态 |
 |------|---------|------|
 | **Resident Consumer（自建服务器）** | 用户自己的 agent 运行时（VPS / Hermes / Claude Code 等） | 跑 `tools/chat_resident_consumer.py` 长轮询聊天、调用 agent、回写加密回复 |
-| **Model API（托管运行时）** | 用户提供的模型 API key（OpenAI / Anthropic / Gemini 等） | 后端托管：加密保存 key、导入聊天历史提取记忆/身份；聊天主路为 agent-runner（`docs/HOSTED_MODEL_API_RETIREMENT_ROADMAP.zh.md`；原 P0 设计文档 `MODEL_API_PATH_P0.md` 已删，见 git 历史） |
+| **Model API（托管 Runtime V2）** | 用户提供的模型 API key（OpenAI / Anthropic / Gemini 等） | 后端加密保存 key；独立 runner CVM 上的有界 `serve-worker` 池从 PostgreSQL 领取任务，所有模型共用同一套原生 tool-calling loop。现行状态见 `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`。 |
 | **官方 App 导入** | — | 历史数据迁移入口 |
 
 > **已移除（2026-06-12）**：MCP 直连（Claude.ai / Claude Desktop 经
@@ -102,16 +102,17 @@ git 历史）。
 - 感知信号先过 `PerceptionDifferV2`。连续信号只能 pull；离散事件才可能 wake。
 - 新控制面是 Ambient / Scheduled / Delivery 三层 gate。旧
   `enabled/dnd/user_state/ai_state` 只属于过渡兼容语义，不能继续扩展新 runtime。
-- Hosted 与 resident 必须共用同一份 tool catalog、wake contract 和 differ
-  语义；差异只在 agent 执行位置。
+- Hosted Model API 只走 Runtime V2 的统一 tool catalog、wake contract 和
+  differ 语义。用户自行运行的 `/v1/chat/*` resident consumer 是另一个产品
+  接入面，不能被 hosted 账号选择，也不是故障回退。
 
-当前生产代码仍保留 `/v1/proactive/jobs/*` 和旧 dashboard 作为过渡通道。
-新入口应先用 per-user flag 切到 V2，并保留旧执行体作为短期 dormant
-fallback；观察窗口健康后再逐条删除旧执行体，而不是长期并存。
+当前 hosted backend manifest 固定为 `v2_only`；不存在 per-user runtime
+flip、resident supervisor 或 hosted resident rollback。旧 proactive API 如仍
+存在，只能作为兼容输入/投影，不能成为另一套 hosted agent 执行体。
 
 ## 4. 系统架构
 
-### 4.1 服务拓扑（生产 CVM 内四个容器）
+### 4.1 服务拓扑（main CVM + Runtime V2 runner CVM）
 
 ```
             iOS App                Claude.ai / Claude Desktop
@@ -138,6 +139,13 @@ fallback；观察窗口健康后再逐条删除旧执行体，而不是长期并
    │  密文信封)  │ │ /attestation + 解密代理    │
    └────────────┘ └──────────────────────────┘
                     ▲ iOS 经 dstack-gateway "-5003s." 直连做证书 pin
+
+        独立 runner CVM（一个或多个）
+        ┌──────────────────────────────┐
+        │ serve-worker（有界 V2 池）   │
+        │ PostgreSQL durable jobs      │
+        │ 无 per-user resident 进程    │
+        └──────────────────────────────┘
 ```
 
 - **backend**（`backend/` 领域包 + `asgi_app.py` 装配层，~139 条路由，
@@ -167,6 +175,10 @@ fallback；观察窗口健康后再逐条删除旧执行体，而不是长期并
   细粒度锁，写操作同步落库；带 15 分钟 TTL 原地刷新（refresh-in-place，
   不换对象，避免写入竞态）和 `POST /v1/admin/store/evict` 定向驱逐
   （2026-06-07 引入，修复带外改库后缓存陈旧问题）。
+- **聊天留存与热缓存分离**：`MAX_CHAT_MESSAGES=5000` 只约束单进程最近消息
+  工作集，不是数据库 retention policy。`chat_messages` 原始加密行与附件正文
+  不因达到 5,000 条或 summary watermark 前进而删除；历史通过数据库分页和
+  稳定 message id 读取，只有显式用户/账号删除才移除源记录。
 - **长轮询**：`/v1/chat/poll`、`/v1/proactive/jobs/poll` 用
   `threading.Event` waiter 挂起，新消息/新 job 到达即唤醒。
 - **多租户**：所有表以 `user_id` 分区；API key 经 HMAC-SHA256(pepper)
@@ -180,9 +192,9 @@ fallback；观察窗口健康后再逐条删除旧执行体，而不是长期并
 |------|------|
 | `content_encryption.py` | v1 信封构建（与 iOS / enclave 三方一致的参考实现） |
 | `provider_client.py` | 模型 API 路由的 LLM provider 客户端（key 校验、chat completion） |
-| `hosted_runtime.py` | 托管运行时的后台执行合约（工具调用、待确认动作）。**现仅剩 fallback**：托管主路已是 agent-runner（`backend/agent_runtime/`），待 Stage F 退役，见 `docs/HOSTED_MODEL_API_RETIREMENT_ROADMAP.zh.md` |
-| `model_api_runtime/` | 托管聊天的 prompt 构建与工具（web search 等）。同上，仅剩 fallback |
-| `agent_runtime/` | agent-runner：托管用户的主运行时（每用户一个 claude/codex CLI agent 进程，supervisor + spawner + litellm gateway） |
+| `hosted_runtime.py` | 旧接口兼容辅助；不是 hosted 执行路径，也不能启动 resident runtime |
+| `model_api_runtime/v2/` | 托管 Runtime V2：durable queue、统一 provider/tool loop、summary+tail、outbox、telemetry、workspace 与 background lanes |
+| `agent_runtime/` | 仅保留与独立 agent 接入有关的非 supervisor 辅助；旧 hosted per-user CLI supervisor/spawner 已删除 |
 | `context_memory_selection.py` | 记忆检索与相关性打分，组上下文窗口 |
 | `perception/` | 扩展感知：信号目录、权限、快照、wake 触发 |
 | `dstack_tls.py` | dstack-KMS 密钥派生 + 确定性 TLS 证书生成 |
@@ -222,8 +234,8 @@ fallback；观察窗口健康后再逐条删除旧执行体，而不是长期并
   落库即唤醒；缓存刷新时也会唤醒 waiter，让挂着的 poll 立刻重连。
 - **运行形态**：gunicorn + UvicornWorker，默认单 worker（进程内缓存
   约束，见优化清单 #1；多 worker 需 `FEEDLING_BACKEND_WORKERS` +
-  leader 选举），另开 :9998 WebSocket 端口收屏幕帧；chat 每用户
-  5000 条环形缓冲，O(1) 修剪。
+  leader 选举），另开 :9998 WebSocket 端口收屏幕帧；chat 每用户最近
+  5,000 条仅作为进程热窗口，数据库原始消息不自动修剪。
 
 ### 5.2 ~~`mcp_server.py` — FastMCP 服务器~~（已移除 2026-06-12）
 
@@ -363,18 +375,16 @@ push token 是明文——文档里明确坦白）。
 服务端逻辑（多租户分区、时间排序、计数、验收门）都必须建立在**有意暴露
 的明文元数据**上，其余全部进密文。
 
-Schema 由 Alembic 管理（`backend/alembic/versions/`，目前 13 个 revision，
-`0001_baseline` … `0012_per_user_cascade_fk`，中间含一次双头 merge
-`0005_merge_agent_perception`），
+Schema 由 Alembic 管理（`backend/alembic/versions/`；以仓库当前单一 Alembic
+head 为准，不在说明文档里复制会快速过期的 revision 数量），
 DDL 全部幂等（`IF NOT EXISTS`），所以 baseline 可以安全地 stamp 到
 Alembic 出现之前就已建表的生产 RDS 上。
 
 ### 7.2 表清单（核心表，来自 `0001_baseline` + `0002_perception_items`）
 
-> 后续 revision 还加了：`agent_runtime_instances`（0004）、`perception_daily`
-> （0004）、`copytext_strings`/`copytext_meta`（0006）、`genesis_import_*` 三表
-> （0008）、`agent_runtime_supervisor_heartbeats`（0010）、`world_book_entries`
-> （0011）。下表只列核心表。
+> 后续 revision 还增加了 perception、Genesis、Runtime V2 durable jobs、
+> summary/metrics/outbox、workspace/sandbox usage 等表。旧 resident supervisor
+> 表只作为迁移兼容数据存在，不代表当前 hosted topology。下表只列核心表。
 
 | 表 | 主键 / 索引 | 存什么 |
 |----|------------|--------|
@@ -382,7 +392,7 @@ Alembic 出现之前就已建表的生产 RDS 上。
 | `global_blobs` | `key` | 全局 JSONB 文档（配置/缓存） |
 | `users` | `user_id` | 用户记录：api_key 哈希、access_bindings、设备公钥等，全在 `doc` |
 | `user_blobs` | `(user_id, kind)` | per-user 键值文档：identity、model_api 配置、bootstrap 状态、push tokens、perception 状态、history_import job 等，按 `kind` 区分 |
-| `chat_messages` | `(user_id, msg_id)`；`(user_id, seq)` 索引，seq 自增 | 聊天消息信封。**环形缓冲**：每用户上限 5000 条，超限按 seq 做 O(1) 修剪 |
+| `chat_messages` | `(user_id, msg_id)`；`(user_id, seq)` 索引，seq 自增 | 聊天消息信封的持久源记录；按 seq 分页，达到 5,000 条或 prompt compaction 都不会自动删除 |
 | `memory_moments` | `(user_id, moment_id)`；`(user_id, occurred_at)` 索引 | 记忆卡片信封（见 §7.4） |
 | `frame_envelopes` | `(user_id, frame_id)`；`(user_id, ts)` 索引 | 屏幕帧大信封（可 >150KB） |
 | `user_logs` | `(user_id, stream, seq)`；另有 ts / item_key 部分索引 | **通用 append-only 流**：proactive_jobs、proactive_decisions、memory_changes、memory_capture_jobs、perception_events 等共用一张表，按 `stream` 命名空间区分 |
@@ -574,7 +584,7 @@ hex / 裸字号 / 裸字体串，必须用 `Color.feedling…` / `Font.feedling�
 | 怎么审计一台活的 CVM | `docs/AUDIT.md` + `tools/audit_live_cvm.py` |
 | 主动唤醒 / 感知 Round 3 | `docs/PROACTIVE_PERCEPTION_SPEC_V2.md`（V2 已全量 cutover；执行计划/迁移契约文档已删，见 CHANGELOG 2026-06-22 / 2026-06-26 与 git 历史） |
 | 扩展感知 API | `docs/EXTENDED_PERCEPTION_API.md` |
-| 托管模型 API 路由 | `docs/HOSTED_MODEL_API_RETIREMENT_ROADMAP.zh.md`（主路 agent-runner；原 P0 设计文档 `MODEL_API_PATH_P0.md` 已删，见 git 历史） |
+| 托管 Runtime V2 现行状态 | `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md` + `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md` |
 | 部署历史与链上记录 | `deploy/DEPLOYMENTS.md` |
 | 运行时流程与 prompt 原文（onboarding 后日常 / 两条路线的数据流） | `docs/RUNTIME_FLOWS.md` |
 | 已知技术债与优化方向 | `docs/OPTIMIZATION_BACKLOG.md` |
