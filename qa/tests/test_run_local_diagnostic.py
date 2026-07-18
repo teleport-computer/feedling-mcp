@@ -2012,6 +2012,9 @@ def test_preflight_creates_sanitized_non_release_artifact_and_calls_cleanup(
             trust_order.append("deployment")
             or _deployment_verification(*args, **kwargs)
         ),
+        observe_deployment=lambda *_args, **_kwargs: pytest.fail(
+            "protected identity mode must not use public health observation"
+        ),
         verify_codex_provenance=lambda _path: trust_order.append("provenance"),
         verify_codex_version=lambda _path: trust_order.append("version"),
         verify_login=lambda *_args: None,
@@ -2033,6 +2036,7 @@ def test_preflight_creates_sanitized_non_release_artifact_and_calls_cleanup(
     assert summary["validated_credential_names"] == ["QA_GEMINI_API_KEY"]
     assert summary["missing_strict_evidence"]
     assert summary["codex_preflight"]["headless_exec_completed"] is True
+    assert summary["deployment_recheck"] is None
     network_profile = dict(summary["codex_network_profile"])
     assert type(network_profile.pop("benchmark_fake_ip_detected")) is bool
     assert network_profile == {
@@ -2052,6 +2056,9 @@ def test_preflight_creates_sanitized_non_release_artifact_and_calls_cleanup(
         "profiles",
     }
     assert "UNVERIFIED" in (artifacts / "matrix.md").read_text()
+    assert "End-of-run deployment recheck: `NOT_APPLICABLE`" in (
+        artifacts / "matrix.md"
+    ).read_text()
     junit = ElementTree.parse(artifacts / "junit.xml").getroot()
     assert junit.attrib["skipped"] == "14"
     assert junit.attrib["release_qualified"] == "false"
@@ -2216,6 +2223,352 @@ def test_public_health_observer_rejects_unhealthy_or_unpinned_target(
         )
 
 
+def _public_health_receipt(
+    receipt_path: Path,
+    *,
+    sha: str,
+    expected_runtime: str,
+) -> dict:
+    receipt = {
+        "schema_version": 1,
+        "environment": "test",
+        "base_url": "https://test-api.feedling.app",
+        "expected_runtime": expected_runtime,
+        "expected_deployment_sha": sha,
+        "observed_backend_sha": sha,
+        "observed_deployment_sha": None,
+        "observed_worker_sha": None,
+        "live_worker_count": None,
+        "runtime_evidence_source": "deployed_runtime_readback",
+        "liveness_verified": True,
+        "deployment_identity_verified": False,
+        "deployment_identity_observed": True,
+        "identity_evidence_source": local.PUBLIC_HEALTH_IDENTITY_SOURCE,
+        "identity_gap_code": local.PUBLIC_HEALTH_IDENTITY_GAP,
+        "health_status": "healthy",
+        "verified_at": "2026-07-18T00:00:00+00:00",
+    }
+    local._write_private_json(receipt_path, receipt)
+    receipt_path.chmod(0o400)
+    return receipt
+
+
+def _public_health_blocked_run_dependencies(
+    events: list[str],
+    observations: list[str | Exception],
+) -> local.DiagnosticDependencies:
+    profile_id = "official-gemini"
+
+    def observe(expected_sha, receipt_path, *, env, expected_runtime):
+        events.append("health-start" if not events else "health-end")
+        assert env == {"IO_E2E_BASE_URL": "https://test-api.feedling.app"}
+        observation = observations.pop(0)
+        if isinstance(observation, Exception):
+            raise observation
+        if expected_sha is not None:
+            assert expected_sha == "a" * 40
+            assert observation == expected_sha
+        return _public_health_receipt(
+            receipt_path,
+            sha=observation,
+            expected_runtime=expected_runtime,
+        )
+
+    def provision(_coverage, manifest_path, **_kwargs):
+        manifest = _diagnostic_manifest(
+            (profile_id,),
+            [
+                _diagnostic_manifest_profile(
+                    profile_id,
+                    provision_status="blocked",
+                    provision_failure_code="VALID_KEY_REJECTED",
+                )
+            ],
+            runtime_requirement=local.BASELINE_RUNTIME,
+        )
+        local._write_private_json(manifest_path, manifest)
+        return manifest
+
+    def cleanup(path, **_kwargs):
+        events.append("cleanup")
+        path.unlink()
+        return {
+            "attempted": 1,
+            "cleaned": 1,
+            "failed_profile_ids": [],
+            "manifest_deleted": True,
+            "manifest_missing": False,
+        }
+
+    return local.DiagnosticDependencies(
+        provision=provision,
+        cleanup=cleanup,
+        launch=lambda **_kwargs: pytest.fail("blocked profile must not launch"),
+        verify_deployment=lambda *_args, **_kwargs: pytest.fail(
+            "protected verifier must not run"
+        ),
+        observe_deployment=observe,
+        verify_codex_provenance=lambda _path: None,
+        verify_codex_version=lambda _path: None,
+        verify_login=lambda *_args: None,
+        verify_codex_exec=_codex_preflight_receipt,
+        collect_harness_provenance=_harness_provenance_receipt,
+    )
+
+
+def test_public_health_same_sha_recheck_passes_after_cleanup(tmp_path):
+    options = replace(
+        _options(tmp_path, preflight_only=False),
+        allow_public_health_identity=True,
+    )
+    events: list[str] = []
+    dependencies = _public_health_blocked_run_dependencies(
+        events, ["a" * 40, "a" * 40]
+    )
+
+    summary, summary_path = local.execute(options, dependencies=dependencies)
+
+    assert events == ["health-start", "cleanup", "health-end"]
+    assert summary["status"] == "DIAGNOSTIC_FAIL"
+    assert summary["deployment_recheck"]["status"] == "PASS"
+    assert summary["deployment_recheck"]["failure_code"] == "NONE"
+    assert summary["deployment_identity"]["stable_for_run"] is True
+    assert "gemini-sensitive-value" not in summary_path.read_text()
+    assert not any(options.private_base.iterdir())
+
+
+def test_public_health_changed_sha_invalidates_run_after_cleanup(tmp_path):
+    options = replace(
+        _options(tmp_path, preflight_only=False),
+        allow_public_health_identity=True,
+    )
+    events: list[str] = []
+    dependencies = _public_health_blocked_run_dependencies(
+        events, ["a" * 40, "b" * 40]
+    )
+
+    with pytest.raises(
+        local.LocalDiagnosticError,
+        match="deployed backend changed during diagnostic run",
+    ):
+        local.execute(options, dependencies=dependencies)
+
+    assert events == ["health-start", "cleanup", "health-end"]
+    summaries = list(
+        options.source_root.glob("qualification-artifacts/*/diagnostic-summary.json")
+    )
+    assert len(summaries) == 1
+    summary = json.loads(summaries[0].read_text())
+    assert summary["status"] == "DIAGNOSTIC_ERROR"
+    assert summary["error"] == "deployed backend changed during diagnostic run"
+    assert summary["deployment_recheck"] == {
+        "required": True,
+        "status": "FAIL",
+        "failure_code": local.PUBLIC_HEALTH_RECHECK_CHANGED,
+        "expected_backend_sha": "a" * 40,
+        "observed_backend_sha": "b" * 40,
+        "health_status": "healthy",
+        "identity_evidence_source": local.PUBLIC_HEALTH_IDENTITY_SOURCE,
+    }
+    assert summary["deployment_identity"]["stable_for_run"] is False
+    assert summary["cleanup"]["cleaned"] == 1
+    assert summary["parent_cleanup_verification"]["status"] == "PASS"
+    assert "gemini-sensitive-value" not in summaries[0].read_text()
+    assert not any(options.private_base.iterdir())
+
+
+def test_public_health_changed_sha_after_launch_cleans_before_end_recheck(
+    tmp_path,
+):
+    options = replace(
+        _options(tmp_path, preflight_only=False),
+        allow_public_health_identity=True,
+    )
+    events: list[str] = []
+    observations = ["a" * 40, "b" * 40]
+
+    def observe(expected_sha, receipt_path, *, env, expected_runtime):
+        events.append("health-start" if not events else "health-end")
+        assert env == {"IO_E2E_BASE_URL": "https://test-api.feedling.app"}
+        observed_sha = observations.pop(0)
+        if expected_sha is not None:
+            assert expected_sha == observed_sha
+        return _public_health_receipt(
+            receipt_path,
+            sha=observed_sha,
+            expected_runtime=expected_runtime,
+        )
+
+    def provision(_coverage, manifest_path, **_kwargs):
+        events.append("provision")
+        manifest = _diagnostic_manifest(
+            ("official-gemini",),
+            [_diagnostic_manifest_profile("official-gemini")],
+            runtime_requirement=local.BASELINE_RUNTIME,
+        )
+        local._write_private_json(manifest_path, manifest)
+        return manifest
+
+    def launch(**kwargs):
+        events.append("launch")
+        profile = _parent_cleanup_deferred_profile("official-gemini")
+        profile.update(
+            {
+                "observed_runtime": "hosted_resident",
+                "observed_runtime_version": 2,
+                "latency": {
+                    "sample_count": 1,
+                    "ack_p50_ms": 1,
+                    "reply_p50_ms": 2,
+                    "reply_p95_ms": 2,
+                    "stage_p50_ms": {
+                        "routing": 1,
+                        "queue": 1,
+                        "provider": 1,
+                        "persistence": 1,
+                        "delivery": 1,
+                    },
+                    "missing_stages": [],
+                },
+                "reasoning": {
+                    "reasoning_event_count": 1,
+                    "metadata_present": True,
+                    "token_metadata_present": True,
+                    "reasoning_token_count": 1,
+                    "user_visible_disclosure_present": True,
+                },
+            }
+        )
+        local._write_private_json(
+            kwargs["aggregation_input_root"] / "official-gemini.json",
+            profile,
+        )
+        return {
+            "launch_attempts": 1,
+            "max_observed_profile_concurrency": 1,
+            "workers": [
+                {
+                    "profile_id": "official-gemini",
+                    "result_source": "codex_worker",
+                    "fallback_reason": None,
+                    **_worker_observability_fields(),
+                    "completed_command_execution_count": 13,
+                    "completed_scenario_command_ids": list(
+                        workers.AGENT_LIVE_SCENARIO_IDS
+                    ),
+                    "completed_scenario_command_counts": (
+                        orchestration.MIN_SCENARIO_COMMAND_COUNTS
+                    ),
+                    "p0_06_command_phases": list(
+                        orchestration.P0_06_COMMAND_PHASES
+                    ),
+                    "cot_receipt_sha256": "a" * 64,
+                    "cot_delivery_status": "PASS",
+                    "cot_failure_code": "NONE",
+                    "cot_delivery_qualified": True,
+                    "cot_final_answer_correct": True,
+                    "cot_reasoning_event_count": 1,
+                    "cot_metadata_present": True,
+                    "cot_token_metadata_status": "PRESENT",
+                    "cot_reasoning_token_count": 1,
+                    "cot_user_visible_disclosure_present": True,
+                }
+            ],
+        }
+
+    def cleanup(path, **_kwargs):
+        events.append("cleanup")
+        path.unlink()
+        return {
+            "attempted": 1,
+            "cleaned": 1,
+            "failed_profile_ids": [],
+            "manifest_deleted": True,
+            "manifest_missing": False,
+        }
+
+    dependencies = local.DiagnosticDependencies(
+        provision=provision,
+        cleanup=cleanup,
+        launch=launch,
+        verify_deployment=lambda *_args, **_kwargs: pytest.fail(
+            "protected verifier must not run"
+        ),
+        observe_deployment=observe,
+        verify_codex_provenance=lambda _path: None,
+        verify_codex_version=lambda _path: None,
+        verify_login=lambda *_args: None,
+        verify_codex_exec=_codex_preflight_receipt,
+        collect_harness_provenance=_harness_provenance_receipt,
+    )
+
+    with pytest.raises(
+        local.LocalDiagnosticError,
+        match="deployed backend changed during diagnostic run",
+    ):
+        local.execute(options, dependencies=dependencies)
+
+    assert events == [
+        "health-start",
+        "provision",
+        "launch",
+        "cleanup",
+        "health-end",
+    ]
+    summaries = list(
+        options.source_root.glob("qualification-artifacts/*/diagnostic-summary.json")
+    )
+    assert len(summaries) == 1
+    summary = json.loads(summaries[0].read_text())
+    assert summary["deployment_recheck"]["failure_code"] == (
+        local.PUBLIC_HEALTH_RECHECK_CHANGED
+    )
+    assert summary["cleanup"]["cleaned"] == 1
+    assert summary["parent_cleanup_verification"]["status"] == "PASS"
+    junit = ElementTree.parse(summaries[0].parent / "junit.xml").getroot()
+    assert junit.find(
+        ".//error[@type='DEPLOYMENT_CHANGED_DURING_RUN']"
+    ) is not None
+
+
+def test_public_health_unavailable_end_recheck_is_sanitized_after_cleanup(tmp_path):
+    options = replace(
+        _options(tmp_path, preflight_only=False),
+        allow_public_health_identity=True,
+    )
+    events: list[str] = []
+    leaked_transport_detail = "gemini-sensitive-value-end-health-error"
+    dependencies = _public_health_blocked_run_dependencies(
+        events,
+        ["a" * 40, RuntimeError(leaked_transport_detail)],
+    )
+
+    with pytest.raises(
+        local.LocalDiagnosticError,
+        match="end-of-run deployed backend health re-attestation failed",
+    ):
+        local.execute(options, dependencies=dependencies)
+
+    assert events == ["health-start", "cleanup", "health-end"]
+    artifact_roots = list(options.source_root.glob("qualification-artifacts/*"))
+    assert len(artifact_roots) == 1
+    summary_path = artifact_roots[0] / "diagnostic-summary.json"
+    summary = json.loads(summary_path.read_text())
+    assert summary["status"] == "DIAGNOSTIC_ERROR"
+    assert summary["deployment_recheck"]["failure_code"] == (
+        local.PUBLIC_HEALTH_RECHECK_FAILED
+    )
+    assert summary["deployment_recheck"]["observed_backend_sha"] is None
+    assert summary["cleanup"]["cleaned"] == 1
+    assert summary["parent_cleanup_verification"]["status"] == "PASS"
+    public_bytes = b"".join(
+        path.read_bytes() for path in artifact_roots[0].rglob("*") if path.is_file()
+    )
+    assert leaked_transport_detail.encode() not in public_bytes
+    assert b"gemini-sensitive-value" not in public_bytes
+    assert not any(options.private_base.iterdir())
+
+
 def test_public_health_mode_is_required_when_admin_credential_is_absent(tmp_path):
     options = replace(
         _options(
@@ -2329,7 +2682,22 @@ def test_adminless_public_health_preflight_uses_observed_sha_before_codex(tmp_pa
         "identity_evidence_source": local.PUBLIC_HEALTH_IDENTITY_SOURCE,
         "identity_gap_code": local.PUBLIC_HEALTH_IDENTITY_GAP,
         "health_status": "healthy",
+        "run_stability_checked": True,
+        "run_stability_status": "PASS",
+        "end_observed_backend_sha": discovered_sha,
+        "end_health_status": "healthy",
+        "stable_for_run": True,
     }
+    assert summary["deployment_recheck"] == {
+        "required": True,
+        "status": "PASS",
+        "failure_code": "NONE",
+        "expected_backend_sha": discovered_sha,
+        "observed_backend_sha": discovered_sha,
+        "health_status": "healthy",
+        "identity_evidence_source": local.PUBLIC_HEALTH_IDENTITY_SOURCE,
+    }
+    assert order.count("public-health") == 2
     matrix = (summary_path.parent / "matrix.md").read_text(encoding="utf-8")
     assert "OBSERVED_UNATTESTED" in matrix
     assert local.PUBLIC_HEALTH_IDENTITY_SOURCE in matrix

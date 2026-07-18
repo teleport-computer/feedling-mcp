@@ -60,6 +60,8 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
 LOCKED_BASE_URL = "https://test-api.feedling.app"
 PUBLIC_HEALTH_IDENTITY_SOURCE = "public_healthz_release_git_commit"
 PUBLIC_HEALTH_IDENTITY_GAP = "DEPLOYMENT_SHA_NOT_INDEPENDENTLY_ATTESTED"
+PUBLIC_HEALTH_RECHECK_CHANGED = "DEPLOYMENT_CHANGED_DURING_RUN"
+PUBLIC_HEALTH_RECHECK_FAILED = "END_HEALTH_REATTESTATION_FAILED"
 BASELINE_RUNTIME = provision_profiles.BASELINE_RUNTIME_REQUIREMENT
 RUNTIME_V2_RUNTIME = provision_profiles.RUNTIME_V2_REQUIREMENT
 DEFAULT_CODEX_MODEL = "gpt-5.4"
@@ -1538,6 +1540,109 @@ def _observe_public_health_deployment(
     return receipt
 
 
+def _public_health_end_recheck(
+    expected_sha: str,
+    receipt_path: Path,
+    *,
+    env: Mapping[str, str],
+    expected_runtime: str,
+    observer: Callable[..., dict[str, Any]],
+) -> tuple[dict[str, Any], str | None]:
+    """Re-observe public health after cleanup without trusting worker output.
+
+    The observer is called without an expected SHA so this boundary can record
+    an honest changed deployment instead of collapsing it into a transport
+    error.  Only fixed, sanitized fields are returned to the public summary.
+    """
+
+    if not _SHA_RE.fullmatch(expected_sha):
+        raise LocalDiagnosticError("candidate SHA must be 40 or 64 lowercase hex characters")
+    try:
+        receipt = observer(
+            None,
+            receipt_path,
+            env=env,
+            expected_runtime=expected_runtime,
+        )
+    except Exception:
+        return (
+            {
+                "required": True,
+                "status": "FAIL",
+                "failure_code": PUBLIC_HEALTH_RECHECK_FAILED,
+                "expected_backend_sha": expected_sha,
+                "observed_backend_sha": None,
+                "health_status": None,
+                "identity_evidence_source": PUBLIC_HEALTH_IDENTITY_SOURCE,
+            },
+            "end-of-run deployed backend health re-attestation failed",
+        )
+
+    observed = (
+        str(receipt.get("observed_backend_sha") or "").lower()
+        if isinstance(receipt, Mapping)
+        else ""
+    )
+    health_status = (
+        str(receipt.get("health_status") or "")
+        if isinstance(receipt, Mapping)
+        else ""
+    )
+    structurally_valid = bool(
+        isinstance(receipt, Mapping)
+        and _SHA_RE.fullmatch(observed)
+        and receipt.get("expected_deployment_sha") == observed
+        and receipt.get("observed_deployment_sha") is None
+        and receipt.get("observed_worker_sha") is None
+        and receipt.get("liveness_verified") is True
+        and receipt.get("deployment_identity_verified") is False
+        and receipt.get("deployment_identity_observed") is True
+        and receipt.get("identity_evidence_source")
+        == PUBLIC_HEALTH_IDENTITY_SOURCE
+        and receipt.get("identity_gap_code") == PUBLIC_HEALTH_IDENTITY_GAP
+        and receipt.get("expected_runtime") == expected_runtime
+        and receipt.get("base_url") == LOCKED_BASE_URL
+    )
+    if not structurally_valid or health_status != "healthy":
+        return (
+            {
+                "required": True,
+                "status": "FAIL",
+                "failure_code": PUBLIC_HEALTH_RECHECK_FAILED,
+                "expected_backend_sha": expected_sha,
+                "observed_backend_sha": observed if _SHA_RE.fullmatch(observed) else None,
+                "health_status": health_status or None,
+                "identity_evidence_source": PUBLIC_HEALTH_IDENTITY_SOURCE,
+            },
+            "end-of-run deployed backend health re-attestation failed",
+        )
+    if observed != expected_sha:
+        return (
+            {
+                "required": True,
+                "status": "FAIL",
+                "failure_code": PUBLIC_HEALTH_RECHECK_CHANGED,
+                "expected_backend_sha": expected_sha,
+                "observed_backend_sha": observed,
+                "health_status": health_status,
+                "identity_evidence_source": PUBLIC_HEALTH_IDENTITY_SOURCE,
+            },
+            "deployed backend changed during diagnostic run",
+        )
+    return (
+        {
+            "required": True,
+            "status": "PASS",
+            "failure_code": "NONE",
+            "expected_backend_sha": expected_sha,
+            "observed_backend_sha": observed,
+            "health_status": health_status,
+            "identity_evidence_source": PUBLIC_HEALTH_IDENTITY_SOURCE,
+        },
+        None,
+    )
+
+
 def _write_private_bytes(path: Path, payload: bytes) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -2763,6 +2868,7 @@ def execute(
         "codex_preflight": None,
         "codex_network_profile": None,
         "deployment_identity": None,
+        "deployment_recheck": None,
         "cot_delivery": {},
         "missing_strict_evidence": list(MISSING_STRICT_EVIDENCE),
         "cleanup": None,
@@ -3154,6 +3260,37 @@ def execute(
                 )
                 else "DIAGNOSTIC_FAIL"
             )
+
+    if (
+        options.allow_public_health_identity
+        and isinstance(summary.get("deployment_identity"), Mapping)
+        and _SHA_RE.fullmatch(str(options.candidate_sha or ""))
+    ):
+        observer = dependencies.observe_deployment or _observe_public_health_deployment
+        recheck, recheck_failure = _public_health_end_recheck(
+            options.candidate_sha,
+            paths.private_root / "deployment-end-observation.json",
+            env={"IO_E2E_BASE_URL": LOCKED_BASE_URL},
+            expected_runtime=options.runtime_requirement,
+            observer=observer,
+        )
+        summary["deployment_recheck"] = recheck
+        identity = summary["deployment_identity"]
+        identity["run_stability_checked"] = True
+        identity["run_stability_status"] = recheck["status"]
+        identity["end_observed_backend_sha"] = recheck[
+            "observed_backend_sha"
+        ]
+        identity["end_health_status"] = recheck["health_status"]
+        if recheck_failure is not None:
+            identity["stable_for_run"] = False
+            if summary["status"] != "CLEANUP_FAIL":
+                summary["status"] = "DIAGNOSTIC_ERROR"
+                summary["error"] = recheck_failure
+            if failure is None:
+                failure = recheck_failure
+        else:
+            identity["stable_for_run"] = True
 
     retain_debug = (
         worker_phase_started

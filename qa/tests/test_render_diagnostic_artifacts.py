@@ -94,6 +94,35 @@ def test_junit_fails_p012_when_trusted_cot_is_nonpassing(cot_status):
     )
 
 
+def test_junit_marks_failed_end_deployment_recheck_as_run_error():
+    summary = _summary("PASS")
+    summary["deployment_recheck"] = {
+        "required": True,
+        "status": "FAIL",
+        "failure_code": "DEPLOYMENT_CHANGED_DURING_RUN",
+    }
+
+    root = ElementTree.fromstring(
+        renderer.render_junit(
+            summary,
+            {PROFILE_ID: _agent_pass_profile()},
+            (PROFILE_ID,),
+        )
+    )
+
+    assert root.attrib["tests"] == "15"
+    assert root.attrib["failures"] == "0"
+    assert root.attrib["errors"] == "1"
+    suite = root.find("./testsuite[@name='io.diagnostic.deployment-stability']")
+    assert suite is not None
+    error = suite.find("./testcase/error")
+    assert error is not None
+    assert error.attrib == {
+        "type": "DEPLOYMENT_CHANGED_DURING_RUN",
+        "message": "deployment-recheck:DEPLOYMENT_CHANGED_DURING_RUN",
+    }
+
+
 def test_junit_keeps_agent_p012_pass_when_trusted_cot_passes():
     root = ElementTree.fromstring(
         renderer.render_junit(

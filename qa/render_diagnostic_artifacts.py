@@ -43,6 +43,9 @@ PROVISION_STATUS_READY = "ready"
 PROVISION_STATUS_BLOCKED = "blocked"
 PROVISION_FAILURE_NONE = "NONE"
 TRUSTED_NOT_RUN_PROVISION_FAILURE_CODES = frozenset({"VALID_KEY_REJECTED"})
+DEPLOYMENT_RECHECK_FAILURE_CODES = frozenset(
+    {"DEPLOYMENT_CHANGED_DURING_RUN", "END_HEALTH_REATTESTATION_FAILED"}
+)
 WORKER_RESULT_SOURCES = frozenset(
     {"codex_worker", "deterministic_fallback", "provision_blocked"}
 )
@@ -85,6 +88,25 @@ def _profile(
 ) -> Mapping[str, Any] | None:
     value = profile_results.get(profile_id)
     return value if isinstance(value, Mapping) else None
+
+
+def _deployment_recheck(summary: Mapping[str, Any]) -> tuple[str, str, bool]:
+    value = summary.get("deployment_recheck")
+    if not isinstance(value, Mapping):
+        return "NOT_APPLICABLE", "NOT_APPLICABLE", False
+    status = value.get("status")
+    code = value.get("failure_code")
+    if (
+        value.get("required") is not True
+        or (status == "PASS" and code != "NONE")
+        or (
+            status == "FAIL"
+            and code not in DEPLOYMENT_RECHECK_FAILURE_CODES
+        )
+        or status not in {"PASS", "FAIL"}
+    ):
+        return "UNVERIFIED", "UNVERIFIED", True
+    return str(status), str(code), True
 
 
 def _provisioning_dispositions(
@@ -338,6 +360,7 @@ def render_matrix(
         if identity_present
         else "UNAVAILABLE"
     )
+    recheck_status, recheck_code, _ = _deployment_recheck(summary)
     lines = [
         "# io local API-key diagnostic",
         "",
@@ -346,6 +369,8 @@ def render_matrix(
         f"- Deployment identity: `{identity_status}`",
         f"- Identity evidence source: `{identity_source}`",
         f"- Identity evidence gap: `{identity_gap}`",
+        f"- End-of-run deployment recheck: `{recheck_status}`",
+        f"- Deployment recheck code: `{recheck_code}`",
         f"- Harness Git HEAD: `{harness.get('git_head', 'UNAVAILABLE')}`",
         f"- Harness source SHA-256: `{harness.get('source_sha256', 'UNAVAILABLE')}`",
         f"- Worker snapshot SHA-256: `{harness.get('worker_snapshot_sha256', 'UNAVAILABLE')}`",
@@ -559,9 +584,11 @@ def render_junit(
     provisioning = _provisioning_dispositions(summary, profile_ids)
     preflight_only = summary.get("preflight_only") is True
     tests_per_profile = len(SCENARIO_IDS) + 1
-    tests = len(profile_ids) * tests_per_profile
+    recheck_status, recheck_code, recheck_present = _deployment_recheck(summary)
+    tests = len(profile_ids) * tests_per_profile + int(recheck_present)
     failures = 0
-    errors = 0
+    recheck_error = int(recheck_present and recheck_status != "PASS")
+    errors = recheck_error
     skipped = 0
     rows: list[tuple[str, dict[str, str], str, str, int, int, int]] = []
     for profile_id in profile_ids:
@@ -612,6 +639,35 @@ def render_junit(
             "release_qualified": "false",
         },
     )
+    if recheck_present:
+        deployment_suite = ElementTree.SubElement(
+            root,
+            "testsuite",
+            {
+                "name": "io.diagnostic.deployment-stability",
+                "tests": "1",
+                "failures": "0",
+                "errors": str(recheck_error),
+                "skipped": "0",
+            },
+        )
+        deployment_case = ElementTree.SubElement(
+            deployment_suite,
+            "testcase",
+            {
+                "classname": "io.diagnostic.deployment-stability",
+                "name": "END_OF_RUN_HEALTH_IDENTITY",
+            },
+        )
+        if recheck_error:
+            ElementTree.SubElement(
+                deployment_case,
+                "error",
+                {
+                    "type": recheck_code,
+                    "message": f"deployment-recheck:{recheck_code}",
+                },
+            )
     for (
         profile_id,
         statuses,
