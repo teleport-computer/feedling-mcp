@@ -119,6 +119,8 @@ if not _provisioned:
         "test_proactive_tool_executor_v2.py",
         "test_proactive_scheduled_wake_v2.py",
         "test_perception.py",
+        "test_perception_recent_apps.py",
+        "test_perception_recent_apps_flow.py",
         "test_ios_perception_contract_v2.py",
         "test_perception_ingress_v2.py",
         "test_provider_client.py",
@@ -145,6 +147,8 @@ if not _provisioned:
         "test_chat_resident_consumer_file.py",
         "test_user_mcp_probe.py",
         "test_user_mcp_materialize.py",
+        "test_user_mcp_ca_fetch.py",
+        "test_identity_value_write_path.py",
     }
     collect_ignore = sorted(
         f

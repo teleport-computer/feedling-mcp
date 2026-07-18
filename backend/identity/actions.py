@@ -44,10 +44,17 @@ def _identity_plain_for_action(store: UserStore, api_key: str | None,
 
 
 def _identity_payload_from_plain(identity: dict) -> dict:
+    from identity import card_policy
+    # Single chokepoint for init / profile_patch / dimension_nudge: run the
+    # dimensions through card_policy.sanitize so no non-integer value (BYOK weak
+    # models emit 0–1-scale floats like 0.95) is ever re-encrypted into the card.
+    # sanitize also drops malformed dims and normalizes to the 0–100 int contract,
+    # self-healing an already-poisoned existing card on the next write.
+    raw_dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
     payload = {
         "agent_name": str(identity.get("agent_name") or "")[:80],
         "self_introduction": str(identity.get("self_introduction") or "")[:1200],
-        "dimensions": identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else [],
+        "dimensions": card_policy.sanitize_identity_card({"dimensions": raw_dims})["dimensions"],
     }
     for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
         if key in {"agent_name", "self_introduction"}:

@@ -76,6 +76,10 @@ DEFAULT_TOOL_SPECS_V2: tuple[ToolSpecV2, ...] = (
     ToolSpecV2("perception.now_playing", "perception", FAST, "Current media playback."),
     ToolSpecV2("perception.motion", "perception", FAST, "Motion is pull-only; it is not a wake source."),
     ToolSpecV2("perception.audio_route", "perception", FAST, "Current audio output route (type/bluetooth/device name)."),
+    ToolSpecV2("perception.recent_apps", "perception", FAST,
+               "Which apps the user opened recently, newest first (app/category/ts/minutes_ago). "
+               "Use this for 'what have I been doing/using' -- perception.now only carries the app "
+               "opened in the last 15 minutes. Args: limit, hours."),
     ToolSpecV2("perception.weather", "perception", FAST, "WeatherKit: condition/temp/apparent/humidity/precip/UV/daylight/alerts."),
     ToolSpecV2("perception.steps", "perception", SLOW, "Today's exact step count (HealthKit)."),
     ToolSpecV2("perception.sleep_last_night", "perception", SLOW, "Last night sleep: asleep + core/deep/rem minutes."),
@@ -128,6 +132,7 @@ FOREGROUND_CHAT_TOOL_NAMES_V2 = frozenset({
     "perception.calendar",
     "perception.motion",
     "perception.weather",
+    "perception.recent_apps",
 })
 
 

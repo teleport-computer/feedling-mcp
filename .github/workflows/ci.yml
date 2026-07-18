@@ -152,6 +152,20 @@ jobs:
       # auth / session / file-routing regression in CI before users see it.
       - name: Install pytest-asyncio (test-only)
         run: pip install pytest-asyncio
+
+      # tests/test_pi_mcp_bridge.py drives the pi user-MCP bridge (JS) through a
+      # node harness. Pinned to 22 to match the runner image, which installs
+      # nodejs from setup_22.x (deploy/Dockerfile.agent-runner) — a CI/production
+      # node skew would let CI bless code that breaks inside the CVM.
+      # Pinning also keeps the harness's `skipif(which("node") is None)` from
+      # firing silently: this repo has a documented silent-green history
+      # (conftest's collect_ignore drops whole DB modules with ZERO skips
+      # reported when Postgres is absent — "391 passed" against a real 2440).
+      - name: Set up Node (pi bridge harness)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Run isolation, CORS, and db regression suites
         # tests/conftest.py provisions a throwaway database from FEEDLING_TEST_PG
         # (the maintenance db) and exports DATABASE_URL for the spawned backends
@@ -196,6 +210,8 @@ jobs:
             tests/test_runtime_v2_default_flag.py \
             tests/test_capture_prompt_v1.py \
             tests/test_dream_prompt_v1.py \
+            tests/test_user_mcp_consumer.py \
+            tests/test_pi_mcp_bridge.py \
             -v
 
   # -------------------------------------------------------------------------
