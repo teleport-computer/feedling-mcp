@@ -409,8 +409,8 @@ class TurnDeps:
     # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
     read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
     # (user_id, message_ids) -> {message_id: {"file_name","file_mime","text","truncated"}}：
-    # 对指定的文件消息做 enclave 解密 + 服务端文本抽取（docx/xlsx/pdf/txt，见
-    # serve_worker._read_files → hosted.file_text）。与 read_images 同理**不能**并进 read_tail
+    # 优先读取加密 VFS text view；cache miss 时必须先拿到 sandbox 并记 usage，之后才从
+    # enclave 解密文件、交给 sandbox materialize/parse。与 read_images 同理**不能**并进 read_tail
     # （compaction 用大 limit 复用 read_tail，抽出的全文会灌爆摘要器 prompt）。默认 None：
     # worker.py 不 import hosted/capabilities，生产装配见 serve_worker。
     read_files: Callable[[str, list[str]], dict[str, dict]] | None = None
@@ -432,7 +432,7 @@ class TurnDeps:
     # user_id -> {"applied": int, "discarded": int}（Task 6 / spec A6）：run the
     # generation-fenced effect-outbox applier (`effect_outbox.apply_pending_effects`)
     # with this turn's real dispatch sinks at end-of-turn. worker.py itself never
-    # imports `model_api_runtime.v2.effect_outbox`'s dispatch-side wiring (the 7
+    # imports `model_api_runtime.v2.effect_outbox`'s dispatch-side wiring (the 8
     # sinks live in serve_worker.py, the assembly tier, since several of them
     # touch hosted-adjacent writers) — it only calls this injected callable.
     # None (the default for every pre-existing test/caller that doesn't wire it)
@@ -1209,6 +1209,11 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
         # Keep the trusted operation authoritative even if a future dispatcher
         # accidentally weakens top-level unknown-field rejection.
         return "schedule", {**tc.args, "op": tc.name}
+    if tc.name in ("workspace_write", "workspace_delete"):
+        # The trusted operation name stays outside the model-controlled args.
+        # Content is encrypted before entering the durable effect outbox, then
+        # re-encrypted as the workspace entry at the sink boundary.
+        return "workspace", {**tc.args, "op": tc.name}
     raise ValueError(f"no effect mapping for write tool {tc.name!r}")
 
 
@@ -1220,6 +1225,7 @@ ENCRYPTED_TOOL_EFFECT_TYPES = {
     "memory": "memory_encrypted_v1",
     "identity": "identity_encrypted_v1",
     "schedule": "schedule_encrypted_v1",
+    "workspace": "workspace_encrypted_v1",
 }
 
 
@@ -2138,7 +2144,7 @@ async def _run_wake(
                 raise RuntimeError("tool effect id derivation mismatch")
 
         async def _before_write() -> None:
-            await _fence_wake_effect("memory/identity/schedule write")
+            await _fence_wake_effect("memory/identity/schedule/workspace write")
 
         async def _dispatch_tools(tool_calls):
             await _fence_wake_effect("tool dispatch")
@@ -2556,12 +2562,12 @@ def _inject_tail_images(tail: list[dict], *, user_id: str, read_images) -> list[
 
 
 def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[dict]:
-    """把 tail 里最近 `_TAIL_FILE_LIMIT` 个文件行的 content 换成「文件名 + 服务端抽取的
-    纯文本」，让 tool-less 模型能真读到 docx/xlsx/pdf/txt 的内容。返回**新列表**，绝不原地
+    """把 tail 里最近 `_TAIL_FILE_LIMIT` 个文件行的 content 换成「文件名 + sandbox 抽取的
+    纯文本」，让 tool-less 模型能真读到附件内容。返回**新列表**，绝不原地
     改输入行（compaction 共用 read_tail 产出的 dict）。
 
-    任何失败（无 reader / 解密抛错 / 抽取为空 / 缺字段）都静默降级成原来的 `[file: name]`
-    文本行：用户拿到一条读不到文件的回复，好过拿到 error chip（no-filler 铁律）。
+    reader 整体失败会保留原 marker；单文件 fail-closed 会追加稳定的 unavailable code，
+    让模型不会误以为自己已经读过附件。两种情况都不产生 UI error chip。
     """
     if read_files is None:
         return tail
@@ -2579,6 +2585,14 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
     for row in tail:
         got = fetched.get(str(row.get("id"))) if row.get("has_file") else None
         text = str((got or {}).get("text") or "")
+        error = str((got or {}).get("error") or "")
+        if error:
+            marker = context.text_of(row.get("content")) or "[file]"
+            out.append({
+                **row,
+                "content": f"{marker}\n[artifact unavailable: {error}]",
+            })
+            continue
         if not text:
             out.append(row)
             continue

@@ -26,7 +26,7 @@ def test_reply_tool_schema_shape():
 
 def test_write_tools_have_object_params():
     specs = {s.name: s for s in tool_schema.build_tool_specs()}
-    for w in ("memory_write", "identity_patch", "schedule_wake"):
+    for w in ("memory_write", "identity_patch", "schedule_wake", "workspace_write"):
         assert specs[w].parameters["type"] == "object"
 
 

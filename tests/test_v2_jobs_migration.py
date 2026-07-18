@@ -120,12 +120,16 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
         "0019_tee_reconcile_state",
     }
     # 0040 chains linearly off 0039 (genesis serve-worker claim attribution for the
-    # deploy-orphan fast reclaim); it is the current single head.
+    # deploy-orphan fast reclaim), followed by 0041 mutation attempts and the
+    # 0042 V2 workspace foundation.
     assert script.get_revision("0040_genesis_worker_claim").down_revision == "0039_merge_tee_recon_state"
     assert script.get_revision("0041_v2_mcp_mutation_attempts").down_revision == (
         "0040_genesis_worker_claim"
     )
-    assert script.get_current_head() == "0041_v2_mcp_mutation_attempts"
+    assert script.get_revision("0042_v2_workspace_foundation").down_revision == (
+        "0041_v2_mcp_mutation_attempts"
+    )
+    assert script.get_current_head() == "0042_v2_workspace_foundation"
 
 
 def test_0041_indexes_and_validated_frontier_constraint_exist():
@@ -149,6 +153,21 @@ def test_0041_indexes_and_validated_frontier_constraint_exist():
     # 0041's keyset backfill advances on enqueue_seq and therefore relies on
     # the uniqueness installed by 0033 and retained/repaired by 0034.
     assert enqueue_seq_index == (True,)
+
+
+def test_0042_workspace_tables_and_mutation_frontier_are_installed():
+    with db.get_pool().connection() as conn:
+        tables = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_name IN ('v2_workspace_entries','v2_sandbox_usage_events')"
+        ).fetchall()
+        function_source = conn.execute(
+            "SELECT pg_get_functiondef('v2_fill_effect_input_frontier()'::regprocedure)"
+        ).fetchone()[0]
+    assert {row[0] for row in tables} == {
+        "v2_workspace_entries", "v2_sandbox_usage_events",
+    }
+    assert "workspace_encrypted_v1" in function_source
 
 
 def test_0041_claim_gate_is_installed_and_backfill_runs_after_ddl_commit():

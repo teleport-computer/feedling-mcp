@@ -63,6 +63,18 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- Runtime V2 adds an encrypted virtual workspace foundation with read-only
+  `/artifacts` and `/skills`, editable `/workspace`, and a persistent editable
+  `/memory/WORKING.md` that is distinct from Memory Garden. Native file writes
+  use optimistic revisions and the existing encrypted, generation-fenced effect
+  outbox. Sandbox acquisition is lazy: stored text views and Markdown edits do
+  not start one, while physical artifact materialization, untrusted binary
+  parsing, shell, and code execution require a registered sandbox provider.
+  Upload persistence is unchanged, but on a deployment without an audited CVM
+  or E2B adapter an uncached attachment is reported as `sandbox_unavailable`
+  instead of falling back to in-process parsing. Successful acquisitions append
+  content-free billing/usage events; cached text reads do not.
+
 - Proactive wake bubbles no longer post on top of an active conversation: right
   before delivery, the consumer re-checks the latest chat rows and skips the
   wake (recorded as `skipped` / `chat_collision`) when a user message or an

@@ -168,6 +168,32 @@ PARAMS: dict[str, dict] = {
         "required": ["wake_id"],
     },
 
+    # -- workspace.py (encrypted virtual workspace, never the host filesystem) --
+    "workspace_list": {
+        "type": "object",
+        "properties": {"path": _STR, "recursive": _BOOL, "limit": _INT},
+        "required": [],
+    },
+    "workspace_read": {
+        "type": "object",
+        "properties": {"path": _STR, "start_line": _INT, "line_count": _INT},
+        "required": ["path"],
+    },
+    "workspace_write": {
+        "type": "object",
+        "properties": {
+            "path": _STR,
+            "content": _STR,
+            "expected_revision": _INT,
+        },
+        "required": ["path", "content", "expected_revision"],
+    },
+    "workspace_delete": {
+        "type": "object",
+        "properties": {"path": _STR, "expected_revision": _INT},
+        "required": ["path", "expected_revision"],
+    },
+
     # -- synthetic reply tool --
     REPLY_TOOL: {
         "type": "object",
@@ -209,6 +235,16 @@ DESCRIPTIONS: dict[str, str] = {
     "web_fetch": "Fetch a URL and return its stripped text content.",
     "schedule_wake": "Schedule a future self-wake at a given time, with optional timezone and reason.",
     "cancel_wake": "Cancel a previously scheduled self-wake by its wake_id.",
+    "workspace_list": ("List encrypted virtual workspace entries and revisions. "
+                       "Namespaces are /artifacts (read-only), /skills (read-only), "
+                       "/workspace (editable), and /memory/WORKING.md (editable)."),
+    "workspace_read": ("Read a line range from a virtual text entry. This reads a "
+                       "stored text view and does not materialize a physical artifact."),
+    "workspace_write": ("Create or replace an editable virtual text file using optimistic "
+                        "revision control. Use expected_revision=0 to create; /artifacts "
+                        "and /skills are read-only."),
+    "workspace_delete": ("Delete an editable virtual file at its exact revision. "
+                         "Artifacts and skills cannot be deleted by the model."),
     REPLY_TOOL: "Send an immediate reply bubble to the user with the given text.",
 }
 
@@ -309,6 +345,10 @@ def validate_tool_args(name: str, args) -> str | None:
                 return f"args.actions[{index}] update requires target_id, summary, and content"
             if op == "delete" and not target_id:
                 return f"args.actions[{index}] delete requires target_id"
+    if name in {"workspace_write", "workspace_delete"}:
+        revision = args.get("expected_revision")
+        if type(revision) is not int or revision < 0:
+            return "expected_revision must be a non-negative integer"
     return None
 
 

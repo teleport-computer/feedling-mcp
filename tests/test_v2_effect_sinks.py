@@ -1,7 +1,7 @@
 """Effect dispatch sinks (Hosted Runtime V2 PR A / spec A6).
 
 `serve_worker.build_effect_dispatch(deps)` is the pure router: it maps each of
-the 7 outbox effect_types (reply/status/cursor/job/memory/identity/schedule)
+the 8 outbox effect_types (reply/status/cursor/job/memory/identity/schedule/workspace)
 to its injected sink callable and raises on anything else. Production sinks
 (`serve_worker._sink_*` / `build_production_effect_dispatch`) wrap generic
 writes in the two-phase sink ledger: claim, durable write, complete. A replay
@@ -30,7 +30,9 @@ pytestmark = pytest.mark.skipif(
     reason="DB-backed V2 effect sink tests require the PostgreSQL test fixture",
 )
 
-_EFFECT_TYPES = ("reply", "status", "cursor", "job", "memory", "identity", "schedule")
+_EFFECT_TYPES = (
+    "reply", "status", "cursor", "job", "memory", "identity", "schedule", "workspace",
+)
 
 
 @pytest.fixture
@@ -88,6 +90,7 @@ def test_replay_same_effect_id_performs_underlying_write_once(pg_clean):
         reply=claimed_sink,
         status=lambda p: None, cursor=lambda p: None, job=lambda p: None,
         memory=lambda p: None, identity=lambda p: None, schedule=lambda p: None,
+        workspace=lambda p: None,
     )
     dispatch = serve_worker.build_effect_dispatch(deps)
     payload = {"effect_id": "job1:reply:0", "text": "hi"}

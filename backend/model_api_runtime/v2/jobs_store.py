@@ -1808,6 +1808,197 @@ def upsert_summary_row_cas(
             return cur.rowcount == 1
 
 
+# ---------------------------------------------------------------------------
+# Encrypted virtual workspace (migration 0042).
+#
+# Contents are v1 shared envelopes. Paths/kinds/revisions are deliberately
+# plaintext routing metadata; callers must never place user document content in
+# those columns. Optimistic revision checks are authoritative in PostgreSQL so
+# disjoint future file writes may execute concurrently without blind last-write
+# wins on the same path.
+# ---------------------------------------------------------------------------
+
+
+def get_workspace_entry(user_id: str, path: str) -> dict | None:
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT path,kind,content_envelope,mime_type,source_ref,revision,"
+                "created_at,updated_at FROM v2_workspace_entries "
+                "WHERE user_id=%s AND path=%s",
+                (user_id, path),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    out = dict(row)
+    out["content_envelope"] = dict(out["content_envelope"])
+    return out
+
+
+def list_workspace_entries(
+    user_id: str,
+    *,
+    prefix: str = "/",
+    recursive: bool = False,
+    limit: int = 100,
+) -> list[dict]:
+    maximum = max(1, min(int(limit), 500))
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if prefix == "/":
+                if recursive:
+                    cur.execute(
+                        "SELECT path,kind,mime_type,source_ref,revision,created_at,updated_at "
+                        "FROM v2_workspace_entries WHERE user_id=%s "
+                        "ORDER BY path LIMIT %s",
+                        (user_id, maximum),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT path,kind,mime_type,source_ref,revision,created_at,updated_at "
+                        "FROM v2_workspace_entries WHERE user_id=%s "
+                        "AND position('/' IN substring(path FROM 2))=0 "
+                        "ORDER BY path LIMIT %s",
+                        (user_id, maximum),
+                    )
+            else:
+                escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                if recursive:
+                    cur.execute(
+                        "SELECT path,kind,mime_type,source_ref,revision,created_at,updated_at "
+                        "FROM v2_workspace_entries WHERE user_id=%s "
+                        "AND (path=%s OR path LIKE %s ESCAPE '\\') "
+                        "ORDER BY path LIMIT %s",
+                        (user_id, prefix, escaped + "/%", maximum),
+                    )
+                else:
+                    # Filter direct children in SQL. A fixed 500-row prefetch
+                    # followed by Python filtering can otherwise return an
+                    # empty/incomplete directory when many nested paths sort
+                    # before its direct children.
+                    cur.execute(
+                        "SELECT path,kind,mime_type,source_ref,revision,created_at,updated_at "
+                        "FROM v2_workspace_entries WHERE user_id=%s "
+                        "AND (path=%s OR (path LIKE %s ESCAPE '\\' "
+                        "AND position('/' IN substring(path FROM %s))=0)) "
+                        "ORDER BY path LIMIT %s",
+                        (
+                            user_id,
+                            prefix,
+                            escaped + "/%",
+                            len(prefix) + 2,
+                            maximum,
+                        ),
+                    )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def put_workspace_entry_cas(
+    user_id: str,
+    path: str,
+    *,
+    kind: str,
+    content_envelope: dict,
+    mime_type: str,
+    source_ref: str,
+    expected_revision: int,
+) -> dict | None:
+    """Create at revision 0 or replace exactly ``expected_revision``.
+
+    Returns the new metadata row. A missing/stale revision returns ``None``;
+    database failures still raise so a write effect is retried rather than
+    acknowledged without durable state.
+    """
+    if type(expected_revision) is not int or expected_revision < 0:
+        raise ValueError("expected_revision must be a non-negative integer")
+    try:
+        with _pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        "SELECT revision FROM v2_workspace_entries "
+                        "WHERE user_id=%s AND path=%s FOR UPDATE",
+                        (user_id, path),
+                    )
+                    current = cur.fetchone()
+                    actual = int(current["revision"]) if current is not None else 0
+                    if actual != expected_revision:
+                        return None
+                    if current is None:
+                        cur.execute(
+                            "INSERT INTO v2_workspace_entries "
+                            "(user_id,path,kind,content_envelope,mime_type,source_ref,revision) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,1) "
+                            "RETURNING path,kind,mime_type,source_ref,revision,created_at,updated_at",
+                            (
+                                user_id,
+                                path,
+                                kind,
+                                Jsonb(dict(content_envelope)),
+                                mime_type,
+                                source_ref,
+                            ),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE v2_workspace_entries SET kind=%s,content_envelope=%s,"
+                            "mime_type=%s,source_ref=%s,revision=revision+1,updated_at=now() "
+                            "WHERE user_id=%s AND path=%s AND revision=%s "
+                            "RETURNING path,kind,mime_type,source_ref,revision,created_at,updated_at",
+                            (
+                                kind,
+                                Jsonb(dict(content_envelope)),
+                                mime_type,
+                                source_ref,
+                                user_id,
+                                path,
+                                expected_revision,
+                            ),
+                        )
+                    row = cur.fetchone()
+                    return dict(row) if row is not None else None
+    except psycopg.errors.UniqueViolation:
+        # Concurrent revision-0 creators: one wins; the loser observes a clean
+        # conflict rather than surfacing a database exception to the model.
+        return None
+
+
+def delete_workspace_entry_cas(
+    user_id: str,
+    path: str,
+    *,
+    expected_revision: int,
+) -> bool:
+    if type(expected_revision) is not int or expected_revision <= 0:
+        return False
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM v2_workspace_entries "
+                "WHERE user_id=%s AND path=%s AND revision=%s",
+                (user_id, path, expected_revision),
+            )
+            return cur.rowcount == 1
+
+
+def record_sandbox_acquisition(
+    user_id: str,
+    *,
+    provider: str,
+    purpose: str,
+) -> int:
+    """Append one content-free provider acquisition event for billing/usage."""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO v2_sandbox_usage_events (user_id,provider,purpose) "
+                "VALUES (%s,%s,%s) RETURNING id",
+                (user_id, str(provider)[:80], str(purpose)[:80]),
+            )
+            return int(cur.fetchone()[0])
+
+
 def get_wake_schedule(user_id) -> dict | None:
     """读取该用户的 v2_wake_schedule 行（proactive 唤醒调度：下次心跳/采集/屏幕监看到期
     时间 + BYOK 支付冷却截止 + screen_watch 的跨-tick 状态 last_screen_watch_frame_id），

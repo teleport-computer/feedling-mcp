@@ -165,6 +165,31 @@ isolation. Keep hosted execution restricted to supported agent entry points, and
 use a separately reviewed container or microVM boundary before offering
 arbitrary untrusted code execution to unrelated tenants.
 
+### Runtime V2 virtual workspace
+
+Runtime V2 exposes a virtual, backend-pluggable workspace to its native agent
+loop. `/artifacts` and `/skills` are read-only; `/workspace` is task-editable;
+and `/memory/WORKING.md` is editable agent working state distinct from
+user-facing Memory Garden cards. Writes use exact revisions, so stale same-file
+writes fail instead of silently overwriting one another.
+
+Workspace bodies are stored as shared encrypted envelopes. PostgreSQL still sees
+the user ID, virtual path, kind, MIME type, source reference, revision, and
+timestamps as plaintext routing metadata. An authorized hosted runner asks the
+decrypt service to open content and sends plaintext—not ciphertext—to the model
+when the turn uses that file.
+
+Reading an already-derived text view or editing a virtual Markdown file does not
+start a sandbox. Physical artifact materialization, untrusted binary parsing,
+shell commands, and code execution cross a separate, lazily acquired sandbox
+provider boundary. The provider is deployment-pluggable; a shared runner process
+or access to a host Docker socket is not treated as a sandbox. A remote provider
+also becomes a plaintext recipient for any decrypted artifact bytes sent to it.
+If no audited provider adapter is registered, uploads remain stored but an
+artifact cache miss is explicitly unavailable rather than parsed inside the API
+or runner process. Successful provider acquisition emits a content-free usage
+event for billing; cached text-view reads do not.
+
 ## Managed and self-hosted trust models
 
 | Deployment | Confidential-compute guarantee | Appropriate boundary |

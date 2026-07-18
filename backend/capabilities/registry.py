@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from capabilities import memory, perception, screen, photo, identity, chat, web, wake
+from capabilities import memory, perception, screen, photo, identity, chat, web, wake, workspace
 from capabilities import errors
 from capabilities.types import CapabilityResult, err
 
@@ -28,9 +28,16 @@ CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
     "web_fetch": lambda store, **kw: web.fetch(store, **kw),
     "schedule_wake": lambda store, **kw: wake.schedule(store, **kw),
     "cancel_wake": lambda store, **kw: wake.cancel(store, **kw),
+    "workspace_list": lambda store, **kw: workspace.list_entries(store, **kw),
+    "workspace_read": lambda store, **kw: workspace.read(store, **kw),
+    "workspace_write": lambda store, **kw: workspace.write(store, **kw),
+    "workspace_delete": lambda store, **kw: workspace.delete(store, **kw),
 }
 
-WRITE_ACTIONS = frozenset({"memory_write", "identity_patch", "schedule_wake", "cancel_wake"})
+WRITE_ACTIONS = frozenset({
+    "memory_write", "identity_patch", "schedule_wake", "cancel_wake",
+    "workspace_write", "workspace_delete",
+})
 READ_ACTIONS = frozenset(set(CAPABILITIES) - WRITE_ACTIONS)
 
 

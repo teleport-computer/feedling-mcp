@@ -71,7 +71,6 @@ from core import store as core_store
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
-from hosted import file_text
 from hosted import mcp_tools
 from identity import identity_core
 from memory import memory_core
@@ -93,6 +92,17 @@ from model_api_runtime.v2 import worker as v2_worker
 from proactive import capture_scheduler
 from proactive import dream_scheduler
 from proactive import gate as proactive_gate
+from workspace.artifacts import ArtifactWorkspace, artifact_text_view_path
+from workspace.backends import WorkspaceNotFound
+from workspace.sandbox import (
+    DisabledSandboxProvider,
+    LazySandbox,
+    SandboxRequiredOperation,
+    SandboxUnavailable,
+    SandboxUsageUnavailable,
+    configured_sandbox_provider,
+)
+from workspace.service import production_backend as production_workspace_backend
 import db
 import memory_readside_core
 import provider_client
@@ -108,6 +118,17 @@ def _positive_float_env(name: str, default: str) -> float:
         raise RuntimeError(f"{name} must be finite and > 0") from exc
     if not math.isfinite(value) or value <= 0:
         raise RuntimeError(f"{name} must be finite and > 0")
+    return value
+
+
+def _positive_int_env(name: str, default: str) -> int:
+    raw = os.environ.get(name, default)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be an integer > 0") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be an integer > 0")
     return value
 
 
@@ -128,6 +149,9 @@ _ASSISTANT_ROLES = ("openclaw", "assistant", "agent")
 _EXTRACTION_ENABLED = os.environ.get(
     "FEEDLING_V2_EXTRACTION_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+_FILE_INLINE_MAX_CHARS = _positive_int_env(
+    "FEEDLING_V2_FILE_INLINE_MAX_CHARS", "30000",
+)
 
 
 def _configure_db_pool_capacity(max_workers: int) -> int:
@@ -764,36 +788,140 @@ def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
 
 
 def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
-    """按 id 取上传文件的解密字节 + 抽取的纯文本。复用内部 `chat_file_read`
-    capability（对标 `_read_images`，同样不暴露给模型），再经 `hosted.file_text`
-    把 docx/xlsx/pdf/文本抽成 prompt 可 inline 的文字。V2 是纯 HTTP、无 CLI/文件系统，
-    这是让 tool-less 模型「读文件」的唯一途径。
+    """Read cached artifact text views or materialize through a real sandbox.
 
-    单条失败/抽取为空只跳过那一条，绝不抛——调用方 `worker._inject_tail_files` 会把缺失
-    的文件行原样留成 `[file: name]` 标记。返回 {mid: {file_name, file_mime, text, truncated}}。
+    Upload/storage remains unchanged. A cache miss acquires the configured
+    sandbox *before* asking the enclave for physical bytes. No provider means a
+    stable ``sandbox_unavailable`` result; there is no fallback to the old
+    in-process PDF/DOCX/XLSX parser.
     """
     store = core_store.get_store(user_id)
     token = _mint_runtime_token(user_id)
+    backend = production_workspace_backend(store, runtime_token=token)
+    try:
+        provider = configured_sandbox_provider()
+    except SandboxUnavailable:
+        # Stored encrypted text views remain readable even when a configured
+        # provider adapter is absent; only a physical cache miss fails closed.
+        provider = DisabledSandboxProvider()
+    lazy = LazySandbox(
+        provider,
+        user_id=user_id,
+        on_acquire=lambda event: jobs_store.record_sandbox_acquisition(
+            event.user_id,
+            provider=event.provider,
+            purpose=event.purpose,
+        ),
+    )
+    artifacts = ArtifactWorkspace(backend, lazy)
     out: dict[str, dict] = {}
-    for mid in message_ids:
-        try:
-            res = cap_registry.run_capability(
-                "chat_file_read", store, api_key=None, runtime_token=token,
-                params={"message_id": mid})
-            data = (res.to_dict() or {}).get("data") or {}
-            b64 = data.get("file_b64")
-            if not b64:
+    try:
+        rows_by_id = {
+            str(row.get("id") or ""): row
+            for row in (getattr(store, "chat_messages", None) or [])
+            if isinstance(row, dict) and row.get("id")
+        }
+        for mid in message_ids:
+            meta = rows_by_id.get(str(mid)) or {}
+            name = str(meta.get("file_name") or "file")
+            mime = str(meta.get("file_mime") or "application/octet-stream")
+            view_path = artifact_text_view_path(str(mid), name)
+            try:
+                entry = artifacts.read_text_view(view_path)
+            except WorkspaceNotFound:
+                try:
+                    # Acquire/bill before decrypted physical bytes enter this path.
+                    lazy.ensure(SandboxRequiredOperation.MATERIALIZE_ARTIFACT)
+                except SandboxUsageUnavailable as exc:
+                    # Usage persistence is part of acquisition. Do not ask the
+                    # enclave for bytes unless provider use is billable.
+                    log.warning(
+                        "[v2.serve_worker] sandbox acquisition audit failed "
+                        "msg=%s type=%s",
+                        mid,
+                        type(exc).__name__,
+                    )
+                    out[str(mid)] = {
+                        "file_name": name,
+                        "file_mime": mime,
+                        "error": "sandbox_usage_unavailable",
+                    }
+                    continue
+                except SandboxUnavailable:
+                    out[str(mid)] = {
+                        "file_name": name,
+                        "file_mime": mime,
+                        "error": "sandbox_unavailable",
+                    }
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "[v2.serve_worker] sandbox acquisition failed "
+                        "msg=%s type=%s",
+                        mid,
+                        type(exc).__name__,
+                    )
+                    out[str(mid)] = {
+                        "file_name": name,
+                        "file_mime": mime,
+                        "error": "sandbox_unavailable",
+                    }
+                    continue
+                try:
+                    res = cap_registry.run_capability(
+                        "chat_file_read", store, api_key=None, runtime_token=token,
+                        params={"message_id": mid})
+                    data = (res.to_dict() or {}).get("data") or {}
+                    b64 = data.get("file_b64")
+                    if not b64:
+                        raise RuntimeError("artifact body unavailable")
+                    name = str(data.get("file_name") or name)
+                    mime = str(data.get("file_mime") or mime)
+                    raw = base64.b64decode(b64, validate=True)
+                    entry = artifacts.ingest(
+                        source_ref=str(mid),
+                        filename=name,
+                        mime_type=mime,
+                        data=raw,
+                    )
+                    view_path = entry.path
+                except Exception as exc:  # noqa: BLE001 - one bad artifact is isolated
+                    log.warning(
+                        "[v2.serve_worker] sandbox artifact read failed msg=%s type=%s",
+                        mid,
+                        type(exc).__name__,
+                    )
+                    out[str(mid)] = {
+                        "file_name": name,
+                        "file_mime": mime,
+                        "error": "artifact_read_unavailable",
+                    }
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[v2.serve_worker] artifact text-view read failed msg=%s type=%s",
+                    mid,
+                    type(exc).__name__,
+                )
+                out[str(mid)] = {
+                    "file_name": name,
+                    "file_mime": mime,
+                    "error": "artifact_read_unavailable",
+                }
                 continue
-            raw = base64.b64decode(b64)
-            name = data.get("file_name") or "file"
-            extracted = file_text.extract_file_text(raw, name=name, mime=data.get("file_mime") or "")
-        except Exception as e:  # noqa: BLE001
-            log.warning("[v2.serve_worker] file read failed msg=%s: %s", mid, e)
-            continue
-        if extracted.text:
-            out[str(mid)] = {"file_name": name,
-                             "file_mime": data.get("file_mime") or "application/octet-stream",
-                             "text": extracted.text, "truncated": extracted.truncated}
+
+            text = str(entry.content or "")
+            if text:
+                truncated = len(text) > _FILE_INLINE_MAX_CHARS
+                out[str(mid)] = {
+                    "file_name": name,
+                    "file_mime": mime,
+                    "text": text[:_FILE_INLINE_MAX_CHARS],
+                    "truncated": truncated,
+                    "workspace_path": view_path,
+                }
+    finally:
+        lazy.close()
     return out
 
 
@@ -1072,6 +1200,7 @@ class EffectSinkDeps:
     memory: Callable[[dict], None]
     identity: Callable[[dict], None]
     schedule: Callable[[dict], None]
+    workspace: Callable[[dict], None]
 
 
 def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], None]:
@@ -1088,6 +1217,7 @@ def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], None]:
         "memory": deps.memory,
         "identity": deps.identity,
         "schedule": deps.schedule,
+        "workspace": deps.workspace,
     }
 
     def dispatch(effect_type: str, payload: dict) -> None:
@@ -1430,12 +1560,38 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
     db.effect_sink_complete(eid)
 
 
+def _sink_workspace(user_id: str, payload: dict, *, runtime_token: str) -> None:
+    """Apply one encrypted, revision-fenced virtual workspace mutation."""
+    eid = payload["effect_id"]
+    if not db.effect_sink_claim(eid):
+        return
+    try:
+        op = str(payload.get("op") or "")
+        if op not in {"workspace_write", "workspace_delete"}:
+            raise db.EffectTerminalError("workspace_operation_invalid")
+        store = core_store.get_store(user_id)
+        params = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+        result = cap_registry.run_capability(
+            op,
+            store,
+            api_key=None,
+            runtime_token=runtime_token,
+            params=params,
+        )
+        if not result.ok:
+            raise _capability_effect_error(result, f"{op}_failed")
+    except Exception:
+        db.effect_sink_release(eid)
+        raise
+    db.effect_sink_complete(eid)
+
+
 def build_production_effect_dispatch(
     user_id: str,
     *,
     runtime_token_provider: Callable[[], str] | None = None,
 ) -> Callable[[str, dict], None]:
-    """Wire the 7 real sinks bound to a single user (see `EffectSinkDeps`
+    """Wire the real sinks bound to a single user (see `EffectSinkDeps`
     docstring for why the binding happens here and not inside
     `build_effect_dispatch`). Called once per `apply_pending_effects(user_id,
     ...)` at end-of-turn (see `build_production_deps`'s `apply_pending_effects`
@@ -1465,6 +1621,11 @@ def build_production_effect_dispatch(
             runtime_token=runtime_token_provider(),
         ),
         schedule=lambda p: _sink_schedule(user_id, p),
+        workspace=lambda p: _sink_workspace(
+            user_id,
+            p,
+            runtime_token=runtime_token_provider(),
+        ),
     )
     return build_effect_dispatch(deps)
 
@@ -1594,6 +1755,14 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
         tool_name = str(payload.get("op") or "")
         if tool_name not in _SCHEDULE_CAPABILITY_OPS:
             raise RuntimeError("invalid encrypted schedule operation")
+        args = {
+            k: v for k, v in payload.items()
+            if k not in ("effect_id", "op")
+        }
+    elif effect_type == "workspace":
+        tool_name = str(payload.get("op") or "")
+        if tool_name not in {"workspace_write", "workspace_delete"}:
+            raise RuntimeError("invalid encrypted workspace operation")
         args = {
             k: v for k, v in payload.items()
             if k not in ("effect_id", "op")

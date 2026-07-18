@@ -1,8 +1,9 @@
 """V2 file-text injection into the prompt tail (worker._inject_tail_files).
 
 Mirrors test_v2_worker_images.py. Lets a tool-less HTTP model read an uploaded
-docx/xlsx/pdf/txt by replacing the `[file: name]` marker row with the file name
-plus server-extracted text (serve_worker._read_files -> hosted.file_text).
+artifact by replacing the `[file: name]` marker row with a cached encrypted VFS
+text view. Cache misses are materialized and parsed by a lazy sandbox provider,
+never by the backend process.
 """
 import sys
 from pathlib import Path
@@ -46,6 +47,20 @@ def test_inject_keeps_marker_when_extraction_empty():
     tail = [_file_row("m1", name="scan.pdf")]
     out = worker._inject_tail_files(tail, user_id="u", read_files=_fake_reader({}))
     assert out[0]["content"] == "[file: scan.pdf]"
+
+
+def test_inject_surfaces_fail_closed_sandbox_unavailable():
+    tail = [_file_row("m1", name="contract.pdf")]
+    out = worker._inject_tail_files(
+        tail,
+        user_id="u",
+        read_files=_fake_reader({
+            "m1": {"file_name": "contract.pdf", "error": "sandbox_unavailable"},
+        }),
+    )
+    assert out[0]["content"] == (
+        "[file: contract.pdf]\n[artifact unavailable: sandbox_unavailable]"
+    )
 
 
 def test_inject_only_takes_the_most_recent_N_files():

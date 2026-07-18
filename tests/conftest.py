@@ -147,6 +147,7 @@ if not _provisioned:
         "test_v2_coalesce.py",
         "test_v2_status_stream.py",
         "test_v2_dependency_direction.py",
+        "test_v2_workspace_unit.py",
     }
     collect_ignore = sorted(
         f
