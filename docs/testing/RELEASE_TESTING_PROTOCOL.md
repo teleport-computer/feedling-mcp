@@ -52,6 +52,10 @@
   E2E_KEY_DEEPSEEK=…`。
 - 建池动作（待 Seven/志豪提供 key）：额度各留最低档即可，P0 单轮消耗很小。
 
+**待建（§9）：mock relay** —— key 池的"中转站代表"只能测到当天恰好发生的坏；
+真实故障族（SSE 中断/假模型名/慢首 token/间歇 5xx）要用 `tools/e2e/` 的 mock
+openai_compatible 代理主动注入（见 §4.7 故障注入四连）。
+
 ### 1.3 测试账号纪律（test-account-hygiene）
 
 - 每轮 E2E 现场注册、跑完 **当场 `/v1/account/reset`（confirm=delete-all-data）删除**；
@@ -114,6 +118,22 @@
 
 ---
 
+### 2.5 双签范围与 gatekeep 清单（审查是拦截率最高的一道测试）
+
+**必须双签**：用户可见行为变更、共享接缝（§5 表）、并发/存储原语、加密/账号链路、
+prompt 注入文本。单签豁免仅限不改变契约/流程/门禁的说明性 docs 与注释——**改变
+发版规范、测试义务、API 契约的文档照样双签**。（实证：2026-07-17 一天六批，独立
+gatekeep 抓出 10+ 个测试没抓到的真缺陷。）
+
+**gatekeep 最小动作**（审者）：读完整 diff 逐 hunk 问为什么；独立跑测试（别信
+提交者数字，PG 依赖用真 PG）；边界三问（空值/保留值？两个同时到？失败路径
+fail-open 还是 fail-closed？）；用户可见文字的术语/归因/双语义；push 后远端复验
+SHA/文件集/净 diff。
+
+**提交纪律**（提交者）：commit 前 `git diff --cached` 与审定 diff **逐 hunk** 比对
+（文件名一致不够）；进行中工作放专属 worktree；mailbox 脚本从主仓根跑，
+pytest/build 必须在被审的树里跑。
+
 ## 3. P0 冒烟集（全自动，Claude 执行，~30-45 分钟）
 
 **目标**：每个 driver 一个临时账号，把"用户能不能正常用"的最小闭环跑通。
@@ -158,6 +178,8 @@ verify_loop passing → 发消息收回复 → 删号。
 | 12 | 错误话术抽查 | 停用 key 发消息 → 气泡是 auth 类话术（不是 unknown/怪我们） |
 | 13 | 账号生命周期 | key regenerate（数据保留）/ reset（硬删）/ recover（keypair 找回） |
 | 14 | admin data-track | 用户页各区块渲染正常、时间北京、无 5xx |
+| 14.5 | **重试路径专项** | 每个用户可见"重试"按钮=独立用例：造失败→点重试→断言端点/payload/最终**恰好一份**；同 UUID 双 POST → 1 row；发消息后不读响应直接同 UUID 重发（模拟 lost-202）→ 1 行；known gap：iOS 图片/文件重试尚无幂等键（P1 目标） |
+| 14.6 | **故障注入四连**（待 §1.2 mock relay 落地） | 流断首 token 前→单次重试无感/再败气泡怪 relay；流断首 token 后→无"."退化气泡；tool call 400→降级不循环；慢首 token→打字指示不消失不误标失败。**归因必须对**：上游的错说"你的模型服务"，我们的错才说"连接模型服务时出了问题" |
 | 15 | 【真机·人工】push / Live Activity / 锁屏 | Seven 或真机持有者按 Health Check 页操作 |
 | 16 | 【真机·人工】iOS 端 UI 体感（打字指示、错误展示、进度页） | 同上 |
 
@@ -192,6 +214,21 @@ pi 中转** 两个代表配置上各扫一遍；每项的通过标准是括号�
 | 蒸馏中插聊天 | 聊天先回、续跑不重不丢 | resident 逐窗游标 |
 | 首轮冷启动 | runner 首轮可能丢——重试/预热 | 别拿首轮失败下结论 |
 
+### 4.7 注入文本审计（喂给模型的每个词都会出现在用户屏幕上）
+
+usr_fee1 教训：模型是复读机——转写标签/prompt 术语/硬编码兜底文案会照搬进用户
+可见产物（"记忆卡叫她'用户'"根因=转写行首写死 `user:`）。规则：
+
+- 新增/修改任何喂给模型的注入段 → grep 禁词表：`user:`、`agent:`、裸"用户"、
+  裸"TA"(指人)——出现即需论证；
+- 用户可见的模型产物（记忆卡/主动消息）E2E 断言不含系统称谓；
+- "名字"类字段写读双端防呆：写入端拒占位词、读取端 sanitize（单一保留词事实源），
+  占位名不得遮蔽后备真名；
+- 保留词双语义（产品面 TA=AI vs prompt 内部 TA=用户）维护小表，prompt 借用必须
+  显式声明"仅指令内标记"；
+- 改称谓/术语时全仓 grep（backend/enclave/consumer/iOS xcstrings）——usr_fee1
+  第一轮就漏了 enclave readside 的 legacy 路径。
+
 ## 5. VPS harness × 功能矩阵 E2E（新功能触碰 consumer 时加跑）
 
 **共享接缝触发器（根治"改 A 坏 B"）**：动了下表任一文件，L2 回归必须
@@ -223,7 +260,16 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
   的 consumer commit（随 expected_consumer_commit 自更新）；
 - `/healthz` + attestation/canary 绿；
 - 抽 2-3 个真实活跃用户 admin 页看健康信号（错误气泡增量、proactive 状态分布）；
-- 部署断连窗口投诉核对（单点 CVM 原地部署问题，见 usr_ed21 事故）。
+- 部署断连窗口投诉核对（单点 CVM 原地部署问题，见 usr_ed21 事故）；
+- **发版时间线记录**：deploy 起止 UTC（main CVM / runner CVM 分开）+ 当时 runner
+  拓扑——事后任何"连不上"先对这张表；±分钟级吻合=标记 deploy-window candidate，
+  仍需核 health 时间线才归因，**不许拿时间相关性自动驳回**；
+- **admin 三读性能打表**：单用户 detail <10s、debug trace <5s、users 列表 <30s，
+  记录数值报劣化趋势（排障工具坏了=盲飞：旧 debug 视图事故当天 >400s 超时，
+  修复 get_blobs_for_users 后 2.5s）；trace ring 噪声比 >90% 即信噪比退化要处理；
+- **部署后 30 分钟竞态信号**：`chat_collision`（admin job_failed_reasons 有聚合）
+  与 `already_answered` 409（暂只在 per-user trace，手工抽查，仪表待补）——
+  runner 原地更新的新老共存窗是双 turn 竞态高发期。
 
 ## 7. 事故回归案例库（每案一条永久用例）
 
@@ -237,6 +283,12 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 | resident 假掉线 | P1 #14 |
 | DAU 历史缩水 | 快照冻结测试（已入 pytest） |
 | 单点 CVM 部署断连（usr_ed21） | §6 固定项 |
+
+| 重发双份/lost-202（usr_9f5d） | P1 #14.5 重试路径专项（幂等窗 cbecec05 + ios 重试路由 9f33d65 + 幂等键 49afa7a） |
+| 同秒双回复竞态（usr_a0b7） | §2.5 并发自查 + TESTING §2-F 确定性并发测试；reply 侧原子 CAS 仍未完成——"缓解"≠"已修" |
+| debug_trace 写后读竞态 | TESTING §6 flaky 规范（e4b38e39，bounded best-effort 契约） |
+| 注入文本污染（usr_fee1"用户"称谓） | §4.7 注入文本审计 |
+| admin debug 慢查询（>400s 不可用） | §6 admin 三读性能打表（get_blobs_for_users） |
 
 **规则**：以后每个 prod 事故结案时，必须在本表加一行 + 在对应层落一条用例，
 否则不算结案。
@@ -256,6 +308,11 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 4. 生效：/healthz git_commit 对上目标 SHA 了吗？（§6-0）
 5. 分层：模型家族/harness 分层验了吗？（§5）
 6. 收尾：测试账号删干净了吗？事故落回归用例了吗？（§7 / §1.3）
+7. 第二次：每条数据写入，重发/重试一遍还是一份吗？（P1 #14.5）
+8. 同时：两个执行体同时到，防线在服务端持久层吗？（§2.5 / TESTING §2-F）
+9. 喂词：这次改动往模型嘴里塞了什么新词？会照搬到用户屏幕吗？（§4.7）
+10. 工具：现在出事故，admin 读得动、trace 还在窗口内吗？（§6）
+11. 归因：新增错误路径，气泡怪对人了吗？（P1 #14.6）
 
 ## 9. 落地顺序（待办）
 
@@ -267,3 +324,7 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
    首个案例 = pi MCP。
 5. 【全员约定】新功能 PR 模板加"能力矩阵已更新 + L1 证据"检查项；
    事故结案必须落 §7 案例行。
+6. 【Claude+codex2】mock relay（openai_compatible 故障注入代理）→ 解锁 P1 #14.6。
+7. 【iOS/排期 Seven 定】iOS 单测 target（最小核：消息发送状态机——先提取
+   choosePreferredCopy / isLikelyOptimisticDuplicate 纯函数 + retryMessage
+   路由决策抽可注入 helper，三处恰是本周三个 bug 的宿主）。
