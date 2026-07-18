@@ -94,6 +94,7 @@ from proactive import dream_scheduler
 from proactive import gate as proactive_gate
 from workspace.artifacts import ArtifactWorkspace, artifact_text_view_path
 from workspace.backends import WorkspaceNotFound
+from workspace.prompt import render_trusted_prefix_blocks
 from workspace.sandbox import (
     DisabledSandboxProvider,
     LazySandbox,
@@ -108,6 +109,34 @@ import memory_readside_core
 import provider_client
 
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
+
+
+def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
+    """Render one authoritative workspace prompt snapshot for a turn.
+
+    Skill entries come only from the backend's read-only ``/skills`` namespace
+    and therefore retain system authority. ``WORKING.md`` is agent-editable and
+    must cross into the worker through the separate untrusted data field. Any
+    malformed/unknown block fails the turn instead of silently dropping policy.
+    """
+    backend = production_workspace_backend(
+        store, runtime_token=str(runtime_token or ""))
+    trusted_system_blocks: list[str] = []
+    working_memory: str | None = None
+    for block in render_trusted_prefix_blocks(backend):
+        if block.name.startswith("skill:/skills/"):
+            trusted_system_blocks.append(block.content)
+            continue
+        if block.name == "working-memory" and working_memory is None:
+            working_memory = block.content
+            continue
+        raise RuntimeError("invalid workspace prompt block")
+    if working_memory is None:
+        raise RuntimeError("workspace working memory block missing")
+    return {
+        "trusted_system_blocks": tuple(trusted_system_blocks),
+        "working_memory": working_memory,
+    }
 
 
 def _positive_float_env(name: str, default: str) -> float:
@@ -1853,6 +1882,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         build_memory_envelope=_build_memory_envelope,
         apply_pending_effects=_apply_pending_effects_for_user,
         load_mcp_turn=mcp_tools.load_turn_mcp,
+        load_workspace_prompt=_load_workspace_prompt,
     )
 
 

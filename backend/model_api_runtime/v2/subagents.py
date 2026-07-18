@@ -14,10 +14,10 @@ import math
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Sequence
 
+from capabilities.tool_schema import TASK_TOOL
 from provider_types import ToolResult
 
 
-TASK_TOOL = "task"
 DEFAULT_MAX_TASKS_PER_ROUND = 4
 DEFAULT_MAX_PARALLEL_TASKS = 4
 DEFAULT_CHILD_DEADLINE_SEC = 45.0
@@ -69,7 +69,7 @@ def _parse_task(call: Any) -> ChildTask:
     if not prompt:
         raise SubagentBatchError("subagent task prompt is required")
     mode = str(args.get("workspace_mode") or "read_only").strip().lower()
-    if mode not in {"read_only", "overlay"}:
+    if mode != "read_only":
         raise SubagentBatchError("unsupported subagent workspace mode")
     return ChildTask(
         call_id=call_id,

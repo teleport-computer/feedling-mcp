@@ -236,6 +236,167 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
+def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
+    monkeypatch,
+):
+    uid = "u_toolloop_workspace_prompt"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-workspace-prompt")
+
+    _patch_real_write(monkeypatch)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({"items": []}),
+    )
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("read", "memory_index")),
+        _text_round("workspace-aware reply"),
+    ])
+    loader_calls = []
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
+    ])
+    deps.load_workspace_prompt = lambda _store, **kwargs: (
+        loader_calls.append(kwargs["runtime_token"])
+        or {
+            "trusted_system_blocks": (
+                "<feedling-skill>trusted skill</feedling-skill>",
+            ),
+            "working_memory": "editable working state",
+        }
+    )
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert loader_calls == ["rt"]
+    assert len(calls) == 2
+    for call in calls:
+        prompt = str(call["messages"])
+        assert "trusted skill" in prompt
+        assert "editable working state" in prompt
+    system = next(
+        message for message in calls[0]["messages"]
+        if message["role"] == "system"
+    )
+    assert "trusted skill" in str(system["content"])
+    working = next(
+        message for message in calls[0]["messages"]
+        if worker.context.WORKING_MEMORY_HEADER
+        in str(message.get("content"))
+    )
+    assert working["role"] == "user"
+
+
+def test_chat_workspace_prompt_failure_is_visible_before_provider(
+    monkeypatch,
+):
+    uid = "u_toolloop_workspace_prompt_failure"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-workspace-prompt-failure")
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
+    ])
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError("private workspace plaintext"))
+    )
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider called after workspace prompt failure"
+        ),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert _job_status_row(job_id)[:2] == (
+        "failed",
+        "turn_failed:workspace_prompt_unavailable",
+    )
+
+
+def test_chat_native_task_runs_child_then_returns_result_to_parent(
+    monkeypatch,
+):
+    uid = "u_toolloop_native_task"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-native-task")
+    _patch_real_write(monkeypatch)
+    responses = iter([
+        _tool_round(_tc(
+            "task-1",
+            "task",
+            prompt="Inspect the report independently.",
+        )),
+        _text_round("child evidence"),
+        _text_round("parent answer using child evidence"),
+    ])
+    calls = []
+
+    async def provider(config, messages, *, tools=None):
+        calls.append({
+            "config": config,
+            "messages": messages,
+            "tools": tools,
+        })
+        return next(responses)
+
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        provider,
+    )
+    deps = _deps(messages=[
+        {
+            "id": "m1",
+            "ts": 10.0,
+            "role": "user",
+            "content": "Please inspect the report.",
+        },
+    ])
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 3
+    assert all(call["config"] is _BYOK for call in calls)
+    parent_tools = {spec.name for spec in calls[0]["tools"]}
+    child_tools = {spec.name for spec in calls[1]["tools"]}
+    assert "task" in parent_tools
+    assert child_tools == worker._SUBAGENT_ALLOWED_TOOLS
+    assert "Inspect the report independently." in str(calls[1]["messages"])
+    assert "Please inspect the report." not in str(calls[1]["messages"])
+    assert "child evidence" in str(calls[2]["messages"])
+    assert _turn_metric_row(job_id)[0] == 3
+
+
 def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     monkeypatch,
 ):

@@ -1,8 +1,8 @@
 """Deterministic trusted-prefix rendering for skills and working memory.
 
-Dynamic ``/workspace`` and ``/artifacts`` files are intentionally absent.  A
-provider adapter may cache each returned block independently and invalidate the
-working-memory block only when its revision/content changes.
+Dynamic ``/workspace`` and ``/artifacts`` files are intentionally absent.  The
+returned ordering keeps the stable skills prefix ahead of the mutable working-memory
+boundary so provider prompt caching can reuse the longest unchanged prefix.
 """
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ import hashlib
 from dataclasses import dataclass
 from workspace.backends import SKILLS_ROOT, WORKING_MEMORY_PATH, WorkspaceBackend
 from workspace.service import ensure_working_memory
+
+
+_SKILL_SENTINEL_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -44,9 +47,18 @@ def render_trusted_prefix_blocks(
     """
     blocks: list[TrustedPromptBlock] = []
     skills = sorted(
-        backend.list(SKILLS_ROOT, recursive=True, limit=500),
+        backend.list(
+            SKILLS_ROOT,
+            recursive=True,
+            limit=_SKILL_SENTINEL_LIMIT,
+        ),
         key=lambda entry: entry.path,
     )
+    # Fail conservatively at the sentinel instead of silently omitting a
+    # policy-bearing skill from the trusted prompt. The backend API has no
+    # unbounded listing mode, so an exact sentinel-sized result is ambiguous.
+    if len(skills) >= _SKILL_SENTINEL_LIMIT:
+        raise RuntimeError("workspace skill prompt limit exceeded")
     for meta in skills:
         entry = backend.read(meta.path)
         body = (

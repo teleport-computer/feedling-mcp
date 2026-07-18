@@ -20,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client as pc  # noqa: E402
 from model_api_runtime.v2 import context as v2_context  # noqa: E402
+from workspace.backends import InMemoryWorkspaceBackend  # noqa: E402
+from workspace.prompt import render_trusted_prefix_blocks  # noqa: E402
 from provider_types import (  # noqa: E402
     NativeAssistantTurn,
     ToolCall,
@@ -353,6 +355,128 @@ def test_stable_skills_and_working_memory_precede_dynamic_cache_frontier() -> No
     assert merged[working_index + 1] == {"cachePoint": {"type": "default"}}
     assert working_index < working_index + 1 < runtime_index
     assert not any("cachePoint" in block for block in merged[runtime_index + 1 :])
+
+
+def test_working_memory_revision_preserves_skill_prefix_on_all_cache_wires():
+    backend = InMemoryWorkspaceBackend()
+    backend.put_read_only(
+        "/skills/research.md",
+        "Stable research policy",
+        kind="skill",
+        expected_revision=0,
+    )
+
+    def rendered_messages():
+        blocks = render_trusted_prefix_blocks(backend)
+        return v2_context.build_turn_messages(
+            system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+            trusted_system_blocks=tuple(
+                block.content for block in blocks
+                if block.name.startswith("skill:")
+            ),
+            working_memory=next(
+                block.content for block in blocks
+                if block.name == "working-memory"
+            ),
+            summary="- stable summary",
+            tail=[{"role": "user", "content": "continue"}],
+            action_context="dynamic-now",
+        )
+
+    first_messages = rendered_messages()
+    memory = backend.read("/memory/WORKING.md")
+    backend.write(
+        "/memory/WORKING.md",
+        "New editable state",
+        expected_revision=memory.revision,
+    )
+    second_messages = rendered_messages()
+
+    def openrouter(messages):
+        return pc._build_openai_compat_payload(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+            messages=messages,
+            temperature=None,
+            max_tokens=256,
+            response_format=None,
+            extra_body=None,
+            include_reasoning=False,
+            tools=TOOLS,
+            prompt_cache_key=CACHE_KEY,
+        )
+
+    first_openrouter = openrouter(first_messages)
+    second_openrouter = openrouter(second_messages)
+    assert first_openrouter["messages"][0] == second_openrouter["messages"][0]
+    assert "Stable research policy" in str(first_openrouter["messages"][0])
+    first_working = next(
+        message for message in first_openrouter["messages"]
+        if v2_context.WORKING_MEMORY_HEADER in str(message.get("content"))
+    )
+    second_working = next(
+        message for message in second_openrouter["messages"]
+        if v2_context.WORKING_MEMORY_HEADER in str(message.get("content"))
+    )
+    assert first_working != second_working
+    assert _nested_cache_controls(first_working) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(second_working) == [{"type": "ephemeral"}]
+
+    def anthropic(messages):
+        payload, _, _ = pc._build_anthropic_payload(
+            model="claude-sonnet-4-5",
+            base_url="https://api.anthropic.com/v1",
+            key="sk-test",
+            messages=messages,
+            max_tokens=256,
+            temperature=None,
+            response_format=None,
+            tools=TOOLS,
+            prompt_cache_key=CACHE_KEY,
+        )
+        return payload
+
+    first_anthropic = anthropic(first_messages)
+    second_anthropic = anthropic(second_messages)
+    assert first_anthropic["system"] == second_anthropic["system"]
+    assert first_anthropic["messages"] != second_anthropic["messages"]
+    assert _nested_cache_controls(first_anthropic["system"]) == [
+        {"type": "ephemeral"}
+    ]
+
+    def bedrock(messages):
+        payload, _, _ = pc._build_bedrock_payload(
+            model="us.anthropic.claude-sonnet-4-6",
+            base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            key="bedrock-key",
+            messages=messages,
+            max_tokens=256,
+            temperature=None,
+            response_format=None,
+            tools=TOOLS,
+            prompt_cache_key=CACHE_KEY,
+        )
+        return payload
+
+    first_bedrock_payload = bedrock(first_messages)
+    second_bedrock_payload = bedrock(second_messages)
+    assert (
+        first_bedrock_payload["system"]
+        == second_bedrock_payload["system"]
+    )
+    assert "Stable research policy" in str(first_bedrock_payload["system"])
+    first_bedrock = first_bedrock_payload["messages"][0]["content"]
+    second_bedrock = second_bedrock_payload["messages"][0]["content"]
+    assert first_bedrock != second_bedrock
+    for blocks in (first_bedrock, second_bedrock):
+        working_index = next(
+            index for index, block in enumerate(blocks)
+            if v2_context.WORKING_MEMORY_HEADER
+            in str(block.get("text") or "")
+        )
+        assert blocks[working_index + 1] == {
+            "cachePoint": {"type": "default"}
+        }
 
 
 def test_direct_anthropic_two_turn_runtime_data_preserves_cached_prefix() -> None:

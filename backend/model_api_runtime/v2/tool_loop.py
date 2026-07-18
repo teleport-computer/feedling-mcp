@@ -162,6 +162,8 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
                         on_progress=None, extra_tool_specs=None,
                         extra_mutating_tool_names=None,
                         disabled_tool_names=None,
+                        allow_reply_tool: bool = True,
+                        outbound_blocking_read_tool_names=None,
                         max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
                         max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
                         tool_result_char_cap: int = DEFAULT_TOOL_RESULT_CHAR_CAP,
@@ -248,6 +250,12 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
     force_text_fallback = False
     external_content_seen = False
     mutation_outcome_unknown = False
+    outbound_tools_blocked = False
+    outbound_blocking_reads = {
+        str(name)
+        for name in (outbound_blocking_read_tool_names or ())
+        if str(name)
+    }
     allowed_fetch_urls: set[str] = set()
     # Per-turn tool surface = the static platform catalog plus any user-MCP tools
     # injected for this turn (chat lane only). New list, never mutates the memoized
@@ -258,10 +266,14 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
     disabled_names = {
         str(name) for name in (disabled_tool_names or ()) if str(name)
     }
-    # ``reply`` is part of the loop protocol rather than a side-effect
+    # ``reply`` is part of the parent loop protocol rather than a side-effect
     # capability. Recovery callers may remove every mutation schema, but must
-    # always leave the model a way to produce an intermediate bubble.
-    disabled_names.discard(tool_schema.REPLY_TOOL)
+    # always leave the model a way to produce an intermediate bubble. Isolated
+    # child loops explicitly disable it and return only terminal plain text.
+    if allow_reply_tool:
+        disabled_names.discard(tool_schema.REPLY_TOOL)
+    else:
+        disabled_names.add(tool_schema.REPLY_TOOL)
     turn_catalog = [
         spec
         for spec in (_catalog() + list(extra_tool_specs or []))
@@ -298,7 +310,11 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
         # this same one-shot fallback; the fallback itself is never retried.
         if force_text_fallback or attempts == max_calls - 1:
             tools = None
-        elif external_content_seen or mutation_outcome_unknown:
+        elif (
+            external_content_seen
+            or mutation_outcome_unknown
+            or outbound_tools_blocked
+        ):
             # Web results are untrusted model input. Once one is present, page
             # text cannot spend the original write authorization or choose a
             # fresh outbound query/URL. Preserve the useful search -> fetch flow
@@ -309,6 +325,7 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
                 blocked_tools.update(cap_registry.WRITE_ACTIONS)
                 blocked_tools.update(mutating_mcp_names)
                 blocked_tools.add("web_search")
+                blocked_tools.add(tool_schema.TASK_TOOL)
                 if not allowed_fetch_urls:
                     blocked_tools.add("web_fetch")
             # A timed-out MCP mutation may already have committed remotely.
@@ -317,6 +334,12 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
             if mutation_outcome_unknown:
                 blocked_tools.update(cap_registry.WRITE_ACTIONS)
                 blocked_tools.update(mutating_mcp_names)
+            # A restricted child may inspect encrypted workspace/artifact or
+            # memory content, but that private observation cannot influence a
+            # later outbound query/URL. MCP is likewise outbound when present.
+            if outbound_tools_blocked:
+                blocked_tools.update({"web_search", "web_fetch"})
+                blocked_tools.update(mcp_names)
             tools = [
                 spec for spec in turn_catalog
                 if spec.name not in blocked_tools
@@ -517,6 +540,10 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
             # chosen before the model saw the external result.  Only later
             # rounds are influenced by that result and therefore lose writes.
             external_content_seen = True
+        if any(tc.name in outbound_blocking_reads for tc in other_calls):
+            # Same-batch outbound calls were selected before the model observed
+            # this result. Only subsequent rounds are data-dependent and fenced.
+            outbound_tools_blocked = True
 
         transcript.append(ToolExchange(
             calls=tuple(pr.tool_calls), results=tuple(ordered_results),

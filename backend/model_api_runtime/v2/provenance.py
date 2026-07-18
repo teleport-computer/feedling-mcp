@@ -16,7 +16,9 @@ WAKE_TRIGGER = "wake_trigger"
 EXTERNAL = "external"
 INTERNAL = "internal"
 
-EXTERNAL_READS = frozenset({"web_search", "web_fetch"})
+# A child summary can contain remote web text or user-editable workspace/memory
+# content. Treat it exactly like other external model input in the parent loop.
+EXTERNAL_READS = frozenset({"web_search", "web_fetch", "task"})
 
 
 def provenance_for_read(tool_name: str) -> str:

@@ -2,8 +2,9 @@
 
 Derives one `ToolSpec` per model-facing capability in `capabilities.registry.CAPABILITIES`
 (everything except the internal-only `chat_image_read` and `chat_file_read`, which have
-no model-facing schema) plus a synthetic `reply` tool that the unified tool loop treats
-specially (writes an immediate bubble instead of dispatching through the executor).
+no model-facing schema) plus the runtime-native `task` and `reply` tools.  The unified
+tool loop handles both specially instead of dispatching them through the capability
+executor.
 
 Each entry in `PARAMS` mirrors exactly the `params` fields each capability module reads —
 see the module docstring/params usage cited per tool below. Do not add fields the
@@ -16,6 +17,7 @@ from provider_types import ToolSpec
 from capabilities import registry
 
 REPLY_TOOL = "reply"
+TASK_TOOL = "task"
 
 _EXCLUDED = frozenset({"chat_image_read", "chat_file_read"})
 
@@ -194,6 +196,22 @@ PARAMS: dict[str, dict] = {
         "required": ["path", "expected_revision"],
     },
 
+    # -- synthetic bounded-subagent tool --
+    # Overlay workspace merges are intentionally not advertised until the
+    # worker has an isolated overlay + explicit CAS merge implementation.
+    TASK_TOOL: {
+        "type": "object",
+        "properties": {
+            "prompt": _STR,
+            "label": _STR,
+            "workspace_mode": {
+                "type": "string",
+                "enum": ["read_only"],
+            },
+        },
+        "required": ["prompt"],
+    },
+
     # -- synthetic reply tool --
     REPLY_TOOL: {
         "type": "object",
@@ -245,6 +263,9 @@ DESCRIPTIONS: dict[str, str] = {
                         "and /skills are read-only."),
     "workspace_delete": ("Delete an editable virtual file at its exact revision. "
                          "Artifacts and skills cannot be deleted by the model."),
+    TASK_TOOL: ("Run a bounded isolated subagent on one focused task. The child can "
+                "read workspace/artifact, memory, and web data but cannot reply to "
+                "the user, mutate state, call MCP, or spawn another task."),
     REPLY_TOOL: "Send an immediate reply bubble to the user with the given text.",
 }
 
@@ -349,6 +370,8 @@ def validate_tool_args(name: str, args) -> str | None:
         revision = args.get("expected_revision")
         if type(revision) is not int or revision < 0:
             return "expected_revision must be a non-negative integer"
+    if name == TASK_TOOL and not str(args.get("prompt") or "").strip():
+        return "task requires a non-empty prompt"
     return None
 
 
@@ -358,5 +381,10 @@ def build_tool_specs() -> list[ToolSpec]:
         if name in _EXCLUDED:
             continue
         specs.append(ToolSpec(name=name, description=DESCRIPTIONS[name], parameters=PARAMS[name]))
-    specs.append(ToolSpec(name=REPLY_TOOL, description=DESCRIPTIONS[REPLY_TOOL], parameters=PARAMS[REPLY_TOOL]))
+    for name in (TASK_TOOL, REPLY_TOOL):
+        specs.append(ToolSpec(
+            name=name,
+            description=DESCRIPTIONS[name],
+            parameters=PARAMS[name],
+        ))
     return specs

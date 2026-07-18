@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import base64
 from pathlib import Path
@@ -91,6 +92,116 @@ def test_prompt_prefix_is_deterministic_and_excludes_dynamic_workspace():
     third = render_trusted_prefix_blocks(backend)
     assert third[:-1] == first[:-1]
     assert third[-1].cache_key != first[-1].cache_key
+
+
+def test_prompt_prefix_fails_instead_of_silently_truncating_skills():
+    class _SentinelBackend:
+        def list(self, *_args, **_kwargs):
+            return [
+                SimpleNamespace(path=f"/skills/{index:03d}.md")
+                for index in range(500)
+            ]
+
+        def read(self, _path):  # pragma: no cover - limit fails first
+            raise AssertionError("truncated skill set must not be rendered")
+
+    with pytest.raises(RuntimeError, match="skill prompt limit"):
+        render_trusted_prefix_blocks(_SentinelBackend())
+
+
+def test_production_workspace_prompt_loader_preserves_trust_partition(
+    monkeypatch,
+):
+    backend = InMemoryWorkspaceBackend()
+    backend.put_read_only(
+        "/skills/runtime.md",
+        "Always preserve the user-visible error contract.",
+        kind="skill",
+        expected_revision=0,
+    )
+    backend.write(
+        "/memory/WORKING.md",
+        "Editable scratch state",
+        expected_revision=0,
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "production_workspace_backend",
+        lambda *_args, **_kwargs: backend,
+    )
+
+    rendered = serve_worker._load_workspace_prompt(
+        SimpleNamespace(),
+        runtime_token="runtime-token",
+    )
+
+    assert len(rendered["trusted_system_blocks"]) == 1
+    assert "<feedling-skill" in rendered["trusted_system_blocks"][0]
+    assert "Always preserve" in rendered["trusted_system_blocks"][0]
+    assert "<feedling-working-memory" in rendered["working_memory"]
+    assert "Editable scratch state" in rendered["working_memory"]
+    assert "Editable scratch state" not in str(
+        rendered["trusted_system_blocks"]
+    )
+
+
+def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
+    calls = []
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "token",
+        load_workspace_prompt=lambda _store, **kwargs: (
+            calls.append(kwargs["runtime_token"])
+            or {
+                "trusted_system_blocks": ("skill",),
+                "working_memory": "scratch",
+            }
+        ),
+    )
+
+    loaded = asyncio.run(worker._load_workspace_prompt_context(
+        deps,
+        SimpleNamespace(),
+        runtime_token="token",
+        enclave_sem=asyncio.Semaphore(1),
+    ))
+    assert loaded == (("skill",), "scratch")
+    assert calls == ["token"]
+
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError("decrypted private value"))
+    )
+    with pytest.raises(worker.WorkspacePromptUnavailable):
+        asyncio.run(worker._load_workspace_prompt_context(
+            deps,
+            SimpleNamespace(),
+            runtime_token="token",
+            enclave_sem=asyncio.Semaphore(1),
+        ))
+
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "trusted_system_blocks": ("",),
+        "working_memory": "scratch",
+    }
+    with pytest.raises(worker.WorkspacePromptUnavailable):
+        asyncio.run(worker._load_workspace_prompt_context(
+            deps,
+            SimpleNamespace(),
+            runtime_token="token",
+            enclave_sem=asyncio.Semaphore(1),
+        ))
+    assert worker._safe_failure_code(
+        "turn_failed",
+        worker.WorkspacePromptUnavailable(),
+    ) == "turn_failed:workspace_prompt_unavailable"
+
+
+def test_production_deps_wire_workspace_prompt_loader():
+    assert (
+        serve_worker.build_production_deps().load_workspace_prompt
+        is serve_worker._load_workspace_prompt
+    )
 
 
 def test_sandbox_is_lazy_and_artifact_ingest_never_uses_host_filesystem():
