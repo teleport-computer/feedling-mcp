@@ -1893,6 +1893,8 @@ def test_diagnostic_no_tool_verdict_uses_specific_fallback(tmp_path):
 
     assert worker["result_source"] == "deterministic_fallback"
     assert worker["fallback_reason"] == "AGENT_TOOL_USE_MISSING"
+    assert worker["failure_stage"] == "SCENARIO_COMMAND_EVIDENCE"
+    assert worker["failure_code"] == "AGENT_TOOL_USE_MISSING"
     assert worker["completed_command_execution_count"] == 0
     assert worker["thread_id"] is None
 
@@ -1945,6 +1947,8 @@ def test_diagnostic_short_circuited_live_matrix_becomes_invalid_worker(tmp_path)
 
     assert receipt["workers"][0]["result_source"] == "deterministic_fallback"
     assert receipt["workers"][0]["fallback_reason"] == "WORKER_RESULT_INVALID"
+    assert receipt["workers"][0]["failure_stage"] == "STRUCTURED_RESULT"
+    assert receipt["workers"][0]["failure_code"] == "STRUCTURED_RESULT_INVALID"
 
 
 def test_diagnostic_nonzero_preserves_sanitized_agent_error_row(tmp_path):
@@ -1979,6 +1983,8 @@ def test_diagnostic_nonzero_preserves_sanitized_agent_error_row(tmp_path):
     assert worker["exec_events_sha256"] is None
     assert worker["result_source"] == "deterministic_fallback"
     assert worker["fallback_reason"] == "PROCESS_EXIT_NONZERO"
+    assert worker["failure_stage"] == "PROCESS_EXIT"
+    assert worker["failure_code"] == "PROCESS_EXIT_NONZERO"
     assert result["status"] == "AGENT_ERROR"
     assert result["diagnostic_codes"] == [
         "AGENT_EXECUTION_ERROR",
@@ -1993,9 +1999,15 @@ def test_diagnostic_nonzero_preserves_sanitized_agent_error_row(tmp_path):
     assert "content-secret-must-not-escape" not in serialized
 
 
-@pytest.mark.parametrize("failure_mode", ("malformed", "missing"))
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_stage", "expected_code"),
+    (
+        ("malformed", "STRUCTURED_RESULT", "STRUCTURED_RESULT_INVALID"),
+        ("missing", "OUTPUT_FILE_SET", "OUTPUT_FILE_SET_INVALID"),
+    ),
+)
 def test_diagnostic_malformed_or_missing_result_becomes_fallback(
-    tmp_path, failure_mode
+    tmp_path, failure_mode, expected_stage, expected_code
 ):
     paths = _setup(tmp_path, qualification_mode="diagnostic")
 
@@ -2045,6 +2057,8 @@ def test_diagnostic_malformed_or_missing_result_becomes_fallback(
 
     assert worker["result_source"] == "deterministic_fallback"
     assert worker["fallback_reason"] == "WORKER_RESULT_INVALID"
+    assert worker["failure_stage"] == expected_stage
+    assert worker["failure_code"] == expected_code
     assert worker["thread_id"] is None
     assert len(worker["cot_receipt_sha256"]) == 64
     assert worker["cot_delivery_status"] == "PASS"
@@ -2099,6 +2113,8 @@ def test_diagnostic_keeps_valid_worker_when_peer_uses_fallback(tmp_path):
     assert set(results) == {"official-gemini", "openrouter-glm"}
     assert workers["official-gemini"]["result_source"] == "codex_worker"
     assert workers["official-gemini"]["fallback_reason"] is None
+    assert workers["official-gemini"]["failure_stage"] is None
+    assert workers["official-gemini"]["failure_code"] is None
     assert workers["official-gemini"]["cot_evidence_failure"] is None
     assert workers["official-gemini"]["completed_command_execution_count"] == 14
     assert workers["official-gemini"]["completed_scenario_command_ids"] == list(
@@ -2111,6 +2127,8 @@ def test_diagnostic_keeps_valid_worker_when_peer_uses_fallback(tmp_path):
     assert workers["official-gemini"]["cot_failure_code"] == "NONE"
     assert len(workers["official-gemini"]["cot_receipt_sha256"]) == 64
     assert workers["openrouter-glm"]["result_source"] == "deterministic_fallback"
+    assert workers["openrouter-glm"]["failure_stage"] == "PROCESS_EXIT"
+    assert workers["openrouter-glm"]["failure_code"] == "PROCESS_EXIT_NONZERO"
     assert results["official-gemini"]["status"] == "BLOCKED_EVIDENCE"
     assert results["openrouter-glm"]["status"] == "AGENT_ERROR"
 
@@ -2172,6 +2190,8 @@ def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
     assert worker["result_source"] == "codex_worker"
     assert worker["fallback_reason"] is None
     assert worker["cot_evidence_failure"] == expected_reason
+    assert worker["failure_stage"] == "COT_RECEIPT_LOAD"
+    assert worker["failure_code"] == expected_reason
     assert worker["thread_id"] is not None
     assert worker["session_id"] is not None
     assert len(worker["exec_events_sha256"]) == 64

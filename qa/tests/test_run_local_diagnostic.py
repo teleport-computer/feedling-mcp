@@ -265,6 +265,318 @@ def _harness_provenance_receipt(_source_root: Path) -> dict:
     }
 
 
+def _worker_observability_fields(
+    *,
+    exit_code: int = 0,
+    fallback_reason: str | None = None,
+    failure_stage: str | None = None,
+    failure_code: str | None = None,
+    cot_evidence_failure: str | None = None,
+) -> dict:
+    return {
+        "process_exit_code": exit_code,
+        "fallback_reason": fallback_reason,
+        "failure_stage": failure_stage,
+        "failure_code": failure_code,
+        "cot_evidence_failure": cot_evidence_failure,
+    }
+
+
+def _worker_observability_row(
+    *,
+    exit_code: int = 0,
+    fallback_reason: str | None = None,
+    failure_stage: str | None = None,
+    failure_code: str | None = None,
+    cot_evidence_failure: str | None = None,
+    result_source: str | None = None,
+) -> dict:
+    return {
+        "result_source": (
+            result_source
+            if result_source is not None
+            else (
+                "codex_worker"
+                if fallback_reason is None
+                else "deterministic_fallback"
+            )
+        ),
+        **_worker_observability_fields(
+            exit_code=exit_code,
+            fallback_reason=fallback_reason,
+            failure_stage=failure_stage,
+            failure_code=failure_code,
+            cot_evidence_failure=cot_evidence_failure,
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "row",
+    (
+        pytest.param(_worker_observability_row(), id="codex-worker"),
+        pytest.param(
+            _worker_observability_row(
+                cot_evidence_failure="COT_RECEIPT_MISSING",
+                failure_stage="COT_RECEIPT_LOAD",
+                failure_code="COT_RECEIPT_MISSING",
+            ),
+            id="cot-missing",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                cot_evidence_failure="COT_RECEIPT_INVALID",
+                failure_stage="COT_RECEIPT_LOAD",
+                failure_code="COT_RECEIPT_INVALID",
+            ),
+            id="cot-invalid",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                cot_evidence_failure="COT_RESULT_BINDING_MISMATCH",
+                failure_stage="COT_BINDING",
+                failure_code="COT_RESULT_BINDING_MISMATCH",
+            ),
+            id="cot-binding",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                exit_code=125,
+                fallback_reason="INVOCATION_FAILED",
+                failure_stage="INVOCATION",
+                failure_code="INVOCATION_FAILED",
+                cot_evidence_failure="COT_RECEIPT_MISSING",
+            ),
+            id="invocation-fallback",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                exit_code=-9,
+                fallback_reason="PROCESS_EXIT_NONZERO",
+                failure_stage="PROCESS_EXIT",
+                failure_code="PROCESS_EXIT_NONZERO",
+                cot_evidence_failure="COT_RECEIPT_INVALID",
+            ),
+            id="process-fallback",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                fallback_reason="AGENT_TOOL_USE_MISSING",
+                failure_stage="SCENARIO_COMMAND_EVIDENCE",
+                failure_code="AGENT_TOOL_USE_MISSING",
+            ),
+            id="no-tool-fallback",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                fallback_reason="AGENT_SCENARIO_TOOL_USE_MISSING",
+                failure_stage="SCENARIO_COMMAND_EVIDENCE",
+                failure_code="AGENT_SCENARIO_TOOL_USE_MISSING",
+                cot_evidence_failure="COT_RECEIPT_MISSING",
+            ),
+            id="scenario-tool-fallback",
+        ),
+    ),
+)
+def test_worker_observability_accepts_exact_reachable_states(row):
+    projected = local._diagnostic_worker_observability(
+        {"official-gemini": row},
+        ("official-gemini",),
+        ("official-gemini",),
+    )
+
+    assert projected == {
+        "process_exit_codes": {"official-gemini": row["process_exit_code"]},
+        "fallback_reasons": {"official-gemini": row["fallback_reason"]},
+        "failure_stages": {"official-gemini": row["failure_stage"]},
+        "failure_codes": {"official-gemini": row["failure_code"]},
+        "cot_evidence_failures": {
+            "official-gemini": row["cot_evidence_failure"]
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "failure_code"),
+    (
+        ("OUTPUT_FILE_SET", "OUTPUT_FILE_SET_INVALID"),
+        ("STRUCTURED_RESULT", "STRUCTURED_RESULT_INVALID"),
+        ("EVENT_IDENTITY_PARSE", "EVENT_IDENTITY_PARSE_INVALID"),
+        ("EVENT_IDENTITY_PARSE", "EVENT_IDENTITY_DUPLICATED"),
+        ("EVENT_IDENTITY_PARSE", "EVENT_STREAM_DIGEST_INVALID"),
+        ("COMMAND_EVIDENCE_PARSE", "COMMAND_EVIDENCE_PARSE_INVALID"),
+        ("LIVE_RECEIPT_LOAD", "LIVE_RECEIPT_INVALID"),
+        ("LIVE_RECEIPT_PROJECTION", "LIVE_RECEIPT_PROJECTION_INVALID"),
+        ("LIVE_RECEIPT_SHAPE", "LIVE_RECEIPT_SHAPE_INVALID"),
+        ("LIVE_RECEIPT_BINDING", "LIVE_RECEIPT_BINDING_INVALID"),
+        ("WORKER_EVIDENCE", "WORKER_EVIDENCE_INVALID"),
+    ),
+)
+def test_worker_observability_accepts_each_worker_result_failure_pair(
+    failure_stage, failure_code
+):
+    row = _worker_observability_row(
+        fallback_reason="WORKER_RESULT_INVALID",
+        failure_stage=failure_stage,
+        failure_code=failure_code,
+    )
+
+    projected = local._diagnostic_worker_observability(
+        {"official-gemini": row},
+        ("official-gemini",),
+        ("official-gemini",),
+    )
+
+    assert projected["failure_stages"] == {"official-gemini": failure_stage}
+    assert projected["failure_codes"] == {"official-gemini": failure_code}
+
+
+def test_worker_observability_preserves_blocked_profiles_as_null():
+    row = _worker_observability_row()
+
+    projected = local._diagnostic_worker_observability(
+        {"official-gemini": row},
+        ("official-gemini",),
+        ("official-gemini", "relay-kongbeiqie"),
+    )
+
+    assert projected == {
+        "process_exit_codes": {"official-gemini": 0, "relay-kongbeiqie": None},
+        "fallback_reasons": {
+            "official-gemini": None,
+            "relay-kongbeiqie": None,
+        },
+        "failure_stages": {
+            "official-gemini": None,
+            "relay-kongbeiqie": None,
+        },
+        "failure_codes": {
+            "official-gemini": None,
+            "relay-kongbeiqie": None,
+        },
+        "cot_evidence_failures": {
+            "official-gemini": None,
+            "relay-kongbeiqie": None,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "row",
+    (
+        pytest.param(_worker_observability_row(exit_code=1), id="codex-nonzero"),
+        pytest.param(
+            _worker_observability_row(
+                result_source="deterministic_fallback",
+            ),
+            id="source-without-fallback",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                exit_code=0,
+                fallback_reason="PROCESS_EXIT_NONZERO",
+                failure_stage="PROCESS_EXIT",
+                failure_code="PROCESS_EXIT_NONZERO",
+            ),
+            id="process-zero",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                exit_code=124,
+                fallback_reason="INVOCATION_FAILED",
+                failure_stage="INVOCATION",
+                failure_code="INVOCATION_FAILED",
+            ),
+            id="invocation-wrong-exit",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                exit_code=1,
+                fallback_reason="PROCESS_EXIT_NONZERO",
+                failure_stage="INVOCATION",
+                failure_code="INVOCATION_FAILED",
+            ),
+            id="fallback-cross-pair",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                exit_code=1,
+                fallback_reason="AGENT_TOOL_USE_MISSING",
+                failure_stage="SCENARIO_COMMAND_EVIDENCE",
+                failure_code="AGENT_TOOL_USE_MISSING",
+            ),
+            id="tool-fallback-nonzero",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                fallback_reason="WORKER_RESULT_INVALID",
+                failure_stage="PROCESS_EXIT",
+                failure_code="PROCESS_EXIT_NONZERO",
+            ),
+            id="worker-result-forbidden-stage",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                fallback_reason="WORKER_RESULT_INVALID",
+                failure_stage="WORKER_EVIDENCE",
+                failure_code="WORKER_EVIDENCE_INVALID",
+                cot_evidence_failure="COT_RESULT_BINDING_MISMATCH",
+            ),
+            id="fallback-cot-binding",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                cot_evidence_failure="COT_RECEIPT_MISSING",
+            ),
+            id="cot-failure-without-pair",
+        ),
+        pytest.param(
+            _worker_observability_row(
+                failure_stage="COT_RECEIPT_LOAD",
+                failure_code="COT_RECEIPT_MISSING",
+            ),
+            id="cot-pair-without-failure",
+        ),
+        pytest.param(
+            _worker_observability_row(exit_code=True),
+            id="boolean-exit",
+        ),
+        pytest.param(
+            _worker_observability_row(exit_code=256),
+            id="out-of-range-exit",
+        ),
+        pytest.param(
+            _worker_observability_row(failure_stage="WORKER_EVIDENCE"),
+            id="partial-failure-pair",
+        ),
+        pytest.param(
+            {
+                **_worker_observability_row(),
+                "fallback_reason": "UNTRUSTED_FALLBACK",
+            },
+            id="unknown-fallback",
+        ),
+        pytest.param(
+            {
+                **_worker_observability_row(),
+                "cot_evidence_failure": "UNTRUSTED_COT_FAILURE",
+            },
+            id="unknown-cot-failure",
+        ),
+    ),
+)
+def test_worker_observability_rejects_unreachable_or_untrusted_states(row):
+    with pytest.raises(
+        local.LocalDiagnosticError,
+        match="diagnostic worker observability receipt is invalid",
+    ):
+        local._diagnostic_worker_observability(
+            {"official-gemini": row},
+            ("official-gemini",),
+            ("official-gemini",),
+        )
+
+
 def _diagnostic_manifest_profile(
     profile_id: str,
     *,
@@ -2192,6 +2504,7 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
                     "profile_id": "official-gemini",
                     "result_source": "codex_worker",
                     "fallback_reason": None,
+                    **_worker_observability_fields(),
                     "completed_command_execution_count": 13,
                     "completed_scenario_command_ids": list(
                         workers.AGENT_LIVE_SCENARIO_IDS
@@ -2367,7 +2680,12 @@ def test_mixed_matrix_launches_seven_and_accounts_for_blocked_eighth(tmp_path):
                 {
                     "profile_id": profile_id,
                     "result_source": "deterministic_fallback",
-                    "fallback_reason": "COT_RECEIPT_MISSING",
+                    **_worker_observability_fields(
+                        fallback_reason="WORKER_RESULT_INVALID",
+                        failure_stage="WORKER_EVIDENCE",
+                        failure_code="WORKER_EVIDENCE_INVALID",
+                        cot_evidence_failure="COT_RECEIPT_MISSING",
+                    ),
                     "completed_command_execution_count": 0,
                     "completed_scenario_command_ids": [],
                     "completed_scenario_command_counts": {},
@@ -2697,7 +3015,12 @@ def test_nonpassing_worker_retains_only_credential_scrubbed_debug_evidence(tmp_p
                 {
                     "profile_id": "official-gemini",
                     "result_source": "deterministic_fallback",
-                    "fallback_reason": "COT_RECEIPT_MISSING",
+                    **_worker_observability_fields(
+                        fallback_reason="WORKER_RESULT_INVALID",
+                        failure_stage="WORKER_EVIDENCE",
+                        failure_code="WORKER_EVIDENCE_INVALID",
+                        cot_evidence_failure="COT_RECEIPT_MISSING",
+                    ),
                 }
             ],
         }
@@ -2820,7 +3143,12 @@ def test_cleanup_failure_retains_retry_manifest_but_removes_oauth_material(tmp_p
                 {
                     "profile_id": "official-gemini",
                     "result_source": "deterministic_fallback",
-                    "fallback_reason": "COT_RECEIPT_MISSING",
+                    **_worker_observability_fields(
+                        fallback_reason="WORKER_RESULT_INVALID",
+                        failure_stage="WORKER_EVIDENCE",
+                        failure_code="WORKER_EVIDENCE_INVALID",
+                        cot_evidence_failure="COT_RECEIPT_MISSING",
+                    ),
                 }
             ],
         }

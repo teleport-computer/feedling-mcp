@@ -162,6 +162,50 @@ _DIAGNOSTIC_FALLBACK_SCENARIO_TOOL_USE = "AGENT_SCENARIO_TOOL_USE_MISSING"
 _DIAGNOSTIC_FALLBACK_COT_MISSING = "COT_RECEIPT_MISSING"
 _DIAGNOSTIC_FALLBACK_COT_INVALID = "COT_RECEIPT_INVALID"
 _DIAGNOSTIC_COT_BINDING_MISMATCH = "COT_RESULT_BINDING_MISMATCH"
+DIAGNOSTIC_FALLBACK_REASONS = frozenset(
+    (
+        _DIAGNOSTIC_FALLBACK_INVOCATION,
+        _DIAGNOSTIC_FALLBACK_PROCESS,
+        _DIAGNOSTIC_FALLBACK_WORKER_EVIDENCE,
+        _DIAGNOSTIC_FALLBACK_TOOL_USE,
+        _DIAGNOSTIC_FALLBACK_SCENARIO_TOOL_USE,
+    )
+)
+DIAGNOSTIC_COT_EVIDENCE_FAILURES = frozenset(
+    (
+        _DIAGNOSTIC_FALLBACK_COT_MISSING,
+        _DIAGNOSTIC_FALLBACK_COT_INVALID,
+        _DIAGNOSTIC_COT_BINDING_MISMATCH,
+    )
+)
+DIAGNOSTIC_FAILURE_CODES_BY_STAGE = {
+    "INVOCATION": frozenset(("INVOCATION_FAILED",)),
+    "PROCESS_EXIT": frozenset(("PROCESS_EXIT_NONZERO",)),
+    "OUTPUT_FILE_SET": frozenset(("OUTPUT_FILE_SET_INVALID",)),
+    "STRUCTURED_RESULT": frozenset(("STRUCTURED_RESULT_INVALID",)),
+    "EVENT_IDENTITY_PARSE": frozenset(
+        (
+            "EVENT_IDENTITY_PARSE_INVALID",
+            "EVENT_IDENTITY_DUPLICATED",
+            "EVENT_STREAM_DIGEST_INVALID",
+        )
+    ),
+    "COMMAND_EVIDENCE_PARSE": frozenset(("COMMAND_EVIDENCE_PARSE_INVALID",)),
+    "SCENARIO_COMMAND_EVIDENCE": frozenset(
+        ("AGENT_TOOL_USE_MISSING", "AGENT_SCENARIO_TOOL_USE_MISSING")
+    ),
+    "LIVE_RECEIPT_LOAD": frozenset(("LIVE_RECEIPT_INVALID",)),
+    "LIVE_RECEIPT_PROJECTION": frozenset(("LIVE_RECEIPT_PROJECTION_INVALID",)),
+    "LIVE_RECEIPT_SHAPE": frozenset(("LIVE_RECEIPT_SHAPE_INVALID",)),
+    "LIVE_RECEIPT_BINDING": frozenset(("LIVE_RECEIPT_BINDING_INVALID",)),
+    "COT_RECEIPT_LOAD": frozenset(
+        ("COT_RECEIPT_MISSING", "COT_RECEIPT_INVALID")
+    ),
+    "COT_BINDING": frozenset(("COT_RESULT_BINDING_MISMATCH",)),
+    # Defensive catch-all for a sanitized validation exception that does not
+    # originate at one of the explicitly instrumented boundaries above.
+    "WORKER_EVIDENCE": frozenset(("WORKER_EVIDENCE_INVALID",)),
+}
 _PROFILE_PROMPT = """\
 You are one independent intelligent qualification agent in the Feedling API-key
 P0 suite. Read $QA_SOURCE_ROOT/qa/SOP.md,
@@ -309,6 +353,18 @@ matching the supplied output schema; include only sanitized structured evidence.
 
 class WorkerLaunchError(RuntimeError):
     """Sanitized fixed failure from the deterministic process boundary."""
+
+
+class DiagnosticWorkerEvidenceError(WorkerLaunchError):
+    """One fixed, allowlisted diagnostic evidence-boundary failure."""
+
+    def __init__(self, failure_stage: str, failure_code: str) -> None:
+        allowed = DIAGNOSTIC_FAILURE_CODES_BY_STAGE.get(failure_stage)
+        if allowed is None or failure_code not in allowed:
+            raise WorkerLaunchError("diagnostic worker failure code is invalid")
+        super().__init__("Codex worker diagnostic evidence is invalid")
+        self.failure_stage = failure_stage
+        self.failure_code = failure_code
 
 
 class WorkerToolUseError(WorkerLaunchError):
@@ -1780,11 +1836,20 @@ def _validate_result(
         )
         errors = list(Draft202012Validator(schema).iter_errors(result))
         if errors or result.get("profile_id") != spec.profile_id:
-            raise WorkerLaunchError("Codex worker structured result is invalid")
+            raise DiagnosticWorkerEvidenceError(
+                "STRUCTURED_RESULT", "STRUCTURED_RESULT_INVALID"
+            )
+    except OrchestrationError:
+        raise DiagnosticWorkerEvidenceError(
+            "STRUCTURED_RESULT", "STRUCTURED_RESULT_INVALID"
+        ) from None
+    try:
         thread_id, session_id = parse_exec_events(spec.events_path)
-        return thread_id, session_id, result
-    except OrchestrationError as exc:
-        raise WorkerLaunchError(str(exc)) from None
+    except OrchestrationError:
+        raise DiagnosticWorkerEvidenceError(
+            "EVENT_IDENTITY_PARSE", "EVENT_IDENTITY_PARSE_INVALID"
+        ) from None
+    return thread_id, session_id, result
 
 
 def _completed_command_execution_count(path: Path) -> int:
@@ -1814,12 +1879,16 @@ def _validated_worker_evidence(
     try:
         names = {entry.name for entry in spec.output_dir.iterdir()}
     except OSError:
-        raise WorkerLaunchError("worker output is unreadable") from None
+        raise DiagnosticWorkerEvidenceError(
+            "OUTPUT_FILE_SET", "OUTPUT_FILE_SET_INVALID"
+        ) from None
     if (
         not _WORKER_AUTHORED_OUTPUT_FILES.issubset(names)
         or names - _EXPECTED_OUTPUT_FILES
     ):
-        raise WorkerLaunchError("worker output contains missing or extra files")
+        raise DiagnosticWorkerEvidenceError(
+            "OUTPUT_FILE_SET", "OUTPUT_FILE_SET_INVALID"
+        )
     thread_id, session_id, profile_result = _validate_result(spec)
     try:
         (
@@ -1833,7 +1902,9 @@ def _validated_worker_evidence(
             allow_failed_persona_capture=allow_failed_persona_capture,
         )
     except OrchestrationError:
-        raise WorkerLaunchError("Codex worker event stream is invalid") from None
+        raise DiagnosticWorkerEvidenceError(
+            "COMMAND_EVIDENCE_PARSE", "COMMAND_EVIDENCE_PARSE_INVALID"
+        ) from None
     if completed_commands < 1:
         raise WorkerToolUseError(
             "Codex worker returned without executing qualification tools"
@@ -1854,7 +1925,9 @@ def _validated_worker_evidence(
             p0_06_phases,
         )
     if thread_id in identities:
-        raise WorkerLaunchError("independent Codex worker identity is duplicated")
+        raise DiagnosticWorkerEvidenceError(
+            "EVENT_IDENTITY_PARSE", "EVENT_IDENTITY_DUPLICATED"
+        )
     return (
         thread_id,
         session_id,
@@ -2723,7 +2796,9 @@ def _load_live_worker_evidence(
             allow_failed_persona=allow_failed_persona,
         )
     except (LiveScenarioReceiptError, OSError):
-        raise WorkerLaunchError("live scenario receipt is invalid") from None
+        raise DiagnosticWorkerEvidenceError(
+            "LIVE_RECEIPT_LOAD", "LIVE_RECEIPT_INVALID"
+        ) from None
 
 
 def _has_failed_persona_capture(aggregate: Mapping[str, Any]) -> bool:
@@ -3039,14 +3114,20 @@ def launch(
         cot_receipt_sha256: str | None = None
         live_receipt_sha256: str | None = None
         cot_evidence_failure: str | None = None
+        failure_stage: str | None = None
+        failure_code: str | None = None
         completed_command_count: int | None = None
         scenario_command_ids: tuple[str, ...] = ()
         scenario_command_counts: dict[str, int] = {}
         p0_06_command_phases: tuple[str, ...] = ()
         if diagnostic and attempt.invocation_failed:
             fallback_reason = _DIAGNOSTIC_FALLBACK_INVOCATION
+            failure_stage = "INVOCATION"
+            failure_code = "INVOCATION_FAILED"
         elif diagnostic and attempt.exit_code != 0:
             fallback_reason = _DIAGNOSTIC_FALLBACK_PROCESS
+            failure_stage = "PROCESS_EXIT"
+            failure_code = "PROCESS_EXIT_NONZERO"
         elif diagnostic:
             try:
                 try:
@@ -3095,26 +3176,49 @@ def launch(
                         identities,
                         allow_failed_persona_capture=True,
                     )
-                profile_result = _project_diagnostic_live_evidence(
-                    profile_result, live_receipts
-                )
-                _validate_projected_result_shape(spec, profile_result)
-                _validate_diagnostic_live_projection(
-                    profile_result,
-                    live_receipts,
-                    allow_failed_persona=failed_persona_capture,
-                )
-                events_sha256 = file_sha256(
-                    spec.events_path,
-                    "Codex worker event stream",
-                    max_bytes=_MAX_EVENTS_BYTES,
-                )
+                try:
+                    profile_result = _project_diagnostic_live_evidence(
+                        profile_result, live_receipts
+                    )
+                except (WorkerLaunchError, DiagnosticAttemptError, OSError):
+                    raise DiagnosticWorkerEvidenceError(
+                        "LIVE_RECEIPT_PROJECTION",
+                        "LIVE_RECEIPT_PROJECTION_INVALID",
+                    ) from None
+                try:
+                    _validate_projected_result_shape(spec, profile_result)
+                except WorkerLaunchError:
+                    raise DiagnosticWorkerEvidenceError(
+                        "LIVE_RECEIPT_SHAPE", "LIVE_RECEIPT_SHAPE_INVALID"
+                    ) from None
+                try:
+                    _validate_diagnostic_live_projection(
+                        profile_result,
+                        live_receipts,
+                        allow_failed_persona=failed_persona_capture,
+                    )
+                except (WorkerLaunchError, DiagnosticAttemptError, OSError):
+                    raise DiagnosticWorkerEvidenceError(
+                        "LIVE_RECEIPT_BINDING", "LIVE_RECEIPT_BINDING_INVALID"
+                    ) from None
+                try:
+                    events_sha256 = file_sha256(
+                        spec.events_path,
+                        "Codex worker event stream",
+                        max_bytes=_MAX_EVENTS_BYTES,
+                    )
+                except (OrchestrationError, OSError):
+                    raise DiagnosticWorkerEvidenceError(
+                        "EVENT_IDENTITY_PARSE", "EVENT_STREAM_DIGEST_INVALID"
+                    ) from None
             except WorkerToolUseError:
                 thread_id = None
                 session_id = None
                 events_sha256 = None
                 completed_command_count = 0
                 fallback_reason = _DIAGNOSTIC_FALLBACK_TOOL_USE
+                failure_stage = "SCENARIO_COMMAND_EVIDENCE"
+                failure_code = "AGENT_TOOL_USE_MISSING"
             except WorkerScenarioToolUseError as exc:
                 thread_id = None
                 session_id = None
@@ -3124,6 +3228,15 @@ def launch(
                 scenario_command_counts = exc.scenario_counts
                 p0_06_command_phases = exc.p0_06_phases
                 fallback_reason = _DIAGNOSTIC_FALLBACK_SCENARIO_TOOL_USE
+                failure_stage = "SCENARIO_COMMAND_EVIDENCE"
+                failure_code = "AGENT_SCENARIO_TOOL_USE_MISSING"
+            except DiagnosticWorkerEvidenceError as exc:
+                thread_id = None
+                session_id = None
+                events_sha256 = None
+                fallback_reason = _DIAGNOSTIC_FALLBACK_WORKER_EVIDENCE
+                failure_stage = exc.failure_stage
+                failure_code = exc.failure_code
             except (
                 DiagnosticAttemptError,
                 OrchestrationError,
@@ -3134,9 +3247,14 @@ def launch(
                 session_id = None
                 events_sha256 = None
                 fallback_reason = _DIAGNOSTIC_FALLBACK_WORKER_EVIDENCE
+                failure_stage = "WORKER_EVIDENCE"
+                failure_code = "WORKER_EVIDENCE_INVALID"
             cot_path = spec.cot_receipt_path
             if not cot_path.exists():
                 cot_evidence_failure = _DIAGNOSTIC_FALLBACK_COT_MISSING
+                if failure_stage is None:
+                    failure_stage = "COT_RECEIPT_LOAD"
+                    failure_code = "COT_RECEIPT_MISSING"
             else:
                 try:
                     cot_receipt, cot_receipt_sha256 = validate_cot_receipt(
@@ -3146,6 +3264,9 @@ def launch(
                     cot_receipt = None
                     cot_receipt_sha256 = None
                     cot_evidence_failure = _DIAGNOSTIC_FALLBACK_COT_INVALID
+                    if failure_stage is None:
+                        failure_stage = "COT_RECEIPT_LOAD"
+                        failure_code = "COT_RECEIPT_INVALID"
                 else:
                     if fallback_reason is None:
                         try:
@@ -3164,6 +3285,9 @@ def launch(
                             cot_evidence_failure = (
                                 _DIAGNOSTIC_COT_BINDING_MISMATCH
                             )
+                            if failure_stage is None:
+                                failure_stage = "COT_BINDING"
+                                failure_code = _DIAGNOSTIC_COT_BINDING_MISMATCH
             if fallback_reason is not None:
                 thread_id = None
                 session_id = None
@@ -3198,6 +3322,9 @@ def launch(
             cot_path = spec.cot_receipt_path
             if not cot_path.exists():
                 cot_evidence_failure = _DIAGNOSTIC_FALLBACK_COT_MISSING
+                if failure_stage is None:
+                    failure_stage = "COT_RECEIPT_LOAD"
+                    failure_code = "COT_RECEIPT_MISSING"
             else:
                 try:
                     cot_receipt, cot_receipt_sha256 = validate_cot_receipt(
@@ -3205,6 +3332,9 @@ def launch(
                     )
                 except (CotReceiptError, OSError):
                     cot_evidence_failure = _DIAGNOSTIC_FALLBACK_COT_INVALID
+                    if failure_stage is None:
+                        failure_stage = "COT_RECEIPT_LOAD"
+                        failure_code = "COT_RECEIPT_INVALID"
 
         canonical = aggregation / f"{spec.profile_id}.json"
         if fallback_reason is not None:
@@ -3251,6 +3381,21 @@ def launch(
             ),
         }
         if diagnostic:
+            allowed_failure_codes = (
+                DIAGNOSTIC_FAILURE_CODES_BY_STAGE.get(failure_stage)
+                if failure_stage is not None
+                else None
+            )
+            if (failure_stage is None) != (failure_code is None) or (
+                failure_code is not None
+                and (
+                    allowed_failure_codes is None
+                    or failure_code not in allowed_failure_codes
+                )
+            ):
+                raise WorkerLaunchError(
+                    "diagnostic worker failure evidence is invalid"
+                )
             worker.update(
                 {
                     "result_source": (
@@ -3259,6 +3404,8 @@ def launch(
                         else _DIAGNOSTIC_RESULT_SOURCE_CODEX
                     ),
                     "fallback_reason": fallback_reason,
+                    "failure_stage": failure_stage,
+                    "failure_code": failure_code,
                     "cot_evidence_failure": cot_evidence_failure,
                     "completed_command_execution_count": completed_command_count,
                     "completed_scenario_command_ids": list(scenario_command_ids),

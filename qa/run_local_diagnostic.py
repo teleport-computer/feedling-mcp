@@ -2424,6 +2424,166 @@ def _cot_delivery_passes(
     )
 
 
+_WORKER_RESULT_INVALID_FAILURE_STAGES = frozenset(
+    (
+        "OUTPUT_FILE_SET",
+        "STRUCTURED_RESULT",
+        "EVENT_IDENTITY_PARSE",
+        "COMMAND_EVIDENCE_PARSE",
+        "LIVE_RECEIPT_LOAD",
+        "LIVE_RECEIPT_PROJECTION",
+        "LIVE_RECEIPT_SHAPE",
+        "LIVE_RECEIPT_BINDING",
+        "WORKER_EVIDENCE",
+    )
+)
+_EXACT_FALLBACK_FAILURE_PAIRS = {
+    "INVOCATION_FAILED": ("INVOCATION", "INVOCATION_FAILED"),
+    "PROCESS_EXIT_NONZERO": ("PROCESS_EXIT", "PROCESS_EXIT_NONZERO"),
+    "AGENT_TOOL_USE_MISSING": (
+        "SCENARIO_COMMAND_EVIDENCE",
+        "AGENT_TOOL_USE_MISSING",
+    ),
+    "AGENT_SCENARIO_TOOL_USE_MISSING": (
+        "SCENARIO_COMMAND_EVIDENCE",
+        "AGENT_SCENARIO_TOOL_USE_MISSING",
+    ),
+}
+
+
+def _diagnostic_worker_observability_correlates(
+    *,
+    exit_code: int,
+    result_source: str,
+    fallback: str | None,
+    failure_stage: str | None,
+    failure_code: str | None,
+    cot_failure: str | None,
+) -> bool:
+    """Bind fixed public diagnostics to the launcher's reachable states."""
+
+    pair = (failure_stage, failure_code)
+    if fallback is None:
+        if result_source != "codex_worker" or exit_code != 0:
+            return False
+        if cot_failure is None:
+            return pair == (None, None)
+        if cot_failure == "COT_RESULT_BINDING_MISMATCH":
+            return pair == ("COT_BINDING", "COT_RESULT_BINDING_MISMATCH")
+        return pair == ("COT_RECEIPT_LOAD", cot_failure)
+
+    if result_source != "deterministic_fallback":
+        return False
+    # Binding is evaluated only after all non-COT worker evidence succeeds.
+    # Once a deterministic fallback is selected, COT can only be absent,
+    # malformed, or independently valid.
+    if cot_failure == "COT_RESULT_BINDING_MISMATCH":
+        return False
+
+    if fallback == "INVOCATION_FAILED":
+        return exit_code == 125 and pair == _EXACT_FALLBACK_FAILURE_PAIRS[fallback]
+    if fallback == "PROCESS_EXIT_NONZERO":
+        return exit_code != 0 and pair == _EXACT_FALLBACK_FAILURE_PAIRS[fallback]
+    if fallback == "WORKER_RESULT_INVALID":
+        return exit_code == 0 and failure_stage in _WORKER_RESULT_INVALID_FAILURE_STAGES
+    if fallback in {
+        "AGENT_TOOL_USE_MISSING",
+        "AGENT_SCENARIO_TOOL_USE_MISSING",
+    }:
+        return exit_code == 0 and pair == _EXACT_FALLBACK_FAILURE_PAIRS[fallback]
+    return False
+
+
+def _diagnostic_worker_observability(
+    worker_by_id: Mapping[str, Mapping[str, Any]],
+    ready_profile_ids: Sequence[str],
+    selected_profile_ids: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Return only fixed, public-safe worker failure diagnostics."""
+
+    ready = tuple(ready_profile_ids)
+    selected = tuple(selected_profile_ids)
+    if tuple(worker_by_id) != ready or any(
+        profile_id not in selected for profile_id in ready
+    ):
+        raise LocalDiagnosticError("diagnostic worker observability matrix is invalid")
+
+    process_exit_codes: dict[str, int | None] = {}
+    fallback_reasons: dict[str, str | None] = {}
+    failure_stages: dict[str, str | None] = {}
+    failure_codes: dict[str, str | None] = {}
+    cot_evidence_failures: dict[str, str | None] = {}
+    for profile_id in selected:
+        row = worker_by_id.get(profile_id)
+        if row is None:
+            process_exit_codes[profile_id] = None
+            fallback_reasons[profile_id] = None
+            failure_stages[profile_id] = None
+            failure_codes[profile_id] = None
+            cot_evidence_failures[profile_id] = None
+            continue
+
+        exit_code = row.get("process_exit_code")
+        fallback = row.get("fallback_reason")
+        failure_stage = row.get("failure_stage")
+        failure_code = row.get("failure_code")
+        cot_failure = row.get("cot_evidence_failure")
+        result_source = row.get("result_source")
+        allowed_failure_codes = (
+            run_codex_profile_workers.DIAGNOSTIC_FAILURE_CODES_BY_STAGE.get(
+                failure_stage
+            )
+            if isinstance(failure_stage, str)
+            else None
+        )
+        if (
+            not isinstance(exit_code, int)
+            or isinstance(exit_code, bool)
+            or not -255 <= exit_code <= 255
+            or fallback
+            not in run_codex_profile_workers.DIAGNOSTIC_FALLBACK_REASONS
+            | {None}
+            or cot_failure
+            not in run_codex_profile_workers.DIAGNOSTIC_COT_EVIDENCE_FAILURES
+            | {None}
+            or (failure_stage is None) != (failure_code is None)
+            or (
+                failure_code is not None
+                and (
+                    allowed_failure_codes is None
+                    or failure_code not in allowed_failure_codes
+                )
+            )
+            or result_source not in {"codex_worker", "deterministic_fallback"}
+            or (result_source == "codex_worker") != (fallback is None)
+            or not _diagnostic_worker_observability_correlates(
+                exit_code=exit_code,
+                result_source=result_source,
+                fallback=fallback,
+                failure_stage=failure_stage,
+                failure_code=failure_code,
+                cot_failure=cot_failure,
+            )
+        ):
+            raise LocalDiagnosticError(
+                "diagnostic worker observability receipt is invalid"
+            )
+
+        process_exit_codes[profile_id] = exit_code
+        fallback_reasons[profile_id] = fallback
+        failure_stages[profile_id] = failure_stage
+        failure_codes[profile_id] = failure_code
+        cot_evidence_failures[profile_id] = cot_failure
+
+    return {
+        "process_exit_codes": process_exit_codes,
+        "fallback_reasons": fallback_reasons,
+        "failure_stages": failure_stages,
+        "failure_codes": failure_codes,
+        "cot_evidence_failures": cot_evidence_failures,
+    }
+
+
 def _profile_passes_before_parent_cleanup(
     profile_result: Mapping[str, Any], profile_id: str
 ) -> bool:
@@ -2828,6 +2988,11 @@ def execute(
                 for row in workers
                 if isinstance(row, Mapping)
             }
+            worker_observability = _diagnostic_worker_observability(
+                worker_by_id,
+                ready_profile_ids,
+                options.profile_ids,
+            )
             result_sources = {
                 profile_id: (
                     "provision_blocked"
@@ -2849,6 +3014,7 @@ def execute(
                 "max_observed_profile_concurrency": receipt.get(
                     "max_observed_profile_concurrency"
                 ),
+                **worker_observability,
                 "completed_command_execution_counts": {
                     profile_id: (
                         worker_by_id[profile_id].get(
