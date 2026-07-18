@@ -96,6 +96,9 @@ def test_bundle_isolates_workers_aggregation_and_persona_judge(tmp_path):
 
     assert document["default_permissions"] == writer.SUPERVISOR_PERMISSION_PROFILE
     assert document["model"] == "gpt-5.4"
+    assert document["model_reasoning_effort"] == "low"
+    assert document["model_reasoning_summary"] == "none"
+    assert document["model_verbosity"] == "low"
     assert document["approval_policy"] == "never"
     assert document["features"]["multi_agent"] is False
     assert document["features"]["hooks"] is False
@@ -138,6 +141,9 @@ def test_bundle_isolates_workers_aggregation_and_persona_judge(tmp_path):
         assert profile["default_permissions"] == permission_name
         assert policy[memory_manifest] == "deny"
         assert profile["model"] == "gpt-5.4"
+        assert profile["model_reasoning_effort"] == "low"
+        assert profile["model_reasoning_summary"] == "none"
+        assert profile["model_verbosity"] == "low"
         assert "agents" not in profile
         assert "permissions" not in profile
         assert (
@@ -191,6 +197,9 @@ def test_bundle_isolates_workers_aggregation_and_persona_judge(tmp_path):
         == writer.PERSONA_MEMORY_JUDGE_PERMISSION_PROFILE
     )
     assert judge_profile["model"] == "gpt-5.4"
+    assert judge_profile["model_reasoning_effort"] == "low"
+    assert judge_profile["model_reasoning_summary"] == "none"
+    assert judge_profile["model_verbosity"] == "low"
     assert judge_profile["approval_policy"] == "never"
     assert set(judge_profile["shell_environment_policy"]["include_only"]) == {
         "HOME",

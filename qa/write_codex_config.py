@@ -354,6 +354,14 @@ def _base_settings(profile: str, codex_model: str) -> list[str]:
     return [
         f"default_permissions = {_quoted(profile)}",
         f"model = {_quoted(codex_model)}",
+        # The qualification journey is highly constrained and its semantic
+        # decisions are bounded.  Pin the lowest practical supervisor effort
+        # and verbosity so the final schema-bound response does not spend
+        # minutes reasoning silently and trip the authenticated stream's idle
+        # timeout after every deterministic probe has already completed.
+        'model_reasoning_effort = "low"',
+        'model_reasoning_summary = "none"',
+        'model_verbosity = "low"',
         'approval_policy = "never"',
         'web_search = "disabled"',
         'cli_auth_credentials_store = "file"',
