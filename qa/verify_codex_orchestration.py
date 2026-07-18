@@ -11,6 +11,7 @@ import re
 import shlex
 import stat
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Mapping, Sequence
@@ -430,21 +431,11 @@ def _p0_06_phase(tokens: tuple[str, ...]) -> str | None:
     return phase if arguments == expected.get(phase) else None
 
 
-def _successful_scenario_marker(
-    row: Mapping[str, Any],
-) -> tuple[str, int | str] | None:
-    item = row.get("item")
-    if not (
-        row.get("type") == "item.completed"
-        and isinstance(item, dict)
-        and item.get("type") == "command_execution"
-        and item.get("status") == "completed"
-        and type(item.get("exit_code")) is int
-        and item.get("exit_code") == 0
-        and isinstance(item.get("command"), str)
-    ):
-        return None
-    tokens = _command_tokens(item["command"])
+ScenarioCommandMarker = tuple[str, int | str]
+
+
+def _scenario_command_marker(command: str) -> ScenarioCommandMarker | None:
+    tokens = _command_tokens(command)
     if not tokens:
         return None
     match = _SCENARIO_COMMAND_RE.match(tokens[0])
@@ -475,58 +466,186 @@ def _successful_scenario_marker(
     )
 
 
-def completed_scenario_command_sequence_snapshot(
-    path: Path,
-) -> tuple[tuple[str, int | str], ...]:
-    """Parse only newline-terminated parent-owned Codex JSONL rows.
+def _successful_scenario_marker(
+    row: Mapping[str, Any],
+) -> ScenarioCommandMarker | None:
+    item = row.get("item")
+    if not (
+        row.get("type") == "item.completed"
+        and isinstance(item, dict)
+        and item.get("type") == "command_execution"
+        and item.get("status") == "completed"
+        and type(item.get("exit_code")) is int
+        and item.get("exit_code") == 0
+        and isinstance(item.get("command"), str)
+    ):
+        return None
+    return _scenario_command_marker(item["command"])
 
-    The Codex subprocess may be appending its current event.  A trailing partial
-    row is not evidence and is ignored; every complete row is parsed strictly.
-    The parent can therefore gate live mutations on completed exact commands
-    without trusting worker-writable request artifacts.
-    """
 
-    try:
-        with open_owned_regular(
-            path, "live Codex worker event stream", max_bytes=_MAX_EVENTS_BYTES
-        ) as handle:
-            size = os.fstat(handle.fileno()).st_size
-            content = handle.read(size)
-    except OrchestrationError:
-        raise
-    except OSError:
-        raise OrchestrationError(
-            "live Codex worker event stream is unreadable"
-        ) from None
-    if len(content) != size:
-        raise OrchestrationError("live Codex worker event stream changed while reading")
-    final_newline = content.rfind(b"\n")
-    if final_newline < 0:
-        if len(content) > _MAX_JSON_LINE_BYTES:
+@dataclass(frozen=True)
+class ScenarioCommandEventSnapshot:
+    """Bound exact command starts and their parent-observed terminal exits."""
+
+    started: tuple[ScenarioCommandMarker, ...]
+    completed: tuple[tuple[ScenarioCommandMarker, int], ...]
+
+
+class ScenarioCommandEventCursor:
+    """Incrementally parse one append-only, parent-owned Codex JSONL stream."""
+
+    def __init__(self, path: Path, *, max_bytes: int = _MAX_EVENTS_BYTES):
+        if max_bytes <= 0 or max_bytes > _MAX_EVENTS_BYTES:
+            raise ValueError("event cursor byte bound is invalid")
+        self.path = path
+        self.max_bytes = max_bytes
+        self._identity: tuple[int, int] | None = None
+        self._offset = 0
+        self._tail = b""
+        self._started_items: dict[
+            str, tuple[ScenarioCommandMarker, str]
+        ] = {}
+        self._seen_item_ids: set[str] = set()
+        self._started: list[ScenarioCommandMarker] = []
+        self._completed: list[tuple[ScenarioCommandMarker, int]] = []
+        self._rows_parsed = 0
+
+    @property
+    def bytes_consumed(self) -> int:
+        return self._offset
+
+    @property
+    def rows_parsed(self) -> int:
+        return self._rows_parsed
+
+    def _consume_row(self, row: Mapping[str, Any]) -> None:
+        row_type = row.get("type")
+        if row_type not in {"item.started", "item.completed"}:
+            return
+        item = row.get("item")
+        if not (
+            isinstance(item, dict)
+            and item.get("type") == "command_execution"
+            and isinstance(item.get("command"), str)
+        ):
+            return
+        marker = _scenario_command_marker(item["command"])
+        item_id = item.get("id")
+        if row_type == "item.started":
+            if marker is None:
+                return
+            if not _valid_identifier(item_id) or item_id in self._seen_item_ids:
+                raise OrchestrationError(
+                    "live Codex command lifecycle is invalid"
+                )
+            normalized_id = str(item_id)
+            self._seen_item_ids.add(normalized_id)
+            self._started_items[normalized_id] = (
+                marker,
+                item["command"],
+            )
+            self._started.append(marker)
+            return
+
+        if not _valid_identifier(item_id):
+            if marker is not None:
+                raise OrchestrationError(
+                    "live Codex command lifecycle is invalid"
+                )
+            return
+        normalized_id = str(item_id)
+        started = self._started_items.get(normalized_id)
+        if started is None:
+            if marker is not None:
+                raise OrchestrationError(
+                    "live Codex command lifecycle is invalid"
+                )
+            return
+        if (
+            marker != started[0]
+            or item["command"] != started[1]
+            or item.get("status") != "completed"
+            or type(item.get("exit_code")) is not int
+        ):
+            raise OrchestrationError("live Codex command lifecycle is invalid")
+        del self._started_items[normalized_id]
+        self._completed.append((started[0], item["exit_code"]))
+
+    def snapshot(self) -> ScenarioCommandEventSnapshot:
+        label = "live Codex worker event stream"
+        try:
+            with open_owned_regular(
+                self.path,
+                label,
+                max_bytes=self.max_bytes,
+            ) as handle:
+                before = os.fstat(handle.fileno())
+                identity = (before.st_dev, before.st_ino)
+                if self._identity is None:
+                    self._identity = identity
+                elif identity != self._identity:
+                    raise OrchestrationError(f"{label} changed while reading")
+                if before.st_size < self._offset:
+                    raise OrchestrationError(f"{label} changed while reading")
+                handle.seek(self._offset)
+                expected = before.st_size - self._offset
+                chunk = handle.read(expected)
+                after = os.fstat(handle.fileno())
+                linked = self.path.stat(follow_symlinks=False)
+        except OrchestrationError:
+            raise
+        except OSError:
+            raise OrchestrationError(f"{label} is unreadable") from None
+        if (
+            len(chunk) != expected
+            or after.st_size < before.st_size
+            or after.st_size > self.max_bytes
+            or (after.st_dev, after.st_ino) != self._identity
+            or not stat.S_ISREG(linked.st_mode)
+            or linked.st_uid != os.geteuid()
+            or stat.S_IMODE(linked.st_mode) != 0o600
+            or linked.st_nlink != 1
+            or linked.st_size < before.st_size
+            or linked.st_size > self.max_bytes
+            or (linked.st_dev, linked.st_ino) != self._identity
+        ):
+            raise OrchestrationError(f"{label} changed while reading")
+        self._offset = before.st_size
+        pending = self._tail + chunk
+        raw_rows = pending.split(b"\n")
+        self._tail = raw_rows.pop()
+        if len(self._tail) > _MAX_JSON_LINE_BYTES:
             raise OrchestrationError(
                 "live Codex worker event stream contains an oversized row"
             )
-        return ()
-    if len(content) - final_newline - 1 > _MAX_JSON_LINE_BYTES:
-        raise OrchestrationError(
-            "live Codex worker event stream contains an oversized row"
+        for raw in raw_rows:
+            if not raw or len(raw) > _MAX_JSON_LINE_BYTES:
+                raise OrchestrationError("live Codex worker event stream is invalid")
+            try:
+                row = json.loads(raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError, RecursionError):
+                raise OrchestrationError(
+                    "live Codex worker event stream is invalid"
+                ) from None
+            if not isinstance(row, dict):
+                raise OrchestrationError("live Codex worker event stream is invalid")
+            self._consume_row(row)
+            self._rows_parsed += 1
+        return ScenarioCommandEventSnapshot(
+            started=tuple(self._started),
+            completed=tuple(self._completed),
         )
-    markers: list[tuple[str, int | str]] = []
-    for raw in content[: final_newline + 1].splitlines():
-        if not raw or len(raw) > _MAX_JSON_LINE_BYTES:
-            raise OrchestrationError("live Codex worker event stream is invalid")
-        try:
-            row = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError, RecursionError):
-            raise OrchestrationError(
-                "live Codex worker event stream is invalid"
-            ) from None
-        if not isinstance(row, dict):
-            raise OrchestrationError("live Codex worker event stream is invalid")
-        marker = _successful_scenario_marker(row)
-        if marker is not None:
-            markers.append(marker)
-    return tuple(markers)
+
+
+def completed_scenario_command_sequence_snapshot(
+    path: Path,
+) -> tuple[tuple[str, int | str], ...]:
+    """Return exact successful lifecycles from one bounded snapshot."""
+
+    snapshot = ScenarioCommandEventCursor(path).snapshot()
+    return tuple(
+        marker for marker, exit_code in snapshot.completed if exit_code == 0
+    )
 
 
 def completed_command_evidence(

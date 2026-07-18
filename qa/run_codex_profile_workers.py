@@ -73,9 +73,10 @@ try:
         AGENT_LIVE_SCENARIO_IDS,
         MAX_CONFIGURED_CONCURRENCY,
         RECEIPT_SCHEMA_VERSION,
+        ScenarioCommandEventCursor,
+        ScenarioCommandEventSnapshot,
         OrchestrationError,
         canonical_json_sha256,
-        completed_scenario_command_sequence_snapshot,
         completed_command_evidence,
         file_sha256,
         load_private_json,
@@ -123,9 +124,10 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
         AGENT_LIVE_SCENARIO_IDS,
         MAX_CONFIGURED_CONCURRENCY,
         RECEIPT_SCHEMA_VERSION,
+        ScenarioCommandEventCursor,
+        ScenarioCommandEventSnapshot,
         OrchestrationError,
         canonical_json_sha256,
-        completed_scenario_command_sequence_snapshot,
         completed_command_evidence,
         file_sha256,
         load_private_json,
@@ -1295,41 +1297,39 @@ def _expected_parent_command_prefix(
 
 
 def _parent_command_predecessor_ready(
-    spec: WorkerSpec,
+    event_cursor: ScenarioCommandEventCursor,
     receipts: Sequence[Mapping[str, Any]],
     *,
+    current: tuple[str, int | str],
     include_cot: bool = False,
-    cot_request: bool = False,
+    cot_terminal_ack: CotTerminalAck | None = None,
 ) -> bool:
-    """Trust only exact successful commands in the parent-owned Codex stream."""
+    """Require exact predecessor exits plus the current parent-observed start."""
 
     try:
-        observed = completed_scenario_command_sequence_snapshot(spec.events_path)
+        observed: ScenarioCommandEventSnapshot = event_cursor.snapshot()
     except OrchestrationError:
         raise WorkerLaunchError("live Codex command evidence is invalid") from None
     expected = _expected_parent_command_prefix(
         receipts,
         include_cot=include_cot,
     )
-    if observed[: len(expected)] != expected:
+    if observed.started[: len(expected) + 1] != (*expected, current):
         return False
-    if cot_request:
-        # In a real worker P0-11 cannot complete without the corresponding
-        # parent receipt.  Keeping this explicit predecessor assertion also
-        # supports deterministic process-runner fixtures that pre-render their
-        # complete event transcript before requesting probes.
-        try:
-            p0_11_index = max(
-                index
-                for index, marker in enumerate(observed)
-                if marker[0] == "P0-11"
-            )
-        except ValueError:
-            return False
-        p0_12_indices = [
-            index for index, marker in enumerate(observed) if marker == ("P0-12", 1)
-        ]
-        if p0_12_indices and p0_11_index > min(p0_12_indices):
+    completed = observed.completed[: len(expected)]
+    if tuple(marker for marker, _ in completed) != expected:
+        return False
+    for marker, exit_code in completed:
+        if marker == ("P0-12", 1):
+            if cot_terminal_ack is None:
+                return False
+            if exit_code == 0 and not cot_terminal_ack.available:
+                return False
+            if exit_code == 3 and cot_terminal_ack.available:
+                return False
+            if exit_code not in {0, 3}:
+                return False
+        elif exit_code != 0:
             return False
     return True
 
@@ -1630,6 +1630,7 @@ def _run_process_with_trusted_cot(
             result["failed"] = True
 
     worker = threading.Thread(target=run_worker, daemon=False)
+    event_cursor = ScenarioCommandEventCursor(spec.events_path)
     worker.start()
     cot_probe_handled = False
     cot_terminal_ack: CotTerminalAck | None = None
@@ -1647,9 +1648,9 @@ def _run_process_with_trusted_cot(
             cot_key = "P0-12"
             try:
                 cot_ready = _parent_command_predecessor_ready(
-                    spec,
+                    event_cursor,
                     live_receipts,
-                    cot_request=True,
+                    current=("P0-12", 1),
                 )
             except WorkerLaunchError:
                 cot_ready = False
@@ -1686,9 +1687,15 @@ def _run_process_with_trusted_cot(
                 ack_key = f"{scenario_id}:{attempt}"
                 try:
                     predecessor_ready = _parent_command_predecessor_ready(
-                        spec,
+                        event_cursor,
                         live_receipts,
+                        current=(
+                            (scenario_id, "CAPTURE")
+                            if scenario_id == "P0-06"
+                            else (scenario_id, attempt)
+                        ),
                         include_cot=scenario_id == "P0-13",
+                        cot_terminal_ack=cot_terminal_ack,
                     )
                 except WorkerLaunchError:
                     predecessor_ready = False

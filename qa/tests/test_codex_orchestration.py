@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import pytest
 
@@ -861,9 +861,15 @@ def _persona_finalize_runner(
     }
 
 
-def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
+def _request_passing_live_probes(
+    spec: launcher.WorkerSpec,
+    *,
+    before_p0_13: Callable[[], None] | None = None,
+) -> None:
     receipts: list[dict[str, Any]] = []
     for scenario_id in live_request.LIVE_SCENARIO_IDS:
+        if scenario_id == "P0-13" and before_p0_13 is not None:
+            before_p0_13()
         request_path = live_request.request_path(spec.work, scenario_id, 1)
         facts_path = live_request.facts_path(spec.work, scenario_id, 1)
         facts = live_request.request_and_wait(
@@ -1153,6 +1159,49 @@ def _scenario_command_rows() -> list[dict[str, Any]]:
     ]
 
 
+def _scenario_command_lifecycle_rows(
+    *,
+    exit_codes: Mapping[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Add stable item IDs and starts to the exact command fixture."""
+
+    configured = dict(exit_codes or {})
+    rows: list[dict[str, Any]] = []
+    for index, completed in enumerate(_scenario_command_rows(), start=1):
+        command = completed["item"]["command"]
+        scenario_id = next(
+            scenario_id
+            for scenario_id in verifier.AGENT_LIVE_SCENARIO_IDS
+            if f"QA_SCENARIO_ID={scenario_id}" in command
+        )
+        key = scenario_id
+        if scenario_id == "P0-06":
+            phase = next(
+                phase
+                for phase in verifier.P0_06_COMMAND_PHASES
+                if f"QA_SCENARIO_PHASE={phase}" in command
+            )
+            key = f"{scenario_id}:{phase}"
+        item_id = f"scenario-command-{index}"
+        rows.append(
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "id": item_id,
+                    "command": command,
+                },
+            }
+        )
+        terminal = json.loads(json.dumps(completed))
+        terminal["item"]["id"] = item_id
+        terminal["item"]["exit_code"] = configured.get(
+            key, configured.get(scenario_id, terminal["item"]["exit_code"])
+        )
+        rows.append(terminal)
+    return rows
+
+
 def _successful_runner(
     captured: list[launcher.WorkerSpec],
     *,
@@ -1310,7 +1359,14 @@ def _successful_runner(
         # event validation modes, so first publish an exact gate transcript,
         # then replace it with the requested final transcript after all probe
         # helpers have reached terminal exit.
-        gate_rows = [rows[0], rows[1], *_scenario_command_rows()]
+        gate_exit_codes = (
+            {"P0-12": 3} if cot_mode in {"missing", "malformed"} else None
+        )
+        gate_rows = [
+            rows[0],
+            rows[1],
+            *_scenario_command_lifecycle_rows(exit_codes=gate_exit_codes),
+        ]
         staged_events = spec.events_path.with_name(".events-fixture.tmp")
         staged_events.write_text(
             "".join(json.dumps(row) + "\n" for row in gate_rows)
@@ -1330,8 +1386,12 @@ def _successful_runner(
                 spec.profile_id,
                 after_ack=cot_mode == "request-failed-after-ack",
             )
-        _request_passing_cot_probe(spec, expected_receipt)
-        _request_passing_live_probes(spec)
+        _request_passing_live_probes(
+            spec,
+            before_p0_13=lambda: _request_passing_cot_probe(
+                spec, expected_receipt
+            ),
+        )
         if cot_mode == "binding-mismatch":
             result = json.loads(spec.result_path.read_text())
             result["reasoning"]["disclosure_length"] += 1
@@ -1699,8 +1759,11 @@ def test_live_request_loader_retries_transient_atomic_publication(
 
 def test_parent_event_snapshot_ignores_only_trailing_partial_json(tmp_path):
     path = tmp_path.resolve() / "events.jsonl"
-    row = _scenario_command_rows()[0]
-    path.write_bytes(json.dumps(row).encode("utf-8") + b'\n{"type":')
+    rows = _scenario_command_lifecycle_rows()[:2]
+    path.write_bytes(
+        b"".join(json.dumps(row).encode("utf-8") + b"\n" for row in rows)
+        + b'{"type":'
+    )
     path.chmod(0o600)
 
     assert verifier.completed_scenario_command_sequence_snapshot(path) == (
@@ -1711,6 +1774,90 @@ def test_parent_event_snapshot_ignores_only_trailing_partial_json(tmp_path):
         handle.write(b"\n")
     with pytest.raises(verifier.OrchestrationError, match="event stream is invalid"):
         verifier.completed_scenario_command_sequence_snapshot(path)
+
+
+def test_parent_event_cursor_parses_only_appended_bytes_near_limit(tmp_path):
+    path = tmp_path.resolve() / "events.jsonl"
+    maximum = 8 * 1024
+    lifecycle = _scenario_command_lifecycle_rows()
+    initial_rows = [
+        {"type": "notice", "padding": "x" * 6000},
+        *lifecycle[:2],
+    ]
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in initial_rows),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    assert path.stat().st_size > maximum * 3 // 4
+    cursor = verifier.ScenarioCommandEventCursor(path, max_bytes=maximum)
+
+    first = cursor.snapshot()
+    consumed = cursor.bytes_consumed
+    parsed = cursor.rows_parsed
+    assert first.completed == ((('P0-02', 1), 0),)
+    assert consumed == path.stat().st_size
+    assert parsed == len(initial_rows)
+
+    assert cursor.snapshot() == first
+    assert cursor.bytes_consumed == consumed
+    assert cursor.rows_parsed == parsed
+
+    with path.open("ab") as handle:
+        handle.write(
+            b"".join(
+                json.dumps(row).encode("utf-8") + b"\n"
+                for row in lifecycle[2:4]
+            )
+        )
+    second = cursor.snapshot()
+    assert second.completed[-1] == (("P0-03", 1), 0)
+    assert cursor.bytes_consumed == path.stat().st_size
+    assert cursor.rows_parsed == parsed + 2
+
+
+def test_parent_event_cursor_rejects_post_open_growth_past_limit(
+    tmp_path, monkeypatch
+):
+    path = tmp_path.resolve() / "events.jsonl"
+    rows = _scenario_command_lifecycle_rows()[:2]
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    maximum = path.stat().st_size + 64
+    original_fstat = verifier.os.fstat
+    calls = 0
+
+    def grow_before_post_read_fstat(descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            with path.open("ab") as handle:
+                handle.write(b"x" * 65)
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(verifier.os, "fstat", grow_before_post_read_fstat)
+
+    with pytest.raises(verifier.OrchestrationError, match="changed while reading"):
+        verifier.ScenarioCommandEventCursor(
+            path, max_bytes=maximum
+        ).snapshot()
+
+
+def test_parent_event_cursor_rejects_completion_with_different_item_id(tmp_path):
+    path = tmp_path.resolve() / "events.jsonl"
+    rows = _scenario_command_lifecycle_rows()[:2]
+    rows[1]["item"]["id"] = "different-command-item"
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+    with pytest.raises(verifier.OrchestrationError, match="lifecycle is invalid"):
+        verifier.ScenarioCommandEventCursor(path).snapshot()
 
 
 def test_parent_rejects_forged_p0_13_cot_terminal_binding(
@@ -1741,7 +1888,7 @@ def test_parent_rejects_forged_p0_13_cot_terminal_binding(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="qualification runner is POSIX")
-def test_parent_gate_ignores_forged_persona_files_and_replaced_worker_lock(
+def test_parent_gate_rejects_forged_current_marker_and_replaced_worker_lock(
     tmp_path, monkeypatch
 ):
     paths = _setup(tmp_path)
@@ -1785,15 +1932,11 @@ def test_parent_gate_ignores_forged_persona_files_and_replaced_worker_lock(
         assert received_spec is spec
         assert timeout == 600
         rows: list[dict[str, Any]] = []
-        for row in _scenario_command_rows():
+        for row in _scenario_command_lifecycle_rows():
             command = row["item"]["command"]
             if "QA_SCENARIO_ID=P0-07" in command:
                 break
-            if (
-                "QA_SCENARIO_ID=P0-06" not in command
-                or "QA_SCENARIO_PHASE=FINALIZE" not in command
-            ):
-                rows.append(row)
+            rows.append(row)
         staged = spec.events_path.with_name(".adversarial-events.tmp")
         staged.write_text(
             "".join(json.dumps(row) + "\n" for row in rows),
@@ -1906,6 +2049,157 @@ sys.stdin.buffer.read(1)
     assert invoked == ["P0-02", "P0-03", "P0-04", "P0-05", "P0-06"]
 
 
+@pytest.mark.parametrize(
+    ("p0_12_exit", "cot_available", "expected"),
+    (
+        (0, True, True),
+        (0, False, False),
+        (3, False, True),
+        (3, True, False),
+        (1, False, False),
+        (2, False, False),
+    ),
+)
+def test_p0_13_parent_gate_accepts_only_bound_p0_12_terminal_exit(
+    tmp_path, p0_12_exit, cot_available, expected
+):
+    path = tmp_path.resolve() / "events.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps(row) + "\n"
+            for row in _scenario_command_lifecycle_rows(
+                exit_codes={"P0-12": p0_12_exit}
+            )
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    receipts = [
+        {"scenario_id": scenario_id, "attempt": 1, "status": "PASS"}
+        for scenario_id in launcher.PARENT_LIVE_SCENARIO_IDS
+        if scenario_id != "P0-13"
+    ]
+    ack = launcher.CotTerminalAck(
+        terminal_sha256="a" * 64,
+        receipt_sha256=("b" * 64 if cot_available else None),
+        available=cot_available,
+    )
+
+    assert launcher._parent_command_predecessor_ready(
+        verifier.ScenarioCommandEventCursor(path),
+        receipts,
+        current=("P0-13", 1),
+        include_cot=True,
+        cot_terminal_ack=ack,
+    ) is expected
+
+
+def test_unavailable_cot_exit_three_still_runs_p0_13_cleanup(tmp_path):
+    paths = _setup(tmp_path)
+    spec = launcher._prepare_specs(
+        codex_bin=paths["codex_bin"],
+        codex_home=paths["codex_home"],
+        source_root=paths["source"],
+        artifact_root=paths["artifacts"],
+        profile_manifest_dir=paths["manifests"],
+        worker_root=paths["worker_root"],
+        worker_output_root=paths["raw"],
+        authoring_schema=launcher._load_authoring_schema(paths["schema"]),
+        worker_python=paths["worker_python"],
+        run_id="run-unavailable-cot-cleanup",
+        base_url="https://test-api.feedling.app",
+        expected_sha="a" * 40,
+        assignments=(PROFILE_AGENT_TYPES[0],),
+    )[0]
+    invoked: list[str] = []
+
+    def live_probe_runner(
+        received_spec,
+        scenario_id,
+        attempt,
+        nonce,
+        prior_receipts,
+    ):
+        invoked.append(scenario_id)
+        return _passing_live_probe(
+            received_spec,
+            scenario_id,
+            attempt,
+            nonce,
+            prior_receipts,
+        )
+
+    def process_runner(received_spec: launcher.WorkerSpec, timeout: int) -> int:
+        assert received_spec is spec
+        assert timeout == 600
+        staged = spec.events_path.with_name(".cot-unavailable-events.tmp")
+        staged.write_text(
+            "".join(
+                json.dumps(row) + "\n"
+                for row in _scenario_command_lifecycle_rows(
+                    exit_codes={"P0-12": 3}
+                )
+            ),
+            encoding="utf-8",
+        )
+        staged.chmod(0o600)
+        os.replace(staged, spec.events_path)
+
+        for scenario_id in live_request.LIVE_SCENARIO_IDS:
+            if scenario_id == "P0-13":
+                break
+            facts = live_request.request_and_wait(
+                scenario_id=scenario_id,
+                attempt=1,
+                request=live_request.request_path(spec.work, scenario_id, 1),
+                facts=live_request.facts_path(spec.work, scenario_id, 1),
+                environment=spec.environment,
+                wait_seconds=5.0,
+                sequence_wait_seconds=5.0,
+            )
+            if scenario_id == "P0-06" and facts["receipt"]["status"] == "PASS":
+                judgment = spec.work / "p0-06-semantic-judgment.json"
+                judgment.write_text("{}\n", encoding="utf-8")
+                judgment.chmod(0o600)
+
+        _request_passing_cot_probe(spec)
+        deadline = time.monotonic() + 3.0
+        while not spec.cot_facts_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert spec.cot_facts_path.exists()
+        cot_facts = json.loads(spec.cot_facts_path.read_text(encoding="utf-8"))
+        assert cot_facts["status"] == "UNAVAILABLE"
+        assert cot_facts["receipt_sha256"] is None
+
+        p0_13 = live_request.request_and_wait(
+            scenario_id="P0-13",
+            attempt=1,
+            request=live_request.request_path(spec.work, "P0-13", 1),
+            facts=live_request.facts_path(spec.work, "P0-13", 1),
+            environment=spec.environment,
+            wait_seconds=5.0,
+            sequence_wait_seconds=5.0,
+        )
+        assert p0_13["receipt"]["status"] == "BLOCKED_EVIDENCE"
+        assert p0_13["receipt"]["failure_code"] == "TRACE_UNAVAILABLE"
+        assert p0_13["receipt"]["result_projection"]["cleanup"]["attempted"] is True
+        return 0
+
+    assert launcher._run_process_with_trusted_cot(
+        spec,
+        600,
+        process_runner,
+        _cot_probe_runner("missing"),
+        live_probe_runner,
+        _persona_finalize_runner,
+    ) == 0
+    assert invoked == list(live_request.LIVE_SCENARIO_IDS)
+    aggregate = json.loads(spec.live_receipt_path.read_text(encoding="utf-8"))
+    p0_13 = aggregate["receipts"][-1]
+    assert p0_13["scenario_id"] == "P0-13"
+    assert p0_13["result_projection"]["cleanup"]["status"] == "PASS"
+
+
 def test_cot_request_loader_retries_transient_shell_publication(monkeypatch):
     spec = object()
     calls = 0
@@ -1979,6 +2273,12 @@ def test_overlapping_live_requests_fail_closed_without_future_probe(tmp_path):
 
     def overlapping_runner(spec: launcher.WorkerSpec, _timeout: int) -> int:
         captured.append(spec)
+        current_start = _scenario_command_lifecycle_rows()[0]
+        assert current_start["type"] == "item.started"
+        spec.events_path.write_text(
+            json.dumps(current_start) + "\n", encoding="utf-8"
+        )
+        spec.events_path.chmod(0o600)
         live_request.write_request_marker(
             live_request.request_path(spec.work, "P0-02", 1),
             run_id=spec.environment["QA_RUN_ID"],
@@ -2493,10 +2793,20 @@ def test_diagnostic_malformed_or_missing_result_becomes_fallback(
     paths = _setup(tmp_path, qualification_mode="diagnostic")
 
     def runner(spec: launcher.WorkerSpec, _timeout: int) -> int:
-        if failure_mode == "malformed":
-            spec.result_path.write_text("{}\n")
-        else:
-            spec.result_path.unlink()
+        schema = json.loads(spec.schema_path.read_text())
+        spec.result_path.write_text(
+            json.dumps(_instance(schema, schema["$defs"])) + "\n"
+        )
+        spec.events_path.write_text(
+            "".join(
+                json.dumps(row) + "\n"
+                for row in _scenario_command_lifecycle_rows()
+            )
+        )
+        _request_passing_live_probes(
+            spec,
+            before_p0_13=lambda: _request_passing_cot_probe(spec),
+        )
         spec.events_path.write_text(
             json.dumps(
                 {
@@ -2524,18 +2834,13 @@ def test_diagnostic_malformed_or_missing_result_becomes_fallback(
                 }
             )
             + "\n"
-            + json.dumps(
-                next(
-                    row
-                    for row in _scenario_command_rows()
-                    if "QA_SCENARIO_ID=P0-11" in row["item"]["command"]
-                )
-            )
-            + "\n"
             + json.dumps({"type": "turn.completed", "usage": {}})
             + "\n"
         )
-        _request_passing_cot_probe(spec)
+        if failure_mode == "malformed":
+            spec.result_path.write_text("{}\n")
+        else:
+            spec.result_path.unlink()
         return 0
 
     receipt = _launch_diagnostic(paths, runner)
@@ -2580,14 +2885,16 @@ def test_diagnostic_keeps_valid_worker_when_peer_uses_fallback(tmp_path):
                     "exit_code": 0,
                 },
             },
-            *_scenario_command_rows(),
+            *_scenario_command_lifecycle_rows(),
             {"type": "turn.completed", "usage": {}},
         ]
         spec.events_path.write_text(
             "".join(json.dumps(row) + "\n" for row in rows)
         )
-        _request_passing_cot_probe(spec)
-        _request_passing_live_probes(spec)
+        _request_passing_live_probes(
+            spec,
+            before_p0_13=lambda: _request_passing_cot_probe(spec),
+        )
         return 0
 
     receipt = _launch_diagnostic(
@@ -2638,7 +2945,7 @@ def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
         schema = json.loads(spec.schema_path.read_text())
         result = _instance(schema, schema["$defs"])
         spec.result_path.write_text(json.dumps(result) + "\n")
-        rows = [
+        final_rows = [
             {
                 "type": "thread.started",
                 "thread_id": "30000000-0000-4000-8000-000000000003",
@@ -2654,14 +2961,24 @@ def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
                     "exit_code": 0,
                 },
             },
-            *_scenario_command_rows(),
+            *_scenario_command_lifecycle_rows(),
             {"type": "turn.completed", "usage": {}},
         ]
+        gate_rows = [
+            final_rows[0],
+            final_rows[1],
+            *_scenario_command_lifecycle_rows(exit_codes={"P0-12": 3}),
+        ]
         spec.events_path.write_text(
-            "".join(json.dumps(row) + "\n" for row in rows)
+            "".join(json.dumps(row) + "\n" for row in gate_rows)
         )
-        _request_passing_cot_probe(spec)
-        _request_passing_live_probes(spec)
+        _request_passing_live_probes(
+            spec,
+            before_p0_13=lambda: _request_passing_cot_probe(spec),
+        )
+        spec.events_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in final_rows)
+        )
         return 0
 
     receipt = _launch_diagnostic(
@@ -2871,13 +3188,15 @@ def test_diagnostic_canonicalizes_parent_owned_live_and_cot_evidence(tmp_path):
                             "exit_code": 0,
                         },
                     },
-                    *_scenario_command_rows(),
+                    *_scenario_command_lifecycle_rows(),
                     {"type": "turn.completed", "usage": {}},
                 )
             )
         )
-        _request_passing_cot_probe(spec)
-        _request_passing_live_probes(spec)
+        _request_passing_live_probes(
+            spec,
+            before_p0_13=lambda: _request_passing_cot_probe(spec),
+        )
 
         # Reproduce the canary's harmless model transcription/staleness errors.
         result = json.loads(spec.result_path.read_text())
@@ -2953,13 +3272,15 @@ def test_diagnostic_preserves_parent_owned_negative_persona_verdict(tmp_path):
                             "exit_code": 0,
                         },
                     },
-                    *_scenario_command_rows(),
+                    *_scenario_command_lifecycle_rows(),
                     {"type": "turn.completed", "usage": {}},
                 )
             )
         )
-        _request_passing_cot_probe(spec)
-        _request_passing_live_probes(spec)
+        _request_passing_live_probes(
+            spec,
+            before_p0_13=lambda: _request_passing_cot_probe(spec),
+        )
         return 0
 
     def negative_persona(spec, capture_receipt):
@@ -3039,7 +3360,7 @@ def test_diagnostic_persona_capture_failure_continues_later_scenarios(tmp_path):
         )
         commands = [
             row
-            for row in _scenario_command_rows()
+            for row in _scenario_command_lifecycle_rows()
             if not (
                 "QA_SCENARIO_ID=P0-06" in row["item"]["command"]
                 and any(
@@ -3075,8 +3396,10 @@ def test_diagnostic_persona_capture_failure_continues_later_scenarios(tmp_path):
                 )
             )
         )
-        _request_passing_cot_probe(spec)
-        _request_passing_live_probes(spec)
+        _request_passing_live_probes(
+            spec,
+            before_p0_13=lambda: _request_passing_cot_probe(spec),
+        )
         return 0
 
     def failed_persona_probe(spec, scenario_id, attempt, nonce, prior_receipts):
@@ -3162,13 +3485,15 @@ def test_diagnostic_trusted_probe_error_is_receipted_and_sequence_continues(
                             "exit_code": 0,
                         },
                     },
-                    *_scenario_command_rows(),
+                    *_scenario_command_lifecycle_rows(),
                     {"type": "turn.completed", "usage": {}},
                 )
             )
         )
-        _request_passing_cot_probe(spec)
-        _request_passing_live_probes(spec)
+        _request_passing_live_probes(
+            spec,
+            before_p0_13=lambda: _request_passing_cot_probe(spec),
+        )
         result = json.loads(spec.result_path.read_text())
         scenario = next(
             row for row in result["scenarios"] if row["scenario_id"] == "P0-09"
@@ -3369,13 +3694,15 @@ def test_diagnostic_p0_13_probe_error_preserves_agent_result(tmp_path):
                             "exit_code": 0,
                         },
                     },
-                    *_scenario_command_rows(),
+                    *_scenario_command_lifecycle_rows(),
                     {"type": "turn.completed", "usage": {}},
                 )
             )
         )
-        _request_passing_cot_probe(spec)
-        _request_passing_live_probes(spec)
+        _request_passing_live_probes(
+            spec,
+            before_p0_13=lambda: _request_passing_cot_probe(spec),
+        )
         return 0
 
     def crashing_probe(spec, scenario_id, attempt, nonce, prior_receipts):
