@@ -40,8 +40,13 @@ CREATE TABLE IF NOT EXISTS v2_sandbox_usage_events (
   provider TEXT NOT NULL,
   purpose TEXT NOT NULL,
   acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  released_at TIMESTAMPTZ,
+  duration_ms BIGINT,
+  outcome TEXT NOT NULL DEFAULT 'acquired',
   CONSTRAINT ck_v2_sandbox_provider_nonempty CHECK (length(provider) BETWEEN 1 AND 80),
-  CONSTRAINT ck_v2_sandbox_purpose_nonempty CHECK (length(purpose) BETWEEN 1 AND 80)
+  CONSTRAINT ck_v2_sandbox_purpose_nonempty CHECK (length(purpose) BETWEEN 1 AND 80),
+  CONSTRAINT ck_v2_sandbox_duration CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  CONSTRAINT ck_v2_sandbox_outcome_nonempty CHECK (length(outcome) BETWEEN 1 AND 40)
 );
 
 CREATE INDEX IF NOT EXISTS ix_v2_sandbox_usage_user_time

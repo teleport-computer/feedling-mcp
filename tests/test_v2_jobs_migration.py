@@ -164,10 +164,18 @@ def test_0042_workspace_tables_and_mutation_frontier_are_installed():
         function_source = conn.execute(
             "SELECT pg_get_functiondef('v2_fill_effect_input_frontier()'::regprocedure)"
         ).fetchone()[0]
+        usage_columns = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='v2_sandbox_usage_events'"
+            ).fetchall()
+        }
     assert {row[0] for row in tables} == {
         "v2_workspace_entries", "v2_sandbox_usage_events",
     }
     assert "workspace_encrypted_v1" in function_source
+    assert {"released_at", "duration_ms", "outcome"} <= usage_columns
 
 
 def test_0041_claim_gate_is_installed_and_backfill_runs_after_ddl_commit():

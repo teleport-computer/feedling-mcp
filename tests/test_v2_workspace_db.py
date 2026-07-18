@@ -62,7 +62,7 @@ def test_postgres_workspace_encrypts_content_and_enforces_revision_cas(clean_wor
     backend.delete("/workspace/plan.md", expected_revision=second.revision)
 
 
-def test_sandbox_acquisition_is_append_only_billable_usage(clean_workspace):
+def test_sandbox_acquisition_is_append_only_billable_lifecycle(clean_workspace):
     uid = "u_workspace_billing"
     seed_user(uid)
     first = jobs_store.record_sandbox_acquisition(
@@ -72,13 +72,23 @@ def test_sandbox_acquisition_is_append_only_billable_usage(clean_workspace):
         uid, provider="cvm", purpose="shell",
     )
     assert second > first
+    assert jobs_store.finish_sandbox_acquisition(
+        first, uid, duration_ms=1234, outcome="closed",
+    ) is True
+    assert jobs_store.finish_sandbox_acquisition(
+        first, uid, duration_ms=9999, outcome="duplicate",
+    ) is False
     with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT provider,purpose FROM v2_sandbox_usage_events "
+            "SELECT provider,purpose,duration_ms,outcome,released_at IS NOT NULL "
+            "FROM v2_sandbox_usage_events "
             "WHERE user_id=%s ORDER BY id",
             (uid,),
         ).fetchall()
-    assert rows == [("cvm", "materialize_artifact"), ("cvm", "shell")]
+    assert rows == [
+        ("cvm", "materialize_artifact", 1234, "closed", True),
+        ("cvm", "shell", None, "acquired", False),
+    ]
 
 
 def test_nonrecursive_listing_is_not_starved_by_nested_entries(clean_workspace):

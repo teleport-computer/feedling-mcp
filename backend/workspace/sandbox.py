@@ -8,9 +8,14 @@ resource, and billing policy.
 from __future__ import annotations
 
 import os
+import logging
+import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
+
+
+log = logging.getLogger("feedling.workspace.sandbox")
 
 
 class SandboxRequiredOperation(str, Enum):
@@ -35,6 +40,18 @@ class SandboxAcquisitionEvent:
     user_id: str
     provider: str
     purpose: str
+
+
+@dataclass(frozen=True)
+class SandboxReleaseEvent:
+    """Content-free lifecycle event used to finalize duration-based billing."""
+
+    user_id: str
+    provider: str
+    purpose: str
+    duration_ms: int
+    outcome: str
+    usage_ref: Any = None
 
 
 @runtime_checkable
@@ -119,12 +136,19 @@ class LazySandbox:
         provider: SandboxProvider,
         *,
         user_id: str,
-        on_acquire: Callable[[SandboxAcquisitionEvent], None] | None = None,
+        on_acquire: Callable[[SandboxAcquisitionEvent], Any] | None = None,
+        on_release: Callable[[SandboxReleaseEvent], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.provider = provider
         self.user_id = str(user_id)
         self.on_acquire = on_acquire
+        self.on_release = on_release
+        self.clock = clock
         self._session: SandboxSession | None = None
+        self._purpose = ""
+        self._acquired_at: float | None = None
+        self._usage_ref: Any = None
 
     @property
     def acquired(self) -> bool:
@@ -138,8 +162,9 @@ class LazySandbox:
                 user_id=self.user_id, purpose=operation.value,
             )
             try:
+                usage_ref = None
                 if self.on_acquire is not None:
-                    self.on_acquire(SandboxAcquisitionEvent(
+                    usage_ref = self.on_acquire(SandboxAcquisitionEvent(
                         user_id=self.user_id,
                         provider=str(self.provider.name),
                         purpose=operation.value,
@@ -153,6 +178,9 @@ class LazySandbox:
                     "sandbox usage ledger unavailable"
                 )
             self._session = session
+            self._purpose = operation.value
+            self._acquired_at = self.clock()
+            self._usage_ref = usage_ref
         return self._session
 
     def ensure(self, operation: SandboxRequiredOperation) -> None:
@@ -178,10 +206,39 @@ class LazySandbox:
             language=language, source=source,
         )
 
-    def close(self) -> None:
-        if self._session is not None:
-            self._session.close()
-            self._session = None
+    def close(self, *, outcome: str = "closed") -> None:
+        if self._session is None:
+            return
+        session = self._session
+        acquired_at = self._acquired_at
+        usage_ref = self._usage_ref
+        purpose = self._purpose
+        self._session = None
+        self._acquired_at = None
+        self._usage_ref = None
+        self._purpose = ""
+        session.close()
+        if self.on_release is None:
+            return
+        duration_ms = max(
+            0,
+            int((self.clock() - acquired_at) * 1000),
+        ) if acquired_at is not None else 0
+        try:
+            self.on_release(SandboxReleaseEvent(
+                user_id=self.user_id,
+                provider=str(self.provider.name),
+                purpose=purpose,
+                duration_ms=duration_ms,
+                outcome=str(outcome or "closed")[:40],
+                usage_ref=usage_ref,
+            ))
+        except Exception as exc:  # provider is already closed; reconciliation owns retry
+            log.error(
+                "sandbox usage finalization failed provider=%s type=%s",
+                str(self.provider.name),
+                type(exc).__name__,
+            )
 
 
 _PROVIDER_FACTORIES: dict[str, Callable[[], SandboxProvider]] = {

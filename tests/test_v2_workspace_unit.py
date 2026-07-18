@@ -135,6 +135,29 @@ def test_sandbox_session_is_not_published_when_usage_event_fails():
     assert lazy.acquired is False
 
 
+def test_sandbox_release_reports_bounded_duration_and_usage_identity():
+    provider = MemoryTestSandboxProvider()
+    now = [10.0]
+    releases = []
+    lazy = LazySandbox(
+        provider,
+        user_id="u_workspace",
+        on_acquire=lambda _event: 77,
+        on_release=releases.append,
+        clock=lambda: now[0],
+    )
+    lazy.ensure(SandboxRequiredOperation.MATERIALIZE_ARTIFACT)
+    now[0] = 11.25
+    lazy.close(outcome="completed")
+
+    assert lazy.acquired is False
+    assert len(releases) == 1
+    event = releases[0]
+    assert event.usage_ref == 77
+    assert event.duration_ms == 1250
+    assert event.outcome == "completed"
+
+
 def test_cvm_provider_registration_is_deployment_owned(monkeypatch):
     provider = MemoryTestSandboxProvider()
     provider.name = "cvm"
@@ -303,6 +326,7 @@ def test_production_file_read_materializes_once_then_uses_encrypted_text_view(mo
     )
     calls = []
     billing = []
+    finalized = []
 
     def capability(*_args, **_kwargs):
         calls.append("decrypt")
@@ -320,7 +344,14 @@ def test_production_file_read_materializes_once_then_uses_encrypted_text_view(mo
     monkeypatch.setattr(
         serve_worker.jobs_store,
         "record_sandbox_acquisition",
-        lambda uid, **event: billing.append((uid, event)),
+        lambda uid, **event: billing.append((uid, event)) or 41,
+    )
+    monkeypatch.setattr(
+        serve_worker.jobs_store,
+        "finish_sandbox_acquisition",
+        lambda usage_id, uid, **event: finalized.append(
+            (usage_id, uid, event)
+        ) or True,
     )
 
     first = serve_worker._read_files(store.user_id, ["m1"])
@@ -333,6 +364,10 @@ def test_production_file_read_materializes_once_then_uses_encrypted_text_view(mo
         store.user_id,
         {"provider": "memory-test", "purpose": "materialize_artifact"},
     )]
+    assert len(finalized) == 1
+    assert finalized[0][0:2] == (41, store.user_id)
+    assert finalized[0][2]["outcome"] == "closed"
+    assert finalized[0][2]["duration_ms"] >= 0
 
 
 def test_workspace_tool_schemas_are_closed_and_revision_fenced():

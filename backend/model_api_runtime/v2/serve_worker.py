@@ -804,14 +804,27 @@ def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
         # Stored encrypted text views remain readable even when a configured
         # provider adapter is absent; only a physical cache miss fails closed.
         provider = DisabledSandboxProvider()
-    lazy = LazySandbox(
-        provider,
-        user_id=user_id,
-        on_acquire=lambda event: jobs_store.record_sandbox_acquisition(
+    def _record_sandbox_acquire(event):
+        return jobs_store.record_sandbox_acquisition(
             event.user_id,
             provider=event.provider,
             purpose=event.purpose,
-        ),
+        )
+
+    def _record_sandbox_release(event) -> None:
+        if type(event.usage_ref) is not int or not jobs_store.finish_sandbox_acquisition(
+            event.usage_ref,
+            event.user_id,
+            duration_ms=event.duration_ms,
+            outcome=event.outcome,
+        ):
+            raise RuntimeError("sandbox usage row was not finalized")
+
+    lazy = LazySandbox(
+        provider,
+        user_id=user_id,
+        on_acquire=_record_sandbox_acquire,
+        on_release=_record_sandbox_release,
     )
     artifacts = ArtifactWorkspace(backend, lazy)
     out: dict[str, dict] = {}

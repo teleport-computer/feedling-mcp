@@ -1999,6 +1999,32 @@ def record_sandbox_acquisition(
             return int(cur.fetchone()[0])
 
 
+def finish_sandbox_acquisition(
+    usage_id: int,
+    user_id: str,
+    *,
+    duration_ms: int,
+    outcome: str,
+) -> bool:
+    """Finalize one billable sandbox lifetime exactly once.
+
+    An acquired row left open after a worker crash is intentionally visible to
+    reconciliation; this update never guesses a duration or overwrites a prior
+    close event.
+    """
+    bounded_duration = max(0, int(duration_ms))
+    bounded_outcome = str(outcome or "closed")[:40]
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE v2_sandbox_usage_events "
+                "SET released_at=now(),duration_ms=%s,outcome=%s "
+                "WHERE id=%s AND user_id=%s AND released_at IS NULL",
+                (bounded_duration, bounded_outcome, int(usage_id), user_id),
+            )
+            return cur.rowcount == 1
+
+
 def get_wake_schedule(user_id) -> dict | None:
     """读取该用户的 v2_wake_schedule 行（proactive 唤醒调度：下次心跳/采集/屏幕监看到期
     时间 + BYOK 支付冷却截止 + screen_watch 的跨-tick 状态 last_screen_watch_frame_id），
