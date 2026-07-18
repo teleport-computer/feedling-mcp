@@ -856,12 +856,13 @@ def cmd_doctor(args):
 
 
 def _require_admin():
-    """Resolve (api_url, auth_headers) for the ops-only hosted_runtime_mode
-    endpoints. These are gated by FEEDLING_ADMIN_TOKEN (X-Admin-Token) on the
+    """Resolve credentials for the ops-only Runtime V2 repair/status surface.
+
+    These endpoints are gated by FEEDLING_ADMIN_TOKEN (X-Admin-Token) on the
     backend (backend/admin/routes_asgi.py's _require_admin) — deliberately NOT
     the caller's own per-user FEEDLING_API_KEY / runtime token from
-    _auth_headers(), since this flips another user's runtime mode and must not
-    be reachable with just that user's own credentials."""
+    _auth_headers().
+    """
     api_url = _env("FEEDLING_API_URL")
     token = _env("FEEDLING_ADMIN_TOKEN")
     if not api_url or not token:
@@ -869,25 +870,23 @@ def _require_admin():
     return api_url.rstrip("/"), {"X-Admin-Token": token}
 
 
-def cmd_set_runtime_mode(args):
-    """[ops] Flip a user's hosted_runtime_mode. POST /v1/admin/hosted-runtime-mode."""
+def cmd_repair_runtime_v2(args):
+    """[ops] Materialize/repair one user's V2-only ownership tuple."""
     api_url, auth = _require_admin()
     status, body = _http_json(
         "POST", f"{api_url}/v1/admin/hosted-runtime-mode", auth,
-        payload={"user_id": args.user_id, "mode": args.mode},
+        payload={"user_id": args.user_id, "mode": "db_action_v2"},
     )
     if status == 200:
         _emit({"ok": True, **body})
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
-def cmd_list_runtime_mode(args):
-    """[ops] List user_ids grouped by hosted_runtime_mode. GET /v1/admin/hosted-runtime-modes."""
+def cmd_runtime_v2_status(args):
+    """[ops] Read the V2 ownership reconciliation status."""
     api_url, auth = _require_admin()
     status, body = _http_json("GET", f"{api_url}/v1/admin/hosted-runtime-modes", auth)
     if status == 200:
-        if args.mode:
-            _emit({"ok": True, "mode": args.mode, "user_ids": body.get(args.mode, [])})
         _emit({"ok": True, **body})
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
@@ -1051,20 +1050,18 @@ def main():
                         help="Five-probe environment health check (api/enclave/identity/memory/chat, read-only).")
     dr.set_defaults(func=cmd_doctor)
 
-    srm = sub.add_parser(
-        "set-runtime-mode",
-        help="[ops] Flip a user's hosted_runtime_mode (resident_cli|db_action_v2). Requires FEEDLING_ADMIN_TOKEN.",
+    rv2 = sub.add_parser(
+        "repair-runtime-v2",
+        help="[ops] Repair one user's V2-only ownership tuple. Requires FEEDLING_ADMIN_TOKEN.",
     )
-    srm.add_argument("user_id")
-    srm.add_argument("mode", choices=["resident_cli", "db_action_v2"])
-    srm.set_defaults(func=cmd_set_runtime_mode)
+    rv2.add_argument("user_id")
+    rv2.set_defaults(func=cmd_repair_runtime_v2)
 
-    lrm = sub.add_parser(
-        "list-runtime-mode",
-        help="[ops] List user_ids grouped by hosted_runtime_mode. Requires FEEDLING_ADMIN_TOKEN.",
+    rv2s = sub.add_parser(
+        "runtime-v2-status",
+        help="[ops] Show V2 ownership reconciliation status. Requires FEEDLING_ADMIN_TOKEN.",
     )
-    lrm.add_argument("--mode", default="", choices=["", "resident_cli", "db_action_v2"], help="filter to one mode")
-    lrm.set_defaults(func=cmd_list_runtime_mode)
+    rv2s.set_defaults(func=cmd_runtime_v2_status)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")

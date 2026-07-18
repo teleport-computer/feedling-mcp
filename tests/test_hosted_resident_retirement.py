@@ -162,6 +162,15 @@ def test_admin_resident_selector_fails_before_hydration(monkeypatch):
     assert source.index("mode !=") < source.index("get_store")
 
 
+def test_ops_cli_exposes_v2_repair_not_a_runtime_selector():
+    source = (ROOT / "tools/io_cli.py").read_text()
+    assert '"repair-runtime-v2"' in source
+    assert '"runtime-v2-status"' in source
+    assert 'payload={"user_id": args.user_id, "mode": "db_action_v2"}' in source
+    assert '"set-runtime-mode"' not in source
+    assert '"list-runtime-mode"' not in source
+
+
 def test_hosted_resident_implementation_is_absent():
     for relative in (
         "backend/agent_runtime/supervisor.py",
