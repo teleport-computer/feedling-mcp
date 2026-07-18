@@ -26,6 +26,7 @@ from bootstrap import gates as boot_gates
 from chat import chat_core
 from chat import consumer as chat_consumer
 from chat import poll_core as chat_poll_core
+from chat import resident_maintenance
 from chat import service as chat_service
 from runtime.waiters import registry
 
@@ -40,6 +41,12 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
     remote_addr = request.client.host if request.client else ""
     consumer_info = chat_consumer._consumer_headers_from_map(request.headers, remote_addr)
     await threadpool.run_db(chat_consumer._record_consumer_event, store, "poll", info=consumer_info)
+    await threadpool.run_db(
+        resident_maintenance.maybe_handle_poll,
+        store,
+        consumer_info,
+        runtime_token_auth=bool(auth.runtime_token_claims),
+    )
     context = await threadpool.run_db(chat_poll_core.poll_context, store)
 
     try:
@@ -153,7 +160,7 @@ async def chat_response(request: Request, auth: AuthResult = Depends(require_aut
         _allow_verify_reply_with_fresh_pending_check, store
     )
     gated = await threadpool.run_db(
-        chat_core.gate_response_dict, store, allow_verify_reply
+        chat_core.gate_response_dict, store, allow_verify_reply, payload
     )
     if gated is not None:
         await threadpool.run_db(chat_core.trace_response_gated, store, payload, allow_verify_reply)

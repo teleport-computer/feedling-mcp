@@ -35,7 +35,7 @@ def test_full_envelope():
 
 
 def test_invalid_blame_rejected():
-    # blame 是三值枚举（FRONTEND_ERROR_CONTRACT.md §二），传错是编程错误——立刻炸
+    # blame 是固定枚举（FRONTEND_ERROR_CONTRACT.md §二），传错是编程错误——立刻炸
     import pytest
     with pytest.raises(ValueError):
         responses.api_error(400, "x", blame="somebody_else")

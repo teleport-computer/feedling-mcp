@@ -334,7 +334,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "blame": {
                 "type": "string",
-                "enum": ["user_provider", "provider_transient", "system"],
+                "enum": ["user_provider", "provider_transient", "user_environment", "system"],
                 "description": "Stable responsibility classification when the endpoint can identify it.",
             },
             "request_id": {"type": "string", "description": "Support correlation identifier when available."},
@@ -604,7 +604,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
             "source": {
                 "type": "string",
-                "enum": ["chat", "live_activity", "heartbeat", "verify_ping", "agent_initiated_proactive"],
+                "enum": [
+                    "chat",
+                    "live_activity",
+                    "heartbeat",
+                    "verify_ping",
+                    "resident_maintenance",
+                    "agent_initiated_proactive",
+                ],
                 "default": "chat",
                 "description": "Resident protocol source. Ordinary replies should use chat.",
             },

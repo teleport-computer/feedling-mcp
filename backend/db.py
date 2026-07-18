@@ -692,7 +692,10 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 """
                 SELECT user_id,
                        COUNT(*)::int AS total,
-                       COUNT(*) FILTER (WHERE doc->>'role' = 'user')::int AS user_messages,
+                       COUNT(*) FILTER (
+                         WHERE doc->>'role' = 'user'
+                           AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
+                       )::int AS user_messages,
                        COUNT(*) FILTER (WHERE doc->>'role' IN ('agent', 'openclaw'))::int AS agent_messages,
                        COUNT(*) FILTER (WHERE doc->>'content_type' = 'image')::int AS image_messages,
                        COUNT(*) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive')::int AS proactive_messages,
@@ -702,7 +705,10 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                        MIN(ts) AS first_ts,
                        MAX(ts) AS last_ts,
                        MAX(ts) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive') AS proactive_last_ts,
-                       MAX(ts) FILTER (WHERE doc->>'role' = 'user') AS last_user_ts,
+                       MAX(ts) FILTER (
+                         WHERE doc->>'role' = 'user'
+                           AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
+                       ) AS last_user_ts,
                        MAX(ts) FILTER (WHERE doc->>'role' IN ('agent', 'openclaw')) AS last_agent_ts
                 FROM chat_messages
                 WHERE user_id = ANY(%s)
@@ -1051,7 +1057,7 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                     SELECT user_id, ts, 'chat' AS source
                     FROM chat_messages
                     WHERE doc->>'role' = 'user'
-                      AND COALESCE(doc->>'source', '') <> 'verify_ping'
+                      AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
                       AND (%s = 0 OR ts >= %s)
 
                     UNION ALL
@@ -1152,7 +1158,7 @@ def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
             SELECT user_id, ts, 'chat' AS source
             FROM chat_messages
             WHERE doc->>'role' = 'user'
-              AND COALESCE(doc->>'source', '') <> 'verify_ping'
+              AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
               AND ts >= %s AND ts < %s
 
             UNION ALL
@@ -1478,12 +1484,12 @@ def admin_events_overview() -> dict:
     rows = _run("reply", f"""
         {_EVENTS_ROUTES_CTE}, paired AS (
           SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
-            MAX(CASE WHEN c.doc->>'role'='user' AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
+            MAX(CASE WHEN c.doc->>'role'='user' AND COALESCE(c.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') THEN c.ts END)
               OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
           FROM chat_messages c
         )
         SELECT COALESCE(r.route,'resident') AS route,
-               (COUNT(*) FILTER (WHERE p.role='user' AND p.src<>'verify_ping'))::int AS user_msgs,
+               (COUNT(*) FILTER (WHERE p.role='user' AND p.src NOT IN ('verify_ping','resident_maintenance')))::int AS user_msgs,
                (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw')
                     AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')
                     AND p.last_user_ts IS NOT NULL))::int AS real_replies,
@@ -1595,12 +1601,12 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
         rows = _run(f"""
             {_EVENTS_ROUTES_CTE}, paired AS (
               SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
-                MAX(CASE WHEN c.doc->>'role'='user' AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
+                MAX(CASE WHEN c.doc->>'role'='user' AND COALESCE(c.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') THEN c.ts END)
                   OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
               FROM chat_messages c
             )
             SELECT p.user_id, COALESCE(r.route,'resident') AS route,
-                   (COUNT(*) FILTER (WHERE p.role='user' AND p.src<>'verify_ping'))::int AS user_msgs,
+                   (COUNT(*) FILTER (WHERE p.role='user' AND p.src NOT IN ('verify_ping','resident_maintenance')))::int AS user_msgs,
                    (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw') AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive') AND p.last_user_ts IS NOT NULL))::int AS real_replies,
                    (COUNT(*) FILTER (WHERE p.src='foreground_fallback'))::int AS fallback_replies,
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY
@@ -2366,6 +2372,42 @@ def genesis_reap_stale_unclaimed_jobs(
     return out
 
 
+def genesis_oldest_awaiting_resident_job(user_id: str, *, older_than_sec: int) -> dict | None:
+    """Oldest still-unclaimed resident distill job for one user, or None.
+
+    Read-only early warning helper. The terminal state transition stays owned by
+    genesis_reap_stale_unclaimed_jobs, which uses a much longer cutoff.
+    """
+    safe_sec = max(60, int(older_than_sec or 0))
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT *,
+                   EXTRACT(EPOCH FROM (now() - updated_at)) AS age_sec
+            FROM genesis_import_jobs
+            WHERE user_id = %s
+              AND status = 'awaiting_resident'
+              AND updated_at < now() - make_interval(secs => %s)
+            ORDER BY updated_at ASC
+            LIMIT 1
+            """,
+            (user_id, safe_sec),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cur.description]
+    item = dict(zip(cols, row))
+    for key, value in list(item.items()):
+        if hasattr(value, "isoformat"):
+            item[key] = value.isoformat()
+    try:
+        item["age_sec"] = float(item.get("age_sec") or 0.0)
+    except (TypeError, ValueError):
+        item["age_sec"] = 0.0
+    return item
+
+
 def genesis_put_chunk(
     user_id: str,
     job_id: str,
@@ -3043,7 +3085,8 @@ def chat_try_claim_reply(
       _redelivery_floor pre-filter can miss it because parent reply_status
       metadata updates are not broadcast across workers, and a late reply to a
       conversation that already moved on would land out of order. Synthetic
-      verify_ping probes are not conversation and never supersede."""
+      verify_ping probes and resident maintenance prompts are not conversation
+      and never supersede."""
     same_consumer_sql = "" if redelivery else "OR doc->>'reply_claimed_by' = %s "
     unanswered_tail_sql = (
         "  AND NOT EXISTS ("
@@ -3051,7 +3094,7 @@ def chat_try_claim_reply(
         "    WHERE n.user_id = chat_messages.user_id "
         "      AND n.ts > chat_messages.ts "
         "      AND n.doc->>'role' = 'user' "
-        "      AND COALESCE(n.doc->>'source','') <> 'verify_ping' "
+        "      AND COALESCE(n.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') "
         "      AND ((n.doc->>'reply_status') = 'replied' "
         "           OR COALESCE(n.doc->>'reply_message_id','') <> '')"
         "  ) "

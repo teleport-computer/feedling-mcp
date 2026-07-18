@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- Self-hosted resident polls may now receive server-generated maintenance turns
+  with `role: "user"` and `source: "resident_maintenance"` when the resident
+  consumer appears stale or is not claiming resident-only distill jobs. These
+  rows use shared envelopes so enclave-backed consumers can decrypt the repair
+  prompt. Notices and API errors can now use `blame: "user_environment"` for
+  issues in the user's VPS/runtime environment. The resident-only distill job
+  fallback scan is throttled by `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default
+  300 seconds).
 - New `GET /v1/agent/perception/recent_apps` returns recent app-open history
   (`app`, `category`, `ts`, `minutes_ago`), newest first, with optional `limit`
   (1–100, default 20) and `hours` query parameters. It reads the same app-open

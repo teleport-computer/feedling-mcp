@@ -108,6 +108,22 @@ def test_history_decrypts_text_messages(client, monkeypatch):
     assert "context_memories" in body
 
 
+def test_history_decrypts_resident_maintenance_message(client, monkeypatch):
+    prompt = "【Feedling 系统维护提醒】\n请更新 resident consumer。"
+    _wire(monkeypatch, [
+        {"id": "rm1", "role": "user", "ts": 1.0, "v": 1, "source": "resident_maintenance",
+         "K_enclave": "x", "body_ct": "x", "nonce": "x", "owner_user_id": "usr_a",
+         "visibility": "shared", "content_type": "text"},
+    ])
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: prompt.encode("utf-8"))
+    r = client.get("/v1/chat/history", headers={"X-API-Key": "k"})
+    assert r.status_code == 200
+    m = r.get_json()["messages"][0]
+    assert m["source"] == "resident_maintenance"
+    assert m["content"] == prompt
+    assert m["decrypt_status"] == "ok"
+
+
 def test_local_only_placeholder(client, monkeypatch):
     _wire(monkeypatch, [
         {"id": "m1", "role": "user", "ts": 1.0, "v": 1,

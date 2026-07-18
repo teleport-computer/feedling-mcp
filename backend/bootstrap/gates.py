@@ -8,6 +8,7 @@ from core.store import UserStore
 
 from accounts import onboarding as accounts_onboarding
 from chat import consumer as chat_consumer
+from chat import service as chat_service
 from identity import service as identity_service
 from memory import service as memory_service
 
@@ -81,7 +82,7 @@ def _chat_loop_verified_by_server(store) -> bool:
     seen_user = False
     for m in sorted_msgs:
         role = m.get("role")
-        if role == "user" and m.get("source") != "verify_ping":
+        if chat_service.is_conversation_user_message(m):
             seen_user = True
         elif role in ("agent", "openclaw") and seen_user:
             return True

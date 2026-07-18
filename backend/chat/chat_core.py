@@ -147,6 +147,19 @@ def _chat_message_by_id(store: UserStore, msg_id: str) -> dict | None:
     return None
 
 
+def _is_resident_maintenance_reply(store: UserStore, payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("source") or "").strip() != "resident_maintenance":
+        return False
+    parent = _chat_message_by_id(store, _reply_to_message_id(payload))
+    return bool(
+        parent
+        and str(parent.get("role") or "") == "user"
+        and str(parent.get("source") or "") == "resident_maintenance"
+    )
+
+
 FIRST_CHAT_OK_USER_SOURCES = {"chat", "model_api"}
 
 
@@ -512,7 +525,7 @@ def trace_response_gated(store: UserStore, payload: dict, allow_verify_reply: bo
     )
 
 
-def gate_response_dict(store: UserStore, allow_verify_reply: bool):
+def gate_response_dict(store: UserStore, allow_verify_reply: bool, payload: dict | None = None):
     """Bridge to the shared bootstrap gate.
 
     ``boot_gates._gate_bootstrap_for_chat`` returns a framework-neutral
@@ -527,6 +540,8 @@ def gate_response_dict(store: UserStore, allow_verify_reply: bool):
         store, allow_verify_reply=allow_verify_reply
     )
     if gated is None:
+        return None
+    if _is_resident_maintenance_reply(store, payload):
         return None
     body, status = gated
     return body, status
@@ -598,11 +613,17 @@ def write_response(
     else:
         thinking_extra.update(chat_service._chat_plaintext_thinking_extra_for_store(store, payload))
     source = str(payload.get("source") or "chat").strip() or "chat"
-    # "verify_ping": the resident consumer stamps its synthetic liveness reply
-    # with this source so the visible /v1/chat/history feed can filter it out
-    # (and verify_loop's GC can match it) regardless of GC timing. It is never a
-    # user-visible message.
-    if source not in {"chat", "live_activity", "heartbeat", "verify_ping", proactive_service.PROACTIVE_JOB_SOURCE}:
+    # "verify_ping": synthetic liveness reply, hidden from visible history.
+    # "resident_maintenance": reply to a server-authored maintenance prompt; it
+    # is visible in history but must not trigger push or bootstrap success.
+    if source not in {
+        "chat",
+        "live_activity",
+        "heartbeat",
+        "verify_ping",
+        "resident_maintenance",
+        proactive_service.PROACTIVE_JOB_SOURCE,
+    }:
         return {"error": "invalid source"}, 400
     # role: 消费者可声明 "system"（技术通知气泡，spec 2026-07-06-upstream-error-
     # surfacing）。白名单外一律落 openclaw——新增 role 前先过 spec 的 role 审计表。
@@ -668,17 +689,16 @@ def write_response(
         _maybe_mark_first_chat_ok(store, reply_to_message_id)
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
-    # Defense-in-depth: a synthetic verify-loop liveness reply must NEVER surface
-    # as a push / Live Activity, no matter what the caller passed. The resident
-    # consumer already sends suppress_push=True, so this changes nothing today —
-    # it just closes the gap if a future caller regression posts source=verify_ping
-    # with a body.
-    if source == "verify_ping":
+    # Defense-in-depth: synthetic/maintenance replies must NEVER surface as push
+    # or Live Activity, no matter what the caller passed.
+    if source in {"verify_ping", "resident_maintenance"}:
         visible_push_body = ""
     # Any plaintext AI reply supplied by the caller enters the same app-state
     # policy: background/unknown app state gets Live Activity + APNs alert;
     # foreground app state records a suppression instead of interrupting.
-    if source != "verify_ping" and (visible_push_body or payload.get("push_live_activity")):
+    if source not in {"verify_ping", "resident_maintenance"} and (
+        visible_push_body or payload.get("push_live_activity")
+    ):
         delivery = None
         if source == proactive_service.PROACTIVE_JOB_SOURCE:
             delivery = _proactive_delivery_decision_v2(store, payload)

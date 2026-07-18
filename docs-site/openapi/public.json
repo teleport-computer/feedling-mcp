@@ -7216,6 +7216,7 @@
             "enum": [
               "user_provider",
               "provider_transient",
+              "user_environment",
               "system"
             ],
             "description": "Stable responsibility classification when the endpoint can identify it."
@@ -7874,6 +7875,7 @@
               "live_activity",
               "heartbeat",
               "verify_ping",
+              "resident_maintenance",
               "agent_initiated_proactive"
             ],
             "default": "chat",
