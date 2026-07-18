@@ -117,7 +117,7 @@ silently truncate required history. The remaining long-horizon design is to
 replace one ever-growing summary blob with immutable encrypted segments and
 append-only higher-level checkpoints while preserving this coverage invariant.
 
-## Telemetry is not a full trajectory
+## Aggregate telemetry and encrypted full trajectories
 
 The current telemetry is valuable. `v2_turn_metrics` is deliberately
 content-free and aggregated to one best-effort row per job; the other persisted
@@ -130,22 +130,32 @@ records below each capture only one operational slice of the turn.
 | Runtime action digest | Counts and success by tool name | No arguments, results, ordering, or context |
 | Encrypted effect outbox | Durable replies and platform mutations | Captures business effects, not read tools or model exchanges |
 | MCP mutation frontier | Whether a remote mutation may have an ambiguous outcome | Stores hashes/status, not the remote arguments or result |
-| In-process native transcript | Enough ordered tool context for the next model round | Discarded when the turn/process ends |
+| In-process native transcript | Enough ordered tool context for the next model round | Discarded when the turn/process ends; the encrypted trajectory is the durable copy |
+| `v2_trajectory_events` | Immutable per-job request/response, fold, tool, reply, exception, and terminal chronology | Sensitive payload is a user+enclave shared envelope; only fixed ordering/type/size metadata is plaintext |
 
 Telemetry is the **odometer/instrument panel**: it tells us how much, how long,
 and whether the turn failed. A trajectory is the **flight recorder**: it tells
 us exactly what happened, in what order, with which context and tool inputs and
 outputs. Token telemetry therefore does not make a failed turn replayable.
 
-A complete encrypted trajectory store still needs immutable ordered records for
-the rendered context/version of every provider call, offered tool schemas,
-provider attempts and responses, tool call IDs/arguments/results/timing,
-late-message folds, replies and effects, retry/error/stop reasons, and explicit
-capture-completeness metadata. It must exclude provider secrets and have
-content-equivalent at-rest protection, retention, consent, and access controls.
-With the current external database that means application envelope encryption;
-if the store moves inside the trusted CVM, storage-adapted full-disk encryption
-may provide that boundary instead.
+Runtime V2 now also writes the flight recorder: each causal event is bounded,
+compressed, sealed to the user's content key and enclave key in the trusted
+worker, then appended under an immutable per-job index. Provider credentials
+and raw exception strings are never part of an event. Capture-state metadata is
+explicitly `open`, `complete`, `partial`, or `missing` and exposes the terminal
+event index plus truncation bit. A terminal source job without a terminal event
+is `partial`; per-event idempotency preserves the durable prefix.
+Attempt-scoped idempotency plus deterministic call-ID child scopes keep parallel
+subagent/tool events stable across redelivery. Each child provider round and
+each parallel call's start/result/error is captured independently, so one
+failing sibling cannot erase evidence already produced by another.
+
+One event's pre-compression JSON is capped (512 KiB by default), with explicit
+`truncated` and original-size markers rather than a silent clip. Review reads at
+most the newest 256 events and has its own 128 KiB prompt frontier; those are
+analysis bounds, not deletion policies. Raw encrypted event rows remain until
+the owning job/account is explicitly deleted. The store has no public plaintext
+read API and is never injected into live conversation context.
 
 ## Deferred D items, precisely defined
 
@@ -166,22 +176,38 @@ request; provider-side speculative calls require a separate explicit budget and
 waste policy. The first implementation should warm only local/TEE/network work
 and preserve ordinary prompt-cache affinity for real turns.
 
-### Encrypted full trajectories and failure-replay Dream lane
+### Encrypted full trajectories and failure-review Dream lane (capture implemented; review opt-in)
 
-The current Dream lane is user-memory housekeeping: it consolidates memory
-cards and does not run the conversation agent or write chat. Failure replay is
-a separate offline evaluation lane built on the future encrypted trajectory
-store. It would select a failed/anomalous turn, decrypt it only inside the
-trusted runtime, reconstruct the historical context, and disable every external
-side effect. A deterministic runtime replay can reuse the recorded provider and
-tool outputs; an evaluation of a new prompt/model may make a fresh explicitly
-budgeted model call while replaying recorded or mocked read-tool results. Both
-modes suppress every write. Reviewed cases could become versioned regression
-fixtures.
+The existing `dream` lane remains user-memory housekeeping. Encrypted
+trajectory capture remains on independently. Provider-backed review defaults
+off and requires `FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=1`; a database-serialized
+`FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE` pending+running ceiling (64 by
+default when enabled) rejects overflow without creating a runner. Invalid
+configuration fails closed, and execution rechecks the flag as a cost kill
+switch before provider boundaries. When enabled and admitted, terminal failed
+or expired turns enqueue a distinct low-priority `trajectory_review` lane. It
+decrypts the bounded failed trajectory only inside the trusted worker, makes at
+most one tools-disabled provider call per attempt, and persists the result as a
+second shared encrypted envelope. A failed review is retried at most three
+times with bounded exponential backoff; a crashed runner releases its claim
+through the ordinary lease reaper. Lease renewal and watchdog progress cover
+long decrypt frontiers. Review commit compares the exact captured stream
+frontier, so a concurrent or later trajectory append discards/reopens stale
+analysis instead of silently blessing an incomplete prefix.
+
+The prohibition on side effects is structural, not prompt-only: this handler
+never enters `process_job` or the native tool loop and has no reply callback,
+capability/MCP loader, effect outbox, or workspace backend. Review output is not
+fed to the user or a later agent turn automatically.
 
 This is analysis, not production retry. The existing effect outbox handles
 durable effect recovery; failure replay must never resend replies, rewrite
 memory/identity/schedules, or repeat remote MCP mutations.
+
+Automatic retention/GC is not implemented: encrypted rows follow explicit
+job/account deletion. Keep provider review opt-in until BYOK budget and
+retention policy are agreed; capture itself remains available while review is
+off or globally capped.
 
 ### Fleet-wide resident-process retirement
 
@@ -209,10 +235,10 @@ a release operation, not an alternate runtime implementation or rollback path.
    a real conversation reaches the total prompt frontier.
 3. Design and instrument safe typing pre-warm; measure first-request/first-token
    p50/p95 and wasted-prewarm rate.
-4. Implement encrypted full trajectories with explicit completeness, retention,
-   consent, and access controls.
-5. Add the side-effect-disabled failure-replay evaluation lane on top of those
-   trajectories.
+4. Define operator retention/export policy and restricted inspection tooling for
+   encrypted trajectories; neither is required by the live agent loop.
+5. Finish capture/Dream lifecycle rollout, migrate test/production, and retire
+   the hosted resident supervisor fleet after rollback gates pass.
 
 Generic local file/bash access, remote artifact download, and an on-demand
 artifact sandbox are separate harness-expansion decisions, not unfinished

@@ -1,4 +1,5 @@
 """0014 迁移落地：四张 V2 表 + single-flight 唯一索引真的存在且生效。"""
+
 import inspect
 import sys
 from pathlib import Path
@@ -26,9 +27,11 @@ def _migration_0041_module():
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
-    return ScriptDirectory.from_config(cfg).get_revision(
-        "0041_v2_mcp_mutation_attempts"
-    ).module
+    return (
+        ScriptDirectory.from_config(cfg)
+        .get_revision("0041_v2_mcp_mutation_attempts")
+        .module
+    )
 
 
 def test_v2_tables_exist():
@@ -39,7 +42,12 @@ def test_v2_tables_exist():
             "('agent_jobs','agent_action_queue','agent_status_events','runtime_state')"
         ).fetchall()
     names = {r[0] for r in rows}
-    assert names == {"agent_jobs", "agent_action_queue", "agent_status_events", "runtime_state"}
+    assert names == {
+        "agent_jobs",
+        "agent_action_queue",
+        "agent_status_events",
+        "runtime_state",
+    }
 
 
 def test_v2_job_liveness_columns_exist():
@@ -50,7 +58,9 @@ def test_v2_job_liveness_columns_exist():
             "AND column_name IN ('input_generation','lease_expires_at','queue_deadline_at')"
         ).fetchall()
     assert {row[0] for row in rows} == {
-        "input_generation", "lease_expires_at", "queue_deadline_at",
+        "input_generation",
+        "lease_expires_at",
+        "queue_deadline_at",
     }
 
 
@@ -121,15 +131,22 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     }
     # 0040 chains linearly off 0039 (genesis serve-worker claim attribution for the
     # deploy-orphan fast reclaim), followed by 0041 mutation attempts and the
-    # 0042 V2 workspace foundation.
-    assert script.get_revision("0040_genesis_worker_claim").down_revision == "0039_merge_tee_recon_state"
+    # 0042 V2 workspace foundation, then 0043 encrypted trajectories and the
+    # side-effect-disabled terminal-failure review lane.
+    assert (
+        script.get_revision("0040_genesis_worker_claim").down_revision
+        == "0039_merge_tee_recon_state"
+    )
     assert script.get_revision("0041_v2_mcp_mutation_attempts").down_revision == (
         "0040_genesis_worker_claim"
     )
     assert script.get_revision("0042_v2_workspace_foundation").down_revision == (
         "0041_v2_mcp_mutation_attempts"
     )
-    assert script.get_current_head() == "0042_v2_workspace_foundation"
+    assert script.get_revision("0043_v2_encrypted_trajectories").down_revision == (
+        "0042_v2_workspace_foundation"
+    )
+    assert script.get_current_head() == "0043_v2_encrypted_trajectories"
 
 
 def test_0041_indexes_and_validated_frontier_constraint_exist():
@@ -172,7 +189,8 @@ def test_0042_workspace_tables_and_mutation_frontier_are_installed():
             ).fetchall()
         }
     assert {row[0] for row in tables} == {
-        "v2_workspace_entries", "v2_sandbox_usage_events",
+        "v2_workspace_entries",
+        "v2_sandbox_usage_events",
     }
     assert "workspace_encrypted_v1" in function_source
     assert {"released_at", "duration_ms", "outcome"} <= usage_columns
@@ -287,8 +305,7 @@ def test_0041_seeds_and_raises_legacy_active_job_frontier(status):
         second_seq = db.chat_seq_for_msg_id(uid, "legacy-input-2")
         with db.get_pool().connection() as conn:
             conn.execute(
-                "UPDATE agent_jobs SET input_generation=input_generation+1 "
-                "WHERE id=%s",
+                "UPDATE agent_jobs SET input_generation=input_generation+1 WHERE id=%s",
                 (job_id,),
             )
             raised = conn.execute(

@@ -1,5 +1,6 @@
 """Unified provider-native tool loop (spec C2). Dependency-clean: no hosted/agent_runtime/db;
 all side effects injected. One loop for every model — no is_official branch."""
+
 from __future__ import annotations
 from dataclasses import dataclass
 import json
@@ -28,9 +29,7 @@ DEFAULT_MAX_NATIVE_ASSISTANT_TURN_CHARS = 65536
 DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS = 8192
 MIN_TOOL_RESULT_ERROR_QUOTA = 64
 _RESULT_TRUNCATION_MARKER = "...[truncated]"
-MCP_MUTATION_OUTCOME_UNKNOWN_ERROR = (
-    "error: mcp_mutation_outcome_unknown"
-)
+MCP_MUTATION_OUTCOME_UNKNOWN_ERROR = "error: mcp_mutation_outcome_unknown"
 MUTATION_BLOCKED_AFTER_UNKNOWN_OUTCOME_ERROR = (
     "error: mutation_blocked_after_unknown_outcome"
 )
@@ -68,12 +67,14 @@ def _positive_limit(value, *, name: str) -> int:
 
 def _serialized_chars(value) -> int | None:
     try:
-        return len(json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ))
+        return len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     except (TypeError, ValueError, OverflowError):
         return None
 
@@ -86,7 +87,7 @@ def _truncate_result_content(content: str, cap: int) -> str:
     marker = _RESULT_TRUNCATION_MARKER
     if cap <= len(marker):
         return marker[:cap]
-    return text[:cap - len(marker)] + marker
+    return text[: cap - len(marker)] + marker
 
 
 def _result_quotas(lengths: list[int], batch_cap: int) -> list[int]:
@@ -119,15 +120,18 @@ def _result_quotas(lengths: list[int], batch_cap: int) -> list[int]:
 
 
 def _normalize_tool_results(
-    results: list[ToolResult], *, per_result_cap: int, batch_cap: int,
+    results: list[ToolResult],
+    *,
+    per_result_cap: int,
+    batch_cap: int,
 ) -> list[ToolResult]:
     """Apply provider-neutral per-call and aggregate prompt budgets in call order."""
     individually_capped = [
-        _truncate_result_content(result.content, per_result_cap)
-        for result in results
+        _truncate_result_content(result.content, per_result_cap) for result in results
     ]
     quotas = _result_quotas(
-        [len(content) for content in individually_capped], batch_cap)
+        [len(content) for content in individually_capped], batch_cap
+    )
     return [
         ToolResult(
             call_id=result.call_id,
@@ -156,28 +160,37 @@ class FinalReplySuperseded(RuntimeError):
     """
 
 
-async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_reply,
-                        fold_new_messages, add_usage, max_calls: int,
-                        fold_before_first: bool = False,
-                        on_progress=None, extra_tool_specs=None,
-                        extra_mutating_tool_names=None,
-                        disabled_tool_names=None,
-                        allow_reply_tool: bool = True,
-                        outbound_blocking_read_tool_names=None,
-                        max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
-                        max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
-                        tool_result_char_cap: int = DEFAULT_TOOL_RESULT_CHAR_CAP,
-                        tool_batch_result_char_cap: int = DEFAULT_TOOL_BATCH_RESULT_CHAR_CAP,
-                        max_tool_args_chars: int = DEFAULT_MAX_TOOL_ARGS_CHARS,
-                        max_tool_batch_args_chars: int = DEFAULT_MAX_TOOL_BATCH_ARGS_CHARS,
-                        max_native_assistant_turn_chars: int = DEFAULT_MAX_NATIVE_ASSISTANT_TURN_CHARS,
-                        max_assistant_tool_text_chars: int = DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS,
-                        prompt_context_window_overrides=None,
-                        prompt_output_reserve_tokens: int = prompt_frontier.DEFAULT_OUTPUT_RESERVE_TOKENS,
-                        prompt_safety_margin_tokens: int | None = None,
-                        prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
-                        prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
-                        ) -> LoopOutcome:
+async def run_tool_loop(
+    *,
+    provider_config,
+    build_messages,
+    dispatch_tools,
+    on_reply,
+    fold_new_messages,
+    add_usage,
+    max_calls: int,
+    fold_before_first: bool = False,
+    on_progress=None,
+    on_trajectory_event=None,
+    extra_tool_specs=None,
+    extra_mutating_tool_names=None,
+    disabled_tool_names=None,
+    allow_reply_tool: bool = True,
+    outbound_blocking_read_tool_names=None,
+    max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
+    max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+    tool_result_char_cap: int = DEFAULT_TOOL_RESULT_CHAR_CAP,
+    tool_batch_result_char_cap: int = DEFAULT_TOOL_BATCH_RESULT_CHAR_CAP,
+    max_tool_args_chars: int = DEFAULT_MAX_TOOL_ARGS_CHARS,
+    max_tool_batch_args_chars: int = DEFAULT_MAX_TOOL_BATCH_ARGS_CHARS,
+    max_native_assistant_turn_chars: int = DEFAULT_MAX_NATIVE_ASSISTANT_TURN_CHARS,
+    max_assistant_tool_text_chars: int = DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS,
+    prompt_context_window_overrides=None,
+    prompt_output_reserve_tokens: int = prompt_frontier.DEFAULT_OUTPUT_RESERVE_TOKENS,
+    prompt_safety_margin_tokens: int | None = None,
+    prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
+    prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
+) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
     ``build_messages`` receives a single chronological list containing newly folded
@@ -200,17 +213,23 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
     ``on_reply`` must be awaited here, never called synchronously (a sync call would
     reintroduce the event-loop-blocking write the offload is meant to avoid)."""
     max_tool_calls_per_round = _positive_limit(
-        max_tool_calls_per_round, name="max_tool_calls_per_round")
+        max_tool_calls_per_round, name="max_tool_calls_per_round"
+    )
     max_tool_calls_per_turn = _positive_limit(
-        max_tool_calls_per_turn, name="max_tool_calls_per_turn")
+        max_tool_calls_per_turn, name="max_tool_calls_per_turn"
+    )
     tool_result_char_cap = _positive_limit(
-        tool_result_char_cap, name="tool_result_char_cap")
+        tool_result_char_cap, name="tool_result_char_cap"
+    )
     tool_batch_result_char_cap = _positive_limit(
-        tool_batch_result_char_cap, name="tool_batch_result_char_cap")
+        tool_batch_result_char_cap, name="tool_batch_result_char_cap"
+    )
     max_tool_args_chars = _positive_limit(
-        max_tool_args_chars, name="max_tool_args_chars")
+        max_tool_args_chars, name="max_tool_args_chars"
+    )
     max_tool_batch_args_chars = _positive_limit(
-        max_tool_batch_args_chars, name="max_tool_batch_args_chars")
+        max_tool_batch_args_chars, name="max_tool_batch_args_chars"
+    )
     max_native_assistant_turn_chars = _positive_limit(
         max_native_assistant_turn_chars,
         name="max_native_assistant_turn_chars",
@@ -220,14 +239,14 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
         name="max_assistant_tool_text_chars",
     )
     if tool_result_char_cap < MIN_TOOL_RESULT_ERROR_QUOTA:
-        raise ValueError(
-            "tool_result_char_cap is too small for stable error results")
+        raise ValueError("tool_result_char_cap is too small for stable error results")
     if (
         tool_batch_result_char_cap
         < max_tool_calls_per_round * MIN_TOOL_RESULT_ERROR_QUOTA
     ):
         raise ValueError(
-            "tool_batch_result_char_cap is too small for stable batch errors")
+            "tool_batch_result_char_cap is too small for stable batch errors"
+        )
     model_prompt_limit = prompt_frontier.resolve_model_limit_from_config(
         provider_config,
         deployment_overrides=prompt_context_window_overrides,
@@ -252,9 +271,7 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
     mutation_outcome_unknown = False
     outbound_tools_blocked = False
     outbound_blocking_reads = {
-        str(name)
-        for name in (outbound_blocking_read_tool_names or ())
-        if str(name)
+        str(name) for name in (outbound_blocking_read_tool_names or ()) if str(name)
     }
     allowed_fetch_urls: set[str] = set()
     # Per-turn tool surface = the static platform catalog plus any user-MCP tools
@@ -263,9 +280,7 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
     # platform PARAMS validation (the MCP server validates its own schema). MCP
     # result content is nevertheless untrusted external input: after the model
     # observes it, later writes are stripped exactly like web-derived content.
-    disabled_names = {
-        str(name) for name in (disabled_tool_names or ()) if str(name)
-    }
+    disabled_names = {str(name) for name in (disabled_tool_names or ()) if str(name)}
     # ``reply`` is part of the parent loop protocol rather than a side-effect
     # capability. Recovery callers may remove every mutation schema, but must
     # always leave the model a way to produce an intermediate bubble. Isolated
@@ -296,13 +311,26 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
         except Exception:  # noqa: BLE001
             pass
 
+    async def _trajectory(event_kind: str, payload: dict) -> None:
+        # Unlike cheap progress telemetry this callback is the encrypted flight
+        # recorder. Production awaits its durable append at causal boundaries;
+        # a pre-action append failure therefore prevents the action from running.
+        if on_trajectory_event is not None:
+            await on_trajectory_event(event_kind, payload)
+
     while attempts < max_calls:
         _progress("round_boundary")
         if attempts > 0 or fold_before_first:
             # Seq-native production callers also fold at the first boundary to
             # close the prompt-assembly race. Legacy fixtures keep the historical
             # after-first behavior until their timestamp seam is removed.
-            transcript.extend(await fold_new_messages())
+            folded = await fold_new_messages()
+            if folded:
+                await _trajectory(
+                    "late_input_fold",
+                    {"round": attempts + 1, "messages": folded},
+                )
+                transcript.extend(folded)
 
         messages = build_messages(list(transcript))
         # Reserve the final provider attempt for a tools-disabled terminal reply.
@@ -311,9 +339,7 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
         if force_text_fallback or attempts == max_calls - 1:
             tools = None
         elif (
-            external_content_seen
-            or mutation_outcome_unknown
-            or outbound_tools_blocked
+            external_content_seen or mutation_outcome_unknown or outbound_tools_blocked
         ):
             # Web results are untrusted model input. Once one is present, page
             # text cannot spend the original write authorization or choose a
@@ -340,10 +366,7 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
             if outbound_tools_blocked:
                 blocked_tools.update({"web_search", "web_fetch"})
                 blocked_tools.update(mcp_names)
-            tools = [
-                spec for spec in turn_catalog
-                if spec.name not in blocked_tools
-            ]
+            tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:
             tools = turn_catalog
         frontier_plan = prompt_frontier.plan_provider_round(
@@ -360,11 +383,30 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
             # valid weak-model/text-only degradation. Required conversation and
             # native tool exchanges are never clipped to make room.
             tools = None
+        await _trajectory(
+            "provider_request",
+            {
+                "round": attempts + 1,
+                "messages": messages,
+                "tools": tools,
+                "prompt_frontier": frontier_plan,
+            },
+        )
         attempts += 1
         _progress("provider_start")
         try:
-            result = await provider_client.chat_completion_async(provider_config, messages, tools=tools)
+            result = await provider_client.chat_completion_async(
+                provider_config, messages, tools=tools
+            )
         except Exception as exc:
+            await _trajectory(
+                "provider_error",
+                {
+                    "round": attempts,
+                    "error_class": type(exc).__name__,
+                    "tools_enabled": tools is not None,
+                },
+            )
             # TurnMetrics' docstring promises failed provider calls ARE counted
             # (model_calls bumped, just with no token usage) — add_usage(None)
             # before either falling back or propagating.
@@ -376,16 +418,33 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
                 and attempts < max_calls
             ):
                 force_text_fallback = True
+                await _trajectory(
+                    "protocol_fallback",
+                    {"round": attempts, "reason": "tool_schema_rejected"},
+                )
                 _progress("provider_retry_boundary")
                 continue
             raise
         _progress("provider_complete")
         add_usage(result.get("usage"))
+        await _trajectory(
+            "provider_response",
+            {"round": attempts, "response": result},
+        )
         pr = ProviderResponse.from_result(result)
 
         # A tools-disabled request is terminal even if a broken relay invents a
         # tool call anyway.  Never execute an undeclared call; use only its text.
         if tools is None or not pr.tool_calls:
+            await _trajectory(
+                "reply_planned",
+                {
+                    "round": attempts,
+                    "final": True,
+                    "text": pr.text,
+                    "reason": "terminal_provider_text",
+                },
+            )
             try:
                 # Plain text IS the final reply (no responder).  The worker's
                 # final-effect callback may reject it atomically when user input
@@ -396,19 +455,18 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
                 await on_reply(pr.text, final=True)
             except FinalReplySuperseded:
                 _progress("final_reply_superseded")
+                await _trajectory(
+                    "final_reply_superseded",
+                    {"round": attempts},
+                )
                 if attempts < max_calls:
                     continue
-                return LoopOutcome(
-                    "", attempts, "input_advanced", replied_intermediate)
+                return LoopOutcome("", attempts, "input_advanced", replied_intermediate)
             return LoopOutcome(pr.text, attempts, "final_text", replied_intermediate)
 
         call_ids = [tc.id for tc in pr.tool_calls]
         argument_sizes = [
-            (
-                _serialized_chars(tc.args)
-                if tc.args_ok
-                else len(str(tc.args_raw or ""))
-            )
+            (_serialized_chars(tc.args) if tc.args_ok else len(str(tc.args_raw or "")))
             for tc in pr.tool_calls
         ]
         native_turn_size = (
@@ -417,12 +475,8 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
             else 0
         )
         oversized_tool_exchange = (
-            any(
-                size is None or size > max_tool_args_chars
-                for size in argument_sizes
-            )
-            or sum(size or 0 for size in argument_sizes)
-            > max_tool_batch_args_chars
+            any(size is None or size > max_tool_args_chars for size in argument_sizes)
+            or sum(size or 0 for size in argument_sizes) > max_tool_batch_args_chars
             or native_turn_size is None
             or native_turn_size > max_native_assistant_turn_chars
             or len(pr.text) > max_assistant_tool_text_chars
@@ -451,8 +505,7 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
         mixed_reply_write = any(
             tc.name == tool_schema.REPLY_TOOL for tc in pr.tool_calls
         ) and any(
-            tc.name in cap_registry.WRITE_ACTIONS
-            or tc.name in mutating_mcp_names
+            tc.name in cap_registry.WRITE_ACTIONS or tc.name in mutating_mcp_names
             for tc in pr.tool_calls
         )
         if (
@@ -473,6 +526,17 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
             # after observing its result in the next.
             if attempts >= max_calls:
                 break
+            await _trajectory(
+                "protocol_fallback",
+                {
+                    "round": attempts,
+                    "reason": "invalid_or_over_budget_tool_exchange",
+                    "malformed": malformed,
+                    "mixed_reply_write": mixed_reply_write,
+                    "over_tool_call_budget": over_tool_call_budget,
+                    "oversized_tool_exchange": oversized_tool_exchange,
+                },
+            )
             force_text_fallback = True
             continue
 
@@ -484,7 +548,16 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
         reply_results: dict[str, ToolResult] = {}
         for tc in reply_calls:
             reply_text = str(tc.args.get("text") or "")
-            await on_reply(reply_text, final=False)   # immediate intermediate bubble
+            await _trajectory(
+                "reply_planned",
+                {
+                    "round": attempts,
+                    "final": False,
+                    "call_id": tc.id,
+                    "text": reply_text,
+                },
+            )
+            await on_reply(reply_text, final=False)  # immediate intermediate bubble
             if reply_text.strip():
                 replied_intermediate = True
                 content = "ok: reply delivered"
@@ -492,6 +565,11 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
                 content = "ok: empty reply ignored"
             reply_results[tc.id] = ToolResult(call_id=tc.id, content=content)
 
+        if other_calls:
+            await _trajectory(
+                "tool_batch_planned",
+                {"round": attempts, "calls": other_calls},
+            )
         dispatched = list(await dispatch_tools(other_calls)) if other_calls else []
         _progress("tool_batch_complete")
         dispatched_by_id = {result.call_id: result for result in dispatched}
@@ -523,9 +601,19 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
             per_result_cap=tool_result_char_cap,
             batch_cap=tool_batch_result_char_cap,
         )
-        ordered_results_by_id = {
-            result.call_id: result for result in ordered_results
-        }
+        ordered_results_by_id = {result.call_id: result for result in ordered_results}
+        if other_calls:
+            # Capture only the same bounded results the next provider round
+            # receives. A malicious/buggy MCP response must not make the flight
+            # recorder serialize an unbounded pre-normalization object.
+            await _trajectory(
+                "tool_batch_result",
+                {
+                    "round": attempts,
+                    "calls": other_calls,
+                    "results": [ordered_results_by_id[tc.id] for tc in other_calls],
+                },
+            )
         for tc in other_calls:
             result = ordered_results_by_id[tc.id]
             if tc.name == "web_search":
@@ -545,10 +633,18 @@ async def run_tool_loop(*, provider_config, build_messages, dispatch_tools, on_r
             # this result. Only subsequent rounds are data-dependent and fenced.
             outbound_tools_blocked = True
 
-        transcript.append(ToolExchange(
-            calls=tuple(pr.tool_calls), results=tuple(ordered_results),
-            assistant_text=pr.text, assistant_turn=pr.assistant_turn,
-        ))
+        transcript.append(
+            ToolExchange(
+                calls=tuple(pr.tool_calls),
+                results=tuple(ordered_results),
+                assistant_text=pr.text,
+                assistant_turn=pr.assistant_turn,
+            )
+        )
     # Only reachable for max_calls == 0, or when a malformed response consumed the
     # last reserved attempt before a fallback could be made.
+    await _trajectory(
+        "loop_exhausted",
+        {"rounds": attempts, "tool_calls_used": tool_calls_used},
+    )
     return LoopOutcome("", attempts, "budget_exhausted", replied_intermediate)

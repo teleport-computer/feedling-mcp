@@ -1,4 +1,5 @@
 """jobs_store：single-flight coalesce、SKIP LOCKED 独占 claim、job 生命周期。"""
+
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -57,7 +58,7 @@ def _seed_active_route(uid: str, *, error: str = "") -> str:
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
     """claim_next_job() is a GLOBAL work-queue claim (by design it doesn't filter
     by user_id — any worker can pick up any user's pending job). That means a
     pending job left behind by one test (e.g. an enqueue test that never drains
@@ -71,6 +72,10 @@ def _clean_agent_jobs_table():
     and a leftover row from an earlier test would let a later test's
     `db.get_runtime_generation("u_...")` lazy-init see a stale generation
     instead of starting fresh at 1."""
+    # Legacy lifecycle assertions in this module intentionally exercise the
+    # opt-in review lane. Production defaults remain fail-closed/off.
+    monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE", "64")
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
         conn.execute("DELETE FROM v2_runtime_state")
@@ -78,7 +83,8 @@ def _clean_agent_jobs_table():
 
 
 def test_enqueue_returns_job_id_and_not_coalesced_first_time():
-    seed_user("u_js_1"); _reset("u_js_1")
+    seed_user("u_js_1")
+    _reset("u_js_1")
     job_id, coalesced = jobs_store.enqueue_job("u_js_1", "chat", reason="hi")
     assert isinstance(job_id, int) and job_id > 0
     assert coalesced is False
@@ -92,7 +98,8 @@ def test_positive_job_ttl_settings_fail_closed(monkeypatch, raw):
 
 
 def test_enqueue_same_user_lane_coalesces_to_existing_pending():
-    seed_user("u_js_2"); _reset("u_js_2")
+    seed_user("u_js_2")
+    _reset("u_js_2")
     first_id, first_c = jobs_store.enqueue_job("u_js_2", "chat")
     second_id, second_c = jobs_store.enqueue_job("u_js_2", "chat")
     assert second_id == first_id
@@ -100,7 +107,8 @@ def test_enqueue_same_user_lane_coalesces_to_existing_pending():
 
 
 def test_enqueue_replaces_overdue_pending_row_instead_of_coalescing():
-    seed_user("u_js_stale_pending"); _reset("u_js_stale_pending")
+    seed_user("u_js_stale_pending")
+    _reset("u_js_stale_pending")
     old_id, _ = jobs_store.enqueue_job("u_js_stale_pending", "chat")
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -114,7 +122,7 @@ def test_enqueue_replaces_overdue_pending_row_instead_of_coalescing():
     assert coalesced is False and new_id != old_id
     with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT id,status,last_error FROM agent_jobs "
+            "SELECT id,lane,status,last_error FROM agent_jobs "
             "WHERE user_id=%s ORDER BY id",
             ("u_js_stale_pending",),
         ).fetchall()
@@ -122,15 +130,16 @@ def test_enqueue_replaces_overdue_pending_row_instead_of_coalescing():
             "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
             (old_id,),
         ).fetchone()
-    assert rows == [
-        (old_id, "expired", "queue_timeout"),
-        (new_id, "pending", None),
-    ]
+    assert len(rows) == 3
+    assert rows[0] == (old_id, "chat", "expired", "queue_timeout")
+    assert rows[1][1:] == ("trajectory_review", "pending", None)
+    assert rows[2] == (new_id, "chat", "pending", None)
     assert marker == ("queue_timeout",)
 
 
 def test_enqueue_replaces_expired_active_lease_and_fences_old_owner():
-    seed_user("u_js_stale_active"); _reset("u_js_stale_active")
+    seed_user("u_js_stale_active")
+    _reset("u_js_stale_active")
     old_id, _ = jobs_store.enqueue_job("u_js_stale_active", "chat")
     jobs_store.claim_next_job("old-owner")
     with db.get_pool().connection() as conn:
@@ -146,48 +155,57 @@ def test_enqueue_replaces_expired_active_lease_and_fences_old_owner():
     assert jobs_store.mark_completed(old_id, claimed_by="old-owner") is False
     with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT id,status,last_error FROM agent_jobs "
+            "SELECT id,lane,status,last_error FROM agent_jobs "
             "WHERE user_id=%s ORDER BY id",
             ("u_js_stale_active",),
         ).fetchall()
-    assert rows == [
-        (old_id, "expired", "lease_timeout"),
-        (new_id, "pending", None),
-    ]
+    assert len(rows) == 3
+    assert rows[0] == (old_id, "chat", "expired", "lease_timeout")
+    assert rows[1][1:] == ("trajectory_review", "pending", None)
+    assert rows[2] == (new_id, "chat", "pending", None)
 
 
 def test_chat_enqueue_sets_pending_deadline_and_coalesce_advances_generation():
-    seed_user("u_js_deadline"); _reset("u_js_deadline")
+    seed_user("u_js_deadline")
+    _reset("u_js_deadline")
     job_id, _ = jobs_store.enqueue_job("u_js_deadline", "chat")
     with db.get_pool().connection() as conn:
         before = conn.execute(
             "SELECT queue_deadline_at,deadline_at,input_generation "
-            "FROM agent_jobs WHERE id=%s", (job_id,)
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
         ).fetchone()
     assert before[0] is not None
-    assert before[1] is None  # old workers mint their own full execution deadline at claim
+    assert (
+        before[1] is None
+    )  # old workers mint their own full execution deadline at claim
     assert before[2] == 0
 
     same_id, coalesced = jobs_store.enqueue_job("u_js_deadline", "chat")
     with db.get_pool().connection() as conn:
         after = conn.execute(
             "SELECT queue_deadline_at,deadline_at,input_generation "
-            "FROM agent_jobs WHERE id=%s", (job_id,)
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
         ).fetchone()
     assert (same_id, coalesced) == (job_id, True)
-    assert after[0] == before[0]  # coalescing must not postpone the oldest input forever
+    assert (
+        after[0] == before[0]
+    )  # coalescing must not postpone the oldest input forever
     assert after[1] is None
     assert after[2] == 1
 
 
 def test_enqueue_rejects_unknown_lane():
-    seed_user("u_js_2b"); _reset("u_js_2b")
+    seed_user("u_js_2b")
+    _reset("u_js_2b")
     with pytest.raises(ValueError):
         jobs_store.enqueue_job("u_js_2b", "not_a_lane")
 
 
 def test_claim_moves_pending_to_claimed_and_returns_row():
-    seed_user("u_js_3"); _reset("u_js_3")
+    seed_user("u_js_3")
+    _reset("u_js_3")
     job_id, _ = jobs_store.enqueue_job("u_js_3", "chat", trace_id="t1")
     row = jobs_store.claim_next_job("worker-A")
     assert row is not None
@@ -205,7 +223,8 @@ def test_claim_moves_pending_to_claimed_and_returns_row():
 
 
 def test_claim_converts_pending_deadline_to_active_lease():
-    seed_user("u_js_3b"); _reset("u_js_3b")
+    seed_user("u_js_3b")
+    _reset("u_js_3b")
     job_id, _ = jobs_store.enqueue_job("u_js_3b", "chat")  # no explicit deadline_at
     row = jobs_store.claim_next_job("worker-B")
     assert row is not None
@@ -219,7 +238,8 @@ def test_claim_converts_pending_deadline_to_active_lease():
 def test_claim_is_exclusive_second_claim_skips():
     # single-flight means at most one active job per (user, lane); after one claim
     # of the only pending job, a second claim finds nothing.
-    seed_user("u_js_4"); _reset("u_js_4")
+    seed_user("u_js_4")
+    _reset("u_js_4")
     jobs_store.enqueue_job("u_js_4", "chat")
     first = jobs_store.claim_next_job("w1")
     second = jobs_store.claim_next_job("w2")
@@ -228,7 +248,8 @@ def test_claim_is_exclusive_second_claim_skips():
 
 
 def test_lifecycle_running_completed_frees_singleflight_slot():
-    seed_user("u_js_5"); _reset("u_js_5")
+    seed_user("u_js_5")
+    _reset("u_js_5")
     job_id, _ = jobs_store.enqueue_job("u_js_5", "chat")
     jobs_store.claim_next_job("w")
     jobs_store.mark_running(job_id, claimed_by="w")
@@ -241,13 +262,15 @@ def test_lifecycle_running_completed_frees_singleflight_slot():
 
 
 def test_mark_failed_increments_attempt_count():
-    seed_user("u_js_6"); _reset("u_js_6")
+    seed_user("u_js_6")
+    _reset("u_js_6")
     job_id, _ = jobs_store.enqueue_job("u_js_6", "chat")
     jobs_store.claim_next_job("w")
     jobs_store.mark_failed(job_id, "boom", claimed_by="w")
     with db.get_pool().connection() as conn:
         row = conn.execute(
-            "SELECT status, attempt_count, last_error FROM agent_jobs WHERE id=%s", (job_id,)
+            "SELECT status, attempt_count, last_error FROM agent_jobs WHERE id=%s",
+            (job_id,),
         ).fetchone()
     assert row[0] == "failed"
     assert row[1] == 1
@@ -285,8 +308,10 @@ def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     jobs_store.claim_next_job("w")
 
-    assert jobs_store.mark_failed(
-        job_id, "turn_failed:runtimeerror", claimed_by="w") is True
+    assert (
+        jobs_store.mark_failed(job_id, "turn_failed:runtimeerror", claimed_by="w")
+        is True
+    )
 
     with db.get_pool().connection() as conn:
         marker = conn.execute(
@@ -319,13 +344,16 @@ def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once
     }
     assert recorded == [(uid, "turn_failed:runtimeerror")]
     errors = [
-        event for event in jobs_store.list_status_events(uid, after_id=0)
+        event
+        for event in jobs_store.list_status_events(uid, after_id=0)
         if event["kind"] == "error" and event["job_id"] == job_id
     ]
     assert len(errors) == 1
 
 
-def test_terminal_visibility_retries_each_fail_once_sink_without_duplicates(monkeypatch):
+def test_terminal_visibility_retries_each_fail_once_sink_without_duplicates(
+    monkeypatch,
+):
     uid = "u_js_terminal_retry"
     seed_user(uid)
     _reset(uid)
@@ -352,15 +380,19 @@ def test_terminal_visibility_retries_each_fail_once_sink_without_duplicates(monk
         recorded.append((user_id, code))
 
     monkeypatch.setattr(
-        jobs_store, "_deliver_terminal_failure_status", _status_fails_once)
+        jobs_store, "_deliver_terminal_failure_status", _status_fails_once
+    )
 
     base_now = time.time()
     first = jobs_store.reconcile_terminal_failure_outbox(
-        record_terminal_error=_runtime_fails_once, job_id=job_id, now=base_now)
+        record_terminal_error=_runtime_fails_once, job_id=job_id, now=base_now
+    )
     second = jobs_store.reconcile_terminal_failure_outbox(
-        record_terminal_error=_runtime_fails_once, job_id=job_id, now=base_now + 2)
+        record_terminal_error=_runtime_fails_once, job_id=job_id, now=base_now + 2
+    )
     third = jobs_store.reconcile_terminal_failure_outbox(
-        record_terminal_error=_runtime_fails_once, job_id=job_id, now=base_now + 4)
+        record_terminal_error=_runtime_fails_once, job_id=job_id, now=base_now + 4
+    )
 
     assert first["status_delivered"] == 0
     assert first["runtime_error_delivered"] == 0
@@ -371,7 +403,8 @@ def test_terminal_visibility_retries_each_fail_once_sink_without_duplicates(monk
     assert runtime_attempts["n"] == 2
     assert recorded == [(uid, "provider_unavailable")]
     errors = [
-        event for event in jobs_store.list_status_events(uid, after_id=0)
+        event
+        for event in jobs_store.list_status_events(uid, after_id=0)
         if event["kind"] == "error" and event["job_id"] == job_id
     ]
     assert len(errors) == 1
@@ -384,7 +417,8 @@ def test_terminal_visibility_redacts_unstable_error_before_user_sinks():
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     jobs_store.claim_next_job("w")
     assert jobs_store.mark_failed(
-        job_id, "raw provider secret sk-do-not-leak", claimed_by="w")
+        job_id, "raw provider secret sk-do-not-leak", claimed_by="w"
+    )
 
     recorded = []
     jobs_store.reconcile_terminal_failure_outbox(
@@ -447,18 +481,22 @@ def test_poison_oldest_rotates_so_newer_marker_delivers_both_sinks(monkeypatch):
         delivered_runtime.append((user_id, code))
 
     monkeypatch.setattr(
-        jobs_store, "_deliver_terminal_failure_status", _poison_old_status)
+        jobs_store, "_deliver_terminal_failure_status", _poison_old_status
+    )
     base_now = time.time()
     jobs_store.reconcile_terminal_failure_outbox(
-        record_terminal_error=_poison_old_runtime, limit=1, now=base_now)
+        record_terminal_error=_poison_old_runtime, limit=1, now=base_now
+    )
     second = jobs_store.reconcile_terminal_failure_outbox(
-        record_terminal_error=_poison_old_runtime, limit=1, now=base_now + 2)
+        record_terminal_error=_poison_old_runtime, limit=1, now=base_now + 2
+    )
 
     assert second["status_delivered"] == 1
     assert second["runtime_error_delivered"] == 1
     assert delivered_runtime == [(uid, "lease_timeout")]
     errors = [
-        event for event in jobs_store.list_status_events(uid, after_id=0)
+        event
+        for event in jobs_store.list_status_events(uid, after_id=0)
         if event["kind"] == "error"
     ]
     assert [event["job_id"] for event in errors] == [new_id]
@@ -473,7 +511,8 @@ def test_delayed_failure_cannot_overwrite_newer_success(monkeypatch):
     failed_id, _ = jobs_store.enqueue_job(uid, "chat")
     jobs_store.claim_next_job("w-fail")
     assert jobs_store.mark_failed(
-        failed_id, "provider_unavailable", claimed_by="w-fail")
+        failed_id, "provider_unavailable", claimed_by="w-fail"
+    )
 
     real_runtime_sink = jobs_store._deliver_terminal_failure_runtime_error
     attempts = {"n": 0}
@@ -485,7 +524,8 @@ def test_delayed_failure_cannot_overwrite_newer_success(monkeypatch):
         return real_runtime_sink(job_id)
 
     monkeypatch.setattr(
-        jobs_store, "_deliver_terminal_failure_runtime_error", _runtime_fails_once)
+        jobs_store, "_deliver_terminal_failure_runtime_error", _runtime_fails_once
+    )
     base_now = time.time()
     jobs_store.reconcile_terminal_failure_outbox(job_id=failed_id, now=base_now)
 
@@ -493,11 +533,13 @@ def test_delayed_failure_cannot_overwrite_newer_success(monkeypatch):
     jobs_store.claim_next_job("w-success")
     assert jobs_store.mark_running(success_id, claimed_by="w-success")
     completed, _successor = jobs_store.finish_chat_job(
-        success_id, claimed_by="w-success", observed_generation=0)
+        success_id, claimed_by="w-success", observed_generation=0
+    )
     assert completed
 
     retried = jobs_store.reconcile_terminal_failure_outbox(
-        job_id=failed_id, now=base_now + 2)
+        job_id=failed_id, now=base_now + 2
+    )
     assert retried["runtime_error_delivered"] == 1
     with db.get_pool().connection() as conn:
         route_error = conn.execute(
@@ -533,9 +575,9 @@ def test_delayed_failure_never_stamps_newly_active_route(monkeypatch):
         )
     new_route_id = _seed_active_route(uid)
     monkeypatch.setattr(
-        jobs_store, "_deliver_terminal_failure_runtime_error", real_runtime_sink)
-    jobs_store.reconcile_terminal_failure_outbox(
-        job_id=failed_id, now=base_now + 2)
+        jobs_store, "_deliver_terminal_failure_runtime_error", real_runtime_sink
+    )
+    jobs_store.reconcile_terminal_failure_outbox(job_id=failed_id, now=base_now + 2)
     with db.get_pool().connection() as conn:
         errors = conn.execute(
             "SELECT id::text,last_runtime_error FROM model_api_routes "
@@ -551,7 +593,8 @@ def test_enqueue_after_failed_job_also_coalesces_free(monkeypatch=None):
     rows are covered by ux_agent_jobs_singleflight. A full (non-partial) unique
     index would wrongly reject/coalesce this new INSERT.
     """
-    seed_user("u_js_7"); _reset("u_js_7")
+    seed_user("u_js_7")
+    _reset("u_js_7")
     job_id, _ = jobs_store.enqueue_job("u_js_7", "chat")
     jobs_store.claim_next_job("w")
     jobs_store.mark_failed(job_id, "boom", claimed_by="w")
@@ -561,16 +604,22 @@ def test_enqueue_after_failed_job_also_coalesces_free(monkeypatch=None):
 
 
 def test_reap_expires_stuck_claimed_job_by_deadline():
-    seed_user("u_js_7b"); _reset("u_js_7b")
+    seed_user("u_js_7b")
+    _reset("u_js_7b")
     job_id, _ = jobs_store.enqueue_job("u_js_7b", "chat")
     jobs_store.claim_next_job("w")
     jobs_store.mark_running(job_id, claimed_by="w")
     # reap with a "now" far in the future → deadline is in the past relative to it.
     import time
-    reaped = jobs_store.reap_stuck_jobs(now=time.time() + jobs_store.RUNNING_TTL_SEC + 10)
+
+    reaped = jobs_store.reap_stuck_jobs(
+        now=time.time() + jobs_store.RUNNING_TTL_SEC + 10
+    )
     assert reaped == 1
     with db.get_pool().connection() as conn:
-        row = conn.execute("SELECT status FROM agent_jobs WHERE id=%s", (job_id,)).fetchone()
+        row = conn.execute(
+            "SELECT status FROM agent_jobs WHERE id=%s", (job_id,)
+        ).fetchone()
         marker = conn.execute(
             "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
             (job_id,),
@@ -580,7 +629,8 @@ def test_reap_expires_stuck_claimed_job_by_deadline():
 
 
 def test_reap_leaves_fresh_running_job_alone():
-    seed_user("u_js_8"); _reset("u_js_8")
+    seed_user("u_js_8")
+    _reset("u_js_8")
     job_id, _ = jobs_store.enqueue_job("u_js_8", "chat")
     jobs_store.claim_next_job("w")
     jobs_store.mark_running(job_id, claimed_by="w")
@@ -589,17 +639,20 @@ def test_reap_leaves_fresh_running_job_alone():
 
 
 def test_reap_expires_overdue_pending_chat_job():
-    seed_user("u_js_pending_timeout"); _reset("u_js_pending_timeout")
+    seed_user("u_js_pending_timeout")
+    _reset("u_js_pending_timeout")
     job_id, _ = jobs_store.enqueue_job("u_js_pending_timeout", "chat")
     reaped = jobs_store.reap_stuck_job_rows(
-        now=time.time() + jobs_store.PENDING_CHAT_TTL_SEC + 10)
+        now=time.time() + jobs_store.PENDING_CHAT_TTL_SEC + 10
+    )
     assert [(row["id"], row["last_error"]) for row in reaped] == [
         (job_id, "queue_timeout")
     ]
 
 
 def test_reap_expires_legacy_pending_chat_without_queue_deadline():
-    seed_user("u_js_legacy_pending"); _reset("u_js_legacy_pending")
+    seed_user("u_js_legacy_pending")
+    _reset("u_js_legacy_pending")
     with db.get_pool().connection() as conn:
         job_id = conn.execute(
             "INSERT INTO agent_jobs "
@@ -617,7 +670,8 @@ def test_reap_expires_legacy_pending_chat_without_queue_deadline():
 
 
 def test_reap_expires_legacy_active_job_using_deadline_fallback():
-    seed_user("u_js_legacy_active"); _reset("u_js_legacy_active")
+    seed_user("u_js_legacy_active")
+    _reset("u_js_legacy_active")
     with db.get_pool().connection() as conn:
         job_id = conn.execute(
             "INSERT INTO agent_jobs "
@@ -635,21 +689,28 @@ def test_reap_expires_legacy_active_job_using_deadline_fallback():
 
 
 def test_owner_fence_and_late_input_successor():
-    seed_user("u_js_successor"); _reset("u_js_successor")
+    seed_user("u_js_successor")
+    _reset("u_js_successor")
     job_id, _ = jobs_store.enqueue_job("u_js_successor", "chat")
     jobs_store.claim_next_job("owner-a")
     assert jobs_store.mark_running(job_id, claimed_by="owner-a") is True
     assert jobs_store.mark_completed(job_id, claimed_by="owner-b") is False
-    assert jobs_store.get_job_status(
-        job_id,
-        user_id="u_js_successor",
-        claimed_by="owner-a",
-    ) == "running"
-    assert jobs_store.get_job_status(
-        job_id,
-        user_id="u_js_successor",
-        claimed_by="owner-b",
-    ) is None
+    assert (
+        jobs_store.get_job_status(
+            job_id,
+            user_id="u_js_successor",
+            claimed_by="owner-a",
+        )
+        == "running"
+    )
+    assert (
+        jobs_store.get_job_status(
+            job_id,
+            user_id="u_js_successor",
+            claimed_by="owner-b",
+        )
+        is None
+    )
 
     observed = jobs_store.get_input_generation(job_id, claimed_by="owner-a")
     assert observed == 0
@@ -657,7 +718,8 @@ def test_owner_fence_and_late_input_successor():
     assert (same_id, coalesced) == (job_id, True)
 
     completed, successor_id = jobs_store.finish_chat_job(
-        job_id, claimed_by="owner-a", observed_generation=observed)
+        job_id, claimed_by="owner-a", observed_generation=observed
+    )
     assert completed is True
     assert successor_id is not None
     with db.get_pool().connection() as conn:
@@ -666,11 +728,14 @@ def test_owner_fence_and_late_input_successor():
             ("u_js_successor",),
         ).fetchall()
     assert rows == [(job_id, "completed"), (successor_id, "pending")]
-    assert jobs_store.get_job_status(
-        job_id,
-        user_id="u_js_successor",
-        claimed_by="owner-a",
-    ) == "completed"
+    assert (
+        jobs_store.get_job_status(
+            job_id,
+            user_id="u_js_successor",
+            claimed_by="owner-a",
+        )
+        == "completed"
+    )
 
 
 def test_forced_successor_is_generation_pinned_singleflight_and_preserves_error():
@@ -679,8 +744,7 @@ def test_forced_successor_is_generation_pinned_singleflight_and_preserves_error(
     _reset(uid)
     _seed_active_route(uid, error="previous_runtime_failure")
     generation = db.get_runtime_generation(uid)
-    job_id, _ = jobs_store.enqueue_job(
-        uid, "chat", expected_generation=generation)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
     claimed = jobs_store.claim_next_job("force-owner")
     assert claimed is not None and int(claimed["id"]) == job_id
     assert jobs_store.mark_running(job_id, claimed_by="force-owner")
@@ -729,14 +793,16 @@ def test_forced_successor_is_generation_pinned_singleflight_and_preserves_error(
     [("draining", 1), ("v2", 2)],
 )
 def test_forced_successor_declines_after_runtime_ownership_changes(
-    state, generation,
+    state,
+    generation,
 ):
     uid = f"u_js_forced_successor_fenced_{state}_{generation}"
     seed_user(uid)
     _reset(uid)
     original_generation = db.get_runtime_generation(uid)
     job_id, _ = jobs_store.enqueue_job(
-        uid, "chat", expected_generation=original_generation)
+        uid, "chat", expected_generation=original_generation
+    )
     claimed = jobs_store.claim_next_job("force-fenced-owner")
     assert claimed is not None and int(claimed["id"]) == job_id
     assert jobs_store.mark_running(job_id, claimed_by="force-fenced-owner")
@@ -766,8 +832,7 @@ def test_finish_chat_job_blocked_past_lease_expiry_fails_closed():
     seed_user(uid)
     _reset(uid)
     generation = db.get_runtime_generation(uid)
-    job_id, _ = jobs_store.enqueue_job(
-        uid, "chat", expected_generation=generation)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
     claimed = jobs_store.claim_next_job("expiry-owner")
     assert claimed is not None and int(claimed["id"]) == job_id
     assert jobs_store.mark_running(job_id, claimed_by="expiry-owner")
@@ -799,25 +864,29 @@ def test_finish_chat_job_blocked_past_lease_expiry_fails_closed():
                 deadline = time.monotonic() + 3
                 waiting = False
                 while time.monotonic() < deadline:
-                    waiting = bool(blocker.execute(
-                        "SELECT EXISTS ("
-                        " SELECT 1 FROM pg_stat_activity "
-                        " WHERE datname=current_database() "
-                        " AND wait_event_type='Lock' "
-                        " AND query LIKE '%%expected_runtime_generation%%' "
-                        " AND query LIKE '%%FROM agent_jobs%%FOR UPDATE%%'"
-                        ")"
-                    ).fetchone()[0])
+                    waiting = bool(
+                        blocker.execute(
+                            "SELECT EXISTS ("
+                            " SELECT 1 FROM pg_stat_activity "
+                            " WHERE datname=current_database() "
+                            " AND wait_event_type='Lock' "
+                            " AND query LIKE '%%expected_runtime_generation%%' "
+                            " AND query LIKE '%%FROM agent_jobs%%FOR UPDATE%%'"
+                            ")"
+                        ).fetchone()[0]
+                    )
                     if waiting:
                         break
                     time.sleep(0.01)
                 assert waiting, "finisher never reached the blocked lease check"
-                remaining = float(blocker.execute(
-                    "SELECT GREATEST(EXTRACT(EPOCH FROM "
-                    "(lease_expires_at-clock_timestamp())),0) "
-                    "FROM agent_jobs WHERE id=%s",
-                    (job_id,),
-                ).fetchone()[0])
+                remaining = float(
+                    blocker.execute(
+                        "SELECT GREATEST(EXTRACT(EPOCH FROM "
+                        "(lease_expires_at-clock_timestamp())),0) "
+                        "FROM agent_jobs WHERE id=%s",
+                        (job_id,),
+                    ).fetchone()[0]
+                )
                 time.sleep(remaining + 0.1)
         result = future.result(timeout=3)
 
@@ -831,7 +900,8 @@ def test_finish_chat_job_blocked_past_lease_expiry_fails_closed():
 
 
 def test_claim_serializes_all_lanes_per_user():
-    seed_user("u_js_lane_lock"); _reset("u_js_lane_lock")
+    seed_user("u_js_lane_lock")
+    _reset("u_js_lane_lock")
     chat_id, _ = jobs_store.enqueue_job("u_js_lane_lock", "chat")
     wake_id, _ = jobs_store.enqueue_job("u_js_lane_lock", "heartbeat")
 
@@ -870,7 +940,9 @@ def test_append_status_event_fires_cross_process_chat_wake(monkeypatch):
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_status_events WHERE user_id='u_js_9d'")
     calls = []
-    monkeypatch.setattr(wake_bus, "notify", lambda channel, user_id="": calls.append((channel, user_id)))
+    monkeypatch.setattr(
+        wake_bus, "notify", lambda channel, user_id="": calls.append((channel, user_id))
+    )
     event_id = jobs_store.append_status_event("u_js_9d", "processing", label="starting")
     assert calls == [("chat", "u_js_9d")]
     # The notify is additive/best-effort — the status row itself must still land.
@@ -950,7 +1022,8 @@ def test_live_worker_count_counts_only_recent():
 
 
 def test_inflight_job_count_counts_active_states():
-    seed_user("u_js_11"); _reset("u_js_11")
+    seed_user("u_js_11")
+    _reset("u_js_11")
     before = jobs_store.inflight_job_count()
     jobs_store.enqueue_job("u_js_11", "chat", reason="t")
     assert jobs_store.inflight_job_count() == before + 1
@@ -996,7 +1069,7 @@ def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
     single-process pool and over-admit onto turn slots that do not exist.
     """
     _clear_heartbeats()
-    jobs_store.record_worker_heartbeat("w1")                      # default kind='turn'
+    jobs_store.record_worker_heartbeat("w1")  # default kind='turn'
     jobs_store.record_worker_heartbeat("w1:genesis", kind="genesis")
 
     assert jobs_store.live_worker_count() == 1
@@ -1023,7 +1096,8 @@ def test_recent_worker_heartbeats_returns_identity_kind_capacity_and_db_age():
     _clear_heartbeats()
     jobs_store.record_worker_heartbeat("v2-worker-new-deadbeef1234", capacity=4)
     jobs_store.record_worker_heartbeat(
-        "v2-worker-new-deadbeef1234:genesis", kind="genesis", capacity=0)
+        "v2-worker-new-deadbeef1234:genesis", kind="genesis", capacity=0
+    )
     with db.get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO v2_worker_heartbeats (worker_id, beat_at, kind, capacity) "
@@ -1073,8 +1147,7 @@ def test_resident_owned_job_is_superseded_without_running():
     uid = "u_job_resident_owned"
     seed_user(uid)
     generation = db.get_runtime_generation(uid)
-    job_id, _ = jobs_store.enqueue_job(
-        uid, "chat", expected_generation=generation)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
 
     assert jobs_store.claim_next_job("w-resident-fence") is None
     with db.get_pool().connection() as conn:
@@ -1140,8 +1213,7 @@ def test_generation_aba_during_turn_prevents_lease_renewal():
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     claimed = jobs_store.claim_next_job("w-running-aba")
     assert claimed is not None
-    assert jobs_store.mark_running(
-        job_id, claimed_by="w-running-aba") is True
+    assert jobs_store.mark_running(job_id, claimed_by="w-running-aba") is True
     with db.get_pool().connection() as conn:
         conn.execute(
             "UPDATE v2_runtime_state SET runtime_generation=3 "
@@ -1149,8 +1221,7 @@ def test_generation_aba_during_turn_prevents_lease_renewal():
             (uid,),
         )
 
-    assert jobs_store.renew_job_lease(
-        job_id, "w-running-aba") is False
+    assert jobs_store.renew_job_lease(job_id, "w-running-aba") is False
 
 
 def test_enqueue_after_generation_aba_replaces_old_pending_job():

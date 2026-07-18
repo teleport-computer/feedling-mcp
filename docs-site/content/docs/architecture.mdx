@@ -190,6 +190,37 @@ artifact cache miss is explicitly unavailable rather than parsed inside the API
 or runner process. Successful provider acquisition emits a content-free usage
 event for billing; cached text-view reads do not.
 
+### Runtime V2 encrypted trajectories and offline review
+
+Runtime V2 keeps an append-only flight recorder for each job in addition to
+aggregate token and latency telemetry. Rendered provider requests, provider
+responses, late-message folds, tool calls and results, planned replies,
+exceptions, and terminal state are serialized inside the trusted runner,
+bounded and compressed, then stored as shared encrypted envelopes. PostgreSQL
+sees the user and job IDs, event index, event kind, ciphertext size, truncation
+bit, and timestamps, but not the conversation or tool payload. Event updates
+are rejected; explicit account or job deletion still removes associated rows.
+
+A failed or expired turn can enqueue a separate low-priority offline review,
+but provider-backed review is off by default and requires the managed runner's
+explicit enable variable. Admission is serialized in PostgreSQL against a
+fleet-wide pending-plus-running ceiling; disabled, invalid, and overflow cases
+retain capture but create no review runner. The same flag is checked before
+provider boundaries as an operational cost kill switch. The review worker
+decrypts only a bounded trajectory frontier, calls the user's
+configured model once with no tool schemas, and encrypts the analysis before
+storage. This is not a production retry and cannot resend a reply or invoke a
+platform, MCP, Memory, schedule, or workspace mutation: the review handler does
+not receive those dispatch surfaces. Review output is not inserted into Chat or
+agent context automatically. Its lease and process-watchdog progress remain
+live across decrypt/provider work, and completion is fenced to the exact event
+frontier: any late event discards or reopens stale analysis.
+
+Trajectory and review rows currently have no automatic retention job; they are
+removed by explicit owning job/account deletion. Keep provider review opt-in
+until a BYOK budget and retention/GC policy are chosen. Turning review off never
+turns trajectory capture off.
+
 ## Managed and self-hosted trust models
 
 | Deployment | Confidential-compute guarantee | Appropriate boundary |

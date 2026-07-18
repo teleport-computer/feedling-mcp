@@ -3,6 +3,7 @@
 These stay below ``process_job`` so barriers can prove overlap, mutation ordering,
 and timeout isolation without a database or timing-dependent sleeps.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -32,8 +33,7 @@ def _path_call(call_id: str, name: str, path: str) -> ToolCall:
 class _DispatchingMcpTurn:
     def __init__(self, names, dispatch):
         self.tool_specs = tuple(
-            ToolSpec(name=name, description=name, parameters={})
-            for name in names
+            ToolSpec(name=name, description=name, parameters={}) for name in names
         )
         self._names = frozenset(names)
         self._dispatch = dispatch
@@ -43,6 +43,44 @@ class _DispatchingMcpTurn:
 
     async def dispatch(self, call: ToolCall) -> ToolResult:
         return await self._dispatch(call)
+
+
+def test_partial_parallel_results_and_sibling_error_are_observable():
+    async def _scenario():
+        good_recorded = asyncio.Event()
+        events = []
+
+        async def _platform_dispatch(call):
+            if call.id == "bad":
+                await good_recorded.wait()
+                raise RuntimeError("read failed")
+            return ToolResult(call_id=call.id, content="evidence")
+
+        async def _tool_event(call, event_kind, payload):
+            events.append((call.id, event_kind, payload))
+            if call.id == "good" and event_kind == "tool_call_result":
+                good_recorded.set()
+
+        with pytest.raises(RuntimeError, match="read failed"):
+            await worker._dispatch_mixed_tool_calls(
+                [_call("good", "memory_index"), _call("bad", "memory_search")],
+                mcp_turn=_DispatchingMcpTurn([], None),
+                mutating_mcp_names=frozenset(),
+                dispatch_platform_one=_platform_dispatch,
+                before_mcp_mutation=lambda: None,
+                read_parallelism=2,
+                mcp_timeout_sec=1,
+                on_tool_event=_tool_event,
+            )
+
+        assert ("good", "tool_call_result") in [
+            (call_id, kind) for call_id, kind, _payload in events
+        ]
+        assert ("bad", "tool_call_error") in [
+            (call_id, kind) for call_id, kind, _payload in events
+        ]
+
+    asyncio.run(_scenario())
 
 
 def test_task_batch_overlaps_reads_and_both_settle_before_mutation():
@@ -64,8 +102,7 @@ def test_task_batch_overlaps_reads_and_both_settle_before_mutation():
             task_started.set()
             await release.wait()
             return [
-                ToolResult(call_id=call.id, content=f"task:{call.id}")
-                for call in calls
+                ToolResult(call_id=call.id, content=f"task:{call.id}") for call in calls
             ]
 
         calls = [
@@ -73,16 +110,18 @@ def test_task_batch_overlaps_reads_and_both_settle_before_mutation():
             ToolCall("task", "task", {"prompt": "inspect"}),
             _call("read", "memory_index"),
         ]
-        running = asyncio.create_task(worker._dispatch_mixed_tool_calls(
-            calls,
-            mcp_turn=_DispatchingMcpTurn([], None),
-            mutating_mcp_names=frozenset(),
-            dispatch_platform_one=_platform_dispatch,
-            dispatch_task_batch=_tasks,
-            before_mcp_mutation=lambda: None,
-            read_parallelism=2,
-            mcp_timeout_sec=1,
-        ))
+        running = asyncio.create_task(
+            worker._dispatch_mixed_tool_calls(
+                calls,
+                mcp_turn=_DispatchingMcpTurn([], None),
+                mutating_mcp_names=frozenset(),
+                dispatch_platform_one=_platform_dispatch,
+                dispatch_task_batch=_tasks,
+                before_mcp_mutation=lambda: None,
+                read_parallelism=2,
+                mcp_timeout_sec=1,
+            )
+        )
 
         await asyncio.wait_for(read_started.wait(), timeout=1)
         await asyncio.wait_for(task_started.wait(), timeout=1)
@@ -91,11 +130,11 @@ def test_task_batch_overlaps_reads_and_both_settle_before_mutation():
         results = await running
 
         assert mutation_started.is_set()
-        assert [result.call_id for result in results] == [
-            "write", "task", "read"
-        ]
+        assert [result.call_id for result in results] == ["write", "task", "read"]
         assert [result.content for result in results] == [
-            "platform:write", "task:task", "platform:read"
+            "platform:write",
+            "task:task",
+            "platform:read",
         ]
 
     asyncio.run(_scenario())
@@ -120,15 +159,17 @@ def test_workspace_mutations_stay_serial_and_stop_after_failure():
             _path_call("a", "workspace_write", "/workspace/tree"),
             _path_call("b", "workspace_write", "/workspace/other"),
         ]
-        running = asyncio.create_task(worker._dispatch_mixed_tool_calls(
-            calls,
-            mcp_turn=_DispatchingMcpTurn([], None),
-            mutating_mcp_names=frozenset(),
-            dispatch_platform_one=_platform_dispatch,
-            before_mcp_mutation=lambda: None,
-            read_parallelism=2,
-            mcp_timeout_sec=1,
-        ))
+        running = asyncio.create_task(
+            worker._dispatch_mixed_tool_calls(
+                calls,
+                mcp_turn=_DispatchingMcpTurn([], None),
+                mutating_mcp_names=frozenset(),
+                dispatch_platform_one=_platform_dispatch,
+                before_mcp_mutation=lambda: None,
+                read_parallelism=2,
+                mcp_timeout_sec=1,
+            )
+        )
 
         await asyncio.wait_for(a_started.wait(), timeout=1)
         assert events == ["start:a"]
@@ -261,7 +302,9 @@ def test_platform_reads_really_overlap_but_results_keep_model_order():
         assert events == ["first:start", "second:end", "first:end"]
         assert [result.call_id for result in results] == ["first", "second"]
         assert [result.content for result in results] == [
-            "first result", "second result"]
+            "first result",
+            "second result",
+        ]
 
     asyncio.run(_scenario())
 
@@ -287,20 +330,22 @@ def test_approved_mcp_and_platform_reads_overlap_under_one_gate():
             return ToolResult(call_id=call.id, content="ok")
 
         mcp = _DispatchingMcpTurn(["mcp__files__search"], _enter)
-        task = asyncio.create_task(worker._dispatch_mixed_tool_calls(
-            [
-                _call("mcp", "mcp__files__search"),
-                _call("platform", "memory_index"),
-            ],
-            mcp_turn=mcp,
-            # An exact catalog approval removes this MCP tool from the mutating
-            # set; without that approval the same call is serialized below.
-            mutating_mcp_names=frozenset(),
-            dispatch_platform_one=_enter,
-            before_mcp_mutation=lambda: None,
-            read_parallelism=2,
-            mcp_timeout_sec=1,
-        ))
+        task = asyncio.create_task(
+            worker._dispatch_mixed_tool_calls(
+                [
+                    _call("mcp", "mcp__files__search"),
+                    _call("platform", "memory_index"),
+                ],
+                mcp_turn=mcp,
+                # An exact catalog approval removes this MCP tool from the mutating
+                # set; without that approval the same call is serialized below.
+                mutating_mcp_names=frozenset(),
+                dispatch_platform_one=_enter,
+                before_mcp_mutation=lambda: None,
+                read_parallelism=2,
+                mcp_timeout_sec=1,
+            )
+        )
         await asyncio.wait_for(mcp_started.wait(), timeout=1)
         await asyncio.wait_for(platform_started.wait(), timeout=1)
         assert active == 2
@@ -338,15 +383,17 @@ def test_platform_read_parallelism_gate_is_shared_across_the_batch():
             _call("p3", "web_search"),
             _call("p4", "web_fetch"),
         ]
-        task = asyncio.create_task(worker._dispatch_mixed_tool_calls(
-            calls,
-            mcp_turn=mcp,
-            mutating_mcp_names=frozenset(),
-            dispatch_platform_one=_read,
-            before_mcp_mutation=lambda: None,
-            read_parallelism=2,
-            mcp_timeout_sec=1,
-        ))
+        task = asyncio.create_task(
+            worker._dispatch_mixed_tool_calls(
+                calls,
+                mcp_turn=mcp,
+                mutating_mcp_names=frozenset(),
+                dispatch_platform_one=_read,
+                before_mcp_mutation=lambda: None,
+                read_parallelism=2,
+                mcp_timeout_sec=1,
+            )
+        )
         await asyncio.wait_for(two_started.wait(), timeout=1)
         assert active == 2
         assert max_active == 2
@@ -354,8 +401,7 @@ def test_platform_read_parallelism_gate_is_shared_across_the_batch():
         results = await task
 
         assert max_active == 2
-        assert [result.call_id for result in results] == [
-            "p1", "p2", "p3", "p4"]
+        assert [result.call_id for result in results] == ["p1", "p2", "p3", "p4"]
 
     asyncio.run(_scenario())
 
@@ -377,7 +423,8 @@ def test_all_reads_settle_before_cross_domain_mutations_run_in_model_order():
             events.append("fence:mcp")
 
         mcp = _DispatchingMcpTurn(
-            ["mcp__read", "mcp__write_1", "mcp__write_2"], _mcp_dispatch)
+            ["mcp__read", "mcp__write_1", "mcp__write_2"], _mcp_dispatch
+        )
         calls = [
             _call("p-read-1", "memory_index"),
             _call("m-read", "mcp__read"),
@@ -391,8 +438,7 @@ def test_all_reads_settle_before_cross_domain_mutations_run_in_model_order():
             mcp_turn=mcp,
             # Even the server's nominal "read" route is mutating until an
             # independent approval policy exists.
-            mutating_mcp_names={
-                "mcp__read", "mcp__write_1", "mcp__write_2"},
+            mutating_mcp_names={"mcp__read", "mcp__write_1", "mcp__write_2"},
             dispatch_platform_one=_platform_dispatch,
             before_mcp_mutation=_before_mcp_mutation,
             read_parallelism=2,
@@ -401,7 +447,9 @@ def test_all_reads_settle_before_cross_domain_mutations_run_in_model_order():
 
         first_mutation = events.index("fence:mcp")
         assert set(events[:first_mutation]) == {
-            "read:memory_index", "read:perception_snapshot"}
+            "read:memory_index",
+            "read:perception_snapshot",
+        }
         assert events[first_mutation:] == [
             "fence:mcp",
             "mutate:mcp__read",
@@ -412,8 +460,13 @@ def test_all_reads_settle_before_cross_domain_mutations_run_in_model_order():
             "mutate:mcp__write_2",
         ]
         assert [result.call_id for result in results] == [
-            "p-read-1", "m-read", "p-read-2", "m-write-1",
-            "p-write", "m-write-2"]
+            "p-read-1",
+            "m-read",
+            "p-read-2",
+            "m-write-1",
+            "p-write",
+            "m-write-2",
+        ]
 
     asyncio.run(_scenario())
 
@@ -437,8 +490,7 @@ def test_all_mcp_tools_are_serial_and_fenced_by_default():
         async def _before_mcp_mutation():
             events.append("fence")
 
-        mcp = _DispatchingMcpTurn(
-            ["mcp__declared_read", "mcp__write"], _mcp_dispatch)
+        mcp = _DispatchingMcpTurn(["mcp__declared_read", "mcp__write"], _mcp_dispatch)
         results = await worker._dispatch_mixed_tool_calls(
             [
                 _call("first", "mcp__declared_read"),
@@ -454,8 +506,12 @@ def test_all_mcp_tools_are_serial_and_fenced_by_default():
 
         assert max_active == 1
         assert events == [
-            "fence", "start:first", "end:first",
-            "fence", "start:second", "end:second",
+            "fence",
+            "start:first",
+            "end:first",
+            "fence",
+            "start:second",
+            "end:second",
         ]
         assert [result.call_id for result in results] == ["first", "second"]
 
@@ -487,8 +543,7 @@ def test_ambiguous_mutating_mcp_failures_lock_out_all_later_mutations():
             async def _before_mcp_mutation():
                 fences.append("fenced")
 
-            mcp = _DispatchingMcpTurn(
-                ["mcp__ambiguous", "mcp__later"], _mcp_dispatch)
+            mcp = _DispatchingMcpTurn(["mcp__ambiguous", "mcp__later"], _mcp_dispatch)
             results = await worker._dispatch_mixed_tool_calls(
                 [
                     _call("first", "mcp__ambiguous"),
@@ -533,7 +588,8 @@ def test_mutation_timeout_is_fenced_and_reports_unknown_outcome_without_raising(
             return ToolResult(call_id=call.id, content="ok")
 
         mcp = _DispatchingMcpTurn(
-            ["mcp__slow_write", "mcp__later_write"], _mcp_dispatch)
+            ["mcp__slow_write", "mcp__later_write"], _mcp_dispatch
+        )
         results = await worker._dispatch_mixed_tool_calls(
             [
                 _call("write", "mcp__slow_write"),
@@ -626,8 +682,7 @@ def test_independently_approved_read_only_set_is_respected():
         def mutating_tool_names(self):
             return frozenset()
 
-    assert worker._mcp_mutating_names_for_turn(
-        _AdvisoryOnlyMcpTurn()) == frozenset()
+    assert worker._mcp_mutating_names_for_turn(_AdvisoryOnlyMcpTurn()) == frozenset()
 
 
 def test_progress_reports_read_phase_and_every_serial_or_blocked_mutation():
@@ -649,8 +704,7 @@ def test_progress_reports_read_phase_and_every_serial_or_blocked_mutation():
         async def _before_mcp_mutation():
             return None
 
-        mcp = _DispatchingMcpTurn(
-            ["mcp__first", "mcp__blocked"], _mcp_dispatch)
+        mcp = _DispatchingMcpTurn(["mcp__first", "mcp__blocked"], _mcp_dispatch)
         results = await worker._dispatch_mixed_tool_calls(
             [
                 _call("read", "memory_index"),
@@ -698,10 +752,8 @@ def test_mcp_wall_budget_is_shared_and_rejects_without_starting_next_call():
         async def _before_mcp_mutation():
             fenced.append("fence")
 
-        budget = worker._McpTurnWallBudget(
-            3.0, clock=lambda: now[0])
-        mcp = _DispatchingMcpTurn(
-            ["mcp__first", "mcp__second"], _mcp_dispatch)
+        budget = worker._McpTurnWallBudget(3.0, clock=lambda: now[0])
+        mcp = _DispatchingMcpTurn(["mcp__first", "mcp__second"], _mcp_dispatch)
         results = await worker._dispatch_mixed_tool_calls(
             [
                 _call("first", "mcp__first"),

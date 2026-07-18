@@ -33,9 +33,12 @@ def test_every_hosted_backend_compose_is_literal_v2_only():
         "deploy/docker-compose.phala.pre.yaml",
     ):
         compose = yaml.safe_load((ROOT / relative).read_text())
-        assert compose["services"]["backend"]["environment"][
-            "FEEDLING_HOSTED_RUNTIME_POLICY"
-        ] == "v2_only", relative
+        assert (
+            compose["services"]["backend"]["environment"][
+                "FEEDLING_HOSTED_RUNTIME_POLICY"
+            ]
+            == "v2_only"
+        ), relative
 
 
 def test_every_hosted_worker_compose_can_launch_only_the_v2_pool():
@@ -69,13 +72,28 @@ def test_every_hosted_worker_compose_wires_fail_closed_sandbox_configuration():
     ):
         compose = yaml.safe_load((ROOT / relative).read_text())
         environment = compose["services"]["serve-worker"]["environment"]
-        assert environment["FEEDLING_V2_SANDBOX_PROVIDER"].endswith(
-            ":-disabled}"
-        ), relative
+        assert environment["FEEDLING_V2_SANDBOX_PROVIDER"].endswith(":-disabled}"), (
+            relative
+        )
         assert "E2B_API_KEY" in environment, relative
         assert "FEEDLING_V2_E2B_TEMPLATE" in environment, relative
-        assert environment["FEEDLING_V2_E2B_ALLOW_INTERNET"].endswith(
-            ":-0}"
+        assert environment["FEEDLING_V2_E2B_ALLOW_INTERNET"].endswith(":-0}"), relative
+
+
+def test_every_hosted_worker_compose_wires_fail_closed_review_configuration():
+    for relative in (
+        "deploy/docker-compose.agent-runner.yaml",
+        "deploy/docker-compose.phala.runner.yaml",
+        "deploy/docker-compose.phala.pre.runner.yaml",
+        "deploy/docker-compose.phala.prod.runner.yaml",
+    ):
+        compose = yaml.safe_load((ROOT / relative).read_text())
+        environment = compose["services"]["serve-worker"]["environment"]
+        assert environment["FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED"].endswith(":-0}"), (
+            relative
+        )
+        assert environment["FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE"].endswith(
+            ":-64}"
         ), relative
 
 
@@ -84,7 +102,9 @@ def test_worker_image_contains_no_resident_runtime_or_cli_toolchain():
     instructions = "\n".join(
         line for line in source.splitlines() if not line.lstrip().startswith("#")
     )
-    assert 'CMD ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]' in source
+    assert (
+        'CMD ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]' in source
+    )
     for retired in (
         "npm install",
         "backend/agent_runtime/supervisor.py",
@@ -125,6 +145,32 @@ def test_ci_passes_e2b_configuration_only_through_worker_deploys():
     assert "secrets.PRE_E2B_API_KEY" in source
     assert "secrets.E2B_API_KEY" in source
     assert source.count('FEEDLING_V2_SANDBOX_PROVIDER" = "e2b"') == 3
+
+
+def test_ci_passes_opt_in_review_configuration_to_every_worker_deploy():
+    source = (ROOT / ".github/workflows/ci.yml").read_text()
+    for environment in ("TEST", "PRE", "PROD"):
+        assert (
+            f"vars.{environment}_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0'" in source
+        )
+        assert (
+            f"vars.{environment}_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64'"
+            in source
+        )
+    assert (
+        source.count(
+            '-e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED='
+            '$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED"'
+        )
+        == 3
+    )
+    assert (
+        source.count(
+            '-e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE='
+            '$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE"'
+        )
+        == 3
+    )
 
 
 def test_production_worker_topology_requires_two_distinct_cvm_ids(tmp_path):

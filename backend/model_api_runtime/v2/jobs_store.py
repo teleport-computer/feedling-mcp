@@ -4,6 +4,7 @@ CONTRIBUTING §2：新表存取逻辑全部收进本模块（jobs_store）。连
 （autocommit）；需要跨语句持行锁的地方（SKIP LOCKED claim / single-flight 选举）
 用显式 conn.transaction()。行返回 dict 用 psycopg.rows.dict_row 游标。
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -22,7 +23,17 @@ from core import wake_bus
 
 log = logging.getLogger("feedling.runtime_v2.jobs_store")
 
-LANES = {"chat", "manual_wake", "heartbeat", "scheduled", "capture", "maintenance", "dream", "screen_watch"}
+LANES = {
+    "chat",
+    "manual_wake",
+    "heartbeat",
+    "scheduled",
+    "capture",
+    "maintenance",
+    "dream",
+    "screen_watch",
+    "trajectory_review",
+}
 
 
 def _positive_float_env(name: str, default: str) -> float:
@@ -34,6 +45,7 @@ def _positive_float_env(name: str, default: str) -> float:
     if not math.isfinite(value) or value <= 0:
         raise RuntimeError(f"{name} must be finite and > 0")
     return value
+
 
 # 默认（lane 派生）优先级：预留槽位场景下 chat/manual_wake 必须能在一堆 heartbeat/
 # capture 前面被抢到，防止后台唤醒风暴饿死聊天回复。enqueue_job 未显式传 priority
@@ -47,6 +59,9 @@ LANE_PRIORITY = {
     "capture": 10,
     "maintenance": 10,
     "dream": 10,
+    # Offline analysis must never contend with foreground chat/wake or memory
+    # maintenance. One generic job drains one encrypted failed-turn review.
+    "trajectory_review": 1,
 }
 # Chat admission and execution use separate columns and clocks. Pending rows
 # have a short queue deadline so an admitted turn cannot wait forever when the
@@ -79,6 +94,199 @@ def _terminal_error_code(error: object) -> str:
 
 def _pool():
     return db.get_pool()
+
+
+_TRAJECTORY_REVIEW_LANE = "trajectory_review"
+_TRAJECTORY_REVIEW_MAX_ATTEMPTS = 3
+_TRAJECTORY_REVIEW_ENABLED_ENV = "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED"
+_TRAJECTORY_REVIEW_MAX_ACTIVE_ENV = "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE"
+_TRAJECTORY_REVIEW_DEFAULT_MAX_ACTIVE = 64
+# A database-wide transaction advisory lock makes the active-review count and
+# insert/reopen one admission decision across every worker process.  This is a
+# namespace-local constant, not a secret or an ownership fence.
+_TRAJECTORY_REVIEW_ADMISSION_LOCK = 0x46563254524A0001
+_TRAJECTORY_EVENT_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_TRAJECTORY_IDEMPOTENCY_RE = re.compile(r"^[a-zA-Z0-9_.:-]{1,96}$")
+_TRAJECTORY_ENVELOPE_REQUIRED = frozenset(
+    {
+        "v",
+        "id",
+        "owner_user_id",
+        "visibility",
+        "body_ct",
+        "nonce",
+        "K_user",
+        "K_enclave",
+    }
+)
+_TRAJECTORY_ENVELOPE_ALLOWED = frozenset(
+    {
+        "v",
+        "id",
+        "owner_user_id",
+        "visibility",
+        "body_ct",
+        "nonce",
+        "K_user",
+        "K_enclave",
+        "enclave_pk_fpr",
+        "content_pk_fpr",
+    }
+)
+
+
+def trajectory_review_admission_cap() -> int:
+    """Return the explicit fleet review ceiling, or zero on bad config.
+
+    Review is a BYOK provider call and must fail closed without jeopardizing
+    source-job terminalization.  Parsing therefore happens at the decision
+    boundary instead of module import: malformed live configuration disables
+    review; it never rolls back a user's terminal failure transaction.
+    """
+    raw = os.environ.get(
+        _TRAJECTORY_REVIEW_MAX_ACTIVE_ENV,
+        str(_TRAJECTORY_REVIEW_DEFAULT_MAX_ACTIVE),
+    )
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+    return value if 1 <= value <= 10_000 else 0
+
+
+def trajectory_review_enabled() -> bool:
+    """Whether provider-backed failure review is explicitly safe to execute."""
+    enabled = os.environ.get(_TRAJECTORY_REVIEW_ENABLED_ENV, "0").strip().lower()
+    return enabled in {"1", "true", "yes", "on"} and bool(
+        trajectory_review_admission_cap()
+    )
+
+
+def _review_admission_available_on_cursor(cur) -> bool:
+    """Serialize and enforce the durable global pending+running ceiling."""
+    if not trajectory_review_enabled():
+        return False
+    cap = trajectory_review_admission_cap()
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(%s::bigint)",
+        (_TRAJECTORY_REVIEW_ADMISSION_LOCK,),
+    )
+    cur.execute(
+        "SELECT COUNT(*)::int AS active_count FROM v2_trajectory_reviews "
+        "WHERE status IN ('pending','running')"
+    )
+    row = cur.fetchone()
+    active = int(row["active_count"] if isinstance(row, dict) else row[0])
+    return active < cap
+
+
+def _validate_trajectory_envelope(user_id: str, envelope: object) -> dict:
+    if not isinstance(envelope, dict):
+        raise ValueError("trajectory payload envelope must be an object")
+    if not _TRAJECTORY_ENVELOPE_REQUIRED.issubset(envelope):
+        raise ValueError("trajectory payload envelope is incomplete")
+    if set(envelope) - _TRAJECTORY_ENVELOPE_ALLOWED:
+        raise ValueError("trajectory payload envelope has unsupported fields")
+    if type(envelope.get("v")) is not int:
+        raise ValueError("trajectory payload envelope version must be an integer")
+    if envelope.get("owner_user_id") != str(user_id):
+        raise ValueError("trajectory payload envelope owner mismatch")
+    if envelope.get("visibility") != "shared":
+        raise ValueError("trajectory payload envelope must be shared")
+    for field in ("id", "body_ct", "nonce", "K_user", "K_enclave"):
+        if not isinstance(envelope.get(field), str) or not envelope[field]:
+            raise ValueError(f"trajectory payload envelope {field} required")
+    return envelope
+
+
+def _ensure_review_runner_on_cursor(cur, user_id: str) -> None:
+    """Ensure one low-priority generic runner exists for this user's backlog.
+
+    The source review row carries the source-job identity.  The generic
+    ``agent_jobs`` row only gives the existing worker pool a separately
+    schedulable lane, so its ordinary per-user/lane single-flight semantics are
+    desirable here.
+    """
+    if not trajectory_review_enabled():
+        return
+    cur.execute(
+        "INSERT INTO agent_jobs "
+        "(user_id,lane,status,reason,priority,expected_runtime_generation) "
+        "SELECT %s,%s,'pending','terminal_failure_review',%s,s.runtime_generation "
+        "FROM v2_runtime_state s "
+        "WHERE s.user_id=%s AND s.hosted_runtime_state='v2' "
+        "AND EXISTS (SELECT 1 FROM v2_trajectory_reviews r "
+        "            WHERE r.user_id=%s AND r.status='pending') "
+        "AND NOT EXISTS (SELECT 1 FROM agent_jobs j "
+        "                WHERE j.user_id=%s AND j.lane=%s "
+        "                  AND j.status IN ('pending','claimed','running')) "
+        "ON CONFLICT DO NOTHING",
+        (
+            str(user_id),
+            _TRAJECTORY_REVIEW_LANE,
+            int(LANE_PRIORITY[_TRAJECTORY_REVIEW_LANE]),
+            str(user_id),
+            str(user_id),
+            str(user_id),
+            _TRAJECTORY_REVIEW_LANE,
+        ),
+    )
+
+
+def _queue_failure_review_on_cursor(cur, source_job_id: int | str) -> bool:
+    """Create a review request in the caller's terminal-state transaction."""
+    # Materialize the stream even when capture produced no events. Review
+    # completion locks this row as its frontier fence, while later appenders
+    # lock the same row before reopening an already-completed review.
+    cur.execute(
+        "INSERT INTO v2_trajectory_streams (job_id,user_id) "
+        "SELECT id,user_id FROM agent_jobs WHERE id=%s "
+        "ON CONFLICT (job_id) DO NOTHING",
+        (source_job_id,),
+    )
+    if not _review_admission_available_on_cursor(cur):
+        return False
+    cur.execute(
+        "INSERT INTO v2_trajectory_reviews (source_job_id,user_id,status) "
+        "SELECT j.id,j.user_id,'pending' FROM agent_jobs j "
+        "JOIN v2_runtime_state s ON s.user_id=j.user_id "
+        "WHERE j.id=%s AND j.status IN ('failed','expired') AND j.lane<>%s "
+        "AND s.hosted_runtime_state='v2' "
+        "ON CONFLICT (source_job_id) DO NOTHING RETURNING user_id",
+        (source_job_id, _TRAJECTORY_REVIEW_LANE),
+    )
+    row = cur.fetchone()
+    if row is not None:
+        user_id = row["user_id"] if isinstance(row, dict) else row[0]
+        _ensure_review_runner_on_cursor(cur, str(user_id))
+        return True
+    return False
+
+
+def _recover_review_runner_on_cursor(cur, runner_job_id: int | str) -> None:
+    """Release a review claim whose generic runner terminalized unexpectedly."""
+    cur.execute(
+        "UPDATE v2_trajectory_reviews r SET "
+        "status=CASE WHEN r.attempt_count<%s THEN 'pending' ELSE 'failed' END, "
+        "claimed_by_job_id=NULL, "
+        "last_error=CASE WHEN r.attempt_count<%s THEN r.last_error "
+        "                ELSE COALESCE(r.last_error,'review_runner_failed') END, "
+        "finished_at=CASE WHEN r.attempt_count<%s THEN NULL ELSE now() END "
+        "FROM agent_jobs j WHERE j.id=%s AND j.lane=%s "
+        "AND r.claimed_by_job_id=j.id AND r.status='running' "
+        "RETURNING r.user_id",
+        (
+            _TRAJECTORY_REVIEW_MAX_ATTEMPTS,
+            _TRAJECTORY_REVIEW_MAX_ATTEMPTS,
+            _TRAJECTORY_REVIEW_MAX_ATTEMPTS,
+            runner_job_id,
+            _TRAJECTORY_REVIEW_LANE,
+        ),
+    )
+    rows = cur.fetchall()
+    for row in rows:
+        user_id = row["user_id"] if isinstance(row, dict) else row[0]
+        _ensure_review_runner_on_cursor(cur, str(user_id))
 
 
 def coalesce_or_insert_on_cursor(
@@ -129,8 +337,7 @@ def coalesce_or_insert_on_cursor(
         and expected_generation is not None
         and (
             existing["expected_runtime_generation"] is None
-            or int(existing["expected_runtime_generation"])
-            != int(expected_generation)
+            or int(existing["expected_runtime_generation"]) != int(expected_generation)
         )
     )
     if existing is not None and not existing_stale and not generation_stale:
@@ -174,6 +381,7 @@ def coalesce_or_insert_on_cursor(
                 "ON CONFLICT (job_id) DO NOTHING",
                 (existing["id"],),
             )
+            _queue_failure_review_on_cursor(cur, existing["id"])
     cur.execute(
         "INSERT INTO agent_jobs "
         "(user_id, lane, status, reason, trace_id, priority, queue_deadline_at, "
@@ -183,8 +391,15 @@ def coalesce_or_insert_on_cursor(
         "     WHEN %s='chat' THEN now() + make_interval(secs => %s) "
         "     ELSE NULL END, %s) RETURNING id",
         (
-            user_id, lane, reason, trace_id, int(priority),
-            deadline_at, deadline_at, lane, float(PENDING_CHAT_TTL_SEC),
+            user_id,
+            lane,
+            reason,
+            trace_id,
+            int(priority),
+            deadline_at,
+            deadline_at,
+            lane,
+            float(PENDING_CHAT_TTL_SEC),
             expected_generation,
         ),
     )
@@ -240,10 +455,16 @@ def enqueue_job(
                                 and str(control["hosted_runtime_state"]) == "v2"
                             ):
                                 effective_generation = int(
-                                    control["runtime_generation"])
+                                    control["runtime_generation"]
+                                )
                         return coalesce_or_insert_on_cursor(
-                            cur, user_id, lane, reason=reason, trace_id=trace_id,
-                            priority=priority, deadline_at=deadline_at,
+                            cur,
+                            user_id,
+                            lane,
+                            reason=reason,
+                            trace_id=trace_id,
+                            priority=priority,
+                            deadline_at=deadline_at,
                             expected_generation=effective_generation,
                         )
         except psycopg.errors.UniqueViolation:
@@ -268,8 +489,13 @@ def enqueue_job(
                     ):
                         effective_generation = int(control["runtime_generation"])
                 return coalesce_or_insert_on_cursor(
-                    cur, user_id, lane, reason=reason, trace_id=trace_id,
-                    priority=priority, deadline_at=deadline_at,
+                    cur,
+                    user_id,
+                    lane,
+                    reason=reason,
+                    trace_id=trace_id,
+                    priority=priority,
+                    deadline_at=deadline_at,
                     expected_generation=effective_generation,
                 )
 
@@ -326,7 +552,11 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
             "AND active.status IN ('claimed','running')) "
             "ORDER BY j.priority DESC, j.created_at LIMIT 1"
         )
-        select_args = (float(PENDING_CHAT_TTL_SEC), float(PENDING_CHAT_TTL_SEC), list(lanes))
+        select_args = (
+            float(PENDING_CHAT_TTL_SEC),
+            float(PENDING_CHAT_TTL_SEC),
+            list(lanes),
+        )
 
     # Lock order is runtime-state -> job everywhere. chat/send's atomic
     # append+coalesce and cutover already use that order; claiming the job
@@ -344,8 +574,7 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
                     # zero rows. Scope this opt-in to exactly one claim
                     # transaction so pooled connections cannot leak authority.
                     cur.execute(
-                        "SELECT set_config("
-                        "'feedling.v2_worker_protocol',%s,true)",
+                        "SELECT set_config('feedling.v2_worker_protocol',%s,true)",
                         (_WORKER_CLAIM_PROTOCOL,),
                     )
                     cur.execute(select_sql, select_args)
@@ -393,7 +622,10 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
                         continue
                     expected_gen = locked_job["expected_runtime_generation"]
                     current_generation = int(control["runtime_generation"])
-                    if expected_gen is not None and int(expected_gen) != current_generation:
+                    if (
+                        expected_gen is not None
+                        and int(expected_gen) != current_generation
+                    ):
                         cur.execute(
                             "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
                             "last_error='stale_runtime_generation' WHERE id=%s",
@@ -470,7 +702,9 @@ def mark_running(job_id, *, claimed_by: str) -> bool:
             return cur.rowcount == 1
 
 
-def renew_job_lease(job_id, claimed_by: str, *, ttl_sec: float = RUNNING_TTL_SEC) -> bool:
+def renew_job_lease(
+    job_id, claimed_by: str, *, ttl_sec: float = RUNNING_TTL_SEC
+) -> bool:
     with _pool().connection() as conn:
         with conn.transaction():
             row = conn.execute(
@@ -519,51 +753,61 @@ def mark_completed(job_id, *, claimed_by: str) -> bool:
 def mark_failed(job_id, error: str, *, claimed_by: str) -> bool:
     """Fail an owned job and transactionally queue chat failure visibility.
 
-    The CTE is intentionally one statement: there is no process-crash window
-    in which ``agent_jobs`` is terminal but the status/error obligation is not
-    durable.  Background lanes remain silent and do not get an outbox row.
+    Terminalization, the user-visible outbox obligation, and any trajectory
+    review handoff share one explicit transaction, so there is no process-crash
+    window between them. Background lanes remain silent and do not get an
+    outbox row.
     """
     visible_error = _terminal_error_code(error)
     with _pool().connection() as conn:
-        cur = conn.execute(
-            "WITH terminal AS ("
-            "  UPDATE agent_jobs SET status='failed', finished_at=now(), "
-            "    last_error=%s, attempt_count=attempt_count+1 "
-            "  WHERE id=%s AND status IN ('claimed','running') "
-            "    AND claimed_by=%s AND lease_expires_at > now() "
-            "  RETURNING id,user_id,lane"
-            "), queued AS ("
-            "  INSERT INTO v2_terminal_failure_outbox "
-            "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
-            "  SELECT t.id,t.user_id,%s,r.id,r.updated_at FROM terminal t "
-            "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
-            "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
-            "  WHERE t.lane='chat' "
-            "  ON CONFLICT (job_id) DO NOTHING RETURNING job_id"
-            ") SELECT EXISTS (SELECT 1 FROM terminal)",
-            (str(error)[:500], job_id, str(claimed_by), visible_error),
-        )
-        row = cur.fetchone()
-        return bool(row and row[0])
+        with conn.transaction():
+            cur = conn.execute(
+                "WITH terminal AS ("
+                "  UPDATE agent_jobs SET status='failed', finished_at=now(), "
+                "    last_error=%s, attempt_count=attempt_count+1 "
+                "  WHERE id=%s AND status IN ('claimed','running') "
+                "    AND claimed_by=%s AND lease_expires_at > now() "
+                "  RETURNING id,user_id,lane"
+                "), queued AS ("
+                "  INSERT INTO v2_terminal_failure_outbox "
+                "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
+                "  SELECT t.id,t.user_id,%s,r.id,r.updated_at FROM terminal t "
+                "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
+                "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
+                "  WHERE t.lane='chat' "
+                "  ON CONFLICT (job_id) DO NOTHING RETURNING job_id"
+                ") SELECT id,user_id,lane FROM terminal",
+                (str(error)[:500], job_id, str(claimed_by), visible_error),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            _recover_review_runner_on_cursor(cur, job_id)
+            _queue_failure_review_on_cursor(cur, job_id)
+            return True
 
 
 def mark_expired(job_id, error: str = "runtime_expired") -> None:
     visible_error = _terminal_error_code(error)
     with _pool().connection() as conn:
-        conn.execute(
-            "WITH terminal AS ("
-            "  UPDATE agent_jobs SET status='expired',finished_at=now(),last_error=%s "
-            "  WHERE id=%s RETURNING id,user_id,lane"
-            "), queued AS ("
-            "  INSERT INTO v2_terminal_failure_outbox "
-            "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
-            "  SELECT t.id,t.user_id,%s,r.id,r.updated_at FROM terminal t "
-            "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
-            "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
-            "  WHERE t.lane='chat' ON CONFLICT (job_id) DO NOTHING"
-            ") SELECT 1",
-            (str(error)[:500], job_id, visible_error),
-        )
+        with conn.transaction():
+            cur = conn.execute(
+                "WITH terminal AS ("
+                "  UPDATE agent_jobs SET status='expired',finished_at=now(),last_error=%s "
+                "  WHERE id=%s RETURNING id,user_id,lane"
+                "), queued AS ("
+                "  INSERT INTO v2_terminal_failure_outbox "
+                "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
+                "  SELECT t.id,t.user_id,%s,r.id,r.updated_at FROM terminal t "
+                "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
+                "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
+                "  WHERE t.lane='chat' ON CONFLICT (job_id) DO NOTHING"
+                ") SELECT id,user_id,lane FROM terminal",
+                (str(error)[:500], job_id, visible_error),
+            )
+            if cur.fetchone() is not None:
+                _recover_review_runner_on_cursor(cur, job_id)
+                _queue_failure_review_on_cursor(cur, job_id)
 
 
 def reap_stuck_job_rows(now=None) -> list[dict]:
@@ -575,45 +819,50 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
     """
     ts = float(now) if now is not None else None
     with _pool().connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "WITH terminal AS ("
-                "  UPDATE agent_jobs SET status='expired', finished_at=now(), "
-                "  attempt_count=attempt_count+1, "
-                "  last_error=CASE WHEN EXISTS ("
-                "    SELECT 1 FROM v2_mcp_mutation_attempts a "
-                "    WHERE a.job_id=agent_jobs.id "
-                "      AND (a.outcome IS NULL OR a.outcome='unknown')"
-                "  ) THEN 'mcp_mutation_outcome_unknown' "
-                "  WHEN status='pending' THEN 'queue_timeout' "
-                "  ELSE 'lease_timeout' END "
-                "  WHERE (status='pending' "
-                "         AND COALESCE(queue_deadline_at, deadline_at, "
-                "             CASE WHEN lane='chat' THEN "
-                "               created_at + make_interval(secs => %s) END) "
-                "             <= COALESCE(to_timestamp(%s), now())) "
-                "     OR (status IN ('claimed','running') "
-                "         AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
-                "         AND COALESCE(lease_expires_at, deadline_at) "
-                "             <= COALESCE(to_timestamp(%s), now())) "
-                "  RETURNING id,user_id,lane,last_error,claimed_by"
-                "), mutation_unknown AS ("
-                "  UPDATE v2_mcp_mutation_attempts a "
-                "  SET outcome='unknown',resolved_at=clock_timestamp() "
-                "  FROM terminal t WHERE a.job_id=t.id AND a.outcome IS NULL "
-                "  RETURNING a.job_id"
-                "), queued AS ("
-                "  INSERT INTO v2_terminal_failure_outbox "
-                "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
-                "  SELECT t.id,t.user_id,t.last_error,r.id,r.updated_at FROM terminal t "
-                "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
-                "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
-                "  WHERE t.lane='chat' "
-                "  ON CONFLICT (job_id) DO NOTHING RETURNING job_id"
-                ") SELECT id,user_id,lane,last_error,claimed_by FROM terminal",
-                (float(PENDING_CHAT_TTL_SEC), ts, ts),
-            )
-            return [dict(row) for row in cur.fetchall()]
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "WITH terminal AS ("
+                    "  UPDATE agent_jobs SET status='expired', finished_at=now(), "
+                    "  attempt_count=attempt_count+1, "
+                    "  last_error=CASE WHEN EXISTS ("
+                    "    SELECT 1 FROM v2_mcp_mutation_attempts a "
+                    "    WHERE a.job_id=agent_jobs.id "
+                    "      AND (a.outcome IS NULL OR a.outcome='unknown')"
+                    "  ) THEN 'mcp_mutation_outcome_unknown' "
+                    "  WHEN status='pending' THEN 'queue_timeout' "
+                    "  ELSE 'lease_timeout' END "
+                    "  WHERE (status='pending' "
+                    "         AND COALESCE(queue_deadline_at, deadline_at, "
+                    "             CASE WHEN lane='chat' THEN "
+                    "               created_at + make_interval(secs => %s) END) "
+                    "             <= COALESCE(to_timestamp(%s), now())) "
+                    "     OR (status IN ('claimed','running') "
+                    "         AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+                    "         AND COALESCE(lease_expires_at, deadline_at) "
+                    "             <= COALESCE(to_timestamp(%s), now())) "
+                    "  RETURNING id,user_id,lane,last_error,claimed_by"
+                    "), mutation_unknown AS ("
+                    "  UPDATE v2_mcp_mutation_attempts a "
+                    "  SET outcome='unknown',resolved_at=clock_timestamp() "
+                    "  FROM terminal t WHERE a.job_id=t.id AND a.outcome IS NULL "
+                    "  RETURNING a.job_id"
+                    "), queued AS ("
+                    "  INSERT INTO v2_terminal_failure_outbox "
+                    "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
+                    "  SELECT t.id,t.user_id,t.last_error,r.id,r.updated_at FROM terminal t "
+                    "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
+                    "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
+                    "  WHERE t.lane='chat' "
+                    "  ON CONFLICT (job_id) DO NOTHING RETURNING job_id"
+                    ") SELECT id,user_id,lane,last_error,claimed_by FROM terminal",
+                    (float(PENDING_CHAT_TTL_SEC), ts, ts),
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+                for row in rows:
+                    _recover_review_runner_on_cursor(cur, row["id"])
+                    _queue_failure_review_on_cursor(cur, row["id"])
+                return rows
 
 
 def ensure_terminal_failure_outbox(job_id, user_id: str, error: str) -> bool:
@@ -639,7 +888,11 @@ def ensure_terminal_failure_outbox(job_id, user_id: str, error: str) -> bool:
 
 
 def _pending_terminal_failure_rows(
-    sink: str, *, job_id=None, limit: int = 100, now=None,
+    sink: str,
+    *,
+    job_id=None,
+    limit: int = 100,
+    now=None,
 ) -> list[dict]:
     """List one sink's due markers with unattempted/fair-rotation priority."""
     if sink == "status":
@@ -700,7 +953,11 @@ def _defer_terminal_failure_sink(job_id, sink: str, *, now=None) -> None:
 
 
 def _deliver_terminal_failure_status(
-    job_id, *, kind: str, label: str | None, detail: dict | None,
+    job_id,
+    *,
+    kind: str,
+    label: str | None,
+    detail: dict | None,
 ) -> bool:
     """Atomically insert the unique error event and acknowledge that sink.
 
@@ -827,7 +1084,11 @@ def _deliver_terminal_failure_runtime_error(job_id) -> bool:
 
 
 def reconcile_terminal_failure_outbox(
-    *, record_terminal_error=None, job_id=None, limit: int = 100, now=None,
+    *,
+    record_terminal_error=None,
+    job_id=None,
+    limit: int = 100,
+    now=None,
 ) -> dict[str, int]:
     """Best-effort replay of both user-visible terminal failure sinks.
 
@@ -841,9 +1102,11 @@ def reconcile_terminal_failure_outbox(
     from model_api_runtime.v2 import status_stream
 
     status_rows = _pending_terminal_failure_rows(
-        "status", job_id=job_id, limit=limit, now=now)
+        "status", job_id=job_id, limit=limit, now=now
+    )
     runtime_rows = _pending_terminal_failure_rows(
-        "runtime_error", job_id=job_id, limit=limit, now=now)
+        "runtime_error", job_id=job_id, limit=limit, now=now
+    )
     status_count = 0
     runtime_error_count = 0
     event = status_stream.redact_status("error")
@@ -882,8 +1145,7 @@ def reconcile_terminal_failure_outbox(
                 runtime_error_count += 1
         except Exception as exc:  # noqa: BLE001 — marker remains pending
             try:
-                _defer_terminal_failure_sink(
-                    current_job_id, "runtime_error", now=now)
+                _defer_terminal_failure_sink(current_job_id, "runtime_error", now=now)
             except Exception:  # noqa: BLE001 — original DB outage may persist
                 pass
             log.warning(
@@ -1105,7 +1367,9 @@ def get_job_status(
 
 
 def get_expected_runtime_generation(
-    job_id, *, claimed_by: str,
+    job_id,
+    *,
+    claimed_by: str,
 ) -> int | None:
     """Return the claim-time runtime generation pinned on an owned job."""
     with _pool().connection() as conn:
@@ -1180,8 +1444,7 @@ def finish_chat_job(
                 lease_valid = False
                 if row is not None and row["lease_expires_at"] is not None:
                     cur.execute(
-                        "SELECT %s::timestamptz > clock_timestamp() "
-                        "AS lease_valid",
+                        "SELECT %s::timestamptz > clock_timestamp() AS lease_valid",
                         (row["lease_expires_at"],),
                     )
                     lease_valid = bool(cur.fetchone()["lease_valid"])
@@ -1191,8 +1454,7 @@ def finish_chat_job(
                     or str(row["lane"]) != "chat"
                     or not lease_valid
                     or row["expected_runtime_generation"] is None
-                    or int(row["expected_runtime_generation"])
-                    != current_generation
+                    or int(row["expected_runtime_generation"]) != current_generation
                 ):
                     return False, None
                 cur.execute(
@@ -1210,9 +1472,8 @@ def finish_chat_job(
                         (row["user_id"],),
                     )
                 successor_id = None
-                if (
-                    force_successor
-                    or int(row["input_generation"] or 0) > int(observed_generation)
+                if force_successor or int(row["input_generation"] or 0) > int(
+                    observed_generation
                 ):
                     cur.execute(
                         "INSERT INTO agent_jobs "
@@ -1249,7 +1510,14 @@ def append_status_event(
                 "INSERT INTO agent_status_events "
                 "(job_id, user_id, kind, label, detail_json, seq) "
                 "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-                (job_id, user_id, str(kind), label, Jsonb(dict(detail or {})), int(seq)),
+                (
+                    job_id,
+                    user_id,
+                    str(kind),
+                    label,
+                    Jsonb(dict(detail or {})),
+                    int(seq),
+                ),
             )
             event_id = int(cur.fetchone()["id"])
     try:
@@ -1270,7 +1538,9 @@ def list_status_events(user_id, *, after_id=0, limit=50) -> list[dict]:
 def get_runtime_state(user_id) -> dict:
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT state_json FROM runtime_state WHERE user_id=%s", (user_id,))
+            cur.execute(
+                "SELECT state_json FROM runtime_state WHERE user_id=%s", (user_id,)
+            )
             row = cur.fetchone()
     return dict(row["state_json"]) if row else {}
 
@@ -1452,16 +1722,37 @@ def record_turn_metric(
             "INSERT INTO v2_turn_metrics "
             "(job_id, user_id, lane, prompt_tokens, completion_tokens, latency_ms) "
             "VALUES (%s,%s,%s,%s,%s,%s)",
-            (job_id, str(user_id), str(lane), prompt_tokens, completion_tokens, latency_ms),
+            (
+                job_id,
+                str(user_id),
+                str(lane),
+                prompt_tokens,
+                completion_tokens,
+                latency_ms,
+            ),
         )
 
 
 def record_whole_turn_metric(
-    job_id, user_id, lane, *, prompt_tokens, completion_tokens,
-    latency_ms, model_calls, retries, failed, status,
-    cache_read_tokens=None, cache_write_tokens=None, cache_miss_tokens=None,
-    usage_reported_calls=0, cache_reported_calls=0,
-    provider=None, model=None, cache_route_fingerprint=None,
+    job_id,
+    user_id,
+    lane,
+    *,
+    prompt_tokens,
+    completion_tokens,
+    latency_ms,
+    model_calls,
+    retries,
+    failed,
+    status,
+    cache_read_tokens=None,
+    cache_write_tokens=None,
+    cache_miss_tokens=None,
+    usage_reported_calls=0,
+    cache_reported_calls=0,
+    provider=None,
+    model=None,
+    cache_route_fingerprint=None,
 ) -> None:
     """One idempotent whole-turn metric per job (spec B5): upsert on job_id so a
     re-drive (redelivery/retry of the same job) REPLACES rather than appends. Covers
@@ -1489,12 +1780,26 @@ def record_whole_turn_metric(
                 "retries=EXCLUDED.retries, failed=EXCLUDED.failed, status=EXCLUDED.status, "
                 "updated_at=now()",
                 (
-                    job_id, user_id, lane, prompt_tokens, completion_tokens,
-                    cache_read_tokens, cache_write_tokens, cache_miss_tokens,
-                    int(usage_reported_calls), int(cache_reported_calls),
-                    provider, model, cache_route_fingerprint,
-                    latency_ms, model_calls, retries, failed, status,
-                ))
+                    job_id,
+                    user_id,
+                    lane,
+                    prompt_tokens,
+                    completion_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    cache_miss_tokens,
+                    int(usage_reported_calls),
+                    int(cache_reported_calls),
+                    provider,
+                    model,
+                    cache_route_fingerprint,
+                    latency_ms,
+                    model_calls,
+                    retries,
+                    failed,
+                    status,
+                ),
+            )
     except Exception as e:  # noqa: BLE001 — best-effort instrumentation, never fail the turn
         log.error("[jobs_store] record_whole_turn_metric(%s) failed: %s", job_id, e)
 
@@ -1640,7 +1945,8 @@ def recent_prompt_cache_stats(
         ),
         "route_identity_coverage": (
             float(route_identified_turns) / float(sampled_turns)
-            if sampled_turns else None
+            if sampled_turns
+            else None
         ),
         "route_fingerprint_count": route_fingerprint_count,
         "route_fingerprint": sole_route_fingerprint,
@@ -1654,9 +1960,17 @@ def recent_prompt_cache_stats(
     if include_turns:
         turns = row[11] if row is not None and len(row) > 11 else []
         result["turns"] = list(turns) if isinstance(turns, list) else []
-    if include_turns or any(value is not None for value in (
-        provider_filter, model_filter, route_filter, user_filter, since_ts, until_ts,
-    )):
+    if include_turns or any(
+        value is not None
+        for value in (
+            provider_filter,
+            model_filter,
+            route_filter,
+            user_filter,
+            since_ts,
+            until_ts,
+        )
+    ):
         result["filter"] = {
             "provider": provider_filter,
             "model": model_filter,
@@ -1757,7 +2071,9 @@ def get_summary_row(user_id) -> dict | None:
     if watermark_seq == 0 and watermark_ts > 0:
         watermark_seq = db.seq_for_watermark_ts(user_id, watermark_ts)
     return {
-        "summary_envelope": dict(row["summary_envelope"]) if row["summary_envelope"] is not None else None,
+        "summary_envelope": dict(row["summary_envelope"])
+        if row["summary_envelope"] is not None
+        else None,
         "watermark_ts": watermark_ts,
         "version": int(row["version"]),
         "watermark_seq": watermark_seq,
@@ -1765,7 +2081,11 @@ def get_summary_row(user_id) -> dict | None:
 
 
 def upsert_summary_row_cas(
-    user_id, *, summary_envelope: dict, watermark_ts: float, expected_version: int,
+    user_id,
+    *,
+    summary_envelope: dict,
+    watermark_ts: float,
+    expected_version: int,
     watermark_seq: int | None = None,
 ) -> bool:
     """compare-and-swap 写入该用户的会话摘要行。expected_version==0 走首建
@@ -1787,7 +2107,9 @@ def upsert_summary_row_cas(
                     "(user_id, summary_envelope, watermark_ts, version, watermark_seq) "
                     "VALUES (%s, %s, %s, 1, %s) ON CONFLICT (user_id) DO NOTHING",
                     (
-                        user_id, Jsonb(dict(summary_envelope or {})), float(watermark_ts),
+                        user_id,
+                        Jsonb(dict(summary_envelope or {})),
+                        float(watermark_ts),
                         int(watermark_seq or 0),
                     ),
                 )
@@ -1863,7 +2185,9 @@ def list_workspace_entries(
                         (user_id, maximum),
                     )
             else:
-                escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                escaped = (
+                    prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                )
                 if recursive:
                     cur.execute(
                         "SELECT path,kind,mime_type,source_ref,revision,created_at,updated_at "
@@ -2025,6 +2349,377 @@ def finish_sandbox_acquisition(
             return cur.rowcount == 1
 
 
+def append_trajectory_event(
+    job_id: int | str,
+    user_id: str,
+    *,
+    event_kind: str,
+    idempotency_key: str,
+    payload_envelope: dict,
+    payload_bytes: int,
+    truncated: bool = False,
+) -> int:
+    """Append one encrypted event and return its immutable per-job index.
+
+    Stream-row locking serializes concurrent callbacks without locking the
+    source ``agent_jobs`` row. Repeating an idempotency key returns the existing
+    index and never rewrites its ciphertext.
+    """
+    event_kind = str(event_kind or "")
+    idempotency_key = str(idempotency_key or "")
+    if not _TRAJECTORY_EVENT_KIND_RE.fullmatch(event_kind):
+        raise ValueError("invalid trajectory event kind")
+    if not _TRAJECTORY_IDEMPOTENCY_RE.fullmatch(idempotency_key):
+        raise ValueError("invalid trajectory idempotency key")
+    if type(payload_bytes) is not int or not 1 <= payload_bytes <= 1024 * 1024:
+        raise ValueError("invalid trajectory payload size")
+    envelope = _validate_trajectory_envelope(str(user_id), payload_envelope)
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "INSERT INTO v2_trajectory_streams (job_id,user_id) "
+                    "SELECT id,user_id FROM agent_jobs WHERE id=%s AND user_id=%s "
+                    "ON CONFLICT (job_id) DO NOTHING",
+                    (job_id, str(user_id)),
+                )
+                cur.execute(
+                    "SELECT next_event_index FROM v2_trajectory_streams "
+                    "WHERE job_id=%s AND user_id=%s FOR UPDATE",
+                    (job_id, str(user_id)),
+                )
+                stream = cur.fetchone()
+                if stream is None:
+                    raise ValueError("trajectory source job not found")
+                cur.execute(
+                    "SELECT event_index FROM v2_trajectory_events "
+                    "WHERE job_id=%s AND idempotency_key=%s",
+                    (job_id, idempotency_key),
+                )
+                existing = cur.fetchone()
+                if existing is not None:
+                    return int(existing["event_index"])
+                event_index = int(stream["next_event_index"])
+                cur.execute(
+                    "INSERT INTO v2_trajectory_events "
+                    "(job_id,user_id,event_index,event_kind,idempotency_key,"
+                    "payload_envelope,payload_bytes,truncated) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        job_id,
+                        str(user_id),
+                        event_index,
+                        event_kind,
+                        idempotency_key,
+                        Jsonb(dict(envelope)),
+                        payload_bytes,
+                        bool(truncated),
+                    ),
+                )
+                cur.execute(
+                    "UPDATE v2_trajectory_streams SET next_event_index=%s "
+                    "WHERE job_id=%s AND user_id=%s",
+                    (event_index + 1, job_id, str(user_id)),
+                )
+                # A terminal event can land just after an offline review
+                # completed. Reopen it while holding the same stream frontier
+                # lock so the completed analysis can never remain authoritative
+                # over an older prefix. If review is disabled or globally
+                # capped, invalidate the stale analysis without scheduling a
+                # provider call; trajectory capture itself remains intact.
+                cur.execute(
+                    "SELECT 1 FROM v2_trajectory_reviews "
+                    "WHERE source_job_id=%s AND user_id=%s AND status='completed'",
+                    (job_id, str(user_id)),
+                )
+                if cur.fetchone() is not None:
+                    admitted = _review_admission_available_on_cursor(cur)
+                    cur.execute(
+                        "UPDATE v2_trajectory_reviews SET status=%s,"
+                        "attempt_count=0,claimed_by_job_id=NULL,review_envelope=NULL,"
+                        "last_error=%s,finished_at="
+                        "CASE WHEN %s THEN NULL ELSE clock_timestamp() END "
+                        "WHERE source_job_id=%s AND user_id=%s AND status='completed'",
+                        (
+                            "pending" if admitted else "failed",
+                            "trajectory_frontier_advanced"
+                            if admitted
+                            else "trajectory_review_disabled_or_capped",
+                            admitted,
+                            job_id,
+                            str(user_id),
+                        ),
+                    )
+                    if admitted and cur.rowcount:
+                        _ensure_review_runner_on_cursor(cur, str(user_id))
+                return event_index
+
+
+def list_trajectory_events(
+    job_id: int | str,
+    user_id: str,
+    *,
+    after_index: int = -1,
+    limit: int = 256,
+) -> list[dict]:
+    if type(after_index) is not int or after_index < -1:
+        raise ValueError("invalid trajectory event cursor")
+    if type(limit) is not int or not 1 <= limit <= 1024:
+        raise ValueError("invalid trajectory event limit")
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT event_index,event_kind,payload_envelope,payload_bytes,"
+                "truncated,created_at FROM v2_trajectory_events "
+                "WHERE job_id=%s AND user_id=%s AND event_index>%s "
+                "ORDER BY event_index LIMIT %s",
+                (job_id, str(user_id), after_index, limit),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def get_trajectory_capture_state(job_id: int | str, user_id: str) -> dict:
+    """Content-free capture completeness frontier for diagnostics/review."""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT s.next_event_index,COALESCE(MAX(e.event_index),-1) AS last_event_index,"
+                "COUNT(e.event_index)::int AS event_count,BOOL_OR(e.truncated) AS any_truncated,"
+                "COALESCE(MAX(e.event_index) FILTER "
+                "(WHERE e.event_kind='turn_terminal'),-1) AS terminal_event_index,"
+                "j.status AS source_job_status,CASE "
+                "WHEN BOOL_OR(e.event_kind='turn_terminal') THEN 'complete' "
+                "WHEN j.status IN ('completed','failed','expired','superseded') THEN 'partial' "
+                "ELSE 'open' END AS capture_status "
+                "FROM v2_trajectory_streams s JOIN agent_jobs j ON j.id=s.job_id "
+                "LEFT JOIN v2_trajectory_events e "
+                "ON e.job_id=s.job_id WHERE s.job_id=%s AND s.user_id=%s "
+                "GROUP BY s.next_event_index,j.status",
+                (job_id, str(user_id)),
+            )
+            row = cur.fetchone()
+            return (
+                dict(row)
+                if row is not None
+                else {
+                    "next_event_index": 0,
+                    "last_event_index": -1,
+                    "event_count": 0,
+                    "any_truncated": False,
+                    "terminal_event_index": -1,
+                    "source_job_status": None,
+                    "capture_status": "missing",
+                }
+            )
+
+
+def claim_failure_review(
+    user_id: str,
+    *,
+    runner_job_id: int | str,
+    claimed_by: str,
+) -> dict | None:
+    """Claim the oldest pending source for one owned review-lane job."""
+    if not trajectory_review_enabled():
+        return None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT 1 FROM agent_jobs WHERE id=%s AND user_id=%s "
+                    "AND lane=%s AND status IN ('claimed','running') "
+                    "AND claimed_by=%s AND lease_expires_at>now() FOR UPDATE",
+                    (
+                        runner_job_id,
+                        str(user_id),
+                        _TRAJECTORY_REVIEW_LANE,
+                        str(claimed_by),
+                    ),
+                )
+                if cur.fetchone() is None:
+                    return None
+                cur.execute(
+                    "SELECT source_job_id FROM v2_trajectory_reviews "
+                    "WHERE user_id=%s AND status='pending' "
+                    "AND attempt_count<%s ORDER BY created_at,source_job_id "
+                    "LIMIT 1 FOR UPDATE SKIP LOCKED",
+                    (str(user_id), _TRAJECTORY_REVIEW_MAX_ATTEMPTS),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                source_job_id = int(row["source_job_id"])
+                cur.execute(
+                    "UPDATE v2_trajectory_reviews SET status='running',"
+                    "attempt_count=attempt_count+1,claimed_by_job_id=%s,"
+                    "started_at=clock_timestamp(),finished_at=NULL,last_error=NULL "
+                    "WHERE source_job_id=%s RETURNING *",
+                    (runner_job_id, source_job_id),
+                )
+                return dict(cur.fetchone())
+
+
+def finish_failure_review(
+    *,
+    runner_job_id: int | str,
+    source_job_id: int | str,
+    user_id: str,
+    claimed_by: str,
+    review_envelope: dict | None = None,
+    error_code: str | None = None,
+    captured_next_event_index: int | None = None,
+) -> dict:
+    """Atomically settle one review runner and schedule any remaining backlog."""
+    if (review_envelope is None) == (error_code is None):
+        raise ValueError("provide exactly one review outcome")
+    envelope = None
+    if review_envelope is not None:
+        envelope = _validate_trajectory_envelope(str(user_id), review_envelope)
+        if type(captured_next_event_index) is not int or captured_next_event_index < 0:
+            raise ValueError("captured trajectory frontier required")
+    safe_error = _terminal_error_code(error_code) if error_code is not None else None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Global lifecycle lock order is agent job -> trajectory stream
+                # -> review row. The
+                # timeout reaper terminalizes the runner before releasing its
+                # review claim, so taking these in the opposite order here
+                # would create an ABBA deadlock at lease expiry.
+                cur.execute(
+                    "SELECT 1 FROM agent_jobs j JOIN v2_runtime_state s "
+                    "ON s.user_id=j.user_id WHERE j.id=%s AND j.user_id=%s "
+                    "AND j.lane=%s AND j.status IN ('claimed','running') "
+                    "AND j.claimed_by=%s AND j.lease_expires_at>now() "
+                    "AND s.hosted_runtime_state='v2' "
+                    "AND j.expected_runtime_generation=s.runtime_generation "
+                    "FOR UPDATE OF j",
+                    (
+                        runner_job_id,
+                        str(user_id),
+                        _TRAJECTORY_REVIEW_LANE,
+                        str(claimed_by),
+                    ),
+                )
+                if cur.fetchone() is None:
+                    return {"settled": False, "review_status": "lost"}
+                cur.execute(
+                    "SELECT next_event_index FROM v2_trajectory_streams "
+                    "WHERE job_id=%s AND user_id=%s FOR UPDATE",
+                    (source_job_id, str(user_id)),
+                )
+                stream = cur.fetchone()
+                if stream is None:
+                    return {"settled": False, "review_status": "lost"}
+                cur.execute(
+                    "SELECT attempt_count FROM v2_trajectory_reviews "
+                    "WHERE source_job_id=%s AND user_id=%s AND status='running' "
+                    "AND claimed_by_job_id=%s FOR UPDATE",
+                    (source_job_id, str(user_id), runner_job_id),
+                )
+                review = cur.fetchone()
+                if review is None:
+                    return {"settled": False, "review_status": "lost"}
+                frontier_advanced = envelope is not None and int(
+                    stream["next_event_index"]
+                ) != int(captured_next_event_index)
+                if frontier_advanced:
+                    review_status = "pending"
+                    stored_envelope = None
+                    stored_error = "trajectory_frontier_advanced"
+                elif envelope is not None:
+                    review_status = "completed"
+                    stored_envelope = envelope
+                    stored_error = None
+                elif int(review["attempt_count"]) < _TRAJECTORY_REVIEW_MAX_ATTEMPTS:
+                    review_status = "pending"
+                    stored_envelope = None
+                    stored_error = safe_error
+                else:
+                    review_status = "failed"
+                    stored_envelope = None
+                    stored_error = safe_error
+                cur.execute(
+                    "UPDATE v2_trajectory_reviews SET status=%s,"
+                    "claimed_by_job_id=NULL,review_envelope=%s,last_error=%s,"
+                    "attempt_count=CASE WHEN %s THEN "
+                    "GREATEST(attempt_count-1,0) ELSE attempt_count END,"
+                    "finished_at=CASE WHEN %s='pending' THEN NULL ELSE now() END "
+                    "WHERE source_job_id=%s",
+                    (
+                        review_status,
+                        Jsonb(dict(stored_envelope))
+                        if stored_envelope is not None
+                        else None,
+                        stored_error,
+                        frontier_advanced,
+                        review_status,
+                        source_job_id,
+                    ),
+                )
+                cur.execute(
+                    "UPDATE agent_jobs SET status='completed',finished_at=now() "
+                    "WHERE id=%s AND user_id=%s AND lane=%s "
+                    "AND status IN ('claimed','running') AND claimed_by=%s "
+                    "AND lease_expires_at>now()",
+                    (
+                        runner_job_id,
+                        str(user_id),
+                        _TRAJECTORY_REVIEW_LANE,
+                        str(claimed_by),
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("trajectory review runner ownership lost")
+                _ensure_review_runner_on_cursor(cur, str(user_id))
+                return {
+                    "settled": True,
+                    "review_status": review_status,
+                    "frontier_advanced": frontier_advanced,
+                }
+
+
+def finish_empty_failure_review_runner(
+    *,
+    runner_job_id: int | str,
+    user_id: str,
+    claimed_by: str,
+) -> bool:
+    """Complete a stale generic runner that found no pending source row."""
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "UPDATE agent_jobs SET status='completed',finished_at=now() "
+                    "WHERE id=%s AND user_id=%s AND lane=%s "
+                    "AND status IN ('claimed','running') AND claimed_by=%s "
+                    "AND lease_expires_at>now()",
+                    (
+                        runner_job_id,
+                        str(user_id),
+                        _TRAJECTORY_REVIEW_LANE,
+                        str(claimed_by),
+                    ),
+                )
+                completed = cur.rowcount == 1
+                if completed:
+                    _ensure_review_runner_on_cursor(cur, str(user_id))
+                return completed
+
+
+def get_failure_review(source_job_id: int | str, user_id: str) -> dict | None:
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT source_job_id,user_id,status,attempt_count,review_envelope,"
+                "last_error,created_at,started_at,finished_at "
+                "FROM v2_trajectory_reviews WHERE source_job_id=%s AND user_id=%s",
+                (source_job_id, str(user_id)),
+            )
+            row = cur.fetchone()
+            return dict(row) if row is not None else None
+
+
 def get_wake_schedule(user_id) -> dict | None:
     """读取该用户的 v2_wake_schedule 行（proactive 唤醒调度：下次心跳/采集/屏幕监看到期
     时间 + BYOK 支付冷却截止 + screen_watch 的跨-tick 状态 last_screen_watch_frame_id），
@@ -2093,9 +2788,15 @@ def upsert_wake_schedule(
                 user_id,
                 float(next_heartbeat_at) if next_heartbeat_at is not None else None,
                 float(next_capture_at) if next_capture_at is not None else None,
-                float(payment_cooldown_until) if payment_cooldown_until is not None else None,
-                float(next_screen_watch_at) if next_screen_watch_at is not None else None,
-                str(last_screen_watch_frame_id) if last_screen_watch_frame_id is not None else None,
+                float(payment_cooldown_until)
+                if payment_cooldown_until is not None
+                else None,
+                float(next_screen_watch_at)
+                if next_screen_watch_at is not None
+                else None,
+                str(last_screen_watch_frame_id)
+                if last_screen_watch_frame_id is not None
+                else None,
             ),
         )
 

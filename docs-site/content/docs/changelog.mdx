@@ -63,6 +63,17 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- Runtime V2 now persists an immutable encrypted turn trajectory alongside its
+  aggregate token telemetry. Provider prompts and responses, late input folds,
+  tool calls and results, planned replies, and failure details are compressed
+  and sealed to the user's and trusted-decrypt keys before database storage.
+  Provider-backed failure review is off by default; when explicitly enabled,
+  a database-serialized fleet ceiling admits a bounded `trajectory_review`
+  lane whose provider call has no tools and whose handler has no reply, effect,
+  MCP, Memory, schedule, or workspace dispatch surface. Disabled/overflow
+  failures still retain capture but enqueue no provider runner, and encrypted
+  analysis is never added to live conversation context automatically.
+
 - Runtime V2 adds an encrypted virtual workspace foundation with read-only
   `/artifacts` and `/skills`, editable `/workspace`, and a persistent editable
   `/memory/WORKING.md` that is distinct from Memory Garden. Native file writes

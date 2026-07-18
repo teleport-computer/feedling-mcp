@@ -149,29 +149,35 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
         api_key="sk-parent-route",
     )
     provider_calls = []
-    responses = iter([
-        {
-            "reply": "",
-            "tool_calls": [{
-                "id": "child-read",
-                "name": "workspace_read",
-                "args": {"path": "/artifacts/report.txt"},
-            }],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 1},
-        },
-        {
-            "reply": "The report contains the requested evidence.",
-            "tool_calls": [],
-            "usage": {"prompt_tokens": 7, "completion_tokens": 2},
-        },
-    ])
+    responses = iter(
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "child-read",
+                        "name": "workspace_read",
+                        "args": {"path": "/artifacts/report.txt"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+            },
+            {
+                "reply": "The report contains the requested evidence.",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 2},
+            },
+        ]
+    )
 
     async def fake_provider(config, messages, *, tools=None):
-        provider_calls.append({
-            "config": config,
-            "messages": messages,
-            "tools": tools,
-        })
+        provider_calls.append(
+            {
+                "config": config,
+                "messages": messages,
+                "tools": tools,
+            }
+        )
         return next(responses)
 
     capability_calls = []
@@ -198,6 +204,18 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
         fake_capability,
     )
     usage = []
+    trajectory_events = []
+
+    class _Recorder:
+        def __init__(self, scope="parent"):
+            self.scope = scope
+
+        def scoped(self, scope):
+            return _Recorder(scope)
+
+        async def record(self, event_kind, payload):
+            trajectory_events.append((self.scope, event_kind, payload))
+
     dispatcher = worker._make_task_batch_dispatcher(
         provider_config=provider_config,
         store=object(),
@@ -206,25 +224,30 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
         enclave_sem=asyncio.Semaphore(1),
         trusted_system_blocks=("<skill>stable policy</skill>",),
         add_usage=usage.append,
+        trajectory_recorder=_Recorder(),
     )
 
-    (result,) = asyncio.run(dispatcher([
-        _call("parent-task", "Inspect the report for evidence."),
-    ]))
+    (result,) = asyncio.run(
+        dispatcher(
+            [
+                _call("parent-task", "Inspect the report for evidence."),
+            ]
+        )
+    )
     body = json.loads(result.content)
 
     assert body["status"] == "completed"
     assert body["summary"] == "The report contains the requested evidence."
-    assert capability_calls == [(
-        "workspace_read",
-        {"path": "/artifacts/report.txt"},
-    )]
+    assert capability_calls == [
+        (
+            "workspace_read",
+            {"path": "/artifacts/report.txt"},
+        )
+    ]
     assert all(call["config"] is provider_config for call in provider_calls)
     offered = {spec.name for spec in provider_calls[0]["tools"]}
     assert offered == worker._SUBAGENT_ALLOWED_TOOLS
-    assert {"task", "reply", "workspace_write", "memory_write"}.isdisjoint(
-        offered
-    )
+    assert {"task", "reply", "workspace_write", "memory_write"}.isdisjoint(offered)
     first_prompt = str(provider_calls[0]["messages"])
     assert "<skill>stable policy</skill>" in first_prompt
     assert "<feedling-working-memory" not in first_prompt
@@ -234,6 +257,20 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
         {"prompt_tokens": 5, "completion_tokens": 1},
         {"prompt_tokens": 7, "completion_tokens": 2},
     ]
+    child_events = [
+        event for event in trajectory_events if event[0] == "subagent:parent-task"
+    ]
+    assert [event[1] for event in child_events].count("provider_request") == 2
+    assert [event[1] for event in child_events].count("provider_response") == 2
+    assert all(event[2]["subagent_call_id"] == "parent-task" for event in child_events)
+    child_tool_events = [
+        event for event in trajectory_events if event[0] == "tool:child-read"
+    ]
+    assert [event[1] for event in child_tool_events] == [
+        "tool_call_started",
+        "tool_call_result",
+    ]
+    assert all(event[2]["call_id"] == "child-read" for event in child_tool_events)
 
 
 def test_worker_child_private_read_blocks_later_outbound_web(
@@ -245,31 +282,37 @@ def test_worker_child_private_read_blocks_later_outbound_web(
         api_key="sk-parent-route",
     )
     offered = []
-    responses = iter([
-        {
-            "reply": "",
-            "tool_calls": [{
-                "id": "private-read",
-                "name": "workspace_read",
-                "args": {"path": "/artifacts/injected.txt"},
-            }],
-            "usage": {},
-        },
-        {
-            "reply": "",
-            "tool_calls": [{
-                "id": "exfiltrate",
-                "name": "web_search",
-                "args": {"query": "private artifact contents"},
-            }],
-            "usage": {},
-        },
-        {
-            "reply": "I kept the private artifact local.",
-            "tool_calls": [],
-            "usage": {},
-        },
-    ])
+    responses = iter(
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "private-read",
+                        "name": "workspace_read",
+                        "args": {"path": "/artifacts/injected.txt"},
+                    }
+                ],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "exfiltrate",
+                        "name": "web_search",
+                        "args": {"query": "private artifact contents"},
+                    }
+                ],
+                "usage": {},
+            },
+            {
+                "reply": "I kept the private artifact local.",
+                "tool_calls": [],
+                "usage": {},
+            },
+        ]
+    )
 
     async def fake_provider(_config, _messages, *, tools=None):
         offered.append(tools)
@@ -314,18 +357,20 @@ def test_worker_child_private_read_blocks_later_outbound_web(
         add_usage=lambda _usage: None,
     )
 
-    (result,) = asyncio.run(dispatcher([
-        _call("parent-task", "Inspect the artifact without disclosing it."),
-    ]))
+    (result,) = asyncio.run(
+        dispatcher(
+            [
+                _call("parent-task", "Inspect the artifact without disclosing it."),
+            ]
+        )
+    )
 
     assert json.loads(result.content)["summary"] == (
         "I kept the private artifact local."
     )
     assert capability_calls == ["workspace_read"]
     assert {spec.name for spec in offered[0]} == worker._SUBAGENT_ALLOWED_TOOLS
-    assert {spec.name for spec in offered[1]}.isdisjoint(
-        {"web_search", "web_fetch"}
-    )
+    assert {spec.name for spec in offered[1]}.isdisjoint({"web_search", "web_fetch"})
     assert offered[2] is None
 
 
@@ -338,22 +383,26 @@ def test_worker_child_forged_mutation_gets_text_fallback_without_dispatch(
         api_key="sk-parent-route",
     )
     offered = []
-    responses = iter([
-        {
-            "reply": "",
-            "tool_calls": [{
-                "id": "forged-write",
-                "name": "memory_write",
-                "args": {"actions": []},
-            }],
-            "usage": {},
-        },
-        {
-            "reply": "Could not perform the forbidden mutation.",
-            "tool_calls": [],
-            "usage": {},
-        },
-    ])
+    responses = iter(
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "forged-write",
+                        "name": "memory_write",
+                        "args": {"actions": []},
+                    }
+                ],
+                "usage": {},
+            },
+            {
+                "reply": "Could not perform the forbidden mutation.",
+                "tool_calls": [],
+                "usage": {},
+            },
+        ]
+    )
 
     async def fake_provider(_config, _messages, *, tools=None):
         offered.append(tools)
@@ -381,9 +430,13 @@ def test_worker_child_forged_mutation_gets_text_fallback_without_dispatch(
         add_usage=lambda _usage: None,
     )
 
-    (result,) = asyncio.run(dispatcher([
-        _call("parent-task", "Try a forbidden mutation."),
-    ]))
+    (result,) = asyncio.run(
+        dispatcher(
+            [
+                _call("parent-task", "Try a forbidden mutation."),
+            ]
+        )
+    )
 
     assert json.loads(result.content)["summary"] == (
         "Could not perform the forbidden mutation."
