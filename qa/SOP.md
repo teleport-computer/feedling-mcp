@@ -88,9 +88,13 @@ The launcher is not intelligent. It MUST:
    Missing all tool use is
    `AGENT_TOOL_USE_MISSING`; missing scenario-bound commands is
    `AGENT_SCENARIO_TOOL_USE_MISSING`; either is a hard release failure.
-   P0-06 is the semantic exception and specifically requires exactly three
-   ordered, successful, phase-specific commands:
-   `QA_SCENARIO_PHASE=CAPTURE`, `REVIEW`, then `FINALIZE`. Use the exact commands
+   P0-06 is the semantic exception. A parent-owned PASS capture specifically
+   requires exactly three ordered, successful, phase-specific commands:
+   `QA_SCENARIO_PHASE=CAPTURE`, `REVIEW`, then `FINALIZE`. In diagnostic mode,
+   a non-PASS parent capture with no private review evidence instead requires
+   exactly the successful CAPTURE command: the agent MUST NOT run REVIEW or
+   FINALIZE, MUST continue with P0-07, and MUST keep P0-06 red. Strict
+   qualification rejects that capture-only path. Use the exact commands
    embedded in the profile-agent prompt. CAPTURE invokes only
    `request_live_scenario_probe.py`; the deterministic parent performs every
    upload and Genesis network call, keeps the authoritative private evidence
@@ -155,7 +159,7 @@ other tool call or scenario, or read the facts file, while that execution is
 running. Only after terminal exit may it read the command's facts, complete the
 current scenario, and continue.
 
-For P0-06 it MUST use this exact capture/review/finalize flow:
+For P0-06 it MUST use this exact conditional capture/review/finalize flow:
 
 1. Run the exact CAPTURE `request_live_scenario_probe.py` command. The helper
    writes only a request marker. The deterministic parent loads the four
@@ -172,6 +176,12 @@ For P0-06 it MUST use this exact capture/review/finalize flow:
    has no authenticated readback endpoint, so this is deliberately not
    described as independent persistence or archive-side `client_job_id`
    readback.
+   If the authoritative parent receipt is non-PASS in diagnostic mode and no
+   private review evidence was published, P0-06 ends after this successful
+   CAPTURE command. The agent MUST NOT invoke REVIEW or FINALIZE, MUST continue
+   with P0-07, and MUST report the bounded non-PASS receipt. Steps 2 and 3 apply
+   only when CAPTURE passed and the private review copy exists. Strict
+   qualification rejects the capture-only path.
 2. Run the exact offline REVIEW command. It prints the reviewed evidence plus
    an `evidence_sha256` computed over the exact evidence-file bytes. Read that
    output, make the bounded semantic decisions, and write an exact

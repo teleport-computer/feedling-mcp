@@ -40,10 +40,14 @@ or read a facts file. A yielded/running result is not completion; only after
 terminal exit may the agent read that command's facts, finish the scenario, and
 proceed.
 
-P0-06 is the exception to the one-command minimum: it requires exactly three
-ordered, successful tool calls prefixed with `QA_SCENARIO_ID=P0-06` and distinct
-`QA_SCENARIO_PHASE=CAPTURE`, `REVIEW`, and `FINALIZE` assignments, using the
-exact commands embedded in the profile-agent prompt. CAPTURE and FINALIZE
+P0-06 is the exception to the one-command minimum. A parent-owned PASS capture
+requires exactly three ordered, successful tool calls prefixed with
+`QA_SCENARIO_ID=P0-06` and distinct `QA_SCENARIO_PHASE=CAPTURE`, `REVIEW`, and
+`FINALIZE` assignments, using the exact commands embedded in the profile-agent
+prompt. In diagnostic mode, a non-PASS parent capture with no private review
+evidence requires exactly CAPTURE: the agent MUST NOT invoke REVIEW or FINALIZE,
+MUST continue with P0-07, and MUST keep P0-06 red. Strict qualification rejects
+that capture-only path. CAPTURE and FINALIZE
 have different trust owners: CAPTURE invokes only
 `request_live_scenario_probe.py`, after which the deterministic parent performs
 the deployed upload/Genesis capture, retains an authoritative copy outside the
@@ -182,6 +186,12 @@ request marker; the agent reads bounded facts and supplies semantic judgment.
   owner-mode `0600` `$QA_WORK_ROOT/p0-06-private-evidence.json`. The worker does not provision a
   second user, consume a provider secret, or replace/delete the provisioned
   provider configuration.
+- If the authoritative parent capture is non-PASS in diagnostic mode and no
+  private review evidence exists, stop P0-06 after the successful CAPTURE
+  command, preserve the bounded non-PASS receipt, and continue with P0-07.
+  REVIEW and FINALIZE are prohibited on that path; strict qualification rejects
+  it. The remaining P0-06 steps apply only to a PASS capture with a published
+  private review copy.
 - Run the exact offline REVIEW command. After capture reaches `done`, read the
   decrypted private evidence together with the REVIEW command's
   `evidence_sha256` (computed over the exact evidence-file bytes), and write a
