@@ -486,8 +486,8 @@ def test_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# screen_watch lane: its own system prompt + screen_recent grounding flows
-# through `extra_context`, still on the same unified tool loop.
+# screen_watch lane: its own system prompt + safe screen availability grounding
+# flows through `extra_context`; caption text remains an explicit tool read.
 # ------------------------------------------------------------------
 
 def test_screen_watch_lane_uses_its_own_prompt_and_screen_context(monkeypatch):
@@ -508,6 +508,7 @@ def test_screen_watch_lane_uses_its_own_prompt_and_screen_context(monkeypatch):
 
     async def _fake(config, messages, *, tools=None):
         seen["messages"] = messages
+        seen["tools"] = tools
         return _text_round("你在看这个报错？")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -520,5 +521,7 @@ def test_screen_watch_lane_uses_its_own_prompt_and_screen_context(monkeypatch):
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert "watching the screen" in system_msg["content"]
     joined = " ".join(str(m.get("content", "")) for m in seen["messages"])
-    assert "a stack trace" in joined
+    assert "a stack trace" not in joined
+    assert '"recent_count":1' in joined
+    assert "screen_recent" in {spec.name for spec in seen["tools"]}
     assert _bubbles(uid)[0]["body_ct"] == "你在看这个报错？"

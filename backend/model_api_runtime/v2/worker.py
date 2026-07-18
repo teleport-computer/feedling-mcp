@@ -317,6 +317,155 @@ _PRIVATE_READ_TOOLS = frozenset(
         "memory_fetch",
     }
 )
+# Static perception grounding is allowed to coexist with first-round web/MCP/task
+# access, so it must contain only values that cannot carry natural-language
+# instructions.  Keep useful typed readings eager while making every free-form
+# label/title/description pull-only.  The allowlist is deliberately per field,
+# not merely ``isinstance(value, scalar)``: strings are scalars too, and are the
+# exact prompt-injection carrier this boundary excludes.
+_EAGER_PERCEPTION_SCALAR_FIELDS = {
+    "now": frozenset({"battery_level", "charging", "broadcast_active"}),
+    "weather": frozenset(
+        {
+            "temperature",
+            "apparent_temperature",
+            "humidity",
+            "precipitation_chance",
+            "uv_index",
+            "is_daylight",
+        }
+    ),
+    "calendar": frozenset({"calendar_events_truncated"}),
+    "focus": frozenset({"in_focus"}),
+    "audio_route": frozenset({"is_bluetooth"}),
+    "steps": frozenset({"step_count"}),
+    "sleep": frozenset(
+        {"asleep_minutes", "core_minutes", "deep_minutes", "rem_minutes"}
+    ),
+    "workout": frozenset({"duration_min", "count_today"}),
+    "vitals": frozenset(
+        {
+            "resting_heart_rate",
+            "step_count",
+            "current_heart_rate",
+            "hrv_sdnn_ms",
+            "respiratory_rate",
+            "oxygen_saturation_pct",
+            "vo2_max",
+        }
+    ),
+    "activity": frozenset(
+        {"active_energy_kcal", "exercise_minutes", "stand_minutes", "mindful_minutes"}
+    ),
+    "body": frozenset({"weight_kg", "bmi", "body_fat_pct", "height_cm"}),
+    "metabolic": frozenset(
+        {"blood_glucose_mmol_l", "blood_pressure_systolic", "blood_pressure_diastolic"}
+    ),
+    "cycle": frozenset({"is_active_period"}),
+    "mood": frozenset({"valence", "label_count", "recorded_today"}),
+    "reminders": frozenset(
+        {"overdue_count", "due_today_count", "reminders_truncated"}
+    ),
+}
+_STABLE_DISABLED_REASONS = frozenset({"not_permitted", "switch_off"})
+
+# These snapshot signals are made entirely of numeric fields (apart from the
+# runtime-generated disabled marker).  An explicit read limited to this set can
+# safely leave later outbound tools available. Mixed/free-form signals fence the
+# next round. Raw perception_history is always fenced because its field-agnostic
+# day documents can retain strings even for an otherwise numeric signal.
+_OUTBOUND_SAFE_PERCEPTION_SIGNALS = frozenset(
+    {"steps", "sleep", "vitals", "activity", "body", "metabolic"}
+)
+_TEXT_BEARING_MEDIA_READ_TOOLS = frozenset(
+    {"screen_recent", "screen_read", "photo_recent", "photo_read"}
+)
+
+
+def _finite_typed_scalar(value: object) -> bool:
+    if value is None or isinstance(value, bool) or isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _safe_eager_perception_snapshot(data: object) -> dict:
+    """Project a full snapshot to fixed numeric/bool/null fields only.
+
+    Calendar/reminder titles, place/wifi/app/device labels, playback metadata,
+    weather alerts/condition strings, and every other free-form string are
+    intentionally absent. They remain available through an explicit tool read,
+    which activates the outbound fence below.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("signals"), dict):
+        return {}
+    safe_signals: dict[str, dict] = {}
+    for signal, allowed_fields in _EAGER_PERCEPTION_SCALAR_FIELDS.items():
+        raw_doc = data["signals"].get(signal)
+        if not isinstance(raw_doc, dict):
+            continue
+        safe_doc = {
+            field: raw_doc[field]
+            for field in allowed_fields
+            if field in raw_doc and _finite_typed_scalar(raw_doc[field])
+        }
+        if raw_doc.get("disabled") is True:
+            safe_doc["disabled"] = True
+            reason = str(raw_doc.get("reason") or "").strip().lower()
+            if reason in _STABLE_DISABLED_REASONS:
+                safe_doc["reason"] = reason
+        if safe_doc:
+            safe_signals[signal] = safe_doc
+    return {"signals": safe_signals} if safe_signals else {}
+
+
+def _safe_eager_screen_metadata(data: object) -> dict:
+    """Retain only controlled counts; captions/labels/ids stay pull-only."""
+    if not isinstance(data, dict):
+        return {}
+    safe: dict[str, int | float] = {}
+    frames = data.get("frames")
+    if isinstance(frames, list):
+        safe["recent_count"] = len(frames)
+    total = data.get("total")
+    if (
+        isinstance(total, (int, float))
+        and not isinstance(total, bool)
+        and (not isinstance(total, float) or math.isfinite(total))
+    ):
+        safe["total"] = total
+    return safe
+
+
+def _read_blocks_later_outbound(tool_call) -> bool:
+    """Argument-aware private/text read boundary for one completed tool call."""
+    name = str(getattr(tool_call, "name", "") or "")
+    if name in _PRIVATE_READ_TOOLS or name in _TEXT_BEARING_MEDIA_READ_TOOLS:
+        return True
+    args = getattr(tool_call, "args", None)
+    if not isinstance(args, dict):
+        args = {}
+    if name == "perception_history":
+        return True
+    if name == "perception_trend":
+        signal = str(args.get("signal") or "").strip().lower()
+        return signal not in _OUTBOUND_SAFE_PERCEPTION_SIGNALS
+    if name == "perception_snapshot":
+        signals = args.get("signals")
+        if not isinstance(signals, list) or not signals:
+            # Omitted/empty means the capability's FAST default, which includes
+            # location/weather/calendar free-form fields.
+            return True
+        normalized = {
+            str(signal or "").strip().lower() for signal in signals
+        }
+        return (
+            not normalized
+            or "" in normalized
+            or not normalized.issubset(_OUTBOUND_SAFE_PERCEPTION_SIGNALS)
+        )
+    return False
+
+
 _SUBAGENT_DISABLED_TOOLS = frozenset(
     spec.name
     for spec in cap_tool_schema.build_tool_specs()
@@ -355,7 +504,8 @@ _WAKE_NUDGE = "(A quiet moment has passed. Reach out only if something is genuin
 # answer most ticks (inherits the "weak wake sleeps" empty_reply path).
 _SCREEN_WATCH_SYSTEM_PROMPT = (
     "You are the user's personal companion, quietly watching the screen they are sharing. "
-    "Recent frames (with captions) are provided as grounding context. "
+    "Recent frame availability is provided as grounding context; use the screen tools "
+    "to inspect frame content when needed. "
     "Speak ONLY if you have something genuinely useful or warm to say about what changed on "
     "screen right now. If nothing is worth saying, reply with an empty message — silence is "
     "the correct answer most of the time. Never narrate that you are watching or that you "
@@ -1518,7 +1668,7 @@ async def _run_trajectory_review_turn(
 
 
 async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
-    """Prefetch the turn's perception snapshot as static grounding.
+    """Prefetch safe typed perception scalars as static grounding.
 
     Without this the agent is perception-BLIND on every lane but screen_watch: the
     chat system prompt never mentions perception, so asked "how many steps today"
@@ -1534,11 +1684,17 @@ async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
     the base context, before any same-turn transcript), so it does not invalidate
     prompt caching.
 
-    Disabled/null signals are kept, not filtered: the agent must be told what it
-    CANNOT see ("now: not_permitted") rather than infer from an absence. Their
-    interpretation guidance lives in ``context._RUNTIME_CONTEXT_POLICY`` so the
-    changing runtime-data payload remains observations only and cannot smuggle
-    app-authored instructions across the untrusted-data boundary.
+    The complete snapshot is *not* safe to place before first-round outbound
+    tools: calendar/reminder titles, app/device/place labels, playback metadata,
+    and similar third-party strings can contain instructions. The eager block is
+    therefore projected through ``_safe_eager_perception_snapshot``; text remains
+    available only through an explicit perception tool read, after which the
+    tool loop removes later web/MCP/task channels.
+
+    Disabled/null values for allowlisted typed fields are kept: the agent must not
+    infer zero from an absent reading. Their interpretation guidance lives in
+    ``context._RUNTIME_CONTEXT_POLICY`` so the changing runtime-data payload
+    remains observations only.
 
     Returns the `action_results` shape `action_context_str` expects, or None when the
     prefetch came back empty — `_cap_data` degrades to {} on failure and this is
@@ -1552,9 +1708,10 @@ async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
         params={"signals": list(_PERCEPTION_GROUNDING_SIGNALS)},
         enclave_sem=enclave_sem,
     )
-    if not data:
+    safe_data = _safe_eager_perception_snapshot(data)
+    if not safe_data:
         return None
-    return {"perception_snapshot": [{"ok": True, "data": dict(data)}]}
+    return {"perception_snapshot": [{"ok": True, "data": safe_data}]}
 
 
 async def _cap_data(
@@ -1959,6 +2116,7 @@ def _make_task_batch_dispatcher(
                 disabled_tool_names=_SUBAGENT_DISABLED_TOOLS,
                 allow_reply_tool=False,
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
+                outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -3243,9 +3401,12 @@ async def _run_wake(
             await _assert_prompt_covers(user_id, _TAIL_BUDGET)
         wake_tail = list(tail) + [{"role": "user", "content": _WAKE_NUDGE}]
 
-        # screen_watch lane grounds on recent shared-screen frames (Task 3). Fetch
-        # ONLY screen_recent — NOT perception_snapshot: the resident explicitly sets
-        # perception_digest=None for screen-watch jobs (chat_resident_consumer.py:6611).
+        # screen_watch lane grounds on recent shared-screen availability (Task 3).
+        # Fetch ONLY screen_recent — NOT perception_snapshot: the resident explicitly
+        # sets perception_digest=None for screen-watch jobs
+        # (chat_resident_consumer.py:6611). Caption/app/window text is pull-only;
+        # putting it in the first prompt would let screen content choose an outbound
+        # web/MCP/task call before any execution fence can activate.
         #
         # This _cap_data call sits DELIBERATELY OUTSIDE the `async with enclave_sem`
         # block above: `_cap_data` acquires enclave_sem ITSELF (see its body), and
@@ -3263,9 +3424,11 @@ async def _run_wake(
                 runtime_token=token,
                 enclave_sem=enclave_sem,
             )
-            # _fold_action_results caps each action at _PER_ACTION_CHAR_CAP=2000 chars
-            # (the multimodal round's anti-poisoning cap); captions fit.
-            screen_results = {"screen_recent": [{"ok": True, "data": data}]}
+            safe_screen = _safe_eager_screen_metadata(data)
+            if safe_screen:
+                screen_results = {
+                    "screen_recent": [{"ok": True, "data": safe_screen}]
+                }
         else:
             # Every OTHER wake lane grounds on the user's perception instead: a
             # proactive message that cannot see how the user slept / moved / where
@@ -3578,6 +3741,7 @@ async def _run_wake(
                     else None
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
+                outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -4941,6 +5105,7 @@ async def process_job(
             extra_mutating_tool_names=mcp_mutating_names,
             disabled_tool_names=disabled_mutation_tool_names,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
+            outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
             max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
             tool_result_char_cap=TOOL_RESULT_CHAR_CAP,

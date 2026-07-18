@@ -177,6 +177,7 @@ async def run_tool_loop(
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
     outbound_blocking_read_tool_names=None,
+    outbound_blocking_read_tool_predicate=None,
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     tool_result_char_cap: int = DEFAULT_TOOL_RESULT_CHAR_CAP,
@@ -273,6 +274,25 @@ async def run_tool_loop(
     outbound_blocking_reads = {
         str(name) for name in (outbound_blocking_read_tool_names or ()) if str(name)
     }
+
+    def _read_blocks_later_outbound(tool_call) -> bool:
+        """Classify a completed local read before the next provider round.
+
+        Name-only callers remain supported for the workspace/memory boundary.
+        Runtime V2 also supplies an argument-aware predicate because a numeric
+        health snapshot is safe to combine with later outbound tools while a
+        calendar/title/screen read is not.  Classification failures are
+        fail-closed: malformed model arguments must never reopen an exfiltration
+        channel.
+        """
+        if tool_call.name in outbound_blocking_reads:
+            return True
+        if outbound_blocking_read_tool_predicate is None:
+            return False
+        try:
+            return bool(outbound_blocking_read_tool_predicate(tool_call))
+        except Exception:  # noqa: BLE001 - security classifier fails closed
+            return True
     allowed_fetch_urls: set[str] = set()
     # Per-turn tool surface = the static platform catalog plus any user-MCP tools
     # injected for this turn (chat lane only). New list, never mutates the memoized
@@ -632,7 +652,7 @@ async def run_tool_loop(
             # chosen before the model saw the external result.  Only later
             # rounds are influenced by that result and therefore lose writes.
             external_content_seen = True
-        if any(tc.name in outbound_blocking_reads for tc in other_calls):
+        if any(_read_blocks_later_outbound(tc) for tc in other_calls):
             # Same-batch outbound calls were selected before the model observed
             # this result. Only subsequent rounds are data-dependent and fenced.
             outbound_tools_blocked = True
