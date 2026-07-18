@@ -1,185 +1,236 @@
-# Hosted Runtime V2 — Parity Matrix
+# Hosted Runtime V2 — Current Parity and Completion Matrix
 
-> **STATUS: HISTORICAL / SUPERSEDED FOR GO-NO-GO.** This matrix preserves the
-> 2026-07-10 capability archaeology; every live/broken conclusion below is a
-> point-in-time finding, not current runtime status. Use
-> `docs/superpowers/specs/runtime-v2-parity-matrix.md` for implementation parity
-> and `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md` for the current rollout gates. Do not
-> delete resident or enroll users based on this file alone.
+> **CURRENT SOURCE OF TRUTH — 2026-07-18.** This page describes the runtime
+> deployed to Pre by `b79943a9` (runtime source `de0ec00e`). Use
+> [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)
+> for operational gates and
+> [`docs/superpowers/specs/runtime-v2-parity-matrix.md`](superpowers/specs/runtime-v2-parity-matrix.md)
+> for the detailed capability-to-facade mapping. The dated design plans and
+> [`HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md`](HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md)
+> are historical evidence, not live status.
 
-> **This is walkthrough §8 gate 0**, built late (2026-07-10). The gate said: *"Table of every resident capability → V2 action. Gate: every later acceptance test traces to a row."* We skipped it and started at gate 1, so capability gaps have been discovered by accident (three real bugs below were found while building this table, not by tests). Every future V2 acceptance test should cite a row here.
->
-> **Scope:** what the legacy per-user resident consumer (`tools/chat_resident_consumer.py` + `backend/agent_runtime/supervisor.py`) can do, versus what the V2 worker pool (`backend/model_api_runtime/v2/*` + `backend/capabilities/*`) can do.
-
-## How to read this
+## Status legend
 
 | Mark | Meaning |
 |---|---|
-| ✅ | Verified in code, `file:line` cited |
-| ⚠️ | Exists but broken / half-wired — see notes |
-| ❌ | Absent |
-| 🔎 | **Inferred, not verified** — needs confirmation before anyone relies on it |
+| ✅ | Implemented and guarded in the current source |
+| ⚠️ | Correctness exists, but a rollout, scale, or long-horizon gate remains |
+| ❌ | Explicitly deferred or not implemented |
 
----
+## Original V2 vision
 
-## A. Agent tool surface
-
-The resident agent's tools are the `io_cli` subcommands it can shell out to (`tools/io_cli.py`, `add_parser` calls) **plus whatever the codex/claude CLI provides natively** (web, file read, bash). V2's tools are `backend/capabilities/registry.py:12-27`, selectable by the planner's vocabulary (`backend/model_api_runtime/v2/planner.py:17-23`).
-
-| Capability | Resident | V2 | Verdict |
-|---|---|---|---|
-| `memory_index` | ✅ `io_cli memory-index` | ✅ `registry.py:14` | aligned |
-| `memory_fetch` | ✅ `io_cli memory-fetch` | ✅ `registry.py:15` | aligned |
-| `perception_snapshot` | ✅ `io_cli perception` | ✅ `registry.py:18` | aligned |
-| `perception_trend` | ✅ `io_cli perception-trend` | ✅ `registry.py:19` | aligned |
-| `perception_history` | ✅ `io_cli perception-history` | ✅ `registry.py:20` | aligned |
-| `screen_recent` | ✅ `io_cli screen-recent` | ✅ `registry.py:21` | aligned |
-| `screen_read` | ✅ `io_cli screen-read` | ✅ `registry.py:22` | aligned |
-| `photo_recent` | ✅ `io_cli photo-recent` | ✅ `registry.py:23` | aligned |
-| `photo_read` | ✅ `io_cli photo-read` | ✅ `registry.py:24` | aligned |
-| `memory_search` | ❌ no such tool | ✅ `registry.py:17` | **V2 stronger** (walkthrough called this out) |
-| `memory_write` | ❌ agent can't; only the capture lane writes memory | ✅ `registry.py:16` | **V2 stronger** |
-| `identity_get` / `identity_patch` | ❌ `io_cli identity-write` is `(phase 2 — not implemented yet)` | ✅ `registry.py:12-13` | **V2 stronger** |
-| web search / fetch | 🔎 via codex/claude CLI built-in — **no** `web` subcommand exists in `io_cli` or the consumer | ✅ `web_search` / `web_fetch` `registry.py:26-27` (DuckDuckGo facade) | roughly aligned, different impl |
-| **chat image** | ✅ `io_cli chat-image`; **codex attaches images natively** (`chat_resident_consumer.py:2768`); non-native drivers get a local file path (`:371-379`) | ✅ **in-band**: `serve_worker._read_images` → `worker._inject_tail_images` → OpenAI content blocks → `provider_client` (openai-compat verbatim / anthropic / gemini wires). Capped at `_TAIL_IMAGE_LIMIT=2` per turn. Image **caption** now decrypted (`_caption_envelope`) — it had been silently dropped since V2 began. | aligned |
-| **`schedule_wake` / `cancel_wake`** | ✅ `io_cli schedule-wake` / `cancel-wake` | ✅ **WRITE capabilities** `registry.py` (`schedule_wake`/`cancel_wake` → `capabilities/wake.py`, facade over `ScheduledWakeServiceV2.apply_turn_actions`); in planner vocabulary + `planner._WRITE_ACTIONS`; executor runs them serially (no longer in `_CONTROL_ACTIONS`). Capability persists the timer and does **not** enqueue — the D3 scheduler fires it within one tick (≤30 s). | aligned |
-| local file read / bash | ✅ codex runs sandbox-bypassed (`--dangerously-bypass-…`), so it reads local files | ❌ | **decide: drop or port** — this may be an accident of the sandbox flag, not a product capability |
-
----
-
-## B. Background lanes
-
-`LANES = {"chat","manual_wake","heartbeat","scheduled","capture","maintenance"}` (`jobs_store.py:16`). A lane is only a capability if it has **both a producer and a handler**.
-
-| Lane | Resident | V2 producer | V2 handler | Verdict |
-|---|---|---|---|---|
-| chat | ✅ chat poll loop | ✅ `chat_send_core` → `enqueue_job` | ✅ chat path (`worker.py:395+`) | aligned |
-| heartbeat | ✅ `PROACTIVE_TICK_ENABLED` (`:228`), POST `/v1/proactive/tick` | ✅ D3 scheduler (`scheduler.py` + `serve_worker._scheduler_loop`) | ✅ `_run_wake` (`worker.py:392`) | aligned |
-| manual_wake | ✅ manual/force payload on `/v1/proactive/tick` | ✅ D3 bridge (`proactive_core.proactive_tick`) | ✅ `_run_wake` | aligned |
-| `scheduled` | ✅ `fire_scheduled_wakes` → `/v1/proactive/scheduled/fire`, timers in `proactive_scheduled_wakes_v2` | ✅ D3 scheduler `serve_worker._fire_scheduled_for_user` drains due timers → `enqueue_job(uid, "scheduled")`; `schedule_wake` capability (§A) persists them | ✅ in `_WAKE_LANES` (`worker.py:100`) | aligned |
-| `capture` | ✅ `fire_capture_tick()` (`:3844`) → `/v1/capture/tick` | ⚠️ producer code exists but is default-off | ✅ `worker._run_extraction` | **not parity-complete**: durable input/watermark/backoff/idempotency lifecycle is missing |
-| `dream` | ✅ proactive job kind (`_is_memory_dream_job` `:4782`) | ⚠️ producer code exists but is default-off | ✅ `worker._run_extraction` (same handler) | **not parity-complete**: durable lifecycle and failure replay are missing |
-| screen-watch | ✅ `SCREEN_WATCH_ENABLED` / `SCREEN_WATCH_INTERVAL_SEC=120` (`:246-250`) | ✅ D3 scheduler `serve_worker._tick_screen_watch_for_user` — pure gate `v2/screen_watch.py` (fresh→changed→chatting, no enclave), then read-only oracle `_wake_decision_for_user`, then `enqueue_job(uid, "screen_watch")`; state in `v2_wake_schedule` (`next_screen_watch_at` / `last_screen_watch_frame_id`) | ✅ `_run_wake` (`worker.py:396`, `screen_watch` ∈ `_WAKE_LANES`) | aligned |
-| maintenance (compaction) | ❌ n/a (resident has no summary compaction) | ✅ `worker.py:363` | ✅ `_run_compaction` (`worker.py:387`) | V2-only |
-
----
-
-## C. Turn shape
-
-| | Resident | V2 |
+| Requirement | Current status | Evidence and remaining gap |
 |---|---|---|
-| Who picks tools | The model itself, natively (`tools=` wire protocol) | A separate **planner** LLM emits a JSON plan of ≤5 actions, **before seeing any tool results** (`planner.py`) |
-| Iteration | Multi-round: the codex/claude CLI runs its own agent loop inside `subprocess.run(..., timeout=120)` (`chat_resident_consumer.py:3172+`) | **One shot.** `planner → executor → responder` |
-| Replan | n/a | ⚠️ exists but is **not model-driven** — `v2_inval.evaluate(safe_point="before_final_response")` (`worker.py:347-358`) only replans when **a new user message arrived**, never because the model wants more context |
-| Who writes the reply | Same model that called the tools; it saw raw tool results in its own conversation | A **different** call (`responder.respond`), which sees tool results only as a truncated JSON blob (`_action_context_str` → `json.dumps(folded)[:8000]`, `responder.py:33`) |
+| No silent wedges | ✅ | Admission checks the turn-worker heartbeat; pending jobs have queue deadlines and a reaper; terminal failures publish `error` status and `last_runtime_error`; the worker contains turn exceptions; provider I/O is async. A dead pool must fail visibly rather than leave a message in `processing` forever. |
+| Full conversation, not a fixed message window | ⚠️ | The prompt is built from an encrypted, append-only itemized summary plus a verbatim tail. Coverage and watermark invariants prevent messages from being silently dropped, and automatic compaction is live. The summary itself still grows forever; immutable encrypted summary segments and higher-level checkpoints are the remaining long-horizon task. |
+| One native agent loop for every model | ✅ | Chat and wake use the same in-process provider-native tool loop. There is no `official`/`rule` tier, planner, or separate responder. A model that does not call a tool naturally returns once; malformed tool output gets bounded compatibility handling, not pre-assigned model routing. |
+| Reply inside the loop; eager late-message folding | ✅ | `reply` is a loop tool, so the model may acknowledge the user and continue working. New user messages are claimed without debounce and folded at every round boundary. |
+| Parallel tool use | ✅ | A provider turn may request a batch of tools. Independent read tools execute with bounded parallelism; writes and externally mutating MCP calls remain ordered/serialized for safety. |
+| Executable action vocabulary | ✅ | The exposed native catalog maps to registered executable capabilities. Scheduling, web search/fetch, and exact memory search are present; obsolete planner-only `sleep`/`capture_memory` vocabulary is absent. |
+| One deployment topology | ✅ | Hosted V2 runs as a bounded `serve-worker` pool in the runner CVM, separate from the main backend/enclave CVM. Pre is `v2_only`; there is no per-account runtime flip for an iOS Pre tester. |
+| Prompt caching and cache telemetry | ✅ | Provider-aware caching and per-turn cache-token telemetry are live. A route-bound two-request cache-hit canary has succeeded on Pre. |
+| Tokens/turn and admission ceiling | ✅ | Whole-turn token/call/latency metrics and an admission ceiling are implemented. The offline token regression gate is live. |
+| Concurrent CVM-class load proof | ⚠️ | The harness exists, but the authoritative concurrent run on the target CVM class remains an operational gate. |
+| Typing-signal pre-warm | ❌ | Not implemented. See the definition below. |
+| Encrypted full trajectories and failure replay | ❌ | Aggregate telemetry and durable effects exist, but the complete ordered model/tool execution is not persisted. See the distinction below. |
+| Fleet-wide resident-process retirement | ⚠️ | Pre's eligible users already run only on V2 and have no per-user resident children. The idle rollback supervisor/container remains, and test/production are not fully migrated. |
 
-**This is the deepest gap, and it is architectural, not a missing function.** Addressed by `docs/superpowers/specs/2026-07-10-hosted-runtime-v2-agent-loop-design.md`.
+## Current turn shape
 
----
+```text
+claim immediately
+  -> load encrypted summary + verbatim uncovered tail
+  -> render the complete prompt frontier
+  -> provider-native model round (same loop for every model)
+  -> execute a requested tool batch
+       reads: bounded parallelism
+       mutations: ordered and durability-fenced
+       reply: publish immediately, then the loop may continue
+  -> fold newly arrived user messages at the round boundary
+  -> repeat within round/token/deadline limits
+  -> terminal reply or visible terminal failure
+```
 
-## D. Not capabilities — infrastructure that lives in the runner container
+The retired `planner -> executor -> responder` architecture is not a live V2
+path. `planner.py`, `responder.py`, `agent_loop.py`, and `invalidation.py` have
+been deleted. `backend/model_api_runtime/v2/tool_loop.py` is the unified loop,
+and `tests/test_v2_no_dispatch_tiering.py` prevents the old dispatch split from
+returning.
 
-These block "delete agent-runner" but are a rehome, not a rewrite.
+## Tool and lane parity
 
-| Thing | Where | Note |
+The model-visible native catalog contains 17 static platform tools plus the
+synthetic `reply` tool:
+
+- identity read/write;
+- memory index/fetch/write/exact search;
+- perception snapshot/trend/history;
+- screen and photo list/read;
+- web search/fetch;
+- schedule/cancel wake;
+- `reply`; and
+- eligible user-connected MCP tools, subject to approval, taint, ordering, and
+  crash-recovery controls.
+
+Chat image/file reads are internal ingestion capabilities, not model-selectable
+tools. Images enter the provider request as multimodal content. Supported
+uploaded text/PDF/DOCX/XLSX files are decrypted, text-extracted, and injected by
+the worker (up to the configured file limit); this is not arbitrary filesystem
+or shell access. The detailed facade and enclave mapping lives in
+[`docs/superpowers/specs/runtime-v2-parity-matrix.md`](superpowers/specs/runtime-v2-parity-matrix.md).
+
+| Lane | Status | Note |
 |---|---|---|
-| genesis import worker | ~~`supervisor._genesis_worker_should_start`~~ → `backend/genesis/daemon.py`; started by `serve_worker._start_genesis_thread` | ✅ **Rehomed 2026-07-10.** It was a daemon thread in `agent-runner`'s supervisor only because supervisor was the CVM's one long-running process — zero coupling to the resident CLI runtime. `genesis_import_jobs` has exactly ONE drain (`db.genesis_claim_uploaded_jobs`), so retiring agent-runner would have silently stalled all onboarding distillation. Now a dedicated thread in `serve-worker` (not `asyncio.to_thread` — a tick blocks minutes on the LLM reduce). Liveness: `v2_worker_heartbeats.kind='genesis'` → `genesis_alive` on `/v1/admin/v2-metrics`. |
-| in-CVM LiteLLM gateway child | `supervisor.py:60` imports `litellm_gateway`; spawned for gateway providers (gemini / openrouter / openai_compatible) | ✅ **Verified independent of V2** (§G Q2). It is a codex-CLI bridge. V2 calls the user's upstream directly. `GatewayManager.reconcile([])` self-stops once the roster empties, so kill-resident retires it automatically. Guarded by `tests/test_v2_no_gateway_dependency.py`. |
-| per-user leases + heartbeats | `agent_runtime/leases.py`, `agent_runtime_instances` | V2 uses `agent_jobs` single-flight + `v2_worker_heartbeats` instead |
+| Chat | ✅ | Unified native loop with durable reply/effect handling |
+| Manual, heartbeat, scheduled wake | ✅ | Same native loop as chat |
+| Screen watch | ✅ | Producer and wake handler are live |
+| Maintenance/compaction | ✅ | Encrypted summary compaction path is live |
+| Capture | ⚠️ | Producer/handler code exists but rollout remains default-off pending a complete durable lifecycle |
+| Memory Dream | ⚠️ | Producer/handler code exists but rollout remains default-off pending a complete durable lifecycle; current Dream consolidates memory cards and is not runtime failure replay |
+| Genesis import | ✅ | Rehomed under `serve-worker` with a dedicated heartbeat |
 
----
+## Conversation storage and prompt frontier
 
-## E. Bugs found while building this matrix
+V2 does not send ciphertext to the model. Chat content and the append-only
+summary are encrypted at rest in database-backed storage. The trusted runtime
+decrypts the selected summary and verbatim tail in memory, renders ordinary
+model-readable messages, and sends those plaintext messages over the user's
+configured provider connection.
 
-Four real defects, none caught by the 2637-test suite — because no test traced to a parity row.
+Every source message must be covered: either by the committed append-only
+summary watermark or verbatim in the tail. Compaction appends itemized facts;
+it does not rewrite the full conversation into a new lossy summary.
 
-**🔴 BUG-1 — `chat_image_read` poisons the turn's grounding context (live, reachable today).**
-`chat_image_read` is in the planner's vocabulary (`planner.py:21`), so the planner *can* pick it when a user sends an image. It returns `{"message_id","image_mime","image_b64"}` (`capabilities/chat.py:50-52`). `_fold_action_results` copies `data` **verbatim, no key whitelist** (`responder.py`), then `_action_context_str` does `json.dumps(folded)[:8000]`. A base64 JPEG blows past 8000 chars, so the model receives ~8000 characters of truncated base64 **instead of** the memory cards / perception it also fetched. Not "V2 is image-blind" — V2 actively corrupts the turn when it tries to look at an image.
+The **total prompt frontier** is the complete per-round budget calculation over
+the rendered system text, summary, verbatim messages, images, exact tool
+schemas, tool transcript, newly folded input, output reserve, and safety
+headroom. If required context no longer fits, V2 fails visibly. It does not
+silently truncate required history. The remaining long-horizon design is to
+replace one ever-growing summary blob with immutable encrypted segments and
+append-only higher-level checkpoints while preserving this coverage invariant.
 
-**✅ RESOLVED (2026-07-10), in two rounds.** The agent-loop round removed `chat_image_read` from the planner vocabulary and hardened `_fold_action_results` (blob-key strip + `_PER_ACTION_CHAR_CAP`, so no capability can evict the others from the context budget). The multimodal round then routed images **in-band through the conversation tail** as real content blocks, so no image byte ever enters the text grounding context. `chat_image_read` remains *registered* and is invoked directly by `serve_worker._read_images` — never by the planner. That distinction is the fix: the capability still exists, it just no longer flows through the channel that corrupted it.
+## Telemetry is not a full trajectory
 
-**Bonus defect found while fixing it:** the image **caption** (the text a user sends *with* a picture, encrypted separately into `extra.caption_*` by `chat/service.py:115`) was read by **no V2 code path at all**. A user sending a screenshot plus "what's wrong with this?" gave the model the five characters `[image]` and nothing else. Fixed by `serve_worker._caption_envelope` + `_image_row`.
+The current telemetry is valuable. `v2_turn_metrics` is deliberately
+content-free and aggregated to one best-effort row per job; the other persisted
+records below each capture only one operational slice of the turn.
 
-**🟡 BUG-2 — a `capture`-lane job falls through to the chat path.** *(safety fix landed; full handler still pending)*
-`enqueue_job(uid, "capture")` is accepted (`capture` ∈ `LANES`, `jobs_store.py:16`), but `process_job` dispatches only `maintenance` and `_WAKE_LANES`; everything else used to take the chat path. The chat path's early-return guard is `if not coalesced and lane == "chat"`, so a capture job did **not** bail — it ran planner → executor → responder and **wrote a chat bubble**, and on failure emitted a user-visible error chip. **Safety fix:** `process_job` now has an explicit `if lane != "chat"` guard (`worker.py:463-474`) that logs and `mark_failed`s any unhandled lane **silently** (no bubble, no error chip) before the chat path is reached. This closes the "background job writes a chat bubble" hazard. That guard remains as defence in depth. `capture` and `dream` subsequently got producer/handler code and `screen_watch` got a producer plus `_run_wake`; however capture/dream remain default-off and are not parity-complete until their durable lifecycle lands.
+| Persisted today | What it answers | Why it is not a full trajectory |
+|---|---|---|
+| `v2_turn_metrics` | Total prompt/completion/cache tokens, calls, retries, latency, provider/model, final status | No per-round request, response, tool I/O, provider-attempt lineage, or exact context; failed sends may have unknown token usage |
+| `agent_jobs` and status events | Whether/when a job queued, ran, failed, or expired | Status vocabulary is coarse and original content is intentionally excluded |
+| Runtime action digest | Counts and success by tool name | No arguments, results, ordering, or context |
+| Encrypted effect outbox | Durable replies and platform mutations | Captures business effects, not read tools or model exchanges |
+| MCP mutation frontier | Whether a remote mutation may have an ambiguous outcome | Stores hashes/status, not the remote arguments or result |
+| In-process native transcript | Enough ordered tool context for the next model round | Discarded when the turn/process ends |
 
-**✅ BUG-3 — RESOLVED. `scheduled` lane now has a producer AND a way to create timers.**
-Was: handler with no producer; agent-scheduled wakes silently never fired for `db_action_v2` users (see §B). Fixed in two parts: (1) the D3 scheduler (`serve_worker._fire_scheduled_for_user`) drains due timers via `ScheduledWakeServiceV2.fire_due_timers` and `enqueue_job(uid, "scheduled")` — the one and only producer; (2) the agent can now **create/cancel** those timers through the `schedule_wake` / `cancel_wake` WRITE capabilities (`capabilities/wake.py`, §A), which persist the timer without enqueuing and let the scheduler pick it up within one tick.
+Telemetry is the **odometer/instrument panel**: it tells us how much, how long,
+and whether the turn failed. A trajectory is the **flight recorder**: it tells
+us exactly what happened, in what order, with which context and tool inputs and
+outputs. Token telemetry therefore does not make a failed turn replayable.
 
-**🔴 BUG-4 — a chat turn whose plan omits `final_response` silently produces no reply (live, hits *trusted* models only).**
-`validate_plan` appends `final_response` only when the model asked for it (`planner.py:54-58`); it never forces one. `worker.py:458` computes `wants_reply = any(s["type"] == "final_response" for s in steps)`, and when it's False the responder is skipped entirely — the job goes `mark_completed` + `_emit_status "done"` with **no chat bubble**. The user's message is swallowed, and the client's long-poll sees a completed turn with nothing in it.
+A complete encrypted trajectory store still needs immutable ordered records for
+the rendered context/version of every provider call, offered tool schemas,
+provider attempts and responses, tool call IDs/arguments/results/timing,
+late-message folds, replies and effects, retry/error/stop reasons, and explicit
+capture-completeness metadata. It must exclude provider secrets and have
+content-equivalent at-rest protection, retention, consent, and access controls.
+With the current external database that means application envelope encryption;
+if the store moves inside the trusted CVM, storage-adapted full-disk encryption
+may provide that boundary instead.
 
-Reproduced:
-```
->>> planner.validate_plan({"plan":[{"type":"memory_search","payload":{"query":"x"}}]})
-[{'type': 'memory_search', 'payload': {'query': 'x'}}]     # no final_response
->>> wants_reply
-False                                                       # → responder never runs
-```
-`rule_plan` always appends `final_response` (`planner.py:75`), so weak/relay models are immune. Only `official_plan` — the *trusted* models we route our best users to — can drop it. `_PLANNER_SYSTEM` says "include final_response LAST", which is a prompt-level hope, not an invariant.
+## Deferred D items, precisely defined
 
-This is the deepest reason the one-shot shape is wrong: **"the planner didn't ask to reply" and "the planner wants more tools first" are the same wire signal today**, and the worker guesses the first. Under the agent loop the same signal means "loop again", with a forced `final_response` at the round cap — so the loop **fixes BUG-4 by construction** rather than needing a separate patch.
+### Typing-signal pre-warm
 
----
+This is a latency optimization triggered by an authenticated, short-lived iOS
+“user started typing” event before Send. It may warm deterministic work such as
+worker capacity/heartbeat checks, database/enclave reads, summary decryption,
+memory indexes, provider routing configuration, and HTTP/TLS connections. The
+speculative state must have a short TTL, be invalidated on conversation/config
+version drift, remain process-local, never occupy reserved foreground capacity,
+and fall back normally on a miss.
 
-## F. Triage
+It must not create a chat row/job/reply, execute a tool, call the model, reserve
+a slot indefinitely, or incur token billing before Send. In particular, a
+remote provider prompt cache normally cannot be populated without a provider
+request; provider-side speculative calls require a separate explicit budget and
+waste policy. The first implementation should warm only local/TEE/network work
+and preserve ordinary prompt-cache affinity for real turns.
 
-**1. Must build (V2 cannot replace resident without these)** — **bucket is not empty.**
-- Provider-native unified tool loop; `agent_loop.py` is orchestration scaffolding,
-  while official/rule planning and the separate responder remain.
-- Durable capture/dream lifecycle and failure replay; current producers stay off.
-- See the current audit handoff for cutover, transactional effects, liveness,
-  full-history, security, telemetry, and kill-switch blockers.
-- ⚠️ **PARTIAL** — `v2/agent_loop.py` adds bounded orchestration and the chat
-  path forces a reply, closing BUG-4. The provider-native unified tool loop,
-  per-round message folding, reply-as-tool, and removal of the official/rule
-  split remain open.
-- ~~Multimodal: give `provider_client` a real image content block; stop feeding b64 through the text context (fully fixes BUG-1; the loop round only stops the bleeding).~~ ✅ **DONE** — images route in-band through the conversation tail as real content blocks (§A "chat image" = aligned, BUG-1 RESOLVED in §E).
-- ~~`schedule_wake` / `cancel_wake` capability + planner vocabulary, and a producer for the `scheduled` lane (fixes BUG-3).~~ ✅ **DONE** — see §A, §B `scheduled`, and BUG-3.
-- ~~`screen_watch` lane.~~ ✅ **DONE** — producer `serve_worker._tick_screen_watch_for_user` (pure gate `v2/screen_watch.py`, state in `v2_wake_schedule`), handler `_run_wake`; see §B `screen-watch`. **Deliberate divergence from the resident:** a frame suppressed by active chat is **not** consumed (`last_screen_watch_frame_id` is written only on a real wake, never on a suppressed tick) — the resident writes it as soon as `fresh and changed`, permanently losing frames it then suppresses.
+### Encrypted full trajectories and failure-replay Dream lane
 
-**2. Decide: drop or port**
-- Local file read / bash. Resident has it only because codex runs with the sandbox bypassed. Probably not an intended product capability.
+The current Dream lane is user-memory housekeeping: it consolidates memory
+cards and does not run the conversation agent or write chat. Failure replay is
+a separate offline evaluation lane built on the future encrypted trajectory
+store. It would select a failed/anomalous turn, decrypt it only inside the
+trusted runtime, reconstruct the historical context, and disable every external
+side effect. A deterministic runtime replay can reuse the recorded provider and
+tool outputs; an evaluation of a new prompt/model may make a fresh explicitly
+budgeted model call while replaying recorded or mocked read-tool results. Both
+modes suppress every write. Reviewed cases could become versioned regression
+fixtures.
 
-**3. V2 has additional primitives, but they still need rollout proof**
-- `memory_search`, `memory_write`, `identity_get`/`identity_patch`, and summary
-  compaction exist; bounded search pagination and summary-coverage/retention
-  invariants remain open.
+This is analysis, not production retry. The existing effect outbox handles
+durable effect recovery; failure replay must never resend replies, rewrite
+memory/identity/schedules, or repeat remote MCP mutations.
 
-**4. Infrastructure rehome (not capability work)** — ✅ **BUCKET EMPTY**
-- ~~Move the genesis import worker out of the agent-runner container.~~ ✅ **DONE 2026-07-10** — extracted to `backend/genesis/daemon.py`, hosted by `serve_worker` on a dedicated thread, with a `kind='genesis'` heartbeat so its death stops being silent. `supervisor.py` no longer starts it at all.
-- ~~Confirm gateway providers need no in-CVM LiteLLM under V2, then drop the child.~~ ✅ **DONE** — confirmed (§G Q2); the child self-stops on an empty roster, so there is nothing to drop by hand.
+### Fleet-wide resident-process retirement
 
-Do **not** delete the `agent-runner` container yet; the current audit handoff's
-parity, cutover, soak, and rollback gates remain open.
+Pre is already `v2_only`: eligible accounts have no resident per-user child
+process and an iOS tester simply uses Pre. The runner still carries an idle
+`agent-runner` supervisor/container with an empty eligible roster so operators
+can roll back. Test and production still support per-user resident routing.
 
----
+Fleet-wide retirement means completing capture/Dream lifecycle rollout and the
+wake fault-injection, real-CVM load, recovery, cohort-soak, and no-dual-route gates;
+migrating every hosted eligible test/production account; observing an empty
+resident roster through the rollback window; then stopping and removing the
+supervisor container, its deployment configuration, and eventually its legacy
+consumer code. That final operator step is when hosted RAM/process count becomes
+a function of the bounded worker pool rather than user count.
 
-## G. Open questions
+## Remaining work, in order
 
-1. **Local file read / bash** — port, or declare it a sandbox accident and drop it?
-2. ~~**Gateway + LiteLLM** — does V2 truly bypass it?~~ ✅ **ANSWERED: yes, completely (2026-07-10).**
-   The in-CVM LiteLLM proxy is a **codex-CLI bridge**: codex speaks the OpenAI Responses wire and cannot
-   reach gemini/openrouter directly, so the resident runtime ran a per-CVM proxy and pointed codex at it.
-   V2 never spawns codex — `responder`/`planner`/`extraction` call `provider_client` over plain HTTP, and
-   `provider_client` speaks all three providers natively. Verified three ways: (a) zero references to
-   `litellm`/`FEEDLING_LITELLM`/`:4000` anywhere in `model_api_runtime/v2/*` or `capabilities/*`;
-   (b) the only readers of `FEEDLING_LITELLM_BASE_URL` are `agent_runtime/spawners.py` and
-   `agent_runtime/supervisor.py` (the codex spawn path); (c) **behavioural** — poison the gateway endpoint
-   and drive the real `responder.respond` for gemini/openrouter/openai_compatible: every outbound request
-   lands on the user's own upstream. Pinned by `tests/test_v2_no_gateway_dependency.py`.
-   **Teardown is automatic**: the D0 exclusivity guard drops `db_action_v2` users from
-   `db.list_agent_runtime_enabled_users`, so `_gateway_entries(roster)` yields `[]`, and
-   `GatewayManager.reconcile([])` calls `_stop()` (`litellm_gateway.py:362-365`). Once every user is
-   migrated the child stops itself — no separate step, nothing to delete by hand.
-3. **Resident web access** — confirm it comes from the CLI's built-in web tool and not something we haven't found. If a user's provider is a relay whose CLI has no web tool, does the resident agent have web at all today? (Affects whether V2's DuckDuckGo facade is parity, a regression, or an upgrade.)
-4. **dream / screen_watch** — both remain desired products. Screen-watch has a
-   producer and handler; dream has code paths but is default-off and is not
-   shipped until its durable lifecycle and failure replay gates pass.
-5. **Dead column: `v2_wake_schedule.next_capture_at`.** The capture lane is driven by `capture_scheduler.tick_quiet_capture`'s own quiet-window bookkeeping (§B `capture`), **not** by a `next_capture_at` poll — so `upsert_wake_schedule(next_capture_at=…)` / `get_wake_schedule()["next_capture_at"]` have **no production writer or reader**. The column is inert (mirrors `next_heartbeat_at` / `next_screen_watch_at` for symmetry but was never wired to a producer). Safe to drop in a future migration, or wire if capture ever moves to a due-time poll.
+1. Run the authoritative concurrent workload on target CVM-class hardware and
+   complete the fault/recovery and cohort-soak gates.
+2. Add immutable encrypted summary segments and higher-level checkpoints before
+   a real conversation reaches the total prompt frontier.
+3. Design and instrument safe typing pre-warm; measure first-request/first-token
+   p50/p95 and wasted-prewarm rate.
+4. Implement encrypted full trajectories with explicit completeness, retention,
+   consent, and access controls.
+5. Add the side-effect-disabled failure-replay evaluation lane on top of those
+   trajectories.
+6. Finish capture/Dream lifecycle rollout, migrate test/production, and retire
+   the hosted resident supervisor fleet after rollback gates pass.
 
----
+Generic local file/bash access, remote artifact download, and an on-demand
+artifact sandbox are separate harness-expansion decisions, not unfinished
+claims in the original V2 parity contract. Do not accidentally treat the
+resident CLI's sandbox-bypassed local filesystem access as an intended hosted
+capability.
 
-## Traceability rule (the gate)
+## Traceability guards
 
-From here on: **every V2 acceptance test names the row it covers.** A capability with no row is not shipped; a row with no test is not done.
+At minimum, current-status changes should remain covered by:
+
+- `tests/test_v2_no_dispatch_tiering.py`
+- `tests/test_v2_p0_unified_loop.py`
+- `tests/test_v2_tool_loop.py`
+- `tests/test_v2_tool_loop_mcp.py`
+- `tests/test_v2_mixed_tool_dispatch.py`
+- `tests/test_provider_client_async.py`
+- `tests/test_v2_prompt_cache_key.py`
+- `tests/test_v2_turn_metrics.py`
+- `tests/test_v2_summary_store.py`
+- `tests/test_v2_summary_watermark_seq.py`
+- `tests/test_v2_prompt_invariant.py`
+- `tests/test_v2_p0_history_safety.py`
+- `tests/test_memory_readside_core.py`
+- `tests/test_v2_worker_files.py`
+- `tests/test_v2_atomic_reply_cursor.py`
+- `tests/test_hosted_runtime_policy.py`
+- `tests/test_no_litellm_anywhere.py`
+
+When architecture or rollout state changes, update this page in the same commit.

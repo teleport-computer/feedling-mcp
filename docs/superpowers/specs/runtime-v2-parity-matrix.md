@@ -1,8 +1,15 @@
-# Runtime V2 Parity Matrix
+# Runtime V2 Capability Facade Mapping
 
-Phase 0 deliverable — the acceptance checklist mapping each current resident/io_cli
-capability to its existing framework-neutral core, the new capability facade
-function, the V2 action-type string, and whether it hits the enclave.
+> **Tool-level companion matrix.** This page maps the executable capability
+> vocabulary to its framework-neutral facades. For current end-to-end runtime
+> status, deferred D items, telemetry-versus-trajectory scope, and deployment
+> state, use [`docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`](../../HOSTED_RUNTIME_V2_PARITY_MATRIX.md).
+> For operational rollout gates use
+> [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../../../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md).
+
+This appendix maps each current resident/io_cli capability to its existing
+framework-neutral core, capability facade, V2 action-type string, and enclave
+boundary. It is not the complete runtime acceptance matrix.
 
 | io_cli verb | backend endpoint | existing *_core fn | capability fn | action_type | enclave? |
 |---|---|---|---|---|---|
@@ -17,7 +24,8 @@ function, the V2 action-type string, and whether it hits the enclave.
 | screen-read | GET /v1/screen/frames/{id}/decrypt | screen_read_core.frame_decrypt | capabilities.screen.read | screen_read | yes |
 | photo-recent | GET /v1/perception/photos | perception_read_core.photos_recent | capabilities.photo.recent | photo_recent | no |
 | photo-read | GET /v1/perception/photo/{id}/content | perception_read_core.photo_content | capabilities.photo.read | photo_read | yes (image) |
-| chat-image | GET {ENCLAVE}/v1/chat/history | (none — enclave direct) | capabilities.chat.image_read | chat_image_read | yes |
+| chat-image | GET {ENCLAVE}/v1/chat/history | (none — enclave direct) | capabilities.chat.image_read | chat_image_read (internal only) | yes |
+| (uploaded chat file) | GET {ENCLAVE}/v1/chat/history | (none — enclave direct) | capabilities.chat.file_read | chat_file_read (internal only) | yes |
 | identity-write | POST /v1/identity/actions | identity_core.run_actions | capabilities.identity.patch | identity_patch | no |
 | (GET /v1/identity/get) | GET /v1/identity/get | identity_core.get_identity | capabilities.identity.get | identity_get | no |
 | (web search — legacy runtime tool-call, no endpoint) | (none — in-process) | model_api_runtime.tools.web_search_duckduckgo | capabilities.web.search | web_search | no |
@@ -26,9 +34,17 @@ function, the V2 action-type string, and whether it hits the enclave.
 | (cancel scheduled wake) | POST /v1/proactive/scheduled/actions | proactive.scheduled_wake_v2 | capabilities.wake.cancel | cancel_wake | no |
 
 Notes:
+- `chat_image_read` and `chat_file_read` are registered worker capabilities but
+  intentionally have no model-facing schemas. The worker injects images as
+  multimodal content and extracted supported-file text into the prompt. The
+  model sees neither raw base64 nor arbitrary local filesystem access.
+- The model-visible catalog adds a synthetic `reply` tool handled directly by
+  the unified loop. Eligible per-user MCP tools are appended dynamically; they
+  are not rows in this static platform-facade table.
 - `recent_chat_digest` (spec §4.3 read word list) is **not** a capability — it is a
   deterministic worker-side transform over decrypted messages (no endpoint, no LLM).
-- Enclave-bound rows (memory index/fetch, screen read, photo read w/ image, chat-image)
+- Enclave-bound rows (memory index/fetch, screen read, photo read w/ image,
+  chat-image, and uploaded chat file)
   must be wrapped in the shared `ENCLAVE_SEMAPHORE` by the V2 worker (spec §11 R3).
 - **Scheduling vocabulary is now executable:** the production native catalog exposes
   `schedule_wake` and `cancel_wake`, both are registered capabilities, and their durable

@@ -1,9 +1,9 @@
 """Tool-schema catalog (Plan C, Task 3 / C1).
 
 Derives one `ToolSpec` per model-facing capability in `capabilities.registry.CAPABILITIES`
-(everything except `chat_image_read`, which has no backend route and is never offered to
-the model) plus a synthetic `reply` tool that the unified tool loop treats specially
-(writes an immediate bubble instead of dispatching through the executor).
+(everything except the internal-only `chat_image_read` and `chat_file_read`, which have
+no model-facing schema) plus a synthetic `reply` tool that the unified tool loop treats
+specially (writes an immediate bubble instead of dispatching through the executor).
 
 Each entry in `PARAMS` mirrors exactly the `params` fields each capability module reads —
 see the module docstring/params usage cited per tool below. Do not add fields the

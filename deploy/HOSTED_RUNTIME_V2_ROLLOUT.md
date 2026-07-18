@@ -1,6 +1,11 @@
 # Hosted Runtime V2 — Gated Rollout & Kill-Resident Runbook
 
-> Ops runbook (D4 Task 5). Not TDD — a human/ops executes this sequence. Cross-reference `deploy/DEPLOYMENTS.md` for the CVM deploy/re-auth mechanics. Companion code: §6 admission ceiling + D0 rollout infra + D3 proactive/wake lanes + D4 load-test harness (`scripts/loadtest/`).
+> Ops runbook (D4 Task 5). Not TDD — a human/ops executes this sequence. Use
+> [`docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`](../docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md)
+> for current implementation and deferred-feature status, and cross-reference
+> [`deploy/DEPLOYMENTS.md`](DEPLOYMENTS.md) for CVM deploy/re-auth mechanics.
+> Companion code: §6 admission ceiling + D0 rollout infra + D3 proactive/wake
+> lanes + D4 load-test harness (`scripts/loadtest/`).
 
 ## What "done" means
 
