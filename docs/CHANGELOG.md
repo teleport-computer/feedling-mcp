@@ -47,6 +47,29 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-18（第二批：常量/方法维度 + 活文档失实修正）
+
+### [DONE] 仓库清理第三轮·第二批：死常量、死方法、活文档状态复核
+
+- **新扫描维度**（此前只扫了顶层函数/类）：模块级常量 + 类方法 + tests
+  死 helper，同一标准（全仓含 docs-site/contracts 全文件类型 whole-word
+  grep ≤1 即 def-only）迭代到不动点。
+- 删 37 个死常量/方法/helper：hosted_runtime 的 TOOL_*/RUNTIME_ENGINE_*/
+  BACKGROUND_METHOD 簇（wire 值已确认无其他发射方）、turn.py 死 env knob
+  （MODEL_API_WEB_SEARCH_MAX_RESULTS/TIMEOUT、PROVIDER_REASONING_ENABLED、
+  STATE_RECEIPT_MAX——对应 FEEDLING_* flag 本已无效）、memory_readside 死
+  limit 簇、genesis checkpoint 死前缀/死状态、3 个死方法
+  （InMemoryMetricsSinkV2.list_events / DeliveryDecisionV2.allow_push /
+  PerceptionDifferV2.state_for）、tests/_clear_cursor 等。
+- **有意保留**：perception/catalog.SCENE_HINTS（与 iOS Vision 分类器共享的
+  canonical enum，跨仓契约文档，本仓 grep 不到≠死）；pytest_report_header
+  等钩子与 Test* 类为框架按名调用，扫描已排除。
+- **活文档失实修正**：OPTIMIZATION_BACKLOG 复核（#1/#4 补 ✅ 及 commit 证据，
+  #3 标注部分完成——api_key 路径仍回环 whoami）；DEPLOYMENTS.md TEE Postgres
+  段从「待开通」改为已开通（test+prod，指向 TEE_POSTGRES_SHADOW_PROVISIONING）。
+- 验证：全量 pytest 对比基线零新增失败；两入口 + 全部触及包 import 冒烟通过；
+  不碰 deploy 配置/alembic/路由（iOS 为独立仓，路由是公共 API 面）。
+
 ## 2026-07-18
 
 ### [DONE] 仓库清理第三轮：过时文档 + 符号级死码 + 全量 unused imports

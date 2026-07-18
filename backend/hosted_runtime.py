@@ -10,21 +10,7 @@ from memory.prompts_v1 import MEMORY_WRITE_GUIDANCE_V1
 
 ACTION_RESPONSE_FORMAT: dict[str, Any] = {"type": "json_object"}
 
-RUNTIME_ENGINE_NATIVE = "feedling_native"
-RUNTIME_ENGINE_HERMES_ADAPTER = "hermes_adapter"
 
-TOOL_WEB_SEARCH = "web.search"
-TOOL_MEMORY_CREATE = "memory.create"
-TOOL_MEMORY_PATCH = "memory.patch"
-TOOL_MEMORY_SUPERSEDE = "memory.supersede"
-TOOL_MEMORY_DELETE = "memory.delete"
-TOOL_IDENTITY_PATCH = "identity.patch"
-TOOL_IDENTITY_DIMENSION_NUDGE = "identity.dimension_nudge"
-TOOL_IDENTITY_RELATIONSHIP_DAYS_SET = "identity.relationship_days_set"
-TOOL_CONFIRMATION_REQUEST = "confirmation.request"
-
-BACKGROUND_METHOD = "feedling_background_execution"
-BACKGROUND_NOT_STARTED_METHOD = "feedling_background_execution_not_started"
 ACTION_METHOD = "feedling_runtime_actions"
 NOOP_METHOD = "feedling_runtime_noop"
 PENDING_CONFIRM_METHOD = "feedling_runtime_pending_confirm"

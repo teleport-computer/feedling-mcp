@@ -11,25 +11,13 @@ import httpx
 from memory import service as memory_service
 
 
-MEMORY_READSIDE_DEFAULT_LIMIT = 0
 MEMORY_READSIDE_DEFAULT_HARD_MAX = 1000
-MEMORY_READSIDE_LIMIT = MEMORY_READSIDE_DEFAULT_LIMIT
-MEMORY_FETCH_TOOL_LIMIT = 5
-MEMORY_FETCH_LOOP_LIMIT = 8
 
-_SALIENCE_WEIGHT = {
-    "critical": 4,
-    "high": 3,
-    "medium": 2,
-    "low": 1,
-}
 _INACTIVE_STATUSES = {
     "archived",
     "deleted",
     "superseded",
 }
-
-PostEnclave = Callable[[str | None, list[dict], ...], dict]
 
 
 def _status(moment: dict) -> str:

@@ -122,14 +122,6 @@ DEFAULT_TOOL_SPECS_V2: tuple[ToolSpecV2, ...] = (
     ToolSpecV2("cancel_wake", "action", FAST, "Cancel a durable future wake."),
 )
 
-FOREGROUND_CHAT_TOOL_NAMES_V2 = frozenset({
-    "perception.now",
-    "perception.location",
-    "perception.calendar",
-    "perception.motion",
-    "perception.weather",
-})
-
 
 def default_tool_catalog_v2() -> ToolCatalogV2:
     return ToolCatalogV2(DEFAULT_TOOL_SPECS_V2)

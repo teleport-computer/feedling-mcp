@@ -6,16 +6,19 @@
 
 ## 推荐启动顺序
 
-1. **#4 memory 写放大改单行 upsert** —— 一天内完成，立刻见效
-2. ~~**#2 enclave 换生产 WSGI 服务器**~~ —— ✅ 已完成（gunicorn gthread）
+1. ~~**#4 memory 写放大改单行 upsert**~~ —— ✅ 已完成（`a94b9aa8`，选择性 upsert/delete）
+2. ~~**#2 enclave 换生产 WSGI 服务器**~~ —— ✅ 已完成（gunicorn gthread；后又整体迁 ASGI）
 3. ~~**#1 规划 LISTEN/NOTIFY 替代进程内 waiter**~~ —— ✅ 多 worker 已 ship+deploy
-   （2026-07-01，backend `-w4`）；#3 回环鉴权亦已本地 HMAC 化。**本节 #1/#2/#3 均已过时，待整体复核。**
+   （2026-07-01，backend `-w4`）
+4. 复核记录（2026-07-18）：#1/#2/#4/#6/#14 已完成；#3 **部分**完成——
+   runtime-token 路径已本地 HMAC 验证，但 api_key 路径仍回环 whoami
+   （07-16 prod 仍见 enclave_http_502 = reentrant whoami 超时，见 CHANGELOG）。
 
 ---
 
 ## 一、结构性瓶颈（影响扩展上限）
 
-### #1 单 worker 天花板 ⬜ P0 · 改动大
+### #1 单 worker 天花板 ✅ 已完成（2026-07-01，multi-worker `-w4` + LISTEN/NOTIFY 唤醒总线）
 
 （下文为历史分析，多 worker 已 ship+deploy，见顶部推荐启动顺序的注记。）
 
@@ -43,7 +46,7 @@
   → **enclave 早已不是「单线程 Werkzeug」**。真正残余瓶颈是 backend 线程饱和 +
   内存墙，见 2026-07-02 longpoll 并发调查稿（`2026-07-02-backend-longpoll-concurrency-investigation.md`，已删，见 git 历史）。
 
-### #3 enclave→backend 回环鉴权耦合 ⬜ P2 · 中等
+### #3 enclave→backend 回环鉴权耦合 🔶 部分完成（runtime-token 已本地 HMAC；api_key 路径仍回环）P2 · 中等
 
 - **现状**：每个解密请求回头调 backend `/v1/users/whoami` 验 key，缓存
   只是降频；backend 卡顿时解密路径陪着卡。
@@ -52,13 +55,10 @@
 
 ## 二、性能（便宜的赢面）
 
-### #4 memory 写放大 ⬜ P1 · 一天内 —— 建议第一个修
+### #4 memory 写放大 ✅ 已完成（`a94b9aa8` feat(db): optimize memory_replace_all）
 
-- **现状**：`backend/db.py:792` `memory_replace_all`——每加/改/归档
-  **一张**记忆卡，DELETE 该用户全部行再逐行重插，且在 `memory_lock` 内。
-  老用户 floors 87 张起步 → 写一张卡重写近百行。
-- **方向**：schema 已有 `(user_id, moment_id)` 主键 + `ON CONFLICT`
-  支持，改单行 upsert/delete 即可。改动小、收益明确。
+- **结果**：`memory_replace_all` 改为选择性 reconcile——只删被移除的行、
+  只 upsert doc 变化的行，单卡编辑不再重写整个 garden（full-replace 语义保留）。
 
 ### #5 屏幕帧存 PG JSONB ⬜ P2 · 中期
 

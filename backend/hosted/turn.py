@@ -53,21 +53,15 @@ MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC = max(
 )
 MODEL_API_WEB_SEARCH_ENABLED = os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 MODEL_API_WEB_SEARCH_MAX_QUERIES = max(1, min(3, int(os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_MAX_QUERIES", "2"))))
-MODEL_API_WEB_SEARCH_MAX_RESULTS = max(1, min(8, int(os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_MAX_RESULTS", "5"))))
-MODEL_API_WEB_SEARCH_TIMEOUT_SEC = max(2.0, min(20.0, float(os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_TIMEOUT_SEC", "8"))))
-MODEL_API_PROVIDER_REASONING_ENABLED = os.environ.get("FEEDLING_MODEL_API_PROVIDER_REASONING_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 MODEL_API_PROVIDER_REASONING_MAX_CHARS = chat_service.MODEL_API_PROVIDER_REASONING_MAX_CHARS
 # State receipts: one append per chat turn. Read views cap at 100; keep a
 # generous tail so the stream can't grow without bound across a user's history.
-STATE_RECEIPT_MAX = int(os.environ.get("FEEDLING_STATE_RECEIPT_MAX", 1000))
 _sanitize_visible_thinking_summary = chat_service._sanitize_visible_thinking_summary
 _sanitize_provider_reasoning_text = chat_service._sanitize_provider_reasoning_text
 
 _STATE_PENDING_BLOB = "model_api_state_pending"
 _model_api_recap_active_users: set[str] = set()
 _model_api_recap_active_lock = threading.Lock()
-_model_api_state_active_users: set[str] = set()
-_model_api_state_active_lock = threading.Lock()
 # Per-user guard for the running memory-capture job. State actions and recap
 # already have one each; capture did not — overlapping capture windows (the
 # turn-24 job still running when turn-48 fires) could double-write cards. Mirror

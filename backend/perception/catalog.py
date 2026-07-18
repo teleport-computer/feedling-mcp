@@ -171,7 +171,6 @@ COMPOSITE_KEYS: dict[str, list[str]] = {}
 # envelope in the frame channel. Allowing kind=photo via /items would let a
 # caller inject a confirmed photo doc without the envelope path.
 # (calendar is reported via /report, not /items.)
-ITEM_KINDS = ("photo", "workout", "sleep", "vitals")
 KIND_CAPABILITY = {
     "workout": "health_workout",
     "sleep": "health_sleep",

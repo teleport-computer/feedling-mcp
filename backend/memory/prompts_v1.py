@@ -33,7 +33,6 @@ COMMON_BUCKETS_V1 = [
 ]
 
 # Ready-to-inject bilingual line: 工作/Work、目标与成长/Goals & growth、… — short enough to fit every prompt.
-COMMON_BUCKETS_LINE_V1 = "、".join(f"{zh}/{en}" for zh, en in COMMON_BUCKETS_V1)
 # English-only list for the route-B guidance block below (kept in sync automatically).
 _COMMON_BUCKETS_EN = " / ".join(en for _zh, en in COMMON_BUCKETS_V1)
 # Chinese-only list — the guidance presents zh and en as SEPARATE lists (not 工作/Work

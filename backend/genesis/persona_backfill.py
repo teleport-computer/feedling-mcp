@@ -23,7 +23,6 @@ import hashlib
 _SIGNAL_FIELDS = ("custom_persona_prompt", "tone_style", "self_introduction")
 
 _SOURCE_KIND = "companion_persona_backfill"
-_KEY_VERSION = "v1"
 
 
 def _clean(value) -> str:

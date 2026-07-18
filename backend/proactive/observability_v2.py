@@ -67,11 +67,6 @@ class InMemoryMetricsSinkV2:
     def record(self, event: MetricEventV2) -> None:
         self.events.append(event)
 
-    def list_events(self, user_id: str = "") -> list[MetricEventV2]:
-        if not user_id:
-            return list(self.events)
-        return [event for event in self.events if event.user_id == user_id]
-
 
 def record_metric_v2(
     sink: MetricsSinkV2 | None,

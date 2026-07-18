@@ -8,7 +8,6 @@ Persistence is PostgreSQL (db.save_all_users / db.upsert_user).
 import copy
 import hashlib
 import hmac
-import re
 import secrets
 import threading
 import time
@@ -312,9 +311,6 @@ def _resolve_user(api_key: str) -> str | None:
         if changed:
             _save_users()
     return None
-
-
-_USER_ID_RE = re.compile(r"^usr_[a-f0-9]{16}$")
 
 
 def _register_user(public_key: str | None = None,
