@@ -252,3 +252,45 @@ def test_normal_decrypt_keeps_enclave_start_and_done_traces(monkeypatch):
     assert plaintext == b"plaintext"
     assert [event["type"] for event in events] == ["enclave.call.start", "enclave.call.done"]
     assert all(event["detail"]["purpose"] == "chat:history" for event in events)
+
+
+def test_flush_pending_waits_for_worker_in_flight_batch(monkeypatch):
+    """Read-after-write consistency: unfinished_tasks must not hit zero while
+    the worker still holds an un-appended batch (a concurrent reader would
+    early-return stale DB), and a read must see the event once the worker's
+    append + task_done complete. Deterministic: the append is gated."""
+    import threading
+
+    gate = threading.Event()
+    entered = threading.Event()
+    written: list = []
+    real_wait = debug_trace._FLUSH_WAIT_SEC
+
+    def blocking_append(uid, events):
+        entered.set()
+        assert gate.wait(5)
+        written.extend(events)
+
+    monkeypatch.setattr(debug_trace, "_append_events", blocking_append)
+    monkeypatch.setattr(debug_trace, "_FLUSH_WAIT_SEC", 0.01)  # tight batch window
+    try:
+        debug_trace._enqueue("usr_dbg_race", {"ts": time.time(), "type": "unit.race"})
+        assert entered.wait(5)  # worker popped the item and is mid-append (pre-task_done)
+
+        t0 = time.monotonic()
+        debug_trace._flush_pending_for_user("usr_dbg_race", timeout=0.2)
+        blocked_wait = time.monotonic() - t0
+        # Must NOT early-return while the append is in flight.
+        assert blocked_wait >= 0.15
+        assert not written
+
+        gate.set()
+        t1 = time.monotonic()
+        debug_trace._flush_pending_for_user("usr_dbg_race", timeout=2.0)
+        # Returns promptly once the worker acked, and the event is visible.
+        assert time.monotonic() - t1 < 1.0
+        assert written and written[0]["type"] == "unit.race"
+        assert debug_trace._event_queue.unfinished_tasks == 0
+    finally:
+        gate.set()  # never leave the daemon worker blocked past this test
+        monkeypatch.setattr(debug_trace, "_FLUSH_WAIT_SEC", real_wait)

@@ -222,7 +222,14 @@ def _worker_loop() -> None:
                     batch.append(_event_queue.get(timeout=timeout))
                 except queue.Empty:
                     break
-            _flush_batch(batch)
+            try:
+                _flush_batch(batch)
+            finally:
+                # task_done bookkeeping lets _flush_pending_for_user see the
+                # worker's in-flight batch via unfinished_tasks — without it a
+                # debug read racing this batching window returns stale data.
+                for _ in batch:
+                    _event_queue.task_done()
         except Exception:
             pass
 
@@ -247,32 +254,25 @@ def _enqueue(uid: str, event: dict[str, Any]) -> None:
 
 
 def _flush_pending_for_user(uid: str, *, timeout: float = 0.5) -> None:
-    """Best-effort debug-read helper: drain queued events for one user.
+    """Best-effort debug-read helper: wait until already-enqueued events land.
 
-    This may touch DB, so only callers on debug/admin read paths should use it.
-    The product write path (`trace_event`) never waits for this.
+    Bounded wait for the flush worker to finish everything it has accepted;
+    only debug/admin read paths call this. The product write path
+    (`trace_event`) never waits for this.
     """
     if not uid:
         return
+    # The flush worker is the ONLY DB appender (started by the first
+    # _enqueue), and it acknowledges each popped item via task_done only
+    # AFTER its batch hit the DB — so unfinished_tasks == 0 is the exact
+    # "everything enqueued so far is readable" linearization point. Do not
+    # drain or append here: a reader-side drain either acks items before
+    # they are written (a concurrent reader then early-returns stale) or
+    # races the worker's get_blob→extend→set_blob with a second unlocked
+    # RMW and loses events.
     deadline = time.monotonic() + max(0.0, timeout)
-    mine: list[dict[str, Any]] = []
-    others: list[tuple[str, dict[str, Any]]] = []
-    while time.monotonic() < deadline:
-        try:
-            item_uid, event = _event_queue.get_nowait()
-        except queue.Empty:
-            break
-        if item_uid == uid:
-            mine.append(event)
-        else:
-            others.append((item_uid, event))
-    for item in others:
-        try:
-            _event_queue.put_nowait(item)
-        except queue.Full:
-            _record_drop(item[0])
-    if mine:
-        _append_events(uid, mine)
+    while time.monotonic() < deadline and _event_queue.unfinished_tasks:
+        time.sleep(0.005)
 
 
 def trace_event(

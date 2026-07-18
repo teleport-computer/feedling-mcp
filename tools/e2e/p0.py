@@ -29,7 +29,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default="", help="comma-separated cell names")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--cleanup-orphans", action="store_true",
+                    help="delete accounts left behind by crashed runs (leak manifest)")
     args = ap.parse_args()
+
+    if args.cleanup_orphans:
+        return _cleanup_orphans()
 
     pool = load_keys()
     only = {s.strip() for s in args.only.split(",") if s.strip()}
@@ -90,6 +95,56 @@ def main() -> int:
 def p0_blocks_release(results: list[dict]) -> bool:
     """A single failed cell blocks test-to-main promotion."""
     return any(result.get("result") == "fail" for result in results)
+
+
+def _cleanup_orphans() -> int:
+    """Sweep ~/.feedling-e2e-orphans: reset each leaked account with its stored
+    key. Manifest entries are removed ONLY on proof of deletion: 200 (deleted
+    now) or 404 (account already gone). 401 means the key is invalid — the
+    account may well still exist, so the entry is KEPT as the evidence trail
+    (codex2 R1). Every manifest is validated through _refuse_prod before any
+    request: a corrupted/hand-edited manifest must not let the sweeper POST a
+    destructive reset at a non-test host. Bad files are reported, kept, and
+    never abort the rest of the sweep."""
+    import json as _json
+
+    import httpx as _httpx
+
+    from tools.e2e.client import _ORPHANS_DIR, _refuse_prod
+    files = sorted(_ORPHANS_DIR.glob("*.json")) if _ORPHANS_DIR.exists() else []
+    if not files:
+        print("no orphaned e2e accounts recorded")
+        return 0
+    remaining = 0
+    for f in files:
+        try:
+            creds = _json.loads(f.read_text())
+            api_url = str(creds["api_url"])
+            user_id = str(creds["user_id"])
+            api_key = str(creds["api_key"])
+            _refuse_prod(api_url)               # the package's test-only line holds here too
+        except Exception as e:  # noqa: BLE001 — one bad manifest must not stop the sweep
+            print(f"  ❌ {f.name}: bad/unsafe manifest ({type(e).__name__}: {e}); kept")
+            remaining += 1
+            continue
+        try:
+            r = _httpx.post(f"{api_url}/v1/account/reset",
+                            headers={"X-API-Key": api_key},
+                            json={"confirm": "delete-all-data"},
+                            timeout=30, verify=False)
+        except _httpx.TransportError as e:
+            print(f"  ⏳ {user_id}: transport error ({e}); kept for next sweep")
+            remaining += 1
+            continue
+        if r.status_code in (200, 404):
+            state = "deleted" if r.status_code == 200 else "already gone (404)"
+            print(f"  ✅ {user_id}: {state}")
+            f.unlink(missing_ok=True)
+        else:
+            # 401 lands here on purpose: invalid key ≠ deleted account.
+            print(f"  ❌ {user_id}: {r.status_code} {r.text[:80]}; kept")
+            remaining += 1
+    return 1 if remaining else 0
 
 
 def _print_cell(r: dict) -> None:

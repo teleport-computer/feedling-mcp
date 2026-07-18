@@ -94,7 +94,9 @@ def _memory_content_from_action(data: dict, summary: str) -> str:
     if quote or context:
         parts.append(f"上下文: {quote or context}")
     else:
-        parts.append("上下文: 用户在对话中明确提到。")
+        # Card text is user-visible: no "用户"/system labels (and "TA" is the
+        # app surface's name for the AI). Subject-free reads naturally.
+        parts.append("上下文: 对话中明确提到。")
     follow_up = str(data.get("follow_up") or "").strip()[:1000]
     parts.append(f"使用提示: {follow_up or '自然使用这条记忆，不要机械复述。'}")
     return "\n".join(parts)

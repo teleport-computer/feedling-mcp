@@ -107,6 +107,21 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
             return {"cell": cell.name, "result": "fail", "steps": steps,
                     "user_id": c.user_id}
 
+        # -- decryption continuity (HARD P0, Seven 2026-07-18) ----------------
+        # A reply ARRIVING is not enough — the USER must decrypt it with THEIR
+        # key, or their screen is garbage while the AI keeps talking
+        # (usr_f13f922a). Strict decrypt, no server-plaintext shortcut; failure
+        # blocks the release just like a dead chat loop.
+        try:
+            dec = c.decrypt_reply(reply)
+            dec_err = ""
+        except Exception as de:  # noqa: BLE001
+            dec, dec_err = "", f"{type(de).__name__}: {de}"
+        if not step("decrypt", bool(dec.strip()),
+                    f"len={len(dec)}" if dec.strip() else (dec_err or "empty plaintext")):
+            return {"cell": cell.name, "result": "fail", "steps": steps,
+                    "user_id": c.user_id}
+
         # -- continuity -------------------------------------------------------
         sent2, err2 = _hosted_send(c, CONTINUITY_MSG)
         reply2 = c.wait_reply(sent2, timeout=NEXT_REPLY_TIMEOUT) if not err2 else None

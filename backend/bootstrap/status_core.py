@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from accounts import onboarding as accounts_onboarding
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
 from core.store import UserStore
@@ -93,14 +94,19 @@ def bootstrap_status_payload(store: UserStore) -> dict:
     candidate_ts = [t for t in (identity_updated_at, last_moment_ts, last_agent_msg_ts) if t]
     last_activity = max(candidate_ts) if (agent_connected and candidate_ts) else ""
 
-    # is_complete: identity written + live chat loop wired (resident consumer +
-    # verified loop) + at least one agent message. Memory is no longer a gate
-    # (2026-06); memories_count stays informational.
+    # Hosted model_api accounts have no independent resident consumer, so their
+    # onboarding completion cannot require a resident heartbeat or verify_loop.
+    # This mirrors the route exemption in gates._gate_bootstrap_for_chat
+    # (gates.py:137-159). Other and legacy/missing routes retain the resident
+    # completion contract. Memory is informational for every route.
+    route = accounts_onboarding._load_onboarding_route(store)
+    live_loop_complete = route == "model_api" or (
+        resident_consumer["passing"] and chat_loop_verified
+    )
     is_complete = (
         has_identity
         and agent_msg_count >= 1
-        and resident_consumer["passing"]
-        and chat_loop_verified
+        and live_loop_complete
     )
 
     return {

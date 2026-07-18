@@ -53,6 +53,22 @@ change must not be interpreted as an API guarantee.
   (Cloudflare Tunnel, Tailscale Funnel, ngrok) in front of a local MCP server
   and register its public address instead. See the
   [MCP servers workflow](/docs/workflows/mcp) for the full guide.
+- Self-signed and private-CA MCP servers no longer require pasting a CA
+  certificate. Your agent now fetches and pins the server's own trust anchor
+  automatically the first time it connects (trust-on-first-use), then
+  verifies against it on every connection after that — TLS verification
+  stays on throughout, and the server still has to hold the matching private
+  key. `ca_pem` is now optional: paste one yourself (out-of-band) for
+  stronger-than-TOFU assurance, and a manually-pasted `ca_pem` always takes
+  priority over the automatic fetch. Servers with a publicly-trusted
+  certificate (Let's Encrypt, etc.) are never pinned — auto-fetching is
+  reserved for servers that can't verify against the public roots, which keeps
+  the trust-on-first-use window as small as possible.
+  **Self-hosted residents:** the fetch shells out to `openssl`; a host without
+  that binary on `PATH` silently materializes no CA, leaving such a server
+  unreachable exactly as it was before — see [self-hosting](/docs/self-hosting).
+  See the [MCP servers workflow](/docs/workflows/mcp) for the full explanation,
+  including the TOFU exposure window.
 - Rename the `POST /v1/mcp/servers/{name}/test` error kind previously returned
   for non-public hosts from `blocked_url` to `unreachable_from_backend` — the
   backend still refuses to probe non-global addresses itself (that refusal is
@@ -70,6 +86,16 @@ change must not be interpreted as an API guarantee.
   greetings and scheduled-wake reminders still deliver. This closes the "one
   message, two near-identical replies" duplication seen when a wake and the
   chat turn answer the same moment.
+- Memory Garden cards no longer refer to the person as "用户"/"user": the
+  capture and dream transcripts label lines with the known identity names
+  (falling back to internal TA/我 markers only when unknown) instead of
+  literal `user:`/`agent:` markers, the card-writing prompts require the
+  person's name (or a natural relationship referent when unknown — never a
+  system label),
+  placeholder "names" such as 用户/user/TA stored on the identity card are
+  treated as unknown, and the hardcoded fallback line "用户在对话中明确提到"
+  is now subject-free. Dream consolidation also rewrites the old wording out
+  of existing cards over time.
 
 ### Documentation and contract
 

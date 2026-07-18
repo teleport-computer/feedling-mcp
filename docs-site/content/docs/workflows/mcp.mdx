@@ -97,10 +97,67 @@ exists on a network you already trust), not a default recommendation. Prefer
 
 ## Self-signed certificates and private CAs
 
-If your MCP server uses a certificate that isn't publicly trusted (self-signed,
-or issued by a private/internal CA), paste the **issuing CA certificate** —
-not the server's own leaf certificate — in PEM format into `ca_pem` when you
-add or update the server:
+Self-signed MCP servers work with **no configuration**: register the URL and
+nothing else. When your agent — hosted or self-hosted — connects to a server
+whose certificate doesn't chain to a public root, it fetches that server's
+certificate chain, picks the anchor, and adds that anchor to its own local
+trust store before making the real TLS connection.
+
+**This adds trust; it does not disable verification.** TLS verification
+stays on throughout: the server still has to present a certificate that
+chains to the anchor it fetched, and it still has to prove it holds the
+matching private key during the handshake. A server that merely claims to be
+yours, without that key, still fails. This is the same trust model as
+installing a corporate or personal CA in a browser; it is not "skip
+certificate checking." We deliberately rejected the alternative of skipping
+verification: `claude` can only turn TLS verification off for its whole
+process — which would also stop it from verifying its own calls to
+Anthropic — and `codex` has no such switch at all.
+
+### This is trust-on-first-use (TOFU) — say it plainly
+
+The automatic anchor is pinned at the moment your agent *first* connects to
+that server. If that specific first connection is intercepted — before your
+agent has ever reached the real server — it will pin the interceptor's
+certificate instead, and every later connection will trust the wrong party.
+This is the same exposure as SSH's "the authenticity of host '...' can't be
+established" prompt the first time you connect to a new machine. It is a
+real window, and it is the price of the zero-configuration default: nobody
+has to find an out-of-band channel to hand you a CA. When you paste `ca_pem`
+yourself (see below), the paste itself — you getting the certificate from
+wherever you got the server, not through the connection being secured — is
+that out-of-band anchor; the automatic path has no equivalent, and doesn't
+claim to.
+
+**Be precise about what a bad pin exposes.** The anchor doesn't land in a
+store scoped to that one server — it lands in your agent runtime's global
+trust store. `SSL_CERT_FILE` governs *every* outbound TLS connection `codex`
+makes, including its own calls to `api.openai.com`; `NODE_EXTRA_CA_CERTS`
+governs every one `claude` makes, including its calls to
+`api.anthropic.com`. So if the first-connection intercept succeeds, the
+attacker's CA is trusted for anything that agent talks to afterward, not
+just the MCP server you configured — this is a global trust escalation for
+that agent, not a scoped one.
+
+That global scope isn't new here: neither runtime offers per-server trust
+scoping, so the pre-existing "paste `ca_pem` yourself" path carries the same
+global exposure once a certificate is stored, and always has. What automatic
+fetching adds is narrower — it moves the moment of trust from a manual,
+out-of-band paste to a connection your agent's code initiates on its own,
+which is a connection an attacker could in principle be positioned to
+intercept. Put together: **attacker-specific TOFU window, on a global trust
+store** — a real, non-trivial exposure, but still far narrower than the
+alternative of disabling TLS verification for the whole process (which is
+open to every attacker, at every moment, with no window to miss). That
+trade-off is why this design proceeds with TOFU rather than either pasting
+being mandatory or verification being disabled.
+
+### `ca_pem` is now optional, and manual always wins
+
+Pasting the CA certificate yourself is no longer required, but it's still
+supported — it's the escape hatch for anyone who wants stronger-than-TOFU
+assurance. Fetch the CA certificate out-of-band (from wherever you obtained
+the server in the first place) and paste it into `ca_pem` in PEM format:
 
 ```json
 {
@@ -114,25 +171,53 @@ add or update the server:
 time (`invalid_ca` if it doesn't parse, `ca_too_large` if it's over the
 limit). Send an empty string to clear a previously stored CA.
 
-**This adds trust; it does not disable verification.** Registering `ca_pem`
-tells your agent's TLS client to also trust certificates issued by that CA —
-the server still has to present a certificate that chains to it, and still
-has to prove it holds the matching private key during the TLS handshake. A
-server that merely claims to be yours, without that key, still fails the
-handshake. This is the same trust model as installing a corporate or personal
-CA in a browser; it is not "skip certificate checking."
+**A manually-pasted `ca_pem` always takes priority over the automatic
+fetch.** If one is stored for a server, your agent uses it as-is and never
+attempts to fetch and pin an anchor for that server. Clearing it doesn't
+turn the automatic fetch off — it just means that server goes back to relying
+on TOFU instead of your pasted anchor.
 
-Both first-party agent runtimes verified this end-to-end against a real
-self-signed server (a real TLS handshake against a real certificate, not a
-mock):
+### Publicly-trusted servers are never touched
+
+If your server presents a certificate that already verifies against the
+public root store (Let's Encrypt, a commercial CA, etc.), your agent detects
+that and pins nothing for it — the connection just uses the ordinary system
+trust store, like any other HTTPS client. This was verified directly against
+a real Let's Encrypt-issued server: it produces no pinned CA file at all.
+
+Pinning a publicly-trusted certificate anyway wouldn't actually break on
+rotation — both delivery mechanisms are additive (`NODE_EXTRA_CA_CERTS` adds
+to Node's trust store rather than replacing it; `SSL_CERT_FILE`'s content is
+the public CA bundle *plus* whatever gets pinned), so the public roots stay
+trusted either way. The real reason to skip it is narrower and more
+important: every automatic pin is a moment of exposure, described in detail
+in the "trust-on-first-use" section above — and pinning a server that
+already verifies normally would open that window for zero benefit.
+Auto-fetching is reserved for the servers that actually need it — the
+self-signed ones — to keep that exposure as small as possible.
+
+Both first-party agent runtimes verified the self-signed path end-to-end
+against a real self-signed server (a real TLS handshake against a real
+certificate, not a mock):
 
 | Runtime | Self-signed CA support |
 | --- | --- |
 | `claude` | Supported and verified. |
 | `codex` | Supported and verified. |
 
-`has_ca` on the server record tells you whether a CA is currently stored; the
-certificate content itself is never returned by any endpoint.
+`has_ca` on the server record reports whether a **manually pasted** CA is
+currently stored — it does not reflect anchors your agent fetched and pinned
+automatically, since those live only in your agent's local runtime and are
+never sent to this backend. The certificate content itself is never returned
+by any endpoint.
+
+### Hosted-runtime users: this does not change reachability
+
+Automatic trust-anchor fetching only removes a certificate-pasting step; it
+does not open a network path. If your MCP server only exists on your home or
+office network, the hosted agent runtime still cannot reach it — see
+[Network requirements](#network-requirements) above. Put a tunnel in front of
+it and register the tunnel's public address, same as before.
 
 ## Verify a server
 
@@ -175,6 +260,13 @@ Other `400` kinds from this endpoint:
 | `http_401` / `http_403` / `http_404` / `http_4xx` / `http_5xx` | The server responded with an HTTP error status. |
 | `protocol` | The response wasn't a valid MCP handshake (bad JSON-RPC envelope, redirect, or empty SSE stream). |
 | `decrypt_failed` | The stored config could not be decrypted for this caller. |
+
+This probe runs from this backend's own network and only ever trusts a
+**manually-pasted** `ca_pem` — it does not perform the automatic
+trust-on-first-use fetch described above, because that fetch happens inside
+your agent's own runtime, not here. A self-signed server with no manually
+pasted `ca_pem` will fail this probe with `tls`; that's expected, and it
+still works fine for your agent once your agent connects to it.
 
 `404 not_found` means no server with that name exists.
 

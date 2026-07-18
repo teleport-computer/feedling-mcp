@@ -31,6 +31,33 @@ def test_prompt_falls_back_to_neutral_defaults():
     assert "（暂无卡）" in p and "（这几天没有新对话）" in p
 
 
+def test_prompt_naming_rule_and_backfill_instruction():
+    """Dream shares capture's naming rule and additionally rewrites the old
+    wording (用户/user/TA) out of existing cards while consolidating — the
+    self-healing path for cards polluted before the fix."""
+    p = build_dream_prompt(
+        ai_name="小柒", user_name="Seven", cards="", recent_conversations="",
+    )
+    assert "提到 Seven 就用「Seven」" in p
+    flat = p.replace("\n", "").replace(" ", "")
+    assert '永远不要用"用户"/"user"' in flat
+    assert "不要用「TA」指代对方" in flat
+    # Backfill is scoped: only TA that refers to the PERSON gets rewritten;
+    # TA correctly referring to the AI (the app-surface meaning) is preserved.
+    assert '把指代对方本人的"用户"/"user"/「TA」改成正确称呼' in flat
+    assert "指代你（AI）的「TA」" in flat and "保留不动" in flat
+    p2 = build_dream_prompt(ai_name="", user_name="", cards="", recent_conversations="")
+    assert "你们关系里自然的称呼" in p2
+
+
+def test_reserved_placeholder_user_name_treated_as_unknown():
+    p = build_dream_prompt(
+        ai_name="", user_name="用户", cards="", recent_conversations="",
+    )
+    assert "你们关系里自然的称呼" in p
+    assert "就用「用户」" not in p
+
+
 def test_parse_normal_consolidation():
     raw = ('{"consolidations":[{"op":"merge","card_ids":["a","b"],'
            '"result":{"bucket":"工作","threads":["加班"],"summary":"合并卡",'

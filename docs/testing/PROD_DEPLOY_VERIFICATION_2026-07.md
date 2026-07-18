@@ -10,6 +10,9 @@ docs/ENABLE_PROD_ADMIN_PASSWORD_2026-07-14.md 一并配好,顺带验证 §6)。
 
 ## 0. 部署本身
 
+- [ ] **记录发版时间线**：main CVM deploy 起止 UTC ___～___；runner CVM 起止
+      ___～___；当时 runner 拓扑（单点/双机）___。事后"连不上"投诉先对此表。
+
 - [ ] runner CVM image bump commit 出现在 main,prod 后端 `/v1/...` 正常响应。
 - [ ] **ec55ae18 singleton deploy guard**:部署流程未被门禁误拦(zhihao 执行时反馈即可);
       若被拦,说明拓扑判定误报,找我或 codex2。
