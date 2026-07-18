@@ -74,6 +74,48 @@ def test_canary_refuses_production_host() -> None:
         canary.run(config, request=lambda *_args, **_kwargs: (500, {}))
 
 
+def test_canary_refuses_plaintext_pre_transport() -> None:
+    config = canary.Config(
+        api_url="http://pre-api.feedling.app",
+        admin_token="admin",
+        provider_api_key="provider",
+    )
+    with pytest.raises(canary.CanaryFailure, match="requires HTTPS"):
+        canary.run(config, request=lambda *_args, **_kwargs: (500, {}))
+
+
+def test_http_refuses_plaintext_before_sending_credentials() -> None:
+    with pytest.raises(canary.CanaryFailure, match="requires HTTPS"):
+        canary._http(
+            "GET",
+            "http://pre-api.feedling.app/v1/admin/v2-metrics",
+            admin_token="admin-secret",
+        )
+
+
+def test_redirect_handler_never_forwards_request() -> None:
+    request = canary.urllib.request.Request(
+        "https://pre-api.feedling.app/v1/admin/v2-metrics",
+        headers={"X-Admin-Token": "admin-secret"},
+    )
+    assert canary._NoRedirectHandler().redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {},
+        "https://example.test/steal",
+    ) is None
+
+
+def test_loopback_http_remains_available_for_local_canary() -> None:
+    canary._validate_config(canary.Config(
+        api_url="http://127.0.0.1:8000",
+        admin_token="admin",
+        provider_api_key="provider",
+    ))
+
+
 def test_end_to_end_orchestration_resets_throwaway_account(monkeypatch) -> None:
     calls: list[tuple[str, str, dict]] = []
     sends = 0

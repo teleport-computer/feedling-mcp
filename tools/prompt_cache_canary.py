@@ -13,6 +13,7 @@ has no user FK, so the non-content proof remains available after cleanup.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import secrets
@@ -44,6 +45,39 @@ class Config:
 RequestFn = Callable[..., tuple[int, dict[str, Any]]]
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep credentials bound to the exact origin selected by the canary."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_transport_url(url: str, *, require_pre_host: bool) -> None:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if require_pre_host and host != "pre-api.feedling.app" and not _is_loopback(host):
+        raise CanaryFailure(
+            f"prompt-cache canary refuses non-Pre host: {host or '<empty>'}")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise CanaryFailure("prompt-cache canary refuses credentialed or fragment URLs")
+    if parsed.scheme not in {"http", "https"}:
+        raise CanaryFailure("prompt-cache canary requires an HTTP(S) URL")
+    if parsed.scheme != "https" and not _is_loopback(host):
+        raise CanaryFailure("prompt-cache canary requires HTTPS outside loopback")
+
+
 def _env_config() -> Config:
     return Config(
         api_url=os.environ.get(
@@ -60,10 +94,7 @@ def _env_config() -> Config:
 
 
 def _validate_config(config: Config) -> None:
-    host = (urllib.parse.urlparse(config.api_url).hostname or "").lower()
-    if host not in {"pre-api.feedling.app", "127.0.0.1", "localhost"}:
-        raise CanaryFailure(
-            f"prompt-cache canary refuses non-Pre host: {host or '<empty>'}")
+    _validate_transport_url(config.api_url, require_pre_host=True)
     if not config.admin_token:
         raise CanaryFailure("FEEDLING_ADMIN_TOKEN is required")
     if not config.provider_api_key:
@@ -87,6 +118,10 @@ def _http(
     admin_token: str = "",
     timeout: float = 30.0,
 ) -> tuple[int, dict[str, Any]]:
+    # Validate every request independently as defense in depth. The custom
+    # opener below refuses redirects, so secrets cannot cross origins after
+    # this exact URL has been accepted.
+    _validate_transport_url(url, require_pre_host=False)
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"Content-Type": "application/json"} if data is not None else {}
     if api_key:
@@ -96,7 +131,7 @@ def _http(
     request = urllib.request.Request(
         url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
             raw = response.read()
             payload = json.loads(raw) if raw else {}
             return int(response.status), payload if isinstance(payload, dict) else {}

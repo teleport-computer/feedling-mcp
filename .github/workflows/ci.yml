@@ -344,6 +344,7 @@ jobs:
               - 'backend/**'
               - 'tools/chat_resident_consumer.py'
               - 'tools/deploy_canary.py'
+              - 'tools/prompt_cache_canary.py'
               - 'deploy/attestation-gate.sh'
               - 'deploy/Dockerfile'
               - 'deploy/Dockerfile.agent-runner'
