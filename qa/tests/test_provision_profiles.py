@@ -1960,7 +1960,10 @@ def test_cleanup_rejects_non_strict_manifest_json_before_reset(tmp_path, raw):
     assert manifest_path.read_text(encoding="utf-8") == raw
 
 
-def test_cleanup_manifest_snapshot_keeps_manifest_after_partial_cleanup(tmp_path):
+def test_cleanup_manifest_snapshot_keeps_manifest_after_partial_cleanup(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_DELAY_SECONDS", 0)
     manifest_path = tmp_path / "manifest.json"
     manifest = {
         "schema_version": 1,
@@ -2029,6 +2032,114 @@ def test_cleanup_manifest_snapshot_can_checkpoint_success_before_unlink(tmp_path
     )
     assert manifest_path.exists() is False
 
+
+def test_diagnostic_cleanup_retries_all_pending_accounts_after_transient_rollover(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_ATTEMPTS", 3)
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_DELAY_SECONDS", 0)
+    smoke = FakeSmokeClient()
+    profiles = [
+        {
+            "profile_id": profile_id,
+            "user_id": f"user-{index}",
+            "api_key": f"account-{index}",
+        }
+        for index, profile_id in enumerate(provisioner.PROFILE_SPECS, start=1)
+    ]
+    first_round_pending = {row["api_key"] for row in profiles}
+    original_request = smoke._req
+
+    def rollover_request(method, path, *, api_key=None, body=None, **kwargs):
+        if path == "/v1/account/reset" and api_key in first_round_pending:
+            first_round_pending.remove(api_key)
+            smoke.reset_calls.append((api_key, body))
+            return 503, {"error": "deployment_rollover"}
+        return original_request(method, path, api_key=api_key, body=body, **kwargs)
+
+    monkeypatch.setattr(smoke, "_req", rollover_request)
+    manifest_path = tmp_path / "diagnostic.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "qualification_mode": "diagnostic",
+                "base_url": provisioner.ALLOWED_BASE_URL,
+                "profiles": profiles,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = provisioner.cleanup(manifest_path, env={}, client=smoke)
+
+    assert result == {
+        "attempted": len(profiles),
+        "cleaned": len(profiles),
+        "failed_profile_ids": [],
+        "manifest_deleted": True,
+        "manifest_missing": False,
+    }
+    assert first_round_pending == set()
+    assert [api_key for api_key, _body in smoke.reset_calls] == [
+        *[row["api_key"] for row in profiles],
+        *[row["api_key"] for row in profiles],
+    ]
+    assert manifest_path.exists() is False
+
+
+def test_diagnostic_cleanup_retries_only_pending_and_retains_partial_failure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_ATTEMPTS", 3)
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_DELAY_SECONDS", 0)
+    smoke = FakeSmokeClient()
+    smoke.reset_fail_for.add("account-2")
+    transient_failures = {"account-1": 1}
+    original_request = smoke._req
+
+    def partial_failure_request(method, path, *, api_key=None, body=None, **kwargs):
+        if path == "/v1/account/reset" and transient_failures.get(api_key, 0) > 0:
+            transient_failures[api_key] -= 1
+            smoke.reset_calls.append((api_key, body))
+            return 503, {"error": "deployment_rollover"}
+        return original_request(method, path, api_key=api_key, body=body, **kwargs)
+
+    monkeypatch.setattr(smoke, "_req", partial_failure_request)
+    profiles = [
+        {"profile_id": "p1", "user_id": "u1", "api_key": "account-1"},
+        {"profile_id": "p2", "user_id": "u2", "api_key": "account-2"},
+        {"profile_id": "p3", "user_id": "u3", "api_key": "account-3"},
+    ]
+    manifest_path = tmp_path / "diagnostic.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "qualification_mode": "diagnostic",
+                "base_url": provisioner.ALLOWED_BASE_URL,
+                "profiles": profiles,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = provisioner.cleanup(manifest_path, env={}, client=smoke)
+
+    assert result == {
+        "attempted": 3,
+        "cleaned": 2,
+        "failed_profile_ids": ["p2"],
+        "manifest_deleted": False,
+        "manifest_missing": False,
+    }
+    reset_keys = [api_key for api_key, _body in smoke.reset_calls]
+    assert reset_keys.count("account-1") == 2
+    assert reset_keys.count("account-2") == 3
+    assert reset_keys.count("account-3") == 1
+    assert manifest_path.exists()
+
+
 def test_adminless_diagnostic_cleanup_needs_no_admin_token(tmp_path):
     manifest_path = tmp_path / "diagnostic.json"
     manifest_path.write_text(
@@ -2057,7 +2168,8 @@ def test_adminless_diagnostic_cleanup_needs_no_admin_token(tmp_path):
     assert not manifest_path.exists()
 
 
-def test_cleanup_failure_keeps_manifest_for_retry(tmp_path):
+def test_cleanup_failure_keeps_manifest_for_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_DELAY_SECONDS", 0)
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
         json.dumps(
@@ -2114,6 +2226,7 @@ def test_cleanup_treats_already_reset_401_as_success(tmp_path):
     assert result["failed_profile_ids"] == []
     assert result["manifest_deleted"] is True
     assert not manifest_path.exists()
+    assert smoke.reset_calls == [("account-1", {"confirm": "delete-all-data"})]
     assert admin.calls == [
         (
             "POST",
@@ -2127,7 +2240,9 @@ def test_cleanup_treats_already_reset_401_as_success(tmp_path):
     ]
 
 
-def test_cleanup_401_without_admin_proof_keeps_manifest(tmp_path):
+def test_cleanup_401_without_admin_proof_keeps_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_ATTEMPTS", 3)
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_DELAY_SECONDS", 0)
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
         json.dumps(
@@ -2154,9 +2269,11 @@ def test_cleanup_401_without_admin_proof_keeps_manifest(tmp_path):
     assert result["failed_profile_ids"] == ["p1"]
     assert result["manifest_deleted"] is False
     assert manifest_path.exists()
+    assert len(smoke.reset_calls) == 3
 
 
-def test_adminless_diagnostic_cleanup_retains_ambiguous_manifest(tmp_path):
+def test_adminless_diagnostic_cleanup_retains_ambiguous_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_DELAY_SECONDS", 0)
     manifest_path = tmp_path / "diagnostic.json"
     manifest_path.write_text(
         json.dumps(
@@ -2185,7 +2302,8 @@ def test_adminless_diagnostic_cleanup_retains_ambiguous_manifest(tmp_path):
     assert manifest_path.exists()
 
 
-def test_cleanup_401_with_existing_admin_user_keeps_manifest(tmp_path):
+def test_cleanup_401_with_existing_admin_user_keeps_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr(provisioner, "CLEANUP_EVIDENCE_DELAY_SECONDS", 0)
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
         json.dumps(

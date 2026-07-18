@@ -1876,8 +1876,8 @@ def cleanup_manifest_snapshot(
         }
 
     cleaned = 0
-    failed: list[str] = []
     seen_users: set[str] = set()
+    pending: list[tuple[str, Mapping[str, Any]]] = []
     for entry in entries:
         profile_id = str(entry.get("profile_id") or "unknown")
         user_id = str(entry.get("user_id") or "")
@@ -1885,10 +1885,26 @@ def cleanup_manifest_snapshot(
             continue
         if user_id:
             seen_users.add(user_id)
-        if _reset_one(active_client, entry, verification_admin):
-            cleaned += 1
-        else:
-            failed.append(profile_id)
+        pending.append((profile_id, entry))
+
+    # A deployment rollover can transiently reject every reset in one round.
+    # Retry only accounts that have not already produced authoritative success;
+    # this keeps cleanup bounded and avoids issuing duplicate destructive calls.
+    attempts = max(1, int(CLEANUP_EVIDENCE_ATTEMPTS))
+    for attempt in range(attempts):
+        still_pending: list[tuple[str, Mapping[str, Any]]] = []
+        for profile_id, entry in pending:
+            if _reset_one(active_client, entry, verification_admin):
+                cleaned += 1
+            else:
+                still_pending.append((profile_id, entry))
+        pending = still_pending
+        if not pending:
+            break
+        if attempt + 1 < attempts:
+            time.sleep(CLEANUP_EVIDENCE_DELAY_SECONDS)
+
+    failed = [profile_id for profile_id, _entry in pending]
 
     deleted = False
     delete_failure: str | None = None
