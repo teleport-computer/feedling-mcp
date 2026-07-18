@@ -141,6 +141,58 @@ def test_matrix_separates_cot_gate_failure_from_trusted_observation():
     )
 
 
+def test_matrix_surfaces_fixed_worker_failure_observability():
+    summary = _summary("FAIL")
+    summary["orchestration"] = {
+        "result_sources": {PROFILE_ID: "deterministic_fallback"},
+        "process_exit_codes": {PROFILE_ID: 0},
+        "failure_stages": {PROFILE_ID: "STRUCTURED_RESULT"},
+        "failure_codes": {PROFILE_ID: "STRUCTURED_RESULT_INVALID"},
+    }
+
+    matrix = renderer.render_matrix(
+        summary,
+        {PROFILE_ID: _agent_pass_profile()},
+        (PROFILE_ID,),
+    )
+    header_line, profile_line = (
+        line
+        for line in matrix.splitlines()
+        if line.startswith("| Profile") or line.startswith(f"| {PROFILE_ID}")
+    )
+    headers = [cell.strip() for cell in header_line.strip("|").split("|")]
+    values = [cell.strip() for cell in profile_line.strip("|").split("|")]
+    rendered = dict(zip(headers, values, strict=True))
+
+    assert rendered["Worker source"] == "deterministic_fallback"
+    assert rendered["Worker exit"] == "0"
+    assert rendered["Worker failure stage"] == "STRUCTURED_RESULT"
+    assert rendered["Worker failure code"] == "STRUCTURED_RESULT_INVALID"
+
+
+def test_matrix_rejects_contradictory_worker_observability():
+    summary = _summary("FAIL")
+    summary["orchestration"] = {
+        "result_sources": {PROFILE_ID: "deterministic_fallback"},
+        "process_exit_codes": {PROFILE_ID: 0},
+        "failure_stages": {PROFILE_ID: "PROCESS_EXIT"},
+        "failure_codes": {PROFILE_ID: "STRUCTURED_RESULT_INVALID"},
+    }
+
+    matrix = renderer.render_matrix(
+        summary,
+        {PROFILE_ID: _agent_pass_profile()},
+        (PROFILE_ID,),
+    )
+    profile_line = next(
+        line for line in matrix.splitlines() if line.startswith(f"| {PROFILE_ID}")
+    )
+
+    assert "deterministic_fallback" not in profile_line
+    assert "STRUCTURED_RESULT_INVALID" not in profile_line
+    assert profile_line.count("UNVERIFIED") >= 4
+
+
 def test_provision_blocked_profile_renders_as_not_run_with_sanitized_code():
     summary = _summary("NOT_RUN")
     summary["provisioning"] = {

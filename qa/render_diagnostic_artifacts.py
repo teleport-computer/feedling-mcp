@@ -43,6 +43,33 @@ PROVISION_STATUS_READY = "ready"
 PROVISION_STATUS_BLOCKED = "blocked"
 PROVISION_FAILURE_NONE = "NONE"
 TRUSTED_NOT_RUN_PROVISION_FAILURE_CODES = frozenset({"VALID_KEY_REJECTED"})
+WORKER_RESULT_SOURCES = frozenset(
+    {"codex_worker", "deterministic_fallback", "provision_blocked"}
+)
+WORKER_FAILURE_CODES_BY_STAGE = {
+    "INVOCATION": frozenset({"INVOCATION_FAILED"}),
+    "PROCESS_EXIT": frozenset({"PROCESS_EXIT_NONZERO"}),
+    "OUTPUT_FILE_SET": frozenset({"OUTPUT_FILE_SET_INVALID"}),
+    "STRUCTURED_RESULT": frozenset({"STRUCTURED_RESULT_INVALID"}),
+    "EVENT_IDENTITY_PARSE": frozenset(
+        {
+            "EVENT_IDENTITY_PARSE_INVALID",
+            "EVENT_IDENTITY_DUPLICATED",
+            "EVENT_STREAM_DIGEST_INVALID",
+        }
+    ),
+    "COMMAND_EVIDENCE_PARSE": frozenset({"COMMAND_EVIDENCE_PARSE_INVALID"}),
+    "SCENARIO_COMMAND_EVIDENCE": frozenset(
+        {"AGENT_TOOL_USE_MISSING", "AGENT_SCENARIO_TOOL_USE_MISSING"}
+    ),
+    "LIVE_RECEIPT_LOAD": frozenset({"LIVE_RECEIPT_INVALID"}),
+    "LIVE_RECEIPT_PROJECTION": frozenset({"LIVE_RECEIPT_PROJECTION_INVALID"}),
+    "LIVE_RECEIPT_SHAPE": frozenset({"LIVE_RECEIPT_SHAPE_INVALID"}),
+    "LIVE_RECEIPT_BINDING": frozenset({"LIVE_RECEIPT_BINDING_INVALID"}),
+    "COT_RECEIPT_LOAD": frozenset({"COT_RECEIPT_MISSING", "COT_RECEIPT_INVALID"}),
+    "COT_BINDING": frozenset({"COT_RESULT_BINDING_MISMATCH"}),
+    "WORKER_EVIDENCE": frozenset({"WORKER_EVIDENCE_INVALID"}),
+}
 
 
 class DiagnosticRenderError(RuntimeError):
@@ -102,6 +129,60 @@ def _provisioning_dispositions(
             rows[profile_id] = ("BLOCKED", str(code), "NOT_RUN")
         else:
             return unverified
+    return rows
+
+
+def _worker_observability(
+    summary: Mapping[str, Any], profile_ids: Sequence[str]
+) -> dict[str, tuple[str, str, str, str]]:
+    """Return fixed public worker source/exit/stage/code fields or UNVERIFIED."""
+
+    unverified = {
+        profile_id: ("UNVERIFIED", "UNVERIFIED", "UNVERIFIED", "UNVERIFIED")
+        for profile_id in profile_ids
+    }
+    orchestration = summary.get("orchestration")
+    if not isinstance(orchestration, Mapping):
+        return unverified
+    sources = orchestration.get("result_sources")
+    exits = orchestration.get("process_exit_codes")
+    stages = orchestration.get("failure_stages")
+    codes = orchestration.get("failure_codes")
+    maps = (sources, exits, stages, codes)
+    expected = set(profile_ids)
+    if any(not isinstance(value, Mapping) or set(value) != expected for value in maps):
+        return unverified
+
+    rows: dict[str, tuple[str, str, str, str]] = {}
+    for profile_id in profile_ids:
+        source = sources[profile_id]
+        exit_code = exits[profile_id]
+        stage = stages[profile_id]
+        code = codes[profile_id]
+        allowed_codes = WORKER_FAILURE_CODES_BY_STAGE.get(stage)
+        if source not in WORKER_RESULT_SOURCES:
+            return unverified
+        if exit_code is not None and (
+            not isinstance(exit_code, int)
+            or isinstance(exit_code, bool)
+            or not -255 <= exit_code <= 255
+        ):
+            return unverified
+        if (stage is None) != (code is None) or (
+            code is not None and (allowed_codes is None or code not in allowed_codes)
+        ):
+            return unverified
+        if source == "provision_blocked":
+            if exit_code is not None or stage is not None:
+                return unverified
+        elif exit_code is None:
+            return unverified
+        rows[profile_id] = (
+            str(source),
+            "NONE" if exit_code is None else str(exit_code),
+            "NONE" if stage is None else str(stage),
+            "NONE" if code is None else str(code),
+        )
     return rows
 
 
@@ -216,6 +297,7 @@ def render_matrix(
     """Return a fixed-field Markdown view of the selected diagnostic matrix."""
 
     provisioning = _provisioning_dispositions(summary, profile_ids)
+    worker_observability = _worker_observability(summary, profile_ids)
     harness = summary.get("qualification_harness")
     if not isinstance(harness, Mapping):
         harness = {}
@@ -280,6 +362,10 @@ def render_matrix(
         "Provisioning",
         "Provisioning code",
         "Disposition",
+        "Worker source",
+        "Worker exit",
+        "Worker failure stage",
+        "Worker failure code",
         "Runtime",
         "COT delivery",
         "COT code",
@@ -299,6 +385,9 @@ def render_matrix(
         scenario_statuses = _scenario_statuses(profile)
         reasoning = profile.get("reasoning") if profile else None
         provision_status, provision_code, disposition = provisioning[profile_id]
+        worker_source, worker_exit, worker_stage, worker_code = worker_observability[
+            profile_id
+        ]
         if disposition == "NOT_RUN":
             profile_status = "NOT_RUN"
             runtime = "NOT_RUN"
@@ -311,6 +400,10 @@ def render_matrix(
             reasoning_tokens = "NOT_RUN"
             user_disclosure = "NOT_RUN"
             rendered_scenarios = ("NOT_RUN",) * len(SCENARIO_IDS)
+            worker_source = "provision_blocked"
+            worker_exit = "NOT_RUN"
+            worker_stage = "NOT_RUN"
+            worker_code = provision_code
         elif disposition == "UNVERIFIED":
             profile_status = "UNVERIFIED"
             runtime = "UNVERIFIED"
@@ -323,6 +416,10 @@ def render_matrix(
             reasoning_tokens = "UNVERIFIED"
             user_disclosure = "UNVERIFIED"
             rendered_scenarios = ("UNVERIFIED",) * len(SCENARIO_IDS)
+            worker_source = "UNVERIFIED"
+            worker_exit = "UNVERIFIED"
+            worker_stage = "UNVERIFIED"
+            worker_code = "UNVERIFIED"
         else:
             profile_status = (
                 _status(profile.get("status"), missing="AGENT_ERROR")
@@ -373,6 +470,10 @@ def render_matrix(
             provision_status,
             provision_code,
             profile_status,
+            worker_source,
+            worker_exit,
+            worker_stage,
+            worker_code,
             runtime,
             cot_status,
             cot_code,
