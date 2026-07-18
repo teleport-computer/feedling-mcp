@@ -94,15 +94,56 @@ def test_sanitize_clamps_dedups_truncates_drops():
         {"name": "锐利", "value": 150, "description": "x"},   # 越界 → 夹到 100
         {"name": "锐利", "value": 30, "description": "dup"},   # 重名 → 丢
         {"name": "温情", "value": -5, "description": "y"},     # 越界 → 夹到 0
-        {"name": "坏", "value": "hi", "description": "z"},      # 非数字 → 丢
-        "not-a-dict",                                           # 非 dict → 丢
+        {"name": "坏", "value": "hi", "description": "z"},      # 非数字 → capture-more 补 50
+        {"name": "", "value": 60},                              # 无名 → 丢
+        42,                                                      # 非 dict/str → 丢
     ]}
     out = card_policy.sanitize_identity_card(dirty)
     dims = out["dimensions"]
-    assert [d["name"] for d in dims] == ["锐利", "温情"]
-    assert dims[0]["value"] == 100 and dims[1]["value"] == 0
+    assert [d["name"] for d in dims] == ["锐利", "温情", "坏"]
+    assert dims[0]["value"] == 100 and dims[1]["value"] == 0 and dims[2]["value"] == 50
     # sanitize 后必然通过强校验(结构)
     assert card_policy.validate_dimensions_structure(dims) == (True, "")
+
+
+def test_normalize_dimension_value_rescales_and_rounds():
+    n = card_policy.normalize_dimension_value
+    # 0<v<=1 判定为 0–1 概率刻度误用 → ×100 还原
+    assert n(0.95) == 95
+    assert n(0.9) == 90
+    assert n(0.6) == 60
+    assert n(0.85) == 85
+    assert n(1) == 100      # 1.0 视为满分而非 1 分(高分维度语义)
+    # 常规 0–100 刻度 → 取整不变
+    assert n(95) == 95
+    assert n(0) == 0
+    assert n(100) == 100
+    assert n(87.4) == 87
+    # 越界 → clamp
+    assert n(150) == 100
+    assert n(-5) == 0
+    # 结果永远是 int(iOS JSONDecoder 只认整数)
+    for v in (0.95, 95, 0, 1, 150, -5, 87.4):
+        assert type(n(v)) is int
+
+
+def test_sanitize_rounds_non_integer_dimension_values():
+    # 自托管弱模型把 0–100 刻度当 0–1 概率吐出的浮点,必须被还原成整数分值,
+    # 否则 iOS JSONDecoder 撞上 0.95 抛 dataCorrupted → 整卡解析失败误报 decrypt failed
+    dirty = {"agent_name": "阿锐", "dimensions": [
+        {"name": "锐利", "value": 0.95, "description": "x"},
+        {"name": "温情", "value": 0.9, "description": "y"},
+        {"name": "直接", "value": 0.6, "description": "z"},
+        {"name": "克制", "value": 0.85, "description": "w"},
+        {"name": "已是整数", "value": 95, "description": "v"},
+        {"name": "满分", "value": 1, "description": "u"},
+    ]}
+    out = card_policy.sanitize_identity_card(dirty)
+    got = {d["name"]: d["value"] for d in out["dimensions"]}
+    assert got == {"锐利": 95, "温情": 90, "直接": 60, "克制": 85, "已是整数": 95, "满分": 100}
+    for d in out["dimensions"]:
+        assert type(d["value"]) is int
+    assert card_policy.validate_dimensions_structure(out["dimensions"]) == (True, "")
 
 
 def test_sanitize_truncates_to_max():
@@ -122,3 +163,52 @@ def test_sanitize_normalizes_non_list_dimensions_to_empty_list():
     assert card_policy.sanitize_identity_card({"dimensions": None})["dimensions"] == []
     assert card_policy.sanitize_identity_card({"dimensions": "nope"})["dimensions"] == []
     assert card_policy.sanitize_identity_card({})["dimensions"] == []
+
+
+def test_sanitize_adopts_score_key_as_value():
+    # prod 实卡形态(usr_56e0/usr_a7ea):弱模型用 score 键代替 value。
+    # capture-more:收编成 value(过同一套 normalize),不丢维度。
+    dirty = {"agent_name": "X", "dimensions": [
+        {"name": "占有欲", "score": 82},
+        {"name": "intellectual partner", "score": 95, "evidence": "…"},
+        {"name": "概率刻度", "score": 0.8},
+    ]}
+    out = card_policy.sanitize_identity_card(dirty)
+    got = {d["name"]: d["value"] for d in out["dimensions"]}
+    assert got == {"占有欲": 82, "intellectual partner": 95, "概率刻度": 80}
+    for d in out["dimensions"]:
+        assert type(d["value"]) is int
+        assert "score" not in d  # 收编后丢弃,别让卡里留两套分值
+    # 其它键(evidence)保留
+    assert out["dimensions"][1]["evidence"] == "…"
+
+
+def test_sanitize_value_wins_over_score_when_both_present():
+    out = card_policy.sanitize_identity_card({"dimensions": [
+        {"name": "a", "value": 70, "score": 10}]})
+    assert out["dimensions"][0]["value"] == 70
+
+
+def test_sanitize_converts_bare_string_dimension():
+    # prod 实卡形态(usr_6876):维度是裸字符串。转成 {name, value:50} 保内容。
+    out = card_policy.sanitize_identity_card({"dimensions": [
+        "温柔但有原则", "ISTJ", "", 42]})
+    dims = out["dimensions"]
+    assert [d["name"] for d in dims] == ["温柔但有原则", "ISTJ"]
+    assert all(d["value"] == 50 for d in dims)
+    # 空串和非 dict/str 元素仍然丢
+    assert len(dims) == 2
+
+
+def test_sanitize_defaults_named_dimension_without_numeric_value_to_50():
+    # prod 实卡形态(usr_c37c):只有 name+summary 没分值 → 补中位 50,保住 summary。
+    out = card_policy.sanitize_identity_card({"dimensions": [
+        {"name": "表达方式", "summary": "先给结论"},
+        {"name": "布尔坑", "value": True},
+        {"name": "文字分值", "value": "高", "description": "d"},
+    ]})
+    got = {d["name"]: d["value"] for d in out["dimensions"]}
+    assert got == {"表达方式": 50, "布尔坑": 50, "文字分值": 50}
+    assert out["dimensions"][0]["summary"] == "先给结论"
+    assert out["dimensions"][2]["description"] == "d"
+    assert card_policy.validate_dimensions_structure(out["dimensions"]) == (True, "")

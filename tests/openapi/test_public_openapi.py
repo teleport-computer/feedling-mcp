@@ -158,7 +158,8 @@ def _resolve_local_ref(document: dict[str, Any], ref: str) -> Any:
 def test_public_operation_and_parameter_inventory(
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
-    assert len(operations) == 143
+    # 144 since GET /v1/agent/perception/recent_apps (Lark t100530)
+    assert len(operations) == 144
     assert sum("requestBody" in operation for operation in operations.values()) == 65
 
     query_operations = {
@@ -167,7 +168,7 @@ def test_public_operation_and_parameter_inventory(
     header_operations = {
         key for key, operation in operations.items() if _parameters(operation, "header")
     }
-    assert len(query_operations) == 31
+    assert len(query_operations) == 32
     assert header_operations == set(EXPECTED_HEADER_OPERATIONS)
 
     for key, expected_names in EXPECTED_HEADER_OPERATIONS.items():

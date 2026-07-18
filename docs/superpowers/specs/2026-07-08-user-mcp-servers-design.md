@@ -3,6 +3,10 @@
 日期：2026-07-08
 状态：v2 已与用户确认方向（v1 的「后端代理」模型已废弃），待实施计划
 目标分支：**test**（pre 暂不稳定；test 无 pi driver，托管 driver 仅 claude/codex）
+> ⚠️ **2026-07-17 订正**：本行的「test 无 pi driver」在 2026-07-13 已过期（pi driver
+> 于 `1e01ef7e` 合流 test）。pi 现承载 gemini / openrouter / openai_compatible。
+> 本行仅作历史记录，**不得据此推论 pi 路线状态**。§11 的 pi MCP extension 已由
+> `2026-07-17-pi-user-mcp-bridge-design.md` 实施。
 
 ## 0. 一句话
 
@@ -23,7 +27,7 @@
 | 生效范围 | 仅聊天回合（proactive/后台回合不注入，避免静默消耗用户第三方 API 额度） |
 | 架构 | **配置分发**：consumer 经 poll 感知变更 → 拉信封 → enclave 解密 → 物化原生配置；后端无 MCP 代理 |
 | 落地范围 | 本仓（后端 + consumer/spawners）+ iOS 交互契约 + io-onboarding 文档更新 |
-| pi | test 分支无 pi driver，本期不涉及；pi MCP extension 列为后续项（见 §11） |
+| pi | ~~test 分支无 pi driver，本期不涉及~~ **（2026-07-13 起过期）**；pi MCP extension 见 `2026-07-17-pi-user-mcp-bridge-design.md` |
 
 ### 1.1 为什么是配置分发而不是后端代理（v1→v2 的变化）
 

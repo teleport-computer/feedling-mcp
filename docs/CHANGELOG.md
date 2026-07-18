@@ -175,6 +175,46 @@
 
 ## 2026-07-17
 
+### [FEAT] pi 路线终于能用用户 MCP 了（v2 spec §11 的后续项，欠了 4 天）
+
+- **缺口**：`_user_mcp_cli_value` 只有 claude（`--mcp-config`）和 codex
+  （`-c mcp_servers.*`）两个分支，pi 模板根本没有 `{mcp}` 占位符 → 对 pi 返回空。
+  影响 **gemini / openrouter / openai_compatible 全部托管用户**（不含 deepseek，
+  它 07-14 已回 claude driver）。iOS 的 MCP 设置页对任何路线都放行添加、无能力提示，
+  用户白配一通。usr_6f5a 的「连了 ombre brain MCP 但 AI 看不到」就是它。
+- **做法**：pi 官方无 MCP（README:491 明示），写 extension 桥
+  （`tools/pi_mcp_bridge/`，零 npm 依赖手写 MCP client，与 `mcp_probe.py` 同协议同
+  理由）读**已物化**的 `user-mcp.json`、把每个 MCP 工具注册成 pi 原生工具。
+  **数据链路一行没改**——`user_mcp_materialize.py` 的 docstring 早就写了这个文件
+  「doubles as the generic user-mcp.json」。
+- **模板必须动**：`-t bash` → `-ne -xt read,edit,write`。`-t` 是 allowlist 且
+  **对 extension 工具同样生效**（`pi --help` 明示；`agent-session.js:1867` 在工具进
+  registry 前就过滤）——不换的话桥注册的工具会被静默丢弃，`setActiveTools()` 也救不回。
+  `-ne` 补回 `-t bash` 原本提供的隔离（关掉 extension 自动发现，显式 `-e` 照常）。
+  **对无 MCP 的 pi 用户行为不变**（active 集合仍是 `["bash"]`）。
+- lane gating 白送：chat 回合注入 `-e <bridge>`，background 不注入 → 那个回合工具
+  **根本不存在**，结构性满足 v2 spec §1「不静默消耗用户第三方额度」。
+- CA 顺带修：`_user_mcp_ca_env`（已更名 `_user_mcp_child_env`）删掉 pi 的
+  early-return——pi 与 claude 同为 Node 进程，`NODE_EXTRA_CA_CERTS` 对它天然正确。
+
+### [LESSON] 一句过期事实被升级成错误结论，把一个到期的待办误销案了
+
+- 这个洞存在 4 天，不是因为难，是因为**没人回头改一句话**：v2 spec §1（07-08）写
+  「test 无 pi driver，本期不涉及」——**当时属实**；07-13 pi driver 合流 test
+  （`1e01ef7e`），该句过期但没改；07-16 的 spec 读到它，写成「**路线已放弃**」；
+  07-17 该结论被 `8cb9314b` 刻进代码注释 `# pi: route abandoned`。
+  §11 那个「等 pi driver 合流就做」的待办在 07-13 到期，却被反向**误销案**。
+  「本期不涉及」（排期）→「路线已放弃」（战略）这一步偷换，**从来没有人做过那个决定**。
+- 同一种病不是孤例：起草新 spec 时据 `Dockerfile.agent-runner:42` 的注释把 deepseek
+  写进 pi 影响面，经 `db.py:1800` / `agent_runtime_cutover.py:101` / `supervisor.py:714`
+  三处交叉核对才纠正——那句注释是 07-14 改回 claude 后没跟进的。
+- 因此新 spec §6 给**每条 pi 内部行为断言都标了源码行号证据 + 时效性声明**（全部绑定
+  pi 0.80.3，升级必须重验，且**不得在未重验时被下游文档升级成更强表述**）。
+- 已订正：v2 spec §1（标注过期而非删除——它当时是对的）、`chat_resident_consumer.py`
+  的注释、锁死错误理由的那条测试断言、Dockerfile 的 deepseek。
+  ⚠️ **遗留**：`2026-07-16-user-mcp-network-relaxation` 的 spec/plan 两处仍未订正——
+  它们是 ca-fetch 那条线**尚未提交**的产物，只存在于主工作树，不在本分支。
+
 ### [DECISION] prod runner 拓扑闸降级为警告（用户拍板）
 
 - `validate prod runner topology`（ec55ae18 今晨新增，要求 ≥2 台独立 prod

@@ -37,6 +37,19 @@ async def agent_perception(request: Request, auth: AuthResult = Depends(require_
         return _error_response(err)
 
 
+@router.get("/v1/agent/perception/recent_apps")
+async def agent_perception_recent_apps(request: Request, auth: AuthResult = Depends(require_auth)):
+    try:
+        return await threadpool.run_db(
+            perception_core.recent_apps_payload,
+            auth.store,
+            limit_raw=request.query_params.get("limit"),
+            hours_raw=request.query_params.get("hours"),
+        )
+    except perception_core.AgentRouteError as err:
+        return _error_response(err)
+
+
 @router.get("/v1/agent/perception/trend")
 async def agent_perception_trend(request: Request, auth: AuthResult = Depends(require_auth)):
     try:
