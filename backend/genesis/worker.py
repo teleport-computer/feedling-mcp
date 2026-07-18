@@ -1694,6 +1694,71 @@ def reap_stale_resident_jobs() -> list[dict]:
     return reaped
 
 
+def _unclaimed_stale_sec() -> int:
+    # Generous by design (24h default, 1h floor): an unclaimed sealed job must outlive a
+    # consumer that self-updates late or reboots and only THEN opens the distill lane —
+    # reaping too early would fail a job that was about to be claimed and lose the import.
+    return max(3600, _env_int("FEEDLING_GENESIS_UNCLAIMED_STALE_SEC", 86400))
+
+
+def _write_genesis_state_if_current(store, job: dict) -> bool:
+    """Only sync the per-user genesis_state blob when it still points at THIS job.
+
+    The blob is a per-user singleton (no job dimension), so reaping an old wedged job
+    must never clobber a newer job's state — /pending claims at limit=4, so a user with
+    5 jobs routinely has old 'awaiting_resident' rows alongside newer 'processing' ones
+    (seen in prod). If the blob already points elsewhere, fail only the ledger row.
+
+    Read-compare-write: the residual TOCTOU window is milliseconds against a
+    minute-interval daemon, and a miss self-heals on the consumer's next blob write —
+    a DB-level CAS on the shared set_blob primitive isn't worth the blast radius.
+    """
+    blob = db.get_blob(store.user_id, "genesis_state")
+    if blob is not None:
+        if not isinstance(blob, dict):
+            return False
+        if str(blob.get("job_id") or "") != str(job.get("job_id") or ""):
+            return False
+    service.write_genesis_state(store, job, status="failed")
+    return True
+
+
+def reap_stale_unclaimed_jobs() -> list[dict]:
+    """Fail sealed resident-distill jobs that no consumer ever claimed (wedged in
+    'awaiting_resident' past the cutoff — consumer running stale code that never opened the
+    distill lane, offline, or never started). The two reapers above only ever see
+    'processing', so without this backstop the app spins 'processing' forever with no error.
+    Flips to 'failed' and syncs the genesis_state blob so the app poll shows a
+    terminal/visible error instead of an eternal spinner. One bad reap doesn't stop the
+    rest."""
+    stale_sec = _unclaimed_stale_sec()
+    # Slug must NOT contain "timeout" — the notices upstream-classifier's `timed? ?out`
+    # regex would match it and mislabel this as a server outage ("服务商暂时不可用，请稍后
+    # 重试"), telling the user to retry when the real fix is updating their own consumer.
+    error = f"resident_never_claimed:{stale_sec}s"
+    reaped: list[dict] = []
+    for job in db.genesis_reap_stale_unclaimed_jobs(stale_sec, error=error):
+        user_id = str(job.get("user_id") or "")
+        job_id = str(job.get("job_id") or "")
+        if not user_id or not job_id:
+            continue
+        store = get_store(user_id)
+        try:
+            _write_genesis_state_if_current(store, job)
+        except Exception as e:  # noqa: BLE001
+            print(f"[genesis:reaper] unclaimed blob sync failed for {user_id}/{job_id}: {type(e).__name__}:{str(e)[:120]}")
+        _trace_genesis(
+            store,
+            "genesis.worker.unclaimed_stale_reaped",
+            job_id=job_id,
+            status="error",
+            summary="unclaimed resident distill job failed (never claimed past cutoff)",
+            detail={"error": error},
+        )
+        reaped.append({"user_id": user_id, "job_id": job_id})
+    return reaped
+
+
 def tick(
     *,
     api_url: str,

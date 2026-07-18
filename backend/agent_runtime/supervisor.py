@@ -1110,6 +1110,12 @@ def _genesis_worker_loop(*, api_url, enclave_url, mint_genesis, interval, stop_e
             # a resident-claimed distill job whose consumer died mid-run stayed
             # 'processing' forever (live-e2e-confirmed 2026-07-14).
             genesis_worker.reap_stale_resident_jobs()
+            # Both reapers above only see 'processing'. A sealed job that NO consumer
+            # ever claims (stale consumer code that never opened the distill lane,
+            # offline, or never started) sits 'awaiting_resident' with no timeout — the
+            # app spins "开始中" forever. Fail those past a generous cutoff (24h) so the
+            # app shows a terminal/visible error instead (prod 2026-07-17).
+            genesis_worker.reap_stale_unclaimed_jobs()
             genesis_worker.tick(api_url=api_url, enclave_url=enclave_url,
                                 mint_runtime_token=mint_genesis, max_jobs=1)
         except Exception as e:  # noqa: BLE001

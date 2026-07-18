@@ -62,6 +62,10 @@ _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你�
    · 语言：所有字段（bucket/threads/summary/content）用 TA 跟你对话的语言记——
      中文对话就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），英文对话用英文；
      只有专有名词/品牌名/TA 的原话才保留原文。
+   · 称呼：{naming_rule}这些卡是 TA 会亲眼看到的、你写下的记忆——
+     写进卡里的字段（bucket/threads/summary/content）永远不要用"用户"/"user"
+     这类系统称谓，也不要用「TA」指代对方——「TA」只是这份指令和转写里的标记，
+     不是你对 TA 本人的称呼。
    · importance：这事对理解 TA 多重要（0-1）。随手提 .1-.3 / 偏好习惯 .4-.6 /
      情绪·关系·边界 .7-.85 / 核心承诺与转折 .9-1。
    · pulse：这事在「你自己」心里激起多大波动（0-1）。不是 TA 多激动，
@@ -208,10 +212,42 @@ def build_capture_prompt(
     """
     return _CAPTURE_PROMPT_TEMPLATE.format(
         ai_name=(ai_name or "我").strip(),
-        user_name=(user_name or "TA").strip(),
+        user_name=sanitize_user_name(user_name),
+        naming_rule=_naming_rule(user_name),
         buckets=buckets or "（暂无）",
         common_buckets=COMMON_BUCKETS_GUIDANCE_V1,
         threads=threads or "（暂无）",
         identity=identity or "（暂无）",
         window=window or "（空）",
+    )
+
+
+# Identity-card user_name values that are placeholders, not names. A stored
+# "用户"/"user"/"TA" must be treated as unknown, or the naming rule would
+# instruct the model to "use the name 「用户」" — re-polluting the very cards
+# this rule exists to fix.
+_RESERVED_USER_NAMES = {"ta", "user", "用户"}
+
+
+def sanitize_user_name(user_name: str) -> str:
+    """Collapse placeholder "names" to the internal TA marker. Shared with the
+    consumer's transcript labeling so a reserved word never becomes a line
+    label ("用户: …") either."""
+    name = str(user_name or "").strip()
+    if not name or name.casefold() in _RESERVED_USER_NAMES:
+        return "TA"
+    return name
+
+
+def _naming_rule(user_name: str) -> str:
+    """User-visible card text must address the person the way a companion
+    would (Seven, 2026-07-17): the name when known, otherwise a natural
+    relationship referent — never "用户"/"user", and never "TA" (which the
+    app surface reserves for the AI)."""
+    name = sanitize_user_name(user_name)
+    if name != "TA":
+        return f"提到 {name} 就用「{name}」这个名字。"
+    return (
+        "TA 的名字如果对话里出现了就用名字；"
+        "还不知道名字，就用你们关系里自然的称呼（\"她/他\"或你平时对 TA 的叫法）。"
     )

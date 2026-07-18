@@ -23,6 +23,7 @@ from core import wake_bus as core_wake_bus
 
 import db
 import debug_trace
+from chat import idempotency as chat_idempotency
 from chat import service as chat_service
 from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
@@ -49,6 +50,9 @@ def model_api_chat_send_core(
     JSON body (``request.get_json(silent=True) or {}`` / ``read_json_silent``).
     """
     trace_start = time.time()
+    client_msg_id, client_msg_id_err = chat_idempotency.parse_client_msg_id(payload)
+    if client_msg_id_err is not None:
+        return client_msg_id_err
     image_bytes, image_mime, image_err = hosted_turn._model_api_image_payload(payload)
     if image_err:
         return {"error": "invalid_image", "detail": image_err}, 400
@@ -275,26 +279,26 @@ def model_api_chat_send_core(
     ]
     if quoted_memory_ids:
         extra["quoted_memory_ids"] = ",".join(quoted_memory_ids[:8])
-    # A7: for the v2 send path, the message INSERT and its chat-job
-    # enqueue/coalesce must land in ONE DB transaction, so a crash between
-    # them can never orphan a persisted-but-never-enqueued message. The
-    # generation is read ONCE, before the append, and the trace_id is derived
-    # from the envelope's own id (the same value append_chat will use as the
-    # stored message's msg_id) — both must be known before the call since the
-    # enqueue now happens INSIDE store.append_chat via db.chat_append_and_enqueue,
-    # not as a separate call afterward.
-    _envelope_id = user_env.get("id")
-    _trace_id = str(_envelope_id) if isinstance(_envelope_id, str) and _envelope_id else None
-    try:
-        user_row = store.append_chat(
-            "user",
-            "model_api",
-            user_env,
-            content_type="image" if has_image else ("file" if has_file else "text"),
-            extra=extra or None,
-            strict=_v2_mode,
-            enqueue=(
-                {
+    if _v2_mode:
+        # A7: for the v2 send path, the message INSERT and its chat-job
+        # enqueue/coalesce must land in ONE DB transaction, so a crash between
+        # them can never orphan a persisted-but-never-enqueued message. The
+        # generation is read ONCE, before the append, and the trace_id is derived
+        # from the envelope's own id (the same value append_chat will use as the
+        # stored message's msg_id) — both must be known before the call since the
+        # enqueue now happens INSIDE store.append_chat via db.chat_append_and_enqueue,
+        # not as a separate call afterward.
+        _envelope_id = user_env.get("id")
+        _trace_id = str(_envelope_id) if isinstance(_envelope_id, str) and _envelope_id else None
+        try:
+            user_row = store.append_chat(
+                "user",
+                "model_api",
+                user_env,
+                content_type="image" if has_image else ("file" if has_file else "text"),
+                extra=extra or None,
+                strict=_v2_mode,
+                enqueue={
                     "lane": "chat",
                     "reason": "chat_send",
                     "trace_id": _trace_id,
@@ -303,27 +307,58 @@ def model_api_chat_send_core(
                     "expected_runtime_mode": (
                         hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
                     ),
-                }
-                if _v2_mode else None
-            ),
-        )
-    except db.RuntimeControlChangedError:
-        debug_trace.trace_event(
-            store, subsystem="route", type="route.decided",
-            actor="host_agent_runtime", status="gated",
-            summary="runtime_control_changed",
-            detail={"mode": "blocked", "reason": "runtime_control_changed"},
-        )
-        return {"error": "runtime_control_changed"}, 503
-    store.notify_chat_waiters()
+                },
+            )
+        except db.RuntimeControlChangedError:
+            debug_trace.trace_event(
+                store, subsystem="route", type="route.decided",
+                actor="host_agent_runtime", status="gated",
+                summary="runtime_control_changed",
+                detail={"mode": "blocked", "reason": "runtime_control_changed"},
+            )
+            return {"error": "runtime_control_changed"}, 503
+        # The v2 atomic path always inserts (it carries no client-msg-id dedup);
+        # the shared notify/trace below keys off `inserted`.
+        inserted = True
+    else:
+        # Legacy (resident) send with client-msg-id dedup (origin/test): a
+        # re-sent client_msg_id recovers the original row instead of double-
+        # inserting, and the assistant reply may already be posted.
+        inserted = True
+        if client_msg_id is not None:
+            user_row, inserted = store.append_chat_idempotent(
+                "user",
+                "model_api",
+                user_env,
+                client_msg_id=client_msg_id,
+                window_sec=chat_idempotency.CLIENT_MSG_ID_WINDOW_SEC,
+                content_type="image" if has_image else ("file" if has_file else "text"),
+                extra=extra or None,
+            )
+        else:
+            user_row = store.append_chat(
+                "user",
+                "model_api",
+                user_env,
+                content_type="image" if has_image else ("file" if has_file else "text"),
+                extra=extra or None,
+            )
+    if inserted:
+        store.notify_chat_waiters()
 
     # image turn 不再被挡在 legacy；consumer 已能处理图片 envelope。
     _turn_id = str(user_row.get("id") or "") if isinstance(user_row, dict) else ""
-    debug_trace.trace_event(
-        store, subsystem="route", type="route.decided", actor="host_agent_runtime",
-        turn_id=_turn_id, summary="agent_runtime",
-        detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
-    )
+    if inserted:
+        debug_trace.trace_event(
+            store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+            turn_id=_turn_id, summary="agent_runtime",
+            detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
+        )
+    else:
+        # The assistant reply may have been posted through another worker since
+        # this store's last wake refresh. Reload before the existing response
+        # builder checks for it; this does not notify or re-run the turn.
+        store.reload()
     if _v2_mode:
         # 落加密用户消息 + 入队/合并 chat job 已经在上方 append_chat 内一个事务里原子
         # 完成（db.chat_append_and_enqueue，spec A7）；这里只需唤醒 worker 池，快速

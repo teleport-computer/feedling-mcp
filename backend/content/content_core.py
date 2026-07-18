@@ -404,8 +404,8 @@ def _build_rewrapped_envelope(
         return None, "skipped_local_only", ""
     if not record.get("K_enclave"):
         return None, "skipped_missing_enclave_key", ""
-    # 已是当前钥 → 跳过,不进 enclave。仅 rewrap 会盖 content_pk_fpr,故字段与
-    # K_user 始终由同一 env 原子写入、二者一致可信。
+    # 已是当前钥 → 跳过,不进 enclave。content_pk_fpr 由 build_envelope 在
+    # seal 时与 K_user 同一 env 原子写入(rewrap 落盘时再盖一次),二者一致可信。
     if current_fpr and record.get("content_pk_fpr") == current_fpr:
         return None, "skipped_already_current", ""
     try:

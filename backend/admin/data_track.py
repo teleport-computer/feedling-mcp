@@ -2171,7 +2171,9 @@ def _render_data_track_dau_page(payload: dict) -> str:
             f"<td>{int(row.get('user_messages') or 0)}</td>"
             f"<td>{int(row.get('tracking_events') or 0)}</td>"
             f"<td>{int(row.get('session_dau') or 0)}</td>"
-            f"<td><b>{_fmt_duration_sec(row.get('avg_session_sec'))}</b></td>"
+            # 人均日使用时长 = 当天总前台时长 / 使用DAU(每个活跃用户当天实际用了多久)。
+            # 之前是 avg_session_sec(每次会话均长),被大量前后台切换的微会话拉低,误导。
+            f"<td><b>{_fmt_duration_sec((row.get('foreground_sec') or 0) / (row.get('session_dau') or 1))}</b></td>"
             f"<td>{int(row.get('session_count') or 0)}</td>"
             f"<td>{html.escape(_bj_iso(row.get('last_at')))}</td>"
             "</tr>"
@@ -2231,10 +2233,10 @@ def _render_data_track_dau_page(payload: dict) -> str:
     {_cutover_html}
   </div>
   <div class="muted">{html.escape(definition.get("dau") or "")} {html.escape(definition.get("excluded") or "")}</div>
-  <div class="muted">使用DAU=当天有 app 使用时长上报的用户数；平均使用时长=当天所有会话的平均前台时长；会话数=当天 app_session_end 事件数。前台被杀会漏报，略偏低估。均按北京日。</div>
+  <div class="muted">使用DAU=当天有 app 后台上报（app_session_end 事件）的用户数；人均日使用时长=当天总前台时长÷使用DAU（每个活跃用户当天实际用了多久，比"每次会话均长"更贴合直觉）；会话数=当天 app_session_end 事件数（含大量前后台切换的微会话）。前台被强杀会漏报，略偏低估。均按北京日。</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>平均使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
+    <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>人均日使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='12' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
   </table>
 </main>

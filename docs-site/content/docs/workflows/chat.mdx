@@ -33,6 +33,7 @@ Content-Type: application/json
 X-API-Key: YOUR_FEEDLING_API_KEY
 
 {
+  "client_msg_id": "76ba05cf-d6ee-45af-a1e6-091dbd8c1f0a",
   "message": "Use the selected memory to help me plan tomorrow.",
   "context_refs": [
     {
@@ -43,6 +44,13 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   ]
 }
 ```
+
+Generate and persist one UUID as `client_msg_id` before the first send. If the
+request times out or its `202` response is lost, retry with the same UUID. For
+600 seconds from the first accepted row, the server returns that row's original
+`user_message` reference and does not store, wake, or run a second turn. The key
+is scoped to the authenticated user and works across both Chat ingest paths.
+Omitting it preserves the legacy non-idempotent behavior.
 
 For an image turn, add `image_b64` and `image_mime`. The decoded image limit is
 2,000,000 bytes and the supported MIME types are JPEG, PNG, WebP, and GIF.
@@ -188,6 +196,7 @@ Content-Type: application/json
 X-API-Key: YOUR_FEEDLING_API_KEY
 
 {
+  "client_msg_id": "76ba05cf-d6ee-45af-a1e6-091dbd8c1f0a",
   "envelope": {
     "v": 1,
     "id": "env_user_123",
@@ -202,6 +211,12 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   "content_type": "text"
 }
 ```
+
+On an ambiguous network failure, retry with the same `client_msg_id`. The
+envelope may have a new encrypted `id`; within the 600-second window the server
+still returns the first stored row in the same `{id, ts, v}` response shape and
+does not wake the resident consumer again. An invalid UUID returns
+`400 client_msg_id_invalid`.
 
 For `content_type: "file"`, `file_name` and `file_mime` are optional metadata.
 

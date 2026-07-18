@@ -12,6 +12,23 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- `POST /v1/model_api/chat/send` and `POST /v1/chat/message` now accept an
+  optional UUID `client_msg_id`. Reusing the same value for the same user within
+  600 seconds returns the first stored user row without appending or waking a
+  second agent turn, including when a retry switches between the two ingest
+  paths. Invalid values return `400 client_msg_id_invalid`; requests that omit
+  the field retain their previous behavior.
+- Encrypted envelopes now carry an optional `content_pk_fpr` label (first
+  16 hex chars of SHA-256 of the user public key `K_user` was sealed to);
+  server- and consumer-built envelopes set it automatically. `POST
+  /v1/chat/message` and `POST /v1/chat/response` reject a labeled envelope
+  whose fingerprint no longer matches the user's registered content key with
+  a new `409 content_pk_fpr_mismatch` error (response includes
+  `current_public_key_fpr` and `envelope_content_pk_fpr`) — a writer holding
+  a stale key cache should re-fetch `whoami`, re-seal, and retry once.
+  Unlabeled envelopes are accepted unchanged, so existing clients are
+  unaffected. This closes the failure mode where a writer with a stale key
+  seals messages the owner's device can never decrypt.
 - Expand `GET /healthz` from a fixed liveness stub into a structured
   liveness-and-dependency probe. Responses now carry a top-level `status`
   (`healthy`, `degraded`, or `unhealthy`), a `checks` object with per-component
@@ -43,6 +60,26 @@ change must not be interpreted as an API guarantee.
   rejection when the server had, in fact, already saved successfully. Clients
   matching on the literal string `blocked_url` for this case must update to
   `unreachable_from_backend`.
+
+### Behavior
+
+- Proactive wake bubbles no longer post on top of an active conversation: right
+  before delivery, the consumer re-checks the latest chat rows and skips the
+  wake (recorded as `skipped` / `chat_collision`) when a user message or an
+  agent chat reply landed within the last 90 seconds. One-shot introduction
+  greetings and scheduled-wake reminders still deliver. This closes the "one
+  message, two near-identical replies" duplication seen when a wake and the
+  chat turn answer the same moment.
+- Memory Garden cards no longer refer to the person as "用户"/"user": the
+  capture and dream transcripts label lines with the known identity names
+  (falling back to internal TA/我 markers only when unknown) instead of
+  literal `user:`/`agent:` markers, the card-writing prompts require the
+  person's name (or a natural relationship referent when unknown — never a
+  system label),
+  placeholder "names" such as 用户/user/TA stored on the identity card are
+  treated as unknown, and the hardcoded fallback line "用户在对话中明确提到"
+  is now subject-free. Dream consolidation also rewrites the old wording out
+  of existing cards over time.
 
 ### Documentation and contract
 

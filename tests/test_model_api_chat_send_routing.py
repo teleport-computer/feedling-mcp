@@ -391,6 +391,128 @@ def test_send_configured_routes_to_agent_runner(client, monkeypatch):
     assert calls == ["pi"], f"expected driver='pi', got {calls}"
 
 
+def test_send_client_msg_id_deduplicates_hosted_and_cross_route_retry(client, monkeypatch):
+    """The incident path (hosted send, lost response, resident-route retry)
+    must keep one user row and return the first row pointer from both APIs."""
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder()
+    )
+    _setup_openrouter(client, api_key, monkeypatch)
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-or-test",
+    )
+    monkeypatch.setattr(
+        agent_runtime_cutover, "wait_for_reply", lambda *args, **kwargs: None
+    )
+    key = "5968A42D-D06A-4B9B-B183-8BCB47E44CB4"
+
+    first = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "hello", "client_msg_id": key},
+        headers=_headers(api_key),
+    )
+    cross_route = client.post(
+        "/v1/chat/message",
+        json={
+            "envelope": _chat_envelope(user_id, "retry-new-envelope"),
+            "client_msg_id": key.lower(),
+        },
+        headers=_headers(api_key),
+    )
+    hosted_retry = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "hello", "client_msg_id": key.lower()},
+        headers=_headers(api_key),
+    )
+
+    assert first.status_code == hosted_retry.status_code == 202
+    assert cross_route.status_code == 200
+    first_body = first.get_json()
+    retry_body = hosted_retry.get_json()
+    assert retry_body == first_body
+    assert cross_route.get_json()["id"] == first_body["user_message"]["id"]
+    store = core_store.get_store(user_id)
+    rows = [
+        row for row in store.chat_messages
+        if row.get("role") == "user" and row.get("client_msg_id") == key.lower()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["source"] == "model_api"
+
+
+def test_send_rejects_invalid_client_msg_id_before_append(client):
+    user_id, api_key = _register(client)
+    response = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "hello", "client_msg_id": "not-a-uuid"},
+        headers=_headers(api_key),
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "error": "client_msg_id_invalid",
+        "detail": "client_msg_id must be a UUID string",
+    }
+    store = core_store._stores.get(user_id)
+    assert store is None or not [
+        row for row in store.chat_messages if row.get("role") == "user"
+    ]
+
+
+def test_send_duplicate_reports_assistant_that_already_exists(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder()
+    )
+    _setup_openrouter(client, api_key, monkeypatch)
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-or-test",
+    )
+    # Keep the test fast while exercising the real ready/processing builders.
+    monkeypatch.setattr(
+        agent_runtime_cutover,
+        "wait_for_reply",
+        lambda store, message_id, **_kwargs: agent_runtime_cutover.find_reply_row(
+            store, message_id
+        ),
+    )
+    key = "13fc8cc4-45f8-4867-8e98-bcfcc89e3b1f"
+    first = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "hello", "client_msg_id": key},
+        headers=_headers(api_key),
+    )
+    assert first.status_code == 202
+    assert first.get_json()["reply_ready"] is False
+
+    store = core_store.get_store(user_id)
+    parent_id = first.get_json()["user_message"]["id"]
+    reply = store.append_chat(
+        "openclaw", "model_api", _chat_envelope(user_id, "already-replied")
+    )
+    store.update_chat_message_metadata(
+        parent_id,
+        {"reply_status": "replied", "reply_message_id": reply["id"]},
+    )
+
+    duplicate = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "hello", "client_msg_id": key},
+        headers=_headers(api_key),
+    )
+
+    assert duplicate.status_code == 202
+    body = duplicate.get_json()
+    assert body["reply_ready"] is True
+    assert body["user_message"]["id"] == parent_id
+    assert body["assistant_message"]["id"] == reply["id"]
+
+
 def test_send_image_turn_also_routes(client, monkeypatch):
     """图片 turn 不再被 should_route 拦在 legacy，也走 agent-runner（返回 202）。"""
     user_id, api_key = _register(client)

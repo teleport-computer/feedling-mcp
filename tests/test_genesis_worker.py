@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client  # noqa: E402
-from genesis import worker  # noqa: E402
+from genesis import prompts, worker  # noqa: E402
 
 
 def _chunk(seq: int, body: bytes = b"ct") -> dict:
@@ -787,6 +787,10 @@ def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatc
             task_id = kwargs["task_id"]
             llm_calls.append({"task_id": task_id, "messages": kwargs["messages"]})
             if task_id.startswith("fact-write"):
+                system = kwargs["messages"][0]["content"]
+                assert prompts.FACT_WRITE_KEEP_ALL_SUFFIX in system
+                assert "date 或 occurred_at" in system
+                assert "tags" in system and "threads" in system
                 payload = json.loads(kwargs["messages"][1]["content"])
                 assert payload["fact_digest"] == []
                 assert payload["persona_material"] == ""

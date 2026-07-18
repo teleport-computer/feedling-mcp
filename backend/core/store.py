@@ -338,6 +338,124 @@ class UserStore:
             return
         wake_bus.notify(channel, self.user_id)
 
+    def _build_chat_message(
+        self,
+        role: str,
+        source: str,
+        envelope: dict,
+        content_type: str = "text",
+        extra: dict | None = None,
+    ) -> dict:
+        """Build the stored form of a v1 ciphertext chat message.
+
+        The client supplies the envelope's `id`, which becomes the stored
+        message id so the AEAD additional-data the client baked in
+        (owner||v||id) stays verifiable by the enclave on read-back.
+
+        `content_type` is plaintext metadata: "text" (default), "image", or
+        "file". Used by clients/enclave to render the decrypted bytes
+        correctly — the envelope itself only carries opaque bytes; the type
+        tag tells the renderer to show a string, decode JPEG, or offer a
+        file download (with `file_name`/`file_mime` extras, see below).
+        """
+        msg_id = envelope.get("id") if isinstance(envelope.get("id"), str) and envelope["id"] else uuid.uuid4().hex
+        ct = content_type if content_type in ("text", "image", "file") else "text"
+
+        msg: dict = {
+            "id": msg_id,
+            "role": role,
+            "ts": time.time(),
+            "source": source,
+            "v": envelope.get("v", 1),
+            "body_ct": envelope["body_ct"],
+            "nonce": envelope["nonce"],
+            "K_user": envelope["K_user"],
+            "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+            # Seal-time label of the user pk K_user was wrapped to; rewrap's
+            # skip logic reads it off the stored row (empty for old clients).
+            "content_pk_fpr": envelope.get("content_pk_fpr", ""),
+            "visibility": envelope.get("visibility", "shared"),
+            "owner_user_id": envelope.get("owner_user_id", self.user_id),
+            "content_type": ct,
+        }
+        # Synthetic verify pings are not real user content and are removed
+        # after /v1/chat/verify_loop completes. They still need plaintext
+        # while resident consumers are polling, because local_only synthetic
+        # envelopes intentionally do not carry K_enclave and therefore cannot
+        # be decrypted through the normal enclave/MCP history path.
+        if source == "verify_ping" and envelope.get("synthetic_marker"):
+            msg["content"] = envelope["synthetic_marker"]
+        if envelope.get("K_enclave") is not None:
+            msg["K_enclave"] = envelope["K_enclave"]
+        if extra:
+            for key in (
+                "gate_decision_id",
+                "proactive_job_id",
+                "notice_kind",
+                "alert_preview",
+                "push_body_preview",
+                "push_live_activity_requested",
+                "live_activity_status",
+                "live_activity_reason",
+                "live_activity_activity_id",
+                "live_activity_mode",
+                "alert_status",
+                "alert_reason",
+                "push_decision",
+                "push_reason",
+                "app_presence_phase",
+                "app_presence_age_sec",
+                "model_api_kind",
+                # Comma-joined memory ids the user explicitly referenced for
+                # this turn (Garden「talk in chat」). Plaintext ids only; the
+                # enclave expands them into decrypted memory context on read.
+                "quoted_memory_ids",
+                "image_mime",
+                "file_name",
+                "file_mime",
+                # Optional client operation UUID. Plaintext routing metadata
+                # only: it identifies a logical send retry but carries no
+                # message content and is not part of the E2EE envelope.
+                "client_msg_id",
+                "caption_v",
+                "caption_id",
+                "caption_body_ct",
+                "caption_nonce",
+                "caption_K_user",
+                "caption_K_enclave",
+                "caption_enclave_pk_fpr",
+                "caption_content_pk_fpr",
+                "caption_visibility",
+                "caption_owner_user_id",
+                "thinking_v",
+                "thinking_id",
+                "thinking_body_ct",
+                "thinking_nonce",
+                "thinking_K_user",
+                "thinking_K_enclave",
+                "thinking_enclave_pk_fpr",
+                "thinking_content_pk_fpr",
+                "thinking_visibility",
+                "thinking_owner_user_id",
+                "thinking_kind",
+                "thinking_source",
+                "thinking_model",
+                "thinking_native",
+                "reply_claimed_by",
+                "reply_claimed_at",
+                "reply_claim_expires_at",
+                "reply_status",
+                "reply_message_id",
+                "replied_by",
+                "replied_at",
+            ):
+                value = extra.get(key)
+                if isinstance(value, str) and value.strip():
+                    msg[key] = value.strip()
+                elif isinstance(value, bool):
+                    msg[key] = value
+        return msg
+
     def append_chat(
         self,
         role: str,
@@ -353,9 +471,7 @@ class UserStore:
         resident_reply_to: str | None = None,
         resident_replied_by: str = "",
     ) -> dict:
-        """Append a v1 ciphertext chat message. `envelope` holds the AEAD
-        payload. See docs/DESIGN_E2E.md §3.2 for field definitions. Server
-        never decrypts — the envelope is stored verbatim.
+        """Build the stored form of a v1 ciphertext chat message.
 
         The client supplies the envelope's `id`, which becomes the stored
         message id so the AEAD additional-data the client baked in
@@ -413,6 +529,9 @@ class UserStore:
             "nonce": envelope["nonce"],
             "K_user": envelope["K_user"],
             "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+            # Seal-time label of the user pk K_user was wrapped to; rewrap's
+            # skip logic reads it off the stored row (empty for old clients).
+            "content_pk_fpr": envelope.get("content_pk_fpr", ""),
             "visibility": envelope.get("visibility", "shared"),
             "owner_user_id": envelope.get("owner_user_id", self.user_id),
             "content_type": ct,
@@ -452,6 +571,10 @@ class UserStore:
                 "image_mime",
                 "file_name",
                 "file_mime",
+                # Optional client operation UUID. Plaintext routing metadata
+                # only: it identifies a logical send retry but carries no
+                # message content and is not part of the E2EE envelope.
+                "client_msg_id",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",
@@ -459,6 +582,7 @@ class UserStore:
                 "caption_K_user",
                 "caption_K_enclave",
                 "caption_enclave_pk_fpr",
+                "caption_content_pk_fpr",
                 "caption_visibility",
                 "caption_owner_user_id",
                 "thinking_v",
@@ -468,6 +592,7 @@ class UserStore:
                 "thinking_K_user",
                 "thinking_K_enclave",
                 "thinking_enclave_pk_fpr",
+                "thinking_content_pk_fpr",
                 "thinking_visibility",
                 "thinking_owner_user_id",
                 "thinking_kind",
@@ -578,6 +703,64 @@ class UserStore:
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return msg
+
+    def append_chat_idempotent(
+        self,
+        role: str,
+        source: str,
+        envelope: dict,
+        *,
+        client_msg_id: str,
+        window_sec: int,
+        content_type: str = "text",
+        extra: dict | None = None,
+    ) -> tuple[dict, bool]:
+        """Append one logical client send, atomically across backend workers.
+
+        Returns ``(winner, inserted)``. A duplicate reconciles the authoritative
+        database winner into this worker's cache but deliberately emits none of
+        append_chat's wake/capture side effects. Database failures propagate:
+        failing closed is required because treating an unavailable lookup as a
+        miss could start a duplicate turn.
+        """
+        metadata = dict(extra or {})
+        metadata["client_msg_id"] = client_msg_id
+        candidate = self._build_chat_message(
+            role, source, envelope, content_type, metadata
+        )
+        winner, inserted = db.chat_append_idempotent(
+            self.user_id,
+            str(candidate["id"]),
+            float(candidate["ts"]),
+            candidate,
+            MAX_CHAT_MESSAGES,
+            client_msg_id=client_msg_id,
+            window_sec=window_sec,
+        )
+
+        with self.chat_lock:
+            replaced = False
+            for index, existing in enumerate(self.chat_messages):
+                if str(existing.get("id") or "") == str(winner.get("id") or ""):
+                    self.chat_messages[index] = dict(winner)
+                    replaced = True
+                    break
+            if not replaced:
+                self.chat_messages.append(dict(winner))
+            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
+                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+
+        if not inserted:
+            return winner, False
+
+        wake_bus.notify("chat", self.user_id)
+        try:
+            from proactive import capture_scheduler
+
+            capture_scheduler.record_chat_append(self, winner)
+        except Exception as e:
+            print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
+        return winner, True
 
     # ------- world book -------
     def _load_world_books(self):

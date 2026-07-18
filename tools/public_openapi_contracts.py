@@ -351,6 +351,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "visibility": {"type": "string", "enum": ["shared", "local_only"]},
             "owner_user_id": {"type": "string"},
             "enclave_pk_fpr": {"type": "string"},
+            "content_pk_fpr": {
+                "type": "string",
+                "description": "Optional label: first 16 hex chars of SHA-256 of the "
+                               "user public key K_user was sealed to. When present on a "
+                               "chat write and it does not match the user's currently "
+                               "registered content key, the write is rejected with 409 "
+                               "content_pk_fpr_mismatch — re-fetch whoami and re-seal.",
+            },
         },
         "if": {
             "properties": {"visibility": {"const": "shared"}},
@@ -523,6 +531,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     "HostedChatSendRequest": {
         "type": "object",
         "properties": {
+            "client_msg_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Optional logical-send identifier. Reusing it for the same user within 600 seconds returns the first stored user message without starting another turn.",
+            },
             "message": {"type": "string", "maxLength": 12000, "example": "Help me plan tomorrow."},
             "content": {"type": "string", "maxLength": 12000, "deprecated": True, "description": "Compatibility alias for message."},
             "context_refs": {"type": "array", "maxItems": 8, "items": {"$ref": "#/components/schemas/ChatContextReference"}},
@@ -569,6 +582,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": ["envelope"],
         "properties": {
             "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "client_msg_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Optional logical-send identifier. Reusing it for the same user within 600 seconds returns the first stored row and emits no second consumer wake.",
+            },
             "content_type": {"type": "string", "enum": ["text", "image", "file"], "default": "text"},
             "file_name": {"type": "string"},
             "file_mime": {"type": "string"},
@@ -998,6 +1016,8 @@ SPECIAL_REQUEST_BODIES: dict[Operation, dict[str, Any]] = {
 
 
 OPERATION_DESCRIPTIONS: dict[Operation, str] = {
+    ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
+    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
     ("get", "/v1/chat/history"): "Read encrypted chat history using timestamp watermarks. Use oldest_ts as before for older pages and latest_ts as since for newer pages.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",

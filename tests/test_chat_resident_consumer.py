@@ -3587,6 +3587,318 @@ def test_process_proactive_v2_sleep_marks_completed_without_post(monkeypatch):
     assert completed[-1][3]["extra"]["wake_result"] == "sleep"
 
 
+def test_is_degenerate_proactive_reply_classification():
+    # Relay-truncated fragments: whitespace/punctuation only → degenerate.
+    for text in (".", "。", "…", "……", "?!", "——", "", "   ", "\n", None, ". .", "、"):
+        assert crc._is_degenerate_proactive_reply(text), repr(text)
+    # Anything with a letter, digit, CJK char or emoji is real content.
+    for text in ("嗯", "在忙吗?", "ok.", "1", "🌙", "好~", "Hi"):
+        assert not crc._is_degenerate_proactive_reply(text), repr(text)
+
+
+def _degenerate_test_harness(monkeypatch, agent_result):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    captured = {"statuses": [], "posted": [], "failures": []}
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: agent_result,
+    )
+    monkeypatch.setattr(
+        crc,
+        "post_reply",
+        lambda reply, **kwargs: (captured["posted"].append(reply), {"id": f"msg_{len(captured['posted'])}"})[1],
+    )
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(
+        crc,
+        "_notify_agent_turn_failure",
+        lambda exc, *, foreground: captured["failures"].append((str(exc), foreground)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    return captured
+
+
+def test_process_proactive_degenerate_only_reply_fails_without_post(monkeypatch):
+    """A relay-truncated turn whose ONLY output is a bare "." must not become
+    an unprompted chat bubble (seen live 2026-07-17: a 2-hour heartbeat
+    posting "." twice). Same posture as agent_reply_parse_failed: report +
+    fail the job, post nothing — and do NOT count as a realized idle send
+    (two truncated wakes in a row must not trip the idle-loop guard)."""
+    captured = _degenerate_test_harness(monkeypatch, {"messages": ["."]})
+    monkeypatch.setattr(crc, "_proactive_empty_streak", 0)
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_degen_only",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.0,
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.0)
+    assert captured["posted"] == []
+    failed = [s for s in captured["statuses"] if s[1] == "failed"]
+    assert failed and failed[-1][2] == "degenerate_reply_suppressed"
+    assert captured["failures"] and captured["failures"][-1][1] is False
+    assert crc._proactive_empty_streak == 0  # suppressed ≠ realized idle send
+
+
+def test_process_proactive_degenerate_fragment_dropped_real_reply_posted(monkeypatch):
+    captured = _degenerate_test_harness(
+        monkeypatch, {"messages": [".", "今晚月色不错"]}
+    )
+    monkeypatch.setattr(crc, "_proactive_empty_streak", 0)
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_degen_mixed",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.1,
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.1)
+    assert captured["posted"] == ["今晚月色不错"]
+    assert [s for s in captured["statuses"] if s[1] == "posted"]
+    assert not [s for s in captured["statuses"] if s[1] == "failed"]
+    assert crc._proactive_empty_streak == 1  # real send keeps its accounting
+
+
+def test_process_proactive_degenerate_reply_with_sleep_action_still_sleeps(monkeypatch):
+    """Before the guard, a sleep action paired with a truncated "." fragment
+    fell through to the posting loop (sleep requires `not replies`) and the
+    fragment shipped as a bubble. The guard empties replies first, so the
+    sleep completes quietly."""
+    captured = _degenerate_test_harness(
+        monkeypatch,
+        {
+            "actions": [{"type": "proactive.sleep", "reason": "nothing to say"}],
+            "messages": ["…"],
+        },
+    )
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_degen_sleep",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.2,
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.2)
+    assert captured["posted"] == []
+    completed = [s for s in captured["statuses"] if s[1] == "completed"]
+    assert completed and completed[-1][3]["extra"]["wake_result"] == "sleep"
+    assert not [s for s in captured["statuses"] if s[1] == "failed"]
+
+
+def test_proactive_chat_collision_classification(monkeypatch):
+    now = 10_000.0
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_COLLISION_WINDOW_SEC", 90.0)
+
+    def _with_history(rows):
+        monkeypatch.setattr(crc, "get_decrypted_history", lambda **kwargs: rows)
+
+    # Fresh user message → collision.
+    _with_history([{"role": "user", "source": "chat", "ts": now - 10}])
+    assert crc._proactive_chat_collision(now=now)
+    # Fresh non-proactive agent reply → collision.
+    _with_history([{"role": "openclaw", "source": "chat", "ts": now - 30}])
+    assert crc._proactive_chat_collision(now=now)
+    # Fresh proactive-source agent row → NOT this gate's job.
+    _with_history([{"role": "openclaw", "source": crc.PROACTIVE_JOB_SOURCE, "ts": now - 5}])
+    assert not crc._proactive_chat_collision(now=now)
+    # verify_ping is never conversation.
+    _with_history([{"role": "user", "source": "verify_ping", "ts": now - 5}])
+    assert not crc._proactive_chat_collision(now=now)
+    # system rows (upstream-error notices) are not the agent speaking.
+    _with_history([{"role": "system", "source": "chat", "ts": now - 5}])
+    assert not crc._proactive_chat_collision(now=now)
+    # Outside the window → no collision.
+    _with_history([{"role": "user", "source": "chat", "ts": now - 91}])
+    assert not crc._proactive_chat_collision(now=now)
+    # Malformed ts must not raise (fail-open) and must not collide.
+    _with_history([{"role": "user", "source": "chat", "ts": "bad"}])
+    assert not crc._proactive_chat_collision(now=now)
+    # Far-future ts is malformed data, not a fresh message.
+    _with_history([{"role": "user", "source": "chat", "ts": now + 3600}])
+    assert not crc._proactive_chat_collision(now=now)
+    # Slight clock skew ahead of this host still counts as fresh.
+    _with_history([{"role": "user", "source": "chat", "ts": now + 2}])
+    assert crc._proactive_chat_collision(now=now)
+    # Fail-open: unreachable source / fetch error must not silence proactive.
+    _with_history(None)
+    assert not crc._proactive_chat_collision(now=now)
+    monkeypatch.setattr(
+        crc, "get_decrypted_history",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert not crc._proactive_chat_collision(now=now)
+    # window <= 0 disables the gate entirely.
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_COLLISION_WINDOW_SEC", 0.0)
+    _with_history([{"role": "user", "source": "chat", "ts": now - 1}])
+    assert not crc._proactive_chat_collision(now=now)
+
+
+def test_process_proactive_chat_collision_skips_post(monkeypatch):
+    """A wake whose model turn finished while a chat exchange was happening
+    must not post its bubble on top of the conversation (seen live 2026-07-17:
+    wake + chat turn answered the same arrival message with two near-identical
+    replies). The job is skipped with the fixed reason `chat_collision` so the
+    admin failed/skipped-reason aggregation can count it."""
+    captured = _degenerate_test_harness(monkeypatch, {"messages": ["姐姐到了呀"]})
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_COLLISION_WINDOW_SEC", 90.0)
+    monkeypatch.setattr(crc, "_proactive_chat_collision", lambda now=None: True)
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_collision",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 126.0,
+        "trigger": "presence_tick",
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(126.0)
+    assert captured["posted"] == []
+    skipped = [s for s in captured["statuses"] if s[1] == "skipped"]
+    assert skipped and skipped[-1][2] == "chat_collision"
+    assert skipped[-1][3]["extra"]["wake_result"] == "chat_collision"
+
+
+def test_process_proactive_chat_collision_exempts_scheduled_wake(monkeypatch):
+    """A user-requested reminder firing mid-conversation must still deliver."""
+    captured = _degenerate_test_harness(monkeypatch, {"messages": ["提醒:该出发了"]})
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_COLLISION_WINDOW_SEC", 90.0)
+    monkeypatch.setattr(crc, "_proactive_chat_collision", lambda now=None: True)
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_collision_sched",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 126.1,
+        "trigger": "scheduled_wake",
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(126.1)
+    assert captured["posted"] == ["提醒:该出发了"]
+    assert not [s for s in captured["statuses"] if s[1] == "skipped"]
+
+
+def test_process_proactive_no_collision_posts_normally(monkeypatch):
+    captured = _degenerate_test_harness(monkeypatch, {"messages": ["月色不错"]})
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_COLLISION_WINDOW_SEC", 90.0)
+    monkeypatch.setattr(crc, "_proactive_chat_collision", lambda now=None: False)
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_no_collision",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 126.2,
+        "trigger": "presence_tick",
+    }
+    assert crc._process_proactive_jobs([job]) == pytest.approx(126.2)
+    assert captured["posted"] == ["月色不错"]
+    assert [s for s in captured["statuses"] if s[1] == "posted"]
+
+
+def test_capture_transcript_labels_use_real_names():
+    """The capture/dream transcript must never label lines with a literal
+    "user:"/"agent:" — models mirror the label into user-visible cards as
+    "用户" (usr_fee1 complaint 2026-07-17). Known names are used verbatim;
+    unknown fall back to the prompt's own TA/我 framing."""
+    user_msg = {"role": "user", "ts": 1000.0, "content": "我在看攻略"}
+    agent_msg = {"role": "openclaw", "ts": 1001.0, "content": "山路小心"}
+    assert crc._capture_message_role(user_msg, user_label="小雨", agent_label="小舟") == "小雨"
+    assert crc._capture_message_role(agent_msg, user_label="小雨", agent_label="小舟") == "小舟"
+    # Defaults match the prompt framing, not system labels.
+    assert crc._capture_message_role(user_msg) == "TA"
+    assert crc._capture_message_role(agent_msg) == "我"
+    # Empty labels fall back rather than rendering "" as a name.
+    assert crc._capture_message_role(user_msg, user_label="", agent_label="") == "TA"
+
+    text = crc._capture_window_text(
+        [user_msg, agent_msg], user_label="小雨", agent_label="小舟"
+    )
+    assert "小雨: 我在看攻略" in text
+    assert "小舟: 山路小心" in text
+    assert "user:" not in text and "agent:" not in text
+
+
+def test_capture_transcript_labels_reject_reserved_placeholder_names():
+    """A placeholder "name" stored on the identity card (用户/user) must not
+    become a transcript label either — that re-creates the exact "用户: …"
+    line the fix removes."""
+    user_msg = {"role": "user", "ts": 1000.0, "content": "hi"}
+    for reserved in ("用户", "user", "USER", "ta"):
+        assert crc._capture_message_role(user_msg, user_label=reserved) == "TA", repr(reserved)
+    text = crc._capture_window_text([user_msg], user_label="用户", agent_label="小舟")
+    assert "用户:" not in text and "TA: hi" in text
+
+
+def test_capture_identity_context_sanitizes_reserved_user_name(monkeypatch):
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    monkeypatch.setattr(
+        crc,
+        "_capture_get_json",
+        lambda path, **kwargs: {"identity": {"agent_name": "小舟", "user_preferred_name": "用户"}},
+    )
+    _identity, ai_name, user_name, text = crc._capture_identity_context()
+    assert ai_name == "小舟"
+    assert user_name == "TA"
+    # The rendered identity context must not carry the reserved value as a
+    # "name" — it would contradict the naming rule sitting next to it.
+    assert "用户" not in text
+
+
+def test_capture_identity_context_placeholder_does_not_shadow_real_fallback_name(monkeypatch):
+    """user_preferred_name="用户" + user_name="小雨" must resolve to 小雨:
+    per-candidate sanitize, not `or`-then-sanitize (which would collapse the
+    whole chain to TA and violate "use the name when known")."""
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    monkeypatch.setattr(
+        crc,
+        "_capture_get_json",
+        lambda path, **kwargs: {"identity": {
+            "agent_name": "小舟",
+            "user_preferred_name": "用户",
+            "user_name": "小雨",
+        }},
+    )
+    _identity, _ai_name, user_name, text = crc._capture_identity_context()
+    assert user_name == "小雨"
+    assert "小雨" in text
+    assert "用户" not in text
+
+
+def test_capture_empty_window_fails_fast_without_identity_fetch(monkeypatch):
+    """An empty/unavailable capture window must keep the fast-fail path — no
+    identity round-trips (up to two network calls) for a job that cannot run."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    statuses = []
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: statuses.append((job_id, status, reason)),
+    )
+    monkeypatch.setattr(crc, "_capture_window_messages", lambda job: [])
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: (_ for _ in ()).throw(AssertionError("identity fetched for empty window")),
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "cap_empty_window",
+        "job_kind": "memory_capture",
+        "source": "memory_capture",
+        "ts": 321.0,
+    }
+    assert crc._process_capture_jobs([job]) == pytest.approx(321.0)
+    assert ("cap_empty_window", "failed", "capture_window_unavailable") in statuses
+
+
 def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -5756,7 +6068,7 @@ def test_call_agent_cli_claude_session_survives_many_turns(monkeypatch, tmp_path
     raw = _claude_chatty_stream("嗯", session_id="c-longlived")
     monkeypatch.setattr(
         crc, "AGENT_CLI_CMD",
-        "claude -p --output-format stream-json --include-partial-messages --session-id {session_id}")
+        "claude -p \"{message}\" --output-format stream-json --include-partial-messages --session-id {session_id}")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     monkeypatch.setattr(crc.subprocess, "run",
                         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=""))
@@ -6006,6 +6318,89 @@ def test_call_agent_cli_pi_marks_session_bridged_after_injected_turn(monkeypatch
 
     assert crc.call_agent_cli(injected) == "ok"
     assert crc._agent_session_is_bridged() is True
+
+
+# The relay-cut stream shape (prod usr_6f5a 2026-07-17): pi exits 0, no usable
+# message_end, "Stream ended without finish_reason" in the final event. One
+# immediate in-turn retry; a second cut still raises (single-shot, no loop).
+_PI_STREAM_CUT_TURN = _pi_stream_lines(
+    _PI_HEADER,
+    {"type": "message_end", "message": {"role": "assistant", "content": []},
+     "stopReason": "error", "errorMessage": "Stream ended without finish_reason"},
+)
+
+
+def test_call_agent_cli_pi_stream_cut_retries_once_and_succeeds(monkeypatch, tmp_path):
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_cut_ok")
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        out = _PI_STREAM_CUT_TURN if len(runs) == 1 else _PI_OK_TURN
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    assert crc.call_agent_cli("hello") == "ok"
+    assert len(runs) == 2                      # exactly one retry
+    assert runs[0] == runs[1]                  # same turn, same command
+
+
+def test_call_agent_cli_pi_stream_cut_twice_raises_no_loop(monkeypatch, tmp_path):
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_cut_fail", stdout=_PI_STREAM_CUT_TURN)
+    runs = []
+    real = subprocess.CompletedProcess
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        return real(cmd, 0, stdout=_PI_STREAM_CUT_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="pi agent produced no reply"):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 2                      # one retry, then surface the error
+
+
+def test_call_agent_cli_pi_stream_cut_retry_nonzero_exit_raises_even_with_reply(monkeypatch, tmp_path):
+    # codex2 R1 P1: the retry runs after the function's original returncode gate.
+    # A crashed retry (rc=1) whose partial stdout still parses to an assistant
+    # message must NOT be returned as success — "all nonzero CLI exits raise"
+    # survives the retry path, and the failed turn never marks the bridge.
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_cut_rc1")
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        if len(runs) == 1:
+            return subprocess.CompletedProcess(cmd, 0, stdout=_PI_STREAM_CUT_TURN, stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout=_PI_OK_TURN, stderr="pi crashed")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="cli agent exited 1"):
+        crc.call_agent_cli(injected)
+    assert len(runs) == 2
+    assert crc._agent_session_is_bridged() is False
+
+
+def test_call_agent_cli_pi_non_stream_cut_no_reply_does_not_retry(monkeypatch, tmp_path):
+    # Other no-reply shapes (relay 429 / out of credit) keep the old single-shot
+    # behavior — retrying those would just double-bill a deterministic failure.
+    quota_turn = _pi_stream_lines(
+        _PI_HEADER,
+        {"type": "message_end", "message": {"role": "assistant", "content": []},
+         "stopReason": "error", "errorMessage": "insufficient_quota: credit balance too low"},
+    )
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_quota")
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout=quota_turn, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="pi agent produced no reply"):
+        crc.call_agent_cli("hello")
+    assert len(runs) == 1                      # no retry for non-transient shapes
 
 
 def test_call_agent_cli_pi_background_turn_does_not_mark_bridged(monkeypatch, tmp_path):
@@ -6790,6 +7185,67 @@ def test_distill_without_chat_since_never_peeks_and_runs_to_completion(monkeypat
     assert calls["map"] == [f"jobm:resident:map:{i}" for i in (1, 2)]
     assert calls["complete"] == [("jobm", 2, "skipped")]
     assert crc._distill_in_progress is None
+
+
+def test_distill_preserves_dates_for_long_term_memory_material(monkeypatch):
+    # LTM archive (material_kind == "memory_summary" → keep_all) carries each card's
+    # original date into the envelope, so decades of uploaded memories keep their dates
+    # instead of collapsing onto today. A card the model couldn't date falls back to a
+    # real now() stamp — never empty (resident has no server-side relationship anchor).
+    _patch_memory_distill(monkeypatch, windows=1)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+
+    once = {"n": 0}
+
+    def ltm_pending():
+        once["n"] += 1
+        return [{"job_id": "jobm", "mode": "add_memory",
+                 "material_kind": "memory_summary",
+                 "sealed": {"envelope": {"body_ct": "x"}}}] if once["n"] == 1 else []
+
+    monkeypatch.setattr(crc, "genesis_resident_pending", ltm_pending)
+    sys.modules["genesis"].worker.build_memory_output_from_fact_candidates = lambda **kw: {
+        "memories": [
+            {"summary": "birthday", "occurred_at": "2019-06-01"},
+            {"summary": "graduation", "date": "2020-02-02"},   # alternate key also honored
+            {"summary": "no_date"},
+        ],
+    }
+    seen = {}
+    monkeypatch.setattr(
+        crc, "_capture_build_envelope",
+        lambda card, *, occurred_at, source:
+            seen.__setitem__(card["summary"], occurred_at) or {"card": card},
+    )
+
+    crc._process_resident_distill_once()
+
+    assert seen["birthday"] == "2019-06-01"
+    assert seen["graduation"] == "2020-02-02"
+    assert seen["no_date"] and "T" in seen["no_date"]   # undated → real now() ISO, not empty
+
+
+def test_distill_ignores_dates_for_chat_history_material(monkeypatch):
+    # Chat-history distill (material_kind != memory_summary → keep_all False) is the
+    # normal path: even if a card happens to carry a date, the write stamps now(). Date
+    # preservation is scoped strictly to long-term-memory uploads.
+    _patch_memory_distill(monkeypatch, windows=1)   # base job material_kind is ""
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+
+    sys.modules["genesis"].worker.build_memory_output_from_fact_candidates = lambda **kw: {
+        "memories": [{"summary": "chatty", "occurred_at": "2019-06-01"}],
+    }
+    seen = {}
+    monkeypatch.setattr(
+        crc, "_capture_build_envelope",
+        lambda card, *, occurred_at, source:
+            seen.__setitem__(card["summary"], occurred_at) or {"card": card},
+    )
+
+    crc._process_resident_distill_once()
+
+    assert seen["chatty"] != "2019-06-01"   # date ignored off the LTM path
+    assert "T" in seen["chatty"]            # now() stamp
 
 
 def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
@@ -7908,3 +8364,54 @@ def test_foreground_prepend_includes_language_line_and_time(monkeypatch):
     assert "current_time:" in out
     assert "Reply language policy" in out  # language line now wired into foreground
     assert out.rstrip().endswith("hello")
+
+
+# --- custom-wrapper guardrails (usr_c190 xiake_wrapper, 2026-07-18) ----------
+
+def test_cli_cmd_without_message_placeholder_fails_loud(monkeypatch, tmp_path):
+    # A template with no {message} used to run the agent WITH NO PROMPT and let
+    # it tell the user "your message never reached me". Now: hard, actionable
+    # error before any subprocess spawns.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_no_placeholder")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "python3 my_wrapper.py")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    ran = []
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda cmd, **kw: ran.append(cmd))
+    with pytest.raises(RuntimeError, match=r"missing the \{message\} placeholder"):
+        crc.call_agent_cli("hello")
+    assert ran == []                             # no blind agent invocation
+
+    # ...and the error classifies as an actionable user-config notice, not
+    # a "our system broke" bubble.
+    n = crc.classify_agent_error(RuntimeError(
+        "AGENT_CLI_CMD is missing the {message} placeholder — the user's ..."))
+    assert n.error_class == "cli_config_invalid"
+    assert n.blame == "user_provider"
+    assert "AGENT_CLI_CMD" in n.user_text
+
+
+def test_pi_without_message_placeholder_is_exempt(monkeypatch, tmp_path):
+    # pi's managed path deliberately omits {message} (stdin feed) — must not trip.
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_no_placeholder")
+    assert crc.call_agent_cli("hello") == "ok"
+
+
+def test_turn_timeout_is_env_tunable(monkeypatch, tmp_path):
+    # Heavy self-hosted stacks (wrapper + MCP cold start + long thinking) need
+    # more than the 120s default; the cap rides AGENT_TURN_TIMEOUT_SEC.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_slow_stack")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "AGENT_TURN_TIMEOUT_SEC", 300)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["timeout"] = kw.get("timeout")
+        return subprocess.CompletedProcess(cmd, 0, stdout=_CLAUDE_OK_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    assert crc.call_agent_cli("hello") == "ok"
+    assert seen["timeout"] == 300

@@ -1065,8 +1065,11 @@ jobs:
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
-            --wait
+            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE"
+          # NOT --wait: the CLI's readiness wait is hard-capped at 300s and the
+          # runner image pull + boot regularly exceeds it. Poll with our own
+          # configurable deadline instead (deploy/wait-cvm-ready.sh).
+          ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
 
       - name: Publish live runner compose_hash on Sepolia (test contract)
         env:
@@ -1737,8 +1740,11 @@ jobs:
               -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
               -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
               -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-              -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
-              --wait
+              -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE"
+            # NOT --wait: the CLI's readiness wait is hard-capped at 300s and
+            # the runner image pull + boot regularly exceeds it. Poll with our
+            # own configurable deadline instead (deploy/wait-cvm-ready.sh).
+            ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
           done
 
       - name: Publish live prod runner compose_hash on Sepolia (per CVM)

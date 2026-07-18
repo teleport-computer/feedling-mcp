@@ -279,11 +279,19 @@ def test_runtime_success_statuses_and_non_json_media_are_explicit(
 
 
 def test_chat_memory_and_perception_contracts_are_concrete(
+    public_schema: dict[str, Any],
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
     for key, schema_name in EXPECTED_CORE_BODY_REFS.items():
         assert _json_body_ref(operations[key]) == f"#/components/schemas/{schema_name}"
         assert operations[key]["x-feedling-contract-level"] == "documented"
+
+    schemas = public_schema["components"]["schemas"]
+    for schema_name in ("HostedChatSendRequest", "ChatTransportRequest"):
+        client_msg_id = schemas[schema_name]["properties"]["client_msg_id"]
+        assert client_msg_id["type"] == "string"
+        assert client_msg_id["format"] == "uuid"
+        assert "600 seconds" in client_msg_id["description"]
 
     poll_query = _parameters(operations[("get", "/v1/chat/poll")], "query")
     assert set(poll_query) == {"since", "timeout", "consumer_id", "claim"}

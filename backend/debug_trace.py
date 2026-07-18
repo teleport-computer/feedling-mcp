@@ -233,7 +233,14 @@ def _worker_loop() -> None:
                     batch.append(_event_queue.get(timeout=timeout))
                 except queue.Empty:
                     break
-            _flush_batch(batch)
+            try:
+                _flush_batch(batch)
+            finally:
+                # task_done bookkeeping lets _flush_pending_for_user see the
+                # worker's in-flight batch via unfinished_tasks — without it a
+                # debug read racing this batching window returns stale data.
+                for _ in batch:
+                    _event_queue.task_done()
         except Exception:
             pass
         finally:
@@ -282,10 +289,20 @@ def _flush_pending_for_user(uid: str, *, timeout: float = 0.5) -> None:
     The request path must not drain or persist queue items itself: becoming a
     second writer races a batch already owned by the background thread. The DB
     append is atomic across processes; this condition only supplies bounded
-    read-your-writes behavior for events queued in this process.
+    read-your-writes behavior for events queued in this process. The per-uid
+    counter is decremented only AFTER the worker's batch hits the DB, so a zero
+    count also honors the worker's in-flight batch (origin/test's intent).
     """
     if not uid:
         return
+    # The flush worker is the ONLY DB appender (started by the first
+    # _enqueue), and it acknowledges each popped item via task_done only
+    # AFTER its batch hit the DB — so unfinished_tasks == 0 is the exact
+    # "everything enqueued so far is readable" linearization point. Do not
+    # drain or append here: a reader-side drain either acks items before
+    # they are written (a concurrent reader then early-returns stale) or
+    # races the worker's get_blob→extend→set_blob with a second unlocked
+    # RMW and loses events.
     deadline = time.monotonic() + max(0.0, timeout)
     with _pending_condition:
         while _pending_by_uid.get(uid, 0) > 0:
