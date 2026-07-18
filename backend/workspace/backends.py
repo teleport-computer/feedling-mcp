@@ -144,6 +144,18 @@ def _assert_model_writable(path: str) -> None:
     _kind_for_path(path)
 
 
+def model_writable_path(raw: str) -> str:
+    """Canonicalize and authorize one model-visible mutation path.
+
+    Batch schedulers use this before launching any sibling so a malformed or
+    read-only path cannot partially apply an otherwise parallel provider batch.
+    Backends remain the final authority and repeat the same check.
+    """
+    path = canonical_path(raw)
+    _assert_model_writable(path)
+    return path
+
+
 class InMemoryWorkspaceBackend:
     """Thread-safe, host-filesystem-free backend for tests and local harnesses."""
 
@@ -179,16 +191,14 @@ class InMemoryWorkspaceBackend:
 
     def write(self, path: str, content: str, *, expected_revision: int,
               mime_type: str = "text/markdown") -> WorkspaceEntry:
-        path = canonical_path(path)
-        _assert_model_writable(path)
+        path = model_writable_path(path)
         return self._write_internal(
             path, content, expected_revision=expected_revision,
             mime_type=mime_type, kind=_kind_for_path(path), source_ref="",
         )
 
     def delete(self, path: str, *, expected_revision: int) -> None:
-        path = canonical_path(path)
-        _assert_model_writable(path)
+        path = model_writable_path(path)
         with self._lock:
             current = self._entries.get(path)
             if current is None:
@@ -270,16 +280,14 @@ class PostgresWorkspaceBackend:
 
     def write(self, path: str, content: str, *, expected_revision: int,
               mime_type: str = "text/markdown") -> WorkspaceEntry:
-        path = canonical_path(path)
-        _assert_model_writable(path)
+        path = model_writable_path(path)
         return self._write_internal(
             path, content, expected_revision=expected_revision,
             mime_type=mime_type, kind=_kind_for_path(path), source_ref="",
         )
 
     def delete(self, path: str, *, expected_revision: int) -> None:
-        path = canonical_path(path)
-        _assert_model_writable(path)
+        path = model_writable_path(path)
         if not jobs_store.delete_workspace_entry_cas(
             self.user_id, path, expected_revision=expected_revision,
         ):

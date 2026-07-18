@@ -129,10 +129,9 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
         "0038_v2_prompt_cache_metrics",
         "0019_tee_reconcile_state",
     }
-    # 0040 chains linearly off 0039 (genesis serve-worker claim attribution for the
-    # deploy-orphan fast reclaim), followed by 0041 mutation attempts and the
-    # 0042 V2 workspace foundation, then 0043 encrypted trajectories and the
-    # side-effect-disabled terminal-failure review lane.
+    # 0040 chains linearly off 0039 (genesis serve-worker claim attribution for
+    # deploy-orphan reclaim), followed by 0041 mutation attempts, 0042
+    # workspace, 0043 encrypted trajectories, and 0044 workspace batches.
     assert (
         script.get_revision("0040_genesis_worker_claim").down_revision
         == "0039_merge_tee_recon_state"
@@ -146,7 +145,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0043_v2_encrypted_trajectories").down_revision == (
         "0042_v2_workspace_foundation"
     )
-    assert script.get_current_head() == "0043_v2_encrypted_trajectories"
+    assert script.get_revision("0044_v2_workspace_batches").down_revision == (
+        "0043_v2_encrypted_trajectories"
+    )
+    assert script.get_current_head() == "0044_v2_workspace_batches"
 
 
 def test_0041_indexes_and_validated_frontier_constraint_exist():
@@ -194,6 +196,15 @@ def test_0042_workspace_tables_and_mutation_frontier_are_installed():
     }
     assert "workspace_encrypted_v1" in function_source
     assert {"released_at", "duration_ms", "outcome"} <= usage_columns
+
+
+def test_0044_workspace_batch_mutation_frontier_is_installed():
+    with db.get_pool().connection() as conn:
+        function_source = conn.execute(
+            "SELECT pg_get_functiondef("
+            "'v2_fill_effect_input_frontier()'::regprocedure)"
+        ).fetchone()[0]
+    assert "workspace_batch_encrypted_v1" in function_source
 
 
 def test_0041_claim_gate_is_installed_and_backfill_runs_after_ddl_commit():

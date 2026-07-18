@@ -71,17 +71,23 @@ def test_run_forever_backoff_is_bounded(monkeypatch):
 
 def test_db_pool_capacity_scales_for_nested_effect_sinks(monkeypatch):
     monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
+    monkeypatch.delenv(
+        "FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", raising=False
+    )
 
-    # Sixteen simultaneous effect drains can each hold an outer generation-lock
-    # connection while requesting one nested sink connection: 2*16 + 4.
-    assert serve_worker._configure_db_pool_capacity(16) == 36
-    assert __import__("os").environ["FEEDLING_DB_POOL_MAX_SIZE"] == "36"
+    # Sixteen simultaneous drains may each hold an outer generation connection.
+    # While one workspace batch occupies four shared nested CAS slots, the other
+    # turns may each need an ordinary nested sink connection too. The
+    # conservative floor is 2*16 + 4 workspace + 4 operational headroom.
+    assert serve_worker._configure_db_pool_capacity(16) == 40
+    assert __import__("os").environ["FEEDLING_DB_POOL_MAX_SIZE"] == "40"
 
 
 def test_db_pool_capacity_rejects_explicit_saturation_cliff(monkeypatch):
-    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", "35")
+    monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "4")
+    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", "39")
 
-    with pytest.raises(RuntimeError, match=r"too small.*require >= 36"):
+    with pytest.raises(RuntimeError, match=r"too small.*require >= 40"):
         serve_worker._configure_db_pool_capacity(16)
 
 

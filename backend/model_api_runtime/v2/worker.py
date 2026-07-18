@@ -654,8 +654,10 @@ async def _dispatch_mixed_tool_calls(
     before_mcp_mutation,
     read_parallelism: int,
     mcp_timeout_sec: float,
+    dispatch_workspace_batch=None,
     dispatch_task_batch=None,
     prepare_platform_mutation=None,
+    prepare_workspace_batch=None,
     mcp_mutation_started=None,
     mcp_mutation_finished=None,
     mcp_wall_budget: _McpTurnWallBudget | None = None,
@@ -712,16 +714,65 @@ async def _dispatch_mixed_tool_calls(
             # error without ever routing one through a write fence.
             reads.append(("platform", tc))
 
-    # Reserve all durable platform identities before any sibling coroutine can
-    # launch. The callback is deliberately provider-ordered even though a later
-    # disjoint workspace group may overlap at the scheduler/callback layer.
-    if prepare_platform_mutation is not None:
-        for kind, tc in mutations:
-            if kind != "platform":
-                continue
+    def _workspace_run(start: int) -> tuple[list[Any], int]:
+        run: list[Any] = []
+        index = start
+        while (
+            index < len(mutations)
+            and len(run) < MAX_WORKSPACE_BATCH_OPERATIONS
+        ):
+            candidate_kind, candidate = mutations[index]
+            if (
+                candidate_kind != "platform"
+                or candidate.name not in {"workspace_write", "workspace_delete"}
+            ):
+                break
+            run.append(candidate)
+            index += 1
+        return run, index
+
+    def _valid_workspace_calls(run) -> list[Any]:
+        # Mirror executor's validation filter. Invalid calls remain model-visible
+        # results but never enter the durable parent effect, so they must not
+        # consume a child identity inside its encrypted payload.
+        return [
+            tc
+            for tc in run
+            if tc.args_ok
+            and cap_tool_schema.validate_tool_args(tc.name, tc.args) is None
+        ]
+
+    # Reserve every durable platform identity before read/subagent coroutines
+    # launch. A workspace run consumes one parent reservation; ordinary writes
+    # retain one reservation each. This pins provider mutation order even though
+    # encryption and the read/task phase can overlap around the reservation step.
+    reservation_index = 0
+    while reservation_index < len(mutations):
+        kind, tc = mutations[reservation_index]
+        if (
+            dispatch_workspace_batch is not None
+            and kind == "platform"
+            and tc.name in {"workspace_write", "workspace_delete"}
+        ):
+            run, reservation_index = _workspace_run(reservation_index)
+            valid_run = _valid_workspace_calls(run)
+            if valid_run and prepare_workspace_batch is not None:
+                prepared = prepare_workspace_batch(valid_run)
+                if inspect.isawaitable(prepared):
+                    await prepared
+            elif prepare_platform_mutation is not None:
+                # Compatibility for callers that opt into scheduling batches but
+                # have not adopted parent-effect reservations.
+                for candidate in run:
+                    prepared = prepare_platform_mutation(candidate)
+                    if inspect.isawaitable(prepared):
+                        await prepared
+            continue
+        if kind == "platform" and prepare_platform_mutation is not None:
             prepared = prepare_platform_mutation(tc)
             if inspect.isawaitable(prepared):
                 await prepared
+        reservation_index += 1
 
     async def _mcp_result(tc, *, mutating: bool, use_read_gate: bool) -> ToolResult:
         async def _invoke():
@@ -872,12 +923,16 @@ async def _dispatch_mixed_tool_calls(
     if reads or task_calls:
         _progress("tool_read_phase_complete")
 
-    # Platform write fence/enqueue failures intentionally propagate; an
-    # uncertain durable effect must never become an ordinary tool error.
+    # One ordered sequence across BOTH mutation domains preserves model order.
+    # Only a contiguous run of workspace mutations may collapse into one
+    # generation-fenced batch; its sink applies disjoint paths concurrently and
+    # conflicting paths in ordered waves. Platform write fence/enqueue failures
+    # intentionally propagate; an uncertain durable platform effect must never
+    # be converted into an ordinary tool error.
     mutation_outcome_unknown = False
-    index = 0
-    while index < len(mutations):
-        kind, tc = mutations[index]
+    mutation_index = 0
+    while mutation_index < len(mutations):
+        kind, tc = mutations[mutation_index]
         await _event(tc, "tool_call_started", {"phase": f"{kind}_mutation"})
         if mutation_outcome_unknown:
             result = ToolResult(
@@ -890,9 +945,54 @@ async def _dispatch_mixed_tool_calls(
                 "tool_call_result",
                 {"phase": f"{kind}_mutation_blocked", "result": result},
             )
-            index += 1
+            mutation_index += 1
             _progress("tool_mutation_complete")
             continue
+
+        if (
+            dispatch_workspace_batch is not None
+            and kind == "platform"
+            and tc.name in {"workspace_write", "workspace_delete"}
+        ):
+            run, next_mutation_index = _workspace_run(mutation_index)
+            # The first event was emitted above; preserve a complete per-call
+            # trajectory for the rest of the collapsed run as well.
+            for candidate in run[1:]:
+                await _event(
+                    candidate,
+                    "tool_call_started",
+                    {"phase": "platform_mutation"},
+                )
+            try:
+                batch_results = list(await dispatch_workspace_batch(run))
+                if [str(result.call_id) for result in batch_results] != [
+                    str(candidate.id) for candidate in run
+                ]:
+                    raise RuntimeError(
+                        "workspace batch dispatcher returned mismatched call ids"
+                    )
+            except Exception as exc:
+                for candidate in run:
+                    await _event(
+                        candidate,
+                        "tool_call_error",
+                        {
+                            "phase": "platform_mutation",
+                            "error_class": type(exc).__name__,
+                        },
+                    )
+                raise
+            for candidate, batch_result in zip(run, batch_results):
+                results_by_id[candidate.id] = batch_result
+                await _event(
+                    candidate,
+                    "tool_call_result",
+                    {"phase": "platform_mutation", "result": batch_result},
+                )
+                _progress("tool_mutation_complete")
+            mutation_index = next_mutation_index
+            continue
+
         try:
             if kind == "platform":
                 result = await dispatch_platform_one(tc)
@@ -930,8 +1030,8 @@ async def _dispatch_mixed_tool_calls(
             "tool_call_result",
             {"phase": f"{kind}_mutation", "result": result},
         )
-        index += 1
         _progress("tool_mutation_complete")
+        mutation_index += 1
 
     return [results_by_id[tc.id] for tc in tool_calls]
 
@@ -2008,7 +2108,38 @@ ENCRYPTED_TOOL_EFFECT_TYPES = {
     "identity": "identity_encrypted_v1",
     "schedule": "schedule_encrypted_v1",
     "workspace": "workspace_encrypted_v1",
+    # One row is the global provider-order/generation fence for a contiguous
+    # workspace mutation run.  Each encrypted operation carries a deterministic
+    # child sink id so partial success remains retry-idempotent.
+    "workspace_batch": "workspace_batch_encrypted_v1",
 }
+
+MAX_WORKSPACE_BATCH_OPERATIONS = 24
+
+
+def _workspace_batch_effect_payload(
+    tool_calls,
+    *,
+    parent_effect_id: str,
+) -> dict:
+    calls = list(tool_calls)
+    if not calls or len(calls) > MAX_WORKSPACE_BATCH_OPERATIONS:
+        raise ValueError("workspace batch size is invalid")
+    operations = []
+    for index, tc in enumerate(calls):
+        logical_effect_type, payload = _write_tool_effect_payload(tc)
+        if logical_effect_type != "workspace":
+            raise ValueError("workspace batch contains a non-workspace tool")
+        operations.append(
+            {
+                **payload,
+                "sub_effect_id": v2_effect_id.derive_batch_item(
+                    parent_effect_id=parent_effect_id,
+                    ordinal=index,
+                ),
+            }
+        )
+    return {"operations": operations}
 
 
 @dataclass
@@ -2024,10 +2155,12 @@ class _PreparedPlatformEffect:
 class _PlatformEffectReservations:
     """Reserve deterministic write identities before mutation dispatch.
 
-    Mutations execute serially, while identities are still reserved before the
-    read/task phase settles. PostgreSQL assigns the outbox's global enqueue
-    sequence at insert time, so each reservation also keeps an explicit
-    provider-order predecessor fence as defence in depth.
+    Mutation groups execute serially, while identities are reserved before the
+    read/task phase settles. Ordinary writes consume one reservation; one
+    contiguous workspace run consumes one encrypted parent reservation whose
+    deterministic child ids are derived from it. PostgreSQL assigns the
+    outbox's global enqueue sequence at insert time, so every reservation also
+    keeps an explicit provider-order predecessor fence as defence in depth.
     """
 
     def __init__(self, *, job_id, ordinal_counter) -> None:
@@ -2035,17 +2168,24 @@ class _PlatformEffectReservations:
         self._ordinal_counter = ordinal_counter
         self._last_ready: asyncio.Event | None = None
         self._by_call: dict[str, _PreparedPlatformEffect] = {}
+        self._by_batch: dict[tuple[str, ...], _PreparedPlatformEffect] = {}
 
-    def prepare(self, tc) -> None:
-        call_id = str(tc.id)
-        existing = self._by_call.get(call_id)
-        if existing is not None and not existing.ready.is_set():
-            raise RuntimeError("duplicate prepared platform write")
-        logical_effect_type, payload = _write_tool_effect_payload(tc)
-        effect_type = ENCRYPTED_TOOL_EFFECT_TYPES[logical_effect_type]
+    @staticmethod
+    def _batch_key(tool_calls) -> tuple[str, ...]:
+        key = tuple(str(tc.id) for tc in tool_calls)
+        if not key or len(set(key)) != len(key):
+            raise RuntimeError("workspace batch call identity is invalid")
+        return key
+
+    def _reserve(
+        self,
+        *,
+        payload: dict,
+        effect_type: str,
+    ) -> _PreparedPlatformEffect:
         ordinal = next(self._ordinal_counter)
         ready = asyncio.Event()
-        self._by_call[call_id] = _PreparedPlatformEffect(
+        prepared = _PreparedPlatformEffect(
             payload=payload,
             effect_type=effect_type,
             ordinal=ordinal,
@@ -2058,11 +2198,59 @@ class _PlatformEffectReservations:
             ready=ready,
         )
         self._last_ready = ready
+        return prepared
+
+    def prepare(self, tc) -> None:
+        call_id = str(tc.id)
+        existing = self._by_call.get(call_id)
+        if existing is not None and not existing.ready.is_set():
+            raise RuntimeError("duplicate prepared platform write")
+        logical_effect_type, payload = _write_tool_effect_payload(tc)
+        effect_type = ENCRYPTED_TOOL_EFFECT_TYPES[logical_effect_type]
+        self._by_call[call_id] = self._reserve(
+            payload=payload,
+            effect_type=effect_type,
+        )
+
+    def prepare_batch(self, tool_calls) -> None:
+        calls = list(tool_calls)
+        key = self._batch_key(calls)
+        existing = self._by_batch.get(key)
+        if existing is not None and not existing.ready.is_set():
+            raise RuntimeError("duplicate prepared workspace batch")
+        effect_type = ENCRYPTED_TOOL_EFFECT_TYPES["workspace_batch"]
+        # Reserve the ordinal before deriving the payload because child sink
+        # identities are cryptographically bound to the resulting parent id.
+        ordinal = next(self._ordinal_counter)
+        effect_id = v2_effect_id.derive(
+            job_id=self._job_id,
+            effect_type=effect_type,
+            ordinal=ordinal,
+        )
+        ready = asyncio.Event()
+        self._by_batch[key] = _PreparedPlatformEffect(
+            payload=_workspace_batch_effect_payload(
+                calls,
+                parent_effect_id=effect_id,
+            ),
+            effect_type=effect_type,
+            ordinal=ordinal,
+            effect_id=effect_id,
+            previous_ready=self._last_ready,
+            ready=ready,
+        )
+        self._last_ready = ready
 
     def get(self, tc) -> _PreparedPlatformEffect:
         prepared = self._by_call.get(str(tc.id))
         if prepared is None:
             raise RuntimeError("platform write effect was not prepared")
+        return prepared
+
+    def get_batch(self, tool_calls) -> _PreparedPlatformEffect:
+        prepared = self._by_batch.get(self._batch_key(tool_calls))
+        if prepared is None:
+            raise RuntimeError("workspace batch effect was not prepared")
         return prepared
 
     async def wait_for_enqueue_turn(
@@ -2076,6 +2264,12 @@ class _PlatformEffectReservations:
         prepared = self._by_call.get(str(tc.id))
         if prepared is not None:
             prepared.ready.set()
+
+    def mark_batch_ready(self, tool_calls) -> None:
+        call_ids = {str(tc.id) for tc in tool_calls}
+        for key, prepared in self._by_batch.items():
+            if call_ids.intersection(key):
+                prepared.ready.set()
 
 
 def _write_encrypted_reply(store, text: str) -> dict | None:
@@ -3119,6 +3313,34 @@ async def _run_wake(
             finally:
                 effect_reservations.mark_ready(tc)
 
+        async def _enqueue_workspace_batch_effect(tool_calls) -> str:
+            calls = list(tool_calls)
+            prepared = effect_reservations.get_batch(calls)
+            encrypted_payload = await asyncio.to_thread(
+                _build_encrypted_tool_effect_payload,
+                store,
+                prepared.payload,
+                effect_id=prepared.effect_id,
+            )
+            await effect_reservations.wait_for_enqueue_turn(prepared)
+            try:
+                enqueued_id = await asyncio.to_thread(
+                    v2_effect_outbox.enqueue_effect,
+                    job_id=job_id,
+                    user_id=user_id,
+                    effect_type=prepared.effect_type,
+                    ordinal=prepared.ordinal,
+                    expected_generation=gen,
+                    payload=encrypted_payload,
+                )
+                if enqueued_id != prepared.effect_id:
+                    raise RuntimeError(
+                        "workspace batch effect id derivation mismatch"
+                    )
+            finally:
+                effect_reservations.mark_batch_ready(calls)
+            return enqueued_id
+
         async def _before_write() -> None:
             await _fence_wake_effect("memory/identity/schedule/workspace write")
 
@@ -3157,16 +3379,37 @@ async def _run_wake(
                 finally:
                     effect_reservations.mark_ready(tc)
 
+            async def _dispatch_workspace_batch(calls) -> list[ToolResult]:
+                try:
+                    return await v2_executor.dispatch_tool_calls(
+                        list(calls),
+                        store=store,
+                        api_key=None,
+                        runtime_token=token,
+                        enclave_sem=enclave_sem,
+                        turn_authorization=True,
+                        enqueue_write_effect=_enqueue_write_effect,
+                        enqueue_workspace_batch_effect=(
+                            _enqueue_workspace_batch_effect
+                        ),
+                        before_write=_before_write,
+                        read_parallelism=1,
+                    )
+                finally:
+                    effect_reservations.mark_batch_ready(calls)
+
             return await _dispatch_mixed_tool_calls(
                 tool_calls,
                 mcp_turn=_EMPTY_MCP_TURN,
                 mutating_mcp_names=frozenset(),
                 dispatch_platform_one=_dispatch_platform_one,
                 before_mcp_mutation=_before_write,
+                dispatch_workspace_batch=_dispatch_workspace_batch,
                 read_parallelism=MAX_READ_ACTION_PARALLELISM,
                 mcp_timeout_sec=MCP_TOOL_CALL_TIMEOUT_SEC,
                 dispatch_task_batch=dispatch_task_batch,
                 prepare_platform_mutation=effect_reservations.prepare,
+                prepare_workspace_batch=effect_reservations.prepare_batch,
                 on_progress=_report_turn_progress,
                 on_tool_event=_make_tool_trajectory_callback(trajectory_recorder),
             )
@@ -4125,6 +4368,9 @@ async def process_job(
             summary, tail = "", []
 
         platform_effects_by_call: dict[str, tuple[str, str]] = {}
+        platform_workspace_batches: dict[
+            tuple[str, ...], tuple[str, str]
+        ] = {}
 
         async def _enqueue_write_effect(tc) -> str:
             """WRITE tool_call -> PR A effect (spec C6). Mapping lives in the shared
@@ -4156,6 +4402,44 @@ async def process_job(
                 )
             finally:
                 effect_reservations.mark_ready(tc)
+            return enqueued_id
+
+        async def _enqueue_workspace_batch_effect(tool_calls) -> str:
+            calls = list(tool_calls)
+            prepared = effect_reservations.get_batch(calls)
+            encrypted_payload = await asyncio.to_thread(
+                _build_encrypted_tool_effect_payload,
+                store,
+                prepared.payload,
+                effect_id=prepared.effect_id,
+            )
+            await effect_reservations.wait_for_enqueue_turn(prepared)
+            try:
+                enqueued_id = await asyncio.to_thread(
+                    v2_effect_outbox.enqueue_effect,
+                    job_id=job_id,
+                    user_id=user_id,
+                    effect_type=prepared.effect_type,
+                    ordinal=prepared.ordinal,
+                    expected_generation=gen,
+                    payload=encrypted_payload,
+                    input_frontier_seq=int(cursor_box["seq"]),
+                )
+                if enqueued_id != prepared.effect_id:
+                    raise RuntimeError(
+                        "workspace batch effect id derivation mismatch"
+                    )
+                batch_key = tuple(str(tc.id) for tc in calls)
+                if batch_key in platform_workspace_batches:
+                    raise RuntimeError(
+                        "workspace batch identity was recorded twice"
+                    )
+                platform_workspace_batches[batch_key] = (
+                    enqueued_id,
+                    prepared.effect_type,
+                )
+            finally:
+                effect_reservations.mark_batch_ready(calls)
             return enqueued_id
 
         async def _before_write() -> None:
@@ -4305,6 +4589,68 @@ async def process_job(
                     )
                 return result
 
+            async def _dispatch_workspace_batch(tool_calls) -> list[ToolResult]:
+                calls = list(tool_calls)
+                try:
+                    results = await v2_executor.dispatch_tool_calls(
+                        calls,
+                        store=store,
+                        api_key=api_key,
+                        runtime_token=runtime_token,
+                        enclave_sem=enclave_sem,
+                        turn_authorization=(mutation_recovery_barrier is None),
+                        enqueue_write_effect=_enqueue_write_effect,
+                        enqueue_workspace_batch_effect=(
+                            _enqueue_workspace_batch_effect
+                        ),
+                        before_write=_before_write,
+                        read_parallelism=1,
+                    )
+                finally:
+                    effect_reservations.mark_batch_ready(calls)
+                queued = [
+                    result
+                    for result in results
+                    if str(result.content).startswith("queued:")
+                ]
+                if not queued or deps.apply_pending_effects is None:
+                    return results
+                if len(queued) != len(calls):
+                    raise RuntimeError(
+                        "workspace batch was only partially enqueued"
+                    )
+                batch_key = tuple(str(tc.id) for tc in calls)
+                effect_ref = platform_workspace_batches.pop(batch_key, None)
+                if effect_ref is None:
+                    raise RuntimeError(
+                        "workspace batch effect identity was not recorded"
+                    )
+                effect_id, effect_type = effect_ref
+                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                disposition = await asyncio.to_thread(
+                    v2_effect_outbox.get_effect_disposition,
+                    effect_id,
+                    user_id=user_id,
+                    job_id=job_id,
+                    effect_type=effect_type,
+                )
+                if disposition is None or disposition["status"] != "applied":
+                    status = (
+                        "missing"
+                        if disposition is None
+                        else disposition["status"]
+                    )
+                    raise RuntimeError(
+                        "workspace batch was not durably applied: " + status
+                    )
+                return [
+                    ToolResult(
+                        call_id=tc.id,
+                        content=f"ok: {tc.name} applied",
+                    )
+                    for tc in calls
+                ]
+
             # Schema omission is the provider-facing control; this runtime
             # gate is the independent fail-closed boundary. A broken relay or
             # direct caller that invents an omitted mutating MCP call must not
@@ -4350,10 +4696,12 @@ async def process_job(
                 mutating_mcp_names=mcp_mutating_names,
                 dispatch_platform_one=_dispatch_platform_one,
                 before_mcp_mutation=_before_write,
+                dispatch_workspace_batch=_dispatch_workspace_batch,
                 read_parallelism=read_parallelism,
                 mcp_timeout_sec=MCP_TOOL_CALL_TIMEOUT_SEC,
                 dispatch_task_batch=dispatch_task_batch,
                 prepare_platform_mutation=effect_reservations.prepare,
+                prepare_workspace_batch=effect_reservations.prepare_batch,
                 mcp_mutation_started=_mcp_mutation_started,
                 mcp_mutation_finished=_mcp_mutation_finished,
                 mcp_wall_budget=mcp_wall_budget,

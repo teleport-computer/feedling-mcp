@@ -93,8 +93,8 @@ def test_migration_head_and_watermark_seq_column():
         "0019_tee_reconcile_state",
     }
     # 0040 (genesis serve-worker claim attribution) chains linearly off 0039;
-    # 0041 installs mutation attempts, 0042 adds the V2 workspace, and 0043
-    # adds encrypted full trajectories plus offline failure review.
+    # 0041 installs mutation attempts, 0042 adds the V2 workspace, 0043 adds
+    # encrypted trajectories, and 0044 registers encrypted workspace batches.
     assert script.get_revision("0041_v2_mcp_mutation_attempts").down_revision == (
         "0040_genesis_worker_claim"
     )
@@ -104,7 +104,10 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0043_v2_encrypted_trajectories").down_revision == (
         "0042_v2_workspace_foundation"
     )
-    assert script.get_current_head() == "0043_v2_encrypted_trajectories"
+    assert script.get_revision("0044_v2_workspace_batches").down_revision == (
+        "0043_v2_encrypted_trajectories"
+    )
+    assert script.get_current_head() == "0044_v2_workspace_batches"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

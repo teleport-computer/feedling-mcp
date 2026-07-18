@@ -46,6 +46,7 @@ import threading
 import time
 import types
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
@@ -77,6 +78,7 @@ from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
+from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import reaper as v2_reaper
@@ -95,7 +97,7 @@ from proactive import capture_scheduler
 from proactive import dream_scheduler
 from proactive import gate as proactive_gate
 from workspace.artifacts import ArtifactWorkspace, artifact_text_view_path
-from workspace.backends import WorkspaceNotFound
+from workspace.backends import WorkspaceNotFound, model_writable_path
 from workspace.prompt import render_trusted_prefix_blocks
 from workspace.sandbox import (
     DisabledSandboxProvider,
@@ -164,6 +166,52 @@ def _positive_int_env(name: str, default: str) -> int:
     return value
 
 
+def _workspace_write_parallelism() -> int:
+    value = _positive_int_env(
+        "FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM",
+        "4",
+    )
+    if value > 8:
+        raise RuntimeError(
+            "FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM must be <= 8"
+        )
+    return value
+
+
+_workspace_executor_lock = threading.Lock()
+_workspace_executor: ThreadPoolExecutor | None = None
+_workspace_executor_size = 0
+
+
+def _workspace_write_executor() -> ThreadPoolExecutor:
+    """Process-wide admission ceiling for durable workspace mutations.
+
+    A per-batch pool would let every live turn fan out independently and move
+    the old hidden concurrency cliff from provider threads to PostgreSQL
+    connections.  One shared executor still overlaps disjoint operations while
+    bounding nested sink connections across the whole worker process.
+    """
+    global _workspace_executor, _workspace_executor_size
+    parallelism = _workspace_write_parallelism()
+    with _workspace_executor_lock:
+        if (
+            _workspace_executor is None
+            or _workspace_executor_size != parallelism
+        ):
+            previous = _workspace_executor
+            _workspace_executor = ThreadPoolExecutor(
+                max_workers=parallelism,
+                thread_name_prefix="v2-workspace-write",
+            )
+            _workspace_executor_size = parallelism
+            # Environment values are immutable in production.  This branch is
+            # primarily useful to isolated tests that deliberately exercise
+            # more than one configured ceiling in a single interpreter.
+            if previous is not None:
+                previous.shutdown(wait=True)
+        return _workspace_executor
+
+
 def _default_worker_id() -> str:
     """Replica-unique identity even when every container runs as PID 1."""
     raw_commit = os.environ.get("FEEDLING_GIT_COMMIT", "dev")
@@ -193,12 +241,17 @@ def _configure_db_pool_capacity(max_workers: int) -> int:
 
     ``effect_outbox.apply_pending_effects`` deliberately keeps one transaction
     and generation lock open while its sink performs the durable write.  Most
-    sinks therefore need a second pooled connection.  With an unscaled pool,
-    N concurrent drains can occupy all N connections and then all wait for a
-    nested connection until timeout (the exact silent concurrency cliff V2 is
-    meant to remove).  Reserve two connections per slot plus four for queue,
-    cursor, and reconciliation work.  The historical backend floor of 16 is
-    retained for smaller pools.
+    sinks therefore need nested pooled connections.  A workspace batch holds
+    the outer generation transaction while up to
+    ``FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM`` durable CAS operations run on
+    separate connections behind one process-wide admission ceiling. At the
+    same time, every other active turn can hold its own outer generation
+    transaction and one ordinary nested sink connection. With an unscaled
+    pool, those mixed drains can deadlock waiting for nested writes (the exact
+    silent concurrency cliff V2 is meant to remove). Conservatively reserve
+    two connections per turn slot, the process-wide workspace fan-out, and
+    four for queue, cursor, and reconciliation work. The historical backend
+    floor of 16 is retained for smaller pools.
 
     An explicit operator override may raise the ceiling but may not undercut
     the invariant.  This runs before ``db.init_schema()`` opens the lazy pool;
@@ -212,7 +265,8 @@ def _configure_db_pool_capacity(max_workers: int) -> int:
     if slots <= 0:
         raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be an integer > 0")
 
-    required = max(16, (2 * slots) + 4)
+    workspace_parallelism = _workspace_write_parallelism()
+    required = max(16, (2 * slots) + workspace_parallelism + 4)
     raw = os.environ.get("FEEDLING_DB_POOL_MAX_SIZE", "").strip()
     if raw:
         try:
@@ -1797,6 +1851,128 @@ def _sink_workspace(user_id: str, payload: dict, *, runtime_token: str) -> None:
     db.effect_sink_complete(eid)
 
 
+def _workspace_paths_conflict(left: str, right: str) -> bool:
+    return (
+        left == right
+        or left.startswith(right + "/")
+        or right.startswith(left + "/")
+    )
+
+
+def _workspace_mutation_waves(operations: list[dict]) -> list[list[dict]]:
+    """Partition provider-ordered mutations into conflict-free waves.
+
+    Same-path and ancestor/descendant operations stay ordered.  Disjoint paths
+    in the same wave may reach their actual durable backend CAS concurrently.
+    All paths are validated before the first wave starts, preventing one bad
+    path from causing a surprising partial batch.
+    """
+    prepared: list[dict] = []
+    try:
+        for operation in operations:
+            prepared.append(
+                {
+                    **operation,
+                    "path": model_writable_path(operation.get("path")),
+                }
+            )
+    except Exception as exc:
+        raise db.EffectTerminalError(
+            "workspace_operation_invalid"
+        ) from exc
+
+    waves: list[list[dict]] = []
+    current: list[dict] = []
+    for operation in prepared:
+        path = str(operation["path"])
+        if any(
+            _workspace_paths_conflict(path, str(existing["path"]))
+            for existing in current
+        ):
+            waves.append(current)
+            current = []
+        current.append(operation)
+    if current:
+        waves.append(current)
+    return waves
+
+
+def _apply_workspace_batch_operation(
+    user_id: str,
+    operation: dict,
+    *,
+    runtime_token: str,
+) -> None:
+    """Apply one child with its own crash-safe idempotency claim."""
+    child_effect_id = str(operation["sub_effect_id"])
+    if not db.effect_sink_claim(child_effect_id):
+        return
+    try:
+        op = str(operation["op"])
+        store = core_store.get_store(user_id)
+        params = {
+            key: value
+            for key, value in operation.items()
+            if key not in {"op", "sub_effect_id"}
+        }
+        result = cap_registry.run_capability(
+            op,
+            store,
+            api_key=None,
+            runtime_token=runtime_token,
+            params=params,
+        )
+        if not result.ok:
+            raise _capability_effect_error(result, f"{op}_failed")
+    except Exception:
+        # Only a write that raised is safe to retry.  A hard process death after
+        # the backend commit leaves the child claim unresolved, and the parent
+        # moves to explicit reconciliation instead of guessing.
+        db.effect_sink_release(child_effect_id)
+        raise
+    db.effect_sink_complete(child_effect_id)
+
+
+def _sink_workspace_batch(
+    user_id: str,
+    payload: dict,
+    *,
+    runtime_token: str,
+) -> None:
+    """Apply one encrypted workspace batch with real durable concurrency."""
+    operations = list(payload.get("operations") or [])
+    waves = _workspace_mutation_waves(operations)
+    executor = _workspace_write_executor()
+    for wave in waves:
+        futures = [
+            executor.submit(
+                _apply_workspace_batch_operation,
+                user_id,
+                operation,
+                runtime_token=runtime_token,
+            )
+            for operation in wave
+        ]
+        errors: list[Exception] = []
+        # Read results in provider order. All futures are already running, so
+        # this preserves deterministic error selection without serializing the
+        # actual backend work.
+        for future in futures:
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001 - re-raised after siblings settle
+                errors.append(exc)
+        if errors:
+            # Uncertain delivery dominates deterministic conflicts and ordinary
+            # retryable failures. Discarding the parent because an earlier
+            # sibling hit a terminal CAS conflict would otherwise orphan a
+            # later child whose durable outcome is genuinely unknown.
+            for error in errors:
+                if isinstance(error, db.EffectDeliveryUncertainError):
+                    raise error
+            raise errors[0]
+
+
 def build_production_effect_dispatch(
     user_id: str,
     *,
@@ -1979,7 +2155,50 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
         tool_name = str(payload.get("op") or "")
         if tool_name not in {"workspace_write", "workspace_delete"}:
             raise RuntimeError("invalid encrypted workspace operation")
-        args = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+        args = {
+            k: v
+            for k, v in payload.items()
+            if k not in ("effect_id", "op")
+        }
+    elif effect_type == "workspace_batch":
+        if set(payload) != {"operations", "effect_id"}:
+            raise RuntimeError("invalid encrypted workspace batch shape")
+        parent_effect_id = str(payload.get("effect_id") or "")
+        operations = payload.get("operations")
+        if (
+            not parent_effect_id
+            or not isinstance(operations, list)
+            or not operations
+            or len(operations) > v2_worker.MAX_WORKSPACE_BATCH_OPERATIONS
+        ):
+            raise RuntimeError("invalid encrypted workspace batch")
+        for index, operation in enumerate(operations):
+            if not isinstance(operation, dict):
+                raise RuntimeError("invalid encrypted workspace batch operation")
+            tool_name = str(operation.get("op") or "")
+            expected_fields = (
+                {"op", "path", "content", "expected_revision", "sub_effect_id"}
+                if tool_name == "workspace_write"
+                else {"op", "path", "expected_revision", "sub_effect_id"}
+                if tool_name == "workspace_delete"
+                else set()
+            )
+            if not expected_fields or set(operation) != expected_fields:
+                raise RuntimeError("invalid encrypted workspace batch operation")
+            expected_child_id = v2_effect_id.derive_batch_item(
+                parent_effect_id=parent_effect_id,
+                ordinal=index,
+            )
+            if str(operation.get("sub_effect_id") or "") != expected_child_id:
+                raise RuntimeError("invalid workspace batch child identity")
+            args = {
+                key: value
+                for key, value in operation.items()
+                if key not in {"op", "sub_effect_id"}
+            }
+            if cap_tool_schema.validate_tool_args(tool_name, args):
+                raise RuntimeError("invalid encrypted workspace batch arguments")
+        return
     else:
         raise RuntimeError("unsupported encrypted effect type")
     error = cap_tool_schema.validate_tool_args(tool_name, args)
@@ -2016,6 +2235,13 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
                 runtime_token=get_runtime_token(),
             )
             _validate_decrypted_tool_effect(logical_effect_type, payload)
+            if logical_effect_type == "workspace_batch":
+                _sink_workspace_batch(
+                    user_id,
+                    payload,
+                    runtime_token=get_runtime_token(),
+                )
+                return
             effect_type = logical_effect_type
         production_dispatch(effect_type, payload)
 

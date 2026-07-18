@@ -17,3 +17,20 @@ def derive_control(*, generation: int, effect_type: str, key: str) -> str:
     """Control-plane effect with no owning job (e.g. a cutover-driven cursor advance):
     keyed by (generation, effect_type, caller-stable key)."""
     return f"gen{int(generation)}:{effect_type}:{key}"
+
+
+def derive_batch_item(*, parent_effect_id: str, ordinal: int) -> str:
+    """Child sink identity for one operation inside an atomic outbox batch.
+
+    The parent row is still the generation/order fence.  Children need their
+    own deterministic identities because disjoint workspace writes may commit
+    independently before a sibling fails.  Replaying the parent can then skip
+    completed children and retry only operations that provably did not land.
+    """
+    parent = str(parent_effect_id or "")
+    if not parent:
+        raise ValueError("parent_effect_id is required")
+    index = int(ordinal)
+    if index < 0:
+        raise ValueError("ordinal must be non-negative")
+    return f"{parent}:item:{index}"
