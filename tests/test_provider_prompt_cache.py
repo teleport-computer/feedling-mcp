@@ -37,6 +37,20 @@ CACHE_KEY = "feedling-v2-deadbeef"
 CACHE_FIELDS = {"prompt_cache_key", "prompt_cache_options", "cache_control", "session_id"}
 
 
+def _nested_cache_controls(value) -> list[dict]:
+    found: list[dict] = []
+    if isinstance(value, dict):
+        control = value.get("cache_control")
+        if isinstance(control, dict):
+            found.append(control)
+        for child in value.values():
+            found.extend(_nested_cache_controls(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_nested_cache_controls(child))
+    return found
+
+
 def _compat_payload(provider: str, model: str) -> dict:
     return pc._build_openai_compat_payload(
         provider=provider,
@@ -128,7 +142,8 @@ def test_openrouter_sends_sticky_cache_fields_and_anthropic_cache_control() -> N
 
     assert payload["prompt_cache_key"] == CACHE_KEY
     assert payload["session_id"] == CACHE_KEY
-    assert payload["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in payload
+    assert _nested_cache_controls(payload["messages"]) == [{"type": "ephemeral"}]
 
 
 def test_direct_anthropic_uses_cache_control_without_disclosing_affinity_key() -> None:
@@ -144,7 +159,8 @@ def test_direct_anthropic_uses_cache_control_without_disclosing_affinity_key() -
         prompt_cache_key=CACHE_KEY,
     )
 
-    assert payload["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in payload
+    assert _nested_cache_controls(payload["messages"]) == [{"type": "ephemeral"}]
     assert "prompt_cache_key" not in payload
     assert "session_id" not in payload
 
@@ -234,9 +250,14 @@ def test_async_anthropic_cache_rejection_retries_without_cache_but_keeps_tools(
 
     assert result["reply"] == "done"
     assert len(seen) == 2
-    assert seen[0]["cache_control"] == {"type": "ephemeral"}
-    assert "cache_control" not in seen[1]
+    assert _nested_cache_controls(seen[0]["messages"]) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(seen[1]["messages"]) == []
     assert seen[1]["tools"] == seen[0]["tools"]
+    assert result["usage"]["provider_retry_count"] == 1
+    assert result["usage"]["cache_hint_sent_on_success"] is False
+    assert result["usage"]["compatibility_fallbacks"] == [
+        "cache_rejected:cache_control",
+    ]
 
 
 def test_openrouter_walks_cache_reasoning_temperature_fallbacks_in_order(
@@ -274,11 +295,20 @@ def test_openrouter_walks_cache_reasoning_temperature_fallbacks_in_order(
     assert result["reply"] == "done"
     assert len(seen) == 4
     assert not CACHE_FIELDS.isdisjoint(seen[0])
-    assert CACHE_FIELDS.isdisjoint(seen[1])
+    assert "prompt_cache_key" not in seen[1]
+    assert seen[1]["session_id"] == CACHE_KEY
+    assert _nested_cache_controls(seen[1]["messages"]) == [{"type": "ephemeral"}]
     assert "reasoning" in seen[1] and "temperature" in seen[1]
     assert "reasoning" not in seen[2] and "temperature" in seen[2]
     assert "reasoning" not in seen[3] and "temperature" not in seen[3]
     assert all(payload["tools"] == seen[0]["tools"] for payload in seen)
+    assert result["usage"]["provider_retry_count"] == 3
+    assert result["usage"]["cache_hint_sent_on_success"] is True
+    assert result["usage"]["compatibility_fallbacks"] == [
+        "cache_rejected:prompt_cache_key",
+        "reasoning_rejected",
+        "temperature_rejected",
+    ]
 
 
 def test_openrouter_reasoning_rejection_preserves_supported_cache_fields(
@@ -316,8 +346,78 @@ def test_openrouter_reasoning_rejection_preserves_supported_cache_fields(
     assert "reasoning" in seen[0] and "reasoning" not in seen[1]
     assert seen[1]["session_id"] == CACHE_KEY
     assert seen[1]["prompt_cache_key"] == CACHE_KEY
-    assert seen[1]["cache_control"] == {"type": "ephemeral"}
+    assert _nested_cache_controls(seen[1]["messages"]) == [{"type": "ephemeral"}]
     assert seen[1]["tools"] == seen[0]["tools"]
+
+
+def test_openrouter_removes_only_each_named_rejected_cache_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict] = []
+    responses = [
+        _response(400, {"error": {"message": "unknown field cache_control"}}),
+        _response(400, {"error": {"message": "unknown field prompt_cache_key"}}),
+        _openai_chat_success(),
+    ]
+
+    class AsyncClient:
+        async def post(self, *args, json=None, **kwargs):
+            seen.append(copy.deepcopy(json))
+            return responses.pop(0)
+
+    monkeypatch.setattr(pc, "_async_http_client", lambda: AsyncClient())
+    config = pc.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        api_key="sk-test",
+        prompt_cache_key=CACHE_KEY,
+    )
+
+    result = asyncio.run(
+        pc.chat_completion_async(config, MESSAGES, temperature=None, tools=TOOLS)
+    )
+
+    assert len(seen) == 3
+    assert _nested_cache_controls(seen[0]["messages"]) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(seen[1]["messages"]) == []
+    assert seen[1]["prompt_cache_key"] == CACHE_KEY
+    assert seen[1]["session_id"] == CACHE_KEY
+    assert "prompt_cache_key" not in seen[2]
+    assert seen[2]["session_id"] == CACHE_KEY
+    assert result["usage"]["cache_hint_sent_on_success"] is True
+    assert result["usage"]["compatibility_fallbacks"] == [
+        "cache_rejected:cache_control",
+        "cache_rejected:prompt_cache_key",
+    ]
+
+
+def test_unrelated_bad_request_is_not_retried_without_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict] = []
+    responses = [
+        _response(400, {"error": {"message": "model does not exist"}}),
+    ]
+
+    class AsyncClient:
+        async def post(self, *args, json=None, **kwargs):
+            seen.append(copy.deepcopy(json))
+            return responses.pop(0)
+
+    monkeypatch.setattr(pc, "_async_http_client", lambda: AsyncClient())
+    config = pc.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/not-a-model",
+        api_key="sk-test",
+        prompt_cache_key=CACHE_KEY,
+    )
+
+    with pytest.raises(pc.ProviderError, match="model does not exist"):
+        asyncio.run(
+            pc.chat_completion_async(config, MESSAGES, temperature=None, tools=TOOLS)
+        )
+
+    assert len(seen) == 1
 
 
 @pytest.mark.parametrize(

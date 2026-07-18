@@ -1246,7 +1246,7 @@ def recent_prompt_cache_stats(
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "WITH recent AS (SELECT id, job_id, created_at, model_calls, "
+                "WITH recent AS (SELECT id, job_id, created_at, model_calls, retries, "
                 "usage_reported_calls, cache_reported_calls, prompt_tokens, "
                 "cache_read_tokens, cache_write_tokens, cache_miss_tokens, "
                 "cache_route_fingerprint, provider, model, failed, status "
@@ -1266,6 +1266,7 @@ def recent_prompt_cache_stats(
                 "'job_id', job_id, "
                 "'created_at_ts', EXTRACT(EPOCH FROM created_at)::double precision, "
                 "'model_calls', model_calls, "
+                "'retries', retries, "
                 "'usage_reported_calls', usage_reported_calls, "
                 "'cache_reported_calls', cache_reported_calls, "
                 "'prompt_tokens', prompt_tokens, "

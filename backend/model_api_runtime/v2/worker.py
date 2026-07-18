@@ -386,11 +386,11 @@ class TurnMetrics:
 
     `add_call` accumulates usage from a REAL provider call —
     `tool_loop.run_tool_loop` (chat and wake both use the same provider-native
-    rounds), `v2_extraction.extract`, and `v2_compaction.compact`. `retries` stays 0
-    today: `reliable_chat_completion*` retries internally but
-    doesn't yet surface a retry count to its callers (out of scope for this
-    task) — the column/field exist so a future provider-level retry count can
-    be wired in without another migration.
+    rounds), `v2_extraction.extract`, and `v2_compaction.compact`. Provider
+    adapters surface a non-sensitive `provider_retry_count` in normalized
+    usage, so `retries` includes hidden compatibility HTTP attempts (for
+    example a rejected cache field or temperature) as well as outer transient
+    retries.
     """
     job_id: Any
     user_id: str
@@ -447,6 +447,19 @@ class TurnMetrics:
             self.retries += 1
         if not isinstance(usage, dict):
             return
+        retry_count = usage.get("provider_retry_count")
+        parsed_retries: int | None = None
+        if isinstance(retry_count, int) and not isinstance(retry_count, bool):
+            parsed_retries = retry_count
+        elif (
+            isinstance(retry_count, float)
+            and math.isfinite(retry_count)
+            and retry_count.is_integer()
+        ):
+            parsed_retries = int(retry_count)
+        if parsed_retries is not None:
+            # Provider data is untrusted; keep the persisted counter bounded.
+            self.retries += max(0, min(parsed_retries, 1000))
         usage_fields = (
             "prompt_tokens", "completion_tokens", "total_tokens",
             "cache_read_tokens", "cache_write_tokens", "cache_miss_tokens",

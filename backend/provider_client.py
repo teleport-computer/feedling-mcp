@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import logging
 import math
 import random
 import threading
@@ -16,6 +18,9 @@ from provider_types import ToolExchange
 
 if TYPE_CHECKING:
     from provider_types import ToolSpec
+
+
+log = logging.getLogger(__name__)
 
 
 class ProviderError(Exception):
@@ -94,7 +99,8 @@ def reliable_chat_completion(
     last_exc: BaseException | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return chat_completion(*args, **kwargs)
+            result = chat_completion(*args, **kwargs)
+            return _with_reliable_retry_count(result, attempt - 1)
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
             cls = classify_provider_error(exc)
             last_exc = exc
@@ -616,12 +622,34 @@ def _parse_tool_args(raw) -> tuple[dict, str, bool]:
         return {}, s, False
 
 
-_CACHE_REQUEST_FIELDS = frozenset({
-    "prompt_cache_key",
-    "prompt_cache_options",
+_CACHE_REQUEST_FIELDS = (
     "cache_control",
+    "prompt_cache_key",
     "session_id",
-})
+    "prompt_cache_options",
+)
+_CACHE_FIELD_ALIASES = {
+    "cache_control": ("cache_control", "cache control"),
+    "prompt_cache_key": ("prompt_cache_key", "prompt cache key"),
+    "session_id": ("session_id", "session id"),
+    "prompt_cache_options": ("prompt_cache_options", "prompt cache options"),
+}
+_SCHEMA_ERROR_HINTS = (
+    "additional properties",
+    "extra field",
+    "not permitted",
+    "unknown field",
+    "unknown parameter",
+    "unrecognized field",
+    "unrecognized parameter",
+    "unsupported parameter",
+)
+
+
+@dataclass(frozen=True)
+class _FallbackDecision:
+    payload: dict[str, Any]
+    code: str
 
 
 def _cache_key(value: Any) -> str:
@@ -629,40 +657,97 @@ def _cache_key(value: Any) -> str:
     return str(value or "").strip()[:256]
 
 
+def _contains_nested_cache_control(value: Any) -> bool:
+    if isinstance(value, dict):
+        if "cache_control" in value:
+            return True
+        return any(_contains_nested_cache_control(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_nested_cache_control(child) for child in value)
+    return False
+
+
+def _cache_fields_present(payload: dict[str, Any]) -> tuple[str, ...]:
+    present: list[str] = []
+    for field in _CACHE_REQUEST_FIELDS:
+        if field == "cache_control":
+            if "cache_control" in payload or _contains_nested_cache_control(payload):
+                present.append(field)
+        elif field in payload:
+            present.append(field)
+    return tuple(present)
+
+
+def _without_nested_cache_control(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_nested_cache_control(child)
+            for key, child in value.items()
+            if key != "cache_control"
+        }
+    if isinstance(value, list):
+        return [_without_nested_cache_control(child) for child in value]
+    return value
+
+
+def _without_cache_field(payload: dict[str, Any], field: str) -> dict[str, Any]:
+    if field == "cache_control":
+        return _without_nested_cache_control(payload)
+    fallback = dict(payload)
+    fallback.pop(field, None)
+    return fallback
+
+
+def _cache_field_named_in_error(resp) -> str | None:
+    try:
+        detail = _response_error_detail(resp).lower()
+    except Exception:  # noqa: BLE001 — absent error text is not a field hint
+        return None
+    for field, aliases in _CACHE_FIELD_ALIASES.items():
+        if any(alias in detail for alias in aliases):
+            return field
+    return None
+
+
 def _cache_fallback_payload(
     payload: dict[str, Any], resp, *, require_error_hint: bool = False,
-) -> dict[str, Any] | None:
-    """Remove only cache/stickiness fields after an unsupported 400/422.
+) -> _FallbackDecision | None:
+    """Remove one rejected cache/stickiness field after an unsupported 400/422.
 
     BYOK relays vary widely.  A cache hint must never turn a previously valid
     request into a terminal failure, but the downgrade must preserve tools,
-    messages, reasoning, and every other semantic field.  When
-    ``require_error_hint`` is true, only downgrade if the provider response
-    actually mentions a cache/session field; callers can make one final generic
-    downgrade after their existing reasoning/temperature fallbacks.
+    messages, still-supported cache affinity, and every other semantic field.
+    Named schema errors remove only the named field.  A generic downgrade is
+    allowed only for an explicit schema-shaped error; an unrelated 400 (bad
+    model/key/request) is never disguised as a cache compatibility retry.
     """
     if getattr(resp, "status_code", None) not in {400, 422}:
         return None
-    present = _CACHE_REQUEST_FIELDS.intersection(payload)
+    present = _cache_fields_present(payload)
     if not present:
         return None
-    if require_error_hint:
-        try:
-            detail = str(resp.text or "").lower()
-        except Exception:  # noqa: BLE001 — absent error text is not a hint
-            detail = ""
-        # Do not treat a generic "unknown field" as a cache rejection: it may
-        # name reasoning or temperature, and stripping cache affinity first
-        # would silently turn a cache-capable route cold.  The final generic
-        # cache-off fallback below still covers relays that return no useful
-        # field name at all after the semantic fallbacks have been attempted.
-        hints = ("cache", "session_id", "prompt_cache")
-        if not any(hint in detail for hint in hints):
+    try:
+        detail = _response_error_detail(resp).lower()
+    except Exception:  # noqa: BLE001 — absent error text is not a hint
+        detail = ""
+    named = _cache_field_named_in_error(resp)
+    if named in present:
+        field = named
+    else:
+        cache_hint = any(hint in detail for hint in ("cache", "session_id", "session id"))
+        schema_hint = any(hint in detail for hint in _SCHEMA_ERROR_HINTS)
+        if require_error_hint and not cache_hint:
             return None
-    fallback = dict(payload)
-    for field in present:
-        fallback.pop(field, None)
-    return fallback
+        if not require_error_hint and not schema_hint:
+            return None
+        # A relay may report only "additional properties are not allowed".
+        # Remove one optional field at a time in deterministic order, preserving
+        # every other potentially supported cache/stickiness hint.
+        field = present[0]
+    return _FallbackDecision(
+        payload=_without_cache_field(payload, field),
+        code=f"cache_rejected:{field}",
+    )
 
 
 def _malformed_tool_call(*, call_id: str = "", name: str = "") -> dict:
@@ -780,6 +865,77 @@ def _encode_messages_openai_chat(messages: list[Any]) -> list[dict[str, Any]]:
         encoded.append(assistant_message)
         encoded.extend(_encode_tool_results_openai_chat(message.results))
     return encoded
+
+
+def _content_with_ephemeral_cache_control(content: Any) -> Any:
+    """Attach one provider-native ephemeral cache breakpoint to text content."""
+    if isinstance(content, str) and content:
+        return [{
+            "type": "text",
+            "text": content,
+            "cache_control": {"type": "ephemeral"},
+        }]
+    if isinstance(content, list):
+        updated = copy.deepcopy(content)
+        for part in reversed(updated):
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                part["cache_control"] = {"type": "ephemeral"}
+                return updated
+    return content
+
+
+def _mark_openai_chat_cache_breakpoint(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Mark a stable message-content prefix for OpenRouter Anthropic caching.
+
+    OpenRouter accepts Anthropic's ``cache_control`` on a content block, not as
+    a top-level Chat Completions parameter.  Prefer the last system message so
+    the breakpoint remains byte-stable as the conversation grows; callers with
+    no system message use the first text-bearing message for the same reason.
+    """
+    updated = copy.deepcopy(messages)
+    system_candidates = [
+        index for index, message in enumerate(updated)
+        if isinstance(message, dict)
+        and str(message.get("role") or "").lower() == "system"
+    ]
+    candidates = (
+        reversed(system_candidates)
+        if system_candidates
+        else iter(range(len(updated)))
+    )
+    for index in candidates:
+        message = updated[index]
+        if not isinstance(message, dict) or "content" not in message:
+            continue
+        marked = _content_with_ephemeral_cache_control(message.get("content"))
+        if marked is not message.get("content"):
+            message["content"] = marked
+            return updated
+    return updated
+
+
+def _mark_anthropic_cache_breakpoint(
+    system: str,
+    messages: list[dict[str, Any]],
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Return Anthropic-native system/messages with one stable breakpoint."""
+    if system:
+        return ([{
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},
+        }], messages)
+    updated = copy.deepcopy(messages)
+    for message in updated:
+        if not isinstance(message, dict) or "content" not in message:
+            continue
+        marked = _content_with_ephemeral_cache_control(message.get("content"))
+        if marked is not message.get("content"):
+            message["content"] = marked
+            break
+    return system, updated
 
 
 def _encode_tools_openai_chat(tools) -> list[dict]:
@@ -1291,14 +1447,25 @@ def _chat_completion_openai_responses(
         except httpx.HTTPError as e:
             raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
-    resp = post_with_payload(payload)
-    try:
-        _raise_for_provider_status(resp)
-    except ProviderError:
-        fallback_payload = _cache_fallback_payload(payload, resp)
-        if fallback_payload is None:
-            raise
-        resp = post_with_payload(fallback_payload)
+    current_payload = payload
+    fallback_codes: list[str] = []
+    attempts_used = 0
+    for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
+        attempts_used = attempt
+        resp = post_with_payload(current_payload)
+        try:
+            _raise_for_provider_status(resp)
+            break
+        except ProviderError:
+            decision = _cache_fallback_payload(
+                current_payload, resp, require_error_hint=False)
+            if decision is None:
+                raise
+            fallback_codes.append(decision.code)
+            _record_compatibility_fallback(
+                provider="openai", model=model, code=decision.code, attempt=attempt)
+            current_payload = decision.payload
+    else:  # pragma: no cover — every fallback removes one finite field
         _raise_for_provider_status(resp)
 
     try:
@@ -1307,7 +1474,15 @@ def _chat_completion_openai_responses(
         raise ProviderError("provider returned non-json response") from e
     if not isinstance(body, dict):
         raise ProviderError("provider returned non-object response")
-    return _parse_openai_responses_body(body, model=model, require_reply=require_reply)
+    result = _parse_openai_responses_body(
+        body, model=model, require_reply=require_reply)
+    return _with_request_diagnostics(
+        result,
+        initial_payload=payload,
+        successful_payload=current_payload,
+        attempts=attempts_used,
+        fallback_codes=fallback_codes,
+    )
 
 
 # openai-compat 的 wire 编解码是 sync（_chat_completion_openai_compatible）与
@@ -1328,9 +1503,10 @@ def _build_openai_compat_payload(
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
 ) -> dict[str, Any]:
+    encoded_messages = _encode_messages_openai_chat(messages)
     payload: dict[str, Any] = {
         "model": model,
-        "messages": _encode_messages_openai_chat(messages),
+        "messages": encoded_messages,
         "stream": False,
         "max_tokens": max(1, min(int(max_tokens), 8192)),
     }
@@ -1357,7 +1533,8 @@ def _build_openai_compat_payload(
             payload["session_id"] = cache_key
             payload["prompt_cache_key"] = cache_key
             if "anthropic" in model.lower() or "claude" in model.lower():
-                payload["cache_control"] = {"type": "ephemeral"}
+                payload["messages"] = _mark_openai_chat_cache_breakpoint(
+                    encoded_messages)
     return payload
 
 
@@ -1368,6 +1545,12 @@ def _reasoning_fallback_payload(
     不适用时返回 None（调用方原样 raise）。"""
     if (include_reasoning and provider == "openrouter"
             and resp.status_code in {400, 422} and "reasoning" in payload):
+        try:
+            detail = _response_error_detail(resp).lower()
+        except Exception:  # noqa: BLE001 — no body means no safe downgrade hint
+            return None
+        if "reasoning" not in detail and "thinking" not in detail:
+            return None
         fallback = dict(payload)
         fallback.pop("reasoning", None)
         return fallback
@@ -1395,6 +1578,86 @@ def _temperature_fallback_payload(payload: dict[str, Any], resp) -> dict[str, An
     fallback = dict(payload)
     fallback.pop("temperature", None)
     return fallback
+
+
+def _compatibility_fallback(
+    payload: dict[str, Any],
+    resp,
+    *,
+    provider: str,
+    include_reasoning: bool,
+) -> _FallbackDecision | None:
+    """Choose one monotonic, privacy-safe compatibility fallback."""
+    decision = _cache_fallback_payload(payload, resp, require_error_hint=True)
+    if decision is not None:
+        return decision
+    reasoning = _reasoning_fallback_payload(
+        payload, resp, provider=provider, include_reasoning=include_reasoning)
+    if reasoning is not None:
+        return _FallbackDecision(reasoning, "reasoning_rejected")
+    temperature = _temperature_fallback_payload(payload, resp)
+    if temperature is not None:
+        return _FallbackDecision(temperature, "temperature_rejected")
+    return _cache_fallback_payload(payload, resp, require_error_hint=False)
+
+
+def _compatibility_attempt_limit(payload: dict[str, Any]) -> int:
+    removable = len(_cache_fields_present(payload))
+    removable += int("reasoning" in payload)
+    removable += int("temperature" in payload)
+    return 1 + removable
+
+
+def _record_compatibility_fallback(
+    *, provider: str, model: str, code: str, attempt: int,
+) -> None:
+    # Fixed vocabulary only: never log response bodies, prompts, keys, or URLs.
+    log.warning(
+        "[provider_client] compatibility_fallback "
+        "provider=%s model=%s code=%s attempt=%d",
+        provider,
+        model,
+        code,
+        attempt,
+    )
+
+
+def _with_request_diagnostics(
+    result: dict[str, Any],
+    *,
+    initial_payload: dict[str, Any],
+    successful_payload: dict[str, Any],
+    attempts: int,
+    fallback_codes: list[str],
+) -> dict[str, Any]:
+    """Attach non-sensitive request-path evidence to normalized usage."""
+    out = dict(result)
+    usage = dict(out.get("usage") or {})
+    usage.update({
+        "provider_retry_count": max(0, int(attempts) - 1),
+        "cache_hint_requested": bool(_cache_fields_present(initial_payload)),
+        "cache_hint_sent_on_success": bool(
+            _cache_fields_present(successful_payload)),
+        "compatibility_fallbacks": list(fallback_codes),
+    })
+    out["usage"] = usage
+    return out
+
+
+def _with_reliable_retry_count(result: Any, retries: int) -> Any:
+    """Fold outer transient retries into the same non-sensitive counter."""
+    if not isinstance(result, dict) or retries <= 0:
+        return result
+    out = dict(result)
+    usage = dict(out.get("usage") or {})
+    try:
+        inner = max(0, int(usage.get("provider_retry_count") or 0))
+    except (TypeError, ValueError, OverflowError):
+        inner = 0
+    usage["provider_retry_count"] = inner + int(retries)
+    usage["transient_retry_count"] = int(retries)
+    out["usage"] = usage
+    return out
 
 
 def _parse_openai_compat_body(
@@ -1469,32 +1732,46 @@ def _chat_completion_openai_compatible(
             raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
     current_payload = payload
+    fallback_codes: list[str] = []
+    attempts_used = 0
     # A relay can reject more than one optional field in sequence (for example
     # cache affinity first, then temperature).  Walk bounded, monotonic
     # fallbacks; each step removes fields only and always preserves tools.
-    for _ in range(4):
+    for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
+        attempts_used = attempt
         resp = post_with_payload(current_payload)
         try:
             _raise_for_provider_status(resp)
             break
         except ProviderError:
-            fallback_payload = (
-                _cache_fallback_payload(
-                    current_payload, resp, require_error_hint=True)
-                or _reasoning_fallback_payload(
-                    current_payload, resp,
-                    provider=provider, include_reasoning=include_reasoning)
-                or _temperature_fallback_payload(current_payload, resp)
-                or _cache_fallback_payload(current_payload, resp)
+            decision = _compatibility_fallback(
+                current_payload,
+                resp,
+                provider=provider,
+                include_reasoning=include_reasoning,
             )
-            if fallback_payload is None:
+            if decision is None:
                 raise
-            current_payload = fallback_payload
+            fallback_codes.append(decision.code)
+            _record_compatibility_fallback(
+                provider=provider,
+                model=model,
+                code=decision.code,
+                attempt=attempt,
+            )
+            current_payload = decision.payload
     else:  # pragma: no cover — every fallback removes at least one finite field
         _raise_for_provider_status(resp)
 
-    return _parse_openai_compat_body(
+    result = _parse_openai_compat_body(
         resp, provider=provider, model=model, require_reply=require_reply)
+    return _with_request_diagnostics(
+        result,
+        initial_payload=payload,
+        successful_payload=current_payload,
+        attempts=attempts_used,
+        fallback_codes=fallback_codes,
+    )
 
 
 # anthropic 的 wire 编解码是 sync（_chat_completion_anthropic）与 async
@@ -1529,14 +1806,17 @@ def _build_anthropic_payload(
         payload["thinking"] = {"type": "enabled", "budget_tokens": min(1024, capped_max_tokens - 512)}
     elif temperature is not None:
         payload["temperature"] = temperature
+    if _cache_key(prompt_cache_key):
+        system, provider_messages = _mark_anthropic_cache_breakpoint(
+            system, provider_messages)
+        payload["messages"] = provider_messages
     if system:
         payload["system"] = system
     if tools:
         payload["tools"] = _encode_tools_anthropic(tools)
-    if _cache_key(prompt_cache_key):
-        # Anthropic automatic caching advances the breakpoint with the growing
-        # conversation.  The key itself is intentionally not sent on this wire.
-        payload["cache_control"] = {"type": "ephemeral"}
+    # The opaque affinity key itself is intentionally not sent on Anthropic's
+    # wire.  ``cache_control`` lives on the stable system/message content block
+    # above; top-level cache_control is not part of the Messages API schema.
 
     url = f"{base_url.rstrip('/')}/messages"
     headers = {
@@ -1608,7 +1888,10 @@ def _chat_completion_anthropic(
             raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
     current_payload = payload
-    for _ in range(3):
+    fallback_codes: list[str] = []
+    attempts_used = 0
+    for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
+        attempts_used = attempt
         resp = post_with_payload(current_payload)
         try:
             _raise_for_provider_status(resp)
@@ -1616,15 +1899,22 @@ def _chat_completion_anthropic(
         except ProviderError:
             # Same temperature downgrade as the openai-compat wire, plus a
             # cache-off retry for older Anthropic relays.  Both preserve tools.
-            fallback_payload = (
-                _cache_fallback_payload(
-                    current_payload, resp, require_error_hint=True)
-                or _temperature_fallback_payload(current_payload, resp)
-                or _cache_fallback_payload(current_payload, resp)
+            decision = _compatibility_fallback(
+                current_payload,
+                resp,
+                provider="anthropic",
+                include_reasoning=False,
             )
-            if fallback_payload is None:
+            if decision is None:
                 raise
-            current_payload = fallback_payload
+            fallback_codes.append(decision.code)
+            _record_compatibility_fallback(
+                provider="anthropic",
+                model=model,
+                code=decision.code,
+                attempt=attempt,
+            )
+            current_payload = decision.payload
     else:  # pragma: no cover — finite monotonic fallback set
         _raise_for_provider_status(resp)
 
@@ -1635,7 +1925,15 @@ def _chat_completion_anthropic(
     if not isinstance(body, dict):
         raise ProviderError("provider returned non-object response")
 
-    return _parse_anthropic_body(body, model=model, require_reply=require_reply)
+    result = _parse_anthropic_body(
+        body, model=model, require_reply=require_reply)
+    return _with_request_diagnostics(
+        result,
+        initial_payload=payload,
+        successful_payload=current_payload,
+        attempts=attempts_used,
+        fallback_codes=fallback_codes,
+    )
 
 
 # gemini 的 wire 编解码是 sync（_chat_completion_gemini）与 async
@@ -1968,21 +2266,31 @@ async def chat_completion_async(
                 raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
         current_payload = payload
-        for _ in range(3):
+        fallback_codes: list[str] = []
+        attempts_used = 0
+        for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
+            attempts_used = attempt
             resp = await post_anthropic(current_payload)
             try:
                 _raise_for_provider_status(resp)
                 break
             except ProviderError:
-                fallback_payload = (
-                    _cache_fallback_payload(
-                        current_payload, resp, require_error_hint=True)
-                    or _temperature_fallback_payload(current_payload, resp)
-                    or _cache_fallback_payload(current_payload, resp)
+                decision = _compatibility_fallback(
+                    current_payload,
+                    resp,
+                    provider="anthropic",
+                    include_reasoning=False,
                 )
-                if fallback_payload is None:
+                if decision is None:
                     raise
-                current_payload = fallback_payload
+                fallback_codes.append(decision.code)
+                _record_compatibility_fallback(
+                    provider="anthropic",
+                    model=model,
+                    code=decision.code,
+                    attempt=attempt,
+                )
+                current_payload = decision.payload
         else:  # pragma: no cover — finite monotonic fallback set
             _raise_for_provider_status(resp)
         try:
@@ -1991,7 +2299,15 @@ async def chat_completion_async(
             raise ProviderError("provider returned non-json response") from e
         if not isinstance(body, dict):
             raise ProviderError("provider returned non-object response")
-        return _parse_anthropic_body(body, model=model, require_reply=require_reply)
+        result = _parse_anthropic_body(
+            body, model=model, require_reply=require_reply)
+        return _with_request_diagnostics(
+            result,
+            initial_payload=payload,
+            successful_payload=current_payload,
+            attempts=attempts_used,
+            fallback_codes=fallback_codes,
+        )
 
     if provider == "gemini":
         payload, url, headers = _build_gemini_payload(
@@ -2029,14 +2345,29 @@ async def chat_completion_async(
             except httpx.HTTPError as e:
                 raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
-        resp = await post_responses(payload)
-        try:
-            _raise_for_provider_status(resp)
-        except ProviderError:
-            fallback_payload = _cache_fallback_payload(payload, resp)
-            if fallback_payload is None:
-                raise
-            resp = await post_responses(fallback_payload)
+        current_payload = payload
+        fallback_codes = []
+        attempts_used = 0
+        for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
+            attempts_used = attempt
+            resp = await post_responses(current_payload)
+            try:
+                _raise_for_provider_status(resp)
+                break
+            except ProviderError:
+                decision = _cache_fallback_payload(
+                    current_payload, resp, require_error_hint=False)
+                if decision is None:
+                    raise
+                fallback_codes.append(decision.code)
+                _record_compatibility_fallback(
+                    provider="openai",
+                    model=request_model,
+                    code=decision.code,
+                    attempt=attempt,
+                )
+                current_payload = decision.payload
+        else:  # pragma: no cover — every fallback removes one finite field
             _raise_for_provider_status(resp)
         try:
             body = resp.json()
@@ -2044,7 +2375,15 @@ async def chat_completion_async(
             raise ProviderError("provider returned non-json response") from e
         if not isinstance(body, dict):
             raise ProviderError("provider returned non-object response")
-        return _parse_openai_responses_body(body, model=request_model, require_reply=require_reply)
+        result = _parse_openai_responses_body(
+            body, model=request_model, require_reply=require_reply)
+        return _with_request_diagnostics(
+            result,
+            initial_payload=payload,
+            successful_payload=current_payload,
+            attempts=attempts_used,
+            fallback_codes=fallback_codes,
+        )
 
     # openai-compat 编解码与同步版共享单实现（_build/_reasoning_fallback/
     # _parse 三个纯函数），这里只保留 async transport。
@@ -2071,29 +2410,43 @@ async def chat_completion_async(
             raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
     current_payload = payload
-    for _ in range(4):
+    fallback_codes = []
+    attempts_used = 0
+    for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
+        attempts_used = attempt
         resp = await post_with_payload(current_payload)
         try:
             _raise_for_provider_status(resp)
             break
         except ProviderError:
-            fallback_payload = (
-                _cache_fallback_payload(
-                    current_payload, resp, require_error_hint=True)
-                or _reasoning_fallback_payload(
-                    current_payload, resp,
-                    provider=provider, include_reasoning=include_reasoning)
-                or _temperature_fallback_payload(current_payload, resp)
-                or _cache_fallback_payload(current_payload, resp)
+            decision = _compatibility_fallback(
+                current_payload,
+                resp,
+                provider=provider,
+                include_reasoning=include_reasoning,
             )
-            if fallback_payload is None:
+            if decision is None:
                 raise
-            current_payload = fallback_payload
+            fallback_codes.append(decision.code)
+            _record_compatibility_fallback(
+                provider=provider,
+                model=request_model,
+                code=decision.code,
+                attempt=attempt,
+            )
+            current_payload = decision.payload
     else:  # pragma: no cover — finite monotonic fallback set
         _raise_for_provider_status(resp)
 
-    return _parse_openai_compat_body(
+    result = _parse_openai_compat_body(
         resp, provider=provider, model=request_model, require_reply=require_reply)
+    return _with_request_diagnostics(
+        result,
+        initial_payload=payload,
+        successful_payload=current_payload,
+        attempts=attempts_used,
+        fallback_codes=fallback_codes,
+    )
 
 
 # --- Hosted runtime V2: natively async reliable wrapper ---------------------
@@ -2140,7 +2493,7 @@ async def reliable_chat_completion_async(
         try:
             result = await chat_completion_async(*args, **kwargs)
             _progress("attempt_complete", attempt)
-            return result
+            return _with_reliable_retry_count(result, attempt - 1)
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
             _progress("attempt_failed", attempt)
             cls = classify_provider_error(exc)
