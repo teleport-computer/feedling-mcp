@@ -73,7 +73,7 @@ from __future__ import annotations
 
 import base64
 import sys
-import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -126,14 +126,14 @@ def _env(user_id: str, marker: str) -> dict:
 
 
 def _send_user_msg(client, user_id: str, api_key: str, marker: str = "u1") -> str:
+    """返回新建用户消息的 id。/v1/chat/send 的返回体是 {"id", "ts", "v"}。"""
     res = client.post(
         "/v1/chat/send",
-        json={"envelope": _env(user_id, marker), "client_msg_id": str(__import__("uuid").uuid4())},
+        json={"envelope": _env(user_id, marker), "client_msg_id": str(uuid.uuid4())},
         headers=_headers(api_key),
     )
     assert res.status_code in (200, 201), res.get_data(as_text=True)
-    body = res.get_json()
-    return str(body.get("message_id") or body.get("id") or "")
+    return str(res.get_json()["id"])
 
 
 def _history(client, api_key: str) -> list[dict]:
