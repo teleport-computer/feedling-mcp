@@ -718,13 +718,21 @@ class SmokeClient:
         return body
 
     def read_trace(
-        self, sess: Session, *, limit: int = 200, subsystem: str = ""
+        self,
+        sess: Session,
+        *,
+        limit: int = 200,
+        subsystem: str = "",
+        attempts: int = 5,
+        read_timeout: float = 45,
     ) -> dict:
         query = urllib.parse.urlencode({"limit": int(limit), "subsystem": subsystem})
         status, body = self._req(
             "GET",
             f"/v1/debug/trace?{query}",
             api_key=sess.api_key,
+            attempts=attempts,
+            read_timeout=read_timeout,
         )
         if status != 200 or not isinstance(body.get("events"), list):
             raise SmokeError("trace", f"read status={status} body={body}")

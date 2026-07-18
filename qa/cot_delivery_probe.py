@@ -39,6 +39,15 @@ RECEIPT_SCHEMA_VERSION = 2
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 TRACE_POLL_SECONDS = 20.0
 TRACE_POLL_INTERVAL_SECONDS = 1.0
+TRACE_READ_TIMEOUT_CAP_SECONDS = 10.0
+CONFIG_READ_ATTEMPTS = 2
+CONFIG_READ_TIMEOUT_SECONDS = 15.0
+CONFIG_READ_RETRY_BACKOFF_SECONDS = 2.0
+CHAT_SEND_TIMEOUT_SECONDS = 45.0
+DEFAULT_REPLY_POLL_SECONDS = 120.0
+MAX_REPLY_POLL_SECONDS = 180.0
+PARENT_COT_TIMEOUT_SECONDS = 300.0
+AGENT_COT_WAIT_SECONDS = 360.0
 EXPECTED_REASONING_EFFORT = "medium"
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 _FAILURE_CODES = frozenset(
@@ -60,6 +69,33 @@ _FAILURE_CODES = frozenset(
 
 class CotProbeError(RuntimeError):
     """A fixed, non-sensitive probe setup failure."""
+
+
+def _request_worst_case_seconds(
+    *, attempts: int, read_timeout: float
+) -> float:
+    """Bound one ``SmokeClient._req`` including its linear retry sleeps."""
+
+    retry_sleeps = CONFIG_READ_RETRY_BACKOFF_SECONDS * sum(
+        range(1, attempts)
+    )
+    return attempts * read_timeout + retry_sleeps
+
+
+COT_PROBE_WORST_CASE_SECONDS = (
+    _request_worst_case_seconds(
+        attempts=CONFIG_READ_ATTEMPTS,
+        read_timeout=CONFIG_READ_TIMEOUT_SECONDS,
+    )
+    + CHAT_SEND_TIMEOUT_SECONDS
+    + MAX_REPLY_POLL_SECONDS
+    + TRACE_POLL_SECONDS
+)
+if not (
+    COT_PROBE_WORST_CASE_SECONDS < PARENT_COT_TIMEOUT_SECONDS
+    < AGENT_COT_WAIT_SECONDS
+):
+    raise RuntimeError("COT qualification timeout hierarchy is invalid")
 
 
 def _owned_private_file(path: Path, label: str, *, max_bytes: int) -> bytes:
@@ -207,8 +243,8 @@ def read_configured_effort(
             "GET",
             "/v1/model_api/get",
             api_key=session.api_key,
-            attempts=2,
-            read_timeout=15,
+            attempts=CONFIG_READ_ATTEMPTS,
+            read_timeout=CONFIG_READ_TIMEOUT_SECONDS,
         )
     except Exception:  # External evidence failure must remain unavailable, not fatal.
         return "unknown", False, False
@@ -476,8 +512,19 @@ def _poll_trace(
     deadline = time.monotonic() + TRACE_POLL_SECONDS
     last: dict[str, Any] = {}
     completed_observations = 0
-    while time.monotonic() < deadline or completed_observations == 1:
-        body = client.read_trace(session, limit=500)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        body = client.read_trace(
+            session,
+            limit=500,
+            attempts=1,
+            read_timeout=max(
+                0.1,
+                min(remaining, TRACE_READ_TIMEOUT_CAP_SECONDS),
+            ),
+        )
         events = [event for event in body.get("events", []) if isinstance(event, dict)]
         last = correlate_trace(
             events,
@@ -506,9 +553,10 @@ def _poll_trace(
                 return last
         else:
             completed_observations = 0
-        if time.monotonic() >= deadline and completed_observations != 1:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             break
-        time.sleep(TRACE_POLL_INTERVAL_SECONDS)
+        time.sleep(min(TRACE_POLL_INTERVAL_SECONDS, remaining))
     return last or {
         "dropped": False,
         "model_call_count": 0,
@@ -532,12 +580,12 @@ def run_probe(
     *,
     nonce: str,
     expected_profile_id: str | None = None,
-    timeout_seconds: float = 120.0,
+    timeout_seconds: float = DEFAULT_REPLY_POLL_SECONDS,
     client: SmokeClient | None = None,
 ) -> dict[str, Any]:
     if not _NONCE_RE.fullmatch(nonce):
         raise CotProbeError("probe nonce is invalid")
-    if not 10 <= timeout_seconds <= 300:
+    if not 10 <= timeout_seconds <= MAX_REPLY_POLL_SECONDS:
         raise CotProbeError("probe timeout is invalid")
     profile, base_url, session = load_profile_context(
         manifest_path, expected_profile_id
@@ -588,6 +636,7 @@ def run_probe(
                 f"Qualification P0-12 {nonce}. Calculate 17 multiplied by 19. "
                 "Give the numeric answer clearly."
             ),
+            read_timeout=CHAT_SEND_TIMEOUT_SECONDS,
         )
         ack_latency_ms = (time.monotonic() - started_monotonic) * 1000.0
         user_message = response.get("user_message") or {}
@@ -716,7 +765,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--nonce", required=True)
     parser.add_argument("--profile-id")
-    parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=DEFAULT_REPLY_POLL_SECONDS,
+    )
     return parser
 
 

@@ -256,8 +256,10 @@ def test_trace_poll_requires_two_completed_observations(monkeypatch):
     class FakeClient:
         calls = 0
 
-        def read_trace(self, _session, *, limit):
+        def read_trace(self, _session, *, limit, attempts, read_timeout):
             assert limit == 500
+            assert attempts == 1
+            assert 0 < read_timeout <= probe.TRACE_READ_TIMEOUT_CAP_SECONDS
             self.calls += 1
             return {"events": _completed_trace_events()}
 
@@ -280,8 +282,10 @@ def test_trace_poll_detects_duplicate_arriving_after_first_completion(monkeypatc
     class FakeClient:
         calls = 0
 
-        def read_trace(self, _session, *, limit):
+        def read_trace(self, _session, *, limit, attempts, read_timeout):
             assert limit == 500
+            assert attempts == 1
+            assert 0 < read_timeout <= probe.TRACE_READ_TIMEOUT_CAP_SECONDS
             self.calls += 1
             return {
                 "events": _completed_trace_events(
@@ -306,6 +310,53 @@ def test_trace_poll_detects_duplicate_arriving_after_first_completion(monkeypatc
         "UNVERIFIED",
         "TRACE_AMBIGUOUS",
     )
+
+
+def test_trace_poll_caps_each_read_to_remaining_budget(monkeypatch):
+    clock = iter((100.0, 100.0, 115.5, 115.5, 120.0))
+
+    class FakeClient:
+        read_timeouts: list[float] = []
+
+        def read_trace(self, _session, *, limit, attempts, read_timeout):
+            assert limit == 500
+            assert attempts == 1
+            self.read_timeouts.append(read_timeout)
+            return {"events": []}
+
+    monkeypatch.setattr(probe.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(probe.time, "sleep", lambda _seconds: None)
+
+    client = FakeClient()
+    result = probe._poll_trace(
+        client,
+        object(),
+        trace_id="turn-1",
+        reply_message_id="reply-1",
+        turn_started_at=100.0,
+    )
+
+    assert result["model_call_count"] == 0
+    assert client.read_timeouts == [10.0, 4.5]
+
+
+def test_cot_probe_budget_finishes_before_parent_and_agent_deadlines():
+    assert probe.COT_PROBE_WORST_CASE_SECONDS == 277.0
+    assert (
+        probe.COT_PROBE_WORST_CASE_SECONDS
+        < probe.PARENT_COT_TIMEOUT_SECONDS
+        < probe.AGENT_COT_WAIT_SECONDS
+    )
+
+
+def test_reply_poll_timeout_cannot_exceed_parent_budget(tmp_path):
+    with pytest.raises(probe.CotProbeError, match="probe timeout is invalid"):
+        probe.run_probe(
+            tmp_path / "unused-manifest.json",
+            tmp_path / "unused-receipt.json",
+            nonce="nonce_123456",
+            timeout_seconds=probe.MAX_REPLY_POLL_SECONDS + 0.1,
+        )
 
 
 def _manifest(tmp_path: Path) -> Path:
@@ -368,7 +419,10 @@ def test_configured_effort_readback_requires_exact_live_route():
         def _req(self, method, path, *, api_key, attempts, read_timeout):
             assert (method, path) == ("GET", "/v1/model_api/get")
             assert api_key == "feedling-user-secret"
-            assert (attempts, read_timeout) == (2, 15)
+            assert (attempts, read_timeout) == (
+                probe.CONFIG_READ_ATTEMPTS,
+                probe.CONFIG_READ_TIMEOUT_SECONDS,
+            )
             return 200, _configured_route()
 
     assert probe.read_configured_effort(
@@ -514,9 +568,10 @@ def test_run_probe_projects_reasoning_delivery_without_raw_text(tmp_path, monkey
             assert (attempts, read_timeout) == (2, 15)
             return 200, _configured_route()
 
-        def send(self, session, text):
+        def send(self, session, text, *, read_timeout):
             assert session.user_id == "user-1"
             assert "17 multiplied by 19" in text
+            assert read_timeout == probe.CHAT_SEND_TIMEOUT_SECONDS
             return {"user_message": {"id": "turn-1", "ts": 100.0}}
 
         def poll_reply_record(
@@ -570,7 +625,8 @@ def test_run_probe_preserves_reply_ids_when_trace_is_unavailable(tmp_path, monke
         def _req(self, *_args, **_kwargs):
             return 200, _configured_route()
 
-        def send(self, _session, _text):
+        def send(self, _session, _text, *, read_timeout):
+            assert read_timeout == probe.CHAT_SEND_TIMEOUT_SECONDS
             return {"user_message": {"id": "turn-1", "ts": 100.0}}
 
         def poll_reply_record(self, *_args, **_kwargs):
@@ -639,7 +695,8 @@ def test_run_probe_always_tests_delivery_regardless_of_configuration_readback(
                 raise readback
             return readback
 
-        def send(self, _session, _text):
+        def send(self, _session, _text, *, read_timeout):
+            assert read_timeout == probe.CHAT_SEND_TIMEOUT_SECONDS
             self.send_calls += 1
             return {"user_message": {"id": "turn-1", "ts": 100.0}}
 
