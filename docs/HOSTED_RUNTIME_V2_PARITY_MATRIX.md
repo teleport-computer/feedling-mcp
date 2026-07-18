@@ -137,7 +137,13 @@ Coverage is a prompt invariant, never a retention authorization. The durable
 deleted at 5,000 rows or after a summary watermark advances. `MAX_CHAT_MESSAGES`
 only bounds each process's recent working set; iOS history uses bounded database
 pages, and a message body can be fetched by stable id outside that hot window.
-Only explicit user/account deletion removes source chat history.
+Only explicit user/account deletion removes source chat history. The explicit
+Chat clear endpoint is generation-fenced and atomically removes raw messages,
+the summary, chat-derived artifact views, pending effects/status, and the reply
+cursor, so an old worker cannot resurrect cleared context. Independent Memory
+Garden, Identity, user-authored workspace/working memory, schedules, metrics,
+and encrypted trajectory telemetry remain; account deletion is the full-data
+erasure boundary.
 
 The **total prompt frontier** is the complete per-round budget calculation over
 the rendered system text, summary, verbatim messages, images, exact tool

@@ -83,6 +83,12 @@ change must not be interpreted as an API guarantee.
   blob still needs segmented encrypted checkpoints for an indefinitely long
   conversation.
 
+- Explicit Chat clear now advances the runtime generation and atomically removes
+  raw messages, summary, chat-derived artifacts, effects/status, and reply
+  cursor. Paused old workers cannot resurrect cleared context. Independent
+  Memory/workspace state and encrypted trajectory telemetry retain their own
+  policies; account deletion remains the complete-erasure operation.
+
 - Runtime V2 adds an encrypted virtual workspace foundation with read-only
   `/artifacts` and `/skills`, editable `/workspace`, and a persistent editable
   `/memory/WORKING.md` that is distinct from Memory Garden. Native file writes

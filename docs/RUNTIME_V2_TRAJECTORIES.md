@@ -102,5 +102,9 @@ working memory, or later prompts automatically.
 
 There is deliberately no time-based trajectory/review retention job yet;
 encrypted rows survive until their owning job/account is explicitly deleted.
-Production review should remain opt-in until the product has chosen a BYOK cost
-budget and retention/GC policy. Disabling review never disables capture.
+`DELETE /v1/chat/history` clears the transcript and every live derived prompt
+surface, but deliberately retains these encrypted flight-recorder rows as
+telemetry; they are never reintroduced into conversation context. Account reset
+or explicit job deletion is the complete-erasure boundary. Production review
+should remain opt-in until the product has chosen a BYOK cost budget and
+retention/GC policy. Disabling review never disables capture.

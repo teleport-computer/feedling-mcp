@@ -315,5 +315,13 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 }
 ```
 
-This clears the authenticated user's transcript only. It does not delete Memory,
-Identity, API keys, or the account.
+This atomically clears the authenticated user's raw transcript plus its live
+Runtime V2 summary, chat-derived artifact views, pending effects/status, and
+reply cursor. It advances the runtime generation so an in-flight pre-clear turn
+cannot recreate a reply or derived context after the endpoint returns.
+
+It does not delete Memory Garden, Identity, API keys, user-authored
+`/workspace`, `/memory/WORKING.md`, skills, schedules, content-free billing/token
+metrics, or the account. Encrypted trajectory/review telemetry is retained under
+its separate retention policy and never re-enters the live prompt. Use account
+reset/deletion when the intended operation is complete data erasure.

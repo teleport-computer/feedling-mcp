@@ -84,6 +84,12 @@
   retention rule. The remaining full-conversation task is to replace the one
   ever-growing summary blob with immutable encrypted segments and higher-level
   checkpoints.
+- Explicit Chat clear is now a generation-fenced atomic reset of raw messages,
+  summary, chat-derived artifacts, pending effects/status, and reply cursor.
+  Paused old workers cannot recreate cleared context. Independent Memory,
+  user-authored workspace, schedules, content-free metrics, and encrypted
+  trajectory telemetry remain under their own retention policies; account
+  deletion remains the complete-erasure boundary.
 - Hosted resident retirement is complete in source and managed manifests, but
   live fleet closure still requires deploying the reviewed image everywhere,
   provisioning production's second runner failure domain, and verifying zero
