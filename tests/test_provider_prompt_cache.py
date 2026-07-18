@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client as pc  # noqa: E402
+from model_api_runtime.v2 import context as v2_context  # noqa: E402
 from provider_types import ToolSpec  # noqa: E402
 
 
@@ -144,6 +145,51 @@ def test_openrouter_sends_sticky_cache_fields_and_anthropic_cache_control() -> N
     assert payload["session_id"] == CACHE_KEY
     assert "cache_control" not in payload
     assert _nested_cache_controls(payload["messages"]) == [{"type": "ephemeral"}]
+
+
+def test_v2_cache_breakpoints_exclude_dynamic_perception_grounding() -> None:
+    messages = v2_context.build_turn_messages(
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+        summary="- user likes tea",
+        tail=[{"role": "user", "content": "What should I drink?"}],
+        action_context="live perception: now=2026-07-18T10:00:00Z",
+    )
+
+    openrouter = pc._build_openai_compat_payload(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        messages=messages,
+        temperature=None,
+        max_tokens=256,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=TOOLS,
+        prompt_cache_key=CACHE_KEY,
+    )
+    controls_by_message = [
+        _nested_cache_controls(message.get("content"))
+        for message in openrouter["messages"]
+    ]
+
+    assert controls_by_message[0] == [{"type": "ephemeral"}]
+    assert controls_by_message[-2] == [{"type": "ephemeral"}]
+    assert controls_by_message[-1] == []
+
+    anthropic, _, _ = pc._build_anthropic_payload(
+        model="claude-sonnet-4-5",
+        base_url="https://api.anthropic.com/v1",
+        key="sk-test",
+        messages=messages,
+        max_tokens=256,
+        temperature=None,
+        response_format=None,
+        tools=TOOLS,
+        prompt_cache_key=CACHE_KEY,
+    )
+    assert _nested_cache_controls(anthropic["system"]) == [{"type": "ephemeral"}]
+    assert "live perception" in str(anthropic["system"][-1]["text"])
+    assert "cache_control" not in anthropic["system"][-1]
 
 
 def test_direct_anthropic_uses_cache_control_without_disclosing_affinity_key() -> None:
@@ -444,6 +490,74 @@ def test_unrelated_bad_request_is_not_retried_without_cache(
         )
 
     assert len(seen) == 1
+
+
+def test_unrelated_named_tool_schema_error_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict] = []
+    responses = [
+        _response(400, {"error": {"message": "unknown field tools"}}),
+    ]
+
+    class AsyncClient:
+        async def post(self, *args, json=None, **kwargs):
+            seen.append(copy.deepcopy(json))
+            return responses.pop(0)
+
+    monkeypatch.setattr(pc, "_async_http_client", lambda: AsyncClient())
+    config = pc.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        api_key="sk-test",
+        prompt_cache_key=CACHE_KEY,
+    )
+
+    with pytest.raises(pc.ProviderError, match="unknown field tools"):
+        asyncio.run(pc.chat_completion_async(config, MESSAGES, tools=TOOLS))
+
+    assert len(seen) == 1
+
+
+def test_cache_fallback_never_deletes_tool_parameter_named_cache_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema_tool = ToolSpec(
+        name="inspect_cache",
+        description="Inspect a caller-supplied cache object",
+        parameters={
+            "type": "object",
+            "properties": {"cache_control": {"type": "string"}},
+        },
+    )
+    seen: list[dict] = []
+    responses = [
+        _response(400, {"error": {"message": "unknown field cache_control"}}),
+        _openai_chat_success(),
+    ]
+
+    class AsyncClient:
+        async def post(self, *args, json=None, **kwargs):
+            seen.append(copy.deepcopy(json))
+            return responses.pop(0)
+
+    monkeypatch.setattr(pc, "_async_http_client", lambda: AsyncClient())
+    config = pc.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        api_key="sk-test",
+        prompt_cache_key=CACHE_KEY,
+    )
+
+    asyncio.run(pc.chat_completion_async(config, MESSAGES, tools=[schema_tool]))
+
+    assert len(seen) == 2
+    assert _nested_cache_controls(seen[1]["messages"]) == []
+    assert (
+        seen[1]["tools"][0]["function"]["parameters"]["properties"]
+        ["cache_control"]
+        == {"type": "string"}
+    )
 
 
 @pytest.mark.parametrize(

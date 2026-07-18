@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -644,6 +645,10 @@ _SCHEMA_ERROR_HINTS = (
     "unrecognized parameter",
     "unsupported parameter",
 )
+_NAMED_SCHEMA_FIELD = re.compile(
+    r"(?:field|parameter)\s*[:=]?\s*[`'\"]?([a-zA-Z_][a-zA-Z0-9_.-]*)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -657,42 +662,58 @@ def _cache_key(value: Any) -> str:
     return str(value or "").strip()[:256]
 
 
-def _contains_nested_cache_control(value: Any) -> bool:
-    if isinstance(value, dict):
-        if "cache_control" in value:
-            return True
-        return any(_contains_nested_cache_control(child) for child in value.values())
-    if isinstance(value, list):
-        return any(_contains_nested_cache_control(child) for child in value)
-    return False
+def _cache_control_blocks(payload: dict[str, Any]):
+    """Yield only provider content blocks where Feedling may inject a marker.
+
+    Never recurse through arbitrary payload data: a tool may legitimately have
+    an argument/property named ``cache_control`` and fallback must preserve it.
+    """
+    system = payload.get("system")
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict):
+                yield block
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        yield block
+
+
+def _contains_provider_cache_control(payload: dict[str, Any]) -> bool:
+    return "cache_control" in payload or any(
+        "cache_control" in block for block in _cache_control_blocks(payload))
 
 
 def _cache_fields_present(payload: dict[str, Any]) -> tuple[str, ...]:
     present: list[str] = []
     for field in _CACHE_REQUEST_FIELDS:
         if field == "cache_control":
-            if "cache_control" in payload or _contains_nested_cache_control(payload):
+            if _contains_provider_cache_control(payload):
                 present.append(field)
         elif field in payload:
             present.append(field)
     return tuple(present)
 
 
-def _without_nested_cache_control(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _without_nested_cache_control(child)
-            for key, child in value.items()
-            if key != "cache_control"
-        }
-    if isinstance(value, list):
-        return [_without_nested_cache_control(child) for child in value]
-    return value
+def _without_provider_cache_control(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    fallback = copy.deepcopy(payload)
+    fallback.pop("cache_control", None)
+    for block in _cache_control_blocks(fallback):
+        block.pop("cache_control", None)
+    return fallback
 
 
 def _without_cache_field(payload: dict[str, Any], field: str) -> dict[str, Any]:
     if field == "cache_control":
-        return _without_nested_cache_control(payload)
+        return _without_provider_cache_control(payload)
     fallback = dict(payload)
     fallback.pop(field, None)
     return fallback
@@ -739,6 +760,17 @@ def _cache_fallback_payload(
         if require_error_hint and not cache_hint:
             return None
         if not require_error_hint and not schema_hint:
+            return None
+        named_schema_field = _NAMED_SCHEMA_FIELD.search(detail)
+        if (
+            not require_error_hint
+            and named_schema_field is not None
+            and named_schema_field.group(1).lower()
+            not in {alias for aliases in _CACHE_FIELD_ALIASES.values() for alias in aliases}
+        ):
+            # "unknown field tools" is about tools, not caching. Do not amplify
+            # it into several cache retries before the tool loop's own bounded
+            # tools-disabled fallback.
             return None
         # A relay may report only "additional properties are not allowed".
         # Remove one optional field at a time in deterministic order, preserving
@@ -887,46 +919,65 @@ def _content_with_ephemeral_cache_control(content: Any) -> Any:
 def _mark_openai_chat_cache_breakpoint(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Mark a stable message-content prefix for OpenRouter Anthropic caching.
+    """Mark stable + advancing prefixes for OpenRouter Anthropic caching.
 
     OpenRouter accepts Anthropic's ``cache_control`` on a content block, not as
-    a top-level Chat Completions parameter.  Prefer the last system message so
-    the breakpoint remains byte-stable as the conversation grows; callers with
-    no system message use the first text-bearing message for the same reason.
+    a top-level Chat Completions parameter. The first system message is the
+    byte-stable tool/persona prefix. The last non-system message advances the
+    conversation prefix while deliberately excluding trailing per-turn system
+    grounding (for example live perception data).
     """
     updated = copy.deepcopy(messages)
-    system_candidates = [
+    stable_candidates = [
         index for index, message in enumerate(updated)
         if isinstance(message, dict)
         and str(message.get("role") or "").lower() == "system"
     ]
-    candidates = (
-        reversed(system_candidates)
-        if system_candidates
-        else iter(range(len(updated)))
-    )
-    for index in candidates:
+    advancing_candidates = [
+        index for index, message in enumerate(updated)
+        if isinstance(message, dict)
+        and str(message.get("role") or "").lower() != "system"
+    ]
+    candidates: list[int] = []
+    if stable_candidates:
+        candidates.append(stable_candidates[0])
+    if advancing_candidates:
+        candidates.append(advancing_candidates[-1])
+    if not candidates:
+        candidates = list(range(len(updated)))
+    marked_any = False
+    for index in dict.fromkeys(candidates):
         message = updated[index]
         if not isinstance(message, dict) or "content" not in message:
             continue
         marked = _content_with_ephemeral_cache_control(message.get("content"))
         if marked is not message.get("content"):
             message["content"] = marked
-            return updated
+            marked_any = True
+    if marked_any:
+        return updated
     return updated
 
 
 def _mark_anthropic_cache_breakpoint(
     system: str,
     messages: list[dict[str, Any]],
+    *,
+    system_parts: list[str] | None = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Return Anthropic-native system/messages with one stable breakpoint."""
     if system:
-        return ([{
-            "type": "text",
-            "text": system,
-            "cache_control": {"type": "ephemeral"},
-        }], messages)
+        parts = [part for part in (system_parts or []) if part]
+        joined = "\n\n".join(parts)
+        if not parts or not system.startswith(joined):
+            parts = [system]
+        else:
+            remainder = system[len(joined):].strip()
+            if remainder:
+                parts.append(remainder)
+        blocks = [{"type": "text", "text": part} for part in parts]
+        blocks[0]["cache_control"] = {"type": "ephemeral"}
+        return blocks, messages
     updated = copy.deepcopy(messages)
     for message in updated:
         if not isinstance(message, dict) or "content" not in message:
@@ -1792,6 +1843,13 @@ def _build_anthropic_payload(
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
+    cacheable_system_parts = [
+        _content_text(message.get("content"))
+        for message in messages
+        if isinstance(message, dict)
+        and str(message.get("role") or "").strip().lower() == "system"
+        and _content_text(message.get("content"))
+    ]
     system, provider_messages = _split_system_messages_anthropic(messages)
     json_instruction = _json_only_instruction(response_format)
     if json_instruction:
@@ -1808,7 +1866,10 @@ def _build_anthropic_payload(
         payload["temperature"] = temperature
     if _cache_key(prompt_cache_key):
         system, provider_messages = _mark_anthropic_cache_breakpoint(
-            system, provider_messages)
+            system,
+            provider_messages,
+            system_parts=cacheable_system_parts,
+        )
         payload["messages"] = provider_messages
     if system:
         payload["system"] = system
