@@ -1,21 +1,15 @@
-"""读时自愈（chat_core.history 的 stale-store 探针）。
+"""Durable chat-history reads and their hot-cache fallback.
 
-多 worker 下 /chat/history 只读本 worker 的内存 store；跨 worker 一致性靠
-LISTEN/NOTIFY 广播。广播一旦漏送（监听断线窗口 / worker 刚回收完监听未建立），
-该 worker 会最长 15 分钟（STORE_CACHE_TTL_SECONDS）持续返回旧聊天——用户收到
-APNs 推送但聊天页看不到消息（2026-07-15 诊断报告）。
-
-自愈约定：带 ``since`` 的请求过滤结果为空时，用一条 (user_id, seq) 索引单行
-探针取 DB 侧最新一条消息的 ts，与内存**原始** ``store.chat_messages``（不是
-可见过滤后的列表——否则最新一条是隐藏 verify 行时会每次空 poll 都白重载）的
-最大 ts 比对；DB 更新 → 就地 ``_evict_store`` 重载后重新作答。探针失败 fail-open
-（照常返回空，绝不 500）。
+The primary history path pages PostgreSQL directly, so missed cross-worker
+LISTEN/NOTIFY broadcasts and the bounded per-process hot window cannot hide a
+durable row. If that bounded read fails, the legacy in-memory path remains a
+fail-open fallback and may use the stale-store probe/reload behavior exercised
+below.
 """
 from __future__ import annotations
 
 import base64
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -25,7 +19,6 @@ from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 from accounts import registry as accounts_registry  # noqa: E402
-from chat import chat_core  # noqa: E402
 import db  # noqa: E402
 
 
@@ -159,3 +152,34 @@ def test_history_probe_fails_open(user, monkeypatch):
     monkeypatch.setattr(db, "chat_newest_ts", boom)
     body = _history_since(client, api_key, ts1)
     assert (body.get("messages") or []) == []
+
+
+def test_history_and_single_body_read_past_hot_window(user, monkeypatch):
+    """The worker cache is only a hot window, never the history boundary."""
+    user_id, api_key = user
+    client = make_client()
+    first = _send(client, user_id, api_key, "oldest")
+    oldest_ts = float(first["ts"])
+
+    for index in range(1, 6):
+        _append_db_only(user_id, f"new-{index}", oldest_ts + index)
+
+    monkeypatch.setattr(core_store, "MAX_CHAT_MESSAGES", 3)
+    core_store._evict_store(user_id)
+    hot_store = core_store.get_store(user_id)
+    assert [row["id"] for row in hot_store.chat_messages] == [
+        "new-3", "new-4", "new-5",
+    ]
+
+    history = client.get("/v1/chat/history?limit=40", headers=_hk(api_key))
+    assert history.status_code == 200
+    payload = history.get_json()
+    assert payload["total"] == 6
+    assert [row["id"] for row in payload["messages"]] == [
+        "oldest", "new-1", "new-2", "new-3", "new-4", "new-5",
+    ]
+
+    body = client.get(
+        "/v1/chat/messages/oldest/body", headers=_hk(api_key))
+    assert body.status_code == 200
+    assert body.get_json()["message"]["body_ct"] == _env(user_id, "oldest")["body_ct"]

@@ -310,33 +310,73 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
     ).lower() not in {"0", "false", "no", "off"}
 
     now = time.time()
-    all_msgs, raw_max_ts = _visible_msgs_and_raw_max(store, now)
-    total = len(all_msgs)
-
-    if before > 0:
-        filtered = [m for m in all_msgs if float(m.get("ts", 0)) < before]
-        msgs = filtered[-limit:]
-        has_more_older = len(filtered) > len(msgs)
-        has_more_newer = False
-        page_mode = "before"
-    elif since > 0:
-        filtered = [m for m in all_msgs if float(m.get("ts", 0)) > since]
-        if not filtered and _self_heal_if_stale(store, raw_max_ts):
-            # Cross-worker staleness healed in place — re-read and re-answer so
-            # THIS response already carries the recovered rows (the whole point:
-            # the user must not wait for the next poll, let alone the 15-min TTL).
-            all_msgs, raw_max_ts = _visible_msgs_and_raw_max(store, now)
-            total = len(all_msgs)
+    verify_cutoff = now - VERIFY_PING_VISIBLE_TTL_SEC
+    try:
+        # Durable source history is never clipped to the process's 5k hot
+        # window. Fetch one bounded DB page plus a sentinel row; this makes an
+        # arbitrarily old encrypted message reachable without materializing the
+        # full transcript or deleting old rows to protect worker memory.
+        page = db.chat_history_page_strict(
+            store.user_id,
+            limit=limit + 1,
+            since=since,
+            before=before,
+            hide_verify_before=verify_cutoff,
+        )
+        total = db.chat_count_strict(
+            store.user_id, hide_verify_before=verify_cutoff)
+        if before > 0:
+            has_more_older = len(page) > limit
+            msgs = page[-limit:]
+            has_more_newer = False
+            page_mode = "before"
+        elif since > 0:
+            has_more_newer = len(page) > limit
+            msgs = page[:limit]
+            if msgs:
+                prior = db.chat_history_page_strict(
+                    store.user_id,
+                    limit=1,
+                    before=float(msgs[0].get("ts", 0) or 0),
+                    hide_verify_before=verify_cutoff,
+                )
+                has_more_older = bool(prior)
+            else:
+                has_more_older = total > 0
+            page_mode = "since"
+        else:
+            has_more_older = len(page) > limit
+            msgs = page[-limit:]
+            has_more_newer = False
+            page_mode = "latest"
+    except Exception as e:  # noqa: BLE001 — history remains fail-open on DB blips
+        print(f"[chat/history:{store.user_id}] durable page failed, using hot cache: {e}")
+        all_msgs, raw_max_ts = _visible_msgs_and_raw_max(store, now)
+        total = len(all_msgs)
+        if before > 0:
+            filtered = [m for m in all_msgs if float(m.get("ts", 0)) < before]
+            msgs = filtered[-limit:]
+            has_more_older = len(filtered) > len(msgs)
+            has_more_newer = False
+            page_mode = "before-cache-fallback"
+        elif since > 0:
             filtered = [m for m in all_msgs if float(m.get("ts", 0)) > since]
-        msgs = filtered[:limit]
-        has_more_older = bool(all_msgs and msgs and float(all_msgs[0].get("ts", 0)) < float(msgs[0].get("ts", 0)))
-        has_more_newer = len(filtered) > len(msgs)
-        page_mode = "since"
-    else:
-        msgs = all_msgs[-limit:]
-        has_more_older = len(all_msgs) > len(msgs)
-        has_more_newer = False
-        page_mode = "latest"
+            if not filtered and _self_heal_if_stale(store, raw_max_ts):
+                all_msgs, _raw_max_ts = _visible_msgs_and_raw_max(store, now)
+                total = len(all_msgs)
+                filtered = [m for m in all_msgs if float(m.get("ts", 0)) > since]
+            msgs = filtered[:limit]
+            has_more_older = bool(
+                all_msgs and msgs
+                and float(all_msgs[0].get("ts", 0)) < float(msgs[0].get("ts", 0))
+            )
+            has_more_newer = len(filtered) > len(msgs)
+            page_mode = "since-cache-fallback"
+        else:
+            msgs = all_msgs[-limit:]
+            has_more_older = len(all_msgs) > len(msgs)
+            has_more_newer = False
+            page_mode = "latest-cache-fallback"
 
     # Pull this page's R2-offloaded bodies concurrently before rendering; without
     # it each one costs a serial round-trip inside _chat_history_item.
@@ -410,8 +450,16 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
 # --------------------------------------------------------------------------- #
 
 def message_body(store: UserStore, message_id: str) -> tuple[dict, int]:
-    with store.chat_lock:
-        msg = next((m for m in store.chat_messages if str(m.get("id") or "") == str(message_id)), None)
+    try:
+        msg = db.chat_get_strict(store.user_id, str(message_id))
+    except Exception as e:  # noqa: BLE001 — preserve cache fallback on DB blips
+        print(f"[chat/body:{store.user_id}] durable lookup failed, using hot cache: {e}")
+        with store.chat_lock:
+            msg = next(
+                (m for m in store.chat_messages
+                 if str(m.get("id") or "") == str(message_id)),
+                None,
+            )
     # A verify-loop synthetic row is never a legitimate single-body fetch target;
     # refuse it here too so a leaked ping id can't be re-fetched out-of-band.
     if not msg or msg.get("source") == "verify_ping":

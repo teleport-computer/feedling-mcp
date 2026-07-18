@@ -44,7 +44,8 @@ def _deps(**over):
             "ai_name": "小克", "user_name": "Z", "buckets": "B",
             "threads": "T", "identity": "I", "cards": "C"},
         build_memory_envelope=lambda uid, inner: {"body_ct": "CT", "_inner": inner},
-        apply_memory_actions=lambda uid, actions: {"applied": len(actions)},
+        apply_memory_actions=lambda uid, actions: {
+            "status": "ok", "applied": len(actions)},
     )
     base.update(over)
     return worker.TurnDeps(**base)
@@ -64,11 +65,18 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
 
     async def _fake_extract(*, provider_config, prompt, parse, **kw):
         assert provider_config is _BYOK          # BYOK-only
-        return ([{"action": "add", "summary": "s", "content": "c"}], None)
+        if lane == "capture":
+            return ([{"action": "add", "summary": "s", "content": "c"}], None)
+        return ([{
+            "op": "merge",
+            "card_ids": ["old-a", "old-b"],
+            "result": {"summary": "s", "content": "c"},
+        }], None)
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
     applied = {}
-    deps = _deps(apply_memory_actions=lambda uid_, actions: applied.update(n=len(actions)) or {})
+    deps = _deps(apply_memory_actions=lambda uid_, actions: (
+        applied.update(n=len(actions)) or {"status": "ok"}))
 
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
@@ -97,7 +105,13 @@ def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane)
             "cache_write_tokens": None,
             "cache_miss_tokens": 20,
         })
-        return ([{"action": "add", "summary": "s", "content": "c"}], None)
+        if lane == "capture":
+            return ([{"action": "add", "summary": "s", "content": "c"}], None)
+        return ([{
+            "op": "merge",
+            "card_ids": ["old-a", "old-b"],
+            "result": {"summary": "s", "content": "c"},
+        }], None)
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
     deps = _deps()
@@ -172,6 +186,46 @@ def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane)
     assert row == ("failed", "extraction_failed:runtimeerror")
 
 
+def test_rejected_memory_write_fails_job_instead_of_marking_completed(monkeypatch):
+    uid = "u_x_write_rejected"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(**_kwargs):
+        return ([{"action": "add", "type": "fact", "summary": "s", "content": "c"}], None)
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    deps = _deps(apply_memory_actions=lambda _uid, _actions: {
+        "status": "error", "error": "occurred_at_required",
+    })
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert _job_row(job_id)[0] == "failed"
+
+
+def test_nonempty_extraction_without_writer_fails_closed(monkeypatch):
+    uid = "u_x_writer_missing"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(**_kwargs):
+        return ([{"action": "add", "summary": "s", "content": "c"}], None)
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    deps = _deps(apply_memory_actions=None)
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert _job_row(job_id)[0] == "failed"
+
+
 def test_extraction_rollback_during_llm_blocks_memory_write(monkeypatch):
     uid = "u_x_rollback"
     _seed_v2(uid)
@@ -186,7 +240,8 @@ def test_extraction_rollback_during_llm_blocks_memory_write(monkeypatch):
     applied = {"n": 0}
     deps = _deps(
         runtime_mode_enabled=lambda uid_: next(mode_checks),
-        apply_memory_actions=lambda uid_, actions: applied.update(n=len(actions)) or {},
+        apply_memory_actions=lambda uid_, actions: (
+            applied.update(n=len(actions)) or {"status": "ok"}),
     )
 
     status = asyncio.run(worker.process_job(

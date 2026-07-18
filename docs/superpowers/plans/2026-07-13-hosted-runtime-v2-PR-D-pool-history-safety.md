@@ -1,10 +1,15 @@
 # Hosted Runtime V2 — PR D: Pool / History Safety — Implementation Plan
 
+> **Historical retention note (2026-07-18):** the D7 coverage-gated trim in
+> this execution plan is no longer current. Durable raw chat and attachment
+> bodies are retained; 5,000 bounds only the process hot window, while summary
+> watermarks affect model context only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the V2 turn pool a killable/restartable child-process crash domain with a split stall/absolute-budget watchdog + health-reflecting capacity + a live kill switch (turns halt, Genesis unaffected), and close the history-integrity gaps (seq cursor, prompt-coverage invariant via synchronous catch-up compaction, coverage-gated GC, compaction CAS-loss requeue, reconcile sweeper).
+**Goal:** Make the V2 turn pool a killable/restartable child-process crash domain with a split stall/absolute-budget watchdog + health-reflecting capacity + a live kill switch (turns halt, Genesis unaffected), and close the history-integrity gaps (seq cursor, prompt-coverage invariant via synchronous catch-up compaction, durable source retention independent of compaction, compaction CAS-loss requeue, reconcile sweeper).
 
-**Architecture:** Split `serve_worker._serve` into a parent supervisor (heartbeat/reaper/scheduler/Genesis/watchdog/kill-switch-poll/reconcile-sweeper) + a killable turn-child subprocess running `run_worker_loop`'s N slots. History safety wires the (already-built) PR A seq cursor + effect outbox into production and gates deletion/coverage on the summary watermark.
+**Architecture:** Split `serve_worker._serve` into a parent supervisor (heartbeat/reaper/scheduler/Genesis/watchdog/kill-switch-poll/reconcile-sweeper) + a killable turn-child subprocess running `run_worker_loop`'s N slots. History safety wires the (already-built) PR A seq cursor + effect outbox into production, enforces prompt coverage by summary watermark, and keeps durable source retention independent from that watermark.
 
 **Tech Stack:** Python asyncio + `multiprocessing`/`subprocess`, psycopg/Postgres, alembic; reuses PR A `effect_outbox`/`effect_id`/`cursor`/`reconcile_unenqueued_v2_messages`, PR C `run_tool_loop`, `reaper.py`, `compaction.py`.
 
@@ -14,7 +19,7 @@
 - **Prompt invariant = synchronous catch-up compaction:** before assembling a turn's prompt, if `watermark_seq < tail_start_seq - 1` (a gap), run an inline catch-up compaction to cover it, then re-read. Post-assembly hard-assert every message with `seq > watermark_seq` is in the tail.
 - **Genesis is NEVER halted/killed:** it runs on a parent thread with a separate `genesis_import_jobs` table + `kind='genesis'` heartbeat + separate token. The kill switch and the child-kill must not touch it.
 - **Kill switch is fail-CLOSED at admission** (503 `turns_halted`), stops claim, fences active writes; live-flippable without redeploy.
-- **Retention/GC only deletes covered content:** the chat trim delete boundary clamps to `min(count-cutoff, watermark_seq)` — never delete a row with `seq > watermark_seq`.
+- **Prompt compaction never deletes source history:** ordinary append keeps every raw chat row and attachment body; 5,000 is a process hot-window bound, not a retention limit.
 - **Compaction CAS-loss requeues** (never silent-abandon); reconcile sweeper runs in the parent.
 - **Exactly-once on kill** leans on PR A's effect_id-idempotent + generation-fenced outbox — do NOT add new outbox mechanics; place the kill/restart boundary so recovery re-drives through `apply_pending_effects`.
 - **NO-COMMIT:** leave every change in the working tree; never `git commit`/`git add`/`git stash`/`git checkout --`/`git reset`/`git clean`. (Template `git add`/`commit` steps → "leave in working tree.")
@@ -168,15 +173,15 @@ def downgrade():
 
 ---
 
-### Task 8: D7 — GC/retention gate on summary coverage (`_chat_insert_on_cursor` trim)
+### Task 8: D7 — durable source retention (`_chat_insert_on_cursor`)
 
 **Files:** Modify `backend/db.py` `_chat_insert_on_cursor` (the trim DELETE, :2106-2119). Test `tests/test_v2_gc_coverage_gate.py`.
 
-**Interfaces:** the trim delete boundary clamps to the user's summary watermark seq — never delete `seq > watermark_seq`.
+**Interfaces:** prompt compaction never authorizes source deletion. Normal append paths preserve every `chat_messages` row and attached R2/TEE body; only explicit delete/account removal or same-id replacement may retire source storage.
 
-- [ ] **Step 1: Failing test** — seed a user, set a summary watermark at a low seq (via the summary row), append > `max_messages` messages so the naive trim would delete rows above the watermark; assert AFTER the insert that NO row with `seq > watermark_seq` was deleted (the row count may exceed max_messages — that's intended until compaction advances the watermark), and that rows at/below the watermark ARE trimmed normally.
-- [ ] **Step 2-4:** change the trim DELETE to also bound by the watermark: read the user's `watermark_seq` (from the summary row; translate the summary's `watermark_ts` to a seq via `chat_messages` if the summary still stores ts — OR after Task 9 the summary stores watermark_seq directly) and change the DELETE to `... WHERE user_id=%s AND seq < LEAST((SELECT MIN(seq) FROM (newest max_messages)), COALESCE(<watermark_seq>+1, ...))` — i.e. never delete a row whose seq is beyond the summarized boundary. If there is no summary row yet (watermark unknown), do NOT trim (fail-safe: never delete uncovered history). Keep `trimmed_docs_out` collection for R2 cleanup of the rows actually trimmed.
-- [ ] **Step 5: Run** `python -m pytest tests/test_v2_gc_coverage_gate.py tests/test_v2_p0_seq_integrity.py -q` → PASS. Leave in working tree.
+- [x] **Step 1: Regression tests** — seed users with and without summary watermarks and exercise every append family; assert row count grows past the hot-window hint and every source row remains.
+- [x] **Step 2-4:** remove append-time trimming and its R2 cleanup mirroring. Keep bounded process loads (`chat_load_recent_strict`), bounded history pages, and stable-id message-body reads. Verify the retirement trigger cannot run on ordinary INSERT.
+- [x] **Step 5: Run** `tests/test_v2_gc_coverage_gate.py`, the 5,001-row same-timestamp P0, R2 lifecycle tests, and TEE dual-write tests.
 
 ---
 
@@ -208,7 +213,7 @@ def downgrade():
 
 **Files:** Create `tests/test_v2_p0_history_safety.py`.
 
-- [ ] **P0 — 5000+ identical-ts + compaction CAS race → no loss, no wrong deletion:** append 5000+ messages with identical ts while keeping compaction behind / CAS-racing; assert (a) the GC trim never deleted a row with `seq > watermark_seq` (Task 8), (b) after catch-up every message is summarized or in the tail (Task 10), (c) a CAS-lost compaction requeued (Task 6). Extends `test_v2_p0_seq_integrity`.
+- [x] **P0 — 5000+ identical-ts + compaction CAS race → no loss, no wrong deletion:** append 5001 messages with identical ts; assert every row and body is individually reachable, exact seq pages visit all ids with no gaps, prompt coverage remains summary-or-tail, and compaction never causes retention.
 - [ ] **P0 — kill at every durable-effect boundary → exactly one reply/effect:** parametrize a simulated kill (interrupt) before/after enqueue and before/after the status flip; assert after a re-drive (re-claim the same job) there is exactly one reply bubble + one of each effect (leans on PR A's effect_id fence + `apply_pending_effects` idempotency; PR D provides the re-claim path). This is the crash-domain recovery invariant.
 - [ ] **Full suite** `python -m pytest tests/ -q --ignore=tests/test_api.py --ignore=tests/e2e_model_api_test.py` → 8-baseline, zero new, single alembic head (0030, or 0031 if Task 9 added a watermark_seq migration). Leave in working tree; do NOT commit.
 
@@ -217,7 +222,7 @@ def downgrade():
 ## Self-Review
 
 - **Spec coverage:** D1→T2; D2→T3; D3→T4; D4→T1; D5→T9; D6→T10; D7→T8; D8→T6; D9→T7. Pool P0s→T5; history/kill-boundary P0s→T11. All nine components + the P0 subset covered.
-- **Ordering/deps:** Half A: 1(kill switch, independent)→2(child split)→3(watchdog, needs supervisor)→4(capacity, needs supervisor)→5(pool P0). Half B: 6(CAS requeue, independent)→7(reconcile, independent)→8(GC gate)→9(seq cursor, provides watermark_seq)→10(prompt invariant, needs 9)→11(history P0). Half A and Half B are largely independent; Half B tasks 6/7/8 don't depend on the child split.
+- **Ordering/deps:** Half A: 1(kill switch, independent)→2(child split)→3(watchdog, needs supervisor)→4(capacity, needs supervisor)→5(pool P0). Half B: 6(CAS requeue, independent)→7(reconcile, independent)→8(durable source retention)→9(seq cursor, provides watermark_seq)→10(prompt invariant, needs 9)→11(history P0). Half A and Half B are largely independent; Half B tasks 6/7/8 don't depend on the child split.
 - **Type consistency:** `kill_switch.turns_halted(default_on_error=False)->bool` T1/T5; `ChildSupervisor.poll_liveness()->{"alive","last_progress_age_sec"}` T2/T3/T4; `watchdog.should_kill(liveness,*,...)->bool` T3/T5; `watermark_seq` T8/T9/T10; `cursor.advance_effect/load_seq` T9/T10.
 - **Genesis-safety:** every pool task (T1 kill switch, T2 child split, T3 watchdog) explicitly leaves Genesis in the parent / untouched; T5 asserts `genesis_alive` across a kill.
 - **NO-COMMIT:** every task leaves changes in the working tree.

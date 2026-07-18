@@ -1,5 +1,10 @@
 # Hosted Runtime V2 — `capture` + `dream` lanes（记忆抽取）
 
+> **Correctness update (2026-07-18):** Capture actions now carry the real
+> Garden validator metadata (`type`, `occurred_at`, source/ranking fields),
+> Dream's `op/card_ids/result` output maps to multi-card supersede actions, and
+> rejected writes fail the extraction job instead of being marked completed.
+
 > 承接 `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md` §B（capture/dream = resident 有、V2 无）+ §E BUG-2
 > （上一轮只做了安全修复：capture job 明确失败而不再偷偷写气泡）。
 

@@ -156,15 +156,16 @@ def test_blob_delete_and_list_by_prefix():
     assert {j["job_id"] for j in jobs} == {"a", "b"}  # prefix isolates the collection
 
 
-def test_chat_append_order_and_ring_buffer():
+def test_chat_append_preserves_durable_order_and_recent_window_is_bounded():
     uid = _uid()
     seed_user(uid)
     for i in range(5):
         db.chat_append(uid, f"m{i}", float(i), {"id": f"m{i}", "body_ct": f"ct{i}"}, max_messages=3)
     loaded = db.chat_load(uid)
-    # ring buffer keeps the newest 3, in insertion order
-    assert [m["id"] for m in loaded] == ["m2", "m3", "m4"]
-    assert loaded[0]["body_ct"] == "ct2"
+    assert [m["id"] for m in loaded] == ["m0", "m1", "m2", "m3", "m4"]
+    recent = db.chat_load_recent_strict(uid, 3)
+    assert [m["id"] for m in recent] == ["m2", "m3", "m4"]
+    assert recent[0]["body_ct"] == "ct2"
 
 
 def _idempotent_chat_doc(msg_id: str, client_msg_id: str, ts: float) -> dict:

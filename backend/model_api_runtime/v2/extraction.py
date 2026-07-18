@@ -65,6 +65,38 @@ def _inner_from_card(card: dict) -> dict:
     }
 
 
+def _memory_envelope_from_card(
+    card: dict,
+    *,
+    occurred_at: str,
+    source: str,
+    build_envelope: Callable[[dict], dict],
+    default_type: str,
+) -> dict:
+    """Seal one card body and attach the plaintext metadata the real memory
+    action validator requires.
+
+    The crypto callback only seals the inner body. ``type``/``occurred_at`` and
+    ranking metadata deliberately remain outside that ciphertext so the Garden
+    can validate/order cards without decrypting them. The resident runtime's
+    ``_capture_build_envelope`` follows the same contract.
+    """
+    when = str(occurred_at or "").strip()
+    if not when:
+        raise ValueError("memory_occurred_at_required")
+    envelope = dict(build_envelope(_inner_from_card(card)) or {})
+    envelope.update({
+        "type": str(card.get("type") or default_type).strip().lower() or default_type,
+        "occurred_at": when,
+        "importance": float(card.get("importance") or 0),
+        "pulse": float(card.get("pulse") or 0),
+        "anchor_memory_ids": [],
+        "source": source,
+        "last_referenced_at": when,
+    })
+    return envelope
+
+
 def _to_actions(
     cards: list[dict],
     *,
@@ -81,7 +113,13 @@ def _to_actions(
         action = str(card.get("action") or "").strip().lower()
         target_id = str(card.get("target_id") or "").strip()
         base = {
-            "envelope": build_envelope(_inner_from_card(card)),
+            "envelope": _memory_envelope_from_card(
+                card,
+                occurred_at=occurred_at,
+                source="memory_capture",
+                build_envelope=build_envelope,
+                default_type="event",
+            ),
             "reason": reason,
             "capture_mode": capture_mode,
             "source_chat_message_ids": list(source_ids),
@@ -107,6 +145,50 @@ def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope):
 
 
 def consolidations_to_actions(consolidations, *, occurred_at, source_ids, build_envelope):
-    return _to_actions(consolidations, occurred_at=occurred_at, source_ids=source_ids,
-                       build_envelope=build_envelope, capture_mode="memory_dream",
-                       reason="Memory consolidated during a dream pass.")
+    """Map Dream's native ``op/card_ids/result`` shape to multi-card
+    ``memory.supersede`` actions.
+
+    Dream never emits Capture's ``action/target_id`` shape. Keeping this mapper
+    separate prevents a valid consolidation from degrading to a silent no-op or
+    ``capture_no_memory_actions``.
+    """
+    actions: list[dict] = []
+    superseded = 0
+    for consolidation in consolidations or []:
+        if not isinstance(consolidation, dict):
+            continue
+        op = str(consolidation.get("op") or "").strip().lower()
+        raw_ids = consolidation.get("card_ids")
+        card_ids = list(dict.fromkeys(
+            str(memory_id or "").strip()
+            for memory_id in (raw_ids if isinstance(raw_ids, list) else [])
+            if str(memory_id or "").strip()
+        ))
+        result = (
+            consolidation.get("result")
+            if isinstance(consolidation.get("result"), dict)
+            else {}
+        )
+        if op not in {"merge", "thicken", "supersede"} or not card_ids or not result:
+            continue
+        card = {"type": "fact", **result}
+        actions.append({
+            "type": "memory.supersede",
+            "supersedes": card_ids,
+            "envelope": _memory_envelope_from_card(
+                card,
+                occurred_at=occurred_at,
+                source="memory_dream",
+                build_envelope=build_envelope,
+                default_type="fact",
+            ),
+            "reason": f"Memory dream {op} consolidation.",
+            "capture_mode": "memory_dream",
+            "dream_op": op,
+            "dream_card_ids": card_ids,
+            "source_chat_message_ids": list(source_ids),
+        })
+        superseded += len(card_ids)
+    if consolidations and not actions:
+        raise ValueError("dream_no_memory_actions")
+    return actions, 0, superseded

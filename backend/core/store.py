@@ -20,12 +20,10 @@ from core import config
 from core import wake_bus
 
 MAX_FRAMES = 200
-# Chat history ring buffer per user. Bumped from 500 → 5000 on 2026-05-11
-# to give users meaningful scroll-back across months of normal use without
-# silently losing their oldest conversations. Chat now persists row-per-message
-# in PostgreSQL (see db.chat_append), so an append is a single-row INSERT plus
-# a bounded trim — O(1) regardless of history depth — rather than rewriting the
-# whole history. The cap still bounds storage and the in-memory list size.
+# Per-process hot chat window per user. The PostgreSQL ``chat_messages`` table
+# is the immutable encrypted source transcript and is never trimmed by this
+# value. History pages and single-message body reads go directly to bounded DB
+# APIs, while resident polling/cache scans keep only this newest working set.
 MAX_CHAT_MESSAGES = 5000
 PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
@@ -293,12 +291,14 @@ class UserStore:
 
     # ------- chat -------
     def _load_chat(self):
-        self.chat_messages = db.chat_load(self.user_id)
+        self.chat_messages = db.chat_load_recent(
+            self.user_id, MAX_CHAT_MESSAGES)
 
     def reload_chat_strict(self) -> list[dict]:
         """Refresh chat state without converting a DB failure into emptiness."""
         with self.chat_lock:
-            rows = db.chat_load_strict(self.user_id)
+            rows = db.chat_load_recent_strict(
+                self.user_id, MAX_CHAT_MESSAGES)
             self.chat_messages = rows
             return list(rows)
 
@@ -318,7 +318,8 @@ class UserStore:
         _reload_guard.active = True
         try:
             with self.chat_lock:
-                self.chat_messages = db.chat_load(self.user_id)
+                self.chat_messages = db.chat_load_recent(
+                    self.user_id, MAX_CHAT_MESSAGES)
             with self.frames_lock:
                 self._load_frames_meta()
             with self.world_books_lock:

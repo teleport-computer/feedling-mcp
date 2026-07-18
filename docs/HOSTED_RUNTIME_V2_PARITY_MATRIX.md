@@ -22,7 +22,7 @@
 | Requirement | Current status | Evidence and remaining gap |
 |---|---|---|
 | No silent wedges | ✅ | Admission checks the turn-worker heartbeat; pending jobs have queue deadlines and a reaper; terminal failures publish `error` status and `last_runtime_error`; the worker contains turn exceptions; provider I/O is async. A dead pool must fail visibly rather than leave a message in `processing` forever. |
-| Full conversation, not a fixed message window | ⚠️ | The prompt is built from an encrypted, append-only itemized summary plus a verbatim tail. Coverage and watermark invariants prevent messages from being silently dropped, and automatic compaction is live. The summary itself still grows forever; immutable encrypted summary segments and higher-level checkpoints are the remaining long-horizon task. |
+| Full conversation, not a fixed message window | ⚠️ | The prompt is built from an encrypted, append-only itemized summary plus a verbatim tail. Raw encrypted chat rows and attached R2 bodies are retained independently of compaction; the former 5,000-row value now bounds only the process hot window. The summary itself still grows forever; immutable encrypted summary segments and higher-level checkpoints are the remaining long-horizon task. |
 | One native agent loop for every model | ✅ | Chat and wake use the same in-process provider-native tool loop. There is no `official`/`rule` tier, planner, or separate responder. A model that does not call a tool naturally returns once; malformed tool output gets bounded compatibility handling, not pre-assigned model routing. |
 | Reply inside the loop; eager late-message folding | ✅ | `reply` is a loop tool, so the model may acknowledge the user and continue working. New user messages are claimed without debounce and folded at every round boundary. |
 | Parallel tool use | ✅ | A provider turn may request a batch of tools. Independent read tools execute with bounded parallelism; writes and externally mutating MCP calls remain ordered/serialized for safety. |
@@ -85,8 +85,8 @@ or shell access. The detailed facade and enclave mapping lives in
 | Manual, heartbeat, scheduled wake | ✅ | Same native loop as chat |
 | Screen watch | ✅ | Producer and wake handler are live |
 | Maintenance/compaction | ✅ | Encrypted summary compaction path is live |
-| Capture | ⚠️ | Producer/handler code exists but rollout remains default-off pending a complete durable lifecycle |
-| Memory Dream | ⚠️ | Producer/handler code exists but rollout remains default-off pending a complete durable lifecycle; current Dream consolidates memory cards and is not runtime failure replay |
+| Capture | ⚠️ | The real parser now emits validator-complete encrypted actions (`type`, `occurred_at`, ranking/source metadata), non-empty captures persist, and a rejected write fails the job rather than being marked completed. Rollout remains default-off pending lifecycle soak. |
+| Memory Dream | ⚠️ | Native `op/card_ids/result` consolidations now map to multi-card supersede actions and pass the real Garden validator. Rollout remains default-off pending lifecycle soak; this Dream organizes memory cards and is not runtime failure replay. |
 | Genesis import | ✅ | Rehomed under `serve-worker` with a dedicated heartbeat |
 
 ## Conversation storage and prompt frontier
@@ -100,6 +100,13 @@ configured provider connection.
 Every source message must be covered: either by the committed append-only
 summary watermark or verbatim in the tail. Compaction appends itemized facts;
 it does not rewrite the full conversation into a new lossy summary.
+
+Coverage is a prompt invariant, never a retention authorization. The durable
+`chat_messages` rows and their encrypted attachment bodies are not automatically
+deleted at 5,000 rows or after a summary watermark advances. `MAX_CHAT_MESSAGES`
+only bounds each process's recent working set; iOS history uses bounded database
+pages, and a message body can be fetched by stable id outside that hot window.
+Only explicit user/account deletion removes source chat history.
 
 The **total prompt frontier** is the complete per-round budget calculation over
 the rendered system text, summary, verbatim messages, images, exact tool
@@ -227,6 +234,9 @@ At minimum, current-status changes should remain covered by:
 - `tests/test_v2_summary_watermark_seq.py`
 - `tests/test_v2_prompt_invariant.py`
 - `tests/test_v2_p0_history_safety.py`
+- `tests/test_v2_gc_coverage_gate.py`
+- `tests/test_v2_compaction_integration.py`
+- `tests/test_v2_extraction_memory_integration.py`
 - `tests/test_memory_readside_core.py`
 - `tests/test_v2_worker_files.py`
 - `tests/test_v2_atomic_reply_cursor.py`

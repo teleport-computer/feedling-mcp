@@ -39,6 +39,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 import db
@@ -2416,14 +2417,25 @@ async def _run_extraction(job_id, user_id: str, lane: str, deps: TurnDeps,
             return "completed"
 
         if deps.build_memory_envelope is None or deps.apply_memory_actions is None:
-            await asyncio.to_thread(
-                jobs_store.mark_completed, job_id, claimed_by=claimed_by)
-            if tm is not None:
-                tm.flush(failed=False, status="ok")
-            return "completed"
+            raise RuntimeError("extraction_memory_writer_unavailable")
+
+        occurred_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        for message in reversed(tail):
+            raw_ts = message.get("ts") if isinstance(message, dict) else None
+            try:
+                ts = float(raw_ts or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts > 0:
+                occurred_at = (
+                    datetime.fromtimestamp(ts, timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                break
 
         actions, _added, _superseded = to_actions(
-            items, occurred_at="", source_ids=source_ids,
+            items, occurred_at=occurred_at, source_ids=source_ids,
             build_envelope=lambda inner: deps.build_memory_envelope(user_id, inner))
         if claimed_by and not await asyncio.to_thread(
             jobs_store.renew_job_lease, job_id, claimed_by,
@@ -2434,7 +2446,18 @@ async def _run_extraction(job_id, user_id: str, lane: str, deps: TurnDeps,
             deps.runtime_mode_enabled, user_id
         ):
             raise RuntimeModeChanged("user rolled back before memory write")
-        await asyncio.to_thread(deps.apply_memory_actions, user_id, actions)
+        write_result = await asyncio.to_thread(
+            deps.apply_memory_actions, user_id, actions)
+        if (
+            not isinstance(write_result, dict)
+            or str(write_result.get("status") or "").strip().lower() != "ok"
+        ):
+            error = (
+                str(write_result.get("error") or "memory_action_failed")
+                if isinstance(write_result, dict)
+                else "memory_action_result_invalid"
+            )
+            raise RuntimeError(f"extraction_memory_write_rejected:{error}")
         await asyncio.to_thread(
             jobs_store.mark_completed, job_id, claimed_by=claimed_by)
         if tm is not None:

@@ -96,6 +96,9 @@ def test_cards_to_actions_add_and_supersede():
     assert actions[0]["type"] == "memory.add"
     assert actions[0]["capture_mode"] == "memory_capture"
     assert actions[0]["source_chat_message_ids"] == ["m1"]
+    assert actions[0]["envelope"]["occurred_at"] == "2026-07-10T10:00:00Z"
+    assert actions[0]["envelope"]["type"] == "event"
+    assert actions[0]["envelope"]["source"] == "memory_capture"
     assert actions[1]["type"] == "memory.supersede"
     assert actions[1]["supersedes"] == "m_old"
     # the envelope carries the card's inner fields, built by the injected callable
@@ -130,11 +133,26 @@ def test_empty_cards_is_not_an_error():
 
 def test_consolidations_to_actions_supersedes_when_target_present():
     actions, added, superseded = extraction.consolidations_to_actions(
-        [{"action": "supersede", "target_id": "m1", "summary": "merged"}],
+        [{
+            "op": "merge",
+            "card_ids": ["m1", "m2"],
+            "result": {"summary": "merged", "content": "merged body"},
+        }],
         occurred_at="T", source_ids=[], build_envelope=_env)
-    assert superseded == 1
+    assert added == 0 and superseded == 2
     assert actions[0]["type"] == "memory.supersede"
+    assert actions[0]["supersedes"] == ["m1", "m2"]
     assert actions[0]["capture_mode"] == "memory_dream"
+    assert actions[0]["envelope"]["type"] == "fact"
+    assert actions[0]["envelope"]["occurred_at"] == "T"
+
+
+def test_nonempty_actions_require_occurred_at():
+    with pytest.raises(ValueError, match="memory_occurred_at_required"):
+        extraction.cards_to_actions(
+            [{"action": "add", "summary": "s"}],
+            occurred_at="", source_ids=[], build_envelope=_env,
+        )
 
 
 def test_extraction_is_pure():
