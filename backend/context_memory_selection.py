@@ -272,16 +272,6 @@ def _memory_relevance(query: str, memory: dict) -> dict:
     }
 
 
-def _memory_relevance_score(query: str, memory: dict) -> float:
-    return float(_memory_relevance(query, memory).get("score") or 0.0)
-
-
-def memory_relevance_score(query: str, memory: dict) -> float:
-    """Public wrapper used by the hosted API state resolver."""
-
-    return _memory_relevance_score(query, memory)
-
-
 def memory_relevance_details(query: str, memory: dict) -> dict:
     """Public explainable relevance wrapper used by hosted API internals."""
 

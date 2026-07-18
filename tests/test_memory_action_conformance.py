@@ -80,37 +80,3 @@ def test_route_a_v2_normalizes_legacy_memory_action_names():
     patched = consumer._normalize_v2_action_type({"type": "memory.patch", "memory_id": "mem_old"})
     assert patched["type"] == "memory.supersede"
     assert patched["supersedes"] == "mem_old"
-
-
-def test_route_b_state_planner_injects_existing_bucket_thread_terms(monkeypatch):
-    store = type("Store", (), {"user_id": "usr_terms"})()
-    captured = {}
-
-    monkeypatch.setattr(hosted_turn, "_state_pending_items", lambda _store: [])
-    monkeypatch.setattr(hosted_turn, "_model_api_state_memory_candidates", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(
-        hosted_turn,
-        "_model_api_existing_memory_terms",
-        lambda _store, _api_key: {"buckets": ["宠物"], "threads": ["蛋子"]},
-    )
-
-    def fake_chat_completion(runtime, messages, **kwargs):
-        captured["payload"] = messages[1]["content"]
-        return {"reply": "{\"actions\":[]}"}
-
-    monkeypatch.setattr(hosted_turn.provider_client, "chat_completion", fake_chat_completion)
-
-    result = hosted_turn._model_api_plan_state_actions(
-        store,
-        "api_key",
-        object(),
-        "我养了一只狗叫蛋子。",
-        [],
-        {},
-    )
-
-    payload = captured["payload"]
-    assert result["actions"] == []
-    assert "existing_memory_terms" in payload
-    assert "宠物" in payload
-    assert "蛋子" in payload

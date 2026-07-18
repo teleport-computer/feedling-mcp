@@ -11,7 +11,7 @@ from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from enclave import auth, backend_client, envelope, readside, state
+from enclave import auth, backend_client, envelope, readside
 from enclave.routes._body import read_json_payload
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 

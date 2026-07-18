@@ -1,11 +1,8 @@
 """Resident-consumer liveness state + validation gate input."""
 
-import json
 import os
-import re
 import time
-import uuid
-from datetime import date, datetime
+from datetime import datetime
 
 import db
 from core.store import UserStore

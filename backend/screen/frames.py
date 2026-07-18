@@ -138,13 +138,6 @@ def _frame_ids(frames: list[dict]) -> list[str]:
     return out
 
 
-def _base64_payload(data_url_or_b64: str) -> str:
-    raw = str(data_url_or_b64 or "").strip()
-    if "," in raw and raw.lower().startswith("data:"):
-        return raw.split(",", 1)[1]
-    return raw
-
-
 def _decrypt_frame_metadata_for_gate(
     store: UserStore,
     frame_id: str,

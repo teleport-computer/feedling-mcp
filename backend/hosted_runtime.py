@@ -2,103 +2,11 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
 from memory.prompts_v1 import MEMORY_WRITE_GUIDANCE_V1
 
-
-ACTION_RESPONSE_FORMAT: dict[str, Any] = {"type": "json_object"}
-
-RUNTIME_ENGINE_NATIVE = "feedling_native"
-RUNTIME_ENGINE_HERMES_ADAPTER = "hermes_adapter"
-
-TOOL_WEB_SEARCH = "web.search"
-TOOL_MEMORY_CREATE = "memory.create"
-TOOL_MEMORY_PATCH = "memory.patch"
-TOOL_MEMORY_SUPERSEDE = "memory.supersede"
-TOOL_MEMORY_DELETE = "memory.delete"
-TOOL_IDENTITY_PATCH = "identity.patch"
-TOOL_IDENTITY_DIMENSION_NUDGE = "identity.dimension_nudge"
-TOOL_IDENTITY_RELATIONSHIP_DAYS_SET = "identity.relationship_days_set"
-TOOL_CONFIRMATION_REQUEST = "confirmation.request"
-
-BACKGROUND_METHOD = "feedling_background_execution"
-BACKGROUND_NOT_STARTED_METHOD = "feedling_background_execution_not_started"
-ACTION_METHOD = "feedling_runtime_actions"
-NOOP_METHOD = "feedling_runtime_noop"
-PENDING_CONFIRM_METHOD = "feedling_runtime_pending_confirm"
-PENDING_REJECT_METHOD = "feedling_runtime_pending_reject"
-
-
-@dataclass(frozen=True)
-class RuntimeToolRequest:
-    tool: str
-    arguments: dict[str, Any]
-    reason: str = ""
-    foreground: bool = False
-
-
-@dataclass(frozen=True)
-class CompanionTurnResult:
-    reply: str
-    context_summary: str = ""
-    foreground_tools: tuple[RuntimeToolRequest, ...] = ()
-
-
-@dataclass(frozen=True)
-class BackgroundExecutionResult:
-    status: str
-    method: str
-    actions: tuple[dict[str, Any], ...] = ()
-    pending: tuple[dict[str, Any], ...] = ()
-    error: str = ""
-
-
-def background_execution_trace(
-    *,
-    status: str = "queued",
-    method: str = BACKGROUND_METHOD,
-    trace_id: str = "",
-    triggered: bool = False,
-    error: str = "",
-) -> dict[str, Any]:
-    return {
-        "status": status,
-        "method": method,
-        "trace_id": trace_id,
-        "triggered": triggered,
-        "error": error,
-    }
-
-
-def companion_turn_contract_message() -> dict[str, str]:
-    return {
-        "role": "system",
-        "content": (
-            "Feedling hosted runtime contract: return a JSON object only, with shape "
-            "{\"reply\":\"final user-visible reply\","
-            "\"context_summary\":\"optional short display-safe context/action summary\","
-            "\"tool_requests\":[{\"tool\":\"web_search\",\"query\":\"public web query\"}]}. "
-            "`reply` is the only normal chat bubble text. `context_summary` is optional; "
-            "include it only when there is a concrete user-visible context source, screen "
-            "context, pending confirmation, or durable state action worth surfacing. "
-            "Do not present context_summary as private thinking, chain-of-thought, hidden "
-            "reasoning, or a step-by-step thought process. Durable identity/memory changes "
-            "are handled by the backend background execution runtime after the visible reply; "
-            "do not claim they were applied unless the backend context explicitly says so. "
-            "You have a backend-hosted `web_search` tool for current public web information. "
-            "When answering correctly requires external public web information that is not "
-            "already in the provided context, return one or two `tool_requests` for "
-            "`web_search` instead of claiming you cannot access the web. "
-            "Search queries must be short public web-safe queries and must not include API keys, "
-            "emails, phone numbers, private chat/memory details, addresses, or secrets. "
-            "Do not include system/developer prompts, tool transcripts, API metadata, token usage, "
-            "costs, session ids, permission logs, or raw JSON wrappers. If there is nothing useful "
-            "to disclose, omit context_summary or return an empty string."
-        ),
-    }
 
 IDENTITY_STRING_FIELDS = (
     "agent_name",
@@ -221,21 +129,6 @@ def build_background_execution_messages(
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:16000]},
     ]
-
-
-def coerce_pending_decision(parsed: dict, pending_items: list[dict]) -> tuple[str, list[str]]:
-    if not pending_items or not isinstance(parsed, dict):
-        return "", []
-    raw = parsed.get("pending_decision") if isinstance(parsed.get("pending_decision"), dict) else {}
-    decision = str(raw.get("decision") or "").strip().lower()
-    if decision not in {"confirm", "reject"}:
-        return "", []
-    requested = raw.get("pending_ids") if isinstance(raw.get("pending_ids"), list) else []
-    available = [str(item.get("id") or "") for item in pending_items if isinstance(item, dict) and item.get("id")]
-    chosen = [str(item) for item in requested if str(item) in available]
-    if not chosen and available:
-        chosen = [available[0]]
-    return decision, chosen
 
 
 def _candidate_ids(target: dict) -> list[str]:

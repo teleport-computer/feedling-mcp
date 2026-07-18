@@ -2,11 +2,9 @@
 
 import json
 import hashlib
-import os
 import re
-import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from urllib.parse import parse_qs, quote
@@ -29,7 +27,6 @@ from bootstrap import gates as boot_gates
 from core import store as core_store
 from core import util as core_util
 from identity import service as identity_service
-
 
 
 # Injected by the assembly layer (asgi_app.py) — the real implementations live
@@ -481,19 +478,6 @@ def _epoch_is_today_shanghai(epoch: float, now_epoch: float) -> bool:
     return d1 == d2
 
 
-def _data_track_days_since(value) -> int | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if dt.tzinfo:
-            dt = dt.replace(tzinfo=None)
-        return max(0, (datetime.now().date() - dt.date()).days)
-    except Exception:
-        return None
-
-
 def _data_track_memory_from_snapshot(snap: dict) -> dict:
     memory = dict(snap.get("memory") or {})
     extra = dict(snap.get("memory_extra") or {})
@@ -719,15 +703,6 @@ def _data_track_history_import_from_snapshot(snap: dict) -> dict:
         "identity_written": bool(latest.get("identity_written")),
         "chat_ready": bool(latest.get("chat_ready")),
     }
-
-
-def _data_track_relationship_days(identity: dict | None, memory: dict) -> int:
-    if identity and identity.get("relationship_started_at"):
-        days = _data_track_days_since(identity.get("relationship_started_at"))
-        if days is not None:
-            return days
-    days = _data_track_days_since(memory.get("earliest_occurred_at"))
-    return days if days is not None else 0
 
 
 def _data_track_fast_validation(
@@ -1395,14 +1370,6 @@ def _debug_trace_events_from_blobs(
     return enabled, out
 
 
-def _debug_trace_events_for_user(user_id: str) -> tuple[bool, list[dict]]:
-    return _debug_trace_events_from_blobs(
-        user_id,
-        db.get_blob(user_id, "v1_flow_trace_enabled"),
-        db.get_blob(user_id, "v1_flow_trace"),
-    )
-
-
 def _debug_trace_stem(event_type: str) -> str:
     typ = str(event_type or "")
     for suffix in (".start", ".done", ".error"):
@@ -1755,7 +1722,6 @@ def _data_track_proactive_daily_payload() -> dict:
     )
     out_rows = []
     for r in rows:
-        jobs = int(r.get("jobs") or 0)
         delivered = int(r.get("delivered") or 0)
         completed = int(r.get("completed") or 0)
         failed = int(r.get("failed") or 0)
@@ -1977,7 +1943,6 @@ def _render_data_track_page(payload: dict) -> str:
         access = row.get("access", {})
         principal = str(access.get("principal_id") or row.get("principal_id") or "")
         principal_short = f"{principal[:12]}…" if len(principal) > 12 else principal
-        connected_modes = ", ".join(access.get("connected_modes") or []) or "none"
         onb_mem, live_mem = _memory_source_split(row["memory"].get("by_source"))
         pro = row["proactive"]
         conn = row.get("connection") or {}
@@ -2246,7 +2211,6 @@ def _render_data_track_dau_page(payload: dict) -> str:
 
 def _render_proactive_daily_page(payload: dict) -> str:
     summary = payload["summary"]
-    filters = payload.get("filters", {})
     rows = payload.get("rows", [])
     definition = payload.get("definition", {})
     api_qs = _data_track_qs(view=None, q=None, limit=None, offset=None, sort=None, dir=None)

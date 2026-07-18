@@ -33,7 +33,6 @@ COMMON_BUCKETS_V1 = [
 ]
 
 # Ready-to-inject bilingual line: 工作/Work、目标与成长/Goals & growth、… — short enough to fit every prompt.
-COMMON_BUCKETS_LINE_V1 = "、".join(f"{zh}/{en}" for zh, en in COMMON_BUCKETS_V1)
 # English-only list for the route-B guidance block below (kept in sync automatically).
 _COMMON_BUCKETS_EN = " / ".join(en for _zh, en in COMMON_BUCKETS_V1)
 # Chinese-only list — the guidance presents zh and en as SEPARATE lists (not 工作/Work
@@ -83,16 +82,6 @@ Memory write guidance:
 - content must use three Markdown sections: 记忆 / 上下文 / 使用提示.
 - Do not claim "saved" or "remembered" before the backend write actually succeeds.
 """).strip()
-
-
-MEMORY_CONTEXT_FRAMING_V1 = """
-Memory context framing:
-- Ambient memories are background color. Use them to maintain continuity; do not force them into the reply as a topic.
-- Fetched memories are evidence. Weave them naturally into the answer instead of reciting card text.
-- Follow each card's 使用提示 when deciding tone, timing, and whether to mention the memory explicitly.
-- If memory conflicts with the user's current message, trust the current message unless safety/privacy says otherwise.
-- If memory is only weakly related, do not assert it as fact.
-""".strip()
 
 
 # Full bucket-convergence guidance injected into every card-creating prompt

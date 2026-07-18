@@ -1,17 +1,13 @@
 """Chat history items, thinking metadata, poll/claim helpers."""
 
-import json
 import os
 import re
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
 
 import db
 from core import envelope as core_envelope
 from core.store import UserStore
-
 
 
 MODEL_API_PROVIDER_REASONING_MAX_CHARS = max(400, min(6000, int(os.environ.get("FEEDLING_MODEL_API_PROVIDER_REASONING_MAX_CHARS", "2400"))))
@@ -85,17 +81,6 @@ CHAT_REDELIVERY_WINDOW_SEC = int(os.environ.get("FEEDLING_CHAT_REDELIVERY_WINDOW
 # immediately — a rolling recovery, never a TTL stall. Sized so
 # batch × turn-time stays under CHAT_POLL_CLAIM_TTL_SEC.
 CHAT_REDELIVERY_BATCH_MAX = int(os.environ.get("FEEDLING_CHAT_REDELIVERY_BATCH_MAX", "5"))
-
-
-def _recent_user_chat_active(store: UserStore, now: float, window_sec: float = 600.0) -> bool:
-    with store.chat_lock:
-        for msg in reversed(store.chat_messages):
-            ts = float(msg.get("ts", 0) or 0)
-            if now - ts > window_sec:
-                return False
-            if msg.get("role") == "user":
-                return True
-    return False
 
 
 def _chat_thinking_extra_from_envelope(envelope: dict | None) -> dict:

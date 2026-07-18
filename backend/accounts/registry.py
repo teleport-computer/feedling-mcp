@@ -8,7 +8,6 @@ Persistence is PostgreSQL (db.save_all_users / db.upsert_user).
 import copy
 import hashlib
 import hmac
-import re
 import secrets
 import threading
 import time
@@ -314,9 +313,6 @@ def _resolve_user(api_key: str) -> str | None:
     return None
 
 
-_USER_ID_RE = re.compile(r"^usr_[a-f0-9]{16}$")
-
-
 def _register_user(public_key: str | None = None,
                    archive_language: str | None = None,
                    access_mode: str = "official_import",
@@ -447,11 +443,6 @@ def _user_entry_snapshot(user_id: str) -> dict | None:
     with _users_lock:
         user_entry = _find_user_entry_locked(user_id)
         return dict(user_entry) if user_entry else None
-
-
-def _principal_id_for_user(user_id: str) -> str:
-    snapshot = _user_entry_snapshot(user_id) or {}
-    return str(snapshot.get("principal_id") or "")
 
 
 def _upsert_access_binding_locked(

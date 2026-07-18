@@ -47,6 +47,132 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-18（第六批：终局——全局复扫 + 灰区 16 项终审全保留）
+
+### [DONE] 仓库清理第三轮·第六批（真收官）
+
+- 第五批大删之后全局复扫：仅新暴露 2 个孤儿（MEMORY_CONTEXT_FRAMING_V1、
+  memory_core.existing_terms_via_api_key——唯一历史调用方在已删的 turn.py
+  死半边），已删；除有意保留的 SCENE_HINTS 外全仓符号级归零。
+- 灰区 16 项逐一 git 取证 + 用法定性，**全部保留**（oracle 型/测试缝/在建
+  预留面三类，详见 OPTIMIZATION_BACKLOG #15 终审记录）；hosted_runtime 模块
+  同判保留（活语义测试的输入构造器）。
+- 结论：可安全机械删除的空间已彻底挖尽；#15 记录了「测试改用手工 fixture
+  后可随手删 hosted_runtime」的未来路径。
+
+## 2026-07-18（第五批：测试手术——hosted legacy 内联轮次机器整体下线）
+
+### [DONE] 仓库清理第三轮·第五批：turn.py 死半边 + model_api_runtime 整包
+
+- **方法升级**：对 turn.py 做文件内传递可达性分析（根=被 turn.py 之外生产
+  代码引用的函数）→ 一次性定位完整死簇 20 函数（capture/recap/state-pending/
+  web-search 提取/回复解析——整套 legacy 内联轮次机器），替代此前逐个追链。
+  关键证据：`_model_api_recap_due` 唯一"生产调用"在死函数
+  `_model_api_maybe_run_memory_capture` 体内（活 capture 早已走 proactive
+  capture lane）。
+- **`model_api_runtime` 整包删除**：prompts/tools/__init__——全仓唯一 import
+  方是其专属测试（memory_tools 模式的包级复刻）；"model_api_runtime" 字符串
+  在 prod 的命中全是 blob/路由名非 Python import。
+- **测试手术**（16 个死路径测试）：两个 worldbook 注入测试文件整删（只测死
+  装配路径；consumer 活注入点无测试=既有缺口，已记 backlog #15）、
+  proactive_jobs/conformance/model_api_path 各删 1-2 个专属死测试、
+  prompts 专属测试文件整删。保留 `_patch_model_api_action_trace`
+  （log_trim 防驱逐回归测试依赖，见 backlog #15）。
+- 级联三波共 -45 函数/常量 + 全部孤儿 import（每波过借道检查）。
+- 验证：全量 pytest 对比基线零新增失败（passed 减少数与被删测试数精确对账）；
+  两入口 + hosted 全家 import 冒烟通过。
+
+## 2026-07-18（第四批：清理收官——「仅测试供养」全量分诊，零删除）
+
+### [DONE] 仓库清理第三轮·第四批（收官）
+
+- 把第三批 memory_tools 的发现系统化成全量扫描：backend 顶层符号
+  prod-corpus 零引用 + test-corpus 有引用 → 40 个候选，**全部逐个分诊后
+  零删除**——proactive V2 全家是 flag-gated 在建功能、reset_cache/insert_user
+  是测试基建、model_api 退役家族 8 个虽经 git 取证确认真死但测试引用散在
+  conftest/worldbook/log_trim 等共享文件（删除=测试手术）。
+  分诊清单落 `OPTIMIZATION_BACKLOG.md` #15，附复现方法。
+- **清理宣告收敛**：文件级→顶层符号→常量/方法→test-only 模块→仅测试供养，
+  五个维度全部扫到不动点；剩余项均需领域判断或 ops 确认，机械清理到此为止。
+
+## 2026-07-18（第三批：test-only 死模块 + tools 内部死码）
+
+### [DONE] 仓库清理第三轮·第三批
+
+- **删 `model_api_runtime/memory_tools.py` + 其测试**：git 取证确认在本次
+  清理开始前（95decf00）它就已无生产调用方——`execute_memory_tool` /
+  `memory_tool_instruction_message` 只被自己的测试文件引用，测试在给死代码
+  续命（hosted model_api 退役残骸的最后一块）。
+- **tools 内部死符号**：chat_resident_consumer 5 个协议演化残留
+  （_extract_openai_reply / _structured_reply_payload / _split_agent_result /
+  update_proactive_state / _resident_perception_trend）+ e2e_encryption_test
+  的 unb64；consumer 删后 py_compile + 全量 consumer 测试通过。
+- **零发现的维度**（扫了但干净）：无人使用的 pytest fixture、backend 不可达
+  代码（return 后语句）、requirements 未用依赖——唯一"疑似"的
+  python-multipart 是 FastAPI 表单运行时依赖（07-07 有漏装致 500 前科），
+  不可删。
+- 验证：3436 passed（−4 = 被删测试文件的用例数，精确对账）/ 5 pre-existing
+  failed，零新增。
+
+### [DONE] 仓库清理第三轮·第二批：死常量、死方法、活文档状态复核
+
+- **新扫描维度**（此前只扫了顶层函数/类）：模块级常量 + 类方法 + tests
+  死 helper，同一标准（全仓含 docs-site/contracts 全文件类型 whole-word
+  grep ≤1 即 def-only）迭代到不动点。
+- 删 37 个死常量/方法/helper：hosted_runtime 的 TOOL_*/RUNTIME_ENGINE_*/
+  BACKGROUND_METHOD 簇（wire 值已确认无其他发射方）、turn.py 死 env knob
+  （MODEL_API_WEB_SEARCH_MAX_RESULTS/TIMEOUT、PROVIDER_REASONING_ENABLED、
+  STATE_RECEIPT_MAX——对应 FEEDLING_* flag 本已无效）、memory_readside 死
+  limit 簇、genesis checkpoint 死前缀/死状态、3 个死方法
+  （InMemoryMetricsSinkV2.list_events / DeliveryDecisionV2.allow_push /
+  PerceptionDifferV2.state_for）、tests/_clear_cursor 等。
+- **有意保留**：perception/catalog.SCENE_HINTS（与 iOS Vision 分类器共享的
+  canonical enum，跨仓契约文档，本仓 grep 不到≠死）；pytest_report_header
+  等钩子与 Test* 类为框架按名调用，扫描已排除。
+- **活文档失实修正**：OPTIMIZATION_BACKLOG 复核（#1/#4 补 ✅ 及 commit 证据，
+  #3 标注部分完成——api_key 路径仍回环 whoami）；DEPLOYMENTS.md TEE Postgres
+  段从「待开通」改为已开通（test+prod，指向 TEE_POSTGRES_SHADOW_PROVISIONING）。
+- 验证：全量 pytest 对比基线零新增失败；两入口 + 全部触及包 import 冒烟通过；
+  不碰 deploy 配置/alembic/路由（iOS 为独立仓，路由是公共 API 面）。
+
+## 2026-07-18
+
+### [DONE] 仓库清理第三轮：过时文档 + 符号级死码 + 全量 unused imports
+
+- **文档**（21 删）：已落地/被推翻的一次性 spec 与事故文档
+  （`INCIDENT_usr_f13f_2026-07-16`（诊断已被 07-17 取证推翻）、
+  `DAU_DAILY_SNAPSHOT_2026-07-14`、`DATATRACK_..._2026-07-13`、
+  `PROACTIVE_AUTONOMY_SWITCHES_2026-07-06`、`V1-迁移-测试清单`）；
+  `docs/memory/` 整目录（07-13 清理漏网的 3 个"已被取代"存档）；
+  13 个已 ship 的 superpowers plan（保留 `2026-07-07-tee-pg-phase0-1-infra`，
+  被 `deploy/DEPLOYMENTS.md` runbook 按 Task 编号引用）。
+- **backend 死码**（25 符号，全部 grep 证实仅剩 def 处一条引用）：
+  `hosted_runtime` 三个死 dataclass、`hosted/turn` 7 个孤儿 wrapper、
+  `memory/actions._memory_content_patch_action`（dispatcher 已 coerce 到
+  supersede，见 conformance test）、`db.genesis_latest_done_job`/`genesis_get_output`、
+  `dstack_tls.derive_key_only`（调用方随 MCP server 一起删了）、
+  `context_memory_selection.memory_relevance_score` 死对、
+  `proactive/runtime_v2.SingleFlightRegistryV2` 等。
+- **unused imports 清扫**：autoflake 全 backend 扫（204 处，26 文件），未触碰
+  `__init__.py`/alembic。⚠️ 教训：`identity/service.py` 的
+  `RUNTIME_LABELS as _IDENTITY_RUNTIME_LABELS` 是故意 re-export（3 处消费方走
+  `identity_service._IDENTITY_RUNTIME_LABELS` 模块属性访问，pyflakes 看不见），
+  被误删导致 30 个测试红，已恢复并加注释说明；其余 203 处经别名感知扫描
+  （`alias.attr` + 字符串形 monkeypatch）确认无借道引用。
+- 审计结论：scripts/ tools/ tests/ deploy/ workflows 无可删项（上两轮清得干净）。
+- **第二轮级联清扫**（全 backend 顶层符号引用扫描迭代到不动点，共 4 轮）：
+  又删 41 个死符号——大头是 hosted model_api 退役残骸的整条死链
+  （turn 的 state-plan/pending-confirmation/web-search 执行路径 →
+  model_api_runtime 的 run_web_searches/web_search_duckduckgo/web_search_trace →
+  hosted_runtime.background_execution_trace，这些在本轮之前就互为唯一调用方、
+  整簇不可达）；另有 asgi/deps.require_store、enclave/readside 两个孤儿、
+  observability_v2 两个死 Sink 类、genesis 三个死 helper、5 处 unused local
+  （含 chat_send_core 每图白算一次的 base64 死计算）；bootstrap 提示词删掉
+  已死的 FEEDLING_MCP_URL 指引。路由 handler（装饰器注册）已全部排除在扫描外。
+- 验证：全量 pytest 对比基线——两轮清理后 3440 passed / 5 failed，失败全部为
+  test 分支 pre-existing（memory_readside×3 + prod_runner_topology×2），零新增；
+  基线里第 6 个红（consumer_whoami_key_guard）系时间敏感 flake，单跑稳定通过。
+
 ## 2026-07-17
 
 ### [FEAT] pi 路线终于能用用户 MCP 了（v2 spec §11 的后续项，欠了 4 天）

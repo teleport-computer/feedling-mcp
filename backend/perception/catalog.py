@@ -18,7 +18,7 @@ agent only ever sees labels.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -177,7 +177,6 @@ COMPOSITE_KEYS: dict[str, list[str]] = {}
 # envelope in the frame channel. Allowing kind=photo via /items would let a
 # caller inject a confirmed photo doc without the envelope path.
 # (calendar is reported via /report, not /items.)
-ITEM_KINDS = ("photo", "workout", "sleep", "vitals")
 KIND_CAPABILITY = {
     "workout": "health_workout",
     "sleep": "health_sleep",
@@ -222,17 +221,3 @@ RECENT_APPS_LIMIT = 10
 # agent asking "what have I been using today?" wants more than the wake budget.
 RECENT_APPS_TOOL_LIMIT = 20
 RECENT_APPS_TOOL_MAX = 100
-
-
-def signals_for_capability(cap_key: str) -> list[Signal]:
-    return [s for s in SIGNALS.values() if s.capability == cap_key]
-
-
-def context_field_names() -> list[str]:
-    """All state field names that belong to context_field capabilities."""
-    out: list[str] = []
-    for s in SIGNALS.values():
-        cap = CAPABILITIES.get(s.capability)
-        if cap and cap.context_field:
-            out.extend(s.outputs)
-    return out

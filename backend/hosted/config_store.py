@@ -1,57 +1,15 @@
 """Model API config / runtime profile / action traces (hosted line)."""
 
-import base64
-import copy
-import hashlib
-import io
-import json
 import os
-import re
-import secrets
-import threading
 import time
 import uuid
-from collections import defaultdict
-from datetime import date, datetime, timedelta
-from typing import Any
 
-import httpx
 
 import db
 from core import enclave as core_enclave
-from provider_client import public_config as public_provider_config
 from provider_client import validate_config as validate_provider_config
 from core.store import UserStore
 
-from hosted_runtime import (
-    ACTION_RESPONSE_FORMAT as HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
-    ACTION_METHOD as HOSTED_RUNTIME_ACTION_METHOD,
-    BACKGROUND_METHOD as HOSTED_RUNTIME_BACKGROUND_METHOD,
-    BACKGROUND_NOT_STARTED_METHOD as HOSTED_RUNTIME_BACKGROUND_NOT_STARTED_METHOD,
-    NOOP_METHOD as HOSTED_RUNTIME_NOOP_METHOD,
-    PENDING_CONFIRM_METHOD as HOSTED_RUNTIME_PENDING_CONFIRM_METHOD,
-    PENDING_REJECT_METHOD as HOSTED_RUNTIME_PENDING_REJECT_METHOD,
-    RUNTIME_ENGINE_NATIVE as HOSTED_RUNTIME_ENGINE_NATIVE,
-    build_background_execution_messages as build_hosted_runtime_background_execution_messages,
-    background_execution_trace as hosted_runtime_background_trace,
-    companion_turn_contract_message as hosted_runtime_companion_turn_contract_message,
-    coerce_pending_decision as coerce_hosted_runtime_pending_decision,
-    coerce_runtime_action as coerce_hosted_runtime_action,
-)
-from model_api_runtime.prompts import (
-    build_foreground_chat_messages as build_model_api_foreground_chat_messages,
-    build_memory_capture_messages as build_model_api_memory_capture_messages,
-    build_pending_confirmation_messages as build_model_api_pending_confirmation_messages,
-    build_web_search_results_message as build_model_api_web_search_results_message,
-    web_search_followup_message as model_api_web_search_followup_message,
-)
-from model_api_runtime.tools import (
-    extract_web_search_requests as extract_model_api_web_search_requests,
-    run_web_searches as run_model_api_web_searches,
-    web_search_trace as model_api_web_search_trace,
-)
-from context_memory_selection import memory_relevance_details
-from content_encryption import build_envelope
 
 from core import util as core_util
 import provider_client
@@ -91,27 +49,6 @@ def _load_model_api_config(store: UserStore) -> dict | None:
     if route.get("reasoning_effort"):
         config["reasoning_effort"] = route["reasoning_effort"]
     return config
-
-
-def _save_model_api_config(store: UserStore, config: dict) -> dict:
-    data = dict(config)
-    data["route"] = "model_api"
-    data["updated_at"] = core_util._now_iso()
-    if not data.get("created_at"):
-        data["created_at"] = data["updated_at"]
-    db.set_blob(store.user_id, "model_api", data)
-    return data
-
-
-def _public_model_api_config(config: dict | None) -> dict:
-    if not config:
-        return {"configured": False}
-    safe = public_provider_config(config)
-    safe["configured"] = True
-    safe["privacy_mode"] = "tdx_cvm_backend_runtime_option_a"
-    if config.get("reasoning_effort") is not None:
-        safe["reasoning_effort"] = str(config.get("reasoning_effort") or "")
-    return safe
 
 
 MODEL_API_RUNTIME_BLOB = "model_api_runtime"
@@ -341,8 +278,6 @@ def _patch_model_api_action_trace(store: UserStore, trace_id: str, patch: dict) 
 def _latest_model_api_action_trace(store: UserStore) -> dict | None:
     traces = db.log_read(store.user_id, MODEL_API_ACTION_TRACE_STREAM, limit=1)
     return traces[-1] if traces else None
-
-
 
 
 def _provider_config_from_plain(config: dict, api_key: str) -> provider_client.ProviderConfig:
