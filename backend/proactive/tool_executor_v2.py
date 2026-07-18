@@ -154,6 +154,7 @@ class ToolBudgetStateV2:
 class ToolRuntimeAdaptersV2:
     perception_snapshot: Callable[[str], Mapping[str, Any]] | None = None
     perception_pull_snapshot: Callable[[str], Mapping[str, Any]] | None = None
+    perception_recent_apps: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None
     photos_recent: Callable[[str, int], Mapping[str, Any]] | None = None
     memory_load: Callable[[str], Sequence[Mapping[str, Any]]] | None = None
     memory_index: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None
@@ -175,6 +176,20 @@ def default_tool_runtime_adapters_v2() -> ToolRuntimeAdaptersV2:
 
         return perception_service.pull_snapshot(user_id)
 
+    def perception_recent_apps(user_id: str, args: Mapping[str, Any]) -> Mapping[str, Any]:
+        from perception import service as perception_service
+
+        hours = args.get("hours")
+        try:
+            hours = float(hours) if hours is not None else None
+        except (TypeError, ValueError):
+            hours = None
+        return perception_service.recent_apps(
+            user_id,
+            limit=_int_arg(args.get("limit"), default=20, lo=1, hi=100),
+            hours=hours if (hours or 0) > 0 else None,
+        )
+
     def photos_recent(user_id: str, limit: int) -> Mapping[str, Any]:
         from perception import service as perception_service
 
@@ -189,6 +204,7 @@ def default_tool_runtime_adapters_v2() -> ToolRuntimeAdaptersV2:
     return ToolRuntimeAdaptersV2(
         perception_snapshot=perception_snapshot,
         perception_pull_snapshot=perception_pull_snapshot,
+        perception_recent_apps=perception_recent_apps,
         photos_recent=photos_recent,
         memory_load=memory_load,
     )
@@ -356,6 +372,8 @@ class ToolExecutorV2:
             self.adapters.perception_pull_snapshot or self.adapters.perception_snapshot
         ):
             return ("perception_snapshot_adapter_missing", "perception snapshot adapter is not configured")
+        if call.name == "perception.recent_apps" and not self.adapters.perception_recent_apps:
+            return ("perception_recent_apps_adapter_missing", "perception recent-apps adapter is not configured")
         if call.name == "perception.photo_recent" and not self.adapters.photos_recent:
             return ("photo_recent_adapter_missing", "photo recent adapter is not configured")
         if call.name == "memory.index" and not (self.adapters.memory_index or self.adapters.memory_load):
@@ -396,6 +414,9 @@ class ToolExecutorV2:
             return {"snapshot": dict(self._snapshot(call.user_id))}
         if call.name == "perception.now_playing":
             return {"now_playing": self._snapshot(call.user_id).get("now_playing")}
+        if call.name == "perception.recent_apps":
+            assert self.adapters.perception_recent_apps is not None
+            return dict(self.adapters.perception_recent_apps(call.user_id, args))
         sig = _PERCEPTION_TOOL_SIGNAL_V2.get(call.name)
         if sig is not None:
             # One projection source of truth with the CLI-tools path: every field

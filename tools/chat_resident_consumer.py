@@ -6890,6 +6890,8 @@ def _native_tool_names_compact() -> str:
         "tools_available (names only; you have your full toolset — call any if the screen makes it relevant):",
         "- perception_<signal>: now, location, weather, motion, calendar, focus, audio_route, app, "
         "steps, sleep, workout, vitals, activity, body, metabolic, cycle, mood, reminders",
+        "- perception_recent_apps: which apps the user opened recently (perception_app only "
+        "covers the last 15 minutes)",
         "- perception_trend, perception_history, memory_index, memory_fetch, "
         "screen_recent, screen_read, photo_recent, photo_read",
         "  (Bash/CLI runtimes: same verbs via io_cli.)",
@@ -7095,7 +7097,10 @@ def _native_reachout_tool_instructions() -> str:
         "quoted card's id), don't just say you did.",
         "- You also have native tools to manage your own future wakes: schedule_wake (ask to be woken at a later time) "
         "and cancel_wake.",
-        "- CLI runtimes call all of these via io_cli: perception, perception-trend, perception-history, memory-index, "
+        "- To answer \"what have I been doing / which apps have I used\", call perception_recent_apps: the current-app "
+        "field only covers the last 15 minutes, this returns the app-open history. Empty result means no app data — "
+        "say so, don't guess.",
+        "- CLI runtimes call all of these via io_cli: perception, perception-recent-apps, perception-trend, perception-history, memory-index, "
         "memory-fetch, memory-write, memory-patch, memory-delete, screen-recent, screen-read, photo-recent, "
         "photo-read, schedule-wake, cancel-wake.",
     ])

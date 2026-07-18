@@ -119,6 +119,8 @@ if not _provisioned:
         "test_proactive_tool_executor_v2.py",
         "test_proactive_scheduled_wake_v2.py",
         "test_perception.py",
+        "test_perception_recent_apps.py",
+        "test_perception_recent_apps_flow.py",
         "test_ios_perception_contract_v2.py",
         "test_perception_ingress_v2.py",
         "test_provider_client.py",

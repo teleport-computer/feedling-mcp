@@ -181,6 +181,10 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("signal", _schema("string", minLength=1), "Agent signal key.", required=True, example="motion"),
         _query("days", _schema("integer", minimum=1, maximum=365, default=14), "Lookback window in days.", example=14),
     ],
+    ("get", "/v1/agent/perception/recent_apps"): [
+        _query("limit", _schema("integer", minimum=1, maximum=100, default=20), "Maximum app-open events to return.", example=20),
+        _query("hours", _schema("number", exclusiveMinimum=0), "Only include opens within the last N hours.", example=24),
+    ],
     ("get", "/v1/agent/perception/digest"): [
         _query("days", _schema("integer", minimum=1, maximum=365, default=30), "Lookback window in days.", example=30),
     ],
