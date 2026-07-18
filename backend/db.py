@@ -6108,19 +6108,174 @@ def chat_delete(user_id: str, msg_id: str) -> bool:
 
 
 def chat_clear(user_id: str) -> int | None:
-    """Delete every chat row for one user. Returns deleted row count, or None
-    if the database operation failed. Even an already-empty clear advances the
-    durable generation so a delayed pre-clear upload can never promote."""
+    """Atomically retire one user's complete *live* chat context.
+
+    The raw transcript is only one input to a V2 turn.  A history clear must
+    also remove its encrypted summary, chat-derived artifact text views,
+    pending effects, recovery barriers, and client status rows.  The existing
+    per-user chat advisory fence is the linearization point: ordinary writers
+    take it shared, while clear takes it exclusive *before* touching runtime
+    state or any child row.  The runtime-generation bump then rejects a worker
+    that was doing provider work without holding a database transaction.
+
+    Terminal job metadata and encrypted trajectory/review rows are retained as
+    telemetry and are never prompt inputs.  Active jobs/reviews are fenced into
+    terminal states instead of deleting ``agent_jobs`` because trajectory rows
+    intentionally cascade from their source job.  Independent Memory Garden,
+    identity, schedules, user-authored workspace/working-memory, skills, and
+    content-free billing/token metrics are also preserved.
+
+    Returns the number of raw chat rows deleted, or ``None`` if the database
+    transaction failed.  Even an already-empty clear advances both the chat R2
+    lifecycle and V2 runtime generation, so delayed pre-clear work cannot
+    publish after the endpoint returns.
+    """
     sql = "DELETE FROM chat_messages WHERE user_id = %s"
+    persisted_runtime_doc: dict | None = None
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
+                    # Global order: chat fence -> R2 lifecycle -> runtime state
+                    # -> job/effect/derived rows.  Effect application follows
+                    # the same chat-fence-before-runtime-state order, avoiding
+                    # an exclusive-clear/shared-writer ABBA cycle.
+                    _lock_chat_user_fence_on_cursor(
+                        cur, user_id, exclusive=True,
+                    )
                     _mark_chat_r2_inventory_pending_on_cursor(
                         cur, user_id, advance_generation=True,
                     )
+
+                    # Materialize the authority row for a known user and bump
+                    # it without changing hosted ownership.  Every active job
+                    # pins the old value, so all later job/effect/trajectory
+                    # writes fail their source-generation check.
+                    cur.execute(
+                        "INSERT INTO v2_runtime_state (user_id) "
+                        "SELECT %s WHERE EXISTS ("
+                        "  SELECT 1 FROM users WHERE user_id=%s"
+                        ") ON CONFLICT (user_id) DO NOTHING",
+                        (user_id, user_id),
+                    )
+                    cur.execute(
+                        "UPDATE v2_runtime_state SET "
+                        "runtime_generation=runtime_generation+1,updated_at=now() "
+                        "WHERE user_id=%s",
+                        (user_id,),
+                    )
+
+                    # Preserve immutable encrypted trajectory history by
+                    # retaining its source jobs, but make every in-flight lane
+                    # lose ownership before the clear commits.
+                    cur.execute(
+                        "UPDATE agent_jobs SET status='superseded',"
+                        "last_error='chat_history_cleared',claimed_by=NULL,"
+                        "lease_expires_at=NULL,finished_at=COALESCE(finished_at,now()) "
+                        "WHERE user_id=%s "
+                        "AND status IN ('pending','claimed','running')",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "UPDATE v2_trajectory_reviews SET status='failed',"
+                        "claimed_by_job_id=NULL,last_error='chat_history_cleared',"
+                        "finished_at=COALESCE(finished_at,now()) "
+                        "WHERE user_id=%s AND status IN ('pending','running')",
+                        (user_id,),
+                    )
+
+                    # A terminal-failure reconciler may already own one of
+                    # these rows.  Deleting it here waits for that transaction;
+                    # status/route cleanup below runs afterwards and therefore
+                    # also erases anything the earlier reconciler committed.
+                    cur.execute(
+                        "DELETE FROM v2_terminal_failure_outbox WHERE user_id=%s",
+                        (user_id,),
+                    )
+
+                    # Sink markers have no user FK.  Remove both parent ids and
+                    # deterministic workspace-batch child ids while the outbox
+                    # rows still identify ownership.
+                    cur.execute(
+                        "DELETE FROM v2_effect_sink_applied AS sink "
+                        "USING v2_effect_outbox AS effect "
+                        "WHERE effect.user_id=%s AND ("
+                        " sink.effect_id=effect.effect_id OR "
+                        " position(effect.effect_id || ':item:' "
+                        "          IN sink.effect_id)=1)",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM v2_effect_outbox WHERE user_id=%s",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM agent_action_queue AS action "
+                        "USING agent_jobs AS job "
+                        "WHERE action.job_id=job.id AND job.user_id=%s",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM v2_mcp_mutation_attempts WHERE user_id=%s",
+                        (user_id,),
+                    )
+
+                    cur.execute(
+                        "DELETE FROM v2_conversation_summary WHERE user_id=%s",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM v2_workspace_entries "
+                        "WHERE user_id=%s AND kind='artifact'",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM runtime_state WHERE user_id=%s",
+                        (user_id,),
+                    )
                     cur.execute(sql, (user_id,))
                     deleted_count = int(cur.rowcount)
+
+                    # Keep provider/route configuration but reset the chat
+                    # cursor and user-visible failure state derived from the
+                    # cleared turns.  A post-clear send starts on the new
+                    # generation and rebuilds these fields normally.
+                    cur.execute(
+                        "UPDATE user_blobs SET doc="
+                        "(doc-'v2_reply_cursor_seq') || jsonb_build_object("
+                        " %s::text, (CASE WHEN COALESCE(doc->>%s,'') "
+                        " ~ '^[0-9]{1,18}$' THEN (doc->>%s)::bigint "
+                        " ELSE 0 END) + 1) "
+                        "WHERE user_id=%s AND kind='model_api_runtime' "
+                        "RETURNING doc",
+                        (
+                            _BLOB_REVISION_KEY,
+                            _BLOB_REVISION_KEY,
+                            _BLOB_REVISION_KEY,
+                            user_id,
+                        ),
+                    )
+                    runtime_row = cur.fetchone()
+                    if runtime_row is not None:
+                        persisted_runtime_doc = (
+                            runtime_row["doc"]
+                            if isinstance(runtime_row, dict)
+                            else runtime_row[0]
+                        )
+                    cur.execute(
+                        "UPDATE model_api_routes SET last_runtime_error='',"
+                        "last_runtime_error_class='',updated_at=now() "
+                        "WHERE user_id=%s",
+                        (user_id,),
+                    )
+
+                    # Last by design.  A failure reconciler that began before
+                    # its marker was deleted can only commit before this DELETE;
+                    # job-scoped ordinary status writers share the chat fence.
+                    cur.execute(
+                        "DELETE FROM agent_status_events WHERE user_id=%s",
+                        (user_id,),
+                    )
     except Exception as e:
         log.error("[db] chat_clear(%s) failed: %s", user_id, e)
         return None
@@ -6130,9 +6285,14 @@ def chat_clear(user_id: str) -> int | None:
     from tee_shadow import mirror
     mirror.execute_many([
         (sql, (user_id,)),
+        ("DELETE FROM runtime_state WHERE user_id = %s", (user_id,)),
         ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
          "AND table_name = 'chat_messages'", (user_id,)),
     ])
+    if persisted_runtime_doc is not None:
+        _mirror_persisted_blob(
+            user_id, "model_api_runtime", persisted_runtime_doc,
+        )
     return deleted_count
 
 

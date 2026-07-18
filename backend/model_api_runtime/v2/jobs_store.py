@@ -915,17 +915,28 @@ def ensure_terminal_failure_outbox(job_id, user_id: str, error: str) -> bool:
     completed.
     """
     with _pool().connection() as conn:
-        cur = conn.execute(
-            "INSERT INTO v2_terminal_failure_outbox "
-            "(job_id,user_id,error_code,target_route_id,target_route_updated_at) "
-            "SELECT j.id,j.user_id,%s,r.id,r.updated_at FROM agent_jobs j "
-            "LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
-            "  WHERE user_id=j.user_id AND is_active LIMIT 1) r ON TRUE "
-            "WHERE j.id=%s AND j.user_id=%s "
-            "ON CONFLICT (job_id) DO NOTHING",
-            (_terminal_error_code(error), job_id, str(user_id)),
-        )
-        return cur.rowcount == 1
+        with conn.transaction():
+            with conn.cursor() as cur:
+                # `_surface_terminal_error` is deliberately retriable and can
+                # run after a worker lost ownership.  Share the transcript-clear
+                # fence and require the source job's pinned V2 generation so a
+                # stale callback cannot recreate status/last_runtime_error after
+                # clear deleted the old obligation.
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                cur.execute(
+                    "INSERT INTO v2_terminal_failure_outbox "
+                    "(job_id,user_id,error_code,target_route_id,target_route_updated_at) "
+                    "SELECT j.id,j.user_id,%s,r.id,r.updated_at FROM agent_jobs j "
+                    "JOIN v2_runtime_state s ON s.user_id=j.user_id "
+                    "LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
+                    "  WHERE user_id=j.user_id AND is_active LIMIT 1) r ON TRUE "
+                    "WHERE j.id=%s AND j.user_id=%s "
+                    "AND s.hosted_runtime_state='v2' "
+                    "AND j.expected_runtime_generation=s.runtime_generation "
+                    "ON CONFLICT (job_id) DO NOTHING",
+                    (_terminal_error_code(error), job_id, str(user_id)),
+                )
+                return cur.rowcount == 1
 
 
 def _pending_terminal_failure_rows(
@@ -1545,22 +1556,44 @@ def append_status_event(
     超时才被看到——退化成事后补发，违反 §9「渐进可见」。best-effort：wake_bus.notify
     本身已在 db 层兜底，这里再包一层 try/except，绝不让可观测性拖垮已经落库成功的
     status 写入。"""
+    # ``job_id=None`` is retained for content-free administrative/test events.
+    # Every production turn-derived caller passes a source job (worker._emit_status
+    # and the generation-fenced status effect sink). New chat-derived callers
+    # must do the same or they will not participate in transcript-clear fencing.
     with _pool().connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "INSERT INTO agent_status_events "
-                "(job_id, user_id, kind, label, detail_json, seq) "
-                "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-                (
-                    job_id,
-                    user_id,
-                    str(kind),
-                    label,
-                    Jsonb(dict(detail or {})),
-                    int(seq),
-                ),
-            )
-            event_id = int(cur.fetchone()["id"])
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                if job_id is not None:
+                    # Clear-history owns the exclusive form.  If this status
+                    # started first, clear waits and deletes it; if clear won,
+                    # the source job's pinned generation no longer matches and
+                    # the stale worker cannot recreate client-visible state.
+                    db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                    cur.execute(
+                        "SELECT 1 FROM agent_jobs AS job "
+                        "JOIN v2_runtime_state AS state "
+                        "ON state.user_id=job.user_id "
+                        "WHERE job.id=%s AND job.user_id=%s "
+                        "AND job.expected_runtime_generation="
+                        "state.runtime_generation",
+                        (job_id, str(user_id)),
+                    )
+                    if cur.fetchone() is None:
+                        raise ValueError("status source job generation is stale")
+                cur.execute(
+                    "INSERT INTO agent_status_events "
+                    "(job_id, user_id, kind, label, detail_json, seq) "
+                    "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (
+                        job_id,
+                        user_id,
+                        str(kind),
+                        label,
+                        Jsonb(dict(detail or {})),
+                        int(seq),
+                    ),
+                )
+                event_id = int(cur.fetchone()["id"])
     try:
         wake_bus.notify("chat", user_id)
     except Exception:  # noqa: BLE001 — best-effort; the INSERT already committed
@@ -2128,6 +2161,7 @@ def upsert_summary_row_cas(
     watermark_ts: float,
     expected_version: int,
     watermark_seq: int | None = None,
+    require_source_row: bool = False,
 ) -> bool:
     """compare-and-swap 写入该用户的会话摘要行。expected_version==0 走首建
     （INSERT ... ON CONFLICT DO NOTHING，若行已存在说明输了竞态，返回 False）；
@@ -2141,34 +2175,53 @@ def upsert_summary_row_cas(
     seq 的调用方）；INSERT 分支没有旧值可留，落 0（与迁移 0031 的列默认值
     一致）。"""
     with _pool().connection() as conn:
-        with conn.cursor() as cur:
-            if int(expected_version) == 0:
-                cur.execute(
-                    "INSERT INTO v2_conversation_summary "
-                    "(user_id, summary_envelope, watermark_ts, version, watermark_seq) "
-                    "VALUES (%s, %s, %s, 1, %s) ON CONFLICT (user_id) DO NOTHING",
-                    (
-                        user_id,
-                        Jsonb(dict(summary_envelope or {})),
-                        float(watermark_ts),
-                        int(watermark_seq or 0),
-                    ),
-                )
-            else:
-                cur.execute(
-                    "UPDATE v2_conversation_summary "
-                    "SET summary_envelope=%s, watermark_ts=%s, version=version+1, "
-                    "watermark_seq=COALESCE(%s, watermark_seq), updated_at=now() "
-                    "WHERE user_id=%s AND version=%s",
-                    (
-                        Jsonb(dict(summary_envelope or {})),
-                        float(watermark_ts),
-                        int(watermark_seq) if watermark_seq is not None else None,
-                        user_id,
-                        int(expected_version),
-                    ),
-                )
-            return cur.rowcount == 1
+        with conn.transaction():
+            with conn.cursor() as cur:
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                if require_source_row and (
+                    watermark_seq is None or int(watermark_seq) <= 0
+                ):
+                    return False
+                if require_source_row:
+                    # The exact high-watermark row is the source-validity
+                    # witness.  Clear removes it under the exclusive fence, so
+                    # a paused pre-clear compactor cannot publish its encrypted
+                    # summary over a new empty/post-clear conversation.
+                    cur.execute(
+                        "SELECT 1 FROM chat_messages "
+                        "WHERE user_id=%s AND seq=%s",
+                        (user_id, int(watermark_seq)),
+                    )
+                    if cur.fetchone() is None:
+                        return False
+                if int(expected_version) == 0:
+                    cur.execute(
+                        "INSERT INTO v2_conversation_summary "
+                        "(user_id, summary_envelope, watermark_ts, version, watermark_seq) "
+                        "VALUES (%s, %s, %s, 1, %s) "
+                        "ON CONFLICT (user_id) DO NOTHING",
+                        (
+                            user_id,
+                            Jsonb(dict(summary_envelope or {})),
+                            float(watermark_ts),
+                            int(watermark_seq or 0),
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE v2_conversation_summary "
+                        "SET summary_envelope=%s, watermark_ts=%s, version=version+1, "
+                        "watermark_seq=COALESCE(%s, watermark_seq), updated_at=now() "
+                        "WHERE user_id=%s AND version=%s",
+                        (
+                            Jsonb(dict(summary_envelope or {})),
+                            float(watermark_ts),
+                            int(watermark_seq) if watermark_seq is not None else None,
+                            user_id,
+                            int(expected_version),
+                        ),
+                    )
+                return cur.rowcount == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2281,6 +2334,15 @@ def put_workspace_entry_cas(
         with _pool().connection() as conn:
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
+                    if str(kind) == "artifact":
+                        db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                        cur.execute(
+                            "SELECT 1 FROM chat_messages "
+                            "WHERE user_id=%s AND msg_id=%s",
+                            (str(user_id), str(source_ref)),
+                        )
+                        if cur.fetchone() is None:
+                            return None
                     cur.execute(
                         "SELECT revision FROM v2_workspace_entries "
                         "WHERE user_id=%s AND path=%s FOR UPDATE",
@@ -2418,6 +2480,23 @@ def append_trajectory_event(
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
+                # Capture is retained across an explicit chat clear, but only
+                # events that linearize before that clear may be appended.  The
+                # shared fence lets clear wait for an already-started append;
+                # the generation witness rejects a worker resuming afterwards.
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                cur.execute(
+                    "SELECT 1 FROM agent_jobs AS job "
+                    "JOIN v2_runtime_state AS state "
+                    "ON state.user_id=job.user_id "
+                    "WHERE job.id=%s AND job.user_id=%s "
+                    "AND state.hosted_runtime_state='v2' "
+                    "AND job.expected_runtime_generation="
+                    "state.runtime_generation",
+                    (job_id, str(user_id)),
+                )
+                if cur.fetchone() is None:
+                    raise ValueError("trajectory source job generation is stale")
                 cur.execute(
                     "INSERT INTO v2_trajectory_streams (job_id,user_id) "
                     "SELECT id,user_id FROM agent_jobs WHERE id=%s AND user_id=%s "
@@ -2915,17 +2994,44 @@ def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[s
     return [str(r[0]) for r in rows]
 
 
-def upsert_runtime_state(user_id, patch: dict) -> dict:
-    """浅合并 patch 进 state_json（JSONB || 合并），返回合并后的 state。"""
+def upsert_runtime_state(
+    user_id,
+    patch: dict,
+    *,
+    source_job_id: int | str | None = None,
+) -> dict | None:
+    """Shallow-merge content-free turn state, optionally source-fenced.
+
+    Production chat turns pass ``source_job_id``.  That form shares the
+    clear-history advisory fence and checks the job's pinned runtime generation
+    before recreating ``runtime_state``.  A stale post-clear worker therefore
+    returns ``None`` instead of resurrecting ``last_replied_ts``/action digest.
+    The optional form preserves the small storage primitive used by tests and
+    non-job maintenance callers.
+    """
     with _pool().connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "INSERT INTO runtime_state (user_id, state_json, updated_at) "
-                "VALUES (%s,%s,now()) "
-                "ON CONFLICT (user_id) DO UPDATE "
-                "SET state_json = runtime_state.state_json || EXCLUDED.state_json, "
-                "    updated_at = now() "
-                "RETURNING state_json",
-                (user_id, Jsonb(dict(patch or {}))),
-            )
-            return dict(cur.fetchone()["state_json"])
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                if source_job_id is not None:
+                    db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                    cur.execute(
+                        "SELECT 1 FROM agent_jobs AS job "
+                        "JOIN v2_runtime_state AS state "
+                        "ON state.user_id=job.user_id "
+                        "WHERE job.id=%s AND job.user_id=%s "
+                        "AND job.expected_runtime_generation="
+                        "state.runtime_generation",
+                        (source_job_id, str(user_id)),
+                    )
+                    if cur.fetchone() is None:
+                        return None
+                cur.execute(
+                    "INSERT INTO runtime_state (user_id, state_json, updated_at) "
+                    "VALUES (%s,%s,now()) "
+                    "ON CONFLICT (user_id) DO UPDATE "
+                    "SET state_json = runtime_state.state_json || EXCLUDED.state_json, "
+                    "    updated_at = now() "
+                    "RETURNING state_json",
+                    (user_id, Jsonb(dict(patch or {}))),
+                )
+                return dict(cur.fetchone()["state_json"])

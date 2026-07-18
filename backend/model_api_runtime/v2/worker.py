@@ -2800,13 +2800,18 @@ async def _run_compaction(
         # 重试风暴），reason 换成 cas_lost_retry 便于跟正常的 catch-up 区分。下一次
         # 尝试会重新从（未被本次推进的）watermark 读 summary/tail，不复用这次算出
         # 的、已经作废的 batch。
-        await asyncio.to_thread(
+        failed_owned = await asyncio.to_thread(
             jobs_store.mark_failed, job_id, "summary_cas_lost", claimed_by=claimed_by
         )
-        await asyncio.to_thread(
-            jobs_store.enqueue_job, user_id, "maintenance", reason="cas_lost_retry"
-        )
-        await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+        # A transcript clear supersedes the source job while this provider call is
+        # in flight.  Only the worker that still owns the terminal transition
+        # may schedule a CAS retry; otherwise stale maintenance work would
+        # recreate a new-generation job immediately after the clear.
+        if failed_owned:
+            await asyncio.to_thread(
+                jobs_store.enqueue_job, user_id, "maintenance", reason="cas_lost_retry"
+            )
+            await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
         if tm is not None:
             tm.flush(failed=True, status="summary_cas_lost")
         return "failed"
@@ -5222,6 +5227,7 @@ async def process_job(
                         "last_replied_ts": new_last_replied,
                         "action_digest": action_digest,
                     },
+                    source_job_id=job_id,
                 )
             except Exception as exc:  # noqa: BLE001 — post-commit telemetry only
                 log.warning(
@@ -5240,6 +5246,7 @@ async def process_job(
                     "last_replied_ts": new_last_replied,
                     "action_digest": action_digest,
                 },
+                source_job_id=job_id,
             )
             await _ensure_runtime_mode()
             completed, successor_id = await asyncio.to_thread(

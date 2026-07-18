@@ -873,6 +873,7 @@ def _write_summary(
             watermark_ts=watermark_ts,
             expected_version=expected_version,
             watermark_seq=watermark_seq,
+            require_source_row=True,
         )
     return jobs_store.upsert_summary_row_cas(
         user_id,

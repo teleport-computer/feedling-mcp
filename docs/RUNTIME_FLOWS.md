@@ -127,6 +127,22 @@ flowchart TD
 （`<think>` 标签内容或模型的 reasoning）会作为独立的 `thinking_envelope`
 单独加密，iOS 上可展开查看，但不会进推送。
 
+#### 1.1.1 「清空聊天记录」的准确边界
+
+`DELETE /v1/chat/history`（body 必须带
+`{"confirm":"clear-chat-history"}`）是**聊天记录＋当前运行时上下文清空**，
+不是删号，也不是全部遥测擦除。它在同一个数据库事务里删除原始密文消息、
+加密 conversation summary、由聊天文件生成的 `/artifacts` 文字视图、旧 effect / MCP
+恢复屏障 / status，并推进 Runtime V2 generation、终止旧 generation 的在飞 job；
+所以清空返回之后，旧 worker 不能再补写回复、summary、artifact 或 status。
+
+它明确**保留**独立的 Memory Garden、identity、用户编辑的 `/workspace` 与
+`/memory/WORKING.md`、skills、schedules、content-free token/billing metrics，以及
+加密 trajectory / failure-review 遥测。trajectory 从不进入 agent prompt，保留周期
+独立于聊天记录；清空时只终止尚在执行的 review，不删除已经加密保存的历史。
+若用户需要连这些独立数据也全部删除，应走 account reset / 删除账号，而不是
+「清空聊天记录」。
+
 ### 1.2 主动唤醒循环（agent 主动找用户）
 
 > Current production compatibility path.

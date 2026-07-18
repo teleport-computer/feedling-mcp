@@ -416,11 +416,15 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
 # --------------------------------------------------------------------------- #
 
 def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
-    """Clear only the caller's chat transcript.
+    """Clear the caller's transcript and live/derived chat context.
 
-    This intentionally does not touch memory, identity, frames, API keys, or
-    onboarding route state. The destructive account reset endpoint remains the
-    only path that wipes the whole user record.
+    The database operation also generation-fences in-flight Runtime V2 work and
+    removes summary/artifact/effect/status state derived from this transcript.
+    It intentionally preserves Memory Garden, identity, user-authored workspace,
+    schedules, billing/token metrics, and encrypted trajectory/review telemetry.
+    Trajectories are not prompt inputs; their retention is independent of chat
+    history. The destructive account reset endpoint remains the only path that
+    wipes the whole user record.
     """
     confirm = (payload.get("confirm") or "").strip()
     if confirm != "clear-chat-history":
@@ -442,7 +446,12 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
     # through append_chat's notify).
     wake_bus.notify("chat", store.user_id)
     print(f"[chat/clear:{store.user_id}] deleted={deleted}")
-    return {"cleared": True, "deleted": deleted}, 200
+    return {
+        "cleared": True,
+        "deleted": deleted,
+        "scope": "chat_history_and_live_runtime_context",
+        "encrypted_trajectory_telemetry_retained": True,
+    }, 200
 
 
 # --------------------------------------------------------------------------- #
