@@ -1036,3 +1036,42 @@ def app_open(user_id: str, app: str, category: str | None = None,
     # append to the usage time series
     store.append_app_open(user_id, {"app": app, "category": category, "ts": now}, now)
     return {"status": "ok", "app": app, "category": category, "ts": now}, 200
+
+
+def recent_apps(user_id: str, *, limit: int | None = None, hours: float | None = None,
+                now: float | None = None) -> dict:
+    """Recent app-open history for an explicit agent pull.
+
+    Reads the SAME ``app_usage`` stream the wake snapshot folds in (no second
+    store). Newest first, each entry projected to exactly {app, category, ts,
+    minutes_ago} — the raw log row is never passed through, so nothing the
+    ingest wrote can leak into a model prompt. No data -> an explicit empty
+    list, never a guess.
+    """
+    now = _now() if now is None else float(now)
+    limit = catalog.RECENT_APPS_TOOL_LIMIT if limit is None else limit
+    limit = max(1, min(int(limit), catalog.RECENT_APPS_TOOL_MAX))
+    since = (now - hours * 3600.0) if hours else 0.0
+
+    rows = store.read_app_opens(user_id, limit=limit, since_epoch=since) or []
+    entries = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        app = str(row.get("app") or "").strip()
+        if not app:
+            continue
+        try:
+            ts = float(row.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        category = row.get("category")
+        entries.append({
+            "app": app,
+            "category": (str(category).strip() or None) if category else None,
+            "ts": ts,
+            "minutes_ago": round(max(0.0, now - ts) / 60.0, 1),
+        })
+    entries.sort(key=lambda e: e["ts"], reverse=True)
+    entries = entries[:limit]
+    return {"ok": True, "apps": entries, "count": len(entries), "window_hours": hours}

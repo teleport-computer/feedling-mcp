@@ -60,6 +60,8 @@ _SIGNAL_PERMISSION_KEYS: dict[str, tuple[str, ...]] = {
     "cycle": ("cycle", "health", "health_cycle"),
     "mood": ("mood", "health", "health_mood"),
     "reminders": ("reminders",),
+    # history rides the same `app` permission as the current-app field
+    "recent_apps": ("app",),
 }
 
 _OFF_VALUES = {"0", "false", "off", "disabled", "switch_off", "switch-off", "no"}
@@ -230,8 +232,41 @@ def agent_perception_payload(store, *, signals_raw: str | None) -> dict[str, Any
     out: dict[str, Any] = {}
     for signal in signals:
         reason = _permission_states_reason(settings, signal) or _null_state_message_reason(state, signal)
-        out[signal] = _disabled(reason) if reason else _signal_doc(signal, snapshot, pull_snapshot)
+        if reason:
+            out[signal] = _disabled(reason)
+        elif signal == "recent_apps":
+            # history, not a state field -- one shape with the dedicated route
+            out[signal] = perception_service.recent_apps(store.user_id)
+        else:
+            out[signal] = _signal_doc(signal, snapshot, pull_snapshot)
     return {"ok": True, "signals": out}
+
+
+def recent_apps_payload(store, *, limit_raw: str | None, hours_raw: str | None,
+                        now: float | None = None) -> dict[str, Any]:
+    """Recent app-open history (the `perception.recent_apps` tool).
+
+    The current-app fields in ``/v1/agent/perception?signals=app`` only answer
+    "what is open right now"; this answers "what has she been using", which is
+    what a chat turn minutes after the fact actually needs.
+    """
+    limit = None
+    if limit_raw is not None and str(limit_raw).strip():
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            raise AgentRouteError(400, {"ok": False, "error": "invalid_limit"})
+
+    hours = None
+    if hours_raw is not None and str(hours_raw).strip():
+        try:
+            hours = float(hours_raw)
+        except (TypeError, ValueError):
+            raise AgentRouteError(400, {"ok": False, "error": "invalid_hours"})
+        if hours <= 0:
+            raise AgentRouteError(400, {"ok": False, "error": "invalid_hours"})
+
+    return perception_service.recent_apps(store.user_id, limit=limit, hours=hours, now=now)
 
 
 def perception_trend_payload(store, *, signal_raw: str | None, field_raw: str | None, days_raw: str | None) -> dict[str, Any]:

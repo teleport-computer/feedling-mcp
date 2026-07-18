@@ -18,7 +18,9 @@ SLOW_AGENT_PERCEPTION_SIGNALS = (
     "steps", "sleep", "workout", "vitals",
     "activity", "body", "metabolic", "cycle", "mood", "reminders",
 )
-PULL_ONLY_AGENT_PERCEPTION_SIGNALS = ("focus", "audio_route", "app")
+# `app` = what is open right now; `recent_apps` = the app-open history behind it
+# (the current field expires, the history does not).
+PULL_ONLY_AGENT_PERCEPTION_SIGNALS = ("focus", "audio_route", "app", "recent_apps")
 AGENT_PERCEPTION_SIGNALS = (
     FAST_AGENT_PERCEPTION_SIGNALS
     + SLOW_AGENT_PERCEPTION_SIGNALS

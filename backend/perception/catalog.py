@@ -142,8 +142,11 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
            ttl_sec=86400.0, significant=False),
     # `app` is reported via the GET /app_open shortcut endpoint (not /report); this
     # entry exists so app_name/app_category appear in the snapshot with a TTL.
+    # 900s, not the 300s this used to be: the Shortcut only fires on app OPEN,
+    # so a 5-minute window meant the agent saw app_name=None for any turn that
+    # wasn't right after a launch. `recent_apps` covers anything older.
     Signal("app", "app", ("app_name", "app_category"),
-           ttl_sec=300.0, significant=False),
+           ttl_sec=900.0, significant=False),
 ]}
 
 
@@ -211,6 +214,11 @@ UNLOCK_BACK_THRESHOLD_SEC = 1800.0  # 30 min
 # Recent app-open events surfaced in the snapshot (folds the standalone
 # /app_usage read; capped to keep the wake-attached snapshot small).
 RECENT_APPS_LIMIT = 10
+
+# Explicit `perception.recent_apps` pulls read the same app_usage stream, but an
+# agent asking "what have I been using today?" wants more than the wake budget.
+RECENT_APPS_TOOL_LIMIT = 20
+RECENT_APPS_TOOL_MAX = 100
 
 
 def signals_for_capability(cap_key: str) -> list[Signal]:

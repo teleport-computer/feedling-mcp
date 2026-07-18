@@ -13,6 +13,7 @@ Run (the absolute path is provided by the host):
 
 ```
 python <io_cli> perception <signal> [<signal> ...]
+python <io_cli> perception-recent-apps [--limit <n>] [--hours <n>]
 python <io_cli> perception-trend <signal> [--field <field>] [--days <n>]
 python <io_cli> perception-history <signal> [--days <n>]
 python <io_cli> memory-index [--query <text>] [--limit <n>] [--bucket <name>] [--thread <tag>]
@@ -33,7 +34,16 @@ python <io_cli> chat-image --id <message_id>
 - Fast: `now`, `location`, `weather`, `motion`, `calendar`
 - Slow: `steps`, `sleep`, `workout`, `vitals`, `activity`, `body`, `metabolic`,
   `cycle`, `mood`, `reminders`
-- Extra: `focus` (is the user in a focus mode), `audio_route` (headphones/car)
+- Extra: `focus` (is the user in a focus mode), `audio_route` (headphones/car),
+  `app` (the app opened in the last 15 minutes — null otherwise)
+
+### Apps: `app` vs `perception-recent-apps`
+
+`app` only answers "what is open right now"; it goes null 15 minutes after the
+user's last app launch. When the user asks what they've *been* doing or using
+("我刚在干嘛", "最近用了什么 app"), call `perception-recent-apps` — it returns the
+app-open history (newest first, with `minutes_ago` and `category`). If it comes
+back `apps: []`, say you don't have app data; never guess an app name.
 
 ## Memory (strict two-step: index → fetch)
 
