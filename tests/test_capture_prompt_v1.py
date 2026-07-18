@@ -37,6 +37,49 @@ def test_prompt_falls_back_to_neutral_defaults():
     assert "（暂无）" in p and "（空）" in p
 
 
+def test_prompt_naming_rule_uses_known_name():
+    """User-visible card text: the name when known — never "用户"/"user"
+    (usr_fee1 complaint 2026-07-17: cards narrated her as "用户" although the
+    agent knew her name)."""
+    p = build_capture_prompt(
+        ai_name="小柒", user_name="Seven",
+        buckets="", threads="", identity="", window="",
+    )
+    assert "提到 Seven 就用「Seven」" in p
+    assert '永远不要用"用户"/"user"' in p
+    # TA is an instruction/transcript marker only — outputs must not use it.
+    assert "不要用「TA」指代对方" in p
+
+
+def test_prompt_naming_rule_without_name_uses_relationship_referent():
+    """No name yet → a natural relationship referent, NOT "TA" alone as the
+    card wording (the app surface reserves TA for the AI) and never 用户."""
+    p = build_capture_prompt(
+        ai_name="", user_name="", buckets="", threads="", identity="", window="",
+    )
+    assert "你们关系里自然的称呼" in p
+    assert '永远不要用"用户"/"user"' in p
+    assert "不要用「TA」指代对方" in p
+
+
+def test_reserved_placeholder_names_are_treated_as_unknown():
+    """A stored placeholder "name" (用户/user/TA, any case) must not be
+    instructed as a real name — `提到 用户 就用「用户」` would re-pollute the
+    very cards this rule fixes."""
+    from memory.capture_prompt_v1 import sanitize_user_name
+
+    for reserved in ("用户", "user", "USER", "ta", "TA", "", "  "):
+        assert sanitize_user_name(reserved) == "TA", repr(reserved)
+        p = build_capture_prompt(
+            ai_name="", user_name=reserved,
+            buckets="", threads="", identity="", window="",
+        )
+        assert "你们关系里自然的称呼" in p, repr(reserved)
+        assert "就用「用户」" not in p and "就用「user」" not in p, repr(reserved)
+    assert sanitize_user_name("Seven") == "Seven"
+    assert sanitize_user_name("小雨") == "小雨"
+
+
 def test_parse_normal_card():
     raw = ('{"cards":[{"action":"add","type":"event","target_id":null,'
            '"bucket":"工作","threads":["加班","心率"],"summary":"开了一天会",'

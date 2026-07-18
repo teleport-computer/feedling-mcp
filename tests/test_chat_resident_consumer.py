@@ -3080,6 +3080,104 @@ def test_process_proactive_no_collision_posts_normally(monkeypatch):
     assert [s for s in captured["statuses"] if s[1] == "posted"]
 
 
+def test_capture_transcript_labels_use_real_names():
+    """The capture/dream transcript must never label lines with a literal
+    "user:"/"agent:" — models mirror the label into user-visible cards as
+    "用户" (usr_fee1 complaint 2026-07-17). Known names are used verbatim;
+    unknown fall back to the prompt's own TA/我 framing."""
+    user_msg = {"role": "user", "ts": 1000.0, "content": "我在看攻略"}
+    agent_msg = {"role": "openclaw", "ts": 1001.0, "content": "山路小心"}
+    assert crc._capture_message_role(user_msg, user_label="小雨", agent_label="小舟") == "小雨"
+    assert crc._capture_message_role(agent_msg, user_label="小雨", agent_label="小舟") == "小舟"
+    # Defaults match the prompt framing, not system labels.
+    assert crc._capture_message_role(user_msg) == "TA"
+    assert crc._capture_message_role(agent_msg) == "我"
+    # Empty labels fall back rather than rendering "" as a name.
+    assert crc._capture_message_role(user_msg, user_label="", agent_label="") == "TA"
+
+    text = crc._capture_window_text(
+        [user_msg, agent_msg], user_label="小雨", agent_label="小舟"
+    )
+    assert "小雨: 我在看攻略" in text
+    assert "小舟: 山路小心" in text
+    assert "user:" not in text and "agent:" not in text
+
+
+def test_capture_transcript_labels_reject_reserved_placeholder_names():
+    """A placeholder "name" stored on the identity card (用户/user) must not
+    become a transcript label either — that re-creates the exact "用户: …"
+    line the fix removes."""
+    user_msg = {"role": "user", "ts": 1000.0, "content": "hi"}
+    for reserved in ("用户", "user", "USER", "ta"):
+        assert crc._capture_message_role(user_msg, user_label=reserved) == "TA", repr(reserved)
+    text = crc._capture_window_text([user_msg], user_label="用户", agent_label="小舟")
+    assert "用户:" not in text and "TA: hi" in text
+
+
+def test_capture_identity_context_sanitizes_reserved_user_name(monkeypatch):
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    monkeypatch.setattr(
+        crc,
+        "_capture_get_json",
+        lambda path, **kwargs: {"identity": {"agent_name": "小舟", "user_preferred_name": "用户"}},
+    )
+    _identity, ai_name, user_name, text = crc._capture_identity_context()
+    assert ai_name == "小舟"
+    assert user_name == "TA"
+    # The rendered identity context must not carry the reserved value as a
+    # "name" — it would contradict the naming rule sitting next to it.
+    assert "用户" not in text
+
+
+def test_capture_identity_context_placeholder_does_not_shadow_real_fallback_name(monkeypatch):
+    """user_preferred_name="用户" + user_name="小雨" must resolve to 小雨:
+    per-candidate sanitize, not `or`-then-sanitize (which would collapse the
+    whole chain to TA and violate "use the name when known")."""
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    monkeypatch.setattr(
+        crc,
+        "_capture_get_json",
+        lambda path, **kwargs: {"identity": {
+            "agent_name": "小舟",
+            "user_preferred_name": "用户",
+            "user_name": "小雨",
+        }},
+    )
+    _identity, _ai_name, user_name, text = crc._capture_identity_context()
+    assert user_name == "小雨"
+    assert "小雨" in text
+    assert "用户" not in text
+
+
+def test_capture_empty_window_fails_fast_without_identity_fetch(monkeypatch):
+    """An empty/unavailable capture window must keep the fast-fail path — no
+    identity round-trips (up to two network calls) for a job that cannot run."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    statuses = []
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: statuses.append((job_id, status, reason)),
+    )
+    monkeypatch.setattr(crc, "_capture_window_messages", lambda job: [])
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: (_ for _ in ()).throw(AssertionError("identity fetched for empty window")),
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "cap_empty_window",
+        "job_kind": "memory_capture",
+        "source": "memory_capture",
+        "ts": 321.0,
+    }
+    assert crc._process_capture_jobs([job]) == pytest.approx(321.0)
+    assert ("cap_empty_window", "failed", "capture_window_unavailable") in statuses
+
+
 def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -5249,7 +5347,7 @@ def test_call_agent_cli_claude_session_survives_many_turns(monkeypatch, tmp_path
     raw = _claude_chatty_stream("嗯", session_id="c-longlived")
     monkeypatch.setattr(
         crc, "AGENT_CLI_CMD",
-        "claude -p --output-format stream-json --include-partial-messages --session-id {session_id}")
+        "claude -p \"{message}\" --output-format stream-json --include-partial-messages --session-id {session_id}")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     monkeypatch.setattr(crc.subprocess, "run",
                         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=""))
@@ -6368,6 +6466,67 @@ def test_distill_without_chat_since_never_peeks_and_runs_to_completion(monkeypat
     assert crc._distill_in_progress is None
 
 
+def test_distill_preserves_dates_for_long_term_memory_material(monkeypatch):
+    # LTM archive (material_kind == "memory_summary" → keep_all) carries each card's
+    # original date into the envelope, so decades of uploaded memories keep their dates
+    # instead of collapsing onto today. A card the model couldn't date falls back to a
+    # real now() stamp — never empty (resident has no server-side relationship anchor).
+    _patch_memory_distill(monkeypatch, windows=1)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+
+    once = {"n": 0}
+
+    def ltm_pending():
+        once["n"] += 1
+        return [{"job_id": "jobm", "mode": "add_memory",
+                 "material_kind": "memory_summary",
+                 "sealed": {"envelope": {"body_ct": "x"}}}] if once["n"] == 1 else []
+
+    monkeypatch.setattr(crc, "genesis_resident_pending", ltm_pending)
+    sys.modules["genesis"].worker.build_memory_output_from_fact_candidates = lambda **kw: {
+        "memories": [
+            {"summary": "birthday", "occurred_at": "2019-06-01"},
+            {"summary": "graduation", "date": "2020-02-02"},   # alternate key also honored
+            {"summary": "no_date"},
+        ],
+    }
+    seen = {}
+    monkeypatch.setattr(
+        crc, "_capture_build_envelope",
+        lambda card, *, occurred_at, source:
+            seen.__setitem__(card["summary"], occurred_at) or {"card": card},
+    )
+
+    crc._process_resident_distill_once()
+
+    assert seen["birthday"] == "2019-06-01"
+    assert seen["graduation"] == "2020-02-02"
+    assert seen["no_date"] and "T" in seen["no_date"]   # undated → real now() ISO, not empty
+
+
+def test_distill_ignores_dates_for_chat_history_material(monkeypatch):
+    # Chat-history distill (material_kind != memory_summary → keep_all False) is the
+    # normal path: even if a card happens to carry a date, the write stamps now(). Date
+    # preservation is scoped strictly to long-term-memory uploads.
+    _patch_memory_distill(monkeypatch, windows=1)   # base job material_kind is ""
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+
+    sys.modules["genesis"].worker.build_memory_output_from_fact_candidates = lambda **kw: {
+        "memories": [{"summary": "chatty", "occurred_at": "2019-06-01"}],
+    }
+    seen = {}
+    monkeypatch.setattr(
+        crc, "_capture_build_envelope",
+        lambda card, *, occurred_at, source:
+            seen.__setitem__(card["summary"], occurred_at) or {"card": card},
+    )
+
+    crc._process_resident_distill_once()
+
+    assert seen["chatty"] != "2019-06-01"   # date ignored off the LTM path
+    assert "T" in seen["chatty"]            # now() stamp
+
+
 def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
     # An operator-pinned --resume with a sid that is NOT ours is their config —
     # never rotate it, even on a missing-session error.
@@ -7484,3 +7643,54 @@ def test_foreground_prepend_includes_language_line_and_time(monkeypatch):
     assert "current_time:" in out
     assert "Reply language policy" in out  # language line now wired into foreground
     assert out.rstrip().endswith("hello")
+
+
+# --- custom-wrapper guardrails (usr_c190 xiake_wrapper, 2026-07-18) ----------
+
+def test_cli_cmd_without_message_placeholder_fails_loud(monkeypatch, tmp_path):
+    # A template with no {message} used to run the agent WITH NO PROMPT and let
+    # it tell the user "your message never reached me". Now: hard, actionable
+    # error before any subprocess spawns.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_no_placeholder")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "python3 my_wrapper.py")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    ran = []
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda cmd, **kw: ran.append(cmd))
+    with pytest.raises(RuntimeError, match=r"missing the \{message\} placeholder"):
+        crc.call_agent_cli("hello")
+    assert ran == []                             # no blind agent invocation
+
+    # ...and the error classifies as an actionable user-config notice, not
+    # a "our system broke" bubble.
+    n = crc.classify_agent_error(RuntimeError(
+        "AGENT_CLI_CMD is missing the {message} placeholder — the user's ..."))
+    assert n.error_class == "cli_config_invalid"
+    assert n.blame == "user_provider"
+    assert "AGENT_CLI_CMD" in n.user_text
+
+
+def test_pi_without_message_placeholder_is_exempt(monkeypatch, tmp_path):
+    # pi's managed path deliberately omits {message} (stdin feed) — must not trip.
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_no_placeholder")
+    assert crc.call_agent_cli("hello") == "ok"
+
+
+def test_turn_timeout_is_env_tunable(monkeypatch, tmp_path):
+    # Heavy self-hosted stacks (wrapper + MCP cold start + long thinking) need
+    # more than the 120s default; the cap rides AGENT_TURN_TIMEOUT_SEC.
+    _bridge_session_env(monkeypatch, tmp_path, "usr_slow_stack")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "AGENT_TURN_TIMEOUT_SEC", 300)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["timeout"] = kw.get("timeout")
+        return subprocess.CompletedProcess(cmd, 0, stdout=_CLAUDE_OK_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    assert crc.call_agent_cli("hello") == "ok"
+    assert seen["timeout"] == 300

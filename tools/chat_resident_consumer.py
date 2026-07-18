@@ -128,7 +128,7 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
-from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
+from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards, sanitize_user_name
 from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
 from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
@@ -224,6 +224,12 @@ AGENT_HTTP_SESSION_KEY_HEADER = os.environ.get(
 )
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
+# Per-turn subprocess cap for the CLI agent. 120s suits the managed claude/codex/
+# pi templates; heavy self-hosted stacks (custom wrappers, slow MCP cold starts,
+# long-thinking models — usr_c190's xiake_wrapper+MCP+opus combo, 2026-07-18)
+# legitimately need more. Raise via env; the cap still exists so a hung agent
+# can never wedge the single-flight chat lane forever.
+AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "120")))
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
@@ -521,6 +527,9 @@ _ERROR_CLASS_RULES = (
     ("model_not_found", "user_provider",
      "模型名不可用，请检查设置里的模型名。",
      re.compile(r"invalid model name|model_not_found|no such model", re.I)),
+    ("cli_config_invalid", "user_provider",
+     "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。",
+     re.compile(r"missing the \{message\} placeholder", re.I)),
     ("provider_incompatible", "user_provider",
      "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
      re.compile(r"unknown variant|not supported|unsupported (parameter|tool)"
@@ -4104,6 +4113,13 @@ def _warn_if_agent_entry_may_drift() -> None:
     if AGENT_MODE != "cli" or not AGENT_CLI_CMD:
         return
 
+    if "{message}" not in AGENT_CLI_CMD and not _is_pi_cmd(_cli_cmd_tokens()):
+        log.error(
+            "AGENT_CLI_CMD has NO {message} placeholder — every chat turn will "
+            "FAIL: the consumer substitutes placeholders and never appends the "
+            "message. Fix the template (e.g. claude -p \"{message}\"); custom "
+            "wrappers must accept the message as an argv placeholder."
+        )
     lower_template = AGENT_CLI_CMD.lower()
     if re.search(r"\b(you are|user message|reply naturally|same style|persona)\b", lower_template):
         log.warning(
@@ -4727,6 +4743,17 @@ def call_agent_cli(
     if _cli_cwd is None and _agent_cli_cwd_error:
         raise RuntimeError(_agent_cli_cwd_error)
 
+    # A custom template without {message} can NOT deliver the user's words to
+    # the agent — the render step substitutes placeholders and appends nothing.
+    # This used to fail SILENTLY: the agent ran with no prompt and told the user
+    # "your message never reached me" (usr_c190's xiake_wrapper, 2026-07-18).
+    # pi is exempt (its managed path feeds the message via stdin by design).
+    if message and "{message}" not in AGENT_CLI_CMD and not _is_pi_cmd(_cli_cmd_tokens()):
+        raise RuntimeError(
+            "AGENT_CLI_CMD is missing the {message} placeholder — the user's "
+            "message cannot reach the agent. Add {message} to the command "
+            "template (e.g. claude -p \"{message}\")."
+        )
     cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
@@ -4758,7 +4785,7 @@ def call_agent_cli(
     _run_kwargs: dict = {
         "capture_output": True,
         "text": True,
-        "timeout": 120,
+        "timeout": AGENT_TURN_TIMEOUT_SEC,
         "env": child_env,
         "encoding": "utf-8",
         "errors": "replace",
@@ -4772,11 +4799,13 @@ def call_agent_cli(
     except subprocess.TimeoutExpired:
         _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
                           dur_ms=(time.monotonic() - _turn_t0) * 1000,
-                          summary="cli turn timeout", explain="模型调用超时（120s 上限）— 卡在模型这一步")
+                          summary="cli turn timeout",
+                          explain=f"模型调用超时（{AGENT_TURN_TIMEOUT_SEC}s 上限，FEEDLING_AGENT_TURN_TIMEOUT_SEC 可调）— 卡在模型这一步")
         log.warning(
-            "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit 120s subprocess cap)",
+            "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit %ds subprocess cap)",
             "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
             int((time.monotonic() - _turn_t0) * 1000),
+            AGENT_TURN_TIMEOUT_SEC,
         )
         raise
     _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
@@ -7374,13 +7403,32 @@ def _capture_identity_context() -> tuple[dict, str, str, str]:
         or identity.get("name")
         or ""
     ).strip() or "我"
-    user_name = str(
-        identity.get("user_preferred_name")
-        or identity.get("user_name")
-        or identity.get("companion_user_name")
-        or ""
-    ).strip() or "TA"
-    return identity, ai_name, user_name, _capture_context_text(identity)
+    # Per-candidate sanitize, then first REAL name wins: `or` before sanitize
+    # would let a stored placeholder ("用户") in the preferred field shadow a
+    # real name in a fallback field and collapse everything to TA.
+    user_name = "TA"
+    for candidate in (
+        identity.get("user_preferred_name"),
+        identity.get("user_name"),
+        identity.get("companion_user_name"),
+    ):
+        name = sanitize_user_name(candidate)
+        if name != "TA":
+            user_name = name
+            break
+    # The rendered identity context must not re-introduce a reserved value as
+    # a "name" either — it would sit right next to the naming rule in the
+    # prompt and contradict it. Drop only placeholder name FIELDS; free prose
+    # elsewhere in the identity is untouched.
+    identity_for_text = {
+        key: value
+        for key, value in identity.items()
+        if not (
+            key in ("user_preferred_name", "user_name", "companion_user_name")
+            and sanitize_user_name(value) == "TA"
+        )
+    }
+    return identity, ai_name, user_name, _capture_context_text(identity_for_text)
 
 
 def _capture_memory_terms_context() -> tuple[str, str]:
@@ -7412,11 +7460,17 @@ def _capture_message_text(msg: dict) -> str:
     return text[:2000]
 
 
-def _capture_message_role(msg: dict) -> str:
+def _capture_message_role(msg: dict, *, user_label: str = "TA", agent_label: str = "我") -> str:
+    """Transcript line label. Real names, not system labels: a literal "user:"
+    prefix is what taught capture models to write "用户" into user-visible
+    cards (usr_fee1 complaint, 2026-07-17) — the model mirrors whatever the
+    transcript calls the speakers."""
     role = str(msg.get("role") or "").strip().lower()
     if role == "user":
-        return "user"
-    return "agent"
+        # sanitize again here (defense in depth): a reserved "name" (用户/user)
+        # passed as a label must never become a "用户: …" line.
+        return sanitize_user_name(user_label)
+    return (agent_label or "").strip() or "我"
 
 
 def _capture_message_id(msg: dict) -> str:
@@ -7485,12 +7539,13 @@ def _capture_window_messages(job: dict) -> list[dict]:
     return selected
 
 
-def _capture_window_text(messages: list[dict]) -> str:
+def _capture_window_text(messages: list[dict], *, user_label: str = "TA", agent_label: str = "我") -> str:
     lines: list[str] = []
     for msg in messages:
         ts = _message_ts_for_context(msg)
         lines.append(
-            f"- [{_format_message_time(ts)}] {_capture_message_role(msg)}: "
+            f"- [{_format_message_time(ts)}] "
+            f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
             f"{msg.get('_capture_text') or _capture_message_text(msg)}"
         )
     text = "\n".join(lines).strip()
@@ -7622,7 +7677,15 @@ def _process_capture_jobs(jobs: list) -> float:
         window = job.get("window") if isinstance(job.get("window"), dict) else {}
         update_proactive_job_status(job_id, "realizing")
         messages = _capture_window_messages(job)
-        window_text = _capture_window_text(messages)
+        window_text = ""
+        if messages:
+            # Names before rendering: the transcript labels use them (never a
+            # literal "user:"). Fetched only when there IS a window — an empty
+            # window keeps the fast-fail path without burning identity calls.
+            identity, ai_name, user_name, identity_text = _capture_identity_context()
+            window_text = _capture_window_text(
+                messages, user_label=user_name, agent_label=ai_name
+            )
         if not window_text:
             update_proactive_job_status(
                 job_id,
@@ -7638,7 +7701,6 @@ def _process_capture_jobs(jobs: list) -> float:
             )
             continue
         buckets_text, threads_text = _capture_memory_terms_context()
-        identity, ai_name, user_name, identity_text = _capture_identity_context()
         prompt = build_capture_prompt(
             ai_name=ai_name,
             user_name=user_name,
@@ -7863,7 +7925,7 @@ def _dream_cards_context() -> tuple[str, dict[str, dict]]:
     return (text or "（暂无卡）")[:20000], by_id
 
 
-def _dream_recent_conversations_context() -> str:
+def _dream_recent_conversations_context(*, user_label: str = "TA", agent_label: str = "我") -> str:
     try:
         # Text only — dream summarizes conversations, not images.
         history = get_decrypted_history(
@@ -7881,7 +7943,8 @@ def _dream_recent_conversations_context() -> str:
     for msg in live[-max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)):]:
         ts = _message_ts_for_context(msg)
         lines.append(
-            f"- [{_format_message_time(ts)}] {_capture_message_role(msg)}: "
+            f"- [{_format_message_time(ts)}] "
+            f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
             f"{msg.get('_capture_text') or _capture_message_text(msg)}"
         )
     text = "\n".join(lines).strip()
@@ -7983,8 +8046,10 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             continue
-        recent_text = _dream_recent_conversations_context()
         _identity, ai_name, user_name, _identity_text = _capture_identity_context()
+        recent_text = _dream_recent_conversations_context(
+            user_label=user_name, agent_label=ai_name
+        )
         prompt = build_dream_prompt(
             ai_name=ai_name,
             user_name=user_name,
@@ -9466,9 +9531,16 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
 
     # actions: envelope + memory.add + complete — HTTP writes only, no model turn, so
     # this tail never yields (yielding here would risk double memory.add on resume).
-    occurred_at = datetime.now(_tzmod.utc).isoformat()
+    now_iso = datetime.now(_tzmod.utc).isoformat()
     actions: list[dict] = []
     for card in state["memories"]:
+        # Long-term-memory distill (keep_all ← material_kind == "memory_summary") carries the
+        # user's original per-card date through fact_write. Preserve it so decades of uploaded
+        # memories don't all collapse onto today. Chat-history distill keeps the "now" stamp;
+        # an LTM card the model couldn't date also falls back to now() — resident has no
+        # server-side relationship anchor to borrow (cloud path uses one; divergence is documented).
+        card_date = str(card.get("occurred_at") or card.get("date") or "").strip()[:80] if keep_all else ""
+        occurred_at = card_date or now_iso
         envelope = _capture_build_envelope(
             card, occurred_at=occurred_at, source="genesis_resident_distill"
         )

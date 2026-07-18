@@ -536,7 +536,12 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
             return {
                 "source_kind": kwargs["source_kind"],
                 "source_family": "memory_summary",
-                "memories": [{"type": "fact", "summary": "Memory summary", "content": "Memory summary."}],
+                "memories": [{
+                    "type": "fact",
+                    "summary": "Memory summary",
+                    "content": "Memory summary.",
+                    "tags": ["archive"],
+                }],
                 "identity": {"agent_name": "MemoryName", "dimensions": [{"name": "ShouldDrop", "description": "drop"}]},
                 "days_with_user": 22,
             }
@@ -602,6 +607,9 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
         "Memory summary",
         "User profile fact",
     ]
+    assert applied["memories"][0]["_source_family"] == "history"
+    assert applied["memories"][1]["_source_family"] == "memory_summary"
+    assert applied["memories"][2]["_source_family"] == "user_profile"
     serialized = json.dumps(applied, ensure_ascii=False)
     assert "WrongUserName" not in serialized
     assert "bad user persona" not in serialized
@@ -677,7 +685,10 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
     monkeypatch.setattr(
         plaintext.service,
         "apply_memory_outputs",
-        lambda _store, _api_key, output: calls.update({"memory_output": output}) or (1, [{"memory": {"id": "m1"}}]),
+        lambda _store, _api_key, output, **kwargs: calls.update({
+            "memory_output": output,
+            "memory_apply_kwargs": kwargs,
+        }) or (1, [{"memory": {"id": "m1"}}]),
     )
     monkeypatch.setattr(plaintext.service, "init_identity_if_absent", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not touch identity")))
     monkeypatch.setattr(plaintext.service, "write_persona_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not write persona")))
@@ -702,6 +713,10 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
     assert calls["foreground"].get("include_voice_candidates") in (None, False)
     assert calls["fact_write"]["fact_candidates"] == [{"summary": "用户养了一条狗"}]
     assert [item["summary"] for item in calls["memory_output"]["memories"]] == ["用户养了一条狗"]
+    assert calls["memory_apply_kwargs"] == {
+        "preserve_dates": False,
+        "fallback_occurred_at": "2099-01-01",
+    }
     assert calls["completed"]["memory_action_count"] == 1
     assert calls["completed"]["identity_status"] == "skipped"
 
