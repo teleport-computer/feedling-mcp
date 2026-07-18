@@ -139,16 +139,40 @@ def test_background_failures_never_banner(monkeypatch):
     assert len(reported) == 2  # 设置页/admin 腿照发
 
 
-def test_foreground_transient_wave_merges_to_one_banner(monkeypatch):
-    # 同一波抖动打出两个瞬时/系统类（429 + unknown）→ 只弹第一条；
-    # 同类在窗口内再失败 → 也不再弹。
+def test_foreground_provider_transient_wave_merges_to_one_banner(monkeypatch):
+    # provider_transient 各类合并一桶：同一波上游抖动打出 429 + 5xx → 只弹第一条；
+    # 同桶在窗口内再失败 → 也不再弹。
     sent = []
     monkeypatch.setattr(crc, "post_reply", lambda text, **kw: sent.append((text, kw)) or {})
     monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: None)
     crc._reset_system_notice_state()
     crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 429"), foreground=True)
-    crc._notify_agent_turn_failure(RuntimeError("totally opaque failure"), foreground=True)  # unknown
+    crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 503"), foreground=True)
     crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 429"), foreground=True)
+    assert len(sent) == 1
+
+
+def test_foreground_system_bucket_separate_from_provider_transient(monkeypatch):
+    # 方案 C 核心：system（unknown）不再和 provider_transient（429）挤一个桶——
+    # 一波上游抖动之后 IO 自己的系统错仍要弹出来，不被吞掉。
+    sent = []
+    monkeypatch.setattr(crc, "post_reply", lambda text, **kw: sent.append((text, kw)) or {})
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: None)
+    crc._reset_system_notice_state()
+    crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 429"), foreground=True)  # provider_transient
+    crc._notify_agent_turn_failure(RuntimeError("totally opaque failure"), foreground=True)   # system/unknown
+    assert len(sent) == 2
+
+
+def test_foreground_system_wave_merges_within_bucket(monkeypatch):
+    # system 自成一桶但仍合并：同故障期多个系统错（unknown + reply_parse_failed）
+    # 只弹第一条防刷屏。
+    sent = []
+    monkeypatch.setattr(crc, "post_reply", lambda text, **kw: sent.append((text, kw)) or {})
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: None)
+    crc._reset_system_notice_state()
+    crc._notify_agent_turn_failure(RuntimeError("totally opaque failure"), foreground=True)  # unknown → system
+    crc._notify_agent_turn_failure(RuntimeError("no usable reply"), foreground=True)         # reply_parse_failed → system
     assert len(sent) == 1
 
 

@@ -603,9 +603,13 @@ def _system_notice_body(notice: AgentErrorNotice) -> str:
 # - 后台车道（心跳/主动/capture/dream）一律不进聊天流——用户无法据此行动，天天聊天
 #   的人会被自己根本看不见的后台车道刷屏；可观测性走设置页/admin 腿
 #   （_report_runtime_error）+ debug 日志。
-# - 前台（用户刚发的消息最终没拿到真实回复）才弹，且限流：可行动类
-#   （blame=user_provider，如额度/key/模型名）按 error_class 各一个窗口；瞬时/系统类
-#   合并进同一个 "_transient" 桶——同一波上游抖动打出多个 error_class 也只弹第一条。
+# - 前台（用户刚发的消息最终没拿到真实回复）才弹，且限流，按 blame 分三桶：
+#   · user_provider（额度/key/模型名）——按 error_class 各一个窗口，各自动作不同都要提醒；
+#   · provider_transient（限流/5xx/超时/内容拦截）——合并一个桶，同一波上游抖动只弹第一条；
+#   · system（我们自己的错，turn_timeout/reply_parse_failed/unknown）——单独一个桶。
+#   拆开 system 是因为它以前和 provider_transient 挤在同一个 "_transient" 桶里，3h 窗口内
+#   先来一个上游抖动就会把随后 IO 自己的系统错吞掉（usr_6f5a 类）；system 自成一桶后
+#   既不被上游抖动吞、故障期内多个 system 错也仍只弹一条防刷屏。
 # - 固定窗口（默认 3h），不因成功回合清零——否则上游一抖一恢复（fail→ok→fail）时
 #   每次"恢复后再坏"都重新弹，越抖越刷屏。进程内存态即可——respawn 顶多多发一条。
 FOREGROUND_NOTICE_WINDOW_SEC = float(os.environ.get("FOREGROUND_NOTICE_WINDOW_SEC", "10800"))
@@ -665,8 +669,14 @@ def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
         _report_runtime_error(notice.detail, notice.error_class)
         if not foreground:
             return
-        # 可行动类按 error_class 分桶；瞬时/系统类共享一个桶（同波合并）。
-        key = notice.error_class if notice.blame == "user_provider" else "_transient"
+        # 三桶（见上方块注释）：user_provider 各 error_class 一桶、provider_transient
+        # 合并、system 单独。避免上游抖动把 IO 自己的系统错吞掉。
+        if notice.blame == "user_provider":
+            key = notice.error_class
+        elif notice.blame == "provider_transient":
+            key = "_provider_transient"
+        else:
+            key = "_system"
         last = _system_notice_last_sent.get(key)
         if last is not None and (time.monotonic() - last) < FOREGROUND_NOTICE_WINDOW_SEC:
             return

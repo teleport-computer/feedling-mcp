@@ -3352,14 +3352,45 @@ def _run_history_import_job(
             "job_id": job_id,
             "created_at": core_util._now_iso(),
         }
+        error_text = f"{type(e).__name__}:{str(e)[:500]}"
         job.update({
             "failed_at": core_util._now_iso(),
-            "error": f"{type(e).__name__}:{str(e)[:500]}",
+            "error": error_text,
         })
         _update_history_job_phase(store, job, "failed", status="failed")
-        notices.emit(store, source="history_import", error_class="import_failed",
-                     blame="system", severity="error",
-                     user_text=catalog.user_text_for("import_failed"),
+        # 归责：**先按异常类型确认来源是 provider，再谈分类**。
+        #
+        # 这个 except 捕获整条导入流水线的所有异常——DB、enclave、信封、配置读取
+        # 都在内。直接把 error_text 喂给 classify_upstream 会按文本命中正则，
+        # 于是我们自己的故障被甩给用户（Codex review 实测，全部成立）：
+        #   Postgres "password authentication failed" → auth_invalid/user_provider
+        #     → 我们数据库密码错了，却让用户去重存他的 API Key
+        #   enclave_http_401:unauthorized              → auth_invalid/user_provider
+        #   DB "connection refused"                    → upstream_unavailable
+        #     → 我们的库连不上，却说「你的模型服务不可用」
+        # 这违反本产品的归责红线：provider 的错要抛给用户，**但不是他的错绝不
+        # 能赖给他**（docs/FRONTEND_ERROR_CONTRACT.md §二 / spec 2026-07-18）。
+        #
+        # 故只在 ProviderError（provider_client 的出口异常，语义上必然来自用户
+        # 的模型服务）时才分类。其余一律 import_failed/system——笼统但安全，
+        # 我们自己扛。这条路上的 provider 调用不会被包成别的异常类型（那几处
+        # RuntimeError 是信封失败，本就是我们的锅）。
+        #
+        # ProviderError 但 classify_upstream 认不出（如 "provider network
+        # error: ConnectError"）→ 落 upstream_unavailable 而非 import_failed：
+        # 它确实是用户的 provider 挂了，只是我们没认出具体形态，归 system 会
+        # 变成我们替他背锅的漏报。
+        #
+        # 范围提醒：这只覆盖冒到顶层、真正把 job 判 failed 的失败。余额不足被
+        # 中途吞成 warning、job 仍 completed 的降级路径不经过这里（另一档产品
+        # 策略，spec §3 第二批处理）。
+        if isinstance(e, provider_client.ProviderError):
+            ec = catalog.classify_upstream(error_text) or "upstream_unavailable"
+        else:
+            ec = "import_failed"
+        notices.emit(store, source="history_import", error_class=ec,
+                     blame=catalog.blame_for(ec), severity="error",
+                     user_text=catalog.user_text_for(ec),
                      detail=f"{type(e).__name__}:{str(e)[:200]}",
                      dedupe_key=f"history_import:{job_id}")
         print(f"[history_import:{store.user_id}] job={job_id} failed={type(e).__name__}:{str(e)[:220]}")
