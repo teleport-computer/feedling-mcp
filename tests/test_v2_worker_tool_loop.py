@@ -307,7 +307,7 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
             "trusted_system_blocks": (
                 "<feedling-skill>trusted skill</feedling-skill>",
             ),
-            "working_memory": "editable working state",
+            "working_memory": "DO_NOT_EAGERLY_INJECT",
         }
     )
 
@@ -327,17 +327,18 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     for call in calls:
         prompt = str(call["messages"])
         assert "trusted skill" in prompt
-        assert "editable working state" in prompt
+        assert "DO_NOT_EAGERLY_INJECT" not in prompt
+        assert "/memory/WORKING.md" in prompt
     system = next(
         message for message in calls[0]["messages"] if message["role"] == "system"
     )
     assert "trusted skill" in str(system["content"])
-    working = next(
-        message
+    assert not any(
+        worker.context.WORKING_MEMORY_HEADER in str(message.get("content"))
         for message in calls[0]["messages"]
-        if worker.context.WORKING_MEMORY_HEADER in str(message.get("content"))
     )
-    assert working["role"] == "user"
+    second_offered = {spec.name for spec in calls[1]["tools"]}
+    assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
 
 
 def test_chat_workspace_prompt_failure_is_visible_before_provider(

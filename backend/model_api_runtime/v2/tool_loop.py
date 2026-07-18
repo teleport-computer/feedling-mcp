@@ -366,6 +366,10 @@ async def run_tool_loop(
             if outbound_tools_blocked:
                 blocked_tools.update({"web_search", "web_fetch"})
                 blocked_tools.update(mcp_names)
+                # A parent task can hand private workspace/memory-derived text
+                # to a child which still has outbound web access.  Treat that
+                # delegation as another outbound channel, not as a local read.
+                blocked_tools.add(tool_schema.TASK_TOOL)
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:
             tools = turn_catalog

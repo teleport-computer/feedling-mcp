@@ -119,28 +119,27 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     """Render one authoritative workspace prompt snapshot for a turn.
 
     Skill entries come only from the backend's read-only ``/skills`` namespace
-    and therefore retain system authority. ``WORKING.md`` is agent-editable and
-    must cross into the worker through the separate untrusted data field. Any
-    malformed/unknown block fails the turn instead of silently dropping policy.
+    and therefore retain system authority. Agent-editable ``WORKING.md`` stays
+    encrypted at rest and is available through ``workspace_read``; it is not
+    eagerly injected, because persistent untrusted text must not be able to
+    choose a future outbound web/MCP/subagent call. Any malformed/unknown skill
+    block fails the turn instead of silently dropping policy.
     """
     backend = production_workspace_backend(
         store, runtime_token=str(runtime_token or "")
     )
     trusted_system_blocks: list[str] = []
-    working_memory: str | None = None
-    for block in render_trusted_prefix_blocks(backend):
+    for block in render_trusted_prefix_blocks(
+        backend,
+        include_working_memory=False,
+    ):
         if block.name.startswith("skill:/skills/"):
             trusted_system_blocks.append(block.content)
             continue
-        if block.name == "working-memory" and working_memory is None:
-            working_memory = block.content
-            continue
         raise RuntimeError("invalid workspace prompt block")
-    if working_memory is None:
-        raise RuntimeError("workspace working memory block missing")
     return {
         "trusted_system_blocks": tuple(trusted_system_blocks),
-        "working_memory": working_memory,
+        "working_memory": "",
     }
 
 

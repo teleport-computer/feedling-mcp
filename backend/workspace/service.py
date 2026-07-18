@@ -11,6 +11,7 @@ from workspace.backends import (
     PostgresWorkspaceBackend,
     WorkspaceBackend,
     WorkspaceEntry,
+    canonical_path,
 )
 
 
@@ -95,7 +96,15 @@ def list_entries(backend: WorkspaceBackend, *, path: str = "/",
 
 def read_text(backend: WorkspaceBackend, *, path: str,
               start_line: int = 1, line_count: int = 200) -> dict:
-    entry = backend.read(path)
+    normalized = canonical_path(path)
+    # The private working file is created lazily on its first explicit read.
+    # This keeps it available to the model without eagerly injecting its
+    # untrusted contents into every provider request.
+    entry = (
+        ensure_working_memory(backend)
+        if normalized == WORKING_MEMORY_PATH
+        else backend.read(normalized)
+    )
     start = max(1, int(start_line))
     count = max(1, min(int(line_count), 500))
     lines = entry.content.splitlines()
@@ -130,4 +139,3 @@ def delete_entry(backend: WorkspaceBackend, *, path: str,
                  expected_revision: int) -> dict:
     backend.delete(path, expected_revision=expected_revision)
     return {"path": path, "deleted": True}
-

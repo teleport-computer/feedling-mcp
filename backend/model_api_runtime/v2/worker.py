@@ -308,7 +308,7 @@ _SUBAGENT_ALLOWED_TOOLS = frozenset(
         "web_fetch",
     }
 )
-_SUBAGENT_PRIVATE_READ_TOOLS = frozenset(
+_PRIVATE_READ_TOOLS = frozenset(
     {
         "workspace_list",
         "workspace_read",
@@ -518,9 +518,11 @@ class TurnDeps:
     # MCP tools.
     load_mcp_turn: Callable[..., Any] | None = None
     # (store, *, runtime_token) -> {trusted_system_blocks, working_memory}.
-    # Production renders encrypted /skills + /memory/WORKING.md exactly once per
-    # chat/wake turn. Missing wiring remains empty only for legacy/unit callers;
-    # a wired loader failure is terminal and therefore visible/conservative.
+    # Production eagerly renders only encrypted read-only /skills. The legacy
+    # working_memory field is accepted but never injected: editable
+    # /memory/WORKING.md is pull-only through workspace_read, which activates
+    # the outbound-data fence. Missing wiring remains empty only for legacy/unit
+    # callers; a wired loader failure is terminal and visible/conservative.
     load_workspace_prompt: Callable[..., dict] | None = None
     # Encrypted full-trajectory codec boundary. Production seals every event to
     # the user's content key + enclave key before jobs_store sees it. The open
@@ -578,7 +580,7 @@ async def _load_workspace_prompt_context(
         if not isinstance(rendered, dict):
             raise TypeError
         trusted = rendered.get("trusted_system_blocks")
-        working_memory = rendered.get("working_memory")
+        working_memory = rendered.get("working_memory", "")
         if (
             not isinstance(trusted, (tuple, list))
             or isinstance(trusted, (str, bytes))
@@ -588,7 +590,10 @@ async def _load_workspace_prompt_context(
             raise TypeError
     except Exception:  # noqa: BLE001 — never leak decrypted workspace data
         raise WorkspacePromptUnavailable from None
-    return tuple(trusted), working_memory
+    # Editable persistent state is deliberately pull-only. Keeping the legacy
+    # field shape during rollout lets old loaders coexist, but the core refuses
+    # to place its untrusted contents in the eager base prompt.
+    return tuple(trusted), ""
 
 
 @dataclass
@@ -1953,7 +1958,7 @@ def _make_task_batch_dispatcher(
                 max_calls=_SUBAGENT_MAX_LLM_CALLS,
                 disabled_tool_names=_SUBAGENT_DISABLED_TOOLS,
                 allow_reply_tool=False,
-                outbound_blocking_read_tool_names=(_SUBAGENT_PRIVATE_READ_TOOLS),
+                outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -3572,6 +3577,7 @@ async def _run_wake(
                     if trajectory_recorder is not None
                     else None
                 ),
+                outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -4934,6 +4940,7 @@ async def process_job(
             extra_tool_specs=offered_mcp_tool_specs,
             extra_mutating_tool_names=mcp_mutating_names,
             disabled_tool_names=disabled_mutation_tool_names,
+            outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
             max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
             tool_result_char_cap=TOOL_RESULT_CHAR_CAP,

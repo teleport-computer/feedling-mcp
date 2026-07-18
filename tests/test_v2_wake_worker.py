@@ -240,9 +240,12 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     assert len(provider_calls) == 2
     assert all(
         "wake skill" in str(call["messages"])
-        and "wake scratch" in str(call["messages"])
+        and "wake scratch" not in str(call["messages"])
+        and "/memory/WORKING.md" in str(call["messages"])
         for call in provider_calls
     )
+    second_offered = {spec.name for spec in provider_calls[1]["tools"]}
+    assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
 
 
 def test_wake_workspace_prompt_failure_is_silent_before_provider(

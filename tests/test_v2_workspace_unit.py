@@ -22,6 +22,7 @@ from workspace.backends import (
     canonical_path,
 )
 from workspace.prompt import render_trusted_prefix_blocks
+from workspace import service as workspace_service
 from workspace import e2b_sandbox
 from workspace.sandbox import (
     LazySandbox,
@@ -138,11 +139,23 @@ def test_production_workspace_prompt_loader_preserves_trust_partition(
     assert len(rendered["trusted_system_blocks"]) == 1
     assert "<feedling-skill" in rendered["trusted_system_blocks"][0]
     assert "Always preserve" in rendered["trusted_system_blocks"][0]
-    assert "<feedling-working-memory" in rendered["working_memory"]
-    assert "Editable scratch state" in rendered["working_memory"]
+    assert rendered["working_memory"] == ""
     assert "Editable scratch state" not in str(
         rendered["trusted_system_blocks"]
     )
+
+
+def test_explicit_working_memory_read_lazily_creates_default():
+    backend = InMemoryWorkspaceBackend()
+
+    rendered = workspace_service.read_text(
+        backend,
+        path="/memory/WORKING.md",
+    )
+
+    assert rendered["path"] == "/memory/WORKING.md"
+    assert rendered["revision"] == 1
+    assert "editable task/agent working state" in rendered["content"]
 
 
 def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
@@ -166,7 +179,7 @@ def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
         runtime_token="token",
         enclave_sem=asyncio.Semaphore(1),
     ))
-    assert loaded == (("skill",), "scratch")
+    assert loaded == (("skill",), "")
     assert calls == ["token"]
 
     deps.load_workspace_prompt = lambda *_args, **_kwargs: (
