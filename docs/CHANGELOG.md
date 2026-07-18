@@ -47,6 +47,44 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-18
+
+### [DONE] 仓库清理第三轮：过时文档 + 符号级死码 + 全量 unused imports
+
+- **文档**（21 删）：已落地/被推翻的一次性 spec 与事故文档
+  （`INCIDENT_usr_f13f_2026-07-16`（诊断已被 07-17 取证推翻）、
+  `DAU_DAILY_SNAPSHOT_2026-07-14`、`DATATRACK_..._2026-07-13`、
+  `PROACTIVE_AUTONOMY_SWITCHES_2026-07-06`、`V1-迁移-测试清单`）；
+  `docs/memory/` 整目录（07-13 清理漏网的 3 个"已被取代"存档）；
+  13 个已 ship 的 superpowers plan（保留 `2026-07-07-tee-pg-phase0-1-infra`，
+  被 `deploy/DEPLOYMENTS.md` runbook 按 Task 编号引用）。
+- **backend 死码**（25 符号，全部 grep 证实仅剩 def 处一条引用）：
+  `hosted_runtime` 三个死 dataclass、`hosted/turn` 7 个孤儿 wrapper、
+  `memory/actions._memory_content_patch_action`（dispatcher 已 coerce 到
+  supersede，见 conformance test）、`db.genesis_latest_done_job`/`genesis_get_output`、
+  `dstack_tls.derive_key_only`（调用方随 MCP server 一起删了）、
+  `context_memory_selection.memory_relevance_score` 死对、
+  `proactive/runtime_v2.SingleFlightRegistryV2` 等。
+- **unused imports 清扫**：autoflake 全 backend 扫（204 处，26 文件），未触碰
+  `__init__.py`/alembic。⚠️ 教训：`identity/service.py` 的
+  `RUNTIME_LABELS as _IDENTITY_RUNTIME_LABELS` 是故意 re-export（3 处消费方走
+  `identity_service._IDENTITY_RUNTIME_LABELS` 模块属性访问，pyflakes 看不见），
+  被误删导致 30 个测试红，已恢复并加注释说明；其余 203 处经别名感知扫描
+  （`alias.attr` + 字符串形 monkeypatch）确认无借道引用。
+- 审计结论：scripts/ tools/ tests/ deploy/ workflows 无可删项（上两轮清得干净）。
+- **第二轮级联清扫**（全 backend 顶层符号引用扫描迭代到不动点，共 4 轮）：
+  又删 41 个死符号——大头是 hosted model_api 退役残骸的整条死链
+  （turn 的 state-plan/pending-confirmation/web-search 执行路径 →
+  model_api_runtime 的 run_web_searches/web_search_duckduckgo/web_search_trace →
+  hosted_runtime.background_execution_trace，这些在本轮之前就互为唯一调用方、
+  整簇不可达）；另有 asgi/deps.require_store、enclave/readside 两个孤儿、
+  observability_v2 两个死 Sink 类、genesis 三个死 helper、5 处 unused local
+  （含 chat_send_core 每图白算一次的 base64 死计算）；bootstrap 提示词删掉
+  已死的 FEEDLING_MCP_URL 指引。路由 handler（装饰器注册）已全部排除在扫描外。
+- 验证：全量 pytest 对比基线——两轮清理后 3440 passed / 5 failed，失败全部为
+  test 分支 pre-existing（memory_readside×3 + prod_runner_topology×2），零新增；
+  基线里第 6 个红（consumer_whoami_key_guard）系时间敏感 flake，单跑稳定通过。
+
 ## 2026-07-17
 
 ### [DECISION] prod runner 拓扑闸降级为警告（用户拍板）

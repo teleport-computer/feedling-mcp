@@ -77,7 +77,7 @@ M0 已上:原语 + 端点 + 面板 + 埋了 route/genesis/memory 三组(双门�
 
 ## E. carry-over(已做完代码、待验/待并)
 
-- [ ] **E1 老卡迁移(§3)** 代码 + 3 轮 Codex review 完,在 `feat/memory-card-migration`;待 hx 真机测(`docs/V1-迁移-测试清单.md`)。
+- [ ] **E1 老卡迁移(§3)** 代码 + 3 轮 Codex review 完,在 `feat/memory-card-migration`;待 hx 真机测(测试清单已于 2026-06-28 通过盖章后归档删除,见 E4)。
 - [ ] **E2** flow-trace M0 在 test;hx 真机验主流程(`docs/V1-功能效果核对清单-给hx.md` 带面板签名)。
 - [ ] **E3** test→main 别人负责,不归 hx。
 - [x] **E4 legacy→v1 migration 真实 test 部署 e2e —— 已通过(0628,`c9c5a5e` 之后)。** seed 4 张老卡 → `legacy_batch` 命中 → `capture/tick` enqueue → 第一批 `migrated=3/4`(1 张 CAS stale 留下,符合预期)→ 第二批 `no legacy`、`migration_state=done`、`legacy_remaining=0`。迁移后:**4 个原 id 都在、能解密读出、bucket/threads 非占位、内容保留、并发改动("蛋子是比熊")没被覆盖、再 tick 不重复**。真环境盖章完成。(过程中真实 e2e 抓到了本地漏掉的 AAD 解密 bug → 见上方"⚠️ 工程纪律"。)
