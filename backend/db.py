@@ -3497,7 +3497,7 @@ def genesis_complete_job(
 
 
 # ---------------------------------------------------------------------------
-# Chat messages (row-per-item ring buffer)
+# Chat messages (durable row-per-item ledger; process caches are bounded)
 # ---------------------------------------------------------------------------
 
 
