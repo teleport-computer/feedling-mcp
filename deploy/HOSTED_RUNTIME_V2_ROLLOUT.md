@@ -49,6 +49,16 @@ PostgreSQL connection capacity and provider limits. `serve-worker` enforces a
 minimum database-pool floor derived from slot count and fails startup when an
 explicit pool is too small.
 
+The artifact sandbox is optional and fail-closed. Worker manifests default
+`FEEDLING_V2_SANDBOX_PROVIDER=disabled`; text-only turns, virtual text reads,
+and Markdown edits require no sandbox. To enable E2B, set the environment's
+`FEEDLING_V2_SANDBOX_PROVIDER=e2b`, encrypted `E2B_API_KEY`, and versioned
+`FEEDLING_V2_E2B_TEMPLATE` together. Deployment fails before rollout if the
+provider is `e2b` but either credential is missing. Internet remains disabled
+unless the deployment explicitly sets `FEEDLING_V2_E2B_ALLOW_INTERNET=1`.
+Decrypted artifact bytes then cross from Feedling's CVM into E2B, so consent,
+egress, retention, and billing policy must be approved before activation.
+
 Do not set `FEEDLING_HOST_ALL`, `AGENT_RUNTIME_USERS`,
 `AGENT_RUNTIME_AUTODISCOVER`, `AGENT_RUNTIME_MAX_CHILDREN`, or a
 `resident_only` policy. They are retired hosted controls.
@@ -139,6 +149,7 @@ claim hosted V2 accounts and is not part of this incident procedure.
 - [ ] Backend and worker image tags point to the intended commit.
 - [ ] Main and runner Compose hashes are authorized.
 - [ ] Runtime-token secret and database URL match across deployment units.
+- [ ] Sandbox is intentionally disabled, or its provider/key/template and data-boundary policy are verified.
 - [ ] Worker capacity, Genesis, policy, queue, wake, and effect gates are green.
 - [ ] Encrypted real-device turn and `client_msg_id` retry pass.
 - [ ] Prompt-cache canary passes where configured.

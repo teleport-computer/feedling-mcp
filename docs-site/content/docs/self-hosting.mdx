@@ -92,6 +92,9 @@ these settings:
 | `FEEDLING_HOSTED_RUNTIME_POLICY` | Hosted deployments are `v2_only`. The reference Compose files set this literally; retired resident/per-user selectors are rejected. |
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and Runtime V2 workers through a secret manager, and never bake it into an image. |
 | `FEEDLING_V2_MAX_WORKERS` | Bounds concurrent Runtime V2 turn slots per worker container. Size it together with PostgreSQL pool capacity and provider limits. |
+| `FEEDLING_V2_SANDBOX_PROVIDER` | Defaults to `disabled`. Set to `e2b` only on worker deployments that are allowed to send decrypted artifact bytes to E2B. Text-only turns and virtual text edits do not need it. |
+| `E2B_API_KEY` + `FEEDLING_V2_E2B_TEMPLATE` | Required together when the sandbox provider is `e2b`. The template must implement Feedling's fixed extractor contract; inject the API key through the deployment secret channel. |
+| `FEEDLING_V2_E2B_ALLOW_INTERNET` | Defaults to `0`. Enabling sandbox internet is a deployment-level trust and egress decision, never a model-selected option. |
 | `FEEDLING_ENCLAVE_URL` | Required for enclave-backed Memory, screen, worldbook, and decrypt operations. Use a private authenticated network path. |
 | `FEEDLING_ASGI_BACKGROUND` | Enable on the real backend instance if it owns the wake bus and screen WebSocket listener. Do not enable competing development instances against the same ports without understanding leader election. |
 | `FEEDLING_PUBLIC_BASE_URL` | Set to the externally reachable HTTPS base URL. |
