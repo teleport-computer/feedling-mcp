@@ -281,6 +281,80 @@ def test_v2_cache_breakpoints_exclude_dynamic_perception_grounding() -> None:
     assert _nested_cache_controls(anthropic["messages"][-1]["content"]) == []
 
 
+def test_stable_skills_and_working_memory_precede_dynamic_cache_frontier() -> None:
+    messages = v2_context.build_turn_messages(
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+        trusted_system_blocks=("<skill>stable skill</skill>",),
+        working_memory="- project alpha is active",
+        summary="- prior discussion",
+        tail=[{"role": "user", "content": "continue"}],
+        action_context="now=dynamic",
+    )
+
+    openrouter = pc._build_openai_compat_payload(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        messages=messages,
+        temperature=None,
+        max_tokens=256,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=TOOLS,
+        prompt_cache_key=CACHE_KEY,
+    )
+    working = next(
+        message
+        for message in openrouter["messages"]
+        if v2_context.WORKING_MEMORY_HEADER in str(message.get("content"))
+    )
+    assert _nested_cache_controls(working["content"]) == [
+        {"type": "ephemeral"}
+    ]
+
+    anthropic, _, _ = pc._build_anthropic_payload(
+        model="claude-sonnet-4-5",
+        base_url="https://api.anthropic.com/v1",
+        key="sk-test",
+        messages=messages,
+        max_tokens=256,
+        temperature=None,
+        response_format=None,
+        tools=TOOLS,
+        prompt_cache_key=CACHE_KEY,
+    )
+    assert "<skill>stable skill</skill>" in str(anthropic["system"])
+    assert _nested_cache_controls(anthropic["system"]) == [
+        {"type": "ephemeral"}
+    ]
+
+    bedrock, _, _ = pc._build_bedrock_payload(
+        model="us.anthropic.claude-sonnet-4-6",
+        base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+        key="bedrock-key",
+        messages=messages,
+        max_tokens=256,
+        temperature=None,
+        response_format=None,
+        tools=TOOLS,
+        prompt_cache_key=CACHE_KEY,
+    )
+    merged = bedrock["messages"][0]["content"]
+    working_index = next(
+        index
+        for index, block in enumerate(merged)
+        if v2_context.WORKING_MEMORY_HEADER in str(block.get("text") or "")
+    )
+    runtime_index = next(
+        index
+        for index, block in enumerate(merged)
+        if v2_context.RUNTIME_CONTEXT_HEADER in str(block.get("text") or "")
+    )
+    assert merged[working_index + 1] == {"cachePoint": {"type": "default"}}
+    assert working_index < working_index + 1 < runtime_index
+    assert not any("cachePoint" in block for block in merged[runtime_index + 1 :])
+
+
 def test_direct_anthropic_two_turn_runtime_data_preserves_cached_prefix() -> None:
     first_messages, second_messages, without_data_messages = (
         _runtime_turn_messages()

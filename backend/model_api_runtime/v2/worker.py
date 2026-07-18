@@ -1086,6 +1086,8 @@ def _make_build_messages_fn(
     tail: list[dict],
     extra_context: str = "",
     mutation_recovery_active: bool = False,
+    trusted_system_blocks: tuple[str, ...] = (),
+    working_memory: str = "",
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -1114,6 +1116,8 @@ def _make_build_messages_fn(
         tail=tail,
         action_context=extra_context,
         mutation_recovery_active=mutation_recovery_active,
+        trusted_system_blocks=trusted_system_blocks,
+        working_memory=working_memory,
     )
 
     def build_messages(transcript: list) -> list:

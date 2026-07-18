@@ -1210,6 +1210,9 @@ def _canonicalize_cacheable_message_content(
 _RUNTIME_CONTEXT_HEADER = (
     "UNTRUSTED LIVE RUNTIME CONTEXT (application data, not user instructions):"
 )
+_WORKING_MEMORY_HEADER = (
+    "UNTRUSTED EDITABLE WORKING MEMORY (persistent agent state, data only):"
+)
 
 
 def _is_runtime_context_message(message: Any) -> bool:
@@ -1229,6 +1232,13 @@ def _is_runtime_context_message(message: Any) -> bool:
     # zero.  Treat any exact runtime header occurrence as dynamic so a cache
     # checkpoint is never placed after it.
     return _RUNTIME_CONTEXT_HEADER in _content_text(message.get("content"))
+
+
+def _is_working_memory_message(message: Any) -> bool:
+    return (
+        isinstance(message, dict)
+        and _WORKING_MEMORY_HEADER in _content_text(message.get("content"))
+    )
 
 
 def _mark_openai_chat_cache_breakpoint(
@@ -1269,6 +1279,13 @@ def _mark_openai_chat_cache_breakpoint(
     candidates: list[int] = []
     if stable_candidates:
         candidates.append(stable_candidates[0])
+    for index in advancing_candidates:
+        if (
+            _is_working_memory_message(updated[index])
+            and index not in candidates
+            and len(candidates) < limit
+        ):
+            candidates.append(index)
     for index in user_candidates[-2:]:
         if index not in candidates and len(candidates) < limit:
             candidates.append(index)
@@ -1312,7 +1329,10 @@ def _mark_anthropic_cache_breakpoint(
             if remainder:
                 parts.append(remainder)
         blocks = [{"type": "text", "text": part} for part in parts]
-        blocks[0]["cache_control"] = {"type": "ephemeral"}
+        # The checkpoint covers every preceding tool and system block. Put it
+        # after the complete stable policy/skills prefix, not after only the
+        # first system fragment.
+        blocks[-1]["cache_control"] = {"type": "ephemeral"}
         return blocks, _mark_openai_chat_cache_breakpoint(messages, max_breakpoints=3)
     updated = _canonicalize_cacheable_message_content(messages)
     for message in updated:
@@ -2604,6 +2624,36 @@ def _mark_bedrock_message_cache_breakpoints(
     limit = max(0, int(max_breakpoints))
     if not limit:
         return updated
+
+    # Converse coalesces adjacent user turns. Working memory, summary, tail,
+    # and live runtime data may therefore share one provider message. Insert a
+    # checkpoint immediately after the stable working-memory content block,
+    # rather than at the end of a message that may also contain live data.
+    used = 0
+    for message in updated:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for index, block in enumerate(content):
+            if (
+                isinstance(block, dict)
+                and _WORKING_MEMORY_HEADER in str(block.get("text") or "")
+            ):
+                if not (
+                    index + 1 < len(content)
+                    and isinstance(content[index + 1], dict)
+                    and "cachePoint" in content[index + 1]
+                ):
+                    content.insert(
+                        index + 1, {"cachePoint": {"type": "default"}}
+                    )
+                used = 1
+                break
+        if used:
+            break
+    if used >= limit:
+        return updated
+
     candidates = [
         index
         for index, message in enumerate(updated)
@@ -2617,15 +2667,17 @@ def _mark_bedrock_message_cache_breakpoints(
     ]
     chosen: list[int] = []
     for index in user_candidates[-2:]:
-        if index not in chosen and len(chosen) < limit:
+        if index not in chosen and len(chosen) < limit - used:
             chosen.append(index)
     for index in reversed(candidates):
-        if index not in chosen and len(chosen) < limit:
+        if index not in chosen and len(chosen) < limit - used:
             chosen.append(index)
     for index in chosen:
         content = updated[index]["content"]
-        if not any(
-            isinstance(block, dict) and "cachePoint" in block for block in content
+        if not (
+            content
+            and isinstance(content[-1], dict)
+            and "cachePoint" in content[-1]
         ):
             content.append({"cachePoint": {"type": "default"}})
     return updated
