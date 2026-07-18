@@ -171,6 +171,7 @@ jobs:
             tests/test_model_api_chat_send_routing.py \
             tests/test_model_api_profiles_endpoints.py \
             tests/test_provider_prompt_cache.py \
+            tests/test_prompt_cache_canary.py \
             tests/test_provider_usage_normalize.py \
             tests/test_v2_prompt_cache_key.py \
             tests/test_v2_metrics_endpoint.py \
@@ -1601,6 +1602,14 @@ jobs:
           print(f"Runtime V2 liveness gate failed: {last_error}", file=sys.stderr)
           raise SystemExit(1)
           PY
+
+      - name: Prove Runtime V2 prompt-cache hit (pre)
+        env:
+          FEEDLING_API_URL: ${{ vars.PRE_API_URL || 'https://pre-api.feedling.app' }}
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          FEEDLING_PROMPT_CACHE_CANARY_MODEL: ${{ vars.PRE_PROMPT_CACHE_CANARY_MODEL || 'openai/gpt-4o-mini' }}
+        run: python3 tools/prompt_cache_canary.py
 
   # =========================================================================
   # DEPLOY — standalone prod runner CVM(s) (Form B, multi-node)

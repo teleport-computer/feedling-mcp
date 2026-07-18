@@ -67,7 +67,15 @@ not permission to apply the same fleet policy to test or production.
    traffic as proof for one route. Also confirm `cache_telemetry_coverage`: a
    missing metric is `null`/unreported, never a fabricated zero. Exercise one
    relay that rejects cache fields and verify the bounded cache-off retry still
-   preserves the native tool catalog.
+   preserves the native tool catalog. **Pre now enforces this automatically**
+   after the runner liveness gate via `tools/prompt_cache_canary.py`: it creates
+   a throwaway `model_api` account, performs the two bounded turns, repeats the
+   proof with the returned opaque route fingerprint, requires
+   `turns[1].cache_read_tokens > 0`, and also requires `retries == 0` for both
+   turns so a hidden provider 400→200 compatibility retry cannot false-green.
+   The account is deleted in `finally`; only the content-free turn metrics
+   survive for audit. Override the low-cost canary model with the repository
+   variable `PRE_PROMPT_CACHE_CANARY_MODEL` when provider availability changes.
 6. **Verify genesis rehome** (2026-07-10): the genesis import worker now runs inside `serve-worker`, not `agent-runner` — `genesis_import_jobs` has exactly one drain in the codebase, so if this container is unhealthy, every new user's onboarding distillation stalls silently. Confirm `GET /v1/admin/v2-metrics` returns `genesis_alive: true`, then drive **one real genesis import end-to-end** and confirm it decrypts (the runner CVM reaches the main enclave over the passthrough URL with `verify=False`; `deploy/DEPLOYMENTS.md` has always flagged this as a post-cutover check). A `genesis_alive: false` with `live_workers ≥ 1` means the genesis thread died while the turn loops kept beating — check the serve-worker logs for `[genesis:daemon]`.
 
 ## Step 1 — Load test (LOCAL, before flipping real users)
