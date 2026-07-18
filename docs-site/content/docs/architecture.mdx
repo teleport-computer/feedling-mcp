@@ -215,19 +215,28 @@ reply, recursive task, mutating MCP, platform-effect, or workspace-write
 surface. Multiple independent children may run in parallel and return bounded
 results to the parent.
 
+Eager perception is projected to fixed numeric, boolean, or null fields.
+Third-party calendar/reminder/app/place/weather text and screen/photo content
+are pull-only; after an explicit text-bearing read, later web, MCP, and `task`
+tools are removed for that turn. Numeric health snapshot/trend reads remain
+compatible with outbound work.
+
 ### Runtime V2 prompt caching
 
-Tool schemas, runtime policy, canonical-path-sorted `/skills`, and
-`/memory/WORKING.md` are serialized deterministically before dynamic summary,
-tail, perception, and tool results. Provider adapters use route-bound cache
-affinity or provider-native cache controls/checkpoints where supported and
-normalize cache read/write/miss usage into whole-turn telemetry. `WORKING.md`
-is an untrusted data block, not a system instruction; changing it can invalidate
-its later boundary while leaving the earlier tool/system/skills prefix stable.
+Tool schemas, runtime policy, and canonical-path-sorted trusted `/skills` are
+serialized deterministically before dynamic summary, tail, perception, and tool
+results. Provider adapters use route-bound cache affinity or provider-native
+cache controls/checkpoints where supported and normalize cache read/write/miss
+usage into whole-turn telemetry.
+
+Editable `/memory/WORKING.md` is encrypted persistent state, but it is pull-only
+through `workspace_read`, not silently injected into future prompts or cache
+prefixes. After private workspace state is read, later outbound web, MCP, and
+`task` tools are unavailable for the remainder of that turn.
 
 The current Pre canary proves an OpenRouter cache read over a stable synthetic
-conversation prefix. Native Bedrock and the deployed skills/working-memory
-boundary still require their own live post-deploy evidence; unit and wire tests
+conversation prefix. Native Bedrock and the deployed trusted-skills boundary
+still require their own live post-deploy evidence; unit and wire tests
 are not presented as that proof.
 
 ### Runtime V2 encrypted trajectories and offline review

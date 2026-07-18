@@ -114,7 +114,9 @@ evidence that caching is merely “best effort.”
 
 The checked-in canary currently proves OpenRouter with one OpenAI-family and one
 Anthropic-family model over a long stable synthetic conversation prefix. It
-does not prove native Bedrock or a deployed `/skills`/`WORKING.md` mutation.
+does not prove native Bedrock or a deployed trusted `/skills` mutation.
+Editable `/memory/WORKING.md` is deliberately pull-only and is not an eager
+cache-prefix layer.
 After those source paths change, add route-specific live probes rather than
 using the existing OpenRouter success as proxy evidence.
 

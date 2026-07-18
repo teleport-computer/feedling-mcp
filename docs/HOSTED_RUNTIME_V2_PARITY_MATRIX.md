@@ -29,7 +29,7 @@
 | Parallel tool use | ✅ | A provider turn may request a batch of tools. Independent reads and bounded `task` subagents execute concurrently. Disjoint workspace writes can execute in conflict-free waves while same/ancestor/descendant paths serialize; externally effectful platform/MCP mutations remain provider-ordered. Results are reconstructed in provider order. |
 | Executable action vocabulary | ✅ | The exposed native catalog maps to registered executable capabilities. Scheduling, web search/fetch, and exact memory search are present; obsolete planner-only `sleep`/`capture_memory` vocabulary is absent. |
 | One deployment topology | ✅ | Local, test, pre, and production hosted model-API deployments are `v2_only`. A bounded `serve-worker` pool runs in the runner CVM, separate from the main backend/enclave CVM; there is no hosted per-account runtime flip. |
-| Prompt caching and cache telemetry | ⚠️ | Provider-aware cache controls/affinity and per-turn read/write/miss telemetry are implemented for OpenAI-compatible, Anthropic/OpenRouter, Gemini, and Bedrock paths. The existing Pre canary proves a route-bound OpenRouter cache read, but the current skills/`WORKING.md` prefix and native Bedrock path still need post-deploy live cache-hit proof. |
+| Prompt caching and cache telemetry | ⚠️ | Provider-aware cache controls/affinity and per-turn read/write/miss telemetry are implemented for OpenAI-compatible, Anthropic/OpenRouter, Gemini, and Bedrock paths. The existing Pre canary proves a route-bound OpenRouter cache read; the trusted `/skills` prefix and native Bedrock path still need post-deploy live cache-hit proof. Editable `WORKING.md` is deliberately pull-only and is not part of the eager cache prefix. |
 | Tokens/turn and admission ceiling | ✅ | Whole-turn token/call/latency metrics and an admission ceiling are implemented. The offline token regression gate is live. |
 | Concurrent CVM-class load proof | ⚠️ | The harness exists, but the authoritative concurrent run on the target CVM class remains an operational gate. |
 | Typing-signal pre-warm | ❌ | Not implemented. See the definition below. |
@@ -112,6 +112,14 @@ to the user, recurse into more tasks, load user MCP mutations, or perform
 platform/workspace writes. Multiple independent tasks can run concurrently and
 return bounded results to the parent.
 
+Eager perception grounding contains only fixed-field numeric, boolean, or null
+readings. Calendar/reminder titles, app/audio/place/weather text, screen
+captions, and photo text are pull-only. After an explicit text-bearing
+perception, screen, or photo read, later web, MCP, and `task` tools are removed
+for that turn; numeric health snapshot/trend reads remain composable with
+outbound tools. Same-batch calls are allowed because their arguments were chosen
+before the private read result existed in the model transcript.
+
 ## Conversation storage and prompt frontier
 
 V2 does not send ciphertext to the model. Chat content and the append-only
@@ -141,21 +149,23 @@ append-only higher-level checkpoints while preserving this coverage invariant.
 
 ## Prompt-cache boundaries and live evidence
 
-Tool schemas, runtime policy, canonical-path-sorted `/skills` content, and
-editable working memory are rendered deterministically before dynamic summary,
-tail, perception, and tool results. Provider adapters place cache controls or
-cache points at supported stable boundaries; OpenAI-compatible routes also use
-a route-bound cache-affinity key. A `WORKING.md` change invalidates its later
-block while leaving the earlier tool/system/skills prefix reusable where the
-provider supports multiple boundaries. Cache read/write/miss tokens are
-normalized into whole-turn telemetry.
+Tool schemas, runtime policy, and canonical-path-sorted trusted `/skills`
+content are rendered deterministically before dynamic summary, tail,
+perception, and tool results. Provider adapters place cache controls or cache
+points at supported stable boundaries; OpenAI-compatible routes also use a
+route-bound cache-affinity key. Cache read/write/miss tokens are normalized
+into whole-turn telemetry.
+
+Editable `/memory/WORKING.md` is persistent but pull-only. Production does not
+eagerly place it in the prompt or cache prefix: after an explicit
+`workspace_read`, later outbound web/MCP/`task` tools are removed for that turn.
 
 The checked-in live canary currently uses OpenRouter with an OpenAI-family model
 and an Anthropic-family model. It proves that two real Hosted Runtime V2 turns
 stay on one route, make no hidden retry, and report a non-zero second-turn cache
 read over a long stable synthetic conversation prefix. It does **not** yet prove
-native Anthropic, native Bedrock, or mutation of the newly added
-`/skills`/`WORKING.md` prefix in a deployed environment. Those remain explicit
+native Anthropic, native Bedrock, or mutation of the newly added trusted
+`/skills` prefix in a deployed environment. Those remain explicit
 post-deploy canary work rather than inferred success from unit tests.
 
 ## Aggregate telemetry and encrypted full trajectories

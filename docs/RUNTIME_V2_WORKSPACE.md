@@ -120,23 +120,30 @@ reply to the user, recurse into more tasks, load mutating MCP tools, or perform
 platform/workspace mutations. Multiple independent task calls can run in
 parallel, and the parent receives bounded results in provider order.
 
+The same outbound-data boundary covers non-workspace private text. Eager
+perception contains fixed numeric/boolean/null readings only, and screen-watch
+eagerly receives frame counts rather than captions. Calendar/reminder/app/place
+text and screen/photo content require an explicit read; after such a read,
+later web, MCP, and `task` tools are unavailable for the remainder of the turn.
+Numeric health snapshot/trend reads do not trigger that restriction.
+
 ## Prompt caching seam
 
-`workspace.prompt.render_trusted_prefix_blocks()` returns deterministic,
-versioned blocks in this order:
+Production eagerly renders only deterministic, versioned,
+canonical-path-sorted `/skills/*` documents. Dynamic `/workspace`,
+`/artifacts`, and editable `/memory/WORKING.md` data is excluded from the base
+prompt. Skills remain trusted system instructions, so the tool/system/skills
+prefix is both stable and safe for provider caching.
 
-1. canonical-path-sorted `/skills/*` documents;
-2. `/memory/WORKING.md`.
-
-Dynamic `/workspace` and `/artifacts` data is excluded. Skills remain trusted
-system instructions; `WORKING.md` is rendered as an explicitly untrusted,
-data-only user block. Provider adapters place supported cache boundaries after
-the stable tool/system/skills prefix and after working memory. Changing
-`WORKING.md` therefore invalidates the later block without changing the earlier
-prefix where the provider supports multiple boundaries.
+`WORKING.md` is persistent agent-authored state and therefore an untrusted
+prompt-injection surface. It stays encrypted at rest and is pull-only through
+`workspace_read`; it is not silently injected into later turns and is not
+claimed as part of the stable cache prefix. After a turn explicitly reads
+private workspace or working-memory content, the loop removes outbound web,
+MCP, and `task` tools for later rounds of that turn.
 
 Unit and wire tests cover OpenAI-compatible cache affinity,
 Anthropic/OpenRouter cache controls, Gemini cache telemetry, and Bedrock Converse
 `cachePoint` blocks. The deployed Pre canary currently proves only an
 OpenRouter route-bound cache read over a stable synthetic conversation prefix;
-it does not yet prove native Bedrock or a live skills/`WORKING.md` mutation.
+it does not yet prove native Bedrock or a deployed `/skills` prefix mutation.

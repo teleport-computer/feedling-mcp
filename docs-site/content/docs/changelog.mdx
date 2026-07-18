@@ -104,11 +104,19 @@ change must not be interpreted as an API guarantee.
   exposing reply, recursive-task, MCP mutation, platform-effect, or
   workspace-write surfaces.
 
-- Provider-aware prompt caching now keeps deterministic tool/system/skills and
-  editable-working-memory blocks ahead of dynamic conversation/tool data,
-  including Bedrock Converse cache points and provider-neutral cache usage
-  telemetry. The existing Pre canary proves an OpenRouter cache hit; native
-  Bedrock and live `/skills`/`WORKING.md` mutation still need post-deploy proof.
+- Provider-aware prompt caching now keeps deterministic tool/system/trusted-
+  skills blocks ahead of dynamic conversation/tool data, including Bedrock
+  Converse cache points and provider-neutral cache usage telemetry. Editable
+  `WORKING.md` is deliberately pull-only; after it or another private workspace
+  entry is read, later outbound web/MCP/`task` tools are unavailable for that
+  turn. The existing Pre canary proves an OpenRouter cache hit; native Bedrock
+  and live trusted-`/skills` mutation still need post-deploy proof.
+
+- Eager perception grounding now contains only fixed numeric/boolean/null
+  fields. Calendar/reminder/app/place/weather strings and screen/photo content
+  are pull-only; once explicitly read, later web, MCP, and `task` tools are
+  removed for that turn. Numeric health reads remain composable with outbound
+  tools.
 
 - Proactive wake bubbles no longer post on top of an active conversation: right
   before delivery, the consumer re-checks the latest chat rows and skips the

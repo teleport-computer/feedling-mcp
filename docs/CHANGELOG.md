@@ -62,15 +62,23 @@
   a sandbox; uncached artifact materialization fails closed unless an E2B or CVM
   provider is configured. E2B is source-wired but remains a deployment data-
   boundary decision, not an automatic upload path.
-- Provider adapters preserve deterministic tool/system/skills/working-memory
-  cache boundaries and normalize cache reads/writes/misses, including Bedrock
-  Converse cache points. The existing Pre canary proves OpenRouter only; native
-  Bedrock and live skills/`WORKING.md` mutation still need deployment evidence.
+- Provider adapters preserve a deterministic tool/system/trusted-skills cache
+  prefix and normalize cache reads/writes/misses, including Bedrock Converse
+  cache points. Editable `WORKING.md` is deliberately pull-only rather than
+  eagerly cached; reading private workspace state removes later outbound
+  web/MCP/`task` tools for that turn. The existing Pre canary proves OpenRouter
+  only; native Bedrock and a live trusted-skills mutation still need deployment
+  evidence.
 - Runtime V2 now persists a bounded, append-only encrypted per-job trajectory.
   Optional provider-backed failure review is default-off, fail-closed,
   database-admission-bounded, and structurally has no reply/tool/effect surface.
   It is offline analysis rather than deterministic replay; automatic retention/
   GC and restricted inspection/export policy remain open.
+- Eager perception grounding is now a strict fixed-field numeric/boolean/null
+  projection. Third-party calendar/reminder/app/place/weather text and
+  screen/photo content are pull-only; after an explicit text-bearing read the
+  loop removes later web, MCP, and `task` channels. Numeric health reads remain
+  compatible with later outbound work.
 - Raw encrypted Chat rows and attachment bodies remain the durable ledger. The
   5,000-message value is only an in-process hot-window bound, never a database
   retention rule. The remaining full-conversation task is to replace the one
