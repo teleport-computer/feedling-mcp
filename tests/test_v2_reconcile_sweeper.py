@@ -23,6 +23,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
+from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import serve_worker
 from hosted import config_store as hosted_config_store
 from core import store as core_store
@@ -131,6 +132,38 @@ def test_per_iteration_exception_does_not_crash_the_loop(monkeypatch):
 
     asyncio.run(_driver())
     assert calls["n"] >= 2  # survived the first raise and ticked again
+
+
+def test_one_iteration_reconciles_missing_failure_review_runner(monkeypatch):
+    calls = {"n": 0}
+
+    monkeypatch.setattr(db, "reconcile_unenqueued_v2_messages", lambda: 0)
+    monkeypatch.setattr(db, "effect_pending_users", lambda: [])
+
+    def _counting_review_reconcile():
+        calls["n"] += 1
+        return 1
+
+    monkeypatch.setattr(
+        jobs_store,
+        "reconcile_failure_review_runners",
+        _counting_review_reconcile,
+    )
+    stop_event = asyncio.Event()
+
+    async def _driver():
+        task = asyncio.create_task(
+            serve_worker._reconcile_loop(stop_event, interval=0.02)
+        )
+        for _ in range(200):
+            if calls["n"] >= 1:
+                break
+            await asyncio.sleep(0.01)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    asyncio.run(_driver())
+    assert calls["n"] >= 1
 
 
 def test_one_iteration_drains_pending_effect_without_a_future_turn(monkeypatch):

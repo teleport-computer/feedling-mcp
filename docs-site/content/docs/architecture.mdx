@@ -206,8 +206,11 @@ but provider-backed review is off by default and requires the managed runner's
 explicit enable variable. Admission is serialized in PostgreSQL against a
 fleet-wide pending-plus-running ceiling; disabled, invalid, and overflow cases
 retain capture but create no review runner. The same flag is checked before
-provider boundaries as an operational cost kill switch. The review worker
-decrypts only a bounded trajectory frontier, calls the user's
+provider boundaries as an operational cost kill switch. If that fence stops an
+in-flight runner, its durable request returns to pending; after re-enable, the
+parent reconciler idempotently recreates one runner per pending-review user in
+bounded batches. The review worker decrypts only a bounded trajectory frontier,
+calls the user's
 configured model once with no tool schemas, and encrypts the analysis before
 storage. This is not a production retry and cannot resend a reply or invoke a
 platform, MCP, Memory, schedule, or workspace mutation: the review handler does

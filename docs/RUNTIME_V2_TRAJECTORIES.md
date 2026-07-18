@@ -66,7 +66,12 @@ pending-plus-running count and admission insert atomic across every worker.
 When review is disabled, misconfigured, or at the ceiling, failed jobs retain
 their encrypted trajectory but create neither a review request nor a provider
 runner. The enable flag is also checked at execution fences, so turning it off
-stops queued work before its next provider call.
+stops queued work before its next provider call. A disabled in-flight runner
+returns its durable request to `pending` without spawning a successor. After
+re-enable, the parent process reconciles at most 64 pending-review users per
+sweep (every 60 seconds by default) and idempotently recreates one runner per
+user; the partial active-job unique index prevents duplicate runners across
+worker CVMs.
 
 When enabled and admitted, a failed or expired source job transactionally
 creates one `v2_trajectory_reviews` request and ensures a low-priority

@@ -2770,9 +2770,11 @@ async def _reconcile_loop(
     is bridged via `asyncio.to_thread` — same pattern as every other sync DB call in
     these parent loops.
 
-    The same parent loop also drains due outbox rows independently of future
-    turns. Transient failures receive exponential backoff; poison rows stop at
-    ``needs_reconciliation`` and are surfaced by ``/v1/admin/v2-metrics``.
+    The same parent loop also recreates missing opt-in failure-review runners
+    after a review kill-switch off→on transition, then drains due outbox rows
+    independently of future turns. Transient failures receive exponential
+    backoff; poison rows stop at ``needs_reconciliation`` and are surfaced by
+    ``/v1/admin/v2-metrics``.
     """
     while not stop_event.is_set():
         try:
@@ -2784,6 +2786,20 @@ async def _reconcile_loop(
                 )
         except Exception as e:  # noqa: BLE001 — 瞬时故障绝不能杀掉 sweeper/worker 进程
             log.warning("[v2.serve_worker] reconcile sweep failed: %s", e)
+        try:
+            review_runners = await asyncio.to_thread(
+                jobs_store.reconcile_failure_review_runners
+            )
+            if review_runners:
+                log.info(
+                    "[v2.serve_worker] reconciled %d failure-review runner(s)",
+                    review_runners,
+                )
+        except Exception as e:  # noqa: BLE001 — optional review cannot kill parent loop
+            log.warning(
+                "[v2.serve_worker] failure-review reconcile failed: %s",
+                type(e).__name__,
+            )
         try:
             pending_users = await asyncio.to_thread(db.effect_pending_users)
         except Exception as e:  # noqa: BLE001 — one DB failure must not kill the parent loop

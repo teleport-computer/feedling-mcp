@@ -286,6 +286,103 @@ def test_terminal_failure_queues_review_in_same_lifecycle_and_recovers_crash():
     assert review_secret not in stored_review
 
 
+def test_review_reconciler_recovers_pending_backlog_after_kill_switch_reenable(
+    monkeypatch,
+):
+    uid = "u_trajectory_review_reenable_recovery"
+    source_job_id, _job = _source_job(uid)
+    assert jobs_store.mark_failed(
+        source_job_id,
+        "turn_failed:providererror",
+        claimed_by="worker-source",
+    )
+    runner = jobs_store.claim_next_job("worker-review", lanes={"trajectory_review"})
+    assert runner is not None
+    assert jobs_store.mark_running(runner["id"], claimed_by="worker-review")
+    claimed = jobs_store.claim_failure_review(
+        uid,
+        runner_job_id=runner["id"],
+        claimed_by="worker-review",
+    )
+    assert claimed is not None and claimed["status"] == "running"
+
+    monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", "0")
+    assert jobs_store.mark_failed(
+        runner["id"],
+        "trajectory_review_disabled",
+        claimed_by="worker-review",
+    )
+    recovered = jobs_store.get_failure_review(source_job_id, uid)
+    assert recovered is not None and recovered["status"] == "pending"
+    assert jobs_store.reconcile_failure_review_runners(limit=8) == 0
+    with db.get_pool().connection() as conn:
+        active_while_off = conn.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE user_id=%s "
+            "AND lane='trajectory_review' "
+            "AND status IN ('pending','claimed','running')",
+            (uid,),
+        ).fetchone()[0]
+    assert active_while_off == 0
+
+    monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", "1")
+    barrier = threading.Barrier(2)
+
+    def reconcile():
+        barrier.wait()
+        return jobs_store.reconcile_failure_review_runners(limit=8)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reconciled = list(pool.map(lambda _index: reconcile(), range(2)))
+    assert sum(reconciled) == 1
+    assert jobs_store.reconcile_failure_review_runners(limit=8) == 0
+    with db.get_pool().connection() as conn:
+        active_after_reenable = conn.execute(
+            "SELECT id,status,reason FROM agent_jobs WHERE user_id=%s "
+            "AND lane='trajectory_review' "
+            "AND status IN ('pending','claimed','running')",
+            (uid,),
+        ).fetchall()
+    assert len(active_after_reenable) == 1
+    assert active_after_reenable[0][1:] == ("pending", "terminal_failure_review")
+
+
+def test_review_reconciler_bounds_each_tick_by_pending_user(monkeypatch):
+    users = ("u_review_reconcile_limit_a", "u_review_reconcile_limit_b")
+    for uid in users:
+        source_job_id, _job = _source_job(uid)
+        assert jobs_store.mark_failed(
+            source_job_id,
+            "turn_failed:providererror",
+            claimed_by="worker-source",
+        )
+
+    monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", "0")
+    for index in range(2):
+        runner = jobs_store.claim_next_job(
+            f"review-limit-worker-{index}",
+            lanes={"trajectory_review"},
+        )
+        assert runner is not None
+        claimed_by = f"review-limit-worker-{index}"
+        assert jobs_store.mark_running(runner["id"], claimed_by=claimed_by)
+        assert jobs_store.mark_failed(
+            runner["id"],
+            "trajectory_review_disabled",
+            claimed_by=claimed_by,
+        )
+
+    monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", "1")
+    assert jobs_store.reconcile_failure_review_runners(limit=1) == 1
+    with db.get_pool().connection() as conn:
+        first_tick_active = conn.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE lane='trajectory_review' "
+            "AND status IN ('pending','claimed','running')"
+        ).fetchone()[0]
+    assert first_tick_active == 1
+    assert jobs_store.reconcile_failure_review_runners(limit=1) == 1
+    assert jobs_store.reconcile_failure_review_runners(limit=1) == 0
+
+
 def test_review_frontier_reopens_when_a_late_event_lands():
     uid = "u_trajectory_late_frontier"
     source_job_id, _job = _source_job(uid)

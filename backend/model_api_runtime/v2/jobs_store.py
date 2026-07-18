@@ -199,7 +199,7 @@ def _validate_trajectory_envelope(user_id: str, envelope: object) -> dict:
     return envelope
 
 
-def _ensure_review_runner_on_cursor(cur, user_id: str) -> None:
+def _ensure_review_runner_on_cursor(cur, user_id: str) -> bool:
     """Ensure one low-priority generic runner exists for this user's backlog.
 
     The source review row carries the source-job identity.  The generic
@@ -208,7 +208,7 @@ def _ensure_review_runner_on_cursor(cur, user_id: str) -> None:
     desirable here.
     """
     if not trajectory_review_enabled():
-        return
+        return False
     cur.execute(
         "INSERT INTO agent_jobs "
         "(user_id,lane,status,reason,priority,expected_runtime_generation) "
@@ -231,6 +231,7 @@ def _ensure_review_runner_on_cursor(cur, user_id: str) -> None:
             _TRAJECTORY_REVIEW_LANE,
         ),
     )
+    return cur.rowcount == 1
 
 
 def _queue_failure_review_on_cursor(cur, source_job_id: int | str) -> bool:
@@ -287,6 +288,46 @@ def _recover_review_runner_on_cursor(cur, runner_job_id: int | str) -> None:
     for row in rows:
         user_id = row["user_id"] if isinstance(row, dict) else row[0]
         _ensure_review_runner_on_cursor(cur, str(user_id))
+
+
+def reconcile_failure_review_runners(*, limit: int = 64) -> int:
+    """Recreate missing generic runners for durable pending reviews.
+
+    The review enable flag is an operational kill switch. A runner fenced while
+    it is off returns its claimed review to ``pending`` but intentionally cannot
+    create a successor at that moment. This bounded parent-process sweep closes
+    the other half of that contract after re-enable.
+
+    The active-job partial unique index on ``(user_id, lane)`` and
+    ``ON CONFLICT DO NOTHING`` make concurrent fleet reconcilers idempotent. A
+    tick examines at most ``limit`` users and creates at most one runner per
+    pending-review user. Default-off/invalid review configuration returns before
+    acquiring a database connection.
+    """
+    if type(limit) is not int or not 1 <= limit <= 1_000:
+        raise ValueError("failure review reconcile limit must be 1..1000")
+    if not trajectory_review_enabled():
+        return 0
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT r.user_id FROM v2_trajectory_reviews r "
+                    "JOIN v2_runtime_state s ON s.user_id=r.user_id "
+                    "WHERE r.status='pending' AND r.attempt_count<%s "
+                    "AND s.hosted_runtime_state='v2' "
+                    "AND NOT EXISTS (SELECT 1 FROM agent_jobs j "
+                    "  WHERE j.user_id=r.user_id AND j.lane=%s "
+                    "  AND j.status IN ('pending','claimed','running')) "
+                    "GROUP BY r.user_id ORDER BY MIN(r.created_at),r.user_id "
+                    "LIMIT %s",
+                    (_TRAJECTORY_REVIEW_MAX_ATTEMPTS, _TRAJECTORY_REVIEW_LANE, limit),
+                )
+                users = [str(row["user_id"]) for row in cur.fetchall()]
+                return sum(
+                    bool(_ensure_review_runner_on_cursor(cur, user_id))
+                    for user_id in users
+                )
 
 
 def coalesce_or_insert_on_cursor(

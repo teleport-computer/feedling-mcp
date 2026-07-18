@@ -457,6 +457,22 @@ def test_failure_review_bad_admission_config_fails_closed(monkeypatch, raw_cap):
     assert jobs_store.trajectory_review_enabled() is False
 
 
+def test_failure_review_reconciler_default_off_does_not_touch_db(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", raising=False)
+
+    def forbidden_pool():
+        raise AssertionError("default-off review reconciler touched PostgreSQL")
+
+    monkeypatch.setattr(jobs_store, "_pool", forbidden_pool)
+    assert jobs_store.reconcile_failure_review_runners() == 0
+
+
+@pytest.mark.parametrize("limit", [0, -1, 1001, True])
+def test_failure_review_reconciler_rejects_unbounded_limits(limit):
+    with pytest.raises(ValueError, match="1..1000"):
+        jobs_store.reconcile_failure_review_runners(limit=limit)
+
+
 def test_review_prompt_retains_an_oversized_newest_event_as_bounded_evidence():
     messages = trajectory.build_review_messages(
         [

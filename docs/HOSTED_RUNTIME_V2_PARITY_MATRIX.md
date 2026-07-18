@@ -184,8 +184,11 @@ off and requires `FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=1`; a database-serialize
 `FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE` pending+running ceiling (64 by
 default when enabled) rejects overflow without creating a runner. Invalid
 configuration fails closed, and execution rechecks the flag as a cost kill
-switch before provider boundaries. When enabled and admitted, terminal failed
-or expired turns enqueue a distinct low-priority `trajectory_review` lane. It
+switch before provider boundaries. A runner stopped while disabled returns its
+review to durable `pending`; the parent reconciler recreates at most 64 missing
+runners per tick after re-enable, with database single-flight preventing fleet
+duplicates. When enabled and admitted, terminal failed or expired turns enqueue
+a distinct low-priority `trajectory_review` lane. It
 decrypts the bounded failed trajectory only inside the trusted worker, makes at
 most one tools-disabled provider call per attempt, and persists the result as a
 second shared encrypted envelope. A failed review is retried at most three
