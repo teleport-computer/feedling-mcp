@@ -67,6 +67,15 @@ protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
 
+Runtime V2 builds each turn from an encrypted itemized summary plus every
+uncovered source message verbatim. The trusted runner decrypts that selected
+view in memory before sending ordinary plaintext messages to the configured
+model. The durable encrypted `chat_messages` rows and referenced object-storage
+bodies remain the source ledger: compaction does not delete them, and the
+5,000-message constant bounds only a process-local hot window. The current
+single summary blob still grows over time; immutable encrypted segments and
+higher-level checkpoints are the remaining long-horizon prompt-bound task.
+
 An [independent resident consumer](/docs/workflows/chat#independent-resident-loop)
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
 user or integrator controls instead of Feedling's hosted runner.
@@ -173,6 +182,13 @@ and `/memory/WORKING.md` is editable agent working state distinct from
 user-facing Memory Garden cards. Writes use exact revisions, so stale same-file
 writes fail instead of silently overwriting one another.
 
+Independent reads and bounded child tasks can execute concurrently. Disjoint
+workspace mutations are grouped into conflict-free waves and may commit in
+parallel at the database CAS boundary; same-path and ancestor/descendant paths
+serialize. Platform effects, schedules, Memory Garden writes, and mutating MCP
+calls remain in provider order, and tool results are reconstructed in that same
+order.
+
 Workspace bodies are stored as shared encrypted envelopes. PostgreSQL still sees
 the user ID, virtual path, kind, MIME type, source reference, revision, and
 timestamps as plaintext routing metadata. An authorized hosted runner asks the
@@ -185,10 +201,34 @@ shell commands, and code execution cross a separate, lazily acquired sandbox
 provider boundary. The provider is deployment-pluggable; a shared runner process
 or access to a host Docker socket is not treated as a sandbox. A remote provider
 also becomes a plaintext recipient for any decrypted artifact bytes sent to it.
-If no audited provider adapter is registered, uploads remain stored but an
-artifact cache miss is explicitly unavailable rather than parsed inside the API
-or runner process. Successful provider acquisition emits a content-free usage
-event for billing; cached text-view reads do not.
+The E2B adapter is source-wired but active only when the deployment selects it
+and supplies its API key and template. If the provider is disabled,
+misconfigured, or unavailable, uploads remain stored but an artifact cache miss
+is explicitly unavailable rather than parsed inside the API or runner process.
+Successful provider acquisition emits a content-free usage event for billing;
+cached text-view reads do not. The current catalog does not expose generic shell
+or arbitrary code execution.
+
+The native `task` tool runs a bounded child loop with the same provider route
+and an isolated transcript. Children receive approved read tools but no user
+reply, recursive task, mutating MCP, platform-effect, or workspace-write
+surface. Multiple independent children may run in parallel and return bounded
+results to the parent.
+
+### Runtime V2 prompt caching
+
+Tool schemas, runtime policy, canonical-path-sorted `/skills`, and
+`/memory/WORKING.md` are serialized deterministically before dynamic summary,
+tail, perception, and tool results. Provider adapters use route-bound cache
+affinity or provider-native cache controls/checkpoints where supported and
+normalize cache read/write/miss usage into whole-turn telemetry. `WORKING.md`
+is an untrusted data block, not a system instruction; changing it can invalidate
+its later boundary while leaving the earlier tool/system/skills prefix stable.
+
+The current Pre canary proves an OpenRouter cache read over a stable synthetic
+conversation prefix. Native Bedrock and the deployed skills/working-memory
+boundary still require their own live post-deploy evidence; unit and wire tests
+are not presented as that proof.
 
 ### Runtime V2 encrypted trajectories and offline review
 
@@ -212,17 +252,20 @@ parent reconciler idempotently recreates one runner per pending-review user in
 bounded batches. The review worker decrypts only a bounded trajectory frontier,
 calls the user's
 configured model once with no tool schemas, and encrypts the analysis before
-storage. This is not a production retry and cannot resend a reply or invoke a
-platform, MCP, Memory, schedule, or workspace mutation: the review handler does
-not receive those dispatch surfaces. Review output is not inserted into Chat or
-agent context automatically. Its lease and process-watchdog progress remain
-live across decrypt/provider work, and completion is fenced to the exact event
-frontier: any late event discards or reopens stale analysis.
+storage. This is not a production retry or deterministic replay and cannot
+resend a reply or invoke a platform, MCP, Memory, schedule, or workspace
+mutation: the review handler does not receive those dispatch surfaces. Review
+output is not inserted into Chat or agent context automatically. Its lease and
+process-watchdog progress remain live across decrypt/provider work, and
+completion is fenced to the exact event frontier: any late event discards or
+reopens stale analysis.
 
-Trajectory and review rows currently have no automatic retention job; they are
-removed by explicit owning job/account deletion. Keep provider review opt-in
-until a BYOK budget and retention/GC policy are chosen. Turning review off never
-turns trajectory capture off.
+Explicit event truncation, changing external reads, and fresh model sampling
+also mean the flight recorder cannot promise byte-for-byte historical
+re-execution. Trajectory and review rows currently have no automatic retention
+job; they are removed by explicit owning job/account deletion. Keep provider
+review opt-in until a BYOK budget and retention/GC policy are chosen. Turning
+review off never turns trajectory capture off.
 
 ## Managed and self-hosted trust models
 

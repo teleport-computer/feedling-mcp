@@ -193,7 +193,7 @@ flip、resident supervisor 或 hosted resident rollback。旧 proactive API 如�
 | `content_encryption.py` | v1 信封构建（与 iOS / enclave 三方一致的参考实现） |
 | `provider_client.py` | 模型 API 路由的 LLM provider 客户端（key 校验、chat completion） |
 | `hosted_runtime.py` | 旧接口兼容辅助；不是 hosted 执行路径，也不能启动 resident runtime |
-| `model_api_runtime/v2/` | 托管 Runtime V2：durable queue、统一 provider/tool loop、summary+tail、outbox、telemetry、workspace 与 background lanes |
+| `model_api_runtime/v2/` | 托管 Runtime V2：durable queue、统一 provider/tool loop、summary+tail、outbox、prompt-cache telemetry、加密 trajectory、workspace、bounded subagents 与 background lanes |
 | `agent_runtime/` | 仅保留与独立 agent 接入有关的非 supervisor 辅助；旧 hosted per-user CLI supervisor/spawner 已删除 |
 | `context_memory_selection.py` | 记忆检索与相关性打分，组上下文窗口 |
 | `perception/` | 扩展感知：信号目录、权限、快照、wake 触发 |

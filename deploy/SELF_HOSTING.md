@@ -1,5 +1,15 @@
 # Self-Hosting Feedling
 
+> **Legacy resident-route runbook — not a Runtime V2 stack.** This SSH/systemd
+> guide predates PostgreSQL-only persistence and the pooled Hosted Runtime V2
+> worker. It remains useful only as historical guidance for an independently
+> operated `/v1/chat/*` resident consumer. For the current component inventory,
+> PostgreSQL/enclave/worker requirements, sandbox configuration, encrypted
+> workspace/trajectory storage, and readiness checks, use
+> [`docs-site/content/docs/self-hosting.mdx`](../docs-site/content/docs/self-hosting.mdx).
+> Do not use the commands below to claim hosted-runtime or managed-production
+> parity.
+
 Run your own Feedling backend on a VPS you control. Your data stays on
 your VPS; the Feedling team is not in the loop.
 

@@ -1,7 +1,9 @@
 # Runtime V2 workspace, working memory, and sandbox boundary
 
-Runtime V2 owns a virtual workspace. A model-visible path is never evidence that
-the same path exists on the runner host.
+Runtime V2 owns a backend-pluggable virtual workspace. Production uses the
+encrypted PostgreSQL backend; the in-memory backend is test-only. A
+model-visible path is never evidence that the same path exists on the runner
+host.
 
 ## Namespaces
 
@@ -43,10 +45,14 @@ Every create, replace, or delete uses an exact revision:
 - replacing or deleting requires the last observed revision;
 - a stale revision returns a conflict instead of silently overwriting.
 
-This is the backend authority needed for future parallel file writes. Reads can
-run concurrently. External mutations remain serialized in model order. File
-writes may later run concurrently when paths/revisions are disjoint; same-path
-conflicts remain explicit.
+The durable sink groups a provider-authored run of workspace mutations into
+conflict-free waves. Disjoint paths can commit concurrently at the database CAS
+boundary. The same path and ancestor/descendant paths serialize in provider
+order, so a directory delete cannot race a nested write. Each child mutation
+has a deterministic sink identity and its own claim/complete state, making
+retries idempotent without hiding an uncertain sibling outcome. Tool results
+are reconstructed in the provider's original call order. Platform effects,
+schedules, Memory Garden writes, and mutating MCP calls remain provider-ordered.
 
 ## Sandbox trigger boundary
 
@@ -70,7 +76,8 @@ another provider is registered by deployment assembly. There is intentionally
 no Docker-socket adapter. The bundled memory provider is test-only, holds bytes
 in memory, and refuses all shell/code execution.
 
-The optional E2B adapter requires `E2B_API_KEY` and
+The E2B adapter is source-wired but configuration-dependent. It requires
+`FEEDLING_V2_SANDBOX_PROVIDER=e2b`, `E2B_API_KEY`, and
 `FEEDLING_V2_E2B_TEMPLATE`. It always requests `secure=True`, disables internet
 access by default, caps lifetime/command/output/artifact size, and kills the
 sandbox on close. Its template must provide the fixed
@@ -80,13 +87,12 @@ output path. User filenames, MIME types, and model content are never appended
 to that extractor command. `FEEDLING_V2_E2B_ALLOW_INTERNET=1` is an explicit
 deployment-level opt-in, not a model option.
 
-The repository's older resident `container` strategy is not a usable adapter:
-it only builds a `docker run` argv and the live spawner explicitly falls back to
-the shared process strategy. The old memory-sandbox compose is a local
-backend+enclave validation stack, not an artifact execution API. Until an
-audited `cvm` or `e2b` adapter is registered, uploads remain durably stored but a
-Runtime V2 binary/text attachment cache miss is surfaced as
-`sandbox_unavailable`; it is never parsed in the backend process.
+The repository's older resident `container` strategy is not a usable adapter,
+and the old memory-sandbox compose is a local backend+enclave validation stack,
+not an artifact execution API. When the sandbox provider is disabled,
+misconfigured, or unavailable, uploads remain durably stored but a Runtime V2
+binary/text attachment cache miss is surfaced as `sandbox_unavailable`; it is
+never parsed in the backend or shared worker process.
 
 Every successful provider acquisition appends a content-free
 `v2_sandbox_usage_events` row (`user_id`, provider, purpose, timestamp). This is
@@ -100,6 +106,20 @@ sandbox can preserve the existing confidential-compute boundary but still needs
 resource/egress limits and a broker API; the shared runner process is not itself
 a hostile-code sandbox.
 
+The current model-facing catalog exposes artifact/workspace operations but not a
+generic shell or arbitrary code-execution tool. The shell/code bullets above
+define the mandatory sandbox boundary if those tools are added later; they do
+not claim that arbitrary execution is already available.
+
+## Bounded subagents
+
+`task` is a native loop tool. Each child uses the same provider route with an
+isolated transcript, a deadline, and bounded provider/tool-call budgets.
+Children can inspect approved workspace/artifact/Memory/web reads, but cannot
+reply to the user, recurse into more tasks, load mutating MCP tools, or perform
+platform/workspace mutations. Multiple independent task calls can run in
+parallel, and the parent receives bounded results in provider order.
+
 ## Prompt caching seam
 
 `workspace.prompt.render_trusted_prefix_blocks()` returns deterministic,
@@ -108,6 +128,15 @@ versioned blocks in this order:
 1. canonical-path-sorted `/skills/*` documents;
 2. `/memory/WORKING.md`.
 
-Dynamic `/workspace` and `/artifacts` data is excluded. Provider adapters can
-therefore cache stable skills and working memory separately, invalidating only a
-block whose exact revision/content digest changed.
+Dynamic `/workspace` and `/artifacts` data is excluded. Skills remain trusted
+system instructions; `WORKING.md` is rendered as an explicitly untrusted,
+data-only user block. Provider adapters place supported cache boundaries after
+the stable tool/system/skills prefix and after working memory. Changing
+`WORKING.md` therefore invalidates the later block without changing the earlier
+prefix where the provider supports multiple boundaries.
+
+Unit and wire tests cover OpenAI-compatible cache affinity,
+Anthropic/OpenRouter cache controls, Gemini cache telemetry, and Bedrock Converse
+`cachePoint` blocks. The deployed Pre canary currently proves only an
+OpenRouter route-bound cache read over a stable synthetic conversation prefix;
+it does not yet prove native Bedrock or a live skills/`WORKING.md` mutation.

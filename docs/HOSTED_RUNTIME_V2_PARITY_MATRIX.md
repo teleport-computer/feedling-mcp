@@ -1,6 +1,6 @@
 # Hosted Runtime V2 — Current Parity and Completion Matrix
 
-> **CURRENT SOURCE OF TRUTH — 2026-07-18.** This page describes the current
+> **CURRENT SOURCE OF TRUTH — 2026-07-19.** This page describes the current
 > Runtime V2 source and managed deployment manifests. A live environment changes
 > only after this source is deployed. Use
 > [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)
@@ -26,15 +26,15 @@
 | Full conversation, not a fixed message window | ⚠️ | The prompt is built from an encrypted, append-only itemized summary plus a verbatim tail. Raw encrypted chat rows and attached R2 bodies are retained independently of compaction; the former 5,000-row value now bounds only the process hot window. The summary itself still grows forever; immutable encrypted summary segments and higher-level checkpoints are the remaining long-horizon task. |
 | One native agent loop for every model | ✅ | Chat and wake use the same in-process provider-native tool loop. There is no `official`/`rule` tier, planner, or separate responder. A model that does not call a tool naturally returns once; malformed tool output gets bounded compatibility handling, not pre-assigned model routing. |
 | Reply inside the loop; eager late-message folding | ✅ | `reply` is a loop tool, so the model may acknowledge the user and continue working. New user messages are claimed without debounce and folded at every round boundary. |
-| Parallel tool use | ✅ | A provider turn may request a batch of tools. Independent read tools execute with bounded parallelism; writes and externally mutating MCP calls remain ordered/serialized for safety. |
+| Parallel tool use | ✅ | A provider turn may request a batch of tools. Independent reads and bounded `task` subagents execute concurrently. Disjoint workspace writes can execute in conflict-free waves while same/ancestor/descendant paths serialize; externally effectful platform/MCP mutations remain provider-ordered. Results are reconstructed in provider order. |
 | Executable action vocabulary | ✅ | The exposed native catalog maps to registered executable capabilities. Scheduling, web search/fetch, and exact memory search are present; obsolete planner-only `sleep`/`capture_memory` vocabulary is absent. |
 | One deployment topology | ✅ | Local, test, pre, and production hosted model-API deployments are `v2_only`. A bounded `serve-worker` pool runs in the runner CVM, separate from the main backend/enclave CVM; there is no hosted per-account runtime flip. |
-| Prompt caching and cache telemetry | ✅ | Provider-aware caching and per-turn cache-token telemetry are live. A route-bound two-request cache-hit canary has succeeded on Pre. |
+| Prompt caching and cache telemetry | ⚠️ | Provider-aware cache controls/affinity and per-turn read/write/miss telemetry are implemented for OpenAI-compatible, Anthropic/OpenRouter, Gemini, and Bedrock paths. The existing Pre canary proves a route-bound OpenRouter cache read, but the current skills/`WORKING.md` prefix and native Bedrock path still need post-deploy live cache-hit proof. |
 | Tokens/turn and admission ceiling | ✅ | Whole-turn token/call/latency metrics and an admission ceiling are implemented. The offline token regression gate is live. |
 | Concurrent CVM-class load proof | ⚠️ | The harness exists, but the authoritative concurrent run on the target CVM class remains an operational gate. |
 | Typing-signal pre-warm | ❌ | Not implemented. See the definition below. |
-| Encrypted full trajectories and failure replay | ❌ | Aggregate telemetry and durable effects exist, but the complete ordered model/tool execution is not persisted. See the distinction below. |
-| Fleet-wide resident-process retirement | ✅ | Hosted resident source, supervisor services, per-user homes/leases/CLI toolchain, rollout selectors, and the admin rollback flip are removed. Every managed environment can launch only the pooled V2 worker. The independent user-operated `/v1/chat/*` resident consumer remains a separate product path and cannot be selected for hosted accounts. |
+| Encrypted full trajectories and failure review | ⚠️ | Immutable encrypted per-job provider/tool/reply/fold/error capture is implemented. Provider-backed offline review is explicit opt-in, fail-closed, globally admission-bounded, and structurally side-effect-free; it is analysis, not deterministic replay. Automatic retention/GC and operator inspection/export policy remain open. |
+| Fleet-wide resident-process retirement | ⚠️ | Source and managed topology are complete: hosted supervisors, per-user homes/leases/CLI toolchains, selectors, and the admin rollback flip are removed, and every managed manifest can launch only pooled V2 workers. Live closure still requires deploying the reviewed image to each environment, provisioning the required second production runner failure domain, and verifying that no legacy hosted process remains. The independent user-operated `/v1/chat/*` resident consumer is a separate product path. |
 
 ## Current turn shape
 
@@ -44,8 +44,9 @@ claim immediately
   -> render the complete prompt frontier
   -> provider-native model round (same loop for every model)
   -> execute a requested tool batch
-       reads: bounded parallelism
-       mutations: ordered and durability-fenced
+       reads + bounded subagents: parallel
+       disjoint workspace writes: conflict-free parallel waves
+       external/conflicting mutations: provider-ordered and durability-fenced
        reply: publish immediately, then the loop may continue
   -> fold newly arrived user messages at the round boundary
   -> repeat within round/token/deadline limits
@@ -60,8 +61,8 @@ returning.
 
 ## Tool and lane parity
 
-The model-visible native catalog contains 17 static platform tools plus the
-synthetic `reply` tool:
+The model-visible native catalog contains **23** built-in tools: 21 platform
+tools plus the synthetic `task` and `reply` loop tools:
 
 - identity read/write;
 - memory index/fetch/write/exact search;
@@ -69,15 +70,19 @@ synthetic `reply` tool:
 - screen and photo list/read;
 - web search/fetch;
 - schedule/cancel wake;
+- workspace list/read/write/delete;
+- bounded read-only `task` subagents;
 - `reply`; and
 - eligible user-connected MCP tools, subject to approval, taint, ordering, and
   crash-recovery controls.
 
-Chat image/file reads are internal ingestion capabilities, not model-selectable
-tools. Images enter the provider request as multimodal content. Supported
-uploaded text/PDF/DOCX/XLSX files are decrypted, text-extracted, and injected by
-the worker (up to the configured file limit); this is not arbitrary filesystem
-or shell access. The detailed facade and enclave mapping lives in
+Chat image/file reads are internal ingestion capabilities, not additional
+model-selectable tools. Images enter the provider request as multimodal content.
+Uploaded artifacts are represented through the encrypted virtual workspace;
+reading an existing encrypted text view needs no sandbox, while a cache miss
+must acquire a configured sandbox before decrypted bytes are materialized or an
+untrusted binary is parsed. Runtime V2 does not currently expose a generic shell
+or arbitrary code-execution tool. The detailed facade and enclave mapping lives in
 [`docs/superpowers/specs/runtime-v2-parity-matrix.md`](superpowers/specs/runtime-v2-parity-matrix.md).
 
 | Lane | Status | Note |
@@ -89,6 +94,23 @@ or shell access. The detailed facade and enclave mapping lives in
 | Capture | ⚠️ | The real parser now emits validator-complete encrypted actions (`type`, `occurred_at`, ranking/source metadata), non-empty captures persist, and a rejected write fails the job rather than being marked completed. Rollout remains default-off pending lifecycle soak. |
 | Memory Dream | ⚠️ | Native `op/card_ids/result` consolidations now map to multi-card supersede actions and pass the real Garden validator. Rollout remains default-off pending lifecycle soak; this Dream organizes memory cards and is not runtime failure replay. |
 | Genesis import | ✅ | Rehomed under `serve-worker` with a dedicated heartbeat |
+| Trajectory review | ⚠️ | Encrypted capture is always on; provider-backed offline review is opt-in/default-off, globally capped, tools-disabled, and has no live effect surfaces. Retention/GC policy remains open. |
+
+## Workspace, working memory, and subagents
+
+Runtime V2 exposes a backend-pluggable virtual filesystem. Production stores
+file bodies as user+enclave shared encrypted envelopes in PostgreSQL; the
+in-memory backend is test-only. `/artifacts` and `/skills` are read-only,
+`/workspace` is model-editable with exact revision CAS, and the only editable
+Memory path is `/memory/WORKING.md`. That Markdown file is operational scratch
+state for plans and continuation, not a replacement or file projection of
+Memory Garden's structured semantic cards.
+
+The native `task` tool starts bounded child loops with isolated transcripts and
+the same provider route. Children may use approved read tools, but cannot reply
+to the user, recurse into more tasks, load user MCP mutations, or perform
+platform/workspace writes. Multiple independent tasks can run concurrently and
+return bounded results to the parent.
 
 ## Conversation storage and prompt frontier
 
@@ -117,15 +139,34 @@ silently truncate required history. The remaining long-horizon design is to
 replace one ever-growing summary blob with immutable encrypted segments and
 append-only higher-level checkpoints while preserving this coverage invariant.
 
+## Prompt-cache boundaries and live evidence
+
+Tool schemas, runtime policy, canonical-path-sorted `/skills` content, and
+editable working memory are rendered deterministically before dynamic summary,
+tail, perception, and tool results. Provider adapters place cache controls or
+cache points at supported stable boundaries; OpenAI-compatible routes also use
+a route-bound cache-affinity key. A `WORKING.md` change invalidates its later
+block while leaving the earlier tool/system/skills prefix reusable where the
+provider supports multiple boundaries. Cache read/write/miss tokens are
+normalized into whole-turn telemetry.
+
+The checked-in live canary currently uses OpenRouter with an OpenAI-family model
+and an Anthropic-family model. It proves that two real Hosted Runtime V2 turns
+stay on one route, make no hidden retry, and report a non-zero second-turn cache
+read over a long stable synthetic conversation prefix. It does **not** yet prove
+native Anthropic, native Bedrock, or mutation of the newly added
+`/skills`/`WORKING.md` prefix in a deployed environment. Those remain explicit
+post-deploy canary work rather than inferred success from unit tests.
+
 ## Aggregate telemetry and encrypted full trajectories
 
 The current telemetry is valuable. `v2_turn_metrics` is deliberately
 content-free and aggregated to one best-effort row per job; the other persisted
 records below each capture only one operational slice of the turn.
 
-| Persisted today | What it answers | Why it is not a full trajectory |
+| Persisted record | What it answers | Scope boundary |
 |---|---|---|
-| `v2_turn_metrics` | Total prompt/completion/cache tokens, calls, retries, latency, provider/model, final status | No per-round request, response, tool I/O, provider-attempt lineage, or exact context; failed sends may have unknown token usage |
+| `v2_turn_metrics` | Total prompt/completion/cache tokens, calls, retries, latency, provider/model, final status | Aggregate and content-free; failed sends may still have unknown provider usage |
 | `agent_jobs` and status events | Whether/when a job queued, ran, failed, or expired | Status vocabulary is coarse and original content is intentionally excluded |
 | Runtime action digest | Counts and success by tool name | No arguments, results, ordering, or context |
 | Encrypted effect outbox | Durable replies and platform mutations | Captures business effects, not read tools or model exchanges |
@@ -134,9 +175,12 @@ records below each capture only one operational slice of the turn.
 | `v2_trajectory_events` | Immutable per-job request/response, fold, tool, reply, exception, and terminal chronology | Sensitive payload is a user+enclave shared envelope; only fixed ordering/type/size metadata is plaintext |
 
 Telemetry is the **odometer/instrument panel**: it tells us how much, how long,
-and whether the turn failed. A trajectory is the **flight recorder**: it tells
-us exactly what happened, in what order, with which context and tool inputs and
-outputs. Token telemetry therefore does not make a failed turn replayable.
+and whether the turn failed. The encrypted trajectory is the **flight
+recorder**: it records the bounded causal chronology and explicit completeness
+state. Token telemetry alone therefore does not explain a failed turn, and the
+flight recorder still is not a deterministic replay engine: truncated events,
+external read changes, and fresh model sampling can make exact re-execution
+impossible.
 
 Runtime V2 now also writes the flight recorder: each causal event is bounded,
 compressed, sealed to the user's content key and enclave key in the trusted
@@ -176,7 +220,7 @@ request; provider-side speculative calls require a separate explicit budget and
 waste policy. The first implementation should warm only local/TEE/network work
 and preserve ordinary prompt-cache affinity for real turns.
 
-### Encrypted full trajectories and failure-review Dream lane (capture implemented; review opt-in)
+### Encrypted full trajectories and failure review (capture implemented; review opt-in)
 
 The existing `dream` lane remains user-memory housekeeping. Encrypted
 trajectory capture remains on independently. Provider-backed review defaults
@@ -204,8 +248,8 @@ capability/MCP loader, effect outbox, or workspace backend. Review output is not
 fed to the user or a later agent turn automatically.
 
 This is analysis, not production retry. The existing effect outbox handles
-durable effect recovery; failure replay must never resend replies, rewrite
-memory/identity/schedules, or repeat remote MCP mutations.
+durable effect recovery. Any future replay mechanism must never resend replies,
+rewrite memory/identity/schedules, or repeat remote MCP mutations.
 
 Automatic retention/GC is not implemented: encrypted rows follow explicit
 job/account deletion. Keep provider review opt-in until BYOK budget and
@@ -229,6 +273,11 @@ deleted or replaced and for explicitly independent `/v1/chat/*` consumers. A
 hosted send requires the exact `db_action_v2` + `v2` ownership tuple and fails
 before persistence otherwise. Deploying the new manifests to each live fleet is
 a release operation, not an alternate runtime implementation or rollback path.
+The repository requires at least two production worker CVM IDs but currently
+records only one provisioned ID, so the production rollout gate intentionally
+remains closed until the second independent failure domain exists. Final closure
+also requires a live process inventory proving zero old hosted resident
+processes.
 
 ## Remaining work, in order
 
@@ -240,14 +289,18 @@ a release operation, not an alternate runtime implementation or rollback path.
    p50/p95 and wasted-prewarm rate.
 4. Define operator retention/export policy and restricted inspection tooling for
    encrypted trajectories; neither is required by the live agent loop.
-5. Finish capture/Dream lifecycle rollout, migrate test/production, and retire
-   the hosted resident supervisor fleet after rollback gates pass.
+5. Extend the live prompt-cache canary to exercise skills/working-memory
+   boundaries and native Bedrock where credentials are available.
+6. Provision the second production runner, deploy the reviewed V2-only images
+   across every live environment, and verify zero hosted resident processes.
 
-Generic local file/bash access, remote artifact download, and an on-demand
-artifact sandbox are separate harness-expansion decisions, not unfinished
-claims in the original V2 parity contract. Do not accidentally treat the
-resident CLI's sandbox-bypassed local filesystem access as an intended hosted
-capability.
+The encrypted workspace, artifact materialization boundary, optional E2B
+adapter, and bounded subagents are implemented source capabilities. E2B remains
+configuration- and policy-dependent because decrypted artifact bytes leave the
+Feedling CVM. Generic shell/code execution is still not model-visible; adding it
+would require the same sandbox boundary and a separate permission/billing
+contract. Do not treat the retired resident CLI's host filesystem access as an
+intended hosted capability.
 
 ## Traceability guards
 
@@ -260,6 +313,9 @@ At minimum, current-status changes should remain covered by:
 - `tests/test_v2_mixed_tool_dispatch.py`
 - `tests/test_provider_client_async.py`
 - `tests/test_v2_prompt_cache_key.py`
+- `tests/test_provider_prompt_cache.py`
+- `tests/test_provider_tools_bedrock.py`
+- `tests/test_prompt_cache_canary.py`
 - `tests/test_v2_turn_metrics.py`
 - `tests/test_v2_summary_store.py`
 - `tests/test_v2_summary_watermark_seq.py`
@@ -270,9 +326,15 @@ At minimum, current-status changes should remain covered by:
 - `tests/test_v2_extraction_memory_integration.py`
 - `tests/test_memory_readside_core.py`
 - `tests/test_v2_worker_files.py`
+- `tests/test_v2_workspace_db.py`
+- `tests/test_v2_workspace_unit.py`
+- `tests/test_v2_subagents.py`
+- `tests/test_v2_trajectory_db.py`
+- `tests/test_v2_trajectory_unit.py`
 - `tests/test_v2_atomic_reply_cursor.py`
 - `tests/test_hosted_runtime_policy.py`
 - `tests/test_hosted_resident_retirement.py`
+- `tests/test_prod_runner_topology.py`
 - `tests/test_no_litellm_anywhere.py`
 
 When architecture or rollout state changes, update this page in the same commit.

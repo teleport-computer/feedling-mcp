@@ -371,8 +371,11 @@ PostgreSQL durable job，并在同一个 provider-native tool loop 里执行。�
 现行 prompt 使用加密 append-only itemized summary + 未覆盖的 verbatim tail；
 trusted runtime 在内存中解密后给模型普通明文。5,000 条只约束进程热窗口，
 数据库原始加密消息不会因 compaction 或行数自动删除。每轮可以并行执行
-有界只读工具批次，mutation 保持 durability fence；`reply` 本身是 loop tool，
-新用户输入在 round boundary 即时折入。
+有界只读工具批次和 `task` 子 agent；互不冲突的 workspace 写可按 conflict-free
+wave 并行落 CAS，同一路径/祖先子孙路径与外部 effectful mutation 保持 provider
+顺序和 durability fence。`reply` 本身是 loop tool，新用户输入在 round boundary
+即时折入。workspace/summary/trajectory 在库中是加密信封，trusted runtime 解密后
+才把普通明文交给模型；模型从来不吃 ciphertext。
 
 > **现状标注（2026-07-18）**：下面 §3.1–§3.7 保存的是已经退役的 legacy
 > inline prompt/controller 的历史说明，不是 fallback，也不能被 hosted 账号

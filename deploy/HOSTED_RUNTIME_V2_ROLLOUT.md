@@ -1,6 +1,6 @@
 # Hosted Runtime V2 — Deployment and Recovery Runbook
 
-> **Current source of truth — 2026-07-18.** Hosted model-API execution is
+> **Current source of truth — 2026-07-19.** Hosted model-API execution is
 > Runtime V2-only in local, test, pre, and production manifests. There is no
 > hosted resident rollback, per-user runtime selector, supervisor service, or
 > empty resident roster to preserve. The independent user-operated
@@ -59,6 +59,14 @@ unless the deployment explicitly sets `FEEDLING_V2_E2B_ALLOW_INTERNET=1`.
 Decrypted artifact bytes then cross from Feedling's CVM into E2B, so consent,
 egress, retention, and billing policy must be approved before activation.
 
+Encrypted trajectory capture is always on. Provider-backed offline review is
+separate, defaults off, and must stay off unless
+`FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=1` and a valid
+`FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE` fleet ceiling are configured. The
+ceiling bounds pending plus running provider reviews; it is not a retention
+policy. There is no automatic trajectory/review GC yet, so keep review opt-in
+until BYOK budget and retention/export policy are approved.
+
 Do not set `FEEDLING_HOST_ALL`, `AGENT_RUNTIME_USERS`,
 `AGENT_RUNTIME_AUTODISCOVER`, `AGENT_RUNTIME_MAX_CHILDREN`, or a
 `resident_only` policy. They are retired hosted controls.
@@ -103,6 +111,12 @@ Pre additionally runs the prompt-cache canary after worker liveness. Keep the
 canary route/model stable so the second request can reuse an identical provider
 prefix, and treat missing cache-read tokens as a failed gate rather than
 evidence that caching is merely “best effort.”
+
+The checked-in canary currently proves OpenRouter with one OpenAI-family and one
+Anthropic-family model over a long stable synthetic conversation prefix. It
+does not prove native Bedrock or a deployed `/skills`/`WORKING.md` mutation.
+After those source paths change, add route-specific live probes rather than
+using the existing OpenRouter success as proxy evidence.
 
 ## Failure behavior
 
@@ -150,9 +164,12 @@ claim hosted V2 accounts and is not part of this incident procedure.
 - [ ] Main and runner Compose hashes are authorized.
 - [ ] Runtime-token secret and database URL match across deployment units.
 - [ ] Sandbox is intentionally disabled, or its provider/key/template and data-boundary policy are verified.
+- [ ] Trajectory review is intentionally disabled, or its fleet ceiling, BYOK budget, and retention policy are verified.
 - [ ] Worker capacity, Genesis, policy, queue, wake, and effect gates are green.
 - [ ] Encrypted real-device turn and `client_msg_id` retry pass.
 - [ ] Prompt-cache canary passes where configured.
+- [ ] Production lists at least two independent runner CVMs before rollout.
+- [ ] Live process inventory shows no hosted resident supervisor or per-user CLI process.
 - [ ] Previous database-compatible V2 image and scale-out procedure are known.
 
 Implementation parity and remaining non-retirement work are tracked in

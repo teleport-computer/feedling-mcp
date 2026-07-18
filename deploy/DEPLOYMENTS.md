@@ -60,6 +60,14 @@ retirement when keeping the exact value no longer helps verification.
 > **historical** are incident evidence only and must not be used as deployment
 > instructions; the current CVM tables and V2 rollout runbook are authoritative.
 
+> **Source is not live state.** The V2-only manifests and retirement guards can
+> be complete in Git while a live CVM still runs an older image. Production also
+> requires two independent runner IDs; the repository currently records one, so
+> its hard topology gate must remain closed until runner two is provisioned.
+> Declare fleet-wide retirement complete only after the reviewed images are
+> deployed to every environment and a live process inventory shows no hosted
+> resident supervisor or per-user CLI process.
+
 ### Production CVM (prod9, current)
 
 | | |

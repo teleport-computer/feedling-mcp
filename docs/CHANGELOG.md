@@ -47,6 +47,40 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-19
+
+### [DONE] Runtime V2 harness parity lands in source with explicit live gates
+
+- The unified model-visible catalog now has 23 built-in tools: 21 platform
+  capabilities plus bounded `task` subagents and loop-native `reply`. Independent
+  reads/tasks run concurrently; disjoint workspace writes may commit in
+  conflict-free waves, while conflicting paths and external effects remain
+  provider-ordered.
+- Added the encrypted, backend-pluggable VFS: read-only `/artifacts` and
+  `/skills`, editable `/workspace`, and editable `/memory/WORKING.md` separate
+  from Memory Garden. Existing text views and virtual text edits do not acquire
+  a sandbox; uncached artifact materialization fails closed unless an E2B or CVM
+  provider is configured. E2B is source-wired but remains a deployment data-
+  boundary decision, not an automatic upload path.
+- Provider adapters preserve deterministic tool/system/skills/working-memory
+  cache boundaries and normalize cache reads/writes/misses, including Bedrock
+  Converse cache points. The existing Pre canary proves OpenRouter only; native
+  Bedrock and live skills/`WORKING.md` mutation still need deployment evidence.
+- Runtime V2 now persists a bounded, append-only encrypted per-job trajectory.
+  Optional provider-backed failure review is default-off, fail-closed,
+  database-admission-bounded, and structurally has no reply/tool/effect surface.
+  It is offline analysis rather than deterministic replay; automatic retention/
+  GC and restricted inspection/export policy remain open.
+- Raw encrypted Chat rows and attachment bodies remain the durable ledger. The
+  5,000-message value is only an in-process hot-window bound, never a database
+  retention rule. The remaining full-conversation task is to replace the one
+  ever-growing summary blob with immutable encrypted segments and higher-level
+  checkpoints.
+- Hosted resident retirement is complete in source and managed manifests, but
+  live fleet closure still requires deploying the reviewed image everywhere,
+  provisioning production's second runner failure domain, and verifying zero
+  legacy hosted processes. Typing-signal pre-warm also remains unimplemented.
+
 ## 2026-07-18
 
 ### [DONE] Hosted resident fleet retired; all managed hosting is Runtime V2-only

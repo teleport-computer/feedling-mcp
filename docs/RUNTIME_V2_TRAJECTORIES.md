@@ -91,7 +91,10 @@ a completed review atomically reopens that review if admission is available;
 otherwise it invalidates the stale analysis without calling the provider. Thus
 a late terminal event cannot leave an older prefix marked fully reviewed.
 
-This is offline analysis, not production retry. The handler does not call
+This is offline analysis, not production retry or deterministic replay. The
+encrypted event stream is a bounded causal record: explicit truncation,
+time-varying external reads, and fresh provider sampling mean it cannot promise
+byte-for-byte re-execution of every historical turn. The handler does not call
 `process_job` or `run_tool_loop`, and receives no reply callback, effect outbox,
 platform capability dispatcher, MCP loader, Memory writer, schedule writer, or
 workspace backend. Its encrypted output is not added to Chat, Memory Garden,

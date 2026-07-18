@@ -72,7 +72,16 @@ change must not be interpreted as an API guarantee.
   lane whose provider call has no tools and whose handler has no reply, effect,
   MCP, Memory, schedule, or workspace dispatch surface. Disabled/overflow
   failures still retain capture but enqueue no provider runner, and encrypted
-  analysis is never added to live conversation context automatically.
+  analysis is never added to live conversation context automatically. This is
+  bounded offline analysis, not deterministic replay; automatic trajectory
+  retention/GC and restricted operator inspection/export remain open.
+
+- Runtime V2 now treats encrypted Chat rows and referenced object-storage bodies
+  as the durable source ledger. Conversation compaction advances only the
+  summary prompt view: it does not delete source messages, and the 5,000-message
+  limit now bounds only each process's hot cache. The current append-only summary
+  blob still needs segmented encrypted checkpoints for an indefinitely long
+  conversation.
 
 - Runtime V2 adds an encrypted virtual workspace foundation with read-only
   `/artifacts` and `/skills`, editable `/workspace`, and a persistent editable
@@ -80,11 +89,26 @@ change must not be interpreted as an API guarantee.
   use optimistic revisions and the existing encrypted, generation-fenced effect
   outbox. Sandbox acquisition is lazy: stored text views and Markdown edits do
   not start one, while physical artifact materialization, untrusted binary
-  parsing, shell, and code execution require a registered sandbox provider.
+  parsing, and any future shell/code execution require a registered sandbox
+  provider. Generic shell/code tools are not currently model-visible.
   Upload persistence is unchanged, but on a deployment without an audited CVM
   or E2B adapter an uncached attachment is reported as `sandbox_unavailable`
   instead of falling back to in-process parsing. Successful acquisitions append
-  content-free billing/usage events; cached text reads do not.
+  content-free billing/usage events; cached text reads do not. Disjoint
+  workspace writes can commit concurrently in conflict-free waves, while
+  same/ancestor/descendant paths and external mutations remain ordered.
+
+- The model-visible Runtime V2 catalog now contains 23 built-in tools: 21
+  platform tools plus `task` and `reply`. `task` runs bounded read-only child
+  loops with isolated transcripts and can parallelize independent work without
+  exposing reply, recursive-task, MCP mutation, platform-effect, or
+  workspace-write surfaces.
+
+- Provider-aware prompt caching now keeps deterministic tool/system/skills and
+  editable-working-memory blocks ahead of dynamic conversation/tool data,
+  including Bedrock Converse cache points and provider-neutral cache usage
+  telemetry. The existing Pre canary proves an OpenRouter cache hit; native
+  Bedrock and live `/skills`/`WORKING.md` mutation still need post-deploy proof.
 
 - Proactive wake bubbles no longer post on top of an active conversation: right
   before delivery, the consumer re-checks the latest chat rows and skips the
