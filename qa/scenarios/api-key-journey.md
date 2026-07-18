@@ -312,31 +312,25 @@ request marker; the agent reads bounded facts and supplies semantic judgment.
 **Act**
 
 - Request the deterministic parent-owned delivery probe exactly once for this
-  profile. The profile writes only a fixed marker, then waits for the sanitized
-  facts copy:
+  profile, after P0-11 and before P0-13, with this exact single command:
 
   ```sh
-  umask 077
-  test ! -e "$QA_WORK_ROOT/.cot-probe-request"
-  test ! -e "$QA_WORK_ROOT/cot-delivery-facts.json"
-  printf '%s\n' "$QA_PROFILE_ID" > "$QA_WORK_ROOT/.cot-probe-request"
-  i=0
-  while test ! -f "$QA_WORK_ROOT/cot-delivery-facts.json" && test "$i" -lt 360; do
-    sleep 1
-    i=$((i + 1))
-  done
-  test -f "$QA_WORK_ROOT/cot-delivery-facts.json"
+  QA_SCENARIO_ID=P0-12 "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/qa/request_cot_delivery_probe.py" --request "$QA_WORK_ROOT/.cot-probe-request" --facts "$QA_WORK_ROOT/cot-delivery-facts.json"
   ```
 
-  Do not invoke `qa/cot_delivery_probe.py` yourself and do not create, replace,
-  edit, or delete the facts copy. The trusted parent derives the nonce, sends
-  the sole P0-12 turn, and writes the authoritative receipt under its private
-  worker-output root. That root is explicitly denied to this profile.
+  The unprivileged helper one-shot creates the fixed profile-ID marker, waits a
+  bounded interval for the sanitized facts copy, and validates its receipt. Do
+  not invoke `qa/cot_delivery_probe.py` yourself and do not directly create,
+  replace, edit, or delete the marker or facts copy. The trusted parent derives
+  the nonce, sends the sole P0-12 turn, and writes the authoritative receipt
+  under its private worker-output root. That root is explicitly denied to this
+  profile.
 
   A facts copy containing a failed or unverified receipt is a completed
-  observation, not a reason to discard it or send a replacement P0-12 turn. An
-  unavailable/error facts copy is an evidence failure, not permission for the
-  profile to run its own probe.
+  observation, so the helper exits zero; it is not a reason to discard it or
+  send a replacement P0-12 turn. An unavailable/error facts copy makes the
+  helper exit nonzero and is an evidence failure, not permission for the profile
+  to run its own probe.
 - The probe sends `17 × 19`, requires final answer `323`, exact-correlates the
   resulting user turn and stored reply, and records only bounded metadata. Do
   not send a second reasoning task or substitute a different turn.

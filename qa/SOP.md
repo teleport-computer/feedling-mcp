@@ -79,8 +79,10 @@ The launcher is not intelligent. It MUST:
    latencies to the agent result. Only P0-08–P0-11 may have attempt 2, and only
    after parent attempt 1 is `AGENT_ERROR` with `CHAT_TIMEOUT` or
    `MISSING_REPLY`; preserve both attempts.
-   P0-01 provisioner/deployment evidence and the parent-owned P0-12 probe remain
-   independently deterministic. P0-13 uses the same fixed request/facts
+   P0-01 provisioner/deployment evidence remains independently deterministic.
+   P0-12 requires its own exact `request_cot_delivery_probe.py` command once in
+   order between P0-11 and P0-13; missing, duplicate, generic, failed, or
+   out-of-order commands are rejected. P0-13 uses the live fixed request/facts
    handshake, but the trusted parent owns its trace read, five-stage latency
    projection, provider-route deletion, account reset, and old-key rejection.
    Missing all tool use is
@@ -107,11 +109,16 @@ The launcher is not intelligent. It MUST:
    duplicate/out-of-order phase, or worker-authored script that pre-fills an
    all-true judgment before the evidence-review result is not semantic
    qualification evidence.
-6. When each profile reaches P0-12, consume its fixed request marker, execute
-   `qa/cot_delivery_probe.py` in the trusted launcher process, and write the
-   authoritative receipt beneath the supervisor-owned worker-output root that
-   the profile permission explicitly denies. Publish only a sanitized facts
-   copy to the agent work root. Validate each final profile JSON against the
+6. When each profile reaches P0-12, require the one exact
+   `request_cot_delivery_probe.py` command after P0-11 and before P0-13. Its
+   unprivileged helper publishes the fixed profile marker and waits for the
+   result. Consume that marker, execute `qa/cot_delivery_probe.py` in the
+   trusted launcher process, and write the authoritative receipt beneath the
+   supervisor-owned worker-output root that the profile permission explicitly
+   denies. Publish only a sanitized facts copy to the agent work root. The
+   helper validates the bounded facts and exits zero for PASS, FAIL, or
+   UNVERIFIED; missing or unavailable facts exit nonzero. Validate each final
+   profile JSON against the
    profile-locked Structured Outputs schema. Securely validate the private
    P0-12 receipt and require its
    request, turn, trace, counts, reasoning metadata, disclosure length, and
@@ -408,10 +415,14 @@ private chain-of-thought. For a locked profile with `reasoning_expected: true`:
   release gate still requires the healthy values above for PASS; agents MUST
   NOT coerce observed failures into success-shaped evidence or claim an
   effective effort the runtime did not attest.
-- P0-12 MUST be driven exactly once by the deterministic launcher through
-  `qa/cot_delivery_probe.py`. The profile writes only the fixed
-  `$QA_WORK_ROOT/.cot-probe-request` marker and waits for the parent-authored
-  `$QA_WORK_ROOT/cot-delivery-facts.json` sanitized copy. The authoritative
+- P0-12 MUST be requested exactly once after P0-11 and before P0-13 with the
+  single exact agent command
+  `QA_SCENARIO_ID=P0-12 "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/qa/request_cot_delivery_probe.py" --request "$QA_WORK_ROOT/.cot-probe-request" --facts "$QA_WORK_ROOT/cot-delivery-facts.json"`.
+  The unprivileged helper one-shot creates the fixed profile-ID marker, waits a
+  bounded interval, and validates the parent-authored sanitized facts. It exits
+  zero for a completed PASS, FAIL, or UNVERIFIED receipt and nonzero when
+  protocol facts are unavailable. The deterministic launcher alone invokes
+  `qa/cot_delivery_probe.py`. The authoritative
   receipt is written under the worker-output root, which the profile's
   filesystem permission denies. The probe binds
   `agent.model.call.done(trace_id=U) -> agent.reply(trace_id=U) ->
@@ -419,9 +430,10 @@ private chain-of-thought. For a locked profile with `reasoning_expected: true`:
   separately encrypted thinking envelope for that exact reply. The agent MUST
   preserve a probe exit status `2` and its receipt as failure/unverified
   evidence and MUST NOT hide it by sending another reasoning turn.
-- Workers MUST NOT invoke the probe. The launcher invokes it with the trusted
-  qualification Python after the deterministic preflight verifies that exact
-  interpreter inside the real worker permission profile before provisioning.
+- Workers MUST NOT invoke the probe or directly author the marker/facts files.
+  The launcher invokes the probe with the trusted qualification Python after
+  the deterministic preflight verifies that exact interpreter inside the real
+  worker permission profile before provisioning.
 - The trusted launcher validates and hashes the authoritative private COT
   receipt. The profile
   result's P0-12 request, turn, and trace IDs and bounded reasoning projection

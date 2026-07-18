@@ -358,8 +358,11 @@ was necessarily the model's applied effort. Exact applied-effort qualification
 requires separate runtime trace instrumentation and is outside this QA-only
 change. The suite never requests or stores a model's hidden private
 chain-of-thought.
-At P0-12 the worker writes a fixed request marker, and the trusted launcher runs
-`cot_delivery_probe.py` once. The authoritative private receipt lives in that
+At P0-12 the worker runs the single exact unprivileged
+`request_cot_delivery_probe.py` command after P0-11 and before P0-13. The helper
+one-shot writes the fixed request marker and validates the bounded facts copy;
+the trusted launcher runs `cot_delivery_probe.py` once. The authoritative
+private receipt lives in that
 profile's directory beneath the worker-output root, which the profile's
 permission denies; the worker receives only a sanitized facts copy in its work
 root. The receipt binds

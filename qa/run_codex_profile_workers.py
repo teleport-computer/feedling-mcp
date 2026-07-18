@@ -317,15 +317,18 @@ were observed unless you actually read or exercised them with tools in this turn
 Drive the live user journey, inspect correlated traces and latency stages,
 adapt the next probe when evidence is ambiguous, and make semantic judgments
 for chat, reasoning disclosure, memory, persona import, identity, and cleanup.
-For P0-12, request the trusted parent delivery probe exactly once using the
-fixed marker/facts handshake specified by the scenario document, even if an
-earlier scenario failed or produced incomplete evidence. The deterministic
-parent—not this agent—sends the reasoning turn and owns the authoritative
-receipt outside every agent-writable root. Read the sanitized facts copy,
-preserve FAIL/UNVERIFIED observations, do not retry the reasoning turn, and bind
-the profile reasoning object plus the P0-12 scenario and turn IDs to those
-facts. Never invoke qa/cot_delivery_probe.py or create, edit, replace, or delete
-the facts copy or authoritative receipt yourself.
+For P0-12, request the trusted parent delivery probe exactly once, after P0-11
+and before P0-13, using this exact single command even if an earlier scenario
+failed or produced incomplete evidence:
+QA_SCENARIO_ID=P0-12 "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/qa/request_cot_delivery_probe.py" --request "$QA_WORK_ROOT/.cot-probe-request" --facts "$QA_WORK_ROOT/cot-delivery-facts.json"
+The deterministic parent—not this agent—sends the reasoning turn and owns the
+authoritative receipt outside every agent-writable root. The helper alone
+creates the fixed marker, waits for the sanitized facts copy, and validates its
+bounded receipt. A helper exit zero completes PASS, FAIL, or UNVERIFIED
+evidence. Preserve FAIL/UNVERIFIED observations, do not retry the reasoning
+turn, and bind the profile reasoning object plus the P0-12 scenario and turn IDs
+to those facts. Never invoke qa/cot_delivery_probe.py; never directly create,
+edit, replace, or delete the marker, facts copy, or authoritative receipt.
 Copy receipt facts exactly: empty receipt request/turn/trace IDs map to empty
 reasoning IDs and empty scenario ID arrays; empty delivered kind/source/model
 strings map to null result fields. Never substitute the configured provider

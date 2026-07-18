@@ -126,6 +126,20 @@ def test_accepts_probe_contract_and_returns_canonical_sha256(tmp_path):
     assert len(digest) == 64
 
 
+def test_decoded_receipt_validator_matches_file_validator(tmp_path):
+    receipt = _passing_receipt()
+
+    decoded, decoded_digest = validator.validate_cot_receipt_document(
+        receipt, PROFILE_ID
+    )
+    loaded, loaded_digest = validator.validate_cot_receipt(
+        _write_receipt(tmp_path, receipt), PROFILE_ID
+    )
+
+    assert decoded == loaded == receipt
+    assert decoded_digest == loaded_digest
+
+
 @pytest.mark.parametrize("count", (0, 192))
 def test_accepts_explicit_reasoning_token_metadata(tmp_path, count):
     receipt = _passing_receipt()
@@ -209,7 +223,8 @@ def test_accepts_receipt_emitted_by_current_probe(tmp_path, monkeypatch):
                 }
             }
 
-        def send(self, _session, _text):
+        def send(self, _session, _text, *, read_timeout):
+            assert read_timeout == probe.CHAT_SEND_TIMEOUT_SECONDS
             return {"user_message": {"id": "request-1", "ts": 100.0}}
 
         def poll_reply_record(self, *_args, **_kwargs):

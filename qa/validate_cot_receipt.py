@@ -536,6 +536,21 @@ def canonical_receipt_sha256(receipt: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def validate_cot_receipt_document(
+    receipt: object, expected_profile_id: str
+) -> tuple[dict[str, Any], str]:
+    """Validate and hash an already-decoded bounded COT receipt.
+
+    The unprivileged request helper receives the authoritative receipt inside a
+    parent-authored facts envelope rather than as a standalone file.  Keeping
+    the document validator here ensures both paths enforce the same exact
+    receipt contract.
+    """
+
+    validated = _validate_receipt(receipt, expected_profile_id)
+    return validated, canonical_receipt_sha256(validated)
+
+
 def validate_cot_receipt(
     path: Path, expected_profile_id: str
 ) -> tuple[dict[str, Any], str]:
@@ -548,5 +563,4 @@ def validate_cot_receipt(
         raise
     except (UnicodeError, json.JSONDecodeError, RecursionError):
         raise CotReceiptError("COT receipt JSON is invalid") from None
-    receipt = _validate_receipt(document, expected_profile_id)
-    return receipt, canonical_receipt_sha256(receipt)
+    return validate_cot_receipt_document(document, expected_profile_id)

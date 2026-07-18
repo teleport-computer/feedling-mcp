@@ -1061,6 +1061,8 @@ def _scenario_command_rows() -> list[dict[str, Any]]:
         for command in (
             commands[scenario_id]
             if scenario_id in commands
+            else (verifier.cot_request_command(),)
+            if scenario_id == "P0-12"
             else (verifier.live_request_command(scenario_id, 1),)
         )
     ]
@@ -2269,7 +2271,7 @@ def test_diagnostic_keeps_valid_worker_when_peer_uses_fallback(tmp_path):
     assert workers["official-gemini"]["failure_stage"] is None
     assert workers["official-gemini"]["failure_code"] is None
     assert workers["official-gemini"]["cot_evidence_failure"] is None
-    assert workers["official-gemini"]["completed_command_execution_count"] == 14
+    assert workers["official-gemini"]["completed_command_execution_count"] == 15
     assert workers["official-gemini"]["completed_scenario_command_ids"] == list(
         verifier.AGENT_LIVE_SCENARIO_IDS
     )
@@ -2348,7 +2350,7 @@ def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
     assert worker["thread_id"] is not None
     assert worker["session_id"] is not None
     assert len(worker["exec_events_sha256"]) == 64
-    assert worker["completed_command_execution_count"] == 14
+    assert worker["completed_command_execution_count"] == 15
     assert worker["completed_scenario_command_ids"] == list(
         verifier.AGENT_LIVE_SCENARIO_IDS
     )
@@ -2974,15 +2976,15 @@ def test_scenario_command_evidence_is_anchored_and_one_marker_per_command(tmp_pa
     ) = verifier.completed_command_evidence(path.resolve())
 
     assert count == sum(verifier.MIN_SCENARIO_COMMAND_COUNTS.values()) + 2
-    assert scenario_ids == verifier.AGENT_LIVE_SCENARIO_IDS
+    assert scenario_ids == ()
     assert sop_read_first is False
-    assert scenario_counts == verifier.MIN_SCENARIO_COMMAND_COUNTS
+    assert scenario_counts["P0-12"] == 2
     assert p0_06_phases == verifier.P0_06_COMMAND_PHASES
     assert (
         verifier.scenario_command_contract_satisfied(
             scenario_counts, p0_06_phases
         )
-        is True
+        is False
     )
 
 
@@ -3013,11 +3015,91 @@ def test_completed_command_evidence_unwraps_real_codex_shell_commands(tmp_path):
         p0_06_phases,
     ) = verifier.completed_command_evidence(path.resolve())
 
-    assert count == 14
+    assert count == 15
     assert scenario_ids == verifier.AGENT_LIVE_SCENARIO_IDS
     assert sop_read_first is True
     assert scenario_counts == verifier.MIN_SCENARIO_COMMAND_COUNTS
     assert p0_06_phases == verifier.P0_06_COMMAND_PHASES
+
+
+def test_p0_12_command_contract_accepts_exact_helper_once_in_order(tmp_path):
+    rows = _scenario_command_rows()
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    _, scenario_ids, _, counts, phases = verifier.completed_command_evidence(
+        path.resolve()
+    )
+
+    assert scenario_ids == verifier.AGENT_LIVE_SCENARIO_IDS
+    assert counts["P0-12"] == 1
+    assert verifier.scenario_command_contract_satisfied(counts, phases)
+
+
+def test_p0_12_command_contract_rejects_missing_helper(tmp_path):
+    rows = [
+        row
+        for row in _scenario_command_rows()
+        if "QA_SCENARIO_ID=P0-12" not in row["item"]["command"]
+    ]
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    _, scenario_ids, _, counts, phases = verifier.completed_command_evidence(
+        path.resolve()
+    )
+
+    assert "P0-12" not in scenario_ids
+    assert counts["P0-12"] == 0
+    assert not verifier.scenario_command_contract_satisfied(counts, phases)
+
+
+def test_p0_12_command_contract_rejects_duplicate_helper(tmp_path):
+    rows = _scenario_command_rows()
+    p0_12 = next(
+        index
+        for index, row in enumerate(rows)
+        if "QA_SCENARIO_ID=P0-12" in row["item"]["command"]
+    )
+    rows.insert(p0_12 + 1, json.loads(json.dumps(rows[p0_12])))
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    _, scenario_ids, _, counts, phases = verifier.completed_command_evidence(
+        path.resolve()
+    )
+
+    assert scenario_ids == ()
+    assert counts["P0-12"] == 2
+    assert not verifier.scenario_command_contract_satisfied(counts, phases)
+
+
+def test_p0_12_command_contract_rejects_out_of_order_helper(tmp_path):
+    rows = _scenario_command_rows()
+    p0_11 = next(
+        index
+        for index, row in enumerate(rows)
+        if "QA_SCENARIO_ID=P0-11" in row["item"]["command"]
+    )
+    p0_12 = next(
+        index
+        for index, row in enumerate(rows)
+        if "QA_SCENARIO_ID=P0-12" in row["item"]["command"]
+    )
+    rows[p0_11], rows[p0_12] = rows[p0_12], rows[p0_11]
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    _, scenario_ids, _, counts, _ = verifier.completed_command_evidence(
+        path.resolve()
+    )
+
+    assert scenario_ids == ()
+    assert counts["P0-12"] == 1
 
 
 @pytest.mark.parametrize(

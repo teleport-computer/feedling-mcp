@@ -53,19 +53,17 @@ _MAX_RESULT_BYTES = 32 * 1024 * 1024
 _MAX_SCHEMA_BYTES = 8 * 1024 * 1024
 _MAX_STDERR_BYTES = 64 * 1024 * 1024
 _MAX_JSON_LINE_BYTES = 16 * 1024 * 1024
-AGENT_LIVE_SCENARIO_IDS = tuple(f"P0-{index:02d}" for index in range(2, 12)) + (
-    "P0-13",
-)
+AGENT_LIVE_SCENARIO_IDS = tuple(f"P0-{index:02d}" for index in range(2, 14))
 MIN_SCENARIO_COMMAND_COUNTS = {
     scenario_id: (3 if scenario_id == "P0-06" else 1)
     for scenario_id in AGENT_LIVE_SCENARIO_IDS
 }
 MANDATORY_SOP_READ_COMMAND = 'sed -n \'1,999p\' "$QA_SOURCE_ROOT/qa/SOP.md"'
 _SCENARIO_COMMAND_RE = re.compile(
-    r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[013]))(?:[ \t]|$)"
+    r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[0-3]))(?:[ \t]|$)"
 )
 _RAW_SCENARIO_COMMAND_RE = re.compile(
-    r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[013]))(?:[ \t]|$)"
+    r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[0-3]))(?:[ \t]|$)"
 )
 P0_06_COMMAND_PHASES = ("CAPTURE", "REVIEW", "FINALIZE")
 _CODEX_SHELLS = frozenset(("/bin/bash", "/bin/sh", "/bin/zsh"))
@@ -109,8 +107,19 @@ _P0_06_FINALIZE_TOKENS = (
     "--artifact-dir",
     "$QA_ARTIFACT_DIR",
 )
+_P0_12_REQUEST_TOKENS = (
+    "QA_SCENARIO_ID=P0-12",
+    "$QA_PYTHON_BIN",
+    "$QA_SOURCE_ROOT/qa/request_cot_delivery_probe.py",
+    "--request",
+    "$QA_WORK_ROOT/.cot-probe-request",
+    "--facts",
+    "$QA_WORK_ROOT/cot-delivery-facts.json",
+)
 _PARENT_LIVE_SCENARIO_IDS = tuple(
-    scenario_id for scenario_id in AGENT_LIVE_SCENARIO_IDS if scenario_id != "P0-06"
+    scenario_id
+    for scenario_id in AGENT_LIVE_SCENARIO_IDS
+    if scenario_id not in {"P0-06", "P0-12"}
 )
 _RETRYABLE_LIVE_SCENARIO_IDS = frozenset({"P0-08", "P0-09", "P0-10", "P0-11"})
 
@@ -153,6 +162,22 @@ def live_request_command(scenario_id: str, attempt: int = 1) -> str:
             f'"$QA_WORK_ROOT/.live-probe-{scenario_id}-{attempt}.request"',
             "--facts",
             f'"$QA_WORK_ROOT/live-probe-{scenario_id}-{attempt}.facts.json"',
+        )
+    )
+
+
+def cot_request_command() -> str:
+    """Return the sole exact agent-visible P0-12 request command."""
+
+    return " ".join(
+        (
+            "QA_SCENARIO_ID=P0-12",
+            '"$QA_PYTHON_BIN"',
+            '"$QA_SOURCE_ROOT/qa/request_cot_delivery_probe.py"',
+            "--request",
+            '"$QA_WORK_ROOT/.cot-probe-request"',
+            "--facts",
+            '"$QA_WORK_ROOT/cot-delivery-facts.json"',
         )
     )
 
@@ -418,9 +443,8 @@ def completed_command_evidence(
     first_terminal_command: tuple[str, ...] | None = None
     first_terminal_command_succeeded = False
     p0_06_phases: list[str] = []
-    valid_attempts = {
-        scenario_id: [] for scenario_id in _PARENT_LIVE_SCENARIO_IDS
-    }
+    valid_attempts = {scenario_id: [] for scenario_id in _PARENT_LIVE_SCENARIO_IDS}
+    valid_cot_commands = 0
     valid_sequence: list[tuple[str, int | str]] = []
     for row in _json_lines(path, "Codex worker event stream"):
         item = row.get("item")
@@ -469,6 +493,12 @@ def completed_command_evidence(
             p0_06_phases.append(phase)
             valid_sequence.append((scenario_id, phase))
             continue
+        if scenario_id == "P0-12":
+            if tokens != _P0_12_REQUEST_TOKENS:
+                continue
+            valid_cot_commands += 1
+            valid_sequence.append((scenario_id, 1))
+            continue
         if scenario_id not in _PARENT_LIVE_SCENARIO_IDS:
             continue
         matched_attempt = next(
@@ -511,6 +541,11 @@ def completed_command_evidence(
             expected_sequence.extend((scenario_id, phase) for phase in phases)
             if full_persona or failed_capture_only:
                 valid_ids.append(scenario_id)
+            continue
+        if scenario_id == "P0-12":
+            if valid_cot_commands == 1 and scenario_counts[scenario_id] == 1:
+                valid_ids.append(scenario_id)
+                expected_sequence.append((scenario_id, 1))
             continue
         attempts = valid_attempts[scenario_id]
         if attempts in ([1], [1, 2]) and scenario_counts[scenario_id] == len(attempts):
