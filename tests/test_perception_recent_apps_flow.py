@@ -86,17 +86,17 @@ def test_shortcut_to_chat_answer_across_the_ten_minute_gap(flow):
     clock.advance(600)
 
     # 4. a normal chat turn pulls perception the way io_cli does
-    payload = perception_core.agent_perception_payload(
-        _AuthStore(), signals_raw="app,recent_apps"
-    )
+    payload = perception_core.agent_perception_payload(_AuthStore(), signals_raw="app")
     assert payload["ok"] is True
 
     # current app is still there (this is what used to come back None)
     assert payload["signals"]["app"]["app_name"] == "xiaohongshu"
     assert payload["signals"]["app"]["app_category"] == "social"
 
-    # 5-6. and the history answers "what have I been using?"
-    recent = payload["signals"]["recent_apps"]
+    # 5-6. and the history tool answers "what have I been using?"
+    recent = perception_core.recent_apps_payload(
+        _AuthStore(), limit_raw=None, hours_raw=None
+    )
     assert [a["app"] for a in recent["apps"]] == ["xiaohongshu", "wechat"]
     assert recent["count"] == 2
     assert recent["apps"][0]["minutes_ago"] == 10.0
@@ -109,13 +109,13 @@ def test_current_app_expires_after_fifteen_minutes_but_history_survives(flow):
     _open_app(fake, "wechat", "social")
 
     clock.advance(1200)  # 20 minutes
-    payload = perception_core.agent_perception_payload(
-        _AuthStore(), signals_raw="app,recent_apps"
-    )
-    # "right now" is honestly unknown ...
+    payload = perception_core.agent_perception_payload(_AuthStore(), signals_raw="app")
+    # the last-seen app has aged out, so the agent must not assert it ...
     assert payload["signals"]["app"]["app_name"] is None
-    # ... but the agent can still say what she was doing 20 minutes ago
-    apps = payload["signals"]["recent_apps"]["apps"]
+    # ... but it can still say what she was doing 20 minutes ago
+    apps = perception_core.recent_apps_payload(
+        _AuthStore(), limit_raw=None, hours_raw=None
+    )["apps"]
     assert [a["app"] for a in apps] == ["wechat"]
     assert apps[0]["minutes_ago"] == 20.0
 

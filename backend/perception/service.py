@@ -27,7 +27,7 @@ from content_encryption import random_item_id
 from core import enclave as core_enclave
 from core import util as core_util
 
-from . import catalog, history, resolve, store
+from . import catalog, history, permissions, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
 from .ios_contract_v2 import (
     ENCRYPTED_SIGNAL_KEYS_V2,
@@ -1038,6 +1038,20 @@ def app_open(user_id: str, app: str, category: str | None = None,
     return {"status": "ok", "app": app, "category": category, "ts": now}, 200
 
 
+def app_history_denied_reason(user_id: str) -> str:
+    """"" when app-open history is readable, else the disable reason.
+
+    Fail-closed on a settings read error: if we cannot prove the user still
+    allows `app`, we do not hand over their usage trajectory.
+    """
+    try:
+        settings = _app_proactive_settings(user_id) or {}
+    except Exception as e:
+        log.error("app_history_denied_reason(%s) settings read failed: %s", user_id, e)
+        return "unavailable"
+    return permissions.permission_states_reason(settings, "recent_apps")
+
+
 def recent_apps(user_id: str, *, limit: int | None = None, hours: float | None = None,
                 now: float | None = None) -> dict:
     """Recent app-open history for an explicit agent pull.
@@ -1047,7 +1061,18 @@ def recent_apps(user_id: str, *, limit: int | None = None, hours: float | None =
     minutes_ago} — the raw log row is never passed through, so nothing the
     ingest wrote can leak into a model prompt. No data -> an explicit empty
     list, never a guess.
+
+    Authorization is enforced HERE, not at the callers: the dedicated route,
+    the signal path and the V2 executor adapter all funnel through this
+    function, so turning the `app` capability off stops every one of them.
+    A denied read returns disabled=True (never silently an empty list, which
+    the agent would read as "she hasn't used any apps").
     """
+    reason = app_history_denied_reason(user_id)
+    if reason:
+        return {"ok": True, "disabled": True, "reason": reason,
+                "apps": [], "count": 0, "window_hours": hours}
+
     now = _now() if now is None else float(now)
     limit = catalog.RECENT_APPS_TOOL_LIMIT if limit is None else limit
     limit = max(1, min(int(limit), catalog.RECENT_APPS_TOOL_MAX))

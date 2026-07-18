@@ -18,9 +18,13 @@ SLOW_AGENT_PERCEPTION_SIGNALS = (
     "steps", "sleep", "workout", "vitals",
     "activity", "body", "metabolic", "cycle", "mood", "reminders",
 )
-# `app` = what is open right now; `recent_apps` = the app-open history behind it
-# (the current field expires, the history does not).
-PULL_ONLY_AGENT_PERCEPTION_SIGNALS = ("focus", "audio_route", "app", "recent_apps")
+# `app` = the LAST app-open we observed, within its TTL. The Shortcut fires on
+# open and never on close, so this is "last seen opening X", NOT "X is on screen
+# now" — don't let the agent phrase it as certainty about the present.
+# App-open HISTORY is deliberately not a signal: it returns a list, takes
+# limit/hours, and doesn't fit project_signal's state-field projection. It's a
+# query tool -- perception.recent_apps / io_cli perception-recent-apps.
+PULL_ONLY_AGENT_PERCEPTION_SIGNALS = ("focus", "audio_route", "app")
 AGENT_PERCEPTION_SIGNALS = (
     FAST_AGENT_PERCEPTION_SIGNALS
     + SLOW_AGENT_PERCEPTION_SIGNALS

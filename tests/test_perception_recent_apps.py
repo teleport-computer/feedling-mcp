@@ -13,6 +13,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from agent import perception_core  # noqa: E402
@@ -149,8 +151,89 @@ def test_recent_apps_payload_never_leaks_credentials(monkeypatch):
 # 3. Discoverability -- chat AND proactive must both see the tool
 # ---------------------------------------------------------------------------
 
-def test_recent_apps_is_a_pullable_agent_signal():
-    assert "recent_apps" in agent_fields.AGENT_PERCEPTION_SIGNALS
+def test_recent_apps_is_a_query_tool_not_a_state_signal():
+    # it returns a list and takes limit/hours -- project_signal's state-field
+    # projection is the wrong shape for it, so there is exactly one entry point
+    assert "recent_apps" not in agent_fields.AGENT_PERCEPTION_SIGNALS
+
+
+# ---------------------------------------------------------------------------
+# 4. Authorization -- every entry point, not just the signal path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("permission_state", [
+    False,
+    "off",
+    "denied",
+    {"enabled": False},
+    {"status": "not_authorized"},
+])
+def test_history_is_unreadable_once_app_capability_is_off(monkeypatch, permission_state):
+    """The bypass this fix closes: `app` switched off used to disable the signal
+    path while the dedicated tool happily returned the whole trajectory."""
+    _seed(monkeypatch, opens=[{"app": "wechat", "category": "social", "ts": T0}])
+    monkeypatch.setattr(
+        perception_service, "_app_proactive_settings",
+        lambda uid: {"permission_states": {"app": permission_state}},
+    )
+
+    body = perception_core.recent_apps_payload(_Store(), limit_raw=None, hours_raw=None, now=T0)
+
+    assert body["disabled"] is True
+    assert body["reason"]
+    assert body["apps"] == []          # no trajectory leaks
+    assert body["count"] == 0
+
+
+def test_denied_history_is_distinguishable_from_no_data(monkeypatch):
+    """"no permission" must not look like "she hasn't used any apps"."""
+    _seed(monkeypatch, opens=[{"app": "wechat", "ts": T0}])
+    monkeypatch.setattr(perception_service, "_app_proactive_settings",
+                        lambda uid: {"permission_states": {"app": False}})
+    denied = perception_core.recent_apps_payload(_Store(), limit_raw=None, hours_raw=None, now=T0)
+
+    _seed(monkeypatch, opens=[])
+    monkeypatch.setattr(perception_service, "_app_proactive_settings", lambda uid: {})
+    empty = perception_core.recent_apps_payload(_Store(), limit_raw=None, hours_raw=None, now=T0)
+
+    assert denied.get("disabled") is True
+    assert "disabled" not in empty
+
+
+def test_history_readable_when_app_capability_untouched_or_on(monkeypatch):
+    _seed(monkeypatch, opens=[{"app": "wechat", "ts": T0}])
+    for settings in ({}, {"permission_states": {}}, {"permission_states": {"app": True}}):
+        monkeypatch.setattr(perception_service, "_app_proactive_settings", lambda uid, s=settings: s)
+        body = perception_core.recent_apps_payload(_Store(), limit_raw=None, hours_raw=None, now=T0)
+        assert body.get("disabled") is None
+        assert [a["app"] for a in body["apps"]] == ["wechat"]
+
+
+def test_settings_read_failure_fails_closed(monkeypatch):
+    """If we can't prove the user still allows it, don't hand over the history."""
+    _seed(monkeypatch, opens=[{"app": "wechat", "ts": T0}])
+
+    def boom(uid):
+        raise RuntimeError("settings backend down")
+
+    monkeypatch.setattr(perception_service, "_app_proactive_settings", boom)
+    body = perception_core.recent_apps_payload(_Store(), limit_raw=None, hours_raw=None, now=T0)
+    assert body["disabled"] is True
+    assert body["apps"] == []
+
+
+def test_v2_executor_adapter_enforces_the_same_permission(monkeypatch):
+    """The other bypass: the proactive adapter reads the stream directly."""
+    from proactive.tool_executor_v2 import default_tool_runtime_adapters_v2
+
+    _seed(monkeypatch, opens=[{"app": "wechat", "ts": T0}])
+    monkeypatch.setattr(perception_service, "_app_proactive_settings",
+                        lambda uid: {"permission_states": {"app": "denied"}})
+
+    adapter = default_tool_runtime_adapters_v2().perception_recent_apps
+    result = adapter("u_apps", {"limit": 10})
+    assert result["disabled"] is True
+    assert result["apps"] == []
 
 
 def test_proactive_catalog_registers_recent_apps_as_a_perception_tool():

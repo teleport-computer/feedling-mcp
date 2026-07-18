@@ -65,7 +65,10 @@ CAPABILITIES: dict[str, Capability] = {c.key: c for c in [
     Capability("now_playing", "你在听的音乐", 1, context_field=True, query_tool=True),
     Capability("focus", "专注模式", 1, context_field=True),
     Capability("audio_route", "音频输出路由", 2, query_tool=True),
-    Capability("app", "你在用哪个 app（通过 iOS 快捷指令上报）", 1,
+    # One switch covers BOTH resolutions (current field + the recent_apps
+    # history tool), so the copy has to say so — otherwise the user thinks they
+    # are allowing "which app now" and is actually allowing a usage trajectory.
+    Capability("app", "你最近打开了哪些 app（通过 iOS 快捷指令上报，含最近使用记录）", 1,
                context_field=True, query_tool=True),
     Capability("weather", "粗天气", 2, query_tool=True),
     Capability("photos", "你拍的照片", 2, wake_source=True, query_tool=True),
