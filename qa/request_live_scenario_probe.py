@@ -90,6 +90,7 @@ def _expected_payload(
     scenario_id: str,
     attempt: int,
     previous_receipt_sha256: str | None,
+    cot_terminal_sha256: str | None,
 ) -> dict[str, Any]:
     return {
         "schema_version": REQUEST_SCHEMA_VERSION,
@@ -98,6 +99,7 @@ def _expected_payload(
         "scenario_id": scenario_id,
         "attempt": attempt,
         "previous_receipt_sha256": previous_receipt_sha256,
+        "cot_terminal_sha256": cot_terminal_sha256,
     }
 
 
@@ -176,6 +178,7 @@ def write_request_marker(
     scenario_id: str,
     attempt: int,
     previous_receipt_sha256: str | None,
+    cot_terminal_sha256: str | None = None,
 ) -> None:
     """Create the one-shot marker with O_EXCL and mode 0600."""
 
@@ -189,6 +192,12 @@ def write_request_marker(
         previous_receipt_sha256
     ):
         raise LiveProbeRequestError("live probe predecessor digest is invalid")
+    if cot_terminal_sha256 is not None and not _SHA256_RE.fullmatch(
+        cot_terminal_sha256
+    ):
+        raise LiveProbeRequestError("COT terminal digest is invalid")
+    if (scenario_id == "P0-13") != (cot_terminal_sha256 is not None):
+        raise LiveProbeRequestError("COT terminal digest binding is invalid")
     if not path.is_absolute() or path.is_symlink() or path.exists():
         raise LiveProbeRequestError("live probe request path is unsafe")
     try:
@@ -210,6 +219,7 @@ def write_request_marker(
                 scenario_id=scenario_id,
                 attempt=attempt,
                 previous_receipt_sha256=previous_receipt_sha256,
+                cot_terminal_sha256=cot_terminal_sha256,
             ),
             sort_keys=True,
             separators=(",", ":"),
@@ -230,6 +240,7 @@ def load_request_marker(
     scenario_id: str,
     attempt: int,
     previous_receipt_sha256: str | None,
+    cot_terminal_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Validate a worker marker without trusting any worker-selected fields."""
 
@@ -243,6 +254,12 @@ def load_request_marker(
         previous_receipt_sha256
     ):
         raise LiveProbeRequestError("live probe predecessor digest is invalid")
+    if cot_terminal_sha256 is not None and not _SHA256_RE.fullmatch(
+        cot_terminal_sha256
+    ):
+        raise LiveProbeRequestError("COT terminal digest is invalid")
+    if (scenario_id == "P0-13") != (cot_terminal_sha256 is not None):
+        raise LiveProbeRequestError("COT terminal digest binding is invalid")
     try:
         payload = json.loads(
             _owned_private_file(
@@ -258,6 +275,7 @@ def load_request_marker(
         scenario_id=scenario_id,
         attempt=attempt,
         previous_receipt_sha256=previous_receipt_sha256,
+        cot_terminal_sha256=cot_terminal_sha256,
     )
     if not isinstance(payload, dict) or payload != expected:
         raise LiveProbeRequestError("live probe request marker is invalid")
@@ -572,6 +590,11 @@ def _reconcile_completed_facts(
                 if state["completed"]
                 else None
             ),
+            cot_terminal_sha256=(
+                _cot_predecessor_digest(work_root, profile_id)
+                if expected[0] == "P0-13"
+                else None
+            ),
         )
         payload = _validated_facts(
             expected_facts,
@@ -644,17 +667,15 @@ def _persona_predecessor_ready(
     return evidence_state == "absent" and judgment_state == "present"
 
 
-def _cot_predecessor_ready(work_root: Path, profile_id: str) -> bool:
+def _cot_predecessor_digest(work_root: Path, profile_id: str) -> str | None:
     try:
         from qa.request_cot_delivery_probe import (
             CotProbeRequestError,
-            CotProbeUnavailableError,
             _load_facts as load_cot_delivery_facts,
         )
     except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
         from request_cot_delivery_probe import (  # type: ignore[no-redef]
             CotProbeRequestError,
-            CotProbeUnavailableError,
             _load_facts as load_cot_delivery_facts,
         )
 
@@ -662,18 +683,15 @@ def _cot_predecessor_ready(work_root: Path, profile_id: str) -> bool:
     if path.is_symlink():
         raise LiveProbeRequestError("COT predecessor facts are unsafe")
     if not path.exists():
-        return False
+        return None
     try:
-        load_cot_delivery_facts(path, profile_id)
-    except CotProbeUnavailableError:
-        # The parent-authored unavailable envelope still proves the separate
-        # P0-12 helper reached a terminal protocol state.  Release validation
-        # rejects its nonzero command; diagnostic P0-13 may still gather trace
-        # and cleanup evidence without reordering ahead of P0-12.
-        return True
+        payload = load_cot_delivery_facts(
+            path, profile_id, allow_unavailable=True
+        )
     except CotProbeRequestError:
-        return False
-    return True
+        return None
+    terminal_sha256 = payload.get("terminal_sha256")
+    return terminal_sha256 if isinstance(terminal_sha256, str) else None
 
 
 def _sequence_rank(key: tuple[str, int]) -> tuple[int, int]:
@@ -688,7 +706,7 @@ def _acquire_sequence_turn(
     scenario_id: str,
     attempt: int,
     wait_seconds: float,
-) -> tuple[int, dict[str, Any]]:
+) -> tuple[int, dict[str, Any], str | None]:
     gate_path = sequence_gate_path(work_root)
     deadline = time.monotonic() + max(0.0, wait_seconds)
     requested = (scenario_id, attempt)
@@ -729,12 +747,16 @@ def _acquire_sequence_turn(
                     work_root, facts_by_key
                 ):
                     should_wait = True
-                elif scenario_id == "P0-13" and not _cot_predecessor_ready(
-                    work_root, profile_id
-                ):
-                    should_wait = True
+                elif scenario_id == "P0-13":
+                    cot_terminal_sha256 = _cot_predecessor_digest(
+                        work_root, profile_id
+                    )
+                    if cot_terminal_sha256 is None:
+                        should_wait = True
+                    else:
+                        return descriptor, state, cot_terminal_sha256
                 else:
-                    return descriptor, state
+                    return descriptor, state, None
         except Exception:
             if locked:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -899,7 +921,7 @@ def request_and_wait(
         or facts.exists()
     ):
         raise LiveProbeRequestError("live probe handshake paths are invalid")
-    descriptor, state = _acquire_sequence_turn(
+    descriptor, state, cot_terminal_sha256 = _acquire_sequence_turn(
         work_root,
         run_id=run_id,
         profile_id=profile_id,
@@ -919,6 +941,7 @@ def request_and_wait(
                 if state["completed"]
                 else None
             ),
+            cot_terminal_sha256=cot_terminal_sha256,
         )
         deadline = time.monotonic() + max(0.0, wait_seconds)
         publish_deadline: float | None = None

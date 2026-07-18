@@ -79,6 +79,7 @@ def _load_marker(
     scenario_id: str,
     attempt: int,
     previous_receipt_sha256: str | None,
+    cot_terminal_sha256: str | None = None,
 ) -> dict:
     deadline = time.monotonic() + 1.0
     while True:
@@ -90,6 +91,7 @@ def _load_marker(
                 scenario_id=scenario_id,
                 attempt=attempt,
                 previous_receipt_sha256=previous_receipt_sha256,
+                cot_terminal_sha256=cot_terminal_sha256,
             )
         except request.LiveProbeRequestError:
             if time.monotonic() >= deadline:
@@ -297,10 +299,16 @@ def test_p0_13_waits_for_terminal_p0_12_facts(tmp_path, monkeypatch):
     )
     marker = request.request_path(work, "P0-13", 1)
     result: dict[str, object] = {}
+    terminal_sha256 = "c" * 64
     monkeypatch.setattr(
         cot_request,
         "_load_facts",
-        lambda path, profile_id: {"path": str(path), "profile_id": profile_id},
+        lambda path, profile_id, *, allow_unavailable: {
+            "path": str(path),
+            "profile_id": profile_id,
+            "terminal_sha256": terminal_sha256,
+            "allow_unavailable": allow_unavailable,
+        },
     )
 
     def run() -> None:
@@ -331,6 +339,7 @@ def test_p0_13_waits_for_terminal_p0_12_facts(tmp_path, monkeypatch):
         "P0-13",
         1,
         previous,
+        terminal_sha256,
     )
     payload = _facts_payload("P0-13", 1)
     _publish(request.facts_path(work, "P0-13", 1), payload)

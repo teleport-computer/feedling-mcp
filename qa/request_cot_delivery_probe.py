@@ -11,6 +11,7 @@ malformed protocol facts are an operational failure.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -46,10 +47,23 @@ FACTS_PUBLISH_GRACE_SECONDS = 2.0
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SUCCESS_FACT_KEYS = frozenset(
-    {"schema_version", "profile_id", "receipt_sha256", "receipt"}
+    {
+        "schema_version",
+        "profile_id",
+        "receipt_sha256",
+        "terminal_sha256",
+        "receipt",
+    }
 )
 _UNAVAILABLE_FACT_KEYS = frozenset(
-    {"schema_version", "profile_id", "receipt_sha256", "status", "failure_code"}
+    {
+        "schema_version",
+        "profile_id",
+        "receipt_sha256",
+        "terminal_sha256",
+        "status",
+        "failure_code",
+    }
 )
 
 
@@ -59,6 +73,43 @@ class CotProbeRequestError(RuntimeError):
 
 class CotProbeUnavailableError(CotProbeRequestError):
     """The trusted parent explicitly could not produce protocol evidence."""
+
+
+def cot_terminal_sha256(
+    profile_id: str,
+    *,
+    receipt_sha256: str | None,
+    status: str,
+    failure_code: str,
+) -> str:
+    """Bind one parent terminal COT state without exposing private content."""
+
+    if (
+        not _IDENTIFIER_RE.fullmatch(profile_id)
+        or status not in {"RECEIPT", "UNAVAILABLE"}
+        or (status == "RECEIPT" and failure_code != "NONE")
+        or (status == "UNAVAILABLE" and failure_code != "TRUSTED_PROBE_ERROR")
+        or (
+            receipt_sha256 is not None
+            and not _SHA256_RE.fullmatch(receipt_sha256)
+        )
+        or (status == "RECEIPT") != (receipt_sha256 is not None)
+    ):
+        raise CotProbeRequestError("COT terminal state is invalid")
+    encoded = json.dumps(
+        {
+            "schema_version": FACTS_SCHEMA_VERSION,
+            "profile_id": profile_id,
+            "receipt_sha256": receipt_sha256,
+            "status": status,
+            "failure_code": failure_code,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def request_path(work_root: Path) -> Path:
@@ -153,7 +204,12 @@ def write_request_marker(path: Path, profile_id: str) -> None:
         raise CotProbeRequestError("unable to create COT request marker") from None
 
 
-def _load_facts(path: Path, profile_id: str) -> Mapping[str, Any]:
+def _load_facts(
+    path: Path,
+    profile_id: str,
+    *,
+    allow_unavailable: bool = False,
+) -> Mapping[str, Any]:
     try:
         payload = json.loads(
             _owned_private_file(path),
@@ -167,14 +223,23 @@ def _load_facts(path: Path, profile_id: str) -> Mapping[str, Any]:
         raise CotProbeRequestError("COT delivery facts are invalid")
 
     if set(payload) == _UNAVAILABLE_FACT_KEYS:
+        expected_terminal = cot_terminal_sha256(
+            profile_id,
+            receipt_sha256=None,
+            status="UNAVAILABLE",
+            failure_code="TRUSTED_PROBE_ERROR",
+        )
         if payload != {
             "schema_version": FACTS_SCHEMA_VERSION,
             "profile_id": profile_id,
             "receipt_sha256": None,
+            "terminal_sha256": expected_terminal,
             "status": "UNAVAILABLE",
             "failure_code": "TRUSTED_PROBE_ERROR",
         }:
             raise CotProbeRequestError("COT unavailable facts are invalid")
+        if allow_unavailable:
+            return payload
         raise CotProbeUnavailableError("trusted COT probe evidence is unavailable")
 
     if (
@@ -183,6 +248,8 @@ def _load_facts(path: Path, profile_id: str) -> Mapping[str, Any]:
         or payload.get("profile_id") != profile_id
         or not isinstance(payload.get("receipt_sha256"), str)
         or not _SHA256_RE.fullmatch(payload["receipt_sha256"])
+        or not isinstance(payload.get("terminal_sha256"), str)
+        or not _SHA256_RE.fullmatch(payload["terminal_sha256"])
     ):
         raise CotProbeRequestError("COT delivery facts are invalid")
     try:
@@ -191,11 +258,17 @@ def _load_facts(path: Path, profile_id: str) -> Mapping[str, Any]:
         )
     except CotReceiptError:
         raise CotProbeRequestError("COT delivery receipt is invalid") from None
-    if payload["receipt_sha256"] != digest or receipt.get("status") not in {
-        "PASS",
-        "FAIL",
-        "UNVERIFIED",
-    }:
+    expected_terminal = cot_terminal_sha256(
+        profile_id,
+        receipt_sha256=digest,
+        status="RECEIPT",
+        failure_code="NONE",
+    )
+    if (
+        payload["receipt_sha256"] != digest
+        or payload["terminal_sha256"] != expected_terminal
+        or receipt.get("status") not in {"PASS", "FAIL", "UNVERIFIED"}
+    ):
         raise CotProbeRequestError("COT delivery receipt binding is invalid")
     return payload
 

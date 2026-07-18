@@ -1227,6 +1227,18 @@ def _successful_runner(
                             break
                 rows.extend(scenario_rows)
         rows.append({"type": "turn.completed", "usage": {}})
+        # The production process runner streams parent-owned Codex events while
+        # the worker is still running.  This fixture separately exercises final
+        # event validation modes, so first publish an exact gate transcript,
+        # then replace it with the requested final transcript after all probe
+        # helpers have reached terminal exit.
+        gate_rows = [rows[0], rows[1], *_scenario_command_rows()]
+        staged_events = spec.events_path.with_name(".events-fixture.tmp")
+        staged_events.write_text(
+            "".join(json.dumps(row) + "\n" for row in gate_rows)
+        )
+        staged_events.chmod(0o600)
+        os.replace(staged_events, spec.events_path)
         expected_receipt = _passing_cot_receipt(spec.profile_id)
         if cot_mode in {"failed", "failed-status-mismatch"}:
             expected_receipt.update(
@@ -1260,7 +1272,14 @@ def _successful_runner(
             "failed",
         }:
             raise AssertionError(f"unknown COT fixture mode: {cot_mode}")
-        spec.events_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        staged_final_events = spec.events_path.with_name(
+            ".events-final-fixture.tmp"
+        )
+        staged_final_events.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows)
+        )
+        staged_final_events.chmod(0o600)
+        os.replace(staged_final_events, spec.events_path)
         if extra_file and index == 0:
             extra = spec.output_dir / "extra.txt"
             extra.write_text("unexpected\n")
@@ -1588,8 +1607,218 @@ def test_live_request_loader_retries_transient_atomic_publication(
         scenario_id="P0-02",
         attempt=1,
         previous_receipt_sha256=None,
+        cot_terminal_sha256=None,
     ) == expected
     assert calls == 2
+
+
+def test_parent_event_snapshot_ignores_only_trailing_partial_json(tmp_path):
+    path = tmp_path.resolve() / "events.jsonl"
+    row = _scenario_command_rows()[0]
+    path.write_bytes(json.dumps(row).encode("utf-8") + b'\n{"type":')
+    path.chmod(0o600)
+
+    assert verifier.completed_scenario_command_sequence_snapshot(path) == (
+        ("P0-02", 1),
+    )
+
+    with path.open("ab") as handle:
+        handle.write(b"\n")
+    with pytest.raises(verifier.OrchestrationError, match="event stream is invalid"):
+        verifier.completed_scenario_command_sequence_snapshot(path)
+
+
+def test_parent_rejects_forged_p0_13_cot_terminal_binding(
+    tmp_path, monkeypatch
+):
+    marker = tmp_path.resolve() / ".live-probe-P0-13-1.request"
+    live_request.write_request_marker(
+        marker,
+        run_id="run-123",
+        profile_id="official-deepseek",
+        scenario_id="P0-13",
+        attempt=1,
+        previous_receipt_sha256="1" * 64,
+        cot_terminal_sha256="2" * 64,
+    )
+    monkeypatch.setattr(launcher, "_REQUEST_PUBLICATION_GRACE_SECONDS", 0.0)
+
+    with pytest.raises(live_request.LiveProbeRequestError, match="marker is invalid"):
+        launcher._load_ready_live_request(
+            marker,
+            run_id="run-123",
+            profile_id="official-deepseek",
+            scenario_id="P0-13",
+            attempt=1,
+            previous_receipt_sha256="1" * 64,
+            cot_terminal_sha256="3" * 64,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="qualification runner is POSIX")
+def test_parent_gate_ignores_forged_persona_files_and_replaced_worker_lock(
+    tmp_path, monkeypatch
+):
+    paths = _setup(tmp_path)
+    spec = launcher._prepare_specs(
+        codex_bin=paths["codex_bin"],
+        codex_home=paths["codex_home"],
+        source_root=paths["source"],
+        artifact_root=paths["artifacts"],
+        profile_manifest_dir=paths["manifests"],
+        worker_root=paths["worker_root"],
+        worker_output_root=paths["raw"],
+        authoring_schema=launcher._load_authoring_schema(paths["schema"]),
+        worker_python=paths["worker_python"],
+        run_id="run-adversarial-parent-gate",
+        base_url="https://test-api.feedling.app",
+        expected_sha="a" * 40,
+        assignments=(PROFILE_AGENT_TYPES[0],),
+    )[0]
+    monkeypatch.setattr(launcher, "_PARENT_COMMAND_ACK_GRACE_SECONDS", 0.05)
+    invoked: list[str] = []
+    adversary_was_alive = False
+
+    def live_probe_runner(
+        received_spec,
+        scenario_id,
+        attempt,
+        nonce,
+        prior_receipts,
+    ):
+        invoked.append(scenario_id)
+        return _passing_live_probe(
+            received_spec,
+            scenario_id,
+            attempt,
+            nonce,
+            prior_receipts,
+        )
+
+    def process_runner(received_spec: launcher.WorkerSpec, timeout: int) -> int:
+        nonlocal adversary_was_alive
+        assert received_spec is spec
+        assert timeout == 600
+        rows: list[dict[str, Any]] = []
+        for row in _scenario_command_rows():
+            command = row["item"]["command"]
+            if "QA_SCENARIO_ID=P0-07" in command:
+                break
+            if (
+                "QA_SCENARIO_ID=P0-06" not in command
+                or "QA_SCENARIO_PHASE=FINALIZE" not in command
+            ):
+                rows.append(row)
+        staged = spec.events_path.with_name(".adversarial-events.tmp")
+        staged.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        staged.chmod(0o600)
+        os.replace(staged, spec.events_path)
+
+        previous_sha256: str | None = None
+        for scenario_id in ("P0-02", "P0-03", "P0-04", "P0-05", "P0-06"):
+            facts = live_request.request_and_wait(
+                scenario_id=scenario_id,
+                attempt=1,
+                request=live_request.request_path(spec.work, scenario_id, 1),
+                facts=live_request.facts_path(spec.work, scenario_id, 1),
+                environment=spec.environment,
+                wait_seconds=5.0,
+                sequence_wait_seconds=5.0,
+            )
+            previous_sha256 = facts["receipt_sha256"]
+
+        assert previous_sha256 is not None
+        adversary_program = r'''
+import fcntl
+import json
+import os
+import sys
+
+work, run_id, profile_id, previous_sha256 = sys.argv[1:]
+gate = os.path.join(work, ".live-probe-sequence.lock")
+try:
+    os.unlink(gate)
+except FileNotFoundError:
+    pass
+descriptor = os.open(gate, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(descriptor, b'{"forged_worker_state":true}\n')
+os.fsync(descriptor)
+fcntl.flock(descriptor, fcntl.LOCK_EX)
+judgment = os.path.join(work, "p0-06-semantic-judgment.json")
+with open(judgment, "x", encoding="utf-8") as handle:
+    json.dump({"forged": True}, handle)
+    handle.write("\n")
+os.chmod(judgment, 0o600)
+evidence = os.path.join(work, "p0-06-private-evidence.json")
+try:
+    os.unlink(evidence)
+except FileNotFoundError:
+    pass
+marker = os.path.join(work, ".live-probe-P0-07-1.request")
+payload = {
+    "schema_version": 2,
+    "run_id": run_id,
+    "profile_id": profile_id,
+    "scenario_id": "P0-07",
+    "attempt": 1,
+    "previous_receipt_sha256": previous_sha256,
+    "cot_terminal_sha256": None,
+}
+marker_fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(marker_fd, (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
+os.close(marker_fd)
+print("ready", flush=True)
+sys.stdin.buffer.read(1)
+'''
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                adversary_program,
+                str(spec.work),
+                spec.environment["QA_RUN_ID"],
+                spec.profile_id,
+                previous_sha256,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert child.stdout is not None
+            assert child.stdout.readline() == "ready\n"
+            p0_07_facts = live_request.facts_path(spec.work, "P0-07", 1)
+            deadline = time.monotonic() + 3.0
+            while not p0_07_facts.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert p0_07_facts.exists()
+            adversary_was_alive = child.poll() is None
+            payload = json.loads(p0_07_facts.read_text(encoding="utf-8"))
+            assert payload["failure_code"] == "LIVE_REQUEST_PROTOCOL_VIOLATION"
+        finally:
+            if child.stdin is not None:
+                child.stdin.write("x")
+                child.stdin.flush()
+            child.wait(timeout=3.0)
+            assert child.returncode == 0, (
+                child.stderr.read() if child.stderr is not None else ""
+            )
+        return 0
+
+    assert launcher._run_process_with_trusted_cot(
+        spec,
+        600,
+        process_runner,
+        _cot_probe_runner(),
+        live_probe_runner,
+        _persona_finalize_runner,
+    ) == 0
+    assert adversary_was_alive is True
+    assert invoked == ["P0-02", "P0-03", "P0-04", "P0-05", "P0-06"]
 
 
 def test_cot_request_loader_retries_transient_shell_publication(monkeypatch):
@@ -2208,6 +2437,14 @@ def test_diagnostic_malformed_or_missing_result_becomes_fallback(
                         "status": "completed",
                     },
                 }
+            )
+            + "\n"
+            + json.dumps(
+                next(
+                    row
+                    for row in _scenario_command_rows()
+                    if "QA_SCENARIO_ID=P0-11" in row["item"]["command"]
+                )
             )
             + "\n"
             + json.dumps({"type": "turn.completed", "usage": {}})

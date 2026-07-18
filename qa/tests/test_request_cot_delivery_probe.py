@@ -25,6 +25,12 @@ def _facts(status: str, digest: str = "a" * 64) -> dict:
         "schema_version": 1,
         "profile_id": PROFILE_ID,
         "receipt_sha256": digest,
+        "terminal_sha256": request.cot_terminal_sha256(
+            PROFILE_ID,
+            receipt_sha256=digest,
+            status="RECEIPT",
+            failure_code="NONE",
+        ),
         "receipt": {
             "status": status,
             "failure_code": "NONE" if status == "PASS" else "CHAT_TIMEOUT",
@@ -89,6 +95,12 @@ def test_helper_rejects_explicit_unavailable_facts(tmp_path):
             "schema_version": 1,
             "profile_id": PROFILE_ID,
             "receipt_sha256": None,
+            "terminal_sha256": request.cot_terminal_sha256(
+                PROFILE_ID,
+                receipt_sha256=None,
+                status="UNAVAILABLE",
+                failure_code="TRUSTED_PROBE_ERROR",
+            ),
             "status": "UNAVAILABLE",
             "failure_code": "TRUSTED_PROBE_ERROR",
         },

@@ -42,6 +42,7 @@ try:
     from qa.codex_output_schema import validate_authoring_schema
     from qa.diagnostic_results import DiagnosticResultError, agent_error_profile
     from qa.orchestration_contract import PROFILE_AGENT_TYPES
+    from qa.request_cot_delivery_probe import cot_terminal_sha256
     from qa.validate_diagnostic_attempts import (
         DiagnosticAttemptError,
         validate_live_attempts,
@@ -74,6 +75,7 @@ try:
         RECEIPT_SCHEMA_VERSION,
         OrchestrationError,
         canonical_json_sha256,
+        completed_scenario_command_sequence_snapshot,
         completed_command_evidence,
         file_sha256,
         load_private_json,
@@ -90,6 +92,7 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
     from codex_output_schema import validate_authoring_schema
     from diagnostic_results import DiagnosticResultError, agent_error_profile
     from orchestration_contract import PROFILE_AGENT_TYPES
+    from request_cot_delivery_probe import cot_terminal_sha256
     from validate_diagnostic_attempts import (
         DiagnosticAttemptError,
         validate_live_attempts,
@@ -122,6 +125,7 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
         RECEIPT_SCHEMA_VERSION,
         OrchestrationError,
         canonical_json_sha256,
+        completed_scenario_command_sequence_snapshot,
         completed_command_evidence,
         file_sha256,
         load_private_json,
@@ -147,6 +151,7 @@ _MAX_RESULT_BYTES = 32 * 1024 * 1024
 _MAX_EVENTS_BYTES = 64 * 1024 * 1024
 _MAX_PERSONA_JUDGMENT_BYTES = 64 * 1024
 _REQUEST_PUBLICATION_GRACE_SECONDS = 2.0
+_PARENT_COMMAND_ACK_GRACE_SECONDS = 2.0
 _LIVE_REQUEST_PROTOCOL_VIOLATION = "LIVE_REQUEST_PROTOCOL_VIOLATION"
 _COT_PROBE_TIMEOUT_SECONDS = 300
 _DEFAULT_LIVE_PROBE_TIMEOUT_SECONDS = 300
@@ -460,6 +465,15 @@ class WorkerAttempt:
     started_at: str
     stopped_at: str
     invocation_failed: bool
+
+
+@dataclass(frozen=True)
+class CotTerminalAck:
+    """Parent-owned terminal COT evidence retained outside worker roots."""
+
+    terminal_sha256: str
+    receipt_sha256: str | None
+    available: bool
 
 
 ProcessRunner = Callable[[WorkerSpec, int], int]
@@ -1229,6 +1243,7 @@ def _load_ready_live_request(
     scenario_id: str,
     attempt: int,
     previous_receipt_sha256: str | None,
+    cot_terminal_sha256: str | None,
 ) -> Mapping[str, Any]:
     """Allow atomic hard-link publication to settle to one private link."""
 
@@ -1242,11 +1257,81 @@ def _load_ready_live_request(
                 scenario_id=scenario_id,
                 attempt=attempt,
                 previous_receipt_sha256=previous_receipt_sha256,
+                cot_terminal_sha256=cot_terminal_sha256,
             )
         except LiveProbeRequestError:
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.01)
+
+
+def _expected_parent_command_prefix(
+    receipts: Sequence[Mapping[str, Any]],
+    *,
+    include_cot: bool = False,
+) -> tuple[tuple[str, int | str], ...]:
+    """Project parent receipts into their required successful command prefix."""
+
+    expected: list[tuple[str, int | str]] = []
+    for receipt in receipts:
+        scenario_id = str(receipt.get("scenario_id") or "")
+        attempt = receipt.get("attempt")
+        if scenario_id not in PARENT_LIVE_SCENARIO_IDS or type(attempt) is not int:
+            raise WorkerLaunchError("parent live receipt sequence is invalid")
+        if scenario_id == "P0-06":
+            expected.append((scenario_id, "CAPTURE"))
+            if receipt.get("status") == "PASS":
+                expected.extend(
+                    (
+                        (scenario_id, "REVIEW"),
+                        (scenario_id, "FINALIZE"),
+                    )
+                )
+        else:
+            expected.append((scenario_id, attempt))
+    if include_cot:
+        expected.append(("P0-12", 1))
+    return tuple(expected)
+
+
+def _parent_command_predecessor_ready(
+    spec: WorkerSpec,
+    receipts: Sequence[Mapping[str, Any]],
+    *,
+    include_cot: bool = False,
+    cot_request: bool = False,
+) -> bool:
+    """Trust only exact successful commands in the parent-owned Codex stream."""
+
+    try:
+        observed = completed_scenario_command_sequence_snapshot(spec.events_path)
+    except OrchestrationError:
+        raise WorkerLaunchError("live Codex command evidence is invalid") from None
+    expected = _expected_parent_command_prefix(
+        receipts,
+        include_cot=include_cot,
+    )
+    if observed[: len(expected)] != expected:
+        return False
+    if cot_request:
+        # In a real worker P0-11 cannot complete without the corresponding
+        # parent receipt.  Keeping this explicit predecessor assertion also
+        # supports deterministic process-runner fixtures that pre-render their
+        # complete event transcript before requesting probes.
+        try:
+            p0_11_index = max(
+                index
+                for index, marker in enumerate(observed)
+                if marker[0] == "P0-11"
+            )
+        except ValueError:
+            return False
+        p0_12_indices = [
+            index for index, marker in enumerate(observed) if marker == ("P0-12", 1)
+        ]
+        if p0_12_indices and p0_11_index > min(p0_12_indices):
+            return False
+    return True
 
 
 def _perform_trusted_live_handshake(
@@ -1255,6 +1340,7 @@ def _perform_trusted_live_handshake(
     attempt: int,
     live_probe_runner: LiveProbeRunner,
     receipts: list[dict[str, Any]],
+    cot_terminal_ack: CotTerminalAck | None,
 ) -> set[tuple[str, int]]:
     request_path, facts_path = _live_handshake_paths(spec, scenario_id, attempt)
     nonce = ""
@@ -1270,7 +1356,14 @@ def _perform_trusted_live_handshake(
             previous_receipt_sha256=(
                 live_json_sha256(receipts[-1]) if receipts else None
             ),
+            cot_terminal_sha256=(
+                cot_terminal_ack.terminal_sha256
+                if scenario_id == "P0-13" and cot_terminal_ack is not None
+                else None
+            ),
         )
+        if scenario_id == "P0-13" and cot_terminal_ack is None:
+            raise WorkerLaunchError("trusted COT terminal binding is unavailable")
         if facts_path.exists() or not _live_request_is_next(
             receipts, scenario_id, attempt
         ):
@@ -1431,24 +1524,36 @@ def _validate_ready_cot_request(spec: WorkerSpec) -> None:
             time.sleep(0.01)
 
 
-def _write_cot_error_facts(spec: WorkerSpec) -> None:
+def _write_cot_error_facts(spec: WorkerSpec) -> CotTerminalAck:
     """Unblock the agent without fabricating an authoritative receipt."""
 
+    terminal_sha256 = cot_terminal_sha256(
+        spec.profile_id,
+        receipt_sha256=None,
+        status="UNAVAILABLE",
+        failure_code="TRUSTED_PROBE_ERROR",
+    )
     _write_private_json(
         spec.cot_facts_path,
         {
             "schema_version": 1,
             "profile_id": spec.profile_id,
             "receipt_sha256": None,
+            "terminal_sha256": terminal_sha256,
             "status": "UNAVAILABLE",
             "failure_code": "TRUSTED_PROBE_ERROR",
         },
+    )
+    return CotTerminalAck(
+        terminal_sha256=terminal_sha256,
+        receipt_sha256=None,
+        available=False,
     )
 
 
 def _perform_trusted_cot_handshake(
     spec: WorkerSpec, cot_probe_runner: CotProbeRunner
-) -> None:
+) -> CotTerminalAck:
     """Consume the agent's marker and publish only validated sanitized facts."""
 
     try:
@@ -1461,21 +1566,43 @@ def _perform_trusted_cot_handshake(
         )
         if not isinstance(returned, Mapping) or dict(returned) != receipt:
             raise WorkerLaunchError("trusted COT probe result is inconsistent")
+        terminal_sha256 = cot_terminal_sha256(
+            spec.profile_id,
+            receipt_sha256=receipt_sha256,
+            status="RECEIPT",
+            failure_code="NONE",
+        )
         _write_private_json(
             spec.cot_facts_path,
             {
                 "schema_version": 1,
                 "profile_id": spec.profile_id,
                 "receipt_sha256": receipt_sha256,
+                "terminal_sha256": terminal_sha256,
                 "receipt": receipt,
             },
+        )
+        return CotTerminalAck(
+            terminal_sha256=terminal_sha256,
+            receipt_sha256=receipt_sha256,
+            available=True,
         )
     except (CotReceiptError, OSError, WorkerLaunchError):
         if not spec.cot_facts_path.exists():
             try:
-                _write_cot_error_facts(spec)
+                return _write_cot_error_facts(spec)
             except WorkerLaunchError:
                 pass
+    return CotTerminalAck(
+        terminal_sha256=cot_terminal_sha256(
+            spec.profile_id,
+            receipt_sha256=None,
+            status="UNAVAILABLE",
+            failure_code="TRUSTED_PROBE_ERROR",
+        ),
+        receipt_sha256=None,
+        available=False,
+    )
 
 
 def _run_process_with_trusted_cot(
@@ -1505,14 +1632,49 @@ def _run_process_with_trusted_cot(
     worker = threading.Thread(target=run_worker, daemon=False)
     worker.start()
     cot_probe_handled = False
+    cot_terminal_ack: CotTerminalAck | None = None
     live_handled: set[tuple[str, int]] = set()
     live_receipts: list[dict[str, Any]] = []
+    request_first_seen: dict[str, float] = {}
 
-    def handle_visible_requests() -> None:
-        nonlocal cot_probe_handled
+    def command_ack_expired(key: str, *, final: bool) -> bool:
+        first_seen = request_first_seen.setdefault(key, time.monotonic())
+        return final or time.monotonic() - first_seen >= _PARENT_COMMAND_ACK_GRACE_SECONDS
+
+    def handle_visible_requests(*, final: bool = False) -> None:
+        nonlocal cot_probe_handled, cot_terminal_ack
         if not cot_probe_handled and spec.cot_request_path.exists():
-            cot_probe_handled = True
-            _perform_trusted_cot_handshake(spec, cot_probe_runner)
+            cot_key = "P0-12"
+            try:
+                cot_ready = _parent_command_predecessor_ready(
+                    spec,
+                    live_receipts,
+                    cot_request=True,
+                )
+            except WorkerLaunchError:
+                cot_ready = False
+                final = True
+            if cot_ready:
+                cot_probe_handled = True
+                cot_terminal_ack = _perform_trusted_cot_handshake(
+                    spec, cot_probe_runner
+                )
+                request_first_seen.pop(cot_key, None)
+            elif command_ack_expired(cot_key, final=final):
+                cot_probe_handled = True
+                try:
+                    cot_terminal_ack = _write_cot_error_facts(spec)
+                except WorkerLaunchError:
+                    cot_terminal_ack = CotTerminalAck(
+                        terminal_sha256=cot_terminal_sha256(
+                            spec.profile_id,
+                            receipt_sha256=None,
+                            status="UNAVAILABLE",
+                            failure_code="TRUSTED_PROBE_ERROR",
+                        ),
+                        receipt_sha256=None,
+                        available=False,
+                    )
         for scenario_id in PARENT_LIVE_SCENARIO_IDS:
             for attempt in (1, 2):
                 key = (scenario_id, attempt)
@@ -1521,6 +1683,35 @@ def _run_process_with_trusted_cot(
                 )
                 if key in live_handled or not request_path.exists():
                     continue
+                ack_key = f"{scenario_id}:{attempt}"
+                try:
+                    predecessor_ready = _parent_command_predecessor_ready(
+                        spec,
+                        live_receipts,
+                        include_cot=scenario_id == "P0-13",
+                    )
+                except WorkerLaunchError:
+                    predecessor_ready = False
+                    final = True
+                if scenario_id == "P0-13" and cot_terminal_ack is None:
+                    predecessor_ready = False
+                if not predecessor_ready:
+                    if command_ack_expired(ack_key, final=final):
+                        live_handled.add(key)
+                        _, facts_path = _live_handshake_paths(
+                            spec, scenario_id, attempt
+                        )
+                        try:
+                            _write_live_error_facts(
+                                spec,
+                                scenario_id,
+                                attempt,
+                                facts_path,
+                                failure_code=_LIVE_REQUEST_PROTOCOL_VIOLATION,
+                            )
+                        except WorkerLaunchError:
+                            pass
+                    continue
                 live_handled.add(key)
                 premature = _perform_trusted_live_handshake(
                     spec,
@@ -1528,15 +1719,17 @@ def _run_process_with_trusted_cot(
                     attempt,
                     live_probe_runner,
                     live_receipts,
+                    cot_terminal_ack,
                 )
                 live_handled.update(premature)
+                request_first_seen.pop(ack_key, None)
 
     while worker.is_alive():
         handle_visible_requests()
         worker.join(timeout=0.05)
     # Close the race where markers and process completion become visible in the
     # opposite order, then freeze the parent-owned aggregate exactly once.
-    handle_visible_requests()
+    handle_visible_requests(final=True)
     persona_finalizer: Mapping[str, Any] | None = None
     capture_receipts = [
         receipt

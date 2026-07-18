@@ -430,6 +430,105 @@ def _p0_06_phase(tokens: tuple[str, ...]) -> str | None:
     return phase if arguments == expected.get(phase) else None
 
 
+def _successful_scenario_marker(
+    row: Mapping[str, Any],
+) -> tuple[str, int | str] | None:
+    item = row.get("item")
+    if not (
+        row.get("type") == "item.completed"
+        and isinstance(item, dict)
+        and item.get("type") == "command_execution"
+        and item.get("status") == "completed"
+        and type(item.get("exit_code")) is int
+        and item.get("exit_code") == 0
+        and isinstance(item.get("command"), str)
+    ):
+        return None
+    tokens = _command_tokens(item["command"])
+    if not tokens:
+        return None
+    match = _SCENARIO_COMMAND_RE.match(tokens[0])
+    if not match:
+        return None
+    scenario_id = match.group(1)
+    if scenario_id == "P0-06":
+        phase = _p0_06_phase(tokens)
+        return (scenario_id, phase) if phase is not None else None
+    if scenario_id == "P0-12":
+        return (scenario_id, 1) if tokens == _P0_12_REQUEST_TOKENS else None
+    if scenario_id not in _PARENT_LIVE_SCENARIO_IDS:
+        return None
+    matched_attempt = next(
+        (
+            attempt
+            for attempt in (
+                (1, 2)
+                if scenario_id in _RETRYABLE_LIVE_SCENARIO_IDS
+                else (1,)
+            )
+            if tokens == _live_request_tokens(scenario_id, attempt)
+        ),
+        None,
+    )
+    return (
+        (scenario_id, matched_attempt) if matched_attempt is not None else None
+    )
+
+
+def completed_scenario_command_sequence_snapshot(
+    path: Path,
+) -> tuple[tuple[str, int | str], ...]:
+    """Parse only newline-terminated parent-owned Codex JSONL rows.
+
+    The Codex subprocess may be appending its current event.  A trailing partial
+    row is not evidence and is ignored; every complete row is parsed strictly.
+    The parent can therefore gate live mutations on completed exact commands
+    without trusting worker-writable request artifacts.
+    """
+
+    try:
+        with open_owned_regular(
+            path, "live Codex worker event stream", max_bytes=_MAX_EVENTS_BYTES
+        ) as handle:
+            size = os.fstat(handle.fileno()).st_size
+            content = handle.read(size)
+    except OrchestrationError:
+        raise
+    except OSError:
+        raise OrchestrationError(
+            "live Codex worker event stream is unreadable"
+        ) from None
+    if len(content) != size:
+        raise OrchestrationError("live Codex worker event stream changed while reading")
+    final_newline = content.rfind(b"\n")
+    if final_newline < 0:
+        if len(content) > _MAX_JSON_LINE_BYTES:
+            raise OrchestrationError(
+                "live Codex worker event stream contains an oversized row"
+            )
+        return ()
+    if len(content) - final_newline - 1 > _MAX_JSON_LINE_BYTES:
+        raise OrchestrationError(
+            "live Codex worker event stream contains an oversized row"
+        )
+    markers: list[tuple[str, int | str]] = []
+    for raw in content[: final_newline + 1].splitlines():
+        if not raw or len(raw) > _MAX_JSON_LINE_BYTES:
+            raise OrchestrationError("live Codex worker event stream is invalid")
+        try:
+            row = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, RecursionError):
+            raise OrchestrationError(
+                "live Codex worker event stream is invalid"
+            ) from None
+        if not isinstance(row, dict):
+            raise OrchestrationError("live Codex worker event stream is invalid")
+        marker = _successful_scenario_marker(row)
+        if marker is not None:
+            markers.append(marker)
+    return tuple(markers)
+
+
 def completed_command_evidence(
     path: Path,
     *,
