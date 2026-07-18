@@ -11,6 +11,10 @@
 #   FEEDLING_RUNTIME_TOKEN_SECRET same value as the main backend
 #   FEEDLING_API_URL              main CVM public ingress URL
 #   FEEDLING_ENCLAVE_URL          main CVM enclave gateway-passthrough URL
+# Optional encrypted sandbox env (required together when provider=e2b):
+#   FEEDLING_V2_SANDBOX_PROVIDER  disabled (default) or e2b
+#   E2B_API_KEY                   E2B project API key
+#   FEEDLING_V2_E2B_TEMPLATE      audited Runtime V2 extractor template tag
 
 name: feedling-pre-runner
 
@@ -19,6 +23,10 @@ x-serve-worker-env: &serve-worker-env
   FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"
   DATABASE_URL: "${DATABASE_URL:-}"
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+  FEEDLING_V2_SANDBOX_PROVIDER: "${FEEDLING_V2_SANDBOX_PROVIDER:-disabled}"
+  E2B_API_KEY: "${E2B_API_KEY:-}"
+  FEEDLING_V2_E2B_TEMPLATE: "${FEEDLING_V2_E2B_TEMPLATE:-}"
+  FEEDLING_V2_E2B_ALLOW_INTERNET: "${FEEDLING_V2_E2B_ALLOW_INTERNET:-0}"
   # Genesis import is a queue worker hosted by Runtime V2. It never depended on
   # the resident CLI process; claim uses FOR UPDATE SKIP LOCKED and has its own
   # heartbeat kind on /v1/admin/v2-metrics.
