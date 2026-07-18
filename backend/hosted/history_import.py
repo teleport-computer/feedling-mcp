@@ -592,15 +592,31 @@ _SUPPORT_JSON_PRIVATE_KEYS = {
     "verified_phone_number",
     "id",
 }
+# STRONG account/PII signals: an object carrying one of these (and no real content)
+# is an account-export blob to drop. Deliberately EXCLUDES bare ``id`` / ``user_id`` —
+# a long-term-memory archive legitimately stamps each item with an ``id`` (e.g.
+# "m0001"), so treating a bare id as an account signal false-positives the whole
+# archive into "empty" and 400s the import. ``id`` stays in the wider
+# ``_SUPPORT_JSON_PRIVATE_KEYS`` set only so the fallback extractor never pulls an id
+# value in as memory text.
+_SUPPORT_JSON_PII_KEYS = {
+    "uuid",
+    "account_uuid",
+    "email",
+    "email_address",
+    "phone",
+    "phone_number",
+    "verified_phone_number",
+}
 
 
 def _support_json_is_account_metadata(value: dict) -> bool:
     keys = {str(k).lower() for k in value.keys()}
-    has_private = bool(keys & _SUPPORT_JSON_PRIVATE_KEYS) or any(
+    has_pii = bool(keys & _SUPPORT_JSON_PII_KEYS) or any(
         "email" in key or "phone" in key or "uuid" in key for key in keys
     )
     has_content = any(key in keys for key in _SUPPORT_JSON_TEXT_KEYS)
-    return has_private and not has_content
+    return has_pii and not has_content
 
 
 def _support_json_scalar_text(value) -> str:
@@ -785,6 +801,11 @@ def _persona_support_messages(payload: dict) -> list[dict]:
         or payload.get("memory_summary")
         or payload.get("memory_sample_content")
         or payload.get("memory_sample")
+        # `support_material_content` is the client's alias for the same long-term
+        # memory material (iOS dual-writes both). Read it too so a client that ever
+        # sends only this field doesn't silently drop the whole upload → empty → 400.
+        or payload.get("support_material_content")
+        or payload.get("support_material")
         or ""
     ).strip()
     if memory_summary:
@@ -792,7 +813,12 @@ def _persona_support_messages(payload: dict) -> list[dict]:
             "Memory summary",
             _MEMORY_SUMMARY_SOURCE,
             memory_summary,
-            str(payload.get("memory_summary_filename") or payload.get("memory_sample_filename") or "").strip(),
+            str(
+                payload.get("memory_summary_filename")
+                or payload.get("memory_sample_filename")
+                or payload.get("support_material_filename")
+                or ""
+            ).strip(),
         )
 
     persona = str(payload.get("persona_content") or payload.get("persona") or "").strip()

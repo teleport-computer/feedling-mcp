@@ -331,7 +331,7 @@ class UserStore:
             return
         wake_bus.notify(channel, self.user_id)
 
-    def append_chat(
+    def _build_chat_message(
         self,
         role: str,
         source: str,
@@ -339,9 +339,7 @@ class UserStore:
         content_type: str = "text",
         extra: dict | None = None,
     ) -> dict:
-        """Append a v1 ciphertext chat message. `envelope` holds the AEAD
-        payload. See docs/DESIGN_E2E.md §3.2 for field definitions. Server
-        never decrypts — the envelope is stored verbatim.
+        """Build the stored form of a v1 ciphertext chat message.
 
         The client supplies the envelope's `id`, which becomes the stored
         message id so the AEAD additional-data the client baked in
@@ -408,6 +406,10 @@ class UserStore:
                 "image_mime",
                 "file_name",
                 "file_mime",
+                # Optional client operation UUID. Plaintext routing metadata
+                # only: it identifies a logical send retry but carries no
+                # message content and is not part of the E2EE envelope.
+                "client_msg_id",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",
@@ -445,6 +447,20 @@ class UserStore:
                     msg[key] = value.strip()
                 elif isinstance(value, bool):
                     msg[key] = value
+        return msg
+
+    def append_chat(
+        self,
+        role: str,
+        source: str,
+        envelope: dict,
+        content_type: str = "text",
+        extra: dict | None = None,
+    ) -> dict:
+        """Append a v1 ciphertext chat message using the legacy non-deduplicated
+        path. See docs/DESIGN_E2E.md §3.2 for envelope field definitions."""
+        msg = self._build_chat_message(role, source, envelope, content_type, extra)
+        msg_id = str(msg["id"])
 
         with self.chat_lock:
             self.chat_messages.append(msg)
@@ -464,6 +480,64 @@ class UserStore:
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return msg
+
+    def append_chat_idempotent(
+        self,
+        role: str,
+        source: str,
+        envelope: dict,
+        *,
+        client_msg_id: str,
+        window_sec: int,
+        content_type: str = "text",
+        extra: dict | None = None,
+    ) -> tuple[dict, bool]:
+        """Append one logical client send, atomically across backend workers.
+
+        Returns ``(winner, inserted)``. A duplicate reconciles the authoritative
+        database winner into this worker's cache but deliberately emits none of
+        append_chat's wake/capture side effects. Database failures propagate:
+        failing closed is required because treating an unavailable lookup as a
+        miss could start a duplicate turn.
+        """
+        metadata = dict(extra or {})
+        metadata["client_msg_id"] = client_msg_id
+        candidate = self._build_chat_message(
+            role, source, envelope, content_type, metadata
+        )
+        winner, inserted = db.chat_append_idempotent(
+            self.user_id,
+            str(candidate["id"]),
+            float(candidate["ts"]),
+            candidate,
+            MAX_CHAT_MESSAGES,
+            client_msg_id=client_msg_id,
+            window_sec=window_sec,
+        )
+
+        with self.chat_lock:
+            replaced = False
+            for index, existing in enumerate(self.chat_messages):
+                if str(existing.get("id") or "") == str(winner.get("id") or ""):
+                    self.chat_messages[index] = dict(winner)
+                    replaced = True
+                    break
+            if not replaced:
+                self.chat_messages.append(dict(winner))
+            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
+                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+
+        if not inserted:
+            return winner, False
+
+        wake_bus.notify("chat", self.user_id)
+        try:
+            from proactive import capture_scheduler
+
+            capture_scheduler.record_chat_append(self, winner)
+        except Exception as e:
+            print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
+        return winner, True
 
     # ------- world book -------
     def _load_world_books(self):

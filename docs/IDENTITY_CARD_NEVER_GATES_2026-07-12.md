@@ -91,3 +91,50 @@ Owners: claude = agent_runtime; codex = 纯后端(gates / genesis / onboarding_v
 
 - [ ] C1：拆门后是否还要留一个"记录性"needs_identity 值供面板显示，还是彻底移除 stage 概念？（建议：stage 只留 main_loop，identity 缺失用独立字段表达。）
 - [ ] A1：B 类全新用户（注册即 fresh_start、零对话）是否要 agent **主动**自我介绍开口？默认按 Seven 意图=可以，靠 A2 标记防刷。若想更保守可设开关。
+
+---
+
+## 8. Addendum（2026-07-18，Seven 定）：两概念正式分离，三处"漂移"收编
+
+背景：2026-07-17 做 tools/e2e 解锁配方时逐行核 gate 代码，发现三处实现与
+本 spec"唯一信号 = genesis done"表述不一致。Seven 决定：**只修其中的真 bug
+（#1 的 model_api 半个），其余按现状收编进 spec**——正式承认「聊天可用」和
+「onboarding 完成」是**两个概念**，各路线各有信号，不再追求单一信号统一。
+
+### 8.1 两概念定义（此后以本表为准）
+
+**聊天可用（chat-ready，决定回复能不能投递——gate 层）**：
+
+| 路线 | 信号 |
+|---|---|
+| model_api 托管 | **无条件可用**（gates.py 对 host 账号恒放行；身份/记忆/genesis 均不看） |
+| resident / official_import / 缺省(legacy) | 官方 consumer 心跳（X-Feedling-Consumer，180s 窗口）**且** verify_loop 通过。身份/记忆/genesis 均不看 |
+
+**onboarding 完成（is_complete，进度展示/统计层，不拦任何功能）**：
+
+| 路线 | 信号 |
+|---|---|
+| model_api 托管 | 身份卡已写 **且** agent 回复 ≥1 条（resident 两条件豁免——修复见 8.2） |
+| resident / official_import / 缺省(legacy) | 身份卡已写 且 回复 ≥1 且 consumer 心跳 且 verify_loop |
+
+### 8.2 三处漂移的处置
+
+1. **`/v1/bootstrap/status` is_complete 对 model_api 永假**（status_core.py 要求
+   resident consumer 心跳，API 用户天生不可能满足）→ **真 bug，已修**：
+   route-aware 豁免 resident 两条件（与 gates.py host 豁免同一逻辑依据）。
+   豁免**仅限精确 model_api**：official_import 和缺省/非法路由按
+   `_load_onboarding_route` 的回落语义走 resident 四条件，勿误当 hosted。
+   fresh 无身份用户显示未完成 = 符合进度页语义，保留。
+2. **hosted onboarding completion 双轨**（"有身份卡 或 genesis done"）→
+   **收编为现状**：completion 是展示信号非门槛，双轨可接受；不再要求单一
+   genesis done。
+3. **proactive 激活挂 `first_chat_ok_at`**（非 genesis done）→ **收编为现状**：
+   主动功能在首次聊天成功后激活。§1 表中"首条主动 = 前台就绪即发"相应修正
+   为：**上传路的介绍 job 仍由 genesis 完成触发（A1 机制不变）；持续性主动
+   （心跳/定时等 lane）自 first_chat_ok 起激活**。
+
+### 8.3 对工具/测试的含义
+
+- tools/e2e 的 unlock 配方（unlock.py）即按 8.1 实现——hosted 零解锁、
+  resident 心跳+verify_loop，**不写身份卡**；勿回退到 provider_smoke 旧流程。
+- 能力矩阵/E2E 断言引用"完成"时必须先注明用的是哪个概念、哪条路线。

@@ -374,15 +374,92 @@ def _coerce_memory_type(value: Any) -> str:
     return mem_type
 
 
-def _memory_action_from_output(item: dict) -> dict:
+def _normalized_memory_date(value: Any) -> str:
+    raw = _text(value, 80)
+    if not raw:
+        return ""
+    parsed = identity_service._parse_iso_calendar_date(raw)
+    return parsed.isoformat() if parsed else ""
+
+
+def _memory_output_fallback_occurred_at(output: dict, fallback_occurred_at: str = "") -> str:
+    explicit = _normalized_memory_date(fallback_occurred_at)
+    if explicit:
+        return explicit
+    top_level = _normalized_memory_date(output.get("relationship_started_at"))
+    if top_level:
+        return top_level
+    anchor = output.get("relationship_anchor") if isinstance(output.get("relationship_anchor"), dict) else {}
+    return _normalized_memory_date(anchor.get("relationship_started_at"))
+
+
+def _memory_output_preserves_dates(output: dict, preserve_dates: bool) -> bool:
+    if preserve_dates:
+        return True
+    return str(output.get("source_family") or "").strip() == "memory_summary"
+
+
+def _memory_item_preserves_dates(item: dict, output_preserve_dates: bool) -> bool:
+    if output_preserve_dates:
+        return True
+    return str(item.get("_source_family") or item.get("source_family") or "").strip() == "memory_summary"
+
+
+def _memory_threads_from_output(item: dict, *, preserve_tags: bool = False) -> list:
+    raw_threads = item.get("threads") if isinstance(item.get("threads"), list) else []
+    if not preserve_tags:
+        return raw_threads
+
+    values: list[Any] = list(raw_threads)
+    raw_tags = item.get("tags")
+    if isinstance(raw_tags, list):
+        values.extend(raw_tags)
+    elif isinstance(raw_tags, str):
+        values.extend(part for part in re.split(r"[,，、\n]+", raw_tags) if part.strip())
+
+    seen: set[str] = set()
+    threads: list[str] = []
+    for value in values:
+        clean = _text(value, 80)
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        threads.append(clean)
+    return threads[:16]
+
+
+def _memory_occurred_at_from_output(
+    item: dict,
+    *,
+    preserve_dates: bool = False,
+    fallback_occurred_at: str = "",
+) -> str:
+    if not preserve_dates:
+        return _text(item.get("occurred_at"), 80)
+    return (
+        _normalized_memory_date(item.get("occurred_at") or item.get("date"))
+        or _normalized_memory_date(fallback_occurred_at)
+    )
+
+
+def _memory_action_from_output(
+    item: dict,
+    *,
+    preserve_dates: bool = False,
+    fallback_occurred_at: str = "",
+) -> dict:
     mem_type = _coerce_memory_type(item.get("type"))
     memory = {
         "type": mem_type,
         "summary": _text(item.get("summary") or item.get("title") or item.get("description"), 2000),
         "content": str(item.get("content") or "").strip()[:5000],
         "bucket": _text(item.get("bucket"), 80),
-        "threads": item.get("threads") if isinstance(item.get("threads"), list) else [],
-        "occurred_at": _text(item.get("occurred_at"), 80),
+        "threads": _memory_threads_from_output(item, preserve_tags=preserve_dates),
+        "occurred_at": _memory_occurred_at_from_output(
+            item,
+            preserve_dates=preserve_dates,
+            fallback_occurred_at=fallback_occurred_at,
+        ),
         "source": GENESIS_SOURCE,
         "importance": item.get("importance", 0.5),
         "pulse": item.get("pulse", 0.3),
@@ -399,18 +476,32 @@ def _memory_action_from_output(item: dict) -> dict:
     }
 
 
-def apply_memory_outputs(store: UserStore, api_key: str | None, output: dict) -> tuple[int, list[dict]]:
+def apply_memory_outputs(
+    store: UserStore,
+    api_key: str | None,
+    output: dict,
+    *,
+    preserve_dates: bool = False,
+    fallback_occurred_at: str = "",
+) -> tuple[int, list[dict]]:
     raw_items = output.get("memories")
     if raw_items is None:
         raw_items = output.get("facts")
     if not isinstance(raw_items, list) or not raw_items:
         return 0, []
+    output_preserve_dates = _memory_output_preserves_dates(output, preserve_dates)
+    effective_fallback_occurred_at = _memory_output_fallback_occurred_at(output, fallback_occurred_at)
     actions: list[dict] = []
     for item in raw_items:
         if not isinstance(item, dict):
             continue
+        item_preserve_dates = _memory_item_preserves_dates(item, output_preserve_dates)
         try:
-            actions.append(_memory_action_from_output(item))
+            actions.append(_memory_action_from_output(
+                item,
+                preserve_dates=item_preserve_dates,
+                fallback_occurred_at=effective_fallback_occurred_at,
+            ))
         except ValueError:
             # LLM reducers can occasionally emit a partial memory object. Keep the
             # import alive and write the valid cards instead of failing the whole job.

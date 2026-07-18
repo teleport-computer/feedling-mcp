@@ -32,6 +32,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 from typing import Any
@@ -44,9 +45,108 @@ from notices import core as notices
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
 
+log = logging.getLogger("feedling.genesis.plaintext_import")
+
+# Material fields a plaintext import can carry. We log only their CHAR LENGTHS
+# (never the content) so a rejected import is diagnosable without leaking plaintext.
+_PLAINTEXT_MATERIAL_FIELDS = (
+    "content",
+    "memory_summary_content",
+    "support_material_content",
+    "character_content",
+    "ai_persona_content",
+    "personal_profile_content",
+)
+
+
+def _plaintext_material_sizes(payload: dict) -> dict:
+    """{field: char_len} for every non-empty material field. Lengths only, no content."""
+    return {
+        k: len(str(payload.get(k) or ""))
+        for k in _PLAINTEXT_MATERIAL_FIELDS
+        if str(payload.get(k) or "").strip()
+    }
+
+
+def _log_plaintext_import_rejected(store, *, mode: str, reason: str, payload: dict) -> None:
+    """Always-on breadcrumb for a 400'd plaintext import. The high-signal case is
+    ``material_present=True`` with a ``..._required`` reason: the user DID upload
+    material but it normalized to empty (e.g. a memory archive whose items use a
+    non-whitelisted narrative key) — the exact silent-drop this endpoint used to
+    surface only as an opaque client-side "invalid request". Grep server logs for
+    ``genesis.plaintext.rejected``. Best-effort; never breaks the request path."""
+    try:
+        sizes = _plaintext_material_sizes(payload)
+        material_present = bool(sizes)
+        uid = getattr(store, "user_id", "") or ""
+        log.warning(
+            "genesis.plaintext.rejected user=%s mode=%s material_present=%s sizes=%s reason=%s",
+            uid, mode or "", material_present, sizes, str(reason)[:120],
+        )
+        try:
+            import debug_trace
+            debug_trace.trace_event(
+                store, subsystem="genesis", type="genesis.plaintext.rejected",
+                actor="backend", status="failed",
+                summary="plaintext import rejected (400)",
+                explain=(
+                    "上传了素材但被判为空（可能是记忆归档用了非白名单正文键 / id 误杀）"
+                    if material_present else "无可用素材"
+                ),
+                detail={"mode": mode or "", "material_present": material_present,
+                        "sizes": sizes, "reason": str(reason)[:160]},
+            )
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _log_resident_sealed_rejected(store, *, mode: str, reason: str, env, **facts) -> None:
+    """Always-on breadcrumb for a rejected resident (sealed) import — the sealed-lane
+    sibling of ``_log_plaintext_import_rejected``. These rejections return BEFORE a job
+    row is created, so (like the cloud upload 400) they otherwise leave no trace: no job,
+    no client-visible slug beyond a generic copy. The material is ciphertext, so we log
+    only structural facts (envelope present, body_ct byte length, missing fields,
+    visibility) — never content. Grep server logs for ``genesis.sealed.rejected``.
+    Best-effort; never breaks the request path."""
+    try:
+        env_present = isinstance(env, dict)
+        detail = {"mode": mode or "", "envelope_present": env_present, **facts}
+        if env_present:
+            try:
+                detail["body_ct_bytes"] = len(
+                    base64.b64decode(str(env.get("body_ct") or ""), validate=True))
+            except Exception:
+                detail["body_ct_bytes"] = -1  # unparseable base64
+            detail["visibility"] = str(env.get("visibility") or "")
+        uid = getattr(store, "user_id", "") or ""
+        log.warning(
+            "genesis.sealed.rejected user=%s mode=%s reason=%s detail=%s",
+            uid, mode or "", str(reason)[:120], detail,
+        )
+        try:
+            import debug_trace
+            debug_trace.trace_event(
+                store, subsystem="genesis", type="genesis.sealed.rejected",
+                actor="backend", status="failed",
+                summary="sealed import rejected", detail={"reason": str(reason)[:160], **detail})
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 
 def _bad(error: str, status: int = 400, **extra) -> tuple[dict, int]:
     return {"error": error, **extra}, status
+
+
+def _bad_from_value_error(e: ValueError, status: int = 400) -> tuple[dict, int]:
+    error = str(getattr(e, "error", "") or "")
+    if error == "material_empty":
+        detail = str(getattr(e, "detail", "") or str(e))
+        return _bad("material_empty", status, detail=detail)
+    return _bad(str(e), status)
 
 
 def _is_sealed_body(payload: dict) -> bool:
@@ -91,6 +191,7 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     env = payload.get("envelope")
     mode_hint = str(payload.get("mode") or "").strip().lower()
     if not isinstance(env, dict):
+        _log_resident_sealed_rejected(store, mode=mode_hint, reason="sealed_envelope_incomplete", env=env)
         return _bad("sealed_envelope_incomplete", 400)
     # Reuse the proven v1 content-envelope wire shape (the SAME one memory.add / identity /
     # the genesis chunk path already use, so the enclave decrypts it unchanged): body_ct +
@@ -100,16 +201,23 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     if str(env.get("visibility") or "") == "shared" and not env.get("K_enclave"):
         missing.append("K_enclave")
     if missing:
+        _log_resident_sealed_rejected(
+            store, mode=mode_hint, reason="sealed_envelope_incomplete", env=env, missing=missing)
         return _bad("sealed_envelope_incomplete", 400, missing=missing)
     if str(env.get("owner_user_id") or "") != store.user_id:
         # defense in depth (like identity.init / memory.add) — reject a mismatched owner.
+        _log_resident_sealed_rejected(store, mode=mode_hint, reason="envelope_owner_mismatch", env=env)
         return _bad("envelope_owner_mismatch", 403)
     try:
         encrypted_body = base64.b64decode(str(env.get("body_ct") or ""), validate=True)
     except Exception:
+        _log_resident_sealed_rejected(store, mode=mode_hint, reason="body_ct_invalid", env=env)
         return _bad("body_ct_invalid", 400)
     max_bytes = resident_distill_max_bytes()
     if len(encrypted_body) > max_bytes:
+        _log_resident_sealed_rejected(
+            store, mode=mode_hint, reason="material_too_large", env=env,
+            got_bytes=len(encrypted_body), max_bytes=max_bytes)
         return _bad("material_too_large", 413, max_bytes=max_bytes, got_bytes=len(encrypted_body))
 
     client_job_id = history_import._history_import_client_job_id(payload)
@@ -510,7 +618,8 @@ def plaintext_import(
     try:
         prepared = prepare(payload)
     except ValueError as e:
-        return _bad(str(e), 400)
+        _log_plaintext_import_rejected(store, mode=mode, reason=str(e), payload=payload)
+        return _bad_from_value_error(e, 400)
 
     if existing:
         existing = db.genesis_set_job_status(
@@ -551,7 +660,8 @@ def plaintext_import(
             "metadata": metadata,
         })
     except ValueError as e:
-        return _bad(str(e), 400)
+        _log_plaintext_import_rejected(store, mode=mode, reason=str(e), payload=payload)
+        return _bad_from_value_error(e, 400)
 
     job = db.genesis_set_job_status(
         store.user_id,

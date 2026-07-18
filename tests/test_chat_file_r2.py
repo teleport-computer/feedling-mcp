@@ -12,6 +12,7 @@ stands in for boto3 (reuses test_frame_r2).
 
 import base64
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -89,6 +90,41 @@ def test_offload_stores_pointer_and_chat_load_is_lazy(backend_env, monkeypatch):
     # chat_load is LAZY: returns the pointer, does NOT reconstitute.
     loaded = {m["id"]: m for m in db.chat_load(uid)}
     assert loaded[mid].get("body_key") and loaded[mid].get("body_ct") is None
+
+
+def test_idempotent_retry_offloads_winner_only_once(backend_env, monkeypatch):
+    class _PutCountingS3(_FakeS3):
+        def __init__(self):
+            super().__init__()
+            self.puts = 0
+
+        def put_object(self, Bucket, Key, Body, **kw):
+            self.puts += 1
+            return super().put_object(Bucket, Key, Body, **kw)
+
+    client = _PutCountingS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid(); seed_user(uid)
+    key = str(uuid.uuid4())
+    first = _file_doc(uid, "idem-file-first")
+    first["client_msg_id"] = key
+    retry = _file_doc(uid, "idem-file-retry")
+    retry["client_msg_id"] = key
+
+    first_winner, first_inserted = db.chat_append_idempotent(
+        uid, first["id"], time.time(), first, 100,
+        client_msg_id=key, window_sec=600,
+    )
+    retry_winner, retry_inserted = db.chat_append_idempotent(
+        uid, retry["id"], time.time(), retry, 100,
+        client_msg_id=key, window_sec=600,
+    )
+
+    assert first_inserted is True
+    assert retry_inserted is False
+    assert first_winner["id"] == retry_winner["id"] == first["id"]
+    assert client.puts == 1
+    assert len(client.store) == 1
 
 
 def test_hydrate_helper_reconstitutes(backend_env, monkeypatch):
