@@ -283,10 +283,10 @@ def set_config(key: str, value: bytes) -> None:
     mirror.execute(sql, (key, value))
 
 
-# The agent-runner supervisor heartbeats here each tick; the backend's
-# /v1/model_api/chat/send wedge guard reads it to confirm a supervisor is
-# actually hosting before routing a turn into the agent-runner (else the turn
-# would park in "processing" with no consumer to answer it).
+# Retired resident-supervisor compatibility records. Managed hosted execution
+# neither writes nor reads these rows; Runtime V2 liveness uses its own typed
+# turn-worker heartbeats. Keep the helpers only while old rows remain in schema
+# and account deletion/TEE reconciliation must understand them.
 AGENT_RUNTIME_SUPERVISOR_HEARTBEAT_KEY = "agent_runtime_supervisor_heartbeat"
 
 
@@ -2493,12 +2493,11 @@ def list_hosted_runtime_eligible_user_ids() -> list[str]:
 
 
 def list_hosted_runtime_nonresident_controls() -> list[tuple[str, str, str, int]]:
-    """Every control row that still grants or claims non-resident ownership.
+    """Compatibility inventory of controls not at the dormant resident fence.
 
-    Emergency fleet rollback cannot use the runnable-route roster alone: a V2
-    user's route may already have been deleted or marked failed while a
-    current-generation job/effect remains. Include those orphan/split controls
-    so ``resident_only`` fences them instead of reporting a false-green rollback.
+    This is not a rollback roster. Hosted execution is V2-only; the query is
+    retained for migration/account diagnostics until the legacy control values
+    themselves can be removed in a separate schema cleanup.
     """
     with get_pool().connection() as conn:
         rows = conn.execute(
@@ -6655,10 +6654,9 @@ def model_api_route_activate(user_id: str, route_id: str) -> bool:
 
     先在事务内 ``SELECT ... FOR UPDATE`` 确认目标 route 存在且属于该用户：不存在
     就直接返回 False、**绝不做任何写入**。否则第一条「清 active」的 UPDATE 会在
-    route_id 不存在/属于别人时把用户当前的 active route 误清掉——那会让他从
-    ``list_agent_runtime_enabled_users`` 的 roster 消失、supervisor 杀掉 consumer
-    且不自愈，客户端发一个陈旧 route_id 就能把自己的托管 agent 打停。``FOR UPDATE``
-    顺便锁住目标行，对并发也有好处。route_id 非法 UUID 字面量时 psycopg cast 抛异常，
+    route_id 不存在/属于别人时把用户当前的 active route 误清掉，导致 Runtime V2
+    找不到可执行 provider route。``FOR UPDATE`` 顺便锁住目标行，对并发也有好处。
+    route_id 非法 UUID 字面量时 psycopg cast 抛异常，
     被外层 except 接住返回 False——也是我们要的。"""
     try:
         with get_pool().connection() as conn:

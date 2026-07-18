@@ -53,9 +53,9 @@ from urllib.parse import urlsplit
 # Put the backend dir on sys.path BEFORE importing backend modules. When this is
 # run as a script (`python backend/model_api_runtime/v2/serve_worker.py` — how the
 # runner compose starts it), sys.path[0] is the script's own dir (…/v2), NOT
-# backend/ — so `from accounts import …` below would ImportError. Mirrors the same
-# bootstrap in agent_runtime/supervisor.py. Importing this module normally (tests,
-# which already put backend/ on the path) is unaffected: the insert is a no-op.
+# backend/ — so `from accounts import …` below would ImportError. Importing this
+# module normally (tests, which already put backend/ on the path) is unaffected:
+# the insert is a no-op.
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
@@ -198,11 +198,10 @@ def _configure_db_pool_capacity(max_workers: int) -> int:
         os.environ["FEEDLING_DB_POOL_MAX_SIZE"] = str(configured)
     return configured
 
-# Scope name matches the existing host-all/genesis-worker convention
-# (agent_runtime/supervisor.py mints "envelope_decrypt", not a colon-form) so a
-# future scope-enforcement change (currently the enclave's local HMAC check
-# only verifies signature+expiry+user_id, not scope — see enclave/auth.py
-# local_user_id_from_token) doesn't silently start rejecting this worker.
+# Keep the existing underscore-form scope stable so a future scope-enforcement
+# change (currently the enclave's local HMAC check only verifies
+# signature+expiry+user_id, not scope — see enclave/auth.py) does not silently
+# start rejecting the pooled worker.
 _RUNTIME_TOKEN_SCOPE = ["envelope_decrypt"]
 
 # Genesis mints its own token: a wider scope (it decrypts chunk envelopes AND calls
