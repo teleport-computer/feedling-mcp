@@ -923,9 +923,10 @@ def _mark_openai_chat_cache_breakpoint(
 
     OpenRouter accepts Anthropic's ``cache_control`` on a content block, not as
     a top-level Chat Completions parameter. The first system message is the
-    byte-stable tool/persona prefix. The last non-system message advances the
-    conversation prefix while deliberately excluding trailing per-turn system
-    grounding (for example live perception data).
+    byte-stable tool/persona prefix. Up to three recent non-system messages
+    advance the conversation prefix while preserving the prior turn's boundary
+    and deliberately excluding trailing per-turn system grounding (for example
+    live perception data).
     """
     updated = copy.deepcopy(messages)
     stable_candidates = [
@@ -942,7 +943,10 @@ def _mark_openai_chat_cache_breakpoint(
     if stable_candidates:
         candidates.append(stable_candidates[0])
     if advancing_candidates:
-        candidates.append(advancing_candidates[-1])
+        # Anthropic permits up to four breakpoints. Keep the three most recent
+        # conversation blocks marked so turn N+1 still carries turn N's exact
+        # breakpoint while adding a new advancing boundary.
+        candidates.extend(advancing_candidates[-3:])
     if not candidates:
         candidates = list(range(len(updated)))
     marked_any = False

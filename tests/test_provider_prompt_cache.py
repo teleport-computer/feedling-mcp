@@ -173,6 +173,7 @@ def test_v2_cache_breakpoints_exclude_dynamic_perception_grounding() -> None:
     ]
 
     assert controls_by_message[0] == [{"type": "ephemeral"}]
+    assert controls_by_message[1] == [{"type": "ephemeral"}]
     assert controls_by_message[-2] == [{"type": "ephemeral"}]
     assert controls_by_message[-1] == []
 
