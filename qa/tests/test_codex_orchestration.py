@@ -16,6 +16,7 @@ import pytest
 
 from qa import run_codex_profile_workers as launcher
 from qa import request_live_scenario_probe as live_request
+from qa import validate_cot_receipt as cot_receipts
 from qa import validate_diagnostic_attempts as diagnostic_attempts
 from qa import verify_codex_orchestration as verifier
 from qa import validate_live_scenario_receipts as live_receipts
@@ -231,6 +232,49 @@ def _passing_cot_receipt(profile_id: str) -> dict[str, Any]:
         "raw_thinking_stored": False,
         "raw_trace_stored": False,
     }
+
+
+def _request_failed_cot_receipt(
+    profile_id: str, *, after_ack: bool = False
+) -> dict[str, Any]:
+    receipt = _passing_cot_receipt(profile_id)
+    receipt.update(
+        {
+            "request_id": "request-1" if after_ack else "",
+            "turn_id": "request-1" if after_ack else "",
+            "trace_id": "request-1" if after_ack else "",
+            "reply_message_id": "",
+            "status": "UNVERIFIED",
+            "failure_code": "CHAT_REQUEST_FAILED",
+            "delivery_qualified": False,
+            "final_answer_correct": False,
+            "ack_latency_ms": 25.0 if after_ack else None,
+            "reply_latency_ms": None,
+            "model_duration_ms": None,
+            "provider_api_duration_ms": None,
+            "trace_dropped": False,
+            "model_call_count": 0,
+            "agent_reply_count": 0,
+            "chat_response_count": 0,
+            "chat_response_match_count": 0,
+            "model_thinking_present": False,
+            "model_thinking_len": 0,
+            "reasoning_event_count": 0,
+            "model_thinking_source": "",
+            "agent_reply_thinking_kind": "",
+            "delivered_thinking_present": False,
+            "delivered_thinking_len": 0,
+            "delivered_thinking_kind": "",
+            "delivered_thinking_source": "",
+            "delivered_thinking_model": "",
+            "delivered_thinking_native": None,
+            "metadata_present": False,
+            "user_visible_disclosure_present": False,
+            "token_metadata_status": "UNVERIFIED",
+            "reasoning_token_count": None,
+        }
+    )
+    return receipt
 
 
 def _cot_scenario_projection(receipt: dict[str, Any]) -> tuple[str, str | None]:
@@ -540,13 +584,22 @@ def _cot_probe_runner(mode: str = "valid") -> launcher.CotProbeRunner:
                 delivery_qualified=False,
                 final_answer_correct=False,
             )
+        elif mode in {"request-failed", "request-failed-after-ack"}:
+            receipt = _request_failed_cot_receipt(
+                spec.profile_id, after_ack=mode == "request-failed-after-ack"
+            )
         if mode == "missing":
             return receipt
         if mode == "malformed":
             spec.cot_receipt_path.write_text("{}\n")
             spec.cot_receipt_path.chmod(0o600)
             return receipt
-        if mode not in {"valid", "failed"}:
+        if mode not in {
+            "valid",
+            "failed",
+            "request-failed",
+            "request-failed-after-ack",
+        }:
             raise AssertionError(f"unknown trusted COT fixture mode: {mode}")
         spec.cot_receipt_path.write_text(
             json.dumps(receipt, sort_keys=True) + "\n"
@@ -613,21 +666,34 @@ def _passing_live_probe(
                         )
                     }
                 )
-        cot = _passing_cot_receipt(spec.profile_id)
-        turns.append(
-            {
-                "request_id": cot["request_id"],
-                "turn_id": cot["turn_id"],
-                "trace_id": cot["trace_id"],
-                "ack_latency_ms": cot["ack_latency_ms"],
-                "reply_latency_ms": cot["reply_latency_ms"],
-                "reply_count": cot["chat_response_match_count"],
-                "content_assertion_passed": cot["final_answer_correct"],
-                "fallback_detected": False,
-                "duplicate_detected": False,
-                "out_of_order_detected": False,
-            }
+        try:
+            cot, _ = cot_receipts.validate_cot_receipt(
+                spec.cot_receipt_path, spec.profile_id
+            )
+        except (cot_receipts.CotReceiptError, OSError):
+            cot = None
+        cot_ids = (
+            tuple(cot[field] for field in ("request_id", "turn_id", "trace_id"))
+            if cot is not None
+            else ()
         )
+        if cot is not None and all(cot_ids):
+            turns.append(
+                {
+                    "request_id": cot["request_id"],
+                    "turn_id": cot["turn_id"],
+                    "trace_id": cot["trace_id"],
+                    "ack_latency_ms": cot["ack_latency_ms"],
+                    "reply_latency_ms": cot["reply_latency_ms"],
+                    "reply_count": cot["chat_response_match_count"],
+                    "content_assertion_passed": cot["final_answer_correct"],
+                    "fallback_detected": False,
+                    "duplicate_detected": cot["chat_response_count"] != 1,
+                    "out_of_order_detected": (
+                        cot["chat_response_match_count"] != 1
+                    ),
+                }
+            )
         assert len(turns) <= turn_count
         turns = [
             {
@@ -659,8 +725,13 @@ def _passing_live_probe(
         scenario_id == "P0-13"
         and spec.environment["QA_QUALIFICATION_MODE"] == "diagnostic"
     )
-    status = "BLOCKED_EVIDENCE" if diagnostic_cleanup else "PASS"
-    failure_code = "PRECONDITION_MISSING" if diagnostic_cleanup else "NONE"
+    incomplete_trace = scenario_id == "P0-13" and len(turns) != turn_count
+    if diagnostic_cleanup:
+        status, failure_code = "BLOCKED_EVIDENCE", "PRECONDITION_MISSING"
+    elif incomplete_trace:
+        status, failure_code = "BLOCKED_EVIDENCE", "TRACE_UNAVAILABLE"
+    else:
+        status, failure_code = "PASS", "NONE"
     assertions = {
         key: True
         for key in live_receipts.DETERMINISTIC_ASSERTIONS[scenario_id]
@@ -668,6 +739,8 @@ def _passing_live_probe(
     if diagnostic_cleanup:
         assertions["cleanup_confirmed"] = False
         assertions["trace_correlation_confirmed"] = len(turns) == turn_count
+    elif incomplete_trace:
+        assertions["trace_correlation_confirmed"] = False
     projection: dict[str, Any] | None = None
     if scenario_id == "P0-06":
         projection = {
@@ -701,7 +774,7 @@ def _passing_live_probe(
                 "provider_config_deleted": not diagnostic_cleanup,
                 "account_reset": not diagnostic_cleanup,
                 "old_credential_rejected": not diagnostic_cleanup,
-                "status": status,
+                "status": "BLOCKED_EVIDENCE" if diagnostic_cleanup else "PASS",
             },
         }
     private_facts = {
@@ -1006,20 +1079,23 @@ def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
             "stage_latency_ms"
         ]
     existing_trace_ids = {turn["trace_id"] for turn in bound_turns}
-    cot_turn = next(
+    cot_turns = [
         turn
         for turn in trace_cleanup_receipt["turns"]
         if turn["trace_id"] not in existing_trace_ids
-    )
-    bound_turns.append(
-        {
-            "scenario_id": "P0-12",
-            **cot_turn,
-            "content_assertion_passed": bool(
-                cot_turn["content_assertion_passed"]
-            ),
-        }
-    )
+    ]
+    assert len(cot_turns) <= 1
+    if cot_turns:
+        cot_turn = cot_turns[0]
+        bound_turns.append(
+            {
+                "scenario_id": "P0-12",
+                **cot_turn,
+                "content_assertion_passed": bool(
+                    cot_turn["content_assertion_passed"]
+                ),
+            }
+        )
     result["turns"] = bound_turns
     result["latency"] = trace_cleanup_projection["latency"]
     result["trace"] = trace_cleanup_projection["trace"]
@@ -1092,6 +1168,7 @@ def _successful_runner(
     failed_scenario_command: str | None = None,
     wrong_sop_read: bool = False,
     cot_mode: str = "valid",
+    synchronize: bool = True,
 ) -> launcher.ProcessRunner:
     lock = threading.Lock()
     cap = verifier.MAX_CONFIGURED_CONCURRENCY
@@ -1109,7 +1186,8 @@ def _successful_runner(
         # Nested fake-worker threads can take more than five seconds to be
         # scheduled on a loaded GitHub runner.  Keep this finite so a real
         # launcher concurrency regression still fails instead of hanging.
-        barrier.wait(timeout=30)
+        if synchronize:
+            barrier.wait(timeout=30)
         schema = json.loads(spec.schema_path.read_text())
         result = _instance(schema, schema["$defs"])
         if invalid_result and index == 0:
@@ -1247,6 +1325,11 @@ def _successful_runner(
                 delivery_qualified=False,
                 final_answer_correct=False,
             )
+        elif cot_mode in {"request-failed", "request-failed-after-ack"}:
+            expected_receipt = _request_failed_cot_receipt(
+                spec.profile_id,
+                after_ack=cot_mode == "request-failed-after-ack",
+            )
         _request_passing_cot_probe(spec, expected_receipt)
         _request_passing_live_probes(spec)
         if cot_mode == "binding-mismatch":
@@ -1270,6 +1353,8 @@ def _successful_runner(
             "missing",
             "malformed",
             "failed",
+            "request-failed",
+            "request-failed-after-ack",
         }:
             raise AssertionError(f"unknown COT fixture mode: {cot_mode}")
         staged_final_events = spec.events_path.with_name(
@@ -2608,11 +2693,156 @@ def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
     )
     assert result["profile_id"] == "official-gemini"
     assert result["status"] == "BLOCKED_EVIDENCE"
-    assert next(
-        turn for turn in result["turns"] if turn["scenario_id"] == "P0-12"
-    )["turn_index"] == 1
+    assert len(result["turns"]) == 14
+    assert all(turn["scenario_id"] != "P0-12" for turn in result["turns"])
+    assert result["latency"]["sample_count"] == 14
     assert worker["cot_receipt_sha256"] is None
     assert worker["cot_delivery_status"] is None
+
+
+@pytest.mark.parametrize(
+    ("cot_mode", "expected_turn_count", "expected_cot_turn_count"),
+    (
+        ("request-failed", 14, 0),
+        ("request-failed-after-ack", 15, 1),
+    ),
+)
+def test_diagnostic_projects_negative_cot_before_holistic_attempt_validation(
+    tmp_path, cot_mode, expected_turn_count, expected_cot_turn_count
+):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+    successful = _successful_runner(
+        [], cot_mode=cot_mode, synchronize=False
+    )
+
+    def runner(spec: launcher.WorkerSpec, timeout: int) -> int:
+        code = successful(spec, timeout)
+        result = json.loads(spec.result_path.read_text())
+        scenario = next(
+            row for row in result["scenarios"] if row["scenario_id"] == "P0-12"
+        )
+        stale_failure = {
+            "category": "BLOCKED_EVIDENCE",
+            "stage_code": "REASONING",
+            "failure_code": "PRECONDITION_MISSING",
+            "reproducible": True,
+        }
+        scenario.update(
+            {
+                "status": "BLOCKED_EVIDENCE",
+                "attempt_results": [
+                    {
+                        "attempt": 1,
+                        "status": "BLOCKED_EVIDENCE",
+                        "failure": dict(stale_failure),
+                    }
+                ],
+                "failure": stale_failure,
+            }
+        )
+        spec.result_path.write_text(json.dumps(result) + "\n")
+        return code
+
+    receipt = _launch_diagnostic(
+        paths,
+        runner,
+        cot_probe_runner=_cot_probe_runner(cot_mode),
+    )
+    worker = receipt["workers"][0]
+    result = json.loads(
+        (paths["aggregation"] / "official-gemini.json").read_text()
+    )
+    assert worker["result_source"] == "codex_worker", worker
+    assert worker["fallback_reason"] is None
+    scenario = next(
+        row for row in result["scenarios"] if row["scenario_id"] == "P0-12"
+    )
+    cot_turns = [
+        turn for turn in result["turns"] if turn["scenario_id"] == "P0-12"
+    ]
+
+    assert worker["cot_evidence_failure"] is None
+    assert worker["cot_delivery_status"] == "UNVERIFIED"
+    assert worker["cot_failure_code"] == "CHAT_REQUEST_FAILED"
+    assert scenario["status"] == "BLOCKED_EVIDENCE"
+    assert scenario["failure"] == {
+        "category": "BLOCKED_EVIDENCE",
+        "stage_code": "REASONING",
+        "failure_code": "TRACE_UNAVAILABLE",
+        "reproducible": True,
+    }
+    assert scenario["attempt_results"][0]["failure"] == scenario["failure"]
+    assert len(result["turns"]) == expected_turn_count
+    assert len(cot_turns) == expected_cot_turn_count
+    assert result["latency"]["sample_count"] == expected_turn_count
+    if cot_turns:
+        assert cot_turns[0]["request_id"] == "request-1"
+        assert cot_turns[0]["duplicate_detected"] is True
+        assert cot_turns[0]["out_of_order_detected"] is True
+
+
+@pytest.mark.parametrize(
+    ("cot_mode", "tamper_mode"),
+    (
+        ("request-failed", "unexpected-extra"),
+        ("request-failed-after-ack", "missing-required"),
+    ),
+)
+def test_diagnostic_rejects_p0_13_cot_trace_cardinality_tampering(
+    tmp_path, cot_mode, tamper_mode
+):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+
+    def tampered_probe(spec, scenario_id, attempt, nonce, prior_receipts):
+        receipt, facts = _passing_live_probe(
+            spec, scenario_id, attempt, nonce, prior_receipts
+        )
+        if scenario_id != "P0-13":
+            return receipt, facts
+        turns = receipt["turns"]
+        if tamper_mode == "unexpected-extra":
+            forged = json.loads(json.dumps(turns[-1]))
+            forged.update(
+                {
+                    "turn_index": len(turns) + 1,
+                    "request_id": "forged-cot-request",
+                    "turn_id": "forged-cot-turn",
+                    "trace_id": "forged-cot-trace",
+                }
+            )
+            turns.append(forged)
+        else:
+            turns.pop()
+        receipt["turn_ids"] = [turn["turn_id"] for turn in turns]
+        receipt["trace_ids"] = [turn["trace_id"] for turn in turns]
+        projection = receipt["result_projection"]
+        projection["latency"] = live_receipts.latency_projection(turns)
+        projection["trace"]["correlated_event_count"] = len(turns) * 5
+        receipt["assertions"].update(
+            {
+                "trace_stages_complete": True,
+                "trace_correlation_confirmed": (
+                    len(turns) == 15
+                    and len({turn["trace_id"] for turn in turns}) == 15
+                ),
+                "latency_attributed": True,
+                "cleanup_confirmed": False,
+            }
+        )
+        return receipt, facts
+
+    receipt = _launch_diagnostic(
+        paths,
+        _successful_runner([], cot_mode=cot_mode, synchronize=False),
+        cot_probe_runner=_cot_probe_runner(cot_mode),
+        live_probe_runner=tampered_probe,
+    )
+    worker = receipt["workers"][0]
+
+    assert worker["result_source"] == "deterministic_fallback"
+    assert worker["fallback_reason"] == "WORKER_RESULT_INVALID"
+    assert worker["failure_stage"] == "LIVE_RECEIPT_PROJECTION"
+    assert worker["failure_code"] == "LIVE_RECEIPT_PROJECTION_INVALID"
 
 
 def test_diagnostic_canonicalizes_parent_owned_live_and_cot_evidence(tmp_path):
@@ -2939,6 +3169,19 @@ def test_diagnostic_trusted_probe_error_is_receipted_and_sequence_continues(
         )
         _request_passing_cot_probe(spec)
         _request_passing_live_probes(spec)
+        result = json.loads(spec.result_path.read_text())
+        scenario = next(
+            row for row in result["scenarios"] if row["scenario_id"] == "P0-09"
+        )
+        stale_failure = {
+            "category": "BLOCKED_EVIDENCE",
+            "stage_code": "RELIABILITY_CHAT",
+            "failure_code": "PRECONDITION_MISSING",
+            "reproducible": True,
+        }
+        scenario["failure"] = stale_failure
+        scenario["attempt_results"][0]["failure"] = dict(stale_failure)
+        spec.result_path.write_text(json.dumps(result) + "\n")
         return 0
 
     def crashing_probe(spec, scenario_id, attempt, nonce, prior_receipts):
@@ -2974,6 +3217,129 @@ def test_diagnostic_trusted_probe_error_is_receipted_and_sequence_continues(
     assert by_id["P0-11"]["scenario_id"] == "P0-11"
     assert by_id["P0-13"]["scenario_id"] == "P0-13"
     assert result["scenarios"][8]["status"] == "BLOCKED_EVIDENCE"
+    assert result["scenarios"][8]["failure"] == {
+        "category": "BLOCKED_EVIDENCE",
+        "stage_code": "RELIABILITY_CHAT",
+        "failure_code": "TRACE_UNAVAILABLE",
+        "reproducible": True,
+    }
+    assert (
+        result["scenarios"][8]["attempt_results"][0]["failure"]
+        == result["scenarios"][8]["failure"]
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "target_scenario",
+        "trusted_status",
+        "trusted_code",
+        "expected_stage",
+        "expected_code",
+    ),
+    (
+        (
+            "P0-07",
+            "PRODUCT_FAIL",
+            "ASSERTION_FAILED",
+            "ACTIVATION",
+            "UNCLASSIFIED_PRODUCT_FAILURE",
+        ),
+        (
+            "P0-10",
+            "BLOCKED_EVIDENCE",
+            "LIVE_PROBE_ERROR",
+            "MEMORY_PERSONA",
+            "TRACE_UNAVAILABLE",
+        ),
+    ),
+)
+def test_diagnostic_replaces_stale_failure_with_trusted_live_failure(
+    tmp_path,
+    target_scenario,
+    trusted_status,
+    trusted_code,
+    expected_stage,
+    expected_code,
+):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+    successful = _successful_runner([], synchronize=False)
+
+    def runner(spec: launcher.WorkerSpec, timeout: int) -> int:
+        code = successful(spec, timeout)
+        result = json.loads(spec.result_path.read_text())
+        scenario = next(
+            row
+            for row in result["scenarios"]
+            if row["scenario_id"] == target_scenario
+        )
+        stale_failure = {
+            "category": "BLOCKED_EVIDENCE",
+            "stage_code": expected_stage,
+            "failure_code": "PRECONDITION_MISSING",
+            "reproducible": True,
+        }
+        scenario["failure"] = stale_failure
+        scenario["attempt_results"][0]["failure"] = dict(stale_failure)
+        semantic_assertions = live_receipts.SEMANTIC_ASSERTIONS[target_scenario]
+        if semantic_assertions:
+            scenario["assertions"] = {
+                assertion: True for assertion in semantic_assertions
+            }
+        spec.result_path.write_text(json.dumps(result) + "\n")
+        return code
+
+    def failed_probe(spec, scenario_id, attempt, nonce, prior_receipts):
+        receipt, facts = _passing_live_probe(
+            spec, scenario_id, attempt, nonce, prior_receipts
+        )
+        if scenario_id == target_scenario:
+            receipt.update(
+                {
+                    "status": trusted_status,
+                    "failure_code": trusted_code,
+                    "request_ids": [],
+                    "turn_ids": [],
+                    "trace_ids": [],
+                    "turns": [],
+                }
+            )
+            receipt["assertions"] = {
+                assertion: False
+                for assertion in live_receipts.DETERMINISTIC_ASSERTIONS[scenario_id]
+            }
+        return receipt, facts
+
+    receipt = _launch_diagnostic(
+        paths,
+        runner,
+        live_probe_runner=failed_probe,
+    )
+    worker = receipt["workers"][0]
+    result = json.loads(
+        (paths["aggregation"] / "official-gemini.json").read_text()
+    )
+    assert worker["result_source"] == "codex_worker", worker
+    assert worker["fallback_reason"] is None
+    scenario = next(
+        row
+        for row in result["scenarios"]
+        if row["scenario_id"] == target_scenario
+    )
+    expected_failure = {
+        "category": trusted_status,
+        "stage_code": expected_stage,
+        "failure_code": expected_code,
+        "reproducible": True,
+    }
+
+    assert scenario["status"] == trusted_status
+    assert scenario["failure"] == expected_failure
+    assert scenario["attempt_results"][0]["failure"] == expected_failure
+    assert all(
+        scenario["assertions"][assertion] is False
+        for assertion in live_receipts.SEMANTIC_ASSERTIONS[target_scenario]
+    )
 
 
 def test_diagnostic_p0_13_probe_error_preserves_agent_result(tmp_path):

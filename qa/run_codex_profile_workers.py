@@ -2450,7 +2450,11 @@ def _validate_projected_result_shape(
 
 
 def _failure_projection(
-    *, status: str, stage_code: str, failure_code: str
+    *,
+    status: str,
+    stage_code: str,
+    failure_code: str,
+    reproducible: bool = True,
 ) -> dict[str, Any] | None:
     if status == "PASS":
         return None
@@ -2458,11 +2462,69 @@ def _failure_projection(
         "category": status,
         "stage_code": stage_code,
         "failure_code": failure_code,
-        "reproducible": True,
+        "reproducible": reproducible,
     }
 
 
 _TRACE_STAGE_NAMES = ("routing", "queue", "provider", "persistence", "delivery")
+_LIVE_FAILURE_STAGES = {
+    "P0-02": "ONBOARDING",
+    "P0-03": "INVALID_KEY_VALIDATION",
+    "P0-04": "VALID_KEY_RECOVERY",
+    "P0-05": "RUNTIME_SELECTION",
+    "P0-06": "PERSONA_IMPORT",
+    "P0-07": "ACTIVATION",
+    "P0-08": "BASIC_CHAT",
+    "P0-09": "RELIABILITY_CHAT",
+    "P0-10": "MEMORY_PERSONA",
+    "P0-11": "IDENTITY",
+    "P0-13": "TRACE_LATENCY_CLEANUP",
+}
+_LIVE_FAILURE_CODES = {
+    "LIVE_PROBE_ERROR": "TRACE_UNAVAILABLE",
+    "ASSERTION_FAILED": "UNCLASSIFIED_PRODUCT_FAILURE",
+    "CHAT_TIMEOUT": "CHAT_TIMEOUT",
+    "MISSING_REPLY": "MISSING_REPLY",
+    "PRECONDITION_MISSING": "PRECONDITION_MISSING",
+    "CLEANUP_FAILED": "CLEANUP_FAILED",
+    "TRACE_UNAVAILABLE": "TRACE_UNAVAILABLE",
+    "TRACE_INCOMPLETE": "TRACE_INCOMPLETE",
+}
+
+
+def _trusted_live_failure_projection(
+    scenario_id: str,
+    receipt: Mapping[str, Any],
+    *,
+    reproducible: bool = True,
+) -> dict[str, Any] | None:
+    """Canonicalize one parent-owned non-PASS live observation.
+
+    The worker may describe semantic failures only after a successful transport
+    probe.  Once the trusted parent reports a non-PASS transport outcome, the
+    parent owns the complete failure tuple; retaining an agent-authored
+    ``PRECONDITION_MISSING`` would incorrectly claim the live operation never
+    ran and fail the attempt validator.
+    """
+
+    status = receipt.get("status")
+    raw_failure_code = receipt.get("failure_code")
+    if status == "PASS":
+        if raw_failure_code != "NONE":
+            raise WorkerLaunchError("live diagnostic failure is unavailable")
+        return None
+    stage_code = _LIVE_FAILURE_STAGES.get(scenario_id)
+    failure_code = _LIVE_FAILURE_CODES.get(str(raw_failure_code))
+    if stage_code is None or failure_code is None:
+        raise WorkerLaunchError("live diagnostic failure is unavailable")
+    if scenario_id == "P0-13" and raw_failure_code == "PRECONDITION_MISSING":
+        stage_code = "CLEANUP"
+    return _failure_projection(
+        status=str(status),
+        stage_code=stage_code,
+        failure_code=failure_code,
+        reproducible=reproducible,
+    )
 
 
 def _failed_trace_cleanup_receipt(
@@ -2628,12 +2690,15 @@ def _validate_diagnostic_live_projection(
 
 
 def _project_diagnostic_live_evidence(
-    profile_result: Mapping[str, Any], aggregate: Mapping[str, Any]
+    profile_result: Mapping[str, Any],
+    aggregate: Mapping[str, Any],
+    cot_receipt: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Install receipt-owned live fields without replacing agent semantics.
+    """Install receipt-owned live fields and authoritative transport failures.
 
     The agent remains the judge for P0-10/P0-11 and authors the P0-06 semantic
-    judgment.  The parent already binds that persona judgment independently.
+    judgment only when the trusted parent probe passes.  A non-PASS parent
+    receipt owns the complete failure tuple, including for semantic scenarios.
     Identifiers, timestamps, transport assertions, stage latencies, cleanup,
     and the bound persona finalizer are deterministic receipt facts and should
     never depend on a model copying long opaque values without a typo.
@@ -2719,20 +2784,43 @@ def _project_diagnostic_live_evidence(
         attempt_results = scenario.get("attempt_results")
         if not isinstance(attempt_results, list) or len(attempt_results) != len(rows):
             raise WorkerLaunchError("live diagnostic projection is unavailable")
+        bounded_retry = bool(
+            len(rows) == 2
+            and rows[0].get("status") == "AGENT_ERROR"
+            and rows[0].get("failure_code") in {"CHAT_TIMEOUT", "MISSING_REPLY"}
+            and rows[1].get("status") == "PASS"
+        )
         for index, (attempt_result, receipt) in enumerate(
             zip(attempt_results, rows, strict=True), start=1
         ):
             if not isinstance(attempt_result, dict):
                 raise WorkerLaunchError("live diagnostic projection is unavailable")
             attempt_result["attempt"] = index
-            if scenario_id in deterministic_scenarios or receipt["status"] != "PASS":
+            if receipt["status"] != "PASS":
                 attempt_result["status"] = receipt["status"]
-                if receipt["status"] == "PASS":
-                    attempt_result["failure"] = None
+                attempt_result["failure"] = _trusted_live_failure_projection(
+                    scenario_id,
+                    receipt,
+                    reproducible=not (bounded_retry and index == 1),
+                )
+            elif scenario_id in deterministic_scenarios:
+                attempt_result["status"] = "PASS"
+                attempt_result["failure"] = None
         if scenario_id in deterministic_scenarios:
             scenario["status"] = rows[-1]["status"]
-            if scenario["status"] == "PASS":
-                scenario["failure"] = None
+            scenario["failure"] = _trusted_live_failure_projection(
+                scenario_id, rows[-1]
+            )
+        elif scenario_id != "P0-06" and rows[-1]["status"] != "PASS":
+            scenario["status"] = rows[-1]["status"]
+            scenario["failure"] = _trusted_live_failure_projection(
+                scenario_id, rows[-1]
+            )
+            for semantic_assertion in rows[-1]["semantic_assertions"]:
+                if semantic_assertion in assertions:
+                    assertions[semantic_assertion] = False
+        if rows[-1]["status"] != "PASS" and result.get("status") == "PASS":
+            result["status"] = rows[-1]["status"]
 
         if scenario_id == "P0-06":
             if parent_persona is None and rows[-1]["status"] != "PASS":
@@ -2844,24 +2932,7 @@ def _project_diagnostic_live_evidence(
         if scenario_id == "P0-13":
             receipt = rows[-1]
             status = str(receipt["status"])
-            failed_trace_cleanup = bool(
-                receipt.get("result_projection") is None
-                and receipt.get("failure_code") == "LIVE_PROBE_ERROR"
-            )
-            failure_code = (
-                "TRACE_UNAVAILABLE"
-                if failed_trace_cleanup
-                else str(receipt["failure_code"])
-            )
-            failure = _failure_projection(
-                status=status,
-                stage_code=(
-                    "CLEANUP"
-                    if failure_code == "PRECONDITION_MISSING"
-                    else "TRACE_LATENCY_CLEANUP"
-                ),
-                failure_code=failure_code,
-            )
+            failure = _trusted_live_failure_projection(scenario_id, receipt)
             scenario.update(
                 {
                     "status": status,
@@ -2959,9 +3030,44 @@ def _project_diagnostic_live_evidence(
         for turn in trace_turns
         if isinstance(turn, Mapping) and turn.get("trace_id") not in existing_trace_ids
     ]
+    cot_ids = (
+        tuple(cot_receipt.get(field) for field in ("request_id", "turn_id", "trace_id"))
+        if cot_receipt is not None
+        else ()
+    )
+    usable_cot_ids = bool(
+        cot_receipt is not None
+        and all(isinstance(value, str) and value for value in cot_ids)
+    )
+    if cot_receipt is not None and not usable_cot_ids and any(cot_ids):
+        raise WorkerLaunchError("live diagnostic projection is unavailable")
+    if not usable_cot_ids:
+        if cot_turns:
+            raise WorkerLaunchError("live diagnostic projection is unavailable")
+        result["turns"] = projected_turns
+        result["latency"] = deepcopy(projection["latency"])
+        result["trace"] = deepcopy(projection["trace"])
+        result["cleanup"] = deepcopy(projection["cleanup"])
+        return result
     if len(cot_turns) != 1:
         raise WorkerLaunchError("live diagnostic projection is unavailable")
     cot_turn = cot_turns[0]
+    expected_cot_turn = {
+        "request_id": cot_ids[0],
+        "turn_id": cot_ids[1],
+        "trace_id": cot_ids[2],
+        "ack_latency_ms": cot_receipt.get("ack_latency_ms"),
+        "reply_latency_ms": cot_receipt.get("reply_latency_ms"),
+        "reply_count": cot_receipt.get("chat_response_match_count"),
+        "content_assertion_passed": cot_receipt.get("final_answer_correct"),
+        "fallback_detected": False,
+        "duplicate_detected": cot_receipt.get("chat_response_count") != 1,
+        "out_of_order_detected": cot_receipt.get("chat_response_match_count") != 1,
+    }
+    if any(
+        cot_turn.get(field) != value for field, value in expected_cot_turn.items()
+    ):
+        raise WorkerLaunchError("live diagnostic projection is unavailable")
     projected_turns.append(
         {
             "scenario_id": "P0-12",
@@ -3489,6 +3595,22 @@ def launch(
             failure_stage = "PROCESS_EXIT"
             failure_code = "PROCESS_EXIT_NONZERO"
         elif diagnostic:
+            cot_path = spec.cot_receipt_path
+            if not cot_path.exists():
+                cot_evidence_failure = _DIAGNOSTIC_FALLBACK_COT_MISSING
+                failure_stage = "COT_RECEIPT_LOAD"
+                failure_code = "COT_RECEIPT_MISSING"
+            else:
+                try:
+                    cot_receipt, cot_receipt_sha256 = validate_cot_receipt(
+                        cot_path, spec.profile_id
+                    )
+                except (CotReceiptError, OSError):
+                    cot_receipt = None
+                    cot_receipt_sha256 = None
+                    cot_evidence_failure = _DIAGNOSTIC_FALLBACK_COT_INVALID
+                    failure_stage = "COT_RECEIPT_LOAD"
+                    failure_code = "COT_RECEIPT_INVALID"
             try:
                 try:
                     (
@@ -3538,13 +3660,24 @@ def launch(
                     )
                 try:
                     profile_result = _project_diagnostic_live_evidence(
-                        profile_result, live_receipts
+                        profile_result, live_receipts, cot_receipt
                     )
                 except (WorkerLaunchError, DiagnosticAttemptError, OSError):
                     raise DiagnosticWorkerEvidenceError(
                         "LIVE_RECEIPT_PROJECTION",
                         "LIVE_RECEIPT_PROJECTION_INVALID",
                     ) from None
+                if cot_receipt is not None:
+                    try:
+                        profile_result = _project_diagnostic_cot_evidence(
+                            profile_result, cot_receipt
+                        )
+                    except WorkerLaunchError:
+                        cot_evidence_failure = _DIAGNOSTIC_COT_BINDING_MISMATCH
+                        raise DiagnosticWorkerEvidenceError(
+                            "COT_BINDING",
+                            _DIAGNOSTIC_COT_BINDING_MISMATCH,
+                        ) from None
                 try:
                     _validate_projected_result_shape(spec, profile_result)
                 except WorkerLaunchError:
@@ -3561,6 +3694,15 @@ def launch(
                     raise DiagnosticWorkerEvidenceError(
                         "LIVE_RECEIPT_BINDING", "LIVE_RECEIPT_BINDING_INVALID"
                     ) from None
+                if cot_receipt is not None:
+                    try:
+                        _validate_cot_result_binding(profile_result, cot_receipt)
+                    except WorkerLaunchError:
+                        cot_evidence_failure = _DIAGNOSTIC_COT_BINDING_MISMATCH
+                        raise DiagnosticWorkerEvidenceError(
+                            "COT_BINDING",
+                            _DIAGNOSTIC_COT_BINDING_MISMATCH,
+                        ) from None
                 try:
                     events_sha256 = file_sha256(
                         spec.events_path,
@@ -3609,45 +3751,6 @@ def launch(
                 fallback_reason = _DIAGNOSTIC_FALLBACK_WORKER_EVIDENCE
                 failure_stage = "WORKER_EVIDENCE"
                 failure_code = "WORKER_EVIDENCE_INVALID"
-            cot_path = spec.cot_receipt_path
-            if not cot_path.exists():
-                cot_evidence_failure = _DIAGNOSTIC_FALLBACK_COT_MISSING
-                if failure_stage is None:
-                    failure_stage = "COT_RECEIPT_LOAD"
-                    failure_code = "COT_RECEIPT_MISSING"
-            else:
-                try:
-                    cot_receipt, cot_receipt_sha256 = validate_cot_receipt(
-                        cot_path, spec.profile_id
-                    )
-                except (CotReceiptError, OSError):
-                    cot_receipt = None
-                    cot_receipt_sha256 = None
-                    cot_evidence_failure = _DIAGNOSTIC_FALLBACK_COT_INVALID
-                    if failure_stage is None:
-                        failure_stage = "COT_RECEIPT_LOAD"
-                        failure_code = "COT_RECEIPT_INVALID"
-                else:
-                    if fallback_reason is None:
-                        try:
-                            projected = _project_diagnostic_cot_evidence(
-                                profile_result, cot_receipt
-                            )
-                            _validate_projected_result_shape(spec, projected)
-                            validate_live_attempts(projected)
-                            _validate_cot_result_binding(
-                                projected, cot_receipt
-                            )
-                            profile_result = projected
-                        except (DiagnosticAttemptError, WorkerLaunchError):
-                            # The deterministic receipt remains trustworthy even
-                            # when the agent-authored projection disagrees with it.
-                            cot_evidence_failure = (
-                                _DIAGNOSTIC_COT_BINDING_MISMATCH
-                            )
-                            if failure_stage is None:
-                                failure_stage = "COT_BINDING"
-                                failure_code = _DIAGNOSTIC_COT_BINDING_MISMATCH
             if fallback_reason is not None:
                 thread_id = None
                 session_id = None
