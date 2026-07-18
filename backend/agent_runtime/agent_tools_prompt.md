@@ -13,6 +13,7 @@ Run (the absolute path is provided by the host):
 
 ```
 python <io_cli> perception <signal> [<signal> ...]
+python <io_cli> perception-recent-apps [--limit <n>] [--hours <n>]
 python <io_cli> perception-trend <signal> [--field <field>] [--days <n>]
 python <io_cli> perception-history <signal> [--days <n>]
 python <io_cli> memory-index [--query <text>] [--limit <n>] [--bucket <name>] [--thread <tag>]
@@ -33,7 +34,25 @@ python <io_cli> chat-image --id <message_id>
 - Fast: `now`, `location`, `weather`, `motion`, `calendar`
 - Slow: `steps`, `sleep`, `workout`, `vitals`, `activity`, `body`, `metabolic`,
   `cycle`, `mood`, `reminders`
-- Extra: `focus` (is the user in a focus mode), `audio_route` (headphones/car)
+- Extra: `focus` (is the user in a focus mode), `audio_route` (headphones/car),
+  `app` (the last app-open seen in the past 15 minutes — null otherwise)
+
+### Apps: `app` vs `perception-recent-apps`
+
+The Shortcut reports app **opens** and never closes. So `app` means "the last
+app I saw them open, within 15 minutes" — NOT "this is on their screen now".
+Phrase it that way; don't assert they are currently using it.
+
+When the user asks what they've *been* doing or using ("我刚在干嘛", "最近用了
+什么 app"), call `perception-recent-apps` — app-open history, newest first, each
+with `minutes_ago` and `category`. **Always check `minutes_ago` before calling
+something "刚才"** — the list is not time-bounded by default, so the oldest
+entries can be days old.
+
+Two empty cases, don't conflate them:
+- `apps: []` — no app data. Say you don't know; never guess an app name.
+- `disabled: true` with a `reason` — the user switched app perception off.
+  Say you can't see it, don't imply they haven't used anything.
 
 ## Memory (strict two-step: index → fetch)
 
