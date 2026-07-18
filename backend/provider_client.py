@@ -292,19 +292,75 @@ def _headers(config: ProviderConfig) -> dict[str, str]:
     return headers
 
 
+def _collect_provider_error_details(
+    value: Any,
+    output: list[str],
+    *,
+    depth: int = 0,
+) -> None:
+    """Collect bounded provider error text from known wrapper fields only.
+
+    OpenRouter may surface an upstream Anthropic/OpenAI error as JSON encoded
+    inside ``error.metadata.raw`` while the outer message says only "Provider
+    returned error".  We need the upstream field name to make a safe,
+    one-field compatibility downgrade, but must not walk arbitrary response
+    payloads that could echo request content.
+    """
+    if depth > 5 or len(output) >= 8:
+        return
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return
+        if text[:1] in {"{", "["}:
+            try:
+                decoded = json.loads(text)
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, (dict, list)):
+                _collect_provider_error_details(
+                    decoded, output, depth=depth + 1)
+                return
+        output.append(text[:240])
+        return
+    if isinstance(value, list):
+        for item in value[:4]:
+            _collect_provider_error_details(item, output, depth=depth + 1)
+        return
+    if not isinstance(value, dict):
+        return
+    for field in ("error", "message", "detail", "raw"):
+        if field in value:
+            _collect_provider_error_details(
+                value[field], output, depth=depth + 1)
+    metadata = value.get("metadata")
+    if isinstance(metadata, dict):
+        for field in ("raw", "error", "message", "detail"):
+            if field in metadata:
+                _collect_provider_error_details(
+                    metadata[field], output, depth=depth + 1)
+    for field in ("code", "status"):
+        if field in value:
+            _collect_provider_error_details(
+                value[field], output, depth=depth + 1)
+
+
 def _response_error_detail(resp: httpx.Response) -> str:
     try:
         body = resp.json()
         if isinstance(body, dict):
-            err = body.get("error")
-            if isinstance(err, dict):
-                detail = err.get("message") or err.get("code") or err.get("status") or ""
-                return str(detail)[:240]
-            if isinstance(err, str):
-                return err[:240]
-            message = body.get("message")
-            if isinstance(message, str):
-                return message[:240]
+            details: list[str] = []
+            _collect_provider_error_details(body, details)
+            generic = {
+                "provider returned error",
+                "upstream provider error",
+                "provider error",
+            }
+            for detail in details:
+                if detail.strip().lower() not in generic:
+                    return detail[:240]
+            if details:
+                return details[0][:240]
     except Exception:
         pass
     return resp.text[:240]
@@ -918,17 +974,21 @@ def _content_with_ephemeral_cache_control(content: Any) -> Any:
 
 def _mark_openai_chat_cache_breakpoint(
     messages: list[dict[str, Any]],
+    *,
+    max_breakpoints: int = 4,
 ) -> list[dict[str, Any]]:
     """Mark stable + advancing prefixes for OpenRouter Anthropic caching.
 
     OpenRouter accepts Anthropic's ``cache_control`` on a content block, not as
     a top-level Chat Completions parameter. The first system message is the
-    byte-stable tool/persona prefix. Up to three recent non-system messages
-    advance the conversation prefix while preserving the prior turn's boundary
-    and deliberately excluding trailing per-turn system grounding (for example
-    live perception data).
+    byte-stable tool/persona prefix. The two most recent user boundaries are
+    retained explicitly; remaining slots go to the newest non-system messages.
+    This keeps the current user boundary across a parallel tool-result batch
+    instead of letting assistant/tool blocks displace it. Trailing per-turn
+    system grounding (for example live perception data) is never selected.
     """
     updated = copy.deepcopy(messages)
+    limit = max(1, min(int(max_breakpoints), 4))
     stable_candidates = [
         index for index, message in enumerate(updated)
         if isinstance(message, dict)
@@ -939,16 +999,21 @@ def _mark_openai_chat_cache_breakpoint(
         if isinstance(message, dict)
         and str(message.get("role") or "").lower() != "system"
     ]
+    user_candidates = [
+        index for index in advancing_candidates
+        if str(updated[index].get("role") or "").lower() == "user"
+    ]
     candidates: list[int] = []
     if stable_candidates:
         candidates.append(stable_candidates[0])
-    if advancing_candidates:
-        # Anthropic permits up to four breakpoints. Keep the three most recent
-        # conversation blocks marked so turn N+1 still carries turn N's exact
-        # breakpoint while adding a new advancing boundary.
-        candidates.extend(advancing_candidates[-3:])
+    for index in user_candidates[-2:]:
+        if index not in candidates and len(candidates) < limit:
+            candidates.append(index)
+    for index in reversed(advancing_candidates):
+        if index not in candidates and len(candidates) < limit:
+            candidates.append(index)
     if not candidates:
-        candidates = list(range(len(updated)))
+        candidates = list(range(min(len(updated), limit)))
     marked_any = False
     for index in dict.fromkeys(candidates):
         message = updated[index]
@@ -981,7 +1046,8 @@ def _mark_anthropic_cache_breakpoint(
                 parts.append(remainder)
         blocks = [{"type": "text", "text": part} for part in parts]
         blocks[0]["cache_control"] = {"type": "ephemeral"}
-        return blocks, messages
+        return blocks, _mark_openai_chat_cache_breakpoint(
+            messages, max_breakpoints=3)
     updated = copy.deepcopy(messages)
     for message in updated:
         if not isinstance(message, dict) or "content" not in message:

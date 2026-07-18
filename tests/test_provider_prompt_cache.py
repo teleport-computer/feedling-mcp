@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import sys
 from pathlib import Path
 
@@ -191,6 +192,29 @@ def test_v2_cache_breakpoints_exclude_dynamic_perception_grounding() -> None:
     assert _nested_cache_controls(anthropic["system"]) == [{"type": "ephemeral"}]
     assert "live perception" in str(anthropic["system"][-1]["text"])
     assert "cache_control" not in anthropic["system"][-1]
+
+
+def test_parallel_tool_batch_cannot_displace_user_cache_boundary() -> None:
+    messages = [
+        {"role": "system", "content": "stable persona"},
+        {"role": "user", "content": "current user request"},
+        {
+            "role": "assistant",
+            "content": "calling two tools",
+            "tool_calls": [{"id": "one"}, {"id": "two"}],
+        },
+        {"role": "tool", "content": "first result", "tool_call_id": "one"},
+        {"role": "tool", "content": "second result", "tool_call_id": "two"},
+        {"role": "system", "content": "dynamic perception"},
+    ]
+
+    marked = pc._mark_openai_chat_cache_breakpoint(messages)
+
+    assert _nested_cache_controls(marked[0]["content"])
+    assert _nested_cache_controls(marked[1]["content"])
+    assert _nested_cache_controls(marked[3]["content"])
+    assert _nested_cache_controls(marked[4]["content"])
+    assert not _nested_cache_controls(marked[5]["content"])
 
 
 def test_direct_anthropic_uses_cache_control_without_disclosing_affinity_key() -> None:
@@ -460,6 +484,52 @@ def test_openrouter_removes_only_each_named_rejected_cache_field(
     assert result["usage"]["cache_hint_sent_on_success"] is True
     assert result["usage"]["compatibility_fallbacks"] == [
         "cache_rejected:cache_control",
+        "cache_rejected:prompt_cache_key",
+    ]
+
+
+def test_openrouter_reads_wrapped_upstream_cache_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict] = []
+    responses = [
+        _response(400, {
+            "error": {
+                "message": "Provider returned error",
+                "code": 400,
+                "metadata": {
+                    "raw": json.dumps({
+                        "type": "error",
+                        "error": {
+                            "message": "unknown field prompt_cache_key",
+                        },
+                    }),
+                },
+            },
+        }),
+        _openai_chat_success(),
+    ]
+
+    class AsyncClient:
+        async def post(self, *args, json=None, **kwargs):
+            seen.append(copy.deepcopy(json))
+            return responses.pop(0)
+
+    monkeypatch.setattr(pc, "_async_http_client", lambda: AsyncClient())
+    config = pc.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        api_key="sk-test",
+        prompt_cache_key=CACHE_KEY,
+    )
+
+    result = asyncio.run(pc.chat_completion_async(config, MESSAGES, tools=TOOLS))
+
+    assert len(seen) == 2
+    assert "prompt_cache_key" in seen[0]
+    assert "prompt_cache_key" not in seen[1]
+    assert seen[1]["session_id"] == CACHE_KEY
+    assert result["usage"]["compatibility_fallbacks"] == [
         "cache_rejected:prompt_cache_key",
     ]
 

@@ -7,10 +7,17 @@ import pytest
 from tools import prompt_cache_canary as canary
 
 
-def _proof(*, retries: int = 0, cache_read: int = 800, route: str = "route-opaque"):
+def _proof(
+    *,
+    retries: int = 0,
+    cache_read: int = 1500,
+    first_prompt_tokens: int = 1800,
+    route: str = "route-opaque",
+):
     return {
         "sampled_turns": 2,
         "model_calls": 2,
+        "usage_telemetry_coverage": 1.0,
         "cache_telemetry_coverage": 1.0,
         "route_identity_coverage": 1.0,
         "route_fingerprint_count": 1,
@@ -22,6 +29,7 @@ def _proof(*, retries: int = 0, cache_read: int = 800, route: str = "route-opaqu
                 "failed": False,
                 "model_calls": 1,
                 "retries": 0,
+                "prompt_tokens": first_prompt_tokens,
                 "cache_read_tokens": 0,
             },
             {
@@ -29,6 +37,7 @@ def _proof(*, retries: int = 0, cache_read: int = 800, route: str = "route-opaqu
                 "failed": False,
                 "model_calls": 1,
                 "retries": retries,
+                "prompt_tokens": first_prompt_tokens + 50,
                 "cache_read_tokens": cache_read,
             },
         ],
@@ -54,6 +63,10 @@ def test_validate_cache_proof_accepts_exact_route_bound_hit() -> None:
     ("proof", "error"),
     [
         (_proof(cache_read=0), "zero cache-read"),
+        (
+            _proof(cache_read=1000, first_prompt_tokens=2000),
+            "did not cover the synthetic conversation prefix",
+        ),
         (_proof(retries=1), "hidden provider retry"),
         ({**_proof(), "route_fingerprint_count": 2}, "crossed provider routes"),
         ({**_proof(), "cache_telemetry_coverage": 0.5}, "not 100%"),
@@ -116,6 +129,22 @@ def test_loopback_http_remains_available_for_local_canary() -> None:
     ))
 
 
+def test_env_configs_probe_automatic_and_anthropic_cache_paths(monkeypatch) -> None:
+    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "admin")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "provider")
+    monkeypatch.setenv(
+        "FEEDLING_PROMPT_CACHE_CANARY_MODEL", "openai/gpt-4o-mini")
+    monkeypatch.setenv(
+        "FEEDLING_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL",
+        "anthropic/claude-haiku-4.5",
+    )
+
+    assert [config.model for config in canary._env_configs()] == [
+        "openai/gpt-4o-mini",
+        "anthropic/claude-haiku-4.5",
+    ]
+
+
 def test_end_to_end_orchestration_resets_throwaway_account(monkeypatch) -> None:
     calls: list[tuple[str, str, dict]] = []
     sends = 0
@@ -147,7 +176,7 @@ def test_end_to_end_orchestration_resets_throwaway_account(monkeypatch) -> None:
 
     result = canary.run(_config(), request=request)
 
-    assert result["second_turn_cache_read_tokens"] == 800
+    assert result["second_turn_cache_read_tokens"] == 1500
     assert sends == 2
     assert sum(
         1 for method, url, _ in calls

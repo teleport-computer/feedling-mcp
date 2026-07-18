@@ -23,7 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 
@@ -43,6 +43,7 @@ class Config:
 
 
 RequestFn = Callable[..., tuple[int, dict[str, Any]]]
+_MAX_UNCACHED_INPUT_TOKENS = 768
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -91,6 +92,19 @@ def _env_config() -> Config:
         prefix_chars=int(os.environ.get(
             "FEEDLING_PROMPT_CACHE_CANARY_PREFIX_CHARS", "9000")),
     )
+
+
+def _env_configs() -> list[Config]:
+    """Return the automatic-cache and explicit-boundary live probes."""
+    primary = _env_config()
+    anthropic_model = os.environ.get(
+        "FEEDLING_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL",
+        "anthropic/claude-haiku-4.5",
+    ).strip()
+    configs = [primary]
+    if anthropic_model and anthropic_model != primary.model:
+        configs.append(replace(primary, model=anthropic_model))
+    return configs
 
 
 def _validate_config(config: Config) -> None:
@@ -290,6 +304,8 @@ def validate_cache_proof(
         raise CanaryFailure("cache proof requires exactly two sampled turns")
     if int(cache.get("model_calls") or 0) != 2:
         raise CanaryFailure("cache proof requires exactly two logical model calls")
+    if float(cache.get("usage_telemetry_coverage") or 0.0) != 1.0:
+        raise CanaryFailure("usage telemetry coverage is not 100%")
     if float(cache.get("cache_telemetry_coverage") or 0.0) != 1.0:
         raise CanaryFailure("cache telemetry coverage is not 100%")
     if float(cache.get("route_identity_coverage") or 0.0) != 1.0:
@@ -314,8 +330,21 @@ def validate_cache_proof(
         if int(turn.get("retries") or 0) != 0:
             raise CanaryFailure(
                 f"cache canary turn {index} had a hidden provider retry")
-    if int(turns[1].get("cache_read_tokens") or 0) <= 0:
+    first_prompt_tokens = int(turns[0].get("prompt_tokens") or 0)
+    if first_prompt_tokens <= 0:
+        raise CanaryFailure("first turn omitted prompt-token telemetry")
+    cache_read_tokens = int(turns[1].get("cache_read_tokens") or 0)
+    if cache_read_tokens <= 0:
         raise CanaryFailure("second turn reported zero cache-read tokens")
+    minimum_cache_read = max(
+        1024,
+        first_prompt_tokens - _MAX_UNCACHED_INPUT_TOKENS,
+    )
+    if cache_read_tokens < minimum_cache_read:
+        raise CanaryFailure(
+            "second-turn cache read did not cover the synthetic conversation "
+            f"prefix ({cache_read_tokens} < {minimum_cache_read})"
+        )
     return route
 
 
@@ -404,12 +433,16 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
         validate_cache_proof(route_bound, expected_route=route)
         cache_read = int(route_bound["turns"][1]["cache_read_tokens"])
         result = {
+            "model": config.model,
             "route_fingerprint": route,
+            "first_turn_prompt_tokens": int(
+                route_bound["turns"][0]["prompt_tokens"]),
             "second_turn_cache_read_tokens": cache_read,
             "hit_ratio": route_bound.get("hit_ratio"),
         }
         print(
             "[prompt-cache-canary] CACHE HIT PROVEN: "
+            f"model={config.model} "
             f"second_turn_cache_read_tokens={cache_read} "
             f"hit_ratio={result['hit_ratio']}"
         )
@@ -428,7 +461,9 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
 
 def main() -> int:
     try:
-        run(_env_config())
+        for config in _env_configs():
+            print(f"[prompt-cache-canary] probing model={config.model}")
+            run(config)
     except CanaryFailure as exc:
         print(f"PROMPT CACHE CANARY FAIL: {exc}", file=sys.stderr)
         return 1

@@ -61,8 +61,11 @@ not permission to apply the same fleet policy to test or production.
    chronological `turns` list: require exactly two successful rows,
    `turns[0].model_calls == turns[1].model_calls == 1` (use a simple no-tool
    prompt), and
-   `turns[1].cache_read_tokens > 0`. A non-zero aggregate is insufficient: it
-   could be a hit in the first turn or a later tool round inside that turn. Do not accept an
+   `turns[1].cache_read_tokens` large enough to cover nearly all of
+   `turns[0].prompt_tokens` (allowing only the bounded dynamic tail and provider
+   cache-block rounding). A merely non-zero value is insufficient: it can come
+   from the static system/tool prefix while the conversation prefix stays cold,
+   from the first turn, or from a later tool round inside that turn. Do not accept an
    unfiltered fleet aggregate, an open-ended time window, or another user's
    traffic as proof for one route. Also confirm `cache_telemetry_coverage`: a
    missing metric is `null`/unreported, never a fabricated zero. Exercise one
@@ -70,12 +73,15 @@ not permission to apply the same fleet policy to test or production.
    preserves the native tool catalog. **Pre now enforces this automatically**
    after the runner liveness gate via `tools/prompt_cache_canary.py`: it creates
    a throwaway `model_api` account, performs the two bounded turns, repeats the
-   proof with the returned opaque route fingerprint, requires
-   `turns[1].cache_read_tokens > 0`, and also requires `retries == 0` for both
-   turns so a hidden provider 400→200 compatibility retry cannot false-green.
+   proof with the returned opaque route fingerprint, requires the second cache
+   read to cover the synthetic first-turn prompt, and also requires
+   `retries == 0` for both turns so a hidden provider 400→200 compatibility
+   retry cannot false-green. It probes both an automatic OpenAI cache route and
+   an OpenRouter-Anthropic route with explicit content-block breakpoints.
    The account is deleted in `finally`; only the content-free turn metrics
    survive for audit. Override the low-cost canary model with the repository
-   variable `PRE_PROMPT_CACHE_CANARY_MODEL` when provider availability changes.
+   variables `PRE_PROMPT_CACHE_CANARY_MODEL` and
+   `PRE_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL` when provider availability changes.
 6. **Verify genesis rehome** (2026-07-10): the genesis import worker now runs inside `serve-worker`, not `agent-runner` — `genesis_import_jobs` has exactly one drain in the codebase, so if this container is unhealthy, every new user's onboarding distillation stalls silently. Confirm `GET /v1/admin/v2-metrics` returns `genesis_alive: true`, then drive **one real genesis import end-to-end** and confirm it decrypts (the runner CVM reaches the main enclave over the passthrough URL with `verify=False`; `deploy/DEPLOYMENTS.md` has always flagged this as a post-cutover check). A `genesis_alive: false` with `live_workers ≥ 1` means the genesis thread died while the turn loops kept beating — check the serve-worker logs for `[genesis:daemon]`.
 
 ## Step 1 — Load test (LOCAL, before flipping real users)
