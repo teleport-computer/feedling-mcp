@@ -509,7 +509,12 @@ async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
     action_context LAST), so it does not invalidate prompt caching.
 
     Disabled/null signals are kept, not filtered: the agent must be told what it
-    CANNOT see ("now: not_permitted") rather than infer from an absence.
+    CANNOT see ("now: not_permitted") rather than infer from an absence. A
+    ``_reading_guide`` rides along so the model reads those gaps correctly — a null
+    reading is "no current data" (e.g. steps not logged yet today, or a sample that
+    aged out of the freshness window), NOT a malfunction. Without it the agent
+    phrases an absent signal as "获取不到/没检测到", which reads to the user as a
+    broken system rather than "nothing recorded yet".
 
     Returns the `action_results` shape `action_context_str` expects, or None when the
     prefetch came back empty — `_cap_data` degrades to {} on failure and this is
@@ -521,7 +526,16 @@ async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
         enclave_sem=enclave_sem)
     if not data:
         return None
-    return {"perception_snapshot": [{"ok": True, "data": data}]}
+    annotated = dict(data)
+    annotated["_reading_guide"] = (
+        "Each signal is this turn's live reading. A null field, or a signal marked "
+        "'disabled', is simply unavailable this turn — nothing recorded/reported "
+        "recently, a sample that aged out, or a capability this device/iOS version "
+        "can't provide — NOT a malfunction. If the user asks about one, say there's "
+        "no current reading (e.g. 'no steps logged yet today'); never imply the "
+        "sensor or app is broken, and don't read a null as zero."
+    )
+    return {"perception_snapshot": [{"ok": True, "data": annotated}]}
 
 
 async def _cap_data(store, action_type, *, api_key, runtime_token, params=None, enclave_sem=None) -> dict:

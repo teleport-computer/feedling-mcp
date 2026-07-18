@@ -163,6 +163,38 @@ def test_chat_turn_injects_perception_grounding(monkeypatch):
     joined = _joined(seen)
     assert "step_count" in joined and "365" in joined     # live value reached the prompt
     assert "not_permitted" in joined                       # disabled signals injected too
+    # A reading guide rides along so a null/disabled signal is read as "no current
+    # data", not a malfunction (the "没检测到 sounds broken" UX fix).
+    assert "_reading_guide" in joined and "malfunction" in joined
+
+
+def test_reading_guide_present_and_does_not_hide_null_signals(monkeypatch):
+    """The reading guide is added WITHOUT dropping any signal — a null-valued signal
+    (e.g. stale steps) must still be visible, just interpretable."""
+    uid = "u_pg_guide"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+    seen, calls = {}, []
+    _spy_provider(monkeypatch, seen)
+    # steps null (stale) alongside a live signal — the exact live scenario.
+    _spy_cap_data(monkeypatch, calls, data={
+        "ok": True,
+        "signals": {"steps": {"step_count": None}, "weather": {"condition": "cloudy"}},
+    })
+
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(worker.process_job(
+        job, _chat_deps([{"id": "m1", "ts": 1.0, "role": "user", "content": "走了多少步"}]),
+        provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    joined = _joined(seen)
+    assert "_reading_guide" in joined and "malfunction" in joined  # guide text present
+    assert "step_count" in joined                           # the null signal still shown
+    assert "cloudy" in joined                               # live signal still shown
 
 
 def test_wake_turn_injects_perception_grounding(monkeypatch):
