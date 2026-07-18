@@ -1327,7 +1327,7 @@ jobs:
       - name: Run eight independent headless Codex profile agents
         id: profile_workers
         if: steps.manifest_isolation.outcome == 'success'
-        timeout-minutes: 140
+        timeout-minutes: 200
         env:
           QA_CODEX_HOME: ${{ steps.context.outputs.codex_home }}
           QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
@@ -1358,7 +1358,7 @@ jobs:
             --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
             --expected-runtime "$QA_EXPECTED_RUNTIME" \
             --worker-python "$(python -c 'import pathlib, sys; print(pathlib.Path(sys.executable).resolve())')" \
-            --timeout-seconds 2400
+            --timeout-seconds 3600
 
       - name: Verify independent Codex worker lifecycle and canonical inputs
         id: orchestration

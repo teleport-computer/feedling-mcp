@@ -42,7 +42,10 @@ LIVE_SCENARIO_IDS = (
 RETRYABLE_SCENARIO_IDS = frozenset({"P0-08", "P0-09", "P0-10", "P0-11"})
 REQUEST_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 4096
-FACTS_WAIT_SECONDS = 1800.0
+# The parent caps the longest allowlisted live probe at 1,500 seconds.  Leave a
+# full minute for authoritative receipt validation and atomic facts publication
+# so the unprivileged helper never races the process it is waiting on.
+FACTS_WAIT_SECONDS = 1560.0
 FACTS_PUBLISH_GRACE_SECONDS = 2.0
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 

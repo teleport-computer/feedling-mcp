@@ -143,6 +143,14 @@ _MAX_RESULT_BYTES = 32 * 1024 * 1024
 _MAX_EVENTS_BYTES = 64 * 1024 * 1024
 _MAX_PERSONA_JUDGMENT_BYTES = 64 * 1024
 _REQUEST_PUBLICATION_GRACE_SECONDS = 2.0
+_LIVE_REQUEST_PROTOCOL_VIOLATION = "LIVE_REQUEST_PROTOCOL_VIOLATION"
+_COT_PROBE_TIMEOUT_SECONDS = 300
+_DEFAULT_LIVE_PROBE_TIMEOUT_SECONDS = 300
+_LIVE_PROBE_TIMEOUT_SECONDS = {
+    "P0-06": 1500,
+    "P0-07": 600,
+    "P0-09": 1500,
+}
 _AMBIENT_READ_ROOTS = tuple(
     dict.fromkeys(Path(value).resolve() for value in ("/tmp", "/var/tmp", "/dev/shm"))
 )
@@ -234,6 +242,12 @@ owned receipt for every agent-driven live scenario. For P0-02, P0-03, P0-04,
 P0-05, and P0-07 through P0-11, request attempt 1 with exactly this command,
 substituting the same scenario ID in all four places:
 QA_SCENARIO_ID=P0-XX "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/qa/request_live_scenario_probe.py" --scenario P0-XX --attempt 1 --request "$QA_WORK_ROOT/.live-probe-P0-XX-1.request" --facts "$QA_WORK_ROOT/live-probe-P0-XX-1.facts.json"
+Exactly one live-scenario command may be active at a time. A yielded tool call
+that reports a running cell or session is not complete: poll or wait on that
+same execution identifier until it reaches terminal exit. While it is running,
+do not start another tool call, issue another scenario request, or read any
+facts file. Only after terminal exit may you read that command's facts, finish
+the current scenario, and proceed to the next command or scenario.
 Read the resulting private facts file. The deterministic parent performs the
 fixed network actions, owns the authoritative receipt outside your writable
 roots, and binds its run/profile/scenario/attempt, IDs, turns, latencies, and
@@ -693,7 +707,7 @@ def _run_trusted_cot_probe(spec: WorkerSpec) -> Mapping[str, Any]:
             env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
             capture_output=True,
             check=False,
-            timeout=360,
+            timeout=_COT_PROBE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         raise WorkerLaunchError("trusted COT probe could not execute") from None
@@ -963,7 +977,9 @@ def _run_trusted_live_probe(
             env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
             capture_output=True,
             check=False,
-            timeout=1800,
+            timeout=_LIVE_PROBE_TIMEOUT_SECONDS.get(
+                scenario_id, _DEFAULT_LIVE_PROBE_TIMEOUT_SECONDS
+            ),
         )
         if completed.returncode not in (0, 2):
             raise WorkerLaunchError("trusted live probe did not produce evidence")
@@ -1031,6 +1047,7 @@ def _live_request_is_next(
     if (
         last.get("attempt") == 1
         and last.get("status") == "AGENT_ERROR"
+        and last.get("failure_code") in {"CHAT_TIMEOUT", "MISSING_REPLY"}
         and last_scenario in {"P0-08", "P0-09", "P0-10", "P0-11"}
         and scenario_id == last_scenario
         and attempt == 2
@@ -1044,7 +1061,12 @@ def _live_request_is_next(
 
 
 def _write_live_error_facts(
-    spec: WorkerSpec, scenario_id: str, attempt: int, facts_path: Path
+    spec: WorkerSpec,
+    scenario_id: str,
+    attempt: int,
+    facts_path: Path,
+    *,
+    failure_code: str = "TRUSTED_PROBE_ERROR",
 ) -> None:
     if facts_path.exists():
         return
@@ -1059,9 +1081,32 @@ def _write_live_error_facts(
             "receipt": None,
             "private_facts": None,
             "status": "UNAVAILABLE",
-            "failure_code": "TRUSTED_PROBE_ERROR",
+            "failure_code": failure_code,
         },
     )
+
+
+def _premature_live_request_keys(
+    spec: WorkerSpec,
+    receipts: Sequence[Mapping[str, Any]],
+    current_key: tuple[str, int],
+) -> set[tuple[str, int]]:
+    """Find markers issued before the current trusted probe was published."""
+
+    represented = {
+        (str(receipt.get("scenario_id") or ""), receipt.get("attempt"))
+        for receipt in receipts
+    }
+    premature: set[tuple[str, int]] = set()
+    for scenario_id in PARENT_LIVE_SCENARIO_IDS:
+        for attempt in (1, 2):
+            key = (scenario_id, attempt)
+            if key == current_key or key in represented:
+                continue
+            request_path, _ = _live_handshake_paths(spec, scenario_id, attempt)
+            if request_path.exists():
+                premature.add(key)
+    return premature
 
 
 def _diagnostic_probe_error_evidence(
@@ -1159,10 +1204,11 @@ def _perform_trusted_live_handshake(
     attempt: int,
     live_probe_runner: LiveProbeRunner,
     receipts: list[dict[str, Any]],
-) -> None:
+) -> set[tuple[str, int]]:
     request_path, facts_path = _live_handshake_paths(spec, scenario_id, attempt)
     nonce = ""
     probe_started = False
+    premature: set[tuple[str, int]] = set()
     try:
         _load_ready_live_request(
             request_path,
@@ -1180,6 +1226,29 @@ def _perform_trusted_live_handshake(
         returned_receipt, private_facts = live_probe_runner(
             spec, scenario_id, attempt, nonce, tuple(receipts)
         )
+        premature = _premature_live_request_keys(
+            spec, receipts, (scenario_id, attempt)
+        )
+        if premature:
+            for premature_scenario, premature_attempt in premature:
+                _, premature_facts = _live_handshake_paths(
+                    spec, premature_scenario, premature_attempt
+                )
+                _write_live_error_facts(
+                    spec,
+                    premature_scenario,
+                    premature_attempt,
+                    premature_facts,
+                    failure_code=_LIVE_REQUEST_PROTOCOL_VIOLATION,
+                )
+            _write_live_error_facts(
+                spec,
+                scenario_id,
+                attempt,
+                facts_path,
+                failure_code=_LIVE_REQUEST_PROTOCOL_VIOLATION,
+            )
+            raise WorkerLaunchError("live probe request protocol was violated")
         receipt = validate_live_receipt_object(
             returned_receipt,
             run_id=str(spec.environment["QA_RUN_ID"]),
@@ -1203,6 +1272,7 @@ def _perform_trusted_live_handshake(
             },
         )
         receipts.append(receipt)
+        return premature
     except (
         LiveProbeRequestError,
         LiveScenarioReceiptError,
@@ -1233,7 +1303,7 @@ def _perform_trusted_live_handshake(
                     },
                 )
                 receipts.append(receipt)
-                return
+                return premature
             except (
                 LiveScenarioReceiptError,
                 OSError,
@@ -1244,6 +1314,7 @@ def _perform_trusted_live_handshake(
             _write_live_error_facts(spec, scenario_id, attempt, facts_path)
         except WorkerLaunchError:
             pass
+    return premature
 
 
 def _write_live_receipt_aggregate(
@@ -1397,13 +1468,14 @@ def _run_process_with_trusted_cot(
                 if key in live_handled or not request_path.exists():
                     continue
                 live_handled.add(key)
-                _perform_trusted_live_handshake(
+                premature = _perform_trusted_live_handshake(
                     spec,
                     scenario_id,
                     attempt,
                     live_probe_runner,
                     live_receipts,
                 )
+                live_handled.update(premature)
 
     while worker.is_alive():
         handle_visible_requests()

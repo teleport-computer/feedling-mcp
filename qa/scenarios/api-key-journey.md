@@ -32,6 +32,14 @@ the parent reads the trace, derives all five stage timings, performs release
 cleanup (or diagnostic cleanup deferral), and publishes only bounded facts for
 offline agent review.
 
+Live-scenario commands are strictly serial: exactly one may be active at a
+time. If a command tool yields a running cell/session instead of a terminal
+exit, the agent MUST poll or wait on that same execution identifier until it
+exits. Until then it MUST NOT start another tool call, request another scenario,
+or read a facts file. A yielded/running result is not completion; only after
+terminal exit may the agent read that command's facts, finish the scenario, and
+proceed.
+
 P0-06 is the exception to the one-command minimum: it requires exactly three
 ordered, successful tool calls prefixed with `QA_SCENARIO_ID=P0-06` and distinct
 `QA_SCENARIO_PHASE=CAPTURE`, `REVIEW`, and `FINALIZE` assignments, using the

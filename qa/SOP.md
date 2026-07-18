@@ -140,6 +140,14 @@ reads their private bounded facts, adapts only the locked diagnostic/retry path,
 and makes the semantic persona, memory, identity, and reasoning judgments that
 deterministic code cannot make.
 
+The profile agent MUST keep live-scenario command execution strictly serial:
+exactly one live-scenario command may be active at a time. If the command tool
+yields a running cell/session rather than a terminal exit, it MUST poll or wait
+on that same execution identifier until terminal exit. It MUST NOT start any
+other tool call or scenario, or read the facts file, while that execution is
+running. Only after terminal exit may it read the command's facts, complete the
+current scenario, and continue.
+
 For P0-06 it MUST use this exact capture/review/finalize flow:
 
 1. Run the exact CAPTURE `request_live_scenario_probe.py` command. The helper

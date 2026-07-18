@@ -498,8 +498,8 @@ def test_deterministic_launcher_runs_exact_independent_profile_matrix():
     assert "qa/schemas/codex-run-result.schema.json" in workers
     assert '--receipt "$QA_ORCHESTRATION_RECEIPT"' in workers
     assert "--worker-python" in workers
-    assert "--timeout-seconds 2400" in workers
-    assert "timeout-minutes: 140" in workers
+    assert "--timeout-seconds 3600" in workers
+    assert "timeout-minutes: 200" in workers
     assert "spawn_agent" not in workers
     assert "followup_task" not in workers
     assert "hook" not in workers.lower()

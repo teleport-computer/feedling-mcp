@@ -2191,7 +2191,7 @@ def _launch_diagnostic(
         run_id=paths.run_id,
         base_url=LOCKED_BASE_URL,
         expected_sha=options.candidate_sha,
-        timeout_seconds=2400,
+        timeout_seconds=3600,
         diagnostic=True,
         profile_ids=selected,
         expected_runtime=options.runtime_requirement,

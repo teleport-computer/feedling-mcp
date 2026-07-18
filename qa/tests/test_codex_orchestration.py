@@ -1341,6 +1341,48 @@ def _launch_diagnostic(
     )
 
 
+def test_generated_profile_prompt_requires_one_live_command_until_terminal_exit(
+    tmp_path,
+):
+    paths = _setup(tmp_path)
+    specs = launcher._prepare_specs(
+        codex_bin=paths["codex_bin"],
+        codex_home=paths["codex_home"],
+        source_root=paths["source"],
+        artifact_root=paths["artifacts"],
+        profile_manifest_dir=paths["manifests"],
+        worker_root=paths["worker_root"],
+        worker_output_root=paths["raw"],
+        authoring_schema=launcher._load_authoring_schema(paths["schema"]),
+        worker_python=paths["worker_python"],
+        run_id="run-serial-command-contract",
+        base_url="https://test-api.feedling.app",
+        expected_sha="a" * 40,
+        assignments=(PROFILE_AGENT_TYPES[0],),
+    )
+
+    prompt = specs[0].prompt
+    required_contract = (
+        "Exactly one live-scenario command may be active at a time.",
+        "A yielded tool call that reports a running cell or session is not complete",
+        "poll or wait on that same execution identifier until it reaches terminal exit",
+        "do not start another tool call, issue another scenario request, or read any facts file",
+        "Only after terminal exit may you read that command's facts",
+    )
+    for instruction in required_contract:
+        assert instruction in " ".join(prompt.split())
+
+
+def test_parent_probe_deadlines_finish_before_agent_and_profile_deadlines():
+    longest_live_probe = max(
+        launcher._DEFAULT_LIVE_PROBE_TIMEOUT_SECONDS,
+        *launcher._LIVE_PROBE_TIMEOUT_SECONDS.values(),
+    )
+
+    assert launcher._COT_PROBE_TIMEOUT_SECONDS < 360
+    assert longest_live_probe < live_request.FACTS_WAIT_SECONDS < 3600
+
+
 def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
     tmp_path, monkeypatch
 ):
@@ -1586,6 +1628,112 @@ def test_transient_request_publication_invokes_each_trusted_probe_once(
     )
     assert len(invocations) == len(first_reads)
     assert set(invocations.values()) == {1}
+
+
+def test_overlapping_live_requests_fail_closed_without_future_probe(tmp_path):
+    paths = _setup(tmp_path, qualification_mode="diagnostic")
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    captured: list[launcher.WorkerSpec] = []
+    invocations: list[tuple[str, int]] = []
+
+    def blocking_probe(spec, scenario_id, attempt, nonce, prior_receipts):
+        invocations.append((scenario_id, attempt))
+        assert scenario_id == "P0-02"
+        probe_started.set()
+        assert release_probe.wait(timeout=5)
+        return _live_probe_runner(
+            spec, scenario_id, attempt, nonce, prior_receipts
+        )
+
+    def overlapping_runner(spec: launcher.WorkerSpec, _timeout: int) -> int:
+        captured.append(spec)
+        live_request.write_request_marker(
+            live_request.request_path(spec.work, "P0-02", 1),
+            run_id=spec.environment["QA_RUN_ID"],
+            profile_id=spec.profile_id,
+            scenario_id="P0-02",
+            attempt=1,
+        )
+        assert probe_started.wait(timeout=5)
+        live_request.write_request_marker(
+            live_request.request_path(spec.work, "P0-03", 1),
+            run_id=spec.environment["QA_RUN_ID"],
+            profile_id=spec.profile_id,
+            scenario_id="P0-03",
+            attempt=1,
+        )
+        release_probe.set()
+        facts = (
+            live_request.facts_path(spec.work, "P0-02", 1),
+            live_request.facts_path(spec.work, "P0-03", 1),
+        )
+        deadline = time.monotonic() + 5
+        while not all(path.exists() for path in facts):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        return 0
+
+    receipt = _launch_diagnostic(
+        paths,
+        overlapping_runner,
+        live_probe_runner=blocking_probe,
+    )
+
+    assert invocations == [("P0-02", 1)]
+    assert len(captured) == 1
+    spec = captured[0]
+    for scenario_id in ("P0-02", "P0-03"):
+        facts = json.loads(
+            live_request.facts_path(spec.work, scenario_id, 1).read_text()
+        )
+        assert facts == {
+            "schema_version": 1,
+            "profile_id": spec.profile_id,
+            "scenario_id": scenario_id,
+            "attempt": 1,
+            "receipt_sha256": None,
+            "receipt": None,
+            "private_facts": None,
+            "status": "UNAVAILABLE",
+            "failure_code": "LIVE_REQUEST_PROTOCOL_VIOLATION",
+        }
+    aggregate = json.loads(spec.live_receipt_path.read_text())
+    assert aggregate["receipts"] == []
+    assert receipt["workers"][0]["result_source"] == "deterministic_fallback"
+
+
+@pytest.mark.parametrize("scenario_id", ("P0-08", "P0-09", "P0-10", "P0-11"))
+@pytest.mark.parametrize("failure_code", ("CHAT_TIMEOUT", "MISSING_REPLY"))
+def test_retry_admission_requires_locked_transient_failure_code(
+    scenario_id, failure_code
+):
+    receipts = [
+        {
+            "scenario_id": scenario_id,
+            "attempt": 1,
+            "status": "AGENT_ERROR",
+            "failure_code": failure_code,
+        }
+    ]
+
+    assert launcher._live_request_is_next(receipts, scenario_id, 2) is True
+
+
+@pytest.mark.parametrize(
+    "failure_code", ("LIVE_PROBE_ERROR", "ASSERTION_FAILED", None)
+)
+def test_retry_admission_rejects_nontransient_agent_error(failure_code):
+    receipts = [
+        {
+            "scenario_id": "P0-08",
+            "attempt": 1,
+            "status": "AGENT_ERROR",
+            "failure_code": failure_code,
+        }
+    ]
+
+    assert launcher._live_request_is_next(receipts, "P0-08", 2) is False
 
 
 def test_transient_cot_publication_invokes_each_trusted_probe_once(

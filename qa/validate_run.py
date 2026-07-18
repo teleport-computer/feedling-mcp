@@ -369,7 +369,7 @@ _EXECUTION_CONTRACT = {
     "allow_profile_skip": False,
     "max_profile_concurrency": 3,
     "max_attempts_per_scenario": 2,
-    "profile_timeout_seconds": 2400,
+    "profile_timeout_seconds": 3600,
     "chat_reply_timeout_seconds": 120,
     "distillation_timeout_seconds": 900,
 }
