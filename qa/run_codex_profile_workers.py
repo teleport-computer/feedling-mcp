@@ -889,14 +889,22 @@ def _trace_cleanup_turn_context(
     try:
         cot, _ = validate_cot_receipt(spec.cot_receipt_path, spec.profile_id)
     except (CotReceiptError, OSError):
-        raise WorkerLaunchError("trusted trace-cleanup COT context is invalid") from None
+        cot = None
     # A valid negative COT receipt can legitimately have no correlated turn
     # identifiers (for example CHAT_REQUEST_FAILED).  Preserve every real turn
     # that exists, but never invent identifiers merely to make the latency
-    # projection look complete.  P0-13 will still perform account cleanup and
-    # will fail closed as BLOCKED_EVIDENCE for the missing trace context.
-    cot_ids = tuple(cot.get(field) for field in ("request_id", "turn_id", "trace_id"))
-    if all(isinstance(value, str) and value for value in cot_ids):
+    # projection look complete.  Missing or invalid COT evidence similarly
+    # omits only P0-12 so P0-13 can inspect all trustworthy live turns.  The
+    # independent COT validation after live-receipt validation still rejects a
+    # strict/release run and records the bounded diagnostic failure.
+    cot_ids = (
+        tuple(cot.get(field) for field in ("request_id", "turn_id", "trace_id"))
+        if cot is not None
+        else ()
+    )
+    if cot is not None and all(
+        isinstance(value, str) and value for value in cot_ids
+    ):
         rows.append(
             {
                 "scenario_id": "P0-12",

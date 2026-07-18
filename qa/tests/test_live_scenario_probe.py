@@ -433,6 +433,69 @@ def test_trace_context_omits_unstarted_cot_turn_without_blocking_cleanup(
     assert all(row["scenario_id"] != "P0-12" for row in context["turns"])
 
 
+@pytest.mark.parametrize(
+    "error_type",
+    (launcher.CotReceiptError, OSError),
+    ids=("invalid", "missing"),
+)
+def test_trace_context_omits_unavailable_cot_and_preserves_live_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+):
+    output = tmp_path / "output"
+    output.mkdir()
+    spec = SimpleNamespace(
+        profile_id="profile-1",
+        cot_receipt_path=output / "cot.json",
+        environment={"QA_RUN_ID": "run-1"},
+    )
+
+    def unavailable(_path, _profile):
+        raise error_type("unavailable")
+
+    monkeypatch.setattr(launcher, "validate_cot_receipt", unavailable)
+    prior = [
+        {
+            "scenario_id": scenario_id,
+            "turns": [
+                {
+                    "turn_index": 1,
+                    "request_id": f"request-{index}",
+                    "turn_id": f"turn-{index}",
+                    "trace_id": f"trace-{index}",
+                    "ack_latency_ms": 10.0,
+                    "reply_latency_ms": 100.0,
+                    "reply_count": 1,
+                    "content_assertion_passed": True,
+                    "fallback_detected": False,
+                    "duplicate_detected": False,
+                    "out_of_order_detected": False,
+                }
+            ],
+        }
+        for index, scenario_id in enumerate(
+            ("P0-08", "P0-09", "P0-10", "P0-11"), start=1
+        )
+    ]
+
+    context = launcher._trace_cleanup_turn_context(spec, prior)
+
+    assert [row["scenario_id"] for row in context["turns"]] == [
+        "P0-08",
+        "P0-09",
+        "P0-10",
+        "P0-11",
+    ]
+    assert [row["trace_id"] for row in context["turns"]] == [
+        "trace-1",
+        "trace-2",
+        "trace-3",
+        "trace-4",
+    ]
+    assert all(row["scenario_id"] != "P0-12" for row in context["turns"])
+
+
 def _persona_spec(tmp_path: Path):
     output = tmp_path / "output"
     work = tmp_path / "work"
