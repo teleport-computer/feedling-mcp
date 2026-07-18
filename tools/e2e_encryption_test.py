@@ -93,10 +93,6 @@ def b64(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
 
 
-def unb64(s: str) -> bytes:
-    return base64.b64decode(s)
-
-
 # ---------------------------------------------------------------------------
 # Client-side encryption (mirrors what iOS will do)
 # ---------------------------------------------------------------------------

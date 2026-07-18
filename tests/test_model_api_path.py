@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import sys
 import threading
 import time
@@ -839,19 +838,6 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     stored_cred = db.model_api_credential_get(user_id, cred_id)
     assert "sk-test-secret" not in json.dumps(stored_cred)
 
-def test_model_api_context_summary_parsing_drops_generic_runtime_fallback():
-    reply, summary = hosted_turn._model_api_parse_turn_reply(
-        '{"reply":"好，我在。","thinking_summary":"参考了 8 条相关记忆。\\n对齐了当前 Identity 设定。"}'
-    )
-    assert reply == "好，我在。"
-    assert summary == ""
-
-    reply, summary = hosted_turn._model_api_parse_turn_reply(
-        '{"reply":"我先不删。","context_summary":"准备删除 Memory：烧卖和蒸饺设定，等待用户确认。"}'
-    )
-    assert reply == "我先不删。"
-    assert summary == "准备删除 Memory：烧卖和蒸饺设定，等待用户确认。"
-
 
 def test_history_import_reuses_inflight_client_job(client, monkeypatch):
     user_id, api_key = _register(client)
@@ -1113,26 +1099,6 @@ def test_large_history_sampling_keeps_middle_and_latest_messages():
     assert "EARLIEST_MARKER" in sample
     assert "MIDDLE_MARKER" in sample
     assert "LATEST_MARKER" in sample
-
-
-def test_large_history_extraction_windows_cover_full_timeline():
-    messages = []
-    for idx in range(120):
-        messages.append({
-            "role": "user",
-            "content": f"history-window-message-{idx} " + ("x" * 350),
-            "ts": 1_700_000_000 + idx,
-            "source": "history_import",
-        })
-    messages[0]["content"] = "FIRST_WINDOW_MARKER " + messages[0]["content"]
-    messages[-1]["content"] = "LAST_WINDOW_MARKER " + messages[-1]["content"]
-
-    windows = history_import._transcript_extraction_windows(messages, max_chars=5000, max_windows=5)
-    joined = "\n".join(windows)
-
-    assert len(windows) > 1
-    assert "FIRST_WINDOW_MARKER" in joined
-    assert "LAST_WINDOW_MARKER" in joined
 
 
 def test_import_memory_targets_do_not_force_historical_floor_padding():

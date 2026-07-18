@@ -19,7 +19,7 @@ from context_memory_selection import (
     select_context_memories,
     select_context_memories_with_trace,
 )
-from enclave import auth, backend_client, envelope, readside, state
+from enclave import auth, backend_client, envelope, readside
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
 

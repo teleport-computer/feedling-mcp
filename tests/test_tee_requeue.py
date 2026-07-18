@@ -61,10 +61,6 @@ def _set_cursor(table, wm_ts, wm_id):
               (table, wm_ts, wm_id))
 
 
-def _clear_cursor(table):
-    _tee_exec("DELETE FROM tee_replication_cursors WHERE table_name=%s", (table,))
-
-
 def _stub_decrypt(envelope, purpose):
     return b"PT:" + envelope["body_ct"].encode()
 

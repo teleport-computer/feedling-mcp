@@ -62,8 +62,6 @@ class PerceptionDifferV2:
         self._state: dict[str, dict[str, SignalStateV2]] = {}
         self.metrics_sink = metrics_sink
 
-    def state_for(self, user_id: str, signal: str) -> SignalStateV2 | None:
-        return self._state.get(user_id, {}).get(signal)
 
     def observe(
         self,

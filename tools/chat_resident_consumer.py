@@ -90,7 +90,6 @@ import base64
 from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
-import inspect
 import io
 import json
 import logging
@@ -3342,22 +3341,6 @@ def _agent_session_key() -> str:
     return f"feedling:{digest}"
 
 
-def _extract_openai_reply(body: dict) -> str:
-    choices = body.get("choices")
-    if isinstance(choices, list) and choices:
-        first = choices[0]
-        if isinstance(first, dict):
-            message = first.get("message")
-            if isinstance(message, dict):
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
-            text = first.get("text")
-            if isinstance(text, str) and text.strip():
-                return text.strip()
-    raise ValueError("OpenAI-compatible response has no usable reply text")
-
-
 def _response_text_len(resp: httpx.Response) -> int:
     try:
         return len((resp.text or "").encode("utf-8"))
@@ -5151,13 +5134,6 @@ def _sanitize_reply_text(text: str) -> str:
     return "\n".join(deduped).strip()
 
 
-def _structured_reply_payload(raw_reply: str) -> Any:
-    try:
-        return json.loads(raw_reply)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
 def _cap_agent_replies(replies: list[str], max_items: int | None = None) -> list[str]:
     limit = max(1, max_items if max_items is not None else PROACTIVE_MAX_REPLY_MESSAGES)
     return replies[:limit]
@@ -5182,10 +5158,6 @@ def _normalize_agent_output(raw_reply: Any, max_items: int | None = None) -> tup
 
 def _normalize_agent_replies(raw_reply: str, max_items: int | None = None) -> list[str]:
     return _normalize_agent_output(raw_reply, max_items=max_items)[1]
-
-
-def _split_agent_result(result: Any, max_items: int | None = None) -> tuple[list[dict], list[str]]:
-    return _normalize_agent_output(result, max_items=max_items)
 
 
 def _split_agent_turn(result: Any, max_items: int | None = None) -> AgentTurn:
@@ -6128,22 +6100,6 @@ def update_proactive_job_status(
         resp.raise_for_status()
     except Exception as e:
         log.warning("failed to update proactive job status id=%s status=%s error=%s", job_id, status, e)
-
-
-def update_proactive_state(**patch: Any) -> None:
-    clean = {k: v for k, v in patch.items() if v not in (None, "")}
-    if not clean:
-        return
-    try:
-        resp = _HTTP.post(
-            f"{FEEDLING_API_URL}/v1/proactive/state",
-            json=clean,
-            headers=_HEADERS,
-            timeout=10,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        log.warning("failed to update proactive state patch=%s error=%s", clean, e)
 
 
 def _job_wake_ids(job: dict) -> list[str]:
@@ -7160,23 +7116,6 @@ def _is_memory_dream_job(job: dict) -> bool:
         str((job or {}).get("job_kind") or "").strip() == "memory_dream"
         or str((job or {}).get("source") or "").strip() == "memory_dream"
     )
-
-
-def _resident_perception_trend(signal: str, field: str) -> dict:
-    """Best-effort GET of one signal's rolling baseline/delta (Tier 2 history)."""
-    try:
-        resp = _HTTP.get(
-            f"{FEEDLING_API_URL}/v1/agent/perception/trend",
-            headers=_HEADERS,
-            params={"signal": signal, "field": field, "days": 30},
-            timeout=15,
-        )
-        if resp.status_code >= 400:
-            return {}
-        return resp.json()
-    except Exception as e:
-        log.debug("proactive trend pull failed %s.%s: %s", signal, field, e)
-        return {}
 
 
 def _resident_perception_now() -> dict:
