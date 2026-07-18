@@ -205,8 +205,8 @@ def test_concurrent_client_retries_have_one_message_and_one_job():
     assert (message_count, job_count) == (1, 1)
 
 
-def test_atomic_send_trim_mirrors_exact_tee_evictions(monkeypatch):
-    """Message+job atomicity must not leave trimmed rows in the TEE shadow."""
+def test_atomic_send_retains_every_source_row_without_tee_eviction(monkeypatch):
+    """The 5,000-row value is a hot-cache cap, never durable history GC."""
     uid = "u_atomic_send_tee_trim"
     seed_user(uid)
     gen = db.get_runtime_generation(uid)
@@ -253,10 +253,8 @@ def test_atomic_send_trim_mirrors_exact_tee_evictions(monkeypatch):
                 "SELECT msg_id FROM chat_messages WHERE user_id=%s", (uid,)
             ).fetchall()
         }
-    assert remaining == {"old-3", new_id}
-    assert len(mirrored) == 1
-    assert mirrored[0][0][1] == (uid, ["old-1", "old-2"])
-    assert mirrored[0][1][1] == (uid, ["old-1", "old-2"])
+    assert remaining == {"old-1", "old-2", "old-3", new_id}
+    assert mirrored == []
 
 
 def test_singleflight_race_retries_and_preserves_message(monkeypatch):

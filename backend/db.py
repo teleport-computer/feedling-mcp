@@ -864,7 +864,7 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 ("content_type", "by_content_type"),
             ):
                 rows = conn.execute(
-                    f"""
+                    """
                     SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
                            COUNT(*)::int
                     FROM chat_messages
@@ -904,7 +904,7 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
 
             for field, target in (("type", "by_type"), ("source", "by_source")):
                 rows = conn.execute(
-                    f"""
+                    """
                     SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
                            COUNT(*)::int
                     FROM memory_moments

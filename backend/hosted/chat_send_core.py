@@ -11,8 +11,6 @@ monkeypatch those module attributes keep working unchanged.
 
 from __future__ import annotations
 
-import base64
-
 from core import envelope as core_envelope
 from core import wake_bus as core_wake_bus
 
@@ -50,7 +48,6 @@ def model_api_chat_send_core(
     image_bytes, image_mime, image_err = hosted_turn._model_api_image_payload(payload)
     if image_err:
         return {"error": "invalid_image", "detail": image_err}, 400
-    image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else ""
     has_image = image_bytes is not None
     file_parse, file_err = hosted_turn._model_api_file_payload(payload)
     if file_err:
@@ -60,7 +57,6 @@ def model_api_chat_send_core(
     if file_parse is not None and file_parse["kind"] == "image":
         image_bytes = file_parse["bytes"]
         image_mime = file_parse["mime"]
-        image_b64 = base64.b64encode(image_bytes).decode("ascii")
         has_image = True
         file_parse = None
     has_file = file_parse is not None
