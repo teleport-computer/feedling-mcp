@@ -36,7 +36,9 @@ RUN apt-get update \
 #  - Claude Code CLI (`claude`)                    — anthropic driver
 #  - Codex CLI (`codex exec --json`)               — openai driver (native)
 #  - pi CLI (`pi --mode json`)                     — pi driver: gemini/openrouter/
-#    openai_compatible/deepseek, direct-native (no gateway). Exact pin only (pi
+#    openai_compatible, direct-native (no gateway). NOT deepseek — it moved back
+#    to the claude driver's Anthropic wire on 2026-07-14 (spawners.py:556,:834).
+#    Exact pin only (pi
 #    iterates fast; bump explicitly after reviewing its output-protocol changes).
 RUN npm install -g @anthropic-ai/claude-code@2.1.195 @openai/codex@0.142.4 \
         @earendil-works/pi-coding-agent@0.80.3

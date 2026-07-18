@@ -6,6 +6,7 @@ docker argv. The live process/docker spawn is integration. Pure-unit (no PG).
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -757,10 +758,36 @@ def test_agent_home_files_identity_block_sits_above_persona():
 
 
 def test_pi_default_cli_cmd():
-    cmd = spawners._default_cli_cmd("pi", "/h", model="x")
-    assert "pi --mode json" in cmd and "-t bash" in cmd
-    assert "--model feedling/x" in cmd and "--session-id {session_id}" in cmd
-    assert "{message}" not in cmd   # message via STDIN, never argv
+    cmd = spawners._default_cli_cmd("pi", "/h", model="m")
+    assert "pi --mode json" in cmd
+    # -t bash would ALSO filter out extension-registered tools (pi 0.80.3
+    # agent-session.js:1867 filters allCustomTools through isAllowedTool), which
+    # would silently kill the user-MCP bridge. -xt read,edit,write leaves the
+    # same active set (["bash"]) while letting extension tools through.
+    assert "-xt read,edit,write" in cmd
+    assert "-t bash" not in cmd
+    # -ne: with no -t, allowedToolNames is undefined and auto-discovered
+    # extensions in ~/.pi/agent/extensions/ would get their tools activated by
+    # includeAllExtensionTools. The agent can write files there via bash. -ne
+    # closes discovery; explicit -e still works.
+    assert "-ne" in cmd
+    assert "{mcp}" in cmd
+
+
+def test_pi_default_cli_cmd_tool_posture_equals_old_t_bash():
+    """Regression: a pi user with no MCP config must keep the old active set.
+
+    pi's defaultActiveToolNames is the hardcoded ["read","bash","edit","write"]
+    (sdk.js:131). Excluding read/edit/write leaves exactly ["bash"] — which is
+    what `-t bash` used to produce. Asserting this against the real command
+    (rather than against a literal) is the point: it is what would catch the
+    template drifting away from the posture it is supposed to preserve.
+    """
+    cmd = spawners._default_cli_cmd("pi", "/h", model="m")
+    excluded = re.search(r"-xt (\S+)", cmd).group(1).split(",")
+    # Order within -xt is not semantically meaningful; the SET is.
+    assert set(excluded) == {"read", "edit", "write"}
+    assert {"read", "bash", "edit", "write"} - set(excluded) == {"bash"}
 
 
 def test_pi_default_cli_cmd_omits_model_when_unset():
@@ -888,7 +915,7 @@ def test_consumer_env_uses_pi_cli_and_home_for_pi_driver():
         user_id="u_1", home="/h",
     )
     cmd = env["AGENT_CLI_CMD"]
-    assert cmd.startswith("pi --mode json -t bash ")
+    assert cmd.startswith("pi --mode json -ne -xt read,edit,write {mcp} ")
     assert "--append-system-prompt /h/agent-tools-prompt.md" in cmd
     assert "--model feedling/qwen-max" in cmd
     assert "--session-id {session_id}" in cmd

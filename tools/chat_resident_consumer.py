@@ -260,6 +260,13 @@ USER_MCP_CASTORE_FILE = os.environ.get(
     "USER_MCP_CASTORE_FILE",
     f"/tmp/feedling_user_mcp_castore_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
 )
+# The pi user-MCP bridge extension. ONE shared static file for every user —
+# `COPY tools/ ./tools/` (Dockerfile.agent-runner) puts it here; the per-user
+# config path rides FEEDLING_USER_MCP_FILE instead (see _user_mcp_child_env).
+# Overridable for tests and for the self-hosted VPS layout.
+PI_MCP_BRIDGE_FILE = os.environ.get(
+    "PI_MCP_BRIDGE_FILE", "/app/tools/pi_mcp_bridge/index.js",
+)
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
@@ -938,6 +945,14 @@ def _runtime_repo_files() -> set[str]:
             # public-roots check + the double self-verification) — a release
             # that only touches this file must still trigger a self-update.
             "tools/user_mcp_ca_fetch.py",
+            # The pi user-MCP bridge (README:491) is a Node extension shipped
+            # alongside us — it's never imported (not Python, not `.py`) so it
+            # can never land in sys.modules. Register it explicitly so a
+            # self-hosted pi resident restarts on a bridge bugfix instead of
+            # running stale bridge code forever.
+            "tools/pi_mcp_bridge/index.js",
+            "tools/pi_mcp_bridge/mcp_client.js",
+            "tools/pi_mcp_bridge/tool_mapping.js",
             "tools/chat_resident_requirements.txt",
             "backend/requirements.txt",
         }
@@ -4763,7 +4778,7 @@ def call_agent_cli(
                       explain="模型调用发起（" + ("pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude")) + "）",
                       content_excerpt={"prompt_head": (message or "")[:1000]})
     child_env = os.environ.copy()
-    child_env.update(_user_mcp_ca_env(cmd))
+    child_env.update(_user_mcp_child_env(cmd))
     if trace_id:
         child_env["FEEDLING_TRACE_ID"] = trace_id
         child_env["FEEDLING_DEBUG_TRACE_ID"] = trace_id
@@ -5764,8 +5779,8 @@ def _write_user_mcp_ca(servers: list[dict]) -> None:
                     "trust store: %s: %s", type(e).__name__, e)
 
 
-def _user_mcp_ca_env(cmd: list[str]) -> dict:
-    """Per-runtime CA env for one turn. Empty dict = inject nothing.
+def _user_mcp_child_env(cmd: list[str]) -> dict:
+    """Per-runtime child-process env for one turn. Empty dict = inject nothing.
 
     Gates on the in-memory ``_user_mcp_applied`` state first — the same
     source of truth ``_user_mcp_cli_value`` uses — not just on-disk file
@@ -5780,21 +5795,31 @@ def _user_mcp_ca_env(cmd: list[str]) -> dict:
 
     Never set an empty value: an unset var leaves the runtime on its own trust
     store, which is the correct no-CA behavior.
+
+    pi is intentionally NOT special-cased for CA: like claude it is a Node
+    process, so it falls through to NODE_EXTRA_CA_CERTS. (A prior version
+    early-returned {} here citing "pi: route abandoned" — that was a misreading
+    of v2 spec §1's "本期不涉及"; see 2026-07-17-pi-user-mcp-bridge-design.md
+    §1.1.) pi additionally gets FEEDLING_USER_MCP_FILE: the bridge extension is
+    one shared static file, so the per-user config path has to ride the env.
     """
-    if _is_pi_cmd(cmd):
-        return {}          # pi: route abandoned (v2 spec §1), no CA surface
     enabled_servers = [
         s for s in _user_mcp_applied.get("servers") or [] if s.get("enabled")
     ]
     if not enabled_servers:
         return {}
+    env: dict = {}
     if _is_codex_cmd(cmd):
         if Path(USER_MCP_CASTORE_FILE).exists():
-            return {"SSL_CERT_FILE": USER_MCP_CASTORE_FILE}   # REPLACES → concat bundle
-        return {}
-    if Path(USER_MCP_CA_FILE).exists():
-        return {"NODE_EXTRA_CA_CERTS": USER_MCP_CA_FILE}      # ADDS → user CA only
-    return {}
+            env["SSL_CERT_FILE"] = USER_MCP_CASTORE_FILE   # REPLACES → concat bundle
+    else:
+        # claude AND pi — both Node, both ADD via NODE_EXTRA_CA_CERTS.
+        if Path(USER_MCP_CA_FILE).exists():
+            env["NODE_EXTRA_CA_CERTS"] = USER_MCP_CA_FILE  # ADDS → user CA only
+    if _is_pi_cmd(cmd):
+        # The bridge is a shared static file; hand it this user's config path.
+        env["FEEDLING_USER_MCP_FILE"] = USER_MCP_FILE
+    return env
 
 
 def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
@@ -5881,6 +5906,9 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
       does NOT work — codex deep-merges ``-c`` overrides onto the config, and an
       empty parent table is a no-op that leaves each ``[mcp_servers.<name>]``
       enabled. Only an explicit ``enabled=false`` per server disables it.
+    - pi     → ``-e <bridge>`` ONLY on the chat lane. pi has no MCP of its own;
+      the extension registers the user's MCP tools as native pi tools. A
+      background turn simply loads no extension, so the tools do not exist.
     Values contain only controlled characters (a filesystem path, or fixed
     literals plus ``_SAFE_NAME``-constrained server names), so pre-split
     substitution into the template is shlex-safe."""
@@ -5891,6 +5919,25 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
     ]
     if not enabled_servers:
         return ""
+    if _cli_template_is_pi():
+        # pi has no built-in MCP (README:491) — the bridge extension registers
+        # each MCP tool as a native pi tool. Same lane rule as claude: chat only.
+        if lane != "chat":
+            return ""
+        # Same failure shape _strip_missing_mcp_config guards against for
+        # claude's --mcp-config: pi exits 1 with empty stdout when `-e <path>`
+        # points at a file that doesn't exist — no model call at all — and
+        # this is the chat-only lane, so a missing bridge silently kills chat
+        # replies while background/proactive turns (which never pass `-e`)
+        # keep running. PI_MCP_BRIDGE_FILE defaults to the hosted `/app` COPY
+        # target but is overridable for the self-hosted VPS layout, where it
+        # may not exist; degrade to no-MCP instead of killing the turn.
+        if not Path(PI_MCP_BRIDGE_FILE).exists():
+            log.warning(
+                "[user_mcp] pi bridge file missing at %s — disabling pi MCP "
+                "tools for this turn", PI_MCP_BRIDGE_FILE)
+            return ""
+        return f"-e {PI_MCP_BRIDGE_FILE}"
     if _cli_template_is_codex():
         if lane == "chat":
             return ""
