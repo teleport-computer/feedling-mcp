@@ -1,9 +1,6 @@
 """Identity card storage, change log, relationship-day anchors."""
 
-import json
-import os
 import re
-import time
 import uuid
 from datetime import date, datetime, timedelta
 
@@ -12,7 +9,11 @@ import db
 from core.store import UserStore
 
 from memory import service as memory_service
-from identity.card_policy import RUNTIME_LABELS as _IDENTITY_RUNTIME_LABELS
+
+# Re-exported: consumers access this as identity_service._IDENTITY_RUNTIME_LABELS
+# (identity/actions.py, genesis/service.py, hosted/history_import.py).
+from identity.card_policy import RUNTIME_LABELS as _IDENTITY_RUNTIME_LABELS  # noqa: F401
+
 
 def _load_identity(store: UserStore) -> dict | None:
     try:
