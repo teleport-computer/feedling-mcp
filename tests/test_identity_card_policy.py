@@ -105,6 +105,46 @@ def test_sanitize_clamps_dedups_truncates_drops():
     assert card_policy.validate_dimensions_structure(dims) == (True, "")
 
 
+def test_normalize_dimension_value_rescales_and_rounds():
+    n = card_policy.normalize_dimension_value
+    # 0<v<=1 判定为 0–1 概率刻度误用 → ×100 还原
+    assert n(0.95) == 95
+    assert n(0.9) == 90
+    assert n(0.6) == 60
+    assert n(0.85) == 85
+    assert n(1) == 100      # 1.0 视为满分而非 1 分(高分维度语义)
+    # 常规 0–100 刻度 → 取整不变
+    assert n(95) == 95
+    assert n(0) == 0
+    assert n(100) == 100
+    assert n(87.4) == 87
+    # 越界 → clamp
+    assert n(150) == 100
+    assert n(-5) == 0
+    # 结果永远是 int(iOS JSONDecoder 只认整数)
+    for v in (0.95, 95, 0, 1, 150, -5, 87.4):
+        assert type(n(v)) is int
+
+
+def test_sanitize_rounds_non_integer_dimension_values():
+    # 自托管弱模型把 0–100 刻度当 0–1 概率吐出的浮点,必须被还原成整数分值,
+    # 否则 iOS JSONDecoder 撞上 0.95 抛 dataCorrupted → 整卡解析失败误报 decrypt failed
+    dirty = {"agent_name": "阿锐", "dimensions": [
+        {"name": "锐利", "value": 0.95, "description": "x"},
+        {"name": "温情", "value": 0.9, "description": "y"},
+        {"name": "直接", "value": 0.6, "description": "z"},
+        {"name": "克制", "value": 0.85, "description": "w"},
+        {"name": "已是整数", "value": 95, "description": "v"},
+        {"name": "满分", "value": 1, "description": "u"},
+    ]}
+    out = card_policy.sanitize_identity_card(dirty)
+    got = {d["name"]: d["value"] for d in out["dimensions"]}
+    assert got == {"锐利": 95, "温情": 90, "直接": 60, "克制": 85, "已是整数": 95, "满分": 100}
+    for d in out["dimensions"]:
+        assert type(d["value"]) is int
+    assert card_policy.validate_dimensions_structure(out["dimensions"]) == (True, "")
+
+
 def test_sanitize_truncates_to_max():
     many = {"agent_name": "阿锐", "dimensions": [
         {"name": f"d{i}", "value": 50, "description": "x"} for i in range(20)]}
