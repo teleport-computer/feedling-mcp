@@ -2230,7 +2230,11 @@ async def chat_completion_async(
     messages: list[dict[str, Any]],
     *,
     max_tokens: int = 700,
-    temperature: float | None = 0.7,
+    # Native async callers (including Runtime V2) use provider defaults unless
+    # a structured/extraction lane explicitly asks for determinism. New model
+    # generations increasingly reject temperature outright; sending 0.7 here
+    # caused one guaranteed hidden 400→retry on every ordinary chat round.
+    temperature: float | None = None,
     timeout: float = 60.0,
     response_format: dict[str, Any] | None = None,
     require_reply: bool = True,

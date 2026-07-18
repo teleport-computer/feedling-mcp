@@ -350,6 +350,32 @@ def test_openrouter_reasoning_rejection_preserves_supported_cache_fields(
     assert seen[1]["tools"] == seen[0]["tools"]
 
 
+def test_async_runtime_default_omits_temperature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict] = []
+
+    class AsyncClient:
+        async def post(self, *args, json=None, **kwargs):
+            seen.append(copy.deepcopy(json))
+            return _openai_chat_success()
+
+    monkeypatch.setattr(pc, "_async_http_client", lambda: AsyncClient())
+    config = pc.ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-4o-mini",
+        api_key="sk-test",
+        prompt_cache_key=CACHE_KEY,
+    )
+
+    result = asyncio.run(pc.chat_completion_async(config, MESSAGES, tools=TOOLS))
+
+    assert result["reply"] == "done"
+    assert len(seen) == 1
+    assert "temperature" not in seen[0]
+    assert result["usage"]["provider_retry_count"] == 0
+
+
 def test_openrouter_removes_only_each_named_rejected_cache_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
