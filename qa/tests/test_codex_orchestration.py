@@ -1714,6 +1714,76 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
         )
 
 
+def test_launcher_backfills_freed_slot_without_batch_barrier(tmp_path):
+    paths = _setup(tmp_path)
+    captured: list[launcher.WorkerSpec] = []
+    base_runner = _successful_runner(captured, synchronize=False)
+    initial_three_started = threading.Event()
+    release_slow_workers = threading.Event()
+    fourth_started = threading.Event()
+    fourth_completed = threading.Event()
+    state_lock = threading.Lock()
+    start_counts = {profile_id: 0 for profile_id, _ in PROFILE_AGENT_TYPES}
+    initial_profiles: set[str] = set()
+
+    def gated_runner(spec: launcher.WorkerSpec, timeout: int) -> int:
+        index = PROFILE_AGENT_TYPES.index((spec.profile_id, spec.agent_type))
+        with state_lock:
+            start_counts[spec.profile_id] += 1
+            if index < verifier.MAX_CONFIGURED_CONCURRENCY:
+                initial_profiles.add(spec.profile_id)
+                if len(initial_profiles) == verifier.MAX_CONFIGURED_CONCURRENCY:
+                    initial_three_started.set()
+        if index < verifier.MAX_CONFIGURED_CONCURRENCY:
+            assert initial_three_started.wait(timeout=30)
+            if index in {1, 2}:
+                assert release_slow_workers.wait(timeout=30)
+        elif index == verifier.MAX_CONFIGURED_CONCURRENCY:
+            fourth_started.set()
+        exit_code = base_runner(spec, timeout)
+        if index == verifier.MAX_CONFIGURED_CONCURRENCY:
+            fourth_completed.set()
+        return exit_code
+
+    outcome: dict[str, Any] = {}
+
+    def launch() -> None:
+        try:
+            outcome["receipt"] = _launch(paths, gated_runner)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the test thread
+            outcome["error"] = exc
+
+    launch_thread = threading.Thread(target=launch, daemon=True)
+    launch_thread.start()
+    refilled = False
+    fourth_finished_while_slow_workers_held = False
+    try:
+        assert initial_three_started.wait(timeout=30)
+        refilled = fourth_started.wait(timeout=15)
+        fourth_finished_while_slow_workers_held = fourth_completed.wait(timeout=15)
+    finally:
+        release_slow_workers.set()
+        launch_thread.join(timeout=60)
+
+    assert not launch_thread.is_alive()
+    if "error" in outcome:
+        raise outcome["error"]
+    assert refilled
+    assert fourth_finished_while_slow_workers_held
+    assert start_counts == {profile_id: 1 for profile_id, _ in PROFILE_AGENT_TYPES}
+
+    receipt = outcome["receipt"]
+    assert receipt["launch_attempts"] == len(PROFILE_AGENT_TYPES)
+    assert receipt["max_configured_profile_concurrency"] == 3
+    assert receipt["max_observed_profile_concurrency"] == 3
+    assert [
+        (row["profile_id"], row["agent_type"]) for row in receipt["workers"]
+    ] == list(PROFILE_AGENT_TYPES)
+    assert verifier.verify(paths["receipt"], paths["raw"], paths["aggregation"]) == (
+        receipt
+    )
+
+
 def test_fake_worker_completion_is_not_coupled_to_slowest_peer(tmp_path):
     """A slow parent probe must not break an unrelated fake worker barrier."""
 

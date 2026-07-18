@@ -555,8 +555,9 @@ def test_aggregator_preserves_semantic_and_cot_evidence_and_writes_privately():
     assert "reasoning/COT evidence" in supervisor
     assert "trace correlation" in supervisor
     assert "Copy all eight profile objects exactly" in supervisor
-    assert "three fixed" in supervisor
-    assert "batches (3+3+2)" in supervisor
+    assert "fixed" in supervisor
+    assert "three-slot queue" in supervisor
+    assert "immediately backfilled" in supervisor
     assert "profiles_expected and profiles_completed are both 8" in supervisor
     assert "must sum to eight" in supervisor
     assert "summary counts" in supervisor

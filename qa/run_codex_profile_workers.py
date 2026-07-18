@@ -3647,14 +3647,14 @@ def launch(
             invocation_failed=failed,
         )
 
-    # Three fixed batches (3+3+2) guarantee at most three simultaneous processes.
-    # Every locked profile is attempted exactly once even when an earlier worker
-    # fails.
+    # A fixed three-slot queue backfills each freed slot immediately. Submit every
+    # locked profile exactly once up front, then consume results in submission
+    # order so completion timing cannot reorder the locked matrix. The executor
+    # owns the concurrency cap; eager submission also preserves attempt-all
+    # behavior when an earlier worker fails.
     with ThreadPoolExecutor(max_workers=MAX_CONFIGURED_CONCURRENCY) as executor:
-        for offset in range(0, len(specs), MAX_CONFIGURED_CONCURRENCY):
-            batch = specs[offset : offset + MAX_CONFIGURED_CONCURRENCY]
-            futures = [executor.submit(invoke, spec) for spec in batch]
-            attempts.extend(future.result() for future in futures)
+        futures = [executor.submit(invoke, spec) for spec in specs]
+        attempts.extend(future.result() for future in futures)
 
     if len(attempts) != len(assignments) or not (
         1 <= observed_peak <= MAX_CONFIGURED_CONCURRENCY

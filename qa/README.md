@@ -66,8 +66,9 @@ The protected workflow is deliberately split across explicit trust zones:
    provider manifests and one owner-only memory manifest. Every provider
    worker explicitly denies the memory manifest as well as all seven sibling
    provider manifests. `run_codex_profile_workers.py` launches exactly eight
-   independent top-level `codex exec` processes in three fixed batches (3+3+2),
-   with at most three running concurrently. Each selected Codex profile exposes
+   independent top-level `codex exec` processes through one fixed three-slot
+   queue that immediately backfills each freed slot, with at most three running
+   concurrently. Each selected Codex profile exposes
    only its matching row and isolated home/temp/work roots; no process receives
    provider or admin credentials. Every profile worker and the aggregation
    supervisor have tool/shell network fully disabled—no allowed domains, no

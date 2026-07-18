@@ -1565,8 +1565,9 @@ jobs:
           Read and obey ${GITHUB_WORKSPACE}/qa/SOP.md,
           ${GITHUB_WORKSPACE}/qa/coverage-lock.json, and
           ${GITHUB_WORKSPACE}/qa/scenarios/api-key-journey.md. Trusted code has
-          already run exactly eight independent profile agents in three fixed
-          batches (3+3+2), with a concurrency cap of three. Read only the eight
+          already run exactly eight independent profile agents through one fixed
+          three-slot queue that immediately backfilled each freed slot, with a
+          concurrency cap of three. Read only the eight
           schema-validated profile JSON files in
           ${QA_AGGREGATION_INPUT_ROOT} and the trusted lifecycle receipt at
           ${QA_ORCHESTRATION_RECEIPT}. Never read raw worker events/stderr,

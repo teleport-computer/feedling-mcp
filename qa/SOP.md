@@ -55,8 +55,9 @@ profile. Missing coverage is never a successful `SKIP`.
 The launcher is not intelligent. It MUST:
 
 1. Start exactly eight independent top-level `codex exec` processes, one selected
-   profile per locked matrix row, in three fixed batches (3+3+2) of no more than
-   three.
+   profile per locked matrix row, through one fixed three-slot queue that
+   immediately backfills each freed slot and never exceeds three simultaneous
+   profiles.
    Native Codex subagent roles are not used because pinned Codex 0.144.3 does
    not reliably preserve their permission-profile isolation.
 2. Build each process environment from an explicit allowlist. Provider/admin
