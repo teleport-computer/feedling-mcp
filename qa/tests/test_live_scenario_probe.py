@@ -8,7 +8,7 @@ import pytest
 
 from qa import live_scenario_probe as probe
 from qa import run_codex_profile_workers as launcher
-from tools.provider_smoke.client import Session
+from tools.provider_smoke.client import Session, SmokeClient
 
 
 def _prior_turns() -> list[dict[str, object]]:
@@ -63,6 +63,85 @@ def _trace_events(*, include_delivery: bool) -> list[dict[str, object]]:
                 }
             )
     return events
+
+
+def test_probe_client_bounds_unspecified_transport_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[dict[str, object]] = []
+
+    def request(
+        _client,
+        method,
+        path,
+        *,
+        api_key=None,
+        body=None,
+        attempts=5,
+        read_timeout=45,
+    ):
+        calls.append(
+            {
+                "method": method,
+                "path": path,
+                "api_key": api_key,
+                "body": body,
+                "attempts": attempts,
+                "read_timeout": read_timeout,
+            }
+        )
+        return 200, {}
+
+    monkeypatch.setattr(SmokeClient, "_req", request)
+    client = probe.LiveScenarioProbeClient(probe.LOCKED_BASE_URL)
+
+    client._req("GET", "/v1/model_api/runtime", api_key="key")
+
+    assert calls == [
+        {
+            "method": "GET",
+            "path": "/v1/model_api/runtime",
+            "api_key": "key",
+            "body": None,
+            "attempts": probe.LIVE_PROBE_REQUEST_ATTEMPTS,
+            "read_timeout": probe.LIVE_PROBE_READ_TIMEOUT_SECONDS,
+        }
+    ]
+    assert probe.LIVE_PROBE_REQUEST_ATTEMPTS < 5
+    assert probe.LIVE_PROBE_READ_TIMEOUT_SECONDS < 45
+
+
+def test_probe_client_preserves_explicit_transport_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[int, float]] = []
+
+    def request(
+        _client,
+        _method,
+        _path,
+        *,
+        api_key=None,
+        body=None,
+        attempts=5,
+        read_timeout=45,
+    ):
+        del api_key, body
+        calls.append((attempts, read_timeout))
+        return 200, {}
+
+    monkeypatch.setattr(SmokeClient, "_req", request)
+    client = probe.LiveScenarioProbeClient(probe.LOCKED_BASE_URL)
+
+    client._req(
+        "GET",
+        "/v1/chat/history?limit=1",
+        api_key="key",
+        attempts=1,
+        read_timeout=7.5,
+    )
+
+    assert calls == [(1, 7.5)]
 
 
 class _TraceOnlyClient:

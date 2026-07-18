@@ -50,6 +50,8 @@ CHAT_TIMEOUT_SECONDS = 120.0
 CHAT_SETTLE_SECONDS = 1.0
 CHAT_SETTLE_INTERVAL_SECONDS = 0.25
 CHAT_SETTLE_READ_TIMEOUT_SECONDS = 5.0
+LIVE_PROBE_REQUEST_ATTEMPTS = 2
+LIVE_PROBE_READ_TIMEOUT_SECONDS = 15.0
 _ASSISTANT_ROLES = frozenset({"openclaw", "assistant", "agent"})
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _TRACE_STAGES = ("routing", "queue", "provider", "persistence", "delivery")
@@ -58,6 +60,34 @@ _DELIVERY_CONFIRMATION_EVENT = "chat.delivery.confirmed"
 
 class LiveScenarioProbeError(RuntimeError):
     """A fixed, non-sensitive live probe setup failure."""
+
+
+class LiveScenarioProbeClient(SmokeClient):
+    """QA-only client with bounded defaults for non-chat probe requests.
+
+    Chat mutations and reply polling already supply their own stricter retry and
+    timeout policy in :class:`SmokeClient`; explicit call-site overrides pass
+    through unchanged.
+    """
+
+    def _req(
+        self,
+        method: str,
+        path: str,
+        *,
+        api_key: str | None = None,
+        body: dict[str, Any] | None = None,
+        attempts: int = LIVE_PROBE_REQUEST_ATTEMPTS,
+        read_timeout: float = LIVE_PROBE_READ_TIMEOUT_SECONDS,
+    ):
+        return super()._req(
+            method,
+            path,
+            api_key=api_key,
+            body=body,
+            attempts=attempts,
+            read_timeout=read_timeout,
+        )
 
 
 def _utc_now() -> str:
@@ -1254,7 +1284,7 @@ def run_probe(
     ):
         raise LiveScenarioProbeError("live probe identity is invalid")
     profile, session = load_profile(manifest_path, profile_id)
-    active_client = client or SmokeClient(LOCKED_BASE_URL)
+    active_client = client or LiveScenarioProbeClient(LOCKED_BASE_URL)
     started_at = _utc_now()
     request_ids: list[str] = []
     turn_ids: list[str] = []
