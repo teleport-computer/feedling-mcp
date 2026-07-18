@@ -139,3 +139,47 @@ verify 回包 gate 竞态等三层修复曾处于"已修未部署"状态，确�
   自然被跳过；跨 worker 的 `try_consume_pending_for_user` 也是 cache-only
   查找（`_stores.get`，不加载）。回归测试见
   `tests/test_hosted_wake_distribution.py`。
+
+### #15 「生产已死、仅测试供养」符号分诊清单 ⬜ P3 · 需领域判断
+
+2026-07-18 清理第五轮扫描产出：backend 有 ~40 个顶层符号在生产侧
+（backend+tools+scripts+deploy）零引用、只被 tests/ 引用。**不是**都该删——
+分四类，删错会误伤测试基建或在建功能：
+
+- **在建/flag-gated（勿删）**：proactive V2 全家
+  （TurnRunnerV2/ToolExecutorV2/DB*StoreV2/InMemory*V2 等 ~13 个，
+  `FEEDLING_RUNTIME_V2_DEFAULT_ON` 门控，test enclave 全量开）。
+- **测试钩子/播种工具（勿删）**：`enclave/auth.reset_cache`（25 处测试用）、
+  `db.insert_user`、`accounts/runtime_auth._secret` 等。
+- **确认已死但测试共享**：hosted model_api 退役家族——**测试手术已于第六轮
+  完成**（turn.py 传递可达性分析定位整个死半边 20 函数 + context/config_store/
+  history_import 尾巴 + `model_api_runtime` 整包及其专属测试，共删 16 个
+  死路径测试）。唯一保留：`_patch_model_api_action_trace`——log_trim 的
+  防驱逐回归测试（`test_action_trace_trim_preserves_queued_until_patched`）
+  经它验证 `_append` 里活着的 queued-保护语义；且 prod 已无人写 queued
+  trace，这条保护本身是否已成死语义待人工裁定后再动。
+- **已知覆盖缺口（第六轮记录）**：consumer 侧 worldbook 注入
+  （`chat_resident_consumer._worldbook_context_for_foreground`）无直接测试——
+  被删的两个 worldbook 注入测试测的是死掉的 hosted 装配路径，不算它的覆盖。
+- **灰区终审（2026-07-18 第七轮，全部保留）**：16 个逐一核完，git 取证
+  （95decf00）确认生产零调用，但用法定性后没有一个该删——
+  ① **oracle 型**（测试用它回读/断言活路径行为）：genesis/checkpoint 四件套
+  （genesis v2 e2e 靠它们断言 worker 恢复语义）、perception/store 的
+  get_photo_envelope（6 个照片存储测试的回读口）与 merge_state、
+  memory/migration.is_capped、ios_contract_v2.missing_expected_keys_v2；
+  ② **测试缝/播种**：enclave/auth.reset_cache（20 个 fixture 的缓存隔离）、
+  storage_crypto.open_、runtime_auth._secret、db.insert_user；
+  ③ **在建预留面**：agent_runtime/leases.set_session_ref/list_active
+  （07-17 multi-node runner 工作进行中）、agent_protocol_v2.agent_tool_calls_v2
+  （V2 栈）；④ 待议：perception/service.set_manual_user_state（单测试，疑
+  debug 缝）。
+- **hosted_runtime 模块终审（保留）**：生产 import 已归零（coerce_runtime_action
+  等 8 函数），但它是 m2_write_loop / memory_action_conformance /
+  test_hosted_runtime 三个测试文件的**输入构造器**——这些测试断言的是活的
+  memory/actions 语义（如 patch→supersede 守卫）。删模块=重写活语义测试的
+  fixture，回归风险大于收益；若未来重写这批测试改用手工 executor_action
+  字典，可随手删掉整个模块。"hosted_runtime_state/_action" source 标签
+  在 DB 历史行里存在，读侧当不透明字符串处理。
+
+复现扫描：对 backend 顶层符号统计 prod-corpus 与 test-corpus whole-word
+引用数，prod≤1 且 test≥1 即候选（`asgi_test_client.py` 计入 test 侧）。

@@ -84,16 +84,6 @@ Memory write guidance:
 """).strip()
 
 
-MEMORY_CONTEXT_FRAMING_V1 = """
-Memory context framing:
-- Ambient memories are background color. Use them to maintain continuity; do not force them into the reply as a topic.
-- Fetched memories are evidence. Weave them naturally into the answer instead of reciting card text.
-- Follow each card's 使用提示 when deciding tone, timing, and whether to mention the memory explicitly.
-- If memory conflicts with the user's current message, trust the current message unless safety/privacy says otherwise.
-- If memory is only weakly related, do not assert it as fact.
-""".strip()
-
-
 # Full bucket-convergence guidance injected into every card-creating prompt
 # (capture / migrate / genesis) so onboarding and capture steer toward the same set.
 COMMON_BUCKETS_GUIDANCE_V1 = (

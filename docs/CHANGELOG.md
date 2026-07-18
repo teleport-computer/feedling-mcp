@@ -47,6 +47,54 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-18（第六批：终局——全局复扫 + 灰区 16 项终审全保留）
+
+### [DONE] 仓库清理第三轮·第六批（真收官）
+
+- 第五批大删之后全局复扫：仅新暴露 2 个孤儿（MEMORY_CONTEXT_FRAMING_V1、
+  memory_core.existing_terms_via_api_key——唯一历史调用方在已删的 turn.py
+  死半边），已删；除有意保留的 SCENE_HINTS 外全仓符号级归零。
+- 灰区 16 项逐一 git 取证 + 用法定性，**全部保留**（oracle 型/测试缝/在建
+  预留面三类，详见 OPTIMIZATION_BACKLOG #15 终审记录）；hosted_runtime 模块
+  同判保留（活语义测试的输入构造器）。
+- 结论：可安全机械删除的空间已彻底挖尽；#15 记录了「测试改用手工 fixture
+  后可随手删 hosted_runtime」的未来路径。
+
+## 2026-07-18（第五批：测试手术——hosted legacy 内联轮次机器整体下线）
+
+### [DONE] 仓库清理第三轮·第五批：turn.py 死半边 + model_api_runtime 整包
+
+- **方法升级**：对 turn.py 做文件内传递可达性分析（根=被 turn.py 之外生产
+  代码引用的函数）→ 一次性定位完整死簇 20 函数（capture/recap/state-pending/
+  web-search 提取/回复解析——整套 legacy 内联轮次机器），替代此前逐个追链。
+  关键证据：`_model_api_recap_due` 唯一"生产调用"在死函数
+  `_model_api_maybe_run_memory_capture` 体内（活 capture 早已走 proactive
+  capture lane）。
+- **`model_api_runtime` 整包删除**：prompts/tools/__init__——全仓唯一 import
+  方是其专属测试（memory_tools 模式的包级复刻）；"model_api_runtime" 字符串
+  在 prod 的命中全是 blob/路由名非 Python import。
+- **测试手术**（16 个死路径测试）：两个 worldbook 注入测试文件整删（只测死
+  装配路径；consumer 活注入点无测试=既有缺口，已记 backlog #15）、
+  proactive_jobs/conformance/model_api_path 各删 1-2 个专属死测试、
+  prompts 专属测试文件整删。保留 `_patch_model_api_action_trace`
+  （log_trim 防驱逐回归测试依赖，见 backlog #15）。
+- 级联三波共 -45 函数/常量 + 全部孤儿 import（每波过借道检查）。
+- 验证：全量 pytest 对比基线零新增失败（passed 减少数与被删测试数精确对账）；
+  两入口 + hosted 全家 import 冒烟通过。
+
+## 2026-07-18（第四批：清理收官——「仅测试供养」全量分诊，零删除）
+
+### [DONE] 仓库清理第三轮·第四批（收官）
+
+- 把第三批 memory_tools 的发现系统化成全量扫描：backend 顶层符号
+  prod-corpus 零引用 + test-corpus 有引用 → 40 个候选，**全部逐个分诊后
+  零删除**——proactive V2 全家是 flag-gated 在建功能、reset_cache/insert_user
+  是测试基建、model_api 退役家族 8 个虽经 git 取证确认真死但测试引用散在
+  conftest/worldbook/log_trim 等共享文件（删除=测试手术）。
+  分诊清单落 `OPTIMIZATION_BACKLOG.md` #15，附复现方法。
+- **清理宣告收敛**：文件级→顶层符号→常量/方法→test-only 模块→仅测试供养，
+  五个维度全部扫到不动点；剩余项均需领域判断或 ops 确认，机械清理到此为止。
+
 ## 2026-07-18（第三批：test-only 死模块 + tools 内部死码）
 
 ### [DONE] 仓库清理第三轮·第三批

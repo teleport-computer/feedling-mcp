@@ -1989,42 +1989,6 @@ def test_quiet_capture_respects_capture_enabled_switch(tmp_path, monkeypatch):
     assert enabled["job"]["job_kind"] == "memory_capture"
 
 
-def test_model_api_capture_and_recap_respect_capture_enabled_switch(tmp_path, monkeypatch):
-    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    core_store._stores.clear()
-
-    user_id = "usr_model_api_capture_enabled_switch"
-    seed_user(user_id)
-    store = core_store.UserStore(user_id)
-    store.save_proactive_settings({"capture_enabled": False})
-    monkeypatch.setattr(
-        hosted_turn,
-        "_model_api_turn_count",
-        lambda _store: hosted_turn.MODEL_API_CAPTURE_TURN_INTERVAL,
-    )
-
-    capture = hosted_turn._model_api_maybe_run_memory_capture(
-        store,
-        api_key=None,
-        runtime=None,
-        user_message="hello",
-        assistant_reply="hi",
-        user_message_id="msg_user",
-        assistant_message_id="msg_assistant",
-        context_payload={},
-        effects=[],
-    )
-    recap_due, recap_reason = hosted_turn._model_api_recap_due(
-        store,
-        hosted_turn.MODEL_API_CONSOLIDATE_TURN_INTERVAL,
-    )
-
-    assert capture["status"] == "skipped"
-    assert capture["reason"] == "capture_disabled"
-    assert recap_due is False
-    assert recap_reason == "capture_disabled"
-
-
 def test_capture_device_boundary_ignores_proactive_switches(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "999")

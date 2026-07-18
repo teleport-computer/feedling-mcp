@@ -23,7 +23,6 @@ from identity import service as identity_service
 from memory import service as memory_service
 import provider_client
 from hosted import config_store as hosted_config_store
-from hosted import onboarding_validation as hosted_onboarding_validation
 from notices import core as notices
 from notices import catalog
 
@@ -962,39 +961,6 @@ def _format_import_message_line(msg: dict) -> str:
     return f"{at}{role}: {text}"
 
 
-def _model_api_agent_profile_context(store: UserStore, identity: dict) -> dict:
-    latest_job = None
-    try:
-        latest_job = hosted_onboarding_validation._latest_history_import_job(store)
-    except Exception:
-        latest_job = None
-    latest_job = latest_job if isinstance(latest_job, dict) else {}
-    return {
-        "runtime_boundary": (
-            "Feedling provides the container, iOS context, tools, Identity, and durable memory cards. "
-            "The imported agent materials and chat history own the companion persona."
-        ),
-        "agent_name": str(identity.get("agent_name") or ""),
-        "self_introduction": str(identity.get("self_introduction") or "")[:1200],
-        "category": str(identity.get("category") or "")[:240],
-        "signature": identity.get("signature", []) if isinstance(identity.get("signature"), list) else [],
-        "dimensions": identity.get("dimensions", []) if isinstance(identity.get("dimensions"), list) else [],
-        "import_sources": {
-            "ai_persona": bool(latest_job.get("ai_persona_chars") or latest_job.get("agent_prompt_chars") or latest_job.get("character_chars")),
-            "user_profile": bool(latest_job.get("user_profile_chars") or latest_job.get("persona_chars")),
-            "memory_summary": bool(latest_job.get("memory_summary_chars")),
-            "chat_history": bool(latest_job.get("messages_parsed")),
-        },
-        "source_priority": [
-            "explicit user corrections",
-            "AI persona materials",
-            "Feedling Identity",
-            "candidate memory context",
-            "recent chat",
-        ],
-    }
-
-
 def _append_import_lines(lines: list[str], out: list[str], budget: int, *, reverse: bool = False) -> int:
     total = sum(len(line) + 1 for line in out)
     iterable = reversed(lines) if reverse else lines
@@ -1176,15 +1142,6 @@ def _transcript_sample(messages: list[dict], max_chars: int = 18000) -> str:
     if history_text:
         parts.append(history_text)
     return "\n\n".join(parts)[:max_chars].strip()
-
-
-def _transcript_extraction_windows(
-    messages: list[dict],
-    *,
-    max_chars: int = 18000,
-    max_windows: int = 8,
-) -> list[str]:
-    return [w["text"] for w in _build_transcript_windows(messages, max_chars=max_chars, max_windows=max_windows)]
 
 
 def _select_evenly(items: list[Any], limit: int) -> list[Any]:

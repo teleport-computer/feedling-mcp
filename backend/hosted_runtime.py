@@ -8,15 +8,6 @@ from typing import Any
 from memory.prompts_v1 import MEMORY_WRITE_GUIDANCE_V1
 
 
-ACTION_RESPONSE_FORMAT: dict[str, Any] = {"type": "json_object"}
-
-
-ACTION_METHOD = "feedling_runtime_actions"
-NOOP_METHOD = "feedling_runtime_noop"
-PENDING_CONFIRM_METHOD = "feedling_runtime_pending_confirm"
-PENDING_REJECT_METHOD = "feedling_runtime_pending_reject"
-
-
 IDENTITY_STRING_FIELDS = (
     "agent_name",
     "self_introduction",
@@ -138,21 +129,6 @@ def build_background_execution_messages(
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:16000]},
     ]
-
-
-def coerce_pending_decision(parsed: dict, pending_items: list[dict]) -> tuple[str, list[str]]:
-    if not pending_items or not isinstance(parsed, dict):
-        return "", []
-    raw = parsed.get("pending_decision") if isinstance(parsed.get("pending_decision"), dict) else {}
-    decision = str(raw.get("decision") or "").strip().lower()
-    if decision not in {"confirm", "reject"}:
-        return "", []
-    requested = raw.get("pending_ids") if isinstance(raw.get("pending_ids"), list) else []
-    available = [str(item.get("id") or "") for item in pending_items if isinstance(item, dict) and item.get("id")]
-    chosen = [str(item) for item in requested if str(item) in available]
-    if not chosen and available:
-        chosen = [available[0]]
-    return decision, chosen
 
 
 def _candidate_ids(target: dict) -> list[str]:

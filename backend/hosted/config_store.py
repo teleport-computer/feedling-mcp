@@ -51,16 +51,6 @@ def _load_model_api_config(store: UserStore) -> dict | None:
     return config
 
 
-def _save_model_api_config(store: UserStore, config: dict) -> dict:
-    data = dict(config)
-    data["route"] = "model_api"
-    data["updated_at"] = core_util._now_iso()
-    if not data.get("created_at"):
-        data["created_at"] = data["updated_at"]
-    db.set_blob(store.user_id, "model_api", data)
-    return data
-
-
 MODEL_API_RUNTIME_BLOB = "model_api_runtime"
 MODEL_API_RUNTIME_VERSION = 2
 MODEL_API_RUNTIME_MODE = "hosted_resident"
