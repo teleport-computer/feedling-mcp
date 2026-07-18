@@ -44,6 +44,10 @@ _IO_CLI = str(_REPO_ROOT / "tools" / "io_cli.py")
 # can pull the same native context tools as VPS/OpenClaw.
 _IO_CLI_VERBS = (
     "perception",
+    # "what has she been using" — the current-app field only covers the last 15
+    # minutes, so without this verb the agent cannot answer it at all. Same
+    # allowlist/prompt-consistency rule as photo-* below.
+    "perception-recent-apps",
     "perception-trend",
     "perception-history",
     "memory-index",

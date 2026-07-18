@@ -1127,3 +1127,35 @@ def test_identity_sanitization_does_not_change_pi_routing_model():
     assert "[Kiro]" not in prompt
     assert "[不补]" not in prompt
     assert models["providers"]["feedling"]["models"][0]["id"] == raw_model
+
+
+def test_every_verb_documented_in_the_prompt_is_also_allowlisted():
+    """Prompt/allowlist consistency, enforced generically.
+
+    The per-verb assertions above are hand-written, so adding a new io_cli verb
+    to the prompt without adding it to _IO_CLI_VERBS slips through: claude's
+    --allowed-tools then blocks the call in non-interactive acceptEdits mode
+    while the prompt insists the tool exists, and the agent either loops on
+    "requires approval" or tells the user it can't do something it was told it
+    could. perception-recent-apps shipped with exactly that gap.
+    """
+    import re
+    from pathlib import Path
+
+    prompt = Path(spawners.__file__).resolve().parent / "agent_tools_prompt.md"
+    documented = set(re.findall(r"<io_cli>\s+([a-z][a-z0-9-]*)", prompt.read_text()))
+    assert documented, "prompt must document at least one io_cli verb"
+
+    missing = sorted(documented - set(spawners._IO_CLI_VERBS))
+    assert not missing, (
+        f"verbs documented in agent_tools_prompt.md but not granted in "
+        f"_IO_CLI_VERBS (the agent will be blocked calling them): {missing}"
+    )
+
+
+def test_recent_apps_verb_is_granted():
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider_key": "sk-ant"},
+        user_id="u", home="/agent-data/users/u",
+    )
+    assert "io_cli.py perception-recent-apps" in env["AGENT_CLI_CMD"]
