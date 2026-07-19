@@ -12,12 +12,11 @@ Design notes:
   - Two-head routing:
       perception.*   -> main backend (FEEDLING_API_URL)   [coarse, no decrypt]
       photo/memory   -> enclave (FEEDLING_ENCLAVE_URL)     [decrypt; phase 2]
-  - Auth: X-API-Key = FEEDLING_API_KEY, or (zero-roster host-all) the Stage-D
-    runtime token from FEEDLING_RUNTIME_TOKEN_FILE as X-Feedling-Runtime-Token.
-    Both backend and enclave accept either.
+  - Auth: X-API-Key = FEEDLING_API_KEY. Runtime V2 tools execute in-process and
+    do not launch this CLI or materialize a managed-hosted token file.
 
 Config via env (same as the resident consumer): FEEDLING_API_URL,
-FEEDLING_API_KEY (or FEEDLING_RUNTIME_TOKEN_FILE), FEEDLING_ENCLAVE_URL.
+FEEDLING_API_KEY, FEEDLING_ENCLAVE_URL.
 
 MVP = `perception`. send / wait-for-wake / schedule-wake / photo are phase 2 and
 currently return a clean "not implemented" JSON so the agent degrades gracefully.
@@ -107,22 +106,9 @@ def _trace_id():
 
 
 def _auth_headers():
-    """Auth header for backend/enclave calls. Prefer ``FEEDLING_API_KEY``; in
-    zero-roster host-all mode it is absent, so fall back to the Stage-D runtime
-    token written to ``FEEDLING_RUNTIME_TOKEN_FILE`` (both backend and enclave
-    accept ``X-Feedling-Runtime-Token``). Empty dict when neither is available."""
+    """Auth header for the independent API-key resident product."""
     api_key = _env("FEEDLING_API_KEY")
-    if api_key:
-        return {"X-API-Key": api_key}
-    token_file = _env("FEEDLING_RUNTIME_TOKEN_FILE")
-    if token_file:
-        try:
-            tok = open(token_file).read().strip()
-        except Exception:
-            tok = ""
-        if tok:
-            return {"X-Feedling-Runtime-Token": tok}
-    return {}
+    return {"X-API-Key": api_key} if api_key else {}
 
 
 def _http_json(method, url, auth, *, payload=None, insecure=False, timeout=30):
@@ -239,7 +225,7 @@ def cmd_perception(args):
     api_url = _env("FEEDLING_API_URL")
     auth = _auth_headers()
     if not api_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
     signals = list(args.signals) or list(FAST_SIGNALS)
     unknown = [s for s in signals if s not in PERCEPTION_SIGNALS]
     if unknown:
@@ -275,7 +261,7 @@ def cmd_perception_trend(args):
     api_url = _env("FEEDLING_API_URL")
     auth = _auth_headers()
     if not api_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
     params = {"signal": args.signal, "days": str(args.days)}
     if args.field:
         params["field"] = args.field
@@ -290,7 +276,7 @@ def cmd_perception_history(args):
     api_url = _env("FEEDLING_API_URL")
     auth = _auth_headers()
     if not api_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
     params = {"signal": args.signal, "days": str(args.days)}
     url = f"{api_url.rstrip('/')}/v1/agent/perception/history?{urllib.parse.urlencode(params)}"
     status, body = _http_json("GET", url, auth)
@@ -300,12 +286,11 @@ def cmd_perception_history(args):
 
 
 def _require_backend():
-    """Resolve (api_url, auth_headers). auth uses _auth_headers() so memory/screen
-    work in both api-key and host-all runtime-token modes (mirrors perception)."""
+    """Resolve the API-key resident backend and auth headers."""
     api_url = _env("FEEDLING_API_URL")
     auth = _auth_headers()
     if not api_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
     return api_url.rstrip("/"), auth
 
 
@@ -483,7 +468,7 @@ def cmd_chat_image(args):
     auth = _auth_headers()
     mid = (args.message_id or "").strip()
     if not enclave_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_ENCLAVE_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_ENCLAVE_URL / FEEDLING_API_KEY in env"}, 2)
     if not mid:
         _emit({"ok": False, "error": "chat-image needs --id <message_id> (from the [image] placeholder in the recent-chat transcript)"}, 2)
     qs = urllib.parse.urlencode({"since": 0, "limit": args.limit})
@@ -523,7 +508,7 @@ def cmd_identity_read(args):
     to the backend when no enclave is configured."""
     auth = _auth_headers()
     if not auth:
-        _emit({"ok": False, "error": "missing auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_API_KEY in env"}, 2)
     enclave_url = _env("FEEDLING_ENCLAVE_URL")
     status, body = -1, {}
     if enclave_url:
@@ -871,12 +856,13 @@ def cmd_doctor(args):
 
 
 def _require_admin():
-    """Resolve (api_url, auth_headers) for the ops-only hosted_runtime_mode
-    endpoints. These are gated by FEEDLING_ADMIN_TOKEN (X-Admin-Token) on the
+    """Resolve credentials for the ops-only Runtime V2 repair/status surface.
+
+    These endpoints are gated by FEEDLING_ADMIN_TOKEN (X-Admin-Token) on the
     backend (backend/admin/routes_asgi.py's _require_admin) — deliberately NOT
     the caller's own per-user FEEDLING_API_KEY / runtime token from
-    _auth_headers(), since this flips another user's runtime mode and must not
-    be reachable with just that user's own credentials."""
+    _auth_headers().
+    """
     api_url = _env("FEEDLING_API_URL")
     token = _env("FEEDLING_ADMIN_TOKEN")
     if not api_url or not token:
@@ -884,25 +870,23 @@ def _require_admin():
     return api_url.rstrip("/"), {"X-Admin-Token": token}
 
 
-def cmd_set_runtime_mode(args):
-    """[ops] Flip a user's hosted_runtime_mode. POST /v1/admin/hosted-runtime-mode."""
+def cmd_repair_runtime_v2(args):
+    """[ops] Materialize/repair one user's V2-only ownership tuple."""
     api_url, auth = _require_admin()
     status, body = _http_json(
         "POST", f"{api_url}/v1/admin/hosted-runtime-mode", auth,
-        payload={"user_id": args.user_id, "mode": args.mode},
+        payload={"user_id": args.user_id, "mode": "db_action_v2"},
     )
     if status == 200:
         _emit({"ok": True, **body})
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
-def cmd_list_runtime_mode(args):
-    """[ops] List user_ids grouped by hosted_runtime_mode. GET /v1/admin/hosted-runtime-modes."""
+def cmd_runtime_v2_status(args):
+    """[ops] Read the V2 ownership reconciliation status."""
     api_url, auth = _require_admin()
     status, body = _http_json("GET", f"{api_url}/v1/admin/hosted-runtime-modes", auth)
     if status == 200:
-        if args.mode:
-            _emit({"ok": True, "mode": args.mode, "user_ids": body.get(args.mode, [])})
         _emit({"ok": True, **body})
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
@@ -1076,20 +1060,18 @@ def main():
                         help="Five-probe environment health check (api/enclave/identity/memory/chat, read-only).")
     dr.set_defaults(func=cmd_doctor)
 
-    srm = sub.add_parser(
-        "set-runtime-mode",
-        help="[ops] Flip a user's hosted_runtime_mode (resident_cli|db_action_v2). Requires FEEDLING_ADMIN_TOKEN.",
+    rv2 = sub.add_parser(
+        "repair-runtime-v2",
+        help="[ops] Repair one user's V2-only ownership tuple. Requires FEEDLING_ADMIN_TOKEN.",
     )
-    srm.add_argument("user_id")
-    srm.add_argument("mode", choices=["resident_cli", "db_action_v2"])
-    srm.set_defaults(func=cmd_set_runtime_mode)
+    rv2.add_argument("user_id")
+    rv2.set_defaults(func=cmd_repair_runtime_v2)
 
-    lrm = sub.add_parser(
-        "list-runtime-mode",
-        help="[ops] List user_ids grouped by hosted_runtime_mode. Requires FEEDLING_ADMIN_TOKEN.",
+    rv2s = sub.add_parser(
+        "runtime-v2-status",
+        help="[ops] Show V2 ownership reconciliation status. Requires FEEDLING_ADMIN_TOKEN.",
     )
-    lrm.add_argument("--mode", default="", choices=["", "resident_cli", "db_action_v2"], help="filter to one mode")
-    lrm.set_defaults(func=cmd_list_runtime_mode)
+    rv2s.set_defaults(func=cmd_runtime_v2_status)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")

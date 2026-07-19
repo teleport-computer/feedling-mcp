@@ -1,4 +1,4 @@
-"""D4 Task 4: tokens/turn vs resident-runtime comparison — the rollback gate.
+"""D4 Task 4: tokens/turn vs the frozen resident-runtime efficiency baseline.
 
 The V1 (resident) runtime drives the LLM via subprocess CLIs (codex/claude),
 which cannot be cleanly pointed at an HTTP mock provider, so a true live A/B
@@ -10,7 +10,8 @@ runbook). What THIS module provides instead:
      resident run's logs/telemetry, or from ``collect.tokens_per_turn_samples``
      read against resident-tagged rows). A regression here (V2 using more
      than ``threshold`` extra tokens/turn than resident) is the documented
-     ROLLBACK condition for the V2 cutover (D4 plan, hard gate).
+     regression condition for V2. The retired hosted resident is a historical
+     measurement baseline, not a deployable rollback target.
   2. ``measure_v2_tokens_per_turn`` — drives V2's production unified native
      tool loop (``model_api_runtime.v2.tool_loop.run_tool_loop``) against
      fixture conversations through a ``MockProvider`` (deterministic token
@@ -49,6 +50,11 @@ from scripts.loadtest.mock_provider import MockProvider  # noqa: E402
 from scripts.loadtest.fixtures import v2_turn_fixtures  # noqa: E402
 
 DEFAULT_THRESHOLD = 0.10
+# The custom mock endpoint has no provider-owned model metadata.  Runtime V2
+# deliberately fails closed for such routes unless the context window is
+# explicit, so the load-test harness must declare its synthetic model budget
+# just like a real custom OpenAI-compatible deployment.
+LOADTEST_CONTEXT_WINDOW_TOKENS = 128_000
 
 # A small built-in fixture set for the __main__ entrypoint — a couple of
 # short, plausible conversation turns. Real gate runs should pass a richer,
@@ -63,9 +69,9 @@ def compare_tokens_per_turn(
     """Compare V2's mean tokens/turn against a resident-runtime baseline.
 
     ``regression`` is True when V2 uses MORE than ``threshold`` (fractional,
-    e.g. 0.10 == +10%) extra tokens/turn than resident — this is the D4
-    ROLLBACK condition: if this comes back True near cutover, the rollout
-    must not proceed / must be rolled back to resident.
+    e.g. 0.10 == +10%) extra tokens/turn than the frozen resident benchmark.
+    This is a V2 optimization gate; the retired hosted runtime is not a
+    rollback target.
 
     Invalid baselines/thresholds raise. A rollout gate must fail closed rather
     than convert a skipped comparison into exit code zero.
@@ -103,6 +109,7 @@ async def _measure_v2_tokens_per_turn_async(
         model="loadtest-mock",
         api_key="mock-key",
         base_url=mock_base_url,
+        context_window_tokens=LOADTEST_CONTEXT_WINDOW_TOKENS,
     )
     totals: list[float] = []
     for fixture in fixtures:
@@ -205,7 +212,7 @@ async def _drive_turn_async(
         fold_new_messages=_fold_new_messages,
         add_usage=_add_usage,
         # One tools-enabled tool round plus the reserved tools-disabled final
-        # reply is the representative multi-call fixture for this rollback gate.
+        # reply is the representative multi-call fixture for this efficiency gate.
         max_calls=int(fixture.get("max_calls") or 2),
     )
     return {
@@ -228,6 +235,7 @@ def measure_turn_tokens(fixtures: list[dict[str, Any]], *, provider) -> dict[str
     provider_config = provider_client.ProviderConfig(
         provider="openai_compatible", model="loadtest-mock",
         api_key="mock-key", base_url=provider.base_url,
+        context_window_tokens=LOADTEST_CONTEXT_WINDOW_TOKENS,
     )
     before_prompt = provider.total_prompt_tokens
     before_completion = provider.total_completion_tokens
@@ -260,7 +268,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare V2's mean tokens/turn (measured against a mock "
         "provider) to a supplied resident-runtime baseline. Exits nonzero "
-        "(the rollback signal) if V2 regresses beyond --threshold."
+        "if V2 regresses beyond --threshold."
     )
     parser.add_argument(
         "--resident-baseline",

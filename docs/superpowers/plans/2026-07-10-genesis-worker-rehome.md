@@ -1,5 +1,8 @@
 # Genesis Worker Rehome — Implementation Plan
 
+> **RETIRED / DO NOT DEPLOY.** Historical implementation record; Genesis now
+> runs with the pooled Runtime V2 worker, not a hosted resident supervisor.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Move the genesis import worker out of the `agent-runner` container (where it is a parasitic daemon thread inside `supervisor.serve()`) into the V2 `serve-worker` process, and give it a heartbeat so its death stops being silent.

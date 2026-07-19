@@ -117,6 +117,50 @@ def test_fold_filters_non_user_roles():
     assert _run_fold(fold) == []
 
 
+def test_prompt_snapshot_bound_suppresses_duplicate_without_consuming_assistant_seq():
+    """All-role prompt membership and the consumed-user cursor are independent."""
+    reader = _FakeReader(rows=[
+        {
+            "id": "user-1",
+            "ts": 100.0,
+            "seq": 1,
+            "role": "user",
+            "content": "already in base tail",
+        },
+        {
+            "id": "assistant-2",
+            "ts": 101.0,
+            "seq": 2,
+            "role": "openclaw",
+            "content": "intermediate bubble after the latest user",
+        },
+    ])
+    cursor_box = {"seq": 0, "ts": 0.0}
+    fold = worker._make_fold_new_messages(
+        "u_fold_prompt_snapshot",
+        _deps(reader),
+        cursor_box,
+        enclave_sem=None,
+        prompt_through_seq=2,
+    )
+
+    # user-1 was coalesced and consumed, but omitted because the base tail
+    # already carries it. assistant-2 is never a consumed-input frontier.
+    assert _run_fold(fold) == []
+    assert cursor_box["seq"] == 1
+
+    reader.rows.append({
+        "id": "user-3",
+        "ts": 102.0,
+        "seq": 3,
+        "role": "user",
+        "content": "arrived after the prompt snapshot",
+    })
+    folded = _run_fold(fold)
+    assert [row["id"] for row in folded] == ["user-3"]
+    assert cursor_box["seq"] == 3
+
+
 class _CountingSemaphore(asyncio.Semaphore):
     """Real semaphore that counts acquisitions (mirrors
     tests/test_v2_worker.py's own `_CountingSemaphore`) — used here to prove the

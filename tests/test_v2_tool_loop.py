@@ -213,6 +213,68 @@ def test_superseded_final_at_budget_returns_clean_handoff_outcome(monkeypatch):
     assert outcome.replied_intermediate is False
 
 
+def test_child_loop_can_remove_reply_from_the_offered_catalog(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "child result", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        allow_reply_tool=False,
+    ))
+
+    offered = {spec.name for spec in provider.calls[0]["tools"]}
+    assert "reply" not in offered
+    assert outcome.final_text == "child result"
+
+
+def test_task_result_is_external_and_removes_later_writes_and_recursion(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "task-1",
+                "name": "task",
+                "args": {"prompt": "inspect external evidence"},
+            }],
+            "usage": {},
+        },
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch(
+        '{"status":"completed","summary":"untrusted child output"}'
+    )
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+    ))
+
+    first = {spec.name for spec in provider.calls[0]["tools"]}
+    second = {spec.name for spec in provider.calls[1]["tools"]}
+    assert "task" in first
+    assert "task" not in second
+    assert "memory_write" not in second
+    assert "workspace_write" not in second
+    assert "web_search" not in second
+    assert outcome.final_text == "done"
+
+
 def test_intermediate_reply_remains_visible_when_later_final_is_superseded(
     monkeypatch,
 ):

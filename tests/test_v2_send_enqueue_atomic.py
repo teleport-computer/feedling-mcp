@@ -8,6 +8,7 @@ threads the generation through to the new job row.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import sys
 import time
@@ -111,8 +112,101 @@ def test_success_persists_message_and_one_job_with_generation(monkeypatch):
     assert int(expected_gen) == gen
 
 
-def test_atomic_send_trim_mirrors_exact_tee_evictions(monkeypatch):
-    """Message+job atomicity must not leave trimmed rows in the TEE shadow."""
+def test_client_retry_recovers_original_message_without_second_job():
+    """A lost iOS response must not duplicate the message or execute twice."""
+    uid = "u_atomic_client_retry"
+    seed_user(uid)
+    gen = db.get_runtime_generation(uid)
+    client_msg_id = str(uuid.uuid4())
+    first_id = uuid.uuid4().hex
+    first_doc = {**_msg_doc(first_id), "client_msg_id": client_msg_id}
+
+    first_seq, first_job_id = db.chat_append_and_enqueue(
+        uid,
+        first_id,
+        time.time(),
+        first_doc,
+        5000,
+        "chat",
+        reason="chat_send",
+        trace_id=first_id,
+        expected_generation=gen,
+        client_msg_id=client_msg_id,
+        idempotency_window_sec=600,
+    )
+
+    retry_id = uuid.uuid4().hex
+    retry_doc = {**_msg_doc(retry_id), "client_msg_id": client_msg_id}
+    retry_seq, retry_job_id = db.chat_append_and_enqueue(
+        uid,
+        retry_id,
+        time.time(),
+        retry_doc,
+        5000,
+        "chat",
+        reason="chat_send",
+        trace_id=retry_id,
+        expected_generation=gen,
+        client_msg_id=client_msg_id,
+        idempotency_window_sec=600,
+    )
+
+    assert retry_seq == first_seq
+    assert retry_job_id is None
+    assert isinstance(first_job_id, int) and first_job_id > 0
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT msg_id,doc->>'client_msg_id' FROM chat_messages "
+            "WHERE user_id=%s",
+            (uid,),
+        ).fetchall()
+        jobs = conn.execute(
+            "SELECT id FROM agent_jobs WHERE user_id=%s", (uid,)
+        ).fetchall()
+    assert rows == [(first_id, client_msg_id)]
+    assert jobs == [(first_job_id,)]
+
+
+def test_concurrent_client_retries_have_one_message_and_one_job():
+    """The advisory lock makes simultaneous multi-worker retries single-flight."""
+    uid = "u_atomic_concurrent_client_retry"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    client_msg_id = str(uuid.uuid4())
+
+    def send(index: int):
+        msg_id = f"retry-{index}-{uuid.uuid4().hex}"
+        return db.chat_append_and_enqueue(
+            uid,
+            msg_id,
+            time.time(),
+            {**_msg_doc(msg_id), "client_msg_id": client_msg_id},
+            5000,
+            "chat",
+            reason="chat_send",
+            trace_id=msg_id,
+            expected_generation=generation,
+            client_msg_id=client_msg_id,
+            idempotency_window_sec=600,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(send, (1, 2)))
+
+    assert len({seq for seq, _job_id in results}) == 1
+    assert sum(job_id is not None for _seq, job_id in results) == 1
+    with db.get_pool().connection() as conn:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE user_id=%s", (uid,)
+        ).fetchone()[0]
+        job_count = conn.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE user_id=%s", (uid,)
+        ).fetchone()[0]
+    assert (message_count, job_count) == (1, 1)
+
+
+def test_atomic_send_retains_every_source_row_without_tee_eviction(monkeypatch):
+    """The 5,000-row value is a hot-cache cap, never durable history GC."""
     uid = "u_atomic_send_tee_trim"
     seed_user(uid)
     gen = db.get_runtime_generation(uid)
@@ -159,10 +253,8 @@ def test_atomic_send_trim_mirrors_exact_tee_evictions(monkeypatch):
                 "SELECT msg_id FROM chat_messages WHERE user_id=%s", (uid,)
             ).fetchall()
         }
-    assert remaining == {"old-3", new_id}
-    assert len(mirrored) == 1
-    assert mirrored[0][0][1] == (uid, ["old-1", "old-2"])
-    assert mirrored[0][1][1] == (uid, ["old-1", "old-2"])
+    assert remaining == {"old-1", "old-2", "old-3", new_id}
+    assert mirrored == []
 
 
 def test_singleflight_race_retries_and_preserves_message(monkeypatch):

@@ -1,9 +1,4 @@
-"""account_reset (POST /v1/account/reset) 必须清掉该用户在所有按 user_id 存储的表里的行。
-
-回归测试：baseline(0001) 之后新增的 perception / agent_runtime / genesis 表
-曾被 db.delete_user_data 的硬编码清单漏掉，导致"删账号"后这些数据永久残留。
-此测试给一个用户在每张表里塞行，走真实 reset 路由，断言全部清零。
-"""
+"""Account reset removes every durable per-user row."""
 
 import itertools
 import sys
@@ -59,11 +54,6 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             (user_id,),
         )
         conn.execute(
-            "INSERT INTO agent_runtime_instances (user_id, driver, status, runtime_home) "
-            "VALUES (%s, 'claude', 'idle', '/tmp/rt')",
-            (user_id,),
-        )
-        conn.execute(
             "INSERT INTO genesis_import_jobs (user_id, job_id, status) "
             "VALUES (%s, 'job1', 'done')",
             (user_id,),
@@ -95,7 +85,6 @@ def _seed_all_per_user_tables(user_id: str) -> None:
 _PER_USER_TABLES = (
     "perception_items",
     "perception_daily",
-    "agent_runtime_instances",
     "genesis_import_jobs",
     "genesis_import_chunks",
     "genesis_import_outputs",
@@ -188,16 +177,12 @@ def test_reset_besteffort_downstream_failure_does_not_abort_or_half_delete(clien
             assert n == 0, f"{t} not purged despite best-effort downstream failure ({n} rows)"
 
 
-def test_reset_stops_hosted_agent(client):
-    """删账号后托管 agent 必须停下来：用户既不再被托管发现（→ supervisor 下个
-    tick 把子进程 kill + 释放 lease），其 agent_runtime_instances lease 行也清掉
-    （renew 命中 0 行 → supervisor 判定丢 lease 同样会 kill）。"""
+def test_reset_removes_hosted_runtime_eligibility(client):
+    """A deleted account cannot remain eligible for the Runtime V2 queue."""
     import db as _db
     uid, api_key = _register(client)
 
-    # 该用户配了一个能 fit 的 provider 且 test_status=ok → 会被托管发现
-    # (roster 数据源已从 user_blobs(kind='model_api') 改为
-    # model_api_routes JOIN model_api_credentials，见 Task 3)
+    # An active, tested route is the current hosted eligibility source.
     cid = _db.model_api_credential_create(
         uid, provider="anthropic", base_url="", label="k",
         api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
@@ -206,15 +191,7 @@ def test_reset_stops_hosted_agent(client):
     rid = _db.model_api_route_upsert(uid, cid, "claude-x", None)
     _db.model_api_route_mark_test(uid, rid, status="ok")
     _db.model_api_route_activate(uid, rid)
-    with _db.get_pool().connection() as conn:
-        conn.execute(
-            "INSERT INTO agent_runtime_instances (user_id, driver, status, runtime_home) "
-            "VALUES (%s, 'claude', 'running', '/tmp/rt')",
-            (uid,),
-        )
-
-    discovered = {u["user_id"] for u in _db.list_agent_runtime_enabled_users()}
-    assert uid in discovered, "前置条件：用户应被托管发现"
+    assert uid in _db.list_hosted_runtime_eligible_user_ids()
 
     res = client.post(
         "/v1/account/reset",
@@ -223,8 +200,4 @@ def test_reset_stops_hosted_agent(client):
     )
     assert res.status_code == 200, res.get_data(as_text=True)
 
-    discovered_after = {u["user_id"] for u in _db.list_agent_runtime_enabled_users()}
-    assert uid not in discovered_after, "删账号后用户仍被托管发现 → supervisor 会重新拉起 agent"
-
-    from agent_runtime import leases
-    assert leases.get(uid) is None, "删账号后 lease 行仍在"
+    assert uid not in _db.list_hosted_runtime_eligible_user_ids()

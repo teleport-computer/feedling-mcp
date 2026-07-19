@@ -65,9 +65,12 @@
 | `model_api_key_envelope_missing` | 400/404 | user_provider | 同 model_api_not_configured 的两条路径 | ✅ |
 | `model_api_credential_write_failed` | 500 | system | 写 model_api_credentials 失败（DB 异常被 db.py 吞成 None） | |
 | `model_api_route_write_failed` | 500 | system | 写/激活 model_api_routes 失败（DB 异常，或 route 被并发删除） | |
+| `prompt_context_limit_unconfigured` | 400 | user_provider | 未审计的 OpenRouter/custom route 未提供 `context_window_tokens`；setup 在 provider I/O/写库前拒绝 | |
+| `invalid_context_window_tokens` | 400 | user_provider | context window 越界、非整数，或不大于 output reserve + safety margin | |
+| `prompt_frontier_configuration_invalid` | 503 | system | 服务端 prompt-window override/reserve 配置非法 | |
 | `provider_not_configured` | 409 | user_provider | | ✅ |
 | `provider_not_hostable` | 409 | user_provider | | ✅ |
-| `hosting_runtime_unavailable` | 503 | system | 托管 supervisor 未起来（detail.reason） | ✅ |
+| `hosting_runtime_unavailable` | 503 | system | 历史 hosted-supervisor 兼容 slug；Runtime V2 托管路径不再返回（worker 全挂改用 `workers_unavailable`） | ✅ |
 | `provider_test_failed` | 400 | user_provider | 保存/测试 key 时上游拒绝（detail 带 status_code） | |
 | `cannot_encrypt_provider_key` | 409 | — | 缺 content public key 或 enclave attestation 不可达 | |
 | `route_not_found` | 404 | user_provider | 指定的 route id 不属于该用户或已删除 | |
@@ -85,6 +88,12 @@
 | `user_message_envelope_failed` | 409 | — | | ✅ |
 | `confirmation_required` | 400 | — | 清空聊天 / 账号重置缺确认字段 | |
 | `chat_clear_failed` | 500 | system | | |
+| `runtime_control_unavailable` | 503 | system | 无法读取/验证 Runtime V2 control 或强制 `v2_only` policy，发送前失败关闭 | |
+| `runtime_policy_not_ready` | 503 | system | 账号的 runtime control 尚未处于 `db_action_v2` + `v2`，消息不会落库或入队 | |
+| `workers_unavailable` | 503 | system | 没有 live Runtime V2 turn-worker 心跳；发送前拒绝，绝不退回 resident | |
+| `turns_halted` | 503 | system | 运维 kill switch 已暂停新 turn；Genesis 使用独立控制面 | |
+| `busy` | 503 | system | live worker pool 的预计排队时间超过 admission SLA；`reason=queue_over_sla` | |
+| `runtime_control_changed` | 503 | system | 加密消息写入前后 runtime generation/control 发生变化，事务回滚且不留下孤儿 job | |
 
 ## 记忆（memory 路由 + memory action）
 
@@ -293,11 +302,12 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 > `rate_limited` / `upstream_unavailable` / `turn_timeout` /
 > `reply_parse_failed` / `unknown` 8 类是 Phase B/B3 既有的 chat 上游类
 > （`tools/chat_resident_consumer.py` `_ERROR_CLASS_RULES` 同源），未在本次
-> 新增，不重复列。下表只列 **Phase C（2026-07-08）新增的 11 类**。
+> 新增，不重复列。下表保留 Phase C 后加入的目录项；其中 `runner_*` 三项只是
+> 已冻结的历史 resident/supervisor 通知兼容值，Runtime V2 不再产生它们。
 
 | error_class | 状态码 | blame | severity | 触发场景 |
 |---|---|---|---|---|
-| `provider_incompatible` | — | user_provider | error | chat：agent-runner 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
+| `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |
 | `content_filtered` | — | provider_transient | error | chat：回复被上游内容策略拦截 |
 | `genesis_failed` | — | system | error | genesis：蒸馏 job 整体失败（`service.mark_failed`；先过 `classify_upstream` 分类，未命中时兜底到本类） |
@@ -305,6 +315,6 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `import_failed` | — | system | error | history_import：聊天记录导入失败 |
 | `import_stale` | — | system | error | history_import：导入 job 卡在 queued/processing 超过阈值，判定超时失败 |
 | `memory_backoff` | — | system | warning | memory：capture/migrate/dream 三条 lane 之一连续失败 streak ≥ 3（`_BACKOFF_NOTICE_STREAK`），已进自动退避 |
-| `runner_spawn_failed` | — | system | error | runner：supervisor 拉起用户子进程失败 |
-| `runner_key_decrypt_failed` | — | system | error | runner：provider key 解密失败，子进程无法拉起 |
-| `runner_degraded` | — | system | warning | runner：runtime-token 刷新失败但子进程仍存活，能力部分受限（token 刷新恢复才会 resolve，spawn 成功不清） |
+| `runner_spawn_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 拉起 per-user 子进程失败 |
+| `runner_key_decrypt_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 为 per-user 子进程解密 provider key 失败 |
+| `runner_degraded` | — | system | warning | **历史兼容，不再产生**：旧 resident 子进程 runtime-token 刷新失败 |

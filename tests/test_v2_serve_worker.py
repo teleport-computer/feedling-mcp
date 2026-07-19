@@ -71,17 +71,23 @@ def test_run_forever_backoff_is_bounded(monkeypatch):
 
 def test_db_pool_capacity_scales_for_nested_effect_sinks(monkeypatch):
     monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
+    monkeypatch.delenv(
+        "FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", raising=False
+    )
 
-    # Sixteen simultaneous effect drains can each hold an outer generation-lock
-    # connection while requesting one nested sink connection: 2*16 + 4.
-    assert serve_worker._configure_db_pool_capacity(16) == 36
-    assert __import__("os").environ["FEEDLING_DB_POOL_MAX_SIZE"] == "36"
+    # Sixteen simultaneous drains may each hold an outer generation connection.
+    # While one workspace batch occupies four shared nested CAS slots, the other
+    # turns may each need an ordinary nested sink connection too. The
+    # conservative floor is 2*16 + 4 workspace + 4 operational headroom.
+    assert serve_worker._configure_db_pool_capacity(16) == 40
+    assert __import__("os").environ["FEEDLING_DB_POOL_MAX_SIZE"] == "40"
 
 
 def test_db_pool_capacity_rejects_explicit_saturation_cliff(monkeypatch):
-    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", "35")
+    monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "4")
+    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", "39")
 
-    with pytest.raises(RuntimeError, match=r"too small.*require >= 36"):
+    with pytest.raises(RuntimeError, match=r"too small.*require >= 40"):
         serve_worker._configure_db_pool_capacity(16)
 
 
@@ -141,6 +147,86 @@ def test_default_worker_id_is_unique_across_same_pid_replica_calls(monkeypatch):
     assert first.endswith("-abcdef1")
     assert second.endswith("-abcdef1")
     assert first != second
+
+
+def test_managed_fleet_worker_id_has_stable_deployment_prefix_and_unique_boot(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_FLEET_IDENTITY_REQUIRED", "1")
+    monkeypatch.setenv(
+        "FEEDLING_V2_RUNNER_CVM_ID", "130fdfc6-5736-4cdc-9d0f-a35af8957cf2"
+    )
+    monkeypatch.setenv("FEEDLING_V2_DEPLOYED_BUILD", "abcdef1")
+    monkeypatch.setenv("FEEDLING_GIT_COMMIT", "abcdef1234567890")
+
+    first = serve_worker.runner_identity.resolve_worker_id(
+        lambda: "ephemeral-must-not-be-used"
+    )
+    second = serve_worker.runner_identity.resolve_worker_id(
+        lambda: "different-ephemeral-must-not-be-used"
+    )
+
+    expected_prefix = (
+        "v2-fleet-cvm-130fdfc6-5736-4cdc-9d0f-a35af8957cf2-build-abcdef1-boot-"
+    )
+    assert first.startswith(expected_prefix)
+    assert second.startswith(expected_prefix)
+    assert first != second
+    assert serve_worker.runner_identity.parse_fleet_worker_id(first)[:2] == (
+        "130fdfc6-5736-4cdc-9d0f-a35af8957cf2",
+        "abcdef1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("missing", "value"),
+    [
+        ("FEEDLING_V2_RUNNER_CVM_ID", ""),
+        ("FEEDLING_V2_DEPLOYED_BUILD", ""),
+    ],
+)
+def test_managed_fleet_worker_id_requires_both_inputs(monkeypatch, missing, value):
+    monkeypatch.setenv("FEEDLING_V2_FLEET_IDENTITY_REQUIRED", "1")
+    monkeypatch.setenv("FEEDLING_V2_RUNNER_CVM_ID", "runner-a")
+    monkeypatch.setenv("FEEDLING_V2_DEPLOYED_BUILD", "abcdef1")
+    monkeypatch.setenv("FEEDLING_GIT_COMMIT", "abcdef1234567890")
+    monkeypatch.setenv(missing, value)
+
+    with pytest.raises(RuntimeError, match="requires both"):
+        serve_worker.runner_identity.resolve_worker_id(lambda: "ephemeral")
+
+
+def test_managed_fleet_worker_id_rejects_image_build_mismatch(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_FLEET_IDENTITY_REQUIRED", "1")
+    monkeypatch.setenv("FEEDLING_V2_RUNNER_CVM_ID", "runner-a")
+    monkeypatch.setenv("FEEDLING_V2_DEPLOYED_BUILD", "abcdef1")
+    monkeypatch.setenv("FEEDLING_GIT_COMMIT", "1234567890abcdef")
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        serve_worker.runner_identity.resolve_worker_id(lambda: "ephemeral")
+
+
+def test_managed_fleet_worker_id_rejects_arbitrary_override(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_FLEET_IDENTITY_REQUIRED", "1")
+    monkeypatch.setenv("FEEDLING_V2_RUNNER_CVM_ID", "runner-a")
+    monkeypatch.setenv("FEEDLING_V2_DEPLOYED_BUILD", "abcdef1")
+    monkeypatch.setenv("FEEDLING_GIT_COMMIT", "abcdef1234567890")
+    monkeypatch.setenv("FEEDLING_V2_WORKER_ID", "pretend-to-be-another-cvm")
+
+    with pytest.raises(RuntimeError, match="cannot override"):
+        serve_worker.runner_identity.resolve_worker_id(lambda: "ephemeral")
+
+
+def test_main_rejects_invalid_fleet_identity_before_schema_mutation(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_FLEET_IDENTITY_REQUIRED", "1")
+    monkeypatch.delenv("FEEDLING_V2_RUNNER_CVM_ID", raising=False)
+    monkeypatch.delenv("FEEDLING_V2_DEPLOYED_BUILD", raising=False)
+    monkeypatch.delenv("FEEDLING_V2_WORKER_ID", raising=False)
+    schema_calls = []
+    monkeypatch.setattr(serve_worker.db, "init_schema", lambda: schema_calls.append(1))
+
+    with pytest.raises(RuntimeError, match="requires both"):
+        serve_worker.main()
+
+    assert schema_calls == []
 
 
 def test_build_production_deps_returns_turndeps():
@@ -298,7 +384,7 @@ def test_seq_catchup_reader_uses_strict_db_order_and_preserves_seq(monkeypatch):
          "body_ct": "x", "K_enclave": "k"},
         {"id": "a1", "seq": 12, "ts": 100.0, "role": "assistant",
          "body_ct": "x", "K_enclave": "k"},
-        {"id": "m2", "seq": 13, "ts": 100.0, "role": "user",
+        {"id": "m2", "seq": 13, "ts": 100.0, "role": "human",
          "body_ct": "x", "K_enclave": "k"},
     ]
     monkeypatch.setattr(
@@ -317,6 +403,207 @@ def test_seq_catchup_reader_uses_strict_db_order_and_preserves_seq(monkeypatch):
 
     assert calls == [("u", 10, None, True, 13)]
     assert [(row["id"], row["seq"]) for row in out] == [("m1", 11), ("m2", 13)]
+    assert [row["role"] for row in out] == ["user", "user"]
+
+
+def test_compaction_reader_decrypts_every_selected_media_caption_past_eight(
+    monkeypatch,
+):
+    rows = [
+        {
+            "id": f"m{i}",
+            "seq": i,
+            "ts": float(i),
+            "role": "user",
+            "content_type": "image" if i % 2 else "file",
+            "file_name": f"f{i}.pdf",
+            "caption_id": f"cap{i}",
+            "caption_body_ct": f"cipher-caption-{i}",
+            "caption_K_enclave": "k",
+            "caption_owner_user_id": "u",
+        }
+        for i in range(1, 13)
+    ]
+    selected = []
+    decrypted = []
+
+    def _read(uid, after_seq, *, limit, oldest_first=True, through_seq=None):
+        selected.append((uid, after_seq, limit, oldest_first, through_seq))
+        return rows
+
+    def _decrypt(envelope, *args, **kwargs):
+        decrypted.append(envelope["id"])
+        return f"caption-{envelope['id']}".encode()
+
+    monkeypatch.setattr(serve_worker.db, "chat_messages_after_seq", _read)
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        _decrypt,
+    )
+
+    out = serve_worker._read_compaction_tail_after_seq(
+        "u", 0, 12, through_seq=12,
+    )
+
+    assert selected == [("u", 0, 12, True, 12)]
+    assert decrypted == [f"cap{i}" for i in range(1, 13)]
+    assert [row["content"] for row in out] == [
+        f"caption-cap{i}" for i in range(1, 13)
+    ]
+
+
+def test_compaction_caption_failure_aborts_the_whole_read(monkeypatch):
+    rows = [
+        {
+            "id": f"m{i}",
+            "seq": i,
+            "ts": float(i),
+            "role": "user",
+            "content_type": "image",
+            "caption_id": f"cap{i}",
+            "caption_body_ct": f"cipher-caption-{i}",
+            "caption_K_enclave": "k",
+            "caption_owner_user_id": "u",
+        }
+        for i in range(1, 10)
+    ]
+
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_messages_after_seq",
+        lambda *args, **kwargs: rows,
+    )
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+
+    def _decrypt(envelope, *args, **kwargs):
+        if envelope["id"] == "cap9":
+            raise RuntimeError("caption unavailable")
+        return f"caption-{envelope['id']}".encode()
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        _decrypt,
+    )
+
+    # No partial list reaches compaction, so its summary watermark cannot move
+    # past cap9 while that selected row's original text is unavailable.
+    with pytest.raises(RuntimeError, match="caption unavailable"):
+        serve_worker._read_compaction_tail_after_seq(
+            "u", 0, 9, through_seq=9,
+        )
+
+
+def test_media_caption_failure_does_not_advance_compaction_watermark(monkeypatch):
+    """The real maintenance path must fail before summary CAS on caption loss."""
+    import conftest
+    import db
+    import provider_client
+    from core import store as core_store
+    from model_api_runtime.v2 import compaction as v2_compaction
+
+    uid = "u_media_caption_compaction_fail_closed"
+    conftest.seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs")
+        conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
+        conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
+    conftest.set_v2_runtime_owner(uid)
+
+    row_count = max(12, worker._TAIL_KEEP + 2)
+    for i in range(1, row_count + 1):
+        db.chat_append_strict(
+            uid,
+            f"m{i}",
+            float(i),
+            {
+                "id": f"m{i}",
+                "ts": float(i),
+                "role": "user",
+                "content_type": "image",
+                "body_ct": f"cipher-image-{i}",
+                "nonce": f"image-nonce-{i}",
+                "K_user": "wrapped-user-key",
+                "K_enclave": "wrapped-enclave-key",
+                "owner_user_id": uid,
+                "caption_id": f"cap{i}",
+                "caption_body_ct": f"cipher-caption-{i}",
+                "caption_nonce": f"caption-nonce-{i}",
+                "caption_K_enclave": "wrapped-caption-key",
+                "caption_owner_user_id": uid,
+            },
+            core_store.MAX_CHAT_MESSAGES,
+        )
+
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    decrypted = []
+
+    def _decrypt(envelope, *args, **kwargs):
+        decrypted.append(envelope["id"])
+        if envelope["id"] == "cap9":
+            raise RuntimeError("caption unavailable")
+        return f"caption-{envelope['id']}".encode()
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        _decrypt,
+    )
+    monkeypatch.setattr(
+        v2_compaction,
+        "compact",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("provider compaction must not run after caption read failure")
+        ),
+    )
+    writes = []
+
+    def _write_summary(*args, **kwargs):
+        writes.append((args, kwargs))
+        return True
+
+    config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-test",
+        context_window_tokens=200_000,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
+    job = jobs_store.claim_next_job("media-caption-worker")
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (config, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        read_summary_with_seq=serve_worker._read_summary_with_seq,
+        read_compaction_tail_after_seq=(
+            serve_worker._read_compaction_tail_after_seq
+        ),
+        write_summary=_write_summary,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=config,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert decrypted == [f"cap{i}" for i in range(1, 10)]
+    assert writes == []
+    assert jobs_store.get_summary_row(uid) is None
+    with db.get_pool().connection() as conn:
+        job_row = conn.execute(
+            "SELECT status,last_error FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert job_row[0] == "failed"
+    assert job_row[1] == "compaction_failed:runtimeerror"
 
 
 def test_seq_tail_readers_request_exact_oldest_and_newest_windows(monkeypatch):
@@ -676,7 +963,7 @@ def test_read_summary_missing_returns_empty(monkeypatch):
     round trip attempted."""
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
-    monkeypatch.setattr(v2_jobs_store, "get_summary_row", lambda uid: None)
+    monkeypatch.setattr(v2_jobs_store, "get_summary_frontier_state", lambda uid: None)
 
     out = serve_worker._read_summary("u_summary_test")
     assert out == ("", 0.0, 0)
@@ -689,7 +976,7 @@ def test_read_summary_decrypts_present_row(monkeypatch):
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(
-        v2_jobs_store, "get_summary_row",
+        v2_jobs_store, "get_summary_frontier_state",
         lambda uid: {"summary_envelope": {"body_ct": "x"}, "watermark_ts": 7.0,
                      "watermark_seq": 19, "version": 3})
     monkeypatch.setattr(
@@ -715,7 +1002,7 @@ def test_read_summary_nonzero_watermark_without_envelope_fails_closed(
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(
-        v2_jobs_store, "get_summary_row",
+        v2_jobs_store, "get_summary_frontier_state",
         lambda uid: {
             "summary_envelope": None,
             "watermark_ts": watermark_ts,
@@ -738,7 +1025,7 @@ def test_read_summary_nonzero_watermark_with_empty_plaintext_fails_closed(monkey
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(
-        v2_jobs_store, "get_summary_row",
+        v2_jobs_store, "get_summary_frontier_state",
         lambda uid: {
             "summary_envelope": {"body_ct": "x"},
             "watermark_ts": 7.0,
@@ -760,7 +1047,7 @@ def test_read_summary_zero_watermark_without_envelope_is_valid(monkeypatch):
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(
-        v2_jobs_store, "get_summary_row",
+        v2_jobs_store, "get_summary_frontier_state",
         lambda uid: {
             "summary_envelope": None,
             "watermark_ts": 0.0,
@@ -775,6 +1062,76 @@ def test_read_summary_zero_watermark_without_envelope_is_valid(monkeypatch):
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
 
     assert serve_worker._read_summary_with_seq("u_summary_test") == ("", 0.0, 1, 0)
+
+
+def test_read_segmented_summary_requires_exact_materialized_id_binding(monkeypatch):
+    from core import enclave as core_enclave
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(
+        v2_jobs_store,
+        "get_summary_frontier_state",
+        lambda uid: {
+            "summary_envelope": {"body_ct": "authentic-but-stale"},
+            "watermark_ts": 1.0,
+            "watermark_seq": 10,
+            "version": 2,
+            "materialized_segment_ids": (999,),
+            "has_segment_rows": True,
+            "first_source_seq": 10,
+            "covered_source_count": 1,
+            "segments": [{
+                "segment_id": 1,
+                "coverage_kind": "exact",
+                "level": 0,
+                "start_seq": 10,
+                "end_seq": 10,
+                "source_message_count": 1,
+                "legacy_opaque_through_seq": 0,
+                "child_segment_ids": [],
+                "summary_envelope": {"body_ct": "leaf"},
+            }],
+        },
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("mismatched head must fail before decrypt")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
+    with pytest.raises(
+        RuntimeError, match="^v2_summary_frontier_integrity_error$"
+    ):
+        serve_worker._read_summary_with_seq("u_summary_test")
+
+
+def test_read_segmented_summary_rejects_bound_ids_without_canonical_rows(monkeypatch):
+    from core import enclave as core_enclave
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(
+        v2_jobs_store,
+        "get_summary_frontier_state",
+        lambda uid: {
+            "summary_envelope": {"body_ct": "orphaned-head"},
+            "watermark_ts": 1.0,
+            "watermark_seq": 10,
+            "version": 2,
+            "materialized_segment_ids": (),
+            "has_segment_rows": True,
+            "first_source_seq": 10,
+            "covered_source_count": 1,
+            "segments": [],
+        },
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("orphaned head must fail before decrypt")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
+    with pytest.raises(
+        RuntimeError, match="^v2_summary_frontier_integrity_error$"
+    ):
+        serve_worker._read_summary_with_seq("u_summary_test")
 
 
 def test_write_summary_builds_envelope_and_cas(monkeypatch):

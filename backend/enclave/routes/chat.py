@@ -64,6 +64,7 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
         if m.get("visibility") == "local_only":
             decrypted.append({
                 "id": m["id"],
+                "seq": m.get("seq"),
                 "role": m["role"],
                 "ts": m["ts"],
                 "source": m.get("source"),
@@ -84,6 +85,7 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
             # message at a time via GET /v1/chat/messages/<id>/body.
             entry = {
                 "id": m["id"],
+                "seq": m.get("seq"),
                 "role": m["role"],
                 "ts": m["ts"],
                 "source": m.get("source"),
@@ -117,6 +119,7 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
             plaintext = envelope.decrypt_envelope(m, authorized_user_id, content_sk)
             entry: dict = {
                 "id": m["id"],
+                "seq": m.get("seq"),
                 "role": m["role"],
                 "ts": m["ts"],
                 "source": m.get("source"),
@@ -158,6 +161,7 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
             errors.append({"id": m.get("id"), "reason": e.reason})
             decrypted.append({
                 "id": m["id"],
+                "seq": m.get("seq"),
                 "role": m["role"],
                 "ts": m["ts"],
                 "content": None,
@@ -261,9 +265,15 @@ async def v1_chat_history(request: Request):
         body, status = error
         return JSONResponse(body, status_code=status)
 
-    since = request.query_params.get("since", "0")
     limit = request.query_params.get("limit", "200")
-    params = {"since": since, "limit": limit}
+    params = {"limit": limit}
+    # Sequence cursors are the lossless pagination contract: unlike timestamps,
+    # they cannot skip siblings appended with the same client clock value. Keep
+    # forwarding the timestamp cursors for older app builds.
+    for cursor_name in ("since", "before", "after_seq", "before_seq"):
+        cursor_value = request.query_params.get(cursor_name)
+        if cursor_value is not None:
+            params[cursor_name] = cursor_value
     # Forward the body opt-out. Dropping it (the old behaviour) forced every
     # caller to take the image bodies: a window holding a handful of 1.4MB photos
     # serialized to a multi-MB response that the CVM egress truncated mid-body,
@@ -352,6 +362,22 @@ async def v1_chat_history(request: Request):
         "total": hist.get("total", len(decrypted)),
         "decrypt_errors": errors,
     }
+    # Sequence cursors are the lossless pagination contract. Keep them outside
+    # the encrypted body but preserve them through this decrypting boundary;
+    # timestamp cursors alone can skip rows that share the same timestamp.
+    for key in (
+        "oldest_ts",
+        "latest_ts",
+        "oldest_seq",
+        "latest_seq",
+        "has_more_older",
+        "has_more_newer",
+        "bodies_omitted",
+        "image_bodies_omitted",
+        "body_omit_inline_max",
+    ):
+        if key in hist:
+            payload[key] = hist[key]
     if context_memory_trace is not None:
         payload["context_memory_trace"] = context_memory_trace
     # 图片聊天史 payload 可达数 MB（image_b64）——json.dumps 离事件循环

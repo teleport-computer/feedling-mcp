@@ -76,6 +76,7 @@ def _summarize_capability_result(data: dict) -> str:
 async def dispatch_tool_calls(
     tool_calls, *, store, api_key, runtime_token, enclave_sem,
     turn_authorization: bool, enqueue_write_effect, before_write=None,
+    enqueue_workspace_batch_effect=None,
     read_parallelism: int = 4,
 ) -> list[ToolResult]:
     """Dispatch provider tool_calls (spec C3). READ_ACTIONS run inline-parallel (their content
@@ -125,10 +126,58 @@ async def dispatch_tool_calls(
     for cid, tr in (await asyncio.gather(*[_guarded(t) for t in reads]) if reads else []):
         results_by_id[cid] = tr
 
-    for tc in writes:   # serial + provenance gate + fence
+    write_index = 0
+    while write_index < len(writes):
+        tc = writes[write_index]
+
+        # A contiguous workspace run may share one encrypted outbox row.  The
+        # row is still one ordered mutation relative to every platform/MCP
+        # mutation around it; the sink alone decides which disjoint paths may
+        # overlap at the durable backend boundary.  Keeping batching opt-in
+        # preserves compatibility callers and makes it impossible for this
+        # preparation layer to pretend that merely concurrent encryption is a
+        # concurrent durable write.
+        if (
+            enqueue_workspace_batch_effect is not None
+            and tc.name in {"workspace_write", "workspace_delete"}
+        ):
+            run = []
+            while write_index < len(writes):
+                candidate = writes[write_index]
+                if candidate.name not in {"workspace_write", "workspace_delete"}:
+                    break
+                allowed, reason = _prov.write_gate(
+                    candidate.name,
+                    turn_authorization=turn_authorization,
+                )
+                if not allowed:
+                    results_by_id[candidate.id] = ToolResult(
+                        call_id=candidate.id,
+                        content=reason,
+                    )
+                else:
+                    if before_write is not None:
+                        await before_write()
+                    run.append(candidate)
+                write_index += 1
+            if run:
+                enqueued = enqueue_workspace_batch_effect(run)
+                if inspect.isawaitable(enqueued):
+                    await enqueued
+                for candidate in run:
+                    results_by_id[candidate.id] = ToolResult(
+                        call_id=candidate.id,
+                        content=f"queued: {candidate.name}",
+                    )
+            continue
+
+        # Every non-workspace mutation remains strictly serial in provider
+        # order.  A workspace run stops before reaching this branch, so it can
+        # never overtake a memory/identity/schedule/MCP operation.
         allowed, reason = _prov.write_gate(tc.name, turn_authorization=turn_authorization)
         if not allowed:
             results_by_id[tc.id] = ToolResult(call_id=tc.id, content=reason)
+            write_index += 1
             continue
         if before_write is not None:
             await before_write()
@@ -136,5 +185,6 @@ async def dispatch_tool_calls(
         if inspect.isawaitable(enqueued):
             await enqueued
         results_by_id[tc.id] = ToolResult(call_id=tc.id, content=f"queued: {tc.name}")
+        write_index += 1
 
     return [results_by_id[tc.id] for tc in tool_calls]   # preserve original order + every call_id

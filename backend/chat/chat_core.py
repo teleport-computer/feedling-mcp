@@ -305,38 +305,132 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
         except (TypeError, ValueError):
             return {"error": "invalid before"}, 400
 
+    def _optional_seq(name: str) -> int | None:
+        raw = query.get(name, "")
+        if raw in ("", None):
+            return None
+        value = int(str(raw))
+        if value < 0:
+            raise ValueError(name)
+        return value
+
+    try:
+        after_seq = _optional_seq("after_seq")
+        before_seq = _optional_seq("before_seq")
+    except (TypeError, ValueError):
+        return {"error": "invalid sequence cursor"}, 400
+    if after_seq is not None and before_seq is not None:
+        return {"error": "after_seq and before_seq are mutually exclusive"}, 400
+    if before_seq == 0:
+        return {"error": "before_seq must be greater than zero"}, 400
+
     include_image_body = str(
         query.get("include_image_body", query.get("include_image_bodies", "true"))
     ).lower() not in {"0", "false", "no", "off"}
 
     now = time.time()
-    all_msgs, raw_max_ts = _visible_msgs_and_raw_max(store, now)
-    total = len(all_msgs)
-
-    if before > 0:
-        filtered = [m for m in all_msgs if float(m.get("ts", 0)) < before]
-        msgs = filtered[-limit:]
-        has_more_older = len(filtered) > len(msgs)
-        has_more_newer = False
-        page_mode = "before"
-    elif since > 0:
-        filtered = [m for m in all_msgs if float(m.get("ts", 0)) > since]
-        if not filtered and _self_heal_if_stale(store, raw_max_ts):
-            # Cross-worker staleness healed in place — re-read and re-answer so
-            # THIS response already carries the recovered rows (the whole point:
-            # the user must not wait for the next poll, let alone the 15-min TTL).
-            all_msgs, raw_max_ts = _visible_msgs_and_raw_max(store, now)
-            total = len(all_msgs)
+    verify_cutoff = now - VERIFY_PING_VISIBLE_TTL_SEC
+    try:
+        # Durable source history is never clipped to the process's 5k hot
+        # window. Fetch one bounded DB page plus a sentinel row; this makes an
+        # arbitrarily old encrypted message reachable without materializing the
+        # full transcript or deleting old rows to protect worker memory.
+        if before_seq is not None:
+            page = db.chat_history_page_by_seq_strict(
+                store.user_id,
+                limit=limit + 1,
+                before_seq=before_seq,
+                hide_verify_before=verify_cutoff,
+            )
+        elif after_seq is not None:
+            page = db.chat_history_page_by_seq_strict(
+                store.user_id,
+                limit=limit + 1,
+                after_seq=after_seq,
+                hide_verify_before=verify_cutoff,
+            )
+        elif before > 0 or since > 0:
+            page = db.chat_history_page_strict(
+                store.user_id,
+                limit=limit + 1,
+                since=since,
+                before=before,
+                hide_verify_before=verify_cutoff,
+            )
+        else:
+            page = db.chat_history_page_by_seq_strict(
+                store.user_id,
+                limit=limit + 1,
+                latest=True,
+                hide_verify_before=verify_cutoff,
+            )
+        total = db.chat_count_strict(
+            store.user_id, hide_verify_before=verify_cutoff)
+        if before_seq is not None or before > 0:
+            has_more_older = len(page) > limit
+            msgs = page[-limit:]
+            has_more_newer = False
+            page_mode = "before-seq" if before_seq is not None else "before"
+        elif after_seq is not None or since > 0:
+            has_more_newer = len(page) > limit
+            msgs = page[:limit]
+            if msgs:
+                if after_seq is not None:
+                    prior = db.chat_history_page_by_seq_strict(
+                        store.user_id,
+                        limit=1,
+                        before_seq=int(msgs[0].get("seq", 0) or 0),
+                        hide_verify_before=verify_cutoff,
+                    )
+                else:
+                    prior = db.chat_history_page_strict(
+                        store.user_id,
+                        limit=1,
+                        before=float(msgs[0].get("ts", 0) or 0),
+                        hide_verify_before=verify_cutoff,
+                    )
+                has_more_older = bool(prior)
+            else:
+                has_more_older = total > 0
+            page_mode = "after-seq" if after_seq is not None else "since"
+        else:
+            has_more_older = len(page) > limit
+            msgs = page[-limit:]
+            has_more_newer = False
+            page_mode = "latest"
+    except Exception as e:  # noqa: BLE001 — history remains fail-open on DB blips
+        print(f"[chat/history:{store.user_id}] durable page failed, using hot cache: {e}")
+        if after_seq is not None or before_seq is not None:
+            # The bounded process cache does not carry a trustworthy durable
+            # sequence for every row. Returning a different page here would
+            # silently skip/duplicate history, defeating the tie-safe cursor.
+            return {"error": "durable history unavailable for sequence cursor"}, 503
+        all_msgs, raw_max_ts = _visible_msgs_and_raw_max(store, now)
+        total = len(all_msgs)
+        if before > 0:
+            filtered = [m for m in all_msgs if float(m.get("ts", 0)) < before]
+            msgs = filtered[-limit:]
+            has_more_older = len(filtered) > len(msgs)
+            has_more_newer = False
+            page_mode = "before-cache-fallback"
+        elif since > 0:
             filtered = [m for m in all_msgs if float(m.get("ts", 0)) > since]
-        msgs = filtered[:limit]
-        has_more_older = bool(all_msgs and msgs and float(all_msgs[0].get("ts", 0)) < float(msgs[0].get("ts", 0)))
-        has_more_newer = len(filtered) > len(msgs)
-        page_mode = "since"
-    else:
-        msgs = all_msgs[-limit:]
-        has_more_older = len(all_msgs) > len(msgs)
-        has_more_newer = False
-        page_mode = "latest"
+            if not filtered and _self_heal_if_stale(store, raw_max_ts):
+                all_msgs, _raw_max_ts = _visible_msgs_and_raw_max(store, now)
+                total = len(all_msgs)
+                filtered = [m for m in all_msgs if float(m.get("ts", 0)) > since]
+            msgs = filtered[:limit]
+            has_more_older = bool(
+                all_msgs and msgs
+                and float(all_msgs[0].get("ts", 0)) < float(msgs[0].get("ts", 0))
+            )
+            has_more_newer = len(filtered) > len(msgs)
+            page_mode = "since-cache-fallback"
+        else:
+            msgs = all_msgs[-limit:]
+            has_more_older = len(all_msgs) > len(msgs)
+            has_more_newer = False
+            page_mode = "latest-cache-fallback"
 
     # Pull this page's R2-offloaded bodies concurrently before rendering; without
     # it each one costs a serial round-trip inside _chat_history_item.
@@ -350,10 +444,13 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
     )
     oldest_ts = float(out[0].get("ts", 0)) if out else 0
     latest_ts = float(out[-1].get("ts", 0)) if out else 0
+    oldest_seq = int(out[0].get("seq", 0) or 0) if out else 0
+    latest_seq = int(out[-1].get("seq", 0) or 0) if out else 0
 
     print(
         f"[chat/history:{store.user_id}] ip={remote_addr} mode={page_mode} "
-        f"since={since} before={before} limit={limit} returned={len(out)} total={total} "
+        f"since={since} before={before} after_seq={after_seq} before_seq={before_seq} "
+        f"limit={limit} returned={len(out)} total={total} "
         f"include_image_body={include_image_body} omitted_bodies={omitted_bodies} "
         f"omitted_images={omitted_image_bodies} ua={user_agent[:80]}"
     )
@@ -363,6 +460,8 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
         "total": total,
         "oldest_ts": oldest_ts,
         "latest_ts": latest_ts,
+        "oldest_seq": oldest_seq,
+        "latest_seq": latest_seq,
         "has_more_older": has_more_older,
         "has_more_newer": has_more_newer,
         "bodies_omitted": omitted_bodies,
@@ -376,11 +475,15 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
 # --------------------------------------------------------------------------- #
 
 def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
-    """Clear only the caller's chat transcript.
+    """Clear the caller's transcript and live/derived chat context.
 
-    This intentionally does not touch memory, identity, frames, API keys, or
-    onboarding route state. The destructive account reset endpoint remains the
-    only path that wipes the whole user record.
+    The database operation also generation-fences in-flight Runtime V2 work and
+    removes summary/artifact/effect/status state derived from this transcript.
+    It intentionally preserves Memory Garden, identity, user-authored workspace,
+    schedules, billing/token metrics, and encrypted trajectory/review telemetry.
+    Trajectories are not prompt inputs; their retention is independent of chat
+    history. The destructive account reset endpoint remains the only path that
+    wipes the whole user record.
     """
     confirm = (payload.get("confirm") or "").strip()
     if confirm != "clear-chat-history":
@@ -402,7 +505,12 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
     # through append_chat's notify).
     wake_bus.notify("chat", store.user_id)
     print(f"[chat/clear:{store.user_id}] deleted={deleted}")
-    return {"cleared": True, "deleted": deleted}, 200
+    return {
+        "cleared": True,
+        "deleted": deleted,
+        "scope": "chat_history_and_live_runtime_context",
+        "encrypted_trajectory_telemetry_retained": True,
+    }, 200
 
 
 # --------------------------------------------------------------------------- #
@@ -410,8 +518,16 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
 # --------------------------------------------------------------------------- #
 
 def message_body(store: UserStore, message_id: str) -> tuple[dict, int]:
-    with store.chat_lock:
-        msg = next((m for m in store.chat_messages if str(m.get("id") or "") == str(message_id)), None)
+    try:
+        msg = db.chat_get_strict(store.user_id, str(message_id))
+    except Exception as e:  # noqa: BLE001 — preserve cache fallback on DB blips
+        print(f"[chat/body:{store.user_id}] durable lookup failed, using hot cache: {e}")
+        with store.chat_lock:
+            msg = next(
+                (m for m in store.chat_messages
+                 if str(m.get("id") or "") == str(message_id)),
+                None,
+            )
     # A verify-loop synthetic row is never a legitimate single-body fetch target;
     # refuse it here too so a leaked ping id can't be re-fetched out-of-band.
     if not msg or msg.get("source") == "verify_ping":
@@ -768,38 +884,30 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
         "synthetic_marker": ping_marker,
     }
 
-    # Hosted Runtime V2 does not poll /v1/chat/poll, so a resident synthetic
-    # ping can never prove that path. Read/repair ownership first; V2 uses its
-    # fresh worker heartbeat as the connection proof (real end-to-end behavior
-    # is separately gated by the Hosted Chat step / ordinary chat send).
-    try:
-        from hosted import config_store as hosted_config_store
+    # Hosted model-API accounts always use Runtime V2, which never polls this
+    # synthetic row. Explicitly independent resident accounts keep the ping
+    # protocol below and cannot be selected as a hosted fallback.
+    from hosted import config_store as hosted_config_store
 
-        runtime_mode, runtime_state, _runtime_generation = (
-            hosted_config_store.get_hosted_runtime_control_strict(store)
-        )
-        forced_mode = hosted_config_store.forced_hosted_runtime_mode()
-        forced_state = (
-            "v2"
-            if forced_mode
-            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-            else "resident"
-        )
-        if forced_mode is not None and (
-            runtime_mode != forced_mode or runtime_state != forced_state
-        ):
-            return {"error": "runtime_policy_not_ready"}, 503
-        v2_mode = (
-            runtime_mode
-            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-        )
-        expected_state = "v2" if v2_mode else "resident"
-        if runtime_state != expected_state:
-            return {"error": "runtime_control_inconsistent"}, 503
-    except Exception:
-        return {"error": "runtime_control_unavailable"}, 503
+    # The active model-API route is the authoritative hosted-account marker.
+    # Onboarding metadata is historical UI state and can be absent or stale, so
+    # using it here could accidentally send a hosted user down the independent
+    # resident verification protocol.
+    if hosted_config_store.load_active_route(store):
+        try:
+            runtime_mode, runtime_state, _runtime_generation = (
+                hosted_config_store.get_hosted_runtime_control_strict(store)
+            )
+            hosted_config_store.hosted_runtime_policy()
+            if (
+                runtime_mode
+                != hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+                or runtime_state != "v2"
+            ):
+                return {"error": "runtime_policy_not_ready"}, 503
+        except Exception:
+            return {"error": "runtime_control_unavailable"}, 503
 
-    if v2_mode:
         from model_api_runtime.v2 import jobs_store
 
         alive = jobs_store.workers_alive()

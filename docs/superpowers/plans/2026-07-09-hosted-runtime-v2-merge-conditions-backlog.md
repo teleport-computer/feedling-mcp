@@ -1,5 +1,8 @@
 # Hosted Runtime V2 — Merge-Conditions Backlog
 
+> **RETIRED / DO NOT DEPLOY.** Historical snapshot; use the live Runtime V2
+> rollout and parity documents for current operations.
+
 > **STATUS: HISTORICAL SNAPSHOT (2026-07-09).** The live completion and rollout
 > gates are tracked in `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`; this file preserves
 > the pre-native-loop audit only.

@@ -1,9 +1,10 @@
 """Tool-schema catalog (Plan C, Task 3 / C1).
 
 Derives one `ToolSpec` per model-facing capability in `capabilities.registry.CAPABILITIES`
-(everything except `chat_image_read`, which has no backend route and is never offered to
-the model) plus a synthetic `reply` tool that the unified tool loop treats specially
-(writes an immediate bubble instead of dispatching through the executor).
+(everything except the internal-only `chat_image_read` and `chat_file_read`, which have
+no model-facing schema) plus the runtime-native `task` and `reply` tools.  The unified
+tool loop handles both specially instead of dispatching them through the capability
+executor.
 
 Each entry in `PARAMS` mirrors exactly the `params` fields each capability module reads —
 see the module docstring/params usage cited per tool below. Do not add fields the
@@ -16,6 +17,7 @@ from provider_types import ToolSpec
 from capabilities import registry
 
 REPLY_TOOL = "reply"
+TASK_TOOL = "task"
 
 _EXCLUDED = frozenset({"chat_image_read", "chat_file_read"})
 
@@ -168,6 +170,48 @@ PARAMS: dict[str, dict] = {
         "required": ["wake_id"],
     },
 
+    # -- workspace.py (encrypted virtual workspace, never the host filesystem) --
+    "workspace_list": {
+        "type": "object",
+        "properties": {"path": _STR, "recursive": _BOOL, "limit": _INT},
+        "required": [],
+    },
+    "workspace_read": {
+        "type": "object",
+        "properties": {"path": _STR, "start_line": _INT, "line_count": _INT},
+        "required": ["path"],
+    },
+    "workspace_write": {
+        "type": "object",
+        "properties": {
+            "path": _STR,
+            "content": _STR,
+            "expected_revision": _INT,
+        },
+        "required": ["path", "content", "expected_revision"],
+    },
+    "workspace_delete": {
+        "type": "object",
+        "properties": {"path": _STR, "expected_revision": _INT},
+        "required": ["path", "expected_revision"],
+    },
+
+    # -- synthetic bounded-subagent tool --
+    # Overlay workspace merges are intentionally not advertised until the
+    # worker has an isolated overlay + explicit CAS merge implementation.
+    TASK_TOOL: {
+        "type": "object",
+        "properties": {
+            "prompt": _STR,
+            "label": _STR,
+            "workspace_mode": {
+                "type": "string",
+                "enum": ["read_only"],
+            },
+        },
+        "required": ["prompt"],
+    },
+
     # -- synthetic reply tool --
     REPLY_TOOL: {
         "type": "object",
@@ -209,6 +253,19 @@ DESCRIPTIONS: dict[str, str] = {
     "web_fetch": "Fetch a URL and return its stripped text content.",
     "schedule_wake": "Schedule a future self-wake at a given time, with optional timezone and reason.",
     "cancel_wake": "Cancel a previously scheduled self-wake by its wake_id.",
+    "workspace_list": ("List encrypted virtual workspace entries and revisions. "
+                       "Namespaces are /artifacts (read-only), /skills (read-only), "
+                       "/workspace (editable), and /memory/WORKING.md (editable)."),
+    "workspace_read": ("Read a line range from a virtual text entry. This reads a "
+                       "stored text view and does not materialize a physical artifact."),
+    "workspace_write": ("Create or replace an editable virtual text file using optimistic "
+                        "revision control. Use expected_revision=0 to create; /artifacts "
+                        "and /skills are read-only."),
+    "workspace_delete": ("Delete an editable virtual file at its exact revision. "
+                         "Artifacts and skills cannot be deleted by the model."),
+    TASK_TOOL: ("Run a bounded isolated subagent on one focused task. The child can "
+                "read workspace/artifact, memory, and web data but cannot reply to "
+                "the user, mutate state, call MCP, or spawn another task."),
     REPLY_TOOL: "Send an immediate reply bubble to the user with the given text.",
 }
 
@@ -309,6 +366,12 @@ def validate_tool_args(name: str, args) -> str | None:
                 return f"args.actions[{index}] update requires target_id, summary, and content"
             if op == "delete" and not target_id:
                 return f"args.actions[{index}] delete requires target_id"
+    if name in {"workspace_write", "workspace_delete"}:
+        revision = args.get("expected_revision")
+        if type(revision) is not int or revision < 0:
+            return "expected_revision must be a non-negative integer"
+    if name == TASK_TOOL and not str(args.get("prompt") or "").strip():
+        return "task requires a non-empty prompt"
     return None
 
 
@@ -318,5 +381,10 @@ def build_tool_specs() -> list[ToolSpec]:
         if name in _EXCLUDED:
             continue
         specs.append(ToolSpec(name=name, description=DESCRIPTIONS[name], parameters=PARAMS[name]))
-    specs.append(ToolSpec(name=REPLY_TOOL, description=DESCRIPTIONS[REPLY_TOOL], parameters=PARAMS[REPLY_TOOL]))
+    for name in (TASK_TOOL, REPLY_TOOL):
+        specs.append(ToolSpec(
+            name=name,
+            description=DESCRIPTIONS[name],
+            parameters=PARAMS[name],
+        ))
     return specs

@@ -1,12 +1,8 @@
 """Framework-neutral body of ``POST /v1/model_api/chat/send`` (ASGI-migration).
 
-The route logic — image parse, runtime-provider load, user-message envelope
-build, driver resolve, supervisor wedge guard, chat append + wake, debug traces,
-and the delegation to ``agent_runtime_cutover.handle_send`` — with no framework
-request/response object. The ASGI route (``hosted.chat_routes_asgi``) calls this
-and wraps the returned ``(body, status)`` in its response type, preserving the
-202 contract, every debug/action trace, the 402/409/503/400/413 error branches,
-and the single (non-double) append.
+The route logic — image parse, V2 ownership/liveness/admission checks, encrypted
+message append + atomic job enqueue, and wake notification — with no framework
+request/response object. Hosted model-API accounts have no resident fallback.
 
 Every collaborator is referenced via its module (``agent_runtime_cutover.X``,
 ``hosted_config_store.X``, ``core_envelope.X`` …) so the existing tests that
@@ -14,8 +10,6 @@ monkeypatch those module attributes keep working unchanged.
 """
 
 from __future__ import annotations
-
-import time
 
 from core import envelope as core_envelope
 from core import wake_bus as core_wake_bus
@@ -48,7 +42,6 @@ def model_api_chat_send_core(
     verified runtime token when no api_key is present, else "". ``payload`` is the
     JSON body (``request.get_json(silent=True) or {}`` / ``read_json_silent``).
     """
-    trace_start = time.time()
     client_msg_id, client_msg_id_err = chat_idempotency.parse_client_msg_id(payload)
     if client_msg_id_err is not None:
         return client_msg_id_err
@@ -87,52 +80,33 @@ def model_api_chat_send_core(
         _runtime_mode, _runtime_state, _generation = (
             hosted_config_store.get_hosted_runtime_control_strict(store)
         )
-        _forced_mode = hosted_config_store.forced_hosted_runtime_mode()
-        _forced_state = (
-            "v2"
-            if _forced_mode
-            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-            else "resident"
-        )
-        if _forced_mode is not None and (
-            _runtime_mode != _forced_mode or _runtime_state != _forced_state
-        ):
-            # Startup and setup materialize the environment policy. A request
-            # must never repair ownership itself: doing so can race the
-            # credential-delete fence and resurrect V2 after credentials have
-            # disappeared. Refuse before persisting the user message; startup
-            # reconciliation or a successful setup/test will repair the row.
-            return {"error": "runtime_policy_not_ready"}, 503
-        _v2_mode = (
-            _runtime_mode
-            == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-        )
+        hosted_config_store.hosted_runtime_policy()
     except Exception:
         return {"error": "runtime_control_unavailable"}, 503
-    # The blob is the routing selector while v2_runtime_state is the
-    # authoritative ownership fence.  A split tuple must not fall through to
-    # either runtime: resident would eventually lose its reply fence and V2
-    # would run without generation ownership.
-    _expected_state = "v2" if _v2_mode else "resident"
-    if _runtime_state != _expected_state:
+    # Startup/setup materialize V2 ownership. A request never repairs it: doing
+    # so can race credential deletion. Any dormant, stale resident, or split
+    # tuple fails closed before the user message is persisted.
+    if (
+        _runtime_mode
+        != hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+        or _runtime_state != "v2"
+    ):
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided",
             actor="host_agent_runtime", status="gated",
-            summary="runtime_control_inconsistent",
-            detail={"mode": "blocked", "reason": "runtime_control_inconsistent"},
+            summary="runtime_policy_not_ready",
+            detail={"mode": "blocked", "reason": "runtime_policy_not_ready"},
         )
-        return {"error": "runtime_control_inconsistent"}, 503
+        return {"error": "runtime_policy_not_ready"}, 503
 
-    # V2 liveness guard: db_action_v2 users skip the resident wedge guard further
-    # down, and without this they'd have NO replacement — if every serve_worker
+    # V2 liveness guard: if every serve_worker
     # process is dead (crashed, not yet deployed, scaled to zero), enqueue_job
     # would still succeed and the message would queue in agent_jobs forever with
     # no error, no reply, no visible failure. jobs_store.workers_alive() reads the
     # v2_worker_heartbeats table each live serve_worker UPSERTs every ~10s.
-    # Distinct code/summary ("workers_unavailable") from the resident wedge guard's
-    # "hosting_runtime_unavailable"/"supervisor_unavailable" — dead worker pool vs.
-    # dead resident supervisor are unrelated and must stay distinguishable.
-    if _v2_mode and not jobs_store.workers_alive():
+    # ``workers_unavailable`` is the sole managed-host liveness error; no
+    # resident supervisor is consulted or offered as a fallback.
+    if not jobs_store.workers_alive():
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             status="gated", summary="workers_unavailable",
@@ -146,7 +120,7 @@ def model_api_chat_send_core(
     # admitting" into a pool that may in fact be halted. Live-flippable without redeploy
     # via kill_switch.set_turns_halted; Genesis is a separate table/thread and never
     # consults this gate.
-    if _v2_mode and kill_switch.turns_halted(default_on_error=True):
+    if kill_switch.turns_halted(default_on_error=True):
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             status="gated", summary="turns_halted",
@@ -157,52 +131,35 @@ def model_api_chat_send_core(
     # §6 admission ceiling：存活闸已保证 ≥1 活 worker；再估排队等待，超 SLA 就在
     # persist 之前回独立 busy（区别于 workers_unavailable=供给死）。任何计算异常
     # fail-open（放行）——此闸绝不能自身变成故障源。
-    if _v2_mode:
-        _inflight = _workers = 0
-        try:
-            _workers = jobs_store.live_worker_capacity(within_sec=30)
-            _inflight = jobs_store.inflight_job_count()
-            _mean = jobs_store.recent_mean_service_sec(lane="chat", limit=admission.SERVICE_SAMPLE_N)
-            _est = admission.estimate_wait_sec(
-                inflight=_inflight, workers=_workers,
-                mean_service_sec=_mean, default_service_sec=admission.DEFAULT_SERVICE_SEC,
-            )
-            _admit = admission.should_admit(_est, sla_sec=admission.SLA_SEC)
-        except Exception as exc:  # fail-open
-            debug_trace.trace_event(
-                store, subsystem="route", type="route.decided", actor="host_agent_runtime",
-                status="ok", summary="admission_failopen",
-                detail={"mode": "admit", "error": str(exc)[:120]},
-            )
-            _admit = True
-            _est = 0.0
-        if not _admit:
-            debug_trace.trace_event(
-                store, subsystem="route", type="route.decided", actor="host_agent_runtime",
-                status="gated", summary="admission_over_sla",
-                detail={"mode": "blocked", "reason": "queue_over_sla",
-                        "est_wait_sec": int(_est), "inflight": _inflight, "workers": _workers},
-            )
-            return {"error": "busy", "reason": "queue_over_sla", "est_wait_sec": int(_est)}, 503
+    _inflight = _workers = 0
+    try:
+        _workers = jobs_store.live_worker_capacity(within_sec=30)
+        _inflight = jobs_store.inflight_job_count()
+        _mean = jobs_store.recent_mean_service_sec(lane="chat", limit=admission.SERVICE_SAMPLE_N)
+        _est = admission.estimate_wait_sec(
+            inflight=_inflight, workers=_workers,
+            mean_service_sec=_mean, default_service_sec=admission.DEFAULT_SERVICE_SEC,
+        )
+        _admit = admission.should_admit(_est, sla_sec=admission.SLA_SEC)
+    except Exception as exc:  # fail-open
+        debug_trace.trace_event(
+            store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+            status="ok", summary="admission_failopen",
+            detail={"mode": "admit", "error": str(exc)[:120]},
+        )
+        _admit = True
+        _est = 0.0
+    if not _admit:
+        debug_trace.trace_event(
+            store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+            status="gated", summary="admission_over_sla",
+            detail={"mode": "blocked", "reason": "queue_over_sla",
+                    "est_wait_sec": int(_est), "inflight": _inflight, "workers": _workers},
+        )
+        return {"error": "busy", "reason": "queue_over_sla", "est_wait_sec": int(_est)}, 503
     # ---- end V2 gates ---------------------------------------------------------
 
     config = hosted_config_store._load_model_api_config(store)
-    if not _v2_mode:
-        runtime = hosted_config_store._load_runtime_provider_config(
-            store, api_key, runtime_token=runtime_tok,
-        )
-        if isinstance(runtime, tuple):
-            _, err = runtime
-            hosted_config_store._append_model_api_action_trace(store, {
-                "status": "failed",
-                "error": err.get("error", "runtime_load_failed"),
-                "context": {"stage": "load_runtime"},
-                "duration_ms": int((time.time() - trace_start) * 1000),
-            })
-            return err, 400
-        hosted_config_store._ensure_model_api_runtime_profile(
-            store, config, touch=True,
-        )
 
     if has_image:
         user_plaintext = image_bytes
@@ -213,35 +170,20 @@ def model_api_chat_send_core(
     user_env, env_err = core_envelope._build_shared_envelope_for_store(store, user_plaintext)
     if user_env is None:
         return {"error": "user_message_envelope_failed", "detail": env_err}, 409
-    # 收口：配了 fit provider 即托管到 agent-runner，否则 409。
+    # A supported provider enters the unified V2 loop; reject before persistence
+    # when no provider mapping exists.
     # 先校验 driver 再入 store，避免未配置时写入孤儿用户消息。
     try:
         driver = agent_runtime_cutover.resolve_driver(config)
     except agent_runtime_cutover.UnsupportedProviderError:
         return {"error": "provider_not_configured"}, 409
 
-    # Wedge guard: routing to the agent-runner only works if a supervisor is
-    # actually hosting. assert_hosting_ready validated THIS process's env at
-    # startup, but the consumer lives in a separate service — if its heartbeat is
-    # missing/stale or its host-all/pi flags are off, this turn would park in
-    # "processing" forever. Surface a clear 503 instead, BEFORE writing the user
-    # message (so no orphan turn is left unanswered). Fail-open on a DB hiccup.
-    #
-    # Only gate on pi if this provider actually routes through the pi driver
-    # (the in-CVM LiteLLM gateway is retired). anthropic (claude driver) and
-    # openai (codex-native) must not be blocked by a pi-off heartbeat.
-    _provider = str((config or {}).get("provider") or "")
-    _require_pi = agent_runtime_cutover.driver_for_provider(_provider) == "pi"
-    live, reason = agent_runtime_cutover.check_supervisor_live(require_pi=_require_pi)
-    if not _v2_mode and not live:
-        debug_trace.trace_event(
-            store, subsystem="route", type="route.decided", actor="host_agent_runtime",
-            status="gated", summary="supervisor_unavailable",
-            detail={"mode": "blocked", "reason": "supervisor_unavailable", "live_reason": str(reason or "")[:80]},
-        )
-        return {"error": "hosting_runtime_unavailable", "reason": reason}, 503
-
     extra: dict = {}
+    if client_msg_id is not None:
+        # Plain routing metadata only; the message body remains ciphertext.
+        # The database uses this UUID to serialize iOS transport retries across
+        # every backend process and both chat-send endpoints.
+        extra["client_msg_id"] = client_msg_id
     if has_image and image_mime:
         extra["image_mime"] = image_mime
     if has_image and message:
@@ -276,70 +218,43 @@ def model_api_chat_send_core(
     ]
     if quoted_memory_ids:
         extra["quoted_memory_ids"] = ",".join(quoted_memory_ids[:8])
-    if _v2_mode:
-        # A7: for the v2 send path, the message INSERT and its chat-job
-        # enqueue/coalesce must land in ONE DB transaction, so a crash between
-        # them can never orphan a persisted-but-never-enqueued message. The
-        # generation is read ONCE, before the append, and the trace_id is derived
-        # from the envelope's own id (the same value append_chat will use as the
-        # stored message's msg_id) — both must be known before the call since the
-        # enqueue now happens INSIDE store.append_chat via db.chat_append_and_enqueue,
-        # not as a separate call afterward.
-        _envelope_id = user_env.get("id")
-        _trace_id = str(_envelope_id) if isinstance(_envelope_id, str) and _envelope_id else None
-        try:
-            user_row = store.append_chat(
-                "user",
-                "model_api",
-                user_env,
-                content_type="image" if has_image else ("file" if has_file else "text"),
-                extra=extra or None,
-                strict=_v2_mode,
-                enqueue={
-                    "lane": "chat",
-                    "reason": "chat_send",
-                    "trace_id": _trace_id,
-                    "expected_generation": _generation,
-                    "expected_runtime_state": "v2",
-                    "expected_runtime_mode": (
-                        hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-                    ),
-                },
-            )
-        except db.RuntimeControlChangedError:
-            debug_trace.trace_event(
-                store, subsystem="route", type="route.decided",
-                actor="host_agent_runtime", status="gated",
-                summary="runtime_control_changed",
-                detail={"mode": "blocked", "reason": "runtime_control_changed"},
-            )
-            return {"error": "runtime_control_changed"}, 503
-        # The v2 atomic path always inserts (it carries no client-msg-id dedup);
-        # the shared notify/trace below keys off `inserted`.
-        inserted = True
-    else:
-        # Legacy (resident) send with client-msg-id dedup (origin/test): a
-        # re-sent client_msg_id recovers the original row instead of double-
-        # inserting, and the assistant reply may already be posted.
-        inserted = True
-        if client_msg_id is not None:
-            user_row, inserted = store.append_chat_idempotent(
-                "user",
-                "model_api",
-                user_env,
-                client_msg_id=client_msg_id,
-                window_sec=chat_idempotency.CLIENT_MSG_ID_WINDOW_SEC,
-                content_type="image" if has_image else ("file" if has_file else "text"),
-                extra=extra or None,
-            )
-        else:
-            user_row = store.append_chat(
-                "user",
-                "model_api",
-                user_env,
-                content_type="image" if has_image else ("file" if has_file else "text"),
-                extra=extra or None,
-            )
+    # Message INSERT and chat-job enqueue/coalesce land in one transaction.
+    _envelope_id = user_env.get("id")
+    _trace_id = str(_envelope_id) if isinstance(_envelope_id, str) and _envelope_id else None
+    try:
+        user_row = store.append_chat(
+            "user",
+            "model_api",
+            user_env,
+            content_type="image" if has_image else ("file" if has_file else "text"),
+            extra=extra or None,
+            strict=True,
+            enqueue={
+                "lane": "chat",
+                "reason": "chat_send",
+                "trace_id": _trace_id,
+                "expected_generation": _generation,
+                "expected_runtime_state": "v2",
+                "expected_runtime_mode": (
+                    hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+                ),
+                "client_msg_id": client_msg_id,
+                "idempotency_window_sec": (
+                    chat_idempotency.CLIENT_MSG_ID_WINDOW_SEC
+                    if client_msg_id is not None
+                    else None
+                ),
+            },
+        )
+    except db.RuntimeControlChangedError:
+        debug_trace.trace_event(
+            store, subsystem="route", type="route.decided",
+            actor="host_agent_runtime", status="gated",
+            summary="runtime_control_changed",
+            detail={"mode": "blocked", "reason": "runtime_control_changed"},
+        )
+        return {"error": "runtime_control_changed"}, 503
+    inserted = not bool(user_row.pop("_client_msg_replayed", False))
     if inserted:
         store.notify_chat_waiters()
 
@@ -356,13 +271,7 @@ def model_api_chat_send_core(
         # this store's last wake refresh. Reload before the existing response
         # builder checks for it; this does not notify or re-run the turn.
         store.reload()
-    if _v2_mode:
-        # 落加密用户消息 + 入队/合并 chat job 已经在上方 append_chat 内一个事务里原子
-        # 完成（db.chat_append_and_enqueue，spec A7）；这里只需唤醒 worker 池，快速
-        # 返回 202 processing（不写 filler；客户端经 chat poll 取加密回复）。
+    if inserted:
         core_wake_bus.notify("v2_jobs", store.user_id)
-        body, status = agent_runtime_cutover.build_processing_response(user_row, driver=driver)
-        return body, status
-
-    body, status = agent_runtime_cutover.handle_send(store, user_row, driver)
+    body, status = agent_runtime_cutover.build_processing_response(user_row, driver=driver)
     return body, status

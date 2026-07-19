@@ -1,8 +1,8 @@
 """V2 worker 进程入口 + 生产依赖装配（子项目 B，Task 8 扩到全流程）。
 
-部署目标（已钉死，见 spec §2.1）：这是**同一 backend 镜像的兄弟入口**，运行在独立
-runner CVM 的 `serve-worker` service；它与 resident `agent-runner` service 并列，而不是
-由 supervisor 托管。Genesis 已在 2026-07-10 rehome 到本进程的 dedicated thread。
+部署目标（已钉死，见 spec §2.1）：这是 backend 代码的 worker 镜像入口，运行在独立
+runner CVM 的唯一 `serve-worker` service；hosted resident supervisor 已退役。
+Genesis 已在 2026-07-10 rehome 到本进程的 dedicated thread。
 它**不是**独立 repo，也**不**贴着主 app CVM 的 FastAPI backend 跑。HTTP 化会把
 backend→enclave→backend 的 reentrant 502 根因请回来；贴主 app 跑则与 backend 争 CPU/内存。
 
@@ -28,6 +28,7 @@ Model calls and reply construction are hosted-free and stay directly in the
 worker/tool-loop layer; only hosted configuration, enclave access, and effect
 sinks are assembled here.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -45,6 +46,7 @@ import threading
 import time
 import types
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
@@ -53,9 +55,9 @@ from urllib.parse import urlsplit
 # Put the backend dir on sys.path BEFORE importing backend modules. When this is
 # run as a script (`python backend/model_api_runtime/v2/serve_worker.py` — how the
 # runner compose starts it), sys.path[0] is the script's own dir (…/v2), NOT
-# backend/ — so `from accounts import …` below would ImportError. Mirrors the same
-# bootstrap in agent_runtime/supervisor.py. Importing this module normally (tests,
-# which already put backend/ on the path) is unaffected: the insert is a no-op.
+# backend/ — so `from accounts import …` below would ImportError. Importing this
+# module normally (tests, which already put backend/ on the path) is unaffected:
+# the insert is a no-op.
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
@@ -71,19 +73,22 @@ from core import store as core_store
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
-from hosted import file_text
 from hosted import mcp_tools
 from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
+from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import reaper as v2_reaper
+from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import screen_watch
+from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import watchdog as v2_watchdog
 from model_api_runtime.v2 import worker as v2_worker
+
 # `turn_child` is NOT imported at module scope here: turn_child.py imports THIS module
 # (to reuse wire_assembly/build_production_deps — see turn_child.py's docstring for why
 # that's the correct direction of reuse) at ITS top level. If serve_worker also imported
@@ -93,11 +98,51 @@ from model_api_runtime.v2 import worker as v2_worker
 from proactive import capture_scheduler
 from proactive import dream_scheduler
 from proactive import gate as proactive_gate
+from workspace.artifacts import ArtifactWorkspace, artifact_text_view_path
+from workspace.backends import WorkspaceNotFound, model_writable_path
+from workspace.prompt import render_trusted_prefix_blocks
+from workspace.sandbox import (
+    DisabledSandboxProvider,
+    LazySandbox,
+    SandboxRequiredOperation,
+    SandboxUnavailable,
+    SandboxUsageUnavailable,
+    configured_sandbox_provider,
+)
+from workspace.service import production_backend as production_workspace_backend
 import db
 import memory_readside_core
 import provider_client
 
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
+
+
+def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
+    """Render one authoritative workspace prompt snapshot for a turn.
+
+    Skill entries come only from the backend's read-only ``/skills`` namespace
+    and therefore retain system authority. Agent-editable ``WORKING.md`` stays
+    encrypted at rest and is available through ``workspace_read``; it is not
+    eagerly injected, because persistent untrusted text must not be able to
+    choose a future outbound web/MCP/subagent call. Any malformed/unknown skill
+    block fails the turn instead of silently dropping policy.
+    """
+    backend = production_workspace_backend(
+        store, runtime_token=str(runtime_token or "")
+    )
+    trusted_system_blocks: list[str] = []
+    for block in render_trusted_prefix_blocks(
+        backend,
+        include_working_memory=False,
+    ):
+        if block.name.startswith("skill:/skills/"):
+            trusted_system_blocks.append(block.content)
+            continue
+        raise RuntimeError("invalid workspace prompt block")
+    return {
+        "trusted_system_blocks": tuple(trusted_system_blocks),
+        "working_memory": "",
+    }
 
 
 def _positive_float_env(name: str, default: str) -> float:
@@ -109,6 +154,63 @@ def _positive_float_env(name: str, default: str) -> float:
     if not math.isfinite(value) or value <= 0:
         raise RuntimeError(f"{name} must be finite and > 0")
     return value
+
+
+def _positive_int_env(name: str, default: str) -> int:
+    raw = os.environ.get(name, default)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be an integer > 0") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be an integer > 0")
+    return value
+
+
+def _workspace_write_parallelism() -> int:
+    value = _positive_int_env(
+        "FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM",
+        "4",
+    )
+    if value > 8:
+        raise RuntimeError(
+            "FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM must be <= 8"
+        )
+    return value
+
+
+_workspace_executor_lock = threading.Lock()
+_workspace_executor: ThreadPoolExecutor | None = None
+_workspace_executor_size = 0
+
+
+def _workspace_write_executor() -> ThreadPoolExecutor:
+    """Process-wide admission ceiling for durable workspace mutations.
+
+    A per-batch pool would let every live turn fan out independently and move
+    the old hidden concurrency cliff from provider threads to PostgreSQL
+    connections.  One shared executor still overlaps disjoint operations while
+    bounding nested sink connections across the whole worker process.
+    """
+    global _workspace_executor, _workspace_executor_size
+    parallelism = _workspace_write_parallelism()
+    with _workspace_executor_lock:
+        if (
+            _workspace_executor is None
+            or _workspace_executor_size != parallelism
+        ):
+            previous = _workspace_executor
+            _workspace_executor = ThreadPoolExecutor(
+                max_workers=parallelism,
+                thread_name_prefix="v2-workspace-write",
+            )
+            _workspace_executor_size = parallelism
+            # Environment values are immutable in production.  This branch is
+            # primarily useful to isolated tests that deliberately exercise
+            # more than one configured ceiling in a single interpreter.
+            if previous is not None:
+                previous.shutdown(wait=True)
+        return _workspace_executor
 
 
 def _default_worker_id() -> str:
@@ -124,10 +226,15 @@ def _default_worker_id() -> str:
         f"{uuid.uuid4().hex[:8]}-{build_commit}"
     )
 
+
 _ASSISTANT_ROLES = ("openclaw", "assistant", "agent")
 _EXTRACTION_ENABLED = os.environ.get(
     "FEEDLING_V2_EXTRACTION_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+_FILE_INLINE_MAX_CHARS = _positive_int_env(
+    "FEEDLING_V2_FILE_INLINE_MAX_CHARS",
+    "30000",
+)
 
 
 def _configure_db_pool_capacity(max_workers: int) -> int:
@@ -135,12 +242,17 @@ def _configure_db_pool_capacity(max_workers: int) -> int:
 
     ``effect_outbox.apply_pending_effects`` deliberately keeps one transaction
     and generation lock open while its sink performs the durable write.  Most
-    sinks therefore need a second pooled connection.  With an unscaled pool,
-    N concurrent drains can occupy all N connections and then all wait for a
-    nested connection until timeout (the exact silent concurrency cliff V2 is
-    meant to remove).  Reserve two connections per slot plus four for queue,
-    cursor, and reconciliation work.  The historical backend floor of 16 is
-    retained for smaller pools.
+    sinks therefore need nested pooled connections.  A workspace batch holds
+    the outer generation transaction while up to
+    ``FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM`` durable CAS operations run on
+    separate connections behind one process-wide admission ceiling. At the
+    same time, every other active turn can hold its own outer generation
+    transaction and one ordinary nested sink connection. With an unscaled
+    pool, those mixed drains can deadlock waiting for nested writes (the exact
+    silent concurrency cliff V2 is meant to remove). Conservatively reserve
+    two connections per turn slot, the process-wide workspace fan-out, and
+    four for queue, cursor, and reconciliation work. The historical backend
+    floor of 16 is retained for smaller pools.
 
     An explicit operator override may raise the ceiling but may not undercut
     the invariant.  This runs before ``db.init_schema()`` opens the lazy pool;
@@ -154,7 +266,8 @@ def _configure_db_pool_capacity(max_workers: int) -> int:
     if slots <= 0:
         raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be an integer > 0")
 
-    required = max(16, (2 * slots) + 4)
+    workspace_parallelism = _workspace_write_parallelism()
+    required = max(16, (2 * slots) + workspace_parallelism + 4)
     raw = os.environ.get("FEEDLING_DB_POOL_MAX_SIZE", "").strip()
     if raw:
         try:
@@ -165,20 +278,23 @@ def _configure_db_pool_capacity(max_workers: int) -> int:
             ) from exc
         if configured < required:
             raise RuntimeError(
-                "FEEDLING_DB_POOL_MAX_SIZE=" + str(configured)
-                + " is too small for FEEDLING_V2_MAX_WORKERS=" + str(slots)
-                + "; require >= " + str(required)
+                "FEEDLING_DB_POOL_MAX_SIZE="
+                + str(configured)
+                + " is too small for FEEDLING_V2_MAX_WORKERS="
+                + str(slots)
+                + "; require >= "
+                + str(required)
             )
     else:
         configured = required
         os.environ["FEEDLING_DB_POOL_MAX_SIZE"] = str(configured)
     return configured
 
-# Scope name matches the existing host-all/genesis-worker convention
-# (agent_runtime/supervisor.py mints "envelope_decrypt", not a colon-form) so a
-# future scope-enforcement change (currently the enclave's local HMAC check
-# only verifies signature+expiry+user_id, not scope — see enclave/auth.py
-# local_user_id_from_token) doesn't silently start rejecting this worker.
+
+# Keep the existing underscore-form scope stable so a future scope-enforcement
+# change (currently the enclave's local HMAC check only verifies
+# signature+expiry+user_id, not scope — see enclave/auth.py) does not silently
+# start rejecting the pooled worker.
 _RUNTIME_TOKEN_SCOPE = ["envelope_decrypt"]
 
 # Genesis mints its own token: a wider scope (it decrypts chunk envelopes AND calls
@@ -204,9 +320,7 @@ _V2_WAKE_OWNER_ID = "hosted_runtime_v2"
 _IMAGE_MARKER = "[image]"
 _UNAVAILABLE_CHAT_MARKER = "[message unavailable]"
 _SUMMARY_INTEGRITY_ERROR = "v2_summary_integrity_error"
-# 只为最近 N 个图片行解 caption。compaction 用 limit=10_000 调 _read_tail，没有这个上限
-# 它会把该用户历史上每一张图的 caption 都发起一次 enclave 往返（enclave 是单线程瓶颈）。
-_CAPTION_DECRYPT_LIMIT = 8
+_USER_ROLES = frozenset({"user", "human"})
 
 
 def _caption_envelope(m: dict) -> dict | None:
@@ -229,35 +343,42 @@ def _caption_envelope(m: dict) -> dict | None:
     }
 
 
-def _caption_text(m, *, mid, token, caption_budget: list[int], fallback: str) -> str:
-    """附件行（image / file）的可见文本：随附件发的那句话，取不到就退化成 `fallback`。
+def _caption_text(m, *, mid, token, fallback: str) -> str:
+    """附件行（image / file）的可见文本：随附件发的那句话。
 
-    `caption_budget` 是一个单元素列表（可变计数器）：预算耗尽后不再解 caption。
-    caption 解密失败同样静默退化——看不到那句话，好过整个回合失败。
+    选中行在进入这里之前已由 tail/compaction window 做了有界筛选。因此每个
+    真实存在的 caption 都必须完整解密；解密或 UTF-8 校验失败要让整个读取
+    显式失败，这样 turn/caption compaction 就不会越过这条文本推进 cursor /
+    summary watermark。只有原本就没有 caption，或 caption 明文确实为空，才使用
+    无内容附件标记 `fallback`。
     """
     cap_env = _caption_envelope(m)
-    if cap_env is None or caption_budget[0] <= 0:
+    if cap_env is None:
         return fallback
-    caption_budget[0] -= 1
-    try:
-        caption = core_enclave._decrypt_envelope_via_enclave(
+    caption = (
+        core_enclave._decrypt_envelope_via_enclave(
             cap_env, None, purpose="v2_caption_read", runtime_token=token
-        ).decode("utf-8", errors="replace").strip()
-        return caption or fallback
-    except Exception as e:  # noqa: BLE001 — 静默降级，绝不拖垮回合
-        log.warning("[v2.serve_worker] caption decrypt failed msg=%s: %s", mid, e)
-        return fallback
+        )
+        .decode("utf-8")
+        .strip()
+    )
+    return caption or fallback
 
 
-def _image_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
+def _image_row(m, *, mid, ts, role, token) -> dict:
     """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。"""
-    text = _caption_text(m, mid=mid, token=token, caption_budget=caption_budget,
-                         fallback=_IMAGE_MARKER)
-    return {"id": mid, "ts": ts, "role": role, "content": text,
-            "has_image": True, "image_mime": m.get("image_mime") or "image/jpeg"}
+    text = _caption_text(m, mid=mid, token=token, fallback=_IMAGE_MARKER)
+    return {
+        "id": mid,
+        "ts": ts,
+        "role": role,
+        "content": text,
+        "has_image": True,
+        "image_mime": m.get("image_mime") or "image/jpeg",
+    }
 
 
-def _file_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
+def _file_row(m, *, mid, ts, role, token) -> dict:
     """文件行 -> **纯文本** tail 行。**绝不解密 body_ct。**
 
     文件消息的明文是**原始文件字节**（`chat_send_core`: `user_plaintext = file_parse["bytes"]`，
@@ -274,11 +395,21 @@ def _file_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
     `enclave/routes/chat.py:104-112`）。
     """
     name = str(m.get("file_name") or "file")
-    text = _caption_text(m, mid=mid, token=token, caption_budget=caption_budget,
-                         fallback=f"[file: {name}]")
-    return {"id": mid, "ts": ts, "role": role, "content": text,
-            "has_file": True, "file_name": name,
-            "file_mime": m.get("file_mime") or "application/octet-stream"}
+    text = _caption_text(
+        m,
+        mid=mid,
+        token=token,
+        fallback=f"[file: {name}]",
+    )
+    return {
+        "id": mid,
+        "ts": ts,
+        "role": role,
+        "content": text,
+        "has_file": True,
+        "file_name": name,
+        "file_mime": m.get("file_mime") or "application/octet-stream",
+    }
 
 
 def _mint_runtime_token(user_id: str) -> str:
@@ -324,7 +455,8 @@ def _prompt_cache_route_scope(runtime, *, secret: bytes) -> str:
     user changes routes.
     """
     provider = provider_client.normalize_provider(
-        str(getattr(runtime, "provider", "") or ""))
+        str(getattr(runtime, "provider", "") or "")
+    )
     model = str(getattr(runtime, "model", "") or "").strip().lower()
     api_key = str(getattr(runtime, "api_key", "") or "").strip().encode("utf-8")
     credential_fingerprint = hmac.new(
@@ -342,7 +474,9 @@ def _prompt_cache_route_scope(runtime, *, secret: bytes) -> str:
         port = parsed.port
     except ValueError:
         port = None
-    default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+    default_port = (scheme == "https" and port == 443) or (
+        scheme == "http" and port == 80
+    )
     normalized_port = None if port is None or default_port else int(port)
     path = parsed.path.rstrip("/")
     # Structured serialization avoids delimiter/IPv6 collisions (for example,
@@ -377,9 +511,11 @@ def _resolve_provider(user_id: str):
         token = _mint_runtime_token(user_id)
     except Exception as e:  # noqa: BLE001
         return None, {"error": "runtime_token_mint_failed", "detail": str(e)[:160]}
-    # api_key=None: hosted/host-all turns never hold the user's long-term
+    # api_key=None: Runtime V2 turns never hold the user's long-term
     # Feedling API key — only the runtime token authenticates to the enclave.
-    runtime = hosted_config_store._load_runtime_provider_config(store, None, runtime_token=token)
+    runtime = hosted_config_store._load_runtime_provider_config(
+        store, None, runtime_token=token
+    )
     if isinstance(runtime, tuple):
         return None, runtime[1]
     # Per-user opaque affinity: provider caches must never receive the raw user
@@ -428,29 +564,36 @@ def _decrypt_chat_rows(
     """
     token = _mint_runtime_token(user_id)
     out: list[dict] = []
-    caption_budget = [_CAPTION_DECRYPT_LIMIT]
     for m in rows:
-        raw_role = str(m.get("role") or "")
-        if user_only and raw_role != "user":
+        raw_role = str(m.get("role") or "").strip().lower()
+        if user_only and raw_role not in _USER_ROLES:
             continue
         mid, ts = m.get("id"), m.get("ts")
         role = "assistant" if raw_role in _ASSISTANT_ROLES else "user"
         if m.get("content_type") == "image":
             item = _image_row(
-                m, mid=mid, ts=ts, role=role, token=token,
-                caption_budget=caption_budget,
+                m,
+                mid=mid,
+                ts=ts,
+                role=role,
+                token=token,
             )
         elif m.get("content_type") == "file":
             item = _file_row(
-                m, mid=mid, ts=ts, role=role, token=token,
-                caption_budget=caption_budget,
+                m,
+                mid=mid,
+                ts=ts,
+                role=role,
+                token=token,
             )
         else:
             if not m.get("body_ct") or m.get("K_enclave") is None:
                 if not preserve_unreadable:
                     continue  # legacy ts path keeps the historical skip rule
                 item = {
-                    "id": mid, "ts": ts, "role": role,
+                    "id": mid,
+                    "ts": ts,
+                    "role": role,
                     "content": _UNAVAILABLE_CHAT_MARKER,
                 }
             else:
@@ -469,7 +612,10 @@ def _decrypt_chat_rows(
 
 
 def _read_messages_after_seq(
-    user_id: str, after_seq: int = 0, *, through_seq: int | None = None,
+    user_id: str,
+    after_seq: int = 0,
+    *,
+    through_seq: int | None = None,
 ) -> list[dict]:
     """Strict production catch-up reader keyed only by ``chat_messages.seq``.
 
@@ -482,10 +628,16 @@ def _read_messages_after_seq(
     ``build_production_deps`` wires this function as the production boundary.
     """
     rows = db.chat_messages_after_seq(
-        user_id, int(after_seq), limit=None, through_seq=through_seq,
+        user_id,
+        int(after_seq),
+        limit=None,
+        through_seq=through_seq,
     )
     return _decrypt_chat_rows(
-        user_id, rows, user_only=True, preserve_unreadable=True,
+        user_id,
+        rows,
+        user_only=True,
+        preserve_unreadable=True,
     )
 
 
@@ -559,12 +711,9 @@ def _read_tail_window(
     rows = sorted(rows, key=lambda m: m.get("ts") or 0.0)
     if limit <= 0:
         return []
-    candidates = [
-        m for m in rows
-        if m.get("ts") is not None and m.get("ts") > after_ts
-    ]
-    # Bound enclave work before decrypting. This also allocates the caption
-    # budget to the messages that will actually reach the prompt.
+    candidates = [m for m in rows if m.get("ts") is not None and m.get("ts") > after_ts]
+    # Bound enclave work before decrypting, so every selected caption can be
+    # preserved without an independent cap that silently changes row content.
     rows = candidates[:limit] if oldest_first else candidates[-limit:]
     return _decrypt_chat_rows(user_id, rows, user_only=False)
 
@@ -579,29 +728,51 @@ def _read_tail_window_after_seq(
 ) -> list[dict]:
     """Strict bounded two-role prompt window selected by exact seq identity."""
     rows = db.chat_messages_after_seq(
-        user_id, int(after_seq), limit=int(limit), oldest_first=oldest_first,
+        user_id,
+        int(after_seq),
+        limit=int(limit),
+        oldest_first=oldest_first,
         through_seq=through_seq,
     )
     return _decrypt_chat_rows(
-        user_id, rows, user_only=False, preserve_unreadable=True,
+        user_id,
+        rows,
+        user_only=False,
+        preserve_unreadable=True,
     )
 
 
 def _read_tail_after_seq(
-    user_id: str, after_seq: int, limit: int, *, through_seq: int | None = None,
+    user_id: str,
+    after_seq: int,
+    limit: int,
+    *,
+    through_seq: int | None = None,
 ) -> list[dict]:
     """Newest bounded verbatim window after a summary seq watermark."""
     return _read_tail_window_after_seq(
-        user_id, after_seq, limit, oldest_first=False, through_seq=through_seq,
+        user_id,
+        after_seq,
+        limit,
+        oldest_first=False,
+        through_seq=through_seq,
     )
 
 
 def _read_compaction_tail_after_seq(
-    user_id: str, after_seq: int, limit: int, *, through_seq: int | None = None,
+    user_id: str,
+    after_seq: int,
+    limit: int,
+    *,
+    through_seq: int | None = None,
 ) -> list[dict]:
     """Oldest contiguous compaction batch after a summary seq watermark."""
     return _read_tail_window_after_seq(
-        user_id, after_seq, limit, oldest_first=True, through_seq=through_seq,
+        user_id,
+        after_seq,
+        limit,
+        oldest_first=True,
+        through_seq=through_seq,
     )
 
 
@@ -615,6 +786,118 @@ def _read_compaction_tail(user_id: str, after_ts: float, limit: int) -> list[dic
     return _read_tail_window(user_id, after_ts, limit, oldest_first=True)
 
 
+def _summary_metadata_frontier(state: dict) -> list:
+    """Validate canonical provenance without decrypting every retained node."""
+    opened = [
+        v2_summary_frontier.SummarySegment(
+            segment_id=int(row["segment_id"]),
+            coverage_kind=str(row["coverage_kind"]),
+            level=int(row["level"]),
+            start_seq=int(row["start_seq"]),
+            end_seq=int(row["end_seq"]),
+            source_message_count=int(row["source_message_count"]),
+            legacy_opaque_through_seq=int(
+                row.get("legacy_opaque_through_seq") or 0
+            ),
+            child_segment_ids=tuple(
+                int(value) for value in (row.get("child_segment_ids") or [])
+            ),
+            # The authenticated materialized head is the prompt payload. This
+            # sentinel lets the pure validator check content-free provenance
+            # without N enclave round-trips on every ordinary turn.
+            text="<encrypted-summary-segment>",
+        )
+        for row in list(state.get("segments") or [])
+    ]
+    validated = list(
+        v2_summary_frontier.validate_canonical_frontier(
+            opened,
+            watermark_seq=int(state.get("watermark_seq") or 0),
+            first_source_seq=int(state.get("first_source_seq") or 0),
+            covered_source_count=int(state.get("covered_source_count") or 0),
+        )
+    )
+    canonical_ids = tuple(item.segment_id for item in validated)
+    materialized_ids = tuple(
+        int(value) for value in (state.get("materialized_segment_ids") or [])
+    )
+    if canonical_ids != materialized_ids:
+        raise v2_summary_frontier.SummaryFrontierIntegrityError(
+            "materialized_head_provenance_mismatch"
+        )
+    return validated
+
+
+def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
+    """Open canonical nodes only for checkpoint generation."""
+    state = jobs_store.get_summary_frontier_state(user_id)
+    if state is None:
+        return None, []
+    segment_rows = list(state.get("segments") or [])
+    if not segment_rows:
+        return state, []
+    token = _mint_runtime_token(user_id)
+    metadata = _summary_metadata_frontier(state)
+    metadata_by_id = {item.segment_id: item for item in metadata}
+    opened: list[v2_summary_frontier.SummarySegment] = []
+    for row in segment_rows:
+        env = row.get("summary_envelope")
+        if not env:
+            raise RuntimeError(
+                f"{_SUMMARY_INTEGRITY_ERROR}: segment without encrypted envelope"
+            )
+        plaintext = core_enclave._decrypt_envelope_via_enclave(
+            env,
+            None,
+            purpose="v2_summary_segment_read",
+            runtime_token=token,
+        ).decode("utf-8")
+        meta = metadata_by_id[int(row["segment_id"])]
+        opened.append(
+            v2_summary_frontier.SummarySegment(
+                segment_id=meta.segment_id,
+                coverage_kind=meta.coverage_kind,
+                level=meta.level,
+                start_seq=meta.start_seq,
+                end_seq=meta.end_seq,
+                source_message_count=meta.source_message_count,
+                legacy_opaque_through_seq=meta.legacy_opaque_through_seq,
+                child_segment_ids=meta.child_segment_ids,
+                text=plaintext,
+            )
+        )
+    return state, opened
+
+
+def _read_summary_frontier(user_id: str):
+    """Production roll-up seam: one head-version-pinned decrypted cover."""
+    state, frontier = _open_summary_frontier_state(user_id)
+    if state is None:
+        return None
+    if not frontier and state.get("summary_envelope"):
+        seeded = jobs_store.seed_legacy_summary_segment(
+            user_id,
+            expected_version=int(state.get("version") or 0),
+            translated_watermark_seq=int(state.get("watermark_seq") or 0),
+        )
+        if not seeded:
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "legacy_summary_seed_race"
+            )
+        state, frontier = _open_summary_frontier_state(user_id)
+    if state is not None and not frontier and state.get("summary_envelope"):
+        raise v2_summary_frontier.SummaryFrontierIntegrityError(
+            "legacy_summary_seed_missing"
+        )
+    if state is None or not frontier:
+        return None
+    return v2_summary_frontier.SummaryFrontierSnapshot(
+        segments=tuple(frontier),
+        head_version=int(state.get("version") or 0),
+        watermark_seq=int(state.get("watermark_seq") or 0),
+    )
+
+
 def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     """Read/decrypt summary plus its exact seq coverage watermark.
 
@@ -622,13 +905,20 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     remains during migration/observability, but prompt selection and retention
     use only ``watermark_seq``. A missing row returns all-zero metadata.
     """
-    row = jobs_store.get_summary_row(user_id)
+    row = jobs_store.get_summary_frontier_state(user_id)
     if row is None:
         return "", 0.0, 0, 0
     watermark_ts = float(row.get("watermark_ts") or 0.0)
     watermark_seq = int(row.get("watermark_seq") or 0)
     version = int(row.get("version") or 0)
     has_durable_coverage = watermark_seq > 0 or watermark_ts > 0
+    if row.get("has_segment_rows") and not row.get("segments"):
+        raise v2_summary_frontier.SummaryFrontierIntegrityError(
+            "missing_canonical_segment_rows"
+        )
+    if row.get("segments") or row.get("materialized_segment_ids"):
+        _summary_metadata_frontier(row)
+
     env = row.get("summary_envelope")
     if not env:
         if has_durable_coverage:
@@ -659,7 +949,10 @@ def _read_summary(user_id: str) -> tuple[str, float, int]:
 
 
 def _write_summary(
-    user_id: str, summary: str, watermark_ts: float, expected_version: int,
+    user_id: str,
+    summary: str,
+    watermark_ts: float,
+    expected_version: int,
     watermark_seq: int | None = None,
 ) -> bool:
     """把新压缩出的摘要**本地**加密（core_envelope，非 enclave 往返——跟 worker._write_encrypted_reply
@@ -671,19 +964,138 @@ def _write_summary(
     seq 时（罕见：折叠批次最后一行连 id 都没有）省略这个参数，CAS 只推进 ts，watermark_seq
     保持不变（COALESCE 在 jobs_store 那一层兜底，不在这里假造一个值）。"""
     store = core_store.get_store(user_id)
-    env, err = core_envelope._build_shared_envelope_for_store(store, summary.encode("utf-8"))
+    env, err = core_envelope._build_shared_envelope_for_store(
+        store, summary.encode("utf-8")
+    )
     if env is None:
-        log.warning("[v2.serve_worker] _write_summary build envelope failed for %s: %s", user_id, err)
+        log.warning(
+            "[v2.serve_worker] _write_summary build envelope failed for %s: %s",
+            user_id,
+            err,
+        )
         return False
     # Only pass watermark_seq through when the caller actually has one — keeps
     # the call shape identical to pre-D5 callers (incl. narrow-signature test
     # doubles) when it's omitted, rather than always sending an extra kwarg.
     if watermark_seq is not None:
         return jobs_store.upsert_summary_row_cas(
-            user_id, summary_envelope=env, watermark_ts=watermark_ts,
-            expected_version=expected_version, watermark_seq=watermark_seq)
+            user_id,
+            summary_envelope=env,
+            watermark_ts=watermark_ts,
+            expected_version=expected_version,
+            watermark_seq=watermark_seq,
+            require_source_row=True,
+        )
     return jobs_store.upsert_summary_row_cas(
-        user_id, summary_envelope=env, watermark_ts=watermark_ts, expected_version=expected_version)
+        user_id,
+        summary_envelope=env,
+        watermark_ts=watermark_ts,
+        expected_version=expected_version,
+    )
+
+
+def _append_summary_segment(
+    user_id: str,
+    segment_text: str,
+    *,
+    current_summary: str,
+    start_seq: int,
+    end_seq: int,
+    source_message_count: int,
+    watermark_ts: float,
+    expected_version: int,
+    previous_watermark_seq: int,
+) -> bool:
+    """Seal one leaf and atomically append it with the summary head CAS."""
+    store = core_store.get_store(user_id)
+    env, err = core_envelope._build_shared_envelope_for_store(
+        store, str(segment_text).encode("utf-8")
+    )
+    if env is None:
+        log.warning(
+            "[v2.serve_worker] summary segment envelope failed for %s: %s",
+            user_id,
+            err,
+        )
+        return False
+    compatibility_text = str(current_summary or "").rstrip()
+    if compatibility_text:
+        compatibility_text += "\n"
+    compatibility_text += str(segment_text).strip()
+    head_env, head_err = core_envelope._build_shared_envelope_for_store(
+        store, compatibility_text.encode("utf-8")
+    )
+    if head_env is None:
+        log.warning(
+            "[v2.serve_worker] summary compatibility envelope failed for %s: %s",
+            user_id,
+            head_err,
+        )
+        return False
+    return jobs_store.append_summary_leaf_cas(
+        user_id,
+        summary_envelope=env,
+        head_summary_envelope=head_env,
+        start_seq=int(start_seq),
+        end_seq=int(end_seq),
+        source_message_count=int(source_message_count),
+        watermark_ts=float(watermark_ts),
+        expected_version=int(expected_version),
+        previous_watermark_seq=int(previous_watermark_seq),
+    )
+
+
+def _append_summary_checkpoint(
+    user_id: str,
+    checkpoint_text: str,
+    *,
+    head_summary: str,
+    level: int,
+    start_seq: int,
+    end_seq: int,
+    source_message_count: int,
+    child_segment_ids: tuple[int, ...],
+    expected_version: int,
+    expected_watermark_seq: int,
+    coverage_kind: str = "exact",
+    legacy_opaque_through_seq: int = 0,
+) -> bool:
+    """Seal one derived parent; all encrypted children remain immutable."""
+    store = core_store.get_store(user_id)
+    env, err = core_envelope._build_shared_envelope_for_store(
+        store, str(checkpoint_text).encode("utf-8")
+    )
+    if env is None:
+        log.warning(
+            "[v2.serve_worker] summary checkpoint envelope failed for %s: %s",
+            user_id,
+            err,
+        )
+        return False
+    head_env, head_err = core_envelope._build_shared_envelope_for_store(
+        store, str(head_summary).encode("utf-8")
+    )
+    if head_env is None:
+        log.warning(
+            "[v2.serve_worker] checkpoint prompt-view envelope failed for %s: %s",
+            user_id,
+            head_err,
+        )
+        return False
+    return jobs_store.insert_summary_checkpoint(
+        user_id,
+        summary_envelope=env,
+        head_summary_envelope=head_env,
+        level=int(level),
+        start_seq=int(start_seq),
+        end_seq=int(end_seq),
+        source_message_count=int(source_message_count),
+        child_segment_ids=tuple(int(value) for value in child_segment_ids),
+        coverage_kind=str(coverage_kind),
+        legacy_opaque_through_seq=int(legacy_opaque_through_seq),
+        expected_version=int(expected_version),
+        expected_watermark_seq=int(expected_watermark_seq),
+    )
 
 
 def _wake_decision_for_user(user_id: str) -> dict:
@@ -693,7 +1105,11 @@ def _wake_decision_for_user(user_id: str) -> dict:
     the scheduler decides what to do with should_wake."""
     store = core_store.get_store(user_id)
     if not hosted_config_store.hosted_runtime_v2_enabled_strict(store):
-        return {"should_wake": False, "wake_interval_sec": 7200, "block_reason": "runtime_mode"}
+        return {
+            "should_wake": False,
+            "wake_interval_sec": 7200,
+            "block_reason": "runtime_mode",
+        }
     payload = {"trigger": "heartbeat"}
     d = proactive_gate._build_proactive_v2_wake_decision(store, payload)
     return {
@@ -718,11 +1134,16 @@ def _fire_scheduled_for_user(user_id: str) -> int:
         return 0
 
     from proactive.controls_v2 import WakeControlDecisionV2
-    from proactive.scheduled_wake_v2 import DBScheduledWakeStoreV2, ScheduledWakeServiceV2
+    from proactive.scheduled_wake_v2 import (
+        DBScheduledWakeStoreV2,
+        ScheduledWakeServiceV2,
+    )
     from proactive.store_v2 import DBProactiveSettingsStoreV2
 
     settings = DBProactiveSettingsStoreV2().load(user_id)
-    service = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id=_V2_WAKE_OWNER_ID)
+    service = ScheduledWakeServiceV2(
+        DBScheduledWakeStoreV2(), owner_id=_V2_WAKE_OWNER_ID
+    )
     fired = 0
 
     def _submit(event):
@@ -732,8 +1153,9 @@ def _fire_scheduled_for_user(user_id: str) -> int:
         fired += 1
         return WakeControlDecisionV2(True, "queued_v2", settings)
 
-    service.fire_due_timers(user_id, settings=settings, submit_wake=_submit,
-                            owner_id=_V2_WAKE_OWNER_ID)
+    service.fire_due_timers(
+        user_id, settings=settings, submit_wake=_submit, owner_id=_V2_WAKE_OWNER_ID
+    )
     return fired
 
 
@@ -751,49 +1173,178 @@ def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
     for mid in message_ids:
         try:
             res = cap_registry.run_capability(
-                "chat_image_read", store, api_key=None, runtime_token=token,
-                params={"message_id": mid})
+                "chat_image_read",
+                store,
+                api_key=None,
+                runtime_token=token,
+                params={"message_id": mid},
+            )
             data = (res.to_dict() or {}).get("data") or {}
         except Exception as e:  # noqa: BLE001
             log.warning("[v2.serve_worker] image read failed msg=%s: %s", mid, e)
             continue
         if data.get("image_b64"):
-            out[str(mid)] = {"image_mime": data.get("image_mime") or "image/jpeg",
-                             "image_b64": data["image_b64"]}
+            out[str(mid)] = {
+                "image_mime": data.get("image_mime") or "image/jpeg",
+                "image_b64": data["image_b64"],
+            }
     return out
 
 
 def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
-    """按 id 取上传文件的解密字节 + 抽取的纯文本。复用内部 `chat_file_read`
-    capability（对标 `_read_images`，同样不暴露给模型），再经 `hosted.file_text`
-    把 docx/xlsx/pdf/文本抽成 prompt 可 inline 的文字。V2 是纯 HTTP、无 CLI/文件系统，
-    这是让 tool-less 模型「读文件」的唯一途径。
+    """Read cached artifact text views or materialize through a real sandbox.
 
-    单条失败/抽取为空只跳过那一条，绝不抛——调用方 `worker._inject_tail_files` 会把缺失
-    的文件行原样留成 `[file: name]` 标记。返回 {mid: {file_name, file_mime, text, truncated}}。
+    Upload/storage remains unchanged. A cache miss acquires the configured
+    sandbox *before* asking the enclave for physical bytes. No provider means a
+    stable ``sandbox_unavailable`` result; there is no fallback to the old
+    in-process PDF/DOCX/XLSX parser.
     """
     store = core_store.get_store(user_id)
     token = _mint_runtime_token(user_id)
+    backend = production_workspace_backend(store, runtime_token=token)
+    try:
+        provider = configured_sandbox_provider()
+    except SandboxUnavailable:
+        # Stored encrypted text views remain readable even when a configured
+        # provider adapter is absent; only a physical cache miss fails closed.
+        provider = DisabledSandboxProvider()
+
+    def _record_sandbox_acquire(event):
+        return jobs_store.record_sandbox_acquisition(
+            event.user_id,
+            provider=event.provider,
+            purpose=event.purpose,
+        )
+
+    def _record_sandbox_release(event) -> None:
+        if type(
+            event.usage_ref
+        ) is not int or not jobs_store.finish_sandbox_acquisition(
+            event.usage_ref,
+            event.user_id,
+            duration_ms=event.duration_ms,
+            outcome=event.outcome,
+        ):
+            raise RuntimeError("sandbox usage row was not finalized")
+
+    lazy = LazySandbox(
+        provider,
+        user_id=user_id,
+        on_acquire=_record_sandbox_acquire,
+        on_release=_record_sandbox_release,
+    )
+    artifacts = ArtifactWorkspace(backend, lazy)
     out: dict[str, dict] = {}
-    for mid in message_ids:
-        try:
-            res = cap_registry.run_capability(
-                "chat_file_read", store, api_key=None, runtime_token=token,
-                params={"message_id": mid})
-            data = (res.to_dict() or {}).get("data") or {}
-            b64 = data.get("file_b64")
-            if not b64:
+    try:
+        rows_by_id = {
+            str(row.get("id") or ""): row
+            for row in (getattr(store, "chat_messages", None) or [])
+            if isinstance(row, dict) and row.get("id")
+        }
+        for mid in message_ids:
+            meta = rows_by_id.get(str(mid)) or {}
+            name = str(meta.get("file_name") or "file")
+            mime = str(meta.get("file_mime") or "application/octet-stream")
+            view_path = artifact_text_view_path(str(mid), name)
+            try:
+                entry = artifacts.read_text_view(view_path)
+            except WorkspaceNotFound:
+                try:
+                    # Acquire/bill before decrypted physical bytes enter this path.
+                    lazy.ensure(SandboxRequiredOperation.MATERIALIZE_ARTIFACT)
+                except SandboxUsageUnavailable as exc:
+                    # Usage persistence is part of acquisition. Do not ask the
+                    # enclave for bytes unless provider use is billable.
+                    log.warning(
+                        "[v2.serve_worker] sandbox acquisition audit failed "
+                        "msg=%s type=%s",
+                        mid,
+                        type(exc).__name__,
+                    )
+                    out[str(mid)] = {
+                        "file_name": name,
+                        "file_mime": mime,
+                        "error": "sandbox_usage_unavailable",
+                    }
+                    continue
+                except SandboxUnavailable:
+                    out[str(mid)] = {
+                        "file_name": name,
+                        "file_mime": mime,
+                        "error": "sandbox_unavailable",
+                    }
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "[v2.serve_worker] sandbox acquisition failed msg=%s type=%s",
+                        mid,
+                        type(exc).__name__,
+                    )
+                    out[str(mid)] = {
+                        "file_name": name,
+                        "file_mime": mime,
+                        "error": "sandbox_unavailable",
+                    }
+                    continue
+                try:
+                    res = cap_registry.run_capability(
+                        "chat_file_read",
+                        store,
+                        api_key=None,
+                        runtime_token=token,
+                        params={"message_id": mid},
+                    )
+                    data = (res.to_dict() or {}).get("data") or {}
+                    b64 = data.get("file_b64")
+                    if not b64:
+                        raise RuntimeError("artifact body unavailable")
+                    name = str(data.get("file_name") or name)
+                    mime = str(data.get("file_mime") or mime)
+                    raw = base64.b64decode(b64, validate=True)
+                    entry = artifacts.ingest(
+                        source_ref=str(mid),
+                        filename=name,
+                        mime_type=mime,
+                        data=raw,
+                    )
+                    view_path = entry.path
+                except Exception as exc:  # noqa: BLE001 - one bad artifact is isolated
+                    log.warning(
+                        "[v2.serve_worker] sandbox artifact read failed msg=%s type=%s",
+                        mid,
+                        type(exc).__name__,
+                    )
+                    out[str(mid)] = {
+                        "file_name": name,
+                        "file_mime": mime,
+                        "error": "artifact_read_unavailable",
+                    }
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[v2.serve_worker] artifact text-view read failed msg=%s type=%s",
+                    mid,
+                    type(exc).__name__,
+                )
+                out[str(mid)] = {
+                    "file_name": name,
+                    "file_mime": mime,
+                    "error": "artifact_read_unavailable",
+                }
                 continue
-            raw = base64.b64decode(b64)
-            name = data.get("file_name") or "file"
-            extracted = file_text.extract_file_text(raw, name=name, mime=data.get("file_mime") or "")
-        except Exception as e:  # noqa: BLE001
-            log.warning("[v2.serve_worker] file read failed msg=%s: %s", mid, e)
-            continue
-        if extracted.text:
-            out[str(mid)] = {"file_name": name,
-                             "file_mime": data.get("file_mime") or "application/octet-stream",
-                             "text": extracted.text, "truncated": extracted.truncated}
+
+            text = str(entry.content or "")
+            if text:
+                truncated = len(text) > _FILE_INLINE_MAX_CHARS
+                out[str(mid)] = {
+                    "file_name": name,
+                    "file_mime": mime,
+                    "text": text[:_FILE_INLINE_MAX_CHARS],
+                    "truncated": truncated,
+                    "workspace_path": view_path,
+                }
+    finally:
+        lazy.close()
     return out
 
 
@@ -807,7 +1358,9 @@ def _render_card_line(item: dict) -> str:
     卡内容经 enclave readside 解出明文（见 memory_index_core），服务器本地不再解密。"""
     if not isinstance(item, dict):
         return ""
-    text = str(item.get("title") or item.get("summary") or item.get("content") or "").strip()
+    text = str(
+        item.get("title") or item.get("summary") or item.get("content") or ""
+    ).strip()
     mid = str(item.get("id") or "").strip()
     if not text:
         return ""
@@ -829,29 +1382,48 @@ def _read_memory_context(user_id: str) -> dict:
     try:
         token = _mint_runtime_token(user_id)
     except Exception as e:  # noqa: BLE001 — token 铸造失败只让读侧降级，不抛
-        log.warning("[v2.serve_worker] memory context token mint failed for %s: %s", user_id, e)
+        log.warning(
+            "[v2.serve_worker] memory context token mint failed for %s: %s", user_id, e
+        )
         token = ""
 
     def _post(api_key, candidates, *, operation, payload=None):
         return memory_readside_core.post_enclave_readside(
-            api_key, candidates, operation=operation, payload=payload, runtime_token=token)
+            api_key,
+            candidates,
+            operation=operation,
+            payload=payload,
+            runtime_token=token,
+        )
 
-    ctx = {"ai_name": "", "user_name": "", "buckets": "", "threads": "",
-           "identity": "", "cards": ""}
+    ctx = {
+        "ai_name": "",
+        "user_name": "",
+        "buckets": "",
+        "threads": "",
+        "identity": "",
+        "cards": "",
+    }
     try:
         body, status = memory_core.buckets(store, None, post_enclave=_post)
         if status == 200:
             ctx["buckets"] = ", ".join(str(b) for b in (body.get("buckets") or []))
     except Exception as e:  # noqa: BLE001 — 单项降级
-        log.warning("[v2.serve_worker] memory buckets unavailable for %s: %s", user_id, e)
+        log.warning(
+            "[v2.serve_worker] memory buckets unavailable for %s: %s", user_id, e
+        )
     try:
         body, status = memory_core.threads(store, None, post_enclave=_post)
         if status == 200:
             ctx["threads"] = ", ".join(str(t) for t in (body.get("threads") or []))
     except Exception as e:  # noqa: BLE001 — 单项降级
-        log.warning("[v2.serve_worker] memory threads unavailable for %s: %s", user_id, e)
+        log.warning(
+            "[v2.serve_worker] memory threads unavailable for %s: %s", user_id, e
+        )
     try:
-        body, status = memory_core.index(store, None, {"limit": _MEMORY_CARDS_LIMIT}, post_enclave=_post)
+        body, status = memory_core.index(
+            store, None, {"limit": _MEMORY_CARDS_LIMIT}, post_enclave=_post
+        )
         if status == 200:
             lines = [_render_card_line(it) for it in (body.get("items") or [])]
             ctx["cards"] = "\n".join(ln for ln in lines if ln)
@@ -862,7 +1434,9 @@ def _read_memory_context(user_id: str) -> dict:
         ident = body.get("identity") if isinstance(body, dict) else None
         if status == 200 and isinstance(ident, dict):
             # E2E 信封：服务器侧只有顶层非敏感明文（summary/title 若曾以明文写入），否则 ""。
-            ctx["identity"] = str(ident.get("summary") or ident.get("title") or "").strip()
+            ctx["identity"] = str(
+                ident.get("summary") or ident.get("title") or ""
+            ).strip()
     except Exception as e:  # noqa: BLE001 — 单项降级
         log.warning("[v2.serve_worker] identity unavailable for %s: %s", user_id, e)
     return ctx
@@ -900,10 +1474,16 @@ def _apply_memory_actions(
         runtime_token=runtime_token,
     )
     if status >= 500:
-        raise RuntimeError(f"memory_actions_failed: status={status} body={str(body)[:160]}")
+        raise RuntimeError(
+            f"memory_actions_failed: status={status} body={str(body)[:160]}"
+        )
     if status >= 400:
-        log.warning("[v2.serve_worker] memory action rejected (4xx, dropped) user=%s status=%s body=%s",
-                    user_id, status, str(body)[:300])
+        log.warning(
+            "[v2.serve_worker] memory action rejected (4xx, dropped) user=%s status=%s body=%s",
+            user_id,
+            status,
+            str(body)[:300],
+        )
     return body
 
 
@@ -983,14 +1563,14 @@ def _latest_frame_meta(user_id: str) -> tuple[str, float]:
 
 
 def _last_user_msg_ts(user_id: str) -> float | None:
-    """该用户最后一条 `role == "user"` 消息的 ts —— 直接读 `store.chat_messages` 的明文
+    """该用户最后一条 `role in {"user", "human"}` 消息的 ts —— 直接读 `store.chat_messages` 的明文
     `role`/`ts` 列（**绝不 enclave**：只有 `body_ct` 是密文，role/ts 是明文）。没有任何
     user 行时返回 None（gate 视作「未在对话」，不触发 chatting 让路）。"""
     store = core_store.get_store(user_id)
     rows = getattr(store, "chat_messages", []) or []
     last_ts: float | None = None
     for m in rows:
-        if str(m.get("role") or "") == "user":
+        if str(m.get("role") or "").strip().lower() in _USER_ROLES:
             ts = m.get("ts")
             if ts is not None:
                 last_ts = float(ts)
@@ -1041,8 +1621,10 @@ def _tick_screen_watch_for_user(user_id: str) -> int:
         core_wake_bus.notify("v2_jobs", user_id)
         # 真醒：推进到期时间 **且** 消费这一帧（记 last_screen_watch_frame_id）。
         jobs_store.upsert_wake_schedule(
-            user_id, next_screen_watch_at=next_at,
-            last_screen_watch_frame_id=latest_frame_id)
+            user_id,
+            next_screen_watch_at=next_at,
+            last_screen_watch_frame_id=latest_frame_id,
+        )
         return 1
 
     # 被 gate（未 fresh/未变/chatting）或 oracle（未激活/免打扰）挡下：只推进到期时间，
@@ -1065,6 +1647,7 @@ class EffectSinkDeps:
     that need `user_id` (all of them) get it from a closure built once per
     turn by `build_production_effect_dispatch(user_id)` below; tests just pass
     plain `lambda p: ...` fakes."""
+
     reply: Callable[[dict], None]
     status: Callable[[dict], None]
     cursor: Callable[[dict], None]
@@ -1072,6 +1655,7 @@ class EffectSinkDeps:
     memory: Callable[[dict], None]
     identity: Callable[[dict], None]
     schedule: Callable[[dict], None]
+    workspace: Callable[[dict], None]
 
 
 def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], None]:
@@ -1088,6 +1672,7 @@ def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], None]:
         "memory": deps.memory,
         "identity": deps.identity,
         "schedule": deps.schedule,
+        "workspace": deps.workspace,
     }
 
     def dispatch(effect_type: str, payload: dict) -> None:
@@ -1137,7 +1722,9 @@ def _sink_reply(user_id: str, payload: dict) -> None:
         if row is None:
             raise RuntimeError("reply envelope build failed")
     except Exception:
-        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        db.effect_sink_release(
+            eid
+        )  # write failed -> undo the claim so replay re-does it
         raise
     db.effect_sink_complete(eid)
 
@@ -1227,11 +1814,16 @@ def _sink_status(user_id: str, payload: dict) -> None:
         return
     try:
         jobs_store.append_status_event(
-            user_id, str(payload.get("kind") or ""),
-            job_id=payload.get("job_id"), label=payload.get("label"),
-            detail=payload.get("detail"))
+            user_id,
+            str(payload.get("kind") or ""),
+            job_id=payload.get("job_id"),
+            label=payload.get("label"),
+            detail=payload.get("detail"),
+        )
     except Exception:
-        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        db.effect_sink_release(
+            eid
+        )  # write failed -> undo the claim so replay re-does it
         raise
     db.effect_sink_complete(eid)
 
@@ -1249,11 +1841,15 @@ def _sink_cursor(user_id: str, payload: dict) -> None:
         return
     try:
         db.advance_blob_int_strict(
-            user_id, "model_api_runtime", v2_cursor.CURSOR_KEY,
+            user_id,
+            "model_api_runtime",
+            v2_cursor.CURSOR_KEY,
             int(payload["new_seq"]),
         )
     except Exception:
-        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        db.effect_sink_release(
+            eid
+        )  # write failed -> undo the claim so replay re-does it
         raise
     db.effect_sink_complete(eid)
 
@@ -1290,7 +1886,11 @@ def _sink_job(user_id: str, payload: dict) -> None:
     if not generation_matches:
         log.debug(
             "[v2.serve_worker] job effect skipped: generation advanced user=%s "
-            "expected=%s current=%s", user_id, expected_generation, current)
+            "expected=%s current=%s",
+            user_id,
+            expected_generation,
+            current,
+        )
         db.effect_sink_complete(eid)
         return  # intentional fence skip is a completed no-op, not a write failure
     try:
@@ -1305,7 +1905,9 @@ def _sink_job(user_id: str, payload: dict) -> None:
             expected_generation=int(expected_generation),
         )
     except Exception:
-        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        db.effect_sink_release(
+            eid
+        )  # write failed -> undo the claim so replay re-does it
         raise
     db.effect_sink_complete(eid)
 
@@ -1325,7 +1927,9 @@ def _sink_memory(user_id: str, payload: dict, *, runtime_token: str) -> None:
             runtime_token=runtime_token,
         )
     except Exception:
-        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        db.effect_sink_release(
+            eid
+        )  # write failed -> undo the claim so replay re-does it
         raise
     db.effect_sink_complete(eid)
 
@@ -1370,14 +1974,19 @@ def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
             # 5xx keeps the claim-release retry path below.
             raise _capability_effect_error(result, "identity_patch_failed")
     except Exception:
-        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        db.effect_sink_release(
+            eid
+        )  # write failed -> undo the claim so replay re-does it
         raise
     db.effect_sink_complete(eid)
 
 
 _SCHEDULE_PAYLOAD_KEYS = (
-    "next_heartbeat_at", "next_capture_at", "payment_cooldown_until",
-    "next_screen_watch_at", "last_screen_watch_frame_id",
+    "next_heartbeat_at",
+    "next_capture_at",
+    "payment_cooldown_until",
+    "next_screen_watch_at",
+    "last_screen_watch_frame_id",
 )
 
 
@@ -1415,8 +2024,7 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
         if op in _SCHEDULE_CAPABILITY_OPS:
             store = core_store.get_store(user_id)
             params = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
-            result = cap_registry.run_capability(
-                op, store, api_key=None, params=params)
+            result = cap_registry.run_capability(op, store, api_key=None, params=params)
             if not result.ok:
                 # Same retryable-honoring contract as _sink_identity: a
                 # deterministic 4xx terminal-discards instead of wedging.
@@ -1425,9 +2033,210 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
             kwargs = {k: v for k, v in payload.items() if k in _SCHEDULE_PAYLOAD_KEYS}
             jobs_store.upsert_wake_schedule(user_id, **kwargs)
     except Exception:
-        db.effect_sink_release(eid)  # write failed -> undo the claim so replay re-does it
+        db.effect_sink_release(
+            eid
+        )  # write failed -> undo the claim so replay re-does it
         raise
     db.effect_sink_complete(eid)
+
+
+def _sink_workspace(user_id: str, payload: dict, *, runtime_token: str) -> None:
+    """Apply one encrypted, revision-fenced virtual workspace mutation."""
+    eid = payload["effect_id"]
+    if not db.effect_sink_claim(eid):
+        return
+    try:
+        op = str(payload.get("op") or "")
+        if op not in {"workspace_write", "workspace_delete"}:
+            raise db.EffectTerminalError("workspace_operation_invalid")
+        store = core_store.get_store(user_id)
+        params = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+        result = cap_registry.run_capability(
+            op,
+            store,
+            api_key=None,
+            runtime_token=runtime_token,
+            params=params,
+        )
+        if not result.ok:
+            raise _capability_effect_error(result, f"{op}_failed")
+    except Exception:
+        db.effect_sink_release(eid)
+        raise
+    db.effect_sink_complete(eid)
+
+
+def _workspace_paths_conflict(left: str, right: str) -> bool:
+    return (
+        left == right
+        or left.startswith(right + "/")
+        or right.startswith(left + "/")
+    )
+
+
+def _workspace_mutation_waves(operations: list[dict]) -> list[list[dict]]:
+    """Partition provider-ordered mutations into conflict-free waves.
+
+    Same-path and ancestor/descendant operations stay ordered.  Disjoint paths
+    in the same wave may reach their actual durable backend CAS concurrently.
+    All paths are validated before the first wave starts, preventing one bad
+    path from causing a surprising partial batch.
+    """
+    prepared: list[dict] = []
+    try:
+        for operation in operations:
+            prepared.append(
+                {
+                    **operation,
+                    "path": model_writable_path(operation.get("path")),
+                }
+            )
+    except Exception as exc:
+        raise db.EffectTerminalError(
+            "workspace_operation_invalid"
+        ) from exc
+
+    waves: list[list[dict]] = []
+    current: list[dict] = []
+    for operation in prepared:
+        path = str(operation["path"])
+        if any(
+            _workspace_paths_conflict(path, str(existing["path"]))
+            for existing in current
+        ):
+            waves.append(current)
+            current = []
+        current.append(operation)
+    if current:
+        waves.append(current)
+    return waves
+
+
+def _apply_workspace_batch_operation(
+    user_id: str,
+    operation: dict,
+    *,
+    runtime_token: str,
+) -> dict:
+    """Apply one child with its own crash-safe idempotency claim."""
+    child_effect_id = str(operation["sub_effect_id"])
+    if not db.effect_sink_claim(child_effect_id):
+        return {"effect_id": child_effect_id, "status": "applied"}
+    try:
+        op = str(operation["op"])
+        store = core_store.get_store(user_id)
+        params = {
+            key: value
+            for key, value in operation.items()
+            if key not in {"op", "sub_effect_id"}
+        }
+        result = cap_registry.run_capability(
+            op,
+            store,
+            api_key=None,
+            runtime_token=runtime_token,
+            params=params,
+        )
+        if not result.ok:
+            raise _capability_effect_error(result, f"{op}_failed")
+    except Exception:
+        # Only a write that raised is safe to retry.  A hard process death after
+        # the backend commit leaves the child claim unresolved, and the parent
+        # moves to explicit reconciliation instead of guessing.
+        db.effect_sink_release(child_effect_id)
+        raise
+    db.effect_sink_complete(child_effect_id)
+    return {"effect_id": child_effect_id, "status": "applied"}
+
+
+def _sink_workspace_batch(
+    user_id: str,
+    payload: dict,
+    *,
+    runtime_token: str,
+) -> v2_effect_outbox.WorkspaceBatchAppliedResult:
+    """Apply a workspace batch and retain every child's terminal truth.
+
+    Deterministic conflicts are item results, not parent delivery failures. A
+    transient or uncertain child still keeps the parent unresolved exactly as
+    before; already-completed siblings are skipped safely on replay by their
+    individual sink claims.
+    """
+    operations = list(payload.get("operations") or [])
+    waves = _workspace_mutation_waves(operations)
+    executor = _workspace_write_executor()
+    outcomes: dict[str, dict] = {}
+    for wave in waves:
+        futures = [
+            (
+                operation,
+                executor.submit(
+                    _apply_workspace_batch_operation,
+                    user_id,
+                    operation,
+                    runtime_token=runtime_token,
+                ),
+            )
+            for operation in wave
+        ]
+        retryable_errors: list[Exception] = []
+        uncertain_errors: list[db.EffectDeliveryUncertainError] = []
+        # Read results in provider order. All futures are already running, so
+        # this preserves deterministic results/error selection without
+        # serializing the actual backend work.
+        for operation, future in futures:
+            child_effect_id = str(operation["sub_effect_id"])
+            try:
+                outcome = future.result()
+            except db.EffectDeliveryUncertainError as exc:
+                uncertain_errors.append(exc)
+            except db.EffectTerminalError:
+                outcomes[child_effect_id] = {
+                    "effect_id": child_effect_id,
+                    "status": "discarded",
+                    # The capability adapter deliberately exposes only this
+                    # stable code; never persist exception text from a sink.
+                    "error": f"{operation['op']}_failed",
+                }
+            except Exception as exc:  # noqa: BLE001 - re-raised after siblings settle
+                retryable_errors.append(exc)
+            else:
+                if not isinstance(outcome, dict) or outcome != {
+                    "effect_id": child_effect_id,
+                    "status": "applied",
+                }:
+                    retryable_errors.append(
+                        RuntimeError("workspace child returned an invalid outcome")
+                    )
+                else:
+                    outcomes[child_effect_id] = outcome
+        # Delivery uncertainty dominates every other outcome. Ordinary
+        # retryable failures dominate deterministic item rejections so a
+        # terminal sibling can never discard work that still needs a replay.
+        if uncertain_errors:
+            raise uncertain_errors[0]
+        if retryable_errors:
+            raise retryable_errors[0]
+
+    ordered = []
+    for operation in operations:
+        child_effect_id = str(operation["sub_effect_id"])
+        outcome = outcomes.get(child_effect_id)
+        if outcome is None:
+            raise RuntimeError("workspace batch child outcome is missing")
+        ordered.append(outcome)
+    parent_status = (
+        v2_effect_outbox.APPLIED_WITH_RESULTS_STATUS
+        if any(item["status"] == "discarded" for item in ordered)
+        else "applied"
+    )
+    return v2_effect_outbox.WorkspaceBatchAppliedResult(
+        {
+            "kind": v2_effect_outbox.WORKSPACE_BATCH_RESULT_KIND,
+            "items": ordered,
+        },
+        status=parent_status,
+    )
 
 
 def build_production_effect_dispatch(
@@ -1435,7 +2244,7 @@ def build_production_effect_dispatch(
     *,
     runtime_token_provider: Callable[[], str] | None = None,
 ) -> Callable[[str, dict], None]:
-    """Wire the 7 real sinks bound to a single user (see `EffectSinkDeps`
+    """Wire the real sinks bound to a single user (see `EffectSinkDeps`
     docstring for why the binding happens here and not inside
     `build_effect_dispatch`). Called once per `apply_pending_effects(user_id,
     ...)` at end-of-turn (see `build_production_deps`'s `apply_pending_effects`
@@ -1465,13 +2274,17 @@ def build_production_effect_dispatch(
             runtime_token=runtime_token_provider(),
         ),
         schedule=lambda p: _sink_schedule(user_id, p),
+        workspace=lambda p: _sink_workspace(
+            user_id,
+            p,
+            runtime_token=runtime_token_provider(),
+        ),
     )
     return build_effect_dispatch(deps)
 
 
 _ENCRYPTED_TOOL_EFFECT_TYPES = {
-    stored: logical
-    for logical, stored in v2_worker.ENCRYPTED_TOOL_EFFECT_TYPES.items()
+    stored: logical for logical, stored in v2_worker.ENCRYPTED_TOOL_EFFECT_TYPES.items()
 }
 
 
@@ -1537,9 +2350,10 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
                 raise RuntimeError("invalid encrypted memory action")
             action_type = str(action.get("type") or "")
             if action_type == "memory.delete":
-                if set(action) != {"type", "memory_id"} or not str(
-                    action.get("memory_id") or ""
-                ).strip():
+                if (
+                    set(action) != {"type", "memory_id"}
+                    or not str(action.get("memory_id") or "").strip()
+                ):
                     raise RuntimeError("invalid encrypted memory delete")
                 continue
             if action_type not in {"memory.add", "memory.supersede"}:
@@ -1555,9 +2369,10 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
             if not isinstance(memory, dict):
                 raise RuntimeError("invalid encrypted memory payload")
             if set(memory) == {"summary", "content", "bucket", "threads"}:
-                if not str(memory.get("summary") or "").strip() or not str(
-                    memory.get("content") or ""
-                ).strip():
+                if (
+                    not str(memory.get("summary") or "").strip()
+                    or not str(memory.get("content") or "").strip()
+                ):
                     raise RuntimeError("invalid encrypted memory content")
                 if not isinstance(memory.get("bucket"), str):
                     raise RuntimeError("invalid encrypted memory bucket")
@@ -1570,16 +2385,23 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
                 # Deploy compatibility for encrypted_v1 rows produced before
                 # the model-facing op/summary/content vocabulary landed.
                 legacy_fields = {
-                    "type", "title", "description", "summary", "content",
-                    "bucket", "threads",
+                    "type",
+                    "title",
+                    "description",
+                    "summary",
+                    "content",
+                    "bucket",
+                    "threads",
                 }
                 if set(memory) - legacy_fields:
                     raise RuntimeError("invalid legacy encrypted memory payload")
                 if not str(memory.get("title") or memory.get("summary") or "").strip():
                     raise RuntimeError("invalid legacy encrypted memory title")
                 if not str(
-                    memory.get("description") or memory.get("content")
-                    or memory.get("summary") or ""
+                    memory.get("description")
+                    or memory.get("content")
+                    or memory.get("summary")
+                    or ""
                 ).strip():
                     raise RuntimeError("invalid legacy encrypted memory content")
             if not isinstance(action.get("reason", ""), str) or not isinstance(
@@ -1594,10 +2416,55 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
         tool_name = str(payload.get("op") or "")
         if tool_name not in _SCHEDULE_CAPABILITY_OPS:
             raise RuntimeError("invalid encrypted schedule operation")
+        args = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+    elif effect_type == "workspace":
+        tool_name = str(payload.get("op") or "")
+        if tool_name not in {"workspace_write", "workspace_delete"}:
+            raise RuntimeError("invalid encrypted workspace operation")
         args = {
-            k: v for k, v in payload.items()
+            k: v
+            for k, v in payload.items()
             if k not in ("effect_id", "op")
         }
+    elif effect_type == "workspace_batch":
+        if set(payload) != {"operations", "effect_id"}:
+            raise RuntimeError("invalid encrypted workspace batch shape")
+        parent_effect_id = str(payload.get("effect_id") or "")
+        operations = payload.get("operations")
+        if (
+            not parent_effect_id
+            or not isinstance(operations, list)
+            or not operations
+            or len(operations) > v2_worker.MAX_WORKSPACE_BATCH_OPERATIONS
+        ):
+            raise RuntimeError("invalid encrypted workspace batch")
+        for index, operation in enumerate(operations):
+            if not isinstance(operation, dict):
+                raise RuntimeError("invalid encrypted workspace batch operation")
+            tool_name = str(operation.get("op") or "")
+            expected_fields = (
+                {"op", "path", "content", "expected_revision", "sub_effect_id"}
+                if tool_name == "workspace_write"
+                else {"op", "path", "expected_revision", "sub_effect_id"}
+                if tool_name == "workspace_delete"
+                else set()
+            )
+            if not expected_fields or set(operation) != expected_fields:
+                raise RuntimeError("invalid encrypted workspace batch operation")
+            expected_child_id = v2_effect_id.derive_batch_item(
+                parent_effect_id=parent_effect_id,
+                ordinal=index,
+            )
+            if str(operation.get("sub_effect_id") or "") != expected_child_id:
+                raise RuntimeError("invalid workspace batch child identity")
+            args = {
+                key: value
+                for key, value in operation.items()
+                if key not in {"op", "sub_effect_id"}
+            }
+            if cap_tool_schema.validate_tool_args(tool_name, args):
+                raise RuntimeError("invalid encrypted workspace batch arguments")
+        return
     else:
         raise RuntimeError("unsupported encrypted effect type")
     error = cap_tool_schema.validate_tool_args(tool_name, args)
@@ -1623,7 +2490,7 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
         runtime_token_provider=get_runtime_token,
     )
 
-    def dispatch(effect_type: str, payload: dict) -> None:
+    def dispatch(effect_type: str, payload: dict) -> object:
         if "effect_envelope" in payload:
             logical_effect_type = _ENCRYPTED_TOOL_EFFECT_TYPES.get(effect_type)
             if logical_effect_type is None:
@@ -1634,16 +2501,57 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
                 runtime_token=get_runtime_token(),
             )
             _validate_decrypted_tool_effect(logical_effect_type, payload)
+            if logical_effect_type == "workspace_batch":
+                return _sink_workspace_batch(
+                    user_id,
+                    payload,
+                    runtime_token=get_runtime_token(),
+                )
             effect_type = logical_effect_type
         production_dispatch(effect_type, payload)
+        return None
 
     return v2_effect_outbox.apply_pending_effects(
         user_id,
         dispatch=dispatch,
         dispatch_reply_in_transaction=(
-            lambda _effect_type, payload, connection:
-            _sink_reply_in_transaction(user_id, payload, connection)
+            lambda _effect_type, payload, connection: _sink_reply_in_transaction(
+                user_id, payload, connection
+            )
         ),
+    )
+
+
+def _seal_trajectory_payload(
+    user_id: str,
+    plaintext: bytes,
+    item_id: str,
+) -> dict:
+    """Seal flight-recorder content before any database write."""
+    store = core_store.get_store(str(user_id))
+    envelope, error = core_envelope._build_shared_envelope_for_store(
+        store,
+        bytes(plaintext),
+        item_id=str(item_id),
+    )
+    if envelope is None:
+        raise RuntimeError("trajectory_encryption_failed:" + str(error or "unknown"))
+    return envelope
+
+
+def _open_trajectory_payload(
+    user_id: str,
+    envelope: dict,
+    runtime_token: str,
+) -> bytes:
+    """Open one event only inside the trusted worker for offline review."""
+    if str(envelope.get("owner_user_id") or "") != str(user_id):
+        raise RuntimeError("trajectory_owner_mismatch")
+    return core_enclave._decrypt_envelope_via_enclave(
+        envelope,
+        None,
+        purpose="runtime_v2_trajectory_review",
+        runtime_token=str(runtime_token),
     )
 
 
@@ -1654,7 +2562,8 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_messages_after_seq=_read_messages_after_seq,
         runtime_mode_enabled=lambda user_id: (
             hosted_config_store.hosted_runtime_v2_enabled_strict(
-                core_store.get_store(user_id))
+                core_store.get_store(user_id)
+            )
         ),
         resolve_provider=_resolve_provider,
         mint_enclave_token=_mint_runtime_token,
@@ -1665,6 +2574,9 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_summary=_read_summary,
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,
+        read_summary_frontier=_read_summary_frontier,
+        append_summary_segment=_append_summary_segment,
+        append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,
         read_files=_read_files,
         read_memory_context=_read_memory_context,
@@ -1672,6 +2584,9 @@ def build_production_deps() -> v2_worker.TurnDeps:
         build_memory_envelope=_build_memory_envelope,
         apply_pending_effects=_apply_pending_effects_for_user,
         load_mcp_turn=mcp_tools.load_turn_mcp,
+        load_workspace_prompt=_load_workspace_prompt,
+        seal_trajectory_payload=_seal_trajectory_payload,
+        open_trajectory_payload=_open_trajectory_payload,
     )
 
 
@@ -1689,16 +2604,19 @@ def _build_scheduler_deps():
     不上，但即使将来横向扩容也不需要另起一套选主。"""
     return types.SimpleNamespace(
         eligible_users=lambda: admin_core.list_runtime_modes().get(
-            hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []),
+            hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
+        ),
         runtime_mode_enabled=lambda uid: (
             hosted_config_store.hosted_runtime_v2_enabled_strict(
-                core_store.get_store(uid))
+                core_store.get_store(uid)
+            )
         ),
         due_users=lambda: jobs_store.due_heartbeat_users(),
         wake_decision=_wake_decision_for_user,
         enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(uid, "heartbeat"),
         advance_heartbeat=lambda uid, next_at: jobs_store.upsert_wake_schedule(
-            uid, next_heartbeat_at=next_at),
+            uid, next_heartbeat_at=next_at
+        ),
         # scheduled lane 生产者（BUG-3）：due_scheduled_users（Task 2）列出到期 self-wake
         # timer 的用户，_fire_scheduled_for_user 逐用户走 fire_due_timers 把每个到期 timer
         # 转成一个 `scheduled` lane 的 agent_job。scheduler.py 用 getattr 探测这两个属性。
@@ -1706,13 +2624,15 @@ def _build_scheduler_deps():
         fire_scheduled=_fire_scheduled_for_user,
         # capture/dream 抽取 lane 生产者（Task 4）：extraction_users 列出当前处于 db_action_v2
         # 模式的用户（admin_core.list_runtime_modes 已按模式分组，取 db_action_v2 那组即
-        # list_agent_runtime_enabled_users 的反集，无需另起一条查询）；_tick_extraction_for_user
+        # 与 hosted eligibility 同源，无需另起一条查询）；_tick_extraction_for_user
         # 逐用户跑 capture+dream 触发闸，各自命中安静窗口/夜间阈值时 enqueue 一个抽取 job。
         # scheduler.py 同样用 getattr 探测这两个属性（缺一即整段跳过，既有 FakeDeps 零改动）。
         extraction_users=lambda: (
             admin_core.list_runtime_modes().get(
-                hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, [])
-            if _EXTRACTION_ENABLED else []
+                hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
+            )
+            if _EXTRACTION_ENABLED
+            else []
         ),
         tick_extraction=_tick_extraction_for_user,
         # screen_watch lane 生产者（D-screen_watch Task 4）：screen_watch_users 列出
@@ -1729,7 +2649,8 @@ def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
     """Idempotent startup backfill for users flipped before seeding existed."""
     due_at = time.time() if now is None else float(now)
     users = admin_core.list_runtime_modes().get(
-        hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, [])
+        hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
+    )
     seeded = 0
     for user_id in users:
         if jobs_store.get_wake_schedule(user_id) is not None:
@@ -1775,7 +2696,9 @@ _REAP_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_REAP_INTERVAL_SEC", "30")
 _R2_CLEANUP_SETTINGS = v2_reaper.cleanup_settings_from_env()
 
 
-async def _reaper_loop(stop_event: asyncio.Event, *, interval: float = _REAP_INTERVAL_SEC) -> None:
+async def _reaper_loop(
+    stop_event: asyncio.Event, *, interval: float = _REAP_INTERVAL_SEC
+) -> None:
     """Mirror the backend watchdog inside the worker process.
 
     It expires both queue-deadline and execution-lease timeouts. The ASGI
@@ -1805,7 +2728,9 @@ async def _r2_cleanup_loop(
     )
 
 
-_HEARTBEAT_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_HEARTBEAT_INTERVAL_SEC", "10")
+_HEARTBEAT_INTERVAL_SEC = _positive_float_env(
+    "FEEDLING_V2_HEARTBEAT_INTERVAL_SEC", "10"
+)
 
 # D3 (Task 4, PR-D plan): capacity must reflect the turn-child's ACTUAL health, not
 # the constant `v2_worker.MAX_WORKERS` — otherwise a heartbeat tick ~10s after the
@@ -1885,7 +2810,9 @@ async def _heartbeat_loop(
             log.warning("[v2.serve_worker] clear worker capacity failed: %s", e)
 
 
-_SCHEDULER_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_SCHEDULER_INTERVAL_SEC", "30")
+_SCHEDULER_INTERVAL_SEC = _positive_float_env(
+    "FEEDLING_V2_SCHEDULER_INTERVAL_SEC", "30"
+)
 
 # D2 (Task 3, watchdog.py) is the module that actually ACTS on this — comparing it
 # against `child_supervisor.ChildSupervisor.poll_liveness()["last_progress_age_sec"]`
@@ -1894,7 +2821,9 @@ _SCHEDULER_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_SCHEDULER_INTERVAL_SE
 # value is threaded through to `_watchdog_loop`'s `child_liveness_timeout_sec` below
 # so the supervisor's own liveness_timeout_sec and the watchdog's kill threshold never
 # drift apart under a single env var.
-_CHILD_LIVENESS_TIMEOUT_SEC = _positive_float_env("FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC", "45")
+_CHILD_LIVENESS_TIMEOUT_SEC = _positive_float_env(
+    "FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC", "45"
+)
 
 # A turn has two different clocks and they must never be conflated:
 #
@@ -1913,10 +2842,12 @@ _CHILD_LIVENESS_TIMEOUT_SEC = _positive_float_env("FEEDLING_V2_CHILD_LIVENESS_TI
 # back into an unsafe absolute-age kill.
 if os.environ.get("FEEDLING_V2_TURN_STALL_TIMEOUT_SEC", "").strip():
     _TURN_STALL_TIMEOUT_SEC = _positive_float_env(
-        "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC", "240")
+        "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC", "240"
+    )
 elif os.environ.get("FEEDLING_V2_TURN_HARD_TIMEOUT_SEC", "").strip():
     _TURN_STALL_TIMEOUT_SEC = _positive_float_env(
-        "FEEDLING_V2_TURN_HARD_TIMEOUT_SEC", "240")
+        "FEEDLING_V2_TURN_HARD_TIMEOUT_SEC", "240"
+    )
 else:
     _TURN_STALL_TIMEOUT_SEC = 240.0
 
@@ -1958,7 +2889,8 @@ _validate_mcp_timeout_below_stall(
 )
 
 _TURN_ABSOLUTE_TIMEOUT_SEC = _positive_float_env(
-    "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC", "1800")
+    "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC", "1800"
+)
 _CHAT_TURN_BUDGET_SEC = (
     float(v2_worker._PROMPT_CATCHUP_DEADLINE_SEC)
     # One OpenAI-compatible provider attempt may make a second full-timeout
@@ -1974,8 +2906,7 @@ _CHAT_TURN_BUDGET_SEC = (
 # this is lower than the default chat budget but remains explicit so future
 # tuning cannot accidentally make a background lane the unaccounted maximum.
 _EXTRACTION_TURN_BUDGET_SEC = 3.0 * (2.0 * 90.0) + 6.0 + 120.0
-_MIN_TURN_ABSOLUTE_TIMEOUT_SEC = max(
-    _CHAT_TURN_BUDGET_SEC, _EXTRACTION_TURN_BUDGET_SEC)
+_MIN_TURN_ABSOLUTE_TIMEOUT_SEC = max(_CHAT_TURN_BUDGET_SEC, _EXTRACTION_TURN_BUDGET_SEC)
 if _TURN_ABSOLUTE_TIMEOUT_SEC < _MIN_TURN_ABSOLUTE_TIMEOUT_SEC:
     raise RuntimeError(
         "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC must cover prompt catch-up, "
@@ -1991,7 +2922,8 @@ if _TURN_ABSOLUTE_TIMEOUT_SEC <= _TURN_STALL_TIMEOUT_SEC:
 
 _WATCHDOG_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_WATCHDOG_INTERVAL_SEC", "10")
 _WATCHDOG_DB_TIMEOUT_SEC = _positive_float_env(
-    "FEEDLING_V2_WATCHDOG_DB_TIMEOUT_SEC", "5")
+    "FEEDLING_V2_WATCHDOG_DB_TIMEOUT_SEC", "5"
+)
 
 
 def _jobs_claimable() -> bool:
@@ -2019,7 +2951,9 @@ async def _watchdog_loop(
     process/event loop (never the turn-child): it is the one piece of code with
     both a handle on `supervisor` and the authority to SIGKILL it."""
     await v2_watchdog._watchdog_loop(
-        supervisor, worker_id, stop_event,
+        supervisor,
+        worker_id,
+        stop_event,
         jobs_claimable_fn=_jobs_claimable,
         interval=interval,
         turn_stall_timeout_sec=_TURN_STALL_TIMEOUT_SEC,
@@ -2030,7 +2964,9 @@ async def _watchdog_loop(
     )
 
 
-async def _scheduler_loop(stop_event: asyncio.Event, *, interval: float = _SCHEDULER_INTERVAL_SEC) -> None:
+async def _scheduler_loop(
+    stop_event: asyncio.Event, *, interval: float = _SCHEDULER_INTERVAL_SEC
+) -> None:
     """周期性跑一遍纯调度器（D3 Task 4 `scheduler.run_scheduler_tick`，Task 5 接线）：
     对每个到期用户判定是否唤醒 heartbeat（经 `_wake_decision_for_user` 复用真实
     proactive gate），should_wake 就 enqueue_job("heartbeat")（single-flight 去重、
@@ -2053,11 +2989,16 @@ async def _scheduler_loop(stop_event: asyncio.Event, *, interval: float = _SCHED
     while not stop_event.is_set():
         try:
             deps = _build_scheduler_deps()
-            result = await asyncio.to_thread(scheduler.run_scheduler_tick, deps, now=time.time())
+            result = await asyncio.to_thread(
+                scheduler.run_scheduler_tick, deps, now=time.time()
+            )
             if result.get("considered"):
                 log.info(
                     "[v2.serve_worker] scheduler tick considered=%s enqueued=%s skipped=%s",
-                    result.get("considered"), result.get("enqueued"), result.get("skipped"))
+                    result.get("considered"),
+                    result.get("enqueued"),
+                    result.get("skipped"),
+                )
         except Exception as e:  # noqa: BLE001 — 瞬时故障绝不能杀掉 scheduler/worker 进程
             log.warning("[v2.serve_worker] scheduler tick failed: %s", e)
         try:
@@ -2066,10 +3007,14 @@ async def _scheduler_loop(stop_event: asyncio.Event, *, interval: float = _SCHED
             pass
 
 
-_RECONCILE_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_RECONCILE_INTERVAL_SEC", "60")
+_RECONCILE_INTERVAL_SEC = _positive_float_env(
+    "FEEDLING_V2_RECONCILE_INTERVAL_SEC", "60"
+)
 
 
-async def _reconcile_loop(stop_event: asyncio.Event, *, interval: float = _RECONCILE_INTERVAL_SEC) -> None:
+async def _reconcile_loop(
+    stop_event: asyncio.Event, *, interval: float = _RECONCILE_INTERVAL_SEC
+) -> None:
     """Periodic orphan-message and durable-effect reconciliation.
 
     D9 (Task 7, PR-D plan): periodic wiring for `db.reconcile_unenqueued_v2_messages`
@@ -2095,17 +3040,36 @@ async def _reconcile_loop(stop_event: asyncio.Event, *, interval: float = _RECON
     is bridged via `asyncio.to_thread` — same pattern as every other sync DB call in
     these parent loops.
 
-    The same parent loop also drains due outbox rows independently of future
-    turns. Transient failures receive exponential backoff; poison rows stop at
-    ``needs_reconciliation`` and are surfaced by ``/v1/admin/v2-metrics``.
+    The same parent loop also recreates missing opt-in failure-review runners
+    after a review kill-switch off→on transition, then drains due outbox rows
+    independently of future turns. Transient failures receive exponential
+    backoff; poison rows stop at ``needs_reconciliation`` and are surfaced by
+    ``/v1/admin/v2-metrics``.
     """
     while not stop_event.is_set():
         try:
             enqueued = await asyncio.to_thread(db.reconcile_unenqueued_v2_messages)
             if enqueued:
-                log.info("[v2.serve_worker] reconcile sweeper enqueued %d catch-up job(s)", enqueued)
+                log.info(
+                    "[v2.serve_worker] reconcile sweeper enqueued %d catch-up job(s)",
+                    enqueued,
+                )
         except Exception as e:  # noqa: BLE001 — 瞬时故障绝不能杀掉 sweeper/worker 进程
             log.warning("[v2.serve_worker] reconcile sweep failed: %s", e)
+        try:
+            review_runners = await asyncio.to_thread(
+                jobs_store.reconcile_failure_review_runners
+            )
+            if review_runners:
+                log.info(
+                    "[v2.serve_worker] reconciled %d failure-review runner(s)",
+                    review_runners,
+                )
+        except Exception as e:  # noqa: BLE001 — optional review cannot kill parent loop
+            log.warning(
+                "[v2.serve_worker] failure-review reconcile failed: %s",
+                type(e).__name__,
+            )
         try:
             pending_users = await asyncio.to_thread(db.effect_pending_users)
         except Exception as e:  # noqa: BLE001 — one DB failure must not kill the parent loop
@@ -2144,10 +3108,9 @@ def _start_genesis_thread(worker_id: str):
 
     Rehomed here from `agent_runtime.supervisor` (2026-07-10): genesis never depended
     on the resident CLI runtime — it needed an enclave URL, a token secret, and a
-    long-running loop, and supervisor merely happened to be the only process in the
-    CVM that had one. Deleting agent-runner would have silently stopped draining
-    `genesis_import_jobs`, stalling every new user's onboarding distillation with no
-    error surfaced anywhere.
+    long-running loop, and the former supervisor merely happened to be the only
+    process in the CVM that had one. Keeping it here ensures resident retirement
+    cannot stop draining `genesis_import_jobs`.
 
     NOT `asyncio.to_thread`: a tick blocks for the whole LLM reduce (minutes), and
     `to_thread` would park that in the loop's default executor — `min(32, cpu+4)`, i.e.
@@ -2164,11 +3127,15 @@ def _start_genesis_thread(worker_id: str):
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").strip()
     api_url = os.environ.get("FEEDLING_API_URL", "").strip()
 
-    if not genesis_daemon.should_start(enabled=enabled, secret=secret, enclave_url=enclave_url):
+    if not genesis_daemon.should_start(
+        enabled=enabled, secret=secret, enclave_url=enclave_url
+    ):
         if enabled:
-            log.warning("[v2.serve_worker] FEEDLING_GENESIS_WORKER_ENABLED set but "
-                        "prerequisites missing (need FEEDLING_RUNTIME_TOKEN_SECRET + "
-                        "FEEDLING_ENCLAVE_URL) — genesis worker dormant")
+            log.warning(
+                "[v2.serve_worker] FEEDLING_GENESIS_WORKER_ENABLED set but "
+                "prerequisites missing (need FEEDLING_RUNTIME_TOKEN_SECRET + "
+                "FEEDLING_ENCLAVE_URL) — genesis worker dormant"
+            )
         return None
 
     genesis_worker_id = f"{worker_id}:genesis"
@@ -2180,18 +3147,31 @@ def _start_genesis_thread(worker_id: str):
     # Live-worker liveness window for the orphan reclaim. >= dead cutoff so a
     # heartbeating worker is reliably "live"; a worker dead longer than this drops
     # out and its claims become reclaimable.
-    dead_sec = max(60, int(os.environ.get("FEEDLING_GENESIS_WORKER_DEAD_SEC", "120") or "120"))
+    dead_sec = max(
+        60, int(os.environ.get("FEEDLING_GENESIS_WORKER_DEAD_SEC", "120") or "120")
+    )
 
     def _beat() -> None:
-        jobs_store.record_worker_heartbeat(genesis_worker_id, kind="genesis", capacity=0)
+        jobs_store.record_worker_heartbeat(
+            genesis_worker_id, kind="genesis", capacity=0
+        )
 
     thread = threading.Thread(
-        target=genesis_daemon.run_loop, daemon=True, name="v2-genesis",
-        kwargs={"api_url": api_url, "enclave_url": enclave_url,
-                "mint_genesis": _mint_genesis_token, "interval": interval,
-                "stop_event": stop_event, "worker_id": genesis_worker_id,
-                "list_live_workers": lambda: jobs_store.live_genesis_worker_ids(within_sec=dead_sec),
-                "on_beat": _beat},
+        target=genesis_daemon.run_loop,
+        daemon=True,
+        name="v2-genesis",
+        kwargs={
+            "api_url": api_url,
+            "enclave_url": enclave_url,
+            "mint_genesis": _mint_genesis_token,
+            "interval": interval,
+            "stop_event": stop_event,
+            "worker_id": genesis_worker_id,
+            "list_live_workers": lambda: jobs_store.live_genesis_worker_ids(
+                within_sec=dead_sec
+            ),
+            "on_beat": _beat,
+        },
     )
     thread.start()
 
@@ -2213,8 +3193,14 @@ def _start_genesis_thread(worker_id: str):
 
     threading.Thread(target=_heartbeat_loop, daemon=True, name="v2-genesis-hb").start()
 
-    log.info("[v2.serve_worker] genesis worker enabled — interval=%.0fs hb=%.0fs "
-             "dead=%ds worker_id=%s", interval, hb_interval, dead_sec, genesis_worker_id)
+    log.info(
+        "[v2.serve_worker] genesis worker enabled — interval=%.0fs hb=%.0fs "
+        "dead=%ds worker_id=%s",
+        interval,
+        hb_interval,
+        dead_sec,
+        genesis_worker_id,
+    )
     return thread, stop_event
 
 
@@ -2239,7 +3225,11 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     seeded = await asyncio.to_thread(_seed_existing_v2_wake_schedules)
     if seeded:
         log.info("[v2.serve_worker] seeded %d existing V2 wake schedule(s)", seeded)
-    log.info("[v2.serve_worker] starting worker=%s max_workers=%s", worker_id, v2_worker.MAX_WORKERS)
+    log.info(
+        "[v2.serve_worker] starting worker=%s max_workers=%s",
+        worker_id,
+        v2_worker.MAX_WORKERS,
+    )
 
     # Local import — see the comment beside the module-level import block for why
     # `turn_child` cannot be imported at this module's top level (circular import:
@@ -2267,7 +3257,9 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     tasks = [
         asyncio.create_task(_reaper_loop(stop_event)),
         asyncio.create_task(_r2_cleanup_loop(stop_event)),
-        asyncio.create_task(_heartbeat_loop(worker_id, stop_event, supervisor=supervisor)),
+        asyncio.create_task(
+            _heartbeat_loop(worker_id, stop_event, supervisor=supervisor)
+        ),
         asyncio.create_task(_scheduler_loop(stop_event)),
         asyncio.create_task(_watchdog_loop(supervisor, worker_id, stop_event)),
         asyncio.create_task(_reconcile_loop(stop_event)),
@@ -2329,6 +3321,10 @@ def _run_forever(worker_id: str, poll_interval: float) -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    # Validate the deployment-supplied fleet identity before migrations or any
+    # other durable side effect. A mis-targeted production container must fail
+    # without first applying an irreversible schema upgrade.
+    worker_id = runner_identity.resolve_worker_id(_default_worker_id)
     db_pool_max = _configure_db_pool_capacity(v2_worker.MAX_WORKERS)
     # Schema single-point for this standalone process (idempotent — see
     # db.init_schema docstring). The ASGI backend's gunicorn on_starting also
@@ -2337,7 +3333,6 @@ def main() -> None:
     # not assume the schema is already at head.
     db.init_schema()
     wire_assembly()
-    worker_id = os.environ.get("FEEDLING_V2_WORKER_ID", "").strip() or _default_worker_id()
     poll_interval = _positive_float_env("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0")
     log.info(
         "[v2.serve_worker] configured db_pool_max=%s for max_workers=%s",

@@ -1,5 +1,10 @@
 # Hosted model_api 退役路线图（API-key 用户统一到 agent-runner）
 
+> **【历史路线，已被 Runtime V2 终态取代】** 本文规划的“每用户一个 hosted
+> resident/CLI 进程”已全部退役，不能作为 rollback 或新部署依据。现行状态见
+> `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`，操作手册见
+> `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`。
+
 日期：2026-06-25
 配套：`docs/AGENT_RUNTIME_CC_CODEX_PLAN.zh.md`（agent-runner 总设计）、
 `backend/agent_runtime/README.md`（P0–P5 现状）。

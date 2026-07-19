@@ -1,5 +1,8 @@
 # D4 Load Test + Gated Rollout + Kill Resident Implementation Plan
 
+> **RETIRED / DO NOT DEPLOY.** Historical cutover plan; resident rollback and
+> per-user rollout selectors no longer exist.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development（仅 T1-T4 压测脚手架）。T5 灰度/关 resident 是 **ops runbook 非 TDD**，由用户/ops 手动执行。Steps 用 checkbox。
 
 **Goal:** 证明 V2 对等且不更贵（tokens/turn 不回归）→ 据证据灰度翻用户 → 停 resident，兑现省钱/并发。

@@ -199,6 +199,111 @@ def test_idempotent_retry_offloads_winner_only_once(backend_env, monkeypatch):
     assert len(client.store) == 1
 
 
+def test_idempotent_append_after_clear_pins_live_storage_generation(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    seed_user(uid)
+    assert db.chat_clear(uid) == 0
+    mid = uuid.uuid4().hex
+    client_msg_id = str(uuid.uuid4())
+    doc = _file_doc(uid, mid, b"post-clear-idempotent")
+    doc["client_msg_id"] = client_msg_id
+
+    _winner, inserted = db.chat_append_idempotent(
+        uid,
+        mid,
+        time.time(),
+        doc,
+        100,
+        client_msg_id=client_msg_id,
+        window_sec=600,
+    )
+    assert inserted is True
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT storage_generation,doc FROM chat_messages "
+            "WHERE user_id=%s AND msg_id=%s",
+            (uid, mid),
+        ).fetchone()
+    assert row is not None and int(row[0]) == 1
+    key = str(row[1]["body_key"])
+    assert object_storage.chat_body_storage_generation(key, uid) == 1
+
+
+def test_idempotent_clear_during_slow_put_keeps_durable_cleanup_guard(
+    backend_env, monkeypatch,
+):
+    """A clear cannot lose an idempotent upload that finishes after inventory.
+
+    Clear's generation inventory deliberately runs before the paused PUT has
+    made an object visible.  The writer must therefore have committed an exact
+    key cleanup guard before starting the network call; otherwise the late
+    object has neither a chat-row pointer nor any remaining cleanup work.
+    """
+    upload_started = threading.Event()
+    release_upload = threading.Event()
+
+    class _SlowPutS3(_FakeS3):
+        def put_object(self, Bucket, Key, Body, **kw):
+            upload_started.set()
+            assert release_upload.wait(timeout=5)
+            return super().put_object(Bucket, Key, Body, **kw)
+
+    client = _SlowPutS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    seed_user(uid)
+    mid = uuid.uuid4().hex
+    client_msg_id = str(uuid.uuid4())
+    doc = _file_doc(uid, mid, b"late-idempotent-upload")
+    doc["client_msg_id"] = client_msg_id
+    outcome: list[object] = []
+
+    def _append() -> None:
+        try:
+            outcome.append(
+                db.chat_append_idempotent(
+                    uid,
+                    mid,
+                    time.time(),
+                    doc,
+                    100,
+                    client_msg_id=client_msg_id,
+                    window_sec=600,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced in test thread
+            outcome.append(exc)
+
+    writer = threading.Thread(target=_append, name="slow-idempotent-upload")
+    writer.start()
+    try:
+        assert upload_started.wait(timeout=3)
+        assert db.chat_clear(uid) == 1
+
+        # Reproduce the dangerous ordering: the generation-wide LIST sees no
+        # object and retires its durable marker before the PUT becomes visible.
+        generation = _storage_generation(uid)
+        assert db._reconcile_one_chat_r2_inventory(uid, generation) is True
+        assert _inventory_state(uid)[0] is False
+    finally:
+        release_upload.set()
+        writer.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert len(outcome) == 1 and not isinstance(outcome[0], BaseException)
+    assert outcome[0][1] is True
+    assert _raw_doc(uid, mid) is None
+
+    # Only the per-upload guard can discover and reclaim this late object now.
+    _drain_r2(uid)
+    assert client.store == {}
+    assert _cleanup_keys(uid) == []
+
+
 def test_hydrate_helper_reconstitutes(backend_env, monkeypatch):
     client = _FakeS3()
     _enable_r2(monkeypatch, client)
@@ -874,23 +979,29 @@ def test_omitted_image_never_touches_r2(backend_env, monkeypatch):
     assert client.gets == []                                  # zero R2 round-trips
 
 
-def test_trimmed_image_reclaims_its_r2_object(backend_env, monkeypatch):
-    # The ring-buffer trim must reclaim an evicted image's object, or R2 fills up
-    # with orphans no row points at.
+def test_append_limit_preserves_prior_image_and_r2_object(backend_env, monkeypatch):
+    # The append limit is a hot-cache hint, not a retention policy. The older
+    # durable pointer and its encrypted R2 body must remain readable.
     client = _FakeS3()
     _enable_r2(monkeypatch, client)
     uid = _uid(); seed_user(uid)
     m1, m2 = uuid.uuid4().hex, uuid.uuid4().hex
     db.chat_append(uid, m1, 1.0, _image_doc(uid, m1), 100)
     k1 = _body_key(uid, m1)
-    db.chat_append(uid, m2, 2.0, _image_doc(uid, m2), 1)      # max_messages=1 → m1 evicted
+    db.chat_append(uid, m2, 2.0, _image_doc(uid, m2), 1)
     k2 = _body_key(uid, m2)
+    with db.get_pool().connection() as conn:
+        queued = conn.execute(
+            "SELECT body_key FROM chat_r2_cleanup WHERE user_id=%s",
+            (uid,),
+        ).fetchall()
+    assert queued == [], "ordinary append must not queue any live body for retirement"
     _drain_r2(uid)
-    assert (_BUCKET, k1) not in client.store
+    assert (_BUCKET, k1) in client.store
     assert (_BUCKET, k2) in client.store
 
 
-def test_resident_linked_reply_offloads_and_reclaims_trimmed_body(
+def test_resident_linked_reply_offloads_and_preserves_prior_body(
     backend_env, monkeypatch,
 ):
     client = _FakeS3()
@@ -927,7 +1038,7 @@ def test_resident_linked_reply_offloads_and_reclaims_trimmed_body(
 
     assert inserted is True
     _drain_r2(uid)
-    assert (_BUCKET, evicted_key) not in client.store
+    assert (_BUCKET, evicted_key) in client.store
     raw = _raw_doc(uid, reply)
     reply_key = str(raw["body_key"])
     _assert_versioned_key(reply_key, uid, reply, "image")
@@ -949,10 +1060,10 @@ def test_resident_linked_reply_offloads_and_reclaims_trimmed_body(
     assert replay_inserted is False
     assert replay_parent["reply_message_id"] == reply
     assert replay_doc["body_key"] == reply_key
-    assert list(client.store) == [(_BUCKET, reply_key)]
+    assert set(client.store) == {(_BUCKET, evicted_key), (_BUCKET, reply_key)}
 
 
-def test_resident_unlinked_message_offloads_and_reclaims_trimmed_body(
+def test_resident_unlinked_message_offloads_and_preserves_prior_body(
     backend_env, monkeypatch,
 ):
     client = _FakeS3()
@@ -976,7 +1087,7 @@ def test_resident_unlinked_message_offloads_and_reclaims_trimmed_body(
 
     assert inserted is True
     _drain_r2(uid)
-    assert (_BUCKET, evicted_key) not in client.store
+    assert (_BUCKET, evicted_key) in client.store
     raw = _raw_doc(uid, message)
     message_key = str(raw["body_key"])
     _assert_versioned_key(message_key, uid, message, "file")
@@ -993,10 +1104,10 @@ def test_resident_unlinked_message_offloads_and_reclaims_trimmed_body(
     assert replay_seq == _seq
     assert replay_inserted is False
     assert replay_doc["body_key"] == message_key
-    assert list(client.store) == [(_BUCKET, message_key)]
+    assert set(client.store) == {(_BUCKET, evicted_key), (_BUCKET, message_key)}
 
 
-def test_v2_atomic_reply_reclaims_trimmed_r2_body(backend_env, monkeypatch):
+def test_v2_atomic_reply_preserves_covered_r2_body(backend_env, monkeypatch):
     client = _FakeS3()
     _enable_r2(monkeypatch, client)
     uid = _uid()
@@ -1032,11 +1143,11 @@ def test_v2_atomic_reply_reclaims_trimmed_r2_body(backend_env, monkeypatch):
     )
 
     _drain_r2(uid)
-    assert (_BUCKET, evicted_key) not in client.store
-    assert _raw_doc(uid, evicted) is None
+    assert (_BUCKET, evicted_key) in client.store
+    assert _raw_doc(uid, evicted) is not None
 
 
-def test_v2_atomic_send_offloads_and_reclaims_trimmed_body(
+def test_v2_atomic_send_offloads_and_preserves_prior_body(
     backend_env, monkeypatch,
 ):
     client = _FakeS3()
@@ -1068,7 +1179,7 @@ def test_v2_atomic_send_offloads_and_reclaims_trimmed_body(
 
     assert job_id > 0
     _drain_r2(uid)
-    assert (_BUCKET, evicted_key) not in client.store
+    assert (_BUCKET, evicted_key) in client.store
     raw = _raw_doc(uid, message)
     message_key = str(raw["body_key"])
     _assert_versioned_key(message_key, uid, message, "file")

@@ -1,5 +1,8 @@
 # Hosted Runtime V2 — D4 Load Test + Gated Rollout + Kill Resident 设计
 
+> **RETIRED / DO NOT DEPLOY.** Historical cutover design; resident rollback and
+> supervisor scale-down are complete and cannot be used operationally.
+
 > 子项目 D 的收官，**真正兑现省钱/并发的那一步**。来源：walkthrough §8 gate 6-7 + §9 条件6 + 现状调查（2026-07-09）。**依赖 D0（池在跑+互斥闸+setter+指标）+ D3（proactive 迁走）。** 半代码（压测脚手架）半 ops（灰度/关 resident runbook）。
 
 **Goal:** 用压测证明 V2 对等且不更贵（tokens/turn vs resident 不回归），据证据灰度把用户翻到 db_action_v2，最终停掉常驻 resident 进程——把 RAM/进程数从"随注册数涨"变成"随池大小固定"。

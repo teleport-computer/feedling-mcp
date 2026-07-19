@@ -1,9 +1,9 @@
-# Feedling — agent-runner container image.
+# Feedling — pooled Hosted Runtime V2 worker image.
 #
-# Runs backend/agent_runtime/supervisor.py: a multi-tenant supervisor that hosts
-# the VPS resident consumer (tools/chat_resident_consumer.py) — one process per
-# user, driven in cli mode against `claude` / `codex exec`. So the image ships
-# the backend + the resident consumer + the agent CLIs (Node).
+# The historical package name is retained so existing registries and Phala
+# compose authorization keep working, but this image no longer contains or
+# starts the hosted resident supervisor, resident consumer, Node, Claude Code,
+# Codex CLI, pi CLI, per-user homes, or an /agent-data volume.
 #
 # Supply-chain pinning (matches the backend image): base pinned by digest below,
 # npm CLIs pinned to exact versions, Python deps hash-locked via the backend's
@@ -23,48 +23,26 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps: build toolchain for cryptography/pynacl wheels + curl for the
-# NodeSource setup script.
+# System deps required by the hash-locked Python dependency set.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        build-essential libssl-dev libffi-dev curl ca-certificates \
- && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
- && apt-get install -y --no-install-recommends nodejs \
+        build-essential libssl-dev libffi-dev ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Agent backend CLIs the resident consumer drives in cli mode:
-#  - Claude Code CLI (`claude`)                    — anthropic driver
-#  - Codex CLI (`codex exec --json`)               — openai driver (native)
-#  - pi CLI (`pi --mode json`)                     — pi driver: gemini/openrouter/
-#    openai_compatible, direct-native (no gateway). NOT deepseek — it moved back
-#    to the claude driver's Anthropic wire on 2026-07-14 (spawners.py:556,:834).
-#    Exact pin only (pi
-#    iterates fast; bump explicitly after reviewing its output-protocol changes).
-RUN npm install -g @anthropic-ai/claude-code@2.1.195 @openai/codex@0.142.4 \
-        @earendil-works/pi-coding-agent@0.80.3
-
-# Python deps: reuse the backend's hash-locked set so the resident consumer's
-# whole import graph (content_encryption, proactive-v2, db, …) + the supervisor
-# (httpx, psycopg) all resolve.
+# Runtime V2, Genesis, provider, crypto, and PostgreSQL dependencies.
 COPY backend/requirements.lock ./requirements.lock
 RUN pip install --require-hashes -r requirements.lock
 
-# Ship the backend (content_encryption / db / proactive imported by the resident
-# consumer) AND tools/ (the resident consumer itself, spawned per user).
+# Runtime V2 is entirely in-process Python. The external resident consumer under
+# tools/ is a separately operated product path and is not shipped in this image.
 COPY backend/ ./backend/
-COPY tools/ ./tools/
 
 ARG FEEDLING_GIT_COMMIT=dev
 ENV FEEDLING_GIT_COMMIT=${FEEDLING_GIT_COMMIT}
 
-# Non-root; /agent-data is the per-user runtime volume mount point.
+# Non-root worker; all durable turn state lives in PostgreSQL/object storage.
 RUN useradd --system --uid 1000 --home-dir /home/feedling --create-home feedling \
- && mkdir -p /agent-data \
- && chown -R feedling:feedling /agent-data /app
+ && chown -R feedling:feedling /app
 USER feedling
 
-# Base default only — each per-user consumer overrides CLAUDE_CONFIG_DIR /
-# CODEX_HOME to its own /agent-data/users/<uid>/… so agent homes are never shared.
-ENV CLAUDE_CONFIG_DIR=/agent-data/.claude
-
-CMD ["python", "-u", "backend/agent_runtime/supervisor.py"]
+CMD ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]

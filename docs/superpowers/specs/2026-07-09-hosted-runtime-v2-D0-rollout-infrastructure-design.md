@@ -1,5 +1,8 @@
 # Hosted Runtime V2 — D0 Rollout Infrastructure 设计
 
+> **RETIRED / DO NOT DEPLOY.** Historical cutover design; per-user resident
+> rollback, roster, and selector paths have been removed.
+
 > 子项目 D 的前置基建。来源：walkthrough §8 gate 7 + 两份现状调查（2026-07-09）。**这是 D3/D4 的共同前提**：没有它，V2 worker 池在 prod 一次都没跑过，且被翻到 db_action_v2 的用户会被 resident + V2 双跑。
 
 **Goal:** 让 Hosted Runtime V2 在生产**能跑、安全、可控**——部署 worker 池、堵住双跑、造出灰度翻钥控制面、加上压测/灰度要读的 per-turn 指标。

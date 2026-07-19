@@ -1,182 +1,153 @@
-"""D7 GC/retention gate: count-based chat trimming is bounded by the exact
-``v2_conversation_summary.watermark_seq``.
+"""Durable chat retention: append limits and summary watermarks never delete.
 
-Wall-clock ``watermark_ts`` cannot represent a boundary inside a same-ts tie.
-Only rows with ``seq <= watermark_seq`` are eligible for deletion; a missing
-summary row or zero seq+ts watermark keeps everything fail-safe. A legacy
-nonzero ts watermark gets the conservative strict-less seq translation. Legacy
-chat writes remain ordinary ring-buffer writes and do not use this gate.
+The historical filename is retained so downstream test selectors keep working,
+but the old "coverage gate" is intentionally gone. A summary is a derived
+prompt index, not proof that the encrypted source transcript may be destroyed.
 """
 from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-import db
-from model_api_runtime.v2 import jobs_store
+import db  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 
-from conftest import seed_user
+from conftest import seed_user  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
-    reason="DB-backed V2 GC coverage-gate tests require the PostgreSQL test fixture",
+    reason="DB-backed durable chat retention tests require PostgreSQL",
 )
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def pg_clean():
     with db.get_pool().connection() as conn:
         conn.execute(
-            "TRUNCATE v2_conversation_summary, chat_messages CASCADE"
+            "TRUNCATE v2_conversation_summary, agent_jobs, chat_messages CASCADE"
         )
     yield
 
 
-def _rows(uid: str) -> list[tuple[int, float]]:
-    """Raw (seq, ts) pairs for direct retention-boundary assertions."""
+def _ids(uid: str) -> list[str]:
     with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT seq, ts FROM chat_messages WHERE user_id = %s ORDER BY seq ASC",
+            "SELECT msg_id FROM chat_messages WHERE user_id=%s ORDER BY seq ASC",
             (uid,),
         ).fetchall()
-    return [(int(r[0]), float(r[1])) for r in rows]
+    return [str(row[0]) for row in rows]
 
 
-def _seed_messages(uid: str, n: int, *, base_ts: float, max_messages: int) -> None:
-    for i in range(n):
-        db.chat_append_strict(uid, f"m{i:03d}", base_ts + i, {"role": "user", "n": i}, max_messages)
+def _doc(msg_id: str, *, role: str = "user") -> dict:
+    return {"id": msg_id, "role": role, "body_ct": f"cipher-{msg_id}"}
 
 
-def test_uncovered_rows_survive_trim_even_beyond_max_messages(pg_clean):
-    """Only the summarized prefix may be trimmed below the count cutoff."""
-    uid = "u_gc_partial"
-    seed_user(uid)
-    base_ts = 1000.0
-    _seed_messages(uid, 9, base_ts=base_ts, max_messages=0)
-    watermark_seq = db.chat_seq_for_msg_id(uid, "m002")
-    ok = jobs_store.upsert_summary_row_cas(
-        uid, summary_envelope={}, watermark_ts=base_ts + 2,
-        expected_version=0, watermark_seq=watermark_seq,
-    )
-    assert ok
-    db.chat_append_strict(
-        uid, "m009", base_ts + 9, {"role": "user", "n": 9}, 5,
-    )
-
-    rows = _rows(uid)
-    ts_present = {ts for _, ts in rows}
-
-    # Every uncovered row (i=3..9) survives, including i=3,4 below the plain
-    # newest-five cutoff.
-    for i in range(3, 10):
-        assert (base_ts + i) in ts_present, f"uncovered row i={i} was deleted"
-    assert len(rows) == 7  # 10 - the 3 covered-and-below-cutoff rows (i=0,1,2)
-
-    # Covered rows beyond the count cutoff (i=0,1,2) are trimmed normally.
-    for i in range(0, 3):
-        assert (base_ts + i) not in ts_present, f"covered row i={i} was NOT trimmed"
-
-
-def test_no_summary_row_disables_trim_entirely(pg_clean):
-    """A user who has never been compacted has no v2_conversation_summary
-    row at all. The trim must be a fail-safe no-op: every row survives even
-    though the count far exceeds max_messages."""
-    uid = "u_gc_nosummary"
+def test_legacy_append_limit_only_bounds_hot_cache_not_durable_rows():
+    uid = "retention-legacy"
     seed_user(uid)
 
-    _seed_messages(uid, 10, base_ts=2000.0, max_messages=5)
+    for index in range(10):
+        msg_id = f"message-{index}"
+        db.chat_append(uid, msg_id, float(index), _doc(msg_id), max_messages=3)
 
-    rows = _rows(uid)
-    assert len(rows) == 10  # nothing trimmed — no proof of coverage exists
+    assert _ids(uid) == [f"message-{index}" for index in range(10)]
+    assert [row["id"] for row in db.chat_load_recent_strict(uid, 3)] == [
+        "message-7", "message-8", "message-9",
+    ]
 
 
-def test_zero_seq_watermark_disables_trim(pg_clean):
-    """A zero seq + zero legacy ts watermark proves no coverage."""
-    uid = "u_gc_zerowm"
+def test_v2_summary_watermark_and_compaction_coverage_never_authorize_delete():
+    uid = "retention-v2-summary"
     seed_user(uid)
-    ok = jobs_store.upsert_summary_row_cas(
-        uid, summary_envelope={}, watermark_ts=0.0,
-        expected_version=0, watermark_seq=0,
-    )
-    assert ok
+    for index in range(6):
+        msg_id = f"message-{index}"
+        db.chat_append_strict(uid, msg_id, float(index), _doc(msg_id), 0)
 
-    _seed_messages(uid, 10, base_ts=3000.0, max_messages=5)
-
-    rows = _rows(uid)
-    assert len(rows) == 10
-
-
-def test_legacy_path_plain_trims_even_with_no_summary_row(pg_clean):
-    """Regression guard: ``db.chat_append`` (the LEGACY/pre-V2 best-effort
-    write path, shared by ``core/store.py`` and ``content/content_core.py``)
-    must NOT be gated on summary coverage — that path never writes a
-    ``v2_conversation_summary`` row, so gating it would silently disable
-    trimming forever (unbounded ``chat_messages`` growth). With no summary
-    row at all, ``chat_append`` must still plain-trim to the newest
-    max_messages, exactly like the pre-D7 behavior."""
-    uid = "u_gc_legacy_nosummary"
-    seed_user(uid)
-    base_ts = 5000.0
-    for i in range(10):
-        db.chat_append(uid, f"m{i:03d}", base_ts + i, {"role": "user", "n": i}, max_messages=5)
-
-    rows = _rows(uid)
-    assert len(rows) == 5  # plain ring-buffer trim, unaffected by (absent) coverage
-    ts_present = {ts for _, ts in rows}
-    for i in range(5, 10):
-        assert (base_ts + i) in ts_present
-    for i in range(0, 5):
-        assert (base_ts + i) not in ts_present
-
-
-def test_watermark_above_all_messages_behaves_like_today(pg_clean):
-    """Sanity: once the watermark covers everything (compaction is fully
-    caught up), the gate is a no-op and the trim behaves exactly like the
-    pre-existing count-only trim — keeps only the newest max_messages."""
-    uid = "u_gc_full_coverage"
-    seed_user(uid)
-    base_ts = 4000.0
-    _seed_messages(uid, 9, base_ts=base_ts, max_messages=0)
-    watermark_seq = db.chat_seq_for_msg_id(uid, "m008")
-    ok = jobs_store.upsert_summary_row_cas(
-        uid, summary_envelope={}, watermark_ts=base_ts + 1000,
-        expected_version=0, watermark_seq=watermark_seq,
-    )
-    assert ok
-    db.chat_append_strict(
-        uid, "m009", base_ts + 9, {"role": "user", "n": 9}, 5,
-    )
-
-    rows = _rows(uid)
-    assert len(rows) == 5
-    ts_present = {ts for _, ts in rows}
-    # newest 5 (i=5..9) survive; oldest 5 (i=0..4) are gone.
-    for i in range(5, 10):
-        assert (base_ts + i) in ts_present
-    for i in range(0, 5):
-        assert (base_ts + i) not in ts_present
-
-
-def test_same_timestamp_boundary_trims_exactly_through_watermark_seq(pg_clean):
-    uid = "u_gc_same_ts"
-    seed_user(uid)
-    shared_ts = 7000.0
-    for i in range(9):
-        db.chat_append_strict(
-            uid, f"m{i:03d}", shared_ts, {"role": "user", "n": i}, 0,
-        )
-    watermark_seq = db.chat_seq_for_msg_id(uid, "m002")
+    watermark_seq = db.chat_seq_for_msg_id(uid, "message-5")
     assert jobs_store.upsert_summary_row_cas(
-        uid, summary_envelope={}, watermark_ts=shared_ts,
-        expected_version=0, watermark_seq=watermark_seq,
+        uid,
+        summary_envelope={"body_ct": "encrypted-summary"},
+        watermark_ts=5.0,
+        watermark_seq=watermark_seq,
+        expected_version=0,
     )
 
-    db.chat_append_strict(uid, "m009", shared_ts, {"role": "user", "n": 9}, 5)
+    for index in range(6, 12):
+        msg_id = f"message-{index}"
+        db.chat_append_strict(uid, msg_id, float(index), _doc(msg_id), 3)
 
-    remaining = db.chat_messages_after_seq(uid, 0)
-    assert [row["n"] for row in remaining] == list(range(3, 10))
+    assert _ids(uid) == [f"message-{index}" for index in range(12)]
+
+
+def test_atomic_v2_send_and_reply_paths_preserve_older_source_rows():
+    uid = "retention-v2-atomic"
+    seed_user(uid)
+    for index in range(3):
+        msg_id = f"seed-{index}"
+        db.chat_append_strict(uid, msg_id, float(index), _doc(msg_id), 1)
+
+    db.chat_append_and_enqueue(
+        uid,
+        "atomic-user",
+        10.0,
+        _doc("atomic-user"),
+        1,
+        "chat",
+    )
+    db.chat_append_effect_with_cursor(
+        uid,
+        "atomic-reply",
+        11.0,
+        _doc("atomic-reply", role="openclaw"),
+        1,
+        None,
+    )
+
+    assert _ids(uid) == [
+        "seed-0", "seed-1", "seed-2", "atomic-user", "atomic-reply",
+    ]
+
+
+def test_resident_append_limit_cannot_delete_history_during_rollback_window():
+    uid = "retention-resident"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_runtime_state (user_id,hosted_runtime_state) "
+            "VALUES (%s,'resident') ON CONFLICT (user_id) DO UPDATE "
+            "SET hosted_runtime_state='resident'",
+            (uid,),
+        )
+    db.chat_append(uid, "old", 1.0, _doc("old"), 1)
+    db.chat_append_resident_message(
+        uid, "resident-new", 2.0,
+        _doc("resident-new", role="openclaw"), 1,
+    )
+
+    assert _ids(uid) == ["old", "resident-new"]
+
+
+def test_idempotent_client_send_preserves_rows_beyond_limit():
+    uid = "retention-idempotent"
+    seed_user(uid)
+    for index in range(4):
+        msg_id = f"client-{index}"
+        key = f"00000000-0000-4000-8000-{index:012d}"
+        doc = {
+            **_doc(msg_id),
+            "client_msg_id": key,
+            "ts": time.time() + index,
+        }
+        _winner, inserted = db.chat_append_idempotent(
+            uid, msg_id, doc["ts"], doc, 1,
+            client_msg_id=key, window_sec=600,
+        )
+        assert inserted is True
+
+    assert _ids(uid) == [f"client-{index}" for index in range(4)]

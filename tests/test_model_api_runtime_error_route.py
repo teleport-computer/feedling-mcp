@@ -1,6 +1,6 @@
 """POST /v1/model_api/runtime_error：agent-runner 路径补写 last_runtime_error。
 
-历史教训（memory: model-api-providerkey-runtime-token-decrypt-gap）：host-all
+历史教训（memory: model-api-providerkey-runtime-token-decrypt-gap）：Runtime V2
 consumer 只有 runtime-token，读写侧只认 api-key 就会静默失效——这里走
 require_auth（两者都收），测试只需覆盖 api-key 路径 + 语义。
 Run:  python -m pytest tests/test_model_api_runtime_error_route.py -q

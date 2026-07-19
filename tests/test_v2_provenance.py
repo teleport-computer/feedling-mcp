@@ -4,9 +4,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import provenance as prov
 
 
-def test_read_provenance_tags_web_external():
+def test_read_provenance_tags_web_and_task_external():
     assert prov.provenance_for_read("web_search") == prov.EXTERNAL
     assert prov.provenance_for_read("web_fetch") == prov.EXTERNAL
+    # A parent cannot prove which external/private reads influenced the child
+    # summary, so task provenance is deliberately propagated fail-closed.
+    assert prov.provenance_for_read("task") == prov.EXTERNAL
     assert prov.provenance_for_read("memory_index") == prov.INTERNAL
 
 

@@ -1,5 +1,9 @@
 # Hosted Runtime V2 — `capture` + `dream` lanes — Implementation Plan
 
+> **Correctness update (2026-07-18):** production now validates the complete
+> parser → action → Memory Garden executor path. Non-empty Capture and Dream
+> results cannot complete unless their memory writes succeed.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development.
 
 **Goal:** Give V2 its own memory-extraction lanes: `capture` (a chat window → memory cards) and `dream` (existing cards + recent conversation → consolidations).

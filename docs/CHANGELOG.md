@@ -47,6 +47,85 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-19
+
+### [DONE] Runtime V2 harness parity lands in source with explicit live gates
+
+- The unified model-visible catalog now has 23 built-in tools: 21 platform
+  capabilities plus bounded `task` subagents and loop-native `reply`. Independent
+  reads/tasks run concurrently; disjoint workspace writes may commit in
+  conflict-free waves, while conflicting paths and external effects remain
+  provider-ordered.
+- Added the encrypted, backend-pluggable VFS: read-only `/artifacts` and
+  `/skills`, editable `/workspace`, and editable `/memory/WORKING.md` separate
+  from Memory Garden. Existing text views and virtual text edits do not acquire
+  a sandbox; uncached artifact materialization fails closed unless an E2B or CVM
+  provider is configured. E2B is source-wired but remains a deployment data-
+  boundary decision, not an automatic upload path.
+- Provider adapters preserve a deterministic tool/system/trusted-skills cache
+  prefix and normalize cache reads/writes/misses, including Bedrock Converse
+  cache points. Editable `WORKING.md` is deliberately pull-only rather than
+  eagerly cached; reading private workspace state removes later outbound
+  web/MCP/`task` tools for that turn. The existing Pre canary proves OpenRouter
+  only; native Bedrock and a live trusted-skills mutation still need deployment
+  evidence.
+- Runtime V2 now persists a bounded, append-only encrypted per-job trajectory.
+  Optional provider-backed failure review is default-off, fail-closed,
+  database-admission-bounded, and structurally has no reply/tool/effect surface.
+  It is offline analysis rather than deterministic replay; automatic retention/
+  GC and restricted inspection/export policy remain open.
+- Eager perception grounding is now a strict fixed-field numeric/boolean/null
+  projection. Third-party calendar/reminder/app/place/weather text and
+  screen/photo content are pull-only; after an explicit text-bearing read the
+  loop removes later web, MCP, and `task` channels. Numeric health reads remain
+  compatible with later outbound work.
+- Raw encrypted Chat rows and attachment bodies remain the durable ledger. The
+  5,000-message value is only an in-process hot-window bound, never a database
+  retention rule. Runtime V2 now stores exact-range conversation-summary leaves
+  and higher-level checkpoints as immutable encrypted rows, retains every child,
+  and binds a bounded materialized prompt view to the canonical IDs with a
+  versioned CAS. Existing aggregate summaries migrate lazily and oversized old
+  summaries are reduced through bounded hierarchical calls even without a new
+  message.
+- Explicit Chat clear is now a generation-fenced atomic reset of raw messages,
+  summary, chat-derived artifacts, pending effects/status, and reply cursor.
+  Paused old workers cannot recreate cleared context. Independent Memory,
+  user-authored workspace, schedules, content-free metrics, and encrypted
+  trajectory telemetry remain under their own retention policies; account
+  deletion remains the complete-erasure boundary.
+- Hosted resident retirement is complete in source and managed manifests, but
+  live fleet closure still requires deploying the reviewed image everywhere,
+  provisioning production's second runner failure domain, and verifying zero
+  legacy hosted processes. Typing-signal pre-warm also remains unimplemented.
+- Production runner deploys now bind each worker heartbeat to the target
+  inventory CVM ID and exact seven-character image build. The worker fails
+  closed on missing/mismatched identity, and CI outlives stale heartbeat windows
+  before requiring a current-build turn + Genesis pair for every listed CVM;
+  the gate remains intentionally blocked while only one production CVM ID is
+  provisioned.
+
+## 2026-07-18
+
+### [DONE] Hosted resident fleet retired; all managed hosting is Runtime V2-only
+
+- Local, test, pre, and production backend manifests now force literal
+  `v2_only`; every runner manifest contains only the pooled `serve-worker`.
+  Test/pre/prod worker-CVM deploy jobs are mandatory and fail when their
+  topology is missing.
+- Removed the hosted resident supervisor, spawners, leases, token helper,
+  per-user CLI homes/checkpoints/volumes, roster/host-all controls, and resident
+  rollback/admin selector. The historical `feedling-agent-runner` package name
+  remains, but its image now contains only the Python Runtime V2 worker.
+- Hosted send requires the exact V2 ownership tuple and fails before persistence
+  on stale ownership, dead workers, kill switch, or admission rejection. The
+  independent user-operated `/v1/chat/*` resident consumer remains separate and
+  cannot claim hosted accounts.
+- Preserved iOS retry correctness during the cutover: `client_msg_id` duplicate
+  detection now runs inside the same transaction as V2 message append and job
+  enqueue, so a lost `202` cannot create a second row or execute a second turn.
+- Replaced the resident rollback guide with V2 scale/recovery procedures and
+  added structural tests that reject any return of hosted resident services,
+  selectors, CLI toolchains, or optional worker deploys.
 ## 2026-07-18（第六批：终局——全局复扫 + 灰区 16 项终审全保留）
 
 ### [DONE] 仓库清理第三轮·第六批（真收官）

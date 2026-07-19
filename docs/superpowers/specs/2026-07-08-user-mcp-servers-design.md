@@ -1,5 +1,8 @@
 # 用户 MCP 服务器（user_mcp）设计 v2 —— 配置分发模型
 
+> **RETIRED / DO NOT DEPLOY.** Historical design; host-all token-file and
+> supervisor materialization paths no longer exist.
+
 日期：2026-07-08
 状态：v2 已与用户确认方向（v1 的「后端代理」模型已废弃），待实施计划
 目标分支：**test**（pre 暂不稳定；test 无 pi driver，托管 driver 仅 claude/codex）

@@ -5,7 +5,6 @@ Regression tests for tools/chat_resident_consumer.py
 Run with: pytest tests/test_chat_resident_consumer.py -v
 """
 
-import importlib
 import base64
 import json
 import os
@@ -1638,8 +1637,6 @@ def test_process_messages_executes_memory_actions_before_reply():
 def test_empty_content_decrypt_source_available_replies(monkeypatch):
     """poll returns content="" but decrypt source is available and returns
     plaintext — consumer must reply using the decrypted content."""
-    # Simulate poll returning empty-content message
-    empty_msg = _make_msg(role="user", content="", ts=4000.0)
     # Decrypt source returns the plaintext version
     decrypted_msg = _make_msg(role="user", content="what's the weather?", ts=4000.0)
 
@@ -2438,9 +2435,8 @@ def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(mon
 
 
 def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
-    # Resume is claude's primary continuity path on a self-hosted resident (auto
-    # injects only when _HOSTED — see test_resident_claude_auto_keeps_resume_*).
-    # When a turn DOES carry an injected transcript (hosted / forced on),
+    # Resume is claude's primary continuity path on a self-hosted resident.
+    # When a turn DOES carry a forced injected transcript,
     # _prepare_cli_command suppresses --resume for that turn instead.
     sid = "123e4567-e89b-12d3-a456-426614174000"
     monkeypatch.setattr(
@@ -3123,10 +3119,8 @@ def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch
     assert calls[-1] == ("backend", "https://backend.local/v1/memory/buckets")
 
 
-def test_capture_json_helpers_refresh_runtime_token_before_each_request(monkeypatch, tmp_path):
+def test_capture_json_helpers_use_api_key_for_each_request(monkeypatch):
     calls = []
-    token_file = tmp_path / "runtime.jwt"
-    token_file.write_text("fresh-token")
 
     class _Resp:
         def raise_for_status(self):
@@ -3143,19 +3137,14 @@ def test_capture_json_helpers_refresh_runtime_token_before_each_request(monkeypa
         calls.append(("POST", url, dict(kwargs.get("headers") or {})))
         return _Resp()
 
-    monkeypatch.setattr(crc, "FEEDLING_RUNTIME_TOKEN_FILE", str(token_file))
-    monkeypatch.setattr(crc, "_runtime_token_exp", lambda token: time.time() + 60)
-    monkeypatch.setitem(crc._HEADERS, "X-API-Key", "stale-api-key")
-    crc._HEADERS.pop("X-Feedling-Runtime-Token", None)
+    monkeypatch.setitem(crc._HEADERS, "X-API-Key", "resident-api-key")
     monkeypatch.setattr(crc._HTTP, "get", _get)
     monkeypatch.setattr(crc._HTTP, "post", _post)
 
     assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
     assert crc._capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": 8}) == {"ok": True}
-    assert calls[0][2].get("X-Feedling-Runtime-Token") == "fresh-token"
-    assert calls[1][2].get("X-Feedling-Runtime-Token") == "fresh-token"
-    assert "X-API-Key" not in calls[0][2]
-    assert "X-API-Key" not in calls[1][2]
+    assert calls[0][2].get("X-API-Key") == "resident-api-key"
+    assert calls[1][2].get("X-API-Key") == "resident-api-key"
 
 
 def test_migrate_job_fails_when_legacy_batch_response_missing(monkeypatch):
@@ -6724,9 +6713,8 @@ def test_provider_payment_cooldown_lifecycle(monkeypatch):
 # ---------------------------------------------------------------------------
 # Foreground chat context injection (codex / claude hosted BYOK)
 # ---------------------------------------------------------------------------
-# codex has no --resume and hosted claude's default command carries no session,
-# so cross-turn continuity is injected by the resident: a short recent-chat
-# transcript is prepended to the current turn. pi resumes natively via
+# codex has no --resume, so cross-turn continuity is injected by the resident:
+# a short recent-chat transcript is prepended to the current turn. pi resumes natively via
 # --session-id, but a session rotates to a blank slate every N turns, so pi
 # gets bridged with the transcript exactly once per session (its first
 # foreground chat turn, gated on success — see _mark_agent_session_bridged in
@@ -6747,15 +6735,6 @@ def test_foreground_injection_enabled_for_codex(monkeypatch):
     assert crc._foreground_history_injection_enabled() is True
 
 
-def test_foreground_injection_enabled_for_hosted_claude(monkeypatch):
-    # In-CVM (hosted) claude has no durable session store: transcript injection
-    # IS its continuity.
-    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
-    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
-    monkeypatch.setattr(crc, "_HOSTED", True)
-    assert crc._foreground_history_injection_enabled() is True
-
-
 def test_foreground_injection_skipped_for_resident_claude(monkeypatch):
     # A self-hosted resident's local claude has a reliable --resume. Injection
     # would suppress it (_prepare_cli_command) and cold-start a fresh model
@@ -6764,15 +6743,13 @@ def test_foreground_injection_skipped_for_resident_claude(monkeypatch):
     # the persistent-session path for resident claude.
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
-    monkeypatch.setattr(crc, "_HOSTED", False)
     assert crc._foreground_history_injection_enabled() is False
 
 
-def test_foreground_injection_on_mode_forces_even_resident_claude(monkeypatch):
-    # explicit on outranks the hosted/resident split (operator escape hatch)
+def test_foreground_injection_on_mode_forces_resident_claude(monkeypatch):
+    # Explicit on is an operator escape hatch.
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "on")
-    monkeypatch.setattr(crc, "_HOSTED", False)
     assert crc._foreground_history_injection_enabled() is True
 
 
@@ -6784,7 +6761,6 @@ def test_resident_claude_auto_keeps_resume_and_skips_transcript(monkeypatch):
     sid = "123e4567-e89b-12d3-a456-426614174000"
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
-    monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     monkeypatch.setattr(
@@ -6819,7 +6795,6 @@ def _stale_resume_env(monkeypatch, tmp_path, user_id):
     _bridge_session_env(monkeypatch, tmp_path, user_id)
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
-    monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     crc._save_agent_session_id(_STALE_SID)
 
@@ -8296,7 +8271,7 @@ def test_generic_failure_sets_backoff(monkeypatch):
 
 
 def test_402_failure_feeds_both_cooldown_and_general_backoff(monkeypatch):
-    cap = _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("HTTP 402 payment required"))
+    _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("HTTP 402 payment required"))
     crc._proactive_backoff_until = 0.0
     crc._clear_provider_payment_cooldown()
     crc._process_proactive_jobs([_idle_proactive_job()])
@@ -8403,7 +8378,6 @@ def test_turn_timeout_is_env_tunable(monkeypatch, tmp_path):
     _bridge_session_env(monkeypatch, tmp_path, "usr_slow_stack")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
-    monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     monkeypatch.setattr(crc, "AGENT_TURN_TIMEOUT_SEC", 300)
     seen = {}

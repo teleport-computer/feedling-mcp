@@ -14,6 +14,9 @@ Agent 是大脑，Feedling 是身体。
 > only where they describe past milestones.
 
 1. **HTTP backend** (FastAPI/ASGI, `backend/asgi_app.py`) — iOS, resident-consumer, and proactive APIs
+2. **Hosted Runtime V2 workers** (`backend/model_api_runtime/v2/`) — a bounded,
+   PostgreSQL-backed native agent/tool loop deployed as pooled `serve-worker`
+   processes; hosted resident supervisors and per-user CLI processes are retired
 3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + backend + enclave services running inside one Phala TDX CVM
 4. **Enclave app** (`backend/enclave_app.py`) — owns the content private key, serves `/attestation` on its own pinnable TLS port, and runs the decrypt proxy
 5. **iOS app** — now lives in the companion repo <https://github.com/teleport-computer/feedling-mcp-ios>. It owns Chat · Identity · Garden · Settings, Live Activity / Dynamic Island, Broadcast Extension for screen capture, and the live audit card.
@@ -102,10 +105,11 @@ and the current live-verify command is below.
    from the v1 envelopes sealed to `enclave_content_pk`.
 
 6. **Multi-tenant isolation.** Each user is registered via
-   `POST /v1/users/register`, gets an api_key, and lives under
-   `~/feedling-data/<user_id>/`. API keys are stored as
-   **HMAC-SHA256** (32-byte `.pepper`, `chmod 600`). Envelopes
-   carry `owner_user_id`; the backend rejects cross-tenant reads.
+   `POST /v1/users/register` and gets an API key whose verifier is stored as
+   **HMAC-SHA256** in PostgreSQL. Durable records are scoped by `user_id`, and
+   encrypted envelopes also carry `owner_user_id`; the backend rejects
+   cross-tenant reads. Hosted Runtime V2 has no per-user filesystem home: chat,
+   workspace, trajectory, and queue state use tenant-scoped database records.
 
 ---
 
@@ -244,9 +248,10 @@ keeps its own TLS on `:5003` and is reached through the dstack-gateway
 `-5003s.` passthrough so iOS can pin its cert fingerprint against
 REPORT_DATA.
 
-The local/self-hosting path still uses `deploy/docker-compose.yaml`,
-systemd units, and optionally Caddy on a VPS you control. See
-`deploy/SELF_HOSTING.md`.
+The self-hosting path is experimental and now requires PostgreSQL, the enclave
+path, and either a Runtime V2 worker or an independent resident consumer. See
+[`docs-site/content/docs/self-hosting.mdx`](docs-site/content/docs/self-hosting.mdx);
+`deploy/SELF_HOSTING.md` is retained only as a legacy resident-route runbook.
 
 There is **no** `chat_bridge.py` anymore. Retired 2026-04-20 when
 MCP's `feedling_chat_post_message` landed and agent replies started
@@ -406,7 +411,7 @@ reject plaintext with `400 plaintext_write_rejected`.
 
 The FastMCP SSE server and its `feedling_*` tool set (23 tools mapping
 onto the HTTP endpoints above) were removed on 2026-06-12; users now
-connect through the iOS app + agent-runner paths instead. For the
+connect through the iOS app + Hosted Runtime V2 or independent resident paths instead. For the
 historical tool table and the SSE `?key=` session-pinning details, see
 git history and `deploy/DEPLOYMENTS.md`.
 
@@ -491,7 +496,7 @@ The public iOS onboarding now starts by asking the user which route they need:
 The MCP import route — `claude mcp add feedling --transport sse
 "https://mcp.feedling.app/sse?key=<api_key>"` against the FastMCP SSE
 server — was removed on 2026-06-12 together with that server. Users of
-official apps are now served through the iOS app + agent-runner paths.
+official apps are now served through the iOS app + Hosted Runtime V2 paths.
 The historical setup instructions live in git history and
 `deploy/DEPLOYMENTS.md`.
 
@@ -548,9 +553,10 @@ Implementation note: provider-key storage and hosted runtime execution are part
 of the backend/iOS product surface. Do not ask API-key users to create launchd,
 systemd, bridge scripts, or a `feedling-chat-resident` service.
 
-Self-hosted users: see [`deploy/SELF_HOSTING.md`](deploy/SELF_HOSTING.md)
-for an end-to-end SSH runbook (clone, deps, env, systemd, HTTPS via
-Caddy, DNS, iOS pointing at your URL+key).
+Self-hosted users: see the current
+[`self-hosting component checklist`](docs-site/content/docs/self-hosting.mdx).
+The older [`deploy/SELF_HOSTING.md`](deploy/SELF_HOSTING.md) covers only the
+independent resident route and is not a complete Runtime V2 stack.
 
 ---
 
@@ -571,27 +577,21 @@ Caddy, DNS, iOS pointing at your URL+key).
 | APNs Team / Key ID | Set via `APNS_TEAM_ID` and `APNS_KEY_ID`; production values live in CI/Phala env, not docs |
 | APNs key | Self-host: `~/feedling-data/AuthKey_<KEY_ID>.p8` or `APNS_KEY_PATH` (`chmod 600`); production CVM: `APNS_KEY_P8_B64` injected via Phala env |
 
-### Multi-tenant data layout
+### Persistent data layout
 
-```
-~/feedling-data/
-├── users.json                  # [{user_id, api_key_hash, public_key, created_at}, …]
-├── .pepper                     # 32-byte HMAC secret, chmod 600
-├── AuthKey_<KEY_ID>.p8         # APNs key, chmod 600 (self-host only)
-└── <user_id>/
-    ├── frames/                 # per-user screen frame envelopes
-    ├── chat.json               # v1 envelopes
-    ├── identity.json           # v1 envelope
-    ├── memory.json             # v1 envelopes
-    ├── tokens.json             # APNs tokens (not content — no encryption needed)
-    ├── push_state.json
-    ├── live_activity_state.json
-    ├── bootstrap.json
-    └── bootstrap_events.jsonl
-```
+PostgreSQL is mandatory and authoritative; there is no current JSON-file
+persistence fallback. It stores account/routing metadata, encrypted Chat,
+Memory and identity state, Runtime V2 jobs/effects, encrypted workspace bodies,
+and encrypted trajectory/review payloads. Large encrypted Chat, frame, and
+artifact bodies may instead live in the configured object store, with durable
+database rows retaining their pointers.
 
-`users.json`, `.pepper`, and the APNs `.p8` are the only files
-outside a user directory.
+`FEEDLING_DATA_DIR` holds only deployment-local operational material such as a
+self-hosted APNs key and residual local object files for features that use them.
+It is not the user database and is not a complete backup. Back up PostgreSQL,
+every configured object store, and the content/enclave key material as one
+coherent data set; see the
+[`self-hosting backup boundary`](docs-site/content/docs/self-hosting.mdx#backups-and-key-lifecycle).
 
 ---
 
@@ -604,9 +604,10 @@ outside a user directory.
 | Verify the running enclave yourself | `docs/AUDIT.md` |
 | Redeploy the CVM or rotate `compose_hash` | `deploy/DEPLOYMENTS.md` |
 | See landmark diffs by session (current state lives here too) | `docs/CHANGELOG.md` |
-| Review Hosted Runtime V2 readiness, blockers, and engineer handoff | [`docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md`](docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md) · [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](deploy/HOSTED_RUNTIME_V2_ROLLOUT.md) |
+| Review current Hosted Runtime V2 parity, deferred work, and rollout gates | [`docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`](docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md) · [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](deploy/HOSTED_RUNTIME_V2_ROLLOUT.md) |
+| Read the July 11 Hosted Runtime V2 audit as historical evidence | [`docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md`](docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md) |
 | Work on visuals / UI | `DESIGN.md` |
-| Run your own backend on your VPS | `deploy/SELF_HOSTING.md` |
+| Review the experimental self-hosting topology | [`docs-site/content/docs/self-hosting.mdx`](docs-site/content/docs/self-hosting.mdx) |
 | Set up a resident chat consumer for a non-MCP agent backend | `tools/README.md` |
 | Read the agent skill (what your AI follows during bootstrap) | <https://github.com/teleport-computer/io-onboarding> |
 | Diagnose why chat messages aren't getting replies | `python tools/check_chat_pipeline.py` |

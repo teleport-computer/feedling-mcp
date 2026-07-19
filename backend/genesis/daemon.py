@@ -7,15 +7,13 @@ anything to do with the resident CLI runtime: it needs an enclave URL (to decryp
 E2E chunk envelopes), a runtime-token secret (to mint genesis-scoped tokens), and
 a loop. Nothing else.
 
-Framework-neutral on purpose: this module must import NEITHER ``agent_runtime``
-nor ``model_api_runtime``, so the V2 assembly layer (``serve_worker.py``) and the
-resident supervisor can both host it without violating the dependency-direction
-guard in ``tests/test_v2_dependency_direction.py``.
+Framework-neutral on purpose: this module imports neither runtime package. The
+V2 assembly layer (``serve_worker.py``) is now its sole managed host, while the
+dependency-direction guard remains simple to enforce.
 
 Concurrency contract: the claim is ``FOR UPDATE SKIP LOCKED``
 (``genesis.worker.tick`` -> ``db.genesis_claim_uploaded_jobs``), so running this
-loop in several processes at once is safe and de-dupes. That is what makes a
-coexistence rollout possible.
+loop in several processes at once is safe and de-dupes across worker CVMs.
 """
 from __future__ import annotations
 

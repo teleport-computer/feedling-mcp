@@ -7,10 +7,12 @@
 > correctness/capacity metric; use the provider's cached-input price when
 > calculating billed cost.
 
-> Current rollout-gate result (2026-07-14, shared fixtures): **1707.0
-> tokens/turn, 1.3333 LLM calls/turn**. This is the first measurement through
-> the production provider-native `tool_loop.run_tool_loop`; every older number
-> below is retained as staged-pipeline history, not a current go/no-go number.
+> Last recorded rollout-gate result (2026-07-14, shared fixtures): **1707.0
+> tokens/turn, 1.3333 LLM calls/turn**. This was the first measurement through
+> the production provider-native `tool_loop.run_tool_loop`. The catalog has
+> since expanded to 23 built-in tools with workspace and `task`; rerun the
+> shared fixtures on the reviewed integration commit before using 1707 as a
+> current go/no-go number. Every older number below is staged-pipeline history.
 
 ## Current method and result
 

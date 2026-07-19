@@ -1,4 +1,5 @@
-import sys, pathlib
+import sys
+import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))  # noqa: E402
 
 from capabilities import registry  # noqa: E402
@@ -15,10 +16,12 @@ def test_all_action_types_registered():
         "chat_file_read",
         "web_search", "web_fetch",
         "schedule_wake", "cancel_wake",
+        "workspace_list", "workspace_read", "workspace_write", "workspace_delete",
     }
     assert set(registry.CAPABILITIES) == expected
     assert registry.WRITE_ACTIONS == frozenset({
-        "memory_write", "identity_patch", "schedule_wake", "cancel_wake"})
+        "memory_write", "identity_patch", "schedule_wake", "cancel_wake",
+        "workspace_write", "workspace_delete"})
     assert "memory_index" in registry.READ_ACTIONS
 
 
@@ -35,7 +38,7 @@ def test_run_capability_unknown():
 
 
 def test_capabilities_is_a_real_populated_dict():
-    assert len(registry.CAPABILITIES) == 19
+    assert len(registry.CAPABILITIES) == 23
     assert set(registry.CAPABILITIES.keys()) == {
         "identity_get", "identity_patch", "memory_index", "memory_fetch", "memory_write",
         "memory_search",
@@ -44,6 +47,7 @@ def test_capabilities_is_a_real_populated_dict():
         "chat_file_read",
         "web_search", "web_fetch",
         "schedule_wake", "cancel_wake",
+        "workspace_list", "workspace_read", "workspace_write", "workspace_delete",
     }
-    assert len(list(registry.CAPABILITIES.items())) == 19
+    assert len(list(registry.CAPABILITIES.items())) == 23
     assert bool(registry.CAPABILITIES) is True

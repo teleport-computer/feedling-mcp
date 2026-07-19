@@ -1,6 +1,6 @@
 """CVM-side Genesis worker.
 
-This module is intended to run inside the agent-runner service. It claims
+This module runs as a dedicated thread inside the Runtime V2 ``serve-worker``. It claims
 finalized import jobs, decrypts chunk envelopes via the enclave, calls the
 user-configured LLM provider with the user's key, and posts only distilled
 reducer output back to the backend apply route.
@@ -398,6 +398,7 @@ def _runtime_for_user(user_id: str, provider_key: str) -> provider_client.Provid
         model=model,
         base_url=base_url,
         api_key=provider_key,
+        context_window_tokens=config.get("context_window_tokens"),
     )
 
 

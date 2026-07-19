@@ -1,7 +1,8 @@
 """Task 3 (screen_watch round): the `screen_watch` lane is a WAKE — it may write
 a chat bubble — so it joins `worker._WAKE_LANES` and reuses `_run_wake`, but with
 its own system prompt (`_SCREEN_WATCH_SYSTEM_PROMPT`) and grounded on recent
-screen frames (`screen_recent` capability) instead of a perception snapshot.
+screen availability metadata (`screen_recent` capability) instead of a
+perception snapshot. Caption/window/app text stays pull-only.
 
 `_run_wake` (and therefore `screen_watch`) runs on the unified
 `tool_loop.run_tool_loop`. The `screen_recent` prefetch flows in as a static
@@ -11,8 +12,9 @@ Contract (from the task brief):
 - `"screen_watch" in worker._WAKE_LANES`.
 - The turn fetches ONLY `screen_recent` — NEVER `perception_snapshot` (the
   resident sets `perception_digest=None` for screen-watch jobs,
-  chat_resident_consumer.py:6611), and hands the frames to the loop's system
-  prompt/context under `_SCREEN_WATCH_SYSTEM_PROMPT`.
+  chat_resident_consumer.py:6611), and hands only controlled frame counts to the
+  loop's context under `_SCREEN_WATCH_SYSTEM_PROMPT`. The model can explicitly
+  call screen tools to inspect content.
 - Silence is SUCCESS: an empty terminal reply completes the job with zero
   bubbles (weak wake sleeps) — inherited from `_run_wake`, not a new path.
 
@@ -115,8 +117,8 @@ def test_screen_watch_is_dispatched_to_the_wake_path():
 # fetch a perception snapshot.
 # ------------------------------------------------------------------
 
-def test_screen_watch_turn_passes_screen_context_and_its_own_prompt(monkeypatch):
-    """It must ground on recent frames and must NOT fetch a perception snapshot."""
+def test_screen_watch_turn_passes_safe_screen_context_and_its_own_prompt(monkeypatch):
+    """It grounds on frame counts, never eager caption text or perception."""
     uid = "u_sw_context"
     conftest.seed_user(uid)
     _reset(uid)
@@ -127,6 +129,7 @@ def test_screen_watch_turn_passes_screen_context_and_its_own_prompt(monkeypatch)
 
     async def _fake(config, messages, *, tools=None):
         seen["messages"] = messages
+        seen["tools"] = tools
         return _text_round("你在看这个报错？")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -153,7 +156,9 @@ def test_screen_watch_turn_passes_screen_context_and_its_own_prompt(monkeypatch)
     assert system_msg["content"] is not None
     assert "watching the screen" in system_msg["content"]  # _SCREEN_WATCH_SYSTEM_PROMPT, not _WAKE_SYSTEM_PROMPT
     joined = " ".join(str(m.get("content", "")) for m in seen["messages"])
-    assert "a stack trace" in joined                        # screen_recent frame caption flowed through
+    assert "a stack trace" not in joined                    # caption is pull-only
+    assert '"recent_count":1' in joined
+    assert "screen_recent" in {spec.name for spec in seen["tools"]}
     assert "perception_snapshot" not in caps                # resident sets perception_digest=None
     assert caps == ["screen_recent"]
     assert written["text"] == "你在看这个报错？"

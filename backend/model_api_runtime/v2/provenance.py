@@ -1,12 +1,14 @@
 """Provenance tagging + deterministic write gates (spec C4).
 
 A user/wake seed is necessary for a durable write, but it is not sufficient after
-the model has observed untrusted web content.  The unified loop therefore removes
-all durable writes and free-form outbound web calls after a ``web_search``/
-``web_fetch`` dispatch.  It permits only exact ``web_fetch`` URLs returned by a
-preceding search in the same turn, preserving the normal search -> read flow
-without letting page text invent an exfiltration URL/query.  The seed gate below
-remains defence in depth for direct executor callers and wake/user-less paths.
+the model has observed untrusted external content.  The unified loop therefore
+removes all durable writes, fresh outbound web calls, and every outbound MCP tool
+after a ``web_search``/``web_fetch``/MCP/task dispatch.  A task is conservatively
+external because its child summary can transitively contain web or private-read
+content.  The loop permits only exact ``web_fetch`` URLs returned by a preceding
+search in the same turn, preserving the normal search -> read flow without letting
+page text invent an exfiltration URL/query.  The seed gate below remains defence in
+depth for direct executor callers and wake/user-less paths.
 """
 from __future__ import annotations
 from capabilities import registry as cap_registry
@@ -16,7 +18,9 @@ WAKE_TRIGGER = "wake_trigger"
 EXTERNAL = "external"
 INTERNAL = "internal"
 
-EXTERNAL_READS = frozenset({"web_search", "web_fetch"})
+# A child summary can contain remote web text or user-editable workspace/memory
+# content. Treat it exactly like other external model input in the parent loop.
+EXTERNAL_READS = frozenset({"web_search", "web_fetch", "task"})
 
 
 def provenance_for_read(tool_name: str) -> str:

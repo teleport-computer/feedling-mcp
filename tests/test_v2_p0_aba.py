@@ -29,7 +29,9 @@ pytestmark = pytest.mark.skipif(
     reason="DB-backed V2 P0 tests require the PostgreSQL test fixture",
 )
 
-ALL_EFFECT_TYPES = ["reply", "status", "cursor", "job", "memory", "identity", "schedule"]
+ALL_EFFECT_TYPES = [
+    "reply", "status", "cursor", "job", "memory", "identity", "schedule", "workspace",
+]
 
 
 @pytest.fixture
@@ -73,8 +75,8 @@ def test_aba_stale_generation_effects_never_dispatched(pg_clean):
         uid, dispatch=lambda t, p: recording.append(t)
     )
 
-    assert res == {"applied": 0, "discarded": 7}
-    assert recording == []  # dispatch never called for ANY of the 7 stale effects
+    assert res == {"applied": 0, "discarded": len(ALL_EFFECT_TYPES)}
+    assert recording == []  # dispatch never called for ANY stale effect
 
     # No durable sink write can have happened for any of them (nothing to
     # claim), and every row must be terminally 'discarded'.
@@ -88,5 +90,5 @@ def test_aba_stale_generation_effects_never_dispatched(pg_clean):
             (eids,),
         ).fetchall()
     assert claimed == 0
-    assert len(statuses) == 7
+    assert len(statuses) == len(ALL_EFFECT_TYPES)
     assert all(status == "discarded" for _eid, status in statuses)

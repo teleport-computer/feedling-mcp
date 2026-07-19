@@ -432,16 +432,10 @@ def _pending_chat_messages_for_poll(
     now = time.time()
     claimed: list[dict] = []
     redelivered = 0
-    # Resident↔V2 flip-window guard (defense-in-depth): a user flipped to
-    # db_action_v2 is served ONLY by the V2 worker pool. The D0 exclusivity guard
-    # (db.list_agent_runtime_enabled_users) reaps that user's resident consumer,
-    # but only on the next supervisor tick (~15s). In that window the still-
-    # running resident consumer's CLAIMING poll would claim + reply to the user's
-    # message via the CLI path — while the V2 worker independently reads it too
-    # (the V2 read boundary is the durable SEQ cursor; it does NOT look at
-    # reply_claimed_by), yielding a double reply / a confusing claimed-then-
-    # abandoned state. Refuse the resident's claiming poll for db_action_v2 users
-    # at the source so V2 is the sole responder regardless of supervisor lag.
+    # Product-boundary guard (defense-in-depth): a db_action_v2 user is served
+    # ONLY by the pooled V2 worker. Refuse a separately operated `/v1/chat/*`
+    # consumer's claiming poll at the source so an accidentally still-running
+    # external consumer cannot race the hosted worker and double-reply.
     # NOTE: this is NOT the fix for the no-reply/reconcile-loop bug — that was a
     # ts-cursor fragility, fixed by the seq reply cursor (see
     # serve_worker._read_messages). Read-only

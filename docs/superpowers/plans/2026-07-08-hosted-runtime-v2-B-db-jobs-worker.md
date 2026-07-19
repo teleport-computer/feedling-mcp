@@ -1,5 +1,8 @@
 # Hosted Runtime V2 — 子项目 B（DB job + 有界 worker 骨架）Implementation Plan
 
+> **RETIRED / DO NOT DEPLOY.** Historical implementation record; use the live
+> Runtime V2 rollout and parity documents for current operations.
+
 > **STATUS: HISTORICAL IMPLEMENTATION RECORD.** The durable job/worker
 > foundation remains current, but the `agent_action_queue` planner pipeline and
 > its Python CRUD surface were superseded by provider-native tool calls plus the

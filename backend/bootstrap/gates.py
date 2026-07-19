@@ -142,7 +142,7 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
         if allow_verify_reply:
             return None
         # Host (model_api) accounts don't run an independent resident consumer —
-        # their chat loop is the supervisor-managed agent-runner, which posts via
+        # their chat loop is the pooled Runtime V2 worker, which starts via
         # /v1/model_api/chat/send (gate-free) and never stamps the official
         # `feedling-chat-resident` heartbeat. Requiring that heartbeat here is a
         # route mix-up: it 409s host accounts (e.g. an onboarding-validate job

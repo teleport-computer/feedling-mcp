@@ -1,41 +1,19 @@
-# Feedling — Phala TDX CVM compose (CVM-only, post-VPS migration).
+# Feedling Pre — Phala TDX main-CVM compose.
 #
-# VPS is gone. This compose is the whole production stack:
-#   - dstack-ingress: TLS termination for api.feedling.app
+# This file is the Pre main deployment unit only:
+#   - dstack-ingress: TLS termination for pre-api.feedling.app
 #   - backend:       ASGI (HTTP+WS) — sole source of truth for user data
 #   - enclave:       decrypt proxy + /attestation (own TLS on :5003,
 #                    reachable via dstack-gateway `-5003s.` passthrough)
 #
-# IMPORTANT: this replaces the prior VPS+CVM split. DNS A-records for
-# `api.feedling.app` is migrated off
-# the retired VPS host and onto Phala's dstack-gateway. Existing prod users
-# re-onboard from scratch (per user direction 2026-04-21).
+# Runtime V2 workers are a separate Pre deployment unit described by
+# deploy/docker-compose.phala.pre.runner.yaml. Never add a hosted resident,
+# supervisor, or serve-worker service to this main-CVM manifest.
 #
-# REQUIRED CVM NODE: prod9 (dstack-pha-prod9). Multi-domain TXT routing
-# via `_dstack-app-address.<domain>` only works on the prod9 gateway;
-# prod5/prod7 do not support it. This is why we redeploy to a new CVM
-# rather than updating the existing one on prod5 — new node → new
-# app_id → new compose_hash authorization required.
-#
-# DNS records dstack-ingress manages automatically (needs CF token with
-# Zone.DNS:Edit on feedling.app):
-#   CNAME api.feedling.app → <app-id>.dstack-pha-prod9.phala.network
-#   TXT   _dstack-app-address.api.feedling.app → <app-id>:443
-#   CAA   api.feedling.app pinned to Let's Encrypt
-#
-# Deploy flow:
-#   1. `phala deploy -c deploy/docker-compose.phala.yaml -n feedling-enclave-v2 \
-#         --node-id <prod9-node-id> -e CF_API_TOKEN=... -e CF_ZONE_ID=...`
-#   2. Wait for ingress to issue LE certs (first-time boot ~2–3 min).
-#   3. Update CF DNS: A record for api → the public IP printed by
-#      `phala cvms get feedling-enclave-v2` (or the CNAME target above).
-#   4. Compute compose_hash; publish on-chain via FeedlingAppAuth.addComposeHash.
-#   5. iOS follow-up PR: update `AuditCardView.swift` `makeAttestationURL`
-#      and `FeedlingAPI.swift` pinning URL to the new app_id on prod9.
-#      Decide whether the MCP-port pubkey-pin row stays (now pins ingress
-#      cert — requires enclave_app.py to bake ingress cert SPKI hash into
-#      REPORT_DATA) or is retired (content-layer envelope crypto still
-#      secures reads/writes regardless of transport-layer pinning).
+# dstack-ingress manages the pre-api.feedling.app CNAME/TXT/CAA records through
+# a narrowly scoped Cloudflare token injected by CI. The authoritative CVM IDs,
+# endpoints, deploy order, and compose-hash publication steps live in
+# deploy/DEPLOYMENTS.md and deploy/HOSTED_RUNTIME_V2_ROLLOUT.md.
 #
 # CRITICAL: every literal in this file becomes part of the compose_hash.
 # Any ${VAR} below must be category (A) — cosmetic / non-security.
@@ -87,7 +65,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:de0ec00
+    image: ghcr.io/teleport-computer/feedling:ac7ca8e
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -116,7 +94,7 @@ services:
 
   # --- ASGI backend — the ONLY backend. ---
   # Serves plain HTTP on :5001 (TLS terminated by ingress for
-  # api.feedling.app). Also runs the WebSocket ingest on :9998 for the
+  # pre-api.feedling.app). Also runs the WebSocket ingest on :9998 for the
   # iOS broadcast extension; that port is exposed via dstack-gateway
   # TLS-terminated route `wss://<app-id>-9998.dstack-pha-prod9...` —
   # frames are app-layer encrypted (FrameEnvelope v1) so gateway TLS
@@ -130,7 +108,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:de0ec00
+    image: ghcr.io/teleport-computer/feedling:ac7ca8e
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -156,9 +134,9 @@ services:
       # See asgi/lifespan.py.
       FEEDLING_ASGI_BACKGROUND: "true"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
-      # This deploy serves test-api, so skill_url must point at io-onboarding's
-      # test branch. Code defaults to "main" (so prod just works); the test
-      # deploy overrides it here. See core/util.io_onboarding_branch().
+      # Pre intentionally uses io-onboarding's test branch because that repo has
+      # no separate pre branch. Production defaults to main. See
+      # deploy/DEPLOYMENTS.md and core/util.io_onboarding_branch().
       FEEDLING_IO_ONBOARDING_BRANCH: "test"
       # External Postgres holding all (E2E-encrypted) user data + plaintext
       # metadata. Injected via the encrypted env channel (`phala deploy -e
@@ -206,12 +184,9 @@ services:
       # Proactive wake is native-only after P2-2b and no longer uses this flag.
       # See core/util.runtime_v2_default_on().
       FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
-      # Pre is the Hosted Runtime V2 acceptance environment. The backend
-      # materializes this policy for existing accounts before serving and for
-      # every newly configured route, so iOS users never need an admin flip.
-      # Operators can inject resident_only for a fenced fleet rollback without
-      # changing the compose hash; v2_only remains the fail-safe Pre default.
-      FEEDLING_HOSTED_RUNTIME_POLICY: "${FEEDLING_HOSTED_RUNTIME_POLICY:-v2_only}"
+      # Hosted model-API accounts have one runtime: pooled Runtime V2. This is a
+      # literal measured-compose value, not an encrypted-env rollback selector.
+      FEEDLING_HOSTED_RUNTIME_POLICY: "v2_only"
       # TEST-ONLY: genesis v2 (foreground-fast onboarding). Greet on 3-5 core +
       # identity baseline, push the heavy reduce (the ~37% prod failure surface)
       # to the background. Prod compose deliberately omits this (keeps the v1
@@ -222,16 +197,10 @@ services:
       # worker.genesis_combined_map_enabled(). Flip off to revert to the exact old
       # split-map path (hard rollback). On test for real-device quality comparison.
       FEEDLING_GENESIS_COMBINED_MAP: "true"
-      # Resident rollback only: v2_only ignores host-all for routing and excludes
-      # every eligible account from the resident supervisor roster. Keep the
-      # value mirrored so resident_only can fail-fast and recover deliberately.
-      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
       # Legacy memory migration is opt-in. Empty = off; set to 1 only after
-      # seeded real-device Garden verification passes. Mirror agent-runner.
+      # seeded real-device Garden verification passes. Mirror the pooled V2 worker.
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-      # Stage-D runtime token secret — the BACKEND is the verifier (enclave whoami
-      # falls back here), so it MUST share the agent-runner's secret or token auth
-      # 401s. Empty = off. Encrypted env, not baked into compose_hash.
+      # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
     ports:
       - "5001:5001"

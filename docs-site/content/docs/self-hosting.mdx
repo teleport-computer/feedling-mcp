@@ -23,10 +23,9 @@ tenant isolation for code execution.
 | Single-operator self-host | One person, family, or organization that trusts the host operator and connected agents | Host/VM boundary plus application authorization |
 | Public multi-tenant service | Unrelated users and untrusted prompts | Requires an independent isolation design and security review; the reference self-host stack does not provide this by default |
 
-The reference agent runner's local-development mode uses per-user child
-processes on the same host. Those processes can inherit host environment and do
-not constitute a strong adversarial tenant boundary. Do not put unrelated users'
-untrusted agent workloads on one runner and call the result isolated. Use a
+The reference Runtime V2 worker uses bounded turn slots on the same host. Those
+processes do not constitute a strong adversarial tenant boundary. Do not put
+unrelated users' untrusted code on one worker and call the result isolated. Use a
 separately reviewed container, microVM, or confidential-VM boundary with
 per-tenant secrets and storage, or keep the deployment single-tenant.
 
@@ -45,8 +44,8 @@ A functional deployment can include:
 | ASGI backend | All API operations | Runs FastAPI under gunicorn/Uvicorn worker; public HTTP default is port 5001. |
 | PostgreSQL | All persistent user state | `DATABASE_URL` is mandatory; there is no current file-persistence fallback. |
 | Enclave service | Encrypted read-side and decrypt workflows | Local mode is not hardware-attested. Keep its private port off the public Internet except for a deliberately designed attestation path. |
-| Agent supervisor and runner | Hosted `/v1/model_api/chat/send` | Must share runtime-token configuration with the backend and publish a live supervisor heartbeat. |
-| Resident consumer | Independent agent Chat | Alternative to hosted Chat; polls and posts encrypted replies. Needs an `openssl` binary on `PATH` for privately-signed MCP servers; see below. |
+| Runtime V2 worker pool | Hosted `/v1/model_api/chat/send` | Shares PostgreSQL and runtime-token configuration with the backend and publishes worker-capacity heartbeats. |
+| Resident consumer | Independent agent Chat | Alternative to hosted Chat; polls and posts encrypted replies. |
 | WebSocket ingest | Screen/broadcast ingestion | The ASGI background service binds the configured ingest port, normally 9998. |
 | APNs credentials | Apple push and Live Activity | Optional; Chat storage works without push delivery. |
 | Object storage configuration | Large frames, chat files, and onboarding archives where enabled | Inventory and back up this data separately from PostgreSQL. |
@@ -79,7 +78,7 @@ not complete. Use this only for development or a deliberately limited product.
 Add a local enclave service and either:
 
 - an independent resident consumer connected to an agent entry point; or
-- the supervisor and runner required by hosted model API routes.
+- the pooled Runtime V2 worker required by hosted model API routes.
 
 This profile can exercise end-to-end workflows but is not equivalent to a
 hardware-attested deployment. Prefer one trusted tenant per host.
@@ -101,8 +100,14 @@ these settings:
 | Setting | Requirement |
 | --- | --- |
 | `DATABASE_URL` | Required. Use a dedicated PostgreSQL role and database. External connections must use TLS, such as `sslmode=require`, and should verify the server certificate where the environment supports it. |
-| `FEEDLING_HOST_ALL` | Current production entry points fail fast unless hosted discovery is enabled. Set consistently with the supervisor design you deploy. |
-| `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and supervisor through a secret manager, and never bake it into an image. |
+| `FEEDLING_HOSTED_RUNTIME_POLICY` | Hosted deployments are `v2_only`. The reference Compose files set this literally; retired resident/per-user selectors are rejected. |
+| `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and Runtime V2 workers through a secret manager, and never bake it into an image. |
+| `FEEDLING_V2_MAX_WORKERS` | Bounds concurrent Runtime V2 turn slots per worker container. Size it together with PostgreSQL pool capacity and provider limits. |
+| `FEEDLING_V2_SANDBOX_PROVIDER` | Defaults to `disabled`. Set to `e2b` only on worker deployments that are allowed to send decrypted artifact bytes to E2B. Text-only turns and virtual text edits do not need it. |
+| `E2B_API_KEY` + `FEEDLING_V2_E2B_TEMPLATE` | Required together when the sandbox provider is `e2b`. The template must implement Feedling's fixed extractor contract; inject the API key through the deployment secret channel. |
+| `FEEDLING_V2_E2B_ALLOW_INTERNET` | Defaults to `0`. Enabling sandbox internet is a deployment-level trust and egress decision, never a model-selected option. |
+| `FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED` | Defaults to `0`. Encrypted trajectory capture remains on, but provider-backed offline failure review must stay opt-in because it uses the account's configured provider credential and is not a production retry. |
+| `FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE` | Must be valid when review is enabled; bounds pending plus running review work across the database-backed fleet. The current default is 64. This is an admission ceiling, not a retention policy. |
 | `FEEDLING_ENCLAVE_URL` | Required for enclave-backed Memory, screen, worldbook, and decrypt operations. Use a private authenticated network path. |
 | `FEEDLING_ASGI_BACKGROUND` | Enable on the real backend instance if it owns the wake bus and screen WebSocket listener. Do not enable competing development instances against the same ports without understanding leader election. |
 | `FEEDLING_PUBLIC_BASE_URL` | Set to the externally reachable HTTPS base URL. |
@@ -159,8 +164,9 @@ tickets or CI logs.
 5. Start PostgreSQL connectivity and the enclave path before the backend. The
    gunicorn startup hook applies Alembic migrations and fails if required hosted
    configuration is missing.
-6. Start the backend, then the supervisor/runner or resident consumer. Verify
-   that the supervisor heartbeat is fresh before testing hosted Chat.
+6. Start the backend, then the Runtime V2 worker or an independent resident
+   consumer. Verify that worker capacity and heartbeats are fresh before testing
+   hosted Chat.
 7. Put the API behind HTTPS. Expose 443 publicly; expose the screen WebSocket
    port only if the client requires it and its authentication path has been
    reviewed. Keep PostgreSQL, runner control, and internal enclave ports private.
@@ -181,8 +187,16 @@ traffic until all enabled capabilities pass:
   model and completes a test envelope decrypt.
 - Memory `index` and `fetch` complete instead of returning
   `enclave_unavailable`.
-- Hosted Chat has a fresh supervisor heartbeat and a test turn produces an
+- Hosted Chat has a fresh Runtime V2 worker heartbeat and a test turn produces an
   encrypted assistant response; or the resident consumer polls and responds.
+- Provider cache telemetry reports the expected route and usage fields. Where
+  prompt caching matters operationally, run a two-turn cache-hit canary against
+  the exact provider/model; do not infer a live hit from unit tests. The
+  checked-in canary currently targets OpenRouter, not native Bedrock.
+- If E2B artifact parsing is enabled, an uncached synthetic artifact is parsed
+  through the configured template and emits one sandbox usage event. If it is
+  disabled, the same cache miss fails as `sandbox_unavailable` without parsing
+  in the backend or shared worker.
 - Screen WebSocket ingest works if enabled.
 - Push delivery works if APNs is configured; otherwise the operator has
   explicitly accepted that push is disabled.
@@ -198,6 +212,13 @@ snapshots without large ciphertext objects can restore references that no longer
 resolve. Protect the content/enclave key material separately: losing it can make
 otherwise healthy ciphertext permanently unreadable, while leaking it changes
 the privacy impact of a database backup.
+
+PostgreSQL also holds encrypted Runtime V2 workspace bodies and
+trajectory/review payloads. Conversation compaction does not authorize deletion
+of raw Chat rows, and the 5,000-message constant is only a process hot-window
+limit. Trajectory rows currently have no automatic time-based retention job, so
+operators must choose and document an explicit retention/export/deletion policy
+before enabling provider-backed failure review broadly.
 
 Document recovery point and recovery time targets for your deployment; Feedling
 does not supply them for self-hosted systems. Test restores after schema and key
@@ -231,7 +252,7 @@ operator will respond to a leaked client credential.
   a secret manager.
 - Do not expose admin/debug routes or internal ports through the public proxy.
 - Monitor authentication failures, `5xx`, database pool exhaustion, stale
-  supervisor heartbeats, enclave failures, queue age, disk use, and backup age.
+  Runtime V2 worker heartbeats, enclave failures, queue age, disk use, and backup age.
 - Keep unrelated tenant code and secrets out of a shared process runner.
 - Commission an isolation and abuse review before offering the deployment to
   untrusted public users.

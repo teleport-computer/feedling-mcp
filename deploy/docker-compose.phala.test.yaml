@@ -254,6 +254,8 @@ services:
       # Proactive wake is native-only after P2-2b and no longer uses this flag.
       # See core/util.runtime_v2_default_on().
       FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
+      # Hosted model-API accounts have one runtime: pooled Runtime V2.
+      FEEDLING_HOSTED_RUNTIME_POLICY: "v2_only"
       # TEST-ONLY: genesis v2 (foreground-fast onboarding). Greet on 3-5 core +
       # identity baseline, push the heavy reduce (the ~37% prod failure surface)
       # to the background. Prod compose deliberately omits this (keeps the v1
@@ -264,16 +266,10 @@ services:
       # worker.genesis_combined_map_enabled(). Flip off to revert to the exact old
       # split-map path (hard rollback). Enabled on both test and prod.
       FEEDLING_GENESIS_COMBINED_MAP: "true"
-      # Host-all: every configured user is served by the agent-runner (the send
-      # routing must agree with the supervisor's host_all discovery). Empty = off
-      # (per-user flag still required). Mirror the agent-runner's value.
-      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
       # Legacy memory migration is opt-in. Empty = off; set to 1 only after
-      # seeded real-device Garden verification passes. Mirror agent-runner.
+      # seeded real-device Garden verification passes. Mirror the pooled V2 worker.
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-      # Stage-D runtime token secret — the BACKEND is the verifier (enclave whoami
-      # falls back here), so it MUST share the agent-runner's secret or token auth
-      # 401s. Empty = off. Encrypted env, not baked into compose_hash.
+      # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
     ports:
       - "5001:5001"

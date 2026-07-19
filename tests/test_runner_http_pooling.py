@@ -5,8 +5,8 @@
 频率轮询后端（/v1/proactive/jobs/poll、/v1/chat/poll），所以这条路上的握手是
 纯浪费——实测同一批 10 个请求，模块级 5203ms/请求 vs 共享 Client 973ms/请求。
 
-两条不变量：
-1. 这两个文件里不许再出现裸的 httpx.<verb>(——新增调用点必须走池化 client。
+Two invariants for the independent resident consumer:
+1. 不许出现裸的 httpx.<verb>(——新增调用点必须走池化 client。
 2. 客户端的 keepalive_expiry 必须 **短于** 服务端的 keepalive（gunicorn_conf.py
    = 75s）。否则客户端会留着一条服务端已经关掉的连接，把我们刚在服务端修掉的
    那个 stale-socket 竞态原样搬到客户端来。
@@ -20,7 +20,6 @@ import pytest
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 _RUNNER_FILES = [
     _REPO / "tools" / "chat_resident_consumer.py",
-    _REPO / "backend" / "agent_runtime" / "supervisor.py",
 ]
 
 # 模块级便捷函数（httpx.get/post/...），不含 client.get 这类方法调用。

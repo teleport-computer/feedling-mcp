@@ -2,7 +2,9 @@
 
 > **STATUS: HISTORICAL SNAPSHOT.** This handoff is pinned to the audited SHA
 > below and intentionally preserves the gaps seen on that date. For current
-> implementation status use `docs/superpowers/specs/runtime-v2-parity-matrix.md`;
+> implementation status use `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`;
+> for the tool-level facade mapping use
+> `docs/superpowers/specs/runtime-v2-parity-matrix.md`;
 > for live rollout gates use `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`.
 
 > Audited upstream: `feat/hosted-runtime-v2` at
@@ -343,8 +345,9 @@ content, while the target pg CVM stores plaintext on LUKS2 FDE and deletes the
 application envelope/decrypt layer. Do not turn encryption into a permanent
 compaction or trajectory requirement.
 
-Use docs/HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md as the acceptance
-contract and attach evidence for every rollout gate. Treat 574.0 tokens/turn and
-2.3333 calls/turn as the current offline shared-fixture result, not production
-capacity proof.
+This dated handoff is historical evidence, not the current acceptance contract.
+Use `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md` for implementation status and
+`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md` for the live acceptance gates. The 574.0
+tokens/turn and 2.3333 calls/turn figures below are the offline shared-fixture
+result at the audited SHA, not current production capacity proof.
 ```

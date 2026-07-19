@@ -45,6 +45,18 @@ def test_openrouter_known_family_is_resolved_separately():
     assert resolved.family == "openrouter_modern"
 
 
+def test_bedrock_anthropic_family_uses_native_default_endpoint():
+    resolved = frontier.resolve_model_limit(
+        "aws-bedrock",
+        "us.anthropic.claude-sonnet-4-6",
+    )
+
+    assert resolved.provider == "bedrock"
+    assert resolved.context_window_tokens == 128_000
+    assert resolved.source == "audited_family"
+    assert resolved.family == "bedrock_anthropic_modern"
+
+
 def test_deployment_override_wins_over_audited_family():
     resolved = frontier.resolve_model_limit(
         "openai",
@@ -66,18 +78,30 @@ def test_deployment_override_precedence_is_most_specific_first():
         "*:*": 8_192,
     }
 
-    assert frontier.resolve_model_limit(
-        "openai", "gpt-4o-mini", deployment_overrides=overrides
-    ).context_window_tokens == 131_072
-    assert frontier.resolve_model_limit(
-        "openai", "unlisted", deployment_overrides=overrides
-    ).context_window_tokens == 65_536
-    assert frontier.resolve_model_limit(
-        "some-relay", "gpt-4o-mini", deployment_overrides=overrides
-    ).context_window_tokens == 16_384
-    assert frontier.resolve_model_limit(
-        "some-relay", "unlisted", deployment_overrides=overrides
-    ).context_window_tokens == 8_192
+    assert (
+        frontier.resolve_model_limit(
+            "openai", "gpt-4o-mini", deployment_overrides=overrides
+        ).context_window_tokens
+        == 131_072
+    )
+    assert (
+        frontier.resolve_model_limit(
+            "openai", "unlisted", deployment_overrides=overrides
+        ).context_window_tokens
+        == 65_536
+    )
+    assert (
+        frontier.resolve_model_limit(
+            "some-relay", "gpt-4o-mini", deployment_overrides=overrides
+        ).context_window_tokens
+        == 16_384
+    )
+    assert (
+        frontier.resolve_model_limit(
+            "some-relay", "unlisted", deployment_overrides=overrides
+        ).context_window_tokens
+        == 8_192
+    )
 
 
 def test_unknown_model_and_custom_endpoint_require_an_explicit_limit():
@@ -141,12 +165,11 @@ def test_utf8_and_structural_estimation_is_conservative_and_deterministic():
     assert frontier.canonical_json(first) == '{"a":"中","b":1}'
     assert frontier.estimate_structured_tokens(
         first, structural_overhead_tokens=7
-    ) == frontier.estimate_structured_tokens(
-        second, structural_overhead_tokens=7
+    ) == frontier.estimate_structured_tokens(second, structural_overhead_tokens=7)
+    assert (
+        frontier.estimate_structured_tokens(first, structural_overhead_tokens=7)
+        == len(frontier.canonical_json(first).encode("utf-8")) + 7
     )
-    assert frontier.estimate_structured_tokens(
-        first, structural_overhead_tokens=7
-    ) == len(frontier.canonical_json(first).encode("utf-8")) + 7
 
 
 def test_messages_include_per_message_structural_overhead():
@@ -300,9 +323,7 @@ def test_tool_transcript_is_indivisible_instead_of_partially_admitted():
     exchanges = [
         {
             "assistant": {
-                "tool_calls": [
-                    {"id": "call_1", "name": "web_fetch", "arguments": {}}
-                ]
+                "tool_calls": [{"id": "call_1", "name": "web_fetch", "arguments": {}}]
             },
             "tool_results": [{"tool_call_id": "call_1", "content": "x" * 750}],
         },
@@ -382,26 +403,32 @@ def test_provider_metadata_and_calibrated_estimator_are_supported():
 
     assert resolved.context_window_tokens == 65_536
     assert resolved.source == "provider_metadata"
-    assert frontier.estimate_utf8_tokens(
-        "abcdefgh", utf8_bytes_per_token=4
-    ) == 2
+    assert frontier.estimate_utf8_tokens("abcdefgh", utf8_bytes_per_token=4) == 2
 
 
 def test_image_payload_uses_fixed_reserve_instead_of_base64_text_size():
-    tiny = [{
-        "role": "user",
-        "content": [{
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,AAAA"},
-        }],
-    }]
-    huge = [{
-        "role": "user",
-        "content": [{
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64," + "A" * 500_000},
-        }],
-    }]
+    tiny = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                }
+            ],
+        }
+    ]
+    huge = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64," + "A" * 500_000},
+                }
+            ],
+        }
+    ]
 
     assert frontier.messages_component(tiny).estimated_tokens == (
         frontier.messages_component(huge).estimated_tokens
@@ -412,24 +439,23 @@ def _run_loop(*, monkeypatch, provider, fold, build_messages, **kwargs):
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
 
     async def dispatch(calls):
-        return [
-            ToolResult(call_id=call.id, content="x" * 65_000)
-            for call in calls
-        ]
+        return [ToolResult(call_id=call.id, content="x" * 65_000) for call in calls]
 
     async def on_reply(_text, *, final):
         assert final is True
 
-    return asyncio.run(tool_loop.run_tool_loop(
-        provider_config=kwargs.pop("provider_config"),
-        build_messages=build_messages,
-        dispatch_tools=dispatch,
-        on_reply=on_reply,
-        fold_new_messages=fold,
-        add_usage=lambda _usage: None,
-        max_calls=kwargs.pop("max_calls", 5),
-        **kwargs,
-    ))
+    return asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=kwargs.pop("provider_config"),
+            build_messages=build_messages,
+            dispatch_tools=dispatch,
+            on_reply=on_reply,
+            fold_new_messages=fold,
+            add_usage=lambda _usage: None,
+            max_calls=kwargs.pop("max_calls", 5),
+            **kwargs,
+        )
+    )
 
 
 def test_tool_loop_rejects_unconfigured_custom_limit_before_provider_io(monkeypatch):
@@ -451,7 +477,8 @@ def test_tool_loop_rejects_unconfigured_custom_limit_before_provider_io(monkeypa
             provider=provider,
             fold=fold,
             build_messages=lambda transcript: [
-                {"role": "user", "content": "hello"}, *transcript,
+                {"role": "user", "content": "hello"},
+                *transcript,
             ],
             provider_config=provider_client.ProviderConfig(
                 "custom",
@@ -469,11 +496,17 @@ def test_round_frontier_stops_aggregate_native_transcript_before_provider_call(
 ):
     calls = []
     scripted = [
-        {"reply": "", "tool_calls": [{
-            "id": f"c{index}",
-            "name": "memory_search",
-            "args": {"query": "q"},
-        }], "usage": {}}
+        {
+            "reply": "",
+            "tool_calls": [
+                {
+                    "id": f"c{index}",
+                    "name": "memory_search",
+                    "args": {"query": "q"},
+                }
+            ],
+            "usage": {},
+        }
         for index in range(1, 5)
     ]
 
@@ -490,7 +523,8 @@ def test_round_frontier_stops_aggregate_native_transcript_before_provider_call(
             provider=provider,
             fold=fold,
             build_messages=lambda transcript: [
-                {"role": "user", "content": "start"}, *transcript,
+                {"role": "user", "content": "start"},
+                *transcript,
             ],
             provider_config=provider_client.ProviderConfig(
                 "custom",
@@ -508,11 +542,16 @@ def test_round_frontier_stops_aggregate_native_transcript_before_provider_call(
     # Every 65K exchange is valid alone; only their aggregate crosses the
     # fourth round's single total frontier, which is checked pre-request.
     assert len(calls) == 3
-    assert len([
-        message
-        for message in calls[-1][0]
-        if message.__class__.__name__ == "ToolExchange"
-    ]) == 2
+    assert (
+        len(
+            [
+                message
+                for message in calls[-1][0]
+                if message.__class__.__name__ == "ToolExchange"
+            ]
+        )
+        == 2
+    )
     assert "tool_transcript" in caught.value.required_components
 
 
@@ -532,10 +571,14 @@ def test_late_input_is_in_required_frontier_before_first_provider_call(monkeypat
             provider=provider,
             fold=fold,
             build_messages=lambda transcript: [
-                {"role": "system", "content": "stable prefix"}, *transcript,
+                {"role": "system", "content": "stable prefix"},
+                *transcript,
             ],
             provider_config=provider_client.ProviderConfig(
-                "custom", "test-8k", "key", context_window_tokens=8_192,
+                "custom",
+                "test-8k",
+                "key",
+                context_window_tokens=8_192,
             ),
             fold_before_first=True,
             prompt_output_reserve_tokens=1_024,
@@ -563,16 +606,22 @@ def test_tool_catalog_is_counted_and_omitted_whole_when_only_it_does_not_fit(
         provider=provider,
         fold=fold,
         build_messages=lambda transcript: [
-            {"role": "system", "content": "stable prefix"}, *transcript,
+            {"role": "system", "content": "stable prefix"},
+            *transcript,
         ],
         provider_config=provider_client.ProviderConfig(
-            "custom", "test-20k", "key", context_window_tokens=20_000,
+            "custom",
+            "test-20k",
+            "key",
+            context_window_tokens=20_000,
         ),
-        extra_tool_specs=[ToolSpec(
-            "large_read",
-            "z" * 20_000,
-            {"type": "object", "properties": {}},
-        )],
+        extra_tool_specs=[
+            ToolSpec(
+                "large_read",
+                "z" * 20_000,
+                {"type": "object", "properties": {}},
+            )
+        ],
         prompt_output_reserve_tokens=2_000,
         prompt_safety_margin_tokens=0,
     )

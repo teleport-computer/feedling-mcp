@@ -27,4 +27,4 @@ def test_alembic_single_head():
     cfg = Config(str(here / "alembic.ini"))
     cfg.set_main_option("script_location", str(here / "alembic"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
-    assert list(heads) == ["0041_v2_mcp_mutation_attempts"]
+    assert list(heads) == ["0047_model_route_context_window"]

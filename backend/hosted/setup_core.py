@@ -19,6 +19,7 @@ is ever introduced here. Module-level references (``provider_client``,
 
 from __future__ import annotations
 
+import os
 import threading
 import uuid
 from functools import wraps
@@ -34,10 +35,106 @@ import provider_client
 from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
 from hosted import turn as hosted_turn
+from model_api_runtime.v2 import prompt_frontier
 
 
 _REASONING_EFFORT_OFF = {"off", "none", "no", "false", "0", "disabled"}
 _REASONING_EFFORT_LEVELS = {"low", "medium", "high"}
+
+
+def _prompt_frontier_runtime_numbers() -> tuple[dict[str, int], int, int]:
+    """Read the same frontier knobs as the V2 runner without importing it.
+
+    Importing ``worker`` from the setup process would initialize the whole
+    runtime and its DB/provider dependencies.  Keeping this parser local also
+    makes setup fail loudly when API and runner configuration is malformed.
+    """
+
+    overrides = prompt_frontier.parse_deployment_overrides(
+        os.environ.get("FEEDLING_V2_PROMPT_CONTEXT_WINDOWS_JSON")
+    )
+    try:
+        output_reserve = int(
+            os.environ.get("FEEDLING_V2_PROMPT_OUTPUT_RESERVE_TOKENS", "4096")
+        )
+        safety_margin = int(
+            os.environ.get("FEEDLING_V2_PROMPT_SAFETY_MARGIN_TOKENS", "1024")
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("prompt frontier reserve configuration must be integers") from exc
+    if output_reserve <= 0 or safety_margin < 0:
+        raise ValueError("prompt frontier reserves are invalid")
+    return overrides, output_reserve, safety_margin
+
+
+def _resolve_route_context_window(
+    provider: str,
+    model: str,
+    base_url: str,
+    supplied_value,
+) -> tuple[int | None, tuple[dict, int] | None]:
+    """Resolve and preflight the context-window contract for a saved route.
+
+    ``context_window_tokens`` is a conservative lower bound for this exact
+    provider/model/destination, not a marketing maximum.  Audited first-party
+    families and deployment overrides may supply it automatically.  Every
+    unaudited route must provide it explicitly; otherwise setup is rejected
+    before encryption, provider I/O, or a DB mutation.
+    """
+
+    try:
+        overrides, output_reserve, safety_margin = (
+            _prompt_frontier_runtime_numbers()
+        )
+    except ValueError as exc:
+        return None, (
+            {
+                "error": "prompt_frontier_configuration_invalid",
+                "detail": str(exc),
+            },
+            503,
+        )
+
+    try:
+        limit = prompt_frontier.resolve_model_limit(
+            provider,
+            model,
+            base_url=base_url,
+            provider_context_window_tokens=supplied_value,
+            deployment_overrides=overrides,
+        )
+        budget = prompt_frontier.build_prompt_budget(
+            limit.context_window_tokens,
+            output_reserve_tokens=output_reserve,
+            safety_margin_tokens=safety_margin,
+        )
+        if budget.input_budget_tokens <= 0:
+            raise ValueError(
+                "context window must exceed the configured output reserve "
+                "plus safety margin"
+            )
+    except prompt_frontier.PromptContextLimitUnconfigured:
+        return None, (
+            {
+                "error": prompt_frontier.PromptContextLimitUnconfigured.code,
+                "detail": (
+                    "context_window_tokens is required for an unaudited "
+                    "provider/model route; set it to a verified conservative "
+                    "lower bound for this exact endpoint"
+                ),
+                "required": "context_window_tokens",
+            },
+            400,
+        )
+    except ValueError as exc:
+        return None, (
+            {
+                "error": "invalid_context_window_tokens",
+                "detail": str(exc),
+            },
+            400,
+        )
+    return limit.context_window_tokens, None
 
 
 def _normalize_reasoning_effort(value) -> str | None:
@@ -85,6 +182,8 @@ def _public_route(route: dict | None) -> dict:
     }
     if route.get("reasoning_effort"):
         safe["reasoning_effort"] = route["reasoning_effort"]
+    if route.get("context_window_tokens") is not None:
+        safe["context_window_tokens"] = int(route["context_window_tokens"])
     return safe
 
 
@@ -280,13 +379,34 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     except provider_client.ProviderError as e:
         return {"error": str(e)}, 400
 
+    # Idempotent setup of an already-saved exact route may reuse its persisted
+    # frontier so older clients do not have to resend the new field forever.
+    # A model or destination change is a new contract and must resolve again.
+    active = hosted_config_store.load_active_route(store)
+    reuse = bool(
+        active
+        and active["provider"] == provider
+        and active["base_url"] == base_url
+    )
+    supplied_context_window = payload.get("context_window_tokens")
+    if (
+        "context_window_tokens" not in payload
+        and reuse
+        and active.get("model") == model
+    ):
+        supplied_context_window = active.get("context_window_tokens")
+    context_window_tokens, frontier_error = _resolve_route_context_window(
+        provider,
+        model,
+        base_url,
+        supplied_context_window,
+    )
+    if frontier_error is not None:
+        return frontier_error
+
     # 幂等锚点：当前 active route 的 credential。若它的 (provider, base_url) 与
     # 请求匹配，就复用/更新它；否则新建一条。credentials 没有唯一索引（同 provider
     # 允许多把 key），所以幂等必须在这里用代码保证，不能靠 ON CONFLICT。
-    active = hosted_config_store.load_active_route(store)
-    reuse = bool(active
-                 and active["provider"] == provider
-                 and active["base_url"] == base_url)
     existing = None
     if reuse:
         existing = db.model_api_credential_get(store.user_id, active["credential_id"])
@@ -299,7 +419,14 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
 
     try:
         provider_client.test_provider_key(
-            provider_client.ProviderConfig(provider, model, provider_key, base_url))
+            provider_client.ProviderConfig(
+                provider,
+                model,
+                provider_key,
+                base_url,
+                context_window_tokens=context_window_tokens,
+            )
+        )
     except provider_client.ProviderError as e:
         # Log enough to triage a user-reported "key won't validate" without ever
         # logging the raw key: the failure detail (e.g. provider_http_404 for a
@@ -311,16 +438,20 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
         return {"error": "provider_test_failed", "detail": str(e),
                 "status_code": e.status_code}, 400
 
-    # For openai_compatible relays, probe once whether the relay implements the
-    # OpenAI Responses API. codex speaks the Responses wire; the in-CVM LiteLLM
-    # gateway passes that straight through when the relay supports /v1/responses
-    # (preserving codex's tool loop) and otherwise forces the chat-completions
-    # bridge. We persist the answer so the supervisor picks the right transport
-    # without re-probing every tick. Only openai_compatible uses the flag.
+    # For openai_compatible relays, probe the Responses capability once and
+    # persist it for the native provider client. This is transport metadata for
+    # the unified V2 loop, not a runtime selector.
     supports_responses = False
     if provider == "openai_compatible":
         supports_responses = provider_client.probe_responses_support(
-            provider_client.ProviderConfig(provider, model, provider_key, base_url))
+            provider_client.ProviderConfig(
+                provider,
+                model,
+                provider_key,
+                base_url,
+                context_window_tokens=context_window_tokens,
+            )
+        )
         print(
             f"[model_api:{store.user_id}] openai_compatible /responses probe -> "
             f"supports={supports_responses} base_url={base_url}"
@@ -371,7 +502,12 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             return {"error": "model_api_credential_write_failed"}, 500
 
     route_id = db.model_api_route_upsert(
-        store.user_id, credential_id, model, reasoning_effort)
+        store.user_id,
+        credential_id,
+        model,
+        reasoning_effort,
+        context_window_tokens,
+    )
     if not route_id:
         restore_error = _restore_after_setup_write_failure(
             store,
@@ -457,10 +593,10 @@ def model_api_set_hosting(store) -> tuple[dict, int]:
 def model_api_key_envelope(store) -> tuple[dict, int]:
     """Return the caller's OWN ``api_key_envelope`` ciphertext (active credential).
 
-    Lets the agent-runner supervisor (authenticating with the user's API key)
-    self-fetch the provider-key envelope and enclave-decrypt it JIT, instead of a
-    static roster carrying per-user secrets. The envelope is ciphertext the server
-    cannot decrypt; only the enclave can — so this never exposes the provider key.
+    Compatibility endpoint for explicitly independent consumers that need to
+    fetch the provider-key envelope and enclave-decrypt it JIT. Hosted Runtime
+    V2 reads the active route directly and does not use a static roster. The
+    envelope is ciphertext the API process cannot decrypt; only the enclave can.
 
     An unconfigured user (no active route) collapses to the same
     ``model_api_key_envelope_missing`` 404 the legacy blob path returned, keeping the
@@ -494,9 +630,30 @@ def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, i
             route["provider"], route["model"], route["base_url"])
     except provider_client.ProviderError as e:
         return {"error": "model_api_config_invalid", "detail": str(e)}, 400
+    context_window_tokens, frontier_error = _resolve_route_context_window(
+        provider,
+        model,
+        base_url,
+        route.get("context_window_tokens"),
+    )
+    if frontier_error is not None:
+        db.model_api_route_mark_test(
+            store.user_id,
+            route["id"],
+            status="failed",
+            error=str(frontier_error[0].get("error") or "")[:240],
+        )
+        return frontier_error
     try:
         provider_client.test_provider_key(
-            provider_client.ProviderConfig(provider, model, provider_key, base_url))
+            provider_client.ProviderConfig(
+                provider,
+                model,
+                provider_key,
+                base_url,
+                context_window_tokens=context_window_tokens,
+            )
+        )
     except provider_client.ProviderError as e:
         # Not checked on purpose: the response below is already an accurate 400
         # (provider_test_failed) regardless of whether this write lands, so callers
@@ -789,9 +946,28 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
             envelope, caller_api_key, purpose="model_api_provider_key").decode("utf-8")
     except Exception as e:
         return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
+    context_window_tokens, frontier_error = _resolve_route_context_window(
+        route["provider"],
+        route["model"],
+        route["base_url"],
+        route.get("context_window_tokens"),
+    )
+    if frontier_error is not None:
+        db.model_api_route_mark_test(
+            store.user_id,
+            route["id"],
+            status="failed",
+            error=str(frontier_error[0].get("error") or "")[:240],
+        )
+        return frontier_error
     try:
         provider_client.test_provider_key(provider_client.ProviderConfig(
-            route["provider"], route["model"], provider_key, route["base_url"]))
+            route["provider"],
+            route["model"],
+            provider_key,
+            route["base_url"],
+            context_window_tokens=context_window_tokens,
+        ))
     except provider_client.ProviderError as e:
         # Not checked on purpose: both callers (route_test, route_activate) already
         # surface an accurate 400 below regardless of whether this write lands —
@@ -875,6 +1051,27 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
         provider, model, base_url = provider_client.validate_config(provider, model, base_url)
     except provider_client.ProviderError as e:
         return {"error": str(e)}, 400
+    supplied_context_window = payload.get("context_window_tokens")
+    if "context_window_tokens" not in payload and cred is not None:
+        persisted_route = next(
+            (
+                route
+                for route in db.model_api_routes_list(store.user_id)
+                if route.get("credential_id") == cred["id"]
+                and route.get("model") == model
+            ),
+            None,
+        )
+        if persisted_route is not None:
+            supplied_context_window = persisted_route.get("context_window_tokens")
+    context_window_tokens, frontier_error = _resolve_route_context_window(
+        provider,
+        model,
+        base_url,
+        supplied_context_window,
+    )
+    if frontier_error is not None:
+        return frontier_error
 
     # Tracks whether THIS request minted a new credential row (vs. reusing one via
     # credential_id) — only what we created here gets cleaned up on a later failure;
@@ -887,22 +1084,19 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
             store, raw_key.encode("utf-8"), item_id=f"model_api_key_{uuid.uuid4().hex}")
         if envelope is None:
             return {"error": "cannot_encrypt_provider_key", "detail": err}, 409
-        # Mirrors model_api_setup's probe above: for openai_compatible relays, find
-        # out once whether the relay implements POST /v1/responses so the supervisor
-        # picks native Responses (preserving codex's tool loop) instead of forcing
-        # every route through the LiteLLM chat-completions bridge. Without this the
-        # credential defaults to supports_responses=False even when the relay does
-        # support it, silently degrading memory/tools for the user.
-        # Mirrors model_api_setup's probe above: for openai_compatible relays, find
-        # out once whether the relay implements POST /v1/responses so the supervisor
-        # picks native Responses (preserving codex's tool loop) instead of forcing
-        # every route through the LiteLLM chat-completions bridge. Without this the
-        # credential defaults to supports_responses=False even when the relay does
-        # support it, silently degrading memory/tools for the user.
+        # Mirror model_api_setup's one-time openai_compatible Responses probe so
+        # the native provider client does not silently lose the relay capability.
         supports_responses = False
         if provider == "openai_compatible":
             supports_responses = provider_client.probe_responses_support(
-                provider_client.ProviderConfig(provider, model, raw_key, base_url))
+                provider_client.ProviderConfig(
+                    provider,
+                    model,
+                    raw_key,
+                    base_url,
+                    context_window_tokens=context_window_tokens,
+                )
+            )
             print(
                 f"[model_api:{store.user_id}] openai_compatible /responses probe -> "
                 f"supports={supports_responses} base_url={base_url}"
@@ -918,7 +1112,12 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
             return {"error": "model_api_credential_write_failed"}, 500
 
     route_id = db.model_api_route_upsert(
-        store.user_id, credential_id, model, reasoning_effort)
+        store.user_id,
+        credential_id,
+        model,
+        reasoning_effort,
+        context_window_tokens,
+    )
     if not route_id:
         # Don't strand the credential this request just minted: it holds a real
         # encrypted provider key the user can never see (no route to surface it
@@ -939,9 +1138,9 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
 def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None) -> tuple[dict, int]:
     """先同步测活，通过才切换。测不过 → 400，旧 active 纹丝不动。
 
-    为什么必须 gate：db.list_agent_runtime_enabled_users 只收 is_active AND
-    test_status='ok' 的用户。激活一条未测活的 route 会让该用户下个 tick 从 roster
-    消失，supervisor 走「用户离开 roster」分支杀掉 consumer 且不会自愈。
+    为什么必须 gate：Runtime V2 ownership 只接受 is_active AND
+    test_status='ok' 的 supported route；未测活 route 不能成为 job executor 的
+    provider config。
     """
     route = db.model_api_route_get(store.user_id, route_id)
     if not route:
@@ -976,8 +1175,7 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
     # V2 provider config is pinned once per turn. The fence+restore above bumps
     # its generation around activation, so a turn on the old route can spend
     # provider quota but cannot commit a reply/tool effect after this endpoint
-    # returns. Resident claim handoff remains owned by the supervisor after it
-    # kills the old per-user consumer, avoiding a double-provider call.
+    # returns. No resident process participates in the handoff.
     print(f"[model_api:{store.user_id}] activated route model={route['model']}")
     return {"active_route_id": route_id,
             "route": db.model_api_route_get(store.user_id, route_id)}, 200
@@ -987,9 +1185,9 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
 def model_api_route_test(store, route_id: str, *, api_key: str | None) -> tuple[dict, int]:
     """与 ``DELETE /routes/{id}`` 对称：测的若是当前 active route 且失败了，不能
     让它悬空——它仍 ``is_active=TRUE``（``_test_route_or_error`` 只翻 test_status，
-    从不碰 is_active），而 roster 只收 ``is_active AND test_status='ok'``，用户会
-    立刻从 roster 消失、consumer 被杀且不自愈。一次用户主动点的「测试连接」不该
-    有这种副作用，尤其是上游只是一次瞬时 429/超时。
+    从不碰 is_active），但 V2 eligibility 只收 ``is_active AND
+    test_status='ok'``。一次用户主动点的「测试连接」不应把 control tuple 留在
+    看似 V2-ready、实际没有 runnable provider 的状态。
 
     陷阱：``model_api_autoselect_active`` 只挑 ``NOT is_active`` 的候选——对着仍
     active 的这条失败 route 直接 autoselect 会试图让第二行也变 active，撞
@@ -1115,9 +1313,22 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
 
     active = db.model_api_active_route(store.user_id)
     if active and active["credential_id"] == credential_id:
+        context_window_tokens, frontier_error = _resolve_route_context_window(
+            active["provider"],
+            active["model"],
+            active["base_url"],
+            active.get("context_window_tokens"),
+        )
+        if frontier_error is not None:
+            return frontier_error
         try:
             provider_client.test_provider_key(provider_client.ProviderConfig(
-                active["provider"], active["model"], raw_key, active["base_url"]))
+                active["provider"],
+                active["model"],
+                raw_key,
+                active["base_url"],
+                context_window_tokens=context_window_tokens,
+            ))
         except provider_client.ProviderError as e:
             # 不落库：旧 key 与旧 test_status 都保持原样，用户不会掉出 roster。
             return {"error": "provider_test_failed", "detail": str(e),

@@ -1,4 +1,4 @@
-"""Environment ownership policy for Hosted Runtime V2 acceptance on Pre."""
+"""Fleet-wide Runtime V2-only ownership and deployment policy."""
 
 from __future__ import annotations
 
@@ -51,14 +51,15 @@ def _clear_control(user_id: str) -> None:
         )
 
 
-def test_policy_parser_defaults_per_user_and_rejects_typos(monkeypatch):
+def test_policy_parser_defaults_v2_and_rejects_retired_selectors(monkeypatch):
     monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
-    assert config_store.hosted_runtime_policy() == "per_user"
-    assert config_store.forced_hosted_runtime_mode() is None
+    assert config_store.hosted_runtime_policy() == "v2_only"
+    assert config_store.forced_hosted_runtime_mode() == "db_action_v2"
 
-    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2-onley")
-    with pytest.raises(RuntimeError, match="FEEDLING_HOSTED_RUNTIME_POLICY"):
-        config_store.hosted_runtime_policy()
+    for invalid in ("per_user", "resident_only", "v2-onley"):
+        monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, invalid)
+        with pytest.raises(RuntimeError, match="FEEDLING_HOSTED_RUNTIME_POLICY"):
+            config_store.hosted_runtime_policy()
 
 
 def test_v2_only_reconciles_every_runnable_shape_idempotently(monkeypatch):
@@ -71,9 +72,6 @@ def test_v2_only_reconciles_every_runnable_shape_idempotently(monkeypatch):
         _clear_control(user_id)
 
     monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
-    config_store.set_hosted_runtime_mode(
-        core_store.get_store(resident), config_store.HOSTED_RUNTIME_MODE_RESIDENT
-    )
     config_store.set_hosted_runtime_mode(
         core_store.get_store(already_v2),
         config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
@@ -106,9 +104,6 @@ def test_v2_only_reconciles_every_runnable_shape_idempotently(monkeypatch):
         mode, state, _generation = db.get_hosted_runtime_control_strict(user_id)
         assert (mode, state) == ("db_action_v2", "v2")
         assert jobs_store.get_wake_schedule(user_id) is not None
-        assert user_id not in {
-            row["user_id"] for row in db.list_agent_runtime_enabled_users()
-        }
     assert db.get_hosted_runtime_control_strict(split)[2] == 13
     assert db.get_hosted_runtime_control_strict(failed)[:2] == (
         "resident_cli",
@@ -332,97 +327,6 @@ def test_v2_cutover_immediately_enqueues_resident_unanswered_message(
     )]
 
 
-def test_v2_recutover_replaces_stale_generation_recovery_job(monkeypatch):
-    user_id = _seed_runnable("policy_recutover_chat_recovery")
-    _clear_control(user_id)
-    store = core_store.get_store(user_id)
-    db.chat_append(
-        user_id,
-        "resident-pending",
-        1.0,
-        {"id": "resident-pending", "role": "user", "body_ct": "b"},
-        0,
-    )
-    db.chat_append(
-        user_id,
-        "resident-late-reply",
-        2.0,
-        {"id": "resident-late-reply", "role": "openclaw", "body_ct": "r"},
-        0,
-    )
-    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
-
-    config_store.set_hosted_runtime_mode(
-        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-    )
-    first_generation = db.get_runtime_generation(user_id)
-    config_store.set_hosted_runtime_mode(
-        store, config_store.HOSTED_RUNTIME_MODE_RESIDENT
-    )
-    config_store.set_hosted_runtime_mode(
-        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-    )
-    current_generation = db.get_runtime_generation(user_id)
-
-    with db.get_pool().connection() as conn:
-        jobs = conn.execute(
-            "SELECT status,trace_id,expected_runtime_generation "
-            "FROM agent_jobs WHERE user_id=%s ORDER BY id",
-            (user_id,),
-        ).fetchall()
-    assert jobs == [
-        ("superseded", "resident-pending", first_generation),
-        ("pending", "resident-pending", current_generation),
-    ]
-
-
-def test_v2_recutover_does_not_fall_back_behind_newest_terminal_marker(
-    monkeypatch,
-):
-    user_id = _seed_runnable("policy_recutover_terminal_latest")
-    _clear_control(user_id)
-    store = core_store.get_store(user_id)
-    db.chat_append(
-        user_id,
-        "older-unanswered",
-        1.0,
-        {"id": "older-unanswered", "role": "user", "body_ct": "a"},
-        0,
-    )
-    db.chat_append(
-        user_id,
-        "newest-terminal",
-        2.0,
-        {"id": "newest-terminal", "role": "user", "body_ct": "b"},
-        0,
-    )
-    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
-    config_store.set_hosted_runtime_mode(
-        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-    )
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "UPDATE agent_jobs SET status='failed',finished_at=now(),"
-            "last_error='terminal test marker' "
-            "WHERE user_id=%s AND trace_id='newest-terminal'",
-            (user_id,),
-        )
-
-    config_store.set_hosted_runtime_mode(
-        store, config_store.HOSTED_RUNTIME_MODE_RESIDENT
-    )
-    config_store.set_hosted_runtime_mode(
-        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-    )
-
-    with db.get_pool().connection() as conn:
-        jobs = conn.execute(
-            "SELECT status,trace_id FROM agent_jobs WHERE user_id=%s ORDER BY id",
-            (user_id,),
-        ).fetchall()
-    assert jobs == [("failed", "newest-terminal")]
-
-
 def test_v2_verify_loop_uses_worker_liveness_without_resident_ping(monkeypatch):
     user_id = _seed_runnable("policy_verify_loop")
     _clear_control(user_id)
@@ -472,66 +376,34 @@ def test_failed_active_model_test_fences_current_v2_generation(monkeypatch):
     )
 
 
-def test_resident_only_is_a_fenced_rollback_and_blocks_conflicting_admin_flip(
-    monkeypatch,
-):
-    user_id = _seed_runnable("policy_rollback")
-    _clear_control(user_id)
-    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
-    store = core_store.get_store(user_id)
-    config_store.set_hosted_runtime_mode(
-        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-    )
-    v2_generation = db.get_hosted_runtime_control_strict(user_id)[2]
-
-    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "resident_only")
-    config_store.apply_hosted_runtime_policy(store)
-
-    assert db.get_hosted_runtime_control_strict(user_id) == (
-        "resident_cli",
-        "resident",
-        v2_generation + 2,
-    )
-    with pytest.raises(ValueError, match="resident_only"):
-        config_store.set_hosted_runtime_mode(
-            store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-        )
-
-
-def test_resident_only_fences_orphaned_v2_control_without_a_route(monkeypatch):
-    user_id = _seed_runnable("policy_orphan_rollback")
-    _clear_control(user_id)
-    store = core_store.get_store(user_id)
-    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
-    config_store.set_hosted_runtime_mode(
-        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-    )
-    v2_generation = db.get_runtime_generation(user_id)
-    assert db.model_api_config_delete_strict(user_id) is True
-
-    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "resident_only")
-    before = config_store.hosted_runtime_policy_status()
-    assert user_id in before["inconsistent_user_ids"]
-
-    result = config_store.reconcile_hosted_runtime_policy()
-
-    assert result["eligible"] >= 1
-    assert db.get_hosted_runtime_control_strict(user_id) == (
-        "resident_cli",
-        "resident",
-        v2_generation + 2,
-    )
-    assert config_store.hosted_runtime_policy_status()["inconsistent_count"] == 0
-
-
-def test_only_pre_compose_forces_v2_policy():
-    pre = yaml.safe_load((ROOT / "deploy/docker-compose.phala.pre.yaml").read_text())
-    assert pre["services"]["backend"]["environment"][
-        "FEEDLING_HOSTED_RUNTIME_POLICY"
-    ] == "${FEEDLING_HOSTED_RUNTIME_POLICY:-v2_only}"
-
-    for name in ("docker-compose.phala.yaml", "docker-compose.phala.test.yaml"):
+def test_all_managed_composes_force_literal_v2_policy():
+    for name in (
+        "docker-compose.phala.yaml",
+        "docker-compose.phala.test.yaml",
+        "docker-compose.phala.pre.yaml",
+    ):
         compose = yaml.safe_load((ROOT / "deploy" / name).read_text())
-        assert "FEEDLING_HOSTED_RUNTIME_POLICY" not in compose["services"][
-            "backend"
-        ]["environment"]
+        assert compose["services"]["backend"]["environment"][
+            "FEEDLING_HOSTED_RUNTIME_POLICY"
+        ] == "v2_only"
+
+
+def test_every_managed_runner_compose_has_only_v2_worker():
+    for name in (
+        "docker-compose.phala.runner.yaml",
+        "docker-compose.phala.pre.runner.yaml",
+        "docker-compose.phala.prod.runner.yaml",
+    ):
+        path = ROOT / "deploy" / name
+        source = path.read_text()
+        compose = yaml.safe_load(source)
+        assert set(compose["services"]) == {"serve-worker"}
+        worker = compose["services"]["serve-worker"]
+        assert worker["command"] == [
+            "python",
+            "-u",
+            "backend/model_api_runtime/v2/serve_worker.py",
+        ]
+        assert "volumes" not in compose
+        assert "backend/agent_runtime/supervisor.py" not in source
+        assert "AGENT_RUNTIME_USERS" not in source

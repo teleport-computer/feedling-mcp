@@ -44,6 +44,7 @@
       "base_url": "",
       "supports_responses": false,
       "reasoning_effort": "high",       // "" 表示未设置
+      "context_window_tokens": 128000,  // 该精确 route 的保守下限
       "is_active": true,
       "test_status": "ok",              // untested | ok | failed
       "last_test_at": "2026-07-10T08:12:03Z",   // "" 表示从未测过
@@ -73,12 +74,18 @@
   "base_url": "",               // 仅 openai_compatible 需要
   "label": "Anthropic Key A",   // 仅新建凭据时用；默认取 provider 名
   "reasoning_effort": "off",    // off | low | medium | high | 正整数字符串
+  "context_window_tokens": 128000, // 未审计模型/自定义中转必填；必须是已核实的保守下限
   "activate": true              // 建完立刻激活（走同步测活）
 }
 ```
 
 - 给 `credential_id` 时，`provider` / `base_url` **以该凭据为准**，payload 里的会被忽略。
 - 给 `api_key` 时**总是新建**一条 credential —— 同 provider 允许多把 key。
+- `context_window_tokens` 不是厂商宣传的最大值，而是这条
+  `(provider, model, base_url)` 确认可用的保守下限。已审计的官方模型族或部署
+  override 会自动解析并持久化；任意未知 OpenRouter 模型和
+  `openai_compatible` 自定义中转若不提供该值，会在 provider I/O 和写库前返回
+  `400 prompt_context_limit_unconfigured`，不会等到第一次聊天才失败。
 - 不带 `activate` → 返回 `{"route": {…}}`，新 route 处于 `untested` 且非 active。
 - 带 `activate: true` → 等价于建完立刻调 activate（含同步测活），返回与 activate 相同。
 
@@ -214,7 +221,8 @@
 
 ## 保持不变的端点（旧版 App 无感）
 
-`POST /v1/model_api/setup` 的**路径、请求体、响应体全部不变**，语义改为幂等 upsert：
+`POST /v1/model_api/setup` 保持原路径和兼容字段，并新增可选
+`context_window_tokens`，语义为幂等 upsert：
 
 - 若当前 active route 的 credential 的 `(provider, base_url)` 与请求匹配 → 更新那把 key
 - 否则 → 新建一条 credential
@@ -227,10 +235,11 @@
               "base_url": "", "api_key_hint": "sk-a…451", "test_status": "ok",
               "last_test_at": "…", "last_test_error": "", "created_at": "…",
               "updated_at": "…", "privacy_mode": "tdx_cvm_backend_runtime_option_a",
-              "reasoning_effort": "high" } }
+              "reasoning_effort": "high", "context_window_tokens": 128000 } }
 ```
 
-`reasoning_effort` **仅在设置过时出现**。无 active route 时 `config` 是 `{"configured": false}`。
+`reasoning_effort` **仅在设置过时出现**；`context_window_tokens` 在新建 route
+以及已审计 route 上返回。无 active route 时 `config` 是 `{"configured": false}`。
 
 `POST /test`、`POST /driver`、`DELETE /delete`、`GET /runtime`、`GET /key_envelope` 契约同样不变。
 

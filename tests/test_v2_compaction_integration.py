@@ -63,6 +63,7 @@ def _reset(uid):
         conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
+        conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
     conftest.set_v2_runtime_owner(uid)
 
 
@@ -98,10 +99,14 @@ def _make_fake_conversation_deps(messages: list[dict]):
             return "", row["watermark_ts"], row["version"]
         return str(env.get("plaintext") or ""), row["watermark_ts"], row["version"]
 
-    def _write_summary(uid, summary, watermark_ts, expected_version):
+    def _write_summary(
+        uid, summary, watermark_ts, expected_version, watermark_seq=None,
+    ):
         return jobs_store.upsert_summary_row_cas(
             uid, summary_envelope={"plaintext": summary},
-            watermark_ts=watermark_ts, expected_version=expected_version)
+            watermark_ts=watermark_ts, expected_version=expected_version,
+            watermark_seq=watermark_seq,
+        )
 
     return _read_messages, _read_tail, _read_summary, _write_summary
 
@@ -123,6 +128,23 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
         for i in range(n)
     ]
     messages.append({"id": f"m{n}", "ts": float(n + 1), "role": "user", "content": "final unanswered"})
+    # Persist an encrypted-shaped source row for every plaintext test message.
+    # The prompt adapters below stay fake, but compaction now runs beside the
+    # real durable transcript so this integration test proves advancing the
+    # summary watermark never changes source retention.
+    for message in messages:
+        db.chat_append_strict(
+            uid,
+            message["id"],
+            message["ts"],
+            {
+                "id": message["id"],
+                "role": message["role"],
+                "body_ct": f"cipher-{message['id']}",
+            },
+            core_store.MAX_CHAT_MESSAGES,
+        )
+    durable_count_before = db.chat_count_strict(uid)
     read_messages, read_tail, read_summary, write_summary = _make_fake_conversation_deps(messages)
 
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult())
@@ -205,3 +227,4 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
     new_tail = read_tail(uid, summary_row["watermark_ts"], 10_000)
     assert len(new_tail) < len(full_tail)
     assert len(new_tail) == worker._TAIL_KEEP
+    assert db.chat_count_strict(uid) == durable_count_before == len(messages)

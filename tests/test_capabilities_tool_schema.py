@@ -5,10 +5,11 @@ from capabilities import tool_schema, registry
 from provider_types import ToolSpec
 
 
-def test_catalog_covers_capabilities_plus_reply_minus_chat_image():
+def test_catalog_covers_capabilities_plus_synthetic_tools_minus_internal_reads():
     specs = tool_schema.build_tool_specs()
     names = {s.name for s in specs}
     assert "reply" in names
+    assert "task" in names
     assert "chat_image_read" not in names   # BUG-1 mitigation
     assert "chat_file_read" not in names    # internal-only, never offered to the model
     for cap in registry.CAPABILITIES:
@@ -24,9 +25,27 @@ def test_reply_tool_schema_shape():
     assert reply.parameters["properties"]["text"]["type"] == "string"
 
 
+def test_task_tool_is_read_only_and_requires_a_nonempty_prompt():
+    task = next(s for s in tool_schema.build_tool_specs() if s.name == "task")
+    assert task.parameters["required"] == ["prompt"]
+    assert task.parameters["properties"]["workspace_mode"]["enum"] == [
+        "read_only"
+    ]
+    assert tool_schema.validate_tool_args(
+        "task", {"prompt": "inspect the artifact"}
+    ) is None
+    assert tool_schema.validate_tool_args(
+        "task", {"prompt": "   "}
+    ) == "task requires a non-empty prompt"
+    assert "unsupported value" in tool_schema.validate_tool_args(
+        "task",
+        {"prompt": "edit it", "workspace_mode": "overlay"},
+    )
+
+
 def test_write_tools_have_object_params():
     specs = {s.name: s for s in tool_schema.build_tool_specs()}
-    for w in ("memory_write", "identity_patch", "schedule_wake"):
+    for w in ("memory_write", "identity_patch", "schedule_wake", "workspace_write"):
         assert specs[w].parameters["type"] == "object"
 
 

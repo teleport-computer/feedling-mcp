@@ -39,6 +39,7 @@ import pytest
 import conftest
 import db
 import provider_client
+from capabilities import registry as cap_registry
 from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
@@ -165,6 +166,135 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     assert _job_status(job_id)[0] == "completed"
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert worker._WAKE_SYSTEM_PROMPT in system_msg["content"]
+
+
+def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
+    monkeypatch,
+):
+    uid = "u_wake_workspace_prompt"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    responses = iter([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "read",
+                "name": "memory_index",
+                "args": {},
+            }],
+            "usage": {},
+        },
+        _text_round("workspace-aware wake"),
+    ])
+    provider_calls = []
+
+    async def fake_provider(_config, messages, *, tools=None):
+        provider_calls.append({"messages": messages, "tools": tools})
+        return next(responses)
+
+    class _Result:
+        def to_dict(self):
+            return {"ok": True, "data": {"items": []}}
+
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        fake_provider,
+    )
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _Result(),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "wake-reply"},
+    )
+    loader_calls = []
+    deps = _wake_deps(tail=[])
+    deps.load_workspace_prompt = lambda _store, **kwargs: (
+        loader_calls.append(kwargs["runtime_token"])
+        or {
+            "trusted_system_blocks": (
+                "<feedling-skill>wake skill</feedling-skill>",
+            ),
+            "working_memory": "wake scratch",
+        }
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        worker.ENCLAVE_SEMAPHORE,
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    assert loader_calls == ["rt"]
+    assert len(provider_calls) == 2
+    assert all(
+        "wake skill" in str(call["messages"])
+        and "wake scratch" not in str(call["messages"])
+        and "/memory/WORKING.md" in str(call["messages"])
+        for call in provider_calls
+    )
+    second_offered = {spec.name for spec in provider_calls[1]["tools"]}
+    assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
+
+
+def test_wake_workspace_prompt_failure_is_silent_before_provider(
+    monkeypatch,
+):
+    uid = "u_wake_workspace_prompt_failure"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    deps = _wake_deps(tail=[])
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError("private workspace plaintext"))
+    )
+    provider_called = {"value": False}
+
+    async def provider(*_args, **_kwargs):
+        provider_called["value"] = True
+        return _text_round("must not happen")
+
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        provider,
+    )
+    surface_called = {"value": False}
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda *_args, **_kwargs: surface_called.update(value=True),
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        worker.ENCLAVE_SEMAPHORE,
+        claimed_by,
+    ))
+
+    assert status == "failed"
+    assert provider_called["value"] is False
+    assert surface_called["value"] is False
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:workspace_prompt_unavailable",
+    )
 
 
 def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):

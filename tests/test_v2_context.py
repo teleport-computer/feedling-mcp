@@ -89,6 +89,28 @@ def test_runtime_policy_prefix_is_identical_with_or_without_runtime_data():
     assert without_data[0]["role"] == "system"
     assert "RECOVERY SAFETY RULE" in without_data[0]["content"]
 
+
+def test_skills_are_trusted_but_editable_working_memory_is_user_role_data():
+    messages = context.build_turn_messages(
+        system_prompt="S",
+        trusted_system_blocks=("<skill>stable instructions</skill>",),
+        working_memory="- continue project alpha",
+        summary="- older conversation",
+        tail=[{"role": "user", "content": "what next?"}],
+    )
+
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"].endswith("<skill>stable instructions</skill>")
+    assert messages[1] == {
+        "role": "user",
+        "content": (
+            context.WORKING_MEMORY_HEADER + "\n- continue project alpha"
+        ),
+    }
+    assert messages[2]["content"].startswith(
+        "UNTRUSTED HISTORICAL CONVERSATION SUMMARY"
+    )
+
 def test_build_turn_messages_drops_blank_tail_entries():
     tail=[{"id":"1","ts":1.0,"role":"user","content":"  "},{"id":"2","ts":2.0,"role":"user","content":"real"}]
     msgs = context.build_turn_messages(system_prompt="S", summary="", tail=tail)

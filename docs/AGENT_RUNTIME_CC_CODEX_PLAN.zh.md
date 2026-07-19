@@ -1,8 +1,9 @@
 # Agent Runtime 计划：Claude Agent SDK / Codex
 
-> **【设计存档】** 本文的 P0–P3 已实现为 `backend/agent_runtime/`
-> （supervisor / spawners / leases / litellm_gateway），本文保留作设计
-> 存档；现状以 `docs/CHANGELOG.md` 与代码为准。
+> **【历史设计，已退役】** 本文曾实现的 supervisor / spawners / leases /
+> litellm gateway 与 per-user CLI 进程已从 hosted source、image 和 manifests
+> 删除。本文只保留为决策历史，禁止按此恢复 hosted resident；现状以
+> `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md` 与代码为准。
 
 日期：2026-06-24
 

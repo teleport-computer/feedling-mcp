@@ -1,11 +1,8 @@
-"""Server-side document text extraction for Hosted Runtime V2 file reading.
+"""Legacy in-process document text extraction helpers.
 
-V2 turns are pure HTTP provider calls with no CLI and no filesystem the model can
-reach, so the only way a tool-less model can "read" an uploaded file is to extract
-its text server-side and inline it into the prompt (see
-``model_api_runtime/v2/worker._inject_tail_files``). This is the V2 analog of the
-resident consumer's ``_prepare_file_for_agent`` — except the resident path can lean
-on the CLI reading a PDF off disk, which V2 cannot, so V2 must extract here.
+This module is retained for compatibility tests only. Runtime V2 deliberately
+does not import it: an attachment cache miss must materialize and parse through
+an audited sandbox provider, or fail closed before decrypting physical bytes.
 
 - docx / xlsx are zip+XML → pure stdlib (no dependency), mirroring the resident
   extractors so the two paths agree on what text a document yields.

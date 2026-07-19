@@ -1,9 +1,8 @@
-"""Hosted Runtime V2 D0 Task 2 — mode setter control plane.
+"""Hosted Runtime V2 ownership repair/status control plane.
 
 Admin-token-gated HTTP surface over ``hosted.config_store.set_hosted_runtime_mode``
-/ ``get_hosted_runtime_mode``, so ops can flip a user between ``resident_cli``
-(existing CLI consumer) and ``db_action_v2`` (V2 worker pool) without a direct
-DB write. Mirrors the admin-token gate + route style of
+/ ``get_hosted_runtime_mode``. Ops can repair V2 ownership, but cannot select
+the retired hosted resident runtime. Mirrors the admin-token gate + route style of
 ``admin.routes_asgi``/``tests/test_asgi_admin.py``.
 """
 
@@ -117,7 +116,7 @@ def test_post_control_plane_write_failure_returns_503(env, monkeypatch):
 
     status, body = _asgi_json(
         "POST", "/v1/admin/hosted-runtime-mode", headers=_admin(),
-        json={"user_id": uid, "mode": "resident_cli"},
+        json={"user_id": uid, "mode": "db_action_v2"},
     )
 
     assert status == 503
@@ -137,6 +136,27 @@ def test_post_invalid_mode_returns_400(env):
     assert "error" in body
     # Never silently coerced to a valid mode.
     assert config_store.get_hosted_runtime_mode(core_store.get_store(uid)) == "resident_cli"
+
+
+def test_post_resident_mode_is_retired_before_any_runtime_side_effect(env, monkeypatch):
+    uid = _uid("rtmode_resident_retired")
+    monkeypatch.setattr(
+        core_store,
+        "get_store",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("retired selector must fail before store hydration")
+        ),
+    )
+
+    status, body = _asgi_json(
+        "POST",
+        "/v1/admin/hosted-runtime-mode",
+        headers=_admin(),
+        json={"user_id": uid, "mode": "resident_cli"},
+    )
+
+    assert status == 400
+    assert body == {"error": "hosted resident runtime is retired"}
 
 
 def test_post_user_with_no_model_api_config_returns_400(env):

@@ -345,12 +345,6 @@ def test_kill_switch_halts_admission_then_resumes(monkeypatch):
         chat_send_core.core_wake_bus, "notify",
         lambda channel, user_id="": notified.update(channel=channel, user_id=user_id),
     )
-    handle_send_called = {"n": 0}
-    monkeypatch.setattr(
-        chat_send_core.agent_runtime_cutover, "handle_send",
-        lambda *a, **k: handle_send_called.update(n=handle_send_called["n"] + 1) or ({"status": "resident"}, 202),
-    )
-
     body2, status2 = chat_send_core.model_api_chat_send_core(
         store, api_key="key", runtime_tok="", payload={"message": "hi again"},
     )

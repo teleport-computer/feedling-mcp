@@ -532,8 +532,8 @@ def test_colliding_user_row_cannot_advance_reply_cursor():
     assert role == "user"
 
 
-def test_atomic_reply_trim_mirrors_exact_tee_evictions(monkeypatch):
-    """The rebased TEE shadow must follow retention inside reply+cursor commit."""
+def test_atomic_reply_retains_source_history_without_tee_eviction(monkeypatch):
+    """Reply+cursor commit must never turn prompt coverage into history GC."""
     uid = "u_atomic_reply_tee_trim"
     conftest.seed_user(uid)
     _reset(uid)
@@ -578,16 +578,8 @@ def test_atomic_reply_trim_mirrors_exact_tee_evictions(monkeypatch):
                 "SELECT msg_id FROM chat_messages WHERE user_id=%s", (uid,)
             ).fetchall()
         }
-    assert remaining == {"old-3", "reply-row"}
-    assert len(mirrored) == 1
-    mirrored_user_id, mirrored_ids = mirrored[0][0][1]
-    assert mirrored_user_id == uid
-    # PostgreSQL does not guarantee DELETE ... RETURNING row order; only the
-    # exact eviction set is part of the mirror contract.
-    assert set(mirrored_ids) == {"old-1", "old-2"}
-    mirrored_body_user_id, mirrored_body_ids = mirrored[0][1][1]
-    assert mirrored_body_user_id == uid
-    assert set(mirrored_body_ids) == {"old-1", "old-2"}
+    assert remaining == {"old-1", "old-2", "old-3", "reply-row"}
+    assert mirrored == []
 
 
 def test_reply_effect_payload_contains_ciphertext_not_model_text(monkeypatch):

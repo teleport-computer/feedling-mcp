@@ -5,7 +5,7 @@ Builds on Tasks 6-10 (all already in this working tree):
 
   - Task 6  (worker._run_compaction CAS-loss requeue)   — see test_v2_compaction_cas_requeue.py
   - Task 7  (db.reconcile_unenqueued_v2_messages)        — see test_v2_reconcile_sweeper.py (not exercised here)
-  - Task 8  (GC coverage gate: db._chat_insert_on_cursor coverage_gated=True) — see test_v2_gc_coverage_gate.py
+  - Durable retention (append limits never delete source rows) — see test_v2_gc_coverage_gate.py
   - Task 9  (v2_conversation_summary.watermark_seq, migration 0031)
   - Task 10 (worker._ensure_prompt_coverage / _assert_prompt_covers prompt invariant) — see test_v2_prompt_invariant.py
 
@@ -66,35 +66,16 @@ def _clean_agent_jobs_table():
 
 
 # ---------------------------------------------------------------------------
-# P0 #1 — 5000+ messages, identical ts, compaction behind -> no lost history,
-# no wrong deletion (Task 8's coverage-gated GC trim, exercised at P0 scale).
+# P0 #1 — 5000+ messages, identical ts, compaction watermark -> immutable
+# source history independent of the hot-cache limit.
 # ---------------------------------------------------------------------------
 
-N = 5000  # P0 is specifically about scale — do not reduce.
+N = 5001  # Strictly beyond the former durable-row cap; do not reduce.
 
 
-def test_5000_identical_ts_gc_never_deletes_uncovered_but_trims_covered():
-    """Seed a LOW watermark that covers only a handful of "old" messages, then
-    append N=5000+ messages that all share ONE identical ts (so the ts-based
-    coverage clause — same-ts boundary rows are conservatively "not covered",
-    see db._chat_insert_on_cursor's docstring — puts every one of them on the
-    uncovered side), through the real V2 strict path (db.chat_append_strict,
-    coverage_gated=True) with max_messages FAR below N.
-
-    Strong property, not vacuous: without the coverage gate, a plain
-    count-only ring-buffer trim (max_messages=500) would keep only the newest
-    500 of these 5005 total inserts and silently drop the other ~4500 — the
-    exact bug D7/D8 close. Asserting the surviving count is EXACTLY N (not
-    "at least some survived", and not "<=max_messages") is what makes this
-    non-vacuous: it can only pass if the coverage gate is actually
-    overriding the count cutoff for every single uncovered row, not just
-    some of them.
-
-    The other half of the property (covered rows below the watermark ARE
-    trimmed normally, i.e. the gate isn't a blanket "never delete" bypass) is
-    checked via the 5 old covered messages seeded before the N=5000 batch:
-    they must be gone by the end.
-    """
+def test_5000_identical_ts_and_summary_watermark_preserve_every_source_row():
+    """A full summary watermark and a tiny hot-window hint cannot delete any
+    raw row, including covered rows and a 5000-message same-timestamp batch."""
     uid = "u_p0hs_gc_5000"
     seed_user(uid)
     _reset(uid)
@@ -131,11 +112,13 @@ def test_5000_identical_ts_gc_never_deletes_uncovered_but_trims_covered():
     max_messages = 500
     for i in range(N):
         db.chat_append_strict(
-            uid, f"m{i:05d}", identical_ts, {"role": "user", "n": i}, max_messages)
+            uid,
+            f"m{i:05d}",
+            identical_ts,
+            {"role": "user", "n": i, "body_ct": f"cipher-{i}"},
+            max_messages,
+        )
 
-    # (a) NO message with seq > watermark_seq (== ts >= watermark_ts, i.e.
-    # every one of the N identical-ts messages, all uncovered) was deleted by
-    # the GC trim — the surviving count is exactly N, not merely "some".
     with db.get_pool().connection() as conn:
         rows = conn.execute(
             "SELECT msg_id, seq, ts FROM chat_messages WHERE user_id=%s ORDER BY seq ASC",
@@ -154,15 +137,28 @@ def test_5000_identical_ts_gc_never_deletes_uncovered_but_trims_covered():
         assert seq > watermark_seq
         assert ts >= watermark_ts
 
-    # (b) The covered rows below the watermark (the 5 old messages) ARE
-    # trimmed normally — proves the gate isn't a blanket "never delete".
-    assert old_rows == [], f"covered old rows were NOT trimmed: {old_rows}"
+    assert [row[0] for row in old_rows] == [f"old{i:02d}" for i in range(n_old)]
+    assert len(rows) == N + n_old > max_messages
+    # Single-row durable reads remain available on both sides of the former
+    # 5,000-row boundary even though every message shares one timestamp.
+    for msg_id in ("m00000", "m02500", "m05000"):
+        row = db.chat_get_strict(uid, msg_id)
+        assert row is not None
+        assert row["n"] == int(msg_id.removeprefix("m"))
+        assert row["body_ct"] == f"cipher-{row['n']}"
 
-    # Row count exceeds the max_messages cap (documented, intended behavior
-    # per _chat_insert_on_cursor's coverage_gated docstring): proves this
-    # ISN'T just "the trim happened to keep the newest 500, which happened to
-    # be all of the new batch" — it kept strictly more than the cap allows.
-    assert len(rows) == N > max_messages
+    first_batch_seq = db.chat_seq_for_msg_id(uid, "m00000")
+    assert first_batch_seq is not None
+    cursor_seq = first_batch_seq - 1
+    paged_ids: list[str] = []
+    while True:
+        page = db.chat_history_page_by_seq_strict(
+            uid, after_seq=cursor_seq, limit=777)
+        if not page:
+            break
+        paged_ids.extend(str(item["id"]) for item in page)
+        cursor_seq = int(page[-1]["seq"])
+    assert paged_ids == [f"m{i:05d}" for i in range(N)]
 
 
 # ---------------------------------------------------------------------------

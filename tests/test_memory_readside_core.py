@@ -296,7 +296,7 @@ class _FakeClient:
 
 
 def test_post_enclave_readside_forwards_runtime_token(monkeypatch):
-    # host-all / zero-roster agents have a Stage-D runtime token but NO api_key.
+    # Runtime V2 workers have a scoped runtime token but no account API key.
     # The enclave call must forward X-Feedling-Runtime-Token — without this every
     # hosted agent memory read 503s with api_key_unavailable though data is present.
     monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "http://enclave:5003")

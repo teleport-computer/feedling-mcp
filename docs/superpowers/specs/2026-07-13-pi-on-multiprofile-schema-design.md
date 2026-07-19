@@ -1,5 +1,8 @@
 # Spec: Re-implement the pi driver consolidation on test's multi-profile schema
 
+> **RETIRED / DO NOT DEPLOY.** Historical design; managed hosted host-all and
+> supervisor modes no longer exist.
+
 **Date:** 2026-07-13
 **Status:** Draft (awaiting review)
 **Base branch:** `test` (b6073c6) — NOT the stale `pi-driver`.

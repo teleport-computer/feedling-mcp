@@ -10,11 +10,11 @@ SCRIPT = ROOT / "deploy" / "check-prod-runner-topology.sh"
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
-def _run(tmp_path: Path, body: str, enabled: str = "true") -> subprocess.CompletedProcess[str]:
+def _run(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
     ids = tmp_path / "ids.txt"
     ids.write_text(body)
     return subprocess.run(
-        ["bash", str(SCRIPT), str(ids), enabled],
+        ["bash", str(SCRIPT), str(ids)],
         text=True,
         capture_output=True,
         check=False,
@@ -41,10 +41,11 @@ def test_topology_gate_counts_unique_runner_ids(tmp_path):
     assert "2 independent" in redundant.stdout
 
 
-def test_topology_gate_is_inert_when_standalone_deploy_is_disabled(tmp_path):
-    result = _run(tmp_path, "", enabled="false")
-    assert result.returncode == 0
-    assert "inactive" in result.stdout
+def test_topology_gate_rejects_the_main_cvm_as_a_runner(tmp_path):
+    main_id = (ROOT / "deploy" / "prod-cvm-id.txt").read_text().strip()
+    result = _run(tmp_path, f"runner-a\n{main_id}\n")
+    assert result.returncode == 1
+    assert "main CVM" in result.stdout
 
 
 def test_main_deploy_depends_on_topology_preflight():
@@ -52,3 +53,28 @@ def test_main_deploy_depends_on_topology_preflight():
     assert "validate-prod-runner-topology:" in workflow
     deploy = workflow.split("\n  deploy-cvm:\n", 1)[1].split("\n  deploy-test-cvm:\n", 1)[0]
     assert "validate-prod-runner-topology" in "\n".join(deploy.split("\n", 8)[0:8])
+
+
+def test_prod_inventory_and_fleet_gates_trigger_the_shared_preflight():
+    workflow = WORKFLOW.read_text()
+    prod_filter = workflow.split("\n  detect-cvm-changes:\n", 1)[1].split(
+        "\n  detect-cvm-changes-test:\n", 1
+    )[0]
+    for path in (
+        "deploy/prod-cvm-id.txt",
+        "deploy/prod-runner-cvm-ids.txt",
+        "deploy/check-prod-runner-topology.sh",
+        "deploy/check-v2-runner-fleet.py",
+    ):
+        assert path in prod_filter
+    assert "tools/chat_resident_consumer.py" not in prod_filter
+
+    preflight = workflow.split("\n  validate-prod-runner-topology:\n", 1)[1].split(
+        "\n  detect-cvm-changes-pre:\n", 1
+    )[0]
+    assert "feedling feedling-agent-runner" in preflight
+    assert "docker manifest inspect" in preflight
+    assert 'phala cvms get "$CVM_ID"' in preflight
+    assert "production CVM $CVM_ID does not exist" in preflight
+    assert "Build and verify the production E2B template" in preflight
+    assert "deploy/e2b/runtime-v2/template-tag.txt" in preflight

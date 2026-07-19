@@ -8,6 +8,7 @@ has its own test files) and `provider_client.chat_completion_async` (the LLM
 wire boundary tool_loop.run_tool_loop calls once per round — scripted here to
 drive specific round shapes).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -37,7 +38,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 _BYOK = provider_client.ProviderConfig(
-    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
+    provider="anthropic",
+    model="claude-sonnet-4-test",
+    api_key="sk-user-byok",
+    base_url="",
+)
 
 
 class _FakeCapResult:
@@ -46,7 +51,13 @@ class _FakeCapResult:
         self._ok = ok
 
     def to_dict(self):
-        return {"ok": self._ok, "data": self._data, "error": None, "trace": {}, "warnings": []}
+        return {
+            "ok": self._ok,
+            "data": self._data,
+            "error": None,
+            "trace": {},
+            "warnings": [],
+        }
 
 
 def _reset(uid):
@@ -78,6 +89,7 @@ def _patch_real_write(monkeypatch):
     the server stores ciphertext verbatim regardless of shape, see
     `append_chat`'s docstring) so `_bubbles` below reads back genuine
     chat_messages rows, only the encryption step itself is skipped."""
+
     def _real_write(store, text):
         envelope = {"v": 1, "body_ct": text, "nonce": "n", "K_user": "k_test"}
         return store.append_chat("openclaw", "model_api", envelope, strict=True)
@@ -89,14 +101,20 @@ def _reply_effect_dispatch(user_id):
     """Test-local production-shaped sink for the `reply` effect_type — mirrors
     `serve_worker._sink_reply`'s real write (`worker._write_encrypted_reply`)
     without pulling in serve_worker's hosted-adjacent wiring."""
+
     def dispatch(effect_type, payload):
         if effect_type == "reply":
-            worker._write_encrypted_reply(core_store.get_store(user_id), str(payload.get("text") or ""))
+            worker._write_encrypted_reply(
+                core_store.get_store(user_id), str(payload.get("text") or "")
+            )
+
     return dispatch
 
 
 def _apply_effects(user_id):
-    return v2_effect_outbox.apply_pending_effects(user_id, dispatch=_reply_effect_dispatch(user_id))
+    return v2_effect_outbox.apply_pending_effects(
+        user_id, dispatch=_reply_effect_dispatch(user_id)
+    )
 
 
 def _script_provider(monkeypatch, responses):
@@ -112,13 +130,25 @@ def _script_provider(monkeypatch, responses):
 
 
 def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
-    return {"reply": text, "tool_calls": [],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+    return {
+        "reply": text,
+        "tool_calls": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        },
+    }
 
 
 def _tool_round(*tool_calls, prompt_tokens=1, completion_tokens=1):
-    return {"reply": "", "tool_calls": list(tool_calls),
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+    return {
+        "reply": "",
+        "tool_calls": list(tool_calls),
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        },
+    }
 
 
 def _tc(call_id, name, **args):
@@ -140,14 +170,19 @@ def _bubbles(uid):
     exactly what `worker._write_encrypted_reply` always writes."""
     store = core_store.get_store(uid)
     store.reload()
-    return [m for m in store.chat_messages if m.get("role") == "openclaw" and m.get("source") == "model_api"]
+    return [
+        m
+        for m in store.chat_messages
+        if m.get("role") == "openclaw" and m.get("source") == "model_api"
+    ]
 
 
 def _turn_metric_row(job_id):
     with db.get_pool().connection() as c:
         row = c.execute(
             "SELECT model_calls, failed, status FROM v2_turn_metrics WHERE job_id=%s",
-            (job_id,)).fetchone()
+            (job_id,),
+        ).fetchone()
     return row
 
 
@@ -194,8 +229,7 @@ def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
                     {"v2_reply_cursor_seq": int(payload["reply_through_seq"])},
                 )
 
-        return v2_effect_outbox.apply_pending_effects(
-            user_id, dispatch=dispatch)
+        return v2_effect_outbox.apply_pending_effects(user_id, dispatch=dispatch)
 
     return worker.TurnDeps(
         read_messages=lambda _user_id: read_after_seq(uid, 0),
@@ -220,8 +254,11 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     calls = _script_provider(monkeypatch, [_text_round("hello from the model")])
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
 
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
 
     assert status == "completed"
     assert len(calls) == 1
@@ -230,10 +267,200 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert bubbles[0]["body_ct"] == "hello from the model"
     row = _turn_metric_row(job_id)
     assert row is not None
-    assert row[0] == 1          # exactly one model call
-    assert row[1] is False      # not failed
+    assert row[0] == 1  # exactly one model call
+    assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
+    monkeypatch,
+):
+    uid = "u_toolloop_workspace_prompt"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-workspace-prompt")
+
+    _patch_real_write(monkeypatch)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({"items": []}),
+    )
+    calls = _script_provider(
+        monkeypatch,
+        [
+            _tool_round(_tc("read", "memory_index")),
+            _text_round("workspace-aware reply"),
+        ],
+    )
+    loader_calls = []
+    deps = _deps(
+        messages=[
+            {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
+        ]
+    )
+    deps.load_workspace_prompt = lambda _store, **kwargs: (
+        loader_calls.append(kwargs["runtime_token"])
+        or {
+            "trusted_system_blocks": (
+                "<feedling-skill>trusted skill</feedling-skill>",
+            ),
+            "working_memory": "DO_NOT_EAGERLY_INJECT",
+        }
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert loader_calls == ["rt"]
+    assert len(calls) == 2
+    for call in calls:
+        prompt = str(call["messages"])
+        assert "trusted skill" in prompt
+        assert "DO_NOT_EAGERLY_INJECT" not in prompt
+        assert "/memory/WORKING.md" in prompt
+    system = next(
+        message for message in calls[0]["messages"] if message["role"] == "system"
+    )
+    assert "trusted skill" in str(system["content"])
+    assert not any(
+        worker.context.WORKING_MEMORY_HEADER in str(message.get("content"))
+        for message in calls[0]["messages"]
+    )
+    second_offered = {spec.name for spec in calls[1]["tools"]}
+    assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
+
+
+def test_chat_workspace_prompt_failure_is_visible_before_provider(
+    monkeypatch,
+):
+    uid = "u_toolloop_workspace_prompt_failure"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-workspace-prompt-failure")
+    deps = _deps(
+        messages=[
+            {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
+        ]
+    )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("private workspace plaintext")
+    )
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider called after workspace prompt failure"
+        ),
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert _job_status_row(job_id)[:2] == (
+        "failed",
+        "turn_failed:workspace_prompt_unavailable",
+    )
+
+
+def test_chat_native_task_runs_child_then_returns_result_to_parent(
+    monkeypatch,
+):
+    uid = "u_toolloop_native_task"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-native-task")
+    _patch_real_write(monkeypatch)
+    responses = iter(
+        [
+            _tool_round(
+                _tc(
+                    "task-1",
+                    "task",
+                    prompt="Inspect the report independently.",
+                )
+            ),
+            _text_round("child evidence"),
+            _text_round("parent answer using child evidence"),
+        ]
+    )
+    calls = []
+
+    async def provider(config, messages, *, tools=None):
+        calls.append(
+            {
+                "config": config,
+                "messages": messages,
+                "tools": tools,
+            }
+        )
+        return next(responses)
+
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        provider,
+    )
+    deps = _deps(
+        messages=[
+            {
+                "id": "m1",
+                "ts": 10.0,
+                "role": "user",
+                "content": "Please inspect the report.",
+            },
+        ]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 3
+    assert calls[0]["config"] is _BYOK
+    assert calls[2]["config"] is _BYOK
+    child_config = calls[1]["config"]
+    assert child_config is not _BYOK
+    assert child_config.provider == _BYOK.provider
+    assert child_config.model == _BYOK.model
+    assert child_config.api_key == _BYOK.api_key
+    assert child_config.base_url == _BYOK.base_url
+    assert child_config.context_window_tokens == 32_768
+    parent_tools = {spec.name for spec in calls[0]["tools"]}
+    child_tools = {spec.name for spec in calls[1]["tools"]}
+    assert "task" in parent_tools
+    assert child_tools == worker._SUBAGENT_ALLOWED_TOOLS
+    assert "Inspect the report independently." in str(calls[1]["messages"])
+    assert "Please inspect the report." not in str(calls[1]["messages"])
+    assert "child evidence" in str(calls[2]["messages"])
+    assert _turn_metric_row(job_id)[0] == 3
 
 
 def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
@@ -249,8 +476,7 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
         )
     db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
     generation = db.get_runtime_generation(uid)
-    job_id, _ = jobs_store.enqueue_job(
-        uid, "chat", expected_generation=generation)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
     job = jobs_store.claim_next_job("w-late-final")
 
     # Keep the test focused on the outbox fence rather than enclave crypto: the
@@ -265,7 +491,8 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
         },
     )
     monkeypatch.setattr(
-        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({}))
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({})
+    )
     written: list[str] = []
     deps = _late_input_deps(uid, written)
     calls = []
@@ -294,13 +521,15 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
 
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
 
-    status = asyncio.run(worker.process_job(
-        job,
-        deps,
-        provider_config=_BYOK,
-        api_key=None,
-        runtime_token="rt",
-    ))
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
 
     assert status == "completed"
     assert len(calls) == 2
@@ -321,10 +550,212 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
         ("discarded", "input_generation_advanced"),
         ("applied", ""),
     ]
-    assert v2_cursor.load_seq(core_store.get_store(uid)) == db.chat_seq_for_msg_id(uid, "B")
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == db.chat_seq_for_msg_id(
+        uid, "B"
+    )
 
 
-@pytest.mark.parametrize("failed_post_commit_step", ["done_status", "chat_notify", "metric"])
+def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
+    monkeypatch,
+):
+    """An assistant-only prompt snapshot advance cannot poison the final fence.
+
+    The first worker publishes an intermediate reply, then crashes. The retry's
+    all-role tail includes that bubble after the newest user row, while the
+    compound final reply must still fence and advance only through the user seq.
+    """
+    uid = "u_toolloop_intermediate_crash_retry_cursor"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs "
+            "WHERE user_id=%s AND kind='model_api_runtime'",
+            (uid,),
+        )
+
+    generation = db.get_runtime_generation(uid)
+    user_seq, first_job_id = db.chat_append_and_enqueue(
+        uid,
+        "user-before-crash",
+        10.0,
+        _user_doc("user-before-crash", "please investigate"),
+        5000,
+        "chat",
+        expected_generation=generation,
+    )
+    first_job = jobs_store.claim_next_job("w-intermediate-crash")
+    assert first_job is not None and first_job["id"] == first_job_id
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda store, plaintext, *, item_id=None: (
+            {
+                "v": 1,
+                "id": str(item_id),
+                "owner_user_id": store.user_id,
+                "visibility": "shared",
+                "body_ct": bytes(plaintext).hex(),
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
+            },
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_perception_grounding_results",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+    )
+
+    def _plaintext(row: dict) -> str:
+        if row.get("test_plaintext") is not None:
+            return str(row["test_plaintext"])
+        try:
+            return bytes.fromhex(str(row.get("body_ct") or "")).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return ""
+
+    def _render(rows: list[dict], *, user_only: bool) -> list[dict]:
+        rendered = []
+        for row in rows:
+            role = str(row.get("role") or "")
+            if user_only and role not in {"user", "human"}:
+                continue
+            rendered.append(
+                {
+                    "id": row["id"],
+                    "seq": int(row["seq"]),
+                    "ts": float(row.get("ts") or 0.0),
+                    "role": (
+                        "user" if role in {"user", "human"} else "assistant"
+                    ),
+                    "content": _plaintext(row),
+                }
+            )
+        return rendered
+
+    def _read_after_seq(_user_id: str, after_seq: int):
+        return _render(
+            db.chat_messages_after_seq(uid, after_seq, limit=None),
+            user_only=True,
+        )
+
+    def _read_tail_after_seq(
+        _user_id: str,
+        after_seq: int,
+        limit: int,
+        *,
+        through_seq: int | None = None,
+    ):
+        return _render(
+            db.chat_messages_after_seq(
+                uid,
+                after_seq,
+                limit=limit,
+                oldest_first=False,
+                through_seq=through_seq,
+            ),
+            user_only=False,
+        )
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _user_id: _read_after_seq(uid, 0),
+        read_messages_after_seq=_read_after_seq,
+        resolve_provider=lambda _user_id: (_BYOK, {}),
+        mint_enclave_token=lambda _user_id: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+        read_summary_with_seq=lambda _user_id: ("", 0.0, 0, 0),
+        read_tail_after_seq=_read_tail_after_seq,
+    )
+
+    phase = "crash"
+    first_attempt_calls = 0
+    retry_messages = []
+
+    async def provider(_config, messages, *, tools=None):
+        nonlocal first_attempt_calls
+        if phase == "crash":
+            first_attempt_calls += 1
+            if first_attempt_calls == 1:
+                return _tool_round(
+                    _tc("checking", "reply", text="I am still checking."),
+                )
+            raise RuntimeError("injected worker crash after intermediate reply")
+        retry_messages.append(list(messages))
+        return _text_round("final answer after retry")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    first_status = asyncio.run(
+        worker.process_job(
+            first_job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+    assert first_status == "failed"
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == 0
+    with db.get_pool().connection() as conn:
+        intermediate_seq = conn.execute(
+            "SELECT MAX(seq) FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role'='openclaw'",
+            (uid,),
+        ).fetchone()[0]
+    assert int(intermediate_seq) > user_seq
+
+    phase = "retry"
+    retry_job_id, _ = jobs_store.enqueue_job(
+        uid,
+        "chat",
+        reason="retry_after_worker_crash",
+        expected_generation=generation,
+    )
+    retry_job = jobs_store.claim_next_job("w-intermediate-retry")
+    assert retry_job is not None and retry_job["id"] == retry_job_id
+
+    retry_status = asyncio.run(
+        worker.process_job(
+            retry_job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert retry_status == "completed"
+    assert len(retry_messages) == 1
+    assert "I am still checking." in str(retry_messages[0])
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == user_seq
+    assert _job_status_row(retry_job_id) == ("completed", None)
+    with db.get_pool().connection() as conn:
+        final_effect = conn.execute(
+            "SELECT status,last_error,(payload->>'reply_through_seq')::bigint "
+            "FROM v2_effect_outbox "
+            "WHERE user_id=%s AND job_id=%s AND effect_type=%s",
+            (
+                uid,
+                retry_job_id,
+                v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
+            ),
+        ).fetchone()
+        final_seq = conn.execute(
+            "SELECT MAX(seq) FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role'='openclaw'",
+            (uid,),
+        ).fetchone()[0]
+    assert final_effect == ("applied", "", user_seq)
+    assert int(final_seq) > int(intermediate_seq)
+
+
+@pytest.mark.parametrize(
+    "failed_post_commit_step", ["done_status", "chat_notify", "metric"]
+)
 def test_committed_final_reply_survives_post_commit_bookkeeping_failures(
     monkeypatch,
     failed_post_commit_step,
@@ -389,9 +820,7 @@ def test_committed_final_reply_survives_post_commit_bookkeeping_failures(
     monkeypatch.setattr(
         provider_client,
         "chat_completion_async",
-        lambda *_args, **_kwargs: asyncio.sleep(
-            0, result=_text_round("durable final")
-        ),
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=_text_round("durable final")),
     )
     surfaced: list[str] = []
     monkeypatch.setattr(
@@ -455,8 +884,7 @@ def test_committed_final_reply_survives_post_commit_bookkeeping_failures(
             (uid,),
         ).fetchone()[0]
         effect = conn.execute(
-            "SELECT status FROM v2_effect_outbox "
-            "WHERE user_id=%s AND effect_type=%s",
+            "SELECT status FROM v2_effect_outbox WHERE user_id=%s AND effect_type=%s",
             (uid, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
         ).fetchone()
     assert replies == 1
@@ -556,8 +984,7 @@ def test_sweeper_wins_final_effect_before_producer_drain_and_loop_still_retries(
         )
     db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
     generation = db.get_runtime_generation(uid)
-    job_id, _ = jobs_store.enqueue_job(
-        uid, "chat", expected_generation=generation)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
     job = jobs_store.claim_next_job("w-sweeper-wins")
     monkeypatch.setattr(
         worker,
@@ -568,7 +995,8 @@ def test_sweeper_wins_final_effect_before_producer_drain_and_loop_still_retries(
         },
     )
     monkeypatch.setattr(
-        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({}))
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({})
+    )
     written: list[str] = []
     deps = _late_input_deps(uid, written)
     real_apply = deps.apply_pending_effects
@@ -606,13 +1034,15 @@ def test_sweeper_wins_final_effect_before_producer_drain_and_loop_still_retries(
 
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
 
-    status = asyncio.run(worker.process_job(
-        job,
-        deps,
-        provider_config=_BYOK,
-        api_key=None,
-        runtime_token="rt",
-    ))
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
 
     assert status == "completed"
     assert len(calls) == 2
@@ -649,8 +1079,7 @@ def test_last_call_late_input_hands_off_without_reply_or_error_chip(
         )
     db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
     generation = db.get_runtime_generation(uid)
-    job_id, _ = jobs_store.enqueue_job(
-        uid, "chat", expected_generation=generation)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
     job = jobs_store.claim_next_job("w-late-handoff")
     written: list[str] = []
     deps = _late_input_deps(uid, written)
@@ -670,7 +1099,8 @@ def test_last_call_late_input_hands_off_without_reply_or_error_chip(
         },
     )
     monkeypatch.setattr(
-        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({}))
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({})
+    )
 
     async def provider(_config, _messages, *, tools=None):
         _seq, same_job_id = db.chat_append_and_enqueue(
@@ -687,13 +1117,15 @@ def test_last_call_late_input_hands_off_without_reply_or_error_chip(
 
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
 
-    status = asyncio.run(worker.process_job(
-        job,
-        deps,
-        provider_config=_BYOK,
-        api_key=None,
-        runtime_token="rt",
-    ))
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
 
     assert status == "completed"
     assert written == []
@@ -706,8 +1138,7 @@ def test_last_call_late_input_hands_off_without_reply_or_error_chip(
             (uid,),
         ).fetchall()
     assert rows[0][:2] == (job_id, "completed")
-    assert rows[1][1:] == (
-        "pending", "coalesced_followup", generation)
+    assert rows[1][1:] == ("pending", "coalesced_followup", generation)
 
 
 def test_invalid_final_fence_fails_visibly_without_reply_or_retry_loop(monkeypatch):
@@ -721,8 +1152,7 @@ def test_invalid_final_fence_fails_visibly_without_reply_or_retry_loop(monkeypat
         )
     db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
     generation = db.get_runtime_generation(uid)
-    job_id, _ = jobs_store.enqueue_job(
-        uid, "chat", expected_generation=generation)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
     job = jobs_store.claim_next_job("w-invalid-fence")
     written: list[str] = []
     deps = _late_input_deps(uid, written)
@@ -744,7 +1174,8 @@ def test_invalid_final_fence_fails_visibly_without_reply_or_retry_loop(monkeypat
         },
     )
     monkeypatch.setattr(
-        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({}))
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({})
+    )
     corrupted = []
 
     def corrupt_terminal_before_apply(user_id: str):
@@ -772,13 +1203,15 @@ def test_invalid_final_fence_fails_visibly_without_reply_or_retry_loop(monkeypat
 
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
 
-    status = asyncio.run(worker.process_job(
-        job,
-        deps,
-        provider_config=_BYOK,
-        api_key=None,
-        runtime_token="rt",
-    ))
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
 
     assert status == "failed"
     assert corrupted == [1]
@@ -797,15 +1230,17 @@ def test_invalid_final_fence_fails_visibly_without_reply_or_retry_loop(monkeypat
             "WHERE user_id=%s AND effect_type=%s",
             (uid, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
         ).fetchone()
+    # Encrypted capture is independent; provider-backed offline review is
+    # fail-closed/off unless the deployment explicitly opts in.
     assert rows == [(job_id, "failed", None, generation)]
-    assert effect == (
-        "discarded", v2_effect_outbox.FINAL_REPLY_INVALID_FENCE, 0)
+    assert effect == ("discarded", v2_effect_outbox.FINAL_REPLY_INVALID_FENCE, 0)
 
 
 def _job_status_row(job_id):
     with db.get_pool().connection() as conn:
         row = conn.execute(
-            "SELECT status, last_error FROM agent_jobs WHERE id=%s", (job_id,)).fetchone()
+            "SELECT status, last_error FROM agent_jobs WHERE id=%s", (job_id,)
+        ).fetchone()
     return row
 
 
@@ -825,17 +1260,28 @@ def test_intermediate_reply_then_terminal_text_and_exactly_once_replay(monkeypat
     job = jobs_store.claim_next_job("w")
 
     monkeypatch.setattr(
-        cap_registry, "run_capability",
-        lambda action_type, store, **k: _FakeCapResult({"snippet": "search result"}))
+        cap_registry,
+        "run_capability",
+        lambda action_type, store, **k: _FakeCapResult({"snippet": "search result"}),
+    )
     _patch_real_write(monkeypatch)
-    calls = _script_provider(monkeypatch, [
-        _tool_round(_tc("r1", "reply", text="intermediate"), _tc("s1", "web_search", query="x")),
-        _text_round("final answer"),
-    ])
+    calls = _script_provider(
+        monkeypatch,
+        [
+            _tool_round(
+                _tc("r1", "reply", text="intermediate"),
+                _tc("s1", "web_search", query="x"),
+            ),
+            _text_round("final answer"),
+        ],
+    )
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
 
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
 
     assert status == "completed"
     assert len(calls) == 2
@@ -857,11 +1303,21 @@ def test_intermediate_reply_then_terminal_text_and_exactly_once_replay(monkeypat
     gen = db.get_runtime_generation(uid)
     eid = v2_effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
     replay_id = v2_effect_outbox.enqueue_effect(
-        job_id=job_id, user_id=uid, effect_type="reply", ordinal=0,
-        expected_generation=gen, payload={"text": "intermediate"})
-    assert replay_id == eid  # same deterministic id -> ON CONFLICT DO NOTHING, no new row
+        job_id=job_id,
+        user_id=uid,
+        effect_type="reply",
+        ordinal=0,
+        expected_generation=gen,
+        payload={"text": "intermediate"},
+    )
+    assert (
+        replay_id == eid
+    )  # same deterministic id -> ON CONFLICT DO NOTHING, no new row
     result = _apply_effects(uid)
-    assert result == {"applied": 0, "discarded": 0}  # already applied -> not in the pending set
+    assert result == {
+        "applied": 0,
+        "discarded": 0,
+    }  # already applied -> not in the pending set
 
     bubbles_after = _bubbles(uid)
     assert len(bubbles_after) == 2  # NO duplicate bubble
@@ -883,6 +1339,7 @@ def test_intermediate_reply_then_terminal_text_and_exactly_once_replay(monkeypat
 # `LoopOutcome("", rounds, "budget_exhausted", False)` return.
 # ------------------------------------------------------------------
 
+
 def test_chat_turn_with_no_reply_produced_marks_job_failed_not_completed(monkeypatch):
     uid = "u_toolloop_noreply"
     conftest.seed_user(uid)
@@ -892,27 +1349,38 @@ def test_chat_turn_with_no_reply_produced_marks_job_failed_not_completed(monkeyp
 
     monkeypatch.setattr(worker, "_TURN_MAX_LLM_CALLS", 1)
     monkeypatch.setattr(
-        cap_registry, "run_capability",
-        lambda action_type, store, **k: _FakeCapResult({"snippet": "irrelevant"}))
+        cap_registry,
+        "run_capability",
+        lambda action_type, store, **k: _FakeCapResult({"snippet": "irrelevant"}),
+    )
     # The ONE and only (last) round: tools=None is what the provider is asked
     # for, but it misbehaves and returns a non-reply tool_call anyway.
-    calls = _script_provider(monkeypatch, [_tool_round(_tc("c1", "web_search", query="x"))])
+    calls = _script_provider(
+        monkeypatch, [_tool_round(_tc("c1", "web_search", query="x"))]
+    )
     write_calls = {"n": 0}
     monkeypatch.setattr(
-        worker, "_write_encrypted_reply",
-        lambda store, text: write_calls.update(n=write_calls["n"] + 1) or {"id": "should-not-happen"})
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: (
+            write_calls.update(n=write_calls["n"] + 1) or {"id": "should-not-happen"}
+        ),
+    )
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
 
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
 
     assert status == "failed"
     assert len(calls) == 1
-    assert write_calls["n"] == 0          # no filler bubble, no bubble at all
+    assert write_calls["n"] == 0  # no filler bubble, no bubble at all
     assert _bubbles(uid) == []
     status_row = _job_status_row(job_id)
     assert status_row[0] == "failed"
     assert "empty_reply" in (status_row[1] or "")
     row = _turn_metric_row(job_id)
     assert row is not None
-    assert row[1] is True                 # failed=True in the metric row too
+    assert row[1] is True  # failed=True in the metric row too

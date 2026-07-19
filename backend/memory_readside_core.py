@@ -206,7 +206,7 @@ def post_enclave_readside(
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         raise RuntimeError("enclave_unavailable")
-    # host-all / zero-roster agents authenticate with a Stage-D runtime token and
+    # Runtime V2 workers authenticate with a scoped runtime token and
     # carry NO per-user api_key. The enclave accepts either credential and resolves
     # the caller from it (enclave_app._forward_auth_headers / _whoami_cached), so
     # forward the runtime token when there's no api_key. Without this, every hosted

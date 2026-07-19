@@ -7,10 +7,11 @@ on:
     branches: [main, test, pre]
   workflow_dispatch:
 
-# Cancel in-progress runs on the same ref — latest push wins.
+# Pull-request validation is replaceable, but branch pushes may already be
+# between the main-CVM and runner-CVM mutations. Never cancel a release unit.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # -------------------------------------------------------------------------
@@ -80,9 +81,8 @@ jobs:
           FEEDLING_DATA_DIR: /tmp/feedling-data-ci
           FEEDLING_WS_PORT: "19998"
           DATABASE_URL: "postgresql://postgres:postgres@127.0.0.1:5432/feedling_ci"
-          # 收口后 backend 启动会校验托管前置两件套（assert_hosting_ready）。
-          # CI smoke 用占位值满足校验，让 backend 起得来——不连真 supervisor。
-          FEEDLING_HOST_ALL: "1"
+          # Hosted Runtime V2 needs the shared token secret; there is no
+          # supervisor/host-all prerequisite after resident retirement.
           FEEDLING_RUNTIME_TOKEN_SECRET: "ci-smoke-secret"
         run: |
           mkdir -p "$FEEDLING_DATA_DIR"
@@ -181,9 +181,9 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_hosted_runtime_policy.py \
+            tests/test_hosted_resident_retirement.py \
             tests/test_hosted_runtime_mode.py \
             tests/test_chat_send_v2_enqueue.py \
-            tests/test_v2_exclusivity_guard.py \
             tests/test_model_api_chat_send_routing.py \
             tests/test_model_api_profiles_endpoints.py \
             tests/test_provider_prompt_cache.py \
@@ -197,6 +197,7 @@ jobs:
             tests/test_v2_prompt_cache_key.py \
             tests/test_v2_prompt_frontier.py \
             tests/test_v2_metrics_endpoint.py \
+            tests/test_prod_runner_fleet_gate.py \
             tests/test_v2_turn_metrics.py \
             tests/test_v2_whole_turn_metric.py \
             tests/test_v2_jobs_migration.py \
@@ -303,13 +304,18 @@ jobs:
           filters: |
             cvm:
               - 'backend/**'
-              - 'tools/chat_resident_consumer.py'
               - 'tools/deploy_canary.py'
               - 'deploy/attestation-gate.sh'
               - 'deploy/Dockerfile'
               - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.yaml'
               - 'deploy/docker-compose.phala.prod.runner.yaml'
+              - 'deploy/e2b/runtime-v2/**'
+              - 'deploy/pin-runtime-release.sh'
+              - 'deploy/prod-cvm-id.txt'
+              - 'deploy/prod-runner-cvm-ids.txt'
+              - 'deploy/check-prod-runner-topology.sh'
+              - 'deploy/check-v2-runner-fleet.py'
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
 
@@ -329,34 +335,278 @@ jobs:
           filters: |
             cvm:
               - 'backend/**'
-              - 'tools/chat_resident_consumer.py'
               - 'tools/deploy_canary.py'
               - 'deploy/attestation-gate.sh'
               - 'deploy/Dockerfile'
               - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.test.yaml'
               - 'deploy/docker-compose.phala.runner.yaml'
+              - 'deploy/e2b/runtime-v2/**'
+              - 'deploy/pin-runtime-release.sh'
+              - 'deploy/test-cvm-id.txt'
+              - 'deploy/test-runner-cvm-id.txt'
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
 
-  # The inline prod runner has been removed. Updating either production CVM
-  # while only one standalone runner exists recreates the 2026-07-15 outage:
-  # main deploy interrupts ingress, then runner deploy removes the only hosting
-  # path. Fail before either deployment mutates live state.
+  validate-test-runtime-prerequisites:
+    name: validate test Runtime V2 deploy prerequisites
+    needs: [detect-cvm-changes-test]
+    if: |
+      github.ref == 'refs/heads/test' &&
+      github.event_name == 'push' &&
+      needs.detect-cvm-changes-test.outputs.cvm == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require independent main and runner CVMs
+        run: |
+          MAIN_CVM_ID=$(tr -d '[:space:]' < deploy/test-cvm-id.txt)
+          RUNNER_CVM_ID=$(tr -d '[:space:]' < deploy/test-runner-cvm-id.txt)
+          if [ -z "$MAIN_CVM_ID" ] || [ -z "$RUNNER_CVM_ID" ]; then
+            echo "::error::test main and runner CVM IDs must both be provisioned"
+            exit 1
+          fi
+          if [ "$MAIN_CVM_ID" = "$RUNNER_CVM_ID" ]; then
+            echo "::error::test main and Runtime V2 runner must use independent CVMs"
+            exit 1
+          fi
+
+      - name: Confirm both test CVMs exist before mutating the main CVM
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+        run: |
+          if [ -z "$PHALA_CLOUD_API_KEY" ]; then
+            echo "::error::TEST_PHALA_CLOUD_API_KEY is required to validate the release unit"
+            exit 1
+          fi
+          npm install -g phala@1.1.19
+          for file in deploy/test-cvm-id.txt deploy/test-runner-cvm-id.txt; do
+            CVM_ID=$(tr -d '[:space:]' < "$file")
+            echo "validating test CVM $CVM_ID"
+            if ! phala cvms get "$CVM_ID" --json --api-token "$PHALA_CLOUD_API_KEY" >/dev/null; then
+              echo "::error::test CVM $CVM_ID does not exist or is not accessible"
+              exit 1
+            fi
+          done
+
+      - name: Require complete Runtime V2 configuration
+        env:
+          PHALA_CLOUD_API_KEY:           ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          DATABASE_URL:                  ${{ secrets.TEST_DATABASE_URL }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
+          FEEDLING_API_URL:              ${{ vars.TEST_MAIN_API_URL }}
+          FEEDLING_ENCLAVE_URL:          ${{ vars.TEST_MAIN_ENCLAVE_URL }}
+          FEEDLING_ADMIN_TOKEN:          ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.TEST_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
+          E2B_API_KEY:                    ${{ secrets.TEST_E2B_API_KEY || secrets.E2B_API_KEY }}
+          FEEDLING_V2_E2B_TEMPLATE:       ${{ vars.TEST_FEEDLING_V2_E2B_TEMPLATE }}
+        run: |
+          missing=0
+          for name in \
+            PHALA_CLOUD_API_KEY \
+            DATABASE_URL \
+            FEEDLING_RUNTIME_TOKEN_SECRET \
+            FEEDLING_API_URL \
+            FEEDLING_ENCLAVE_URL \
+            FEEDLING_ADMIN_TOKEN
+          do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is required before either test CVM is changed"
+              missing=1
+            fi
+          done
+          case "$FEEDLING_V2_SANDBOX_PROVIDER" in
+            disabled|e2b) ;;
+            *) echo "::error::test sandbox provider must be exactly disabled or e2b"; missing=1 ;;
+          esac
+          if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
+            if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
+            fi
+            if [ -z "$E2B_API_KEY" ] || [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              echo "::error::test E2B sandbox requires an E2B key and content-addressed template"
+              missing=1
+            fi
+          fi
+          exit "$missing"
+
+      - name: Build and verify the test E2B template
+        if: ${{ vars.TEST_FEEDLING_V2_SANDBOX_PROVIDER == 'e2b' }}
+        env:
+          E2B_API_KEY:              ${{ secrets.TEST_E2B_API_KEY || secrets.E2B_API_KEY }}
+          FEEDLING_V2_E2B_TEMPLATE: ${{ vars.TEST_FEEDLING_V2_E2B_TEMPLATE }}
+        run: |
+          python3 -m pip install --quiet e2b==2.34.0
+          if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+            FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
+            export FEEDLING_V2_E2B_TEMPLATE
+          fi
+          cd deploy/e2b/runtime-v2
+          python3 build_template.py
+          python3 verify_template.py
+
+      - name: Preserve test E2B template build lock
+        if: ${{ vars.TEST_FEEDLING_V2_SANDBOX_PROVIDER == 'e2b' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-e2b-template-${{ github.sha }}
+          path: deploy/e2b/runtime-v2/e2b-template-build.json
+          retention-days: 90
+
+      - name: Require both Runtime V2 images before mutating either CVM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          for name in feedling feedling-agent-runner; do
+            image="ghcr.io/${IMAGE_OWNER}/${name}:$SHA_SHORT"
+            echo "waiting for $image"
+            found=0
+            for i in $(seq 1 60); do
+              if docker manifest inspect "$image" >/dev/null 2>&1; then
+                found=1
+                break
+              fi
+              sleep 10
+            done
+            if [ "$found" != 1 ]; then
+              echo "::error::$image did not appear in 10 min — no test CVM was changed"
+              exit 1
+            fi
+          done
+
+  # Runtime V2 has no resident fallback. Fail before mutating live state unless
+  # at least two independent production worker CVMs are recorded.
   validate-prod-runner-topology:
-    name: validate prod runner topology
+    name: validate prod deploy prerequisites
     needs: [detect-cvm-changes]
     if: |
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&
       needs.detect-cvm-changes.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
-      - name: Require two independent prod runner CVMs
+      - name: Require two production Runtime V2 worker CVMs
+        run: ./deploy/check-prod-runner-topology.sh deploy/prod-runner-cvm-ids.txt deploy/prod-cvm-id.txt
+      - name: Confirm every production CVM exists before mutating the main CVM
         env:
-          DEPLOY_PROD_RUNNER_CVM: ${{ vars.DEPLOY_PROD_RUNNER_CVM }}
-        run: ./deploy/check-prod-runner-topology.sh deploy/prod-runner-cvm-ids.txt "$DEPLOY_PROD_RUNNER_CVM"
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          if [ -z "$PHALA_CLOUD_API_KEY" ]; then
+            echo "::error::PHALA_CLOUD_API_KEY is required to validate the release fleet"
+            exit 1
+          fi
+          npm install -g phala@1.1.19
+          {
+            cat deploy/prod-cvm-id.txt
+            grep -vE '^[[:space:]]*(#|$)' deploy/prod-runner-cvm-ids.txt
+          } | while IFS= read -r CVM_ID; do
+            CVM_ID=$(printf '%s' "$CVM_ID" | tr -d '[:space:]')
+            [ -z "$CVM_ID" ] && continue
+            echo "validating production CVM $CVM_ID"
+            if ! phala cvms get "$CVM_ID" --json --api-token "$PHALA_CLOUD_API_KEY" >/dev/null; then
+              echo "::error::production CVM $CVM_ID does not exist or is not accessible"
+              exit 1
+            fi
+          done
+
+      - name: Require complete production Runtime V2 configuration
+        env:
+          DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
+          FEEDLING_API_URL:              ${{ vars.PROD_MAIN_API_URL }}
+          FEEDLING_ENCLAVE_URL:          ${{ vars.PROD_MAIN_ENCLAVE_URL }}
+          FEEDLING_ADMIN_TOKEN:          ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PROD_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
+          E2B_API_KEY:                    ${{ secrets.E2B_API_KEY }}
+          FEEDLING_V2_E2B_TEMPLATE:       ${{ vars.PROD_FEEDLING_V2_E2B_TEMPLATE }}
+        run: |
+          missing=0
+          for name in \
+            DATABASE_URL \
+            FEEDLING_RUNTIME_TOKEN_SECRET \
+            FEEDLING_API_URL \
+            FEEDLING_ENCLAVE_URL \
+            FEEDLING_ADMIN_TOKEN
+          do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is required before any production CVM is changed"
+              missing=1
+            fi
+          done
+          case "$FEEDLING_V2_SANDBOX_PROVIDER" in
+            disabled|e2b) ;;
+            *) echo "::error::production sandbox provider must be exactly disabled or e2b"; missing=1 ;;
+          esac
+          if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
+            if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
+            fi
+            if [ -z "$E2B_API_KEY" ] || [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              echo "::error::production E2B sandbox requires a key and content-addressed template"
+              missing=1
+            fi
+          fi
+          exit "$missing"
+
+      - name: Build and verify the production E2B template
+        if: ${{ vars.PROD_FEEDLING_V2_SANDBOX_PROVIDER == 'e2b' }}
+        env:
+          E2B_API_KEY:              ${{ secrets.E2B_API_KEY }}
+          FEEDLING_V2_E2B_TEMPLATE: ${{ vars.PROD_FEEDLING_V2_E2B_TEMPLATE }}
+        run: |
+          python3 -m pip install --quiet e2b==2.34.0
+          if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+            FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
+            export FEEDLING_V2_E2B_TEMPLATE
+          fi
+          cd deploy/e2b/runtime-v2
+          python3 build_template.py
+          python3 verify_template.py
+
+      - name: Preserve production E2B template build lock
+        if: ${{ vars.PROD_FEEDLING_V2_SANDBOX_PROVIDER == 'e2b' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-e2b-template-${{ github.sha }}
+          path: deploy/e2b/runtime-v2/e2b-template-build.json
+          retention-days: 90
+
+      - name: Require both production images before mutating either CVM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          for name in feedling feedling-agent-runner; do
+            image="ghcr.io/${IMAGE_OWNER}/${name}:$SHA_SHORT"
+            echo "waiting for $image"
+            found=0
+            for i in $(seq 1 60); do
+              if docker manifest inspect "$image" >/dev/null 2>&1; then
+                found=1
+                break
+              fi
+              sleep 10
+            done
+            if [ "$found" != 1 ]; then
+              echo "::error::$image did not appear in 10 min — no production CVM was changed"
+              exit 1
+            fi
+          done
 
   detect-cvm-changes-pre:
     name: detect CVM changes (pre)
@@ -374,7 +624,6 @@ jobs:
           filters: |
             cvm:
               - 'backend/**'
-              - 'tools/chat_resident_consumer.py'
               - 'tools/deploy_canary.py'
               - 'tools/prompt_cache_canary.py'
               - 'deploy/attestation-gate.sh'
@@ -382,16 +631,157 @@ jobs:
               - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.pre.yaml'
               - 'deploy/docker-compose.phala.pre.runner.yaml'
+              - 'deploy/e2b/runtime-v2/**'
+              - 'deploy/pin-runtime-release.sh'
+              - 'deploy/pre-cvm-id.txt'
+              - 'deploy/pre-runner-cvm-id.txt'
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
+
+  # Pre is V2-only and has no resident fallback. Validate the complete two-CVM
+  # release unit before changing the main CVM, so a missing runner image or
+  # configuration cannot leave the app accepting jobs with no executor.
+  validate-pre-runtime-prerequisites:
+    name: validate pre Runtime V2 deploy prerequisites
+    needs: [detect-cvm-changes-pre]
+    if: |
+      github.ref == 'refs/heads/pre' &&
+      github.event_name == 'push' &&
+      needs.detect-cvm-changes-pre.outputs.cvm == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require independent main and runner CVMs
+        run: |
+          MAIN_CVM_ID=$(tr -d '[:space:]' < deploy/pre-cvm-id.txt)
+          RUNNER_CVM_ID=$(tr -d '[:space:]' < deploy/pre-runner-cvm-id.txt)
+          if [ -z "$MAIN_CVM_ID" ] || [ -z "$RUNNER_CVM_ID" ]; then
+            echo "::error::pre main and runner CVM IDs must both be provisioned"
+            exit 1
+          fi
+          if [ "$MAIN_CVM_ID" = "$RUNNER_CVM_ID" ]; then
+            echo "::error::pre main and Runtime V2 runner must use independent CVMs"
+            exit 1
+          fi
+
+      - name: Confirm both pre CVMs exist before mutating the main CVM
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+        run: |
+          if [ -z "$PHALA_CLOUD_API_KEY" ]; then
+            echo "::error::TEST_PHALA_CLOUD_API_KEY is required to validate the release unit"
+            exit 1
+          fi
+          npm install -g phala@1.1.19
+          for file in deploy/pre-cvm-id.txt deploy/pre-runner-cvm-id.txt; do
+            CVM_ID=$(tr -d '[:space:]' < "$file")
+            echo "validating pre CVM $CVM_ID"
+            if ! phala cvms get "$CVM_ID" --json --api-token "$PHALA_CLOUD_API_KEY" >/dev/null; then
+              echo "::error::pre CVM $CVM_ID does not exist or is not accessible"
+              exit 1
+            fi
+          done
+
+      - name: Require complete Runtime V2 configuration
+        env:
+          PHALA_CLOUD_API_KEY:           ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          DATABASE_URL:                  ${{ secrets.PRE_DATABASE_URL }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
+          FEEDLING_API_URL:              ${{ vars.PRE_MAIN_API_URL }}
+          FEEDLING_ENCLAVE_URL:          ${{ vars.PRE_MAIN_ENCLAVE_URL }}
+          FEEDLING_ADMIN_TOKEN:          ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
+          E2B_API_KEY:                    ${{ secrets.PRE_E2B_API_KEY || secrets.E2B_API_KEY }}
+          FEEDLING_V2_E2B_TEMPLATE:       ${{ vars.PRE_FEEDLING_V2_E2B_TEMPLATE }}
+        run: |
+          missing=0
+          for name in \
+            PHALA_CLOUD_API_KEY \
+            DATABASE_URL \
+            FEEDLING_RUNTIME_TOKEN_SECRET \
+            FEEDLING_API_URL \
+            FEEDLING_ENCLAVE_URL \
+            FEEDLING_ADMIN_TOKEN
+          do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is required before either pre CVM is changed"
+              missing=1
+            fi
+          done
+          case "$FEEDLING_V2_SANDBOX_PROVIDER" in
+            disabled|e2b) ;;
+            *) echo "::error::pre sandbox provider must be exactly disabled or e2b"; missing=1 ;;
+          esac
+          if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
+            if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
+            fi
+            if [ -z "$E2B_API_KEY" ] || [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              echo "::error::pre E2B sandbox requires an E2B key and content-addressed template"
+              missing=1
+            fi
+          fi
+          exit "$missing"
+
+      - name: Build and verify the content-addressed E2B template
+        if: ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER == 'e2b' }}
+        env:
+          E2B_API_KEY:               ${{ secrets.PRE_E2B_API_KEY || secrets.E2B_API_KEY }}
+          FEEDLING_V2_E2B_TEMPLATE:  ${{ vars.PRE_FEEDLING_V2_E2B_TEMPLATE }}
+        run: |
+          python3 -m pip install --quiet e2b==2.34.0
+          if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+            FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
+            export FEEDLING_V2_E2B_TEMPLATE
+          fi
+          cd deploy/e2b/runtime-v2
+          python3 build_template.py
+          python3 verify_template.py
+
+      - name: Preserve E2B template build lock
+        if: ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER == 'e2b' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-e2b-template-${{ github.sha }}
+          path: deploy/e2b/runtime-v2/e2b-template-build.json
+          retention-days: 90
+
+      - name: Require both Runtime V2 images before mutating either CVM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          for name in feedling feedling-agent-runner; do
+            image="ghcr.io/${IMAGE_OWNER}/${name}:$SHA_SHORT"
+            echo "waiting for $image"
+            found=0
+            for i in $(seq 1 60); do
+              if docker manifest inspect "$image" >/dev/null 2>&1; then
+                found=1
+                break
+              fi
+              sleep 10
+            done
+            if [ "$found" != 1 ]; then
+              echo "::error::$image did not appear in 10 min — no pre CVM was changed"
+              exit 1
+            fi
+          done
 
   # =========================================================================
   # DEPLOY — CVM (compose_hash on-chain + phala deploy)
   #
   # Chain:  (1) wait for ghcr.io/.../feedling:<sha> image published by
   #             docker-publish.yml
-  #         (2) pin that tag into deploy/docker-compose.phala.yaml, commit
-  #             with [skip ci] (idempotent — no-ops if already pinned)
+  #         (2) atomically pin backend + runner tags from the triggering SHA
+  #             into one compare-and-swap [skip ci] release commit
   #         (3) compute compose_hash from the pinned compose, authorize it
   #             on-chain via FeedlingAppAuth.addComposeHash (idempotent)
   #         (4) phala deploy --cvm-id <uuid> --wait
@@ -415,6 +805,7 @@ jobs:
       cancel-in-progress: false
     outputs:
       cvm_id: ${{ steps.cvmid.outputs.cvm_id }}
+      pinned_sha: ${{ steps.pin.outputs.pinned_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -431,53 +822,23 @@ jobs:
           echo "waiting for ${IMAGE}:$SHA_SHORT"
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
           for i in $(seq 1 60); do
-            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1 \
-               && docker manifest inspect "${IMAGE}-agent-runner:$SHA_SHORT" >/dev/null 2>&1; then
-              echo "images :$SHA_SHORT available (backend + agent-runner)"
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "backend image :$SHA_SHORT available"
               exit 0
             fi
             sleep 10
           done
-          echo "::error::image :$SHA_SHORT (backend or agent-runner) did not appear in 10 min — docker-publish.yml likely failed"
+          echo "::error::backend image :$SHA_SHORT did not appear in 10 min — docker-publish.yml likely failed"
           exit 1
 
-      - name: Pin image tag in deploy/docker-compose.phala.yaml
+      - name: Pin Runtime V2 release images from triggering commit
         id: pin
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        run: |
-          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
-
-          # Sync to latest main FIRST. Rerun case (e.g. a previous deploy-
-          # cvm partially failed after the prior run already pushed the
-          # "deploy: bump CVM image to :<sha>" commit): without this, the
-          # checkout sits on the original triggering commit, the sed
-          # re-creates the pin locally, `git commit` succeeds, and
-          # `git push origin HEAD:main` is rejected as non-fast-forward.
-          # Resetting to origin/main makes this step idempotent — when the
-          # pin already landed in a prior run, the diff is empty and we
-          # take the no-op branch cleanly.
-          git fetch origin main
-          git reset --hard origin/main
-
-          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
-          # Pin the backend image, then the sibling agent-runner image. The first
-          # regex requires the literal "/feedling:" so it never matches the
-          # "/feedling-agent-runner:" line; the second pins that one.
-          sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
-            deploy/docker-compose.phala.yaml
-          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}-agent-runner:${TRIGGER_SHA_SHORT}|g" \
-            deploy/docker-compose.phala.yaml
-          if git diff --quiet -- deploy/docker-compose.phala.yaml; then
-            echo "tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
-          else
-            git config user.name  'feedling-ci'
-            git config user.email 'ci@feedling.app'
-            git add deploy/docker-compose.phala.yaml
-            git commit -m "deploy: bump CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
-            git push origin HEAD:main
-          fi
+        run: >-
+          ./deploy/pin-runtime-release.sh main
+          deploy/docker-compose.phala.yaml
+          deploy/docker-compose.phala.prod.runner.yaml
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
@@ -598,22 +959,7 @@ jobs:
           TEE_DATABASE_URL:        ${{ secrets.PROD_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
-          # agent-runner (4th service) knobs — encrypted env channel, NOT baked
-          # into compose_hash. All default to empty (service idles, gateway off),
-          # so flipping them on later needs no on-chain re-auth. AGENT_RUNTIME_USERS
-          # is the roster JSON (carries per-user keys); the rest are flags/secrets.
-          AGENT_RUNTIME_USERS:          ${{ secrets.AGENT_RUNTIME_USERS }}
-          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
-          # Supervisor cold-start ramp pace: tick interval (compose default 15s).
-          # Lowered to 5 so ~90 consumers respawn ~3× faster after a restart,
-          # shrinking the window where an incoming message hits a not-yet-spawned
-          # consumer. Encrypted env, NOT in compose_hash — override via repo var.
-          AGENT_TICK_INTERVAL_SEC:      ${{ vars.AGENT_TICK_INTERVAL_SEC || '5' }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
-          # Host-all: agent-runner hosts every configured user (zero-roster, via
-          # runtime token) + backend routes their sends to it. Needs the token
-          # secret above. Empty = off. Both services read it from the encrypted env.
-          FEEDLING_HOST_ALL:            ${{ vars.FEEDLING_HOST_ALL }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.FEEDLING_MIGRATE_ENABLE }}
           # gunicorn worker counts (compose reads them; empty → compose default
           # 4/backend, 2/enclave). Encrypted env, NOT baked into compose_hash —
@@ -654,11 +1000,7 @@ jobs:
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
-            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
-            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
-            -e "AGENT_TICK_INTERVAL_SEC=$AGENT_TICK_INTERVAL_SEC" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS" \
@@ -744,7 +1086,7 @@ jobs:
 
   deploy-test-cvm:
     name: deploy CVM (test)
-    needs: [forge-test, python-tests, docker-build, lint, dcap-python, detect-cvm-changes-test]
+    needs: [forge-test, python-tests, docker-build, lint, dcap-python, detect-cvm-changes-test, validate-test-runtime-prerequisites]
     if: |
       github.ref == 'refs/heads/test' &&
       github.event_name == 'push' &&
@@ -756,6 +1098,8 @@ jobs:
     concurrency:
       group: deploy-test-cvm
       cancel-in-progress: false
+    outputs:
+      pinned_sha: ${{ steps.pin.outputs.pinned_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -772,40 +1116,23 @@ jobs:
           echo "waiting for ${IMAGE}:$SHA_SHORT"
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
           for i in $(seq 1 60); do
-            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1 \
-               && docker manifest inspect "${IMAGE}-agent-runner:$SHA_SHORT" >/dev/null 2>&1; then
-              echo "images :$SHA_SHORT available (backend + agent-runner)"
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "backend image :$SHA_SHORT available"
               exit 0
             fi
             sleep 10
           done
-          echo "::error::image :$SHA_SHORT (backend or agent-runner) did not appear in 10 min — docker-publish.yml likely failed"
+          echo "::error::backend image :$SHA_SHORT did not appear in 10 min — docker-publish.yml likely failed"
           exit 1
 
-      - name: Pin image tag in deploy/docker-compose.phala.test.yaml
+      - name: Pin Runtime V2 release images from triggering commit
         id: pin
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        run: |
-          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
-          git fetch origin test
-          git reset --hard origin/test
-          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
-          # Pin the backend image, then the sibling agent-runner image (see prod job).
-          sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
-            deploy/docker-compose.phala.test.yaml
-          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}-agent-runner:${TRIGGER_SHA_SHORT}|g" \
-            deploy/docker-compose.phala.test.yaml
-          if git diff --quiet -- deploy/docker-compose.phala.test.yaml; then
-            echo "tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
-          else
-            git config user.name  'feedling-ci'
-            git config user.email 'ci@feedling.app'
-            git add deploy/docker-compose.phala.test.yaml
-            git commit -m "deploy(test): bump CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
-            git push origin HEAD:test
-          fi
+        run: >-
+          ./deploy/pin-runtime-release.sh test
+          deploy/docker-compose.phala.test.yaml
+          deploy/docker-compose.phala.runner.yaml
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
@@ -848,16 +1175,7 @@ jobs:
           TEE_DATABASE_URL:        ${{ secrets.TEST_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
-          # Shared runner credentials — encrypted env channel, not baked into
-          # compose_hash. Pre V2 uses the runtime-token secret for enclave BYOK
-          # unwrap; resident discovery knobs stay available only for a deliberate
-          # resident_only rollback. TEST_-prefixed reuse is intentional.
-          AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
-          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
-          # Resident rollback only. Under normal v2_only operation every eligible
-          # account is excluded from the resident supervisor roster.
-          FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
@@ -896,11 +1214,7 @@ jobs:
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
-            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
-            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
-            -e "AGENT_TICK_INTERVAL_SEC=$AGENT_TICK_INTERVAL_SEC" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             --wait
@@ -964,20 +1278,12 @@ jobs:
           python3 tools/deploy_canary.py
 
   # =========================================================================
-  # DEPLOY — standalone runner CVM (test, multi-node Form B)
+  # DEPLOY — standalone Runtime V2 worker CVM (test)
   #
-  # Deploys deploy/docker-compose.phala.runner.yaml to a SEPARATE Phala CVM that
-  # runs one resident agent-runner plus a sibling Hosted Runtime V2 serve-worker
-  # (see deploy/DEPLOYMENTS.md “横向扩展”). Both share the same backend-code image,
-  # main-CVM Postgres + token secret, and reach the main backend/enclave over their
-  # public ingress + gateway-passthrough URLs. Neither runs on the main CVM.
-  #
-  # DORMANT BY DEFAULT: skipped unless the repo var DEPLOY_TEST_RUNNER_CVM == 'true'
-  # AND deploy/test-runner-cvm-id.txt names a provisioned runner CVM. So merging
-  # this is a no-op until you (1) provision the runner dstack app, (2) put its CVM
-  # id in that file, (3) set the runner secrets/vars below, (4) flip the var. Runs
-  # AFTER deploy-test-cvm (serialized: shares the branch push + the main CVM must
-  # be up for the runner to reach it).
+  # Deploys deploy/docker-compose.phala.runner.yaml to a separate Phala CVM.
+  # The worker is mandatory because hosted accounts have no resident fallback.
+  # It shares PostgreSQL + the runtime-token secret with the main CVM and reaches
+  # the backend/enclave over their public/gateway paths.
   # =========================================================================
   deploy-test-runner-cvm:
     name: deploy runner CVM (test)
@@ -985,11 +1291,10 @@ jobs:
     if: |
       github.ref == 'refs/heads/test' &&
       github.event_name == 'push' &&
-      needs.detect-cvm-changes-test.outputs.cvm == 'true' &&
-      vars.DEPLOY_TEST_RUNNER_CVM == 'true'
+      needs.detect-cvm-changes-test.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
       packages: read
     concurrency:
       group: deploy-test-runner-cvm
@@ -998,6 +1303,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.deploy-test-cvm.outputs.pinned_sha }}
 
       - name: Wait for ghcr.io agent-runner image :<sha>
         env:
@@ -1017,29 +1323,6 @@ jobs:
           done
           echo "::error::agent-runner image :$SHA_SHORT did not appear in 10 min"
           exit 1
-
-      - name: Pin image tag in deploy/docker-compose.phala.runner.yaml
-        env:
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        run: |
-          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
-          # deploy-test-cvm already pushed the main test bump; sync to it so this
-          # push fast-forwards (no race — the two deploy jobs are serialized).
-          git fetch origin test
-          git reset --hard origin/test
-          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
-          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
-            deploy/docker-compose.phala.runner.yaml
-          if git diff --quiet -- deploy/docker-compose.phala.runner.yaml; then
-            echo "runner tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
-          else
-            git config user.name  'feedling-ci'
-            git config user.email 'ci@feedling.app'
-            git add deploy/docker-compose.phala.runner.yaml
-            git commit -m "deploy: bump runner CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
-            git push origin HEAD:test
-          fi
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
@@ -1069,37 +1352,54 @@ jobs:
           #   TEST_MAIN_ENCLAVE_URL = https://<main-app-id>-5003s.dstack-pha-prod9.phala.network
           FEEDLING_API_URL:             ${{ vars.TEST_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:         ${{ vars.TEST_MAIN_ENCLAVE_URL }}
-          AGENT_MAX_CHILDREN:           ${{ vars.TEST_AGENT_MAX_CHILDREN }}
           # Shared with the main test CVM — MUST match (esp. the token secret).
           DATABASE_URL:                 ${{ secrets.TEST_DATABASE_URL }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
-          AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
-          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
-          FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
-          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
+          FEEDLING_V2_RUNNER_CVM_ID:      ${{ steps.cvmid.outputs.cvm_id }}
+          FEEDLING_V2_MAX_WORKERS:       ${{ vars.TEST_FEEDLING_V2_MAX_WORKERS || '4' }}
+          FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: ${{ vars.TEST_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0' }}
+          FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: ${{ vars.TEST_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64' }}
+          FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.TEST_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
+          E2B_API_KEY:                   ${{ secrets.TEST_E2B_API_KEY || secrets.E2B_API_KEY }}
+          FEEDLING_V2_E2B_TEMPLATE:      ${{ vars.TEST_FEEDLING_V2_E2B_TEMPLATE }}
+          FEEDLING_V2_E2B_ALLOW_INTERNET: ${{ vars.TEST_FEEDLING_V2_E2B_ALLOW_INTERNET || '0' }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
-            echo "::error::TEST_DATABASE_URL not set — runner has no lease store"
+            echo "::error::TEST_DATABASE_URL not set — worker has no durable job store"
             exit 1
           fi
           if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
             echo "::error::TEST_MAIN_API_URL / TEST_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"
             exit 1
           fi
+          if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
+            if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
+            fi
+            if [ -z "$E2B_API_KEY" ] || [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              echo "::error::TEST E2B sandbox requires an E2B key and content-addressed template"
+              exit 1
+            fi
+          fi
+          DEPLOYED_BUILD="${GITHUB_SHA:0:7}"
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
             -c deploy/docker-compose.phala.runner.yaml \
             -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
             -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
-            -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
-            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
-            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE"
+            -e "FEEDLING_V2_RUNNER_CVM_ID=$FEEDLING_V2_RUNNER_CVM_ID" \
+            -e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD" \
+            -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
+            -e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED" \
+            -e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE=$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE" \
+            -e "FEEDLING_V2_SANDBOX_PROVIDER=$FEEDLING_V2_SANDBOX_PROVIDER" \
+            -e "E2B_API_KEY=$E2B_API_KEY" \
+            -e "FEEDLING_V2_E2B_TEMPLATE=$FEEDLING_V2_E2B_TEMPLATE" \
+            -e "FEEDLING_V2_E2B_ALLOW_INTERNET=$FEEDLING_V2_E2B_ALLOW_INTERNET"
           # NOT --wait: the CLI's readiness wait is hard-capped at 300s and the
           # runner image pull + boot regularly exceeds it. Poll with our own
           # configurable deadline instead (deploy/wait-cvm-ready.sh).
@@ -1133,9 +1433,19 @@ jobs:
           done
           exit "$publish_status"
 
+      - name: Post-deploy Runtime V2 fleet identity gate (test)
+        env:
+          FEEDLING_API_URL:     ${{ vars.TEST_API_URL || 'https://test-api.feedling.app' }}
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+        run: |
+          python3 deploy/check-v2-runner-fleet.py \
+            --base-url "$FEEDLING_API_URL" \
+            --inventory deploy/test-runner-cvm-id.txt \
+            --build "${GITHUB_SHA:0:7}"
+
   deploy-pre-cvm:
     name: deploy CVM (pre)
-    needs: [forge-test, python-tests, docker-build, lint, dcap-python, detect-cvm-changes-pre]
+    needs: [forge-test, python-tests, docker-build, lint, dcap-python, detect-cvm-changes-pre, validate-pre-runtime-prerequisites]
     if: |
       github.ref == 'refs/heads/pre' &&
       github.event_name == 'push' &&
@@ -1147,6 +1457,8 @@ jobs:
     concurrency:
       group: deploy-pre-cvm
       cancel-in-progress: false
+    outputs:
+      pinned_sha: ${{ steps.pin.outputs.pinned_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1163,40 +1475,23 @@ jobs:
           echo "waiting for ${IMAGE}:$SHA_SHORT"
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
           for i in $(seq 1 60); do
-            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1 \
-               && docker manifest inspect "${IMAGE}-agent-runner:$SHA_SHORT" >/dev/null 2>&1; then
-              echo "images :$SHA_SHORT available (backend + agent-runner)"
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "backend image :$SHA_SHORT available"
               exit 0
             fi
             sleep 10
           done
-          echo "::error::image :$SHA_SHORT (backend or agent-runner) did not appear in 10 min — docker-publish.yml likely failed"
+          echo "::error::backend image :$SHA_SHORT did not appear in 10 min — docker-publish.yml likely failed"
           exit 1
 
-      - name: Pin image tag in deploy/docker-compose.phala.pre.yaml
+      - name: Pin Runtime V2 release images from triggering commit
         id: pin
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        run: |
-          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml COMMIT_SHORT (CI #906)
-          git fetch origin pre
-          git reset --hard origin/pre
-          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
-          # Pin the backend image, then the sibling agent-runner image (see prod job).
-          sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
-            deploy/docker-compose.phala.pre.yaml
-          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}-agent-runner:${TRIGGER_SHA_SHORT}|g" \
-            deploy/docker-compose.phala.pre.yaml
-          if git diff --quiet -- deploy/docker-compose.phala.pre.yaml; then
-            echo "tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
-          else
-            git config user.name  'feedling-ci'
-            git config user.email 'ci@feedling.app'
-            git add deploy/docker-compose.phala.pre.yaml
-            git commit -m "deploy(pre): bump CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
-            git push origin HEAD:pre
-          fi
+        run: >-
+          ./deploy/pin-runtime-release.sh pre
+          deploy/docker-compose.phala.pre.yaml
+          deploy/docker-compose.phala.pre.runner.yaml
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
@@ -1233,26 +1528,13 @@ jobs:
           FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           DATABASE_URL:        ${{ secrets.PRE_DATABASE_URL }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
-          # agent-runner (4th service) knobs — encrypted env channel, NOT baked
-          # into compose_hash (see prod deploy step). Default empty = idle + gateway
-          # off; flip on later with no on-chain re-auth. TEST_-prefixed where a
-          # separate test value is wanted; falls back to the shared secret/var.
-          AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
-          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
-          # Host-all: agent-runner hosts every configured user (zero-roster, via
-          # runtime token) + backend routes their sends to it. Needs the token
-          # secret above. Empty = off. Both services read it from the encrypted env.
-          FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
           # election patch (core/leader.py) or N>1 double-binds :9998.
           FEEDLING_BACKEND_WORKERS:     ${{ vars.TEST_FEEDLING_BACKEND_WORKERS }}
-          # v2_only is the normal acceptance mode. An operator may set the repo
-          # variable to resident_only for a generation-fenced fleet rollback.
-          FEEDLING_HOSTED_RUNTIME_POLICY: ${{ vars.PRE_HOSTED_RUNTIME_POLICY || 'v2_only' }}
           # R2 frame-ciphertext offload — TEST_-prefixed secrets, un-prefixed
           # container env. Empty = feature off; token MUST be scoped to the
           # frames bucket. See deploy/DEPLOYMENTS.md.
@@ -1282,14 +1564,9 @@ jobs:
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "DATABASE_URL=$DATABASE_URL" \
-            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
-            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
-            -e "AGENT_TICK_INTERVAL_SEC=$AGENT_TICK_INTERVAL_SEC" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
-            -e "FEEDLING_HOSTED_RUNTIME_POLICY=$FEEDLING_HOSTED_RUNTIME_POLICY" \
             --wait
 
       - name: Publish live compose_hash on Sepolia (pre contract)
@@ -1351,18 +1628,15 @@ jobs:
           python3 tools/deploy_canary.py
 
   # =========================================================================
-  # DEPLOY — standalone runner CVM (pre, multi-node Form B)
+  # DEPLOY — standalone Runtime V2 worker CVM (pre)
   #
   # Deploys deploy/docker-compose.phala.pre.runner.yaml to a SEPARATE Phala CVM that
-  # runs one resident agent-runner plus a sibling Hosted Runtime V2 serve-worker
-  # (see deploy/DEPLOYMENTS.md “横向扩展”). Both reuse the same
-  # feedling-agent-runner:<sha> image, share the main CVM's Postgres + token
-  # secret, and reach the main backend/enclave over public ingress +
-  # gateway-passthrough URLs.
+  # runs only the pooled serve-worker. It shares the main CVM's PostgreSQL and
+  # token secret and reaches backend/enclave over public/gateway paths.
   #
   # Pre is V2-only by default, so this deploy/readiness gate is mandatory for
-  # every CVM-affecting pre push. Runs AFTER deploy-pre-cvm (serialized: shares
-  # the branch push + the main CVM must be up for the runner to reach it).
+  # every CVM-affecting pre push. Both CVMs are validated before either changes;
+  # deployment remains serialized because the runner must reach the new main CVM.
   # =========================================================================
   deploy-pre-runner-cvm:
     name: deploy runner CVM (pre)
@@ -1373,7 +1647,7 @@ jobs:
       needs.detect-cvm-changes-pre.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
       packages: read
     concurrency:
       group: deploy-pre-runner-cvm
@@ -1382,6 +1656,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.deploy-pre-cvm.outputs.pinned_sha }}
 
       - name: Wait for ghcr.io agent-runner image :<sha>
         env:
@@ -1401,29 +1676,6 @@ jobs:
           done
           echo "::error::agent-runner image :$SHA_SHORT did not appear in 10 min"
           exit 1
-
-      - name: Pin image tag in deploy/docker-compose.phala.pre.runner.yaml
-        env:
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        run: |
-          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml COMMIT_SHORT (CI #906)
-          # deploy-pre-cvm already pushed the main pre bump; sync to it so this
-          # push fast-forwards (no race — the two deploy jobs are serialized).
-          git fetch origin pre
-          git reset --hard origin/pre
-          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
-          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
-            deploy/docker-compose.phala.pre.runner.yaml
-          if git diff --quiet -- deploy/docker-compose.phala.pre.runner.yaml; then
-            echo "runner tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
-          else
-            git config user.name  'feedling-ci'
-            git config user.email 'ci@feedling.app'
-            git add deploy/docker-compose.phala.pre.runner.yaml
-            git commit -m "deploy(pre): bump runner CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
-            git push origin HEAD:pre
-          fi
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
@@ -1453,40 +1705,57 @@ jobs:
           #   PRE_MAIN_ENCLAVE_URL = https://<main-app-id>-5003s.dstack-pha-prod9.phala.network
           FEEDLING_API_URL:             ${{ vars.PRE_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:         ${{ vars.PRE_MAIN_ENCLAVE_URL }}
-          AGENT_MAX_CHILDREN:           ${{ vars.TEST_AGENT_MAX_CHILDREN }}
           # Shared with the main pre CVM — MUST match (esp. the token secret).
           DATABASE_URL:                 ${{ secrets.PRE_DATABASE_URL }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
-          AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
-          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
-          FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
-          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
+          FEEDLING_V2_RUNNER_CVM_ID:      ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_V2_MAX_WORKERS:       ${{ vars.PRE_FEEDLING_V2_MAX_WORKERS || '4' }}
+          FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: ${{ vars.PRE_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0' }}
+          FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: ${{ vars.PRE_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64' }}
+          FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
+          E2B_API_KEY:                   ${{ secrets.PRE_E2B_API_KEY || secrets.E2B_API_KEY }}
+          FEEDLING_V2_E2B_TEMPLATE:      ${{ vars.PRE_FEEDLING_V2_E2B_TEMPLATE }}
+          FEEDLING_V2_E2B_ALLOW_INTERNET: ${{ vars.PRE_FEEDLING_V2_E2B_ALLOW_INTERNET || '0' }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
-            echo "::error::PRE_DATABASE_URL not set — runner has no lease store"
+            echo "::error::PRE_DATABASE_URL not set — worker has no durable job store"
             exit 1
           fi
           if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
             echo "::error::PRE_MAIN_API_URL / PRE_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"
             exit 1
           fi
+          if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
+            if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
+            fi
+            if [ -z "$E2B_API_KEY" ] || [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              echo "::error::PRE E2B sandbox requires an E2B key and content-addressed template"
+              exit 1
+            fi
+          fi
+          DEPLOYED_BUILD="${GITHUB_SHA:0:7}"
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
             -c deploy/docker-compose.phala.pre.runner.yaml \
             -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
             -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
-            -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
-            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
-            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            -e "FEEDLING_V2_RUNNER_CVM_ID=$FEEDLING_V2_RUNNER_CVM_ID" \
+            -e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD" \
             -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
-            --wait
+            -e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED" \
+            -e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE=$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE" \
+            -e "FEEDLING_V2_SANDBOX_PROVIDER=$FEEDLING_V2_SANDBOX_PROVIDER" \
+            -e "E2B_API_KEY=$E2B_API_KEY" \
+            -e "FEEDLING_V2_E2B_TEMPLATE=$FEEDLING_V2_E2B_TEMPLATE" \
+            -e "FEEDLING_V2_E2B_ALLOW_INTERNET=$FEEDLING_V2_E2B_ALLOW_INTERNET"
+          # phala deploy --wait has a fixed 300-second ceiling; runner image
+          # pulls routinely exceed it. Use the repo's explicit bounded poll.
+          ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
 
       - name: Publish live runner compose_hash on Sepolia (pre contract)
         env:
@@ -1520,121 +1789,11 @@ jobs:
         env:
           FEEDLING_API_URL:      ${{ vars.PRE_API_URL || 'https://pre-api.feedling.app' }}
           FEEDLING_ADMIN_TOKEN:  ${{ secrets.FEEDLING_ADMIN_TOKEN }}
-          EXPECTED_RUNTIME_POLICY: ${{ vars.PRE_HOSTED_RUNTIME_POLICY || 'v2_only' }}
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
-          import time
-          import urllib.request
-
-          base_url = os.environ.get("FEEDLING_API_URL", "").rstrip("/")
-          admin_token = os.environ.get("FEEDLING_ADMIN_TOKEN", "")
-          expected_policy = os.environ.get("EXPECTED_RUNTIME_POLICY", "v2_only")
-          expected_modes = {
-              "v2_only": "db_action_v2",
-              "resident_only": "resident_cli",
-          }
-          if expected_policy not in expected_modes:
-              raise SystemExit(
-                  "EXPECTED_RUNTIME_POLICY must be v2_only or resident_only"
-              )
-          expected_mode = expected_modes[expected_policy]
-          expected_commit = os.environ.get("GITHUB_SHA", "")[:7]
-          if not base_url or not admin_token:
-              raise SystemExit("FEEDLING_API_URL / FEEDLING_ADMIN_TOKEN is required")
-          if len(expected_commit) != 7:
-              raise SystemExit("GITHUB_SHA must provide a 7-character build identity")
-
-          endpoint = f"{base_url}/v1/admin/v2-metrics"
-          last_error = "no response"
-          # Outlive the turn heartbeat's normal 30-second freshness window so
-          # an old container cannot make the first post-deploy query false-green.
-          time.sleep(35)
-
-          def heartbeat_age(row):
-              try:
-                  value = row.get("age_sec")
-                  return float(value) if value is not None else float("inf")
-              except (TypeError, ValueError):
-                  return float("inf")
-
-          for _ in range(30):
-              request = urllib.request.Request(
-                  endpoint,
-                  headers={"X-Admin-Token": admin_token},
-              )
-              try:
-                  with urllib.request.urlopen(request, timeout=10) as response:
-                      payload = json.load(response)
-                  live_workers = int(payload.get("live_workers") or 0)
-                  capacity = int(payload.get("live_worker_capacity") or 0)
-                  genesis_alive = payload.get("genesis_alive") is True
-                  runtime_policy = payload.get("runtime_policy") or {}
-                  policy_ready = (
-                      runtime_policy.get("policy") == expected_policy
-                      and runtime_policy.get("target_mode") == expected_mode
-                      and int(runtime_policy.get("eligible_count") or 0)
-                          == int(runtime_policy.get("ready_count") or 0)
-                      and int(runtime_policy.get("inconsistent_count") or 0) == 0
-                  )
-                  heartbeats = payload.get("worker_heartbeats") or []
-                  turns = [
-                      row for row in heartbeats
-                      if row.get("kind") == "turn"
-                      and str(row.get("worker_id") or "").endswith(
-                          f"-{expected_commit}"
-                      )
-                      and int(row.get("capacity") or 0) > 0
-                      and heartbeat_age(row) <= 20
-                  ]
-                  genesis_ids = {
-                      str(row.get("worker_id") or "")
-                      for row in heartbeats
-                      if row.get("kind") == "genesis"
-                      and str(row.get("worker_id") or "").endswith(
-                          f"-{expected_commit}:genesis"
-                      )
-                      and heartbeat_age(row) <= 60
-                  }
-                  matched_identity = next(
-                      (
-                          str(row["worker_id"])
-                          for row in turns
-                          if f'{row["worker_id"]}:genesis' in genesis_ids
-                      ),
-                      None,
-                  )
-                  if (
-                      live_workers >= 1
-                      and capacity > 0
-                      and genesis_alive
-                      and policy_ready
-                      and matched_identity is not None
-                  ):
-                      print(
-                          "Runtime V2 healthy: "
-                          f"live_workers={live_workers} capacity={capacity} "
-                          f"genesis_alive=true policy={expected_policy} "
-                          f"policy_ready=true "
-                          f"eligible={runtime_policy.get('eligible_count')} "
-                          f"worker={matched_identity}"
-                      )
-                      raise SystemExit(0)
-                  last_error = (
-                      f"live_workers={live_workers} capacity={capacity} "
-                      f"genesis_alive={genesis_alive} "
-                      f"runtime_policy={runtime_policy} "
-                      f"expected_build={expected_commit} matched={matched_identity}"
-                  )
-              except Exception as exc:  # transient deploy/startup window
-                  last_error = f"{type(exc).__name__}: {exc}"
-              time.sleep(5)
-
-          print(f"Runtime V2 liveness gate failed: {last_error}", file=sys.stderr)
-          raise SystemExit(1)
-          PY
+          python3 deploy/check-v2-runner-fleet.py \
+            --base-url "$FEEDLING_API_URL" \
+            --inventory deploy/pre-runner-cvm-id.txt \
+            --build "${GITHUB_SHA:0:7}"
 
       - name: Prove Runtime V2 prompt-cache hit (pre)
         env:
@@ -1646,28 +1805,25 @@ jobs:
         run: python3 tools/prompt_cache_canary.py
 
   # =========================================================================
-  # DEPLOY — standalone prod runner CVM(s) (Form B, multi-node)
+  # DEPLOY — standalone production Runtime V2 worker CVM(s)
   #
-  # ONE runner per CVM; scale out by listing MORE CVM ids in
+  # One pooled worker service per CVM; scale out by listing more CVM ids in
   # deploy/prod-runner-cvm-ids.txt (one per line). Deploys the SAME
   # deploy/docker-compose.phala.prod.runner.yaml to each, sharing the main prod
   # CVM's Postgres + secrets via the encrypted env channel. See deploy/DEPLOYMENTS.md.
   #
-  # Active only when repo var DEPLOY_PROD_RUNNER_CVM == 'true'. The topology
-  # preflight above requires >=2 distinct provisioned IDs before either the main
-  # or runner CVMs may be changed. Runner secrets reuse the main prod CVM's
-  # DATABASE_URL / FEEDLING_RUNTIME_TOKEN_SECRET (MUST match) / AGENT_RUNTIME_USERS.
+  # This job is mandatory for every production CVM change because hosted Chat
+  # has no resident fallback. The preflight requires two independent IDs.
   deploy-prod-runner-cvm:
     name: deploy runner CVM (prod)
     needs: [deploy-cvm, detect-cvm-changes]
     if: |
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&
-      needs.detect-cvm-changes.outputs.cvm == 'true' &&
-      vars.DEPLOY_PROD_RUNNER_CVM == 'true'
+      needs.detect-cvm-changes.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
       packages: read
     concurrency:
       group: deploy-prod-runner-cvm
@@ -1676,6 +1832,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.deploy-cvm.outputs.pinned_sha }}
 
       - name: Wait for ghcr.io agent-runner image :<sha>
         env:
@@ -1696,29 +1853,6 @@ jobs:
           echo "::error::agent-runner image :$SHA_SHORT did not appear in 10 min"
           exit 1
 
-      - name: Pin image tag in deploy/docker-compose.phala.prod.runner.yaml
-        env:
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        run: |
-          TRIGGER_SHA_SHORT="${GITHUB_SHA:0:7}"  # fixed 7-char slice; must match docker-publish.yml's COMMIT_SHORT (see CI #906)
-          # deploy-cvm already pushed the main prod bump; sync to it so this push
-          # fast-forwards (the two prod deploy jobs are serialized by needs:).
-          git fetch origin main
-          git reset --hard origin/main
-          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
-          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
-            deploy/docker-compose.phala.prod.runner.yaml
-          if git diff --quiet -- deploy/docker-compose.phala.prod.runner.yaml; then
-            echo "prod runner tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
-          else
-            git config user.name  'feedling-ci'
-            git config user.email 'ci@feedling.app'
-            git add deploy/docker-compose.phala.prod.runner.yaml
-            git commit -m "deploy: bump prod runner CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
-            git push origin HEAD:main
-          fi
-
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: 1.7.1
@@ -1736,7 +1870,7 @@ jobs:
             | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
             | grep . || true)
           if [ -z "$IDS" ]; then
-            echo "::error::deploy/prod-runner-cvm-ids.txt has no CVM ids — provision >=2 prod runner CVMs first"
+            echo "::error::deploy/prod-runner-cvm-ids.txt has no CVM ids — provision two independent worker CVMs first"
             exit 1
           fi
           echo "count=$(printf '%s\n' "$IDS" | wc -l)"
@@ -1753,37 +1887,53 @@ jobs:
           #   PROD_MAIN_ENCLAVE_URL = https://<prod-app-id>-5003s.dstack-pha-prod9.phala.network
           FEEDLING_API_URL:              ${{ vars.PROD_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:          ${{ vars.PROD_MAIN_ENCLAVE_URL }}
-          AGENT_MAX_CHILDREN:            ${{ vars.PROD_AGENT_MAX_CHILDREN }}
           # Reused from the main prod CVM — MUST match (esp. the token secret).
           DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
-          AGENT_RUNTIME_USERS:           ${{ secrets.AGENT_RUNTIME_USERS }}
-          AGENT_RUNTIME_AUTODISCOVER:    ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
-          FEEDLING_HOST_ALL:             ${{ vars.FEEDLING_HOST_ALL }}
-          FEEDLING_MIGRATE_ENABLE:       ${{ vars.FEEDLING_MIGRATE_ENABLE }}
+          FEEDLING_V2_MAX_WORKERS:       ${{ vars.PROD_FEEDLING_V2_MAX_WORKERS || '4' }}
+          FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: ${{ vars.PROD_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0' }}
+          FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: ${{ vars.PROD_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64' }}
+          FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PROD_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
+          E2B_API_KEY:                   ${{ secrets.E2B_API_KEY }}
+          FEEDLING_V2_E2B_TEMPLATE:      ${{ vars.PROD_FEEDLING_V2_E2B_TEMPLATE }}
+          FEEDLING_V2_E2B_ALLOW_INTERNET: ${{ vars.PROD_FEEDLING_V2_E2B_ALLOW_INTERNET || '0' }}
         run: |
           if [ -z "$DATABASE_URL" ]; then
-            echo "::error::DATABASE_URL not set — runner has no lease store"; exit 1
+            echo "::error::DATABASE_URL not set — worker has no durable job store"; exit 1
           fi
           if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
             echo "::error::PROD_MAIN_API_URL / PROD_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"; exit 1
           fi
+          if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
+            if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
+            fi
+            if [ -z "$E2B_API_KEY" ] || [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
+              echo "::error::PROD E2B sandbox requires a key and content-addressed template"
+              exit 1
+            fi
+          fi
+          DEPLOYED_BUILD="${GITHUB_SHA:0:7}"
           printf '%s\n' "$IDS" | while IFS= read -r CVM_ID; do
             [ -z "$CVM_ID" ] && continue
-            echo ">>> deploy prod runner CVM: $CVM_ID"
+            echo ">>> deploy prod runner CVM: $CVM_ID build=$DEPLOYED_BUILD"
             phala deploy \
               --api-token "$PHALA_CLOUD_API_KEY" \
               --cvm-id "$CVM_ID" \
               -c deploy/docker-compose.phala.prod.runner.yaml \
               -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
               -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
-              -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
               -e "DATABASE_URL=$DATABASE_URL" \
               -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-              -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
-              -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
-              -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-              -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE"
+              -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
+              -e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD" \
+              -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
+              -e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED" \
+              -e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE=$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE" \
+              -e "FEEDLING_V2_SANDBOX_PROVIDER=$FEEDLING_V2_SANDBOX_PROVIDER" \
+              -e "E2B_API_KEY=$E2B_API_KEY" \
+              -e "FEEDLING_V2_E2B_TEMPLATE=$FEEDLING_V2_E2B_TEMPLATE" \
+              -e "FEEDLING_V2_E2B_ALLOW_INTERNET=$FEEDLING_V2_E2B_ALLOW_INTERNET"
             # NOT --wait: the CLI's readiness wait is hard-capped at 300s and
             # the runner image pull + boot regularly exceeds it. Poll with our
             # own configurable deadline instead (deploy/wait-cvm-ready.sh).
@@ -1823,13 +1973,22 @@ jobs:
             [ "$publish_status" -eq 0 ] || { echo "::error::publish failed for $CVM_ID"; exit 1; }
           done
 
+      - name: Post-deploy Runtime V2 fleet identity gate (prod)
+        env:
+          FEEDLING_API_URL:     ${{ vars.PROD_API_URL || vars.PROD_MAIN_API_URL || 'https://api.feedling.app' }}
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+        run: |
+          python3 deploy/check-v2-runner-fleet.py \
+            --base-url "$FEEDLING_API_URL" \
+            --inventory deploy/prod-runner-cvm-ids.txt \
+            --build "${GITHUB_SHA:0:7}"
+
   # =========================================================================
   # NOTIFY — Lark "deploy finished", sent only after the WHOLE prod deploy
   # (main CVM + runner CVM(s)) is done, not when the main CVM alone lands.
   # always() + result checks so it still fires when either deploy job fails;
   # gated on deploy-cvm having actually run so PR/test pushes stay silent.
-  # runner result 'skipped' counts as OK (the runner job is dormant unless
-  # DEPLOY_PROD_RUNNER_CVM == 'true').
+  # Runner completion is part of the production deployment result.
   # =========================================================================
   notify-lark-prod-deploy:
     name: notify Lark (prod deploy finished)
@@ -1881,7 +2040,7 @@ jobs:
           cvm: $CVM_ID
           main CVM: $MAIN_STATUS
           runner CVM: $RUNNER_STATUS
-          stage: main CVM + agent-runner CVM deploy
+          stage: main CVM + Runtime V2 worker CVM deploy
 
           actions: $RUN_URL
           commit: $COMMIT_URL

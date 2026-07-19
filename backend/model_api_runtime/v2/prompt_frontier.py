@@ -21,6 +21,7 @@ only a name and a bounded integer estimate.  This makes the result safe to
 persist as metrics without accidentally copying prompt content into plaintext
 runtime state or logs.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -231,6 +232,25 @@ _AUDITED_FAMILIES: tuple[_AuditedFamily, ...] = (
         128_000,
     ),
     _AuditedFamily(
+        "bedrock",
+        "bedrock_anthropic_modern",
+        (
+            "anthropic.claude-3-",
+            "anthropic.claude-sonnet-4",
+            "anthropic.claude-opus-4",
+            "anthropic.claude-haiku-4",
+            "us.anthropic.claude-3-",
+            "us.anthropic.claude-sonnet-4",
+            "us.anthropic.claude-opus-4",
+            "us.anthropic.claude-haiku-4",
+            "eu.anthropic.claude-3-",
+            "eu.anthropic.claude-sonnet-4",
+            "eu.anthropic.claude-opus-4",
+            "eu.anthropic.claude-haiku-4",
+        ),
+        128_000,
+    ),
+    _AuditedFamily(
         "gemini",
         "gemini_modern",
         ("gemini-1.5", "gemini-2", "gemini-3"),
@@ -279,6 +299,7 @@ _DEFAULT_BASE_URLS = {
     "openai": "https://api.openai.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "anthropic": "https://api.anthropic.com/v1",
+    "bedrock": "https://bedrock-runtime.us-east-1.amazonaws.com",
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
     "deepseek": "https://api.deepseek.com",
 }
@@ -287,6 +308,9 @@ _DEFAULT_BASE_URLS = {
 def normalize_provider(provider: str) -> str:
     value = str(provider or "").strip().lower().replace("-", "_")
     aliases = {
+        "amazon_bedrock": "bedrock",
+        "aws_bedrock": "bedrock",
+        "bedrock": "bedrock",
         "claude": "anthropic",
         "google": "gemini",
         "google_gemini": "gemini",
@@ -307,7 +331,10 @@ def _validated_context_window(value: Any, *, label: str) -> int:
         parsed = int(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{label} must be an integer context window") from exc
-    if parsed != value or not MIN_CONTEXT_WINDOW_TOKENS <= parsed <= MAX_CONTEXT_WINDOW_TOKENS:
+    if (
+        parsed != value
+        or not MIN_CONTEXT_WINDOW_TOKENS <= parsed <= MAX_CONTEXT_WINDOW_TOKENS
+    ):
         raise ValueError(
             f"{label} must be between {MIN_CONTEXT_WINDOW_TOKENS} "
             f"and {MAX_CONTEXT_WINDOW_TOKENS}"
@@ -348,7 +375,9 @@ def parse_deployment_overrides(raw: str | None) -> dict[str, int]:
     for key, limit in value.items():
         normalized_key = _normalize_override_key(str(key))
         if normalized_key in parsed:
-            raise ValueError(f"duplicate normalized context-window override: {normalized_key}")
+            raise ValueError(
+                f"duplicate normalized context-window override: {normalized_key}"
+            )
         parsed[normalized_key] = _validated_context_window(
             limit, label=f"context-window override {normalized_key}"
         )
@@ -446,7 +475,9 @@ def resolve_model_limit(
         for family in _AUDITED_FAMILIES:
             if family.provider != normalized_provider:
                 continue
-            if any(normalized_model.startswith(prefix) for prefix in family.model_prefixes):
+            if any(
+                normalized_model.startswith(prefix) for prefix in family.model_prefixes
+            ):
                 return ModelPromptLimit(
                     provider=normalized_provider,
                     model=normalized_model,
@@ -547,9 +578,12 @@ def estimate_structured_tokens(
     overhead = int(structural_overhead_tokens)
     if overhead < 0 or overhead != structural_overhead_tokens:
         raise ValueError("structural overhead must be a non-negative integer")
-    return estimate_utf8_tokens(
-        canonical_json(value), utf8_bytes_per_token=utf8_bytes_per_token
-    ) + overhead
+    return (
+        estimate_utf8_tokens(
+            canonical_json(value), utf8_bytes_per_token=utf8_bytes_per_token
+        )
+        + overhead
+    )
 
 
 def text_component(
@@ -612,9 +646,7 @@ def _image_accounting_value(value: Any) -> tuple[Any, int]:
             sanitized[key] = rendered
             image_count += nested_count
         return sanitized, image_count
-    if isinstance(value, Sequence) and not isinstance(
-        value, (str, bytes, bytearray)
-    ):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         rendered_items: list[Any] = []
         image_count = 0
         for child in value:
@@ -653,9 +685,7 @@ def messages_component(
     )
     return PromptComponent(
         name=component.name,
-        estimated_tokens=(
-            component.estimated_tokens + image_count * image_reserve
-        ),
+        estimated_tokens=(component.estimated_tokens + image_count * image_reserve),
         required=component.required,
         priority=component.priority,
     )
@@ -713,9 +743,7 @@ def build_prompt_budget(
     output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
     safety_margin_tokens: int | None = None,
 ) -> PromptBudget:
-    context = _validated_context_window(
-        context_window_tokens, label="context window"
-    )
+    context = _validated_context_window(context_window_tokens, label="context window")
     if isinstance(output_reserve_tokens, bool):
         raise ValueError("output reserve must be a positive integer")
     output = int(output_reserve_tokens)
@@ -799,21 +827,25 @@ def plan_prompt(
     for index, component in enumerate(ordered):
         if component.required:
             included = True
-            reason: Literal["required", "optional_fit", "optional_over_budget"] = "required"
+            reason: Literal["required", "optional_fit", "optional_over_budget"] = (
+                "required"
+            )
         elif index in included_optional_indexes:
             included = True
             reason = "optional_fit"
         else:
             included = False
             reason = "optional_over_budget"
-        decisions.append(ComponentDecision(
-            name=component.name,
-            estimated_tokens=component.estimated_tokens,
-            required=component.required,
-            priority=component.priority,
-            included=included,
-            reason=reason,
-        ))
+        decisions.append(
+            ComponentDecision(
+                name=component.name,
+                estimated_tokens=component.estimated_tokens,
+                required=component.required,
+                priority=component.priority,
+                included=included,
+                reason=reason,
+            )
+        )
 
     remaining = budget.input_budget_tokens - used
     # Defence in depth: no successful object may describe an overflow, even if
@@ -863,17 +895,21 @@ def plan_provider_round(
         )
     ]
     if exchanges:
-        components.append(tool_transcript_component(
-            exchanges,
-            utf8_bytes_per_token=utf8_bytes_per_token,
-        ))
+        components.append(
+            tool_transcript_component(
+                exchanges,
+                utf8_bytes_per_token=utf8_bytes_per_token,
+            )
+        )
     if tools is not None:
-        components.append(tool_schemas_component(
-            tools,
-            required=False,
-            priority=1,
-            utf8_bytes_per_token=utf8_bytes_per_token,
-        ))
+        components.append(
+            tool_schemas_component(
+                tools,
+                required=False,
+                priority=1,
+                utf8_bytes_per_token=utf8_bytes_per_token,
+            )
+        )
     return plan_prompt(
         model_limit=model_limit,
         components=components,

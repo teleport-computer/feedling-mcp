@@ -719,7 +719,7 @@ def _data_track_fast_validation(
     # Current-reality onboarding check (2026-07 redo). The old 7-step validator
     # asserted removed MCP tools (feedling_identity_init / _chat_verify_loop /
     # _chat_post_message) and retired story/about_me/ta_thinking memory tabs, so
-    # every genesis/host_all user looked permanently stuck. The live flow has
+    # every Genesis/Runtime V2 user looked permanently stuck. The live flow has
     # exactly four ground-truth milestones — identity written, memory distilled,
     # a live connection, and the first AI-visible message — evaluated the same
     # way the authoritative hosted validator does (memory_count > 0, etc.).

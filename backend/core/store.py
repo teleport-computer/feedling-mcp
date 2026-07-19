@@ -20,12 +20,10 @@ from core import config
 from core import wake_bus
 
 MAX_FRAMES = 200
-# Chat history ring buffer per user. Bumped from 500 → 5000 on 2026-05-11
-# to give users meaningful scroll-back across months of normal use without
-# silently losing their oldest conversations. Chat now persists row-per-message
-# in PostgreSQL (see db.chat_append), so an append is a single-row INSERT plus
-# a bounded trim — O(1) regardless of history depth — rather than rewriting the
-# whole history. The cap still bounds storage and the in-memory list size.
+# Per-process hot chat window per user. The PostgreSQL ``chat_messages`` table
+# is the immutable encrypted source transcript and is never trimmed by this
+# value. History pages and single-message body reads go directly to bounded DB
+# APIs, while resident polling/cache scans keep only this newest working set.
 MAX_CHAT_MESSAGES = 5000
 PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
@@ -293,12 +291,14 @@ class UserStore:
 
     # ------- chat -------
     def _load_chat(self):
-        self.chat_messages = db.chat_load(self.user_id)
+        self.chat_messages = db.chat_load_recent(
+            self.user_id, MAX_CHAT_MESSAGES)
 
     def reload_chat_strict(self) -> list[dict]:
         """Refresh chat state without converting a DB failure into emptiness."""
         with self.chat_lock:
-            rows = db.chat_load_strict(self.user_id)
+            rows = db.chat_load_recent_strict(
+                self.user_id, MAX_CHAT_MESSAGES)
             self.chat_messages = rows
             return list(rows)
 
@@ -318,7 +318,8 @@ class UserStore:
         _reload_guard.active = True
         try:
             with self.chat_lock:
-                self.chat_messages = db.chat_load(self.user_id)
+                self.chat_messages = db.chat_load_recent(
+                    self.user_id, MAX_CHAT_MESSAGES)
             with self.frames_lock:
                 self._load_frames_meta()
             with self.world_books_lock:
@@ -491,7 +492,9 @@ class UserStore:
         Shape: `{"lane": str, "reason": str | None, "trace_id": str | None,
         "expected_generation": int | None, "expected_runtime_state": str | None,
         "expected_runtime_mode": str | None}`. The three expected runtime
-        values form the send-time ownership CAS. `None` (the default) preserves
+        values form the send-time ownership CAS. Optional ``client_msg_id`` and
+        ``idempotency_window_sec`` preserve logical-send idempotency inside the
+        same atomic transaction. `None` (the default) preserves
         today's `chat_append_strict`/`chat_append` behavior byte-for-byte —
         the in-memory cache append, trim, `wake_bus.notify`, and
         `capture_scheduler.record_chat_append` side effects are unaffected
@@ -667,11 +670,27 @@ class UserStore:
                     expected_generation=enqueue.get("expected_generation"),
                     expected_runtime_state=enqueue.get("expected_runtime_state"),
                     expected_runtime_mode=enqueue.get("expected_runtime_mode"),
+                    client_msg_id=enqueue.get("client_msg_id"),
+                    idempotency_window_sec=enqueue.get(
+                        "idempotency_window_sec"
+                    ),
                 )
+                if _job_id is None:
+                    winner = db.chat_doc_for_seq(self.user_id, _seq)
+                    if not isinstance(winner, dict):
+                        raise RuntimeError(
+                            "idempotent V2 chat winner disappeared after commit"
+                        )
+                    msg = dict(winner)
+                    persisted_new = False
             elif strict:
                 db.chat_append_strict(
                     self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
-            if not any(str(existing.get("id") or "") == msg_id for existing in self.chat_messages):
+            persisted_msg_id = str(msg.get("id") or msg_id)
+            if not any(
+                str(existing.get("id") or "") == persisted_msg_id
+                for existing in self.chat_messages
+            ):
                 self.chat_messages.append(msg)
             if len(self.chat_messages) > MAX_CHAT_MESSAGES:
                 self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
@@ -693,6 +712,10 @@ class UserStore:
             if resident_runtime_fenced:
                 replayed = dict(msg)
                 replayed["_resident_replayed"] = True
+                return replayed
+            if strict and enqueue is not None and enqueue.get("client_msg_id"):
+                replayed = dict(msg)
+                replayed["_client_msg_replayed"] = True
                 return replayed
             return msg
         wake_bus.notify("chat", self.user_id)
@@ -875,8 +898,8 @@ class UserStore:
             # marker, INDEPENDENT of the identity card (identity-card-never-gates,
             # 2026-07). A no-card / empty-card user has no `self_introduction`
             # field to write, so the intro's one-shot dedup can't live in the card
-            # — it lives here. Set once the introduction job is enqueued; see
-            # agent_runtime.supervisor._enqueue_introduction_job_if_needed.
+            # — it lives here. Set once the introduction job is atomically
+            # enqueued by agent_runtime.introduction.
             "introduced_at": "",
             "updated_at": datetime.now().isoformat(),
         }
