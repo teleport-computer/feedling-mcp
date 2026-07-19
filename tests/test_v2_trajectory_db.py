@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from conftest import seed_user, set_v2_runtime_owner
 import db
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import trajectory
 
 
 pytestmark = pytest.mark.skipif(
@@ -127,6 +129,110 @@ def test_encrypted_events_are_ordered_idempotent_and_immutable():
                 "WHERE job_id=%s AND event_index=0",
                 (job_id,),
             )
+
+
+def test_encrypted_event_batch_is_atomic_ordered_and_idempotent():
+    uid = "u_trajectory_batch"
+    job_id, _job = _source_job(uid)
+    events = [
+        {
+            "event_kind": "provider_request",
+            "idempotency_key": "batch_chunk_0",
+            "payload_envelope": _envelope(uid, "batch-0", "chunk zero"),
+            "payload_bytes": 80,
+            "truncated": False,
+        },
+        {
+            "event_kind": "provider_request",
+            "idempotency_key": "batch_chunk_1",
+            "payload_envelope": _envelope(uid, "batch-1", "chunk one"),
+            "payload_bytes": 81,
+            "truncated": False,
+        },
+    ]
+    first = jobs_store.append_trajectory_events_batch(job_id, uid, events=events)
+    duplicate = jobs_store.append_trajectory_events_batch(
+        job_id,
+        uid,
+        events=[
+            {
+                **events[0],
+                "payload_envelope": _envelope(uid, "replacement-0", "must not land"),
+            },
+            {
+                **events[1],
+                "payload_envelope": _envelope(uid, "replacement-1", "must not land"),
+            },
+        ],
+    )
+    assert first == duplicate == [0, 1]
+    rows = jobs_store.list_trajectory_events(job_id, uid)
+    assert [row["event_index"] for row in rows] == [0, 1]
+    assert [row["payload_envelope"]["id"] for row in rows] == ["batch-0", "batch-1"]
+    state = jobs_store.get_trajectory_capture_state(job_id, uid)
+    assert state["event_count"] == 2
+    assert state["next_event_index"] == 2
+
+
+def test_capture_gap_keeps_terminal_trajectory_explicitly_partial():
+    uid = "u_trajectory_gap"
+    job_id, _job = _source_job(uid)
+    for index, event_kind in enumerate(("capture_gap", "turn_terminal")):
+        jobs_store.append_trajectory_event(
+            job_id,
+            uid,
+            event_kind=event_kind,
+            idempotency_key=f"gap_{index}_{event_kind}",
+            payload_envelope=_envelope(uid, f"gap-{index}", event_kind),
+            payload_bytes=80,
+        )
+    state = jobs_store.get_trajectory_capture_state(job_id, uid)
+    assert state["has_capture_gap"] is True
+    assert state["terminal_event_index"] == 1
+    assert state["capture_status"] == "partial"
+
+
+def test_required_append_failure_is_marked_partial_before_terminal():
+    uid = "u_trajectory_required_gap"
+    job_id, _job = _source_job(uid)
+
+    def seal(user_id, plaintext, item_id):
+        return _envelope(
+            user_id,
+            item_id,
+            base64.b64encode(plaintext).decode("ascii"),
+        )
+
+    def append_batch(source_job_id, user_id, *, events):
+        if events[0]["event_kind"] == "provider_response":
+            raise RuntimeError("simulated required append failure")
+        return jobs_store.append_trajectory_events_batch(
+            source_job_id,
+            user_id,
+            events=events,
+        )
+
+    recorder = trajectory.TrajectoryRecorder(
+        job_id=job_id,
+        user_id=uid,
+        seal=seal,
+        append=jobs_store.append_trajectory_event,
+        append_batch=append_batch,
+    )
+    with pytest.raises(RuntimeError, match="required append failure"):
+        asyncio.run(recorder.record("provider_response", {"reply": "ok"}))
+    asyncio.run(recorder.record("turn_exception", {"error_code": "capture_failed"}))
+    asyncio.run(recorder.record("turn_terminal", {"outcome": "failed"}))
+
+    rows = jobs_store.list_trajectory_events(job_id, uid)
+    assert [row["event_kind"] for row in rows] == [
+        "turn_exception",
+        "capture_gap",
+        "turn_terminal",
+    ]
+    state = jobs_store.get_trajectory_capture_state(job_id, uid)
+    assert state["has_capture_gap"] is True
+    assert state["capture_status"] == "partial"
 
 
 def test_review_default_off_preserves_trajectory_without_review_runner(monkeypatch):

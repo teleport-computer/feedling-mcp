@@ -12,6 +12,7 @@ import db
 import psycopg
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from model_api_runtime.v2 import jobs_store
 
 
 def _seed_user(uid):
@@ -48,6 +49,40 @@ def test_v2_tables_exist():
         "agent_status_events",
         "runtime_state",
     }
+
+
+def test_v2_turn_metrics_user_fk_is_indexed_and_cascades_direct_delete():
+    uid = "u_metric_fk_direct"
+    _seed_user(uid)
+    jobs_store.record_turn_metric(
+        job_id=None,
+        user_id=uid,
+        lane="chat",
+        prompt_tokens=1,
+        completion_tokens=1,
+        latency_ms=1,
+    )
+    with db.get_pool().connection() as conn:
+        constraint = conn.execute(
+            "SELECT convalidated,confdeltype FROM pg_constraint "
+            "WHERE conname='fk_v2_turn_metrics_user' "
+            "AND conrelid='v2_turn_metrics'::regclass"
+        ).fetchone()
+        assert constraint == (True, "c")
+        index = conn.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() "
+            "AND indexname='ix_v2_turn_metrics_user_id'"
+        ).fetchone()
+        assert index is not None and "(user_id)" in index[0]
+        assert conn.execute(
+            "SELECT count(*) FROM v2_turn_metrics WHERE user_id=%s",
+            (uid,),
+        ).fetchone()[0] == 1
+        conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+        assert conn.execute(
+            "SELECT count(*) FROM v2_turn_metrics WHERE user_id=%s",
+            (uid,),
+        ).fetchone()[0] == 0
 
 
 def test_v2_job_liveness_columns_exist():
@@ -157,7 +192,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0047_model_route_context_window").down_revision == (
         "0046_v2_summary_segments"
     )
-    assert script.get_current_head() == "0047_model_route_context_window"
+    assert script.get_revision("0048_v2_turn_metrics_user_fk").down_revision == (
+        "0047_model_route_context_window"
+    )
+    assert script.get_current_head() == "0048_v2_turn_metrics_user_fk"
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():

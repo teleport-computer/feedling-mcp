@@ -1,4 +1,4 @@
-"""Encrypted, bounded flight-recorder payloads for Runtime V2.
+"""Encrypted, exact flight-recorder payloads for Runtime V2.
 
 This module is deliberately storage- and hosting-agnostic.  The worker injects
 an envelope sealer and the append-only DB writer; plaintext exists only in the
@@ -24,6 +24,7 @@ _WIRE_PREFIX = b"feedling-v2-trajectory-json-zlib-v1\x00"
 _EVENT_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ABSOLUTE_MAX_EVENT_JSON_BYTES = 1024 * 1024
 _DEFAULT_MAX_EVENT_JSON_BYTES = 512 * 1024
+_MIN_EXACT_PART_JSON_BYTES = 64 * 1024
 _DEFAULT_MAX_REVIEW_PROMPT_BYTES = 128 * 1024
 _DEFAULT_MAX_REVIEW_EVENTS = 256
 
@@ -50,7 +51,7 @@ def _positive_int_env(
 MAX_EVENT_JSON_BYTES = _positive_int_env(
     "FEEDLING_V2_TRAJECTORY_EVENT_MAX_BYTES",
     _DEFAULT_MAX_EVENT_JSON_BYTES,
-    minimum=512,
+    minimum=_MIN_EXACT_PART_JSON_BYTES,
     # Leave deterministic room for zlib framing beneath the DB's 1 MiB
     # ciphertext-plaintext payload boundary, even for incompressible JSON.
     maximum=900 * 1024,
@@ -98,6 +99,50 @@ def _json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _json_exact_default(value: Any) -> Any:
+    """Lossless JSON representation for accepted production event values.
+
+    Bytes have an explicit reversible representation and dataclasses are
+    expanded structurally. Everything else unsupported fails the capture
+    visibly instead of silently substituting an omission marker.
+    """
+    if isinstance(value, bytes):
+        return {"bytes_b64": base64.b64encode(value).decode("ascii")}
+    if is_dataclass(value):
+        return asdict(value)
+    raise TypeError(
+        f"unsupported exact trajectory value: {type(value).__name__}"
+    )
+
+
+def _json_exact_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+        default=_json_exact_default,
+    ).encode("utf-8")
+
+
+def _event_document_bytes(
+    event_kind: str,
+    payload: Any,
+    *,
+    lossy_legacy: bool = False,
+) -> bytes:
+    event_kind = str(event_kind or "")
+    if not _EVENT_KIND_RE.fullmatch(event_kind):
+        raise ValueError("invalid trajectory event kind")
+    document = {
+        "schema": "feedling.runtime_v2.trajectory_event.v1",
+        "kind": event_kind,
+        "payload": payload,
+    }
+    return _json_bytes(document) if lossy_legacy else _json_exact_bytes(document)
+
+
 def encode_payload(
     event_kind: str,
     payload: Any,
@@ -111,17 +156,9 @@ def encode_payload(
     inside the encrypted document as well as in content-free row metadata.
     """
     event_kind = str(event_kind or "")
-    if not _EVENT_KIND_RE.fullmatch(event_kind):
-        raise ValueError("invalid trajectory event kind")
     if not 512 <= int(max_json_bytes) <= 900 * 1024:
         raise ValueError("invalid trajectory event byte cap")
-    raw = _json_bytes(
-        {
-            "schema": "feedling.runtime_v2.trajectory_event.v1",
-            "kind": event_kind,
-            "payload": payload,
-        }
-    )
+    raw = _event_document_bytes(event_kind, payload, lossy_legacy=True)
     original_size = len(raw)
     truncated = original_size > int(max_json_bytes)
     if truncated:
@@ -155,6 +192,56 @@ def encode_payload(
     return _WIRE_PREFIX + zlib.compress(raw, level=6), truncated, original_size
 
 
+def encode_payload_parts(
+    event_kind: str,
+    payload: Any,
+    *,
+    max_json_bytes: int = MAX_EVENT_JSON_BYTES,
+    document_id: str | None = None,
+) -> tuple[list[bytes], int]:
+    """Encode one logical event exactly into one or more bounded wire parts.
+
+    ``encode_payload`` remains the bounded codec used by legacy callers and the
+    deliberately bounded offline-review output.  Production trajectory capture
+    uses this exact codec instead: an oversized JSON document is split into
+    independently encrypted chunks carrying a whole-document digest.  No raw
+    prompt, image, tool argument, or provider response is discarded.
+    """
+    if not _MIN_EXACT_PART_JSON_BYTES <= int(max_json_bytes) <= 900 * 1024:
+        raise ValueError("invalid trajectory event byte cap")
+    raw = _event_document_bytes(event_kind, payload)
+    original_size = len(raw)
+    if original_size <= int(max_json_bytes):
+        return [_WIRE_PREFIX + zlib.compress(raw, level=6)], original_size
+
+    digest = hashlib.sha256(raw).hexdigest()
+    stable_document_id = str(document_id or digest)
+    # Base64 expands by 4/3.  Reserve ample deterministic room for the schema,
+    # digest, counters, and JSON punctuation so every decompressed part remains
+    # below the existing anti-bomb boundary.
+    chunk_bytes = max(128, ((int(max_json_bytes) - 1024) * 3) // 4)
+    chunk_count = math.ceil(original_size / chunk_bytes)
+    encoded_parts: list[bytes] = []
+    for chunk_index in range(chunk_count):
+        chunk = raw[chunk_index * chunk_bytes : (chunk_index + 1) * chunk_bytes]
+        part_raw = _json_bytes(
+            {
+                "schema": "feedling.runtime_v2.trajectory_chunk.v1",
+                "kind": str(event_kind),
+                "document_id": stable_document_id,
+                "document_sha256": digest,
+                "original_json_bytes": original_size,
+                "chunk_index": chunk_index,
+                "chunk_count": chunk_count,
+                "chunk_b64": base64.b64encode(chunk).decode("ascii"),
+            }
+        )
+        if len(part_raw) > int(max_json_bytes):  # pragma: no cover - reserve invariant
+            raise ValueError("trajectory chunk exceeds configured byte boundary")
+        encoded_parts.append(_WIRE_PREFIX + zlib.compress(part_raw, level=6))
+    return encoded_parts, original_size
+
+
 def decode_payload(data: bytes) -> dict[str, Any]:
     if not isinstance(data, bytes) or not data.startswith(_WIRE_PREFIX):
         raise ValueError("invalid trajectory payload encoding")
@@ -184,6 +271,101 @@ def decode_payload(data: bytes) -> dict[str, Any]:
     return value
 
 
+def reassemble_payload_parts(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reassemble decrypted chunk rows into their original logical events.
+
+    The storage rows may start/end inside a chunk group because offline review
+    intentionally reads only a recent bounded window.  Such a window produces
+    an explicit incomplete marker instead of a misleading partial JSON prefix.
+    A complete group is digest- and length-verified before JSON decoding.
+    """
+    output: list[dict[str, Any]] = []
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[tuple[str, str | int]] = []
+    for position, event in enumerate(events):
+        if event.get("schema") != "feedling.runtime_v2.trajectory_chunk.v1":
+            order.append(("event", position))
+            continue
+        digest = str(event.get("document_sha256") or "")
+        document_id = str(event.get("document_id") or digest)
+        group = groups.get(document_id)
+        if group is None:
+            group = {
+                "kind": str(event.get("kind") or ""),
+                "document_sha256": digest,
+                "original_json_bytes": int(event.get("original_json_bytes") or 0),
+                "chunk_count": int(event.get("chunk_count") or 0),
+                "chunks": {},
+                "event_indices": [],
+                "capture_truncated": False,
+            }
+            groups[document_id] = group
+            order.append(("chunk", document_id))
+        if (
+            group["kind"] != str(event.get("kind") or "")
+            or group["document_sha256"] != digest
+            or group["original_json_bytes"]
+            != int(event.get("original_json_bytes") or 0)
+            or group["chunk_count"] != int(event.get("chunk_count") or 0)
+        ):
+            raise ValueError("inconsistent trajectory chunk metadata")
+        chunk_index = int(event.get("chunk_index") or 0)
+        chunk_b64 = str(event.get("chunk_b64") or "")
+        if chunk_index in group["chunks"] and group["chunks"][chunk_index] != chunk_b64:
+            raise ValueError("conflicting trajectory chunk")
+        group["chunks"][chunk_index] = chunk_b64
+        if event.get("event_index") is not None:
+            group["event_indices"].append(int(event["event_index"]))
+        group["capture_truncated"] = bool(
+            group["capture_truncated"] or event.get("capture_truncated")
+        )
+
+    for entry_type, ref in order:
+        if entry_type == "event":
+            output.append(events[int(ref)])
+            continue
+        group = groups[str(ref)]
+        chunk_count = int(group["chunk_count"])
+        chunks = group["chunks"]
+        if chunk_count < 1 or set(chunks) != set(range(chunk_count)):
+            output.append(
+                {
+                    "schema": "feedling.runtime_v2.trajectory_chunk_incomplete.v1",
+                    "kind": group["kind"],
+                    "document_id": str(ref),
+                    "document_sha256": group["document_sha256"],
+                    "original_json_bytes": group["original_json_bytes"],
+                    "chunk_count": chunk_count,
+                    "captured_chunk_count": len(chunks),
+                    "event_index": min(group["event_indices"], default=None),
+                    "capture_truncated": group["capture_truncated"],
+                }
+            )
+            continue
+        try:
+            raw = b"".join(base64.b64decode(chunks[index], validate=True) for index in range(chunk_count))
+        except (ValueError, TypeError) as exc:
+            raise ValueError("invalid trajectory chunk encoding") from exc
+        if len(raw) != int(group["original_json_bytes"]):
+            raise ValueError("trajectory chunk length mismatch")
+        if hashlib.sha256(raw).hexdigest() != group["document_sha256"]:
+            raise ValueError("trajectory chunk digest mismatch")
+        try:
+            decoded = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid reassembled trajectory json") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError("reassembled trajectory payload must be an object")
+        if decoded.get("kind") != group["kind"]:
+            raise ValueError("reassembled trajectory kind mismatch")
+        decoded["event_index"] = min(group["event_indices"], default=None)
+        decoded["last_event_index"] = max(group["event_indices"], default=None)
+        decoded["storage_chunk_count"] = chunk_count
+        decoded["capture_truncated"] = group["capture_truncated"]
+        output.append(decoded)
+    return output
+
+
 def trajectory_item_id(job_id: int | str, idempotency_key: str) -> str:
     digest = hashlib.sha256(f"{job_id}|{idempotency_key}".encode("utf-8")).hexdigest()[
         :32
@@ -206,15 +388,18 @@ class TrajectoryRecorder:
         user_id: str,
         seal: Callable[[str, bytes, str], dict],
         append: Callable[..., int],
+        append_batch: Callable[..., list[int]] | None = None,
         attempt_identity: int | str = 0,
         _attempt_prefix: str | None = None,
         _scope_prefix: str = "",
         _scopes: dict[str, "TrajectoryRecorder"] | None = None,
+        _capture_state: dict[str, Any] | None = None,
     ) -> None:
         self.job_id = job_id
         self.user_id = str(user_id)
         self._seal = seal
         self._append = append
+        self._append_batch = append_batch
         self._attempt_prefix = (
             str(_attempt_prefix)
             if _attempt_prefix is not None
@@ -224,6 +409,20 @@ class TrajectoryRecorder:
         )
         self._scope_prefix = str(_scope_prefix)
         self._scopes = {} if _scopes is None else _scopes
+        self._capture_state = (
+            {
+                "failed_capture_events": 0,
+                "failed_event_kinds": {},
+                "marked_gap_count": 0,
+                "failed_event_keys": set(),
+                "active_records": 0,
+                "terminalizing": False,
+                "terminal_written": False,
+                "activity_condition": asyncio.Condition(),
+            }
+            if _capture_state is None
+            else _capture_state
+        )
         self._ordinal = 0
         self._lock = asyncio.Lock()
 
@@ -248,9 +447,11 @@ class TrajectoryRecorder:
             user_id=self.user_id,
             seal=self._seal,
             append=self._append,
+            append_batch=self._append_batch,
             _attempt_prefix=self._attempt_prefix,
             _scope_prefix=f"s{digest}_",
             _scopes=self._scopes,
+            _capture_state=self._capture_state,
         )
         self._scopes[scope_key] = recorder
         return recorder
@@ -260,31 +461,147 @@ class TrajectoryRecorder:
         # and advance only after acknowledgement: an ambiguous DB response can
         # be retried with the exact same key, while independent child scopes
         # still append concurrently.
-        async with self._lock:
-            ordinal = self._ordinal
-            idempotency_key = (
-                f"{self._attempt_prefix}{self._scope_prefix}{ordinal:04d}_{event_kind}"
+        if event_kind == "turn_terminal":
+            return await self._record_terminal(payload)
+
+        condition = self._capture_state["activity_condition"]
+        async with condition:
+            if self._capture_state["terminalizing"]:
+                raise RuntimeError("trajectory terminalization is in progress")
+            if self._capture_state["terminal_written"]:
+                raise RuntimeError("trajectory is already terminal")
+            self._capture_state["active_records"] += 1
+        try:
+            async with self._lock:
+                return await self._record_locked(event_kind, payload)
+        except BaseException:
+            self._note_capture_gap(event_kind)
+            raise
+        finally:
+            async with condition:
+                self._capture_state["active_records"] -= 1
+                condition.notify_all()
+
+    async def _record_terminal(self, payload: Any) -> int:
+        condition = self._capture_state["activity_condition"]
+        async with condition:
+            if self._capture_state["terminalizing"]:
+                raise RuntimeError("trajectory terminalization is already in progress")
+            if self._capture_state["terminal_written"]:
+                raise RuntimeError("trajectory is already terminal")
+            self._capture_state["terminalizing"] = True
+            try:
+                await condition.wait_for(
+                    lambda: int(self._capture_state["active_records"]) == 0
+                )
+                # Keep the shared condition while terminalizing. New child
+                # scopes cannot start between the final gap snapshot and the
+                # durable terminal append, while already-active scopes have
+                # completed (or recorded their failure) above.
+                async with self._lock:
+                    failed_count = int(
+                        self._capture_state["failed_capture_events"]
+                    )
+                    marked_count = int(self._capture_state["marked_gap_count"])
+                    if failed_count > marked_count:
+                        await self._record_locked(
+                            "capture_gap",
+                            {
+                                "failed_capture_events": failed_count,
+                                "failed_event_kinds": dict(
+                                    self._capture_state["failed_event_kinds"]
+                                ),
+                            },
+                        )
+                        self._capture_state["marked_gap_count"] = failed_count
+                    event_index = await self._record_locked(
+                        "turn_terminal",
+                        payload,
+                    )
+                self._capture_state["terminal_written"] = True
+                return event_index
+            except BaseException:
+                self._note_capture_gap("turn_terminal")
+                raise
+            finally:
+                self._capture_state["terminalizing"] = False
+                condition.notify_all()
+
+    def _note_capture_gap(self, event_kind: str) -> None:
+        event_key = (
+            f"{self._attempt_prefix}{self._scope_prefix}{self._ordinal:04d}_"
+            f"{event_kind}"
+        )
+        failed_keys = self._capture_state["failed_event_keys"]
+        if event_key in failed_keys:
+            return
+        failed_keys.add(event_key)
+        self._capture_state["failed_capture_events"] += 1
+        failed_kinds = self._capture_state["failed_event_kinds"]
+        failed_kinds[event_kind] = int(failed_kinds.get(event_kind, 0)) + 1
+
+    async def _record_locked(self, event_kind: str, payload: Any) -> int:
+        ordinal = self._ordinal
+        idempotency_key = (
+            f"{self._attempt_prefix}{self._scope_prefix}{ordinal:04d}_{event_kind}"
+        )
+
+        def _prepare_parts() -> list[dict[str, Any]]:
+            encoded_parts, _original_size = encode_payload_parts(
+                event_kind,
+                payload,
+                document_id=trajectory_item_id(self.job_id, idempotency_key),
             )
-            encoded, truncated, _original_size = encode_payload(event_kind, payload)
-            item_id = trajectory_item_id(self.job_id, idempotency_key)
-            envelope = await asyncio.to_thread(
-                self._seal,
-                self.user_id,
-                encoded,
-                item_id,
-            )
-            event_index = await asyncio.to_thread(
-                self._append,
+            prepared: list[dict[str, Any]] = []
+            multi = len(encoded_parts) > 1
+            kind_digest = hashlib.sha256(event_kind.encode("utf-8")).hexdigest()[:8]
+            for part_index, encoded in enumerate(encoded_parts):
+                part_key = (
+                    f"{self._attempt_prefix}{self._scope_prefix}{ordinal:04d}"
+                    f"_p{part_index:06x}_{kind_digest}"
+                    if multi
+                    else idempotency_key
+                )
+                item_id = trajectory_item_id(self.job_id, part_key)
+                prepared.append(
+                    {
+                        "event_kind": event_kind,
+                        "idempotency_key": part_key,
+                        "payload_envelope": self._seal(
+                            self.user_id,
+                            encoded,
+                            item_id,
+                        ),
+                        "payload_bytes": len(encoded),
+                        "truncated": False,
+                    }
+                )
+            return prepared
+
+        # JSON conversion, compression, and envelope sealing are all CPU work;
+        # keep them off the shared asyncio loop. Oversized logical events then
+        # append in one DB transaction and one multi-row INSERT.
+        prepared = await asyncio.to_thread(_prepare_parts)
+        if self._append_batch is not None:
+            event_indices = await asyncio.to_thread(
+                self._append_batch,
                 self.job_id,
                 self.user_id,
-                event_kind=event_kind,
-                idempotency_key=idempotency_key,
-                payload_envelope=envelope,
-                payload_bytes=len(encoded),
-                truncated=truncated,
+                events=prepared,
             )
-            self._ordinal += 1
-            return event_index
+        else:
+            event_indices = []
+            for part in prepared:
+                event_indices.append(
+                    await asyncio.to_thread(
+                        self._append,
+                        self.job_id,
+                        self.user_id,
+                        **part,
+                    )
+                )
+        self._ordinal += 1
+        return int(event_indices[0])
 
     async def record_best_effort(self, event_kind: str, payload: Any) -> bool:
         try:

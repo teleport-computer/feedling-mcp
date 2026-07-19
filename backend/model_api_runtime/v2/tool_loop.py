@@ -435,12 +435,14 @@ async def run_tool_loop(
                 provider_config, messages, tools=tools
             )
         except Exception as exc:
+            attempt_trace = provider_client.runtime_provider_attempt_trace(exc)
             await _trajectory(
                 "provider_error",
                 {
                     "round": attempts,
                     "error_class": type(exc).__name__,
                     "tools_enabled": tools is not None,
+                    "provider_attempt_trace": attempt_trace,
                 },
             )
             # TurnMetrics' docstring promises failed provider calls ARE counted
@@ -467,6 +469,10 @@ async def run_tool_loop(
             "provider_response",
             {"round": attempts, "response": result},
         )
+        # Exact wire attempts are now durably encrypted. Do not retain large
+        # prompt/image bodies through the following tool batch merely because
+        # ProviderResponse.raw keeps its input mapping alive.
+        result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
 
         # A tools-disabled request is terminal even if a broken relay invents a

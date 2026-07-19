@@ -12,6 +12,7 @@ drive specific round shapes).
 from __future__ import annotations
 
 import asyncio
+import base64
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ import pytest
 import conftest
 import db
 import provider_client
-from provider_types import ToolExchange
+from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
 from core import store as core_store
 from model_api_runtime.v2 import cursor as v2_cursor
@@ -95,6 +96,24 @@ def _patch_real_write(monkeypatch):
         return store.append_chat("openclaw", "model_api", envelope, strict=True)
 
     monkeypatch.setattr(worker, "_write_encrypted_reply", _real_write)
+
+
+def _patch_tool_effect_encryption(monkeypatch):
+    def _fake_build(store, plaintext, *, item_id=None):
+        return (
+            {
+                "id": item_id,
+                "owner_user_id": store.user_id,
+                "body_ct": base64.b64encode(plaintext).decode("ascii"),
+            },
+            "",
+        )
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_build,
+    )
 
 
 def _reply_effect_dispatch(user_id):
@@ -271,6 +290,72 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_chat_mixed_valid_invalid_workspace_batch_applies_valid_call(
+    monkeypatch,
+):
+    uid = "u_toolloop_mixed_workspace_batch"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-mixed-workspace")
+    _patch_real_write(monkeypatch)
+    _patch_tool_effect_encryption(monkeypatch)
+    captured = {}
+
+    async def direct_loop(**kwargs):
+        results = await kwargs["dispatch_tools"](
+            [
+                ToolCall(
+                    id="valid",
+                    name="workspace_write",
+                    args={
+                        "path": "/workspace/valid.md",
+                        "content": "kept",
+                        "expected_revision": 0,
+                    },
+                ),
+                ToolCall(
+                    id="invalid",
+                    name="workspace_write",
+                    args={},
+                    args_ok=False,
+                ),
+            ]
+        )
+        captured["results"] = results
+        await kwargs["on_reply"]("done", final=True)
+        return worker.v2_tool_loop.LoopOutcome(
+            final_text="done",
+            rounds=1,
+            stop_reason="final_text",
+            replied_intermediate=False,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+    deps = _deps(
+        messages=[
+            {"id": "m1", "ts": 10.0, "role": "user", "content": "edit"},
+        ]
+    )
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert [result.call_id for result in captured["results"]] == [
+        "valid",
+        "invalid",
+    ]
+    assert captured["results"][0].content == "ok: workspace_write applied"
+    assert captured["results"][1].content.startswith("error: unparseable args")
 
 
 def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(

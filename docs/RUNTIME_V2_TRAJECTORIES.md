@@ -8,8 +8,8 @@ answers what happened and in which causal order.
 
 `v2_trajectory_events` is ordered by `(job_id, event_index)`. The only plaintext
 columns are tenant/job identity, an event kind, an idempotency key, size and
-truncation metadata, and timestamps. The sensitive document is JSON serialized,
-bounded, zlib-compressed, and passed to
+legacy truncation metadata, and timestamps. The sensitive document is JSON
+serialized, zlib-compressed, and passed to
 `core_envelope._build_shared_envelope_for_store` inside the trusted worker before
 the append. PostgreSQL receives only the resulting shared envelope; the schema
 and store reject extra envelope keys that could become an accidental plaintext
@@ -20,15 +20,28 @@ allow explicit job/account deletion. There is no public plaintext trajectory
 read endpoint and trajectory data is not copied to `runtime_state` or ordinary
 logs.
 
-The default pre-compression limit is 512 KiB per event. Oversize events become
-an explicit encrypted truncation document containing the original byte count
-and a bounded prefix. `FEEDLING_V2_TRAJECTORY_EVENT_MAX_BYTES` may tune the cap
-up to 900 KiB. Absence of `turn_terminal` is the completeness signal for a
-process that died after earlier events had already committed. The content-free
-capture-state query makes this explicit as `open`, `complete`, `partial`, or
-`missing`, and also reports the source job status, terminal event index, event
-count, last index, and whether any event was truncated. A terminal source job
-without a `turn_terminal` event is therefore `partial`, not silently complete.
+The default pre-compression limit is 512 KiB per **physical encrypted part**.
+An oversized logical event is preserved exactly as digest-verified ordered
+chunks and all chunks append in one stream transaction and one multi-row INSERT.
+JSON conversion, compression, and envelope sealing run off the shared asyncio
+loop. Accepted production event values are serialized without a nesting-depth
+omission rule; an unsupported non-JSON value fails capture visibly instead of
+being replaced by a silent placeholder. `FEEDLING_V2_TRAJECTORY_EVENT_MAX_BYTES`
+may tune the physical-part cap from the safe 64 KiB batching floor up to 900
+KiB. The `truncated` column remains
+readable for older bounded rows, but the production recorder writes exact parts
+with `truncated=false`.
+
+Absence of `turn_terminal` is the completeness signal for a process that died
+after earlier events had already committed. If any required or post-effect
+best-effort append fails, the recorder emits a content-free encrypted
+`capture_gap` marker before the terminal event; a terminal plus that marker
+remains `partial`, never `complete`. The content-free capture-state query makes
+this explicit as `open`,
+`complete`, `partial`, or `missing`, and also reports the source job status,
+terminal event index, physical event count, last index, gap flag, and whether a
+legacy event was truncated. A terminal source job without a `turn_terminal`
+event is likewise `partial`.
 
 ## Captured boundaries
 
@@ -36,24 +49,40 @@ The unified Chat and wake loop awaits an encrypted append for:
 
 - each rendered provider request and offered tool catalog;
 - each provider response or exception;
+- every underlying async HTTP compatibility/transient attempt, including the
+  exact JSON wire body, effective request provider/model, status or normalized
+  error class, fallback code, ordinals, and monotonic duration;
 - round-boundary late-message folds;
 - planned tool batches and returned results;
-- per-call start/result/error evidence for parallel platform, MCP, and subagent
-  work (so a failed sibling does not erase settled evidence);
+- per-call start/result/error evidence and duration for parallel platform, MCP,
+  and subagent work (so a failed sibling does not erase settled evidence), with
+  durable platform/MCP effect disposition attached to the model-visible result;
 - every provider round inside a bounded subagent loop;
-- intermediate and final planned replies; and
+- intermediate and final planned replies plus reply-effect disposition/duration;
+  and
 - fallback, supersession, exhaustion, exception, and terminal events.
 
-Compaction and memory extraction capture the same outer provider
-request/response/error boundaries. Provider credentials, route base URLs, and
-raw exception strings are deliberately never serialized; provider errors retain
-only their class and a normalized runtime failure code.
+Compaction and memory extraction capture the same provider request/response/
+error and per-attempt evidence. Attempt tracing is accumulated in memory and
+folded into the already-existing encrypted response/error event, so retries do
+not add trajectory database round trips. Provider credentials, HTTP headers,
+route base URLs, and raw exception strings are deliberately never serialized;
+provider errors retain only their class and a normalized runtime failure code.
+The attempt's `model` is the effective wire model. Aggregate `v2_turn_metrics`
+continues to record the user's configured provider/model; an OpenRouter-selected
+upstream vendor is unknown unless the provider exposes it explicitly.
 
 Idempotency keys include the persisted source-job attempt identity. Parallel
 tool and subagent work then uses a deterministic call-ID scope with its own local
 ordinal, so scheduler interleaving cannot remap child events on redelivery. An
 ambiguous append acknowledgement retries the same scope/ordinal key; a genuinely
 new job attempt gets a distinct immutable event series.
+
+Tool `duration_ms` starts after the durable start event and covers dispatcher
+work plus any synchronous durable-effect confirmation. Bounded subagents are
+dispatched as one batch, so each child result currently carries that batch's
+observed wall duration rather than a provider-only per-child duration. Provider
+attempt duration separately measures the individual HTTP attempt.
 
 ## Failure review lane
 
@@ -92,9 +121,11 @@ otherwise it invalidates the stale analysis without calling the provider. Thus
 a late terminal event cannot leave an older prefix marked fully reviewed.
 
 This is offline analysis, not production retry or deterministic replay. The
-encrypted event stream is a bounded causal record: explicit truncation,
-time-varying external reads, and fresh provider sampling mean it cannot promise
-byte-for-byte re-execution of every historical turn. The handler does not call
+encrypted event stream is an exact record of model-visible inputs and accepted
+provider wire attempts, but time-varying external reads, model sampling, and
+intentional normalization of tool results to exactly what the next model round
+saw mean it cannot promise byte-for-byte re-execution of external systems. The
+handler does not call
 `process_job` or `run_tool_loop`, and receives no reply callback, effect outbox,
 platform capability dispatcher, MCP loader, Memory writer, schedule writer, or
 workspace backend. Its encrypted output is not added to Chat, Memory Garden,

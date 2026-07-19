@@ -887,6 +887,9 @@ async def _dispatch_mixed_tool_calls(
         if on_tool_event is not None:
             await on_tool_event(tc, event_kind, payload)
 
+    def _duration_ms(started_ns: int) -> float:
+        return round(max(0, time.monotonic_ns() - started_ns) / 1_000_000.0, 3)
+
     read_gate = asyncio.Semaphore(max(1, int(read_parallelism)))
     mutating_mcp_names = frozenset(str(name) for name in mutating_mcp_names)
     reads: list[tuple[str, Any]] = []
@@ -930,12 +933,7 @@ async def _dispatch_mixed_tool_calls(
         # Mirror executor's validation filter. Invalid calls remain model-visible
         # results but never enter the durable parent effect, so they must not
         # consume a child identity inside its encrypted payload.
-        return [
-            tc
-            for tc in run
-            if tc.args_ok
-            and cap_tool_schema.validate_tool_args(tc.name, tc.args) is None
-        ]
+        return _valid_workspace_tool_calls(run)
 
     # Reserve every durable platform identity before read/subagent coroutines
     # launch. A workspace run consumes one parent reservation; ordinary writes
@@ -1027,6 +1025,7 @@ async def _dispatch_mixed_tool_calls(
 
     async def _read(kind: str, tc) -> ToolResult:
         await _event(tc, "tool_call_started", {"phase": f"{kind}_read"})
+        started_ns = time.monotonic_ns()
         try:
             if kind == "mcp":
                 # wait_for encloses admission as well as transport: this is a total
@@ -1039,11 +1038,21 @@ async def _dispatch_mixed_tool_calls(
             await _event(
                 tc,
                 "tool_call_error",
-                {"phase": f"{kind}_read", "error_class": type(exc).__name__},
+                {
+                    "phase": f"{kind}_read",
+                    "error_class": type(exc).__name__,
+                    "duration_ms": _duration_ms(started_ns),
+                },
             )
             raise
         await _event(
-            tc, "tool_call_result", {"phase": f"{kind}_read", "result": result}
+            tc,
+            "tool_call_result",
+            {
+                "phase": f"{kind}_read",
+                "result": result,
+                "duration_ms": _duration_ms(started_ns),
+            },
         )
         return result
 
@@ -1056,6 +1065,7 @@ async def _dispatch_mixed_tool_calls(
                 for tc in task_calls
             )
         )
+        started_ns = time.monotonic_ns()
         if dispatch_task_batch is None:
             results = [
                 ToolResult(
@@ -1096,7 +1106,15 @@ async def _dispatch_mixed_tool_calls(
                     results = list(task_results)
         await asyncio.gather(
             *(
-                _event(tc, "tool_call_result", {"phase": "subagent", "result": result})
+                _event(
+                    tc,
+                    "tool_call_result",
+                    {
+                        "phase": "subagent",
+                        "result": result,
+                        "duration_ms": _duration_ms(started_ns),
+                    },
+                )
                 for tc, result in zip(task_calls, results)
             )
         )
@@ -1129,6 +1147,7 @@ async def _dispatch_mixed_tool_calls(
     while mutation_index < len(mutations):
         kind, tc = mutations[mutation_index]
         await _event(tc, "tool_call_started", {"phase": f"{kind}_mutation"})
+        started_ns = time.monotonic_ns()
         if mutation_outcome_unknown:
             result = ToolResult(
                 call_id=tc.id,
@@ -1138,7 +1157,11 @@ async def _dispatch_mixed_tool_calls(
             await _event(
                 tc,
                 "tool_call_result",
-                {"phase": f"{kind}_mutation_blocked", "result": result},
+                {
+                    "phase": f"{kind}_mutation_blocked",
+                    "result": result,
+                    "duration_ms": _duration_ms(started_ns),
+                },
             )
             mutation_index += 1
             _progress("tool_mutation_complete")
@@ -1158,6 +1181,7 @@ async def _dispatch_mixed_tool_calls(
                     "tool_call_started",
                     {"phase": "platform_mutation"},
                 )
+            started_ns = time.monotonic_ns()
             try:
                 batch_results = list(await dispatch_workspace_batch(run))
                 if [str(result.call_id) for result in batch_results] != [
@@ -1174,6 +1198,7 @@ async def _dispatch_mixed_tool_calls(
                         {
                             "phase": "platform_mutation",
                             "error_class": type(exc).__name__,
+                            "duration_ms": _duration_ms(started_ns),
                         },
                     )
                 raise
@@ -1182,7 +1207,11 @@ async def _dispatch_mixed_tool_calls(
                 await _event(
                     candidate,
                     "tool_call_result",
-                    {"phase": "platform_mutation", "result": batch_result},
+                    {
+                        "phase": "platform_mutation",
+                        "result": batch_result,
+                        "duration_ms": _duration_ms(started_ns),
+                    },
                 )
                 _progress("tool_mutation_complete")
             mutation_index = next_mutation_index
@@ -1200,7 +1229,11 @@ async def _dispatch_mixed_tool_calls(
             await _event(
                 tc,
                 "tool_call_error",
-                {"phase": f"{kind}_mutation", "error_class": type(exc).__name__},
+                {
+                    "phase": f"{kind}_mutation",
+                    "error_class": type(exc).__name__,
+                    "duration_ms": _duration_ms(started_ns),
+                },
             )
             raise
         if kind == "mcp":
@@ -1223,7 +1256,11 @@ async def _dispatch_mixed_tool_calls(
         await _event(
             tc,
             "tool_call_result",
-            {"phase": f"{kind}_mutation", "result": result},
+            {
+                "phase": f"{kind}_mutation",
+                "result": result,
+                "duration_ms": _duration_ms(started_ns),
+            },
         )
         _progress("tool_mutation_complete")
         mutation_index += 1
@@ -1426,6 +1463,7 @@ def _make_trajectory_recorder(
         user_id=str(job["user_id"]),
         seal=deps.seal_trajectory_payload,
         append=jobs_store.append_trajectory_event,
+        append_batch=jobs_store.append_trajectory_events_batch,
         attempt_identity=int(job.get("attempt_count") or 0),
     )
 
@@ -1447,11 +1485,16 @@ async def _record_trajectory(
 
 def _make_tool_trajectory_callback(
     recorder: v2_trajectory.TrajectoryRecorder | None,
+    effect_evidence_by_call: dict[str, dict] | None = None,
 ):
     if recorder is None:
         return None
 
     async def _record(tc, event_kind: str, payload: dict) -> None:
+        if effect_evidence_by_call is not None and event_kind == "tool_call_started":
+            # Provider call IDs are only round-local. A later round may reuse an
+            # ID, so its invocation must not inherit a prior write's effect.
+            effect_evidence_by_call.pop(str(tc.id), None)
         safe_payload = dict(payload)
         result = safe_payload.pop("result", None)
         if isinstance(result, ToolResult):
@@ -1462,6 +1505,10 @@ def _make_tool_trajectory_callback(
                     TOOL_RESULT_CHAR_CAP,
                 ),
             }
+        if effect_evidence_by_call is not None:
+            effect = effect_evidence_by_call.get(str(tc.id))
+            if effect is not None:
+                safe_payload["effect"] = dict(effect)
         await recorder.scoped(f"tool:{tc.id}").record(
             event_kind,
             {
@@ -1606,12 +1653,15 @@ async def _run_trajectory_review_turn(
             decoded_events.append(event)
             _report_turn_progress("trajectory_review_decrypt_complete")
 
+        loaded_physical_events = len(decoded_events)
+        decoded_events = v2_trajectory.reassemble_payload_parts(decoded_events)
+
         messages = v2_trajectory.build_review_messages(
             decoded_events,
             source_job_id=source_job_id,
             omitted_before=max(
                 0,
-                int(capture_state.get("event_count") or 0) - len(decoded_events),
+                int(capture_state.get("event_count") or 0) - loaded_physical_events,
             ),
         )
         await _review_fence("trajectory_review_provider_start")
@@ -2364,6 +2414,17 @@ MAX_WORKSPACE_BATCH_OPERATIONS = (
 )
 
 
+def _valid_workspace_tool_calls(tool_calls) -> list[Any]:
+    """Mirror executor validation for calls admitted to a durable batch."""
+    return [
+        tc
+        for tc in tool_calls
+        if tc.name in {"workspace_write", "workspace_delete"}
+        and tc.args_ok
+        and cap_tool_schema.validate_tool_args(tc.name, tc.args) is None
+    ]
+
+
 def _workspace_batch_effect_payload(
     tool_calls,
     *,
@@ -2870,6 +2931,9 @@ async def _rebalance_summary_frontier(
                     {
                         "lane": "summary_checkpoint",
                         "error_class": type(exc).__name__,
+                        "provider_attempt_trace": (
+                            provider_client.runtime_provider_attempt_trace(exc)
+                        ),
                     },
                     best_effort=True,
                 )
@@ -3096,7 +3160,12 @@ async def _run_compaction(
                 await _record_trajectory(
                     trajectory_recorder,
                     "provider_error",
-                    {"error_class": type(exc).__name__},
+                    {
+                        "error_class": type(exc).__name__,
+                        "provider_attempt_trace": (
+                            provider_client.runtime_provider_attempt_trace(exc)
+                        ),
+                    },
                     best_effort=True,
                 )
                 raise
@@ -3605,7 +3674,13 @@ async def _ensure_prompt_coverage(
                 await _record_trajectory(
                     trajectory_recorder,
                     "provider_error",
-                    {"lane": "prompt_catchup", "error_class": type(exc).__name__},
+                    {
+                        "lane": "prompt_catchup",
+                        "error_class": type(exc).__name__,
+                        "provider_attempt_trace": (
+                            provider_client.runtime_provider_attempt_trace(exc)
+                        ),
+                    },
                     best_effort=True,
                 )
                 raise
@@ -3982,8 +4057,13 @@ async def _run_wake(
             job_id=job_id,
             ordinal_counter=ordinal,
         )
+        platform_effects_by_call: dict[str, tuple[str, str]] = {}
+        platform_workspace_batches: dict[
+            tuple[str, ...], tuple[str, str]
+        ] = {}
+        effect_evidence_by_call: dict[str, dict] = {}
 
-        async def _enqueue_write_effect(tc) -> None:
+        async def _enqueue_write_effect(tc) -> str:
             prepared = effect_reservations.get(tc)
             encrypted_payload = await asyncio.to_thread(
                 _build_encrypted_tool_effect_payload,
@@ -4004,8 +4084,19 @@ async def _run_wake(
                 )
                 if enqueued_id != prepared.effect_id:
                     raise RuntimeError("tool effect id derivation mismatch")
+                platform_effects_by_call[str(tc.id)] = (
+                    enqueued_id,
+                    prepared.effect_type,
+                )
+                effect_evidence_by_call[str(tc.id)] = {
+                    "domain": "platform",
+                    "effect_id": enqueued_id,
+                    "effect_type": prepared.effect_type,
+                    "status": "enqueued",
+                }
             finally:
                 effect_reservations.mark_ready(tc)
+            return enqueued_id
 
         async def _enqueue_workspace_batch_effect(tool_calls) -> str:
             calls = list(tool_calls)
@@ -4031,6 +4122,22 @@ async def _run_wake(
                     raise RuntimeError(
                         "workspace batch effect id derivation mismatch"
                     )
+                batch_key = tuple(str(tc.id) for tc in calls)
+                if batch_key in platform_workspace_batches:
+                    raise RuntimeError(
+                        "workspace batch identity was recorded twice"
+                    )
+                platform_workspace_batches[batch_key] = (
+                    enqueued_id,
+                    prepared.effect_type,
+                )
+                for tc in calls:
+                    effect_evidence_by_call[str(tc.id)] = {
+                        "domain": "platform",
+                        "effect_id": enqueued_id,
+                        "effect_type": prepared.effect_type,
+                        "status": "enqueued",
+                    }
             finally:
                 effect_reservations.mark_batch_ready(calls)
             return enqueued_id
@@ -4069,14 +4176,69 @@ async def _run_wake(
                         before_write=_before_write,
                         read_parallelism=1,
                     )
-                    return result
                 finally:
                     effect_reservations.mark_ready(tc)
+                if (
+                    tc.name in cap_registry.WRITE_ACTIONS
+                    and not str(result.content).startswith("error")
+                    and deps.apply_pending_effects is not None
+                ):
+                    effect_ref = platform_effects_by_call.pop(str(tc.id), None)
+                    if effect_ref is None:
+                        raise RuntimeError(
+                            "platform write effect identity was not recorded"
+                        )
+                    effect_id, effect_type = effect_ref
+                    try:
+                        await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                    except Exception:
+                        effect_evidence_by_call[str(tc.id)] = {
+                            "domain": "platform",
+                            "effect_id": effect_id,
+                            "effect_type": effect_type,
+                            "status": "uncertain",
+                        }
+                        raise
+                    effect_evidence_by_call[str(tc.id)]["status"] = "uncertain"
+                    disposition = await asyncio.to_thread(
+                        v2_effect_outbox.get_effect_disposition,
+                        effect_id,
+                        user_id=user_id,
+                        job_id=job_id,
+                        effect_type=effect_type,
+                    )
+                    evidence = effect_evidence_by_call.setdefault(
+                        str(tc.id),
+                        {
+                            "domain": "platform",
+                            "effect_id": effect_id,
+                            "effect_type": effect_type,
+                        },
+                    )
+                    evidence["status"] = (
+                        "missing" if disposition is None else disposition["status"]
+                    )
+                    if disposition is not None and disposition.get("last_error"):
+                        evidence["last_error"] = str(disposition["last_error"])
+                    if disposition is None or disposition["status"] != "applied":
+                        status = (
+                            "missing" if disposition is None else disposition["status"]
+                        )
+                        raise RuntimeError(
+                            "platform write was not durably applied: " + status
+                        )
+                    return ToolResult(
+                        call_id=tc.id,
+                        content=f"ok: {tc.name} applied",
+                    )
+                return result
 
             async def _dispatch_workspace_batch(calls) -> list[ToolResult]:
+                calls = list(calls)
+                valid_calls = _valid_workspace_tool_calls(calls)
                 try:
-                    return await v2_executor.dispatch_tool_calls(
-                        list(calls),
+                    results = await v2_executor.dispatch_tool_calls(
+                        calls,
                         store=store,
                         api_key=None,
                         runtime_token=token,
@@ -4091,6 +4253,80 @@ async def _run_wake(
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)
+                queued = [
+                    result
+                    for result in results
+                    if str(result.content).startswith("queued:")
+                ]
+                if not queued or deps.apply_pending_effects is None:
+                    return results
+                if len(queued) != len(valid_calls):
+                    raise RuntimeError(
+                        "workspace batch was only partially enqueued"
+                    )
+                batch_key = tuple(str(tc.id) for tc in valid_calls)
+                effect_ref = platform_workspace_batches.pop(batch_key, None)
+                if effect_ref is None:
+                    raise RuntimeError(
+                        "workspace batch effect identity was not recorded"
+                    )
+                effect_id, effect_type = effect_ref
+                try:
+                    await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                except Exception:
+                    for tc in valid_calls:
+                        effect_evidence_by_call[str(tc.id)] = {
+                            "domain": "platform",
+                            "effect_id": effect_id,
+                            "effect_type": effect_type,
+                            "status": "uncertain",
+                        }
+                    raise
+                for tc in valid_calls:
+                    effect_evidence_by_call[str(tc.id)]["status"] = "uncertain"
+                disposition = await asyncio.to_thread(
+                    v2_effect_outbox.get_effect_disposition,
+                    effect_id,
+                    user_id=user_id,
+                    job_id=job_id,
+                    effect_type=effect_type,
+                )
+                for tc in valid_calls:
+                    evidence = effect_evidence_by_call.setdefault(
+                        str(tc.id),
+                        {
+                            "domain": "platform",
+                            "effect_id": effect_id,
+                            "effect_type": effect_type,
+                        },
+                    )
+                    evidence["status"] = (
+                        "missing" if disposition is None else disposition["status"]
+                    )
+                    if disposition is not None and disposition.get("last_error"):
+                        evidence["last_error"] = str(disposition["last_error"])
+                if disposition is None or disposition["status"] not in {
+                    "applied",
+                    v2_effect_outbox.APPLIED_WITH_RESULTS_STATUS,
+                }:
+                    status = (
+                        "missing" if disposition is None else disposition["status"]
+                    )
+                    raise RuntimeError(
+                        "workspace batch was not durably applied: " + status
+                    )
+                applied = _workspace_batch_tool_results(
+                    valid_calls,
+                    parent_effect_id=effect_id,
+                    disposition=disposition,
+                )
+                applied_by_id = {
+                    str(result.call_id): result for result in applied
+                }
+                return [
+                    applied_by_id.get(str(tc.id), result)
+                    for tc, result in zip(calls, results)
+                ]
 
             return await _dispatch_mixed_tool_calls(
                 tool_calls,
@@ -4105,7 +4341,10 @@ async def _run_wake(
                 prepare_platform_mutation=effect_reservations.prepare,
                 prepare_workspace_batch=effect_reservations.prepare_batch,
                 on_progress=_report_turn_progress,
-                on_tool_event=_make_tool_trajectory_callback(trajectory_recorder),
+                on_tool_event=_make_tool_trajectory_callback(
+                    trajectory_recorder,
+                    effect_evidence_by_call,
+                ),
             )
 
         async def _on_reply(text: str, *, final: bool) -> None:
@@ -4116,6 +4355,7 @@ async def _run_wake(
                 # lane, an empty terminal text is NOT a failure here, so this is a
                 # plain no-op, never a raise.
                 return
+            delivery_started_ns = time.monotonic_ns()
             # The provider call may have taken minutes. Re-check ownership at
             # the actual effect boundary rather than relying on the fence from
             # before the round began.
@@ -4135,18 +4375,18 @@ async def _run_wake(
                         else v2_effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE
                     )
                 )
+            effect_id = v2_effect_id.derive(
+                job_id=job_id,
+                effect_type=reply_effect_type,
+                ordinal=ordinal_value,
+            )
             payload = {"text": text}
             if seq_native:
-                eid = v2_effect_id.derive(
-                    job_id=job_id,
-                    effect_type=reply_effect_type,
-                    ordinal=ordinal_value,
-                )
                 payload = await asyncio.to_thread(
                     _build_encrypted_reply_effect_payload,
                     store,
                     text,
-                    effect_id=eid,
+                    effect_id=effect_id,
                     reply_through_seq=consumed_seq,
                 )
                 if consumed_seq is not None:
@@ -4165,7 +4405,7 @@ async def _run_wake(
                     payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
                         "claimed_by": claimed_by,
                     }
-            await asyncio.to_thread(
+            enqueued_id = await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,
                 user_id=user_id,
@@ -4174,24 +4414,103 @@ async def _run_wake(
                 expected_generation=gen,
                 payload=payload,
             )
+            if enqueued_id != effect_id:
+                raise RuntimeError("wake reply effect id derivation mismatch")
             # C6: drain immediately so an intermediate bubble is visible mid-loop.
             # Offloaded — the reply sink's enclave envelope round-trip must not
             # block the event loop thread (same reasoning as the chat `_on_reply`
             # below and the already-fixed per-round fold offload).
             if deps.apply_pending_effects is not None:
-                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                try:
+                    await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                except Exception as exc:
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "reply_effect_disposition",
+                        {
+                            "effect_id": effect_id,
+                            "effect_type": reply_effect_type,
+                            "ordinal": ordinal_value,
+                            "final": final,
+                            "status": "uncertain",
+                            "error_class": type(exc).__name__,
+                            "duration_ms": round(
+                                max(0, time.monotonic_ns() - delivery_started_ns)
+                                / 1_000_000.0,
+                                3,
+                            ),
+                        },
+                        best_effort=True,
+                    )
+                    raise
             if seq_native:
-                disposition = await asyncio.to_thread(
-                    v2_effect_outbox.get_effect_disposition,
-                    eid,
-                    user_id=user_id,
-                    job_id=job_id,
-                    effect_type=reply_effect_type,
-                )
+                try:
+                    disposition = await asyncio.to_thread(
+                        v2_effect_outbox.get_effect_disposition,
+                        effect_id,
+                        user_id=user_id,
+                        job_id=job_id,
+                        effect_type=reply_effect_type,
+                    )
+                except Exception as exc:
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "reply_effect_disposition",
+                        {
+                            "effect_id": effect_id,
+                            "effect_type": reply_effect_type,
+                            "ordinal": ordinal_value,
+                            "final": final,
+                            "status": "uncertain",
+                            "error_class": type(exc).__name__,
+                            "duration_ms": round(
+                                max(0, time.monotonic_ns() - delivery_started_ns)
+                                / 1_000_000.0,
+                                3,
+                            ),
+                        },
+                        best_effort=True,
+                    )
+                    raise
                 if disposition is None:
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "reply_effect_disposition",
+                        {
+                            "effect_id": effect_id,
+                            "effect_type": reply_effect_type,
+                            "ordinal": ordinal_value,
+                            "final": final,
+                            "status": "missing",
+                            "duration_ms": round(
+                                max(0, time.monotonic_ns() - delivery_started_ns)
+                                / 1_000_000.0,
+                                3,
+                            ),
+                        },
+                        best_effort=True,
+                    )
                     raise RuntimeError("wake reply effect disappeared")
                 status = disposition["status"]
                 last_error = disposition["last_error"]
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "reply_effect_disposition",
+                    {
+                        "effect_id": effect_id,
+                        "effect_type": reply_effect_type,
+                        "ordinal": ordinal_value,
+                        "final": final,
+                        "status": status,
+                        "last_error": last_error,
+                        "duration_ms": round(
+                            max(0, time.monotonic_ns() - delivery_started_ns)
+                            / 1_000_000.0,
+                            3,
+                        ),
+                    },
+                    best_effort=True,
+                )
                 if status == "applied":
                     if final:
                         source_status = await asyncio.to_thread(
@@ -4218,6 +4537,27 @@ async def _run_wake(
                         "wake source job became inactive before reply publication"
                     )
                 raise RuntimeError("wake reply effect not durably applied: " + status)
+            await _record_trajectory(
+                trajectory_recorder,
+                "reply_effect_disposition",
+                {
+                    "effect_id": effect_id,
+                    "effect_type": reply_effect_type,
+                    "ordinal": ordinal_value,
+                    "final": final,
+                    "status": (
+                        "applied_unverified"
+                        if deps.apply_pending_effects is not None
+                        else "enqueued"
+                    ),
+                    "duration_ms": round(
+                        max(0, time.monotonic_ns() - delivery_started_ns)
+                        / 1_000_000.0,
+                        3,
+                    ),
+                },
+                best_effort=True,
+            )
 
         # Snapshot the boundary at wake start. Production uses the same total-order
         # seq reader as chat; timestamp fallback remains only for narrow tests.
@@ -5086,6 +5426,7 @@ async def process_job(
         platform_workspace_batches: dict[
             tuple[str, ...], tuple[str, str]
         ] = {}
+        effect_evidence_by_call: dict[str, dict] = {}
 
         async def _enqueue_write_effect(tc) -> str:
             """WRITE tool_call -> PR A effect (spec C6). Mapping lives in the shared
@@ -5115,6 +5456,12 @@ async def process_job(
                     enqueued_id,
                     prepared.effect_type,
                 )
+                effect_evidence_by_call[str(tc.id)] = {
+                    "domain": "platform",
+                    "effect_id": enqueued_id,
+                    "effect_type": prepared.effect_type,
+                    "status": "enqueued",
+                }
             finally:
                 effect_reservations.mark_ready(tc)
             return enqueued_id
@@ -5153,6 +5500,13 @@ async def process_job(
                     enqueued_id,
                     prepared.effect_type,
                 )
+                for tc in calls:
+                    effect_evidence_by_call[str(tc.id)] = {
+                        "domain": "platform",
+                        "effect_id": enqueued_id,
+                        "effect_type": prepared.effect_type,
+                        "status": "enqueued",
+                    }
             finally:
                 effect_reservations.mark_batch_ready(calls)
             return enqueued_id
@@ -5178,8 +5532,19 @@ async def process_job(
             )
             if not started:
                 raise RuntimeError("MCP mutation intent was not durably recorded")
+            effect_evidence_by_call[str(tc.id)] = {
+                "domain": "mcp",
+                "call_id": str(tc.id),
+                "tool_name": str(tc.name),
+                "status": "started",
+            }
 
         async def _mcp_mutation_finished(tc, outcome: str) -> None:
+            evidence = effect_evidence_by_call.setdefault(
+                str(tc.id),
+                {"domain": "mcp", "call_id": str(tc.id)},
+            )
+            evidence["status"] = "uncertain"
             finished = await asyncio.to_thread(
                 jobs_store.finish_mcp_mutation_attempt,
                 job_id,
@@ -5188,6 +5553,7 @@ async def process_job(
             )
             if not finished:
                 raise RuntimeError("MCP mutation outcome was not durably recorded")
+            evidence["status"] = str(outcome)
 
         # User-MCP tool surface for THIS turn (chat lane only, mirroring the
         # resident which gives claude `--mcp-config` on the chat lane only). The
@@ -5283,7 +5649,17 @@ async def process_job(
                             "platform write effect identity was not recorded"
                         )
                     effect_id, effect_type = effect_ref
-                    await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                    try:
+                        await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                    except Exception:
+                        effect_evidence_by_call[str(tc.id)] = {
+                            "domain": "platform",
+                            "effect_id": effect_id,
+                            "effect_type": effect_type,
+                            "status": "uncertain",
+                        }
+                        raise
+                    effect_evidence_by_call[str(tc.id)]["status"] = "uncertain"
                     disposition = await asyncio.to_thread(
                         v2_effect_outbox.get_effect_disposition,
                         effect_id,
@@ -5291,6 +5667,19 @@ async def process_job(
                         job_id=job_id,
                         effect_type=effect_type,
                     )
+                    evidence = effect_evidence_by_call.setdefault(
+                        str(tc.id),
+                        {
+                            "domain": "platform",
+                            "effect_id": effect_id,
+                            "effect_type": effect_type,
+                        },
+                    )
+                    evidence["status"] = (
+                        "missing" if disposition is None else disposition["status"]
+                    )
+                    if disposition is not None and disposition.get("last_error"):
+                        evidence["last_error"] = str(disposition["last_error"])
                     if disposition is None or disposition["status"] != "applied":
                         status = (
                             "missing" if disposition is None else disposition["status"]
@@ -5306,6 +5695,7 @@ async def process_job(
 
             async def _dispatch_workspace_batch(tool_calls) -> list[ToolResult]:
                 calls = list(tool_calls)
+                valid_calls = _valid_workspace_tool_calls(calls)
                 try:
                     results = await v2_executor.dispatch_tool_calls(
                         calls,
@@ -5330,18 +5720,30 @@ async def process_job(
                 ]
                 if not queued or deps.apply_pending_effects is None:
                     return results
-                if len(queued) != len(calls):
+                if len(queued) != len(valid_calls):
                     raise RuntimeError(
                         "workspace batch was only partially enqueued"
                     )
-                batch_key = tuple(str(tc.id) for tc in calls)
+                batch_key = tuple(str(tc.id) for tc in valid_calls)
                 effect_ref = platform_workspace_batches.pop(batch_key, None)
                 if effect_ref is None:
                     raise RuntimeError(
                         "workspace batch effect identity was not recorded"
                     )
                 effect_id, effect_type = effect_ref
-                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                try:
+                    await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                except Exception:
+                    for tc in valid_calls:
+                        effect_evidence_by_call[str(tc.id)] = {
+                            "domain": "platform",
+                            "effect_id": effect_id,
+                            "effect_type": effect_type,
+                            "status": "uncertain",
+                        }
+                    raise
+                for tc in valid_calls:
+                    effect_evidence_by_call[str(tc.id)]["status"] = "uncertain"
                 disposition = await asyncio.to_thread(
                     v2_effect_outbox.get_effect_disposition,
                     effect_id,
@@ -5349,6 +5751,20 @@ async def process_job(
                     job_id=job_id,
                     effect_type=effect_type,
                 )
+                for tc in valid_calls:
+                    evidence = effect_evidence_by_call.setdefault(
+                        str(tc.id),
+                        {
+                            "domain": "platform",
+                            "effect_id": effect_id,
+                            "effect_type": effect_type,
+                        },
+                    )
+                    evidence["status"] = (
+                        "missing" if disposition is None else disposition["status"]
+                    )
+                    if disposition is not None and disposition.get("last_error"):
+                        evidence["last_error"] = str(disposition["last_error"])
                 if disposition is None or disposition["status"] not in {
                     "applied",
                     v2_effect_outbox.APPLIED_WITH_RESULTS_STATUS,
@@ -5361,11 +5777,18 @@ async def process_job(
                     raise RuntimeError(
                         "workspace batch was not durably applied: " + status
                     )
-                return _workspace_batch_tool_results(
-                    calls,
+                applied = _workspace_batch_tool_results(
+                    valid_calls,
                     parent_effect_id=effect_id,
                     disposition=disposition,
                 )
+                applied_by_id = {
+                    str(result.call_id): result for result in applied
+                }
+                return [
+                    applied_by_id.get(str(tc.id), result)
+                    for tc, result in zip(calls, results)
+                ]
 
             # Schema omission is the provider-facing control; this runtime
             # gate is the independent fail-closed boundary. A broken relay or
@@ -5386,7 +5809,10 @@ async def process_job(
                 dispatchable_calls = [
                     tc for tc in tool_calls if str(tc.id) not in blocked_by_id
                 ]
-                blocked_event = _make_tool_trajectory_callback(trajectory_recorder)
+                blocked_event = _make_tool_trajectory_callback(
+                    trajectory_recorder,
+                    effect_evidence_by_call,
+                )
                 if blocked_event is not None:
                     for tc in tool_calls:
                         result = blocked_by_id.get(str(tc.id))
@@ -5422,7 +5848,10 @@ async def process_job(
                 mcp_mutation_finished=_mcp_mutation_finished,
                 mcp_wall_budget=mcp_wall_budget,
                 on_progress=_report_turn_progress,
-                on_tool_event=_make_tool_trajectory_callback(trajectory_recorder),
+                on_tool_event=_make_tool_trajectory_callback(
+                    trajectory_recorder,
+                    effect_evidence_by_call,
+                ),
             )
             dispatched_by_id = {str(result.call_id): result for result in dispatched}
             results = [
@@ -5449,6 +5878,7 @@ async def process_job(
                 raise TurnError("empty_reply")
             if not text:
                 return  # empty intermediate reply{} call: no bubble, not an error
+            delivery_started_ns = time.monotonic_ns()
             # A cutover/ABA can happen while awaiting the provider. Fence at
             # the reply effect itself; the pre-round check is not sufficient.
             await _ensure_runtime_mode()
@@ -5510,23 +5940,100 @@ async def process_job(
             # dropped that until now — same failure class as the per-round fold
             # offload above).
             if deps.apply_pending_effects is not None:
-                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                try:
+                    await asyncio.to_thread(deps.apply_pending_effects, user_id)
+                except Exception as exc:
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "reply_effect_disposition",
+                        {
+                            "effect_id": effect_id,
+                            "effect_type": reply_effect_type,
+                            "ordinal": ordinal_value,
+                            "final": final,
+                            "status": "uncertain",
+                            "error_class": type(exc).__name__,
+                            "duration_ms": round(
+                                max(0, time.monotonic_ns() - delivery_started_ns)
+                                / 1_000_000.0,
+                                3,
+                            ),
+                        },
+                        best_effort=True,
+                    )
+                    raise
             if seq_native:
                 # The background reconciliation sweeper can win this row before
                 # the producer-owned drain.  Only the durable disposition of this
                 # exact effect is an acknowledgement; a drain result describes
                 # only rows changed by that particular applier invocation.
-                disposition = await asyncio.to_thread(
-                    v2_effect_outbox.get_effect_disposition,
-                    effect_id,
-                    user_id=user_id,
-                    job_id=job_id,
-                    effect_type=reply_effect_type,
-                )
+                try:
+                    disposition = await asyncio.to_thread(
+                        v2_effect_outbox.get_effect_disposition,
+                        effect_id,
+                        user_id=user_id,
+                        job_id=job_id,
+                        effect_type=reply_effect_type,
+                    )
+                except Exception as exc:
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "reply_effect_disposition",
+                        {
+                            "effect_id": effect_id,
+                            "effect_type": reply_effect_type,
+                            "ordinal": ordinal_value,
+                            "final": final,
+                            "status": "uncertain",
+                            "error_class": type(exc).__name__,
+                            "duration_ms": round(
+                                max(0, time.monotonic_ns() - delivery_started_ns)
+                                / 1_000_000.0,
+                                3,
+                            ),
+                        },
+                        best_effort=True,
+                    )
+                    raise
                 if disposition is None:
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "reply_effect_disposition",
+                        {
+                            "effect_id": effect_id,
+                            "effect_type": reply_effect_type,
+                            "ordinal": ordinal_value,
+                            "final": final,
+                            "status": "missing",
+                            "duration_ms": round(
+                                max(0, time.monotonic_ns() - delivery_started_ns)
+                                / 1_000_000.0,
+                                3,
+                            ),
+                        },
+                        best_effort=True,
+                    )
                     raise RuntimeError("final reply effect disappeared")
                 status = disposition["status"]
                 last_error = disposition["last_error"]
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "reply_effect_disposition",
+                    {
+                        "effect_id": effect_id,
+                        "effect_type": reply_effect_type,
+                        "ordinal": ordinal_value,
+                        "final": final,
+                        "status": status,
+                        "last_error": last_error,
+                        "duration_ms": round(
+                            max(0, time.monotonic_ns() - delivery_started_ns)
+                            / 1_000_000.0,
+                            3,
+                        ),
+                    },
+                    best_effort=True,
+                )
                 if status == "applied" and not final:
                     return
                 if status == "applied":
@@ -5585,6 +6092,27 @@ async def process_job(
                 # path surface a stable invariant error instead of silently
                 # completing a turn whose bubble was never committed.
                 raise RuntimeError("final reply effect not durably applied: " + status)
+            await _record_trajectory(
+                trajectory_recorder,
+                "reply_effect_disposition",
+                {
+                    "effect_id": effect_id,
+                    "effect_type": reply_effect_type,
+                    "ordinal": ordinal_value,
+                    "final": final,
+                    "status": (
+                        "applied_unverified"
+                        if deps.apply_pending_effects is not None
+                        else "enqueued"
+                    ),
+                    "duration_ms": round(
+                        max(0, time.monotonic_ns() - delivery_started_ns)
+                        / 1_000_000.0,
+                        3,
+                    ),
+                },
+                best_effort=True,
+            )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's
         # all-role snapshot bound is passed separately to the fold closure so an

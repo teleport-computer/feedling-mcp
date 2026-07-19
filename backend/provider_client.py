@@ -168,6 +168,10 @@ class ProviderConfig:
     # frontier. It is never sent on the wire; missing metadata falls back to an
     # operator override or a conservative built-in family floor.
     context_window_tokens: int | None = None
+    # Runtime V2 may retain exact provider-attempt evidence in its encrypted
+    # trajectory. Keep this opt-in: other async callers include image/VLM
+    # payloads and must not duplicate those large request bodies in memory.
+    capture_attempt_trace: bool = False
 
 
 _DEFAULT_BASE_URLS = {
@@ -2257,6 +2261,178 @@ def _with_reliable_retry_count(result: Any, retries: int) -> Any:
     return out
 
 
+# Private evidence carried from the provider adapter into Runtime V2's encrypted
+# trajectory.  It is deliberately an in-memory return value/exception attribute:
+# observing an attempt must never add a network call or database round trip to the
+# provider path.  The trace stores only the JSON request body plus normalized
+# provider/model metadata -- never request headers, credentials, or the base URL.
+_RUNTIME_PROVIDER_ATTEMPT_TRACE_FIELD = "_runtime_provider_attempt_trace"
+_RUNTIME_PROVIDER_ATTEMPT_TRACE_VERSION = 1
+
+
+def _provider_status_error_class(status_code: int) -> str | None:
+    if 200 <= status_code < 400:
+        return None
+    if status_code in _RETRYABLE_STATUS:
+        return "transient"
+    if status_code in _PROVIDER_CONFIG_STATUS:
+        return "provider_config"
+    return "unknown"
+
+
+def _attempt_duration_ms(start_ns: int) -> float:
+    return round(max(0, time.monotonic_ns() - start_ns) / 1_000_000.0, 3)
+
+
+def _trace_envelope(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "version": _RUNTIME_PROVIDER_ATTEMPT_TRACE_VERSION,
+        "attempts": attempts,
+    }
+
+
+def _with_provider_attempt_trace(
+    result: Any, attempts: list[dict[str, Any]]
+) -> Any:
+    if not isinstance(result, dict):
+        return result
+    out = dict(result)
+    out[_RUNTIME_PROVIDER_ATTEMPT_TRACE_FIELD] = _trace_envelope(attempts)
+    return out
+
+
+def _attach_provider_attempt_trace(
+    exc: BaseException, attempts: list[dict[str, Any]]
+) -> None:
+    # All provider exceptions in this module allow attributes.  Stay defensive
+    # for a foreign exception so trace observation can never replace its cause.
+    try:
+        exc.feedling_provider_attempt_trace = _trace_envelope(attempts)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _mark_attempt_postprocess_error(
+    attempts: list[dict[str, Any]], exc: BaseException
+) -> None:
+    """Mark a transport-2xx attempt whose response failed decode/validation."""
+    for entry in reversed(attempts):
+        if entry.get("kind") != "http_attempt":
+            continue
+        if entry.get("error_class") is None:
+            entry["error_class"] = classify_provider_error(exc)
+            entry["outcome"] = "postprocess_error"
+            entry["postprocess_stage"] = "response_decode_or_validation"
+        return
+
+
+def _attempts_from_result(result: Any) -> list[dict[str, Any]]:
+    if not isinstance(result, dict):
+        return []
+    envelope = result.get(_RUNTIME_PROVIDER_ATTEMPT_TRACE_FIELD)
+    if not isinstance(envelope, dict):
+        return []
+    attempts = envelope.get("attempts")
+    return list(attempts) if isinstance(attempts, list) else []
+
+
+def _attempts_from_exception(exc: BaseException) -> list[dict[str, Any]]:
+    envelope = getattr(exc, "feedling_provider_attempt_trace", None)
+    if not isinstance(envelope, dict):
+        return []
+    attempts = envelope.get("attempts")
+    return list(attempts) if isinstance(attempts, list) else []
+
+
+def runtime_provider_attempt_trace(value: Any) -> dict[str, Any] | None:
+    """Return Runtime V2's private attempt envelope from a result or exception."""
+    if isinstance(value, dict):
+        envelope = value.get(_RUNTIME_PROVIDER_ATTEMPT_TRACE_FIELD)
+    else:
+        envelope = getattr(value, "feedling_provider_attempt_trace", None)
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("attempts"), list):
+        return None
+    return envelope
+
+
+def without_runtime_provider_attempt_trace(result: Any) -> Any:
+    """Drop retained wire-attempt bodies after their encrypted append completes."""
+    if not isinstance(result, dict) or _RUNTIME_PROVIDER_ATTEMPT_TRACE_FIELD not in result:
+        return result
+    out = dict(result)
+    out.pop(_RUNTIME_PROVIDER_ATTEMPT_TRACE_FIELD, None)
+    return out
+
+
+def _extend_attempt_trace(
+    target: list[dict[str, Any]],
+    attempts: list[dict[str, Any]],
+    *,
+    outer_attempt: int | None = None,
+) -> list[int]:
+    ordinals: list[int] = []
+    for raw in attempts:
+        item = dict(raw)
+        item["ordinal"] = len(target) + 1
+        if outer_attempt is not None:
+            item["outer_attempt"] = outer_attempt
+        target.append(item)
+        ordinals.append(item["ordinal"])
+    return ordinals
+
+
+async def _traced_async_json_post(
+    *,
+    trace: list[dict[str, Any]] | None,
+    provider: str,
+    model: str,
+    inner_attempt: int,
+    request_payload: dict[str, Any],
+    post: Any,
+) -> tuple[httpx.Response, dict[str, Any] | None]:
+    """POST once and retain exact, privacy-bounded wire evidence in memory.
+
+    Provider payload builders and compatibility fallbacks create new mappings
+    rather than mutating an attempted payload.  Keeping that mapping by reference
+    therefore preserves the exact JSON body without an extra deep-copy of a large
+    prompt on the latency-sensitive path.
+    """
+    if trace is None:
+        return await post(request_payload), None
+
+    started_ns = time.monotonic_ns()
+    entry: dict[str, Any] = {
+        "ordinal": len(trace) + 1,
+        "kind": "http_attempt",
+        "inner_attempt": int(inner_attempt),
+        "provider": provider,
+        "model": model,
+        "status": None,
+        "error_class": None,
+        "compatibility_fallback": None,
+        "duration_ms": 0.0,
+        "wire": {
+            "encoding": "json_body",
+            "payload": request_payload,
+        },
+    }
+    try:
+        response = await post(request_payload)
+    except Exception as exc:  # noqa: BLE001 -- retain evidence, preserve exception
+        status = getattr(exc, "status_code", None)
+        entry["status"] = int(status) if isinstance(status, int) else None
+        entry["error_class"] = classify_provider_error(exc)
+        entry["duration_ms"] = _attempt_duration_ms(started_ns)
+        trace.append(entry)
+        raise
+    status = int(response.status_code)
+    entry["status"] = status
+    entry["error_class"] = _provider_status_error_class(status)
+    entry["duration_ms"] = _attempt_duration_ms(started_ns)
+    trace.append(entry)
+    return response, entry
+
+
 def _parse_openai_compat_body(
     resp,
     *,
@@ -3184,7 +3360,7 @@ async def aclose_async_http_client() -> None:
         await client.aclose()
 
 
-async def chat_completion_async(
+async def _chat_completion_async_impl(
     config: ProviderConfig,
     messages: list[dict[str, Any]],
     *,
@@ -3199,6 +3375,7 @@ async def chat_completion_async(
     require_reply: bool = True,
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
+    _attempt_trace: list[dict[str, Any]] | None,
 ) -> dict[str, Any]:
     provider, model, base_url = validate_config(
         config.provider, config.model, config.base_url
@@ -3242,7 +3419,14 @@ async def chat_completion_async(
         attempts_used = 0
         for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
             attempts_used = attempt
-            resp = await post_anthropic(current_payload)
+            resp, trace_entry = await _traced_async_json_post(
+                trace=_attempt_trace,
+                provider="anthropic",
+                model=model,
+                inner_attempt=attempt,
+                request_payload=current_payload,
+                post=post_anthropic,
+            )
             try:
                 _raise_for_provider_status(resp)
                 break
@@ -3255,6 +3439,8 @@ async def chat_completion_async(
                 )
                 if decision is None:
                     raise
+                if trace_entry is not None:
+                    trace_entry["compatibility_fallback"] = decision.code
                 fallback_codes.append(decision.code)
                 _record_compatibility_fallback(
                     provider="anthropic",
@@ -3309,7 +3495,14 @@ async def chat_completion_async(
         attempts_used = 0
         for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
             attempts_used = attempt
-            resp = await post_bedrock(current_payload)
+            resp, trace_entry = await _traced_async_json_post(
+                trace=_attempt_trace,
+                provider="bedrock",
+                model=model,
+                inner_attempt=attempt,
+                request_payload=current_payload,
+                post=post_bedrock,
+            )
             try:
                 _raise_for_provider_status(resp)
                 break
@@ -3322,6 +3515,8 @@ async def chat_completion_async(
                 )
                 if decision is None:
                     raise
+                if trace_entry is not None:
+                    trace_entry["compatibility_fallback"] = decision.code
                 fallback_codes.append(decision.code)
                 _record_compatibility_fallback(
                     provider="bedrock",
@@ -3360,12 +3555,24 @@ async def chat_completion_async(
             include_reasoning=include_reasoning,
             tools=tools,
         )
-        try:
-            resp = await _async_http_client().post(
-                url, headers=headers, json=payload, timeout=timeout
-            )
-        except httpx.HTTPError as e:
-            raise ProviderError(f"provider network error: {type(e).__name__}") from e
+        async def post_gemini(request_payload: dict[str, Any]) -> httpx.Response:
+            try:
+                return await _async_http_client().post(
+                    url, headers=headers, json=request_payload, timeout=timeout
+                )
+            except httpx.HTTPError as e:
+                raise ProviderError(
+                    f"provider network error: {type(e).__name__}"
+                ) from e
+
+        resp, _ = await _traced_async_json_post(
+            trace=_attempt_trace,
+            provider="gemini",
+            model=model,
+            inner_attempt=1,
+            request_payload=payload,
+            post=post_gemini,
+        )
         _raise_for_provider_status(resp)
         try:
             body = resp.json()
@@ -3403,7 +3610,14 @@ async def chat_completion_async(
         attempts_used = 0
         for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
             attempts_used = attempt
-            resp = await post_responses(current_payload)
+            resp, trace_entry = await _traced_async_json_post(
+                trace=_attempt_trace,
+                provider="openai",
+                model=request_model,
+                inner_attempt=attempt,
+                request_payload=current_payload,
+                post=post_responses,
+            )
             try:
                 _raise_for_provider_status(resp)
                 break
@@ -3413,6 +3627,8 @@ async def chat_completion_async(
                 )
                 if decision is None:
                     raise
+                if trace_entry is not None:
+                    trace_entry["compatibility_fallback"] = decision.code
                 fallback_codes.append(decision.code)
                 _record_compatibility_fallback(
                     provider="openai",
@@ -3477,7 +3693,14 @@ async def chat_completion_async(
     attempts_used = 0
     for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
         attempts_used = attempt
-        resp = await post_with_payload(current_payload)
+        resp, trace_entry = await _traced_async_json_post(
+            trace=_attempt_trace,
+            provider=provider,
+            model=request_model,
+            inner_attempt=attempt,
+            request_payload=current_payload,
+            post=post_with_payload,
+        )
         try:
             _raise_for_provider_status(resp)
             break
@@ -3490,6 +3713,8 @@ async def chat_completion_async(
             )
             if decision is None:
                 raise
+            if trace_entry is not None:
+                trace_entry["compatibility_fallback"] = decision.code
             fallback_codes.append(decision.code)
             _record_compatibility_fallback(
                 provider=provider,
@@ -3511,6 +3736,52 @@ async def chat_completion_async(
         attempts=attempts_used,
         fallback_codes=fallback_codes,
     )
+
+
+async def chat_completion_async(
+    config: ProviderConfig,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int = 700,
+    temperature: float | None = None,
+    timeout: float = 60.0,
+    response_format: dict[str, Any] | None = None,
+    require_reply: bool = True,
+    include_reasoning: bool = False,
+    tools: "list[ToolSpec] | None" = None,
+) -> dict[str, Any]:
+    """Native async completion, optionally retaining every HTTP attempt.
+
+    Runtime V2 opts into the private trace field for its encrypted trajectory.
+    When enabled, failed calls carry the same envelope on
+    ``exc.feedling_provider_attempt_trace`` so terminal failures do not lose the
+    evidence that led to them. Other callers preserve the ordinary result shape
+    and do not retain a second reference to potentially large request payloads.
+    """
+    attempt_trace: list[dict[str, Any]] | None = (
+        [] if config.capture_attempt_trace else None
+    )
+    try:
+        result = await _chat_completion_async_impl(
+            config,
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout=timeout,
+            response_format=response_format,
+            require_reply=require_reply,
+            include_reasoning=include_reasoning,
+            tools=tools,
+            _attempt_trace=attempt_trace,
+        )
+    except Exception as exc:  # noqa: BLE001 -- annotate and preserve original
+        if attempt_trace is not None:
+            _mark_attempt_postprocess_error(attempt_trace, exc)
+            _attach_provider_attempt_trace(exc, attempt_trace)
+        raise
+    if attempt_trace is None:
+        return result
+    return _with_provider_attempt_trace(result, attempt_trace)
 
 
 # --- Hosted runtime V2: natively async reliable wrapper ---------------------
@@ -3540,6 +3811,21 @@ async def reliable_chat_completion_async(
     """
     attempts = max(1, int(max_attempts))
     last_exc: BaseException | None = None
+    config = args[0] if args and isinstance(args[0], ProviderConfig) else None
+    if config is None and isinstance(kwargs.get("config"), ProviderConfig):
+        config = kwargs["config"]
+    if config is not None:
+        effective_provider = normalize_provider(config.provider)
+        effective_model = _runtime_model(
+            effective_provider, config.model
+        )[0]
+    else:
+        # Generic monkeypatched/test callers may omit ProviderConfig entirely.
+        effective_provider = ""
+        effective_model = ""
+    provider_attempt_trace: list[dict[str, Any]] | None = (
+        [] if config is not None and config.capture_attempt_trace else None
+    )
 
     def _progress(stage: str, attempt: int) -> None:
         # Optional hosted-runtime watchdog telemetry.  Keep it out of kwargs so
@@ -3553,21 +3839,97 @@ async def reliable_chat_completion_async(
             pass
 
     for attempt in range(1, attempts + 1):
+        started_ns = time.monotonic_ns()
         _progress("attempt_start", attempt)
         try:
             result = await chat_completion_async(*args, **kwargs)
             _progress("attempt_complete", attempt)
+            if provider_attempt_trace is not None:
+                inner_ordinals = _extend_attempt_trace(
+                    provider_attempt_trace,
+                    _attempts_from_result(result),
+                    outer_attempt=attempt,
+                )
+                if inner_ordinals:
+                    final_inner = provider_attempt_trace[inner_ordinals[-1] - 1]
+                    marker_provider = str(
+                        final_inner.get("provider") or effective_provider
+                    )
+                    marker_model = str(final_inner.get("model") or effective_model)
+                    marker_status = final_inner.get("status")
+                else:
+                    marker_provider = effective_provider
+                    marker_model = effective_model
+                    marker_status = None
+                provider_attempt_trace.append(
+                    {
+                        "ordinal": len(provider_attempt_trace) + 1,
+                        "kind": "outer_attempt",
+                        "outer_attempt": attempt,
+                        "provider": marker_provider,
+                        "model": marker_model,
+                        "status": marker_status,
+                        "error_class": None,
+                        "compatibility_fallback": None,
+                        "duration_ms": _attempt_duration_ms(started_ns),
+                        "outcome": "success",
+                        "wire": {
+                            "encoding": "inner_http_attempt_ordinals",
+                            "ordinals": inner_ordinals,
+                        },
+                    }
+                )
+                result = _with_provider_attempt_trace(result, provider_attempt_trace)
             return _with_reliable_retry_count(result, attempt - 1)
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
             _progress("attempt_failed", attempt)
             cls = classify_provider_error(exc)
             last_exc = exc
-            if cls == "provider_config" or attempt >= attempts:
+            terminal = cls == "provider_config" or attempt >= attempts
+            if provider_attempt_trace is not None:
+                inner_ordinals = _extend_attempt_trace(
+                    provider_attempt_trace,
+                    _attempts_from_exception(exc),
+                    outer_attempt=attempt,
+                )
+                if inner_ordinals:
+                    final_inner = provider_attempt_trace[inner_ordinals[-1] - 1]
+                    marker_provider = str(
+                        final_inner.get("provider") or effective_provider
+                    )
+                    marker_model = str(final_inner.get("model") or effective_model)
+                    marker_status = final_inner.get("status")
+                else:
+                    marker_provider = effective_provider
+                    marker_model = effective_model
+                    status = getattr(exc, "status_code", None)
+                    marker_status = int(status) if isinstance(status, int) else None
+                provider_attempt_trace.append(
+                    {
+                        "ordinal": len(provider_attempt_trace) + 1,
+                        "kind": "outer_attempt",
+                        "outer_attempt": attempt,
+                        "provider": marker_provider,
+                        "model": marker_model,
+                        "status": marker_status,
+                        "error_class": cls,
+                        "compatibility_fallback": None,
+                        "duration_ms": _attempt_duration_ms(started_ns),
+                        "outcome": "terminal_error" if terminal else "retry",
+                        "wire": {
+                            "encoding": "inner_http_attempt_ordinals",
+                            "ordinals": inner_ordinals,
+                        },
+                    }
+                )
+            if terminal:
                 exc.feedling_error_class = (
                     "provider_config"
                     if cls == "provider_config"
                     else "transient_exhausted"
                 )
+                if provider_attempt_trace is not None:
+                    _attach_provider_attempt_trace(exc, provider_attempt_trace)
                 raise
             delay = min(base_delay_sec * (3 ** (attempt - 1)), max_delay_sec)
             retry_after = _retry_after_seconds(exc)

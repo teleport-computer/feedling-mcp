@@ -74,6 +74,12 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "VALUES (%s, 'wb1', '2026-07-03T00:00:00', '{}'::jsonb)",
             (user_id,),
         )
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(user_id, lane, provider, model, prompt_tokens, completion_tokens, "
+            "latency_ms) VALUES (%s, 'chat', 'anthropic', 'claude-test', 10, 2, 50)",
+            (user_id,),
+        )
     cid = db.model_api_credential_create(
         user_id, provider="anthropic", base_url="", label="k",
         api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
@@ -91,6 +97,7 @@ _PER_USER_TABLES = (
     "world_book_entries",
     "model_api_credentials",
     "model_api_routes",
+    "v2_turn_metrics",
 )
 
 

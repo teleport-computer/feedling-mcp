@@ -49,6 +49,30 @@
 
 ## 2026-07-19
 
+### [DONE] Runtime V2 flight recorder becomes byte-complete for model-visible turns
+
+- Oversized provider/tool/reply trajectory events now use exact, digest-verified
+  encrypted chunks appended in one stream transaction and one multi-row INSERT
+  instead of retaining only a 512 KiB prefix. Serialization, compression, and
+  envelope sealing run off the shared asyncio loop; unsupported values now fail
+  visibly instead of becoming depth/unsupported omission markers.
+- Every async compatibility and transient provider HTTP attempt is retained in
+  memory and folded into the existing encrypted response/error event: exact JSON
+  request body, effective request model, status/error class, fallback, ordinals,
+  and monotonic duration. This adds no attempt-level database or network call.
+- Parallel tool results now carry monotonic duration and durable platform/MCP
+  effect evidence; reply delivery records the durable effect disposition.
+  Aggregate metrics still name the user-configured provider/model, while the
+  trajectory names the effective wire model per attempt.
+- Required or best-effort evidence failures emit an encrypted `capture_gap`
+  marker before terminal capture, so an otherwise terminal trajectory remains
+  explicitly partial rather than claiming false completeness.
+- Per-user `v2_turn_metrics` now cascade on account deletion, with the redundant
+  reset belt, dedicated child-key index, and direct cascade coverage updated so
+  model/token telemetry cannot survive the documented complete-erasure boundary.
+- Offline review remains bounded and side-effect-free, and retention/GC plus a
+  restricted inspection/export policy remain explicit product/operations work.
+
 ### [DONE] Runtime V2 harness parity lands in source with explicit live gates
 
 - The unified model-visible catalog now has 23 built-in tools: 21 platform
@@ -69,7 +93,7 @@
   web/MCP/`task` tools for that turn. The existing Pre canary proves OpenRouter
   only; native Bedrock and a live trusted-skills mutation still need deployment
   evidence.
-- Runtime V2 now persists a bounded, append-only encrypted per-job trajectory.
+- Runtime V2 now persists an append-only encrypted per-job trajectory.
   Optional provider-backed failure review is default-off, fail-closed,
   database-admission-bounded, and structurally has no reply/tool/effect surface.
   It is offline analysis rather than deterministic replay; automatic retention/

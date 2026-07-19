@@ -30,7 +30,7 @@ import pytest
 import conftest
 import db
 import provider_client
-from provider_types import ToolExchange
+from provider_types import ToolCall, ToolExchange
 from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
@@ -158,7 +158,24 @@ def _wake_deps(*, tail=None, summary="", sink_calls=None, token="rt-enclave"):
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
         read_summary=lambda uid: (summary, 0.0, 0),
         apply_pending_effects=_apply_effects_factory(sink_calls if sink_calls is not None else []),
-    )
+)
+
+
+class _TrajectoryCapture:
+    def __init__(self, events=None, scope=""):
+        self.events = [] if events is None else events
+        self.scope = scope
+
+    def scoped(self, scope):
+        return _TrajectoryCapture(self.events, str(scope))
+
+    async def record(self, event_kind, payload):
+        self.events.append((self.scope, event_kind, payload))
+        return len(self.events) - 1
+
+    async def record_best_effort(self, event_kind, payload):
+        await self.record(event_kind, payload)
+        return True
 
 
 def _job_status(job_id):
@@ -201,12 +218,19 @@ def test_wake_terminal_plain_text_writes_exactly_one_proactive_bubble(monkeypatc
     calls = _script_provider(monkeypatch, [_text_round("hey, thinking of you")])
     sink_calls = []
     deps = _wake_deps(tail=[], sink_calls=sink_calls)
+    trajectory = _TrajectoryCapture()
 
     # Through process_job (not a direct _run_wake call) so a `TurnMetrics`
     # accumulator gets created and flushed, same as production's real
     # dispatch path (`_run_turn` -> `process_job` -> lane dispatch).
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+        trajectory_recorder=trajectory,
+    ))
 
     assert status == "completed"
     assert len(calls) == 1
@@ -214,6 +238,13 @@ def test_wake_terminal_plain_text_writes_exactly_one_proactive_bubble(monkeypatc
     assert len(bubbles) == 1
     assert bubbles[0]["body_ct"] == "hey, thinking of you"
     assert [c[0] for c in sink_calls] == ["reply"]
+    reply_dispositions = [
+        payload
+        for _scope, kind, payload in trajectory.events
+        if kind == "reply_effect_disposition"
+    ]
+    assert len(reply_dispositions) == 1
+    assert reply_dispositions[0]["status"] == "applied_unverified"
 
     row = _turn_metric_row(job_id)
     assert row is not None
@@ -293,11 +324,11 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# memory_write is AUTHORIZED (turn_authorization=True from wake) and enqueued
-# — NOT refused by the provenance gate.
+# memory_write is AUTHORIZED (turn_authorization=True from wake), applied, and
+# acknowledged with its durable disposition — never refused by provenance.
 # ------------------------------------------------------------------
 
-def test_wake_memory_write_is_authorized_and_enqueued_not_refused(monkeypatch):
+def test_wake_memory_write_is_authorized_applied_and_not_refused(monkeypatch):
     uid = "u_wake_toolloop_memwrite"
     conftest.seed_user(uid)
     _reset(uid)
@@ -319,9 +350,18 @@ def test_wake_memory_write_is_authorized_and_enqueued_not_refused(monkeypatch):
     ])
     sink_calls = []
     deps = _wake_deps(tail=[], sink_calls=sink_calls)
+    trajectory = _TrajectoryCapture()
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "manual_wake", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, str(job["claimed_by"])))
+        job_id,
+        uid,
+        "manual_wake",
+        deps,
+        _BYOK,
+        worker.ENCLAVE_SEMAPHORE,
+        str(job["claimed_by"]),
+        trajectory_recorder=trajectory,
+    ))
 
     assert status == "completed"
     assert len(calls) == 2
@@ -329,8 +369,15 @@ def test_wake_memory_write_is_authorized_and_enqueued_not_refused(monkeypatch):
     exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
     assert len(exchanges) == 1
     round1_results = " ".join(r.content for r in exchanges[0].results)
-    assert "queued: memory_write" in round1_results
+    assert "ok: memory_write applied" in round1_results
     assert "refused" not in round1_results
+    tool_results = [
+        payload
+        for _scope, kind, payload in trajectory.events
+        if kind == "tool_call_result" and payload.get("call_id") == "w1"
+    ]
+    assert len(tool_results) == 1
+    assert tool_results[0]["effect"]["status"] == "applied"
 
     memory_sinks = [p for (t, p) in sink_calls if t == "memory"]
     assert len(memory_sinks) == 1
@@ -357,6 +404,70 @@ def test_wake_memory_write_is_authorized_and_enqueued_not_refused(monkeypatch):
     assert "likes tea" not in stored_payload
     assert "effect_envelope" in stored_payload
     assert _job_status(job_id)[0] == "completed"
+
+
+def test_wake_mixed_valid_invalid_workspace_batch_applies_valid_call(
+    monkeypatch,
+):
+    uid = "u_wake_mixed_workspace_batch"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    job = jobs_store.claim_next_job("w-mixed-workspace")
+    _patch_tool_effect_encryption(monkeypatch)
+    captured = {}
+
+    async def direct_loop(**kwargs):
+        results = await kwargs["dispatch_tools"](
+            [
+                ToolCall(
+                    id="valid",
+                    name="workspace_write",
+                    args={
+                        "path": "/workspace/valid.md",
+                        "content": "kept",
+                        "expected_revision": 0,
+                    },
+                ),
+                ToolCall(
+                    id="invalid",
+                    name="workspace_write",
+                    args={},
+                    args_ok=False,
+                ),
+            ]
+        )
+        captured["results"] = results
+        return worker.v2_tool_loop.LoopOutcome(
+            final_text="",
+            rounds=1,
+            stop_reason="final_text",
+            replied_intermediate=False,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+    sink_calls = []
+    deps = _wake_deps(tail=[], sink_calls=sink_calls)
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "manual_wake",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            str(job["claimed_by"]),
+        )
+    )
+
+    assert status == "completed"
+    assert [result.call_id for result in captured["results"]] == [
+        "valid",
+        "invalid",
+    ]
+    assert captured["results"][0].content == "ok: workspace_write applied"
+    assert captured["results"][1].content.startswith("error: unparseable args")
+    assert [kind for kind, _payload in sink_calls] == ["workspace_batch"]
 
 
 def test_wake_memory_write_refused_when_process_job_seeds_no_authorization(monkeypatch):
