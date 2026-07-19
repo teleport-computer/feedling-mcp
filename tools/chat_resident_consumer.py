@@ -598,6 +598,21 @@ def _system_notice_body(notice: AgentErrorNotice) -> str:
     return f"⚠️ {notice.user_text}\n详情: {notice.detail}"
 
 
+def turn_failure_post_kwargs(notice: "AgentErrorNotice | None") -> dict:
+    """把分类结果转成 post_reply 的 turn-failure kwargs（spec 2026-07-18 §2.2）。
+
+    只带 error_class / blame / user_text —— detail 绝不下发（可能夹带 provider
+    HTML、request id、敏感上下文；排障走设置页 last_runtime_error 与 admin 面）。
+    无失败时返回空 dict，成功路径零变化。"""
+    if notice is None:
+        return {}
+    return {
+        "turn_failure_error_class": notice.error_class[:64],
+        "turn_failure_blame": notice.blame[:32],
+        "turn_failure_user_text": notice.user_text[:500],
+    }
+
+
 # 聊天流失败横幅节流（Seven 定稿 2026-07-11）：
 # - 后台车道（心跳/主动/capture/dream）一律不进聊天流——用户无法据此行动，天天聊天
 #   的人会被自己根本看不见的后台车道刷屏；可观测性走设置页/admin 腿
@@ -6184,6 +6199,9 @@ def post_reply(
     thinking_native: bool | None = None,
     role: str = "",
     notice_kind: str = "",
+    turn_failure_error_class: str = "",
+    turn_failure_blame: str = "",
+    turn_failure_user_text: str = "",
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -6257,6 +6275,10 @@ def post_reply(
                 body["role"] = role
             if notice_kind:
                 body["notice_kind"] = notice_kind
+            if turn_failure_error_class:
+                body["turn_failure_error_class"] = turn_failure_error_class
+                body["turn_failure_blame"] = turn_failure_blame
+                body["turn_failure_user_text"] = turn_failure_user_text
             if reply_to_message_id:
                 body["reply_to_message_id"] = reply_to_message_id
             if gate_decision_id:
@@ -9173,6 +9195,13 @@ def _process_messages(messages: list) -> float:
                     post_kwargs["thinking_source"] = turn.thinking_source
                     post_kwargs["thinking_model"] = turn.thinking_model
                     post_kwargs["thinking_native"] = turn.thinking_native
+                # 兜底回复才带失败元信息：pending_failure_notice 非空即表示本轮是
+                # 兜底糊的、不是真回复。只给第一条（兜底只有一条）。后台车道的
+                # post_kwargs（proactive 那处）刻意不带——后台失败不进聊天流。
+                if idx == 0 and pending_failure_notice is not None:
+                    post_kwargs.update(
+                        turn_failure_post_kwargs(classify_agent_error(pending_failure_notice))
+                    )
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
                     if result.get("error") == "bootstrap_incomplete":
