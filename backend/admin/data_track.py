@@ -1874,6 +1874,7 @@ def _render_data_track_view_nav(active: str) -> str:
         "<div class='viewbar'>"
         f"{nav_item('users', 'Users')}"
         f"{nav_item('dau', 'DAU')}"
+        f"{nav_item('growth', '增长 & 留存')}"
         f"{nav_item('proactive', 'Proactive 日报')}"
         f"{nav_item('events', '事件健康度')}"
         f"{nav_item('debug', 'Debug')}"
@@ -2208,6 +2209,156 @@ def _render_data_track_dau_page(payload: dict) -> str:
   <table>
     <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>人均日使用时长</th><th>中位数日使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='13' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
+  </table>
+</main>
+</body>
+</html>"""
+
+
+def _data_track_growth_payload() -> dict:
+    filters = _data_track_request_filters()
+    days = int(filters.get("days") or 60)
+    growth = db.admin_data_track_growth(days=days, tz="Asia/Shanghai")
+    retention = db.admin_data_track_retention(tz="Asia/Shanghai")
+    g_bounds = db.admin_growth_snapshot_bounds()
+    latest = growth[-1] if growth else {}
+    summary = {
+        "generated_at": datetime.now().isoformat(),
+        "timezone": "Asia/Shanghai",
+        "days_returned": len(growth),
+        "total_users": int(latest.get("cumulative") or 0),
+        "latest_day": latest.get("day", ""),
+        "latest_new": int(latest.get("new_users") or 0),
+        "snapshot_first_day": g_bounds.get("first_day", ""),
+        "snapshot_days": int(g_bounds.get("days") or 0),
+        "cohort_count": len(retention.get("cohorts") or []),
+    }
+    return {
+        "summary": summary,
+        "filters": {"days": days, "view": "growth"},
+        "growth": growth,
+        "retention": retention,
+    }
+
+
+_GROWTH_STYLE = """
+    :root { color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }
+    body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1280px; margin:0 auto; padding:28px 24px 48px; }
+    h1 { font-size:26px; margin:0 0 4px; }
+    h2 { font-size:16px; margin:28px 0 12px; }
+    .muted { color:var(--muted); font-size:13px; }
+    .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:22px 0; }
+    .metric { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .metric-value { font-size:24px; font-weight:700; }
+    .metric-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .viewbar,.toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }
+    .sort-button { display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }
+    .sort-button.active { border-color:var(--accent); color:var(--accent); background:#fff1ed; }
+    table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+    th,td { text-align:left; padding:9px 11px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }
+    tr:last-child td { border-bottom:0; }
+    a { color:var(--accent); text-decoration:none; }
+    .bar { display:inline-block; height:8px; background:var(--accent); border-radius:3px; vertical-align:middle; }
+"""
+
+
+def _retention_cell_bg(pct: float) -> str:
+    # Heat: 0% pale, 100% saturated warm.
+    frac = max(0.0, min(1.0, pct / 100.0))
+    # blend from #fbf1ea (low) toward #b7352b (high) via alpha on accent.
+    alpha = 0.10 + 0.75 * frac
+    return f"background:rgba(183,53,43,{alpha:.2f})"
+
+
+def _render_data_track_growth_page(payload: dict) -> str:
+    summary = payload["summary"]
+    growth = payload.get("growth", [])
+    retention = payload.get("retention", {})
+    api_qs = _data_track_qs(view=None, q=None, limit=None, offset=None, sort=None, dir=None)
+    api_url = f"/v1/admin/data-track/growth?{api_qs}" if api_qs else "/v1/admin/data-track/growth"
+
+    max_cum = max((int(r.get("cumulative") or 0) for r in growth), default=0) or 1
+    growth_rows = []
+    for row in reversed(growth):  # newest first
+        cum = int(row.get("cumulative") or 0)
+        width = int(round(120 * cum / max_cum))
+        state = ("<span style='color:#1d7a4d;font-size:12px'>🔒 已冻结</span>"
+                 if row.get("frozen")
+                 else "<span style='color:#a05a00;font-size:12px'>⏱ 实时</span>")
+        growth_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('day') or ''))}</td>"
+            f"<td>{state}</td>"
+            f"<td><b>{int(row.get('new_users') or 0)}</b></td>"
+            f"<td>{cum} <span class='bar' style='width:{width}px'></span></td>"
+            "</tr>"
+        )
+
+    cohorts = retention.get("cohorts", [])
+    max_period = int(retention.get("max_period") or 0)
+    head_cells = "".join(f"<th>W{p}</th>" for p in range(max_period + 1))
+    ret_rows = []
+    for c in sorted(cohorts, key=lambda x: x["cohort_week"], reverse=True):
+        cells_html = []
+        for p in range(max_period + 1):
+            cell = c["cells"].get(p)
+            if cell is None:
+                cells_html.append("<td class='muted'></td>")
+                continue
+            mark = "" if cell["frozen"] else "*"
+            cells_html.append(
+                f"<td style='{_retention_cell_bg(cell['pct'])}'>"
+                f"{cell['pct']:.0f}%<br><span class='muted'>{cell['active']}{mark}</span></td>"
+            )
+        ret_rows.append(
+            "<tr>"
+            f"<td><b>{html.escape(c['cohort_week'])}</b></td>"
+            f"<td>{int(c['cohort_size'])}</td>"
+            + "".join(cells_html)
+            + "</tr>"
+        )
+
+    metrics = "".join([
+        _render_metric("累计用户", summary["total_users"]),
+        _render_metric("最新一天新增", summary["latest_new"]),
+        _render_metric("cohort 数", summary["cohort_count"]),
+        _render_metric("已冻结天数", summary["snapshot_days"]),
+    ])
+    snap_first = html.escape(str(summary.get("snapshot_first_day") or ""))
+    boundary = (f"首个冻结日 <b>{snap_first}</b> 起,新增/留存不再随删号变化;之前的历史仍实时重算、会随删号偏少,仅供参考。"
+                if snap_first else "每日快照即将生效;生效后完成日的新增/留存会冻结、不再随删号变化。")
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feedling 增长 & 留存 · Data Track</title>
+  <style>{_GROWTH_STYLE}</style>
+</head>
+<body>
+<main>
+  <h1>增长 & 留存</h1>
+  <div class="muted">Generated {html.escape(_bj_iso(summary["generated_at"]))} · {html.escape(summary["timezone"])}</div>
+  {_render_data_track_view_nav("growth")}
+  <section class="metrics">{metrics}</section>
+  <div class="muted" style="background:#fff8ef;border:1px solid #e8d8be;border-radius:8px;padding:12px 14px;margin:10px 0;line-height:1.7">
+    <b>⚠️ 口径与已知偏差</b><br>
+    {boundary}<br>
+    留存为<b>周 cohort</b>(北京周,行=注册周,列 W0=注册周自身…Wk=第 k 周);格子=该周仍活跃占比,小字=活跃人数(<b>*</b>=当前进行中的实时周,未冻结)。cohort_size 分母在首次冻结时钉死,删号不会缩小分母假抬留存。<br>
+    <b>用户基数极小</b> → 曲线抖动大,当方向性参考,非统计显著。<b>③ 完全自部署</b>用户不在此表(不在我们后端注册)。"活跃"=当天有用户消息或 app tracking 事件,口径同 DAU。
+  </div>
+  <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
+  <h2>用户增长(新增 + 累计)</h2>
+  <table>
+    <thead><tr><th>Beijing day</th><th>状态</th><th>新增</th><th>累计</th></tr></thead>
+    <tbody>{''.join(growth_rows) if growth_rows else "<tr><td colspan='4' class='muted'>暂无注册数据</td></tr>"}</tbody>
+  </table>
+  <h2>周 cohort 留存</h2>
+  <table>
+    <thead><tr><th>注册周</th><th>人数</th>{head_cells}</tr></thead>
+    <tbody>{''.join(ret_rows) if ret_rows else f"<tr><td colspan='{max_period + 3}' class='muted'>暂无 cohort 数据</td></tr>"}</tbody>
   </table>
 </main>
 </body>

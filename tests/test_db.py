@@ -692,6 +692,90 @@ def test_dau_daily_snapshot_freezes_completed_days_and_preserves_live_fallback()
             )
 
 
+def _bj_epoch(y, m, d, h=12):
+    from datetime import timezone, timedelta
+    return datetime(y, m, d, h, tzinfo=timezone(timedelta(hours=8))).timestamp()
+
+
+def test_user_growth_new_cumulative_and_deletion_proof_freeze():
+    # 3 users register Beijing 2038-03-01, 2 on 2038-03-02. Midday created_at is
+    # tz-robust (same Beijing day whether the session casts naive as UTC or CST).
+    a_users = [_uid() for _ in range(3)]
+    b_users = [_uid() for _ in range(2)]
+    for u in a_users:
+        seed_user(u, created_at="2038-03-01T12:00:00")
+    for u in b_users:
+        seed_user(u, created_at="2038-03-02T12:00:00")
+    try:
+        by_day = {r["day"]: r for r in db.admin_data_track_growth(days=365)}
+        assert by_day["2038-03-01"]["new_users"] == 3
+        assert by_day["2038-03-02"]["new_users"] == 2
+        # cumulative is a running sum; 03-02 sits 3 higher than 03-01.
+        assert by_day["2038-03-02"]["cumulative"] - by_day["2038-03-01"]["cumulative"] == 2
+
+        # Freeze establishes the boundary at "yesterday": run at 03-02 to freeze
+        # 03-01, then at 03-03 to freeze 03-02.
+        assert "2038-03-01" in db.freeze_completed_growth_days(now_epoch=_bj_epoch(2038, 3, 2))
+        assert "2038-03-02" in db.freeze_completed_growth_days(now_epoch=_bj_epoch(2038, 3, 3))
+        frozen = {r["day"]: r for r in db.admin_data_track_growth(days=365)}
+        assert frozen["2038-03-01"]["frozen"] is True
+        assert frozen["2038-03-01"]["new_users"] == 3
+
+        # Delete one 2038-03-01 user: the FROZEN day must not change.
+        db.delete_user(a_users[0])
+        after = {r["day"]: r for r in db.admin_data_track_growth(days=365)}
+        assert after["2038-03-01"]["new_users"] == 3   # deletion-proof
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM user_growth_daily_snapshot WHERE day IN ('2038-03-01','2038-03-02')")
+
+
+def test_retention_cohort_matrix_and_pinned_denominator():
+    # Cohort A: 3 users reg 2038-05-03; B: 2 users reg 2038-05-10 (one week later
+    # -> distinct Beijing weeks). Activity at reg_date = period 0, reg_date+7 = 1.
+    a = [_uid() for _ in range(3)]
+    b = [_uid() for _ in range(2)]
+    for u in a:
+        seed_user(u, created_at="2038-05-03T12:00:00")
+    for u in b:
+        seed_user(u, created_at="2038-05-10T12:00:00")
+
+    def chat(uid, ts):
+        db.chat_append(uid, f"m_{uid}_{ts}", ts,
+                       {"id": f"m_{uid}_{ts}", "role": "user", "source": "chat"}, max_messages=0)
+
+    # A: u0 active period 0 and 1; u1 active period 0 only; u2 never.
+    chat(a[0], _bj_epoch(2038, 5, 3)); chat(a[0], _bj_epoch(2038, 5, 10))
+    chat(a[1], _bj_epoch(2038, 5, 4))
+    # B: u0 active period 0 only.
+    chat(b[0], _bj_epoch(2038, 5, 11))
+    try:
+        matrix = {c["cohort_week"]: c for c in db.admin_data_track_retention()["cohorts"]}
+        # find cohort A (size 3) and B (size 2) without hardcoding the Monday.
+        cohort_a = next(c for c in matrix.values() if c["cohort_size"] == 3)
+        cohort_b = next(c for c in matrix.values() if c["cohort_size"] == 2)
+        assert cohort_a["cells"][0]["active"] == 2      # u0,u1 in signup week
+        assert cohort_a["cells"][1]["active"] == 1      # u0 the next week
+        assert cohort_a["cells"][0]["pct"] == round(100 * 2 / 3, 1)
+        assert cohort_b["cells"][0]["active"] == 1
+
+        a_week = cohort_a["cohort_week"]
+        frozen = db.freeze_completed_retention_cohorts(now_epoch=_bj_epoch(2038, 6, 1))
+        assert any(k.startswith(a_week) for k in frozen)
+
+        # Delete the churned A user (u2, never active): cohort_size stays 3, so
+        # retention is NOT fake-inflated (the whole point of freezing).
+        db.delete_user(a[2])
+        after = {c["cohort_week"]: c for c in db.admin_data_track_retention()["cohorts"]}
+        assert after[a_week]["cohort_size"] == 3               # pinned denominator
+        assert after[a_week]["cells"][0]["pct"] == round(100 * 2 / 3, 1)
+        assert after[a_week]["cells"][0]["frozen"] is True
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM retention_cohort_snapshot WHERE cohort_size IN (2, 3)")
+
+
 def test_log_patch_item_only_if_status():
     uid = _uid()
     seed_user(uid)

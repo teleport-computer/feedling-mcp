@@ -1330,6 +1330,298 @@ def admin_dau_snapshot_bounds() -> dict:
         return {"first_day": "", "last_day": "", "days": 0}
 
 
+# --- User growth (new + cumulative signups) ------------------------------- #
+# ``users.created_at`` is a naive server-local ISO string; cast ::timestamptz
+# (session tz) then bucket into Beijing days, matching the onboarding funnel's
+# EXTRACT(EPOCH FROM created_at::timestamptz) contract. Frozen days come from
+# user_growth_daily_snapshot (deletion-proof); pre-boundary days are computed
+# live and understate because deleted accounts drop out of ``users``.
+_CREATED_AT_ISO = "created_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'"
+
+
+def admin_data_track_growth(*, days: int = 60, tz: str = "Asia/Shanghai") -> list[dict]:
+    """Per-Beijing-day new signups + running cumulative, newest last-limited.
+
+    Cumulative is a running sum over the FULL series so the returned tail carries
+    a correct total; only the last ``days`` rows are returned for display.
+    """
+    day_limit = max(1, min(int(days or 60), 366))
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                f"""
+                WITH reg AS (
+                    SELECT to_char(timezone(%s, created_at::timestamptz), 'YYYY-MM-DD') AS day
+                    FROM users
+                    WHERE {_CREATED_AT_ISO}
+                ),
+                live AS (
+                    SELECT day, COUNT(*)::int AS new_users FROM reg GROUP BY day
+                ),
+                frozen_rows AS (
+                    SELECT day, new_users FROM user_growth_daily_snapshot
+                ),
+                merged AS (
+                    SELECT day, new_users, TRUE AS frozen FROM frozen_rows
+                    UNION ALL
+                    SELECT l.day, l.new_users, FALSE AS frozen
+                    FROM live l
+                    WHERE NOT EXISTS (SELECT 1 FROM frozen_rows f WHERE f.day = l.day)
+                )
+                SELECT day, new_users, frozen FROM merged ORDER BY day ASC
+                """,
+                (tz,),
+            ).fetchall()
+        cumulative = 0
+        out: list[dict] = []
+        for day, new_users, frozen in rows:
+            cumulative += int(new_users or 0)
+            out.append({
+                "day": day,
+                "new_users": int(new_users or 0),
+                "cumulative": cumulative,
+                "frozen": bool(frozen),
+            })
+        return out[-day_limit:]
+    except Exception as e:
+        log.error("[db] admin_data_track_growth failed: %s", e)
+        return []
+
+
+def _completed_growth_row(conn, *, day: date, tz: str) -> dict:
+    zone = ZoneInfo(tz)
+    start = datetime.combine(day, datetime.min.time(), tzinfo=zone).timestamp()
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=zone).timestamp()
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*)::int
+        FROM users
+        WHERE {_CREATED_AT_ISO}
+          AND EXTRACT(EPOCH FROM created_at::timestamptz) >= %s
+          AND EXTRACT(EPOCH FROM created_at::timestamptz) < %s
+        """,
+        (start, end),
+    ).fetchone()
+    return {"day": day.isoformat(), "new_users": int(row[0] or 0)}
+
+
+def freeze_completed_growth_days(*, now_epoch: float | None = None,
+                                 tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze immutable new-signup counts for completed Beijing days.
+
+    Mirrors ``freeze_completed_dau_days``: the first run establishes the rollout
+    boundary at yesterday; later runs fill the gap; ``ON CONFLICT DO NOTHING``
+    keeps it write-once so account deletion can never change a frozen day.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = datetime.fromtimestamp(float(now_epoch), zone) if now_epoch is not None else datetime.now(zone)
+        last_completed = now.date() - timedelta(days=1)
+        with get_pool().connection() as conn:
+            row = conn.execute("SELECT MIN(day) FROM user_growth_daily_snapshot").fetchone()
+            first_day = date.fromisoformat(row[0]) if row and row[0] else last_completed
+            if first_day > last_completed:
+                return []
+            existing = {
+                date.fromisoformat(r[0])
+                for r in conn.execute(
+                    "SELECT day FROM user_growth_daily_snapshot WHERE day >= %s AND day <= %s",
+                    (first_day.isoformat(), last_completed.isoformat()),
+                ).fetchall()
+            }
+            inserted: list[str] = []
+            cursor = first_day
+            while cursor <= last_completed:
+                if cursor not in existing:
+                    snap = _completed_growth_row(conn, day=cursor, tz=tz)
+                    saved = conn.execute(
+                        """
+                        INSERT INTO user_growth_daily_snapshot (day, new_users)
+                        VALUES (%s, %s)
+                        ON CONFLICT (day) DO NOTHING
+                        RETURNING day
+                        """,
+                        (snap["day"], snap["new_users"]),
+                    ).fetchone()
+                    if saved:
+                        inserted.append(saved[0])
+                cursor += timedelta(days=1)
+        return inserted
+    except Exception as e:
+        log.error("[db] freeze_completed_growth_days failed: %s", e)
+        return []
+
+
+def admin_growth_snapshot_bounds() -> dict:
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT MIN(day), MAX(day), COUNT(*) FROM user_growth_daily_snapshot"
+            ).fetchone()
+        return {"first_day": row[0] or "", "last_day": row[1] or "", "days": int(row[2] or 0)}
+    except Exception as e:
+        log.error("[db] admin_growth_snapshot_bounds failed: %s", e)
+        return {"first_day": "", "last_day": "", "days": 0}
+
+
+# --- Weekly cohort retention ---------------------------------------------- #
+# Cohort = the Beijing week a user registered in (Monday date). period_index k =
+# weeks since registration (0 = the signup week itself). A cell (W,k) freezes
+# once week k has fully ended; active = the same user-initiated activity DAU
+# uses (user chat message OR tracking event). cohort_size is pinned to the value
+# at the cohort's first frozen cell so deletion can't shrink the denominator and
+# fake-inflate retention.
+
+def _retention_cells(conn, tz: str) -> tuple[dict, dict]:
+    """(cohort_size_by_week, active_count_by_(week,period)) computed live now."""
+    size_rows = conn.execute(
+        f"""
+        SELECT to_char((date_trunc('week', timezone(%s, created_at::timestamptz)))::date,
+                       'YYYY-MM-DD') AS cohort_week,
+               COUNT(*)::int AS cohort_size
+        FROM users
+        WHERE {_CREATED_AT_ISO}
+        GROUP BY cohort_week
+        """,
+        (tz,),
+    ).fetchall()
+    sizes = {r[0]: int(r[1] or 0) for r in size_rows}
+
+    cell_rows = conn.execute(
+        f"""
+        WITH reg AS (
+            SELECT user_id,
+                   (date_trunc('week', timezone(%s, created_at::timestamptz)))::date AS cohort_monday
+            FROM users
+            WHERE {_CREATED_AT_ISO}
+        ),
+        act AS (
+            SELECT DISTINCT r.user_id, r.cohort_monday,
+                   (date_trunc('week', timezone(%s, to_timestamp(a.ts))))::date AS act_monday
+            FROM reg r
+            JOIN (
+                SELECT user_id, ts FROM chat_messages
+                  WHERE doc->>'role' = 'user'
+                    AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
+                UNION ALL
+                SELECT user_id, ts FROM user_logs
+                  WHERE stream = 'tracking_events' AND ts IS NOT NULL
+            ) a ON a.user_id = r.user_id
+        )
+        SELECT to_char(cohort_monday, 'YYYY-MM-DD') AS cohort_week,
+               ((act_monday - cohort_monday) / 7)::int AS period_index,
+               COUNT(DISTINCT user_id)::int AS active_count
+        FROM act
+        WHERE act_monday >= cohort_monday
+        GROUP BY cohort_monday, period_index
+        """,
+        (tz, tz),
+    ).fetchall()
+    cells = {(r[0], int(r[1])): int(r[2] or 0) for r in cell_rows}
+    return sizes, cells
+
+
+def admin_data_track_retention(*, tz: str = "Asia/Shanghai") -> dict:
+    """Weekly cohort retention matrix. Frozen cells win (deletion-proof); the
+    current in-progress period falls back to live. Returns
+    {cohorts: [{cohort_week, cohort_size, cells: {k: {active, pct, frozen}}}],
+     max_period}."""
+    try:
+        with get_pool().connection() as conn:
+            frozen = conn.execute(
+                "SELECT cohort_week, period_index, cohort_size, active_count "
+                "FROM retention_cohort_snapshot"
+            ).fetchall()
+            sizes, live_cells = _retention_cells(conn, tz)
+
+        frozen_cells = {(r[0], int(r[1])): (int(r[2] or 0), int(r[3] or 0)) for r in frozen}
+        # Denominator per cohort: prefer a frozen anchor (pinned size), else live.
+        anchor: dict[str, int] = {}
+        for (week, _period), (size, _active) in frozen_cells.items():
+            anchor.setdefault(week, size)
+        weeks = sorted(set(sizes) | {w for (w, _p) in frozen_cells})
+
+        cohorts = []
+        max_period = 0
+        for week in weeks:
+            size = anchor.get(week, sizes.get(week, 0))
+            cells: dict[int, dict] = {}
+            periods = {p for (w, p) in frozen_cells if w == week} | {
+                p for (w, p) in live_cells if w == week
+            }
+            for p in periods:
+                if (week, p) in frozen_cells:
+                    active = frozen_cells[(week, p)][1]
+                    is_frozen = True
+                else:
+                    active = live_cells.get((week, p), 0)
+                    is_frozen = False
+                pct = round(100.0 * active / size, 1) if size else 0.0
+                cells[p] = {"active": active, "pct": pct, "frozen": is_frozen}
+                max_period = max(max_period, p)
+            cohorts.append({"cohort_week": week, "cohort_size": size, "cells": cells})
+        return {"cohorts": cohorts, "max_period": max_period}
+    except Exception as e:
+        log.error("[db] admin_data_track_retention failed: %s", e)
+        return {"cohorts": [], "max_period": 0}
+
+
+def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
+                                       tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze (cohort_week, period) cells whose week has fully ended.
+
+    cohort_size is pinned to the cohort's earliest already-frozen cell so every
+    period shares one deletion-proof denominator. Returns the "week#period" keys
+    inserted. Best-effort per the scheduler contract.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = datetime.fromtimestamp(float(now_epoch), zone) if now_epoch is not None else datetime.now(zone)
+        now_date = now.date()
+        inserted: list[str] = []
+        with get_pool().connection() as conn:
+            sizes, live_cells = _retention_cells(conn, tz)
+            existing = {
+                (r[0], int(r[1])): int(r[2] or 0)
+                for r in conn.execute(
+                    "SELECT cohort_week, period_index, cohort_size FROM retention_cohort_snapshot"
+                ).fetchall()
+            }
+            # Pin denominator per cohort to the earliest frozen cell if any.
+            anchor: dict[str, int] = {}
+            for (week, period) in sorted(existing, key=lambda k: k[1]):
+                anchor.setdefault(week, existing[(week, period)])
+
+            for week, cohort_size in sizes.items():
+                cohort_monday = date.fromisoformat(week)
+                # periods 0..K-1 are complete: week k ends at monday + (k+1)*7 days.
+                completed = (now_date - cohort_monday).days // 7
+                if completed <= 0:
+                    continue
+                size = anchor.get(week, cohort_size)
+                for k in range(completed):
+                    if (week, k) in existing:
+                        continue
+                    active = live_cells.get((week, k), 0)
+                    saved = conn.execute(
+                        """
+                        INSERT INTO retention_cohort_snapshot
+                            (cohort_week, period_index, cohort_size, active_count)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (cohort_week, period_index) DO NOTHING
+                        RETURNING cohort_week
+                        """,
+                        (week, k, size, active),
+                    ).fetchone()
+                    if saved:
+                        inserted.append(f"{week}#{k}")
+                        anchor.setdefault(week, size)
+            return inserted
+    except Exception as e:
+        log.error("[db] freeze_completed_retention_cohorts failed: %s", e)
+        return []
+
+
 def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30,
                                      tz: str = "Asia/Shanghai") -> list[dict]:
     """Per-Beijing-day proactive-job aggregates for the ops trend view.
