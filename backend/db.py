@@ -3138,6 +3138,60 @@ def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None
     return row[0] if row is not None else None
 
 
+_CHAT_FINALIZE_REPLY_ONCE_SQL = (
+    "WITH won AS ("
+    "  UPDATE chat_messages SET doc = doc || %s "
+    "  WHERE user_id = %s AND msg_id = %s "
+    "    AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+    "    AND COALESCE(doc->>'reply_message_id','') = '' "
+    "  RETURNING doc AS parent_doc"
+    "), inserted AS ("
+    "  INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+    "  SELECT %s, %s, %s, %s FROM won "
+    "  RETURNING doc AS reply_doc"
+    ") "
+    "SELECT won.parent_doc, inserted.reply_doc FROM won CROSS JOIN inserted"
+)
+
+
+def chat_finalize_reply_once(
+    user_id: str,
+    parent_msg_id: str,
+    reply_msg_id: str,
+    reply_ts: float,
+    reply_doc: dict,
+    replied_fields: dict,
+) -> tuple[dict, dict] | None:
+    """Atomically mark one parent answered and insert its encrypted reply.
+
+    The parent primary-key UPDATE is the compare-and-swap.  The data-modifying
+    CTE makes the reply INSERT conditional on winning that UPDATE and keeps the
+    two writes in one PostgreSQL statement: a duplicate reply id or any other
+    INSERT failure rolls the parent mutation back with the statement.  Losing
+    the CAS is the only normal ``None`` result; database failures deliberately
+    propagate so callers fail closed instead of accidentally retrying a reply.
+
+    This low-level helper intentionally performs no cache, wake, capture, R2,
+    or TEE side effects.  Those belong to the winning request after commit.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            _CHAT_FINALIZE_REPLY_ONCE_SQL,
+            (
+                Jsonb(replied_fields),
+                user_id,
+                parent_msg_id,
+                user_id,
+                reply_msg_id,
+                reply_ts,
+                Jsonb(reply_doc),
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    return row[0], row[1]
+
+
 def chat_try_claim_reply(
     user_id: str, msg_id: str, consumer_id: str, now: float, fields: dict,
     *, redelivery: bool = False,
