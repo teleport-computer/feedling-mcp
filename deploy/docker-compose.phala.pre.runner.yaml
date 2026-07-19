@@ -41,7 +41,7 @@ x-serve-worker-env: &serve-worker-env
 
 services:
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:9721b22   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:4c745d0   # CI pins the sha
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
