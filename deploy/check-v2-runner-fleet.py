@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed post-deploy proof for every production Runtime V2 runner CVM."""
+"""Fail-closed post-deploy proof for a managed Runtime V2 runner fleet."""
 
 from __future__ import annotations
 
@@ -228,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
             payload = fetch_metrics(args.base_url, token)
             ok, detail = evaluate_payload(payload, cvm_ids=cvm_ids, build=build)
             if ok:
-                print(f"production Runtime V2 fleet proof passed: {detail}")
+                print(f"Runtime V2 fleet proof passed: {detail}")
                 return 0
             last_error = detail
         except Exception as exc:  # transient startup/network window
@@ -236,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         if attempt < args.attempts:
             time.sleep(max(0.0, args.poll_sec))
 
-    print(f"production Runtime V2 fleet proof failed: {last_error}", file=sys.stderr)
+    print(f"Runtime V2 fleet proof failed: {last_error}", file=sys.stderr)
     return 1
 
 

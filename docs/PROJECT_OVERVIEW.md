@@ -313,23 +313,28 @@ agent 对身体的主动操作（推送、写记忆/身份）走 HTTP API 的
    保存 provider 配置（key 本身也封成 v1 信封存储）。
 2. 可选 `POST /v1/history_import/upload` 导入旧聊天记录，后端用该 provider
    提取记忆、初始化身份卡。
-3. 之后聊天走 `POST /v1/model_api/chat/send`：托管运行时
-   （`hosted_runtime.py` + `model_api_runtime/`）经 enclave 解密必要上下
-   文、用 `context_memory_selection.py` 挑选相关记忆组 prompt、调
-   provider、把用户消息和回复各自封信封落库。
+3. 之后聊天走 `POST /v1/model_api/chat/send`：请求先通过 Runtime V2 的
+   policy、worker 心跳、kill switch 和 admission 检查，再把用户消息加密落库，
+   并与 durable job 原子入队。独立 runner CVM 中的 pooled `serve-worker`
+   （`backend/model_api_runtime/v2/`）通过 `SKIP LOCKED` 领取 job，经 enclave
+   解密本轮所需内容和 BYOK，组装 summary + verbatim tail、相关记忆与工具，
+   进入统一的原生 provider/tool loop；回复、轨迹和 working-memory 内容在持久化
+   前重新加密。终态、deadline、重试和 `last_runtime_error` 均由 durable job
+   状态管理。
 
-   > **现状（2026-07）**：上述 inline 托管路已不是主路。托管聊天主路是
-   > **agent-runner**（`backend/agent_runtime/`，每用户一个 claude/codex
-   > driver 的 CLI agent 进程）；inline 路仅作 fallback，待 Stage F 退役，
-   > 见 `docs/HOSTED_MODEL_API_RETIREMENT_ROADMAP.zh.md`。
-
-这条路里**后端自己就是 consumer**，用户零部署，代价是运行时进程内会
-短暂持有明文（文档明确披露的边界）。
+托管 Model API 路径没有 inline fallback、resident supervisor、per-user CLI
+agent 进程或按用户切换旧 runtime 的机制。`hosted_runtime.py` 只是旧接口兼容
+辅助，`backend/agent_runtime/` 也不是 hosted consumer。用户不需要部署 agent；
+入站消息在 TDX 内的 ASGI handler 封装信封前、enclave 解密时、受信任的
+Runtime V2 worker 组 prompt 时，以及用户授权的模型 provider 处理本轮时会短暂
+成为明文；PostgreSQL 与 backend 持久层只保存密文内容及必要的明文路由元数据。
 
 ### 5.8 隐私梯度
 
 **A/B 路由明文只出现在 enclave 和用户自己的 agent 侧；C 路由为了零部署，
-接受后端托管运行时短暂接触明文。**
+由 TDX main CVM 的入站 handler/enclave 与独立 TDX runner CVM 中的 Runtime V2
+worker 短暂处理明文，并把授权后的 prompt 发送给用户选择的模型 provider。
+backend/数据库不持久化对话、summary、轨迹或 workspace 的明文内容。**
 
 ## 6. 加密设计（v1 信封）
 

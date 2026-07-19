@@ -41,6 +41,13 @@ def test_topology_gate_counts_unique_runner_ids(tmp_path):
     assert "2 independent" in redundant.stdout
 
 
+def test_topology_gate_rejects_the_main_cvm_as_a_runner(tmp_path):
+    main_id = (ROOT / "deploy" / "prod-cvm-id.txt").read_text().strip()
+    result = _run(tmp_path, f"runner-a\n{main_id}\n")
+    assert result.returncode == 1
+    assert "main CVM" in result.stdout
+
+
 def test_main_deploy_depends_on_topology_preflight():
     workflow = WORKFLOW.read_text()
     assert "validate-prod-runner-topology:" in workflow
@@ -54,6 +61,7 @@ def test_prod_inventory_and_fleet_gates_trigger_the_shared_preflight():
         "\n  detect-cvm-changes-test:\n", 1
     )[0]
     for path in (
+        "deploy/prod-cvm-id.txt",
         "deploy/prod-runner-cvm-ids.txt",
         "deploy/check-prod-runner-topology.sh",
         "deploy/check-v2-runner-fleet.py",
@@ -66,3 +74,7 @@ def test_prod_inventory_and_fleet_gates_trigger_the_shared_preflight():
     )[0]
     assert "feedling feedling-agent-runner" in preflight
     assert "docker manifest inspect" in preflight
+    assert 'phala cvms get "$CVM_ID"' in preflight
+    assert "production CVM $CVM_ID does not exist" in preflight
+    assert "Build and verify the production E2B template" in preflight
+    assert "deploy/e2b/runtime-v2/template-tag.txt" in preflight

@@ -52,7 +52,9 @@ def test_load_runtime_provider_config_uses_active_route(backend_env, fake_enclav
 
     cid = _cred(uid)
     r_sonnet = db.model_api_route_upsert(uid, cid, "claude-sonnet-4-5", None)
-    r_haiku = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+    r_haiku = db.model_api_route_upsert(
+        uid, cid, "claude-haiku-4-5", None, 65_536
+    )
     db.model_api_route_mark_test(uid, r_sonnet, status="ok")
     db.model_api_route_mark_test(uid, r_haiku, status="ok")
     db.model_api_route_activate(uid, r_haiku)
@@ -62,6 +64,7 @@ def test_load_runtime_provider_config_uses_active_route(backend_env, fake_enclav
     assert cfg.model == "claude-haiku-4-5"
     assert cfg.api_key == "sk-plain-key"
     assert cfg.provider == "anthropic"
+    assert cfg.context_window_tokens == 65_536
 
 
 def test_load_runtime_provider_config_without_active_route(backend_env):

@@ -23,6 +23,7 @@ from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
 from hosted import chat_send_core  # noqa: E402
+from hosted import config_store as hosted_config_store  # noqa: E402
 from hosted import history_import  # noqa: E402
 from identity import service as identity_service  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
@@ -208,6 +209,7 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     public = setup.get_json()["config"]
     assert public["configured"] is True
     assert public["provider"] == "openrouter"
+    assert public["context_window_tokens"] == 128_000
     assert "api_key" not in public
     assert "api_key_envelope" not in public
 
@@ -233,6 +235,137 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert any(step["id"] == "hosted_runtime" and step["passing"] for step in body["steps"])
 
 
+@pytest.mark.parametrize(
+    ("provider", "model", "base_url"),
+    [
+        ("openrouter", "vendor/unknown-model", ""),
+        ("openai_compatible", "private-model", "https://relay.host/v1"),
+    ],
+)
+def test_model_api_setup_rejects_unconfigured_prompt_frontier_before_io(
+    client, monkeypatch, provider, model, base_url,
+):
+    user_id, api_key = _register(client)
+    provider_calls = []
+
+    def provider_test(cfg):
+        provider_calls.append(cfg)
+        raise AssertionError("frontier validation must run before provider I/O")
+
+    def envelope_build(*_args, **_kwargs):
+        raise AssertionError("frontier validation must run before key encryption")
+
+    monkeypatch.setattr(provider_client, "test_provider_key", provider_test)
+    monkeypatch.setattr(
+        core_envelope, "_build_shared_envelope_for_store", envelope_build
+    )
+    payload = {
+        "provider": provider,
+        "model": model,
+        "api_key": "sk-test",
+    }
+    if base_url:
+        payload["base_url"] = base_url
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json=payload,
+        headers=_headers(api_key),
+    )
+
+    assert setup.status_code == 400
+    body = setup.get_json()
+    assert body["error"] == "prompt_context_limit_unconfigured"
+    assert body["required"] == "context_window_tokens"
+    assert provider_calls == []
+    assert db.model_api_routes_list(user_id) == []
+    assert db.model_api_credentials_list(user_id) == []
+
+
+def test_model_api_setup_persists_explicit_custom_prompt_frontier(
+    client, monkeypatch,
+):
+    user_id, api_key = _register(client)
+    tested = []
+    monkeypatch.setattr(
+        provider_client,
+        "test_provider_key",
+        lambda cfg: tested.append(cfg) or {"reply": "ok", "usage": {}},
+    )
+    monkeypatch.setattr(
+        provider_client, "probe_responses_support", lambda _cfg: True
+    )
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openai_compatible",
+            "model": "private-model",
+            "base_url": "https://relay.host/v1",
+            "api_key": "sk-relay",
+            "context_window_tokens": 32_768,
+        },
+        headers=_headers(api_key),
+    )
+
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    assert setup.get_json()["config"]["context_window_tokens"] == 32_768
+    assert tested[0].context_window_tokens == 32_768
+    route = db.model_api_active_route(user_id)
+    assert route["context_window_tokens"] == 32_768
+    runtime = hosted_config_store._provider_config_from_plain(route, "sk-relay")
+    assert runtime.context_window_tokens == 32_768
+
+    # Exact idempotent setup may reuse the persisted contract, so a client does
+    # not have to resend the field on every key/model health refresh.
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"sk-relay",
+    )
+    repeated = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openai_compatible",
+            "model": "private-model",
+            "base_url": "https://relay.host/v1",
+        },
+        headers=_headers(api_key),
+    )
+    assert repeated.status_code == 200, repeated.get_data(as_text=True)
+    assert repeated.get_json()["config"]["context_window_tokens"] == 32_768
+
+
+def test_model_api_setup_rejects_context_window_without_input_budget(
+    client, monkeypatch,
+):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        provider_client,
+        "test_provider_key",
+        lambda _cfg: (_ for _ in ()).throw(
+            AssertionError("invalid frontier must fail before provider I/O")
+        ),
+    )
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openai_compatible",
+            "model": "private-model",
+            "base_url": "https://relay.host/v1",
+            "api_key": "sk-relay",
+            # Default output + safety reservations consume 5,120 tokens.
+            "context_window_tokens": 5_120,
+        },
+        headers=_headers(api_key),
+    )
+
+    assert setup.status_code == 400
+    assert setup.get_json()["error"] == "invalid_context_window_tokens"
+    assert db.model_api_routes_list(user_id) == []
+
+
 def test_model_api_setup_stores_responses_support_for_openai_compatible(client, monkeypatch):
     # An openai_compatible relay is probed once at setup; the stored config records
     # whether it implements /v1/responses, so the gateway picks native passthrough
@@ -252,7 +385,8 @@ def test_model_api_setup_stores_responses_support_for_openai_compatible(client, 
     setup = client.post(
         "/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.4",
-              "base_url": "https://relay.host/v1", "api_key": "sk-relay"},
+              "base_url": "https://relay.host/v1", "api_key": "sk-relay",
+              "context_window_tokens": 128_000},
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
@@ -376,7 +510,8 @@ def test_setup_warns_when_relay_lacks_responses(client, monkeypatch):
     setup = client.post(
         "/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://relay.host/v1", "api_key": "sk-relay"},
+              "base_url": "https://relay.host/v1", "api_key": "sk-relay",
+              "context_window_tokens": 128_000},
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
@@ -404,11 +539,13 @@ def test_setup_resolves_responses_warning_when_relay_supports(client, monkeypatc
     monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: False)
     client.post("/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://bad/v1", "api_key": "sk-r"}, headers=_headers(api_key))
+              "base_url": "https://bad/v1", "api_key": "sk-r",
+              "context_window_tokens": 128_000}, headers=_headers(api_key))
     monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: True)
     good = client.post("/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://good/v1", "api_key": "sk-r"}, headers=_headers(api_key))
+              "base_url": "https://good/v1", "api_key": "sk-r",
+              "context_window_tokens": 128_000}, headers=_headers(api_key))
     assert not good.get_json().get("warnings"), good.get_json()  # 好中转不带当场警告
     notices = client.get("/v1/notices", headers=_headers(api_key)).get_json()["notices"]
     hit = [n for n in notices if n["error_class"] == "responses_unsupported"]
@@ -426,7 +563,8 @@ def test_delete_resolves_responses_warning(client, monkeypatch):
     client.post("/v1/onboarding/route", json={"route": "model_api"}, headers=_headers(api_key))
     client.post("/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://bad/v1", "api_key": "sk-r"}, headers=_headers(api_key))
+              "base_url": "https://bad/v1", "api_key": "sk-r",
+              "context_window_tokens": 128_000}, headers=_headers(api_key))
     client.delete("/v1/model_api/delete", headers=_headers(api_key))
     notices = client.get("/v1/notices", headers=_headers(api_key)).get_json()["notices"]
     hit = [n for n in notices if n["error_class"] == "responses_unsupported"]

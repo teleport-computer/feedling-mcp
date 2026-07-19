@@ -83,6 +83,40 @@ def test_task_batch_isolates_failure_and_deadline() -> None:
     assert "private" not in str(bodies)
 
 
+def test_shared_budget_reserves_concurrent_calls_and_refunds_reported_usage() -> None:
+    budget = subagents.SharedSubagentBudget(
+        max_provider_calls=3,
+        max_tokens=120,
+        provider_call_token_reservation=50,
+    )
+    budget.before_provider_call()
+    budget.before_provider_call()
+    with pytest.raises(subagents.SubagentBudgetExhausted, match="token"):
+        budget.before_provider_call()
+
+    budget.complete_provider_call(
+        {"prompt_tokens": 10, "completion_tokens": 5},
+    )
+    budget.before_provider_call()
+    assert budget.provider_calls_started == 3
+    assert budget.tokens_charged == 15
+    assert budget.tokens_reserved == 100
+    with pytest.raises(subagents.SubagentBudgetExhausted, match="provider-call"):
+        budget.before_provider_call()
+
+
+def test_missing_child_usage_consumes_the_full_token_reservation() -> None:
+    budget = subagents.SharedSubagentBudget(
+        max_provider_calls=2,
+        max_tokens=50,
+        provider_call_token_reservation=50,
+    )
+    budget.before_provider_call()
+    budget.complete_provider_call(None)
+    with pytest.raises(subagents.SubagentBudgetExhausted, match="token"):
+        budget.before_provider_call()
+
+
 def test_task_result_is_bounded_valid_json() -> None:
     async def child(_task):
         return subagents.ChildTaskResult(
@@ -244,7 +278,9 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
             {"path": "/artifacts/report.txt"},
         )
     ]
-    assert all(call["config"] is provider_config for call in provider_calls)
+    assert all(call["config"].api_key == provider_config.api_key for call in provider_calls)
+    assert all(call["config"].model == provider_config.model for call in provider_calls)
+    assert all(call["config"].context_window_tokens == 32_768 for call in provider_calls)
     offered = {spec.name for spec in provider_calls[0]["tools"]}
     assert offered == worker._SUBAGENT_ALLOWED_TOOLS
     assert {"task", "reply", "workspace_write", "memory_write"}.isdisjoint(offered)
@@ -271,6 +307,53 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
         "tool_call_result",
     ]
     assert all(event[2]["call_id"] == "child-read" for event in child_tool_events)
+
+
+def test_worker_subagent_budget_is_shared_across_parent_task_batches(
+    monkeypatch,
+) -> None:
+    provider_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-parent-route",
+    )
+    provider_calls = []
+
+    async def fake_provider(config, messages, *, tools=None):
+        provider_calls.append((config, messages, tools))
+        return {
+            "reply": "bounded child result",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+        }
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_SUBAGENT_MAX_TOTAL_LLM_CALLS", 1)
+    monkeypatch.setattr(worker, "_SUBAGENT_MAX_TOTAL_TOKENS", 32_768)
+    monkeypatch.setattr(worker, "_SUBAGENT_MAX_TOKENS_PER_CALL", 32_768)
+
+    dispatcher = worker._make_task_batch_dispatcher(
+        provider_config=provider_config,
+        store=object(),
+        api_key=None,
+        runtime_token="runtime-token",
+        enclave_sem=asyncio.Semaphore(1),
+        trusted_system_blocks=(),
+        add_usage=lambda _usage: None,
+    )
+
+    async def scenario():
+        first = await dispatcher([_call("first", "first task")])
+        second = await dispatcher([_call("second", "second task")])
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert json.loads(first[0].content)["status"] == "completed"
+    assert json.loads(second[0].content) == {
+        "status": "error",
+        "error": "subagent_budget_exhausted",
+    }
+    assert len(provider_calls) == 1
 
 
 def test_worker_child_private_read_blocks_later_outbound_web(

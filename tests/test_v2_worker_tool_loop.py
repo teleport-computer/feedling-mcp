@@ -444,7 +444,15 @@ def test_chat_native_task_runs_child_then_returns_result_to_parent(
 
     assert status == "completed"
     assert len(calls) == 3
-    assert all(call["config"] is _BYOK for call in calls)
+    assert calls[0]["config"] is _BYOK
+    assert calls[2]["config"] is _BYOK
+    child_config = calls[1]["config"]
+    assert child_config is not _BYOK
+    assert child_config.provider == _BYOK.provider
+    assert child_config.model == _BYOK.model
+    assert child_config.api_key == _BYOK.api_key
+    assert child_config.base_url == _BYOK.base_url
+    assert child_config.context_window_tokens == 32_768
     parent_tools = {spec.name for spec in calls[0]["tools"]}
     child_tools = {spec.name for spec in calls[1]["tools"]}
     assert "task" in parent_tools
@@ -545,6 +553,204 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     assert v2_cursor.load_seq(core_store.get_store(uid)) == db.chat_seq_for_msg_id(
         uid, "B"
     )
+
+
+def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
+    monkeypatch,
+):
+    """An assistant-only prompt snapshot advance cannot poison the final fence.
+
+    The first worker publishes an intermediate reply, then crashes. The retry's
+    all-role tail includes that bubble after the newest user row, while the
+    compound final reply must still fence and advance only through the user seq.
+    """
+    uid = "u_toolloop_intermediate_crash_retry_cursor"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs "
+            "WHERE user_id=%s AND kind='model_api_runtime'",
+            (uid,),
+        )
+
+    generation = db.get_runtime_generation(uid)
+    user_seq, first_job_id = db.chat_append_and_enqueue(
+        uid,
+        "user-before-crash",
+        10.0,
+        _user_doc("user-before-crash", "please investigate"),
+        5000,
+        "chat",
+        expected_generation=generation,
+    )
+    first_job = jobs_store.claim_next_job("w-intermediate-crash")
+    assert first_job is not None and first_job["id"] == first_job_id
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda store, plaintext, *, item_id=None: (
+            {
+                "v": 1,
+                "id": str(item_id),
+                "owner_user_id": store.user_id,
+                "visibility": "shared",
+                "body_ct": bytes(plaintext).hex(),
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
+            },
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_perception_grounding_results",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+    )
+
+    def _plaintext(row: dict) -> str:
+        if row.get("test_plaintext") is not None:
+            return str(row["test_plaintext"])
+        try:
+            return bytes.fromhex(str(row.get("body_ct") or "")).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return ""
+
+    def _render(rows: list[dict], *, user_only: bool) -> list[dict]:
+        rendered = []
+        for row in rows:
+            role = str(row.get("role") or "")
+            if user_only and role not in {"user", "human"}:
+                continue
+            rendered.append(
+                {
+                    "id": row["id"],
+                    "seq": int(row["seq"]),
+                    "ts": float(row.get("ts") or 0.0),
+                    "role": (
+                        "user" if role in {"user", "human"} else "assistant"
+                    ),
+                    "content": _plaintext(row),
+                }
+            )
+        return rendered
+
+    def _read_after_seq(_user_id: str, after_seq: int):
+        return _render(
+            db.chat_messages_after_seq(uid, after_seq, limit=None),
+            user_only=True,
+        )
+
+    def _read_tail_after_seq(
+        _user_id: str,
+        after_seq: int,
+        limit: int,
+        *,
+        through_seq: int | None = None,
+    ):
+        return _render(
+            db.chat_messages_after_seq(
+                uid,
+                after_seq,
+                limit=limit,
+                oldest_first=False,
+                through_seq=through_seq,
+            ),
+            user_only=False,
+        )
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _user_id: _read_after_seq(uid, 0),
+        read_messages_after_seq=_read_after_seq,
+        resolve_provider=lambda _user_id: (_BYOK, {}),
+        mint_enclave_token=lambda _user_id: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+        read_summary_with_seq=lambda _user_id: ("", 0.0, 0, 0),
+        read_tail_after_seq=_read_tail_after_seq,
+    )
+
+    phase = "crash"
+    first_attempt_calls = 0
+    retry_messages = []
+
+    async def provider(_config, messages, *, tools=None):
+        nonlocal first_attempt_calls
+        if phase == "crash":
+            first_attempt_calls += 1
+            if first_attempt_calls == 1:
+                return _tool_round(
+                    _tc("checking", "reply", text="I am still checking."),
+                )
+            raise RuntimeError("injected worker crash after intermediate reply")
+        retry_messages.append(list(messages))
+        return _text_round("final answer after retry")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    first_status = asyncio.run(
+        worker.process_job(
+            first_job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+    assert first_status == "failed"
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == 0
+    with db.get_pool().connection() as conn:
+        intermediate_seq = conn.execute(
+            "SELECT MAX(seq) FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role'='openclaw'",
+            (uid,),
+        ).fetchone()[0]
+    assert int(intermediate_seq) > user_seq
+
+    phase = "retry"
+    retry_job_id, _ = jobs_store.enqueue_job(
+        uid,
+        "chat",
+        reason="retry_after_worker_crash",
+        expected_generation=generation,
+    )
+    retry_job = jobs_store.claim_next_job("w-intermediate-retry")
+    assert retry_job is not None and retry_job["id"] == retry_job_id
+
+    retry_status = asyncio.run(
+        worker.process_job(
+            retry_job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert retry_status == "completed"
+    assert len(retry_messages) == 1
+    assert "I am still checking." in str(retry_messages[0])
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == user_seq
+    assert _job_status_row(retry_job_id) == ("completed", None)
+    with db.get_pool().connection() as conn:
+        final_effect = conn.execute(
+            "SELECT status,last_error,(payload->>'reply_through_seq')::bigint "
+            "FROM v2_effect_outbox "
+            "WHERE user_id=%s AND job_id=%s AND effect_type=%s",
+            (
+                uid,
+                retry_job_id,
+                v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
+            ),
+        ).fetchone()
+        final_seq = conn.execute(
+            "SELECT MAX(seq) FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role'='openclaw'",
+            (uid,),
+        ).fetchone()[0]
+    assert final_effect == ("applied", "", user_seq)
+    assert int(final_seq) > int(intermediate_seq)
 
 
 @pytest.mark.parametrize(

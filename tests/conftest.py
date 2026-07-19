@@ -204,6 +204,7 @@ def configure_model_api_route(user_id: str, *, provider: str = "anthropic",
                               api_key_hint: str = "sk-a...451",
                               supports_responses: bool = False,
                               reasoning_effort=None,
+                              context_window_tokens: int | None = None,
                               test_status: str = "ok",
                               activate: bool = True):
     """Test-only: configure a user's model_api via the new credentials + routes
@@ -223,7 +224,7 @@ def configure_model_api_route(user_id: str, *, provider: str = "anthropic",
         api_key_envelope=envelope if isinstance(envelope, dict) else _DEFAULT_MODEL_API_ENVELOPE,
         api_key_hint=api_key_hint, supports_responses=supports_responses)
     route_id = db.model_api_route_upsert(
-        user_id, credential_id, model, reasoning_effort)
+        user_id, credential_id, model, reasoning_effort, context_window_tokens)
     if test_status:
         db.model_api_route_mark_test(user_id, route_id, status=test_status)
     if activate:

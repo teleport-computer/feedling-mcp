@@ -398,6 +398,7 @@ def _runtime_for_user(user_id: str, provider_key: str) -> provider_client.Provid
         model=model,
         base_url=base_url,
         api_key=provider_key,
+        context_window_tokens=config.get("context_window_tokens"),
     )
 
 

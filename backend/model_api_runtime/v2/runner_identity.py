@@ -1,7 +1,7 @@
 """Stable, fail-closed identities for managed Runtime V2 worker CVMs.
 
-Local/test/Pre workers may keep their replica-unique ephemeral identity.  The
-production fleet needs a stronger deployment contract: every inventory CVM
+Local/test workers may keep their replica-unique ephemeral identity. Managed
+Pre and production fleets use a stronger deployment contract: every inventory CVM
 must publish one turn heartbeat and its matching Genesis heartbeat carrying the
 same stable CVM/build label and boot-unique owner ID. This module is intentionally
 stdlib-only so both ``serve_worker`` and the post-deploy gate use the same
@@ -83,7 +83,7 @@ def resolve_worker_id(
 ) -> str:
     """Resolve an ephemeral or managed-fleet worker identity.
 
-    Production compose sets ``FLEET_IDENTITY_REQUIRED_ENV=1``.  In that mode
+    Managed Pre/production compose sets ``FLEET_IDENTITY_REQUIRED_ENV=1``. In that mode
     missing identity inputs, an arbitrary worker-id override, or disagreement
     between the deployment build and the commit baked into the image are fatal.
     The process therefore cannot silently fall back to a hostname/UUID identity

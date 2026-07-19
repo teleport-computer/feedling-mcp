@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime.v2 import serve_worker
@@ -50,7 +52,7 @@ def test_file_row_renders_a_marker_and_never_decrypts_the_body():
     try:
         row = serve_worker._file_row(
             {"id": "m1", "file_name": "report.pdf", "file_mime": "application/pdf"},
-            mid="m1", ts=1.0, role="user", token="t", caption_budget=[8])
+            mid="m1", ts=1.0, role="user", token="t")
     finally:
         core_enclave._decrypt_envelope_via_enclave = orig
 
@@ -69,27 +71,26 @@ def test_file_row_prefers_the_user_caption_when_present(monkeypatch):
     row = serve_worker._file_row(
         {"id": "m1", "file_name": "report.pdf", "caption_body_ct": "CT",
          "caption_id": "cap1", "owner_user_id": "u1"},
-        mid="m1", ts=1.0, role="user", token="t", caption_budget=[8])
+        mid="m1", ts=1.0, role="user", token="t")
     assert row["content"] == "这个报告哪里有问题"
 
 
-def test_file_row_degrades_to_the_marker_when_caption_decrypt_fails(monkeypatch):
+def test_file_row_fails_explicitly_when_caption_decrypt_fails(monkeypatch):
     from core import enclave as core_enclave
 
     def _boom(*a, **k):
         raise RuntimeError("enclave down")
 
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
-    row = serve_worker._file_row(
-        {"id": "m1", "file_name": "a.bin", "caption_body_ct": "CT", "caption_id": "c"},
-        mid="m1", ts=1.0, role="user", token="t", caption_budget=[8])
-    assert row["content"] == "[file: a.bin]"   # no-filler: never fail the turn
+    with pytest.raises(RuntimeError, match="enclave down"):
+        serve_worker._file_row(
+            {"id": "m1", "file_name": "a.bin", "caption_body_ct": "CT", "caption_id": "c"},
+            mid="m1", ts=1.0, role="user", token="t")
 
 
 def test_a_pdf_body_would_have_crashed_the_old_generic_branch():
     """Documents the bug this branch exists to prevent. If someone deletes the `file`
     branch, `_read_tail`'s generic path does exactly this on real file bytes."""
-    import pytest
     pdf = b"%PDF-1.4\n1 0 obj\n<</Type/Catalog>>\xff\xfe\x00"
     with pytest.raises(UnicodeDecodeError):
         pdf.decode("utf-8")

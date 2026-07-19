@@ -39,6 +39,7 @@ def _load_model_api_config(store: UserStore) -> dict | None:
         "provider": route["provider"],
         "model": route["model"],
         "base_url": route["base_url"],
+        "context_window_tokens": route.get("context_window_tokens"),
         "api_key_hint": route["api_key_hint"],
         "supports_responses": route["supports_responses"],
         "test_status": route["test_status"],
@@ -349,7 +350,13 @@ def _provider_config_from_plain(config: dict, api_key: str) -> provider_client.P
         str(config.get("model") or ""),
         str(config.get("base_url") or ""),
     )
-    return provider_client.ProviderConfig(provider=provider, model=model, api_key=api_key, base_url=base_url)
+    return provider_client.ProviderConfig(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        context_window_tokens=config.get("context_window_tokens"),
+    )
 
 
 def load_active_route(store: UserStore) -> dict | None:

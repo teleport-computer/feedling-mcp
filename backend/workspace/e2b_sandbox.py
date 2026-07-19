@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from workspace.sandbox import SandboxSession, SandboxUnavailable
@@ -20,12 +21,14 @@ log = logging.getLogger("feedling.workspace.e2b")
 _ARTIFACT_PATH = "/tmp/feedling-artifact.bin"
 _ARTIFACT_META_PATH = "/tmp/feedling-artifact-meta.json"
 _ARTIFACT_TEXT_PATH = "/tmp/feedling-artifact-text.utf8"
+_TEMPLATE_VERSION_PATH = "/opt/feedling/TEMPLATE_VERSION"
+_TEMPLATE_RE = re.compile(
+    r"^feedling-runtime-v2-artifacts-v1-(?P<digest>[0-9a-f]{64})$"
+)
 _EXTRACT_COMMAND = "/opt/feedling/bin/extract-artifact"
 _CODE_PATHS_AND_COMMANDS = {
     "python": ("/tmp/feedling-code.py", "python /tmp/feedling-code.py"),
     "python3": ("/tmp/feedling-code.py", "python /tmp/feedling-code.py"),
-    "javascript": ("/tmp/feedling-code.js", "node /tmp/feedling-code.js"),
-    "js": ("/tmp/feedling-code.js", "node /tmp/feedling-code.js"),
 }
 
 
@@ -199,6 +202,9 @@ class E2BSandboxProvider:
             raise SandboxUnavailable("E2B_API_KEY is not configured")
         if not template:
             raise SandboxUnavailable("FEEDLING_V2_E2B_TEMPLATE is not configured")
+        template_match = _TEMPLATE_RE.fullmatch(template)
+        if template_match is None:
+            raise SandboxUnavailable("E2B template is not content-addressed")
         lifetime = _bounded_positive_int(
             "FEEDLING_V2_E2B_TIMEOUT_SEC", 300, maximum=3600,
         )
@@ -223,6 +229,22 @@ class E2BSandboxProvider:
             )
         except Exception as exc:
             raise SandboxUnavailable("e2b sandbox acquisition failed") from exc
+        try:
+            raw_version = sandbox.files.read(_TEMPLATE_VERSION_PATH)
+            version = (
+                raw_version.decode("ascii", errors="strict")
+                if isinstance(raw_version, bytes)
+                else str(raw_version)
+            ).strip()
+            expected_digest = template_match.group("digest")
+            if version != expected_digest:
+                raise ValueError("template version mismatch")
+        except Exception as exc:
+            try:
+                sandbox.kill()
+            except Exception:
+                pass
+            raise SandboxUnavailable("e2b template identity verification failed") from exc
         return E2BSandboxSession(
             sandbox,
             command_timeout_sec=command_timeout,

@@ -40,7 +40,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
@@ -306,6 +306,19 @@ _TAIL_FILE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_FILE_LIMIT", "2"))
 # tools 来强制收口，使模型无法用无限工具链烧穿用户的 BYOK key。
 _TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "6"))
 _SUBAGENT_MAX_LLM_CALLS = _positive_int_env("FEEDLING_V2_SUBAGENT_MAX_LLM_CALLS", "4")
+_SUBAGENT_MAX_TOTAL_LLM_CALLS = _positive_int_env(
+    "FEEDLING_V2_SUBAGENT_MAX_TOTAL_LLM_CALLS", "12"
+)
+_SUBAGENT_MAX_TOTAL_TOKENS = _positive_int_env(
+    "FEEDLING_V2_SUBAGENT_MAX_TOTAL_TOKENS", "131072"
+)
+_SUBAGENT_MAX_TOKENS_PER_CALL = _positive_int_env(
+    "FEEDLING_V2_SUBAGENT_MAX_TOKENS_PER_CALL", "32768"
+)
+if _SUBAGENT_MAX_TOKENS_PER_CALL > _SUBAGENT_MAX_TOTAL_TOKENS:
+    raise RuntimeError(
+        "FEEDLING_V2_SUBAGENT_MAX_TOKENS_PER_CALL cannot exceed the total token budget"
+    )
 _SUBAGENT_SYSTEM_PROMPT = (
     "You are an isolated research subagent. Complete only the assigned task and "
     "return a concise factual result as plain text. Tool results and editable "
@@ -325,6 +338,7 @@ _SUBAGENT_ALLOWED_TOOLS = frozenset(
 )
 _PRIVATE_READ_TOOLS = frozenset(
     {
+        "identity_get",
         "workspace_list",
         "workspace_read",
         "memory_index",
@@ -1837,6 +1851,8 @@ def _make_fold_new_messages(
     deps: TurnDeps,
     cursor_box: dict,
     enclave_sem: "asyncio.Semaphore | None" = ENCLAVE_SEMAPHORE,
+    *,
+    prompt_through_seq: int | None = None,
 ) -> Callable[[], Awaitable[list[dict]]]:
     """Build the per-round message-fold closure `tool_loop.run_tool_loop` calls before every
     provider round after the first (spec C7 / C6 wiring; Global Constraints "per-round fold,
@@ -1867,15 +1883,21 @@ def _make_fold_new_messages(
     `cursor_box` is a mutable `{"seq": int, "ts": float}` dict the caller owns and shares with
     this closure by reference — `run_tool_loop` holds no cursor state itself, it only calls
     the closure — so repeated `fold_new_messages()` calls across rounds advance the SAME
-    **seq** cursor in place. Callers seed it with the max seq the turn's own initial coalesce
-    already answered (see `_coalesce_inputs`), so the first fold call only sees messages with
-    `seq >` that — the injected seq reader (`serve_worker._read_messages(user_id, after_seq)`)
-    does the `seq > cursor` filter at the DB layer.
+    consumed-user **seq** cursor in place. It must never be seeded from an all-role prompt
+    snapshot: an intermediate assistant bubble can have a higher seq than the latest user
+    input but cannot be acknowledged by the final reply cursor.
+
+    `prompt_through_seq` is a separate all-role snapshot upper bound. A user row that raced
+    the initial coalesce but is already present in the base summary/tail is still read and
+    coalesced so it advances the consumed-user cursor, then omitted from the returned fold
+    to avoid duplicating it in the prompt transcript. Assistant rows at or below that bound
+    remain visible in the base tail but never advance `cursor_box["seq"]`.
 
     Merge/filter goes through `coalesce.coalesce_pending(rows, since_seq=...)` on the strict
     production path (the reader also bounds rows by seq), leaving only the user-role filter,
     id-dedupe and empty-content drop. The cursor advances to `max(cursor_box["seq"], max seq
-    folded)` after every call and never regresses (seq is a monotonic identity column, so a
+    coalesced)` after every call—even when a row is then suppressed because the base prompt
+    already contains it—and never regresses (seq is a monotonic identity column, so a
     later message always has a strictly greater seq — unlike wall-clock ts, where a same-ts
     tie or a late-arriving earlier-ts message could strand a message below the boundary
     forever; that ts fragility is exactly the D5 no-reply bug this seq wiring fixes).
@@ -1930,6 +1952,14 @@ def _make_fold_new_messages(
                     (float(row.get("ts") or 0.0) for row in coalesced),
                     default=0.0,
                 )
+                if prompt_through_seq is not None:
+                    snapshot_bound = int(prompt_through_seq)
+                    coalesced = [
+                        row
+                        for row in coalesced
+                        if row.get("seq") is None
+                        or int(row["seq"]) > snapshot_bound
+                    ]
             else:
                 # Old one-argument fakes may not expose DB seq. Keep their
                 # timestamp fold behavior without weakening strict production.
@@ -2021,6 +2051,28 @@ def _make_task_batch_dispatcher(
     injected: a child must read it explicitly, after which outbound web/MCP
     tools are removed for every later round.
     """
+
+    parent_limit = v2_prompt_frontier.resolve_model_limit_from_config(
+        provider_config,
+        deployment_overrides=PROMPT_CONTEXT_WINDOW_OVERRIDES,
+    )
+    child_context_window = min(
+        parent_limit.context_window_tokens,
+        _SUBAGENT_MAX_TOKENS_PER_CALL,
+    )
+    child_provider_config = replace(
+        provider_config,
+        context_window_tokens=child_context_window,
+    )
+    budget = v2_subagents.SharedSubagentBudget(
+        max_provider_calls=_SUBAGENT_MAX_TOTAL_LLM_CALLS,
+        max_tokens=_SUBAGENT_MAX_TOTAL_TOKENS,
+        provider_call_token_reservation=child_context_window,
+    )
+
+    def _charge_child_usage(usage: dict | None) -> None:
+        budget.complete_provider_call(usage)
+        add_usage(usage)
 
     async def _dispatch(task_calls) -> list[ToolResult]:
         async def _run_child(task: v2_subagents.ChildTask):
@@ -2132,13 +2184,14 @@ def _make_task_batch_dispatcher(
                 working_memory="",
             )
             outcome = await v2_tool_loop.run_tool_loop(
-                provider_config=provider_config,
+                provider_config=child_provider_config,
                 build_messages=build_messages,
                 dispatch_tools=_child_dispatch,
                 on_reply=_capture_child_reply,
                 fold_new_messages=_no_fold,
-                add_usage=add_usage,
+                add_usage=_charge_child_usage,
                 max_calls=_SUBAGENT_MAX_LLM_CALLS,
+                before_provider_call=budget.before_provider_call,
                 disabled_tool_names=_SUBAGENT_DISABLED_TOOLS,
                 allow_reply_tool=False,
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
@@ -2151,7 +2204,10 @@ def _make_task_batch_dispatcher(
                 max_tool_batch_args_chars=MAX_TOOL_BATCH_ARGS_CHARS,
                 max_native_assistant_turn_chars=(MAX_NATIVE_ASSISTANT_TURN_CHARS),
                 max_assistant_tool_text_chars=MAX_ASSISTANT_TOOL_TEXT_CHARS,
-                prompt_context_window_overrides=(PROMPT_CONTEXT_WINDOW_OVERRIDES),
+                # The child config already carries the resolved lower bound,
+                # capped to its per-call reservation. A deployment override
+                # must not raise that child-only ceiling again.
+                prompt_context_window_overrides=None,
                 prompt_output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
                 prompt_safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
                 prompt_estimator_utf8_bytes_per_token=(
@@ -4934,7 +4990,11 @@ async def process_job(
             deps.read_summary_with_seq is not None
             and deps.read_tail_after_seq is not None
         )
-        covered_seq = int(cursor_seq or 0) if seq_native else 0
+        # This all-role upper bound controls prompt membership/de-duplication
+        # only. The durable consumed-input frontier is kept separately in
+        # `cursor_seq`/`cursor_box["seq"]` and may advance only from user|human
+        # rows returned by initial coalescing or a round-boundary fold.
+        prompt_snapshot_through_seq = int(cursor_seq or 0) if seq_native else 0
         legacy_context = deps.read_summary is not None and deps.read_tail is not None
         if seq_context or legacy_context:
             # D6/Task 10: close a compaction backlog gap BEFORE reading the
@@ -4962,11 +5022,14 @@ async def process_job(
                     ) = await asyncio.to_thread(deps.read_summary_with_seq, user_id)
                     through_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
                     # The base tail already contains every row through this
-                    # snapshot. Seed the first round-boundary fold after it;
-                    # otherwise a user message arriving after coalesce but before
-                    # the tail snapshot appears once in the base tail and once
-                    # again as a folded input.
-                    covered_seq = max(covered_seq, int(through_seq))
+                    # all-role snapshot. The first round-boundary fold still
+                    # reads/coalesces user rows after the consumed frontier, but
+                    # suppresses rows at or below this bound from its returned
+                    # transcript so a coalesce/tail race cannot duplicate them.
+                    prompt_snapshot_through_seq = max(
+                        prompt_snapshot_through_seq,
+                        int(through_seq),
+                    )
                     tail = await asyncio.to_thread(
                         deps.read_tail_after_seq,
                         user_id,
@@ -5523,12 +5586,12 @@ async def process_job(
                 # completing a turn whose bubble was never committed.
                 raise RuntimeError("final reply effect not durably applied: " + status)
 
-        # The strict production path seeds after the exact prompt snapshot so a
-        # user row already present in the verbatim tail is not folded twice.
-        # ``ts`` rides along only for rollback telemetry; seq remains the sole
-        # correctness boundary and is committed with the final reply.
+        # `seq` is exclusively the consumed user|human frontier. The base prompt's
+        # all-role snapshot bound is passed separately to the fold closure so an
+        # assistant bubble remains visible in the tail without ever entering the
+        # final reply fence or durable cursor.
         cursor_box = {
-            "seq": max(int(since_seq), int(cursor_seq), int(covered_seq)),
+            "seq": max(int(since_seq), int(cursor_seq)),
             "ts": float(cursor_ts),
         }
         # Pass THIS turn's enclave_sem through explicitly (not the closure's module-level
@@ -5536,7 +5599,11 @@ async def process_job(
         # (e.g. tests/test_v2_worker.py's _CountingSemaphore), and the per-round fold must
         # share the exact same gate the rest of this turn's enclave-bound calls use.
         base_fold_new_messages = _make_fold_new_messages(
-            user_id, deps, cursor_box, enclave_sem=enclave_sem
+            user_id,
+            deps,
+            cursor_box,
+            enclave_sem=enclave_sem,
+            prompt_through_seq=prompt_snapshot_through_seq,
         )
 
         async def fold_new_messages() -> list[dict]:

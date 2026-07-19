@@ -1486,12 +1486,12 @@ def admin_events_overview() -> dict:
     rows = _run("reply", f"""
         {_EVENTS_ROUTES_CTE}, paired AS (
           SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
-            MAX(CASE WHEN c.doc->>'role'='user' AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
+            MAX(CASE WHEN c.doc->>'role' IN ('user','human') AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
               OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
           FROM chat_messages c
         )
         SELECT COALESCE(r.route,'resident') AS route,
-               (COUNT(*) FILTER (WHERE p.role='user' AND p.src<>'verify_ping'))::int AS user_msgs,
+               (COUNT(*) FILTER (WHERE p.role IN ('user','human') AND p.src<>'verify_ping'))::int AS user_msgs,
                (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw')
                     AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')
                     AND p.last_user_ts IS NOT NULL))::int AS real_replies,
@@ -1603,12 +1603,12 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
         rows = _run(f"""
             {_EVENTS_ROUTES_CTE}, paired AS (
               SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
-                MAX(CASE WHEN c.doc->>'role'='user' AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
+                MAX(CASE WHEN c.doc->>'role' IN ('user','human') AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
                   OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
               FROM chat_messages c
             )
             SELECT p.user_id, COALESCE(r.route,'resident') AS route,
-                   (COUNT(*) FILTER (WHERE p.role='user' AND p.src<>'verify_ping'))::int AS user_msgs,
+                   (COUNT(*) FILTER (WHERE p.role IN ('user','human') AND p.src<>'verify_ping'))::int AS user_msgs,
                    (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw') AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive') AND p.last_user_ts IS NOT NULL))::int AS real_replies,
                    (COUNT(*) FILTER (WHERE p.src='foreground_fallback'))::int AS fallback_replies,
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY
@@ -2106,7 +2106,7 @@ def patch_blob_strict(
                 # mode with a stale cursor and re-answer resident history.
                 bridge = conn.execute(
                     "SELECT COALESCE(MAX(seq), 0) FROM chat_messages "
-                    "WHERE user_id=%s AND doc->>'role'='user' "
+                    "WHERE user_id=%s AND doc->>'role' IN ('user','human') "
                     "  AND COALESCE(doc->>'source','') <> 'verify_ping' "
                     "  AND (doc->>'reply_status'='replied' "
                     "       OR COALESCE(doc->>'reply_message_id','') <> '')",
@@ -2133,7 +2133,8 @@ def patch_blob_strict(
                 if v2_cursor_seq > 0:
                     updated = conn.execute(
                         "UPDATE chat_messages SET doc=doc || %s "
-                        "WHERE user_id=%s AND seq<=%s AND doc->>'role'='user' "
+                        "WHERE user_id=%s AND seq<=%s "
+                        "  AND doc->>'role' IN ('user','human') "
                         "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
                         "  AND COALESCE(doc->>'reply_message_id','')='' "
                         "RETURNING msg_id",
@@ -5182,7 +5183,7 @@ def chat_append_effect_with_cursor(
                     cur.execute(
                         "SELECT msg_id FROM chat_messages "
                         "WHERE user_id=%s AND seq>%s AND seq<=%s "
-                        "  AND doc->>'role'='user' "
+                        "  AND doc->>'role' IN ('user','human') "
                         "  AND (doc->>'reply_status'='replied' "
                         "       OR COALESCE(doc->>'reply_message_id','') <> '') "
                         "LIMIT 1",
@@ -5288,7 +5289,7 @@ def chat_append_effect_with_cursor(
                     cur.execute(
                         "UPDATE chat_messages SET doc=doc || %s "
                         "WHERE user_id=%s AND seq>%s AND seq<=%s "
-                        "  AND doc->>'role'='user' "
+                        "  AND doc->>'role' IN ('user','human') "
                         "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
                         "  AND COALESCE(doc->>'reply_message_id','')='' "
                         "RETURNING msg_id",
@@ -5680,7 +5681,7 @@ def reconcile_unenqueued_v2_message_for_user(
                     "WITH latest AS ("
                     "  SELECT cm.user_id,cm.msg_id FROM chat_messages cm "
                     "  WHERE cm.user_id=%s AND cm.seq>%s "
-                    "  AND cm.doc->>'role'='user' "
+                    "  AND cm.doc->>'role' IN ('user','human') "
                     "  AND COALESCE(cm.doc->>'source','') <> 'verify_ping' "
                     "  AND (cm.doc->>'reply_status') IS DISTINCT FROM 'replied' "
                     "  AND COALESCE(cm.doc->>'reply_message_id','')='' "
@@ -6426,7 +6427,8 @@ def world_book_replace_all(user_id: str, entries: list[dict]) -> None:
 _ROUTE_COLUMNS = """
     r.id::text, r.credential_id::text, c.provider, r.model, c.label,
     c.api_key_hint, c.base_url, c.supports_responses,
-    COALESCE(r.reasoning_effort, ''), r.is_active, r.test_status,
+    COALESCE(r.reasoning_effort, ''), r.context_window_tokens,
+    r.is_active, r.test_status,
     COALESCE(to_char(r.last_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
     r.last_test_error, r.last_runtime_error, r.last_runtime_error_class,
     COALESCE(to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
@@ -6439,10 +6441,11 @@ def _route_row_to_dict(row: tuple) -> dict:
         "id": row[0], "credential_id": row[1], "provider": row[2], "model": row[3],
         "credential_label": row[4], "api_key_hint": row[5], "base_url": row[6],
         "supports_responses": bool(row[7]), "reasoning_effort": row[8],
-        "is_active": bool(row[9]), "test_status": row[10], "last_test_at": row[11],
-        "last_test_error": row[12], "last_runtime_error": row[13],
-        "last_runtime_error_class": row[14],
-        "created_at": row[15], "updated_at": row[16],
+        "context_window_tokens": int(row[9]) if row[9] is not None else None,
+        "is_active": bool(row[10]), "test_status": row[11], "last_test_at": row[12],
+        "last_test_error": row[13], "last_runtime_error": row[14],
+        "last_runtime_error_class": row[15],
+        "created_at": row[16], "updated_at": row[17],
     }
 
 
@@ -6639,19 +6642,35 @@ def model_api_active_route(user_id: str) -> dict | None:
         return None
 
 
-def model_api_route_upsert(user_id: str, credential_id: str, model: str,
-                           reasoning_effort: str | None) -> str | None:
+def model_api_route_upsert(
+    user_id: str,
+    credential_id: str,
+    model: str,
+    reasoning_effort: str | None,
+    context_window_tokens: int | None = None,
+) -> str | None:
     """按 (credential_id, model) upsert。跨用户引用会被复合外键拒绝 → 返回 None。"""
     try:
         with get_pool().connection() as conn:
             row = conn.execute(
                 "INSERT INTO model_api_routes "
-                "  (id, user_id, credential_id, model, reasoning_effort) "
-                "VALUES (gen_random_uuid(), %s, %s, %s, %s) "
+                "  (id, user_id, credential_id, model, reasoning_effort, "
+                "   context_window_tokens) "
+                "VALUES (gen_random_uuid(), %s, %s, %s, %s, %s) "
                 "ON CONFLICT (credential_id, model) DO UPDATE SET "
-                "  reasoning_effort = EXCLUDED.reasoning_effort, updated_at = now() "
+                "  reasoning_effort = EXCLUDED.reasoning_effort, "
+                "  context_window_tokens = COALESCE("
+                "      EXCLUDED.context_window_tokens, "
+                "      model_api_routes.context_window_tokens), "
+                "  updated_at = now() "
                 "RETURNING id::text",
-                (user_id, credential_id, model, reasoning_effort),
+                (
+                    user_id,
+                    credential_id,
+                    model,
+                    reasoning_effort,
+                    context_window_tokens,
+                ),
             ).fetchone()
         return row[0] if row else None
     except Exception as e:

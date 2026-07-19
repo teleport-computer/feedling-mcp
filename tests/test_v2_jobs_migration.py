@@ -154,7 +154,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0046_v2_summary_segments").down_revision == (
         "0045_drop_retired_supervisor"
     )
-    assert script.get_current_head() == "0046_v2_summary_segments"
+    assert script.get_revision("0047_model_route_context_window").down_revision == (
+        "0046_v2_summary_segments"
+    )
+    assert script.get_current_head() == "0047_model_route_context_window"
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():

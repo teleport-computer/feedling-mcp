@@ -9,6 +9,7 @@ single-flight enqueues a catch-up job for each.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import time
@@ -19,9 +20,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
-from model_api_runtime.v2 import jobs_store
+import provider_client
 from hosted import config_store as hosted_config_store
 from core import store as core_store
+from model_api_runtime.v2 import cursor as v2_cursor
+from model_api_runtime.v2 import jobs_store, serve_worker, worker
 
 from conftest import configure_model_api_route, seed_user
 
@@ -57,6 +60,31 @@ def _insert_user_message(uid: str, msg_id: str) -> None:
         )
 
 
+def _insert_human_message(uid: str, msg_id: str) -> int:
+    ts = time.time()
+    db.chat_append_strict(
+        uid,
+        msg_id,
+        ts,
+        {
+            "id": msg_id,
+            "role": "human",
+            "ts": ts,
+            "v": 1,
+            "body_ct": "cipher-human-message",
+            "nonce": "nonce-human-message",
+            "K_user": "wrapped-user-key",
+            "K_enclave": "wrapped-enclave-key",
+            "owner_user_id": uid,
+            "content_type": "text",
+        },
+        core_store.MAX_CHAT_MESSAGES,
+    )
+    seq = db.chat_seq_for_msg_id(uid, msg_id)
+    assert seq is not None
+    return seq
+
+
 def test_orphan_user_message_gets_a_catchup_job():
     uid = "u_reconcile_orphan"
     seed_user(uid)
@@ -76,6 +104,149 @@ def test_orphan_user_message_gets_a_catchup_job():
     assert status == "pending"
     assert reason == "reconcile"
     assert trace_id == "m-orphan-1"
+
+
+def test_eager_cutover_recovery_accepts_legacy_human_role():
+    uid = "u_reconcile_eager_human"
+    seed_user(uid)
+    _mark_db_action_v2(uid)
+    _insert_human_message(uid, "m-eager-human")
+
+    assert db.reconcile_unenqueued_v2_message_for_user(uid) is True
+
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT lane,status,reason,trace_id FROM agent_jobs WHERE user_id=%s",
+            (uid,),
+        ).fetchone()
+    assert row == (
+        "chat",
+        "pending",
+        "runtime_cutover_recovery",
+        "m-eager-human",
+    )
+
+
+def test_reconciled_human_message_is_replied_and_advances_seq_cursor(monkeypatch):
+    """Production-shaped regression for the legacy iOS ``role=human`` form.
+
+    Exercise the real orphan reconciler, strict DB seq reader, worker process,
+    fenced reply outbox, and transactional reply+cursor sink. Only enclave and
+    provider boundaries are faked, as they are external to this test process.
+    """
+    uid = "u_reconcile_human"
+    seed_user(uid)
+    _mark_db_action_v2(uid)
+    human_seq = _insert_human_message(uid, "m-human-1")
+
+    assert db.reconcile_unenqueued_v2_messages() == 1
+    job = jobs_store.claim_next_job("human-reconcile-worker")
+    assert job is not None
+    assert job["reason"] == "reconcile"
+    assert job["trace_id"] == "m-human-1"
+
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, *args, **kwargs: (
+            b"hello from legacy human role"
+            if envelope.get("id") == "m-human-1"
+            else (_ for _ in ()).throw(
+                AssertionError(f"unexpected decrypt: {envelope.get('id')}")
+            )
+        ),
+    )
+
+    provider_calls = []
+
+    async def _provider(config, messages, *, tools=None):
+        provider_calls.append({"messages": messages, "tools": tools})
+        return {
+            "reply": "reply to human",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+        }
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+
+    # Keep the production encrypted/fenced outbox shape without requiring a
+    # live client public key in this hermetic test. The real transactional sink
+    # below consumes this envelope and commits reply + cursor together.
+    def _reply_payload(
+        store,
+        text,
+        *,
+        effect_id,
+        reply_through_seq=None,
+    ):
+        assert store.user_id == uid
+        assert text == "reply to human"
+        payload = {
+            "envelope": {
+                "id": "reply-human-1",
+                "v": 1,
+                "body_ct": "cipher-reply-to-human",
+                "nonce": "nonce-reply-to-human",
+                "K_user": "wrapped-user-key",
+                "K_enclave": "wrapped-enclave-key",
+                "owner_user_id": uid,
+                "visibility": "shared",
+            }
+        }
+        if reply_through_seq is not None:
+            payload["reply_through_seq"] = int(reply_through_seq)
+        return payload
+
+    monkeypatch.setattr(worker, "_build_encrypted_reply_effect_payload", _reply_payload)
+
+    config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-test",
+        context_window_tokens=200_000,
+    )
+    deps = worker.TurnDeps(
+        read_messages=serve_worker._read_messages,
+        read_messages_after_seq=serve_worker._read_messages_after_seq,
+        resolve_provider=lambda _uid: (config, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        read_tail_after_seq=serve_worker._read_tail_after_seq,
+        read_summary_with_seq=serve_worker._read_summary_with_seq,
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=config,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(provider_calls) == 1
+    # Prompt assembly may place coalesced input inside a structured context
+    # block rather than retain it as a top-level provider ``user`` message.
+    assert "hello from legacy human role" in str(provider_calls[0]["messages"])
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == human_seq
+    with db.get_pool().connection() as conn:
+        reply = conn.execute(
+            "SELECT doc FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role'='openclaw'",
+            (uid,),
+        ).fetchone()
+        consumed_human = conn.execute(
+            "SELECT doc FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (uid, "m-human-1"),
+        ).fetchone()
+    assert reply is not None
+    assert reply[0]["body_ct"] == "cipher-reply-to-human"
+    assert consumed_human is not None
+    assert consumed_human[0]["reply_status"] == "replied"
+    assert consumed_human[0]["reply_message_id"] == "reply-human-1"
 
 
 def test_terminal_reconcile_job_is_a_durable_per_message_stop_marker():

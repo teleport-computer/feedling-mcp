@@ -327,7 +327,10 @@ class _FakeE2BSandbox:
     @classmethod
     def create(cls, **kwargs):
         cls.create_calls.append(kwargs)
-        return cls()
+        sandbox = cls()
+        digest = kwargs["template"].rsplit("-", 1)[-1]
+        sandbox.files.values[e2b_sandbox._TEMPLATE_VERSION_PATH] = digest.encode()
+        return sandbox
 
     def kill(self):
         self.kill_count += 1
@@ -336,14 +339,15 @@ class _FakeE2BSandbox:
 def test_e2b_adapter_is_secure_offline_bounded_and_uses_fixed_extractor(monkeypatch):
     _FakeE2BSandbox.create_calls = []
     monkeypatch.setenv("E2B_API_KEY", "test-e2b-key")
-    monkeypatch.setenv("FEEDLING_V2_E2B_TEMPLATE", "feedling-artifacts-v1")
+    template = "feedling-runtime-v2-artifacts-v1-" + "0123456789abcdef" * 4
+    monkeypatch.setenv("FEEDLING_V2_E2B_TEMPLATE", template)
     monkeypatch.setenv("FEEDLING_V2_E2B_OUTPUT_MAX_CHARS", "5")
     provider = e2b_sandbox.E2BSandboxProvider(sandbox_cls=_FakeE2BSandbox)
 
     session = provider.acquire(user_id="u_e2b", purpose="materialize_artifact")
     created = _FakeE2BSandbox.create_calls[0]
     assert created == {
-        "template": "feedling-artifacts-v1",
+        "template": template,
         "timeout": 300,
         "secure": True,
         "allow_internet_access": False,
@@ -367,6 +371,8 @@ def test_e2b_adapter_is_secure_offline_bounded_and_uses_fixed_extractor(monkeypa
         "python /tmp/feedling-code.py", 30,
     )
     assert "model source" not in session._sandbox.commands.calls[-1][0]
+    with pytest.raises(workspace_sandbox.SandboxUnavailable, match="unsupported"):
+        session.run_code(language="javascript", source="console.log('not installed')")
     raw = session._sandbox
     session.close()
     session.close()
@@ -382,6 +388,30 @@ def test_e2b_adapter_requires_key_and_template_before_sdk_call(monkeypatch):
     with pytest.raises(workspace_sandbox.SandboxUnavailable, match="E2B_API_KEY"):
         provider.acquire(user_id="u_e2b", purpose="shell")
     assert _FakeE2BSandbox.create_calls == []
+
+
+def test_e2b_adapter_rejects_mutable_or_mismatched_template_identity(monkeypatch):
+    monkeypatch.setenv("E2B_API_KEY", "test-e2b-key")
+    provider = e2b_sandbox.E2BSandboxProvider(sandbox_cls=_FakeE2BSandbox)
+
+    monkeypatch.setenv("FEEDLING_V2_E2B_TEMPLATE", "feedling-artifacts-latest")
+    with pytest.raises(workspace_sandbox.SandboxUnavailable, match="content-addressed"):
+        provider.acquire(user_id="u_e2b", purpose="shell")
+
+    class WrongVersionSandbox(_FakeE2BSandbox):
+        @classmethod
+        def create(cls, **kwargs):
+            sandbox = super().create(**kwargs)
+            sandbox.files.values[e2b_sandbox._TEMPLATE_VERSION_PATH] = b"f" * 64
+            return sandbox
+
+    monkeypatch.setenv(
+        "FEEDLING_V2_E2B_TEMPLATE",
+        "feedling-runtime-v2-artifacts-v1-" + "0123456789abcdef" * 4,
+    )
+    with pytest.raises(workspace_sandbox.SandboxUnavailable, match="identity"):
+        provider = e2b_sandbox.E2BSandboxProvider(sandbox_cls=WrongVersionSandbox)
+        provider.acquire(user_id="u_e2b", purpose="shell")
 
 
 def test_production_file_read_fails_closed_before_decrypt_without_provider(monkeypatch):

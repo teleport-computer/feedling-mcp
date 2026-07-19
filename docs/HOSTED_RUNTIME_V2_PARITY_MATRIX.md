@@ -1,6 +1,6 @@
 # Hosted Runtime V2 — Current Parity and Completion Matrix
 
-> **CURRENT SOURCE OF TRUTH — 2026-07-19.** This page describes the current
+> **CURRENT SOURCE OF TRUTH — 2026-07-18.** This page describes the current
 > Runtime V2 source and managed deployment manifests. A live environment changes
 > only after this source is deployed. Use
 > [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)

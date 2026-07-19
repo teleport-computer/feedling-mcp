@@ -137,7 +137,7 @@ def test_ci_has_mandatory_worker_jobs_and_no_resident_rollback_selector():
         assert retired not in source, retired
 
 
-def test_ci_passes_e2b_configuration_only_through_worker_deploys():
+def test_ci_passes_e2b_configuration_only_through_worker_deploys_and_preflight():
     source = (ROOT / ".github/workflows/ci.yml").read_text()
     for environment in ("TEST", "PRE", "PROD"):
         assert f"{environment}_FEEDLING_V2_SANDBOX_PROVIDER" in source
@@ -146,7 +146,9 @@ def test_ci_passes_e2b_configuration_only_through_worker_deploys():
     assert "secrets.TEST_E2B_API_KEY" in source
     assert "secrets.PRE_E2B_API_KEY" in source
     assert "secrets.E2B_API_KEY" in source
-    assert source.count('FEEDLING_V2_SANDBOX_PROVIDER" = "e2b"') == 3
+    # One guard per test/pre/prod worker deploy plus one preflight guard for
+    # each release unit.
+    assert source.count('FEEDLING_V2_SANDBOX_PROVIDER" = "e2b"') == 6
 
 
 def test_ci_passes_opt_in_review_configuration_to_every_worker_deploy():
@@ -175,14 +177,17 @@ def test_ci_passes_opt_in_review_configuration_to_every_worker_deploy():
     )
 
 
-def test_production_worker_identity_is_fail_closed_and_gated_per_inventory_cvm():
-    compose = yaml.safe_load(
-        (ROOT / "deploy/docker-compose.phala.prod.runner.yaml").read_text()
-    )
-    environment = compose["services"]["serve-worker"]["environment"]
-    assert environment["FEEDLING_V2_FLEET_IDENTITY_REQUIRED"] == "1"
-    assert "FEEDLING_V2_RUNNER_CVM_ID" in environment
-    assert "FEEDLING_V2_DEPLOYED_BUILD" in environment
+def test_managed_worker_identity_is_fail_closed_and_gated_per_inventory_cvm():
+    for relative in (
+        "deploy/docker-compose.phala.runner.yaml",
+        "deploy/docker-compose.phala.pre.runner.yaml",
+        "deploy/docker-compose.phala.prod.runner.yaml",
+    ):
+        compose = yaml.safe_load((ROOT / relative).read_text())
+        environment = compose["services"]["serve-worker"]["environment"]
+        assert environment["FEEDLING_V2_FLEET_IDENTITY_REQUIRED"] == "1"
+        assert "FEEDLING_V2_RUNNER_CVM_ID" in environment
+        assert "FEEDLING_V2_DEPLOYED_BUILD" in environment
 
     workflow = (ROOT / ".github/workflows/ci.yml").read_text()
     assert '-e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID"' in workflow

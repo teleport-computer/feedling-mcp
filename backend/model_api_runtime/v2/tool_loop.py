@@ -169,6 +169,7 @@ async def run_tool_loop(
     fold_new_messages,
     add_usage,
     max_calls: int,
+    before_provider_call=None,
     fold_before_first: bool = False,
     on_progress=None,
     on_trajectory_event=None,
@@ -299,7 +300,10 @@ async def run_tool_loop(
     # `_catalog()`. `mcp_names` marks the injected tools so their args skip the
     # platform PARAMS validation (the MCP server validates its own schema). MCP
     # result content is nevertheless untrusted external input: after the model
-    # observes it, later writes are stripped exactly like web-derived content.
+    # observes it, every later outbound MCP call is stripped, including a tool
+    # whose exact catalog fingerprint the user approved as read-only.  Read-only
+    # controls remote mutation semantics; it does not make sending model-chosen
+    # arguments to that remote server safe after prompt-injected external text.
     disabled_names = {str(name) for name in (disabled_tool_names or ()) if str(name)}
     # ``reply`` is part of the parent loop protocol rather than a side-effect
     # capability. Recovery callers may remove every mutation schema, but must
@@ -369,7 +373,11 @@ async def run_tool_loop(
             blocked_tools: set[str] = set()
             if external_content_seen:
                 blocked_tools.update(cap_registry.WRITE_ACTIONS)
-                blocked_tools.update(mutating_mcp_names)
+                # Every MCP call crosses an outbound data boundary.  A matching
+                # read-only approval permits parallel execution before external
+                # content is observed, but cannot permit a later data-dependent
+                # request which could exfiltrate private conversation history.
+                blocked_tools.update(mcp_names)
                 blocked_tools.add("web_search")
                 blocked_tools.add(tool_schema.TASK_TOOL)
                 if not allowed_fetch_urls:
@@ -380,9 +388,11 @@ async def run_tool_loop(
             if mutation_outcome_unknown:
                 blocked_tools.update(cap_registry.WRITE_ACTIONS)
                 blocked_tools.update(mutating_mcp_names)
-            # A restricted child may inspect encrypted workspace/artifact or
-            # memory content, but that private observation cannot influence a
-            # later outbound query/URL. MCP is likewise outbound when present.
+            # A private read may expose persona, workspace/artifact, or memory
+            # content. That observation cannot influence a later outbound
+            # query/URL/MCP/task call. Local durable edits remain available:
+            # read-then-edit is a core workspace/working-memory workflow and
+            # still carries the original user/wake seed plus generation fence.
             if outbound_tools_blocked:
                 blocked_tools.update({"web_search", "web_fetch"})
                 blocked_tools.update(mcp_names)
@@ -407,6 +417,8 @@ async def run_tool_loop(
             # valid weak-model/text-only degradation. Required conversation and
             # native tool exchanges are never clipped to make room.
             tools = None
+        if before_provider_call is not None:
+            before_provider_call()
         await _trajectory(
             "provider_request",
             {
@@ -650,7 +662,11 @@ async def run_tool_loop(
         ):
             # Set only after dispatch: a write selected in the SAME batch was
             # chosen before the model saw the external result.  Only later
-            # rounds are influenced by that result and therefore lose writes.
+            # rounds are influenced by that result and therefore lose writes
+            # and all outbound MCP tools.  ``task`` is deliberately included
+            # without inspecting its child transcript: a child summary may
+            # contain web data, private workspace data, or both, so provenance
+            # propagates conservatively across the subagent boundary.
             external_content_seen = True
         if any(_read_blocks_later_outbound(tc) for tc in other_calls):
             # Same-batch outbound calls were selected before the model observed

@@ -243,7 +243,7 @@ def _runtime_model(provider: str, model: str) -> tuple[str, dict[str, Any]]:
 def public_config(config: dict) -> dict:
     provider = normalize_provider(str(config.get("provider") or ""))
     key_hint = str(config.get("api_key_hint") or "")
-    return {
+    safe = {
         "provider": provider,
         "model": str(config.get("model") or ""),
         "base_url": str(config.get("base_url") or ""),
@@ -254,6 +254,9 @@ def public_config(config: dict) -> dict:
         "updated_at": str(config.get("updated_at") or ""),
         "last_test_error": str(config.get("last_test_error") or ""),
     }
+    if config.get("context_window_tokens") is not None:
+        safe["context_window_tokens"] = int(config["context_window_tokens"])
+    return safe
 
 
 def validate_config(

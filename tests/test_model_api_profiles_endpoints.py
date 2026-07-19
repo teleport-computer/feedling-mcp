@@ -162,6 +162,29 @@ def test_create_route_with_api_key_always_makes_new_credential(
     assert len(db.model_api_routes_list(uid)) == 2
 
 
+def test_create_custom_route_requires_context_window_before_persistence(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch):
+    uid = registered_user["user_id"]
+    headers = {"X-API-Key": registered_user["api_key"]}
+    before_credentials = len(db.model_api_credentials_list(uid))
+
+    def must_not_probe(_cfg):
+        raise AssertionError("missing frontier must fail before relay probe")
+
+    monkeypatch.setattr(provider_client, "probe_responses_support", must_not_probe)
+    resp = client.post("/v1/model_api/routes", headers=headers, json={
+        "provider": "openai_compatible",
+        "model": "private-model",
+        "base_url": "https://relay.example.com/v1",
+        "api_key": "sk-relay-key",
+    })
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "prompt_context_limit_unconfigured"
+    assert len(db.model_api_credentials_list(uid)) == before_credentials
+
+
 def test_create_route_with_api_key_probes_supports_responses_true(
         client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
     """Issue 2 regression: the api_key branch of model_api_route_create used to
@@ -174,7 +197,8 @@ def test_create_route_with_api_key_probes_supports_responses_true(
 
     resp = client.post("/v1/model_api/routes", headers=headers, json={
         "provider": "openai_compatible", "model": "gpt-relay",
-        "base_url": "https://relay.example.com/v1", "api_key": "sk-relay-key"})
+        "base_url": "https://relay.example.com/v1", "api_key": "sk-relay-key",
+        "context_window_tokens": 128_000})
     assert resp.status_code == 200, resp.get_data(as_text=True)
 
     creds = [c for c in db.model_api_credentials_list(uid) if c["provider"] == "openai_compatible"]
@@ -190,7 +214,8 @@ def test_create_route_with_api_key_probes_supports_responses_false(
 
     resp = client.post("/v1/model_api/routes", headers=headers, json={
         "provider": "openai_compatible", "model": "gpt-relay",
-        "base_url": "https://relay.example.com/v1", "api_key": "sk-relay-key"})
+        "base_url": "https://relay.example.com/v1", "api_key": "sk-relay-key",
+        "context_window_tokens": 128_000})
     assert resp.status_code == 200, resp.get_data(as_text=True)
 
     creds = [c for c in db.model_api_credentials_list(uid) if c["provider"] == "openai_compatible"]
@@ -211,8 +236,10 @@ def test_create_route_reusing_openai_compatible_credential_omits_base_url(
     headers = {"X-API-Key": registered_user["api_key"]}
     create_resp = client.post("/v1/model_api/routes", headers=headers, json={
         "provider": "openai_compatible", "model": "gpt-4o-mini",
-        "base_url": "https://relay.example.com/v1", "api_key": "sk-relay-key"})
+        "base_url": "https://relay.example.com/v1", "api_key": "sk-relay-key",
+        "context_window_tokens": 128_000})
     assert create_resp.status_code == 200, create_resp.get_data(as_text=True)
+    assert create_resp.get_json()["route"]["context_window_tokens"] == 128_000
     cid = db.model_api_credentials_list(uid)[0]["id"]
     assert db.model_api_credentials_list(uid)[0]["base_url"] == "https://relay.example.com/v1"
 
@@ -409,7 +436,7 @@ def test_activate_fails_when_provider_test_fails_and_keeps_old_active(
     headers = _setup_one(client, registered_user)
     old_active = db.model_api_active_route(uid)["id"]
     cid = db.model_api_credentials_list(uid)[0]["id"]
-    r2 = db.model_api_route_upsert(uid, cid, "bad-model", None)
+    r2 = db.model_api_route_upsert(uid, cid, "bad-model", None, 32_768)
 
     def _boom(cfg):
         raise provider_client.ProviderError("provider_http_404", status_code=404)

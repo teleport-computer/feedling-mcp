@@ -239,6 +239,93 @@ def test_history_forwards_include_image_body_to_backend(client, monkeypatch):
     assert seen["params"]["limit"] == "20"
 
 
+def test_sequence_pagination_survives_enclave_with_timestamp_ties(client, monkeypatch):
+    seen: list[dict] = []
+
+    def row(seq: int):
+        return {
+            "id": f"m{seq}",
+            "seq": seq,
+            "role": "user",
+            "ts": 7.0,
+            "v": 1,
+            "source": "ios",
+            "K_enclave": "k",
+            "body_ct": "ct",
+            "nonce": "n",
+            "owner_user_id": "usr_a",
+        }
+
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        if path == "/v1/memory/list":
+            return {"moments": [], "total": 0}
+        if path != "/v1/chat/history":
+            raise AssertionError(path)
+        params = params or {}
+        seen.append(params)
+        if params.get("before_seq") == "102":
+            return {
+                "messages": [row(101)],
+                "total": 3,
+                "oldest_ts": 7.0,
+                "latest_ts": 7.0,
+                "oldest_seq": 101,
+                "latest_seq": 101,
+                "has_more_older": False,
+                "has_more_newer": True,
+                "bodies_omitted": 0,
+                "image_bodies_omitted": 0,
+                "body_omit_inline_max": 262144,
+            }
+        return {
+            "messages": [row(102), row(103)],
+            "total": 3,
+            "oldest_ts": 7.0,
+            "latest_ts": 7.0,
+            "oldest_seq": 102,
+            "latest_seq": 103,
+            "has_more_older": True,
+            "has_more_newer": False,
+            "bodies_omitted": 0,
+            "image_bodies_omitted": 0,
+            "body_omit_inline_max": 262144,
+        }
+
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+
+    async def fake_sk():
+        return object()
+
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+    monkeypatch.setattr(
+        envmod,
+        "decrypt_envelope",
+        lambda message, _user_id, _content_sk: message["id"].encode(),
+    )
+
+    latest = client.get(
+        "/v1/chat/history?limit=2",
+        headers={"X-API-Key": "k"},
+    ).get_json()
+    assert [message["seq"] for message in latest["messages"]] == [102, 103]
+    assert latest["oldest_seq"] == 102
+    assert latest["latest_seq"] == 103
+    assert latest["has_more_older"] is True
+    assert latest["body_omit_inline_max"] == 262144
+
+    older = client.get(
+        f'/v1/chat/history?before_seq={latest["oldest_seq"]}&limit=2',
+        headers={"X-API-Key": "k"},
+    ).get_json()
+    assert [message["seq"] for message in older["messages"]] == [101]
+    assert older["oldest_seq"] == older["latest_seq"] == 101
+    assert older["has_more_older"] is False
+    assert older["has_more_newer"] is True
+    assert seen[-1]["before_seq"] == "102"
+
+
 def test_omitted_image_body_degrades_without_a_decrypt_error(client, monkeypatch):
     """A body-omitted image row has no body_ct. It must NOT be reported as a
     decrypt failure — the caption still decrypts, so the agent keeps the user's

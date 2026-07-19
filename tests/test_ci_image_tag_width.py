@@ -27,35 +27,35 @@ def test_image_tags_use_one_fixed_width_github_sha_prefix():
         for value in ASSIGNMENT.findall(workflow.read_text())
     ]
 
-    # One producer assignment plus every main/test/pre main+runner deploy wait
-    # and pin assignment. A variable-length `git rev-parse --short` can produce
-    # different widths in the publisher's shallow clone and deploy's full clone.
-    # The shared production preflight adds one assignment and proves both
-    # backend + mandatory runner images before either live CVM is mutated.
-    assert len(assignments) == 15
+    # One producer assignment plus every main/test/pre main+runner deploy wait,
+    # fleet-build marker, and release preflight. Image pinning is centralized in
+    # deploy/pin-runtime-release.sh and slices the same trigger SHA exactly once.
+    # A variable-length `git rev-parse --short` can drift between clone depths.
+    assert len(assignments) == 13
     assert set(assignments) == {'"${GITHUB_SHA:0:7}"'}
 
 
-def test_pre_runner_deploy_forwards_pool_size_and_gates_liveness():
+def test_pre_runner_deploy_forwards_pool_size_and_gates_exact_fleet_liveness():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
 
     assert "PRE_FEEDLING_V2_MAX_WORKERS || '4'" in workflow
     assert '-e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS"' in workflow
+    assert '-e "FEEDLING_V2_RUNNER_CVM_ID=$FEEDLING_V2_RUNNER_CVM_ID"' in workflow
+    assert '-e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD"' in workflow
     assert "Post-deploy Runtime V2 liveness gate (pre)" in workflow
-    assert 'headers={"X-Admin-Token": admin_token}' in workflow
-    assert 'payload.get("live_worker_capacity")' in workflow
-    assert 'payload.get("genesis_alive") is True' in workflow
-    assert 'runtime_policy.get("policy") == expected_policy' in workflow
-    assert 'runtime_policy.get("target_mode") == expected_mode' in workflow
-    assert 'runtime_policy.get("inconsistent_count") or 0' in workflow
+    assert "python3 deploy/check-v2-runner-fleet.py" in workflow
+    assert "--inventory deploy/pre-runner-cvm-id.txt" in workflow
     assert "vars.DEPLOY_PRE_RUNNER_CVM == 'true'" not in workflow
-    assert 'payload.get("worker_heartbeats")' in workflow
-    assert 'expected_commit = os.environ.get("GITHUB_SHA", "")[:7]' in workflow
-    assert "time.sleep(35)" in workflow
-    assert "def heartbeat_age(row):" in workflow
-    assert 'row.get("age_sec") or 9999' not in workflow
-    assert 'f"-{expected_commit}"' in workflow
-    assert 'f"-{expected_commit}:genesis"' in workflow
+
+
+def test_test_runner_deploy_uses_the_same_closed_world_fleet_gate():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+
+    assert "validate-test-runtime-prerequisites:" in workflow
+    assert "Post-deploy Runtime V2 fleet identity gate (test)" in workflow
+    assert "--inventory deploy/test-runner-cvm-id.txt" in workflow
+    assert '-e "FEEDLING_V2_RUNNER_CVM_ID=$FEEDLING_V2_RUNNER_CVM_ID"' in workflow
+    assert '-e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD"' in workflow
 
 
 def test_prod_runner_deploy_binds_every_inventory_cvm_to_exact_build():

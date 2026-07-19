@@ -120,6 +120,16 @@ reply to the user, recurse into more tasks, load mutating MCP tools, or perform
 platform/workspace mutations. Multiple independent task calls can run in
 parallel, and the parent receives bounded results in provider order.
 
+The budget is shared across every task batch in one parent turn, not reset per
+child: by default at most 12 child provider calls and 131,072 reported tokens.
+Each concurrent provider call reserves a 32,768-token context ceiling before
+I/O; reported usage refunds unused reservation, while missing usage telemetry
+consumes the full reservation. The deployment knobs are
+`FEEDLING_V2_SUBAGENT_MAX_TOTAL_LLM_CALLS`,
+`FEEDLING_V2_SUBAGENT_MAX_TOTAL_TOKENS`, and
+`FEEDLING_V2_SUBAGENT_MAX_TOKENS_PER_CALL`. Exhaustion becomes the bounded tool
+result `subagent_budget_exhausted`, never an unbounded retry.
+
 The same outbound-data boundary covers non-workspace private text. Eager
 perception contains fixed numeric/boolean/null readings only, and screen-watch
 eagerly receives frame counts rather than captions. Calendar/reminder/app/place

@@ -113,7 +113,10 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0046_v2_summary_segments").down_revision == (
         "0045_drop_retired_supervisor"
     )
-    assert script.get_current_head() == "0046_v2_summary_segments"
+    assert script.get_revision("0047_model_route_context_window").down_revision == (
+        "0046_v2_summary_segments"
+    )
+    assert script.get_current_head() == "0047_model_route_context_window"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

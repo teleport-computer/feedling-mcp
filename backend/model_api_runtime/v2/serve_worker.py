@@ -320,9 +320,7 @@ _V2_WAKE_OWNER_ID = "hosted_runtime_v2"
 _IMAGE_MARKER = "[image]"
 _UNAVAILABLE_CHAT_MARKER = "[message unavailable]"
 _SUMMARY_INTEGRITY_ERROR = "v2_summary_integrity_error"
-# 只为最近 N 个图片行解 caption。compaction 用 limit=10_000 调 _read_tail，没有这个上限
-# 它会把该用户历史上每一张图的 caption 都发起一次 enclave 往返（enclave 是单线程瓶颈）。
-_CAPTION_DECRYPT_LIMIT = 8
+_USER_ROLES = frozenset({"user", "human"})
 
 
 def _caption_envelope(m: dict) -> dict | None:
@@ -345,35 +343,31 @@ def _caption_envelope(m: dict) -> dict | None:
     }
 
 
-def _caption_text(m, *, mid, token, caption_budget: list[int], fallback: str) -> str:
-    """附件行（image / file）的可见文本：随附件发的那句话，取不到就退化成 `fallback`。
+def _caption_text(m, *, mid, token, fallback: str) -> str:
+    """附件行（image / file）的可见文本：随附件发的那句话。
 
-    `caption_budget` 是一个单元素列表（可变计数器）：预算耗尽后不再解 caption。
-    caption 解密失败同样静默退化——看不到那句话，好过整个回合失败。
+    选中行在进入这里之前已由 tail/compaction window 做了有界筛选。因此每个
+    真实存在的 caption 都必须完整解密；解密或 UTF-8 校验失败要让整个读取
+    显式失败，这样 turn/caption compaction 就不会越过这条文本推进 cursor /
+    summary watermark。只有原本就没有 caption，或 caption 明文确实为空，才使用
+    无内容附件标记 `fallback`。
     """
     cap_env = _caption_envelope(m)
-    if cap_env is None or caption_budget[0] <= 0:
+    if cap_env is None:
         return fallback
-    caption_budget[0] -= 1
-    try:
-        caption = (
-            core_enclave._decrypt_envelope_via_enclave(
-                cap_env, None, purpose="v2_caption_read", runtime_token=token
-            )
-            .decode("utf-8", errors="replace")
-            .strip()
+    caption = (
+        core_enclave._decrypt_envelope_via_enclave(
+            cap_env, None, purpose="v2_caption_read", runtime_token=token
         )
-        return caption or fallback
-    except Exception as e:  # noqa: BLE001 — 静默降级，绝不拖垮回合
-        log.warning("[v2.serve_worker] caption decrypt failed msg=%s: %s", mid, e)
-        return fallback
-
-
-def _image_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
-    """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。"""
-    text = _caption_text(
-        m, mid=mid, token=token, caption_budget=caption_budget, fallback=_IMAGE_MARKER
+        .decode("utf-8")
+        .strip()
     )
+    return caption or fallback
+
+
+def _image_row(m, *, mid, ts, role, token) -> dict:
+    """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。"""
+    text = _caption_text(m, mid=mid, token=token, fallback=_IMAGE_MARKER)
     return {
         "id": mid,
         "ts": ts,
@@ -384,7 +378,7 @@ def _image_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
     }
 
 
-def _file_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
+def _file_row(m, *, mid, ts, role, token) -> dict:
     """文件行 -> **纯文本** tail 行。**绝不解密 body_ct。**
 
     文件消息的明文是**原始文件字节**（`chat_send_core`: `user_plaintext = file_parse["bytes"]`，
@@ -405,7 +399,6 @@ def _file_row(m, *, mid, ts, role, token, caption_budget: list[int]) -> dict:
         m,
         mid=mid,
         token=token,
-        caption_budget=caption_budget,
         fallback=f"[file: {name}]",
     )
     return {
@@ -571,10 +564,9 @@ def _decrypt_chat_rows(
     """
     token = _mint_runtime_token(user_id)
     out: list[dict] = []
-    caption_budget = [_CAPTION_DECRYPT_LIMIT]
     for m in rows:
-        raw_role = str(m.get("role") or "")
-        if user_only and raw_role != "user":
+        raw_role = str(m.get("role") or "").strip().lower()
+        if user_only and raw_role not in _USER_ROLES:
             continue
         mid, ts = m.get("id"), m.get("ts")
         role = "assistant" if raw_role in _ASSISTANT_ROLES else "user"
@@ -585,7 +577,6 @@ def _decrypt_chat_rows(
                 ts=ts,
                 role=role,
                 token=token,
-                caption_budget=caption_budget,
             )
         elif m.get("content_type") == "file":
             item = _file_row(
@@ -594,7 +585,6 @@ def _decrypt_chat_rows(
                 ts=ts,
                 role=role,
                 token=token,
-                caption_budget=caption_budget,
             )
         else:
             if not m.get("body_ct") or m.get("K_enclave") is None:
@@ -722,8 +712,8 @@ def _read_tail_window(
     if limit <= 0:
         return []
     candidates = [m for m in rows if m.get("ts") is not None and m.get("ts") > after_ts]
-    # Bound enclave work before decrypting. This also allocates the caption
-    # budget to the messages that will actually reach the prompt.
+    # Bound enclave work before decrypting, so every selected caption can be
+    # preserved without an independent cap that silently changes row content.
     rows = candidates[:limit] if oldest_first else candidates[-limit:]
     return _decrypt_chat_rows(user_id, rows, user_only=False)
 
@@ -1573,14 +1563,14 @@ def _latest_frame_meta(user_id: str) -> tuple[str, float]:
 
 
 def _last_user_msg_ts(user_id: str) -> float | None:
-    """该用户最后一条 `role == "user"` 消息的 ts —— 直接读 `store.chat_messages` 的明文
+    """该用户最后一条 `role in {"user", "human"}` 消息的 ts —— 直接读 `store.chat_messages` 的明文
     `role`/`ts` 列（**绝不 enclave**：只有 `body_ct` 是密文，role/ts 是明文）。没有任何
     user 行时返回 None（gate 视作「未在对话」，不触发 chatting 让路）。"""
     store = core_store.get_store(user_id)
     rows = getattr(store, "chat_messages", []) or []
     last_ts: float | None = None
     for m in rows:
-        if str(m.get("role") or "") == "user":
+        if str(m.get("role") or "").strip().lower() in _USER_ROLES:
             ts = m.get("ts")
             if ts is not None:
                 last_ts = float(ts)
