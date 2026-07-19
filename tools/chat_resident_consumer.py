@@ -5858,6 +5858,9 @@ def _maybe_apply_user_mcp() -> None:
                     "name": srv["name"], "enabled": bool(srv.get("enabled")),
                     "url": secret["url"], "headers": secret.get("headers") or {},
                     "ca_pem": secret.get("ca_pem") or "",
+                    # "" for pre-transport envelopes — materializers fall back
+                    # to user_mcp_materialize.effective_transport's URL heuristic.
+                    "transport": secret.get("transport") or "",
                 })
         # Union of the previously-applied and newly-advertised server names:
         # anything just removed still needs its old allow rule pruned, while
@@ -5924,7 +5927,15 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
     if _cli_template_is_codex():
         if lane == "chat":
             return ""
-        names = sorted(str(s.get("name") or "") for s in enabled_servers)
+        import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
+        # Only servers that were actually materialized into config.toml need a
+        # disable override; legacy-SSE servers are comment-skipped there
+        # (codex_config_merged), and a ``-c mcp_servers.<name>.enabled=false``
+        # for a table that doesn't exist would deep-merge a partial entry into
+        # codex's config instead.
+        names = sorted(
+            str(s.get("name") or "") for s in enabled_servers
+            if _m.effective_transport(s) != "sse")
         return " ".join(
             f"-c mcp_servers.{name}.enabled=false" for name in names if name
         )

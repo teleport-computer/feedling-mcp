@@ -1764,6 +1764,48 @@ def get_blobs_for_users(
         return {}
 
 
+def set_blob_if_unchanged(user_id: str, kind: str, expected_doc, new_doc) -> bool:
+    """Compare-and-swap the (user_id, kind) blob: write ``new_doc`` only if the
+    row's current doc STILL equals ``expected_doc``. Returns True iff the swap
+    happened.
+
+    JSONB ``=`` is a semantic comparison (the column is stored normalized, so
+    key order and whitespace don't matter), and a single ``UPDATE ... WHERE doc
+    = expected RETURNING`` is atomic under the row lock — no read-modify-write
+    window, so a concurrent writer that moved the blob between the caller's read
+    and this call cannot be silently clobbered. Used by mcp_core.test_server:
+    it loads the whole server list, runs a probe that can take tens of seconds,
+    then wants to persist a detected transport WITHOUT rolling back any upsert /
+    delete / toggle that landed in the meantime. On CAS failure the caller drops
+    the (best-effort) persistence and keeps the probe result.
+
+    A missing row (``expected_doc`` from a blob that was since deleted) also
+    returns False: the WHERE matches nothing, so we never resurrect it.
+    """
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "UPDATE user_blobs SET doc = %s "
+                "WHERE user_id = %s AND kind = %s AND doc = %s "
+                "RETURNING user_id",
+                (Jsonb(new_doc), user_id, kind, Jsonb(expected_doc)),
+            ).fetchone()
+    except Exception as e:
+        log.error("[db] set_blob_if_unchanged(%s,%s) failed: %s", user_id, kind, e)
+        return False
+    if row is None:
+        return False
+    # Mirror the winning write to the TEE shadow on the same terms as set_blob
+    # (user_mcp is not an excluded kind). Best-effort; the CAS already committed.
+    if kind not in ("identity", "consumer_state"):
+        from tee_shadow import mirror
+        mirror.execute(
+            "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
+            (user_id, kind, Jsonb(new_doc)))
+    return True
+
+
 def set_blob(user_id: str, kind: str, doc) -> None:
     sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc")

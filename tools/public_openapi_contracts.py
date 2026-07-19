@@ -904,6 +904,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "url_hint": {"type": "string", "description": "Hostname only (no scheme, path, or credentials), for display."},
             "header_names": {"type": "array", "items": {"type": "string"}, "description": "Header names only; values are never returned."},
             "has_ca": {"type": "boolean", "description": "Whether a CA certificate is currently stored for this server."},
+            "transport": {"type": "string", "enum": ["http", "sse"], "description": "MCP transport: 'http' (streamable HTTP) or 'sse' (legacy HTTP+SSE). Guessed from the URL path at save time ('.../sse' => 'sse') and corrected to the server's actual transport the first time a connectivity test succeeds."},
             "created_at": {"type": "string"},
             "updated_at": {"type": "string"},
         },
@@ -915,6 +916,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "url_hint": "mcp.example.com",
             "header_names": ["Authorization"],
             "has_ca": False,
+            "transport": "http",
             "created_at": "2026-07-16T00:00:00Z",
             "updated_at": "2026-07-16T00:00:00Z",
         },
@@ -933,14 +935,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "McpServerTestResponse": {
         "type": "object",
-        "required": ["ok", "tool_count", "tool_names"],
+        "required": ["ok", "tool_count", "tool_names", "transport"],
         "properties": {
             "ok": {"type": "boolean", "const": True},
             "tool_count": {"type": "integer", "minimum": 0},
             "tool_names": {"type": "array", "items": {"type": "string"}},
+            "transport": {"type": "string", "enum": ["http", "sse"], "description": "The MCP transport this probe actually spoke to the server: 'http' (streamable HTTP) or 'sse' (legacy HTTP+SSE). This is the authoritative detection that gets persisted to the server record's transport field."},
         },
         "additionalProperties": True,
-        "example": {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"]},
+        "example": {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"], "transport": "http"},
     },
 }
 

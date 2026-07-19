@@ -8572,6 +8572,14 @@
             "type": "boolean",
             "description": "Whether a CA certificate is currently stored for this server."
           },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "http",
+              "sse"
+            ],
+            "description": "MCP transport: 'http' (streamable HTTP) or 'sse' (legacy HTTP+SSE). Guessed from the URL path at save time ('.../sse' => 'sse') and corrected to the server's actual transport the first time a connectivity test succeeds."
+          },
           "created_at": {
             "type": "string"
           },
@@ -8589,6 +8597,7 @@
             "Authorization"
           ],
           "has_ca": false,
+          "transport": "http",
           "created_at": "2026-07-16T00:00:00Z",
           "updated_at": "2026-07-16T00:00:00Z"
         }
@@ -8626,7 +8635,8 @@
         "required": [
           "ok",
           "tool_count",
-          "tool_names"
+          "tool_names",
+          "transport"
         ],
         "properties": {
           "ok": {
@@ -8642,6 +8652,14 @@
             "items": {
               "type": "string"
             }
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "http",
+              "sse"
+            ],
+            "description": "The MCP transport this probe actually spoke to the server: 'http' (streamable HTTP) or 'sse' (legacy HTTP+SSE). This is the authoritative detection that gets persisted to the server record's transport field."
           }
         },
         "additionalProperties": true,
@@ -8651,7 +8669,8 @@
           "tool_names": [
             "search",
             "fetch"
-          ]
+          ],
+          "transport": "http"
         }
       }
     },

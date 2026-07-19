@@ -99,6 +99,16 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- User MCP servers now support the legacy **HTTP+SSE** transport in addition to
+  streamable HTTP. Some providers (e.g. Chinese map services) still ship their
+  MCP endpoint only as an `…/sse` URL; those now connect end-to-end. The
+  transport is detected automatically — from the URL path at save time and,
+  authoritatively, from the server's handshake when a connectivity test runs —
+  and reported on each server record as a new `transport` field (`"http"` or
+  `"sse"`). The hosted runtime and the `claude` self-hosted runtime speak both
+  transports; the `codex` self-hosted runtime remains streamable-HTTP only, so
+  a legacy-SSE server is left out of its generated config with a note to use the
+  provider's `/mcp` URL instead.
 - `POST /v1/mcp/servers/{name}/test` now enforces a 45-second wall-clock
   ceiling over the whole probe and returns `400 timeout` when it is exceeded.
   Previously a server that answered the handshake with a never-ending event

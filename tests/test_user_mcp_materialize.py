@@ -27,6 +27,46 @@ def test_claude_mcp_json():
         "headers": {"Authorization": 'Bearer "quoted"\\x'}}
 
 
+def test_effective_transport_precedence_and_heuristic():
+    # explicit stored value wins
+    assert m.effective_transport({"transport": "sse", "url": "https://x/mcp"}) == "sse"
+    assert m.effective_transport({"transport": "http", "url": "https://x/sse"}) == "http"
+    # no/blank transport → URL-path heuristic (query string ignored, trailing /)
+    assert m.effective_transport({"url": "https://mcp.map.qq.com/sse?key=K"}) == "sse"
+    assert m.effective_transport({"url": "https://x/sse/"}) == "sse"
+    assert m.effective_transport({"url": "https://x/mcp"}) == "http"
+    assert m.effective_transport({"transport": "", "url": "https://x/mcp"}) == "http"
+    # a junk transport value falls through to the heuristic, not trusted
+    assert m.effective_transport({"transport": "ws", "url": "https://x/sse"}) == "sse"
+
+
+def test_claude_mcp_json_reflects_transport():
+    servers = [
+        {"name": "legacy", "enabled": True, "url": "https://mcp.map.qq.com/sse?key=K",
+         "headers": {}, "transport": "sse"},
+        {"name": "modern", "enabled": True, "url": "https://x/mcp", "headers": {}},
+    ]
+    doc = json.loads(m.claude_mcp_json(servers))
+    assert doc["mcpServers"]["legacy"]["type"] == "sse"
+    assert doc["mcpServers"]["modern"]["type"] == "http"
+
+
+def test_codex_config_comments_out_legacy_sse():
+    servers = [
+        {"name": "legacy", "enabled": True, "url": "https://mcp.map.qq.com/sse",
+         "headers": {}, "transport": "sse"},
+        {"name": "modern", "enabled": True, "url": "https://x/mcp", "headers": {}},
+    ]
+    merged = m.codex_config_merged(None, servers)
+    # legacy server must NOT produce a [mcp_servers.legacy] table (codex can't
+    # speak the transport) — only a comment; modern one still gets its table.
+    assert "[mcp_servers.legacy]" not in merged
+    assert "legacy HTTP+SSE" in merged
+    assert '[mcp_servers.modern]' in merged
+    parsed = tomllib.loads(merged)  # comment must not break TOML validity
+    assert set(parsed.get("mcp_servers", {})) == {"modern"}
+
+
 def test_claude_mcp_json_empty():
     # Implementation pretty-prints (indent=2); lock the real output shape
     # rather than the compact one-liner from the interface prose — both are

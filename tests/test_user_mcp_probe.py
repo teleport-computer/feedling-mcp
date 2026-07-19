@@ -55,7 +55,8 @@ def test_probe_happy_path(monkeypatch):
     monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
     transport = httpx.ASGITransport(app=_fake_mcp_app())
     out = mcp_probe.probe("https://mcp.example.com/mcp", {}, transport=transport)
-    assert out == {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"]}
+    assert out == {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"],
+                   "transport": "http"}
 
 
 def test_probe_forwards_headers(monkeypatch):
@@ -218,3 +219,343 @@ def test_probe_wall_clock_leaves_fast_servers_alone(monkeypatch):
     transport = httpx.ASGITransport(app=_fake_mcp_app())
     out = mcp_probe.probe("https://mcp.example.com/mcp", {}, transport=transport)
     assert out["ok"] is True and out["tool_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Legacy HTTP+SSE transport (SSE-transport batch, 2026-07-19)
+#
+# httpx 0.28's ASGITransport buffers the WHOLE app response before returning
+# (handle_async_request asserts response_complete), so a long-lived legacy
+# stream cannot be faked in-process — these tests run a real loopback HTTP
+# server (the pattern test_pi_mcp_bridge.py already uses) and neutralize the
+# SSRF guard for 127.0.0.1 (the guard itself is covered by
+# test_backend_never_probes_non_global above).
+# ---------------------------------------------------------------------------
+
+import queue as _queue  # noqa: E402
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+
+
+@pytest.fixture()
+def _direct_loopback(monkeypatch):
+    """These tests hit a real 127.0.0.1 server, and the probe's httpx client
+    honors ambient proxies (trust_env — a dev machine's macOS system proxy /
+    Clash surfaces via urllib.getproxies() even with no *_PROXY env var). Force
+    a direct connection for loopback. Production behavior is untouched: a
+    self-hosted resident behind a real proxy still uses it."""
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+
+
+def _legacy_sse_server(*, endpoint_override: str | None = None,
+                       standard_legacy: bool = False):
+    """Loopback fake of the legacy transport, modeled on mcp.map.qq.com/sse
+    (2026-07-19 实测):
+      GET  /sse       → event-stream: endpoint 事件,随后从队列吐 JSON-RPC 回复
+      POST /sse       → (默认,腾讯式)event-stream: endpoint 事件——streamable
+                        首连嗅探要识别的签名
+      POST /messages  → 202;把对应回复放进 GET 流的队列
+
+    standard_legacy=True 改为 MCP 官方规定的合规行为:POST /sse → 405
+    (backwards-compat:客户端应据此转去 GET /sse)。
+    """
+    replies: _queue.Queue = _queue.Queue()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # silence per-request stderr noise
+            pass
+
+        def _sse_headers(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+
+        def _endpoint_event(self):
+            data = endpoint_override or "/messages?session_id=s1"
+            self.wfile.write(f"event:endpoint\ndata:{data}\n\n".encode())
+            self.wfile.flush()
+
+        def do_GET(self):
+            self._sse_headers()
+            self._endpoint_event()
+            try:
+                while True:
+                    doc = replies.get(timeout=5)
+                    self.wfile.write(
+                        b"event:message\ndata:" + json.dumps(doc).encode() + b"\n\n")
+                    self.wfile.flush()
+            except (_queue.Empty, BrokenPipeError, ConnectionResetError):
+                pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length)
+            if self.path.startswith("/messages"):
+                req = json.loads(body)
+                if req.get("method") == "initialize":
+                    replies.put({"jsonrpc": "2.0", "id": req["id"], "result": {
+                        "protocolVersion": "2025-03-26", "capabilities": {},
+                        "serverInfo": {"name": "legacy", "version": "0"}}})
+                elif req.get("method") == "tools/list":
+                    replies.put({"jsonrpc": "2.0", "id": req["id"], "result": {
+                        "tools": [{"name": "geocode", "description": "d",
+                                   "inputSchema": {}}]}})
+                self.send_response(202)
+                self.end_headers()
+                return
+            if standard_legacy:
+                # MCP-compliant legacy server: POST to the SSE URL is 405; the
+                # client must fall back to opening the GET stream.
+                self.send_response(405)
+                self.end_headers()
+                return
+            # POST to the base /sse URL mimics Tencent: a fresh stream whose
+            # first event is `endpoint` — never a JSON-RPC frame.
+            self._sse_headers()
+            self._endpoint_event()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _streamable_only_server():
+    """Loopback streamable-HTTP server that 405s GET — for wrong-hint fallback."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(405)
+            self.end_headers()
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            req = json.loads(self.rfile.read(length) or b"{}")
+            if req.get("method") == "initialize":
+                doc = {"jsonrpc": "2.0", "id": req.get("id"), "result": {
+                    "protocolVersion": "2025-03-26", "capabilities": {},
+                    "serverInfo": {"name": "streamable", "version": "0"}}}
+            elif req.get("method") == "tools/list":
+                doc = {"jsonrpc": "2.0", "id": req.get("id"), "result": {
+                    "tools": [{"name": "search", "description": "d",
+                               "inputSchema": {}}]}}
+            else:  # notifications/initialized
+                self.send_response(202)
+                self.end_headers()
+                return
+            payload = json.dumps(doc).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_probe_detects_legacy_sse_without_hint(monkeypatch, _direct_loopback):
+    """无 hint 首连:streamable 嗅探撞上 endpoint 签名 → 自动切 legacy 握手,
+    全程走通并报 transport=sse。这是腾讯 /sse 用户路径的直接回归。"""
+    monkeypatch.setattr(mcp_probe, "blocked_url_kind", lambda url: None)
+    srv = _legacy_sse_server()
+    try:
+        out = mcp_probe.probe(f"http://127.0.0.1:{srv.server_port}/sse", {})
+    finally:
+        srv.shutdown()
+    assert out["ok"] is True
+    assert out["transport"] == "sse"
+    assert out["tool_names"] == ["geocode"]
+
+
+def test_probe_sse_hint_goes_straight_to_legacy(monkeypatch, _direct_loopback):
+    monkeypatch.setattr(mcp_probe, "blocked_url_kind", lambda url: None)
+    srv = _legacy_sse_server()
+    try:
+        out = mcp_probe.probe(f"http://127.0.0.1:{srv.server_port}/sse", {},
+                              transport_hint="sse")
+    finally:
+        srv.shutdown()
+    assert out["ok"] is True and out["transport"] == "sse"
+
+
+def test_probe_standard_legacy_post_4xx_falls_back_to_get(monkeypatch, _direct_loopback):
+    """MCP 官方 backwards-compat 路径:合规 legacy server 对 streamable
+    initialize POST 回 405,客户端应转去 GET SSE 流。无 hint 也要走通
+    (不能只认腾讯那种非标准 POST-200+endpoint)。"""
+    monkeypatch.setattr(mcp_probe, "blocked_url_kind", lambda url: None)
+    srv = _legacy_sse_server(standard_legacy=True)
+    try:
+        out = mcp_probe.probe(f"http://127.0.0.1:{srv.server_port}/sse", {})
+    finally:
+        srv.shutdown()
+    assert out["ok"] is True and out["transport"] == "sse"
+    assert out["tool_names"] == ["geocode"]
+
+
+def test_probe_neither_transport_surfaces_http_error(monkeypatch, _direct_loopback):
+    """POST 404 + GET 404(根本不是 MCP server):两次尝试都失败时,应 surface
+    最有诊断价值的 HTTP 错误(http_404),而不是笼统的 'no working transport'。"""
+
+    class Dead(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self):
+            self.send_response(404)
+            self.end_headers()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Dead)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(mcp_probe, "blocked_url_kind", lambda url: None)
+    try:
+        with pytest.raises(mcp_probe.ProbeError) as e:
+            mcp_probe.probe(f"http://127.0.0.1:{srv.server_port}/x", {})
+    finally:
+        srv.shutdown()
+    assert e.value.kind == "http_404"
+
+
+def test_probe_sse_no_newline_flood_hits_byte_budget(monkeypatch, _direct_loopback):
+    """恶意 legacy server:endpoint 后 GET 流狂发无换行字节。aiter_lines 永不
+    yield,所以必须按字节 framing 的 _MAX_SSE_BYTES 兜底 —— 在远小于 wall-clock
+    的时间内以 size budget 失败,并且连接关闭(不吃满内存/时间)。"""
+    import time
+
+    class Flood(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            # A wall of bytes with NO newline, forever — the reader can never
+            # frame a line, so only the per-chunk byte-budget check (not the
+            # newline-gated line yield) can stop it.
+            try:
+                while True:
+                    self.wfile.write(b"x" * 8192)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Flood)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(mcp_probe, "blocked_url_kind", lambda url: None)
+    monkeypatch.setattr(mcp_probe, "_WALL_TIMEOUT", 20.0)  # prove budget, not clock
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(mcp_probe.ProbeError) as e:
+            mcp_probe.probe(f"http://127.0.0.1:{srv.server_port}/sse", {},
+                            transport_hint="sse")
+    finally:
+        srv.shutdown()
+    elapsed = time.monotonic() - t0
+    assert e.value.kind == "protocol"
+    assert "size budget" in e.value.detail
+    assert elapsed < 10.0, f"took {elapsed:.1f}s — byte budget didn't cut in early"
+
+
+def test_probe_sse_oversized_event_line_hits_byte_budget(monkeypatch, _direct_loopback):
+    """One huge newline-terminated `event:` line (no data:) must still trip the
+    per-event budget — the cap counts every field, not only data: lines."""
+
+    class BigEvent(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            try:
+                self.wfile.write(b"event:" + b"A" * (512 * 1024) + b"\n")
+                self.wfile.flush()
+                while True:
+                    self.wfile.write(b":\n")   # comments keep the stream open
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), BigEvent)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(mcp_probe, "blocked_url_kind", lambda url: None)
+    try:
+        with pytest.raises(mcp_probe.ProbeError) as e:
+            mcp_probe.probe(f"http://127.0.0.1:{srv.server_port}/sse", {},
+                            transport_hint="sse")
+    finally:
+        srv.shutdown()
+    assert e.value.kind == "protocol"
+    assert "size budget" in e.value.detail
+
+
+def test_probe_wrong_sse_hint_falls_back_to_streamable(monkeypatch, _direct_loopback):
+    """存了 sse hint 但服务器其实是 streamable(比如探测前记录被改):GET 405
+    → 回落 streamable 全通,报 transport=http 供上游纠正持久化。"""
+    monkeypatch.setattr(mcp_probe, "blocked_url_kind", lambda url: None)
+    srv = _streamable_only_server()
+    try:
+        out = mcp_probe.probe(f"http://127.0.0.1:{srv.server_port}/mcp", {},
+                              transport_hint="sse")
+    finally:
+        srv.shutdown()
+    assert out["ok"] is True and out["transport"] == "http"
+
+
+def test_effective_origin_default_port_equivalence():
+    """https://x and https://x:443 (and http/:80) are the same origin; a
+    genuinely different port is not. Guards the endpoint same-origin check
+    against false mismatches on an omitted default port (codex3 P2)."""
+    from urllib.parse import urlparse as _up
+    eo = mcp_probe._effective_origin
+    assert eo(_up("https://x/sse")) == eo(_up("https://x:443/messages"))
+    assert eo(_up("http://x/sse")) == eo(_up("http://x:80/messages"))
+    # host case-insensitive
+    assert eo(_up("https://X.Example/sse")) == eo(_up("https://x.example/m"))
+    # genuinely different port still differs
+    assert eo(_up("https://x/sse")) != eo(_up("https://x:8443/messages"))
+    # scheme difference differs (and http default 80 != https default 443)
+    assert eo(_up("http://x/sse")) != eo(_up("https://x/messages"))
+
+
+def test_probe_sse_endpoint_origin_mismatch_refused(monkeypatch, _direct_loopback):
+    """endpoint 事件是服务器控制的数据——跨源指向必须拒绝(SSRF 回声原语),
+    不允许把探测请求引到别的主机。"""
+    monkeypatch.setattr(mcp_probe, "blocked_url_kind", lambda url: None)
+    srv = _legacy_sse_server(
+        endpoint_override="http://evil.example.invalid:1/messages")
+    try:
+        with pytest.raises(mcp_probe.ProbeError) as e:
+            mcp_probe.probe(f"http://127.0.0.1:{srv.server_port}/sse", {},
+                            transport_hint="sse")
+    finally:
+        srv.shutdown()
+    assert e.value.kind == "protocol"
+    assert "origin mismatch" in e.value.detail
+
+
+def test_probe_sse_malformed_endpoint_port_is_400_not_500(monkeypatch, _direct_loopback):
+    """A malformed endpoint URI (bad port) is server-controlled data — parsing
+    it raises ValueError, which must become a clean 400 protocol error, not a
+    500 (codex3 R2)."""
+    monkeypatch.setattr(mcp_probe, "blocked_url_kind", lambda url: None)
+    srv = _legacy_sse_server(
+        endpoint_override="http://127.0.0.1:notaport/messages")
+    try:
+        with pytest.raises(mcp_probe.ProbeError) as e:
+            mcp_probe.probe(f"http://127.0.0.1:{srv.server_port}/sse", {},
+                            transport_hint="sse")
+    finally:
+        srv.shutdown()
+    assert e.value.kind == "protocol"
+    assert "invalid endpoint" in e.value.detail

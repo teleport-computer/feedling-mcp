@@ -129,6 +129,28 @@ def test_mcp_value_codex_background_disables_every_enabled_server(monkeypatch, t
     assert c._user_mcp_cli_value(tpl_codex, "chat") == ""
 
 
+def test_mcp_value_codex_background_skips_legacy_sse_servers(monkeypatch, tmp_path):
+    """A legacy-SSE server is comment-skipped in config.toml (codex can't speak
+    the transport — codex_config_merged never emits its table), so the codex
+    background lane must NOT emit a `-c mcp_servers.<name>.enabled=false` for
+    it: that override would deep-merge a partial table for a server that
+    otherwise doesn't exist. Only the streamable (http) servers get overrides."""
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "sha256:mixed", "servers": [
+            {"name": "modern", "enabled": True, "url": "https://x/mcp",
+             "headers": {}, "transport": "http"},
+            {"name": "legacy", "enabled": True, "url": "https://mcp.map.qq.com/sse",
+             "headers": {}, "transport": "sse"},
+            # no explicit transport → /sse heuristic still classifies as sse
+            {"name": "legacy2", "enabled": True, "url": "https://y/sse", "headers": {}},
+        ]})
+    tpl_codex = "codex exec --json {mcp} {message}"
+    monkeypatch.setattr(c, "AGENT_CLI_CMD", tpl_codex)
+    assert c._user_mcp_cli_value(tpl_codex, "background") == \
+        "-c mcp_servers.modern.enabled=false"
+
+
 def test_mcp_value_empty_when_no_enabled_server(monkeypatch, tmp_path):
     monkeypatch.setattr(c, "USER_MCP_FILE", str(tmp_path / "mcp.json"))
     # no servers at all
