@@ -283,7 +283,7 @@ def test_deployment_target_is_metadata_and_controller_code_is_immutable():
 def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
     preflight = _step(
         "Install and verify isolated headless Codex runtime",
-        "Provision eight isolated API-key profiles",
+        "Provision nine isolated API-key profiles",
     )
     assert "qa/install_codex_auth.py" in preflight
     assert "qa/write_codex_config.py" in preflight
@@ -335,7 +335,7 @@ def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
 def test_codex_preflight_network_denial_probe_has_balanced_conditionals():
     preflight = _step(
         "Install and verify isolated headless Codex runtime",
-        "Provision eight isolated API-key profiles",
+        "Provision nine isolated API-key profiles",
     )
     first_url = preflight.index("https://test-api.feedling.app/")
     start = preflight.rindex("command -v curl", 0, first_url)
@@ -355,7 +355,7 @@ def test_persona_judge_profile_is_private_offline_and_reuses_codex_oauth():
     )
     preflight = _step(
         "Install and verify isolated headless Codex runtime",
-        "Provision eight isolated API-key profiles",
+        "Provision nine isolated API-key profiles",
     )
     start = preflight.index("# The semantic judge is a separate top-level profile")
     judge_probe = preflight[start:]
@@ -399,11 +399,11 @@ def test_persona_judge_profile_is_private_offline_and_reuses_codex_oauth():
 
 def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
     provision = _step(
-        "Provision eight isolated API-key profiles",
+        "Provision nine isolated API-key profiles",
         "Split credentials into isolated one-profile manifests",
     )
     workers = _step(
-        "Run eight independent headless Codex profile agents",
+        "Run nine independent headless Codex profile agents",
         "Verify independent Codex worker lifecycle and canonical inputs",
     )
     supervisor = _step(
@@ -437,6 +437,7 @@ def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
     assert "env -i" in supervisor
     for variable_name in (
         "QA_GEMINI_MODEL",
+        "QA_OPENROUTER_KIMI_MODEL",
         "QA_KONGBEIQIE_MODEL",
         "QA_KONGBEIQIE_BASE_URL",
     ):
@@ -445,14 +446,14 @@ def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
         assert variable_name not in supervisor
 
 
-def test_manifest_isolation_is_probed_for_all_eight_profiles():
+def test_manifest_isolation_is_probed_for_all_nine_profiles():
     split = _step(
         "Split credentials into isolated one-profile manifests",
         "Verify every profile manifest permission boundary",
     )
     isolation = _step(
         "Verify every profile manifest permission boundary",
-        "Run eight independent headless Codex profile agents",
+        "Run nine independent headless Codex profile agents",
     )
     assert "qa/split_profile_manifests.py" in split
     assert "profiles=(" in isolation
@@ -478,6 +479,7 @@ def test_manifest_isolation_is_probed_for_all_eight_profiles():
         ("openrouter-claude", "profile_openrouter_claude"),
         ("openrouter-openai", "profile_openrouter_openai"),
         ("openrouter-glm", "profile_openrouter_glm"),
+        ("openrouter-kimi", "profile_openrouter_kimi"),
         ("relay-kongbeiqie", "profile_relay_kongbeiqie"),
     ):
         assert f"            {profile_id}\n" in isolation
@@ -486,7 +488,7 @@ def test_manifest_isolation_is_probed_for_all_eight_profiles():
 
 def test_deterministic_launcher_runs_exact_independent_profile_matrix():
     workers = _step(
-        "Run eight independent headless Codex profile agents",
+        "Run nine independent headless Codex profile agents",
         "Verify independent Codex worker lifecycle and canonical inputs",
     )
     assert "qa/run_codex_profile_workers.py" in workers
@@ -508,7 +510,7 @@ def test_deterministic_launcher_runs_exact_independent_profile_matrix():
 def test_real_codex_preflight_binds_the_locked_permission_profile():
     preflight = _step(
         "Install and verify isolated headless Codex runtime",
-        "Provision eight isolated API-key profiles",
+        "Provision nine isolated API-key profiles",
     )
     assert "-p profile_official_deepseek" in preflight
     assert "-c 'default_permissions=\"io-e2e-agent-driven-test-official-deepseek\"'" in preflight
@@ -554,12 +556,12 @@ def test_aggregator_preserves_semantic_and_cot_evidence_and_writes_privately():
     assert "persona" in supervisor
     assert "reasoning/COT evidence" in supervisor
     assert "trace correlation" in supervisor
-    assert "Copy all eight profile objects exactly" in supervisor
+    assert "Copy all nine profile objects exactly" in supervisor
     assert "fixed" in supervisor
     assert "three-slot queue" in supervisor
     assert "immediately backfilled" in supervisor
-    assert "profiles_expected and profiles_completed are both 8" in supervisor
-    assert "must sum to eight" in supervisor
+    assert "profiles_expected and profiles_completed are both 9" in supervisor
+    assert "must sum to nine" in supervisor
     assert "summary counts" in supervisor
     assert "--strict-config" in supervisor
     assert (
@@ -605,11 +607,11 @@ def test_manual_dispatch_defaults_to_strict_v2_and_preserves_baseline_option():
         "Install and verify isolated headless Codex runtime",
     )
     provision = _step(
-        "Provision eight isolated API-key profiles",
+        "Provision nine isolated API-key profiles",
         "Split credentials into isolated one-profile manifests",
     )
     workers = _step(
-        "Run eight independent headless Codex profile agents",
+        "Run nine independent headless Codex profile agents",
         "Verify independent Codex worker lifecycle and canonical inputs",
     )
     deployment_post = _step(
@@ -733,7 +735,7 @@ def test_persona_formal_lane_is_hosted_only_and_records_diagnostic_skip():
     assert "inputs.runtime_target == 'hosted_resident'" in live
     assert "inputs.runtime_target == 'deployed_current'" in skipped
     assert "Not formally qualified" in skipped
-    assert "mandatory eight-provider P0 matrix still ran" in skipped
+    assert "mandatory nine-provider P0 matrix still ran" in skipped
     assert "qa/publish_persona_memory_summary.py" in skipped
     assert "--nonformal-skip" in skipped
     assert '--artifact-dir "$QA_ARTIFACT_DIR"' in skipped

@@ -38,8 +38,8 @@ def _write_pair(tmp_path):
         "kind": "deterministic_cleanup_receipt",
         "run_id": "unit-run-0001",
         "generated_at": "2026-07-15T12:00:00+00:00",
-        "attempted": 9,
-        "cleaned": 9,
+        "attempted": 10,
+        "cleaned": 10,
         "failed_profile_ids": [],
         "manifest_deleted": False,
         "manifest_retained_for_scan": True,
@@ -97,7 +97,7 @@ def test_cleanup_receipt_accepts_admin_verified_account_cascade(tmp_path):
 @pytest.mark.parametrize(
     "mutation,match",
     [
-        (lambda receipt: receipt.update(cleaned=8), "summary"),
+        (lambda receipt: receipt.update(cleaned=9), "summary"),
         (
             lambda receipt: receipt["profiles"][0].update(
                 old_credential_rejected=False

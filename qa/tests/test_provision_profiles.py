@@ -22,6 +22,7 @@ VALID_MODELS = {
     "openrouter-claude": "anthropic/claude-sonnet-4.5",
     "openrouter-openai": "openai/gpt-4.1-mini",
     "openrouter-glm": "z-ai/glm-4.5-air:free",
+    "openrouter-kimi": "moonshotai/kimi-k3",
     "relay-kongbeiqie": "[特价纯血]claude-opus-4-6",
 }
 
@@ -365,11 +366,11 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
         coverage, manifest_path, env=env, client=smoke, admin_client=admin
     )
 
-    assert len(result["profiles"]) == len(provisioner.PROFILE_SPECS) == 8
-    assert len(smoke.registered) == 9
-    assert len(smoke.setup_calls) == 16
-    assert len(smoke.trace_calls) == 8
-    assert len(admin.calls) == 10
+    assert len(result["profiles"]) == len(provisioner.PROFILE_SPECS) == 9
+    assert len(smoke.registered) == 10
+    assert len(smoke.setup_calls) == 18
+    assert len(smoke.trace_calls) == 9
+    assert len(admin.calls) == 11
     assert admin.calls[0] == ("GET", provisioner.SYNTHETIC_REAPER_PATH, None)
     for index in range(0, len(smoke.setup_calls), 2):
         assert smoke.setup_calls[index][4] == provisioner.INVALID_PROVIDER_KEY
@@ -444,13 +445,13 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
             "profile_id": provisioner.MEMORY_CONTRACT_PROFILE_ID,
             "purpose": "deterministic_memory_contract",
             "label": "agent-e2e-unit-42-memory-contract",
-            "user_id": "user-8",
-            "api_key": "feedling-account-key-8",
-            "secret_key_b64": provisioner.base64.b64encode(bytes([9]) * 32).decode(),
-            "public_key_b64": provisioner.base64.b64encode(bytes([19]) * 32).decode(),
+            "user_id": "user-9",
+            "api_key": "feedling-account-key-9",
+            "secret_key_b64": provisioner.base64.b64encode(bytes([10]) * 32).decode(),
+            "public_key_b64": provisioner.base64.b64encode(bytes([20]) * 32).decode(),
             "provision_status": provisioner.PROVISION_STATUS_READY,
             "provision_failure_code": provisioner.PROVISION_FAILURE_NONE,
-            "synthetic_account_lease": _synthetic_lease(9),
+            "synthetic_account_lease": _synthetic_lease(10),
         }
     ]
 
@@ -1193,6 +1194,7 @@ def test_coverage_model_route_fields_are_hard_locked(tmp_path, field, value, err
         ("openrouter-openai", "openai/o-series-preview"),
         ("openrouter-glm", "z-ai/glm-4.5-air:free"),
         ("openrouter-glm", "thudm/glm-4-32b"),
+        ("openrouter-kimi", "moonshotai/kimi-k3"),
         ("relay-kongbeiqie", "claude-sonnet-4-6"),
         ("relay-kongbeiqie", "[特价纯血]claude-opus-4-6"),
     ],
@@ -1216,6 +1218,7 @@ def test_locked_model_families_accept_realistic_ids(profile_id, model):
         ("openrouter-claude", "openai/gpt-4.1-mini"),
         ("openrouter-openai", "z-ai/glm-4.5-air:free"),
         ("openrouter-glm", "anthropic/claude-sonnet-4.5"),
+        ("openrouter-kimi", "z-ai/glm-4.5-air:free"),
         ("relay-kongbeiqie", "openai/gpt-5.4"),
         ("relay-kongbeiqie", "[too-long-label-123456789012345678]claude-opus-4-6"),
     ],
@@ -1257,7 +1260,10 @@ def test_relay_model_rejects_controls_and_newlines_without_echo(bad_model):
     [
         ("openrouter-claude", "openrouter-openai"),
         ("openrouter-claude", "openrouter-glm"),
+        ("openrouter-claude", "openrouter-kimi"),
         ("openrouter-openai", "openrouter-glm"),
+        ("openrouter-openai", "openrouter-kimi"),
+        ("openrouter-glm", "openrouter-kimi"),
     ],
 )
 def test_swapped_openrouter_models_fail_before_external_state(
@@ -1332,7 +1338,7 @@ def test_invalid_key_acceptance_blocks_profiles_without_collapsing_matrix(tmp_pa
         admin_client=FakeAdminClient(smoke),
     )
 
-    assert len(smoke.registered) == 9
+    assert len(smoke.registered) == 10
     assert [row["profile_id"] for row in result["profiles"]] == list(
         provisioner.PROFILE_SPECS
     )
@@ -1401,7 +1407,7 @@ def test_expired_first_provider_key_does_not_abort_remaining_profiles(tmp_path):
 
     rows = result["profiles"]
     assert [row["profile_id"] for row in rows] == list(provisioner.PROFILE_SPECS)
-    assert len(smoke.registered) == 9
+    assert len(smoke.registered) == 10
     assert rows[0]["provision_status"] == provisioner.PROVISION_STATUS_BLOCKED
     assert rows[0]["provision_failure_code"] == "VALID_KEY_REJECTED"
     assert rows[0]["api_key"] == "feedling-account-key-0"
@@ -1646,8 +1652,8 @@ def test_release_cleanup_writes_sanitized_deterministic_receipt_and_retains_mani
     )
 
     assert result == {
-        "attempted": 9,
-        "cleaned": 9,
+        "attempted": 10,
+        "cleaned": 10,
         "failed_profile_ids": [],
         "manifest_deleted": False,
         "manifest_missing": False,
@@ -1796,7 +1802,7 @@ def test_release_cleanup_retries_a_transient_reset_request(tmp_path, monkeypatch
         retain_manifest=True,
     )
 
-    assert result["cleaned"] == 9
+    assert result["cleaned"] == 10
     assert result["failed_profile_ids"] == []
     assert transient_failures[first_api_key] == 0
 
@@ -1889,7 +1895,7 @@ def test_release_cleanup_verifies_accounts_already_reset_by_profile_workers(tmp_
         retain_manifest=True,
     )
 
-    assert result["cleaned"] == 9
+    assert result["cleaned"] == 10
     assert result["failed_profile_ids"] == []
     receipt = json.loads(receipt_path.read_text())
     assert all(
@@ -2370,8 +2376,8 @@ def test_provision_cli_succeeds_for_complete_matrix_with_blocked_profile(
     assert captured.err == ""
     assert output == {
         "ok": True,
-        "profile_count": 8,
-        "ready_profile_count": 7,
+        "profile_count": 9,
+        "ready_profile_count": 8,
         "blocked_profile_count": 1,
         "blocked_profile_ids": ["official-deepseek"],
         "manifest": str(manifest),

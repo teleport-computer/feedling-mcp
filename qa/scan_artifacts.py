@@ -36,6 +36,7 @@ PROFILE_IDS = (
     "openrouter-claude",
     "openrouter-openai",
     "openrouter-glm",
+    "openrouter-kimi",
     "relay-kongbeiqie",
 )
 MEMORY_CONTRACT_PROFILE_ID = "memory-contract"

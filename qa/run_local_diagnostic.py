@@ -73,6 +73,7 @@ DEFAULT_PROVIDER_MODELS = {
     "openrouter-claude": "anthropic/claude-sonnet-4.5",
     "openrouter-openai": "openai/gpt-4.1-mini",
     "openrouter-glm": "z-ai/glm-4.5-air",
+    "openrouter-kimi": "moonshotai/kimi-k3",
     "relay-kongbeiqie": "[特价纯血]claude-opus-4-6",
 }
 MISSING_STRICT_EVIDENCE = (

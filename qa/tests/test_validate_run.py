@@ -21,6 +21,7 @@ VALID_MODELS = {
     "openrouter-claude": "anthropic/claude-sonnet-4.5",
     "openrouter-openai": "openai/gpt-4.1-mini",
     "openrouter-glm": "z-ai/glm-4.5-air:free",
+    "openrouter-kimi": "moonshotai/kimi-k3",
     "relay-kongbeiqie": "[特价纯血]claude-opus-4-6",
 }
 
@@ -196,8 +197,8 @@ def _valid_result() -> dict:
             "expected_runtime": "hosted_resident",
         },
         "overall_status": "PASS",
-        "profiles_expected": 8,
-        "profiles_completed": 8,
+        "profiles_expected": 9,
+        "profiles_completed": 9,
         "orchestration": {
             "supervisor_count": 1,
             "max_configured_profile_concurrency": 3,
@@ -215,7 +216,7 @@ def _valid_result() -> dict:
             for index, profile_id in enumerate(gate.LOCKED_PROFILE_IDS)
         ],
         "summary": {
-            "pass": 8,
+            "pass": 9,
             "product_fail": 0,
             "blocked_credential": 0,
             "blocked_evidence": 0,
@@ -595,7 +596,7 @@ def _write_orchestration_receipt(
         "launcher_id": "run-10000000",
         "max_configured_profile_concurrency": 3,
         "max_observed_profile_concurrency": peak,
-        "launch_attempts": 8,
+        "launch_attempts": 9,
         "workers": workers,
     }
     receipt.update(updates)
@@ -844,7 +845,7 @@ def test_relay_model_label_rejects_controls_and_artifact_delimiters(tmp_path, mo
 
     errors = _validate(tmp_path, result)
 
-    assert any("JSON Schema at $.profiles[7].model" in error for error in errors)
+    assert any("JSON Schema at $.profiles[8].model" in error for error in errors)
 
 
 def test_result_target_must_be_the_exact_test_origin(tmp_path):
@@ -1365,7 +1366,7 @@ def test_reasoning_effort_must_be_medium(tmp_path):
         ),
     ],
 )
-def test_orchestration_proves_eight_workers_and_concurrency_cap(
+def test_orchestration_proves_nine_workers_and_concurrency_cap(
     tmp_path, mutate, expected
 ):
     result = _valid_result()
@@ -1423,7 +1424,7 @@ def test_agent_peak_must_match_trusted_process_receipt(tmp_path):
             "COT lifecycle is invalid",
         ),
         (
-            lambda receipt: receipt.update(launch_attempts=7),
+            lambda receipt: receipt.update(launch_attempts=8),
             "launch count is invalid",
         ),
         (
@@ -1480,7 +1481,7 @@ def test_duplicate_profile_id_and_missing_locked_profile_fail(tmp_path):
     result = _valid_result()
     result["profiles"][-1]["profile_id"] = result["profiles"][0]["profile_id"]
     errors = _validate(tmp_path, result)
-    assert any("exact eight profiles" in error for error in errors)
+    assert any("exact nine profiles" in error for error in errors)
     assert any("duplicate profile IDs" in error for error in errors)
 
 
@@ -1820,6 +1821,32 @@ def test_trusted_provisioning_manifest_rejects_swapped_openrouter_model_families
     assert (
         "profile openrouter-openai trusted provisioning receipt is incomplete" in errors
     )
+
+
+def test_trusted_provisioning_manifest_rejects_swapped_openrouter_kimi_family(
+    tmp_path,
+):
+    result = _valid_result()
+    manifest = json.loads(_write_provisioning_manifest(tmp_path).read_text())
+    manifest_by_id = {row["profile_id"]: row for row in manifest["profiles"]}
+    result_by_id = {row["profile_id"]: row for row in result["profiles"]}
+    glm = manifest_by_id["openrouter-glm"]
+    kimi = manifest_by_id["openrouter-kimi"]
+    glm["configured_model"], kimi["configured_model"] = (
+        kimi["configured_model"],
+        glm["configured_model"],
+    )
+    for profile_id in ("openrouter-glm", "openrouter-kimi"):
+        entry = manifest_by_id[profile_id]
+        model = entry["configured_model"]
+        entry["valid_key_receipt"]["model"] = model
+        result_by_id[profile_id]["model"] = model
+        result_by_id[profile_id]["reasoning"]["model"] = model
+
+    errors = gate._validate_provisioning_manifest(manifest, result, "hosted_resident")
+
+    assert "profile openrouter-glm trusted provisioning receipt is incomplete" in errors
+    assert "profile openrouter-kimi trusted provisioning receipt is incomplete" in errors
 
 
 @pytest.mark.parametrize("tamper_receipt", (False, True))

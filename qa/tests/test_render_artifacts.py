@@ -89,7 +89,7 @@ def test_matrix_and_latency_are_fixed_structured_projections(tmp_path):
     matrix = (artifacts / "matrix.md").read_text(encoding="utf-8")
     assert "PRIVATE_SENTINEL" not in matrix
     assert matrix.count("\n| official-") == 4
-    assert matrix.count("\n| openrouter-") == 3
+    assert matrix.count("\n| openrouter-") == 4
     assert matrix.count("\n| relay-") == 1
     for scenario_id in renderer.SCENARIO_IDS:
         assert scenario_id in matrix
@@ -207,7 +207,7 @@ def test_reasoning_configuration_mismatch_is_schema_valid_and_renderable(tmp_pat
     scenario["failure"] = failure
     profile["status"] = "PRODUCT_FAIL"
     result["overall_status"] = "PRODUCT_FAIL"
-    result["summary"]["pass"] = 7
+    result["summary"]["pass"] = 8
     result["summary"]["product_fail"] = 1
 
     artifacts, _, _ = _render(tmp_path, result)
@@ -239,7 +239,7 @@ def test_junit_contains_only_fixed_attributes_and_no_output_or_error_bodies(tmp_
     root = ElementTree.parse(artifacts / "junit.xml").getroot()
     assert root.attrib == {
         "name": "io-e2e-agent-driven-test-p0",
-        "tests": "104",
+        "tests": "117",
         "failures": "1",
         "errors": "0",
     }

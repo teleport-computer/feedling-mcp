@@ -1473,6 +1473,17 @@ def test_prepare_environment_uses_current_nonretired_openrouter_glm_default():
     assert env["QA_OPENROUTER_GLM_MODEL"] == "z-ai/glm-4.5-air"
 
 
+def test_prepare_environment_uses_openrouter_kimi_k3_default():
+    env, names = local.prepare_environment(
+        {"QA_OPENROUTER_API_KEY": "openrouter-sensitive-value"},
+        ("openrouter-kimi",),
+        "local-unit",
+    )
+
+    assert names == ("QA_OPENROUTER_API_KEY",)
+    assert env["QA_OPENROUTER_KIMI_MODEL"] == "moonshotai/kimi-k3"
+
+
 def test_loaded_credentials_reject_short_unscannable_values():
     with pytest.raises(local.LocalDiagnosticError, match="QA_DEEPSEEK_API_KEY"):
         local._loaded_credential_values({"QA_DEEPSEEK_API_KEY": "abc1234"})
@@ -1764,11 +1775,11 @@ def test_parent_cleanup_projection_rejects_inexact_receipt(field, value):
     assert projection["status"] == "FAIL"
 
 
-def test_parent_cleanup_projection_credits_exact_eight_profile_cleanup():
+def test_parent_cleanup_projection_credits_exact_nine_profile_cleanup():
     projection = local._parent_cleanup_projection(
         {
-            "attempted": 8,
-            "cleaned": 8,
+            "attempted": 9,
+            "cleaned": 9,
             "failed_profile_ids": [],
             "manifest_deleted": True,
             "manifest_missing": False,
@@ -1783,8 +1794,8 @@ def test_parent_cleanup_projection_credits_exact_eight_profile_cleanup():
         "status": "PASS",
         "expected_profile_ids": list(local.PROFILE_IDS),
         "manifest_profiles_validated": True,
-        "attempted": 8,
-        "cleaned": 8,
+        "attempted": 9,
+        "cleaned": 9,
         "failed_profile_ids": [],
         "manifest_deleted": True,
         "manifest_missing": False,
@@ -3007,7 +3018,7 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
     assert not any(options.private_base.iterdir())
 
 
-def test_mixed_matrix_launches_seven_and_accounts_for_blocked_eighth(tmp_path):
+def test_mixed_matrix_launches_eight_and_accounts_for_blocked_ninth(tmp_path):
     options = _matrix_options(tmp_path)
     profile_ids = tuple(local.PROFILE_IDS)
     ready_ids = profile_ids[:-1]
@@ -3069,8 +3080,8 @@ def test_mixed_matrix_launches_seven_and_accounts_for_blocked_eighth(tmp_path):
     def cleanup(path, **_kwargs):
         path.unlink()
         return {
-            "attempted": 8,
-            "cleaned": 8,
+            "attempted": 9,
+            "cleaned": 9,
             "failed_profile_ids": [],
             "manifest_deleted": True,
             "manifest_missing": False,
@@ -3094,10 +3105,10 @@ def test_mixed_matrix_launches_seven_and_accounts_for_blocked_eighth(tmp_path):
     assert launched == [ready_ids]
     assert summary["requested_profile_ids"] == list(profile_ids)
     expected_counts = {
-        "requested_profile_count": 8,
-        "ready_profile_count": 7,
+        "requested_profile_count": 9,
+        "ready_profile_count": 8,
         "blocked_profile_count": 1,
-        "accounted_profile_count": 8,
+        "accounted_profile_count": 9,
     }
     assert {
         name: summary["provisioning"][name] for name in expected_counts
@@ -3105,7 +3116,7 @@ def test_mixed_matrix_launches_seven_and_accounts_for_blocked_eighth(tmp_path):
     assert {
         name: summary["orchestration"][name] for name in expected_counts
     } == expected_counts
-    assert summary["orchestration"]["launch_attempts"] == 7
+    assert summary["orchestration"]["launch_attempts"] == 8
     assert summary["orchestration"]["agent_launch_profile_ids"] == list(
         ready_ids
     )
@@ -3136,8 +3147,8 @@ def test_mixed_matrix_launches_seven_and_accounts_for_blocked_eighth(tmp_path):
         profile_ids
     )
     assert summary["cleanup"] == {
-        "attempted": 8,
-        "cleaned": 8,
+        "attempted": 9,
+        "cleaned": 9,
         "failed_profile_ids": [],
         "manifest_deleted": True,
         "manifest_missing": False,
@@ -3156,7 +3167,7 @@ def test_mixed_matrix_launches_seven_and_accounts_for_blocked_eighth(tmp_path):
         assert secret not in public_payload
 
 
-def test_all_blocked_matrix_never_launches_agents_and_accounts_for_all_eight(
+def test_all_blocked_matrix_never_launches_agents_and_accounts_for_all_nine(
     tmp_path,
 ):
     options = _matrix_options(tmp_path)
@@ -3178,8 +3189,8 @@ def test_all_blocked_matrix_never_launches_agents_and_accounts_for_all_eight(
     def cleanup(path, **_kwargs):
         path.unlink()
         return {
-            "attempted": 8,
-            "cleaned": 8,
+            "attempted": 9,
+            "cleaned": 9,
             "failed_profile_ids": [],
             "manifest_deleted": True,
             "manifest_missing": False,
@@ -3212,18 +3223,18 @@ def test_all_blocked_matrix_never_launches_agents_and_accounts_for_all_eight(
             "accounted_profile_count",
         )
     } == {
-        "requested_profile_count": 8,
+        "requested_profile_count": 9,
         "ready_profile_count": 0,
-        "blocked_profile_count": 8,
-        "accounted_profile_count": 8,
+        "blocked_profile_count": 9,
+        "accounted_profile_count": 9,
     }
     assert list(summary["profile_statuses"]) == list(profile_ids)
     assert list(summary["cot_delivery"]) == list(profile_ids)
     assert {
         row["status"] for row in summary["cot_delivery"].values()
     } == {"NOT_RUN"}
-    assert len(list((summary_path.parent / "profiles").glob("*.json"))) == 8
-    assert summary["cleanup"]["cleaned"] == 8
+    assert len(list((summary_path.parent / "profiles").glob("*.json"))) == 9
+    assert summary["cleanup"]["cleaned"] == 9
     assert summary["cleanup"]["manifest_deleted"] is True
     assert summary["parent_cleanup_verification"]["status"] == "PASS"
 
@@ -3251,8 +3262,8 @@ def test_malformed_blocker_fails_closed_but_cleanup_is_still_credited(tmp_path):
     def cleanup(path, **_kwargs):
         path.unlink()
         return {
-            "attempted": 8,
-            "cleaned": 8,
+            "attempted": 9,
+            "cleaned": 9,
             "failed_profile_ids": [],
             "manifest_deleted": True,
             "manifest_missing": False,
@@ -3282,8 +3293,8 @@ def test_malformed_blocker_fails_closed_but_cleanup_is_still_credited(tmp_path):
     assert len(summaries) == 1
     summary = json.loads(summaries[0].read_text())
     assert summary["status"] == "DIAGNOSTIC_ERROR"
-    assert summary["cleanup"]["attempted"] == 8
-    assert summary["cleanup"]["cleaned"] == 8
+    assert summary["cleanup"]["attempted"] == 9
+    assert summary["cleanup"]["cleaned"] == 9
     assert summary["cleanup"]["manifest_deleted"] is True
     assert summary["parent_cleanup_verification"]["status"] == "PASS"
     assert summary["parent_cleanup_verification"][

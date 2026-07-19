@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify trusted receipts from eight independent top-level Codex processes."""
+"""Verify trusted receipts from nine independent top-level Codex processes."""
 
 from __future__ import annotations
 

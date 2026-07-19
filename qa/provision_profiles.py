@@ -195,6 +195,15 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         allowed_model_regex=r"^(?:z-ai|thudm)/glm-[a-z0-9][a-z0-9._:-]*$",
         expected_configured_base_url="https://openrouter.ai/api/v1",
     ),
+    "openrouter-kimi": ProfileSpec(
+        provider="openrouter",
+        route_family="openrouter",
+        model_family="kimi",
+        credential_env="QA_OPENROUTER_API_KEY",
+        model_env="QA_OPENROUTER_KIMI_MODEL",
+        allowed_model_regex=r"^moonshotai/kimi-[a-z0-9][a-z0-9._:-]*$",
+        expected_configured_base_url="https://openrouter.ai/api/v1",
+    ),
     "relay-kongbeiqie": ProfileSpec(
         provider="openai_compatible",
         route_family="relay",

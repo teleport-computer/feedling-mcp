@@ -48,7 +48,7 @@ The protected workflow is deliberately split across explicit trust zones:
    behavior is proven by the per-profile user path described below. Both
    deployment receipts remain outside the public artifact directory.
 2. `provision_profiles.py` is a deterministic credential boundary. It creates
-   eight fresh provider-profile accounts plus one dedicated memory-contract
+   nine fresh provider-profile accounts plus one dedicated memory-contract
    account, proves invalid-key rejection and valid-key
    recovery without accepting echoed credentials, enables user-scoped trace
    access, requires a server-side synthetic-account TTL/reaper before the first
@@ -57,15 +57,15 @@ The protected workflow is deliberately split across explicit trust zones:
    `hosted_resident` and version `2`; qualification does not mutate runtime mode
    through a test-only admin endpoint. A present-but-expired provider key becomes
    a fixed-code blocked row while provisioning continues through the other
-   profiles, so a failed credential still produces a complete eight-row
+   profiles, so a failed credential still produces a complete nine-row
    diagnostic matrix.
    P0-06 uses four checked-in representative onboarding files: each profile
    archives all four through the deployed multipart endpoint before submitting
    the exact same bytes and filenames to Genesis for agent-judged distillation.
-3. The provisioner output is deterministically split into eight owner-only
+3. The provisioner output is deterministically split into nine owner-only
    provider manifests and one owner-only memory manifest. Every provider
-   worker explicitly denies the memory manifest as well as all seven sibling
-   provider manifests. `run_codex_profile_workers.py` launches exactly eight
+   worker explicitly denies the memory manifest as well as all eight sibling
+   provider manifests. `run_codex_profile_workers.py` launches exactly nine
    independent top-level `codex exec` processes through one fixed three-slot
    queue that immediately backfills each freed slot, with at most three running
    concurrently. Each selected Codex profile exposes
@@ -100,7 +100,7 @@ The protected workflow is deliberately split across explicit trust zones:
    directory. A structurally valid COT product failure is preserved in the
    receipt and artifacts for the deterministic final gate to reject rather than
    being erased by an early launcher exception.
-5. A separate headless Codex qualification supervisor reads only those eight
+5. A separate headless Codex qualification supervisor reads only those nine
    validated profile results and the trusted receipt. It preserves each profile
    judgment, computes the run summary and orchestration projection, and returns
    the canonical JSON final message against
@@ -111,7 +111,7 @@ The protected workflow is deliberately split across explicit trust zones:
    authoritative gate schema at `schemas/run-result.schema.json` and
    mechanically derives the coverage matrix, numeric latency CSV, body-free
    JUnit XML, and exact per-profile JSON documents.
-7. A separate deterministic memory-contract probe uses only the ninth account.
+7. A separate deterministic memory-contract probe uses only the tenth account.
    It always requires fresh empty recall, encrypted v1 index/fetch, a real
    quiet-window capture write, exact route-trace correlation, disposable-chat
    capture no-op, duplicate-fact no-growth, local-only exclusion, and supersede
@@ -126,7 +126,7 @@ The protected workflow is deliberately split across explicit trust zones:
    exact profile/scenario order, scenario-specific assertions/evidence/IDs,
    preserved retry observations, per-turn five-stage trace and numeric latency
    evidence, and nearest-rank p50/p95 summaries recomputed from those turns,
-   one supervisor plus exactly eight uniquely assigned independent profile
+   one supervisor plus exactly nine uniquely assigned independent profile
    workers with no more than three observed concurrently, exact agreement with
    the trusted process/thread/hash receipt, unchanged trusted pre/post liveness
    receipts, strict Runtime V2 user-path evidence when selected, exact binding
@@ -136,7 +136,7 @@ The protected workflow is deliberately split across explicit trust zones:
    `routing`, `queue`, `provider`, `persistence`, or `delivery` duration is
    `BLOCKED_EVIDENCE / TRACE_INCOMPLETE`. Neither can be inferred from history
    or agent prose.
-9. The workflow always runs deterministic cleanup across all nine synthetic
+9. The workflow always runs deterministic cleanup across all ten synthetic
    accounts. For every provider profile it proves the configured route existed,
    deletes the route when it is still authenticated, verifies the public
    projection and encrypted key envelope are gone, resets the account, confirms
@@ -248,7 +248,7 @@ python3 qa/run_local_diagnostic.py \
 
 Then remove `--preflight-only` to create one fresh synthetic account and run the
 live Gemini canary. Repeat `--profile` to select a bounded subset, or omit it to
-run the locked eight-profile matrix. With the public-health flag, the driver
+run the locked nine-profile matrix. With the public-health flag, the driver
 discovers the full source SHA from the live health response before Codex or
 provisioning starts. `--candidate-sha <full-sha>` is an optional extra assertion:
 if supplied, it must exactly match that observed health identity. It never
@@ -305,7 +305,7 @@ source digest, worker-source digest, and exact copied worker-snapshot digest;
 the run aborts before Codex if the snapshot bytes differ from the measured
 source bytes.
 
-All eight locked io API-key profiles are accounted for in the diagnostic
+All nine locked io API-key profiles are accounted for in the diagnostic
 matrix. Each `READY` profile launches one headless Codex worker and executes
 `P0-01` through `P0-13`, including fresh onboarding, key validation, four-part
 persona import/distillation, basic and ten-turn chat, memory/persona
@@ -340,7 +340,7 @@ the model's internal reasoning or defeat a deliberately deceptive judge that
 manufactures an alternate prefill and copies it later; that would require a
 second independent judge or a different trust model.
 
-All eight profiles request reasoning effort `medium`, and the authenticated live
+All nine profiles request reasoning effort `medium`, and the authenticated live
 route readback must attest that `medium` is configured for the same
 provider/model/base URL. A provider default, omitted setting, route mismatch, or
 disabled reasoning cannot produce a release PASS.
@@ -501,6 +501,7 @@ coverage:
 - `QA_OPENROUTER_CLAUDE_MODEL=anthropic/claude-sonnet-5`
 - `QA_OPENROUTER_OPENAI_MODEL=openai/gpt-5.6-terra`
 - `QA_OPENROUTER_GLM_MODEL=z-ai/glm-5.2`
+- `QA_OPENROUTER_KIMI_MODEL=moonshotai/kimi-k3`
 - `QA_KONGBEIQIE_MODEL=[特价纯血]claude-sonnet-5`
 - `QA_KONGBEIQIE_BASE_URL` (the normalized HTTPS OpenAI-compatible endpoint)
 
@@ -580,7 +581,7 @@ or raw-output access and the same disabled-network boundary. Before
 provisioning, the workflow verifies OAuth, strict profile selection, no
 configured MCP server, filesystem boundaries, and that a real worker sandbox
 cannot reach either the test API or a public endpoint. After provisioning, it
-probes all eight exact mode-`0600` rows for own-read/other-deny isolation.
+probes all nine exact mode-`0600` rows for own-read/other-deny isolation.
 
 Keep an independent runner/VPC egress policy as a second boundary: the Codex
 parent needs OpenAI/ChatGPT service access and deterministic parent probes need
@@ -608,7 +609,7 @@ trusted provider proxy) before it can preserve the same boundary. That preview
 and broker layer is explicitly not implemented by this version.
 
 The same dispatch also runs candidate-only persona and memory qualification
-after the mandatory eight-provider P0 matrix. `persona_repetitions=1` is the
+after the mandatory nine-provider P0 matrix. `persona_repetitions=1` is the
 default developer smoke lane and uses eight fresh official-OpenAI synthetic
 accounts; `persona_repetitions=3` is release depth and uses 24. The deep lane is
 formal only for `runtime_target=hosted_resident`, where every account must prove
@@ -710,7 +711,7 @@ Only the secretless AWS expiry reaper runs hourly.
 
 The baseline target requires authoritative backend image identity plus the
 currently deployed API-key/user contracts. The strict Runtime V2 target requires
-all eight provisioner readbacks and parent-owned P0-05/P0-07 receipts to prove
+all nine provisioner readbacks and parent-owned P0-05/P0-07 receipts to prove
 exact `hosted_resident` version `2`. This is end-user-path qualification, not a
 claim about an unobservable worker binary or internal queue topology.
 
@@ -739,8 +740,8 @@ created. Public files must never contain provider keys, Feedling account keys,
 private content keys, raw chat, raw traces, raw private reasoning, or free-form
 evidence/failure text.
 
-The seven summary fields count the exact terminal statuses of the eight profiles
-and must sum to eight. The gate is green only when all eight profiles and all
+The seven summary fields count the exact terminal statuses of the nine profiles
+and must sum to nine. The gate is green only when all nine profiles and all
 thirteen scenarios per profile are present in order and PASS with their locked
 assertions, evidence codes, required IDs, and preserved attempt history; pre/post
 endpoint liveness and backend candidate identity are proven in every mode, with
@@ -751,8 +752,8 @@ P0-13 receipt binds the exact 15 prior turns and matches the profile's bounded
 trace/latency/cleanup projection; missing correlation is
 `BLOCKED_EVIDENCE / TRACE_UNAVAILABLE` and any absent or null stage is
 `BLOCKED_EVIDENCE / TRACE_INCOMPLETE`; deterministic
-cleanup proves all nine accounts absent and all old keys rejected, and its exact
-receipt agrees with the eight agent cleanup projections;
+cleanup proves all ten accounts absent and all old keys rejected, and its exact
+receipt agrees with the nine agent cleanup projections;
 each worker has a completed qualification-tool event and a valid, passing,
 result-bound P0-12 receipt; every parent-probed scenario has an exact helper
 command plus a valid result-bound parent receipt, while P0-06 has its three

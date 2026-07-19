@@ -26,6 +26,7 @@ _PROFILE_METADATA: dict[str, tuple[str, str, str]] = {
     "openrouter-claude": ("openrouter", "claude", "openrouter"),
     "openrouter-openai": ("openrouter", "openai", "openrouter"),
     "openrouter-glm": ("openrouter", "glm", "openrouter"),
+    "openrouter-kimi": ("openrouter", "kimi", "openrouter"),
     "relay-kongbeiqie": ("relay", "claude", "openai_compatible"),
 }
 _TRACE_STAGES = ("routing", "queue", "provider", "persistence", "delivery")

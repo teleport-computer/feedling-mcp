@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write isolated Codex configs for eight independent qualification workers.
+"""Write isolated Codex configs for nine independent qualification workers.
 
 Codex 0.144.3 applies a named ``$CODEX_HOME/<name>.config.toml`` profile only
 when that profile is selected on a top-level invocation with ``-p``.  It does

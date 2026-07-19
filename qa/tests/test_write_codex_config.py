@@ -125,7 +125,7 @@ def test_bundle_isolates_workers_aggregation_and_persona_judge(tmp_path):
         not in document["shell_environment_policy"]["include_only"]
     )
 
-    assert len(bundle.profiles) == len(PROFILE_AGENT_TYPES) + 1 == 9
+    assert len(bundle.profiles) == len(PROFILE_AGENT_TYPES) + 1 == 10
     manifests = Path(values["profile_manifest_dir"])
     worker_root = Path(values["worker_root"])
     permissions = document["permissions"]

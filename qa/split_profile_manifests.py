@@ -187,7 +187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
     print(
-        "eight isolated profile manifests created"
+        "nine isolated profile manifests created"
         + (" with dedicated memory contract manifest" if args.memory_output else "")
     )
     return 0

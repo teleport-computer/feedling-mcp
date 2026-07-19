@@ -11,6 +11,7 @@ PROFILE_AGENT_TYPES: tuple[tuple[str, str], ...] = (
     ("openrouter-claude", "profile_openrouter_claude"),
     ("openrouter-openai", "profile_openrouter_openai"),
     ("openrouter-glm", "profile_openrouter_glm"),
+    ("openrouter-kimi", "profile_openrouter_kimi"),
     ("relay-kongbeiqie", "profile_relay_kongbeiqie"),
 )
 

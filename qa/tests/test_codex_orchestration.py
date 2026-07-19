@@ -1588,6 +1588,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
         ("openrouter-claude", "profile_openrouter_claude"),
         ("openrouter-openai", "profile_openrouter_openai"),
         ("openrouter-glm", "profile_openrouter_glm"),
+        ("openrouter-kimi", "profile_openrouter_kimi"),
         ("relay-kongbeiqie", "profile_relay_kongbeiqie"),
     )
     paths = _setup(tmp_path)
@@ -1601,6 +1602,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
         "QA_GEMINI_API_KEY",
         "QA_KONGBEIQIE_API_KEY",
         "QA_GEMINI_MODEL",
+        "QA_OPENROUTER_KIMI_MODEL",
         "QA_KONGBEIQIE_MODEL",
         "QA_KONGBEIQIE_BASE_URL",
         "QA_CODEX_AUTH_JSON_B64",
@@ -2575,7 +2577,7 @@ def test_launcher_rejects_profile_shell_binding_tampering(
     assert invoked is False
 
 
-def test_nonzero_exit_attempts_all_eight_once_and_writes_no_receipt(tmp_path):
+def test_nonzero_exit_attempts_all_nine_once_and_writes_no_receipt(tmp_path):
     paths = _setup(tmp_path)
     captured: list[launcher.WorkerSpec] = []
     successful = _successful_runner(captured)

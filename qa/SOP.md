@@ -10,7 +10,7 @@ The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are requirements.
 ## 1. Fixed contract
 
 - Load `qa/coverage-lock.json` before doing anything else.
-- Execute exactly the eight locked profiles and `P0-01` through `P0-13` for every
+- Execute exactly the nine locked profiles and `P0-01` through `P0-13` for every
   profile. A required profile or scenario MUST NOT be skipped.
 - The system under test MUST be the deployed test endpoint named by
   `IO_E2E_BASE_URL` and the expected deployment named by
@@ -54,7 +54,7 @@ profile. Missing coverage is never a successful `SKIP`.
 
 The launcher is not intelligent. It MUST:
 
-1. Start exactly eight independent top-level `codex exec` processes, one selected
+1. Start exactly nine independent top-level `codex exec` processes, one selected
    profile per locked matrix row, through one fixed three-slot queue that
    immediately backfills each freed slot and never exceeds three simultaneous
    profiles.
@@ -230,7 +230,7 @@ If the manifest has `provision_status: blocked`, the agent MUST preserve its
 fixed `provision_failure_code`, classify the profile and affected scenarios with
 the appropriate schema-valid blocked status, avoid pretending that unavailable
 live actions ran, and still request the parent-owned P0-13 cleanup path. A
-blocked row remains one of the eight required results and can never release
+blocked row remains one of the nine required results and can never release
 PASS.
 
 The agent MUST return one complete structured profile result. It may adapt the
@@ -250,10 +250,10 @@ judge or a different architecture.
 
 ### Qualification supervisor
 
-After all eight profile processes complete, a separate intelligent headless Codex
+After all nine profile processes complete, a separate intelligent headless Codex
 process aggregates them. It MUST:
 
-1. Read only the eight schema-validated canonical profile JSONs and the trusted
+1. Read only the nine schema-validated canonical profile JSONs and the trusted
    lifecycle receipt. It MUST NOT read a provisioning manifest, credential, raw
    worker event/stderr stream, or agent scratch root, and it runs without product
    network access.
@@ -261,7 +261,7 @@ process aggregates them. It MUST:
    retry observations, persona-finalizer evidence, COT/reasoning evidence, trace
    correlation, latency, and cleanup results.
 3. Verify the exact profile/scenario sets, project the receipt's worker IDs and
-   peak concurrency, compute the seven terminal-status counts (summing to eight),
+   peak concurrency, compute the seven terminal-status counts (summing to nine),
    and choose overall status without converting blocked or failed evidence into
    PASS.
 4. Return only the complete schema-valid canonical run JSON. The Codex parent
@@ -503,7 +503,7 @@ For PASS, every turn also satisfies
 ### Deterministic memory contract
 
 After credential splitting, trusted code MUST run `qa/memory_contract_smoke.py`
-against the dedicated ninth account and write `memory-contract.json` directly
+against the dedicated tenth account and write `memory-contract.json` directly
 to the public artifact root. This process receives no provider key, admin token,
 or Codex OAuth material. The receipt contains only fixed check IDs, statuses,
 failure codes, booleans, and bounded counts; it MUST NOT contain account
@@ -569,8 +569,8 @@ account whose generated label and user ID were not established by this run. A
 lease-attested database absence is the authoritative account/provider-config
 cascade boundary; a process-local registry 404 is never cleanup evidence.
 The parent writes `cleanup-receipt.json` without account IDs, keys, or response
-bodies; `qa/validate_cleanup_receipt.py` MUST require the exact eight profiles,
-the memory-contract account, nine successful cleanups, and exact agreement with
+bodies; `qa/validate_cleanup_receipt.py` MUST require the exact nine profiles,
+the memory-contract account, ten successful cleanups, and exact agreement with
 the canonical result's cleanup fields. Partial provisioning MUST still clean
 every account that exists, even though its incomplete receipt cannot qualify.
 This is not crash-safe against runner loss or forced job termination: the
@@ -615,9 +615,9 @@ before the supervisor returns so these are the only public files after rendering
 
 The overall result is `PASS` only when:
 
-- all eight exact profile IDs occur once;
+- all nine exact profile IDs occur once;
 - the seven summary fields equal the counts of their corresponding profile
-  terminal statuses and sum to eight;
+  terminal statuses and sum to nine;
 - all thirteen exact scenario IDs occur once for every profile;
 - all scenario and profile statuses are `PASS`;
 - the observed runtime is present for every profile and, in the strict V2

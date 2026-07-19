@@ -679,7 +679,7 @@ jobs:
           python3 qa/aws/terminate.py "${args[@]}"
 
   qualify-api-key-runtime:
-    name: qualify eight API-key profiles
+    name: qualify nine API-key profiles
     needs: [validate-dispatch, resolve-test-deployment, provision-aws-runner]
     environment: io-e2e-agent-driven-test
     runs-on:
@@ -787,6 +787,7 @@ jobs:
             profile_openrouter_claude \
             profile_openrouter_openai \
             profile_openrouter_glm \
+            profile_openrouter_kimi \
             profile_relay_kongbeiqie
           do
             mkdir -m 700 "${worker_root}/${agent_type}"
@@ -1175,7 +1176,7 @@ jobs:
 
       # This is the only setup step that receives provider credentials. No
       # provider or admin credential is ever passed to a Codex process.
-      - name: Provision eight isolated API-key profiles
+      - name: Provision nine isolated API-key profiles
         id: provision
         env:
           IO_E2E_BASE_URL: https://test-api.feedling.app
@@ -1194,6 +1195,7 @@ jobs:
           QA_OPENROUTER_CLAUDE_MODEL: ${{ vars.QA_OPENROUTER_CLAUDE_MODEL }}
           QA_OPENROUTER_OPENAI_MODEL: ${{ vars.QA_OPENROUTER_OPENAI_MODEL }}
           QA_OPENROUTER_GLM_MODEL: ${{ vars.QA_OPENROUTER_GLM_MODEL }}
+          QA_OPENROUTER_KIMI_MODEL: ${{ vars.QA_OPENROUTER_KIMI_MODEL }}
           QA_KONGBEIQIE_MODEL: ${{ vars.QA_KONGBEIQIE_MODEL }}
           QA_KONGBEIQIE_BASE_URL: ${{ vars.QA_KONGBEIQIE_BASE_URL }}
           QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
@@ -1245,6 +1247,7 @@ jobs:
             openrouter-claude
             openrouter-openai
             openrouter-glm
+            openrouter-kimi
             relay-kongbeiqie
           )
           agent_types=(
@@ -1255,6 +1258,7 @@ jobs:
             profile_openrouter_claude
             profile_openrouter_openai
             profile_openrouter_glm
+            profile_openrouter_kimi
             profile_relay_kongbeiqie
           )
           for index in "${!profiles[@]}"; do
@@ -1324,7 +1328,7 @@ jobs:
                 "${denied_paths[@]}"
           done
 
-      - name: Run eight independent headless Codex profile agents
+      - name: Run nine independent headless Codex profile agents
         id: profile_workers
         if: steps.manifest_isolation.outcome == 'success'
         timeout-minutes: 200
@@ -1512,7 +1516,7 @@ jobs:
             --build-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
             --repetitions "$PERSONA_REPETITIONS" \
             --artifact-dir "$QA_ARTIFACT_DIR"
-          echo "::notice::persona-memory qualification is not formal for deployed_current; the mandatory eight-provider P0 matrix still ran"
+          echo "::notice::persona-memory qualification is not formal for deployed_current; the mandatory nine-provider P0 matrix still ran"
           {
             echo "### Persona-memory qualification"
             echo
@@ -1565,16 +1569,16 @@ jobs:
           Read and obey ${GITHUB_WORKSPACE}/qa/SOP.md,
           ${GITHUB_WORKSPACE}/qa/coverage-lock.json, and
           ${GITHUB_WORKSPACE}/qa/scenarios/api-key-journey.md. Trusted code has
-          already run exactly eight independent profile agents through one fixed
+          already run exactly nine independent profile agents through one fixed
           three-slot queue that immediately backfilled each freed slot, with a
-          concurrency cap of three. Read only the eight
+          concurrency cap of three. Read only the nine
           schema-validated profile JSON files in
           ${QA_AGGREGATION_INPUT_ROOT} and the trusted lifecycle receipt at
           ${QA_ORCHESTRATION_RECEIPT}. Never read raw worker events/stderr,
           provisioning manifests, credentials, or public artifacts; never run
           another product probe or launch another agent.
 
-          Copy all eight profile objects exactly, in locked matrix order. Do not
+          Copy all nine profile objects exactly, in locked matrix order. Do not
           weaken or rewrite any failed assertion, retry observation, persona
           finalizer receipt or qualification-agent semantic judgment,
           reasoning/COT evidence, trace correlation, per-turn five-stage latency,
@@ -1592,8 +1596,8 @@ jobs:
 
           Set supervisor_count=1, configured concurrency=3, observed concurrency
           and each profile/worker assignment exactly from the trusted receipt.
-          profiles_expected and profiles_completed are both 8. Compute the seven
-          summary counts from the exact profile statuses; they must sum to eight.
+          profiles_expected and profiles_completed are both 9. Compute the seven
+          summary counts from the exact profile statuses; they must sum to nine.
           Compute overall_status from those statuses without turning a blocked
           or failed profile into PASS. Use the earliest scenario start and latest
           scenario finish as run timestamps. Use only the schema-fixed artifact

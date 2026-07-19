@@ -29,6 +29,7 @@ PROFILE_IDS = (
     "openrouter-claude",
     "openrouter-openai",
     "openrouter-glm",
+    "openrouter-kimi",
     "relay-kongbeiqie",
 )
 SCENARIO_IDS = tuple(f"P0-{index:02d}" for index in range(1, 14))

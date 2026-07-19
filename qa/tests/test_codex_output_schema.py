@@ -43,12 +43,12 @@ def test_gate_valid_result_is_valid_authoring_output_offline():
     assert authoring_errors == []
 
 
-def test_authoring_schema_locks_eight_profiles_and_unicode_model_shape():
+def test_authoring_schema_locks_nine_profiles_and_unicode_model_shape():
     schema = _load(AUTHORING_SCHEMA_PATH)
     profile = schema["$defs"]["profileResult"]
     reasoning = schema["$defs"]["reasoningEvidence"]
 
-    assert schema["properties"]["profiles_expected"]["enum"] == [8]
+    assert schema["properties"]["profiles_expected"]["enum"] == [9]
     assert profile["properties"]["profile_id"]["enum"] == [
         "official-deepseek",
         "official-anthropic",
@@ -57,6 +57,7 @@ def test_authoring_schema_locks_eight_profiles_and_unicode_model_shape():
         "openrouter-claude",
         "openrouter-openai",
         "openrouter-glm",
+        "openrouter-kimi",
         "relay-kongbeiqie",
     ]
     assert profile["properties"]["model"] == {"$ref": "#/$defs/modelLabel"}

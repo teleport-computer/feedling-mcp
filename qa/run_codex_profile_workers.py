@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch exactly eight isolated top-level Codex qualification processes.
+"""Launch exactly nine isolated top-level Codex qualification processes.
 
 The launcher is intentionally deterministic and not intelligent.  Intelligence
 lives inside each selected headless Codex profile.  The launcher owns process
@@ -4092,7 +4092,7 @@ def launch(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run eight isolated headless Codex API-key qualification workers"
+        description="Run nine isolated headless Codex API-key qualification workers"
     )
     parser.add_argument("--codex-bin", type=Path, required=True)
     parser.add_argument("--codex-home", type=Path, required=True)
@@ -4163,7 +4163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.diagnostic:
         print("diagnostic Codex qualification workers completed")
     else:
-        print("eight independent Codex qualification workers completed")
+        print("nine independent Codex qualification workers completed")
     return 0
 
 

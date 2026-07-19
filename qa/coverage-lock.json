@@ -10,9 +10,9 @@
     "runtime_admin_token_env": "IO_E2E_ADMIN_TOKEN"
   },
   "execution": {
-    "required_profile_count": 8,
+    "required_profile_count": 9,
     "supervisor_count": 1,
-    "profile_worker_assignment_count": 8,
+    "profile_worker_assignment_count": 9,
     "allow_profile_skip": false,
     "max_profile_concurrency": 3,
     "max_attempts_per_scenario": 2,
@@ -95,6 +95,17 @@
       "provider_key_env": "QA_OPENROUTER_API_KEY",
       "model_env": "QA_OPENROUTER_GLM_MODEL",
       "allowed_model_regex": "^(?:z-ai|thudm)/glm-[a-z0-9][a-z0-9._:-]*$",
+      "reasoning_effort": "medium",
+      "reasoning_expected": true
+    },
+    {
+      "id": "openrouter-kimi",
+      "route_family": "openrouter",
+      "model_family": "kimi",
+      "provider": "openrouter",
+      "provider_key_env": "QA_OPENROUTER_API_KEY",
+      "model_env": "QA_OPENROUTER_KIMI_MODEL",
+      "allowed_model_regex": "^moonshotai/kimi-[a-z0-9][a-z0-9._:-]*$",
       "reasoning_effort": "medium",
       "reasoning_expected": true
     },

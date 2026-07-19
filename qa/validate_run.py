@@ -104,6 +104,7 @@ _PROFILE_METADATA = {
     "openrouter-claude": ("openrouter", "claude", "openrouter"),
     "openrouter-openai": ("openrouter", "openai", "openrouter"),
     "openrouter-glm": ("openrouter", "glm", "openrouter"),
+    "openrouter-kimi": ("openrouter", "kimi", "openrouter"),
     "relay-kongbeiqie": ("relay", "claude", "openai_compatible"),
 }
 _PROFILE_SECRET_AND_MODEL_ENVS = {
@@ -114,6 +115,7 @@ _PROFILE_SECRET_AND_MODEL_ENVS = {
     "openrouter-claude": ("QA_OPENROUTER_API_KEY", "QA_OPENROUTER_CLAUDE_MODEL"),
     "openrouter-openai": ("QA_OPENROUTER_API_KEY", "QA_OPENROUTER_OPENAI_MODEL"),
     "openrouter-glm": ("QA_OPENROUTER_API_KEY", "QA_OPENROUTER_GLM_MODEL"),
+    "openrouter-kimi": ("QA_OPENROUTER_API_KEY", "QA_OPENROUTER_KIMI_MODEL"),
     "relay-kongbeiqie": ("QA_KONGBEIQIE_API_KEY", "QA_KONGBEIQIE_MODEL"),
 }
 _PROFILE_ALLOWED_MODEL_REGEXES = {
@@ -124,6 +126,7 @@ _PROFILE_ALLOWED_MODEL_REGEXES = {
     "openrouter-claude": r"^anthropic/claude-[a-z0-9][a-z0-9._:-]*$",
     "openrouter-openai": (r"^openai/(?:gpt-[a-z0-9][a-z0-9._:-]*|o[a-z0-9._:-]*)$"),
     "openrouter-glm": r"^(?:z-ai|thudm)/glm-[a-z0-9][a-z0-9._:-]*$",
+    "openrouter-kimi": r"^moonshotai/kimi-[a-z0-9][a-z0-9._:-]*$",
     "relay-kongbeiqie": (r"^(?:\[[^\r\n\]|`]{1,32}\])?claude-[a-z0-9][a-z0-9._-]*$"),
 }
 _PROFILE_CONFIGURED_BASE_URLS = {
@@ -134,6 +137,7 @@ _PROFILE_CONFIGURED_BASE_URLS = {
     "openrouter-claude": "https://openrouter.ai/api/v1",
     "openrouter-openai": "https://openrouter.ai/api/v1",
     "openrouter-glm": "https://openrouter.ai/api/v1",
+    "openrouter-kimi": "https://openrouter.ai/api/v1",
     "relay-kongbeiqie": "https://xn--vduyey89e.com/v1",
 }
 _RELAY_BASE_URL_ENVS = {
@@ -363,9 +367,9 @@ _TRACE_LATENCY_CONTRACT = {
     "profile_summary_percentile_method": "nearest_rank",
 }
 _EXECUTION_CONTRACT = {
-    "required_profile_count": 8,
+    "required_profile_count": 9,
     "supervisor_count": 1,
-    "profile_worker_assignment_count": 8,
+    "profile_worker_assignment_count": 9,
     "allow_profile_skip": False,
     "max_profile_concurrency": 3,
     "max_attempts_per_scenario": 2,
@@ -661,7 +665,7 @@ def _validate_coverage(coverage: Any, expected_runtime: str) -> list[str]:
         LOCKED_PROFILE_IDS
     ):
         errors.append(
-            "coverage lock does not contain the exact eight profiles "
+            "coverage lock does not contain the exact nine profiles "
             f"(missing={_fixed_missing(LOCKED_PROFILE_IDS, profile_set)})"
         )
     if "" in profile_set or _duplicates(profile_ids):
@@ -877,7 +881,7 @@ def _validate_orchestration_receipt(
 
     workers = receipt.get("workers")
     if not isinstance(workers, list) or len(workers) != len(PROFILE_AGENT_TYPES):
-        return errors + ["trusted orchestration receipt does not cover eight workers"]
+        return errors + ["trusted orchestration receipt does not cover nine workers"]
     expected_pairs = list(PROFILE_AGENT_TYPES)
     trusted_assignments: list[dict[str, str]] = []
     trusted_profile_hashes: list[str | None] = [None] * len(PROFILE_AGENT_TYPES)
@@ -1194,9 +1198,9 @@ def _validate_result_semantics(
     if result.get("overall_status") != PASS:
         errors.append("overall status is not PASS")
     if result.get("profiles_expected") != len(LOCKED_PROFILE_IDS):
-        errors.append("profiles_expected is not eight")
+        errors.append("profiles_expected is not nine")
     if result.get("profiles_completed") != len(LOCKED_PROFILE_IDS):
-        errors.append("profiles_completed is not eight")
+        errors.append("profiles_completed is not nine")
     errors.extend(_validate_orchestration(result.get("orchestration")))
 
     target = result.get("target")
@@ -1223,7 +1227,7 @@ def _validate_result_semantics(
         LOCKED_PROFILE_IDS
     ):
         errors.append(
-            "result does not contain the exact eight profiles "
+            "result does not contain the exact nine profiles "
             f"(missing={_fixed_missing(LOCKED_PROFILE_IDS, profile_set)})"
         )
     if "" in profile_set or _duplicates(profile_ids):
@@ -1635,7 +1639,7 @@ def _validate_result_semantics(
         errors.append("result summary is missing")
     else:
         if summary.get("pass") != len(LOCKED_PROFILE_IDS):
-            errors.append("summary PASS count is not eight")
+            errors.append("summary PASS count is not nine")
         if any(summary.get(field) != 0 for field in _NONPASS_SUMMARY_FIELDS):
             errors.append("summary contains a non-PASS count")
 

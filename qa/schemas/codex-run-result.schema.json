@@ -48,7 +48,7 @@
     "profiles_expected": {
       "type": "integer",
       "enum": [
-        8
+        9
       ]
     },
     "profiles_completed": {
@@ -245,6 +245,7 @@
             "openrouter-claude",
             "openrouter-openai",
             "openrouter-glm",
+            "openrouter-kimi",
             "relay-kongbeiqie"
           ]
         },
@@ -288,6 +289,7 @@
             "openrouter-claude",
             "openrouter-openai",
             "openrouter-glm",
+            "openrouter-kimi",
             "relay-kongbeiqie"
           ]
         },
@@ -306,7 +308,8 @@
             "claude",
             "openai",
             "gemini",
-            "glm"
+            "glm",
+            "kimi"
           ]
         },
         "provider": {
