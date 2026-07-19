@@ -7903,12 +7903,14 @@
               "provider_transient",
               "system"
             ],
-            "description": "Who the failure belongs to. user_provider is actionable by the user (top up / fix key / fix model name); system must never point the user at their own configuration."
+            "readOnly": true,
+            "description": "Who the failure belongs to. Server-derived from error_class via the notices catalog — a value sent here is NOT trusted (an unknown class always falls back to system, so our own faults are never blamed on the user). user_provider is actionable by the user (top up / fix key / fix model name); system must never point the user at their own configuration."
           },
           "turn_failure_user_text": {
             "type": "string",
             "maxLength": 500,
-            "description": "User-facing copy for the failure, authored server-side. Never contains raw provider detail (which can carry provider HTML, request ids or sensitive context)."
+            "readOnly": true,
+            "description": "User-facing copy for the failure. Server-derived from error_class via the notices catalog — a value sent here is NOT trusted, so the response never carries raw provider detail (which can hold provider HTML, request ids or sensitive context)."
           }
         },
         "additionalProperties": true

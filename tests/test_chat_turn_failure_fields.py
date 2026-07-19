@@ -143,18 +143,26 @@ def test_normal_reply_has_no_turn_failure_fields(client):
     assert "turn_failure_user_text" not in reply
 
 
-def test_user_text_truncated_to_500(client):
-    """契约：user_text ≤ 500，杜绝把原始 provider detail 灌进用户可见文案。"""
+def test_user_text_is_server_authored_not_payload(client):
+    """归责红线的执行点：blame 与 user_text 由服务端按 error_class 查 catalog，
+    **不信 payload**。
+
+    透传 payload 意味着一个写错/被改的 consumer 能把我们自己的故障标成
+    user_provider、或把任意 900 字（可能夹带 provider HTML、request id、敏感
+    上下文）灌进用户可见文案。截断不是脱敏，注释和 OpenAPI 宣称的
+    「服务端组好」必须真由服务端组。
+    """
     user_id, api_key = _register(client)
-    parent_id = _send_user_msg(client, user_id, api_key)
+    parent_id = _send_user_msg(client, user_id, api_key, "u_auth")
 
     res = client.post(
         "/v1/chat/response",
         json={
-            "envelope": _env(user_id, "r3"),
+            "envelope": _env(user_id, "r_auth"),
             "source": "chat",
             "reply_to_message_id": parent_id,
-            "turn_failure_error_class": "unknown",
+            "turn_failure_error_class": "quota_insufficient",
+            # 恶意/错误的 poster：把我们的锅标成用户的，并塞长文
             "turn_failure_blame": "system",
             "turn_failure_user_text": "x" * 900,
         },
@@ -163,7 +171,36 @@ def test_user_text_truncated_to_500(client):
     assert res.status_code in (200, 201), res.get_data(as_text=True)
 
     reply = [m for m in _history(client, api_key) if m.get("role") == "openclaw"][-1]
-    assert len(reply["turn_failure_user_text"]) == 500
+    # catalog 说 quota_insufficient 是 user_provider —— payload 的 "system" 被忽略
+    assert reply["turn_failure_blame"] == "user_provider"
+    assert reply["turn_failure_user_text"] == "模型服务额度不足，充值后再发消息即可恢复。"
+    assert "x" * 20 not in reply["turn_failure_user_text"]
+    assert len(reply["turn_failure_user_text"]) <= 500
+
+
+def test_payload_cannot_blame_user_for_our_failure(client):
+    """反向：我们自己的错（turn_timeout=system），poster 谎称 user_provider
+    也必须被服务端纠正回 system —— 不是他的错绝不能赖给他。"""
+    user_id, api_key = _register(client)
+    parent_id = _send_user_msg(client, user_id, api_key, "u_blame")
+
+    client.post(
+        "/v1/chat/response",
+        json={
+            "envelope": _env(user_id, "r_blame"),
+            "source": "chat",
+            "reply_to_message_id": parent_id,
+            "turn_failure_error_class": "turn_timeout",
+            "turn_failure_blame": "user_provider",
+            "turn_failure_user_text": "去重新保存你的 API Key",
+        },
+        headers=_headers(api_key),
+    )
+
+    reply = [m for m in _history(client, api_key) if m.get("role") == "openclaw"][-1]
+    assert reply["turn_failure_blame"] == "system"
+    for banned in ("API Key", "充值", "设置里"):
+        assert banned not in reply["turn_failure_user_text"]
 
 
 def test_parent_metadata_mirrors_turn_failure(client):
@@ -255,3 +292,57 @@ def test_turn_failure_reaches_incremental_since_feed(client):
     assert c["turn_failure_error_class"] == "quota_insufficient"
     assert c["turn_failure_blame"] == "user_provider"
     assert c["reply_to_message_id"] == parent_id, "拿到失败事件却无法配对回用户消息"
+
+
+@pytest.mark.parametrize("source", ["heartbeat", "agent_initiated_proactive", "verify_ping"])
+def test_background_lanes_never_carry_turn_failure(client, source):
+    """红线门①：后台车道失败不进聊天流（Seven 2026-07-11）。
+
+    心跳/主动/capture/dream 的失败对用户不可行动，进聊天流会被自己看不见的
+    车道刷屏。consumer 侧已不打标，服务端再独立卡一道——这条目前只靠一个 and
+    从句撑着，重构一改就静默失守，故用测试钉住。
+    """
+    user_id, api_key = _register(client)
+    parent_id = _send_user_msg(client, user_id, api_key, f"u_{source[:6]}")
+
+    client.post(
+        "/v1/chat/response",
+        json={
+            "envelope": _env(user_id, f"r_{source[:6]}"),
+            "source": source,
+            "reply_to_message_id": parent_id,
+            "turn_failure_error_class": "quota_insufficient",
+            "turn_failure_blame": "user_provider",
+            "turn_failure_user_text": "额度不足",
+        },
+        headers=_headers(api_key),
+    )
+
+    for m in _history(client, api_key):
+        assert "turn_failure_error_class" not in m, f"{source} 车道漏进了聊天流"
+        assert "reply_error_class" not in m
+
+
+def test_system_role_never_carries_turn_failure(client):
+    """红线门②：role=system 的技术通知气泡不带这些字段——它本就不算对用户
+    消息的回复（07-06 spec 的 role 审计表），带上会让客户端把通知误配成回合结果。"""
+    user_id, api_key = _register(client)
+    parent_id = _send_user_msg(client, user_id, api_key, "u_sysrole")
+
+    client.post(
+        "/v1/chat/response",
+        json={
+            "envelope": _env(user_id, "r_sysrole"),
+            "source": "chat",
+            "role": "system",
+            "notice_kind": "upstream_error",
+            "reply_to_message_id": parent_id,
+            "turn_failure_error_class": "quota_insufficient",
+            "turn_failure_blame": "user_provider",
+            "turn_failure_user_text": "额度不足",
+        },
+        headers=_headers(api_key),
+    )
+
+    for m in _history(client, api_key):
+        assert "turn_failure_error_class" not in m

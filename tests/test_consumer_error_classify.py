@@ -376,7 +376,7 @@ def test_turn_failure_kwargs_empty_for_none():
     assert crc.turn_failure_post_kwargs(None) == {}
 
 
-def test_turn_failure_kwargs_truncate_long_user_text(monkeypatch):
+def test_turn_failure_kwargs_truncate_long_user_text():
     """契约：user_text ≤ 500，杜绝把长文灌进用户可见文案。"""
     notice = crc.AgentErrorNotice("unknown", "system", "x" * 900, "detail")
     assert len(crc.turn_failure_post_kwargs(notice)["turn_failure_user_text"]) == 500

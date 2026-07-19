@@ -224,6 +224,12 @@ worker 内存时才落库，跨 worker 可能静默写失败。
 | `turn_failure_error_class` / `reply_error_class` | 见通道③的 error_class 全集 | 非空即表示这轮是兜底糊的、不是真回复 |
 | `turn_failure_blame` / `reply_blame` | `user_provider` \| `provider_transient` \| `system` | 决定渲染，见下 |
 | `turn_failure_user_text` / `reply_user_text` | ≤500 字 | 服务端已组好的用户可见文案，**直接显示，不要本地映射** |
+
+**blame 与 user_text 由服务端按 `error_class` 查 `notices/catalog.py` 下发，不采信
+poster 提交的值**（`chat_core._turn_failure_attribution`）。理由是归责红线：透传意味着
+一个写错的 consumer 能把我们自己的故障标成 `user_provider`、让用户白跑一趟改配置。
+未知 `error_class` 一律落 `system`——宁可我们背锅，也不误导用户。客户端因此可以信任
+这两个字段，无需再做合法性判断。
 | `reply_to_message_id` | 消息 id | 兜底消息指向的用户消息，客户端靠它配对 |
 
 **不下发 detail**：原始上游报错可能夹带 provider HTML、request id 乃至敏感上下文。

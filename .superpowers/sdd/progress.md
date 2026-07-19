@@ -9,3 +9,7 @@ Pre-flight：修了计划里两处自造缺陷（测试 inline __import__("uuid"
 已确认 chat_core.py 无模块级 log，Task 2 需新增。
 
 ## 任务状态
+Task 1: complete (5aa5e448, 3 tests, chat regression 658 passed)
+Task 2: complete (ef2884b0, +2 tests, 5 passed; chat regression 后台跑)
+Task 3: complete (62374ad4, consumer 34 passed, 端到端 since 实证 6 passed)
+Task 4-7: complete (iOS 71a45ab/a20eb00/7c000f4, contract 64789dfb)

@@ -40,6 +40,8 @@ from chat import service as chat_service
 from core import envelope as core_envelope
 from core import wake_bus
 from core.store import UserStore
+from notices import catalog as notices_catalog
+from notices import core as notices_core
 from proactive import service as proactive_service
 from push import service as push_service
 
@@ -128,6 +130,37 @@ def _proactive_delivery_decision_v2(store: UserStore, payload: dict):
 # --------------------------------------------------------------------------- #
 # debug-trace helpers (moved verbatim from the Flask route; pure store logic)
 # --------------------------------------------------------------------------- #
+
+def _turn_failure_attribution(error_class: str, payload: dict) -> tuple[str, str]:
+    """回合失败的归责与用户文案 —— **服务端按 error_class 查表，不信 payload**。
+
+    归责红线（docs/FRONTEND_ERROR_CONTRACT.md §二）：provider 的错要抛给用户，
+    但不是他的错**绝不能赖给他**。透传 payload 的 blame 意味着一个写错/被改的
+    consumer 能把我们自己的故障标成 user_provider，让用户白跑一趟改配置——这
+    正是红线要防的那件事。catalog.blame_for 对未知 error_class 安全落 system，
+    与另外两条通道（notices.core 丢弃坏枚举、asgi.responses 直接 raise）同纪律。
+
+    user_text 同理：注释和 OpenAPI 都宣称「服务端组好、绝不含原始 provider
+    detail」，那就必须真由服务端组——payload 里的任意 500 字撑不起这个保证
+    （截断不是脱敏）。catalog 的文案与 consumer 分类器由
+    tests/test_catalog_consumer_parity.py 锁住不漂移。
+
+    payload 里的同名字段只在 catalog 未收录该 error_class 时作降级兜底，且
+    blame 仍强制落在合法枚举内。
+    """
+    blame = notices_catalog.blame_for(error_class)
+    user_text = notices_catalog.user_text_for(error_class)
+    if error_class not in notices_catalog.ERROR_CLASSES:
+        # 未收录的新 slug：文案退回 poster 提供的（老后端 + 新 consumer 的过渡期），
+        # 但 blame 绝不退让——非法值一律 system，宁可我们背锅也不误导用户。
+        fallback_text = str(payload.get("turn_failure_user_text") or "")[:500]
+        if fallback_text:
+            user_text = fallback_text
+        raw_blame = str(payload.get("turn_failure_blame") or "")
+        if raw_blame in notices_core.VALID_BLAME:
+            blame = raw_blame
+    return blame, user_text
+
 
 def _reply_to_message_id(payload: dict) -> str:
     """The reply target id from any of the accepted payload aliases (trimmed)."""
@@ -662,11 +695,12 @@ def write_response(
     # 只做加法：不携带这些字段时，本段完全不执行，成功路径零变化。
     turn_failure_error_class = str(payload.get("turn_failure_error_class") or "")[:64]
     if turn_failure_error_class and role != "system" and source == "chat":
+        turn_failure_blame, turn_failure_user_text = _turn_failure_attribution(
+            turn_failure_error_class, payload
+        )
         extra["turn_failure_error_class"] = turn_failure_error_class
-        extra["turn_failure_blame"] = str(payload.get("turn_failure_blame") or "")[:32]
-        # ≤500 且只放 catalog 的 user_text——绝不放原始 provider detail
-        # （可能夹带 provider HTML / request id / 敏感上下文）。
-        extra["turn_failure_user_text"] = str(payload.get("turn_failure_user_text") or "")[:500]
+        extra["turn_failure_blame"] = turn_failure_blame
+        extra["turn_failure_user_text"] = turn_failure_user_text
         if reply_to_message_id:
             extra["reply_to_message_id"] = reply_to_message_id
     msg = store.append_chat(
@@ -684,17 +718,23 @@ def write_response(
             "replied_at": f"{time.time():.3f}",
         }
         if turn_failure_error_class and source == "chat":
+            _blame, _user_text = _turn_failure_attribution(turn_failure_error_class, payload)
             _meta["reply_error_class"] = turn_failure_error_class
-            _meta["reply_blame"] = str(payload.get("turn_failure_blame") or "")[:32]
-            _meta["reply_user_text"] = str(payload.get("turn_failure_user_text") or "")[:500]
+            _meta["reply_blame"] = _blame
+            _meta["reply_user_text"] = _user_text
         # 返回 None = parent 不在本 worker 内存里，metadata 静默没落库。既有代码
         # 忽略了返回值；失败必须可见，但绝不能影响回合收尾——兜底回复消息才是
         # 权威载体，这里只是冗余（spec §2.1）。
+        # 返回 None = parent 不在本 worker 内存里，metadata 没落库。这对【所有】
+        # 跨 worker 的回复都会发生（含成功回复），按 WARNING 记会按正常回复量刷屏；
+        # 只有携带失败信息时才值得告警——那份是冗余，权威在兜底消息上，丢了不影响
+        # 功能，但要可见（spec §2.1）。
         if store.update_chat_message_metadata(reply_to_message_id, _meta) is None:
-            log.warning(
-                "chat reply metadata not persisted (parent not in this worker): parent=%s",
-                reply_to_message_id,
-            )
+            if turn_failure_error_class:
+                log.warning(
+                    "turn-failure metadata not persisted (parent not in this worker): parent=%s",
+                    reply_to_message_id,
+                )
         _maybe_mark_first_chat_ok(store, reply_to_message_id)
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
