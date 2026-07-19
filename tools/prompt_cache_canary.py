@@ -48,6 +48,32 @@ class Config:
 
 RequestFn = Callable[..., tuple[int, dict[str, Any]]]
 _MAX_UNCACHED_INPUT_TOKENS = 768
+_FOLLOWUP_MESSAGES = (
+    "Invoke no tools or functions. Return ordinary assistant text "
+    "containing exactly CACHE_CANARY_TWO.",
+    "Invoke no tools or functions. Return ordinary assistant text "
+    "containing exactly CACHE_CANARY_THREE.",
+    "Invoke no tools or functions. Return ordinary assistant text "
+    "containing exactly CACHE_CANARY_FOUR.",
+)
+_EXPECTED_TURNS = 1 + len(_FOLLOWUP_MESSAGES)
+_FOLLOWUP_SETTLE_SEC = 1.0
+
+
+@dataclass(frozen=True)
+class CacheProof:
+    route: str
+    first_prompt_tokens: int
+    minimum_cache_read_tokens: int
+    followup_cache_read_tokens: tuple[int | None, ...]
+    qualifying_hit_turns: tuple[int, ...]
+
+    @property
+    def best_cache_read_tokens(self) -> int:
+        return max(
+            (value or 0 for value in self.followup_cache_read_tokens),
+            default=0,
+        )
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -172,10 +198,11 @@ def _require_status(status: int, expected: int, step: str, body: dict) -> None:
     raise CanaryFailure(f"{step} returned {status} ({error})")
 
 
-def _long_first_prompt(prefix_chars: int) -> str:
+def _long_first_prompt(prefix_chars: int, probe_nonce: str) -> str:
     instruction = (
         "Runtime prompt-cache deployment canary. Invoke no tools or functions. "
         "Return ordinary assistant text containing exactly CACHE_CANARY_ONE.\n"
+        f"Unique probe nonce: {probe_nonce}\n"
         "The following neutral sequence is a stable cache prefix:\n"
     )
     repeated = ("stable-cache-prefix-token " * (prefix_chars // 26 + 1))
@@ -335,12 +362,27 @@ def validate_cache_proof(
     cache: dict[str, Any],
     *,
     expected_route: str = "",
-) -> str:
-    """Validate exact two-turn cache evidence; return the opaque route id."""
-    if int(cache.get("sampled_turns") or 0) != 2:
-        raise CanaryFailure("cache proof requires exactly two sampled turns")
-    if int(cache.get("model_calls") or 0) != 2:
-        raise CanaryFailure("cache proof requires exactly two logical model calls")
+    expected_turns: int = _EXPECTED_TURNS,
+) -> CacheProof:
+    """Validate an isolated warm-up plus bounded follow-up cache evidence.
+
+    Automatic provider caches are allowed to cold-miss or move to a fallback
+    endpoint once.  Requiring the very first follow-up to hit made the deploy
+    gate stochastic.  The probe now uses a per-run nonce and accepts only a
+    *full-prefix* hit from one of several sequential follow-ups on the same
+    account/session.  Every turn must still be a single logical provider call
+    with complete usage/cache telemetry, zero hidden retries, and one Feedling
+    route fingerprint.
+    """
+    expected_turns = int(expected_turns)
+    if expected_turns < 2:
+        raise ValueError("cache proof needs a warm-up and at least one follow-up")
+    if int(cache.get("sampled_turns") or 0) != expected_turns:
+        raise CanaryFailure(
+            f"cache proof requires exactly {expected_turns} sampled turns")
+    if int(cache.get("model_calls") or 0) != expected_turns:
+        raise CanaryFailure(
+            f"cache proof requires exactly {expected_turns} logical model calls")
     if float(cache.get("usage_telemetry_coverage") or 0.0) != 1.0:
         raise CanaryFailure("usage telemetry coverage is not 100%")
     if float(cache.get("cache_telemetry_coverage") or 0.0) != 1.0:
@@ -355,8 +397,9 @@ def validate_cache_proof(
     if expected_route and route != expected_route:
         raise CanaryFailure("route-bound cache proof changed route fingerprint")
     turns = cache.get("turns")
-    if not isinstance(turns, list) or len(turns) != 2:
-        raise CanaryFailure("cache proof requires two chronological turn rows")
+    if not isinstance(turns, list) or len(turns) != expected_turns:
+        raise CanaryFailure(
+            f"cache proof requires {expected_turns} chronological turn rows")
     for index, turn in enumerate(turns, start=1):
         if not isinstance(turn, dict) or turn.get("failed") is not False:
             raise CanaryFailure(f"cache canary turn {index} failed")
@@ -370,19 +413,102 @@ def validate_cache_proof(
     first_prompt_tokens = int(turns[0].get("prompt_tokens") or 0)
     if first_prompt_tokens <= 0:
         raise CanaryFailure("first turn omitted prompt-token telemetry")
-    cache_read_tokens = int(turns[1].get("cache_read_tokens") or 0)
-    if cache_read_tokens <= 0:
-        raise CanaryFailure("second turn reported zero cache-read tokens")
     minimum_cache_read = max(
         1024,
         first_prompt_tokens - _MAX_UNCACHED_INPUT_TOKENS,
     )
-    if cache_read_tokens < minimum_cache_read:
+
+    followup_reads: list[int | None] = []
+    for turn in turns[1:]:
+        raw = turn.get("cache_read_tokens")
+        if raw is None or isinstance(raw, bool):
+            followup_reads.append(None)
+            continue
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            followup_reads.append(None)
+            continue
+        followup_reads.append(max(0, parsed))
+
+    if all(value is None for value in followup_reads):
         raise CanaryFailure(
-            "second-turn cache read did not cover the synthetic conversation "
-            f"prefix ({cache_read_tokens} < {minimum_cache_read})"
+            "all follow-up turns omitted cache-read token telemetry")
+    best_cache_read = max((value or 0 for value in followup_reads), default=0)
+    if best_cache_read <= 0:
+        raise CanaryFailure(
+            "all follow-up turns reported zero cache-read tokens")
+    if best_cache_read < minimum_cache_read:
+        raise CanaryFailure(
+            "no follow-up cache read covered the synthetic conversation "
+            f"prefix ({best_cache_read} < {minimum_cache_read})"
         )
-    return route
+    qualifying = tuple(
+        index
+        for index, value in enumerate(followup_reads, start=2)
+        if value is not None and value >= minimum_cache_read
+    )
+    return CacheProof(
+        route=route,
+        first_prompt_tokens=first_prompt_tokens,
+        minimum_cache_read_tokens=minimum_cache_read,
+        followup_cache_read_tokens=tuple(followup_reads),
+        qualifying_hit_turns=qualifying,
+    )
+
+
+def _proof_diagnostics(cache: dict[str, Any]) -> str:
+    """Return content-free, secret-free evidence suitable for CI logs."""
+
+    def _number(value: Any) -> int | float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return value
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    rows = []
+    turns = cache.get("turns")
+    for index, turn in enumerate(turns if isinstance(turns, list) else [], start=1):
+        if not isinstance(turn, dict):
+            rows.append({"turn": index, "malformed": True})
+            continue
+        raw_status = str(turn.get("status") or "")[:80]
+        safe_status = "".join(
+            char for char in raw_status if char.isalnum() or char in "_.:-"
+        )
+        rows.append({
+            "turn": index,
+            "prompt_tokens": _number(turn.get("prompt_tokens")),
+            "cache_read_tokens": _number(turn.get("cache_read_tokens")),
+            "cache_write_tokens": _number(turn.get("cache_write_tokens")),
+            "cache_miss_tokens": _number(turn.get("cache_miss_tokens")),
+            "usage_reported_calls": _number(turn.get("usage_reported_calls")),
+            "cache_reported_calls": _number(turn.get("cache_reported_calls")),
+            "model_calls": _number(turn.get("model_calls")),
+            "retries": _number(turn.get("retries")),
+            "failed": turn.get("failed") if isinstance(turn.get("failed"), bool) else None,
+            "status": safe_status,
+        })
+    diagnostic = {
+        "sampled_turns": _number(cache.get("sampled_turns")),
+        "model_calls": _number(cache.get("model_calls")),
+        "usage_telemetry_coverage": _number(
+            cache.get("usage_telemetry_coverage")),
+        "cache_telemetry_coverage": _number(
+            cache.get("cache_telemetry_coverage")),
+        "route_identity_coverage": _number(
+            cache.get("route_identity_coverage")),
+        "same_feedling_route": (
+            int(cache.get("route_fingerprint_count") or 0) == 1
+            and float(cache.get("route_identity_coverage") or 0.0) == 1.0
+        ),
+        "turns": rows,
+    }
+    return json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
 
 
 def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
@@ -429,9 +555,18 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
         if test_status != "ok":
             raise CanaryFailure("model_api setup did not reach test_status=ok")
 
+        # Put a fresh nonce near the front of the long user prefix.  It is never
+        # printed, but remains verbatim in later history turns.  This prevents a
+        # previous CI run from warming the same synthetic conversation and
+        # producing a false green on this run's first request.
+        probe_nonce = secrets.token_hex(16)
         window_start = time.time() - 1.0
         first_sent = _send_until_accepted(
-            config, request, api_key, _long_first_prompt(config.prefix_chars))
+            config,
+            request,
+            api_key,
+            _long_first_prompt(config.prefix_chars, probe_nonce),
+        )
         _wait_for_reply(
             config,
             request,
@@ -440,21 +575,22 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
             user_id,
             window_start,
         )
-        second_sent = _send_until_accepted(
-            config,
-            request,
-            api_key,
-            "Invoke no tools or functions. Return ordinary assistant text "
-            "containing exactly CACHE_CANARY_TWO.",
-        )
-        _wait_for_reply(
-            config,
-            request,
-            api_key,
-            second_sent,
-            user_id,
-            window_start,
-        )
+        for followup in _FOLLOWUP_MESSAGES:
+            time.sleep(_FOLLOWUP_SETTLE_SEC)
+            sent_at = _send_until_accepted(
+                config,
+                request,
+                api_key,
+                followup,
+            )
+            _wait_for_reply(
+                config,
+                request,
+                api_key,
+                sent_at,
+                user_id,
+                window_start,
+            )
 
         # Metrics are flushed at the terminal turn boundary. History can become
         # visible a moment earlier, so poll the bounded proof briefly.
@@ -473,10 +609,17 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
             except TransientCanaryFailure:
                 time.sleep(2)
                 continue
-            if int(last_cache.get("sampled_turns") or 0) >= 2:
+            if int(last_cache.get("sampled_turns") or 0) >= _EXPECTED_TURNS:
                 break
             time.sleep(2)
-        route = validate_cache_proof(last_cache)
+        try:
+            proof = validate_cache_proof(last_cache)
+        except CanaryFailure:
+            print(
+                "[prompt-cache-canary] proof diagnostics: "
+                + _proof_diagnostics(last_cache)
+            )
+            raise
         route_bound: dict[str, Any] | None = None
         route_deadline = time.time() + 30.0
         while time.time() < route_deadline:
@@ -487,7 +630,7 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
                     user_id=user_id,
                     since_ts=window_start,
                     until_ts=time.time() + 1.0,
-                    route_fingerprint=route,
+                    route_fingerprint=proof.route,
                 )
                 break
             except TransientCanaryFailure:
@@ -495,21 +638,35 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
         if route_bound is None:
             raise CanaryFailure(
                 "route-bound v2 metrics unavailable before proof timeout")
-        validate_cache_proof(route_bound, expected_route=route)
-        cache_read = int(route_bound["turns"][1]["cache_read_tokens"])
+        try:
+            route_proof = validate_cache_proof(
+                route_bound,
+                expected_route=proof.route,
+            )
+        except CanaryFailure:
+            print(
+                "[prompt-cache-canary] route-bound proof diagnostics: "
+                + _proof_diagnostics(route_bound)
+            )
+            raise
+        measurement_turns = len(route_proof.followup_cache_read_tokens)
+        hit_turns = len(route_proof.qualifying_hit_turns)
         result = {
             "model": config.model,
-            "route_fingerprint": route,
-            "first_turn_prompt_tokens": int(
-                route_bound["turns"][0]["prompt_tokens"]),
-            "second_turn_cache_read_tokens": cache_read,
+            "route_fingerprint": route_proof.route,
+            "first_turn_prompt_tokens": route_proof.first_prompt_tokens,
+            "measurement_turns": measurement_turns,
+            "qualifying_cache_hit_turns": hit_turns,
+            "cache_hit_rate": hit_turns / measurement_turns,
+            "best_cache_read_tokens": route_proof.best_cache_read_tokens,
             "hit_ratio": route_bound.get("hit_ratio"),
         }
         print(
             "[prompt-cache-canary] CACHE HIT PROVEN: "
             f"model={config.model} "
-            f"second_turn_cache_read_tokens={cache_read} "
-            f"hit_ratio={result['hit_ratio']}"
+            f"qualifying_followup_hits={hit_turns}/{measurement_turns} "
+            f"best_cache_read_tokens={route_proof.best_cache_read_tokens} "
+            f"token_hit_ratio={result['hit_ratio']}"
         )
         return result
     finally:
@@ -525,12 +682,23 @@ def run(config: Config, *, request: RequestFn = _http) -> dict[str, Any]:
 
 
 def main() -> int:
-    try:
-        for config in _env_configs():
-            print(f"[prompt-cache-canary] probing model={config.model}")
+    failures: list[str] = []
+    for config in _env_configs():
+        print(f"[prompt-cache-canary] probing model={config.model}")
+        try:
             run(config)
-    except CanaryFailure as exc:
-        print(f"PROMPT CACHE CANARY FAIL: {exc}", file=sys.stderr)
+        except CanaryFailure as exc:
+            failures.append(f"{config.model}: {exc}")
+            print(
+                f"[prompt-cache-canary] MODEL FAIL: model={config.model} "
+                f"reason={exc}",
+                file=sys.stderr,
+            )
+    if failures:
+        print(
+            "PROMPT CACHE CANARY FAIL: " + "; ".join(failures),
+            file=sys.stderr,
+        )
         return 1
     print("PROMPT CACHE CANARY OK")
     return 0

@@ -19,7 +19,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client as pc  # noqa: E402
+from capabilities import tool_schema  # noqa: E402
 from model_api_runtime.v2 import context as v2_context  # noqa: E402
+from model_api_runtime.v2 import prompt_frontier  # noqa: E402
+from model_api_runtime.v2 import worker as v2_worker  # noqa: E402
 from workspace.backends import InMemoryWorkspaceBackend  # noqa: E402
 from workspace.prompt import render_trusted_prefix_blocks  # noqa: E402
 from provider_types import (  # noqa: E402
@@ -620,6 +623,102 @@ def test_openrouter_two_turn_runtime_data_keeps_existing_cache_boundaries() -> N
     )
     assert _nested_cache_controls(first["messages"][-1]["content"]) == []
     assert first["tools"] == second["tools"] == without_data["tools"]
+
+
+def test_openrouter_openai_production_prompt_has_large_stable_cache_prefix() -> None:
+    """Pin the exact shape used by the live automatic-cache deployment probe.
+
+    The final runtime-data block is deliberately dynamic and therefore cannot
+    be part of the next turn's shared prefix.  Everything before it—including
+    the real 9k synthetic user message—and the complete production tool catalog
+    must remain byte/structure identical across separately assembled jobs.
+    """
+    long_user = (
+        "Runtime prompt-cache deployment canary.\n"
+        + "stable-cache-prefix-token " * 400
+    )[:9000]
+    tools = tool_schema.build_tool_specs()
+    first_messages = v2_worker._make_build_messages_fn(
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+        summary="",
+        tail=[{"role": "user", "content": long_user}],
+        extra_context=v2_context.action_context_str({
+            "perception_snapshot": [{
+                "ok": True,
+                "data": {"now": "2026-07-18T10:00:01Z"},
+            }],
+        }),
+    )([])
+    second_messages = v2_worker._make_build_messages_fn(
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+        summary="",
+        tail=[
+            {"role": "user", "content": long_user},
+            {"role": "assistant", "content": "CACHE_CANARY_ONE"},
+            {"role": "user", "content": "Return CACHE_CANARY_TWO."},
+        ],
+        extra_context=v2_context.action_context_str({
+            "perception_snapshot": [{
+                "ok": True,
+                "data": {"now": "2026-07-18T10:00:02Z"},
+            }],
+        }),
+    )([])
+
+    config = pc.ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-4.1-mini",
+        api_key="sk-test",
+        prompt_cache_key=CACHE_KEY,
+        context_window_tokens=128_000,
+    )
+
+    def build(messages: list[dict]) -> dict:
+        return pc._build_openai_compat_payload(
+            provider=config.provider,
+            model=config.model,
+            messages=messages,
+            temperature=None,
+            max_tokens=256,
+            response_format=None,
+            extra_body=None,
+            include_reasoning=False,
+            tools=tools,
+            prompt_cache_key=config.prompt_cache_key,
+        )
+
+    first = build(first_messages)
+    second = build(second_messages)
+    assert {
+        "web_search",
+        "web_fetch",
+        "memory_search",
+        "workspace_read",
+        "workspace_write",
+        "task",
+        "reply",
+    }.issubset({spec.name for spec in tools})
+    assert first["session_id"] == second["session_id"] == CACHE_KEY
+    assert first["tools"] == second["tools"]
+    assert len(long_user) == 9000
+    assert _wire_message_text(first["messages"][-1]).startswith(
+        v2_context.RUNTIME_CONTEXT_HEADER
+    )
+    assert first["messages"][:-1] == second["messages"][:2]
+    assert {
+        key: value for key, value in first.items() if key != "messages"
+    } == {
+        key: value for key, value in second.items() if key != "messages"
+    }
+
+    model_limit = prompt_frontier.resolve_model_limit_from_config(config)
+    for messages in (first_messages, second_messages):
+        plan = prompt_frontier.plan_provider_round(
+            model_limit=model_limit,
+            messages=messages,
+            tools=tools,
+        )
+        assert "tool_schemas" not in plan.omitted_optional_components
 
 
 def test_openai_chat_two_turn_runtime_data_keeps_existing_cache_contract() -> None:

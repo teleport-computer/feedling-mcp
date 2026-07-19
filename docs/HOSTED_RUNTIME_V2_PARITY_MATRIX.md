@@ -177,12 +177,22 @@ eagerly place it in the prompt or cache prefix: after an explicit
 `workspace_read`, later outbound web/MCP/`task` tools are removed for that turn.
 
 The checked-in live canary currently uses OpenRouter with an OpenAI-family model
-and an Anthropic-family model. It proves that two real Hosted Runtime V2 turns
-stay on one route, make no hidden retry, and report a non-zero second-turn cache
-read over a long stable synthetic conversation prefix. It does **not** yet prove
-native Anthropic, native Bedrock, or mutation of the newly added trusted
-`/skills` prefix in a deployed environment. Those remain explicit
-post-deploy canary work rather than inferred success from unit tests.
+and an Anthropic-family model. Each model probe places a fresh random nonce near
+the front of a long synthetic user prefix, then runs one warm-up plus three
+sequential follow-ups on the same account/session. This prevents an earlier CI
+run from pre-warming the probe. At least one follow-up must report a cache read
+covering the first turn's complete stable prefix; all four turns must stay on one
+Feedling route, make exactly one logical model call, make no hidden retry, and
+report complete usage/cache telemetry. A cold miss on only the first follow-up
+does not fail the deployment because OpenRouter may move to a fallback upstream.
+Failures emit content-free per-turn token diagnostics while preserving `NULL`
+versus explicit zero. Both model probes run before failures are aggregated.
+
+The canary does **not** yet prove native Anthropic, native Bedrock, or mutation
+of the newly added trusted `/skills` prefix in a deployed environment. Those
+remain explicit post-deploy canary work rather than inferred success from unit
+tests. Editable working memory is intentionally pull-only and therefore is not
+an eager prompt-cache boundary.
 
 ## Aggregate telemetry and encrypted full trajectories
 
@@ -319,8 +329,9 @@ identity cannot stand in for the fleet.
    p50/p95 and wasted-prewarm rate.
 3. Define operator retention/export policy and restricted inspection tooling for
    encrypted trajectories; neither is required by the live agent loop.
-4. Extend the live prompt-cache canary to exercise skills/working-memory
-   boundaries and native Bedrock where credentials are available.
+4. Extend the live prompt-cache canary to exercise trusted `/skills` mutation
+   boundaries and native Bedrock where credentials are available. Editable
+   working memory remains pull-only by design rather than an eager cache prefix.
 5. Provision the second production runner, deploy the reviewed V2-only images
    across every live environment, and verify zero hosted resident processes.
 
