@@ -393,6 +393,12 @@ wave 并行落 CAS，同一路径/祖先子孙路径与外部 effectful mutation
 即时折入。workspace/summary/trajectory 在库中是加密信封，trusted runtime 解密后
 才把普通明文交给模型；模型从来不吃 ciphertext。
 
+当当前用户明确要求她根据既有对话创建自己的声音时，Runtime V2 会向模型开放一次
+`voice_design` 设备动作。模型自己写英文 ElevenLabs Voice Design 描述，不走试听候选；
+最终加密回复内封入 `voice.design`，由 IO 设备使用本地保存的 ElevenLabs key 生成并
+选中 Voice ID。后端不接触该 key，也不直接调用 ElevenLabs。新的用户消息会作废尚未
+发布的动作；外部内容或私密文本读取之后也不会再开放这个出站动作。
+
 > **现状标注（2026-07-18）**：下面 §3.1–§3.7 保存的是已经退役的 legacy
 > inline prompt/controller 的历史说明，不是 fallback，也不能被 hosted 账号
 > 重新选择。现行实现与状态以 `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`、

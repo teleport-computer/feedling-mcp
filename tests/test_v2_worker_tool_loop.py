@@ -12,6 +12,8 @@ drive specific round shapes).
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import sys
 from pathlib import Path
 
@@ -271,6 +273,76 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_explicit_voice_design_seals_one_device_action_into_final_reply(monkeypatch):
+    uid = "u_toolloop_voice_design"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-voice-design")
+
+    _patch_real_write(monkeypatch)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({"items": []}),
+    )
+    description = (
+        "A warm young adult feminine voice with a soft low register, clear "
+        "Mandarin-friendly delivery, measured pacing, intimate presence, "
+        "and restrained expressiveness."
+    )
+    calls = _script_provider(
+        monkeypatch,
+        [
+            _tool_round(
+                _tc(
+                    "voice-1",
+                    "voice_design",
+                    voice_name="暮光",
+                    voice_description=description,
+                )
+            ),
+            _text_round("我想好了，这应该就是我的声音。"),
+        ],
+    )
+    deps = _deps(messages=[{
+        "id": "m1",
+        "ts": 10.0,
+        "role": "user",
+        "content": (
+            "根据我们的聊天记录和你的长期记忆，你觉得你会发出什么声音？"
+            "帮我生成，我希望是女孩子的声音，是好听的、性感的。"
+        ),
+    }])
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 2
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    sealed = bubbles[0]["body_ct"]
+    assert worker._strip_client_actions(sealed) == "我想好了，这应该就是我的声音。"
+    encoded = sealed.split(worker._CLIENT_ACTION_MARKER_PREFIX, 1)[1].split(
+        worker._CLIENT_ACTION_MARKER_SUFFIX,
+        1,
+    )[0]
+    encoded += "=" * (-len(encoded) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(encoded))
+    assert payload["version"] == 1
+    assert payload["actions"][0]["type"] == "voice.design"
+    assert payload["actions"][0]["voice_name"] == "暮光"
+    assert payload["actions"][0]["voice_description"] == description
 
 
 def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(

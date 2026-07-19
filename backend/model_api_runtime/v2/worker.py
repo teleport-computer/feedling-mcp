@@ -31,6 +31,7 @@ ENCLAVE_SEMAPHORE 框住 turn 里所有 enclave-bound 调用（provider-key 解�
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import hashlib
 import inspect
@@ -39,6 +40,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -82,6 +84,109 @@ _TRAJECTORY_REVIEW_MAX_TOKENS = 1200
 _TRAJECTORY_REVIEW_TIMEOUT_SEC = 75.0
 
 _MUTATION_RECOVERY_BLOCKED_ERROR = "error: mutation_disabled_during_recovery"
+_VOICE_DESIGN_NOT_AUTHORIZED_ERROR = (
+    "error: voice_design_requires_current_explicit_user_request"
+)
+_CLIENT_ACTION_MARKER_PREFIX = "<!--io-client-actions:"
+_CLIENT_ACTION_MARKER_SUFFIX = "-->"
+_CLIENT_ACTION_MARKER_RE = re.compile(
+    re.escape(_CLIENT_ACTION_MARKER_PREFIX)
+    + r"[A-Za-z0-9_-]+"
+    + re.escape(_CLIENT_ACTION_MARKER_SUFFIX)
+)
+
+_VOICE_DESIGN_REQUEST_RE = re.compile(
+    r"(?:生成|创建|设计|定制|做(?:一个|个)|create|generate|design|make|build)",
+    re.IGNORECASE,
+)
+_VOICE_DESIGN_SUBJECT_RE = re.compile(
+    r"(?:声音|音色|嗓音|voice|sound\s+like)",
+    re.IGNORECASE,
+)
+_VOICE_DESIGN_CANCEL_RE = re.compile(
+    r"(?:算了|取消|"
+    r"(?:别|不要|不用)(?:你|让你|给我|帮我)?(?:再)?(?:生成|创建|设计|做)|"
+    r"不是(?:要|让)(?:你)?(?:生成|创建|设计|做)|"
+    r"never\s+mind|cancel|"
+    r"do\s+not.{0,24}(?:create|generate|design|make)|"
+    r"don['’]?t.{0,24}(?:create|generate|design|make))",
+    re.IGNORECASE,
+)
+
+
+def _voice_design_requested(messages: list[dict]) -> bool:
+    """Return whether the current unseen user turn explicitly authorizes design."""
+    text = "\n".join(
+        str(message.get("content") or "").strip()
+        for message in messages
+        if str(message.get("content") or "").strip()
+    )
+    if not text or _VOICE_DESIGN_SUBJECT_RE.search(text) is None:
+        return False
+
+    cancel_spans = [match.span() for match in _VOICE_DESIGN_CANCEL_RE.finditer(text)]
+    request_positions = [
+        match.start()
+        for match in _VOICE_DESIGN_REQUEST_RE.finditer(text)
+        if not any(start <= match.start() < end for start, end in cancel_spans)
+    ]
+    if not request_positions:
+        return False
+    last_cancel = max((start for start, _end in cancel_spans), default=-1)
+    return max(request_positions) > last_cancel
+
+
+def _voice_design_client_action(
+    *,
+    job_id: str,
+    call_id: str,
+    args: dict,
+) -> dict:
+    """Normalize one validated model tool call into the iOS client protocol."""
+    error = cap_tool_schema.validate_tool_args(
+        cap_tool_schema.VOICE_DESIGN_TOOL,
+        args,
+    )
+    if error:
+        raise ValueError(error)
+    voice_name = str(args["voice_name"]).strip()
+    description = str(args["voice_description"]).strip()
+    stable_material = json.dumps(
+        {
+            "job_id": str(job_id),
+            "call_id": str(call_id),
+            "voice_name": voice_name,
+            "voice_description": description,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    action_id = hashlib.sha256(stable_material.encode("utf-8")).hexdigest()[:32]
+    return {
+        "id": f"voice_{action_id}",
+        "type": "voice.design",
+        "voice_name": voice_name,
+        "voice_description": description,
+    }
+
+
+def _embed_client_actions(text: str, actions: list[dict]) -> str:
+    if not actions:
+        return str(text or "")
+    payload = json.dumps(
+        {"version": 1, "actions": actions},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    marker = f"{_CLIENT_ACTION_MARKER_PREFIX}{encoded}{_CLIENT_ACTION_MARKER_SUFFIX}"
+    return f"{str(text or '').rstrip()}\n\n{marker}"
+
+
+def _strip_client_actions(text: str) -> str:
+    """Drop model/user-authored markers; only runtime-built actions may survive."""
+    return _CLIENT_ACTION_MARKER_RE.sub("", str(text or "")).strip()
 
 # `_slot_loop` installs one callback in this task-local context for the duration
 # of an active turn.  Deep helpers can report real progress without threading a
@@ -4978,6 +5083,9 @@ async def process_job(
         )
         ordinal = itertools.count()
         action_digest: dict[str, dict] = {}
+        voice_request_messages = list(coalesced)
+        voice_design_authorized = _voice_design_requested(voice_request_messages)
+        pending_voice_action: dict | None = None
         effect_reservations = _PlatformEffectReservations(
             job_id=job_id,
             ordinal_counter=ordinal,
@@ -5209,7 +5317,9 @@ async def process_job(
         offered_mcp_tool_specs = tuple(mcp_turn.tool_specs)
         if mutation_recovery_barrier is not None:
             disabled_mutation_tool_names = frozenset(
-                set(cap_registry.WRITE_ACTIONS) | set(mcp_mutating_names)
+                set(cap_registry.WRITE_ACTIONS)
+                | set(mcp_mutating_names)
+                | {cap_tool_schema.VOICE_DESIGN_TOOL}
             )
             offered_mcp_tool_specs = tuple(
                 spec
@@ -5241,6 +5351,7 @@ async def process_job(
         )
 
         async def _dispatch_tools(tool_calls):
+            nonlocal pending_voice_action
             # Fence once per round before any capability executes (mirrors the
             # old _run_tools's renewal ahead of the read burst); writes get a
             # second, per-write fence via before_write above.
@@ -5382,6 +5493,7 @@ async def process_job(
                     for tc in tool_calls
                     if tc.name in mcp_mutating_names
                     or tc.name in cap_registry.WRITE_ACTIONS
+                    or tc.name == cap_tool_schema.VOICE_DESIGN_TOOL
                 }
                 dispatchable_calls = [
                     tc for tc in tool_calls if str(tc.id) not in blocked_by_id
@@ -5406,25 +5518,71 @@ async def process_job(
                             },
                         )
 
-            dispatched = await _dispatch_mixed_tool_calls(
-                dispatchable_calls,
-                mcp_turn=mcp_turn,
-                mutating_mcp_names=mcp_mutating_names,
-                dispatch_platform_one=_dispatch_platform_one,
-                before_mcp_mutation=_before_write,
-                dispatch_workspace_batch=_dispatch_workspace_batch,
-                read_parallelism=read_parallelism,
-                mcp_timeout_sec=MCP_TOOL_CALL_TIMEOUT_SEC,
-                dispatch_task_batch=dispatch_task_batch,
-                prepare_platform_mutation=effect_reservations.prepare,
-                prepare_workspace_batch=effect_reservations.prepare_batch,
-                mcp_mutation_started=_mcp_mutation_started,
-                mcp_mutation_finished=_mcp_mutation_finished,
-                mcp_wall_budget=mcp_wall_budget,
-                on_progress=_report_turn_progress,
-                on_tool_event=_make_tool_trajectory_callback(trajectory_recorder),
+            client_results_by_id: dict[str, ToolResult] = {}
+            ordinary_calls = []
+            client_event = _make_tool_trajectory_callback(trajectory_recorder)
+            for tc in dispatchable_calls:
+                if tc.name != cap_tool_schema.VOICE_DESIGN_TOOL:
+                    ordinary_calls.append(tc)
+                    continue
+                if client_event is not None:
+                    await client_event(
+                        tc,
+                        "tool_call_started",
+                        {"phase": "client_action"},
+                    )
+                if not voice_design_authorized:
+                    result = ToolResult(
+                        call_id=tc.id,
+                        content=_VOICE_DESIGN_NOT_AUTHORIZED_ERROR,
+                    )
+                else:
+                    pending_voice_action = _voice_design_client_action(
+                        job_id=job_id,
+                        call_id=tc.id,
+                        args=tc.args,
+                    )
+                    result = ToolResult(
+                        call_id=tc.id,
+                        content=(
+                            "ok: voice design prepared for one device-side "
+                            "ElevenLabs generation"
+                        ),
+                    )
+                client_results_by_id[str(tc.id)] = result
+                if client_event is not None:
+                    await client_event(
+                        tc,
+                        "tool_call_result",
+                        {"phase": "client_action", "result": result},
+                    )
+
+            dispatched = (
+                await _dispatch_mixed_tool_calls(
+                    ordinary_calls,
+                    mcp_turn=mcp_turn,
+                    mutating_mcp_names=mcp_mutating_names,
+                    dispatch_platform_one=_dispatch_platform_one,
+                    before_mcp_mutation=_before_write,
+                    dispatch_workspace_batch=_dispatch_workspace_batch,
+                    read_parallelism=read_parallelism,
+                    mcp_timeout_sec=MCP_TOOL_CALL_TIMEOUT_SEC,
+                    dispatch_task_batch=dispatch_task_batch,
+                    prepare_platform_mutation=effect_reservations.prepare,
+                    prepare_workspace_batch=effect_reservations.prepare_batch,
+                    mcp_mutation_started=_mcp_mutation_started,
+                    mcp_mutation_finished=_mcp_mutation_finished,
+                    mcp_wall_budget=mcp_wall_budget,
+                    on_progress=_report_turn_progress,
+                    on_tool_event=_make_tool_trajectory_callback(
+                        trajectory_recorder
+                    ),
+                )
+                if ordinary_calls
+                else []
             )
             dispatched_by_id = {str(result.call_id): result for result in dispatched}
+            dispatched_by_id.update(client_results_by_id)
             results = [
                 blocked_by_id.get(str(tc.id)) or dispatched_by_id[str(tc.id)]
                 for tc in tool_calls
@@ -5440,7 +5598,7 @@ async def process_job(
 
         async def _on_reply(text: str, *, final: bool) -> None:
             nonlocal final_job_completed_atomically
-            text = str(text or "").strip()
+            text = _strip_client_actions(text)
             if final and not text:
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
                 # text is a model/provider failure here (unlike wake, where
@@ -5449,6 +5607,8 @@ async def process_job(
                 raise TurnError("empty_reply")
             if not text:
                 return  # empty intermediate reply{} call: no bubble, not an error
+            if final and pending_voice_action is not None and voice_design_authorized:
+                text = _embed_client_actions(text, [pending_voice_action])
             # A cutover/ABA can happen while awaiting the provider. Fence at
             # the reply effect itself; the pre-round check is not sufficient.
             await _ensure_runtime_mode()
@@ -5608,6 +5768,8 @@ async def process_job(
 
         async def fold_new_messages() -> list[dict]:
             nonlocal observed_generation
+            nonlocal pending_voice_action
+            nonlocal voice_design_authorized
             # Pin admission BEFORE the message read. If a send commits between
             # these two operations, the prompt may already contain it but the
             # deliberately older generation makes the final apply fence miss,
@@ -5620,7 +5782,16 @@ async def process_job(
             if boundary_generation is None:
                 raise LostJobLease("job ownership lost at round boundary")
             observed_generation = int(boundary_generation)
-            return await base_fold_new_messages()
+            folded = await base_fold_new_messages()
+            if folded:
+                # Any late user input invalidates a previously prepared action.
+                # The model must see the new message and call voice_design again.
+                pending_voice_action = None
+                voice_request_messages.extend(folded)
+                voice_design_authorized = _voice_design_requested(
+                    voice_request_messages
+                )
+            return folded
 
         turn_extra_context = (
             context.action_context_str(perception_results) if perception_results else ""
@@ -5653,6 +5824,7 @@ async def process_job(
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             extra_mutating_tool_names=mcp_mutating_names,
+            client_action_tool_names={cap_tool_schema.VOICE_DESIGN_TOOL},
             disabled_tool_names=disabled_mutation_tool_names,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
             outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,

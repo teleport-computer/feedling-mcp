@@ -275,6 +275,80 @@ def test_task_result_is_external_and_removes_later_writes_and_recursion(
     assert outcome.final_text == "done"
 
 
+def test_private_read_removes_later_device_client_actions(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "read-1", "name": "memory_index", "args": {}},
+            ],
+            "usage": {},
+        },
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        client_action_tool_names={"voice_design"},
+        outbound_blocking_read_tool_names={"memory_index"},
+    ))
+
+    first = {spec.name for spec in provider.calls[0]["tools"]}
+    second = {spec.name for spec in provider.calls[1]["tools"]}
+    assert "voice_design" in first
+    assert "voice_design" not in second
+
+
+def test_reply_cannot_claim_success_in_same_batch_as_client_action(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "r1", "name": "reply", "args": {"text": "生成好了"}},
+                {
+                    "id": "v1",
+                    "name": "voice_design",
+                    "args": {
+                        "voice_name": "暮光",
+                        "voice_description": (
+                            "A warm young adult feminine voice with a soft low "
+                            "register and intimate measured delivery."
+                        ),
+                    },
+                },
+            ],
+            "usage": {},
+        },
+        {"reply": "我先想想自己的声音。", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    replies = _RecordingReply()
+    dispatch = _RecordingDispatch()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=replies,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        client_action_tool_names={"voice_design"},
+    ))
+
+    assert dispatch.calls == []
+    assert replies.calls == [("我先想想自己的声音。", True)]
+    assert provider.calls[1]["tools"] is None
+    assert outcome.stop_reason == "final_text"
+
+
 def test_intermediate_reply_remains_visible_when_later_final_is_superseded(
     monkeypatch,
 ):

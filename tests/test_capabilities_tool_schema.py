@@ -43,6 +43,28 @@ def test_task_tool_is_read_only_and_requires_a_nonempty_prompt():
     )
 
 
+def test_voice_design_tool_requires_bounded_name_and_description():
+    voice = next(
+        s for s in tool_schema.build_tool_specs() if s.name == "voice_design"
+    )
+    assert voice.parameters["required"] == ["voice_name", "voice_description"]
+    assert "no preview choices" in voice.description
+    assert tool_schema.validate_tool_args(
+        "voice_design",
+        {
+            "voice_name": "暮光",
+            "voice_description": (
+                "A warm young adult feminine voice with a soft low register, "
+                "measured pace, intimate presence, and restrained expression."
+            ),
+        },
+    ) is None
+    assert tool_schema.validate_tool_args(
+        "voice_design",
+        {"voice_name": "暮光", "voice_description": "too short"},
+    ) == "voice_description must be 20-1000 characters"
+
+
 def test_write_tools_have_object_params():
     specs = {s.name: s for s in tool_schema.build_tool_specs()}
     for w in ("memory_write", "identity_patch", "schedule_wake", "workspace_write"):

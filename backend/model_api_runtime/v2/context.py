@@ -75,7 +75,10 @@ _RUNTIME_CONTEXT_POLICY = (
 # caches reuse it across turns.
 CHAT_SYSTEM_PROMPT = (
     "You are the user's personal companion. Reply directly and concisely to the "
-    "user's latest messages. Do not narrate tool use or system status."
+    "user's latest messages. Do not narrate tool use or system status. When the "
+    "current user explicitly asks you to create or design your own speaking voice, "
+    "use voice_design exactly once instead of claiming that voice generation is "
+    "unavailable; do not offer preview choices."
 )
 
 ACTION_CONTEXT_CHAR_CAP = 8000

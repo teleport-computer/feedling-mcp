@@ -154,6 +154,42 @@ Decrypt `body_ct` on the authorized client. When a history item has
 `body_omitted: true`, fetch `/v1/chat/messages/{message_id}/body` instead of
 assuming the message is empty.
 
+### Device-side companion voice design
+
+When the current user explicitly asks the companion to create or generate its
+own voice, Hosted Runtime V2 can choose one voice name and one English
+ElevenLabs Voice Design description from the existing trusted conversation
+context. It does not return preview choices.
+
+The encrypted assistant plaintext ends with an internal marker:
+
+```text
+<!--io-client-actions:BASE64URL_JSON_WITHOUT_PADDING-->
+```
+
+After base64url decoding, the payload is:
+
+```json
+{
+  "version": 1,
+  "actions": [
+    {
+      "id": "voice_0123456789abcdef",
+      "type": "voice.design",
+      "voice_name": "Twilight",
+      "voice_description": "A warm young adult feminine voice..."
+    }
+  ]
+}
+```
+
+An authorized IO client removes the marker from displayed text, submits
+`voice_description` to ElevenLabs with the credential stored on that device,
+and selects the returned Voice ID for later TTS. The backend neither receives
+the ElevenLabs key nor performs that external call. Treat the action `id` as an
+idempotency key and do not generate the same action twice when history is
+reloaded.
+
 ## Independent resident loop
 
 The resident path is a queue-and-reply protocol. It does not accept plaintext

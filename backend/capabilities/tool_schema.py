@@ -2,9 +2,9 @@
 
 Derives one `ToolSpec` per model-facing capability in `capabilities.registry.CAPABILITIES`
 (everything except the internal-only `chat_image_read` and `chat_file_read`, which have
-no model-facing schema) plus the runtime-native `task` and `reply` tools.  The unified
-tool loop handles both specially instead of dispatching them through the capability
-executor.
+no model-facing schema) plus the runtime-native `task`, `reply`, and device-side
+`voice_design` tools. The unified tool loop handles these specially instead of
+dispatching them through the capability executor.
 
 Each entry in `PARAMS` mirrors exactly the `params` fields each capability module reads —
 see the module docstring/params usage cited per tool below. Do not add fields the
@@ -18,6 +18,7 @@ from capabilities import registry
 
 REPLY_TOOL = "reply"
 TASK_TOOL = "task"
+VOICE_DESIGN_TOOL = "voice_design"
 
 _EXCLUDED = frozenset({"chat_image_read", "chat_file_read"})
 
@@ -218,6 +219,16 @@ PARAMS: dict[str, dict] = {
         "properties": {"text": _STR},
         "required": ["text"],
     },
+
+    # -- synthetic device-only voice-design tool --
+    VOICE_DESIGN_TOOL: {
+        "type": "object",
+        "properties": {
+            "voice_name": _STR,
+            "voice_description": _STR,
+        },
+        "required": ["voice_name", "voice_description"],
+    },
 }
 
 # Tool arguments cross an untrusted model boundary.  Close every model-facing
@@ -267,6 +278,15 @@ DESCRIPTIONS: dict[str, str] = {
                 "read workspace/artifact, memory, and web data but cannot reply to "
                 "the user, mutate state, call MCP, or spawn another task."),
     REPLY_TOOL: "Send an immediate reply bubble to the user with the given text.",
+    VOICE_DESIGN_TOOL: (
+        "Design your own speaking voice only when the current user explicitly asks "
+        "you to create or generate it. Decide from your personality and the existing "
+        "conversation context. Provide a short distinctive voice_name and an English "
+        "ElevenLabs Voice Design prompt of 80-600 characters in voice_description. "
+        "Describe audible age range, accent, timbre, pace, warmth, expressiveness, "
+        "and delivery. This prepares one device-side generation with no preview "
+        "choices. Do not claim generation is complete until the tool result says so."
+    ),
 }
 
 
@@ -372,6 +392,15 @@ def validate_tool_args(name: str, args) -> str | None:
             return "expected_revision must be a non-negative integer"
     if name == TASK_TOOL and not str(args.get("prompt") or "").strip():
         return "task requires a non-empty prompt"
+    if name == VOICE_DESIGN_TOOL:
+        voice_name = str(args.get("voice_name") or "").strip()
+        description = str(args.get("voice_description") or "").strip()
+        if not voice_name:
+            return "voice_design requires a non-empty voice_name"
+        if len(voice_name) > 100:
+            return "voice_name must be at most 100 characters"
+        if not 20 <= len(description) <= 1000:
+            return "voice_description must be 20-1000 characters"
     return None
 
 
@@ -381,7 +410,7 @@ def build_tool_specs() -> list[ToolSpec]:
         if name in _EXCLUDED:
             continue
         specs.append(ToolSpec(name=name, description=DESCRIPTIONS[name], parameters=PARAMS[name]))
-    for name in (TASK_TOOL, REPLY_TOOL):
+    for name in (TASK_TOOL, REPLY_TOOL, VOICE_DESIGN_TOOL):
         specs.append(ToolSpec(
             name=name,
             description=DESCRIPTIONS[name],

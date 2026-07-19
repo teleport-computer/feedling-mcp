@@ -91,6 +91,17 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- Hosted Runtime V2 can now prepare one device-side `voice.design` action when
+  the current user explicitly asks the companion to create its own voice. The
+  model chooses a name and an English ElevenLabs Voice Design description from
+  the existing trusted conversation context; the encrypted final reply carries
+  the action to an authorized IO client, which performs generation with its
+  locally stored ElevenLabs key and selects the returned Voice ID. There is no
+  preview-choice round, and the backend never receives or uses that key.
+  Runtime V2 rejects optimistic same-batch replies, strips model-authored action
+  markers, invalidates a prepared action when newer user input arrives, and
+  removes the action tool after external or outbound-blocking reads.
+
 - Runtime V2 now persists an immutable encrypted turn trajectory alongside its
   aggregate token telemetry. Provider prompts and responses, late input folds,
   tool calls and results, planned replies, and failure details are compressed

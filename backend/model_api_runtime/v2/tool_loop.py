@@ -175,6 +175,7 @@ async def run_tool_loop(
     on_trajectory_event=None,
     extra_tool_specs=None,
     extra_mutating_tool_names=None,
+    client_action_tool_names=None,
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
     outbound_blocking_read_tool_names=None,
@@ -323,6 +324,12 @@ async def run_tool_loop(
     # set. Intersecting avoids a stale/buggy loader accidentally reclassifying a
     # platform read or a tool that was never shown to the provider.
     mutating_mcp_names = set(extra_mutating_tool_names or ()) & mcp_names
+    # Client actions are selected by the model but executed later on the user's
+    # device against a third-party service. Treat them like outbound mutations
+    # even though the server itself performs no network call.
+    client_action_names = {
+        str(name) for name in (client_action_tool_names or ()) if str(name)
+    } & {spec.name for spec in turn_catalog}
 
     def _progress(stage: str) -> None:
         # Parent-process wedge detection is observability, never turn logic.
@@ -373,6 +380,7 @@ async def run_tool_loop(
             blocked_tools: set[str] = set()
             if external_content_seen:
                 blocked_tools.update(cap_registry.WRITE_ACTIONS)
+                blocked_tools.update(client_action_names)
                 # Every MCP call crosses an outbound data boundary.  A matching
                 # read-only approval permits parallel execution before external
                 # content is observed, but cannot permit a later data-dependent
@@ -388,6 +396,7 @@ async def run_tool_loop(
             if mutation_outcome_unknown:
                 blocked_tools.update(cap_registry.WRITE_ACTIONS)
                 blocked_tools.update(mutating_mcp_names)
+                blocked_tools.update(client_action_names)
             # A private read may expose persona, workspace/artifact, or memory
             # content. That observation cannot influence a later outbound
             # query/URL/MCP/task call. Local durable edits remain available:
@@ -396,6 +405,7 @@ async def run_tool_loop(
             if outbound_tools_blocked:
                 blocked_tools.update({"web_search", "web_fetch"})
                 blocked_tools.update(mcp_names)
+                blocked_tools.update(client_action_names)
                 # A parent task can hand private workspace/memory-derived text
                 # to a child which still has outbound web access.  Treat that
                 # delegation as another outbound channel, not as a local read.
@@ -541,13 +551,19 @@ async def run_tool_loop(
         mixed_reply_write = any(
             tc.name == tool_schema.REPLY_TOOL for tc in pr.tool_calls
         ) and any(
-            tc.name in cap_registry.WRITE_ACTIONS or tc.name in mutating_mcp_names
+            tc.name in cap_registry.WRITE_ACTIONS
+            or tc.name in mutating_mcp_names
+            or tc.name in client_action_names
             for tc in pr.tool_calls
+        )
+        multiple_client_actions = (
+            sum(tc.name in client_action_names for tc in pr.tool_calls) > 1
         )
         if (
             malformed
             or len(set(call_ids)) != len(call_ids)
             or mixed_reply_write
+            or multiple_client_actions
             or over_tool_call_budget
             or oversized_tool_exchange
         ):
@@ -569,6 +585,7 @@ async def run_tool_loop(
                     "reason": "invalid_or_over_budget_tool_exchange",
                     "malformed": malformed,
                     "mixed_reply_write": mixed_reply_write,
+                    "multiple_client_actions": multiple_client_actions,
                     "over_tool_call_budget": over_tool_call_budget,
                     "oversized_tool_exchange": oversized_tool_exchange,
                 },

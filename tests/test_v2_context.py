@@ -4,6 +4,13 @@ import json
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import context
 
+
+def test_chat_prompt_routes_explicit_voice_creation_to_one_device_action():
+    prompt = context.CHAT_SYSTEM_PROMPT
+    assert "use voice_design exactly once" in prompt
+    assert "do not offer preview choices" in prompt
+
+
 def test_build_turn_messages_orders_persona_summary_tail():
     tail = [
         {"id":"1","ts":1.0,"role":"user","content":"hi"},

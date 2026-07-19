@@ -61,11 +61,23 @@ or diagnostic upload is encrypted.
    plaintext prompt and selected context to the configured model provider.
 5. The runner encrypts the assistant result into a new user-owned envelope before
    it is persisted. The original send remains asynchronous and returns `202`.
+6. When the current user explicitly requests creation of the companion's voice,
+   the encrypted result may also carry one `voice.design` client action. An
+   authorized IO device executes it with the ElevenLabs credential stored on
+   that device; the hosted runner never receives that credential or calls
+   ElevenLabs.
 
 The model provider is an external plaintext recipient. Envelope encryption
 protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
+
+A voice-design description is first selected by the configured model and then
+sent by the authorized device to ElevenLabs. Runtime V2 exposes this outbound
+client action only for an explicit current-user creation request. It cannot
+follow external web/MCP content or a private text-bearing read, and any late
+user message clears the prepared action until the model evaluates that new
+input and requests the action again.
 
 Runtime V2 builds each turn from an encrypted hierarchical summary frontier plus
 every uncovered source message verbatim. The trusted runner decrypts that
