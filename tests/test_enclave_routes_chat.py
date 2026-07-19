@@ -42,7 +42,6 @@ def test_memory_list_fetch_overlaps_history_decrypt(client, monkeypatch):
     """/v1/memory/list 拉取不依赖 history 解密结果，async 化后应与解密并行
     （旧同步 Flask 只能串行；串行让每个请求多付一次 backend RTT）。
     测法：解密故意放慢，断言 memory/list 的回环在解密结束前就已发出。"""
-    import threading
     import time as _time
 
     order = []

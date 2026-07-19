@@ -1,4 +1,5 @@
-import os, psycopg
+import os
+import psycopg
 import db
 from conftest import seed_user  # noqa: E402
 

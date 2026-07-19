@@ -744,7 +744,6 @@ def test_get_credentials_includes_credential_with_zero_routes(
 
 def test_get_credentials_never_leaks_envelope(
         client, registered_user, fake_provider, fake_envelope, fake_enclave):
-    uid = registered_user["user_id"]
     headers = _setup_one(client, registered_user)
     client.post("/v1/model_api/routes", headers=headers, json={
         "provider": "anthropic", "model": "claude-haiku-4-5", "api_key": "sk-ant-second"})

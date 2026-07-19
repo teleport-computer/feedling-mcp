@@ -1,63 +1,19 @@
 """Model API config / runtime profile / action traces (hosted line)."""
 
-import base64
-import copy
-import hashlib
-import io
-import json
 import os
-import re
-import secrets
-import threading
 import time
 import types
 import uuid
-from collections import defaultdict
-from datetime import date, datetime, timedelta
-from typing import Any
-
-import httpx
 
 import db
 from core import enclave as core_enclave
+from core import util as core_util
+from core.store import UserStore
+from notices import catalog as notices_catalog
+from notices import core as notices_core
+import provider_client
 from provider_client import public_config as public_provider_config
 from provider_client import validate_config as validate_provider_config
-from core.store import UserStore
-
-from hosted_runtime import (
-    ACTION_RESPONSE_FORMAT as HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
-    ACTION_METHOD as HOSTED_RUNTIME_ACTION_METHOD,
-    BACKGROUND_METHOD as HOSTED_RUNTIME_BACKGROUND_METHOD,
-    BACKGROUND_NOT_STARTED_METHOD as HOSTED_RUNTIME_BACKGROUND_NOT_STARTED_METHOD,
-    NOOP_METHOD as HOSTED_RUNTIME_NOOP_METHOD,
-    PENDING_CONFIRM_METHOD as HOSTED_RUNTIME_PENDING_CONFIRM_METHOD,
-    PENDING_REJECT_METHOD as HOSTED_RUNTIME_PENDING_REJECT_METHOD,
-    RUNTIME_ENGINE_NATIVE as HOSTED_RUNTIME_ENGINE_NATIVE,
-    build_background_execution_messages as build_hosted_runtime_background_execution_messages,
-    background_execution_trace as hosted_runtime_background_trace,
-    companion_turn_contract_message as hosted_runtime_companion_turn_contract_message,
-    coerce_pending_decision as coerce_hosted_runtime_pending_decision,
-    coerce_runtime_action as coerce_hosted_runtime_action,
-)
-from model_api_runtime.prompts import (
-    build_foreground_chat_messages as build_model_api_foreground_chat_messages,
-    build_memory_capture_messages as build_model_api_memory_capture_messages,
-    build_pending_confirmation_messages as build_model_api_pending_confirmation_messages,
-    build_web_search_results_message as build_model_api_web_search_results_message,
-    web_search_followup_message as model_api_web_search_followup_message,
-)
-from model_api_runtime.tools import (
-    extract_web_search_requests as extract_model_api_web_search_requests,
-    run_web_searches as run_model_api_web_searches,
-    web_search_trace as model_api_web_search_trace,
-)
-from context_memory_selection import memory_relevance_details
-from content_encryption import build_envelope
-
-from core import util as core_util
-import provider_client
-from notices import core as notices_core
-from notices import catalog as notices_catalog
 
 
 def _load_model_api_config(store: UserStore) -> dict | None:

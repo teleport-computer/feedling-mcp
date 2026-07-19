@@ -2,11 +2,9 @@
 
 import json
 import hashlib
-import os
 import re
-import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from urllib.parse import parse_qs, quote
@@ -1755,7 +1753,6 @@ def _data_track_proactive_daily_payload() -> dict:
     )
     out_rows = []
     for r in rows:
-        jobs = int(r.get("jobs") or 0)
         delivered = int(r.get("delivered") or 0)
         completed = int(r.get("completed") or 0)
         failed = int(r.get("failed") or 0)
@@ -1977,7 +1974,6 @@ def _render_data_track_page(payload: dict) -> str:
         access = row.get("access", {})
         principal = str(access.get("principal_id") or row.get("principal_id") or "")
         principal_short = f"{principal[:12]}…" if len(principal) > 12 else principal
-        connected_modes = ", ".join(access.get("connected_modes") or []) or "none"
         onb_mem, live_mem = _memory_source_split(row["memory"].get("by_source"))
         pro = row["proactive"]
         conn = row.get("connection") or {}
@@ -2246,7 +2242,6 @@ def _render_data_track_dau_page(payload: dict) -> str:
 
 def _render_proactive_daily_page(payload: dict) -> str:
     summary = payload["summary"]
-    filters = payload.get("filters", {})
     rows = payload.get("rows", [])
     definition = payload.get("definition", {})
     api_qs = _data_track_qs(view=None, q=None, limit=None, offset=None, sort=None, dir=None)

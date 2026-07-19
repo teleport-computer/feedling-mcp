@@ -1,11 +1,6 @@
 """Bootstrap completion gates for chat / identity writes."""
 
-import json
-import os
-import re
-import time
-import uuid
-from datetime import date, datetime
+from datetime import datetime
 
 import db
 from core import util as core_util

@@ -91,7 +91,6 @@ from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
 import hmac
-import inspect
 import io
 import json
 import logging
@@ -2676,8 +2675,8 @@ def _reply_from_json_obj(obj: Any) -> str:
     if marker in _JSON_NON_FINAL_EVENTS:
         return ""
 
-    for field in _JSON_REPLY_FIELDS:
-        value = obj.get(field)
+    for reply_field in _JSON_REPLY_FIELDS:
+        value = obj.get(reply_field)
         if isinstance(value, str) and value.strip():
             return value.strip()
         if isinstance(value, (dict, list)):
@@ -9734,7 +9733,7 @@ def _window_document(text: str, *, max_chars: int = 18000, overlap_lines: int = 
         if cur_len >= max_chars:
             windows.append("\n".join(cur))
             cur = cur[-overlap_lines:] if overlap_lines > 0 else []
-            cur_len = sum(len(l) + 1 for l in cur)
+            cur_len = sum(len(line) + 1 for line in cur)
     tail = "\n".join(cur).strip()
     if tail and (not windows or "\n".join(cur) != windows[-1]):
         windows.append("\n".join(cur))
