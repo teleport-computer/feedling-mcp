@@ -300,6 +300,8 @@ def test_chat_memory_and_perception_contracts_are_concrete(
     history_query = _parameters(operations[("get", "/v1/chat/history")], "query")
     assert set(history_query) == {
         "limit",
+        "after_seq",
+        "before_seq",
         "since",
         "before",
         "include_image_body",

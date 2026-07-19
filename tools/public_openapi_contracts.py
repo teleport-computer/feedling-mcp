@@ -143,6 +143,8 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
     ],
     ("get", "/v1/chat/history"): [
         _query("limit", _schema("integer", minimum=1, maximum=200, default=200), "Maximum messages in this page.", example=50),
+        _query("after_seq", _schema("integer", minimum=0), "Lossless forward cursor. Return messages whose durable append sequence is greater than this value; takes precedence over timestamp cursors.", example=1042),
+        _query("before_seq", _schema("integer", minimum=1), "Lossless backward cursor. Return messages whose durable append sequence is less than this value; takes precedence over timestamp cursors.", example=1042),
         _query("since", TIMESTAMP, "Return messages with ts strictly greater than this watermark.", example=1783962000.0),
         _query("before", TIMESTAMP, "Return older messages with ts strictly less than this watermark; takes precedence over since.", example=1783962000.0),
         _query("include_image_body", _schema("boolean", default=True), "Set false to omit image and oversized inline bodies.", example=False),
@@ -1099,7 +1101,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
-    ("get", "/v1/chat/history"): "Read encrypted chat history using timestamp watermarks. Use oldest_ts as before for older pages and latest_ts as since for newer pages.",
+    ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
     ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported.",

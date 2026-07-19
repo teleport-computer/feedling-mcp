@@ -229,12 +229,14 @@ def test_history_forwards_include_image_body_to_backend(client, monkeypatch):
     monkeypatch.setattr(keys, "get_content_sk", fake_sk)
 
     r = client.get(
-        "/v1/chat/history?since=5&limit=20&include_image_body=false",
+        "/v1/chat/history?since=5&before=9&before_seq=123&limit=20&include_image_body=false",
         headers={"X-API-Key": "k"},
     )
     assert r.status_code == 200
     assert seen["params"]["include_image_body"] == "false"
     assert seen["params"]["since"] == "5"
+    assert seen["params"]["before"] == "9"
+    assert seen["params"]["before_seq"] == "123"
     assert seen["params"]["limit"] == "20"
 
 

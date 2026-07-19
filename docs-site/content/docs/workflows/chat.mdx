@@ -105,11 +105,12 @@ Content-Type: application/json
 }
 ```
 
-Do not look for a `reply` text field. Advance the transcript with the user
-message timestamp:
+Do not look for a `reply` text field. Advance the transcript with the durable
+append sequence returned by the previous page. Sequence cursors remain exact
+when several messages share a client timestamp:
 
 ```http
-GET /v1/chat/history?since=1783978500.125&limit=50&include_image_body=false HTTP/1.1
+GET /v1/chat/history?after_seq=1041&limit=50&include_image_body=false HTTP/1.1
 Host: api.feedling.app
 X-API-Key: YOUR_FEEDLING_API_KEY
 ```
@@ -124,6 +125,7 @@ X-API-Key: YOUR_FEEDLING_API_KEY
       "sender": "assistant",
       "source": "model_api",
       "content_type": "text",
+      "seq": 1042,
       "ts": 1783978502.75,
       "body_ct": "BASE64_CIPHERTEXT",
       "nonce": "BASE64_NONCE",
@@ -138,6 +140,8 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   "total": 42,
   "oldest_ts": 1783978502.75,
   "latest_ts": 1783978502.75,
+  "oldest_seq": 1042,
+  "latest_seq": 1042,
   "has_more_older": true,
   "has_more_newer": false,
   "bodies_omitted": 0,

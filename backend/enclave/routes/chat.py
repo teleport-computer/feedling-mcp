@@ -261,9 +261,15 @@ async def v1_chat_history(request: Request):
         body, status = error
         return JSONResponse(body, status_code=status)
 
-    since = request.query_params.get("since", "0")
     limit = request.query_params.get("limit", "200")
-    params = {"since": since, "limit": limit}
+    params = {"limit": limit}
+    # Sequence cursors are the lossless pagination contract: unlike timestamps,
+    # they cannot skip siblings appended with the same client clock value. Keep
+    # forwarding the timestamp cursors for older app builds.
+    for cursor_name in ("since", "before", "after_seq", "before_seq"):
+        cursor_value = request.query_params.get(cursor_name)
+        if cursor_value is not None:
+            params[cursor_name] = cursor_value
     # Forward the body opt-out. Dropping it (the old behaviour) forced every
     # caller to take the image bodies: a window holding a handful of 1.4MB photos
     # serialized to a multi-MB response that the CVM egress truncated mid-body,

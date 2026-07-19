@@ -305,6 +305,25 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
         except (TypeError, ValueError):
             return {"error": "invalid before"}, 400
 
+    def _optional_seq(name: str) -> int | None:
+        raw = query.get(name, "")
+        if raw in ("", None):
+            return None
+        value = int(str(raw))
+        if value < 0:
+            raise ValueError(name)
+        return value
+
+    try:
+        after_seq = _optional_seq("after_seq")
+        before_seq = _optional_seq("before_seq")
+    except (TypeError, ValueError):
+        return {"error": "invalid sequence cursor"}, 400
+    if after_seq is not None and before_seq is not None:
+        return {"error": "after_seq and before_seq are mutually exclusive"}, 400
+    if before_seq == 0:
+        return {"error": "before_seq must be greater than zero"}, 400
+
     include_image_body = str(
         query.get("include_image_body", query.get("include_image_bodies", "true"))
     ).lower() not in {"0", "false", "no", "off"}
@@ -316,34 +335,64 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
         # window. Fetch one bounded DB page plus a sentinel row; this makes an
         # arbitrarily old encrypted message reachable without materializing the
         # full transcript or deleting old rows to protect worker memory.
-        page = db.chat_history_page_strict(
-            store.user_id,
-            limit=limit + 1,
-            since=since,
-            before=before,
-            hide_verify_before=verify_cutoff,
-        )
+        if before_seq is not None:
+            page = db.chat_history_page_by_seq_strict(
+                store.user_id,
+                limit=limit + 1,
+                before_seq=before_seq,
+                hide_verify_before=verify_cutoff,
+            )
+        elif after_seq is not None:
+            page = db.chat_history_page_by_seq_strict(
+                store.user_id,
+                limit=limit + 1,
+                after_seq=after_seq,
+                hide_verify_before=verify_cutoff,
+            )
+        elif before > 0 or since > 0:
+            page = db.chat_history_page_strict(
+                store.user_id,
+                limit=limit + 1,
+                since=since,
+                before=before,
+                hide_verify_before=verify_cutoff,
+            )
+        else:
+            page = db.chat_history_page_by_seq_strict(
+                store.user_id,
+                limit=limit + 1,
+                latest=True,
+                hide_verify_before=verify_cutoff,
+            )
         total = db.chat_count_strict(
             store.user_id, hide_verify_before=verify_cutoff)
-        if before > 0:
+        if before_seq is not None or before > 0:
             has_more_older = len(page) > limit
             msgs = page[-limit:]
             has_more_newer = False
-            page_mode = "before"
-        elif since > 0:
+            page_mode = "before-seq" if before_seq is not None else "before"
+        elif after_seq is not None or since > 0:
             has_more_newer = len(page) > limit
             msgs = page[:limit]
             if msgs:
-                prior = db.chat_history_page_strict(
-                    store.user_id,
-                    limit=1,
-                    before=float(msgs[0].get("ts", 0) or 0),
-                    hide_verify_before=verify_cutoff,
-                )
+                if after_seq is not None:
+                    prior = db.chat_history_page_by_seq_strict(
+                        store.user_id,
+                        limit=1,
+                        before_seq=int(msgs[0].get("seq", 0) or 0),
+                        hide_verify_before=verify_cutoff,
+                    )
+                else:
+                    prior = db.chat_history_page_strict(
+                        store.user_id,
+                        limit=1,
+                        before=float(msgs[0].get("ts", 0) or 0),
+                        hide_verify_before=verify_cutoff,
+                    )
                 has_more_older = bool(prior)
             else:
                 has_more_older = total > 0
-            page_mode = "since"
+            page_mode = "after-seq" if after_seq is not None else "since"
         else:
             has_more_older = len(page) > limit
             msgs = page[-limit:]
@@ -351,6 +400,11 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
             page_mode = "latest"
     except Exception as e:  # noqa: BLE001 — history remains fail-open on DB blips
         print(f"[chat/history:{store.user_id}] durable page failed, using hot cache: {e}")
+        if after_seq is not None or before_seq is not None:
+            # The bounded process cache does not carry a trustworthy durable
+            # sequence for every row. Returning a different page here would
+            # silently skip/duplicate history, defeating the tie-safe cursor.
+            return {"error": "durable history unavailable for sequence cursor"}, 503
         all_msgs, raw_max_ts = _visible_msgs_and_raw_max(store, now)
         total = len(all_msgs)
         if before > 0:
@@ -390,10 +444,13 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
     )
     oldest_ts = float(out[0].get("ts", 0)) if out else 0
     latest_ts = float(out[-1].get("ts", 0)) if out else 0
+    oldest_seq = int(out[0].get("seq", 0) or 0) if out else 0
+    latest_seq = int(out[-1].get("seq", 0) or 0) if out else 0
 
     print(
         f"[chat/history:{store.user_id}] ip={remote_addr} mode={page_mode} "
-        f"since={since} before={before} limit={limit} returned={len(out)} total={total} "
+        f"since={since} before={before} after_seq={after_seq} before_seq={before_seq} "
+        f"limit={limit} returned={len(out)} total={total} "
         f"include_image_body={include_image_body} omitted_bodies={omitted_bodies} "
         f"omitted_images={omitted_image_bodies} ua={user_agent[:80]}"
     )
@@ -403,6 +460,8 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
         "total": total,
         "oldest_ts": oldest_ts,
         "latest_ts": latest_ts,
+        "oldest_seq": oldest_seq,
+        "latest_seq": latest_seq,
         "has_more_older": has_more_older,
         "has_more_newer": has_more_newer,
         "bodies_omitted": omitted_bodies,

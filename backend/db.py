@@ -3412,8 +3412,8 @@ def chat_history_page_strict(
     with get_pool().connection() as conn:
         if before > 0:
             rows = conn.execute(
-                "SELECT doc FROM ("
-                "  SELECT seq, doc FROM chat_messages "
+                "SELECT seq,msg_id,doc FROM ("
+                "  SELECT seq,msg_id,doc FROM chat_messages "
                 "  WHERE user_id = %s AND ts < %s "
                 + visibility_sql +
                 "  ORDER BY seq DESC LIMIT %s"
@@ -3422,7 +3422,7 @@ def chat_history_page_strict(
             ).fetchall()
         elif since > 0:
             rows = conn.execute(
-                "SELECT doc FROM chat_messages "
+                "SELECT seq,msg_id,doc FROM chat_messages "
                 "WHERE user_id = %s AND ts > %s "
                 + visibility_sql +
                 "ORDER BY seq ASC LIMIT %s",
@@ -3430,14 +3430,20 @@ def chat_history_page_strict(
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT doc FROM ("
-                "  SELECT seq, doc FROM chat_messages WHERE user_id = %s "
+                "SELECT seq,msg_id,doc FROM ("
+                "  SELECT seq,msg_id,doc FROM chat_messages WHERE user_id = %s "
                 + visibility_sql +
                 "  ORDER BY seq DESC LIMIT %s"
                 ") page ORDER BY seq ASC",
                 (user_id, *visibility_params, bounded),
             ).fetchall()
-    return [r[0] for r in rows]
+    out: list[dict] = []
+    for seq, msg_id, doc in rows:
+        item = dict(doc)
+        item.setdefault("id", str(msg_id))
+        item["seq"] = int(seq)
+        out.append(item)
+    return out
 
 
 def chat_history_page_by_seq_strict(
@@ -3446,29 +3452,54 @@ def chat_history_page_by_seq_strict(
     limit: int,
     after_seq: int = 0,
     before_seq: int = 0,
+    latest: bool = False,
+    hide_verify_before: float | None = None,
 ) -> list[dict]:
     """Read a bounded durable page using the exact append-order cursor.
 
-    This is the tie-safe internal primitive for exports/backfills and future UI
-    cursors. Unlike the legacy timestamp query, it can traverse thousands of
-    rows sharing the same timestamp without skipping a boundary row.
+    This is the tie-safe primitive for exports, backfills, and the public UI
+    cursor. Unlike the legacy timestamp query, it can traverse thousands of
+    rows sharing the same timestamp without skipping a boundary row. ``latest``
+    selects the newest bounded page when neither directional cursor is present.
     """
     bounded = max(1, int(limit))
+    visibility_sql = ""
+    visibility_params: tuple = ()
+    if hide_verify_before is not None:
+        visibility_sql = (
+            " AND NOT (doc->>'source'='verify_ping' AND ("
+            "   doc->>'role' IN ('agent','openclaw') OR ts < %s"
+            " ))"
+        )
+        visibility_params = (float(hide_verify_before),)
     with get_pool().connection() as conn:
         if before_seq > 0:
             rows = conn.execute(
                 "SELECT seq, msg_id, doc FROM ("
                 "  SELECT seq, msg_id, doc FROM chat_messages "
                 "  WHERE user_id=%s AND seq<%s "
+                + visibility_sql +
                 "  ORDER BY seq DESC LIMIT %s"
                 ") page ORDER BY seq ASC",
-                (user_id, int(before_seq), bounded),
+                (user_id, int(before_seq), *visibility_params, bounded),
+            ).fetchall()
+        elif latest:
+            rows = conn.execute(
+                "SELECT seq, msg_id, doc FROM ("
+                "  SELECT seq, msg_id, doc FROM chat_messages "
+                "  WHERE user_id=%s "
+                + visibility_sql +
+                "  ORDER BY seq DESC LIMIT %s"
+                ") page ORDER BY seq ASC",
+                (user_id, *visibility_params, bounded),
             ).fetchall()
         else:
             rows = conn.execute(
                 "SELECT seq, msg_id, doc FROM chat_messages "
-                "WHERE user_id=%s AND seq>%s ORDER BY seq ASC LIMIT %s",
-                (user_id, max(0, int(after_seq)), bounded),
+                "WHERE user_id=%s AND seq>%s "
+                + visibility_sql +
+                "ORDER BY seq ASC LIMIT %s",
+                (user_id, max(0, int(after_seq)), *visibility_params, bounded),
             ).fetchall()
     out: list[dict] = []
     for seq, msg_id, doc in rows:

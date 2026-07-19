@@ -850,6 +850,28 @@
             "example": 50
           },
           {
+            "name": "after_seq",
+            "in": "query",
+            "required": false,
+            "description": "Lossless forward cursor. Return messages whose durable append sequence is greater than this value; takes precedence over timestamp cursors.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 1042
+          },
+          {
+            "name": "before_seq",
+            "in": "query",
+            "required": false,
+            "description": "Lossless backward cursor. Return messages whose durable append sequence is less than this value; takes precedence over timestamp cursors.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "example": 1042
+          },
+          {
             "name": "since",
             "in": "query",
             "required": false,
@@ -894,7 +916,7 @@
           }
         ],
         "x-feedling-contract-level": "documented",
-        "description": "Read encrypted chat history using timestamp watermarks. Use oldest_ts as before for older pages and latest_ts as since for newer pages."
+        "description": "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility."
       },
       "delete": {
         "summary": "Chat History Clear",
