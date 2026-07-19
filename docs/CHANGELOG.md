@@ -94,6 +94,12 @@
   live fleet closure still requires deploying the reviewed image everywhere,
   provisioning production's second runner failure domain, and verifying zero
   legacy hosted processes. Typing-signal pre-warm also remains unimplemented.
+- Production runner deploys now bind each worker heartbeat to the target
+  inventory CVM ID and exact seven-character image build. The worker fails
+  closed on missing/mismatched identity, and CI outlives stale heartbeat windows
+  before requiring a current-build turn + Genesis pair for every listed CVM;
+  the gate remains intentionally blocked while only one production CVM ID is
+  provisioned.
 
 ## 2026-07-18
 

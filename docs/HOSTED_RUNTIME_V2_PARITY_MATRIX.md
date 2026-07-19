@@ -293,7 +293,12 @@ The repository requires at least two production worker CVM IDs but currently
 records only one provisioned ID, so the production rollout gate intentionally
 remains closed until the second independent failure domain exists. Final closure
 also requires a live process inventory proving zero old hosted resident
-processes.
+processes. Once provisioned, the production deploy now assigns every runner a
+stable inventory-CVM/current-build identity and refuses to start on missing or
+mismatched identity inputs. Its post-deploy gate waits beyond old heartbeat
+freshness, then requires an exact positive-capacity turn + Genesis pair for
+every listed CVM at the deployed build; aggregate liveness, a previous-build
+row, or one listed identity cannot stand in for the fleet.
 
 ## Remaining work, in order
 

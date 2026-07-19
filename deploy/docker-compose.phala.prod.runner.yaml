@@ -17,6 +17,12 @@ services:
       FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      # Fail closed unless CI injects the target inventory CVM and the exact
+      # seven-character build baked into this image. These values form the
+      # stable application-level heartbeat identity used by the fleet gate.
+      FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
+      FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-}"
+      FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
       FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: "${FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED:-0}"
       FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: "${FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE:-64}"
       FEEDLING_V2_SANDBOX_PROVIDER: "${FEEDLING_V2_SANDBOX_PROVIDER:-disabled}"

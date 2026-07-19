@@ -1678,9 +1678,10 @@ jobs:
           if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ] && { [ -z "$E2B_API_KEY" ] || [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; }; then
             echo "::error::PROD E2B sandbox requires E2B_API_KEY and PROD_FEEDLING_V2_E2B_TEMPLATE"; exit 1
           fi
+          DEPLOYED_BUILD="${GITHUB_SHA:0:7}"
           printf '%s\n' "$IDS" | while IFS= read -r CVM_ID; do
             [ -z "$CVM_ID" ] && continue
-            echo ">>> deploy prod runner CVM: $CVM_ID"
+            echo ">>> deploy prod runner CVM: $CVM_ID build=$DEPLOYED_BUILD"
             phala deploy \
               --api-token "$PHALA_CLOUD_API_KEY" \
               --cvm-id "$CVM_ID" \
@@ -1689,6 +1690,8 @@ jobs:
               -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
               -e "DATABASE_URL=$DATABASE_URL" \
               -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+              -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
+              -e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD" \
               -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
               -e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED" \
               -e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE=$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE" \
@@ -1734,6 +1737,16 @@ jobs:
             done
             [ "$publish_status" -eq 0 ] || { echo "::error::publish failed for $CVM_ID"; exit 1; }
           done
+
+      - name: Post-deploy Runtime V2 fleet identity gate (prod)
+        env:
+          FEEDLING_API_URL:     ${{ vars.PROD_API_URL || vars.PROD_MAIN_API_URL || 'https://api.feedling.app' }}
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+        run: |
+          python3 deploy/check-v2-runner-fleet.py \
+            --base-url "$FEEDLING_API_URL" \
+            --inventory deploy/prod-runner-cvm-ids.txt \
+            --build "${GITHUB_SHA:0:7}"
 
   # =========================================================================
   # NOTIFY — Lark "deploy finished", sent only after the WHOLE prod deploy

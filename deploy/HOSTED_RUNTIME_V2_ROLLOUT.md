@@ -79,7 +79,10 @@ For a CVM-affecting release:
    image from the same commit.
 2. Deploy the main CVM and publish/authorize its measured Compose hash.
 3. Deploy every runner CVM with the same database and runtime-token secret, then
-   publish/authorize each runner Compose hash.
+   publish/authorize each runner Compose hash. Production CI injects that
+   target's inventory CVM ID plus the exact seven-character image build; the
+   worker refuses to start if either value is missing or the build disagrees
+   with the commit baked into the image.
 4. Do not admit real-device testing until the Runtime V2 readiness gates below
    are green.
 
@@ -88,7 +91,10 @@ The `deploy-test-runner-cvm`, `deploy-pre-runner-cvm`, and
 CVM source changes. A missing test/pre runner ID or an empty production runner
 ID list is a deployment error, not a reason to skip the worker job. Production
 requires at least two distinct worker CVM IDs so rolling one failure domain
-cannot remove the fleet's only hosted executor.
+cannot remove the fleet's only hosted executor. The checked-in inventory still
+contains only one real production runner, so the topology preflight—and thus
+the deploy and identity proof—intentionally cannot close until a second CVM is
+actually provisioned and added.
 
 ## Readiness gates
 
@@ -100,6 +106,33 @@ Check `GET /v1/admin/v2-metrics` with an admin token and require:
 - bounded pending/oldest-job age and no expired job backlog;
 - healthy effect-outbox and wake statistics; and
 - expected provider/model prompt-cache telemetry.
+
+Production does not accept the aggregate checks alone. After every listed CVM
+has deployed, CI waits 65 seconds—longer than both the old turn and Genesis
+heartbeat freshness windows—and requires the exact current-build heartbeat
+pair for **every** non-comment identity in `prod-runner-cvm-ids.txt`:
+
+- `v2-fleet-cvm-<CVM_ID>-build-<7-char-build>-boot-<nonce>` with positive turn capacity; and
+- the same identity plus `:genesis` with a fresh Genesis heartbeat.
+
+The CVM/build portion is stable while the boot nonce remains process-unique so
+job ownership and orphan recovery never confuse a replacement process with the
+one that crashed. Turn and Genesis must share the exact full boot identity.
+Missing identities, duplicate live boots, unlisted current-build identities,
+previous-build rows, and stale rows fail the deployment. The same gate requires literal
+`v2_only`, target mode `db_action_v2`, `ready_count == eligible_count`, and zero
+inconsistent routes. This is an application-level deployment proof bound to
+the trusted Phala target/env injection; Compose-hash publication and CVM
+attestation remain the cryptographic deployment evidence.
+Under the managed one-service-per-CVM compose, one claimed runner identity
+emits only its own CVM/build prefix and therefore cannot satisfy a different
+inventory entry.
+`FEEDLING_V2_RUNNER_CVM_ID` is a CI-injected claimed identity, not a value
+cryptographically derived from dstack attestation. The exact-set gate prevents
+ordinary missing/stale/extra rollout false-greens, but a compromised runner
+with direct write access to the shared heartbeat table could forge another
+claimed ID; preventing that requires binding heartbeat writes to attested CVM
+identity rather than trusting the injected environment.
 
 Then send a real encrypted test turn through the same public API used by iOS.
 The send must return `202 processing`, commit one user row and one durable job,
@@ -171,6 +204,7 @@ claim hosted V2 accounts and is not part of this incident procedure.
 - [ ] Encrypted real-device turn and `client_msg_id` retry pass.
 - [ ] Prompt-cache canary passes where configured.
 - [ ] Production lists at least two independent runner CVMs before rollout.
+- [ ] Production's exact per-CVM/current-build turn + Genesis fleet proof passes.
 - [ ] Live process inventory shows no hosted resident supervisor or per-user CLI process.
 - [ ] Previous database-compatible V2 image and scale-out procedure are known.
 

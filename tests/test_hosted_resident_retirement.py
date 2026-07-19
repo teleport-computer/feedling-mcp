@@ -173,6 +173,23 @@ def test_ci_passes_opt_in_review_configuration_to_every_worker_deploy():
     )
 
 
+def test_production_worker_identity_is_fail_closed_and_gated_per_inventory_cvm():
+    compose = yaml.safe_load(
+        (ROOT / "deploy/docker-compose.phala.prod.runner.yaml").read_text()
+    )
+    environment = compose["services"]["serve-worker"]["environment"]
+    assert environment["FEEDLING_V2_FLEET_IDENTITY_REQUIRED"] == "1"
+    assert "FEEDLING_V2_RUNNER_CVM_ID" in environment
+    assert "FEEDLING_V2_DEPLOYED_BUILD" in environment
+
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert '-e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID"' in workflow
+    assert '-e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD"' in workflow
+    assert "Post-deploy Runtime V2 fleet identity gate (prod)" in workflow
+    assert "python3 deploy/check-v2-runner-fleet.py" in workflow
+    assert '--inventory deploy/prod-runner-cvm-ids.txt' in workflow
+
+
 def test_production_worker_topology_requires_two_distinct_cvm_ids(tmp_path):
     script = ROOT / "deploy/check-prod-runner-topology.sh"
 

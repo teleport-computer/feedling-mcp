@@ -183,7 +183,10 @@ def v2_metrics(
         "pending": jobs_store.pending_job_count(),
         "live_workers": jobs_store.live_worker_count(),
         "live_worker_capacity": jobs_store.live_worker_capacity(),
-        "worker_heartbeats": jobs_store.recent_worker_heartbeats(),
+        # Two rows (turn + Genesis) per runner. Use the store's bounded maximum
+        # so the production per-CVM gate can prove fleets larger than 25 CVMs
+        # instead of silently truncating at the helper's observational default.
+        "worker_heartbeats": jobs_store.recent_worker_heartbeats(limit=200),
         "runtime_policy": config_store.hosted_runtime_policy_status(),
         "mean_service_sec": jobs_store.recent_mean_service_sec(lane="chat"),
         "recent_mean_tokens_per_turn": jobs_store.recent_mean_tokens_per_turn(lane="chat"),

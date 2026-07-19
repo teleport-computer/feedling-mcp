@@ -10,7 +10,8 @@ ROOT = Path(__file__).parent.parent
 # Capture ONLY the quoted GITHUB_SHA slice, ignoring any trailing inline comment
 # (the mainline CI #906 lines carry a `# fixed 7-char slice…` note).
 ASSIGNMENT = re.compile(
-    r'^\s*(?:COMMIT_SHORT|SHA_SHORT|TRIGGER_SHA_SHORT)=("\$\{GITHUB_SHA:0:\d+\}")',
+    r'^\s*(?:COMMIT_SHORT|SHA_SHORT|TRIGGER_SHA_SHORT|DEPLOYED_BUILD)='
+    r'("\$\{GITHUB_SHA:0:\d+\}")',
     re.MULTILINE,
 )
 
@@ -29,7 +30,7 @@ def test_image_tags_use_one_fixed_width_github_sha_prefix():
     # One producer assignment plus every main/test/pre main+runner deploy wait
     # and pin assignment. A variable-length `git rev-parse --short` can produce
     # different widths in the publisher's shallow clone and deploy's full clone.
-    assert len(assignments) == 13
+    assert len(assignments) == 14
     assert set(assignments) == {'"${GITHUB_SHA:0:7}"'}
 
 
@@ -53,3 +54,13 @@ def test_pre_runner_deploy_forwards_pool_size_and_gates_liveness():
     assert 'row.get("age_sec") or 9999' not in workflow
     assert 'f"-{expected_commit}"' in workflow
     assert 'f"-{expected_commit}:genesis"' in workflow
+
+
+def test_prod_runner_deploy_binds_every_inventory_cvm_to_exact_build():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+
+    assert 'DEPLOYED_BUILD="${GITHUB_SHA:0:7}"' in workflow
+    assert '-e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID"' in workflow
+    assert '-e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD"' in workflow
+    assert "Post-deploy Runtime V2 fleet identity gate (prod)" in workflow
+    assert "deploy/check-v2-runner-fleet.py" in workflow

@@ -82,6 +82,7 @@ from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import reaper as v2_reaper
+from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import screen_watch
 from model_api_runtime.v2 import watchdog as v2_watchdog
@@ -3060,9 +3061,7 @@ def main() -> None:
     # not assume the schema is already at head.
     db.init_schema()
     wire_assembly()
-    worker_id = (
-        os.environ.get("FEEDLING_V2_WORKER_ID", "").strip() or _default_worker_id()
-    )
+    worker_id = runner_identity.resolve_worker_id(_default_worker_id)
     poll_interval = _positive_float_env("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0")
     log.info(
         "[v2.serve_worker] configured db_pool_max=%s for max_workers=%s",

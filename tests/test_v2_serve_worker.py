@@ -149,6 +149,72 @@ def test_default_worker_id_is_unique_across_same_pid_replica_calls(monkeypatch):
     assert first != second
 
 
+def test_managed_fleet_worker_id_has_stable_deployment_prefix_and_unique_boot(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_FLEET_IDENTITY_REQUIRED", "1")
+    monkeypatch.setenv(
+        "FEEDLING_V2_RUNNER_CVM_ID", "130fdfc6-5736-4cdc-9d0f-a35af8957cf2"
+    )
+    monkeypatch.setenv("FEEDLING_V2_DEPLOYED_BUILD", "abcdef1")
+    monkeypatch.setenv("FEEDLING_GIT_COMMIT", "abcdef1234567890")
+
+    first = serve_worker.runner_identity.resolve_worker_id(
+        lambda: "ephemeral-must-not-be-used"
+    )
+    second = serve_worker.runner_identity.resolve_worker_id(
+        lambda: "different-ephemeral-must-not-be-used"
+    )
+
+    expected_prefix = (
+        "v2-fleet-cvm-130fdfc6-5736-4cdc-9d0f-a35af8957cf2-build-abcdef1-boot-"
+    )
+    assert first.startswith(expected_prefix)
+    assert second.startswith(expected_prefix)
+    assert first != second
+    assert serve_worker.runner_identity.parse_fleet_worker_id(first)[:2] == (
+        "130fdfc6-5736-4cdc-9d0f-a35af8957cf2",
+        "abcdef1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("missing", "value"),
+    [
+        ("FEEDLING_V2_RUNNER_CVM_ID", ""),
+        ("FEEDLING_V2_DEPLOYED_BUILD", ""),
+    ],
+)
+def test_managed_fleet_worker_id_requires_both_inputs(monkeypatch, missing, value):
+    monkeypatch.setenv("FEEDLING_V2_FLEET_IDENTITY_REQUIRED", "1")
+    monkeypatch.setenv("FEEDLING_V2_RUNNER_CVM_ID", "runner-a")
+    monkeypatch.setenv("FEEDLING_V2_DEPLOYED_BUILD", "abcdef1")
+    monkeypatch.setenv("FEEDLING_GIT_COMMIT", "abcdef1234567890")
+    monkeypatch.setenv(missing, value)
+
+    with pytest.raises(RuntimeError, match="requires both"):
+        serve_worker.runner_identity.resolve_worker_id(lambda: "ephemeral")
+
+
+def test_managed_fleet_worker_id_rejects_image_build_mismatch(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_FLEET_IDENTITY_REQUIRED", "1")
+    monkeypatch.setenv("FEEDLING_V2_RUNNER_CVM_ID", "runner-a")
+    monkeypatch.setenv("FEEDLING_V2_DEPLOYED_BUILD", "abcdef1")
+    monkeypatch.setenv("FEEDLING_GIT_COMMIT", "1234567890abcdef")
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        serve_worker.runner_identity.resolve_worker_id(lambda: "ephemeral")
+
+
+def test_managed_fleet_worker_id_rejects_arbitrary_override(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_FLEET_IDENTITY_REQUIRED", "1")
+    monkeypatch.setenv("FEEDLING_V2_RUNNER_CVM_ID", "runner-a")
+    monkeypatch.setenv("FEEDLING_V2_DEPLOYED_BUILD", "abcdef1")
+    monkeypatch.setenv("FEEDLING_GIT_COMMIT", "abcdef1234567890")
+    monkeypatch.setenv("FEEDLING_V2_WORKER_ID", "pretend-to-be-another-cvm")
+
+    with pytest.raises(RuntimeError, match="cannot override"):
+        serve_worker.runner_identity.resolve_worker_id(lambda: "ephemeral")
+
+
 def test_build_production_deps_returns_turndeps():
     deps = serve_worker.build_production_deps()
     assert isinstance(deps, worker.TurnDeps)
