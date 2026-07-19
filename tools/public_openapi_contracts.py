@@ -1068,7 +1068,9 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "address or a tunnel endpoint that only your agent's environment can reach. For those "
         "servers, skip this probe and instead ask your agent to call the MCP server directly in "
         "chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS "
-        "handshake failure — check ca_pem), timeout, http_401/http_403/http_404/http_4xx/http_5xx "
+        "handshake failure — check ca_pem), timeout (connect/read timeout, or the whole probe "
+        "exceeded its 45-second wall-clock ceiling — e.g. a legacy HTTP+SSE endpoint answering "
+        "with a never-ending event stream), http_401/http_403/http_404/http_4xx/http_5xx "
         "(server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. "
         "404 not_found when no server with that name exists."
     ),

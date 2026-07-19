@@ -256,7 +256,7 @@ Other `400` kinds from this endpoint:
 | `unreachable_from_backend` | Saved successfully; this backend's network can't reach the host. Verify from your agent instead. |
 | `dns` | The hostname did not resolve. |
 | `tls` | Certificate/TLS handshake failure — check `ca_pem` if the server uses a private CA. |
-| `timeout` | Connect or read timeout. |
+| `timeout` | Connect or read timeout, or the whole probe exceeded its 45-second wall-clock ceiling. A legacy HTTP+SSE endpoint that answers with a never-ending event stream lands here instead of hanging the request. |
 | `http_401` / `http_403` / `http_404` / `http_4xx` / `http_5xx` | The server responded with an HTTP error status. |
 | `protocol` | The response wasn't a valid MCP handshake (bad JSON-RPC envelope, redirect, or empty SSE stream). |
 | `decrypt_failed` | The stored config could not be decrypted for this caller. |

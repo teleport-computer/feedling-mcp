@@ -99,6 +99,13 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- `POST /v1/mcp/servers/{name}/test` now enforces a 45-second wall-clock
+  ceiling over the whole probe and returns `400 timeout` when it is exceeded.
+  Previously a server that answered the handshake with a never-ending event
+  stream (a legacy HTTP+SSE endpoint, e.g. `…/sse` URLs) could hold the
+  request open indefinitely — the app sat on "saving…" with no reply. Saving
+  the server (`POST /v1/mcp/servers`) was never affected and still succeeds
+  first; only the connectivity probe is bounded.
 - Proactive wake bubbles no longer post on top of an active conversation: right
   before delivery, the consumer re-checks the latest chat rows and skips the
   wake (recorded as `skipped` / `chat_collision`) when a user message or an

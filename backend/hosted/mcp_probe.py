@@ -23,6 +23,17 @@ import httpx
 
 _CONNECT_TIMEOUT = 10.0
 _TOTAL_TIMEOUT = 30.0
+# Hard wall-clock deadline for the WHOLE probe. httpx's read timeout is
+# per-socket-read: a legacy HTTP+SSE endpoint (e.g. mcp.map.qq.com/sse,
+# 2026-07-19) answers the initialize POST with 200 + an event-stream that
+# trickles keep-alive pings forever — every read completes well inside
+# _TOTAL_TIMEOUT, so without this cap the probe (and the threadpool thread
+# running it, routes go through threadpool.run_db) hangs indefinitely and
+# iOS sits on "保存中…". 45s is a deliberate PRODUCT deadline for the whole
+# 3-RPC handshake — well below the ~90s theoretical worst case of three
+# back-to-back 30s reads: a server that needs longer than 45s to answer a
+# handshake is unusable as an interactive chat tool anyway.
+_WALL_TIMEOUT = 45.0
 _PROTOCOL_VERSION = "2025-03-26"
 
 
@@ -99,7 +110,20 @@ def probe(url: str, headers: dict, *, ca_pem: str | None = None,
     kind = blocked_url_kind(url)
     if kind in ("blocked_url", "dns", "unreachable_from_backend"):
         raise ProbeError(kind, urlparse(url).hostname or "")
-    return asyncio.run(_probe_async(url, headers, ca_pem, transport))
+    return asyncio.run(_probe_bounded(url, headers, ca_pem, transport))
+
+
+async def _probe_bounded(url: str, headers: dict, ca_pem: str | None,
+                         transport) -> dict:
+    """Wall-clock guard around ``_probe_async``: per-read timeouts alone don't
+    bound a stream that trickles (see ``_WALL_TIMEOUT``). Cancellation unwinds
+    through the ``async with httpx.AsyncClient`` in ``_probe_async``, so the
+    connection is closed, not leaked."""
+    try:
+        return await asyncio.wait_for(
+            _probe_async(url, headers, ca_pem, transport), timeout=_WALL_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise ProbeError("timeout", f"no reply within {_WALL_TIMEOUT:.0f}s wall clock")
 
 
 async def _probe_async(url: str, headers: dict, ca_pem: str | None,

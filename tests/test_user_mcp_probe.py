@@ -141,3 +141,80 @@ def test_dns_failure(monkeypatch):
     monkeypatch.setattr(mcp_probe, "_resolve_ips",
                         lambda host: (_ for _ in ()).throw(OSError("nx")))
     assert mcp_probe.blocked_url_kind("https://no-such.example.invalid/") == "dns"
+
+
+def _trickling_sse_app(chunk_sleep: float, max_chunks: int = 500,
+                       flags: dict | None = None):
+    """进程内复刻 legacy HTTP+SSE 端点对 initialize POST 的真实行为
+    （mcp.map.qq.com/sse，2026-07-19 实测）：立刻 200 + text/event-stream，
+    然后只滴心跳、永不给 JSON-RPC 应答、永不主动关流。
+
+    每个 chunk 间隔 << 单次 read 超时，所以 httpx 的 per-read 超时永远不会触发
+    —— 只有 wall-clock 上限能救。max_chunks 是测试套件自保（wall-clock 若被
+    回归删掉，本 app 最多滴 max_chunks 次后收流，测试转为断言失败而不是挂死）。
+
+    flags（可选）记录取消收栈证据：wall-clock 切断时本 app 必须收到
+    CancelledError（"cancelled"）且 finally 必须执行（"unwound"）——
+    这是「不留 pending task/连接」主张的长期守卫。
+    """
+    import asyncio as _asyncio
+
+    async def app(scope, receive, send):
+        assert scope["type"] == "http"
+        try:
+            while True:
+                event = await receive()
+                if not event.get("more_body"):
+                    break
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"text/event-stream")]})
+            for _ in range(max_chunks):
+                await send({"type": "http.response.body",
+                            "body": b": ping\n\n", "more_body": True})
+                await _asyncio.sleep(chunk_sleep)
+            await send({"type": "http.response.body", "body": b""})
+        except _asyncio.CancelledError:
+            if flags is not None:
+                flags["cancelled"] = True
+            raise
+        finally:
+            if flags is not None:
+                flags["unwound"] = True
+
+    return app
+
+
+def test_probe_wall_clock_bounds_trickling_stream(monkeypatch):
+    """SSE 挂流回归守卫:滴流让 per-read 超时永不触发,wall-clock 必须兜底。
+
+    时序设定(全部确定性,无真实网络):chunk 间隔 0.02s < read 超时,
+    wall-clock 压到 0.3s。断言:① 报 timeout;② 在远小于「滴完 500 个
+    chunk(10s)」的时间内返回 —— 证明是 wall-clock 切的,不是流自己走完的。
+    """
+    import time
+
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr(mcp_probe, "_WALL_TIMEOUT", 0.3)
+    flags: dict = {}
+    transport = httpx.ASGITransport(app=_trickling_sse_app(chunk_sleep=0.02, flags=flags))
+    t0 = time.monotonic()
+    with pytest.raises(mcp_probe.ProbeError) as e:
+        mcp_probe.probe("https://mcp.example.com/sse", {}, transport=transport)
+    elapsed = time.monotonic() - t0
+    assert e.value.kind == "timeout"
+    assert "wall clock" in e.value.detail
+    assert elapsed < 3.0, f"probe took {elapsed:.1f}s — wall clock did not cut in"
+    # 取消收栈证据:probe()(同步)返回时 asyncio.run 的 loop 已关闭,所有任务
+    # 已结算 —— 上游 app 必须已收到 CancelledError 且 finally 已执行,
+    # 否则就是留了 pending task/连接。
+    assert flags.get("cancelled") is True
+    assert flags.get("unwound") is True
+
+
+def test_probe_wall_clock_leaves_fast_servers_alone(monkeypatch):
+    """正常 streamable 服务器在 wall-clock 收紧后依然全绿(不误伤)。"""
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr(mcp_probe, "_WALL_TIMEOUT", 5.0)
+    transport = httpx.ASGITransport(app=_fake_mcp_app())
+    out = mcp_probe.probe("https://mcp.example.com/mcp", {}, transport=transport)
+    assert out["ok"] is True and out["tool_count"] == 2
