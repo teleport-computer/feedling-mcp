@@ -91,7 +91,6 @@ from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
 import hmac
-import inspect
 import io
 import json
 import logging
@@ -260,6 +259,13 @@ USER_MCP_CA_FILE = os.environ.get(
 USER_MCP_CASTORE_FILE = os.environ.get(
     "USER_MCP_CASTORE_FILE",
     f"/tmp/feedling_user_mcp_castore_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
+)
+# The pi user-MCP bridge extension. ONE shared static file for every user —
+# `COPY tools/ ./tools/` (Dockerfile.agent-runner) puts it here; the per-user
+# config path rides FEEDLING_USER_MCP_FILE instead (see _user_mcp_child_env).
+# Overridable for tests and for the self-hosted VPS layout.
+PI_MCP_BRIDGE_FILE = os.environ.get(
+    "PI_MCP_BRIDGE_FILE", "/app/tools/pi_mcp_bridge/index.js",
 )
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
@@ -597,9 +603,13 @@ def _system_notice_body(notice: AgentErrorNotice) -> str:
 # - 后台车道（心跳/主动/capture/dream）一律不进聊天流——用户无法据此行动，天天聊天
 #   的人会被自己根本看不见的后台车道刷屏；可观测性走设置页/admin 腿
 #   （_report_runtime_error）+ debug 日志。
-# - 前台（用户刚发的消息最终没拿到真实回复）才弹，且限流：可行动类
-#   （blame=user_provider，如额度/key/模型名）按 error_class 各一个窗口；瞬时/系统类
-#   合并进同一个 "_transient" 桶——同一波上游抖动打出多个 error_class 也只弹第一条。
+# - 前台（用户刚发的消息最终没拿到真实回复）才弹，且限流，按 blame 分三桶：
+#   · user_provider（额度/key/模型名）——按 error_class 各一个窗口，各自动作不同都要提醒；
+#   · provider_transient（限流/5xx/超时/内容拦截）——合并一个桶，同一波上游抖动只弹第一条；
+#   · system（我们自己的错，turn_timeout/reply_parse_failed/unknown）——单独一个桶。
+#   拆开 system 是因为它以前和 provider_transient 挤在同一个 "_transient" 桶里，3h 窗口内
+#   先来一个上游抖动就会把随后 IO 自己的系统错吞掉（usr_6f5a 类）；system 自成一桶后
+#   既不被上游抖动吞、故障期内多个 system 错也仍只弹一条防刷屏。
 # - 固定窗口（默认 3h），不因成功回合清零——否则上游一抖一恢复（fail→ok→fail）时
 #   每次"恢复后再坏"都重新弹，越抖越刷屏。进程内存态即可——respawn 顶多多发一条。
 FOREGROUND_NOTICE_WINDOW_SEC = float(os.environ.get("FOREGROUND_NOTICE_WINDOW_SEC", "10800"))
@@ -659,8 +669,14 @@ def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
         _report_runtime_error(notice.detail, notice.error_class)
         if not foreground:
             return
-        # 可行动类按 error_class 分桶；瞬时/系统类共享一个桶（同波合并）。
-        key = notice.error_class if notice.blame == "user_provider" else "_transient"
+        # 三桶（见上方块注释）：user_provider 各 error_class 一桶、provider_transient
+        # 合并、system 单独。避免上游抖动把 IO 自己的系统错吞掉。
+        if notice.blame == "user_provider":
+            key = notice.error_class
+        elif notice.blame == "provider_transient":
+            key = "_provider_transient"
+        else:
+            key = "_system"
         last = _system_notice_last_sent.get(key)
         if last is not None and (time.monotonic() - last) < FOREGROUND_NOTICE_WINDOW_SEC:
             return
@@ -933,6 +949,20 @@ def _runtime_repo_files() -> set[str]:
             # explicitly so a user_mcp materialization change still triggers a
             # self-update on self-hosted residents.
             "tools/user_mcp_materialize.py",
+            # Same story: imported lazily inside _enrich_with_fetched_ca, so it
+            # may not yet be in sys.modules when a release-diff check runs. This
+            # module is the gate that keeps a bad CA out of SSL_CERT_FILE (the
+            # public-roots check + the double self-verification) — a release
+            # that only touches this file must still trigger a self-update.
+            "tools/user_mcp_ca_fetch.py",
+            # The pi user-MCP bridge (README:491) is a Node extension shipped
+            # alongside us — it's never imported (not Python, not `.py`) so it
+            # can never land in sys.modules. Register it explicitly so a
+            # self-hosted pi resident restarts on a bridge bugfix instead of
+            # running stale bridge code forever.
+            "tools/pi_mcp_bridge/index.js",
+            "tools/pi_mcp_bridge/mcp_client.js",
+            "tools/pi_mcp_bridge/tool_mapping.js",
             "tools/chat_resident_requirements.txt",
             "backend/requirements.txt",
         }
@@ -3604,22 +3634,6 @@ def _agent_session_key() -> str:
     return f"feedling:{digest}"
 
 
-def _extract_openai_reply(body: dict) -> str:
-    choices = body.get("choices")
-    if isinstance(choices, list) and choices:
-        first = choices[0]
-        if isinstance(first, dict):
-            message = first.get("message")
-            if isinstance(message, dict):
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
-            text = first.get("text")
-            if isinstance(text, str) and text.strip():
-                return text.strip()
-    raise ValueError("OpenAI-compatible response has no usable reply text")
-
-
 def _response_text_len(resp: httpx.Response) -> int:
     try:
         return len((resp.text or "").encode("utf-8"))
@@ -5050,7 +5064,7 @@ def call_agent_cli(
                       explain="模型调用发起（" + ("pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude")) + "）",
                       content_excerpt={"prompt_head": (message or "")[:1000]})
     child_env = os.environ.copy()
-    child_env.update(_user_mcp_ca_env(cmd))
+    child_env.update(_user_mcp_child_env(cmd))
     if trace_id:
         child_env["FEEDLING_TRACE_ID"] = trace_id
         child_env["FEEDLING_DEBUG_TRACE_ID"] = trace_id
@@ -5413,13 +5427,6 @@ def _sanitize_reply_text(text: str) -> str:
     return "\n".join(deduped).strip()
 
 
-def _structured_reply_payload(raw_reply: str) -> Any:
-    try:
-        return json.loads(raw_reply)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
 def _cap_agent_replies(replies: list[str], max_items: int | None = None) -> list[str]:
     limit = max(1, max_items if max_items is not None else PROACTIVE_MAX_REPLY_MESSAGES)
     return replies[:limit]
@@ -5444,10 +5451,6 @@ def _normalize_agent_output(raw_reply: Any, max_items: int | None = None) -> tup
 
 def _normalize_agent_replies(raw_reply: str, max_items: int | None = None) -> list[str]:
     return _normalize_agent_output(raw_reply, max_items=max_items)[1]
-
-
-def _split_agent_result(result: Any, max_items: int | None = None) -> tuple[list[dict], list[str]]:
-    return _normalize_agent_output(result, max_items=max_items)
 
 
 def _split_agent_turn(result: Any, max_items: int | None = None) -> AgentTurn:
@@ -5992,6 +5995,47 @@ def _atomic_write_text(path: str, content: str, mode: int = 0o600) -> None:
         raise
 
 
+def _enrich_with_fetched_ca(servers: list[dict], *, budget_s: float = 15.0,
+                            now=time.monotonic, fetch=None) -> list[dict]:
+    """Fill in a trust anchor for servers that lack a manual ca_pem.
+
+    Manual ca_pem always wins. Disabled servers are never fetched — they
+    don't reach ``ca_bundle_pem`` (``_enabled()`` in user_mcp_materialize.py
+    drops them), so spending budget on them would only starve the enabled
+    servers that actually need it: ``_maybe_apply_user_mcp`` passes the FULL
+    server list here (enabled and disabled alike), and disabled servers are
+    the common case (an old/retired local server left in the list). Fetching
+    is best-effort and bounded in TOTAL by ``budget_s``: materialization runs
+    inside the poll loop BEFORE messages are handled, so a stalled fetch
+    stalls chat — and the worst case (a hosted user with private-IP servers
+    the CVM can't route to) burns the full timeout per server for nothing.
+    Once the budget is spent the rest keep an empty ca_pem this round and are
+    retried on the next fingerprint change.
+
+    ``now``/``fetch`` are injected so the budget and failure branches are
+    testable without real clocks or sockets.
+
+    Never raises: one server's fetch failure just means that server has no
+    anchor.
+    """
+    if fetch is None:
+        import user_mcp_ca_fetch  # noqa: PLC0415 — sibling on tools/ path
+        fetch = user_mcp_ca_fetch.fetch_trust_anchor
+    deadline = now() + budget_s
+    out = []
+    for s in servers:
+        ca = s.get("ca_pem") or ""
+        if not ca and s.get("enabled") and now() < deadline:
+            try:
+                ca = fetch(s.get("url") or "") or ""
+            except Exception as e:  # noqa: BLE001 — never wedge materialization
+                log.warning("[user_mcp] ca fetch failed for %s: %s: %s",
+                            s.get("name"), type(e).__name__, e)
+                ca = ""
+        out.append({**s, "ca_pem": ca})
+    return out
+
+
 def _write_user_mcp_ca(servers: list[dict]) -> None:
     """Materialize the two CA bundles. See USER_MCP_CA_FILE for why there are two.
 
@@ -6008,7 +6052,7 @@ def _write_user_mcp_ca(servers: list[dict]) -> None:
     a reader never observes a half-written file, even across a crash.
     """
     import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
-    bundle = _m.ca_bundle_pem(servers)
+    bundle = _m.ca_bundle_pem(_enrich_with_fetched_ca(servers))
     if not bundle:
         for p in (USER_MCP_CA_FILE, USER_MCP_CASTORE_FILE):
             Path(p).unlink(missing_ok=True)
@@ -6037,8 +6081,8 @@ def _write_user_mcp_ca(servers: list[dict]) -> None:
                     "trust store: %s: %s", type(e).__name__, e)
 
 
-def _user_mcp_ca_env(cmd: list[str]) -> dict:
-    """Per-runtime CA env for one turn. Empty dict = inject nothing.
+def _user_mcp_child_env(cmd: list[str]) -> dict:
+    """Per-runtime child-process env for one turn. Empty dict = inject nothing.
 
     Gates on the in-memory ``_user_mcp_applied`` state first — the same
     source of truth ``_user_mcp_cli_value`` uses — not just on-disk file
@@ -6053,21 +6097,31 @@ def _user_mcp_ca_env(cmd: list[str]) -> dict:
 
     Never set an empty value: an unset var leaves the runtime on its own trust
     store, which is the correct no-CA behavior.
+
+    pi is intentionally NOT special-cased for CA: like claude it is a Node
+    process, so it falls through to NODE_EXTRA_CA_CERTS. (A prior version
+    early-returned {} here citing "pi: route abandoned" — that was a misreading
+    of v2 spec §1's "本期不涉及"; see 2026-07-17-pi-user-mcp-bridge-design.md
+    §1.1.) pi additionally gets FEEDLING_USER_MCP_FILE: the bridge extension is
+    one shared static file, so the per-user config path has to ride the env.
     """
-    if _is_pi_cmd(cmd):
-        return {}          # pi: route abandoned (v2 spec §1), no CA surface
     enabled_servers = [
         s for s in _user_mcp_applied.get("servers") or [] if s.get("enabled")
     ]
     if not enabled_servers:
         return {}
+    env: dict = {}
     if _is_codex_cmd(cmd):
         if Path(USER_MCP_CASTORE_FILE).exists():
-            return {"SSL_CERT_FILE": USER_MCP_CASTORE_FILE}   # REPLACES → concat bundle
-        return {}
-    if Path(USER_MCP_CA_FILE).exists():
-        return {"NODE_EXTRA_CA_CERTS": USER_MCP_CA_FILE}      # ADDS → user CA only
-    return {}
+            env["SSL_CERT_FILE"] = USER_MCP_CASTORE_FILE   # REPLACES → concat bundle
+    else:
+        # claude AND pi — both Node, both ADD via NODE_EXTRA_CA_CERTS.
+        if Path(USER_MCP_CA_FILE).exists():
+            env["NODE_EXTRA_CA_CERTS"] = USER_MCP_CA_FILE  # ADDS → user CA only
+    if _is_pi_cmd(cmd):
+        # The bridge is a shared static file; hand it this user's config path.
+        env["FEEDLING_USER_MCP_FILE"] = USER_MCP_FILE
+    return env
 
 
 def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
@@ -6154,6 +6208,9 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
       does NOT work — codex deep-merges ``-c`` overrides onto the config, and an
       empty parent table is a no-op that leaves each ``[mcp_servers.<name>]``
       enabled. Only an explicit ``enabled=false`` per server disables it.
+    - pi     → ``-e <bridge>`` ONLY on the chat lane. pi has no MCP of its own;
+      the extension registers the user's MCP tools as native pi tools. A
+      background turn simply loads no extension, so the tools do not exist.
     Values contain only controlled characters (a filesystem path, or fixed
     literals plus ``_SAFE_NAME``-constrained server names), so pre-split
     substitution into the template is shlex-safe."""
@@ -6164,6 +6221,25 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
     ]
     if not enabled_servers:
         return ""
+    if _cli_template_is_pi():
+        # pi has no built-in MCP (README:491) — the bridge extension registers
+        # each MCP tool as a native pi tool. Same lane rule as claude: chat only.
+        if lane != "chat":
+            return ""
+        # Same failure shape _strip_missing_mcp_config guards against for
+        # claude's --mcp-config: pi exits 1 with empty stdout when `-e <path>`
+        # points at a file that doesn't exist — no model call at all — and
+        # this is the chat-only lane, so a missing bridge silently kills chat
+        # replies while background/proactive turns (which never pass `-e`)
+        # keep running. PI_MCP_BRIDGE_FILE defaults to the hosted `/app` COPY
+        # target but is overridable for the self-hosted VPS layout, where it
+        # may not exist; degrade to no-MCP instead of killing the turn.
+        if not Path(PI_MCP_BRIDGE_FILE).exists():
+            log.warning(
+                "[user_mcp] pi bridge file missing at %s — disabling pi MCP "
+                "tools for this turn", PI_MCP_BRIDGE_FILE)
+            return ""
+        return f"-e {PI_MCP_BRIDGE_FILE}"
     if _cli_template_is_codex():
         if lane == "chat":
             return ""
@@ -6344,22 +6420,6 @@ def update_proactive_job_status(
         resp.raise_for_status()
     except Exception as e:
         log.warning("failed to update proactive job status id=%s status=%s error=%s", job_id, status, e)
-
-
-def update_proactive_state(**patch: Any) -> None:
-    clean = {k: v for k, v in patch.items() if v not in (None, "")}
-    if not clean:
-        return
-    try:
-        resp = _HTTP.post(
-            f"{FEEDLING_API_URL}/v1/proactive/state",
-            json=clean,
-            headers=_HEADERS,
-            timeout=10,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        log.warning("failed to update proactive state patch=%s error=%s", clean, e)
 
 
 def _job_wake_ids(job: dict) -> list[str]:
@@ -7148,6 +7208,8 @@ def _native_tool_names_compact() -> str:
         "tools_available (names only; you have your full toolset — call any if the screen makes it relevant):",
         "- perception_<signal>: now, location, weather, motion, calendar, focus, audio_route, app, "
         "steps, sleep, workout, vitals, activity, body, metabolic, cycle, mood, reminders",
+        "- perception_recent_apps: which apps the user opened recently (perception_app only "
+        "covers the last 15 minutes)",
         "- perception_trend, perception_history, memory_index, memory_fetch, "
         "screen_recent, screen_read, photo_recent, photo_read",
         "  (Bash/CLI runtimes: same verbs via io_cli.)",
@@ -7353,7 +7415,10 @@ def _native_reachout_tool_instructions() -> str:
         "quoted card's id), don't just say you did.",
         "- You also have native tools to manage your own future wakes: schedule_wake (ask to be woken at a later time) "
         "and cancel_wake.",
-        "- CLI runtimes call all of these via io_cli: perception, perception-trend, perception-history, memory-index, "
+        "- To answer \"what have I been doing / which apps have I used\", call perception_recent_apps: the current-app "
+        "field only covers the last 15 minutes, this returns the app-open history. Empty result means no app data — "
+        "say so, don't guess.",
+        "- CLI runtimes call all of these via io_cli: perception, perception-recent-apps, perception-trend, perception-history, memory-index, "
         "memory-fetch, memory-write, memory-patch, memory-delete, screen-recent, screen-read, photo-recent, "
         "photo-read, schedule-wake, cancel-wake.",
     ])
@@ -7403,23 +7468,6 @@ def _is_memory_dream_job(job: dict) -> bool:
         str((job or {}).get("job_kind") or "").strip() == "memory_dream"
         or str((job or {}).get("source") or "").strip() == "memory_dream"
     )
-
-
-def _resident_perception_trend(signal: str, field: str) -> dict:
-    """Best-effort GET of one signal's rolling baseline/delta (Tier 2 history)."""
-    try:
-        resp = _HTTP.get(
-            f"{FEEDLING_API_URL}/v1/agent/perception/trend",
-            headers=_HEADERS,
-            params={"signal": signal, "field": field, "days": 30},
-            timeout=15,
-        )
-        if resp.status_code >= 400:
-            return {}
-        return resp.json()
-    except Exception as e:
-        log.debug("proactive trend pull failed %s.%s: %s", signal, field, e)
-        return {}
 
 
 def _resident_perception_now() -> dict:

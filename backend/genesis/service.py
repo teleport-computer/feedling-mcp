@@ -15,6 +15,7 @@ from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import util as core_util
 from core.store import UserStore
+from identity import card_policy
 from identity import service as identity_service
 from memory import actions as memory_actions
 from notices import catalog
@@ -638,13 +639,15 @@ def _identity_payload_from_output(output: dict) -> dict | None:
         desc = _text(dim.get("description") or dim.get("evidence"), 500)
         if not name or not desc:
             continue
-        try:
-            value = int(dim.get("value", 50))
-        except Exception:
-            value = 50
+        raw_value = dim.get("value", 50)
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            raw_value = 50
+        # Same 0–100 int contract as card_policy.sanitize: a BYOK weak model that
+        # emits a 0–1-scale float (0.95) must be rescaled to 95, not int()-truncated
+        # to 0 (silently zeroing the whole card) and never stored as a raw float.
         clean_dims.append({
             "name": name,
-            "value": max(0, min(100, value)),
+            "value": card_policy.normalize_dimension_value(raw_value),
             "description": desc,
         })
     agent_name = _text(identity.get("agent_name"), 80).strip(" `\"'“”‘’。，,.;；:：!！?？")

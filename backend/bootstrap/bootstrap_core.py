@@ -72,7 +72,7 @@ def bootstrap_payload(store: UserStore) -> dict:
         "**3. 先确认 Live connection，再打招呼**\n"
         "不要先发第一条消息再补确认 chat loop。先按 public skill 的 Connection path 建立"
         "独立 feedling-chat-resident / IO resident consumer service：用 FEEDLING_API_URL、"
-        "FEEDLING_API_KEY、可选 FEEDLING_MCP_URL 配好 consumer，再配置 AGENT_MODE + "
+        "FEEDLING_API_KEY 配好 consumer，再配置 AGENT_MODE + "
         "AGENT_HTTP_URL 或 AGENT_CLI_CMD。consumer 持续轮询 /v1/chat/poll，"
         "把消息交给你的 agent 入口，再写回 /v1/chat/response；然后调用 feedling_chat_verify_loop，"
         "只有 passing=true 才算 Live connection 接通。"

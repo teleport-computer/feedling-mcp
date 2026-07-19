@@ -734,12 +734,12 @@ forge script script/DeployFeedlingAppAuth.s.sol \
 After deploy, run `cast send` with `addComposeHash()` for your compose_hash.
 Record the new address + first-tx info in the table above.
 
-## TEE Postgres (feedling-pg) — 待开通
+## TEE Postgres — ✅ 已开通（test + prod）
 
-影子迁移的代码侧构件已就绪并合入分支：`backend/alembic_tee/`、双写镜像
-(`tee_shadow/`)、cursor 复制器 (`tee_replicator/`)、一致性 verify、admin 触发端点，
-以及 pg 镜像全家桶 / compose / CI workflow（P1–P2 全部 Task）。**但 feedling-pg
-CVM 本身尚未开通** —— 下列 runbook 项必须在开通前逐条补齐（对应
+**状态更新（2026-07-18）**：`feedling-io-db-test` 与 `feedling-io-db-prod`
+（2026-07-14 上线，WAL-G 备份 + 双写 + in-process 同步调度器）均已运行。
+实际开通流程与踩坑记录见 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`——
+**新开实例以那篇为准**。下列原始 runbook 清单保留作核对参考（对应
 `docs/superpowers/plans/2026-07-07-tee-pg-phase0-1-infra.md` 的 Task 编号）：
 
 - **首次 create + AppAuth**：为 feedling-pg 建独立 CVM 与独立 AppAuth 合约

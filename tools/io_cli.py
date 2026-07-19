@@ -256,6 +256,21 @@ def cmd_perception(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+def cmd_perception_recent_apps(args):
+    api_url = _env("FEEDLING_API_URL")
+    auth = _auth_headers()
+    if not api_url or not auth:
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+    params = {"limit": str(args.limit)}
+    if args.hours:
+        params["hours"] = str(args.hours)
+    url = f"{api_url.rstrip('/')}/v1/agent/perception/recent_apps?{urllib.parse.urlencode(params)}"
+    status, body = _http_json("GET", url, auth)
+    if status == 200:
+        _emit(body)
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def cmd_perception_trend(args):
     api_url = _env("FEEDLING_API_URL")
     auth = _auth_headers()
@@ -916,6 +931,16 @@ def main():
         help="one or more of: " + ", ".join(PERCEPTION_SIGNALS) + " (default: fast set)",
     )
     pp.set_defaults(func=cmd_perception)
+
+    pra = sub.add_parser(
+        "perception-recent-apps",
+        help="Which apps the user opened recently (newest first). Use this for "
+             "'what have I been doing/using' — `perception app` only knows the "
+             "last 15 minutes.",
+    )
+    pra.add_argument("--limit", type=int, default=20)
+    pra.add_argument("--hours", type=float, default=0, help="only opens within the last N hours")
+    pra.set_defaults(func=cmd_perception_recent_apps)
 
     pt = sub.add_parser("perception-trend",
                         help="Rolling baseline + delta for one numeric field (sense change vs norm).")

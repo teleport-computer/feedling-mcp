@@ -75,18 +75,6 @@ def existing_terms(store, api_key, *, post_enclave) -> tuple[list[str], list[str
     return _terms_from_memory_items(memory_service._load_moments(store))
 
 
-def existing_terms_via_api_key(store, api_key) -> tuple[list[str], list[str]]:
-    """``hosted/turn.py`` path: derive existing bucket/thread terms with no Flask
-    request context (the deleted ``memory.routes._memory_existing_terms`` bound a
-    request-reading closure). The hosted caller supplies an ``api_key``, so bind a
-    ``post_enclave`` that forwards it (no runtime token)."""
-    def _post(api_key_, candidates, *, operation, payload=None):
-        return memory_readside_core.post_enclave_readside(
-            api_key_, candidates, operation=operation, payload=payload, runtime_token=None,
-        )
-    return existing_terms(store, api_key, post_enclave=_post)
-
-
 # --------------------------------------------------------------------------- #
 # readside routes
 # --------------------------------------------------------------------------- #

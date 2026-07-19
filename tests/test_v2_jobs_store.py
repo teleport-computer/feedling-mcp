@@ -771,10 +771,17 @@ def test_finish_chat_job_blocked_past_lease_expiry_fails_closed():
     claimed = jobs_store.claim_next_job("expiry-owner")
     assert claimed is not None and int(claimed["id"]) == job_id
     assert jobs_store.mark_running(job_id, claimed_by="expiry-owner")
+    # Lease must outlast the finisher's park latency (~0.5s) so the finisher's
+    # scan begins while the lease is still valid — that pre-expiry scan is what
+    # a buggy inline `lease > clock_timestamp()` predicate would sample, and is
+    # the whole premise that lets this test distinguish it from the correct
+    # post-lock re-check. 4s gives comfortable margin; the row is otherwise left
+    # UNCHANGED so real wall-clock time (not a row update) drives expiry — an
+    # update would trigger EvalPlanQual re-evaluation and mask the bug.
     with db.get_pool().connection() as conn:
         conn.execute(
             "UPDATE agent_jobs SET lease_expires_at="
-            "clock_timestamp() + interval '1 second' WHERE id=%s",
+            "clock_timestamp() + interval '4 second' WHERE id=%s",
             (job_id,),
         )
 
@@ -793,33 +800,46 @@ def test_finish_chat_job_blocked_past_lease_expiry_fails_closed():
                     force_successor=True,
                 )
 
-                # Prove the finisher started before expiry and is specifically
-                # sleeping on the held job-row lock; this makes the regression
-                # distinguish transaction-start now() from clock_timestamp().
-                deadline = time.monotonic() + 3
+                # Prove the finisher parked on the held job-row lock before the
+                # lease expired; this makes the regression distinguish
+                # transaction-start now() from clock_timestamp().
+                #
+                # Detect via pg_blocking_pids: a backend is "waiting" iff this
+                # blocker's backend is in its blocking set. This is robust to
+                # query-text drift and to which statement snapshot pg_stat_activity
+                # happens to show — it reads the server's lock wait graph directly,
+                # and is scoped to THIS blocker so a full-suite run's unrelated
+                # lock waits can't false-positive it. Poll gently (100ms): a tight
+                # busy-loop in this process starves the finisher thread of the GIL
+                # and prevents it from ever issuing its blocking statement (the
+                # original 10ms loop was the observer effect that made this flaky).
+                deadline = time.monotonic() + 15
                 waiting = False
                 while time.monotonic() < deadline:
                     waiting = bool(blocker.execute(
                         "SELECT EXISTS ("
                         " SELECT 1 FROM pg_stat_activity "
-                        " WHERE datname=current_database() "
-                        " AND wait_event_type='Lock' "
-                        " AND query LIKE '%%expected_runtime_generation%%' "
-                        " AND query LIKE '%%FROM agent_jobs%%FOR UPDATE%%'"
+                        " WHERE pid <> pg_backend_pid() "
+                        " AND pg_backend_pid() = ANY(pg_blocking_pids(pid))"
                         ")"
                     ).fetchone()[0])
                     if waiting:
                         break
-                    time.sleep(0.01)
+                    time.sleep(0.1)
                 assert waiting, "finisher never reached the blocked lease check"
                 remaining = float(blocker.execute(
-                    "SELECT GREATEST(EXTRACT(EPOCH FROM "
-                    "(lease_expires_at-clock_timestamp())),0) "
+                    "SELECT EXTRACT(EPOCH FROM "
+                    "(lease_expires_at-clock_timestamp())) "
                     "FROM agent_jobs WHERE id=%s",
                     (job_id,),
                 ).fetchone()[0])
+                # The finisher parked while the lease was still valid (its scan
+                # ran pre-expiry) — the precondition for discrimination.
+                assert remaining > 0.1, (
+                    "finisher parked too late; lease already expired at scan time"
+                )
                 time.sleep(remaining + 0.1)
-        result = future.result(timeout=3)
+        result = future.result(timeout=10)
 
     assert result == (False, None)
     with db.get_pool().connection() as conn:

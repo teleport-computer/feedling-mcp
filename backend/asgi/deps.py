@@ -36,11 +36,6 @@ async def require_auth(request: Request) -> AuthResult:
     return result
 
 
-async def require_store(auth: AuthResult = Depends(require_auth)):
-    """Just the UserStore, for routes that don't need the claims/api_key."""
-    return auth.store
-
-
 def require_scope(scope: str):
     """Dependency factory enforcing a runtime-token scope (plan slice 4).
 

@@ -46,10 +46,21 @@ A functional deployment can include:
 | PostgreSQL | All persistent user state | `DATABASE_URL` is mandatory; there is no current file-persistence fallback. |
 | Enclave service | Encrypted read-side and decrypt workflows | Local mode is not hardware-attested. Keep its private port off the public Internet except for a deliberately designed attestation path. |
 | Agent supervisor and runner | Hosted `/v1/model_api/chat/send` | Must share runtime-token configuration with the backend and publish a live supervisor heartbeat. |
-| Resident consumer | Independent agent Chat | Alternative to hosted Chat; polls and posts encrypted replies. |
+| Resident consumer | Independent agent Chat | Alternative to hosted Chat; polls and posts encrypted replies. Needs an `openssl` binary on `PATH` for privately-signed MCP servers; see below. |
 | WebSocket ingest | Screen/broadcast ingestion | The ASGI background service binds the configured ingest port, normally 9998. |
 | APNs credentials | Apple push and Live Activity | Optional; Chat storage works without push delivery. |
 | Object storage configuration | Large frames, chat files, and onboarding archives where enabled | Inventory and back up this data separately from PostgreSQL. |
+
+The resident consumer requires an `openssl` binary on `PATH` if any
+user-configured [MCP server](/docs/workflows/mcp) is registered over HTTPS with a
+certificate that does not chain to a public root. To trust such a server without
+disabling verification, the consumer shells out to `openssl s_client` to fetch
+and pin the server's own trust anchor. The managed runner image ships OpenSSL
+3.0; a self-hosted host without it **degrades silently**. The anchor fetch fails
+open, no CA is materialized, and the agent's connection to that MCP server fails
+with an ordinary certificate-verification error and no log line naming the
+missing binary. MCP servers reached over plain `http://`, or presenting a
+publicly trusted certificate, do not need it.
 
 A backend that returns `/healthz` can still be unable to decrypt Memory, process
 hosted Chat, or persist data. Build readiness from component checks rather than

@@ -263,28 +263,6 @@ class WakeInboxV2:
             return drained
 
 
-class SingleFlightRegistryV2:
-    """Per-user lock registry for turn execution."""
-
-    def __init__(self) -> None:
-        self._guard = threading.Lock()
-        self._locks: dict[str, threading.Lock] = {}
-
-    def lock_for(self, user_id: str) -> threading.Lock:
-        with self._guard:
-            lock = self._locks.get(user_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._locks[user_id] = lock
-            return lock
-
-    def try_acquire(self, user_id: str) -> threading.Lock | None:
-        lock = self.lock_for(user_id)
-        if not lock.acquire(blocking=False):
-            return None
-        return lock
-
-
 @dataclass(frozen=True)
 class LeaseV2:
     scope: str

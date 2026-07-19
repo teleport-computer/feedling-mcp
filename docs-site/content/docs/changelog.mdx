@@ -12,6 +12,18 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- New `GET /v1/agent/perception/recent_apps` returns recent app-open history
+  (`app`, `category`, `ts`, `minutes_ago`), newest first, with optional `limit`
+  (1–100, default 20) and `hours` query parameters. It reads the same app-open
+  history written by `GET /v1/perception/app_open`; no new storage. It is gated
+  by the same `app` capability as the current-app snapshot fields — when the
+  user has disabled that capability the response is
+  `{"ok": true, "disabled": true, "reason": ...}` with an empty `apps` list,
+  which is distinguishable from a genuine empty history.
+- The `app_name` / `app_category` snapshot fields now expire 15 minutes after
+  the reported open instead of 5 minutes. Because the shortcut reports opens and
+  never closes, these fields mean "last open observed within the window", not
+  "currently on screen".
 - `POST /v1/model_api/chat/send` and `POST /v1/chat/message` now accept an
   optional UUID `client_msg_id`. Reusing the same value for the same user within
   600 seconds returns the first stored user row without appending or waking a
@@ -53,6 +65,22 @@ change must not be interpreted as an API guarantee.
   (Cloudflare Tunnel, Tailscale Funnel, ngrok) in front of a local MCP server
   and register its public address instead. See the
   [MCP servers workflow](/docs/workflows/mcp) for the full guide.
+- Self-signed and private-CA MCP servers no longer require pasting a CA
+  certificate. Your agent now fetches and pins the server's own trust anchor
+  automatically the first time it connects (trust-on-first-use), then
+  verifies against it on every connection after that — TLS verification
+  stays on throughout, and the server still has to hold the matching private
+  key. `ca_pem` is now optional: paste one yourself (out-of-band) for
+  stronger-than-TOFU assurance, and a manually-pasted `ca_pem` always takes
+  priority over the automatic fetch. Servers with a publicly-trusted
+  certificate (Let's Encrypt, etc.) are never pinned — auto-fetching is
+  reserved for servers that can't verify against the public roots, which keeps
+  the trust-on-first-use window as small as possible.
+  **Self-hosted residents:** the fetch shells out to `openssl`; a host without
+  that binary on `PATH` silently materializes no CA, leaving such a server
+  unreachable exactly as it was before — see [self-hosting](/docs/self-hosting).
+  See the [MCP servers workflow](/docs/workflows/mcp) for the full explanation,
+  including the TOFU exposure window.
 - Rename the `POST /v1/mcp/servers/{name}/test` error kind previously returned
   for non-public hosts from `blocked_url` to `unreachable_from_backend` — the
   backend still refuses to probe non-global addresses itself (that refusal is

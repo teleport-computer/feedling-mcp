@@ -461,47 +461,6 @@ def _json_only_instruction(response_format: dict[str, Any] | None) -> str:
     return ""
 
 
-def _append_text_message(
-    messages: list[dict[str, str]],
-    *,
-    role: str,
-    content: str,
-) -> None:
-    content = content.strip()
-    if not content:
-        return
-    if messages and messages[-1].get("role") == role:
-        messages[-1]["content"] = f"{messages[-1]['content']}\n\n{content}"
-    else:
-        messages.append({"role": role, "content": content})
-
-
-def _split_system_messages(
-    messages: list[dict[str, Any]],
-    *,
-    assistant_role: str,
-) -> tuple[str, list[dict[str, str]]]:
-    system_parts: list[str] = []
-    provider_messages: list[dict[str, str]] = []
-    for message in messages:
-        role = str(message.get("role") or "").strip().lower()
-        content = _content_text(message.get("content"))
-        if not content:
-            continue
-        if role == "system":
-            system_parts.append(content)
-            continue
-        mapped_role = (
-            assistant_role
-            if role in {"assistant", "openclaw", "agent", "model"}
-            else "user"
-        )
-        _append_text_message(provider_messages, role=mapped_role, content=content)
-    if not provider_messages:
-        provider_messages.append({"role": "user", "content": "Say ok."})
-    return "\n\n".join(system_parts).strip(), provider_messages
-
-
 def _split_system_messages_anthropic(
     messages: list[Any],
 ) -> tuple[str, list[dict[str, Any]]]:

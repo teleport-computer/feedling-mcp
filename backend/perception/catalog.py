@@ -18,7 +18,7 @@ agent only ever sees labels.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,10 @@ CAPABILITIES: dict[str, Capability] = {c.key: c for c in [
     Capability("now_playing", "你在听的音乐", 1, context_field=True, query_tool=True),
     Capability("focus", "专注模式", 1, context_field=True),
     Capability("audio_route", "音频输出路由", 2, query_tool=True),
-    Capability("app", "你在用哪个 app（通过 iOS 快捷指令上报）", 1,
+    # One switch covers BOTH resolutions (current field + the recent_apps
+    # history tool), so the copy has to say so — otherwise the user thinks they
+    # are allowing "which app now" and is actually allowing a usage trajectory.
+    Capability("app", "你最近打开了哪些 app（通过 iOS 快捷指令上报，含最近使用记录）", 1,
                context_field=True, query_tool=True),
     Capability("weather", "粗天气", 2, query_tool=True),
     Capability("photos", "你拍的照片", 2, wake_source=True, query_tool=True),
@@ -142,8 +145,11 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
            ttl_sec=86400.0, significant=False),
     # `app` is reported via the GET /app_open shortcut endpoint (not /report); this
     # entry exists so app_name/app_category appear in the snapshot with a TTL.
+    # 900s, not the 300s this used to be: the Shortcut only fires on app OPEN,
+    # so a 5-minute window meant the agent saw app_name=None for any turn that
+    # wasn't right after a launch. `recent_apps` covers anything older.
     Signal("app", "app", ("app_name", "app_category"),
-           ttl_sec=300.0, significant=False),
+           ttl_sec=900.0, significant=False),
 ]}
 
 
@@ -171,7 +177,6 @@ COMPOSITE_KEYS: dict[str, list[str]] = {}
 # envelope in the frame channel. Allowing kind=photo via /items would let a
 # caller inject a confirmed photo doc without the envelope path.
 # (calendar is reported via /report, not /items.)
-ITEM_KINDS = ("photo", "workout", "sleep", "vitals")
 KIND_CAPABILITY = {
     "workout": "health_workout",
     "sleep": "health_sleep",
@@ -212,16 +217,7 @@ UNLOCK_BACK_THRESHOLD_SEC = 1800.0  # 30 min
 # /app_usage read; capped to keep the wake-attached snapshot small).
 RECENT_APPS_LIMIT = 10
 
-
-def signals_for_capability(cap_key: str) -> list[Signal]:
-    return [s for s in SIGNALS.values() if s.capability == cap_key]
-
-
-def context_field_names() -> list[str]:
-    """All state field names that belong to context_field capabilities."""
-    out: list[str] = []
-    for s in SIGNALS.values():
-        cap = CAPABILITIES.get(s.capability)
-        if cap and cap.context_field:
-            out.extend(s.outputs)
-    return out
+# Explicit `perception.recent_apps` pulls read the same app_usage stream, but an
+# agent asking "what have I been using today?" wants more than the wake budget.
+RECENT_APPS_TOOL_LIMIT = 20
+RECENT_APPS_TOOL_MAX = 100

@@ -21,7 +21,6 @@ from __future__ import annotations
 from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
 
 # action 取值:并入(merge)/ 新增(add)/ 覆盖(supersede)/ 不动(noop)
-CAPTURE_ACTIONS = ("add", "merge", "supersede", "noop")
 
 _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你刚和 TA 聊了一段，这段告一段落了。
 现在没人在等你回复，你安静地回看这段，决定有没有值得长久记住的事。

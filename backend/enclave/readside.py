@@ -245,22 +245,6 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
     return adapted
 
 
-def memory_readside_bucket_refs(inner: dict) -> list[str]:
-    refs = memory_readside_list(inner.get("bucket_refs"))
-    if refs:
-        return refs
-    refs = memory_readside_list(inner.get("bucket_ids"))
-    if refs:
-        return refs
-    linked = memory_readside_text(inner.get("linked_dimension"), 160)
-    return [linked] if linked else []
-
-
-def memory_readside_salience(envelope: dict, inner: dict) -> str:
-    salience = str(envelope.get("salience") or inner.get("salience") or "medium").strip().lower()
-    return salience if salience in {"critical", "high", "medium", "low"} else "medium"
-
-
 def memory_readside_status(envelope: dict, inner: dict) -> str:
     return str(envelope.get("status") or inner.get("status") or "active").strip().lower() or "active"
 

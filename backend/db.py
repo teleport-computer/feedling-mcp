@@ -3456,16 +3456,6 @@ def genesis_upsert_output(
     return result
 
 
-def genesis_get_output(user_id: str, job_id: str, output_type: str) -> dict | None:
-    with get_pool().connection() as conn:
-        cur = conn.execute(
-            "SELECT * FROM genesis_import_outputs "
-            "WHERE user_id = %s AND job_id = %s AND output_type = %s",
-            (user_id, job_id, output_type),
-        )
-        return _genesis_row(cur, cur.fetchone())
-
-
 def genesis_complete_job(
     user_id: str,
     job_id: str,

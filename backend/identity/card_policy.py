@@ -31,6 +31,28 @@ def is_runtime_label(name: str) -> bool:
     return str(name or "").strip().lower() in RUNTIME_LABELS
 
 
+def normalize_dimension_value(v) -> int:
+    """Coerce a dimension value onto the 0–100 INTEGER contract.
+
+    The card contract is an integer 0–100 score, but self-hosted BYOK weak
+    models routinely misread the scale as a 0–1 probability and emit floats
+    like 0.95 / 0.6. A raw float survives ``clamp``-only sanitizing and then
+    crashes iOS' integer JSONDecoder (dataCorrupted) on the decrypted card,
+    which the UI misreports as ``decrypt failed`` and retries forever.
+
+    Rule:
+      * ``0 < v <= 1``  → treat as a 0–1-scale misuse and rescale ``round(v*100)``
+        (so 1.0 is a full-marks dimension, not a score of 1).
+      * otherwise       → ``round(v)``.
+      * clamp to ``[0, 100]``; always return ``int``.
+
+    Callers MUST have already ensured ``v`` is a real number (not bool / str /
+    None) — the structure validators / sanitizer drop non-numbers before this.
+    """
+    scaled = round(v * 100) if 0 < v <= 1 else round(v)
+    return int(max(_VALUE_MIN, min(_VALUE_MAX, scaled)))
+
+
 def validate_dimensions_structure(dims) -> tuple[bool, str]:
     if not isinstance(dims, list):
         return (False, "dimensions_must_be_list")
@@ -98,8 +120,14 @@ def validate_dimension_nudge(target_name: str, new_value) -> tuple[bool, str]:
 def sanitize_identity_card(card: dict) -> dict:
     """Best-effort clean so the card ALWAYS PASSES structure validation WITHOUT
     losing usable content (contract: capture more, don't reject fuzzy issues).
-    Clamp values to [0,100]; drop non-dict / non-number-valued / unnamed dims;
-    drop duplicate dimension names (keep first); truncate to MAX_DIMENSIONS.
+    Normalize values to a 0–100 INTEGER (0–1-scale floats are rescaled ×100,
+    everything else rounded, then clamped — see normalize_dimension_value).
+    Capture-more recovery of real BYOK weak-model shapes seen in prod:
+    a ``score`` key is adopted as ``value`` (then dropped); a bare non-empty
+    string element becomes ``{name, value: 50}``; a named dim with no usable
+    number gets the 50 midpoint (other keys like summary/evidence survive).
+    Still dropped: non-dict/non-str elements, unnamed dims,
+    duplicate dimension names (keep first); truncate to MAX_DIMENSIONS.
     A non-list ``dimensions`` (missing/None/wrong type) normalizes to ``[]``
     rather than being left as-is, so the output is never structurally invalid.
     Does NOT touch agent_name — empty is allowed and a runtime-label name is a
@@ -112,17 +140,24 @@ def sanitize_identity_card(card: dict) -> dict:
         cleaned: list = []
         seen: set[str] = set()
         for d in dims:
+            if isinstance(d, str):
+                d = {"name": d, "value": 50}
             if not isinstance(d, dict):
                 continue
             name = str(d.get("name") or "").strip()
             if not name or name.lower() in seen:
                 continue
-            v = d.get("value")
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
-                continue
             nd = dict(d)
+            v = nd.get("value")
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                score = nd.get("score")
+                if not isinstance(score, bool) and isinstance(score, (int, float)):
+                    v = score
+                    nd.pop("score", None)
+                else:
+                    v = 50
             nd["name"] = name
-            nd["value"] = max(_VALUE_MIN, min(_VALUE_MAX, v))
+            nd["value"] = normalize_dimension_value(v)
             seen.add(name.lower())
             cleaned.append(nd)
             if len(cleaned) >= MAX_DIMENSIONS:

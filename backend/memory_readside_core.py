@@ -11,34 +11,17 @@ import httpx
 from memory import service as memory_service
 
 
-MEMORY_READSIDE_DEFAULT_LIMIT = 0
 MEMORY_READSIDE_DEFAULT_HARD_MAX = 1000
-MEMORY_READSIDE_LIMIT = MEMORY_READSIDE_DEFAULT_LIMIT
-MEMORY_FETCH_TOOL_LIMIT = 5
-MEMORY_FETCH_LOOP_LIMIT = 8
 
-_SALIENCE_WEIGHT = {
-    "critical": 4,
-    "high": 3,
-    "medium": 2,
-    "low": 1,
-}
 _INACTIVE_STATUSES = {
     "archived",
     "deleted",
     "superseded",
 }
 
-PostEnclave = Callable[[str | None, list[dict], ...], dict]
-
 
 def _status(moment: dict) -> str:
     return str(moment.get("status") or "active").strip().lower() or "active"
-
-
-def _salience(moment: dict) -> str:
-    salience = str(moment.get("salience") or "medium").strip().lower()
-    return salience if salience in _SALIENCE_WEIGHT else "medium"
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -144,10 +127,6 @@ def _env_int(name: str, default: int) -> int:
 def readside_hard_max() -> int:
     hard_max = _env_int("FEEDLING_MEMORY_READSIDE_HARD_MAX", MEMORY_READSIDE_DEFAULT_HARD_MAX)
     return max(1, hard_max)
-
-
-def configured_readside_limit() -> int:
-    return MEMORY_READSIDE_DEFAULT_LIMIT
 
 
 def effective_readside_limit(value: Any | None = None) -> int:
