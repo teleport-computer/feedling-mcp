@@ -3595,23 +3595,35 @@ def chat_insert_onboarding_greeting_once(
     ``(winner_doc, inserted_by_this_call)``."""
     with get_pool().connection() as conn:
         with conn.transaction():
-            row = conn.execute(
-                "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
-                "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT (user_id, msg_id) DO NOTHING RETURNING doc",
-                (user_id, msg_id, ts, Jsonb(doc)),
-            ).fetchone()
-            inserted = row is not None
-            if not inserted:
-                # ON CONFLICT waits out an in-flight conflicting insert, so by
-                # here the winner is committed and visible to this statement.
-                row = conn.execute(
-                    "SELECT doc FROM chat_messages WHERE user_id = %s AND msg_id = %s",
-                    (user_id, msg_id),
-                ).fetchone()
+            with conn.cursor() as cur:
+                # Greeting writes participate in the same clear/account-delete
+                # linearization protocol as every ordinary chat writer.  Pin
+                # the live storage generation as well: after a previous clear,
+                # the column default (generation zero) is already retired.
+                storage_generation = _lock_chat_r2_lifecycle_on_cursor(
+                    cur, user_id,
+                )
+                cur.execute(
+                    "INSERT INTO chat_messages "
+                    "(user_id, msg_id, ts, doc, storage_generation) "
+                    "VALUES (%s, %s, %s, %s, %s) "
+                    "ON CONFLICT (user_id, msg_id) DO NOTHING RETURNING doc",
+                    (user_id, msg_id, ts, Jsonb(doc), storage_generation),
+                )
+                row = cur.fetchone()
+                inserted = row is not None
+                if not inserted:
+                    # ON CONFLICT waits out an in-flight conflicting insert, so
+                    # the winner is committed and visible to this statement.
+                    cur.execute(
+                        "SELECT doc FROM chat_messages "
+                        "WHERE user_id = %s AND msg_id = %s",
+                        (user_id, msg_id),
+                    )
+                    row = cur.fetchone()
     if row is None:
-        # Conflict fired yet the row is gone (deleted between statements, e.g.
-        # a concurrent chat clear) — surface it rather than invent an answer.
+        # Conflict fired yet the row is gone despite the shared chat/lifecycle
+        # fences. Surface the invariant violation rather than invent an answer.
         raise RuntimeError("onboarding_greeting_row_vanished_after_conflict")
     # Deliberately NO inline TEE mirror: TEE chat rows are produced by the
     # replicator, which decrypts via the enclave (plaintext body, no
@@ -5741,65 +5753,66 @@ def chat_append_idempotent(
     if window_sec <= 0:
         raise ValueError("window_sec must be positive")
 
-    offload = (
-        object_storage.chat_files_enabled()
-        and isinstance(doc, dict)
-        and doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
-        and doc.get("body_ct") is not None
-    )
+    row = None
+    storage_generation: int | None = None
     with get_pool().connection() as conn:
         with conn.transaction():
-            # Length-prefix the user id so concatenation is unambiguous without
-            # a NUL byte (PostgreSQL text values reject U+0000).
-            lock_key = f"{len(user_id)}:{user_id}{client_msg_id}"
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                (lock_key,),
-            )
-            row = conn.execute(
-                "SELECT doc FROM chat_messages "
-                "WHERE user_id = %s AND doc->>'client_msg_id' = %s "
-                "AND ts >= EXTRACT(EPOCH FROM clock_timestamp()) - %s "
-                "ORDER BY seq DESC LIMIT 1",
-                (user_id, client_msg_id, window_sec),
-            ).fetchone()
-            if row is not None:
-                return row[0], False
+            with conn.cursor() as cur:
+                # Global order matches clear/account deletion: shared chat
+                # fence -> lifecycle row -> idempotency key.  The lifecycle
+                # lock covers both winner lookup and insert, so clear cannot
+                # split those decisions across storage generations.
+                _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
 
-            # Keep normal msg-id semantics: an envelope-id collision updates the
-            # same primary-key row, matching chat_append's existing behavior.
-            row = conn.execute(
-                "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
-                "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT (user_id, msg_id) DO UPDATE "
-                "SET ts = EXCLUDED.ts, doc = EXCLUDED.doc RETURNING doc",
-                (user_id, msg_id, ts, Jsonb(doc)),
-            ).fetchone()
-
-    # Mirror chat_append's crash-safe R2 ordering. Only the transaction winner
-    # reaches this block, so retries neither upload twice nor flip the row twice.
-    if offload:
-        try:
-            body_ct_len = len(doc["body_ct"])
-            key = object_storage.put_chat_body(
-                user_id, msg_id, doc["body_ct"], str(doc.get("content_type") or "file")
-            )
-            pointer = {"body_key": key, "body_ct_len": body_ct_len}
-            with get_pool().connection() as conn:
-                conn.execute(
-                    "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
-                    "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
-                    (Jsonb(pointer), user_id, msg_id),
+                # Length-prefix the user id so concatenation is unambiguous
+                # without a NUL byte (PostgreSQL text rejects U+0000).
+                lock_key = f"{len(user_id)}:{user_id}{client_msg_id}"
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (lock_key,),
                 )
-        except Exception as e:  # noqa: BLE001
-            log.error(
-                "[db] chat_append_idempotent(%s,%s) R2 offload failed, left inline: %s",
-                user_id,
-                msg_id,
-                e,
-            )
-    if row is None:
+                cur.execute(
+                    "SELECT doc FROM chat_messages "
+                    "WHERE user_id = %s AND doc->>'client_msg_id' = %s "
+                    "AND ts >= EXTRACT(EPOCH FROM clock_timestamp()) - %s "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (user_id, client_msg_id, window_sec),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    return row[0], False
+
+                # Preserve normal msg-id semantics: an envelope-id collision
+                # updates the same row, exactly like chat_append.  Reusing the
+                # shared primitive also pins storage_generation and applies the
+                # pointer-replay checks used by every other chat write.
+                _seq, storage_generation = _chat_insert_on_cursor(
+                    cur,
+                    user_id,
+                    msg_id,
+                    ts,
+                    doc,
+                    max_messages,
+                )
+                cur.execute(
+                    "SELECT doc FROM chat_messages "
+                    "WHERE user_id = %s AND msg_id = %s",
+                    (user_id, msg_id),
+                )
+                row = cur.fetchone()
+
+    if row is None or storage_generation is None:
         raise RuntimeError("chat_idempotent_insert_returned_no_row")
+
+    # Only the transaction winner gets here. The shared offload primitive
+    # commits an exact-key cleanup guard before PUT and pins every later CAS to
+    # this row's storage generation, so clear can safely win at any boundary.
+    _offload_chat_body_after_commit(
+        user_id,
+        msg_id,
+        doc,
+        storage_generation,
+    )
     return row[0], True
 
 

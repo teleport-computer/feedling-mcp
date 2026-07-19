@@ -475,6 +475,91 @@ def test_clear_first_rejects_paused_summary_artifact_trajectory_and_status_write
         ).fetchone()[0] == 0
 
 
+def test_onboarding_greeting_writer_first_linearizes_before_clear(monkeypatch):
+    """The immutable greeting writer must hold clear's shared chat fence."""
+    uid = "u_v2_onboarding_writer_before_clear"
+    seed_user(uid)
+    msg_id = "onboarding-greeting"
+    greeting = {
+        "id": msg_id,
+        "role": "openclaw",
+        "ts": 10.0,
+        "body_ct": "encrypted-greeting",
+        "model_api_kind": "onboarding_greeting",
+    }
+
+    original_lock = db._lock_chat_user_fence_on_cursor
+    writer_has_shared = threading.Event()
+    release_writer = threading.Event()
+    paused_once = threading.Event()
+
+    def pausing_lock(cur, user_id: str, *, exclusive: bool = False):
+        original_lock(cur, user_id, exclusive=exclusive)
+        if (
+            not exclusive
+            and str(user_id) == uid
+            and threading.current_thread().name.startswith("greeting-writer")
+            and not paused_once.is_set()
+        ):
+            paused_once.set()
+            writer_has_shared.set()
+            assert release_writer.wait(timeout=5)
+
+    monkeypatch.setattr(db, "_lock_chat_user_fence_on_cursor", pausing_lock)
+
+    with ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="greeting-writer",
+    ) as pool:
+        writer_future = pool.submit(
+            db.chat_insert_onboarding_greeting_once,
+            uid,
+            msg_id,
+            greeting["ts"],
+            greeting,
+        )
+        assert writer_has_shared.wait(timeout=3)
+        clear_future = pool.submit(db.chat_clear, uid)
+        with pytest.raises(FutureTimeoutError):
+            clear_future.result(timeout=0.2)
+        release_writer.set()
+        winner, inserted = writer_future.result(timeout=5)
+        assert inserted is True and winner == greeting
+        assert clear_future.result(timeout=5) == 1
+
+    assert db.chat_onboarding_greeting_row(uid) is None
+
+
+def test_onboarding_greeting_after_clear_uses_live_storage_generation():
+    uid = "u_v2_onboarding_after_clear_generation"
+    seed_user(uid)
+    assert db.chat_clear(uid) == 0
+    greeting = {
+        "id": "post-clear-greeting",
+        "role": "openclaw",
+        "ts": 20.0,
+        "body_ct": "encrypted-post-clear-greeting",
+        "model_api_kind": "onboarding_greeting",
+    }
+
+    winner, inserted = db.chat_insert_onboarding_greeting_once(
+        uid,
+        greeting["id"],
+        greeting["ts"],
+        greeting,
+    )
+    assert inserted is True and winner == greeting
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT message.storage_generation,lifecycle.generation "
+            "FROM chat_messages AS message "
+            "JOIN chat_r2_lifecycle AS lifecycle USING (user_id) "
+            "WHERE message.user_id=%s AND message.msg_id=%s",
+            (uid, greeting["id"]),
+        ).fetchone()
+    assert row == (1, 1)
+
+
 def test_reply_writer_first_linearizes_before_clear_and_clear_removes_reply(
     monkeypatch,
 ):
