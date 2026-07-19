@@ -610,6 +610,34 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "reply_to_message_id": {"type": "string", "description": "Parent user message; strongly recommended for duplicate-reply protection."},
             "content_type": {"type": "string", "enum": ["text", "image"], "default": "text"},
+            "turn_failure_error_class": {
+                "type": "string",
+                "maxLength": 64,
+                "description": (
+                    "Set only when this reply is a fallback standing in for a turn the agent "
+                    "could not answer. Carries the classified failure so the client can show the "
+                    "real reason on the user's own message instead of the generic fallback line. "
+                    "Omit on successful replies."
+                ),
+            },
+            "turn_failure_blame": {
+                "type": "string",
+                "enum": ["user_provider", "provider_transient", "system"],
+                "description": (
+                    "Who the failure belongs to. user_provider is actionable by the user "
+                    "(top up / fix key / fix model name); system must never point the user at "
+                    "their own configuration."
+                ),
+            },
+            "turn_failure_user_text": {
+                "type": "string",
+                "maxLength": 500,
+                "description": (
+                    "User-facing copy for the failure, authored server-side. Never contains raw "
+                    "provider detail (which can carry provider HTML, request ids or sensitive "
+                    "context)."
+                ),
+            },
         },
         "additionalProperties": True,
     },
