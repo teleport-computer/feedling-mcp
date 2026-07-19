@@ -2139,9 +2139,14 @@ def _render_data_track_dau_page(payload: dict) -> str:
             # 人均日使用时长 = 当天总前台时长 / 使用DAU(每个活跃用户当天实际用了多久)。
             # 之前是 avg_session_sec(每次会话均长),被大量前后台切换的微会话拉低,误导。
             f"<td><b>{_fmt_duration_sec((row.get('foreground_sec') or 0) / (row.get('session_dau') or 1))}</b></td>"
-            f"<td>{int(row.get('session_count') or 0)}</td>"
-            f"<td>{html.escape(_bj_iso(row.get('last_at')))}</td>"
-            "</tr>"
+            # 中位数日使用时长 = 每用户当天前台总时长的中位数(典型用户),不被少数
+            # 重度用户拉高。冻结前的历史天没存 per-user 分布,显示 "-"。
+            + (f"<td>{_fmt_duration_sec(row.get('median_user_sec'))}</td>"
+               if (row.get('median_user_sec') or 0) > 0
+               else "<td class='muted'>-</td>")
+            + f"<td>{int(row.get('session_count') or 0)}</td>"
+            + f"<td>{html.escape(_bj_iso(row.get('last_at')))}</td>"
+            + "</tr>"
         )
     metrics = "".join([
         _render_metric("latest DAU", summary["latest_dau"]),
@@ -2198,11 +2203,11 @@ def _render_data_track_dau_page(payload: dict) -> str:
     {_cutover_html}
   </div>
   <div class="muted">{html.escape(definition.get("dau") or "")} {html.escape(definition.get("excluded") or "")}</div>
-  <div class="muted">使用DAU=当天有 app 后台上报（app_session_end 事件）的用户数；人均日使用时长=当天总前台时长÷使用DAU（每个活跃用户当天实际用了多久，比"每次会话均长"更贴合直觉）；会话数=当天 app_session_end 事件数（含大量前后台切换的微会话）。前台被强杀会漏报，略偏低估。均按北京日。</div>
+  <div class="muted">使用DAU=当天有 app 后台上报（app_session_end 事件）的用户数；人均日使用时长=当天总前台时长÷使用DAU（均值，会被少数重度用户拉高）；中位数日使用时长=每个用户当天前台总时长的中位数（典型用户实际用了多久，不被少数重度用户拉高，和均值并看更可信）——冻结快照只存聚合值，改动前已冻结的历史天显示"-"；会话数=当天 app_session_end 事件数（含大量前后台切换的微会话）。前台被强杀会漏报，略偏低估。均按北京日。</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>人均日使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
-    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='12' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
+    <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>人均日使用时长</th><th>中位数日使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='13' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
   </table>
 </main>
 </body>

@@ -1031,7 +1031,8 @@ def _dau_row(row) -> dict:
         "foreground_sec": int(row[10] or 0),
         "session_count": int(row[11] or 0),
         "session_dau": int(row[12] or 0),
-        "frozen": bool(row[13]),
+        "median_user_sec": float(row[13] or 0),
+        "frozen": bool(row[14]),
     }
 
 
@@ -1107,20 +1108,44 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                     FROM usage_events
                     GROUP BY day
                 ),
+                -- Per-user daily foreground total, then the median across users:
+                -- the "typical user" counterpart to foreground_sec/session_dau
+                -- (a mean that a few heavy users skew high). Frozen snapshots
+                -- store only aggregates, so this only populates for live days
+                -- and days frozen after this column shipped.
+                usage_per_user AS (
+                    SELECT
+                        to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                        user_id,
+                        SUM(duration_sec) AS user_sec
+                    FROM usage_events
+                    GROUP BY day, user_id
+                ),
+                usage_median AS (
+                    SELECT day,
+                           COALESCE(
+                             percentile_cont(0.5) WITHIN GROUP (ORDER BY user_sec), 0
+                           )::double precision AS median_user_sec
+                    FROM usage_per_user
+                    GROUP BY day
+                ),
                 live AS (
                     SELECT d.day, d.dau, d.chat_dau, d.tracking_dau, d.active_events,
                            d.user_messages, d.tracking_events, d.first_ts, d.last_ts,
                            COALESCE(u.avg_session_sec, 0)::double precision AS avg_session_sec,
                            COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
                            COALESCE(u.session_count, 0)::int AS session_count,
-                           COALESCE(u.session_dau, 0)::int AS session_dau
+                           COALESCE(u.session_dau, 0)::int AS session_dau,
+                           COALESCE(m.median_user_sec, 0)::double precision AS median_user_sec
                     FROM daily d
                     LEFT JOIN usage_daily u ON u.day = d.day
+                    LEFT JOIN usage_median m ON m.day = d.day
                 ),
                 frozen_rows AS (
                     SELECT day, dau, chat_dau, tracking_dau, active_events,
                            user_messages, tracking_events, first_ts, last_ts,
-                           avg_session_sec, foreground_sec, session_count, session_dau
+                           avg_session_sec, foreground_sec, session_count, session_dau,
+                           median_user_sec
                     FROM dau_daily_snapshot
                     WHERE active_events > 0
                       AND (%s = 0 OR first_ts >= %s)
@@ -1135,12 +1160,12 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                 SELECT day, dau, chat_dau, tracking_dau, active_events,
                        user_messages, tracking_events, first_ts, last_ts,
                        avg_session_sec, foreground_sec, session_count, session_dau,
-                       frozen
+                       median_user_sec, frozen
                 FROM merged
                 ORDER BY day DESC
                 LIMIT %s
                 """,
-                (since, since, since, since, since, since, tz, tz, since, since, day_limit),
+                (since, since, since, since, since, since, tz, tz, tz, since, since, day_limit),
             ).fetchall()
         return [_dau_row(row) for row in rows]
     except Exception as e:
@@ -1195,7 +1220,15 @@ def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
             COALESCE((SELECT AVG(duration_sec) FROM usage_events), 0)::double precision,
             COALESCE((SELECT SUM(duration_sec) FROM usage_events), 0)::bigint,
             (SELECT COUNT(*)::int FROM usage_events),
-            (SELECT COUNT(DISTINCT user_id)::int FROM usage_events)
+            (SELECT COUNT(DISTINCT user_id)::int FROM usage_events),
+            COALESCE((
+                SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY user_sec)
+                FROM (
+                    SELECT SUM(duration_sec) AS user_sec
+                    FROM usage_events
+                    GROUP BY user_id
+                ) per_user
+            ), 0)::double precision
         FROM active
         """,
         (start, end, start, end, start, end),
@@ -1214,6 +1247,7 @@ def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
         "foreground_sec": int(row[9] or 0),
         "session_count": int(row[10] or 0),
         "session_dau": int(row[11] or 0),
+        "median_user_sec": float(row[12] or 0),
     }
 
 
@@ -1254,9 +1288,9 @@ def freeze_completed_dau_days(*, now_epoch: float | None = None,
                             day, dau, chat_dau, tracking_dau, active_events,
                             user_messages, tracking_events, session_dau,
                             avg_session_sec, foreground_sec, session_count,
-                            first_ts, last_ts
+                            first_ts, last_ts, median_user_sec
                         ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (day) DO NOTHING
                         RETURNING day
@@ -1267,7 +1301,7 @@ def freeze_completed_dau_days(*, now_epoch: float | None = None,
                             snap["user_messages"], snap["tracking_events"],
                             snap["session_dau"], snap["avg_session_sec"],
                             snap["foreground_sec"], snap["session_count"],
-                            snap["first_ts"], snap["last_ts"],
+                            snap["first_ts"], snap["last_ts"], snap["median_user_sec"],
                         ),
                     ).fetchone()
                     if saved:
@@ -3102,6 +3136,168 @@ def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None
     from tee_shadow import mirror
     mirror.execute(sql, (Jsonb(fields), user_id, msg_id))
     return row[0] if row is not None else None
+
+
+_CHAT_FINALIZE_REPLY_ONCE_SQL = (
+    "WITH won AS ("
+    "  UPDATE chat_messages SET doc = doc || %s "
+    "  WHERE user_id = %s AND msg_id = %s "
+    "    AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+    "    AND COALESCE(doc->>'reply_message_id','') = '' "
+    "  RETURNING doc AS parent_doc"
+    "), inserted AS ("
+    "  INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+    "  SELECT %s, %s, %s, %s FROM won "
+    "  RETURNING doc AS reply_doc"
+    ") "
+    "SELECT won.parent_doc, inserted.reply_doc FROM won CROSS JOIN inserted"
+)
+
+_CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL = (
+    "UPDATE chat_messages SET doc = doc || %s "
+    "WHERE user_id = %s AND msg_id = %s"
+)
+
+
+def chat_finalize_reply_once(
+    user_id: str,
+    parent_msg_id: str,
+    reply_msg_id: str,
+    reply_ts: float,
+    reply_doc: dict,
+    replied_fields: dict,
+) -> tuple[dict, dict] | None:
+    """Atomically mark one parent answered and insert its encrypted reply.
+
+    The parent primary-key UPDATE is the compare-and-swap.  The data-modifying
+    CTE makes the reply INSERT conditional on winning that UPDATE and keeps the
+    two writes in one PostgreSQL statement: a duplicate reply id or any other
+    INSERT failure rolls the parent mutation back with the statement.  Losing
+    the CAS is the only normal ``None`` result; database failures deliberately
+    propagate so callers fail closed instead of accidentally retrying a reply.
+
+    This low-level helper performs no cache, wake, capture, R2, or inline reply
+    mirror side effects.  After the RDS statement commits, it best-effort
+    mirrors only the parent's plaintext metadata; the encrypted reply remains
+    exclusively on the normal decrypting TEE-replicator path.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            _CHAT_FINALIZE_REPLY_ONCE_SQL,
+            (
+                Jsonb(replied_fields),
+                user_id,
+                parent_msg_id,
+                user_id,
+                reply_msg_id,
+                reply_ts,
+                Jsonb(reply_doc),
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    # The encrypted reply row is intentionally NOT mirrored here.  The normal
+    # TEE replicator decrypts and copies that row in its canonical plaintext
+    # shape.  Only the already-existing parent's plaintext metadata is safe to
+    # merge inline; mirror.execute is best-effort and swallows TEE failures.
+    from tee_shadow import mirror
+
+    mirror.execute(
+        _CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL,
+        (Jsonb(replied_fields), user_id, parent_msg_id),
+    )
+    return row[0], row[1]
+
+
+def chat_finalize_reply_post_commit(
+    user_id: str, reply_doc: dict, max_messages: int
+) -> None:
+    """Run normal append maintenance after an atomic reply winner commits.
+
+    Finalization must commit the parent CAS and inline encrypted reply together,
+    so trimming and optional R2 offload happen afterwards.  This preserves
+    ``chat_append`` semantics: trim to the newest bounded history, write heavy
+    ciphertext inline first, upload outside a transaction, and only then flip
+    the current row to an R2 pointer.  Failures are logged and leave the already
+    committed inline reply readable.
+    """
+    reply_msg_id = str(reply_doc.get("id") or "")
+    offload = (
+        object_storage.chat_files_enabled()
+        and reply_doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
+        and reply_doc.get("body_ct") is not None
+    )
+    trimmed_docs: list = []
+    trimmed_ids: list[str] = []
+    try:
+        if max_messages and max_messages > 0:
+            with get_pool().connection() as conn:
+                rows = conn.execute(
+                    "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
+                    "  SELECT MIN(seq) FROM ("
+                    "    SELECT seq FROM chat_messages WHERE user_id = %s "
+                    "    ORDER BY seq DESC LIMIT %s"
+                    "  ) t"
+                    ") RETURNING msg_id, doc",
+                    (user_id, user_id, max_messages),
+                ).fetchall()
+                trimmed_ids = [row[0] for row in rows]
+                trimmed_docs = [row[1] for row in rows]
+
+        if offload:
+            try:
+                body_ct_len = len(reply_doc["body_ct"])
+                key = object_storage.put_chat_body(
+                    user_id,
+                    reply_msg_id,
+                    reply_doc["body_ct"],
+                    str(reply_doc.get("content_type") or "file"),
+                )
+                pointer = {"body_key": key, "body_ct_len": body_ct_len}
+                with get_pool().connection() as conn:
+                    conn.execute(
+                        "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
+                        "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
+                        (Jsonb(pointer), user_id, reply_msg_id),
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "[db] chat_finalize_reply_post_commit(%s,%s) R2 offload "
+                    "failed, left inline: %s",
+                    user_id,
+                    reply_msg_id,
+                    e,
+                )
+
+        if trimmed_docs and object_storage.chat_files_enabled():
+            for trimmed in trimmed_docs:
+                if isinstance(trimmed, dict) and trimmed.get("body_key"):
+                    object_storage.delete_chat_body(
+                        str(trimmed["body_key"]), user_id
+                    )
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "[db] chat_finalize_reply_post_commit(%s,%s) failed: %s",
+            user_id,
+            reply_msg_id,
+            e,
+        )
+        return
+
+    if trimmed_ids:
+        from tee_shadow import mirror
+
+        mirror.execute_many([
+            (
+                "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = ANY(%s)",
+                (user_id, trimmed_ids),
+            ),
+            (
+                "DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+                "AND table_name = 'chat_messages' AND item_id = ANY(%s)",
+                (user_id, trimmed_ids),
+            ),
+        ])
 
 
 def chat_try_claim_reply(
