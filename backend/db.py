@@ -1031,7 +1031,8 @@ def _dau_row(row) -> dict:
         "foreground_sec": int(row[10] or 0),
         "session_count": int(row[11] or 0),
         "session_dau": int(row[12] or 0),
-        "frozen": bool(row[13]),
+        "median_user_sec": float(row[13] or 0),
+        "frozen": bool(row[14]),
     }
 
 
@@ -1107,20 +1108,44 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                     FROM usage_events
                     GROUP BY day
                 ),
+                -- Per-user daily foreground total, then the median across users:
+                -- the "typical user" counterpart to foreground_sec/session_dau
+                -- (a mean that a few heavy users skew high). Frozen snapshots
+                -- store only aggregates, so this only populates for live days
+                -- and days frozen after this column shipped.
+                usage_per_user AS (
+                    SELECT
+                        to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                        user_id,
+                        SUM(duration_sec) AS user_sec
+                    FROM usage_events
+                    GROUP BY day, user_id
+                ),
+                usage_median AS (
+                    SELECT day,
+                           COALESCE(
+                             percentile_cont(0.5) WITHIN GROUP (ORDER BY user_sec), 0
+                           )::double precision AS median_user_sec
+                    FROM usage_per_user
+                    GROUP BY day
+                ),
                 live AS (
                     SELECT d.day, d.dau, d.chat_dau, d.tracking_dau, d.active_events,
                            d.user_messages, d.tracking_events, d.first_ts, d.last_ts,
                            COALESCE(u.avg_session_sec, 0)::double precision AS avg_session_sec,
                            COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
                            COALESCE(u.session_count, 0)::int AS session_count,
-                           COALESCE(u.session_dau, 0)::int AS session_dau
+                           COALESCE(u.session_dau, 0)::int AS session_dau,
+                           COALESCE(m.median_user_sec, 0)::double precision AS median_user_sec
                     FROM daily d
                     LEFT JOIN usage_daily u ON u.day = d.day
+                    LEFT JOIN usage_median m ON m.day = d.day
                 ),
                 frozen_rows AS (
                     SELECT day, dau, chat_dau, tracking_dau, active_events,
                            user_messages, tracking_events, first_ts, last_ts,
-                           avg_session_sec, foreground_sec, session_count, session_dau
+                           avg_session_sec, foreground_sec, session_count, session_dau,
+                           median_user_sec
                     FROM dau_daily_snapshot
                     WHERE active_events > 0
                       AND (%s = 0 OR first_ts >= %s)
@@ -1135,12 +1160,12 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                 SELECT day, dau, chat_dau, tracking_dau, active_events,
                        user_messages, tracking_events, first_ts, last_ts,
                        avg_session_sec, foreground_sec, session_count, session_dau,
-                       frozen
+                       median_user_sec, frozen
                 FROM merged
                 ORDER BY day DESC
                 LIMIT %s
                 """,
-                (since, since, since, since, since, since, tz, tz, since, since, day_limit),
+                (since, since, since, since, since, since, tz, tz, tz, since, since, day_limit),
             ).fetchall()
         return [_dau_row(row) for row in rows]
     except Exception as e:
@@ -1195,7 +1220,15 @@ def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
             COALESCE((SELECT AVG(duration_sec) FROM usage_events), 0)::double precision,
             COALESCE((SELECT SUM(duration_sec) FROM usage_events), 0)::bigint,
             (SELECT COUNT(*)::int FROM usage_events),
-            (SELECT COUNT(DISTINCT user_id)::int FROM usage_events)
+            (SELECT COUNT(DISTINCT user_id)::int FROM usage_events),
+            COALESCE((
+                SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY user_sec)
+                FROM (
+                    SELECT SUM(duration_sec) AS user_sec
+                    FROM usage_events
+                    GROUP BY user_id
+                ) per_user
+            ), 0)::double precision
         FROM active
         """,
         (start, end, start, end, start, end),
@@ -1214,6 +1247,7 @@ def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
         "foreground_sec": int(row[9] or 0),
         "session_count": int(row[10] or 0),
         "session_dau": int(row[11] or 0),
+        "median_user_sec": float(row[12] or 0),
     }
 
 
@@ -1254,9 +1288,9 @@ def freeze_completed_dau_days(*, now_epoch: float | None = None,
                             day, dau, chat_dau, tracking_dau, active_events,
                             user_messages, tracking_events, session_dau,
                             avg_session_sec, foreground_sec, session_count,
-                            first_ts, last_ts
+                            first_ts, last_ts, median_user_sec
                         ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (day) DO NOTHING
                         RETURNING day
@@ -1267,7 +1301,7 @@ def freeze_completed_dau_days(*, now_epoch: float | None = None,
                             snap["user_messages"], snap["tracking_events"],
                             snap["session_dau"], snap["avg_session_sec"],
                             snap["foreground_sec"], snap["session_count"],
-                            snap["first_ts"], snap["last_ts"],
+                            snap["first_ts"], snap["last_ts"], snap["median_user_sec"],
                         ),
                     ).fetchone()
                     if saved:

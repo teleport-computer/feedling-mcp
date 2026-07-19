@@ -539,6 +539,39 @@ def test_admin_data_track_dau_aggregates_app_sessions_by_beijing_day():
     assert by_day["2030-06-04"]["foreground_sec"] == 0
     assert by_day["2030-06-04"]["session_count"] == 0
     assert by_day["2030-06-04"]["session_dau"] == 0
+    # Median of per-user daily totals: user_a=60+180=240, user_b=120 → median 180;
+    # a chat-only day has no sessions → 0.
+    assert by_day["2030-06-02"]["median_user_sec"] == 180.0
+    assert by_day["2030-06-04"]["median_user_sec"] == 0.0
+
+
+def test_admin_data_track_dau_median_is_robust_to_heavy_users():
+    """Median per-user foreground ≠ the mean when a heavy user skews the day."""
+    light_a = _uid()
+    light_b = _uid()
+    heavy = _uid()
+    for uid in (light_a, light_b, heavy):
+        seed_user(uid)
+
+    since = _epoch("2031-03-01T17:00:00Z")
+    base = _epoch("2031-03-01T18:00:00Z")  # 2031-03-02 Beijing
+    # Per-user daily totals: 10, 20, 300 → mean 110, median 20.
+    for uid, duration in ((light_a, 10), (light_b, 20), (heavy, 300)):
+        db.log_append(
+            uid,
+            "tracking_events",
+            {"type": "app_session_end", "payload": {"duration_sec": duration}},
+            ts=base,
+        )
+
+    by_day = {
+        row["day"]: row
+        for row in db.admin_data_track_dau(since_epoch=since, days=10, tz="Asia/Shanghai")
+    }
+    day = by_day["2031-03-02"]
+    assert day["session_dau"] == 3
+    assert day["foreground_sec"] == 330            # mean per user = 110
+    assert day["median_user_sec"] == 20.0          # median is not fooled by the heavy user
 
 
 def test_dau_daily_snapshot_freezes_completed_days_and_preserves_live_fallback():
@@ -594,6 +627,9 @@ def test_dau_daily_snapshot_freezes_completed_days_and_preserves_live_fallback()
         assert by_day["2042-08-11"]["dau"] == 2
         assert by_day["2042-08-11"]["session_count"] == 1
         assert by_day["2042-08-11"]["foreground_sec"] == 120
+        # Median per-user foreground survives the freeze round-trip (single user
+        # with a 120s total → median 120).
+        assert by_day["2042-08-11"]["median_user_sec"] == 120.0
         assert by_day["2042-08-12"]["frozen"] is False  # current Beijing day
         with pool.connection() as conn:
             assert conn.execute(
