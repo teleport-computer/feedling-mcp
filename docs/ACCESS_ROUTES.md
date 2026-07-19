@@ -13,12 +13,14 @@
 
 ## 三条路线（+ 一个辅助通道）
 
+正名 = iOS 设置页展示标签（Seven 2026-07-19 定，纯短标题）。
+
 | # | 正式名（中/英） | 代码标识 `access_mode` | agent 跑在哪 | 我们后端的角色 | 用户维护什么 |
 |---|---|---|---|---|---|
-| **①** | **API 托管** / Hosted (Model API) | `model_api` | **我们的** runner CVM | 全托管：跑 agent + 加解密 + 存储 + 推送 | 只填一个模型 API key |
-| **②** | **自有服务器** / Your Server (Resident) | `resident` | **用户自己的机器/VPS**（跑我们的 consumer + 用户的 Claude Code 等） | 正常运行：enclave 加解密代理、密封存储、消息中继、推送。用户直连 `api.feedling.app` | 跑好官方 consumer（**git clone 我们的仓库、原样运行、自动跟车更新**） |
-| **③** | **完全自部署** / Fully Self-hosted (openfeedling) | 无（不在我们系统里注册） | 用户自己的服务器 | **零角色** —— 用户把整套后端 stack 抄走自己跑，数据完全不经过我们 | 整套后端 + consumer 全自运维；版本靠自己盯 openfeedling 仓库 |
-| — | **官方 App 导入** / Official App Import | `official_import` | 不跑 agent | 仅存导入的官方 App 聊天记录 | 无（辅助通道，不是完整 agent 路线） |
+| **①** | **模型 API 托管** / Model API (Hosted) | `model_api` | **我们的** runner CVM | 全托管：跑 agent + 加解密 + 存储 + 推送 | 只填一个模型 API key |
+| **②** | **自有服务器连接** / Your Server | `resident` | **用户自己的机器/VPS**（跑我们的 consumer + 用户的 Claude Code 等） | 正常运行：enclave 加解密代理、密封存储、消息中继、推送。用户直连 `api.feedling.app` | 跑好官方 consumer（**git clone 我们的仓库、原样运行、自动跟车更新**） |
+| **③** | **自部署** / Self-hosted (openfeedling) | 无（不在我们系统里注册） | 用户自己的服务器 | **零角色** —— 用户把整套后端 stack 抄走自己跑，数据完全不经过我们 | 整套后端 + consumer 全自运维；版本靠自己盯 openfeedling 仓库 |
+| — | **官方聊天** / Official Chat | `official_import` | 不跑 agent | 仅存导入的官方 App 聊天记录 | 无（辅助通道，不是完整 agent 路线） |
 
 ## 关键澄清（最容易搞混的点）
 
@@ -50,12 +52,17 @@ onboarding 选择卡（措辞已 OK，保留）：
 - `model_api`：「我有模型 API Key / I have a model API key」
 - `official_import`：「我只用官方 App / I only use an official app」
 
-设置页「接入方式」短标签（2026-07-19 修正）：
-- `resident`：`settings.access_modes.route.server` = 「自有服务器 / Your Server」
+设置 → 系统配置 → 访问模式（`SettingsView.accessModesCard`，`route: .systemConfig`）
+的分区标题（2026-07-19 定稿）：
+- `resident`：`settings.access_modes.route.server` = 「自有服务器连接 / Your Server」
   （原「云端托管/Cloud-hosted」是方向性 bug，已改）
-- `model_api`：新增 `settings.access_modes.route.model_api` = 「模型 API / Model API」
-  （原硬编码 `"API Key"`，中文用户无翻译，已补 i18n）
-- `official_import`：`settings.access_modes.route.official_chat` = 「官方聊天 / Official Chat」
+- `model_api`：`settings.access_modes.route.model_api` = 「模型 API 托管 / Model API (Hosted)」
+  （原硬编码 `"API Key"` 无 i18n，已补 key）
+- `official_import`：`settings.access_modes.route.official_chat` = 「官方聊天 / Official chat」
+  （此卡里被 filter 掉不显示，label 供他处用）
+- **③ 自部署就在同卡下方**：`settings.storage.mode.self_hosted` = 「自部署 / Self-hosted」
+  section，填自己后端的 URL+Key（`configureSelfHosted` 改 `api.baseURL`）——即把
+  App 指向用户自己跑的 openfeedling。所以这一屏完整暴露 ①②③。
 
 ## support 分诊 / 事故排查口径
 
