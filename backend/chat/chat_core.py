@@ -651,6 +651,21 @@ def write_response(
             # already-replied, not claim ownership, so a legit reply that omits its
             # consumer_id is never rejected.)
             return {"error": "already_answered", "reply_status": "replied"}, 409
+    # Turn-failure metadata（spec 2026-07-18 §2）：兜底回复是【实时载体】——它是
+    # 新消息、有新 ts，能通过 /v1/chat/history 的 `since` 增量过滤；而对用户那条
+    # 旧消息就地更新 metadata 不产生新 ts，永远进不了增量流。reply_to_message_id
+    # 必须一并落在回复消息上（此前只用于更新 parent 与 trace，不落 doc），否则
+    # 客户端在增量流里拿到失败事件却无法配对回它失败的那条用户消息。
+    # 只做加法：不携带这些字段时，本段完全不执行，成功路径零变化。
+    turn_failure_error_class = str(payload.get("turn_failure_error_class") or "")[:64]
+    if turn_failure_error_class and role != "system" and source == "chat":
+        extra["turn_failure_error_class"] = turn_failure_error_class
+        extra["turn_failure_blame"] = str(payload.get("turn_failure_blame") or "")[:32]
+        # ≤500 且只放 catalog 的 user_text——绝不放原始 provider detail
+        # （可能夹带 provider HTML / request id / 敏感上下文）。
+        extra["turn_failure_user_text"] = str(payload.get("turn_failure_user_text") or "")[:500]
+        if reply_to_message_id:
+            extra["reply_to_message_id"] = reply_to_message_id
     msg = store.append_chat(
         role,
         source,

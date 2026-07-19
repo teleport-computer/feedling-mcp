@@ -441,6 +441,13 @@ class UserStore:
                 "reply_message_id",
                 "replied_by",
                 "replied_at",
+                # Turn-failure metadata (spec 2026-07-18 §2): carried on the
+                # fallback reply doc itself so it survives /v1/chat/history's
+                # `since` incremental filter — see chat_core.write_response.
+                "turn_failure_error_class",
+                "turn_failure_blame",
+                "turn_failure_user_text",
+                "reply_to_message_id",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
