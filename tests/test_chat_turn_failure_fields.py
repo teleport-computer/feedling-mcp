@@ -212,3 +212,46 @@ def test_parent_metadata_absent_on_normal_reply(client):
     parent = [m for m in _history(client, api_key) if m.get("id") == parent_id][0]
     assert "reply_error_class" not in parent
     assert parent["reply_status"] == "replied"
+
+
+def test_turn_failure_reaches_incremental_since_feed(client):
+    """端到端实证 spec §2.1 的核心断言：失败信息必须能通过 `since` 增量过滤。
+
+    第 1 稿方案把失败只写在【用户消息 metadata】上，而增量拉取按消息原始 ts
+    过滤——就地更新旧消息不产生新 ts，永远进不了增量流，真实效果是「杀掉 App
+    重开才看得到失败态」，与「当场抛给用户」正好相反（Codex review 发现）。
+
+    改成双载体后，兜底回复是【新消息、有新 ts】，必须能被 since 拉到，并且
+    自带 reply_to_message_id 供客户端配对回失败的那条用户消息。
+    """
+    user_id, api_key = _register(client)
+    parent_id = _send_user_msg(client, user_id, api_key, "u_since")
+
+    # 客户端此刻的水位：用户消息已在本地，只会再拉 ts 之后的新消息
+    hist = _history(client, api_key)
+    since = max(float(m["ts"]) for m in hist)
+
+    res = client.post(
+        "/v1/chat/response",
+        json={
+            "envelope": _env(user_id, "r_since"),
+            "source": "chat",
+            "reply_to_message_id": parent_id,
+            "turn_failure_error_class": "quota_insufficient",
+            "turn_failure_blame": "user_provider",
+            "turn_failure_user_text": "模型服务额度不足，充值后再发消息即可恢复。",
+        },
+        headers=_headers(api_key),
+    )
+    assert res.status_code in (200, 201), res.get_data(as_text=True)
+
+    inc = client.get(f"/v1/chat/history?since={since}&limit=50", headers=_headers(api_key))
+    assert inc.status_code == 200, inc.get_data(as_text=True)
+    msgs = inc.get_json()["messages"]
+
+    carriers = [m for m in msgs if m.get("turn_failure_error_class")]
+    assert carriers, "失败信息没进增量流——实时链路又断了（spec §2.1 的核心回归）"
+    c = carriers[0]
+    assert c["turn_failure_error_class"] == "quota_insufficient"
+    assert c["turn_failure_blame"] == "user_provider"
+    assert c["reply_to_message_id"] == parent_id, "拿到失败事件却无法配对回用户消息"
