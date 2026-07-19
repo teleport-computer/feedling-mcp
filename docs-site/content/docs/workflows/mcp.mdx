@@ -4,10 +4,18 @@ description: Connect your agent to remote MCP tool servers, including plain HTTP
 ---
 
 Feedling lets each account register up to 10 remote [MCP](https://modelcontextprotocol.io)
-servers (streamable HTTP transport). Your agent — hosted or self-hosted — reads
+servers. Both MCP transports are supported: modern **streamable HTTP** and the
+older **HTTP+SSE** transport that some providers still ship as their `…/sse`
+URL. The transport is detected automatically from the URL and the server's
+handshake — you don't declare it. Your agent — hosted or self-hosted — reads
 this list and calls the tools those servers expose. This backend stores the
 configuration; it does not proxy MCP traffic. Only your agent dials the URL
 when it actually calls a tool.
+
+> **Runtime support:** the hosted runtime and the `claude` self-hosted runtime
+> speak both transports. The `codex` self-hosted runtime speaks streamable HTTP
+> only — for a legacy HTTP+SSE server, prefer the provider's `/mcp` (streamable)
+> URL if they offer one.
 
 Every `/v1/chat/poll` response includes a `user_mcp.fingerprint` that changes
 whenever your server list changes, so a resident consumer can re-materialize
@@ -45,6 +53,7 @@ forbidden header name.
   "url_hint": "mcp.example.com",
   "header_names": ["Authorization"],
   "has_ca": false,
+  "transport": "http",
   "created_at": "2026-07-16T00:00:00Z",
   "updated_at": "2026-07-16T00:00:00Z"
 }
@@ -52,7 +61,10 @@ forbidden header name.
 
 The response never echoes back the URL, header values, or CA certificate.
 `url_hint` is the hostname only; `header_names` lists header keys only;
-`has_ca` reports whether a CA certificate is currently stored.
+`has_ca` reports whether a CA certificate is currently stored. `transport` is
+`"http"` (streamable HTTP) or `"sse"` (legacy HTTP+SSE): it starts as a guess
+from the URL path (`…/sse` ⇒ `"sse"`) and is corrected to whatever the server
+actually speaks the first time a connectivity test succeeds.
 
 `GET /v1/mcp/servers` returns `{"servers": [...]}` with the same shape.
 `PATCH /v1/mcp/servers/{name}` with `{"enabled": false}` toggles a server
@@ -260,9 +272,15 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 {
   "ok": true,
   "tool_count": 2,
-  "tool_names": ["search", "fetch"]
+  "tool_names": ["search", "fetch"],
+  "transport": "http"
 }
 ```
+
+`transport` is the transport this probe actually spoke — `"http"` (streamable
+HTTP) or `"sse"` (legacy HTTP+SSE). It is the authoritative detection: a
+successful test persists it to the server record, so a server saved on a
+non-`/sse` URL that turns out to speak the legacy transport is corrected here.
 
 This runs a best-effort `initialize` → `tools/list` probe **from this
 backend's own network**, as a convenience for validating servers that are
@@ -286,7 +304,7 @@ Other `400` kinds from this endpoint:
 | `dns` | The hostname did not resolve. |
 | `tls` | Certificate/TLS handshake failure — check `ca_pem` if the server uses a private CA. |
 | `codex_cert_chain_required` | The calling account's agent driver is `codex` and the server presented a single self-signed certificate (a CA acting as its own end entity) instead of a CA+leaf chain. See [`codex` needs a certificate chain](#codex-needs-a-certificate-chain-not-a-lone-self-signed-certificate) above. |
-| `timeout` | Connect or read timeout. |
+| `timeout` | Connect or read timeout, or the whole probe exceeded its 45-second wall-clock ceiling. A legacy HTTP+SSE endpoint that answers with a never-ending event stream lands here instead of hanging the request. |
 | `http_401` / `http_403` / `http_404` / `http_4xx` / `http_5xx` | The server responded with an HTTP error status. |
 | `protocol` | The response wasn't a valid MCP handshake (bad JSON-RPC envelope, redirect, or empty SSE stream). |
 | `decrypt_failed` | The stored config could not be decrypted for this caller. |

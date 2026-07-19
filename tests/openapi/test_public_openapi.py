@@ -294,6 +294,9 @@ def test_chat_memory_and_perception_contracts_are_concrete(
         assert client_msg_id["format"] == "uuid"
         assert "600 seconds" in client_msg_id["description"]
 
+    response_sources = schemas["ChatResponseRequest"]["properties"]["source"]["enum"]
+    assert "resident_maintenance" in response_sources
+
     poll_query = _parameters(operations[("get", "/v1/chat/poll")], "query")
     assert set(poll_query) == {"since", "timeout", "consumer_id", "claim"}
     assert poll_query["timeout"]["schema"]["maximum"] == 60
@@ -386,6 +389,7 @@ def test_error_response_supports_unified_and_mcp_shapes(
     assert error["properties"]["blame"]["enum"] == [
         "user_provider",
         "provider_transient",
+        "user_environment",
         "system",
     ]
 

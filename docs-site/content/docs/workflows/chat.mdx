@@ -278,6 +278,16 @@ An empty long poll is a successful `200` with `messages: []` and
 `timed_out: true`. Immediately start the next poll; do not treat it as an error.
 The requested timeout is capped at 60 seconds.
 
+If a self-hosted resident consumer appears stale while it is still polling, the
+server may claimably inject a user-role maintenance message with
+`source: "resident_maintenance"`. It is a shared envelope with `K_enclave`, so
+decrypt it through the same enclave history/MCP path as normal chat and pass the
+plaintext to the agent. Replies to that parent should use
+`source: "resident_maintenance"` and should not trigger user-visible push. Treat
+this source as system repair traffic, not as user-authored activity. The
+resident-job fallback scan is throttled by `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC`
+(default 300 seconds).
+
 `user_mcp.fingerprint` changes whenever the account's MCP server list changes;
 see the [MCP servers workflow](/docs/workflows/mcp) for how to manage that list
 and re-materialize local config when the fingerprint moves.

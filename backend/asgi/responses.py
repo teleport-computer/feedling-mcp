@@ -21,7 +21,7 @@ def json_error(status_code: int, body: dict) -> JSONResponse:
     return JSONResponse(body, status_code=status_code)
 
 
-VALID_BLAME = ("user_provider", "provider_transient", "system")
+VALID_BLAME = ("user_provider", "provider_transient", "user_environment", "system")
 
 
 def api_error(status: int, slug: str, *, blame: str = "", detail=None,

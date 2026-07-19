@@ -267,6 +267,7 @@ PI_MCP_BRIDGE_FILE = os.environ.get(
     "PI_MCP_BRIDGE_FILE", "/app/tools/pi_mcp_bridge/index.js",
 )
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
+RESIDENT_MAINTENANCE_SOURCE = "resident_maintenance"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
 PROACTIVE_POLL_TIMEOUT = int(os.environ.get("PROACTIVE_POLL_TIMEOUT", "1"))
@@ -5922,6 +5923,9 @@ def _maybe_apply_user_mcp() -> None:
                     "name": srv["name"], "enabled": bool(srv.get("enabled")),
                     "url": secret["url"], "headers": secret.get("headers") or {},
                     "ca_pem": secret.get("ca_pem") or "",
+                    # "" for pre-transport envelopes — materializers fall back
+                    # to user_mcp_materialize.effective_transport's URL heuristic.
+                    "transport": secret.get("transport") or "",
                 })
         # Union of the previously-applied and newly-advertised server names:
         # anything just removed still needs its old allow rule pruned, while
@@ -5988,7 +5992,15 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
     if _cli_template_is_codex():
         if lane == "chat":
             return ""
-        names = sorted(str(s.get("name") or "") for s in enabled_servers)
+        import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
+        # Only servers that were actually materialized into config.toml need a
+        # disable override; legacy-SSE servers are comment-skipped there
+        # (codex_config_merged), and a ``-c mcp_servers.<name>.enabled=false``
+        # for a table that doesn't exist would deep-merge a partial entry into
+        # codex's config instead.
+        names = sorted(
+            str(s.get("name") or "") for s in enabled_servers
+            if _m.effective_transport(s) != "sse")
         return " ".join(
             f"-c mcp_servers.{name}.enabled=false" for name in names if name
         )
@@ -6537,6 +6549,8 @@ def _clean_messages_for_proactive_context(history: list[dict] | None) -> list[di
             # system 通知（如上游报错提醒）不是 agent 自己说过的话，混进前台/proactive
             # 上下文会被误认成历史发言（审查发现的串扰源）。
             continue
+        if str(msg.get("source") or "") == RESIDENT_MAINTENANCE_SOURCE:
+            continue
         text = _message_text_for_context(msg)
         if not text or "__VERIFY_PING__" in text:
             continue
@@ -6650,7 +6664,8 @@ def _proactive_chat_collision(now: float | None = None) -> bool:
     for msg in history:
         if not isinstance(msg, dict):
             continue
-        if str(msg.get("source") or "") == "verify_ping":
+        source = str(msg.get("source") or "")
+        if source in {"verify_ping", RESIDENT_MAINTENANCE_SOURCE}:
             continue
         ts = _message_ts_for_context(msg)  # defensive: malformed ts → 0.0
         if ts <= 0:
@@ -8942,7 +8957,8 @@ def _process_messages(messages: list) -> float:
         # excluded) means the loop is not idle and the user is engaged — clear the
         # proactive idle-loop guard and any failure backoff so proactive resumes,
         # and stamp the maintenance soft-idle clock (memory upkeep waits for a lull).
-        if msg.get("source") != "verify_ping":
+        source = str(msg.get("source") or "")
+        if source not in {"verify_ping", RESIDENT_MAINTENANCE_SOURCE}:
             _reset_proactive_idle_guard()
             _clear_proactive_failure()
             _last_user_message_wall = time.time()
@@ -8961,7 +8977,7 @@ def _process_messages(messages: list) -> float:
         # routing the probe through the full agent — a hermes turn can exceed
         # verify_loop's timeout and is fragile to mid-run SIGTERM, so the probe
         # would time out (passing=false) even on a healthy reply pipeline.
-        if msg.get("source") == "verify_ping":
+        if source == "verify_ping":
             # Exercise the REAL agent path so verify catches a broken reply
             # pipeline (e.g. an agent whose output the consumer can't parse).
             # The old canned short-circuit let verify pass while the live loop
@@ -9015,7 +9031,7 @@ def _process_messages(messages: list) -> float:
             latest = max(latest, ts)
             continue
 
-        content = msg.get("content", "").strip()
+        content = str(msg.get("content") or "").strip()
         content_type = msg.get("content_type", "text")
         image_payloads: list[dict[str, str]] = []
         image_paths: list[str] = []
@@ -9230,6 +9246,9 @@ def _process_messages(messages: list) -> float:
         for idx, reply in enumerate(replies):
             try:
                 post_kwargs = {}
+                if source == RESIDENT_MAINTENANCE_SOURCE:
+                    post_kwargs["source"] = RESIDENT_MAINTENANCE_SOURCE
+                    post_kwargs["suppress_push"] = True
                 if reply_to_message_id:
                     post_kwargs["reply_to_message_id"] = reply_to_message_id
                 if idx == 0 and turn.thinking_summary:

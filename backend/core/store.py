@@ -378,6 +378,13 @@ class UserStore:
         # be decrypted through the normal enclave/MCP history path.
         if source == "verify_ping" and envelope.get("synthetic_marker"):
             msg["content"] = envelope["synthetic_marker"]
+        # Server-authored maintenance prompts must also be readable on the
+        # direct /v1/chat/poll fallback path. Unlike user chat, this prompt is
+        # operational copy, not private user content.
+        if source == "resident_maintenance":
+            content = str((extra or {}).get("content") or "").strip()
+            if content:
+                msg["content"] = content
         if envelope.get("K_enclave") is not None:
             msg["K_enclave"] = envelope["K_enclave"]
         if extra:
