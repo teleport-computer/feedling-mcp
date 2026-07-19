@@ -155,7 +155,10 @@ The CVM/build portion is stable while the boot nonce remains process-unique so
 job ownership and orphan recovery never confuse a replacement process with the
 one that crashed. Turn and Genesis must share the exact full boot identity.
 Missing identities, duplicate live boots, unlisted current-build identities,
-previous-build rows, and stale rows fail the deployment. The same gate requires literal
+still-fresh previous-build or ephemeral identities, and zero-capacity old turn
+rows fail the deployment. The metrics response includes the total heartbeat
+row count for the same window; CI requires it to equal the returned list length,
+so the bounded 200-row response cannot hide an extra worker. The same gate requires literal
 `v2_only`, target mode `db_action_v2`, `ready_count == eligible_count`, and zero
 inconsistent routes. This is an application-level deployment proof bound to
 the trusted Phala target/env injection; Compose-hash publication and CVM

@@ -187,6 +187,7 @@ def v2_metrics(
         # so the production per-CVM gate can prove fleets larger than 25 CVMs
         # instead of silently truncating at the helper's observational default.
         "worker_heartbeats": jobs_store.recent_worker_heartbeats(limit=200),
+        "worker_heartbeat_count": jobs_store.recent_worker_heartbeat_count(),
         "runtime_policy": config_store.hosted_runtime_policy_status(),
         "mean_service_sec": jobs_store.recent_mean_service_sec(lane="chat"),
         "recent_mean_tokens_per_turn": jobs_store.recent_mean_tokens_per_turn(lane="chat"),

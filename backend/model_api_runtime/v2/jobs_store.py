@@ -1751,6 +1751,25 @@ def recent_worker_heartbeats(*, within_sec: int = 300, limit: int = 50) -> list[
     ]
 
 
+def recent_worker_heartbeat_count(*, within_sec: int = 300) -> int:
+    """Total rows in the same window as ``recent_worker_heartbeats``.
+
+    The admin endpoint returns a bounded heartbeat list. Deployment gates must
+    compare this count with the returned list length so an extra live worker
+    cannot be hidden beyond that response cap.
+    """
+    safe_window = max(1, min(int(within_sec), 3600))
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM v2_worker_heartbeats "
+                "WHERE kind IN ('turn','genesis') "
+                "AND beat_at > now() - make_interval(secs => %s)",
+                (safe_window,),
+            )
+            return int(cur.fetchone()[0])
+
+
 def inflight_job_count() -> int:
     """在飞 job 数（pending/claimed/running）。单飞唯一索引 → 约等活跃用户数。"""
     with _pool().connection() as conn:

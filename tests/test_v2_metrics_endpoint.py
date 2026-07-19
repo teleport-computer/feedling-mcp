@@ -57,6 +57,7 @@ def env(monkeypatch):
             "age_sec": 2.0,
         }],
     )
+    monkeypatch.setattr(jobs_store, "recent_worker_heartbeat_count", lambda **kw: 1)
     monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: 4.5)
     monkeypatch.setattr(jobs_store, "recent_mean_tokens_per_turn", lambda **kw: 123.0)
     monkeypatch.setattr(
@@ -156,6 +157,7 @@ def test_v2_metrics_returns_every_field(env):
             "beat_at_epoch": 1234.0,
             "age_sec": 2.0,
         }],
+        "worker_heartbeat_count": 1,
         "runtime_policy": {
             "policy": "v2_only",
             "target_mode": "db_action_v2",

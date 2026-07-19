@@ -41,7 +41,7 @@ def _payload(cvm_ids=CVMS, *, build=BUILD):
         worker_id = runner_identity.fleet_worker_id(cvm_id, build, f"{index:012x}")
         rows.append(_row(worker_id, "turn", capacity=4))
         rows.append(_row(f"{worker_id}:genesis", "genesis"))
-    return {
+    payload = {
         "worker_heartbeats": rows,
         "genesis_alive": True,
         "runtime_policy": {
@@ -52,6 +52,13 @@ def _payload(cvm_ids=CVMS, *, build=BUILD):
             "inconsistent_count": 0,
         },
     }
+    payload["worker_heartbeat_count"] = len(rows)
+    return payload
+
+
+def _sync_count(payload):
+    payload["worker_heartbeat_count"] = len(payload["worker_heartbeats"])
+    return payload
 
 
 def test_complete_exact_inventory_build_passes():
@@ -79,6 +86,7 @@ def test_stale_or_previous_build_rows_cannot_satisfy_expected_identity():
             _row(f"{previous_b}:genesis", "genesis"),
         ]
     )
+    _sync_count(payload)
 
     ok, detail = gate.evaluate_payload(payload, cvm_ids=CVMS, build=BUILD)
 
@@ -92,6 +100,50 @@ def test_unlisted_current_build_identity_is_rejected():
     ok, detail = gate.evaluate_payload(payload, cvm_ids=CVMS, build=BUILD)
     assert ok is False
     assert "cvm-rogue" in detail
+
+
+def test_complete_fleet_plus_fresh_previous_build_worker_is_rejected():
+    payload = _payload()
+    previous = runner_identity.fleet_worker_id(
+        "cvm-a", "1234567", "eeeeeeeeeeee"
+    )
+    payload["worker_heartbeats"].extend(
+        [
+            _row(previous, "turn", capacity=4),
+            _row(f"{previous}:genesis", "genesis"),
+        ]
+    )
+    _sync_count(payload)
+
+    ok, detail = gate.evaluate_payload(payload, cvm_ids=CVMS, build=BUILD)
+    assert ok is False
+    assert previous in detail
+
+
+def test_complete_fleet_plus_fresh_ephemeral_worker_is_rejected():
+    payload = _payload()
+    payload["worker_heartbeats"].extend(
+        [
+            _row("v2-worker-ephemeral-old", "turn", capacity=4),
+            _row("v2-worker-ephemeral-old:genesis", "genesis"),
+        ]
+    )
+    _sync_count(payload)
+
+    ok, detail = gate.evaluate_payload(payload, cvm_ids=CVMS, build=BUILD)
+    assert ok is False
+    assert "v2-worker-ephemeral-old" in detail
+
+
+def test_complete_fleet_plus_fresh_zero_capacity_old_worker_is_rejected():
+    payload = _payload()
+    old = runner_identity.fleet_worker_id("cvm-a", "1234567", "dddddddddddd")
+    payload["worker_heartbeats"].append(_row(old, "turn", capacity=0))
+    _sync_count(payload)
+
+    ok, detail = gate.evaluate_payload(payload, cvm_ids=CVMS, build=BUILD)
+    assert ok is False
+    assert old in detail
 
 
 def test_turn_and_genesis_must_share_the_same_boot_identity():
@@ -108,7 +160,7 @@ def test_turn_and_genesis_must_share_the_same_boot_identity():
 
     ok, detail = gate.evaluate_payload(payload, cvm_ids=CVMS, build=BUILD)
     assert ok is False
-    assert "mismatched_boot" in detail
+    assert "unexpected_genesis" in detail
 
 
 def test_two_fresh_process_boots_for_one_deployment_are_rejected():
@@ -120,10 +172,20 @@ def test_two_fresh_process_boots_for_one_deployment_are_rejected():
             _row(f"{extra}:genesis", "genesis"),
         ]
     )
+    _sync_count(payload)
 
     ok, detail = gate.evaluate_payload(payload, cvm_ids=CVMS, build=BUILD)
     assert ok is False
     assert "duplicate_turn" in detail
+
+
+def test_truncated_heartbeat_response_fails_closed():
+    payload = _payload()
+    payload["worker_heartbeat_count"] += 1
+
+    ok, detail = gate.evaluate_payload(payload, cvm_ids=CVMS, build=BUILD)
+    assert ok is False
+    assert "heartbeat_rows=4/5" in detail
 
 
 @pytest.mark.parametrize(

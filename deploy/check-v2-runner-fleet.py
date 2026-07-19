@@ -30,6 +30,8 @@ from model_api_runtime.v2.runner_identity import (  # noqa: E402
 DEFAULT_INITIAL_WAIT_SEC = 65.0
 DEFAULT_TURN_MAX_AGE_SEC = 20.0
 DEFAULT_GENESIS_MAX_AGE_SEC = 30.0
+TURN_LIVENESS_WINDOW_SEC = 30.0
+GENESIS_LIVENESS_WINDOW_SEC = 60.0
 
 
 def read_inventory(path: Path) -> list[str]:
@@ -79,77 +81,105 @@ def evaluate_payload(
         and inconsistent == 0
     )
 
-    fresh_turn: set[str] = set()
-    fresh_genesis: set[str] = set()
-    for row in payload.get("worker_heartbeats") or []:
+    heartbeat_rows = payload.get("worker_heartbeats") or []
+    if not isinstance(heartbeat_rows, list):
+        return False, "worker_heartbeats must be a list"
+    try:
+        heartbeat_count = int(payload.get("worker_heartbeat_count"))
+    except (TypeError, ValueError):
+        return False, "worker_heartbeat_count is required"
+    complete_response = heartbeat_count == len(heartbeat_rows)
+
+    # Use the backend's complete liveness windows for rejection. The stricter
+    # max ages below are still required for the selected positive proof.
+    recent_turn: dict[str, dict[str, Any]] = {}
+    recent_genesis: dict[str, dict[str, Any]] = {}
+    for row in heartbeat_rows:
         if not isinstance(row, dict):
             continue
         worker_id = str(row.get("worker_id") or "")
         kind = row.get("kind")
-        if (
-            kind == "turn"
-            and _age(row) <= turn_max_age_sec
-            and int(row.get("capacity") or 0) > 0
-        ):
-            fresh_turn.add(worker_id)
-        elif kind == "genesis" and _age(row) <= genesis_max_age_sec:
-            fresh_genesis.add(worker_id)
+        if kind == "turn" and _age(row) <= TURN_LIVENESS_WINDOW_SEC:
+            recent_turn[worker_id] = row
+        elif kind == "genesis" and _age(row) <= GENESIS_LIVENESS_WINDOW_SEC:
+            recent_genesis[worker_id] = row
 
-    # Compare exact current-build fleet sets. This rejects missing inventory
-    # identities as well as an unlisted current-build worker. Previous-build or
-    # ephemeral rows cannot substitute for an expected pair.
+    # Closed-world proof: every still-live turn row must parse to an expected
+    # CVM/current-build deployment. Never filter previous-build or ephemeral
+    # rows out before comparison; their coexistence is itself a failed rollout.
     turns_by_deployment: dict[tuple[str, str], list[str]] = {}
-    for worker_id in fresh_turn:
+    unexpected_turn: list[str] = []
+    for worker_id in recent_turn:
         parsed = parse_fleet_worker_id(worker_id)
-        if parsed is not None and parsed[1] == build:
-            turns_by_deployment.setdefault(parsed[:2], []).append(worker_id)
-    genesis_by_deployment: dict[tuple[str, str], list[str]] = {}
-    for worker_id in fresh_genesis:
+        if parsed is None or parsed[:2] not in expected_deployments:
+            unexpected_turn.append(worker_id)
+            continue
+        turns_by_deployment.setdefault(parsed[:2], []).append(worker_id)
+
+    selected_turn: dict[tuple[str, str], str] = {}
+    missing_turn: list[tuple[str, str]] = []
+    duplicate_turn: list[tuple[str, str]] = []
+    nonpositive_turn: list[tuple[str, str]] = []
+    for deployment in sorted(expected_deployments):
+        worker_ids = turns_by_deployment.get(deployment, [])
+        if not worker_ids:
+            missing_turn.append(deployment)
+            continue
+        if len(worker_ids) != 1:
+            duplicate_turn.append(deployment)
+            continue
+        worker_id = worker_ids[0]
+        row = recent_turn[worker_id]
+        if _age(row) > turn_max_age_sec or int(row.get("capacity") or 0) <= 0:
+            nonpositive_turn.append(deployment)
+            continue
+        selected_turn[deployment] = worker_id
+
+    expected_genesis_ids = {
+        f"{worker_id}:genesis" for worker_id in selected_turn.values()
+    }
+    qualified_genesis: set[str] = set()
+    unexpected_genesis: list[str] = []
+    for worker_id, row in recent_genesis.items():
         if not worker_id.endswith(":genesis"):
+            unexpected_genesis.append(worker_id)
             continue
         parsed = parse_fleet_worker_id(worker_id.removesuffix(":genesis"))
-        if parsed is not None and parsed[1] == build:
-            genesis_by_deployment.setdefault(parsed[:2], []).append(worker_id)
-
-    observed_deployments = set(turns_by_deployment)
-    missing_turn = sorted(expected_deployments - observed_deployments)
-    extra_turn = sorted(observed_deployments - expected_deployments)
-    duplicate_turn = sorted(
-        deployment
-        for deployment, worker_ids in turns_by_deployment.items()
-        if len(worker_ids) != 1
-    )
-    missing_genesis: list[tuple[str, str]] = []
-    extra_genesis = sorted(set(genesis_by_deployment) - expected_deployments)
-    mismatched_boot: list[tuple[str, str]] = []
-    for deployment in sorted(expected_deployments):
-        turn_ids = turns_by_deployment.get(deployment, [])
-        genesis_ids = genesis_by_deployment.get(deployment, [])
-        if not genesis_ids:
-            missing_genesis.append(deployment)
-        elif len(turn_ids) == 1 and genesis_ids != [f"{turn_ids[0]}:genesis"]:
-            mismatched_boot.append(deployment)
+        if (
+            parsed is None
+            or parsed[:2] not in expected_deployments
+            or worker_id not in expected_genesis_ids
+        ):
+            unexpected_genesis.append(worker_id)
+            continue
+        if _age(row) <= genesis_max_age_sec:
+            qualified_genesis.add(worker_id)
+        else:
+            unexpected_genesis.append(worker_id)
+    missing_genesis = sorted(expected_genesis_ids - qualified_genesis)
 
     ok = (
         policy_ready
         and payload.get("genesis_alive") is True
+        and complete_response
         and missing_turn == []
-        and extra_turn == []
         and duplicate_turn == []
-        and missing_genesis == []
-        and extra_genesis == []
-        and mismatched_boot == []
+        and nonpositive_turn == []
+        and unexpected_turn == []
+        and not missing_genesis
+        and unexpected_genesis == []
     )
     detail = (
         f"build={build} policy={policy.get('policy')} "
         f"target={policy.get('target_mode')} ready={ready}/{eligible} "
         f"inconsistent={inconsistent} expected_cvm_count={len(cvm_ids)} "
+        f"heartbeat_rows={len(heartbeat_rows)}/{heartbeat_count} "
         f"missing_turn={[fleet_deployment_id(*item) for item in missing_turn]} "
-        f"extra_turn={[fleet_deployment_id(*item) for item in extra_turn]} "
         f"duplicate_turn={[fleet_deployment_id(*item) for item in duplicate_turn]} "
-        f"missing_genesis={[fleet_deployment_id(*item) for item in missing_genesis]} "
-        f"extra_genesis={[fleet_deployment_id(*item) for item in extra_genesis]} "
-        f"mismatched_boot={[fleet_deployment_id(*item) for item in mismatched_boot]}"
+        f"nonpositive_turn={[fleet_deployment_id(*item) for item in nonpositive_turn]} "
+        f"unexpected_turn={sorted(unexpected_turn)} "
+        f"missing_genesis={missing_genesis} "
+        f"unexpected_genesis={sorted(unexpected_genesis)}"
     )
     return ok, detail
 

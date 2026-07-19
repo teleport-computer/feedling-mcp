@@ -1110,6 +1110,7 @@ def test_recent_worker_heartbeats_returns_identity_kind_capacity_and_db_age():
         "v2-worker-new-deadbeef1234",
         "v2-worker-new-deadbeef1234:genesis",
     }
+    assert jobs_store.recent_worker_heartbeat_count(within_sec=300) == 2
     turn = next(row for row in rows if row["kind"] == "turn")
     genesis = next(row for row in rows if row["kind"] == "genesis")
     assert turn["capacity"] == 4

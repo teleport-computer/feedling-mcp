@@ -298,7 +298,8 @@ stable inventory-CVM/current-build identity and refuses to start on missing or
 mismatched identity inputs. Its post-deploy gate waits beyond old heartbeat
 freshness, then requires an exact positive-capacity turn + Genesis pair for
 every listed CVM at the deployed build; aggregate liveness, a previous-build
-row, or one listed identity cannot stand in for the fleet.
+row, an ephemeral identity, a truncated metrics response, or one listed
+identity cannot stand in for the fleet.
 
 ## Remaining work, in order
 
