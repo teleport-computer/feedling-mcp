@@ -116,6 +116,28 @@ worker owns a pool plus listener/election connections; increasing workers withou
 raising the database limit can turn an apparent capacity improvement into an
 outage.
 
+## Apple push without the official key (notify relay)
+
+A self-hosted backend cannot push to the official iOS app: the APNs `.p8`
+signing key belongs to the app developer and is never distributed. The hosted
+service exposes a **notify relay** instead:
+
+1. In the app (self-hosted mode), the user enrolls once; the app calls the
+   official `POST /v1/notify-relay/register` and receives a relay auth token
+   (`nrt_…`).
+2. Your backend or agent calls the official `POST /v1/notify-relay/push` with
+   the `X-Relay-Token` header to deliver alert notifications (`type: 1`) and
+   Live Activity start/update/end (`type: 3/2/4`). Live Activity tokens rotate
+   per activity — your deployment receives them via `POST
+   /v1/push/register-token` and must forward the newest one on each call.
+
+Operational notes: calls are rate limited per token (`429` + `Retry-After`),
+and every relay call is logged on the hosted service with the push content
+truncated to 512 characters for triage. Do not route content through the relay
+that must not be retained there; a terse generic alert text avoids the
+concern entirely. See the API reference (Notify Relay tag) for the full
+request schemas.
+
 ## Use the repository deployment files as references
 
 Pin a commit or immutable image digest. Review these files together:

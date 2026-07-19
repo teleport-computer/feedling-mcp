@@ -173,6 +173,80 @@
   test 分支 pre-existing（memory_readside×3 + prod_runner_topology×2），零新增；
   基线里第 6 个红（consumer_whoami_key_guard）系时间敏感 flake，单跑稳定通过。
 
+## 2026-07-18
+
+### [FEAT] Notify Relay：自部署用户推送中继（后端 + iOS）
+
+- **背景**：自部署用户的后端没有官方 APNs `.p8`（不能外发，用户来信索要），
+  收不到任何推送。方案 = 官方后端开推送中继：App 在设置页向**官方**服务器匿名
+  enroll device token 换取 `nrt_` 中继凭证，自部署后端携 `X-Relay-Token` 调
+  `POST /v1/notify-relay/push` 由官方代发。类型 1=alert、2=LA update（灵动岛
+  同体）、3=LA start、4=LA end；widget 无 silent push 链路，明确排除本期。
+- **后端**：新包 `backend/notify_relay/`（routes/relay_core/ratelimit），
+  迁移 0020 + TEE 0002 双表（`notify_relay_configs` 明文 auth_token —— 幂等
+  返回需要，故意不 hash；`notify_relay_logs` IDENTITY 镜像走 OVERRIDING
+  SYSTEM VALUE），reconciler.TABLES/_IDENTITY_TABLES 已注册。限流是
+  per-worker 内存滑窗（register 10/h/IP、push 120/min/token、bad-auth
+  30/min/IP，env 可调）。LA payload 复用点 = `live_activity.py` 抽出的纯函数
+  `build_content_state`（原 `/v1/push/*` 行为字节不变）。接口B 透传目标
+  token（LA token 每活动轮换，注册制跟不上——用户拍板）。
+- **契约面**：OpenAPI 143→145 操作（register 匿名 security=[]，push 走新
+  securityScheme `RelayTokenAuth`），`public.json` 已重生成；SELF_HOSTING.md
+  新增 §10（4 个 curl 示例 + 隐私披露：log content 默认截 512 字符，
+  `NOTIFY_RELAY_LOG_CONTENT_MAX=0` 可关）；docs-site self-hosting 页 +
+  changelog Unreleased 已更；CORS allow_headers 加 `X-Relay-Token`。
+- **iOS**：`NotifyRelayClient.swift`（NotifyRelayManager + Keychain 的
+  NotifyRelayTokenStore，按环境分槽、本地不同步）；设置页新 `.notifyRelay`
+  路由，入口仅 `storageMode == .selfHosted` 显示；⚠️ 请求显式打
+  `FeedlingEnvironment.current.apiURL`——自部署模式 `baseURL` 指向用户后端。
+- **验证**：`tests/test_notify_relay.py` 30 用例全绿；全量 3500 passed
+  （5 红均 pre-existing：memory_readside×3 / prod_runner_topology×2）；
+  OpenAPI 契约 12 绿；docs-site types/lint/build 绿。**未 commit 未部署**；
+  test 环境端到端（真机 sandbox curl 四类型）待部署后做。
+- **Codex review 两修**（同日）：P1 alert(type 1) 锁定注册设备——显式 token
+  与注册 device_token 不一致返 400（否则泄露的中继 token+已知 APNs token 可借
+  官方钥给他人设备推 alert；type 2-4 透传是有意设计不受影响）；P2 bad-auth
+  限流前置——`peek`（只查不记账）在 `get_config` 查库**之前**短路超限 IP，
+  枚举/DoS 不再每请求打一次 DB。测试 33 用例全绿（新增越权 400、超限跳过查库、
+  peek 不烧合法配额三用例）。
+- **Codex 复审再两修**（同日）：P1 限流身份改取 XFF **末跳**（首跳客户端可控，
+  每请求伪造新 IP 即可绕过全部 per-IP 限流），`NOTIFY_RELAY_XFF_HOPS` env
+  可调（默认 1=CVM ingress；0=直连部署忽略 XFF 用 socket 对端）；P2 TEE 影子
+  表 `notify_relay_configs` **有意去掉 device_token UNIQUE**（主库保留）——
+  换机顶替+镜像漏删场景下，reconciler 按 auth_token upsert 不再于 prune 前
+  撞唯一约束，漏写可自愈（alembic_tee 0002 注释有完整推理）。新增 XFF 伪造
+  ×2 + reconcile 顶替收敛 3 个用例，37 用例全绿。
+- **多代理 code-review 十修**（同日，Codex 配额耗尽后转 workflow 高强度审查，
+  10 条全 CONFIRMED）：①register 命中已注册设备**不再回显 auth_token**
+  （device_token 非秘密，凭它换回别人的中继 token = 越权；只在新建/带有效
+  auth_token 时返回，命中即 `already_enrolled`）；②disabled token 与已知 token
+  的 DB 查询前置 per-token push 限流（peek 于 get_config 前），被撤销 token 不再
+  无限触库；③register 并发竞态 UPDATE 命中 0 行时 fall-through 铸新而非
+  `_register_body(None)` 崩 500；④APNS_KEY 存在但无效（jwt 抛异常）时收尾
+  pending log 并返 503 而非 500 幽灵行；⑤user_id 限长 128 防匿名灌库；
+  ⑥public.json 恢复被版本漂移误删的 ValidationError input/ctx（保 diff 干净）；
+  ⑦_log_finish/_touch_last_used 镜像钉主库 RETURNING 值而非各库 now()（免污染
+  TEE verify gate）；⑧CHANGELOG 恢复丢失的 07-17 日期标题；⑨LA aps 信封抽
+  `build_live_activity_aps` 纯函数两侧共用（消除已分叉的形状/兜底）；⑩
+  notify_relay_logs 加保留期清理（`NOTIFY_RELAY_LOG_RETENTION_DAYS` 默认 30，
+  按 log_id 采样触发）。测试增至 49 用例全绿，OpenAPI/TEE/push 回归全绿。
+- **第四轮 workflow 审查八修**（同日，8 条全 verified）：①**register Path A
+  不再顶替他人 device**——上轮重写引入的回归：只证明"持有某 token"就删/改任意
+  device_token 的行 = 可 DoS/劫持受害者；改为目标 device 被别的 token 占用时
+  返 409 拒绝、绝不 evict；②disabled/撤销 token 不能再经 register 重绑
+  （owns 检查加 `disabled=FALSE`）；③push 移除 bad-auth 前置 peek——它会让
+  共用 NAT/egress IP 的**有效** token 被邻居的坏认证预算误 429；未知 token 改由
+  失败路径 allow 记账限流（取舍：放弃"查库前短路未知 token"换取不误伤合法流量，
+  已知 token 的 DB 仍由 push-limiter peek 保护）；④register 的 TEE 镜像移到主库
+  commit **之后**（Path A 原在事务块内，主库 rollback 时影子会留脏写）；
+  ⑤prune 用主库算的 cutoff 时间戳删两库，不再各库跑 now()（时钟偏移致 churn）；
+  ⑥re-enroll 省略 apns_env 时 COALESCE 保留原值，不把 sandbox 翻成 production；
+  ⑦OpenAPI `NotifyRelayRegisterResponse` 的 auth_token/apns_env 改为非必填 +
+  加 already_enrolled（原 required 与不回显 token 的 200 响应矛盾）；⑧收尾写
+  合并——`_log_finish` 一个连接一次 execute_many 同时写 log 完成态 + last_used，
+  省掉每次 push 的独立 touch 连接/往返。附带把 ValidationError schema 固化进
+  导出工具（防生成环境版本漂移反复增删 input/ctx）。测试增至 66 用例全绿。
+
 ## 2026-07-17
 
 ### [FEAT] pi 路线终于能用用户 MCP 了（v2 spec §11 的后续项，欠了 4 天）
