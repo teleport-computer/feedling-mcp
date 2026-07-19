@@ -206,6 +206,18 @@ def delete_server(store: UserStore, name: str) -> tuple[dict, int]:
     return {"deleted": name}, 200
 
 
+def _user_driver(store: UserStore, caller_api_key: str | None) -> str:
+    """This user's agent driver, or '' when it can't be determined (VPS /
+    unconfigured — then no codex-specific warning is emitted)."""
+    try:
+        from hosted import agent_runtime_cutover
+        from hosted import config_store as hosted_config_store
+        cfg = hosted_config_store._load_runtime_provider_config(store, caller_api_key)
+        return agent_runtime_cutover.driver_for_provider(str((cfg or {}).get("provider") or ""))
+    except Exception:  # noqa: BLE001 — driver unknown ⇒ no warning, never 500
+        return ""
+
+
 def test_server(store: UserStore, name: str, caller_api_key: str | None) -> tuple[dict, int]:
     from core import enclave as core_enclave
     from hosted import mcp_probe
@@ -219,10 +231,16 @@ def test_server(store: UserStore, name: str, caller_api_key: str | None) -> tupl
             purpose="mcp_server_config").decode("utf-8"))
     except Exception as e:
         return _err("decrypt_failed", str(e)[:160]), 400
+    driver = _user_driver(store, caller_api_key)
     try:
         out = mcp_probe.probe(secret["url"], secret.get("headers") or {},
                               ca_pem=secret.get("ca_pem"))
     except mcp_probe.ProbeError as e:
+        # codex(rustls) 无法用单张自签名证书；此时 "agent 会自己处理" 的 tls 文案是错的。
+        if (e.kind == "tls" and driver == "codex"
+                and mcp_probe.leaf_is_ca(secret["url"]) is True):
+            return _err("codex_cert_chain_required",
+                        "single self-signed cert; codex needs a CA+leaf chain"), 400
         return _err(e.kind, e.detail), 400
     return out, 200
 

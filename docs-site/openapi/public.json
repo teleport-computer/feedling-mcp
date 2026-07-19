@@ -3242,7 +3242,7 @@
           }
         ],
         "x-feedling-contract-level": "documented",
-        "description": "Best-effort connectivity probe (MCP initialize -> tools/list) run from this backend's own network, offered purely as a convenience for validating publicly reachable https:// servers. A 400 unreachable_from_backend response does NOT mean the server failed to save — it was already saved successfully by POST /v1/mcp/servers. It only means this backend process could not reach the host, typically because it is a loopback/private-network address or a tunnel endpoint that only your agent's environment can reach. For those servers, skip this probe and instead ask your agent to call the MCP server directly in chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS handshake failure — check ca_pem), timeout, http_401/http_403/http_404/http_4xx/http_5xx (server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. 404 not_found when no server with that name exists."
+        "description": "Best-effort connectivity probe (MCP initialize -> tools/list) run from this backend's own network, offered purely as a convenience for validating publicly reachable https:// servers. A 400 unreachable_from_backend response does NOT mean the server failed to save — it was already saved successfully by POST /v1/mcp/servers. It only means this backend process could not reach the host, typically because it is a loopback/private-network address or a tunnel endpoint that only your agent's environment can reach. For those servers, skip this probe and instead ask your agent to call the MCP server directly in chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS handshake failure — check ca_pem), codex_cert_chain_required (a hosted codex agent uses a rustls TLS stack that rejects a CA certificate presented as the server's own leaf/end-entity certificate; reissue the server with a proper CA+leaf chain — a pasted ca_pem does not fix this, since rustls rejects the leaf's shape regardless of what is trusted), timeout, http_401/http_403/http_404/http_4xx/http_5xx (server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. 404 not_found when no server with that name exists."
       }
     },
     "/v1/memory/actions": {
@@ -7139,13 +7139,6 @@
           "type": {
             "type": "string",
             "title": "Error Type"
-          },
-          "input": {
-            "title": "Input"
-          },
-          "ctx": {
-            "type": "object",
-            "title": "Context"
           }
         },
         "type": "object",

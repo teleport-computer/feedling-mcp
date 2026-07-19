@@ -1061,8 +1061,12 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "address or a tunnel endpoint that only your agent's environment can reach. For those "
         "servers, skip this probe and instead ask your agent to call the MCP server directly in "
         "chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS "
-        "handshake failure — check ca_pem), timeout, http_401/http_403/http_404/http_4xx/http_5xx "
-        "(server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. "
+        "handshake failure — check ca_pem), codex_cert_chain_required (a hosted codex agent uses a "
+        "rustls TLS stack that rejects a CA certificate presented as the server's own leaf/"
+        "end-entity certificate; reissue the server with a proper CA+leaf chain — a pasted ca_pem "
+        "does not fix this, since rustls rejects the leaf's shape regardless of what is trusted), timeout, "
+        "http_401/http_403/http_404/http_4xx/http_5xx (server responded with an HTTP error), "
+        "protocol (malformed MCP handshake), decrypt_failed. "
         "404 not_found when no server with that name exists."
     ),
 }

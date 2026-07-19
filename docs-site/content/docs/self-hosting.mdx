@@ -62,6 +62,13 @@ with an ordinary certificate-verification error and no log line naming the
 missing binary. MCP servers reached over plain `http://`, or presenting a
 publicly trusted certificate, do not need it.
 
+Self-hosted `codex`-driven residents have one further requirement: a
+self-signed MCP server must present a **certificate chain** (a CA certificate
+plus a separate leaf certificate it signs), not a lone self-signed
+certificate — `codex`'s TLS stack rejects a CA used directly as the server's
+own certificate, even though `claude` accepts it. See
+[MCP servers](/docs/workflows/mcp) for the `openssl` recipe.
+
 A backend that returns `/healthz` can still be unable to decrypt Memory, process
 hosted Chat, or persist data. Build readiness from component checks rather than
 using `/healthz` alone.

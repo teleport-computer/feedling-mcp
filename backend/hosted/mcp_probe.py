@@ -67,6 +67,38 @@ def blocked_url_kind(url: str) -> str | None:
     return None
 
 
+def leaf_is_ca(url: str, *, timeout: float = 3.0) -> bool | None:
+    """Does the server's LEAF cert have basicConstraints CA:TRUE? Read-only:
+    a CERT_NONE handshake just to inspect the presented cert (never trusts it).
+    True ⇒ a rustls-based agent (codex) will reject it as CaUsedAsEndEntity.
+    None ⇒ non-global/unreachable/no cert (don't warn). SSRF guard reused."""
+    if blocked_url_kind(url):
+        return None
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return None
+    port = parsed.port or 443
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as ss:
+                der = ss.getpeercert(binary_form=True)
+        if not der:
+            return None
+        from cryptography import x509  # noqa: PLC0415 — backend dep, lazy
+        cert = x509.load_der_x509_certificate(der)
+        try:
+            bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+            return bool(bc.ca)
+        except x509.ExtensionNotFound:
+            return False
+    except Exception:  # noqa: BLE001 — read-only probe, never raise
+        return None
+
+
 def _classify_http(status: int) -> str:
     if status in (401, 403, 404):
         return f"http_{status}"

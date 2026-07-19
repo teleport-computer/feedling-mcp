@@ -5693,27 +5693,72 @@ def _enrich_with_fetched_ca(servers: list[dict], *, budget_s: float = 15.0,
     retried on the next fingerprint change.
 
     ``now``/``fetch`` are injected so the budget and failure branches are
-    testable without real clocks or sockets.
+    testable without real clocks or sockets. ``fetch`` returns a
+    ``(anchor_pem_or_None, leaf_is_ca_or_None)`` tuple (see
+    ``user_mcp_ca_fetch.fetch_anchor_and_leaf_ca``): the anchor fills
+    ``ca_pem`` as before, and the leaf flag drives the codex compatibility
+    warning below — it does not change what gets materialized.
 
     Never raises: one server's fetch failure just means that server has no
     anchor.
     """
     if fetch is None:
         import user_mcp_ca_fetch  # noqa: PLC0415 — sibling on tools/ path
-        fetch = user_mcp_ca_fetch.fetch_trust_anchor
+        fetch = user_mcp_ca_fetch.fetch_anchor_and_leaf_ca
     deadline = now() + budget_s
+    is_codex = _cli_template_is_codex()
     out = []
     for s in servers:
         ca = s.get("ca_pem") or ""
         if not ca and s.get("enabled") and now() < deadline:
             try:
-                ca = fetch(s.get("url") or "") or ""
+                fetched, leaf_ca = fetch(s.get("url") or "")
+                ca = fetched or ""
+                if is_codex and leaf_ca is True:
+                    log.warning(
+                        "[user_mcp] server %r presents a single self-signed "
+                        "certificate (leaf is a CA); codex (rustls) will reject "
+                        "it as CaUsedAsEndEntity — regenerate it as a CA + "
+                        "server-leaf chain. claude/pi accept it as-is.",
+                        s.get("name"))
             except Exception as e:  # noqa: BLE001 — never wedge materialization
                 log.warning("[user_mcp] ca fetch failed for %s: %s: %s",
                             s.get("name"), type(e).__name__, e)
                 ca = ""
         out.append({**s, "ca_pem": ca})
     return out
+
+
+def _materialize_hermes_config(cfg_path: Path, servers: list[dict],
+                               managed_names) -> None:
+    """Write the user's MCP servers into hermes's ``config.yaml`` (mcp_servers).
+
+    hermes discovers MCP tools by re-reading config.yaml every spawn
+    (native-mcp.md), so this is all that's needed for the next turn to see the
+    tools. pyyaml round-trips the file (dropping comments), so we back up the
+    user's original to ``config.yaml.feedling-bak`` first, then write atomically
+    (temp + rename) so a crash never leaves a half-written config.
+    """
+    import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
+    existing = cfg_path.read_text() if cfg_path.exists() else None
+    merged = _m.hermes_config_merged(existing, servers, managed_names)
+    if cfg_path.exists():
+        shutil.copy2(cfg_path, cfg_path.parent / (cfg_path.name + ".feedling-bak"))
+    _atomic_write_text(str(cfg_path), merged)
+
+
+def _materialize_openclaw_config(cfg_path: Path, servers: list[dict],
+                                 managed_names) -> None:
+    """Write the user's MCP servers into OpenClaw's ``openclaw.json``
+    (nested ``mcp.servers``). OpenClaw re-loads it every ``agent --local`` turn.
+    JSON has no comments to lose, but we still back up the user's file to
+    ``openclaw.json.feedling-bak`` and write atomically (temp + rename)."""
+    import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
+    existing = cfg_path.read_text() if cfg_path.exists() else None
+    merged = _m.openclaw_config_merged(existing, servers, managed_names)
+    if cfg_path.exists():
+        shutil.copy2(cfg_path, cfg_path.parent / (cfg_path.name + ".feedling-bak"))
+    _atomic_write_text(str(cfg_path), merged)
 
 
 def _write_user_mcp_ca(servers: list[dict]) -> None:
