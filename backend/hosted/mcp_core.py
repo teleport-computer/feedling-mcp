@@ -107,6 +107,20 @@ def _validate_ca_pem(ca_pem: str) -> dict | None:
     return None
 
 
+def _transport_hint(url: str) -> str:
+    """Save-time transport guess: providers that still run the legacy
+    HTTP+SSE transport advertise it as an ``…/sse`` URL (Tencent/AMap map
+    docs, 2026-07-19). The probe corrects a wrong guess on detection
+    (``test_server`` persists the detected value); the materializers apply
+    the same fallback for pre-transport envelopes
+    (user_mcp_materialize.effective_transport)."""
+    try:
+        path = (urlparse(url).path or "").rstrip("/")
+    except ValueError:
+        return "http"
+    return "sse" if path.lower().endswith("/sse") else "http"
+
+
 def _validate_payload(name: str, url: str, headers: dict, ca_pem: str = "") -> dict | None:
     if not _NAME_RE.match(name or ""):
         return _err("invalid_name", "name must match ^[a-z0-9_-]{1,32}$")
@@ -135,12 +149,16 @@ def _validate_payload(name: str, url: str, headers: dict, ca_pem: str = "") -> d
 def _public(srv: dict) -> dict:
     out = {k: srv.get(k) for k in
            ("id", "name", "enabled", "url_hint", "header_names", "has_ca",
-            "created_at", "updated_at")}
+            "transport", "created_at", "updated_at")}
     # v2 (2026-07-08) records predate the "has_ca" field entirely — .get()
     # returns None for them, which violates the boolean type this endpoint
     # declares in the OpenAPI contract. Coerce, don't KeyError: missing means
     # "no CA was ever set", i.e. False.
     out["has_ca"] = bool(out["has_ca"])
+    # Pre-transport records: the URL lives only inside the envelope, so the
+    # list endpoint can't run the path heuristic — report the default. The
+    # probe stamps the real value on the record at first successful test.
+    out["transport"] = str(out["transport"] or "http")
     return out
 
 
@@ -161,8 +179,10 @@ def upsert_server(store: UserStore, payload: dict) -> tuple[dict, int]:
     existing = next((s for s in servers if s["name"] == name), None)
     if existing is None and len(servers) >= MAX_SERVERS:
         return _err("too_many_servers", f"max {MAX_SERVERS}"), 400
+    transport = _transport_hint(url)
     secret_doc = {"url": url,
-                  "headers": {str(k): str(v) for k, v in headers.items()}}
+                  "headers": {str(k): str(v) for k, v in headers.items()},
+                  "transport": transport}
     if ca_pem:
         secret_doc["ca_pem"] = ca_pem
     secret = json.dumps(secret_doc)
@@ -179,6 +199,7 @@ def upsert_server(store: UserStore, payload: dict) -> tuple[dict, int]:
         "url_hint": urlparse(url).hostname or "",
         "header_names": sorted(str(k) for k in headers),
         "has_ca": bool(ca_pem),
+        "transport": transport,
         "created_at": existing["created_at"] if existing else now,
         "updated_at": now,
     }
@@ -209,7 +230,12 @@ def delete_server(store: UserStore, name: str) -> tuple[dict, int]:
 def test_server(store: UserStore, name: str, caller_api_key: str | None) -> tuple[dict, int]:
     from core import enclave as core_enclave
     from hosted import mcp_probe
-    servers = _load(store)["servers"]
+    # Snapshot the WHOLE blob up front — this is the CAS expectation. The probe
+    # below can take tens of seconds; any upsert/delete/toggle that lands in
+    # that window must NOT be rolled back by our persistence (codex3 P0). We
+    # never mutate `original`; the persist step is a conditional swap on it.
+    original = _load(store)
+    servers = original["servers"]
     srv = next((s for s in servers if s["name"] == name), None)
     if srv is None:
         return _err("not_found", name), 404
@@ -219,11 +245,49 @@ def test_server(store: UserStore, name: str, caller_api_key: str | None) -> tupl
             purpose="mcp_server_config").decode("utf-8"))
     except Exception as e:
         return _err("decrypt_failed", str(e)[:160]), 400
+    hint = str(secret.get("transport") or srv.get("transport")
+               or _transport_hint(secret["url"]))
     try:
         out = mcp_probe.probe(secret["url"], secret.get("headers") or {},
-                              ca_pem=secret.get("ca_pem"))
+                              ca_pem=secret.get("ca_pem"), transport_hint=hint)
     except mcp_probe.ProbeError as e:
         return _err(e.kind, e.detail), 400
+
+    detected = str(out.get("transport") or "")
+    updated_srv = None
+    if detected in ("http", "sse") and detected != hint:
+        # The hint was wrong (e.g. a legacy server on a non-/sse path, or an
+        # old pre-transport record) — persist what actually worked so the
+        # materialized agent config speaks the right protocol. Re-sealing bumps
+        # the envelope id → fingerprint moves → the consumer re-materializes.
+        # Best-effort: a failed re-seal must not fail a probe that succeeded.
+        new_secret = json.dumps({**secret, "transport": detected})
+        envelope, _enc_err = core_envelope._build_shared_envelope_for_store(
+            store, new_secret.encode("utf-8"),
+            item_id=f"user_mcp_{uuid.uuid4().hex}")
+        if envelope is not None:
+            updated_srv = {**srv, "config_envelope": envelope,
+                           "transport": detected, "updated_at": core_util._now_iso()}
+    elif detected in ("http", "sse") and not srv.get("transport"):
+        # Hint matched but the record predates the field — stamp it (metadata
+        # only, envelope untouched, fingerprint therefore unchanged).
+        updated_srv = {**srv, "transport": detected}
+
+    if updated_srv is not None:
+        # Build the new blob from the SNAPSHOT (not a re-load) and CAS on the
+        # snapshot, so a concurrent write between _load above and here is not
+        # clobbered: if `original` moved, the swap no-ops and we keep the probe
+        # result. `srv is s` identity holds — both come from `original`.
+        new_servers = [updated_srv if s is srv else s for s in servers]
+        new_doc = {"fingerprint": compute_fingerprint(new_servers),
+                   "servers": new_servers}
+        if db.set_blob_if_unchanged(store.user_id, USER_MCP_BLOB, original, new_doc):
+            # Only the re-seal path moves the fingerprint (transport is not in
+            # the fingerprint basis); wake the consumer only when it actually
+            # changed, mirroring _save's intent without a spurious wake.
+            if new_doc["fingerprint"] != original.get("fingerprint"):
+                store.notify_chat_waiters()
+                wake_bus.notify("chat", store.user_id)
     return out, 200
 
 
@@ -233,6 +297,10 @@ def envelopes_payload(store: UserStore) -> tuple[dict, int]:
         "fingerprint": data["fingerprint"],
         "servers": [
             {"name": s["name"], "enabled": bool(s.get("enabled")),
+             # convenience mirror of the encrypted secret's transport; ""
+             # for pre-transport records (consumer falls back to the URL
+             # heuristic after decrypting)
+             "transport": str(s.get("transport") or ""),
              "config_envelope": s["config_envelope"]}
             for s in data["servers"]
         ],

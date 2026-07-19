@@ -36,9 +36,28 @@ def _enabled(servers: list[dict]) -> list[dict]:
         key=lambda s: s["name"])
 
 
+def effective_transport(server: dict) -> str:
+    """"http" (streamable HTTP) or "sse" (legacy HTTP+SSE) for one server.
+
+    An explicit stored value wins (mcp_core stamps it at save time and the
+    probe corrects it on detection). Envelopes written before the transport
+    field existed fall back to the same URL-path heuristic mcp_core uses —
+    providers that still run the legacy transport advertise it as an ``/sse``
+    URL (Tencent/AMap docs, 2026-07-19).
+    """
+    t = str(server.get("transport") or "").strip().lower()
+    if t in ("http", "sse"):
+        return t
+    path = (str(server.get("url") or "").split("?", 1)[0]).rstrip("/")
+    return "sse" if path.lower().endswith("/sse") else "http"
+
+
 def claude_mcp_json(servers: list[dict]) -> str:
+    # claude natively speaks both transports; the type field selects it.
+    # This file doubles as the generic VPS user-mcp.json, so the type field
+    # is part of the documented shape.
     doc = {"mcpServers": {
-        s["name"]: {"type": "http", "url": s["url"],
+        s["name"]: {"type": effective_transport(s), "url": s["url"],
                     "headers": dict(s.get("headers") or {})}
         for s in _enabled(servers)
     }}
@@ -119,6 +138,17 @@ def codex_config_merged(existing_text: str | None, servers: list[dict]) -> str:
         return base
     lines = [MARKER_BEGIN]
     for s in enabled:
+        if effective_transport(s) == "sse":
+            # codex only speaks stdio + streamable HTTP (verified against
+            # codex-cli 0.144.6: --url is documented as "streamable HTTP");
+            # a legacy HTTP+SSE table entry would just burn its 20s startup
+            # timeout every turn. Leave a comment instead of a broken table.
+            lines.append(
+                f"# server {_toml_str(s['name'])} uses the legacy HTTP+SSE "
+                "transport — codex supports streamable HTTP only; "
+                "use the provider's /mcp URL instead")
+            lines.append("")
+            continue
         lines.append(f"[mcp_servers.{s['name']}]")
         lines.append(f"url = {_toml_str(s['url'])}")
         headers = s.get("headers") or {}

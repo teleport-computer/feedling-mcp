@@ -122,6 +122,31 @@ def test_blob_get_set():
     assert db.get_blob(uid, "tokens") == [{"token": "abc", "status": "active"}]
 
 
+def test_set_blob_if_unchanged_cas():
+    uid = _uid()
+    seed_user(uid)
+    base = {"fingerprint": "f0", "servers": [{"name": "a", "transport": "http"}]}
+    db.set_blob(uid, "user_mcp", base)
+
+    # CAS with the current value swaps and returns True; JSONB equality is
+    # semantic, so a re-ordered but equal expected still matches.
+    expected_reordered = {"servers": [{"transport": "http", "name": "a"}],
+                          "fingerprint": "f0"}
+    nxt = {"fingerprint": "f1", "servers": [{"name": "a", "transport": "sse"}]}
+    assert db.set_blob_if_unchanged(uid, "user_mcp", expected_reordered, nxt) is True
+    assert db.get_blob(uid, "user_mcp") == nxt
+
+    # CAS against a now-stale expectation must NOT write and returns False.
+    stale = base
+    other = {"fingerprint": "f2", "servers": []}
+    assert db.set_blob_if_unchanged(uid, "user_mcp", stale, other) is False
+    assert db.get_blob(uid, "user_mcp") == nxt   # unchanged
+
+    # Missing row (kind never written) also returns False without resurrecting.
+    assert db.set_blob_if_unchanged(uid, "never", {"x": 1}, {"x": 2}) is False
+    assert db.get_blob(uid, "never") is None
+
+
 def test_get_blobs_for_users_batches_and_omits_missing_rows():
     uid_a = _uid()
     uid_b = _uid()

@@ -3242,7 +3242,7 @@
           }
         ],
         "x-feedling-contract-level": "documented",
-        "description": "Best-effort connectivity probe (MCP initialize -> tools/list) run from this backend's own network, offered purely as a convenience for validating publicly reachable https:// servers. A 400 unreachable_from_backend response does NOT mean the server failed to save — it was already saved successfully by POST /v1/mcp/servers. It only means this backend process could not reach the host, typically because it is a loopback/private-network address or a tunnel endpoint that only your agent's environment can reach. For those servers, skip this probe and instead ask your agent to call the MCP server directly in chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS handshake failure — check ca_pem), timeout, http_401/http_403/http_404/http_4xx/http_5xx (server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. 404 not_found when no server with that name exists."
+        "description": "Best-effort connectivity probe (MCP initialize -> tools/list) run from this backend's own network, offered purely as a convenience for validating publicly reachable https:// servers. A 400 unreachable_from_backend response does NOT mean the server failed to save — it was already saved successfully by POST /v1/mcp/servers. It only means this backend process could not reach the host, typically because it is a loopback/private-network address or a tunnel endpoint that only your agent's environment can reach. For those servers, skip this probe and instead ask your agent to call the MCP server directly in chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS handshake failure — check ca_pem), timeout (connect/read timeout, or the whole probe exceeded its 45-second wall-clock ceiling — e.g. a legacy HTTP+SSE endpoint answering with a never-ending event stream), http_401/http_403/http_404/http_4xx/http_5xx (server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. 404 not_found when no server with that name exists."
       }
     },
     "/v1/memory/actions": {
@@ -7216,6 +7216,7 @@
             "enum": [
               "user_provider",
               "provider_transient",
+              "user_environment",
               "system"
             ],
             "description": "Stable responsibility classification when the endpoint can identify it."
@@ -7874,6 +7875,7 @@
               "live_activity",
               "heartbeat",
               "verify_ping",
+              "resident_maintenance",
               "agent_initiated_proactive"
             ],
             "default": "chat",
@@ -8570,6 +8572,14 @@
             "type": "boolean",
             "description": "Whether a CA certificate is currently stored for this server."
           },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "http",
+              "sse"
+            ],
+            "description": "MCP transport: 'http' (streamable HTTP) or 'sse' (legacy HTTP+SSE). Guessed from the URL path at save time ('.../sse' => 'sse') and corrected to the server's actual transport the first time a connectivity test succeeds."
+          },
           "created_at": {
             "type": "string"
           },
@@ -8587,6 +8597,7 @@
             "Authorization"
           ],
           "has_ca": false,
+          "transport": "http",
           "created_at": "2026-07-16T00:00:00Z",
           "updated_at": "2026-07-16T00:00:00Z"
         }
@@ -8624,7 +8635,8 @@
         "required": [
           "ok",
           "tool_count",
-          "tool_names"
+          "tool_names",
+          "transport"
         ],
         "properties": {
           "ok": {
@@ -8640,6 +8652,14 @@
             "items": {
               "type": "string"
             }
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "http",
+              "sse"
+            ],
+            "description": "The MCP transport this probe actually spoke to the server: 'http' (streamable HTTP) or 'sse' (legacy HTTP+SSE). This is the authoritative detection that gets persisted to the server record's transport field."
           }
         },
         "additionalProperties": true,
@@ -8649,7 +8669,8 @@
           "tool_names": [
             "search",
             "fetch"
-          ]
+          ],
+          "transport": "http"
         }
       }
     },

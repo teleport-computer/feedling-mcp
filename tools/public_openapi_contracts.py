@@ -334,7 +334,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "blame": {
                 "type": "string",
-                "enum": ["user_provider", "provider_transient", "system"],
+                "enum": ["user_provider", "provider_transient", "user_environment", "system"],
                 "description": "Stable responsibility classification when the endpoint can identify it.",
             },
             "request_id": {"type": "string", "description": "Support correlation identifier when available."},
@@ -604,7 +604,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
             "source": {
                 "type": "string",
-                "enum": ["chat", "live_activity", "heartbeat", "verify_ping", "agent_initiated_proactive"],
+                "enum": [
+                    "chat",
+                    "live_activity",
+                    "heartbeat",
+                    "verify_ping",
+                    "resident_maintenance",
+                    "agent_initiated_proactive",
+                ],
                 "default": "chat",
                 "description": "Resident protocol source. Ordinary replies should use chat.",
             },
@@ -897,6 +904,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "url_hint": {"type": "string", "description": "Hostname only (no scheme, path, or credentials), for display."},
             "header_names": {"type": "array", "items": {"type": "string"}, "description": "Header names only; values are never returned."},
             "has_ca": {"type": "boolean", "description": "Whether a CA certificate is currently stored for this server."},
+            "transport": {"type": "string", "enum": ["http", "sse"], "description": "MCP transport: 'http' (streamable HTTP) or 'sse' (legacy HTTP+SSE). Guessed from the URL path at save time ('.../sse' => 'sse') and corrected to the server's actual transport the first time a connectivity test succeeds."},
             "created_at": {"type": "string"},
             "updated_at": {"type": "string"},
         },
@@ -908,6 +916,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "url_hint": "mcp.example.com",
             "header_names": ["Authorization"],
             "has_ca": False,
+            "transport": "http",
             "created_at": "2026-07-16T00:00:00Z",
             "updated_at": "2026-07-16T00:00:00Z",
         },
@@ -926,14 +935,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "McpServerTestResponse": {
         "type": "object",
-        "required": ["ok", "tool_count", "tool_names"],
+        "required": ["ok", "tool_count", "tool_names", "transport"],
         "properties": {
             "ok": {"type": "boolean", "const": True},
             "tool_count": {"type": "integer", "minimum": 0},
             "tool_names": {"type": "array", "items": {"type": "string"}},
+            "transport": {"type": "string", "enum": ["http", "sse"], "description": "The MCP transport this probe actually spoke to the server: 'http' (streamable HTTP) or 'sse' (legacy HTTP+SSE). This is the authoritative detection that gets persisted to the server record's transport field."},
         },
         "additionalProperties": True,
-        "example": {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"]},
+        "example": {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"], "transport": "http"},
     },
 }
 
@@ -1061,7 +1071,9 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "address or a tunnel endpoint that only your agent's environment can reach. For those "
         "servers, skip this probe and instead ask your agent to call the MCP server directly in "
         "chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS "
-        "handshake failure — check ca_pem), timeout, http_401/http_403/http_404/http_4xx/http_5xx "
+        "handshake failure — check ca_pem), timeout (connect/read timeout, or the whole probe "
+        "exceeded its 45-second wall-clock ceiling — e.g. a legacy HTTP+SSE endpoint answering "
+        "with a never-ending event stream), http_401/http_403/http_404/http_4xx/http_5xx "
         "(server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. "
         "404 not_found when no server with that name exists."
     ),

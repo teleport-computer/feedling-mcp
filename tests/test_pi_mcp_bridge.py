@@ -214,6 +214,204 @@ def test_bridge_protocol_version_matches_the_probe():
     assert '_PROTOCOL_VERSION = "2025-03-26"' in py
 
 
+# ---------------------------------------------------------------------------
+# Legacy HTTP+SSE transport (SseMcpClient, SSE-transport batch 2026-07-19)
+# ---------------------------------------------------------------------------
+
+
+def _legacy_sse_handler(*, endpoint_path="/messages?session_id=s1"):
+    """Loopback legacy transport: GET /sse streams an `endpoint` event then the
+    JSON-RPC replies queued by POSTs to /messages. Mirrors mcp.map.qq.com/sse."""
+    import queue
+
+    replies = queue.Queue()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+            self._chunk(f"event:endpoint\ndata:{endpoint_path}\n\n")
+            try:
+                while True:
+                    doc = replies.get(timeout=5)
+                    self._chunk("event:message\ndata:" + json.dumps(doc) + "\n\n")
+            except queue.Empty:
+                self._chunk("")  # terminate stream
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _chunk(self, s):
+            data = s.encode()
+            try:
+                self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                raise
+
+        def do_POST(self):
+            length = int(self.headers.get("content-length", 0))
+            req = json.loads(self.rfile.read(length) or b"{}")
+            method = req.get("method")
+            if method == "initialize":
+                replies.put({"jsonrpc": "2.0", "id": req["id"], "result": {
+                    "protocolVersion": "2025-03-26", "capabilities": {},
+                    "serverInfo": {"name": "legacy", "version": "0"}}})
+            elif method == "tools/list":
+                replies.put({"jsonrpc": "2.0", "id": req["id"], "result": {
+                    "tools": [{"name": "geocode", "description": "find place",
+                               "inputSchema": {"type": "object"}}]}})
+            elif method == "tools/call":
+                replies.put({"jsonrpc": "2.0", "id": req["id"], "result": {
+                    "content": [{"type": "text", "text": "called geocode"}]}})
+            self.send_response(202)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+    return Handler
+
+
+def test_sse_client_handshake_list_and_call():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _legacy_sse_handler())
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        out = _harness("sse-client", f"http://127.0.0.1:{srv.server_port}/sse")
+        assert "error" not in out, out
+        assert [t["name"] for t in out["tools"]] == ["geocode"]
+        assert out["called"]["content"][0]["text"] == "called geocode"
+    finally:
+        srv.shutdown()
+
+
+def test_sse_client_get_stream_socket_is_unref_d():
+    """codex3 P2: the real unref proof. The bridge client is NEVER explicitly
+    closed in production — a connected client just goes out of scope at turn
+    end. So drive it WITHOUT close() and require node to still exit on its own:
+    that can only happen if the long-lived GET stream's socket was unref'd. (The
+    prior test called close() before timing, which destroys the socket
+    regardless of unref and so proved nothing.)"""
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _legacy_sse_handler())
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        t0 = time.monotonic()
+        out = _harness("sse-client-noclose", f"http://127.0.0.1:{srv.server_port}/sse")
+        elapsed = time.monotonic() - t0
+        assert "error" not in out, out
+        assert [t["name"] for t in out["tools"]] == ["geocode"]
+        # No close() was called; node must still exit promptly — proving the
+        # open GET stream is not keeping the event loop alive.
+        assert elapsed < 4.0, f"harness took {elapsed:.1f}s — GET socket not unref'd"
+    finally:
+        srv.shutdown()
+
+
+def test_sse_client_refuses_cross_origin_endpoint():
+    """The endpoint event is server-controlled; a cross-origin target must be
+    refused so a hostile stream can't aim the bridge's POSTs elsewhere."""
+    handler = _legacy_sse_handler(
+        endpoint_path="http://evil.example.invalid:1/messages")
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        out = _harness("sse-client", f"http://127.0.0.1:{srv.server_port}/sse")
+        assert "error" in out
+        assert "origin mismatch" in out["error"]
+    finally:
+        srv.shutdown()
+
+
+def test_sse_client_no_newline_flood_hits_byte_budget():
+    """A GET stream flooding bytes with no newline must trip MAX_SSE_BYTES and
+    tear the connection down — not grow Node's heap unbounded. The harness exits
+    promptly (well under the server's read timeout), proving the guard fired and
+    closed the socket rather than the process lingering on an open stream."""
+
+    class Flood(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+            try:
+                while True:
+                    data = b"x" * 8192   # no newline, ever
+                    self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Flood)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        t0 = time.monotonic()
+        out = _harness("sse-client", f"http://127.0.0.1:{srv.server_port}/sse")
+        elapsed = time.monotonic() - t0
+        assert "error" in out
+        assert "size budget" in out["error"]
+        assert elapsed < 5.0, f"took {elapsed:.1f}s — budget/destroy didn't fire"
+    finally:
+        srv.shutdown()
+
+
+def test_sse_client_oversized_event_line_hits_byte_budget():
+    """A single huge `event:` line (properly newline-terminated, so the
+    no-newline buffer guard never fires) must still trip the per-event budget —
+    the cap covers every field, not just data: (codex3 R2)."""
+
+    class BigEvent(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+            # "event:" + 512KB of name + newline — one framed line, no data:.
+            payload = b"event:" + b"A" * (512 * 1024) + b"\n"
+            try:
+                self.wfile.write(f"{len(payload):X}\r\n".encode() + payload + b"\r\n")
+                self.wfile.flush()
+                while True:  # keep the stream open so only the budget can end it
+                    self.wfile.write(b"1\r\n:\r\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), BigEvent)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        out = _harness("sse-client", f"http://127.0.0.1:{srv.server_port}/sse")
+        assert "error" in out
+        assert "size budget" in out["error"]
+    finally:
+        srv.shutdown()
+
+
+def test_effective_transport_routing():
+    specs = [
+        {"type": "sse", "url": "https://x/mcp"},      # explicit wins
+        {"type": "http", "url": "https://x/sse"},     # explicit wins
+        {"url": "https://mcp.map.qq.com/sse?key=K"},  # heuristic → sse
+        {"url": "https://x/mcp"},                     # heuristic → http
+    ]
+    out = _harness("transport", json.dumps(specs))
+    assert out == ["sse", "http", "sse", "http"]
+
+
 def _servers(*specs):
     """specs: (server_name, [tool_name, ...])"""
     return json.dumps([
