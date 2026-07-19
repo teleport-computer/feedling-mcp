@@ -1,8 +1,9 @@
-"""Atomic reply finalization milestones A and B.
+"""Atomic reply finalization milestones A through C.
 
 The tests pin the single-statement PostgreSQL CAS, its primary-key access path,
 the chat_core wiring, winner-only side effects, row-shape parity, R2 behavior,
-and the parent-only TEE mirror trust boundary.
+the parent-only TEE mirror trust boundary, INSERT-failure rollback, and the
+remaining response-ingress routing.
 
 Run: python3 -m pytest tests/test_chat_response_finalize_cas.py -q
 """
@@ -14,6 +15,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import psycopg
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -255,6 +257,66 @@ def test_finalize_mirrors_parent_metadata_only_for_winner(store, monkeypatch):
     assert params[1:] == (store.user_id, parent["id"])
 
 
+def test_finalize_insert_collision_rolls_back_parent_and_retry_is_safe(store):
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "parent_insert_failure")
+    )
+    candidate = store._build_chat_message(
+        "openclaw", "chat", _envelope(store.user_id, "reply_insert_collision")
+    )
+    replied_fields = {
+        "reply_status": "replied",
+        "reply_message_id": candidate["id"],
+        "replied_by": "collision-consumer",
+        "replied_at": f"{candidate['ts']:.3f}",
+    }
+
+    # Pre-existing same-PK row makes the CTE's INSERT fail after `won` has
+    # tentatively updated the parent.  PostgreSQL must roll that UPDATE back.
+    db.chat_append(
+        store.user_id,
+        candidate["id"],
+        candidate["ts"] - 1,
+        {**candidate, "body_ct": "pre-existing collision"},
+        5000,
+    )
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        db.chat_finalize_reply_once(
+            store.user_id,
+            parent["id"],
+            candidate["id"],
+            candidate["ts"],
+            candidate,
+            replied_fields,
+        )
+
+    with db.get_pool().connection() as conn:
+        parent_after_failure = conn.execute(
+            "SELECT doc FROM chat_messages WHERE user_id = %s AND msg_id = %s",
+            (store.user_id, parent["id"]),
+        ).fetchone()[0]
+        conn.execute(
+            "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s",
+            (store.user_id, candidate["id"]),
+        )
+    assert parent_after_failure.get("reply_status") != "replied"
+    assert not parent_after_failure.get("reply_message_id")
+
+    retried = db.chat_finalize_reply_once(
+        store.user_id,
+        parent["id"],
+        candidate["id"],
+        candidate["ts"],
+        candidate,
+        replied_fields,
+    )
+    assert retried is not None
+    retried_parent, retried_reply = retried
+    assert retried_parent["reply_status"] == "replied"
+    assert retried_parent["reply_message_id"] == candidate["id"]
+    assert retried_reply == candidate
+
+
 def test_finalize_reply_row_shape_matches_append_chat(store, monkeypatch):
     fixed_now = 1_725_000_123.456
     monkeypatch.setattr(core_store.time, "time", lambda: fixed_now)
@@ -406,6 +468,84 @@ def test_system_reply_target_bypasses_finalize_cas(store, monkeypatch):
     cached_parent = next(msg for msg in store.chat_messages if msg["id"] == parent["id"])
     assert cached_parent.get("reply_status") != "replied"
     assert not cached_parent.get("reply_message_id")
+
+
+@pytest.mark.parametrize(
+    ("source", "parent_source", "allow_verify_reply", "uses_reply_cas"),
+    (
+        ("verify_ping", "verify_ping", True, True),
+        ("resident_maintenance", "resident_maintenance", False, True),
+        (chat_core.proactive_service.PROACTIVE_JOB_SOURCE, "", False, False),
+    ),
+)
+def test_verify_resident_and_proactive_response_ingress_remain_valid(
+    store,
+    monkeypatch,
+    source,
+    parent_source,
+    allow_verify_reply,
+    uses_reply_cas,
+):
+    parent = None
+    if parent_source:
+        parent = store.append_chat(
+            "user",
+            parent_source,
+            _envelope(store.user_id, f"{source}_parent"),
+            extra={"content": "maintenance"} if source == "resident_maintenance" else None,
+        )
+
+    finalize_calls = []
+    real_finalize = store.finalize_chat_reply_once
+
+    def spy_finalize(*args, **kwargs):
+        finalize_calls.append((args, kwargs))
+        return real_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(store, "finalize_chat_reply_once", spy_finalize)
+    monkeypatch.setattr(
+        chat_core.chat_consumer, "_record_consumer_event", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        chat_core.push_service,
+        "_deliver_ai_message_push_if_background",
+        lambda *args, **kwargs: pytest.fail(
+            "verify/maintenance suppression or no-push proactive path regressed"
+        ),
+    )
+    payload = {
+        "envelope": _envelope(store.user_id, f"{source}_reply"),
+        "source": source,
+    }
+    if parent is not None:
+        payload.update({
+            "reply_to_message_id": parent["id"],
+            "push_body": "must stay suppressed",
+            "push_live_activity": True,
+        })
+    if source == chat_core.proactive_service.PROACTIVE_JOB_SOURCE:
+        payload["proactive_job_id"] = "proactive_ingress_job"
+
+    body, status = chat_core.write_response(
+        store,
+        payload,
+        consumer_id=f"consumer-{source}",
+        consumer_info={},
+        allow_verify_reply=allow_verify_reply,
+    )
+    assert status == 200, body
+    assert len(finalize_calls) == int(uses_reply_cas)
+
+    stored_reply = next(msg for msg in store.chat_messages if msg["id"] == body["id"])
+    assert stored_reply["source"] == source
+    if parent is not None:
+        stored_parent = next(
+            msg for msg in store.chat_messages if msg["id"] == parent["id"]
+        )
+        assert stored_parent["reply_status"] == "replied"
+        assert stored_parent["reply_message_id"] == stored_reply["id"]
+    else:
+        assert stored_reply["proactive_job_id"] == "proactive_ingress_job"
 
 
 def test_finalize_reply_once_explain_uses_parent_primary_key(store):
