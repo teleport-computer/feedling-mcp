@@ -3153,6 +3153,11 @@ _CHAT_FINALIZE_REPLY_ONCE_SQL = (
     "SELECT won.parent_doc, inserted.reply_doc FROM won CROSS JOIN inserted"
 )
 
+_CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL = (
+    "UPDATE chat_messages SET doc = doc || %s "
+    "WHERE user_id = %s AND msg_id = %s"
+)
+
 
 def chat_finalize_reply_once(
     user_id: str,
@@ -3171,8 +3176,10 @@ def chat_finalize_reply_once(
     the CAS is the only normal ``None`` result; database failures deliberately
     propagate so callers fail closed instead of accidentally retrying a reply.
 
-    This low-level helper intentionally performs no cache, wake, capture, R2,
-    or TEE side effects.  Those belong to the winning request after commit.
+    This low-level helper performs no cache, wake, capture, R2, or inline reply
+    mirror side effects.  After the RDS statement commits, it best-effort
+    mirrors only the parent's plaintext metadata; the encrypted reply remains
+    exclusively on the normal decrypting TEE-replicator path.
     """
     with get_pool().connection() as conn:
         row = conn.execute(
@@ -3189,7 +3196,108 @@ def chat_finalize_reply_once(
         ).fetchone()
     if row is None:
         return None
+    # The encrypted reply row is intentionally NOT mirrored here.  The normal
+    # TEE replicator decrypts and copies that row in its canonical plaintext
+    # shape.  Only the already-existing parent's plaintext metadata is safe to
+    # merge inline; mirror.execute is best-effort and swallows TEE failures.
+    from tee_shadow import mirror
+
+    mirror.execute(
+        _CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL,
+        (Jsonb(replied_fields), user_id, parent_msg_id),
+    )
     return row[0], row[1]
+
+
+def chat_finalize_reply_post_commit(
+    user_id: str, reply_doc: dict, max_messages: int
+) -> None:
+    """Run normal append maintenance after an atomic reply winner commits.
+
+    Finalization must commit the parent CAS and inline encrypted reply together,
+    so trimming and optional R2 offload happen afterwards.  This preserves
+    ``chat_append`` semantics: trim to the newest bounded history, write heavy
+    ciphertext inline first, upload outside a transaction, and only then flip
+    the current row to an R2 pointer.  Failures are logged and leave the already
+    committed inline reply readable.
+    """
+    reply_msg_id = str(reply_doc.get("id") or "")
+    offload = (
+        object_storage.chat_files_enabled()
+        and reply_doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
+        and reply_doc.get("body_ct") is not None
+    )
+    trimmed_docs: list = []
+    trimmed_ids: list[str] = []
+    try:
+        if max_messages and max_messages > 0:
+            with get_pool().connection() as conn:
+                rows = conn.execute(
+                    "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
+                    "  SELECT MIN(seq) FROM ("
+                    "    SELECT seq FROM chat_messages WHERE user_id = %s "
+                    "    ORDER BY seq DESC LIMIT %s"
+                    "  ) t"
+                    ") RETURNING msg_id, doc",
+                    (user_id, user_id, max_messages),
+                ).fetchall()
+                trimmed_ids = [row[0] for row in rows]
+                trimmed_docs = [row[1] for row in rows]
+
+        if offload:
+            try:
+                body_ct_len = len(reply_doc["body_ct"])
+                key = object_storage.put_chat_body(
+                    user_id,
+                    reply_msg_id,
+                    reply_doc["body_ct"],
+                    str(reply_doc.get("content_type") or "file"),
+                )
+                pointer = {"body_key": key, "body_ct_len": body_ct_len}
+                with get_pool().connection() as conn:
+                    conn.execute(
+                        "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
+                        "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
+                        (Jsonb(pointer), user_id, reply_msg_id),
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "[db] chat_finalize_reply_post_commit(%s,%s) R2 offload "
+                    "failed, left inline: %s",
+                    user_id,
+                    reply_msg_id,
+                    e,
+                )
+
+        if trimmed_docs and object_storage.chat_files_enabled():
+            for trimmed in trimmed_docs:
+                if isinstance(trimmed, dict) and trimmed.get("body_key"):
+                    object_storage.delete_chat_body(
+                        str(trimmed["body_key"]), user_id
+                    )
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "[db] chat_finalize_reply_post_commit(%s,%s) failed: %s",
+            user_id,
+            reply_msg_id,
+            e,
+        )
+        return
+
+    if trimmed_ids:
+        from tee_shadow import mirror
+
+        mirror.execute_many([
+            (
+                "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = ANY(%s)",
+                (user_id, trimmed_ids),
+            ),
+            (
+                "DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+                "AND table_name = 'chat_messages' AND item_id = ANY(%s)",
+                (user_id, trimmed_ids),
+            ),
+        ])
 
 
 def chat_try_claim_reply(

@@ -1,8 +1,8 @@
-"""Milestone-A proof for atomic reply finalization.
+"""Atomic reply finalization milestones A and B.
 
-The first test deliberately characterizes the old chat_core
-check -> append -> mark race.  The remaining tests pin the replacement's
-single-statement PostgreSQL CAS and its primary-key access path.
+The tests pin the single-statement PostgreSQL CAS, its primary-key access path,
+the chat_core wiring, winner-only side effects, row-shape parity, R2 behavior,
+and the parent-only TEE mirror trust boundary.
 
 Run: python3 -m pytest tests/test_chat_response_finalize_cas.py -q
 """
@@ -18,6 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
+import object_storage  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from chat import chat_core  # noqa: E402
 from core import store as core_store  # noqa: E402
@@ -50,43 +51,62 @@ def store(backend_env):
     return core_store.get_store(res.get_json()["user_id"])
 
 
-def test_old_chat_core_check_append_mark_reproduces_two_replies(
+def test_chat_core_two_workers_one_reply_and_winner_only_side_effects(
     store, monkeypatch
 ):
-    """Force both old-path callers to inspect the same unanswered snapshot.
-
-    Returning independent snapshots is important: it models two workers, whose
-    caches cannot observe each other's in-place parent mutation.  Once both
-    reads have crossed the barrier, the legacy code has no database CAS, so
-    both requests append successfully and only later overwrite parent metadata.
-    """
     parent = store.append_chat(
-        "user", "chat", _envelope(store.user_id, "parent_old_race")
+        "user", "chat", _envelope(store.user_id, "parent_wired_race")
     )
-    real_lookup = chat_core._chat_message_by_id
-    both_read_parent = threading.Barrier(2)
-    counter_lock = threading.Lock()
-    parent_reads = 0
+    both_entered_finalize = threading.Barrier(2)
+    real_finalize = db.chat_finalize_reply_once
 
-    def synchronized_parent_snapshot(target_store, msg_id):
-        nonlocal parent_reads
-        snapshot = real_lookup(target_store, msg_id)
-        if msg_id != parent["id"]:
-            return snapshot
-        with counter_lock:
-            should_gate = parent_reads < 2
-            parent_reads += 1
-        if should_gate:
-            both_read_parent.wait(timeout=5)
-        return dict(snapshot) if snapshot is not None else None
+    def synchronized_finalize(*args, **kwargs):
+        both_entered_finalize.wait(timeout=5)
+        return real_finalize(*args, **kwargs)
 
-    monkeypatch.setattr(chat_core, "_chat_message_by_id", synchronized_parent_snapshot)
+    wakes = []
+    captures = []
+    first_chat_marks = []
+    pushes = []
+    traces = []
+    metadata_updates = []
+    real_metadata_update = db.chat_update_metadata
+    monkeypatch.setattr(db, "chat_finalize_reply_once", synchronized_finalize)
     monkeypatch.setattr(
         chat_core.chat_consumer, "_record_consumer_event", lambda *args, **kwargs: None
     )
-    monkeypatch.setattr(chat_core.debug_trace, "trace_event", lambda *args, **kwargs: None)
-    monkeypatch.setattr(store, "mark_first_chat_ok", lambda *args, **kwargs: {})
-    monkeypatch.setattr(core_store.wake_bus, "notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        chat_core.debug_trace,
+        "trace_event",
+        lambda *args, **kwargs: traces.append(kwargs),
+    )
+    monkeypatch.setattr(
+        chat_core,
+        "_maybe_mark_first_chat_ok",
+        lambda *args: first_chat_marks.append(args),
+    )
+    monkeypatch.setattr(
+        core_store.wake_bus, "notify", lambda *args: wakes.append(args)
+    )
+    from proactive import capture_scheduler
+
+    monkeypatch.setattr(
+        capture_scheduler,
+        "record_chat_append",
+        lambda *args: captures.append(args) or {},
+    )
+    monkeypatch.setattr(
+        chat_core.push_service,
+        "_deliver_ai_message_push_if_background",
+        lambda *args, **kwargs: pushes.append((args, kwargs))
+        or {"push_decision": "sent"},
+    )
+
+    def spy_metadata_update(user_id, msg_id, fields):
+        metadata_updates.append((user_id, msg_id, fields))
+        return real_metadata_update(user_id, msg_id, fields)
+
+    monkeypatch.setattr(db, "chat_update_metadata", spy_metadata_update)
 
     def post(reply_id: str):
         return chat_core.write_response(
@@ -94,6 +114,7 @@ def test_old_chat_core_check_append_mark_reproduces_two_replies(
             {
                 "envelope": _envelope(store.user_id, reply_id),
                 "reply_to_message_id": parent["id"],
+                "push_body": "winner only",
             },
             consumer_id=f"consumer-{reply_id}",
             consumer_info={},
@@ -101,19 +122,39 @@ def test_old_chat_core_check_append_mark_reproduces_two_replies(
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(post, ("old_reply_a", "old_reply_b")))
+        results = list(executor.map(post, ("wired_reply_a", "wired_reply_b")))
 
-    assert sorted(status for _body, status in results) == [200, 200]
+    assert sorted(status for _body, status in results) == [200, 409]
+    loser_body = next(body for body, status in results if status == 409)
+    assert loser_body == {"error": "already_answered", "reply_status": "replied"}
     replies = [
         msg for msg in db.chat_load(store.user_id)
-        if msg.get("id") in {"old_reply_a", "old_reply_b"}
+        if msg.get("id") in {"wired_reply_a", "wired_reply_b"}
     ]
-    assert {msg["id"] for msg in replies} == {"old_reply_a", "old_reply_b"}
+    assert len(replies) == 1
+    winner_id = replies[0]["id"]
     persisted_parent = next(
         msg for msg in db.chat_load(store.user_id) if msg.get("id") == parent["id"]
     )
     assert persisted_parent["reply_status"] == "replied"
-    assert persisted_parent["reply_message_id"] in {"old_reply_a", "old_reply_b"}
+    assert persisted_parent["reply_message_id"] == winner_id
+
+    cached_parent = next(msg for msg in store.chat_messages if msg["id"] == parent["id"])
+    cached_replies = [
+        msg for msg in store.chat_messages
+        if msg.get("id") in {"wired_reply_a", "wired_reply_b"}
+    ]
+    assert cached_parent["reply_message_id"] == winner_id
+    assert [msg["id"] for msg in cached_replies] == [winner_id]
+    assert len(wakes) == 1
+    assert len(captures) == 1
+    assert len(first_chat_marks) == 1
+    assert len(pushes) == 1
+    assert len(traces) == 1
+    # Delivery metadata may update the winning reply.  The parent itself was
+    # reconciled in memory and must never take a second DB UPDATE.
+    assert [call[1] for call in metadata_updates] == [winner_id]
+    assert all(call[1] != parent["id"] for call in metadata_updates)
 
 
 def test_finalize_reply_once_two_workers_exactly_one_wins(store):
@@ -164,6 +205,207 @@ def test_finalize_reply_once_two_workers_exactly_one_wins(store):
     ]
     assert persisted_parent["reply_message_id"] == winner_id
     assert [msg["id"] for msg in persisted_replies] == [winner_id]
+
+
+def test_finalize_mirrors_parent_metadata_only_for_winner(store, monkeypatch):
+    from tee_shadow import mirror
+
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "parent_tee_boundary")
+    )
+    candidate = store._build_chat_message(
+        "openclaw", "chat", _envelope(store.user_id, "reply_tee_boundary")
+    )
+    replied_fields = {
+        "reply_status": "replied",
+        "reply_message_id": candidate["id"],
+        "replied_by": "consumer-tee",
+        "replied_at": f"{candidate['ts']:.3f}",
+    }
+    mirror_calls = []
+    monkeypatch.setattr(
+        mirror, "execute", lambda sql, params=(): mirror_calls.append((sql, params))
+    )
+
+    won = db.chat_finalize_reply_once(
+        store.user_id,
+        parent["id"],
+        candidate["id"],
+        candidate["ts"],
+        candidate,
+        replied_fields,
+    )
+    lost = db.chat_finalize_reply_once(
+        store.user_id,
+        parent["id"],
+        "reply_tee_loser",
+        candidate["ts"] + 1,
+        {**candidate, "id": "reply_tee_loser"},
+        {**replied_fields, "reply_message_id": "reply_tee_loser"},
+    )
+
+    assert won is not None
+    assert lost is None
+    assert len(mirror_calls) == 1
+    sql, params = mirror_calls[0]
+    assert sql == db._CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL
+    assert "INSERT" not in sql
+    assert params[0].obj == replied_fields
+    assert not ({"body_ct", "nonce", "K_user", "K_enclave"} & params[0].obj.keys())
+    assert params[1:] == (store.user_id, parent["id"])
+
+
+def test_finalize_reply_row_shape_matches_append_chat(store, monkeypatch):
+    fixed_now = 1_725_000_123.456
+    monkeypatch.setattr(core_store.time, "time", lambda: fixed_now)
+    shared_body = _b64(b"same ciphertext")
+    extra = {
+        "gate_decision_id": "gate-1",
+        "proactive_job_id": "job-1",
+        "thinking_kind": "native",
+        "thinking_source": "provider",
+        "thinking_model": "model-1",
+        "thinking_native": True,
+    }
+
+    control_env = _envelope(store.user_id, "shape_append")
+    control_env["body_ct"] = shared_body
+    control = store.append_chat(
+        "openclaw", "chat", control_env, content_type="text", extra=extra
+    )
+
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "shape_parent")
+    )
+    atomic_env = _envelope(store.user_id, "shape_atomic")
+    atomic_env["body_ct"] = shared_body
+    candidate = store._build_chat_message(
+        "openclaw", "chat", atomic_env, content_type="text", extra=extra
+    )
+    finalized = db.chat_finalize_reply_once(
+        store.user_id,
+        parent["id"],
+        candidate["id"],
+        candidate["ts"],
+        candidate,
+        {
+            "reply_status": "replied",
+            "reply_message_id": candidate["id"],
+            "replied_by": "shape-consumer",
+            "replied_at": f"{candidate['ts']:.3f}",
+        },
+    )
+    assert finalized is not None
+    _parent_doc, atomic = finalized
+
+    normalized_control = {**control, "id": "normalized"}
+    normalized_atomic = {**atomic, "id": "normalized"}
+    assert normalized_atomic == normalized_control
+    assert atomic["ts"] == fixed_now
+    assert atomic["source"] == "chat"
+    assert atomic["content_type"] == "text"
+    for key, value in extra.items():
+        assert atomic[key] == value
+
+
+def test_finalize_reply_image_matches_append_r2_pointer_semantics(
+    store, monkeypatch
+):
+    monkeypatch.setattr(object_storage, "chat_files_enabled", lambda: True)
+    uploads = []
+
+    def put_chat_body(user_id, msg_id, body_ct, content_type):
+        uploads.append((user_id, msg_id, body_ct, content_type))
+        return f"chatfiles/{user_id}/{msg_id}"
+
+    monkeypatch.setattr(object_storage, "put_chat_body", put_chat_body)
+    monkeypatch.setattr(object_storage, "delete_chat_body", lambda *args: None)
+    shared_body = _b64(b"same image ciphertext")
+
+    control_env = _envelope(store.user_id, "r2_append")
+    control_env["body_ct"] = shared_body
+    control = store.append_chat(
+        "openclaw", "chat", control_env, content_type="image"
+    )
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "r2_parent")
+    )
+    atomic_env = _envelope(store.user_id, "r2_atomic")
+    atomic_env["body_ct"] = shared_body
+    candidate = store._build_chat_message(
+        "openclaw", "chat", atomic_env, content_type="image"
+    )
+    finalized = db.chat_finalize_reply_once(
+        store.user_id,
+        parent["id"],
+        candidate["id"],
+        candidate["ts"],
+        candidate,
+        {
+            "reply_status": "replied",
+            "reply_message_id": candidate["id"],
+        },
+    )
+    assert finalized is not None
+    db.chat_finalize_reply_post_commit(store.user_id, candidate, 5000)
+
+    def raw_doc(msg_id):
+        with db.get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT doc FROM chat_messages WHERE user_id = %s AND msg_id = %s",
+                (store.user_id, msg_id),
+            ).fetchone()
+        return row[0]
+
+    control_raw = raw_doc(control["id"])
+    atomic_raw = raw_doc(candidate["id"])
+    assert "body_ct" not in control_raw
+    assert "body_ct" not in atomic_raw
+    assert control_raw["body_ct_len"] == atomic_raw["body_ct_len"] == len(shared_body)
+    normalized_control = {
+        **control_raw,
+        "id": "normalized",
+        "body_key": "normalized",
+        "ts": 0,
+    }
+    normalized_atomic = {
+        **atomic_raw,
+        "id": "normalized",
+        "body_key": "normalized",
+        "ts": 0,
+    }
+    assert normalized_atomic == normalized_control
+    assert [upload[1] for upload in uploads] == [control["id"], candidate["id"]]
+
+
+def test_system_reply_target_bypasses_finalize_cas(store, monkeypatch):
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "system_bypass_parent")
+    )
+    monkeypatch.setattr(
+        db,
+        "chat_finalize_reply_once",
+        lambda *args, **kwargs: pytest.fail("system role entered reply CAS"),
+    )
+    monkeypatch.setattr(
+        chat_core.chat_consumer, "_record_consumer_event", lambda *args, **kwargs: None
+    )
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, "system_bypass_notice"),
+            "role": "system",
+            "notice_kind": "upstream_error",
+            "reply_to_message_id": parent["id"],
+        },
+        consumer_id="system-consumer",
+        consumer_info={},
+        allow_verify_reply=False,
+    )
+    assert status == 200, body
+    cached_parent = next(msg for msg in store.chat_messages if msg["id"] == parent["id"])
+    assert cached_parent.get("reply_status") != "replied"
+    assert not cached_parent.get("reply_message_id")
 
 
 def test_finalize_reply_once_explain_uses_parent_primary_key(store):
