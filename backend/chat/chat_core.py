@@ -27,6 +27,7 @@ Wake calls preserved (byte-for-byte with the old Flask routes):
 from __future__ import annotations
 
 import base64
+import logging
 import time
 import uuid
 
@@ -41,6 +42,8 @@ from core import wake_bus
 from core.store import UserStore
 from proactive import service as proactive_service
 from push import service as push_service
+
+log = logging.getLogger(__name__)
 
 _ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
 
@@ -674,12 +677,24 @@ def write_response(
         extra=extra,
     )
     if reply_to_message_id and role != "system":
-        store.update_chat_message_metadata(reply_to_message_id, {
+        _meta: dict = {
             "reply_status": "replied",
             "reply_message_id": str(msg.get("id") or ""),
             "replied_by": consumer_id,
             "replied_at": f"{time.time():.3f}",
-        })
+        }
+        if turn_failure_error_class and source == "chat":
+            _meta["reply_error_class"] = turn_failure_error_class
+            _meta["reply_blame"] = str(payload.get("turn_failure_blame") or "")[:32]
+            _meta["reply_user_text"] = str(payload.get("turn_failure_user_text") or "")[:500]
+        # 返回 None = parent 不在本 worker 内存里，metadata 静默没落库。既有代码
+        # 忽略了返回值；失败必须可见，但绝不能影响回合收尾——兜底回复消息才是
+        # 权威载体，这里只是冗余（spec §2.1）。
+        if store.update_chat_message_metadata(reply_to_message_id, _meta) is None:
+            log.warning(
+                "chat reply metadata not persisted (parent not in this worker): parent=%s",
+                reply_to_message_id,
+            )
         _maybe_mark_first_chat_ok(store, reply_to_message_id)
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()

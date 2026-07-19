@@ -164,3 +164,51 @@ def test_user_text_truncated_to_500(client):
 
     reply = [m for m in _history(client, api_key) if m.get("role") == "openclaw"][-1]
     assert len(reply["turn_failure_user_text"]) == 500
+
+
+def test_parent_metadata_mirrors_turn_failure(client):
+    """冗余持久化：用户消息 metadata 同写一份，供全量 history / 重启后恢复。
+    兜底消息仍是权威载体（跨 worker 时 metadata 可能静默写失败）。"""
+    user_id, api_key = _register(client)
+    parent_id = _send_user_msg(client, user_id, api_key)
+
+    res = client.post(
+        "/v1/chat/response",
+        json={
+            "envelope": _env(user_id, "r4"),
+            "source": "chat",
+            "reply_to_message_id": parent_id,
+            "turn_failure_error_class": "auth_invalid",
+            "turn_failure_blame": "user_provider",
+            "turn_failure_user_text": "API Key 无效或已过期，请到设置里重新保存。",
+        },
+        headers=_headers(api_key),
+    )
+    assert res.status_code in (200, 201), res.get_data(as_text=True)
+
+    parent = [m for m in _history(client, api_key) if m.get("id") == parent_id][0]
+    assert parent["reply_error_class"] == "auth_invalid"
+    assert parent["reply_blame"] == "user_provider"
+    assert parent["reply_user_text"].startswith("API Key")
+    # 既有语义不得改变
+    assert parent["reply_status"] == "replied"
+
+
+def test_parent_metadata_absent_on_normal_reply(client):
+    """成功回合不得写这些键（成功路径零变化）。"""
+    user_id, api_key = _register(client)
+    parent_id = _send_user_msg(client, user_id, api_key)
+
+    client.post(
+        "/v1/chat/response",
+        json={
+            "envelope": _env(user_id, "r5"),
+            "source": "chat",
+            "reply_to_message_id": parent_id,
+        },
+        headers=_headers(api_key),
+    )
+
+    parent = [m for m in _history(client, api_key) if m.get("id") == parent_id][0]
+    assert "reply_error_class" not in parent
+    assert parent["reply_status"] == "replied"

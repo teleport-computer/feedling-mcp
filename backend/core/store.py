@@ -603,6 +603,11 @@ class UserStore:
             "reply_message_id",
             "replied_by",
             "replied_at",
+            # 回合失败冗余持久化（spec 2026-07-18 §2.2）。权威载体是兜底回复消息；
+            # 这里是全量 history / 重启后的恢复路径。
+            "reply_error_class",
+            "reply_blame",
+            "reply_user_text",
         }
         clean: dict = {}
         for key, value in (fields or {}).items():
