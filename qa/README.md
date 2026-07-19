@@ -46,7 +46,8 @@ The protected workflow is deliberately split across explicit trust zones:
    to equal the SHA injected by the serialized test deployment. Worker SHA and
    live-worker count are explicitly unavailable and remain `null`; strict V2
    behavior is proven by the per-profile user path described below. Both
-   deployment receipts remain outside the public artifact directory.
+   deployment receipts remain outside the canonical staging directory and the
+   separately scanned team-safe run report.
 2. `provision_profiles.py` is a deterministic credential boundary. It creates
    nine fresh provider-profile accounts plus one dedicated memory-contract
    account, proves invalid-key rejection and valid-key
@@ -148,7 +149,9 @@ The protected workflow is deliberately split across explicit trust zones:
    deletion cascade. `validate_cleanup_receipt.py` requires the exact
    locked matrix and binds this sanitized receipt to the agent's cleanup
    fields. The private manifests remain available for the final secret scan,
-   and only a scanned, cleanup-bound public artifact directory is uploaded.
+   then a deterministic builder creates a separate, cleanup-bound
+   **team-safe run report**. Only that separately scanned report is uploaded;
+   the canonical staging directory is never uploaded directly.
 
 `codex_output_schema.py --check` proves offline that the checked-in Codex
 authoring schema is the exact compatible projection of the gate schema plus
@@ -165,6 +168,7 @@ The locked matrix is:
 - OpenRouter Claude
 - OpenRouter OpenAI/ChatGPT
 - OpenRouter GLM
+- OpenRouter Kimi K3
 - Kongbeiqie OpenAI-compatible relay
 
 ## Run the currently deployed test build locally
@@ -505,6 +509,38 @@ coverage:
 - `QA_KONGBEIQIE_MODEL=[特价纯血]claude-sonnet-5`
 - `QA_KONGBEIQIE_BASE_URL` (the normalized HTTPS OpenAI-compatible endpoint)
 
+Optionally add `QA_DEBUG_RECIPIENT_PUBLIC_KEYS` to retain encrypted exact-ID
+failure evidence. Its value is a comma-separated list of base64 X25519 public
+keys, one per teammate who must be able to decrypt a failing run. Public keys
+are not secrets; the matching private identity must never be placed in GitHub.
+Each teammate generates and stores their own identity once:
+
+```bash
+install -d -m 700 "$HOME/.config/io-e2e"
+umask 077
+python qa/protected_debug_bundle.py generate-key \
+  --identity-out "$HOME/.config/io-e2e/debug-identity.json"
+```
+
+The command prints only `public_key_b64` and its fingerprint. Keep the generated
+`debug-identity.json` owner-only on that teammate's machine and save an encrypted
+recovery copy in their approved password-manager vault. Send only the printed
+public key to the Environment administrator. After collecting the public keys,
+set the non-secret variable:
+
+```bash
+gh variable set QA_DEBUG_RECIPIENT_PUBLIC_KEYS \
+  --repo teleport-computer/feedling-mcp \
+  --env io-e2e-agent-driven-test \
+  --body 'FIRST_PUBLIC_KEY_B64,SECOND_PUBLIC_KEY_B64'
+```
+
+If this optional variable is absent, the matrix and team-safe report still work
+and the qualification does not fail solely because protected debugging is not
+configured. A failing run simply does not retain exact identifiers. Once the
+variable is configured, a failing run is required to build, upload, and clean up
+its encrypted bundle successfully; those control-plane failures are fail-closed.
+
 These are explicit recommended pins, not hidden defaults. Verify every exact ID
 against the configured provider endpoint before a live run; availability and
 reasoning/token metadata can differ by account, region, or relay catalog. Keep
@@ -681,15 +717,30 @@ the candidate. They deliberately record `observed_worker_sha: null` and
 `live_worker_count: null`: current Runtime V2 does not expose trustworthy worker
 binary identity, so this suite does not fabricate that stronger attestation.
 
-Trigger **CI** manually at protected `main`. Any collaborator with repository
-write access may do this; no Environment reviewer needs to be online:
+Trigger **CI / IO agentic E2E** manually at protected `main`. Any collaborator
+with repository write access may do this; no Environment reviewer needs to be
+online. In the Actions UI, press **Run workflow**, keep the branch set to
+`main`, choose the runtime contract and persona depth, and start the run:
 
 ```bash
 gh workflow run ci.yml --ref main -f runtime_target=deployed_current
 ```
 
-The manual-only `api-key-e2e-manual` job calls the reusable E2E workflow from
-that selected immutable `main` revision and does not inherit caller secrets. A
+A manual dispatch starts only the self-service IO E2E entrypoint. The ordinary
+contract, backend, Docker, lint, and DCAP CI jobs remain push/PR-only; deploy
+jobs remain push-only. Pressing **Run workflow** therefore does not also launch
+an unrelated full CI or deployment run.
+
+The GitHub Actions job summary is the V1 team panel. It shows the full
+nine-profile coverage matrix, latency summary, and expandable fixed-code context
+for each failed or blocked scenario, including the suggested triage layer and
+next probe. Teammates do not need to inspect runner logs for the first pass:
+open the completed run, read the summary, then download the linked report or
+protected bundle when deeper debugging is needed. This is intentionally an
+on-demand Actions UI rather than a separately hosted dashboard.
+
+The manual-only `io-e2e-agent-driven-test` job calls the reusable E2E workflow
+from that selected immutable `main` revision and does not inherit caller secrets. A
 separate GitHub-hosted job, outside `io-e2e-agent-driven-test`, checks out `test`
 without QA Environment secrets, reads the backend image tag pinned in
 `deploy/docker-compose.phala.test.yaml`, and resolves the short tag to a full Git
@@ -725,9 +776,9 @@ to survive.
 
 ## Artifacts and qualification result
 
-`QA_ARTIFACT_DIR` is already the unique run directory. Codex returns only the
-authoritative result JSON; the trusted publisher installs `run-result.json`, and
-`render_artifacts.py` then derives `matrix.md`,
+`QA_ARTIFACT_DIR` is the run's private-to-the-job staging directory. Codex
+returns only the authoritative result JSON; the trusted publisher installs
+`run-result.json`, and `render_artifacts.py` then derives `matrix.md`,
 `latency.csv` (including numeric acknowledgement, reply, per-turn five-stage,
 and profile-summary rows), `junit.xml`, and exact `profiles/<profile-id>.json`
 copies directly beneath the same directory. The deterministic memory probe adds
@@ -735,10 +786,83 @@ copies directly beneath the same directory. The deterministic memory probe adds
 After all profile work, deterministic cleanup adds `cleanup-receipt.json`. That
 receipt contains only locked IDs, booleans, a deletion-source enum, and a run ID;
 it never contains account IDs, account keys, provider keys, or response bodies.
-No second run-ID directory is
-created. Public files must never contain provider keys, Feedling account keys,
-private content keys, raw chat, raw traces, raw private reasoning, or free-form
-evidence/failure text.
+After deterministic cleanup is validated, `build_team_report.py` creates a
+separate owner-only directory beneath
+`team-qualification-artifacts/<run-id>/`. The secret scanner checks that team
+directory against the real run credentials and the canonical staging result.
+Before rendering, the builder also binds that result to the trusted
+provisioning manifest, launcher-owned orchestration receipt, pre-run and
+post-run deployment receipts, selected runtime, exact deployment SHA, and
+deterministic cleanup receipt. A product failure can still be displayed, but a
+forged, incomplete, or mixed-run result cannot become the team panel.
+Only the resulting `io-e2e-team-report-<run-id>` Actions artifact is uploaded,
+with 30-day retention. Its exact scanned `team-summary.md` is also copied into
+the GitHub job summary, followed by the artifact download link. Product
+failures still get a report; a builder, scanner, or cleanup failure publishes
+only a fixed control-plane fallback and keeps the run red.
+
+The panel keeps API-key matrix failures and the formal persona-memory arm in
+separate sections. Persona-memory failures include the allowlisted scenario
+status, trajectory counts, evaluator type, hard/soft gate, pass/fail/blocked/
+infrastructure counts, score/threshold, and fixed public failure codes. The
+persona publisher intentionally removes account, request, turn, trace, and job
+IDs before this boundary, so these rows explicitly say that exact-ID debugging
+is unavailable instead of inventing or implying identifiers that were never
+retained.
+The formal hosted arm is accepted only when it contains all eight checked-in
+version `1.0.0` scenarios in locked order, with exactly the selected repetition
+count per scenario and `8 × repetitions` trajectories overall. A partial or
+empty formal summary cannot render as a valid panel.
+
+This repository is public, so the team-safe run report must be safe for public
+exposure even though it is intended for team debugging. Correlation values are
+one-way hashed handles, not raw request, turn, trace, session, response, account,
+or runtime-session identifiers. The synthetic GitHub qualification run ID
+(`api-key-e2e-<Actions-run-id>-<attempt>`) is public-safe control-plane metadata
+and is intentionally retained so teammates can locate the Actions run.
+Provider/admin credentials, Feedling account keys, private
+content keys, prompt/reply bodies, raw traces, raw or hidden chain of thought,
+and free-form private evidence remain outside the report and are deleted with
+the disposable runner. Exact trace contents and plaintext conversation replay
+are intentionally out of scope for this version.
+
+`failure-index.json` records total, API-key, persona-memory, and exact-ID-
+debuggable failure counts. When its exact-ID failure count is non-zero and
+`QA_DEBUG_RECIPIENT_PUBLIC_KEYS` is configured, deterministic trusted code also
+creates `io-e2e-protected-debug-<run-id>`, retained for 7 days. The repository
+is public, so the uploaded object is ciphertext: a random authenticated symmetric
+key encrypts the failure-only payload and is separately sealed to every listed
+X25519 recipient. The decrypted payload contains exact synthetic user, request,
+turn, trace, and persona-job IDs plus bounded fixed-code, latency, reasoning,
+persona, and trace metadata needed to look up backend logs. It never contains
+raw chats, prompt/reply text, imported persona files, hidden or displayed COT,
+trace bodies, provider response bodies, credentials, or free-form rationale.
+The builder writes no plaintext temporary artifact.
+
+The job summary links both artifacts and gives the decrypt command. A listed
+teammate must download the team-safe report and protected bundle from the same
+original GitHub Actions run; that run page is the provenance boundary. Do not
+trust a re-shared standalone bundle or pair it with a `failure-index.json` from
+another run. After unzipping both artifacts without renaming their files, run:
+
+```bash
+python -m pip install --require-hashes -r qa/requirements.lock
+python qa/protected_debug_bundle.py decrypt \
+  --identity "$HOME/.config/io-e2e/debug-identity.json" \
+  --input ./io-e2e-protected-debug.bundle.json \
+  --failure-index ./failure-index.json \
+  --output ./io-e2e-protected-debug.payload.json
+```
+
+The decrypted file is owner-only and should be deleted after log correlation.
+A green run produces no protected bundle. A failing run without configured
+recipients keeps only the public-safe hashed report; that optional configuration
+gap does not turn the product result into an infrastructure failure. A
+persona-only failing run also produces no encrypted bundle: its aggregate
+failure is fully visible in the team panel, but the persona summary contract has
+no exact identifiers to encrypt. A mixed run still creates a bundle for its
+API-key exact-ID failures and binds it to the complete scanned failure index and
+persona summary from the same Actions run.
 
 The seven summary fields count the exact terminal statuses of the nine profiles
 and must sum to nine. The gate is green only when all nine profiles and all

@@ -40,7 +40,7 @@ def test_deterministic_qualification_contracts_gate_test_and_production_deploys(
 
 
 def test_existing_default_branch_ci_dispatches_trusted_e2e_without_inheriting_secrets():
-    manual_job = _job("api-key-e2e-manual", "forge-test")
+    manual_job = _job("io-e2e-agent-driven-test", "forge-test")
 
     assert "resolve-test-deployment-sha:" not in CI
     assert "github.event_name == 'workflow_dispatch'" in manual_job
@@ -77,6 +77,42 @@ def test_existing_default_branch_ci_dispatches_trusted_e2e_without_inheriting_se
     assert "required: true" in workflow_call
     assert "group: ci-${{ github.event_name }}-${{ github.ref }}" in CI
     assert "cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}" in CI
+
+
+def test_manual_dispatch_skips_ordinary_ci_jobs_and_runs_only_qualification():
+    ordinary_jobs = (
+        ("forge-test", "python-tests"),
+        ("python-tests", "qa-contract-tests"),
+        ("qa-contract-tests", "docker-build"),
+        ("docker-build", "lint"),
+        ("lint", "dcap-python"),
+        ("dcap-python", "detect-cvm-changes"),
+    )
+
+    for job_name, next_job_name in ordinary_jobs:
+        header = _job(job_name, next_job_name).split("    steps:\n", 1)[0]
+        assert "if: github.event_name != 'workflow_dispatch'" in header, job_name
+
+    # Deployment roots already require push events, and the always() notifier
+    # remains transitively suppressed when deploy-cvm is skipped. Keep those
+    # graph constraints explicit so a manual qualification cannot mutate a CVM
+    # or send a misleading production-deploy notification.
+    for job_name, next_job_name in (
+        ("detect-cvm-changes", "detect-cvm-changes-test"),
+        ("detect-cvm-changes-test", "validate-prod-runner-topology"),
+        ("validate-prod-runner-topology", "deploy-cvm"),
+        ("deploy-cvm", "deploy-test-cvm"),
+        ("deploy-test-cvm", "deploy-test-runner-cvm"),
+        ("deploy-test-runner-cvm", "deploy-prod-runner-cvm"),
+        ("deploy-prod-runner-cvm", "notify-lark-prod-deploy"),
+    ):
+        header = _job(job_name, next_job_name).split("    steps:\n", 1)[0]
+        assert "github.event_name == 'push'" in header, job_name
+
+    notifier = CI[CI.index("  notify-lark-prod-deploy:\n") :]
+    notifier_header = notifier.split("    steps:\n", 1)[0]
+    assert "needs: [deploy-cvm, deploy-prod-runner-cvm]" in notifier_header
+    assert "needs.deploy-cvm.result != 'skipped'" in notifier_header
 
 
 def test_no_repository_workflow_implicitly_inherits_every_available_secret():

@@ -1,4 +1,5 @@
-name: CI
+name: CI / IO agentic E2E
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('IO E2E · deployed test · {0} · persona x{1}', inputs.runtime_target, inputs.persona_repetitions) || format('CI · {0} · {1}', github.event_name, github.ref_name) }}
 
 on:
   push:
@@ -37,8 +38,8 @@ jobs:
   # and secret-bearing harness always come from protected main; deployed test
   # code is resolved separately as metadata and is never executed on the
   # evaluator runner.
-  api-key-e2e-manual:
-    name: agentic API-key E2E (self-service trusted controller)
+  io-e2e-agent-driven-test:
+    name: IO agentic E2E — deployed test (self-service)
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
@@ -55,6 +56,7 @@ jobs:
   # -------------------------------------------------------------------------
   forge-test:
     name: forge test (contracts)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -82,6 +84,7 @@ jobs:
   # -------------------------------------------------------------------------
   python-tests:
     name: test_api.py (multi-tenant)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     # All per-user data lives in Postgres now (see backend/db.py), so the
     # backend cannot start without a reachable DB. Provision a throwaway one.
@@ -219,6 +222,7 @@ jobs:
   # -------------------------------------------------------------------------
   qa-contract-tests:
     name: agent qualification contracts
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -246,6 +250,7 @@ jobs:
   # -------------------------------------------------------------------------
   docker-build:
     name: docker compose build (hash-verified)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -278,6 +283,7 @@ jobs:
   # -------------------------------------------------------------------------
   lint:
     name: syntax + static
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -293,6 +299,7 @@ jobs:
   # -------------------------------------------------------------------------
   dcap-python:
     name: DCAP parser (python reference)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

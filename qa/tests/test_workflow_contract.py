@@ -6,6 +6,9 @@ from pathlib import Path
 WORKFLOW = (
     Path(__file__).resolve().parents[2] / ".github" / "workflows" / "api-key-e2e.yml"
 ).read_text(encoding="utf-8")
+CI_WORKFLOW = (
+    Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+).read_text(encoding="utf-8")
 PROVISIONER = (
     Path(__file__).resolve().parents[2] / "qa" / "provision_profiles.py"
 ).read_text(encoding="utf-8")
@@ -25,6 +28,12 @@ def test_workflow_is_manual_only_and_uses_protected_jit_runner():
     assert "pull_request:" not in trigger
     assert "schedule:" not in trigger
     assert "  deployment:" not in trigger
+    assert WORKFLOW.startswith(
+        "name: IO agentic E2E qualification (trusted self-service)\n"
+    )
+    assert "run-name: IO E2E · deployed test" in WORKFLOW
+    assert "name: CI / IO agentic E2E" in CI_WORKFLOW
+    assert "IO agentic E2E — deployed test (self-service)" in CI_WORKFLOW
     assert "validate-dispatch:" in WORKFLOW
     assert 'if [ "$DISPATCH_REF" != "refs/heads/main" ]' in WORKFLOW
     assert (
@@ -32,7 +41,10 @@ def test_workflow_is_manual_only_and_uses_protected_jit_runner():
         in WORKFLOW
     )
     assert "environment: io-e2e-agent-driven-test" in WORKFLOW
-    assert "runs-on:\n      group: ${{ needs.provision-aws-runner.outputs.runner_group }}" in WORKFLOW
+    assert (
+        "runs-on:\n      group: ${{ needs.provision-aws-runner.outputs.runner_group }}"
+        in WORKFLOW
+    )
     assert "labels: ${{ needs.provision-aws-runner.outputs.runner_label }}" in WORKFLOW
     assert "timeout-minutes: 330" in WORKFLOW
     assert "--ttl-seconds 21600" in WORKFLOW
@@ -79,14 +91,17 @@ def test_github_hosted_controller_provisions_private_jit_aws_runner():
     assert 'group.get("allows_public_repositories") is not False' in provision
     assert 'group.get("restricted_to_workflows") is not True' in provision
     assert 'selected_workflows = group.get("selected_workflows")' in provision
-    assert 'selected_workflows != [expected_workflow]' in provision
+    assert "selected_workflows != [expected_workflow]" in provision
     assert '"api-key-e2e.yml@refs/heads/main"' in provision
     assert (
         "qualification runner group must select only the protected main workflow"
         in provision
     )
     assert 'runner_identity="io-e2e-agent-driven-test-${run_key}"' in provision
-    assert '"labels": ["self-hosted", "linux", "x64", "io-e2e-agent-driven-test", label]' in provision
+    assert (
+        '"labels": ["self-hosted", "linux", "x64", "io-e2e-agent-driven-test", label]'
+        in provision
+    )
     assert 'echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"' in provision
     assert provision.index(
         'echo "runner_id=$runner_id" >> "$GITHUB_OUTPUT"'
@@ -166,8 +181,9 @@ def test_qualification_waits_for_exact_online_idle_jit_runner():
 
 def test_failed_provisioning_rolls_back_by_exact_attempt_even_without_instance_output():
     rollback = WORKFLOW[
-        WORKFLOW.index("      - name: Roll back failed AWS provisioning attempt\n") :
-        WORKFLOW.index("  qualify-api-key-runtime:\n")
+        WORKFLOW.index(
+            "      - name: Roll back failed AWS provisioning attempt\n"
+        ) : WORKFLOW.index("  qualify-api-key-runtime:\n")
     ]
 
     assert "if: ${{ always()" in rollback
@@ -278,6 +294,27 @@ def test_deployment_target_is_metadata_and_controller_code_is_immutable():
         in context
     )
     assert 'echo "expected_sha=$EXPECTED_DEPLOYMENT_SHA"' in context
+    assert (
+        'artifact_dir="${GITHUB_WORKSPACE}/qualification-artifacts/${run_id}"'
+        in context
+    )
+    assert (
+        'team_artifact_dir="${GITHUB_WORKSPACE}/team-qualification-artifacts/${run_id}"'
+        in context
+    )
+    assert (
+        'protected_debug_dir="${GITHUB_WORKSPACE}/protected-debug-artifacts/${run_id}"'
+        in context
+    )
+    assert (
+        'protected_debug_bundle="${protected_debug_dir}/io-e2e-protected-debug.bundle.json"'
+        in context
+    )
+    assert 'mkdir -m 700 "$artifact_dir"' in context
+    assert 'mkdir -m 700 "$artifact_dir" "$team_artifact_dir"' not in context
+    assert 'echo "team_artifact_dir=$team_artifact_dir"' in context
+    assert 'echo "protected_debug_dir=$protected_debug_dir"' in context
+    assert 'echo "protected_debug_bundle=$protected_debug_bundle"' in context
 
 
 def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
@@ -362,15 +399,12 @@ def test_persona_judge_profile_is_private_offline_and_reuses_codex_oauth():
 
     assert 'persona_judge_root="${private_root}/persona-judge"' in context
     assert (
-        'persona_judge_scratch_root="${private_root}/persona-judge-scratch"'
-        in context
+        'persona_judge_scratch_root="${private_root}/persona-judge-scratch"' in context
     )
     for leaf in ("home", "tmp", "work"):
         assert f'"${{persona_judge_root}}/{leaf}"' in context
     assert 'echo "persona_judge_root=$persona_judge_root"' in context
-    assert (
-        'echo "persona_judge_scratch_root=$persona_judge_scratch_root"' in context
-    )
+    assert 'echo "persona_judge_scratch_root=$persona_judge_scratch_root"' in context
     assert "secrets.QA_CODEX_AUTH_JSON_B64" in preflight
     assert 'CODEX_HOME="$QA_CODEX_HOME"' in judge_probe
     assert "sandbox -p persona_memory_judge" in judge_probe
@@ -411,8 +445,8 @@ def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
         "Publish canonical result without following agent-created links",
     )
     scan = _step(
-        "Scan public artifacts for secrets and raw evidence",
-        "Upload sanitized public qualification artifacts",
+        "Scan team-safe run report for secrets and raw evidence",
+        "Upload team-safe run report",
     )
     for secret_name in (
         "QA_DEEPSEEK_API_KEY",
@@ -513,7 +547,10 @@ def test_real_codex_preflight_binds_the_locked_permission_profile():
         "Provision nine isolated API-key profiles",
     )
     assert "-p profile_official_deepseek" in preflight
-    assert "-c 'default_permissions=\"io-e2e-agent-driven-test-official-deepseek\"'" in preflight
+    assert (
+        "-c 'default_permissions=\"io-e2e-agent-driven-test-official-deepseek\"'"
+        in preflight
+    )
 
 
 def test_raw_worker_output_is_verified_but_not_exposed_to_aggregator():
@@ -583,7 +620,7 @@ def test_selected_runtime_target_is_checked_before_and_after_live_profile_agents
     )
     validate = _step(
         "Validate complete release result",
-        "Scan public artifacts for secrets and raw evidence",
+        "Cleanup every synthetic account with deterministic evidence",
     )
     for deployment in (deployment_pre, deployment_post):
         assert "qa/verify_deployment.py" in deployment
@@ -601,6 +638,9 @@ def test_manual_dispatch_defaults_to_strict_v2_and_preserves_baseline_option():
     assert "default: hosted_resident" in trigger
     assert "- deployed_current" in trigger
     assert "- hosted_resident" in trigger
+    assert "run_scope:" not in trigger
+    assert "focused_profile:" not in trigger
+    assert "--diagnostic" not in WORKFLOW
 
     deployment_pre = _step(
         "Verify deployed endpoint and selected runtime target before qualification",
@@ -620,7 +660,7 @@ def test_manual_dispatch_defaults_to_strict_v2_and_preserves_baseline_option():
     )
     validate = _step(
         "Validate complete release result",
-        "Scan public artifacts for secrets and raw evidence",
+        "Cleanup every synthetic account with deterministic evidence",
     )
 
     for step in (deployment_pre, provision, workers, deployment_post, validate):
@@ -651,8 +691,8 @@ def test_persona_depth_is_locked_for_dispatch_and_reusable_workflow_calls():
     assert trigger.count('- "1"') == 1
     assert trigger.count('- "3"') == 1
     assert "type: string" in trigger
-    assert 'PERSONA_REPETITIONS: ${{ inputs.persona_repetitions }}' in validation
-    assert 'must be exactly 1 or 3' in validation
+    assert "PERSONA_REPETITIONS: ${{ inputs.persona_repetitions }}" in validation
+    assert "must be exactly 1 or 3" in validation
     assert 'echo "persona_repetitions=$PERSONA_REPETITIONS"' in context
 
 
@@ -689,7 +729,10 @@ def test_persona_live_judge_reuses_codex_oauth_without_admin_or_provider_secrets
     assert '--judge-work-root "$QA_PERSONA_JUDGE_SCRATCH_ROOT"' not in live
     assert '--judge-model "$QA_CODEX_MODEL"' in live
     assert "--judge-codex-profile persona_memory_judge" in live
-    assert "--judge-permission-profile io-e2e-agent-driven-test-persona-memory-judge" in live
+    assert (
+        "--judge-permission-profile io-e2e-agent-driven-test-persona-memory-judge"
+        in live
+    )
     assert "--judge-reasoning-effort medium" in live
     assert "--allow-private-judge-egress" in live
     assert "secrets." not in live
@@ -751,8 +794,8 @@ def test_persona_cleanup_is_validated_before_upload_and_private_scratch_is_remov
         "Validate deterministic cleanup receipt",
     )
     upload = _step(
-        "Upload sanitized public qualification artifacts",
-        "Remove public scratch after upload decision",
+        "Upload team-safe run report",
+        "Plan protected failure debug bundle",
     )
     private_cleanup = _step(
         "Remove private scratch after account cleanup",
@@ -769,8 +812,9 @@ def test_persona_cleanup_is_validated_before_upload_and_private_scratch_is_remov
     assert "qa/publish_persona_memory_summary.py" in finalize
     assert '--arm-receipt "$PERSONA_ARM_RECEIPT"' in finalize
     assert '--artifact-dir "$QA_ARTIFACT_DIR"' in finalize
-    assert "steps.persona_cleanup.outcome == 'success'" in upload
-    assert "steps.persona_finalize.outcome == 'success'" in upload
+    assert "steps.persona_cleanup.outcome == 'success'" not in upload
+    assert "steps.persona_finalize.outcome == 'success'" not in upload
+    assert "steps.team_report.outcome == 'success'" in upload
     assert "if: always()" in private_cleanup
     assert 'runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve()' in private_cleanup
     assert "root.parent.resolve() != runner_temp" in private_cleanup
@@ -799,7 +843,9 @@ def test_github_hosted_run_wide_cleanup_is_durable_bounded_and_manifest_free():
         )
     ]
 
-    assert "if: ${{ always() && needs.validate-dispatch.result == 'success' }}" in header
+    assert (
+        "if: ${{ always() && needs.validate-dispatch.result == 'success' }}" in header
+    )
     assert "needs: [validate-dispatch, qualify-api-key-runtime]" in header
     assert "runs-on: ubuntu-24.04" in header
     assert "timeout-minutes: 20" in header
@@ -821,14 +867,15 @@ def test_github_hosted_run_wide_cleanup_is_durable_bounded_and_manifest_free():
     assert 'payload.get("complete") is not True' in sweep
     assert 'cleanup_one_run "$base_run_id" base base_receipt || failed=1' in sweep
     assert (
-        'cleanup_one_run "$persona_run_id" persona persona_receipt || failed=1'
-        in sweep
+        'cleanup_one_run "$persona_run_id" persona persona_receipt || failed=1' in sweep
     )
-    assert sweep.index(
-        'cleanup_one_run "$base_run_id" base base_receipt || failed=1'
-    ) < sweep.index(
-        'cleanup_one_run "$persona_run_id" persona persona_receipt || failed=1'
-    ) < sweep.index('exit "$failed"')
+    assert (
+        sweep.index('cleanup_one_run "$base_run_id" base base_receipt || failed=1')
+        < sweep.index(
+            'cleanup_one_run "$persona_run_id" persona persona_receipt || failed=1'
+        )
+        < sweep.index('exit "$failed"')
+    )
     cleanup_run_method = PROVISIONER[
         PROVISIONER.index("    def cleanup_synthetic_run(") : PROVISIONER.index(
             "\n\ndef ", PROVISIONER.index("    def cleanup_synthetic_run(") + 5
@@ -841,7 +888,7 @@ def test_github_hosted_run_wide_cleanup_is_durable_bounded_and_manifest_free():
     assert '"run_id_sha256": receipt["run_id_sha256"]' in sweep
     assert '"label_prefix_sha256": receipt["label_prefix_sha256"]' in sweep
     public_projection = sweep[
-        sweep.index('summary = {') : sweep.index(
+        sweep.index("summary = {") : sweep.index(
             'echo "authoritative synthetic account cleanup proved'
         )
     ]
@@ -849,7 +896,10 @@ def test_github_hosted_run_wide_cleanup_is_durable_bounded_and_manifest_free():
     assert "IO_E2E_ADMIN_TOKEN" not in public_projection
     assert "GITHUB_STEP_SUMMARY" in sweep
     assert "Upload sanitized authoritative account cleanup proof" in hosted_cleanup
-    assert "io-e2e-synthetic-cleanup-${{ github.run_id }}-${{ github.run_attempt }}" in hosted_cleanup
+    assert (
+        "io-e2e-synthetic-cleanup-${{ github.run_id }}-${{ github.run_attempt }}"
+        in hosted_cleanup
+    )
     assert "retention-days: 14" in hosted_cleanup
     artifact_cleanup = _step(
         "Remove hosted cleanup artifact scratch",
@@ -939,7 +989,7 @@ def test_memory_contract_uses_isolated_account_and_deterministic_gate_policy():
     )
     validate = _step(
         "Validate complete release result",
-        "Scan public artifacts for secrets and raw evidence",
+        "Cleanup every synthetic account with deterministic evidence",
     )
     enforce = WORKFLOW[WORKFLOW.index("      - name: Enforce fail-closed") :]
 
@@ -949,12 +999,16 @@ def test_memory_contract_uses_isolated_account_and_deterministic_gate_policy():
     assert "continue-on-error: true" in memory
     assert "steps.split_manifests.outcome == 'success'" in memory
     assert "steps.orchestration.outcome == 'success'" in memory
-    assert WORKFLOW.index(
-        "Verify deployed endpoint and selected runtime target before qualification"
-    ) < WORKFLOW.index(
-        "Run deterministic memory contract on isolated synthetic account"
-    ) < WORKFLOW.index(
-        "Verify deployed endpoint and selected runtime target after profile testing"
+    assert (
+        WORKFLOW.index(
+            "Verify deployed endpoint and selected runtime target before qualification"
+        )
+        < WORKFLOW.index(
+            "Run deterministic memory contract on isolated synthetic account"
+        )
+        < WORKFLOW.index(
+            "Verify deployed endpoint and selected runtime target after profile testing"
+        )
     )
     for secret_name in (
         "IO_E2E_ADMIN_TOKEN",
@@ -973,10 +1027,13 @@ def test_memory_contract_uses_isolated_account_and_deterministic_gate_policy():
 
 def test_secret_scan_includes_credentials_oauth_and_persona_privacy_fixture():
     scan = _step(
-        "Scan public artifacts for secrets and raw evidence",
-        "Upload sanitized public qualification artifacts",
+        "Scan team-safe run report for secrets and raw evidence",
+        "Upload team-safe run report",
     )
     assert "qa/scan_artifacts.py" in scan
+    assert '--artifacts "$QA_TEAM_ARTIFACT_DIR"' in scan
+    assert '--canonical-result "$QA_ARTIFACT_DIR/run-result.json"' in scan
+    assert '--artifacts "$QA_ARTIFACT_DIR"' not in scan
     assert "--manifest" in scan
     assert "--memory-manifest" in scan
     assert "--codex-auth" in scan
@@ -1001,15 +1058,39 @@ def test_cleanup_diagnostic_upload_and_final_gate_are_fail_closed():
     )
     cleanup_receipt = _step(
         "Validate deterministic cleanup receipt",
-        "Scan public artifacts for secrets and raw evidence",
+        "Build team-safe run report",
+    )
+    team_report = _step(
+        "Build team-safe run report",
+        "Scan team-safe run report for secrets and raw evidence",
     )
     scan = _step(
-        "Scan public artifacts for secrets and raw evidence",
-        "Upload sanitized public qualification artifacts",
+        "Scan team-safe run report for secrets and raw evidence",
+        "Upload team-safe run report",
     )
     upload = _step(
-        "Upload sanitized public qualification artifacts",
-        "Remove public scratch after upload decision",
+        "Upload team-safe run report",
+        "Plan protected failure debug bundle",
+    )
+    debug_plan = _step(
+        "Plan protected failure debug bundle",
+        "Build protected failure debug bundle",
+    )
+    debug_build = _step(
+        "Build protected failure debug bundle",
+        "Upload encrypted protected failure debug bundle",
+    )
+    debug_upload = _step(
+        "Upload encrypted protected failure debug bundle",
+        "Publish scanned team report to GitHub job summary",
+    )
+    panel = _step(
+        "Publish scanned team report to GitHub job summary",
+        "Remove staging, team, and protected report scratch after upload decision",
+    )
+    report_cleanup = _step(
+        "Remove staging, team, and protected report scratch after upload decision",
+        "Remove private scratch after account cleanup",
     )
     assert "if: always()" in cleanup
     assert "qa/provision_profiles.py cleanup" in cleanup
@@ -1018,17 +1099,154 @@ def test_cleanup_diagnostic_upload_and_final_gate_are_fail_closed():
     assert "--retain-manifest" in cleanup
     assert "qa/validate_cleanup_receipt.py" in cleanup_receipt
     assert "if: always()" in cleanup_receipt
+    assert "qa/build_team_report.py" in team_report
+    assert "--coverage qa/coverage-lock.json" in team_report
+    assert "--schema qa/schemas/run-result.schema.json" in team_report
+    assert '--result "$QA_ARTIFACT_DIR/run-result.json"' in team_report
+    assert (
+        '--provisioning-manifest "${{ steps.context.outputs.manifest }}"' in team_report
+    )
+    assert (
+        '--orchestration-receipt "${{ steps.context.outputs.orchestration_receipt }}"'
+        in team_report
+    )
+    assert (
+        '--deployment-receipt "${{ steps.context.outputs.pre_deployment_receipt }}"'
+        in team_report
+    )
+    assert (
+        "--post-deployment-receipt "
+        '"${{ steps.context.outputs.post_deployment_receipt }}"' in team_report
+    )
+    assert '--cleanup-receipt "$QA_ARTIFACT_DIR/cleanup-receipt.json"' in team_report
+    assert '--source-artifacts "$QA_ARTIFACT_DIR"' in team_report
+    assert '--output "$QA_TEAM_ARTIFACT_DIR"' in team_report
+    assert '--actor "$GITHUB_ACTOR"' in team_report
+    assert '--expected-runtime "$QA_EXPECTED_RUNTIME"' in team_report
+    assert '--expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA"' in team_report
+    assert '--persona-repetitions "$PERSONA_REPETITIONS"' in team_report
+    for stage in ("prepare", "live", "cleanup", "finalize"):
+        assert (
+            f'--persona-{stage}-outcome "${{{{ steps.persona_{stage}.outcome }}}}"'
+            in team_report
+        )
+    assert "steps.validate.outcome" not in team_report
+    assert "steps.persona_cleanup.outcome == 'success'" not in team_report
+    assert "steps.persona_finalize.outcome == 'success'" not in team_report
     assert "qa/scan_artifacts.py" in scan
+    assert (
+        WORKFLOW.index("Validate deterministic cleanup receipt")
+        < WORKFLOW.index("Build team-safe run report")
+        < WORKFLOW.index("Scan team-safe run report for secrets and raw evidence")
+        < WORKFLOW.index("Upload team-safe run report")
+        < WORKFLOW.index("Plan protected failure debug bundle")
+        < WORKFLOW.index("Build protected failure debug bundle")
+        < WORKFLOW.index("Upload encrypted protected failure debug bundle")
+        < WORKFLOW.index("Publish scanned team report to GitHub job summary")
+    )
+    assert "steps.team_report.outcome == 'success'" in upload
     assert "steps.secret_scan.outcome == 'success'" in upload
     assert "steps.cleanup.outcome == 'success'" in upload
     assert "steps.cleanup_receipt.outcome == 'success'" in upload
     assert "steps.validate.outcome" not in upload
+    assert "steps.persona_cleanup.outcome == 'success'" not in upload
+    assert "steps.persona_finalize.outcome == 'success'" not in upload
     assert "include-hidden-files: false" in upload
-    assert "retention-days: 14" in upload
+    assert "retention-days: 30" in upload
+    assert "io-e2e-team-report-${{ steps.context.outputs.run_id }}" in upload
+    assert "path: ${{ steps.context.outputs.team_artifact_dir }}" in upload
+    assert (
+        "QA_DEBUG_RECIPIENT_PUBLIC_KEYS: ${{ vars.QA_DEBUG_RECIPIENT_PUBLIC_KEYS }}"
+        in debug_plan
+    )
+    assert "steps.secret_scan.outcome == 'success'" in debug_plan
+    assert "steps.upload.outcome == 'success'" in debug_plan
+    assert 'document.get("kind") != "io_e2e_team_failure_index"' in debug_plan
+    assert "len(failures) != count" in debug_plan
+    assert 'document.get("api_key_failure_count")' in debug_plan
+    assert 'document.get("persona_memory_failure_count")' in debug_plan
+    assert 'document.get("exact_id_failure_count")' in debug_plan
+    assert "count != api_key_count + persona_count" in debug_plan
+    assert "exact_id_count != api_key_count" in debug_plan
+    assert 'disposition = "no-failures"' in debug_plan
+    assert 'disposition = "no-exact-id-failures"' in debug_plan
+    assert 'disposition = "not-configured"' in debug_plan
+    assert 'disposition = "encrypted"' in debug_plan
+    assert "expected={'true' if expected else 'false'}" in debug_plan
+    assert "steps.debug_plan.outputs.expected == 'true'" in debug_build
+    assert "qa/protected_debug_bundle.py build" in debug_build
+    assert '--result "$QA_ARTIFACT_DIR/run-result.json"' in debug_build
+    assert '--failure-index "$QA_TEAM_ARTIFACT_DIR/failure-index.json"' in debug_build
+    assert (
+        '--persona-summary "$QA_TEAM_ARTIFACT_DIR/persona-memory-summary.json"'
+        in debug_build
+    )
+    assert '--manifest "$QA_PRIVATE_MANIFEST"' in debug_build
+    assert '--expected-runtime "$QA_EXPECTED_RUNTIME"' in debug_build
+    assert '--expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA"' in debug_build
+    assert '--recipients "$QA_DEBUG_RECIPIENT_PUBLIC_KEYS"' in debug_build
+    assert '--output "$QA_PROTECTED_DEBUG_BUNDLE"' in debug_build
+    assert "steps.debug_plan.outputs.expected == 'true'" in debug_upload
+    assert "steps.debug_build.outcome == 'success'" in debug_upload
+    assert "io-e2e-protected-debug-${{ steps.context.outputs.run_id }}" in debug_upload
+    assert "path: ${{ steps.context.outputs.protected_debug_bundle }}" in debug_upload
+    assert "include-hidden-files: false" in debug_upload
+    assert "retention-days: 7" in debug_upload
+    assert 'cat "$QA_TEAM_SUMMARY" >> "$GITHUB_STEP_SUMMARY"' in panel
+    assert "steps.upload.outputs.artifact-url" in panel
+    assert "TEAM_REPORT_OUTCOME" in panel
+    assert "SECRET_SCAN_OUTCOME" in panel
+    assert "UPLOAD_OUTCOME" in panel
+    assert "DEBUG_DISPOSITION" in panel
+    assert "steps.debug_upload.outputs.artifact-url" in panel
+    assert "QA_DEBUG_RECIPIENT_PUBLIC_KEYS" in panel
+    assert "exact synthetic IDs were not retained" in panel
+    assert "No encrypted debug bundle was needed" in panel
+    assert "persona-memory aggregate regressions" in panel
+    assert "no encrypted exact-ID bundle was created" in panel
+    assert "Download the 7-day encrypted exact-ID debug bundle" in panel
+    assert "qa/protected_debug_bundle.py decrypt" in panel
+    assert "--failure-index ./failure-index.json" in panel
+    assert "both linked artifacts from this original Actions run" in panel
+    assert "Do not trust a re-shared standalone bundle" in panel
+    assert "never raw chats, COT, persona files, or trace bodies" in panel
+    assert "panel_failed=1" in panel
+    assert panel.index('[ "$SECRET_SCAN_OUTCOME" = "success" ]') < panel.index(
+        'cat "$QA_TEAM_SUMMARY" >> "$GITHUB_STEP_SUMMARY"'
+    )
+    assert "No unscanned qualification output was published" in panel
+    fallback = panel[panel.index("else\n") : panel.index("          fi\n")]
+    assert "QA_TEAM_SUMMARY" not in fallback
+    assert "TEAM_ARTIFACT_URL" not in fallback
+    assert "QA_ARTIFACT_DIR" in report_cleanup
+    assert "QA_TEAM_ARTIFACT_DIR" in report_cleanup
+    assert "QA_PROTECTED_DEBUG_DIR" in report_cleanup
+    assert 'workspace / "qualification-artifacts"' in report_cleanup
+    assert 'workspace / "team-qualification-artifacts"' in report_cleanup
+    assert 'workspace / "protected-debug-artifacts"' in report_cleanup
+    assert WORKFLOW.index(
+        "Remove staging, team, and protected report scratch after upload decision"
+    ) < WORKFLOW.index("Remove private scratch after account cleanup")
     assert "Enforce fail-closed qualification outcome" in WORKFLOW
     assert '"profile-workers:$PROFILE_WORKERS"' in WORKFLOW
     assert '"orchestration:$ORCHESTRATION"' in WORKFLOW
     assert '"validate:$VALIDATE"' in WORKFLOW
+    assert '"team-report:$TEAM_REPORT"' in WORKFLOW
     assert '"secret-scan:$SECRET_SCAN"' in WORKFLOW
+    assert '"debug-plan:$DEBUG_PLAN"' in WORKFLOW
+    assert 'if [ "$DEBUG_EXPECTED" = "true" ]' in WORKFLOW
+    assert '"protected-debug-build:$DEBUG_BUILD"' in WORKFLOW
+    assert '"protected-debug-upload:$DEBUG_UPLOAD"' in WORKFLOW
+    assert 'elif [ "$DEBUG_EXPECTED" != "false" ]' in WORKFLOW
+    enforce = WORKFLOW[WORKFLOW.index("      - name: Enforce fail-closed") :]
+    unconditional = enforce[
+        enforce.index("          for item in \\\n") : enforce.index(
+            '          if [ "$DEBUG_EXPECTED" = "true" ]'
+        )
+    ]
+    assert "protected-debug-build" not in unconditional
+    assert "protected-debug-upload" not in unconditional
     assert '"cleanup-receipt:$CLEANUP_RECEIPT"' in WORKFLOW
+    assert '"team-panel:$TEAM_PANEL"' in WORKFLOW
+    assert '"report-cleanup:$REPORT_CLEANUP"' in WORKFLOW
     assert "release qualification: PASS" in WORKFLOW

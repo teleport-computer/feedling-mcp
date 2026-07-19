@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Fail-closed scan of the public qualification artifact boundary.
+"""Fail-closed scan of the team-safe qualification report boundary.
 
 The scanner receives real credential values only in its own CI step. It never
 prints a value or an artifact-controlled path; findings are fixed categories
-that are safe for GitHub Actions logs.
+that are safe for GitHub Actions logs.  The validated canonical result remains
+outside this boundary and supplies the synthetic identifiers that must not be
+published.  Team artifacts may expose only independently derived handles.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import base64
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -41,7 +44,9 @@ PROFILE_IDS = (
 )
 MEMORY_CONTRACT_PROFILE_ID = "memory-contract"
 EXPECTED_PUBLIC_FILES = {
-    "run-result.json",
+    "run-index.json",
+    "failure-index.json",
+    "team-summary.md",
     "cleanup-receipt.json",
     "memory-contract.json",
     "persona-memory-summary.json",
@@ -49,23 +54,215 @@ EXPECTED_PUBLIC_FILES = {
     "matrix.md",
     "latency.csv",
     "junit.xml",
-    *(f"profiles/{profile_id}.json" for profile_id in PROFILE_IDS),
 }
 MAX_FILES = 512
 MAX_FILE_BYTES = 20 * 1024 * 1024
+MAX_CANONICAL_RESULT_BYTES = 20 * 1024 * 1024
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MIN_RECONSTRUCTED_FRAGMENT_BYTES = 8
 _FORBIDDEN_JSON_KEY = re.compile(
     rb'(?i)"(?:api_key|secret_key_b64|private_key(?:_b64)?|provider_key|admin_token|'
-    rb'raw_chat|raw_trace|raw_(?:private_)?reasoning|body_ct|thinking_body_ct|K_user|'
-    rb'prompt|response|rationale|evidence_turn_ids|account_fingerprints|turn_id|'
-    rb'session_id|request_id|response_id|trace_id)"\s*:'
+    rb"body_ct|thinking_body_ct|K_user|"
+    rb"prompt|response|rationale|evidence_turn_ids|account_fingerprints|user_id|"
+    rb'turn_id|session_id|request_id|response_id|trace_id|job_id)"\s*:'
 )
+_SAFE_RAW_ATTESTATIONS = {
+    "raw_chat_omitted": True,
+    "raw_correlation_identifiers_omitted": True,
+    "raw_memory_ids_persisted": False,
+    "raw_persona_omitted": True,
+    "raw_private_reasoning_stored": False,
+    "raw_reasoning_omitted": True,
+    "raw_responses_persisted": False,
+    "raw_trace_omitted": True,
+    "raw_trace_stored": False,
+}
 _CREDENTIAL_SIGNATURE = re.compile(rb"(?:sk-ant-|sk-or-v1-|sk-proj-)[A-Za-z0-9_-]{8,}")
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{7,159}$")
+_CANONICAL_IDENTIFIER_FIELDS = frozenset(
+    {"user_id", "request_id", "turn_id", "trace_id", "job_id", "session_id"}
+)
+_CANONICAL_IDENTIFIER_LIST_FIELDS = frozenset({"request_ids", "turn_ids", "trace_ids"})
 
 
 class ArtifactScanError(RuntimeError):
     """A fixed diagnostic safe to print without exposing artifact content."""
+
+
+class _DuplicateTeamJSONKey(ValueError):
+    pass
+
+
+def _team_object_without_duplicate_keys(
+    pairs: Sequence[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateTeamJSONKey
+        result[key] = value
+    return result
+
+
+def _team_json_private_field_issue(data: bytes) -> bool:
+    try:
+        document = json.loads(
+            data.decode("utf-8"), object_pairs_hook=_team_object_without_duplicate_keys
+        )
+    except (_DuplicateTeamJSONKey, UnicodeError, json.JSONDecodeError, RecursionError):
+        return True
+
+    def visit(value: object) -> bool:
+        if isinstance(value, list):
+            return any(visit(item) for item in value)
+        if not isinstance(value, dict):
+            return False
+        for key, child in value.items():
+            if key.lower().startswith("raw_") and (
+                key not in _SAFE_RAW_ATTESTATIONS
+                or child is not _SAFE_RAW_ATTESTATIONS[key]
+            ):
+                return True
+            if visit(child):
+                return True
+        return False
+
+    return visit(document)
+
+
+def _object_without_duplicate_keys(pairs: Sequence[tuple[str, object]]) -> dict:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ArtifactScanError("canonical result contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _read_canonical_result(path: Path) -> tuple[dict, Path]:
+    """Read the validated staging result without following or trusting links."""
+
+    if not path.is_absolute() or path.is_symlink() or path.name != "run-result.json":
+        raise ArtifactScanError("canonical result is missing or unreadable")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise ArtifactScanError("canonical result is missing or unreadable") from None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > MAX_CANONICAL_RESULT_BYTES
+        ):
+            raise ArtifactScanError("canonical result is missing or unreadable")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ArtifactScanError("canonical result changed while reading")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ArtifactScanError("canonical result changed while reading")
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    try:
+        document = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_object_without_duplicate_keys
+        )
+    except ArtifactScanError:
+        raise
+    except (UnicodeError, json.JSONDecodeError, RecursionError):
+        raise ArtifactScanError("canonical result is missing or invalid") from None
+    if not isinstance(document, dict):
+        raise ArtifactScanError("canonical result shape is invalid")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ArtifactScanError("canonical result is missing or unreadable") from None
+    return document, resolved
+
+
+def _canonical_identifier_values(document: dict) -> set[bytes]:
+    """Extract every bounded synthetic correlation identifier from the result."""
+
+    profiles = document.get("profiles")
+    redaction = document.get("redaction")
+    if (
+        not isinstance(profiles, list)
+        or len(profiles) != len(PROFILE_IDS)
+        or not isinstance(redaction, dict)
+        or redaction.get("synthetic_users_only") is not True
+    ):
+        raise ArtifactScanError("canonical result shape is invalid")
+    profile_ids: list[str] = []
+    for profile in profiles:
+        if (
+            not isinstance(profile, dict)
+            or not isinstance(profile.get("scenarios"), list)
+            or not isinstance(profile.get("turns"), list)
+            or not isinstance(profile.get("reasoning"), dict)
+            or not isinstance(profile.get("redaction"), dict)
+            or profile["redaction"].get("synthetic_users_only") is not True
+        ):
+            raise ArtifactScanError("canonical result shape is invalid")
+        profile_id = profile.get("profile_id")
+        if not isinstance(profile_id, str):
+            raise ArtifactScanError("canonical result shape is invalid")
+        profile_ids.append(profile_id)
+        if any(not isinstance(row, dict) for row in profile["scenarios"]):
+            raise ArtifactScanError("canonical result shape is invalid")
+        if any(not isinstance(row, dict) for row in profile["turns"]):
+            raise ArtifactScanError("canonical result shape is invalid")
+    if tuple(profile_ids) != PROFILE_IDS:
+        raise ArtifactScanError("canonical result profile set is invalid")
+
+    raw_values: set[str] = set()
+
+    def visit(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            if key in _CANONICAL_IDENTIFIER_FIELDS:
+                if child is None:
+                    continue
+                if (
+                    not isinstance(child, str)
+                    or _SAFE_IDENTIFIER_RE.fullmatch(child) is None
+                ):
+                    raise ArtifactScanError(
+                        "canonical result identifier shape is invalid"
+                    )
+                raw_values.add(child)
+            elif key in _CANONICAL_IDENTIFIER_LIST_FIELDS:
+                if not isinstance(child, list) or any(
+                    not isinstance(item, str)
+                    or _SAFE_IDENTIFIER_RE.fullmatch(item) is None
+                    for item in child
+                ):
+                    raise ArtifactScanError(
+                        "canonical result identifier shape is invalid"
+                    )
+                raw_values.update(child)
+            visit(child)
+
+    visit(document)
+    if len(raw_values) < len(PROFILE_IDS):
+        raise ArtifactScanError("canonical result identifier set is incomplete")
+    variants: set[bytes] = set()
+    for value in raw_values:
+        variants.update(_encoded_variants(value))
+    return variants
 
 
 def _byte_variants(value: bytes) -> set[bytes]:
@@ -346,6 +543,7 @@ def scan_artifacts(
     memory_manifest_path: Path,
     codex_auth_path: Path,
     fixture_path: Path,
+    canonical_result_path: Path,
     *,
     env: Mapping[str, str] | None = None,
 ) -> list[str]:
@@ -356,6 +554,10 @@ def scan_artifacts(
     codex_auth = _read_codex_auth(codex_auth_path)
     secrets = _secret_values(manifest, memory_manifest, codex_auth, active_env)
     forbidden_fixture_material = _read_fixture_forbidden_values(fixture_path)
+    canonical_result, canonical_result_file = _read_canonical_result(
+        canonical_result_path
+    )
+    forbidden_identifiers = _canonical_identifier_values(canonical_result)
     if artifact_root.is_symlink():
         raise ArtifactScanError("public artifact root is missing or unreadable")
     try:
@@ -366,6 +568,8 @@ def scan_artifacts(
         ) from None
     if not root.is_dir():
         raise ArtifactScanError("public artifact root is not a directory")
+    if root == canonical_result_file or root in canonical_result_file.parents:
+        raise ArtifactScanError("canonical result must remain outside public artifacts")
 
     findings: set[str] = set()
     file_count = 0
@@ -380,8 +584,7 @@ def scan_artifacts(
             findings.add("public artifact tree contains a symbolic link")
             continue
         if path.is_dir():
-            if relative != "profiles":
-                findings.add("public artifact tree contains an unexpected directory")
+            findings.add("public artifact tree contains an unexpected directory")
             continue
         if not path.is_file():
             findings.add("public artifact tree contains a non-regular file")
@@ -424,7 +627,17 @@ def scan_artifacts(
             for forbidden in forbidden_fixture_material
         ):
             findings.add("public artifact contains forbidden persona fixture material")
-        if _FORBIDDEN_JSON_KEY.search(data):
+        if _contains_exact_secret(data, forbidden_identifiers) or any(
+            _can_reconstruct_secret(stream, identifier)
+            for stream in fragment_streams
+            for identifier in forbidden_identifiers
+        ):
+            findings.add(
+                "public artifact contains forbidden synthetic identifier material"
+            )
+        if _FORBIDDEN_JSON_KEY.search(data) or (
+            path.suffix == ".json" and _team_json_private_field_issue(data)
+        ):
             findings.add("public artifact contains a forbidden private-data field")
         if _CREDENTIAL_SIGNATURE.search(data):
             findings.add("public artifact contains a credential-shaped token")
@@ -447,6 +660,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-manifest", type=Path, required=True)
     parser.add_argument("--codex-auth", type=Path, required=True)
     parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument("--canonical-result", type=Path, required=True)
     return parser
 
 
@@ -459,6 +673,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.memory_manifest,
             args.codex_auth,
             args.fixture,
+            args.canonical_result,
         )
     except ArtifactScanError as exc:
         findings = [str(exc)]

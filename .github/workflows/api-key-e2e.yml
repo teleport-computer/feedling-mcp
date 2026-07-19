@@ -1,4 +1,5 @@
-name: Agentic API-key qualification (self-service)
+name: IO agentic E2E qualification (trusted self-service)
+run-name: IO E2E · deployed test · ${{ inputs.runtime_target }} · persona x${{ inputs.persona_repetitions }}
 
 on:
   workflow_dispatch:
@@ -733,6 +734,9 @@ jobs:
           run_id="api-key-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           private_root="${RUNNER_TEMP}/${run_id}-private"
           artifact_dir="${GITHUB_WORKSPACE}/qualification-artifacts/${run_id}"
+          team_artifact_dir="${GITHUB_WORKSPACE}/team-qualification-artifacts/${run_id}"
+          protected_debug_dir="${GITHUB_WORKSPACE}/protected-debug-artifacts/${run_id}"
+          protected_debug_bundle="${protected_debug_dir}/io-e2e-protected-debug.bundle.json"
           manifest="${private_root}/profiles.json"
           profile_manifest_dir="${private_root}/profile-manifests"
           memory_manifest="${profile_manifest_dir}/memory-contract.json"
@@ -796,6 +800,20 @@ jobs:
               "${worker_root}/${agent_type}/tmp" \
               "${worker_root}/${agent_type}/work"
           done
+          for artifact_parent in \
+            "${GITHUB_WORKSPACE}/qualification-artifacts" \
+            "${GITHUB_WORKSPACE}/team-qualification-artifacts" \
+            "${GITHUB_WORKSPACE}/protected-debug-artifacts"
+          do
+            if [ -L "$artifact_parent" ] || \
+              { [ -e "$artifact_parent" ] && [ ! -d "$artifact_parent" ]; }
+            then
+              echo "::error::qualification artifact parent is unsafe"
+              exit 1
+            fi
+            mkdir -p -m 700 "$artifact_parent"
+            chmod 700 "$artifact_parent"
+          done
           mkdir -m 700 "$artifact_dir"
 
           {
@@ -830,6 +848,9 @@ jobs:
             echo "pre_deployment_receipt=$pre_deployment_receipt"
             echo "post_deployment_receipt=$post_deployment_receipt"
             echo "artifact_dir=$artifact_dir"
+            echo "team_artifact_dir=$team_artifact_dir"
+            echo "protected_debug_dir=$protected_debug_dir"
+            echo "protected_debug_bundle=$protected_debug_bundle"
             echo "expected_sha=$EXPECTED_DEPLOYMENT_SHA"
           } >> "$GITHUB_OUTPUT"
 
@@ -1787,13 +1808,46 @@ jobs:
             --receipt "$QA_ARTIFACT_DIR/cleanup-receipt.json" \
             --result "$QA_ARTIFACT_DIR/run-result.json"
 
-      # Retain the private manifests until the scanner has compared every
-      # public byte, including the cleanup receipt, against real secret values.
-      - name: Scan public artifacts for secrets and raw evidence
+      - name: Build team-safe run report
+        id: team_report
+        if: always() && steps.render.outcome == 'success' && steps.cleanup.outcome == 'success' && steps.cleanup_receipt.outcome == 'success'
+        env:
+          QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
+          QA_TEAM_ARTIFACT_DIR: ${{ steps.context.outputs.team_artifact_dir }}
+          PERSONA_REPETITIONS: ${{ steps.context.outputs.persona_repetitions }}
+          QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+          QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
+        run: |
+          set -euo pipefail
+          python qa/build_team_report.py \
+            --coverage qa/coverage-lock.json \
+            --schema qa/schemas/run-result.schema.json \
+            --result "$QA_ARTIFACT_DIR/run-result.json" \
+            --provisioning-manifest "${{ steps.context.outputs.manifest }}" \
+            --orchestration-receipt "${{ steps.context.outputs.orchestration_receipt }}" \
+            --deployment-receipt "${{ steps.context.outputs.pre_deployment_receipt }}" \
+            --post-deployment-receipt "${{ steps.context.outputs.post_deployment_receipt }}" \
+            --cleanup-receipt "$QA_ARTIFACT_DIR/cleanup-receipt.json" \
+            --source-artifacts "$QA_ARTIFACT_DIR" \
+            --output "$QA_TEAM_ARTIFACT_DIR" \
+            --actor "$GITHUB_ACTOR" \
+            --persona-repetitions "$PERSONA_REPETITIONS" \
+            --persona-prepare-outcome "${{ steps.persona_prepare.outcome }}" \
+            --persona-live-outcome "${{ steps.persona_live.outcome }}" \
+            --persona-cleanup-outcome "${{ steps.persona_cleanup.outcome }}" \
+            --persona-finalize-outcome "${{ steps.persona_finalize.outcome }}" \
+            --expected-runtime "$QA_EXPECTED_RUNTIME" \
+            --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA"
+
+      # Retain the private manifests until the scanner has compared every byte
+      # in the separate team report against real secret values and the trusted
+      # canonical result. The staging result is never uploaded directly.
+      - name: Scan team-safe run report for secrets and raw evidence
         id: secret_scan
         if: always()
         env:
           QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
+          QA_TEAM_ARTIFACT_DIR: ${{ steps.context.outputs.team_artifact_dir }}
           QA_PRIVATE_MANIFEST: ${{ steps.context.outputs.manifest }}
           QA_MEMORY_MANIFEST: ${{ steps.context.outputs.memory_manifest }}
           IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
@@ -1807,29 +1861,307 @@ jobs:
         run: |
           set -euo pipefail
           python qa/scan_artifacts.py \
-            --artifacts "$QA_ARTIFACT_DIR" \
+            --artifacts "$QA_TEAM_ARTIFACT_DIR" \
+            --canonical-result "$QA_ARTIFACT_DIR/run-result.json" \
             --manifest "$QA_PRIVATE_MANIFEST" \
             --memory-manifest "$QA_MEMORY_MANIFEST" \
             --codex-auth "${{ steps.codex_preflight.outputs.codex_auth }}" \
             --fixture qa/fixtures/persona-import-v1.json
 
-      - name: Upload sanitized public qualification artifacts
+      - name: Upload team-safe run report
         id: upload
-        if: always() && steps.secret_scan.outcome == 'success' && steps.cleanup.outcome == 'success' && steps.cleanup_receipt.outcome == 'success' && (inputs.runtime_target != 'hosted_resident' || (steps.persona_cleanup.outcome == 'success' && steps.persona_finalize.outcome == 'success'))
+        if: always() && steps.team_report.outcome == 'success' && steps.secret_scan.outcome == 'success' && steps.cleanup.outcome == 'success' && steps.cleanup_receipt.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: io-e2e-agent-driven-test-${{ steps.context.outputs.run_id }}
-          path: ${{ steps.context.outputs.artifact_dir }}
+          name: io-e2e-team-report-${{ steps.context.outputs.run_id }}
+          path: ${{ steps.context.outputs.team_artifact_dir }}
           if-no-files-found: error
           include-hidden-files: false
-          retention-days: 14
+          retention-days: 30
           compression-level: 6
 
-      - name: Remove public scratch after upload decision
-        id: public_cleanup
+      - name: Plan protected failure debug bundle
+        id: debug_plan
+        if: always() && steps.team_report.outcome == 'success' && steps.secret_scan.outcome == 'success' && steps.upload.outcome == 'success'
+        env:
+          QA_FAILURE_INDEX: ${{ steps.context.outputs.team_artifact_dir }}/failure-index.json
+          QA_DEBUG_RECIPIENT_PUBLIC_KEYS: ${{ vars.QA_DEBUG_RECIPIENT_PUBLIC_KEYS }}
+        run: |
+          set -euo pipefail
+          python - "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          import stat
+          import sys
+          from pathlib import Path
+
+          class DuplicateKey(ValueError):
+              pass
+
+          def reject_duplicates(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise DuplicateKey
+                  value[key] = item
+              return value
+
+          path = Path(os.environ["QA_FAILURE_INDEX"]).absolute()
+          try:
+              metadata = path.lstat()
+          except OSError as exc:
+              raise SystemExit("team failure index is missing or unsafe") from exc
+          if (
+              stat.S_ISLNK(metadata.st_mode)
+              or not stat.S_ISREG(metadata.st_mode)
+              or metadata.st_uid != os.geteuid()
+              or metadata.st_nlink != 1
+              or not 1 <= metadata.st_size <= 8 * 1024 * 1024
+          ):
+              raise SystemExit("team failure index is missing or unsafe")
+          try:
+              document = json.loads(
+                  path.read_text(encoding="utf-8"),
+                  object_pairs_hook=reject_duplicates,
+                  parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+              )
+          except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+              raise SystemExit("team failure index is invalid") from exc
+          required = {
+              "schema_version",
+              "kind",
+              "run_id",
+              "failure_count",
+              "api_key_failure_count",
+              "persona_memory_failure_count",
+              "exact_id_failure_count",
+              "failures",
+              "redaction",
+          }
+          if not isinstance(document, dict) or set(document) != required:
+              raise SystemExit("team failure index shape is invalid")
+          failures = document.get("failures")
+          count = document.get("failure_count")
+          api_key_count = document.get("api_key_failure_count")
+          persona_count = document.get("persona_memory_failure_count")
+          exact_id_count = document.get("exact_id_failure_count")
+          if (
+              document.get("schema_version") != 1
+              or document.get("kind") != "io_e2e_team_failure_index"
+              or type(count) is not int
+              or type(api_key_count) is not int
+              or type(persona_count) is not int
+              or type(exact_id_count) is not int
+              or not 0 <= api_key_count <= 9 * 13
+              or not 0 <= persona_count <= 8
+              or count != api_key_count + persona_count
+              or exact_id_count != api_key_count
+              or not isinstance(failures, list)
+              or len(failures) != count
+              or sum(
+                  isinstance(row, dict) and row.get("source") == "api_key_matrix"
+                  for row in failures
+              ) != api_key_count
+              or sum(
+                  isinstance(row, dict)
+                  and row.get("source") == "persona_memory"
+                  and row.get("exact_id_debug_available") is False
+                  for row in failures
+              ) != persona_count
+          ):
+              raise SystemExit("team failure index count is invalid")
+
+          recipients_configured = bool(
+              os.environ.get("QA_DEBUG_RECIPIENT_PUBLIC_KEYS", "").strip()
+          )
+          if count == 0:
+              disposition = "no-failures"
+              expected = False
+          elif exact_id_count == 0:
+              disposition = "no-exact-id-failures"
+              expected = False
+          elif recipients_configured:
+              disposition = "encrypted"
+              expected = True
+          else:
+              disposition = "not-configured"
+              expected = False
+
+          with Path(sys.argv[1]).open("a", encoding="utf-8") as output:
+              output.write(f"expected={'true' if expected else 'false'}\n")
+              output.write(f"disposition={disposition}\n")
+              output.write(f"failure_count={count}\n")
+              output.write(f"exact_id_failure_count={exact_id_count}\n")
+              output.write(f"persona_memory_failure_count={persona_count}\n")
+          PY
+
+      - name: Build protected failure debug bundle
+        id: debug_build
+        if: always() && steps.debug_plan.outputs.expected == 'true'
+        env:
+          QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
+          QA_TEAM_ARTIFACT_DIR: ${{ steps.context.outputs.team_artifact_dir }}
+          QA_PRIVATE_MANIFEST: ${{ steps.context.outputs.manifest }}
+          QA_PROTECTED_DEBUG_DIR: ${{ steps.context.outputs.protected_debug_dir }}
+          QA_PROTECTED_DEBUG_BUNDLE: ${{ steps.context.outputs.protected_debug_bundle }}
+          QA_DEBUG_RECIPIENT_PUBLIC_KEYS: ${{ vars.QA_DEBUG_RECIPIENT_PUBLIC_KEYS }}
+          QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
+          QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          parent = workspace / "protected-debug-artifacts"
+          root = Path(os.environ["QA_PROTECTED_DEBUG_DIR"]).absolute()
+          if (
+              root.parent.resolve() != parent.resolve()
+              or not root.name.startswith("api-key-e2e-")
+              or root.exists()
+              or root.is_symlink()
+          ):
+              raise SystemExit("protected debug output path is unsafe")
+          root.mkdir(mode=0o700)
+          PY
+          python qa/protected_debug_bundle.py build \
+            --result "$QA_ARTIFACT_DIR/run-result.json" \
+            --failure-index "$QA_TEAM_ARTIFACT_DIR/failure-index.json" \
+            --persona-summary "$QA_TEAM_ARTIFACT_DIR/persona-memory-summary.json" \
+            --manifest "$QA_PRIVATE_MANIFEST" \
+            --expected-runtime "$QA_EXPECTED_RUNTIME" \
+            --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+            --recipients "$QA_DEBUG_RECIPIENT_PUBLIC_KEYS" \
+            --output "$QA_PROTECTED_DEBUG_BUNDLE"
+
+      - name: Upload encrypted protected failure debug bundle
+        id: debug_upload
+        if: always() && steps.debug_plan.outputs.expected == 'true' && steps.debug_build.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: io-e2e-protected-debug-${{ steps.context.outputs.run_id }}
+          path: ${{ steps.context.outputs.protected_debug_bundle }}
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+          compression-level: 0
+
+      - name: Publish scanned team report to GitHub job summary
+        id: team_panel
+        if: always()
+        env:
+          QA_TEAM_SUMMARY: ${{ steps.context.outputs.team_artifact_dir }}/team-summary.md
+          TEAM_REPORT_OUTCOME: ${{ steps.team_report.outcome }}
+          SECRET_SCAN_OUTCOME: ${{ steps.secret_scan.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+          TEAM_ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          DEBUG_PLAN_OUTCOME: ${{ steps.debug_plan.outcome }}
+          DEBUG_DISPOSITION: ${{ steps.debug_plan.outputs.disposition }}
+          DEBUG_EXPECTED: ${{ steps.debug_plan.outputs.expected }}
+          DEBUG_BUILD_OUTCOME: ${{ steps.debug_build.outcome }}
+          DEBUG_UPLOAD_OUTCOME: ${{ steps.debug_upload.outcome }}
+          DEBUG_ARTIFACT_URL: ${{ steps.debug_upload.outputs.artifact-url }}
+        run: |
+          set -euo pipefail
+          panel_failed=0
+          if [ "$TEAM_REPORT_OUTCOME" = "success" ] && \
+            [ "$SECRET_SCAN_OUTCOME" = "success" ] && \
+            [ "$UPLOAD_OUTCOME" = "success" ] && \
+            [ -f "$QA_TEAM_SUMMARY" ] && [ ! -L "$QA_TEAM_SUMMARY" ] && \
+            [[ "$TEAM_ARTIFACT_URL" =~ ^https://github.com/teleport-computer/feedling-mcp/actions/runs/[0-9]+/artifacts/[0-9]+$ ]]
+          then
+            cat "$QA_TEAM_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo
+              echo "[Download the 30-day team-safe run report](${TEAM_ARTIFACT_URL})"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            if [ "$DEBUG_PLAN_OUTCOME" != "success" ]; then
+              cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+
+          ## Protected failure debugging unavailable
+
+          The deterministic protected-debug planner did not complete. No exact identifiers were published.
+          EOF
+              panel_failed=1
+            elif [ "$DEBUG_DISPOSITION" = "no-failures" ] && [ "$DEBUG_EXPECTED" = "false" ]; then
+              cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+
+          ## Protected failure debugging
+
+          No encrypted debug bundle was needed because the failure index is empty.
+          EOF
+            elif [ "$DEBUG_DISPOSITION" = "no-exact-id-failures" ] && [ "$DEBUG_EXPECTED" = "false" ]; then
+              cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+
+          ## Protected failure debugging
+
+          The failures above are persona-memory aggregate regressions. Their public-safe scenario and metric evidence is complete, but the persona summary contract intentionally retains no exact account, request, turn, trace, or job IDs, so no encrypted exact-ID bundle was created.
+          EOF
+            elif [ "$DEBUG_DISPOSITION" = "not-configured" ] && [ "$DEBUG_EXPECTED" = "false" ]; then
+              cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+
+          ## Protected failure debugging not configured
+
+          Failed or blocked scenarios are visible above, but exact synthetic IDs were not retained. Configure the non-secret Environment variable `QA_DEBUG_RECIPIENT_PUBLIC_KEYS` to create encrypted exact-ID bundles on future failing runs.
+          EOF
+            elif [ "$DEBUG_DISPOSITION" = "encrypted" ] && \
+              [ "$DEBUG_EXPECTED" = "true" ] && \
+              [ "$DEBUG_BUILD_OUTCOME" = "success" ] && \
+              [ "$DEBUG_UPLOAD_OUTCOME" = "success" ] && \
+              [[ "$DEBUG_ARTIFACT_URL" =~ ^https://github.com/teleport-computer/feedling-mcp/actions/runs/[0-9]+/artifacts/[0-9]+$ ]]
+            then
+              {
+                echo
+                echo "## Protected failure debugging"
+                echo
+                printf '[Download the 7-day encrypted exact-ID debug bundle](%s). It contains failure-only identifiers and bounded metadata, never raw chats, COT, persona files, or trace bodies.\n' "$DEBUG_ARTIFACT_URL"
+              } >> "$GITHUB_STEP_SUMMARY"
+              cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+
+          Download both linked artifacts from this original Actions run, unzip them without renaming the files, and decrypt locally with your owner-only team identity. Do not trust a re-shared standalone bundle:
+
+          ```bash
+          python qa/protected_debug_bundle.py decrypt \
+            --identity "$HOME/.config/io-e2e/debug-identity.json" \
+            --input ./io-e2e-protected-debug.bundle.json \
+            --failure-index ./failure-index.json \
+            --output ./io-e2e-protected-debug.payload.json
+          ```
+          EOF
+            else
+              cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+
+          ## Protected failure debugging unavailable
+
+          An encrypted exact-ID bundle was expected, but its build or upload did not complete. No plaintext exact identifiers were published.
+          EOF
+              panel_failed=1
+            fi
+          else
+            cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## IO agentic E2E report unavailable
+
+          | Control-plane stage | Outcome |
+          | --- | --- |
+          | Team report builder | unavailable |
+          | Team report scanner | unavailable |
+          | Team report upload | unavailable |
+
+          No unscanned qualification output was published to this job summary.
+          EOF
+          fi
+          exit "$panel_failed"
+
+      - name: Remove staging, team, and protected report scratch after upload decision
+        id: report_cleanup
         if: always()
         env:
           QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
+          QA_TEAM_ARTIFACT_DIR: ${{ steps.context.outputs.team_artifact_dir }}
+          QA_PROTECTED_DEBUG_DIR: ${{ steps.context.outputs.protected_debug_dir }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -1838,23 +2170,39 @@ jobs:
           import sys
           from pathlib import Path
 
-          raw = os.environ.get("QA_ARTIFACT_DIR", "")
-          if not raw:
-              raise SystemExit(0)
-          root = Path(raw).absolute()
-          expected_parent = (
-              Path(os.environ["GITHUB_WORKSPACE"]) / "qualification-artifacts"
-          ).resolve()
-          if root.parent.resolve() != expected_parent or not root.name.startswith(
-              "api-key-e2e-"
-          ):
-              print("::error::refusing unsafe public scratch cleanup path", file=sys.stderr)
-              raise SystemExit(1)
-          if root.is_symlink():
-              root.unlink()
-          elif root.exists():
-              shutil.rmtree(root)
-          print("public qualification scratch removed")
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          targets = (
+              (
+                  os.environ.get("QA_ARTIFACT_DIR", ""),
+                  workspace / "qualification-artifacts",
+              ),
+              (
+                  os.environ.get("QA_TEAM_ARTIFACT_DIR", ""),
+                  workspace / "team-qualification-artifacts",
+              ),
+              (
+                  os.environ.get("QA_PROTECTED_DEBUG_DIR", ""),
+                  workspace / "protected-debug-artifacts",
+              ),
+          )
+          for raw, expected_parent in targets:
+              if not raw:
+                  continue
+              root = Path(raw).absolute()
+              if (
+                  root.parent.resolve() != expected_parent.resolve()
+                  or not root.name.startswith("api-key-e2e-")
+              ):
+                  print(
+                      "::error::refusing unsafe qualification report cleanup path",
+                      file=sys.stderr,
+                  )
+                  raise SystemExit(1)
+              if root.is_symlink():
+                  root.unlink()
+              elif root.exists():
+                  shutil.rmtree(root)
+          print("qualification staging, team report, and protected debug scratch removed")
           PY
 
       - name: Remove private scratch after account cleanup
@@ -1902,11 +2250,17 @@ jobs:
           PUBLISH_RESULT: ${{ steps.publish_result.outcome }}
           RENDER: ${{ steps.render.outcome }}
           VALIDATE: ${{ steps.validate.outcome }}
+          TEAM_REPORT: ${{ steps.team_report.outcome }}
           SECRET_SCAN: ${{ steps.secret_scan.outcome }}
+          DEBUG_PLAN: ${{ steps.debug_plan.outcome }}
+          DEBUG_EXPECTED: ${{ steps.debug_plan.outputs.expected }}
+          DEBUG_BUILD: ${{ steps.debug_build.outcome }}
+          DEBUG_UPLOAD: ${{ steps.debug_upload.outcome }}
           CLEANUP: ${{ steps.cleanup.outcome }}
           CLEANUP_RECEIPT: ${{ steps.cleanup_receipt.outcome }}
           UPLOAD: ${{ steps.upload.outcome }}
-          PUBLIC_CLEANUP: ${{ steps.public_cleanup.outcome }}
+          TEAM_PANEL: ${{ steps.team_panel.outcome }}
+          REPORT_CLEANUP: ${{ steps.report_cleanup.outcome }}
           PRIVATE_CLEANUP: ${{ steps.private_cleanup.outcome }}
           PERSONA_PREPARE: ${{ steps.persona_prepare.outcome }}
           PERSONA_LIVE: ${{ steps.persona_live.outcome }}
@@ -1931,11 +2285,14 @@ jobs:
             "publish-result:$PUBLISH_RESULT" \
             "render:$RENDER" \
             "validate:$VALIDATE" \
+            "team-report:$TEAM_REPORT" \
             "secret-scan:$SECRET_SCAN" \
+            "debug-plan:$DEBUG_PLAN" \
             "cleanup:$CLEANUP" \
             "cleanup-receipt:$CLEANUP_RECEIPT" \
             "upload:$UPLOAD" \
-            "public-cleanup:$PUBLIC_CLEANUP" \
+            "team-panel:$TEAM_PANEL" \
+            "report-cleanup:$REPORT_CLEANUP" \
             "private-cleanup:$PRIVATE_CLEANUP"
           do
             name="${item%%:*}"
@@ -1945,6 +2302,22 @@ jobs:
               failed=1
             fi
           done
+          if [ "$DEBUG_EXPECTED" = "true" ]; then
+            for item in \
+              "protected-debug-build:$DEBUG_BUILD" \
+              "protected-debug-upload:$DEBUG_UPLOAD"
+            do
+              name="${item%%:*}"
+              outcome="${item#*:}"
+              if [ "$outcome" != "success" ]; then
+                echo "::error::$name outcome was $outcome"
+                failed=1
+              fi
+            done
+          elif [ "$DEBUG_EXPECTED" != "false" ]; then
+            echo "::error::protected debug expectation was invalid"
+            failed=1
+          fi
           if [ "$QA_EXPECTED_RUNTIME" = "hosted_resident" ]; then
             for item in \
               "persona-prepare:$PERSONA_PREPARE" \
