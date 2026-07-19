@@ -1592,13 +1592,19 @@ def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
             for (week, period) in sorted(existing, key=lambda k: k[1]):
                 anchor.setdefault(week, existing[(week, period)])
 
-            for week, cohort_size in sizes.items():
+            # Freeze cohorts that still have live users OR an existing anchor. The
+            # anchor branch is essential: once a cohort's W0 is frozen, its whole
+            # membership can delete and it drops out of `sizes` — without this it
+            # would never get later-period 0 cells, HIDING total churn (the exact
+            # opposite of the deletion-proofing goal). A cohort deleted before its
+            # first freeze is genuinely unrecoverable and stays absent.
+            for week in set(sizes) | set(anchor):
                 cohort_monday = date.fromisoformat(week)
                 # periods 0..K-1 are complete: week k ends at monday + (k+1)*7 days.
                 completed = (now_date - cohort_monday).days // 7
                 if completed <= 0:
                     continue
-                size = anchor.get(week, cohort_size)
+                size = anchor.get(week, sizes.get(week, 0))
                 for k in range(completed):
                     if (week, k) in existing:
                         continue

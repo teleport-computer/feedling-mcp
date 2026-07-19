@@ -697,6 +697,19 @@ def _bj_epoch(y, m, d, h=12):
     return datetime(y, m, d, h, tzinfo=timezone(timedelta(hours=8))).timestamp()
 
 
+def _cohort_week_of(user_id: str) -> str:
+    """The Beijing-week Monday a seeded user falls in — matches the retention SQL
+    exactly, so tests identify their own cohort robustly amid co-resident data
+    (the session DB is shared and other tests' cohorts also appear)."""
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT to_char(date_trunc('week', timezone('Asia/Shanghai', "
+            "created_at::timestamptz))::date, 'YYYY-MM-DD') FROM users WHERE user_id = %s",
+            (user_id,),
+        ).fetchone()
+    return row[0]
+
+
 def test_user_growth_new_cumulative_and_deletion_proof_freeze():
     # 3 users register Beijing 2038-03-01, 2 on 2038-03-02. Midday created_at is
     # tz-robust (same Beijing day whether the session casts naive as UTC or CST).
@@ -750,17 +763,19 @@ def test_retention_cohort_matrix_and_pinned_denominator():
     chat(a[1], _bj_epoch(2038, 5, 4))
     # B: u0 active period 0 only.
     chat(b[0], _bj_epoch(2038, 5, 11))
+    a_week = _cohort_week_of(a[0])
+    b_week = _cohort_week_of(b[0])
     try:
         matrix = {c["cohort_week"]: c for c in db.admin_data_track_retention()["cohorts"]}
-        # find cohort A (size 3) and B (size 2) without hardcoding the Monday.
-        cohort_a = next(c for c in matrix.values() if c["cohort_size"] == 3)
-        cohort_b = next(c for c in matrix.values() if c["cohort_size"] == 2)
+        cohort_a = matrix[a_week]
+        cohort_b = matrix[b_week]
+        assert cohort_a["cohort_size"] == 3
+        assert cohort_b["cohort_size"] == 2
         assert cohort_a["cells"][0]["active"] == 2      # u0,u1 in signup week
         assert cohort_a["cells"][1]["active"] == 1      # u0 the next week
         assert cohort_a["cells"][0]["pct"] == round(100 * 2 / 3, 1)
         assert cohort_b["cells"][0]["active"] == 1
 
-        a_week = cohort_a["cohort_week"]
         frozen = db.freeze_completed_retention_cohorts(now_epoch=_bj_epoch(2038, 6, 1))
         assert any(k.startswith(a_week) for k in frozen)
 
@@ -773,7 +788,48 @@ def test_retention_cohort_matrix_and_pinned_denominator():
         assert after[a_week]["cells"][0]["frozen"] is True
     finally:
         with db.get_pool().connection() as conn:
-            conn.execute("DELETE FROM retention_cohort_snapshot WHERE cohort_size IN (2, 3)")
+            conn.execute(
+                "DELETE FROM retention_cohort_snapshot WHERE cohort_week IN (%s, %s)",
+                (a_week, b_week))
+
+
+def test_retention_total_churn_still_freezes_zero_cells():
+    # Regression (codex R1): a cohort whose W0 is frozen, then ALL members delete,
+    # must still get later-period 0-cells frozen — otherwise total churn is hidden
+    # (the opposite of deletion-proofing). Anchor keeps the cohort in the freeze set.
+    users = [_uid() for _ in range(2)]
+    for u in users:
+        seed_user(u, created_at="2039-02-07T12:00:00")  # a Monday-ish week
+
+    def chat(uid, ts):
+        db.chat_append(uid, f"m_{uid}_{ts}", ts,
+                       {"id": f"m_{uid}_{ts}", "role": "user", "source": "chat"}, max_messages=0)
+
+    chat(users[0], _bj_epoch(2039, 2, 7))  # active W0
+    week = _cohort_week_of(users[0])
+    try:
+        # Freeze W0 (one week later): cohort_size=2, W0 active=1.
+        frozen0 = db.freeze_completed_retention_cohorts(now_epoch=_bj_epoch(2039, 2, 14))
+        assert any(k.startswith(week) for k in frozen0)
+
+        # Everyone deletes; the cohort drops out of live `users`.
+        for u in users:
+            db.delete_user(u)
+
+        # A later period completes: W1 must be frozen as active=0 / 0%, and the
+        # cohort must still appear (denominator pinned at 2 via the anchor).
+        frozen1 = db.freeze_completed_retention_cohorts(now_epoch=_bj_epoch(2039, 2, 21))
+        assert f"{week}#1" in frozen1
+        after = {c["cohort_week"]: c for c in db.admin_data_track_retention()["cohorts"]}
+        assert week in after
+        assert after[week]["cohort_size"] == 2
+        assert after[week]["cells"][1]["active"] == 0
+        assert after[week]["cells"][1]["pct"] == 0.0
+        assert after[week]["cells"][1]["frozen"] is True
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM retention_cohort_snapshot WHERE cohort_week = %s", (week,))
 
 
 def test_log_patch_item_only_if_status():
