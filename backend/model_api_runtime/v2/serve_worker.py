@@ -85,6 +85,7 @@ from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import screen_watch
+from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import watchdog as v2_watchdog
 from model_api_runtime.v2 import worker as v2_worker
 
@@ -795,6 +796,118 @@ def _read_compaction_tail(user_id: str, after_ts: float, limit: int) -> list[dic
     return _read_tail_window(user_id, after_ts, limit, oldest_first=True)
 
 
+def _summary_metadata_frontier(state: dict) -> list:
+    """Validate canonical provenance without decrypting every retained node."""
+    opened = [
+        v2_summary_frontier.SummarySegment(
+            segment_id=int(row["segment_id"]),
+            coverage_kind=str(row["coverage_kind"]),
+            level=int(row["level"]),
+            start_seq=int(row["start_seq"]),
+            end_seq=int(row["end_seq"]),
+            source_message_count=int(row["source_message_count"]),
+            legacy_opaque_through_seq=int(
+                row.get("legacy_opaque_through_seq") or 0
+            ),
+            child_segment_ids=tuple(
+                int(value) for value in (row.get("child_segment_ids") or [])
+            ),
+            # The authenticated materialized head is the prompt payload. This
+            # sentinel lets the pure validator check content-free provenance
+            # without N enclave round-trips on every ordinary turn.
+            text="<encrypted-summary-segment>",
+        )
+        for row in list(state.get("segments") or [])
+    ]
+    validated = list(
+        v2_summary_frontier.validate_canonical_frontier(
+            opened,
+            watermark_seq=int(state.get("watermark_seq") or 0),
+            first_source_seq=int(state.get("first_source_seq") or 0),
+            covered_source_count=int(state.get("covered_source_count") or 0),
+        )
+    )
+    canonical_ids = tuple(item.segment_id for item in validated)
+    materialized_ids = tuple(
+        int(value) for value in (state.get("materialized_segment_ids") or [])
+    )
+    if canonical_ids != materialized_ids:
+        raise v2_summary_frontier.SummaryFrontierIntegrityError(
+            "materialized_head_provenance_mismatch"
+        )
+    return validated
+
+
+def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
+    """Open canonical nodes only for checkpoint generation."""
+    state = jobs_store.get_summary_frontier_state(user_id)
+    if state is None:
+        return None, []
+    segment_rows = list(state.get("segments") or [])
+    if not segment_rows:
+        return state, []
+    token = _mint_runtime_token(user_id)
+    metadata = _summary_metadata_frontier(state)
+    metadata_by_id = {item.segment_id: item for item in metadata}
+    opened: list[v2_summary_frontier.SummarySegment] = []
+    for row in segment_rows:
+        env = row.get("summary_envelope")
+        if not env:
+            raise RuntimeError(
+                f"{_SUMMARY_INTEGRITY_ERROR}: segment without encrypted envelope"
+            )
+        plaintext = core_enclave._decrypt_envelope_via_enclave(
+            env,
+            None,
+            purpose="v2_summary_segment_read",
+            runtime_token=token,
+        ).decode("utf-8")
+        meta = metadata_by_id[int(row["segment_id"])]
+        opened.append(
+            v2_summary_frontier.SummarySegment(
+                segment_id=meta.segment_id,
+                coverage_kind=meta.coverage_kind,
+                level=meta.level,
+                start_seq=meta.start_seq,
+                end_seq=meta.end_seq,
+                source_message_count=meta.source_message_count,
+                legacy_opaque_through_seq=meta.legacy_opaque_through_seq,
+                child_segment_ids=meta.child_segment_ids,
+                text=plaintext,
+            )
+        )
+    return state, opened
+
+
+def _read_summary_frontier(user_id: str):
+    """Production roll-up seam: one head-version-pinned decrypted cover."""
+    state, frontier = _open_summary_frontier_state(user_id)
+    if state is None:
+        return None
+    if not frontier and state.get("summary_envelope"):
+        seeded = jobs_store.seed_legacy_summary_segment(
+            user_id,
+            expected_version=int(state.get("version") or 0),
+            translated_watermark_seq=int(state.get("watermark_seq") or 0),
+        )
+        if not seeded:
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "legacy_summary_seed_race"
+            )
+        state, frontier = _open_summary_frontier_state(user_id)
+    if state is not None and not frontier and state.get("summary_envelope"):
+        raise v2_summary_frontier.SummaryFrontierIntegrityError(
+            "legacy_summary_seed_missing"
+        )
+    if state is None or not frontier:
+        return None
+    return v2_summary_frontier.SummaryFrontierSnapshot(
+        segments=tuple(frontier),
+        head_version=int(state.get("version") or 0),
+        watermark_seq=int(state.get("watermark_seq") or 0),
+    )
+
+
 def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     """Read/decrypt summary plus its exact seq coverage watermark.
 
@@ -802,13 +915,20 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     remains during migration/observability, but prompt selection and retention
     use only ``watermark_seq``. A missing row returns all-zero metadata.
     """
-    row = jobs_store.get_summary_row(user_id)
+    row = jobs_store.get_summary_frontier_state(user_id)
     if row is None:
         return "", 0.0, 0, 0
     watermark_ts = float(row.get("watermark_ts") or 0.0)
     watermark_seq = int(row.get("watermark_seq") or 0)
     version = int(row.get("version") or 0)
     has_durable_coverage = watermark_seq > 0 or watermark_ts > 0
+    if row.get("has_segment_rows") and not row.get("segments"):
+        raise v2_summary_frontier.SummaryFrontierIntegrityError(
+            "missing_canonical_segment_rows"
+        )
+    if row.get("segments") or row.get("materialized_segment_ids"):
+        _summary_metadata_frontier(row)
+
     env = row.get("summary_envelope")
     if not env:
         if has_durable_coverage:
@@ -881,6 +1001,110 @@ def _write_summary(
         summary_envelope=env,
         watermark_ts=watermark_ts,
         expected_version=expected_version,
+    )
+
+
+def _append_summary_segment(
+    user_id: str,
+    segment_text: str,
+    *,
+    current_summary: str,
+    start_seq: int,
+    end_seq: int,
+    source_message_count: int,
+    watermark_ts: float,
+    expected_version: int,
+    previous_watermark_seq: int,
+) -> bool:
+    """Seal one leaf and atomically append it with the summary head CAS."""
+    store = core_store.get_store(user_id)
+    env, err = core_envelope._build_shared_envelope_for_store(
+        store, str(segment_text).encode("utf-8")
+    )
+    if env is None:
+        log.warning(
+            "[v2.serve_worker] summary segment envelope failed for %s: %s",
+            user_id,
+            err,
+        )
+        return False
+    compatibility_text = str(current_summary or "").rstrip()
+    if compatibility_text:
+        compatibility_text += "\n"
+    compatibility_text += str(segment_text).strip()
+    head_env, head_err = core_envelope._build_shared_envelope_for_store(
+        store, compatibility_text.encode("utf-8")
+    )
+    if head_env is None:
+        log.warning(
+            "[v2.serve_worker] summary compatibility envelope failed for %s: %s",
+            user_id,
+            head_err,
+        )
+        return False
+    return jobs_store.append_summary_leaf_cas(
+        user_id,
+        summary_envelope=env,
+        head_summary_envelope=head_env,
+        start_seq=int(start_seq),
+        end_seq=int(end_seq),
+        source_message_count=int(source_message_count),
+        watermark_ts=float(watermark_ts),
+        expected_version=int(expected_version),
+        previous_watermark_seq=int(previous_watermark_seq),
+    )
+
+
+def _append_summary_checkpoint(
+    user_id: str,
+    checkpoint_text: str,
+    *,
+    head_summary: str,
+    level: int,
+    start_seq: int,
+    end_seq: int,
+    source_message_count: int,
+    child_segment_ids: tuple[int, ...],
+    expected_version: int,
+    expected_watermark_seq: int,
+    coverage_kind: str = "exact",
+    legacy_opaque_through_seq: int = 0,
+) -> bool:
+    """Seal one derived parent; all encrypted children remain immutable."""
+    store = core_store.get_store(user_id)
+    env, err = core_envelope._build_shared_envelope_for_store(
+        store, str(checkpoint_text).encode("utf-8")
+    )
+    if env is None:
+        log.warning(
+            "[v2.serve_worker] summary checkpoint envelope failed for %s: %s",
+            user_id,
+            err,
+        )
+        return False
+    head_env, head_err = core_envelope._build_shared_envelope_for_store(
+        store, str(head_summary).encode("utf-8")
+    )
+    if head_env is None:
+        log.warning(
+            "[v2.serve_worker] checkpoint prompt-view envelope failed for %s: %s",
+            user_id,
+            head_err,
+        )
+        return False
+    return jobs_store.insert_summary_checkpoint(
+        user_id,
+        summary_envelope=env,
+        head_summary_envelope=head_env,
+        level=int(level),
+        start_seq=int(start_seq),
+        end_seq=int(end_seq),
+        source_message_count=int(source_message_count),
+        child_segment_ids=tuple(int(value) for value in child_segment_ids),
+        coverage_kind=str(coverage_kind),
+        legacy_opaque_through_seq=int(legacy_opaque_through_seq),
+        expected_version=int(expected_version),
+        expected_watermark_seq=int(expected_watermark_seq),
     )
 
 
@@ -2309,6 +2533,9 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_summary=_read_summary,
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,
+        read_summary_frontier=_read_summary_frontier,
+        append_summary_segment=_append_summary_segment,
+        append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,
         read_files=_read_files,
         read_memory_context=_read_memory_context,

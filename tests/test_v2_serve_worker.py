@@ -762,7 +762,7 @@ def test_read_summary_missing_returns_empty(monkeypatch):
     round trip attempted."""
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
-    monkeypatch.setattr(v2_jobs_store, "get_summary_row", lambda uid: None)
+    monkeypatch.setattr(v2_jobs_store, "get_summary_frontier_state", lambda uid: None)
 
     out = serve_worker._read_summary("u_summary_test")
     assert out == ("", 0.0, 0)
@@ -775,7 +775,7 @@ def test_read_summary_decrypts_present_row(monkeypatch):
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(
-        v2_jobs_store, "get_summary_row",
+        v2_jobs_store, "get_summary_frontier_state",
         lambda uid: {"summary_envelope": {"body_ct": "x"}, "watermark_ts": 7.0,
                      "watermark_seq": 19, "version": 3})
     monkeypatch.setattr(
@@ -801,7 +801,7 @@ def test_read_summary_nonzero_watermark_without_envelope_fails_closed(
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(
-        v2_jobs_store, "get_summary_row",
+        v2_jobs_store, "get_summary_frontier_state",
         lambda uid: {
             "summary_envelope": None,
             "watermark_ts": watermark_ts,
@@ -824,7 +824,7 @@ def test_read_summary_nonzero_watermark_with_empty_plaintext_fails_closed(monkey
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(
-        v2_jobs_store, "get_summary_row",
+        v2_jobs_store, "get_summary_frontier_state",
         lambda uid: {
             "summary_envelope": {"body_ct": "x"},
             "watermark_ts": 7.0,
@@ -846,7 +846,7 @@ def test_read_summary_zero_watermark_without_envelope_is_valid(monkeypatch):
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(
-        v2_jobs_store, "get_summary_row",
+        v2_jobs_store, "get_summary_frontier_state",
         lambda uid: {
             "summary_envelope": None,
             "watermark_ts": 0.0,
@@ -861,6 +861,76 @@ def test_read_summary_zero_watermark_without_envelope_is_valid(monkeypatch):
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
 
     assert serve_worker._read_summary_with_seq("u_summary_test") == ("", 0.0, 1, 0)
+
+
+def test_read_segmented_summary_requires_exact_materialized_id_binding(monkeypatch):
+    from core import enclave as core_enclave
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(
+        v2_jobs_store,
+        "get_summary_frontier_state",
+        lambda uid: {
+            "summary_envelope": {"body_ct": "authentic-but-stale"},
+            "watermark_ts": 1.0,
+            "watermark_seq": 10,
+            "version": 2,
+            "materialized_segment_ids": (999,),
+            "has_segment_rows": True,
+            "first_source_seq": 10,
+            "covered_source_count": 1,
+            "segments": [{
+                "segment_id": 1,
+                "coverage_kind": "exact",
+                "level": 0,
+                "start_seq": 10,
+                "end_seq": 10,
+                "source_message_count": 1,
+                "legacy_opaque_through_seq": 0,
+                "child_segment_ids": [],
+                "summary_envelope": {"body_ct": "leaf"},
+            }],
+        },
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("mismatched head must fail before decrypt")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
+    with pytest.raises(
+        RuntimeError, match="^v2_summary_frontier_integrity_error$"
+    ):
+        serve_worker._read_summary_with_seq("u_summary_test")
+
+
+def test_read_segmented_summary_rejects_bound_ids_without_canonical_rows(monkeypatch):
+    from core import enclave as core_enclave
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    monkeypatch.setattr(
+        v2_jobs_store,
+        "get_summary_frontier_state",
+        lambda uid: {
+            "summary_envelope": {"body_ct": "orphaned-head"},
+            "watermark_ts": 1.0,
+            "watermark_seq": 10,
+            "version": 2,
+            "materialized_segment_ids": (),
+            "has_segment_rows": True,
+            "first_source_seq": 10,
+            "covered_source_count": 1,
+            "segments": [],
+        },
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("orphaned head must fail before decrypt")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
+    with pytest.raises(
+        RuntimeError, match="^v2_summary_frontier_integrity_error$"
+    ):
+        serve_worker._read_summary_with_seq("u_summary_test")
 
 
 def test_write_summary_builds_envelope_and_cas(monkeypatch):

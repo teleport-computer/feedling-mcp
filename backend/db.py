@@ -6042,6 +6042,15 @@ def chat_clear(user_id: str) -> int | None:
                         (user_id,),
                     )
 
+                    # Immutable summary segments/checkpoints are prompt-derived
+                    # chat state.  They are never compacted/GCed automatically,
+                    # but explicit Chat clear removes them under this same
+                    # exclusive generation fence before deleting the CAS head.
+                    cur.execute(
+                        "DELETE FROM v2_conversation_summary_segments "
+                        "WHERE user_id=%s",
+                        (user_id,),
+                    )
                     cur.execute(
                         "DELETE FROM v2_conversation_summary WHERE user_id=%s",
                         (user_id,),
@@ -7123,6 +7132,8 @@ def delete_user_data(user_id: str) -> None:
     (0011)。仍被 content/content_core.py 的销号(account/reset)兜底路径调用；
     删账号主路径不再依赖它做 R2。"""
     tables = (
+        "v2_conversation_summary_segments",
+        "v2_conversation_summary",
         "chat_messages",
         "memory_moments",
         "world_book_entries",
@@ -7150,7 +7161,13 @@ def delete_user_data(user_id: str) -> None:
     # 0001_tee_baseline.py) and the model_api_* tables (0014 multi-profile,
     # added upstream after the TEE 19-table baseline; not replicated).
     tee_table_for = {"frame_envelopes": "frames"}
-    _no_tee_tables = {"genesis_import_chunks", "model_api_routes", "model_api_credentials"}
+    _no_tee_tables = {
+        "v2_conversation_summary_segments",
+        "v2_conversation_summary",
+        "genesis_import_chunks",
+        "model_api_routes",
+        "model_api_credentials",
+    }
     mirror_group = [
         (f"DELETE FROM {tee_table_for.get(table, table)} WHERE user_id = %s", (user_id,))
         for table in tables

@@ -105,6 +105,11 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
         watermark_seq=seq,
         require_source_row=True,
     )
+    assert jobs_store.seed_legacy_summary_segment(
+        uid,
+        expected_version=1,
+        translated_watermark_seq=seq,
+    )
     artifact = jobs_store.put_workspace_entry_cas(
         uid,
         "/artifacts/pre-clear.txt",
@@ -254,6 +259,7 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
             for table in (
                 "chat_messages",
                 "v2_conversation_summary",
+                "v2_conversation_summary_segments",
                 "agent_status_events",
                 "runtime_state",
                 "v2_effect_outbox",

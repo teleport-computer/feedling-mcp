@@ -79,9 +79,11 @@ change must not be interpreted as an API guarantee.
 - Runtime V2 now treats encrypted Chat rows and referenced object-storage bodies
   as the durable source ledger. Conversation compaction advances only the
   summary prompt view: it does not delete source messages, and the 5,000-message
-  limit now bounds only each process's hot cache. The current append-only summary
-  blob still needs segmented encrypted checkpoints for an indefinitely long
-  conversation.
+  limit now bounds only each process's hot cache. Conversation summaries now use
+  immutable encrypted exact-range leaves and retained higher-level checkpoints;
+  a versioned canonical-ID binding keeps the model-facing view bounded and
+  complete. Existing single-blob summaries migrate lazily, including oversized
+  accounts with no new messages.
 
 - Explicit Chat clear now advances the runtime generation and atomically removes
   raw messages, summary, chat-derived artifacts, effects/status, and reply

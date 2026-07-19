@@ -151,7 +151,49 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0045_drop_retired_supervisor").down_revision == (
         "0044_v2_workspace_batches"
     )
-    assert script.get_current_head() == "0045_drop_retired_supervisor"
+    assert script.get_revision("0046_v2_summary_segments").down_revision == (
+        "0045_drop_retired_supervisor"
+    )
+    assert script.get_current_head() == "0046_v2_summary_segments"
+
+
+def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():
+    with db.get_pool().connection() as conn:
+        columns = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='v2_conversation_summary_segments'"
+            ).fetchall()
+        }
+        head_column = conn.execute(
+            "SELECT is_nullable,column_default FROM information_schema.columns "
+            "WHERE table_name='v2_conversation_summary' "
+            "AND column_name='materialized_segment_ids'"
+        ).fetchone()
+        triggers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND "
+                "tgrelid IN ('v2_conversation_summary'::regclass,"
+                "'v2_conversation_summary_segments'::regclass)"
+            ).fetchall()
+        }
+    assert {
+        "segment_id",
+        "coverage_kind",
+        "level",
+        "start_seq",
+        "end_seq",
+        "source_message_count",
+        "legacy_opaque_through_seq",
+        "child_segment_ids",
+        "summary_envelope",
+    } <= columns
+    assert head_column is not None and head_column[0] == "NO"
+    assert "trg_v2_summary_segments_immutable" in triggers
+    assert "trg_v2_segmented_summary_head" in triggers
+    assert "trg_v2_summary_head_delete_segments" in triggers
 
 
 def test_0041_indexes_and_validated_frontier_constraint_exist():

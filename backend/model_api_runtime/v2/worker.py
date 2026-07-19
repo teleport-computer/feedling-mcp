@@ -66,6 +66,7 @@ from model_api_runtime.v2 import kill_switch
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
+from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
 from model_api_runtime.v2 import trajectory as v2_trajectory
 
@@ -263,6 +264,20 @@ _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200"
 _COMPACTION_BATCH_CHARS = _positive_int_env(
     "FEEDLING_V2_COMPACTION_BATCH_CHARS", "120000"
 )
+_SUMMARY_ROLLUP_FANOUT = _positive_int_env(
+    "FEEDLING_V2_SUMMARY_ROLLUP_FANOUT", "8"
+)
+_SUMMARY_FRONTIER_MAX_SEGMENTS = _positive_int_env(
+    "FEEDLING_V2_SUMMARY_FRONTIER_MAX_SEGMENTS", "24"
+)
+_SUMMARY_FRONTIER_MAX_CHARS = _positive_int_env(
+    "FEEDLING_V2_SUMMARY_FRONTIER_MAX_CHARS", "48000"
+)
+_SUMMARY_ROLLUP_MAX_PASSES = _positive_int_env(
+    "FEEDLING_V2_SUMMARY_ROLLUP_MAX_PASSES", "32"
+)
+if _SUMMARY_ROLLUP_FANOUT < 2:
+    raise RuntimeError("FEEDLING_V2_SUMMARY_ROLLUP_FANOUT must be at least 2")
 # Catch-up may legitimately need many successful batches (for example after a
 # long worker outage), but it must not monopolise a turn forever.  This is an
 # overall wall-clock bound; the per-provider timeout remains independently
@@ -553,6 +568,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         (
             v2_prompt_frontier.PromptContextLimitUnconfigured,
             v2_prompt_frontier.PromptFrontierExhausted,
+            v2_summary_frontier.SummaryFrontierIntegrityError,
+            v2_summary_frontier.SummaryFrontierExhausted,
         ),
     ):
         # Frontier errors expose explicit, content-free protocol codes. Preserve
@@ -618,6 +635,15 @@ class TurnDeps:
     # 批次最后一行的精确 seq 时才会传它（生产路径总是能拿到；某些窄签名的测试 fake 只接 4
     # 个参数，_run_compaction 会退化成旧的 4 参调用，两边都不破）。
     write_summary: Callable[..., bool] | None = None
+    # Segmented production path. Leaf summaries and higher-level checkpoints
+    # are immutable encrypted rows; ``read_summary_with_seq`` renders only the
+    # validated canonical cover. Legacy write_summary remains for isolated
+    # callers and rolling rollback compatibility.
+    read_summary_frontier: Callable[
+        [str], "v2_summary_frontier.SummaryFrontierSnapshot | None"
+    ] | None = None
+    append_summary_segment: Callable[..., bool] | None = None
+    append_summary_checkpoint: Callable[..., bool] | None = None
     # (user_id, message_ids) -> {message_id: {"image_mime": str, "image_b64": str}}：只对
     # 指定的图片消息做 enclave 解密。**不能**并进 read_tail —— compaction 用 limit=10_000 调
     # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
@@ -2630,6 +2656,218 @@ async def _compaction_llm_with_progress(*args: Any, **kwargs: Any) -> Any:
     )
 
 
+async def _rebalance_summary_frontier(
+    user_id: str,
+    deps: TurnDeps,
+    *,
+    provider_config: Any,
+    enclave_sem: "asyncio.Semaphore | None",
+    claimed_by: str | None = None,
+    job_id=None,
+    add_usage: Callable[[dict | None], None] | None = None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+) -> list:
+    """Roll immutable canonical nodes up until the prompt frontier is bounded.
+
+    Children are never updated or deleted. A failed/invalid provider response
+    inserts nothing, and a racing checkpoint writer is handled by re-reading
+    the canonical cover. Exhaustion is loud so no caller can substitute silent
+    truncation for a complete historical representation.
+    """
+    if (
+        deps.read_summary_frontier is None
+        or deps.append_summary_checkpoint is None
+    ):
+        return []
+
+    async def _read_frontier():
+        if enclave_sem is None:
+            return await asyncio.to_thread(deps.read_summary_frontier, user_id)
+        async with enclave_sem:
+            return await asyncio.to_thread(deps.read_summary_frontier, user_id)
+
+    no_progress = 0
+    for _pass in range(_SUMMARY_ROLLUP_MAX_PASSES):
+        snapshot = await _read_frontier()
+        if snapshot is None:
+            return []
+        if not isinstance(snapshot, v2_summary_frontier.SummaryFrontierSnapshot):
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "unversioned_frontier_snapshot"
+            )
+        frontier = list(snapshot.segments)
+        candidate = v2_summary_frontier.choose_rollup_candidate(
+            frontier,
+            fanout=_SUMMARY_ROLLUP_FANOUT,
+            max_frontier_segments=_SUMMARY_FRONTIER_MAX_SEGMENTS,
+            max_frontier_chars=_SUMMARY_FRONTIER_MAX_CHARS,
+            max_rollup_input_chars=_COMPACTION_BATCH_CHARS,
+        )
+        if candidate is None:
+            return frontier
+
+        _report_turn_progress("summary_checkpoint_start")
+        checkpoint_messages = [item.text for item in candidate.children]
+
+        async def _recording_checkpoint_llm(*args: Any, **kwargs: Any) -> Any:
+            # A legacy aggregate may require several bounded map/reduce calls.
+            # Refresh ownership between them so useful progress cannot finish
+            # under an expired job lease and then publish stale coverage.
+            if claimed_by and job_id is not None:
+                renewed = await asyncio.to_thread(
+                    jobs_store.renew_job_lease,
+                    job_id,
+                    claimed_by,
+                    ttl_sec=jobs_store.RUNNING_TTL_SEC,
+                )
+                if not renewed:
+                    raise LostJobLease("summary checkpoint lease lost")
+            if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
+                deps.runtime_mode_enabled, user_id
+            ):
+                raise RuntimeModeChanged(
+                    "user rolled back during summary checkpoint"
+                )
+            messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
+            await _record_trajectory(
+                trajectory_recorder,
+                "provider_request",
+                {
+                    "lane": "summary_checkpoint",
+                    "child_segment_ids": list(candidate.child_segment_ids),
+                    "messages": messages,
+                    "tools": None,
+                },
+            )
+            try:
+                result = await _compaction_llm_with_progress(*args, **kwargs)
+            except Exception as exc:
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "provider_error",
+                    {
+                        "lane": "summary_checkpoint",
+                        "error_class": type(exc).__name__,
+                    },
+                    best_effort=True,
+                )
+                raise
+            await _record_trajectory(
+                trajectory_recorder,
+                "provider_response",
+                {"lane": "summary_checkpoint", "response": result},
+            )
+            return result
+
+        try:
+            checkpoint = await v2_compaction.compact_checkpoint(
+                provider_config=provider_config,
+                child_summaries=checkpoint_messages,
+                llm=_recording_checkpoint_llm,
+                usage_out=add_usage,
+            )
+        except v2_compaction.CheckpointCompactionExhausted as exc:
+            raise v2_summary_frontier.SummaryFrontierExhausted(
+                "checkpoint_work_budget_exhausted"
+            ) from exc
+        if checkpoint is None:
+            raise v2_summary_frontier.SummaryFrontierExhausted(
+                "invalid_checkpoint_output"
+            )
+        materialized_head = v2_summary_frontier.render_replacement(
+            frontier,
+            child_segment_ids=candidate.child_segment_ids,
+            parent_text=checkpoint,
+        )
+        if claimed_by and job_id is not None:
+            renewed = await asyncio.to_thread(
+                jobs_store.renew_job_lease,
+                job_id,
+                claimed_by,
+                ttl_sec=jobs_store.RUNNING_TTL_SEC,
+            )
+            if not renewed:
+                raise LostJobLease("summary checkpoint lease lost")
+        if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
+            deps.runtime_mode_enabled, user_id
+        ):
+            raise RuntimeModeChanged("user rolled back before summary checkpoint")
+        inserted = await asyncio.to_thread(
+            deps.append_summary_checkpoint,
+            user_id,
+            checkpoint,
+            head_summary=materialized_head,
+            level=candidate.parent_level,
+            start_seq=candidate.start_seq,
+            end_seq=candidate.end_seq,
+            source_message_count=candidate.source_message_count,
+            child_segment_ids=candidate.child_segment_ids,
+            coverage_kind=candidate.coverage_kind,
+            legacy_opaque_through_seq=candidate.legacy_opaque_through_seq,
+            expected_version=snapshot.head_version,
+            expected_watermark_seq=snapshot.watermark_seq,
+        )
+        _report_turn_progress("summary_checkpoint_complete")
+        if inserted:
+            no_progress = 0
+            continue
+        no_progress += 1
+        if no_progress >= 3:
+            raise v2_summary_frontier.SummaryFrontierExhausted(
+                "checkpoint_cas_no_progress"
+            )
+    raise v2_summary_frontier.SummaryFrontierExhausted(
+        "checkpoint_pass_budget_exhausted"
+    )
+
+
+async def _bound_materialized_summary(
+    user_id: str,
+    summary: str,
+    deps: TurnDeps,
+    *,
+    provider_config: Any,
+    enclave_sem: "asyncio.Semaphore",
+    claimed_by: str | None,
+    job_id,
+    add_usage: Callable[[dict | None], None] | None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
+) -> str:
+    """Repair an over-target summary view before final per-route admission.
+
+    The 48K character target keeps ordinary audited large-context routes well
+    away from their edge; it is not a substitute for the model-specific total
+    prompt frontier. Custom/small routes still pass through the exact fail-closed
+    provider-round budget after messages and tools are assembled.
+    """
+    if (
+        len(str(summary)) <= _SUMMARY_FRONTIER_MAX_CHARS
+        or deps.read_summary_frontier is None
+        or deps.append_summary_checkpoint is None
+        or deps.read_summary_with_seq is None
+    ):
+        return summary
+    await _rebalance_summary_frontier(
+        user_id,
+        deps,
+        provider_config=provider_config,
+        enclave_sem=enclave_sem,
+        claimed_by=claimed_by,
+        job_id=job_id,
+        add_usage=add_usage,
+        trajectory_recorder=trajectory_recorder,
+    )
+    async with enclave_sem:
+        bounded, _watermark_ts, _version, _watermark_seq = await asyncio.to_thread(
+            deps.read_summary_with_seq, user_id
+        )
+    if len(str(bounded)) > _SUMMARY_FRONTIER_MAX_CHARS:
+        raise v2_summary_frontier.SummaryFrontierExhausted(
+            "materialized_prompt_view_over_target"
+        )
+    return bounded
+
+
 async def _run_compaction(
     job_id,
     user_id: str,
@@ -2640,8 +2878,8 @@ async def _run_compaction(
     tm: "TurnMetrics | None" = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
 ) -> str:
-    """maintenance-lane 压缩：把超预算 tail 的最旧一批折进加密 summary（append-and-merge，
-    CAS 原子写，见 `model_api_runtime.v2.compaction.compact` + `jobs_store.upsert_summary_row_cas`）。
+    """maintenance-lane 压缩：把超预算 tail 的最旧一批写成加密不可变 leaf，
+    再按需生成同样不可变的分层 checkpoint；raw chat 永不因压缩而删除。
     用户 BYOK key（provider_config 已由 `_run_turn` 单次解密并传入，压缩本身不再多解密一次）。
 
     自成一体、自己的 try/except：这是后台维护 job，绝不写聊天气泡、失败绝不给用户弹
@@ -2649,6 +2887,20 @@ async def _run_compaction(
     静默 `mark_failed`，跟 chat turn 的用户可见失败路径彻底分开。
     """
     try:
+        # Rebalance first, then read the head/version used by this leaf CAS.
+        # A checkpoint increments the head version; reading first would waste
+        # one provider call on a predictably stale leaf and force a retry job.
+        if deps.read_summary_frontier is not None:
+            await _rebalance_summary_frontier(
+                user_id,
+                deps,
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=tm.add_call if tm is not None else None,
+                trajectory_recorder=trajectory_recorder,
+            )
         async with enclave_sem:
             if deps.read_summary_with_seq is not None and (
                 deps.read_compaction_tail_after_seq is not None
@@ -2700,6 +2952,13 @@ async def _run_compaction(
                 new_watermark_seq = await asyncio.to_thread(
                     db.chat_seq_for_msg_id, user_id, last_id
                 )
+        first_watermark_seq = old[0].get("seq")
+        if first_watermark_seq is None:
+            first_id = old[0].get("id")
+            if first_id is not None:
+                first_watermark_seq = await asyncio.to_thread(
+                    db.chat_seq_for_msg_id, user_id, first_id
+                )
         _report_turn_progress("compaction_batch_start")
 
         async def _recording_compaction_llm(*args: Any, **kwargs: Any) -> Any:
@@ -2726,16 +2985,32 @@ async def _run_compaction(
             )
             return result
 
-        new_summary = await v2_compaction.compact(
-            provider_config=provider_config,
-            current_summary=summary,
-            old_messages=old,
-            llm=_recording_compaction_llm,
-            usage_out=tm.add_call if tm is not None else None,
+        segmented_write = (
+            deps.append_summary_segment is not None
+            and new_watermark_seq is not None
+            and first_watermark_seq is not None
+            and deps.read_summary_with_seq is not None
         )
+        if segmented_write:
+            segment_text = await v2_compaction.compact_segment(
+                provider_config=provider_config,
+                old_messages=old,
+                llm=_recording_compaction_llm,
+                usage_out=tm.add_call if tm is not None else None,
+            )
+            new_summary = segment_text or ""
+        else:
+            new_summary = await v2_compaction.compact(
+                provider_config=provider_config,
+                current_summary=summary,
+                old_messages=old,
+                llm=_recording_compaction_llm,
+                usage_out=tm.add_call if tm is not None else None,
+            )
         _report_turn_progress("compaction_batch_complete")
         if (
-            new_summary.strip() == summary.strip()
+            (segmented_write and not new_summary.strip())
+            or (not segmented_write and new_summary.strip() == summary.strip())
         ):  # 空/no-op 折叠 → 不推进 watermark/version
             await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by
@@ -2758,7 +3033,20 @@ async def _run_compaction(
         # 稀缺的 enclave_sem——只有解密才走 enclave HTTP（见 _read_summary/_read_tail）。
         # watermark_seq 只在算出来时才多传一个位置参数（见上）——narrow-signature 的旧
         # fake（不接这个参数）走的正是这条 4 参分支，不受影响。
-        if new_watermark_seq is not None:
+        if segmented_write:
+            ok = await asyncio.to_thread(
+                deps.append_summary_segment,
+                user_id,
+                new_summary,
+                current_summary=summary,
+                start_seq=int(first_watermark_seq),
+                end_seq=int(new_watermark_seq),
+                source_message_count=len(old),
+                watermark_ts=new_watermark,
+                expected_version=version,
+                previous_watermark_seq=int(watermark_seq),
+            )
+        elif new_watermark_seq is not None:
             ok = await asyncio.to_thread(
                 deps.write_summary,
                 user_id,
@@ -2772,6 +3060,17 @@ async def _run_compaction(
                 deps.write_summary, user_id, new_summary, new_watermark, version
             )
         if ok:
+            if segmented_write:
+                await _rebalance_summary_frontier(
+                    user_id,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                )
             completed = await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by
             )
@@ -2965,6 +3264,7 @@ async def _ensure_prompt_coverage(
     claimed_by: str | None = None,
     catchup_deadline_sec: float | None = None,
     add_usage: Callable[[dict | None], None] | None = None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
 ) -> tuple[int, int]:
     """D6 (Task 10): close a compaction backlog gap BEFORE assembling a turn's
     prompt. Today's bug: ``_read_tail`` only ever returns the newest
@@ -3104,7 +3404,10 @@ async def _ensure_prompt_coverage(
         )
         if (
             no_progress_attempts >= max_retries
-            or deps.write_summary is None
+            or (
+                deps.write_summary is None
+                and deps.append_summary_segment is None
+            )
             or not (seq_callbacks or legacy_callbacks)
         ):
             raise TurnError("prompt_coverage_incomplete")
@@ -3161,17 +3464,61 @@ async def _ensure_prompt_coverage(
             raise TurnError("prompt_coverage_incomplete")
         attempted_since_observation = True
         _report_turn_progress("prompt_catchup_batch_start")
-        new_summary = await _within_deadline(
-            lambda: v2_compaction.compact(
-                provider_config=provider_config,
-                current_summary=summary,
-                old_messages=old,
-                llm=_compaction_llm_with_progress,
-                usage_out=add_usage,
-            )
+        segmented_write = (
+            seq_callbacks
+            and deps.append_summary_segment is not None
+            and len(summary_fields) >= 4
         )
+
+        async def _recording_catchup_llm(*args: Any, **kwargs: Any) -> Any:
+            messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
+            await _record_trajectory(
+                trajectory_recorder,
+                "provider_request",
+                {"lane": "prompt_catchup", "messages": messages, "tools": None},
+            )
+            try:
+                result = await _compaction_llm_with_progress(*args, **kwargs)
+            except Exception as exc:
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "provider_error",
+                    {"lane": "prompt_catchup", "error_class": type(exc).__name__},
+                    best_effort=True,
+                )
+                raise
+            await _record_trajectory(
+                trajectory_recorder,
+                "provider_response",
+                {"lane": "prompt_catchup", "response": result},
+            )
+            return result
+
+        if segmented_write:
+            segment_text = await _within_deadline(
+                lambda: v2_compaction.compact_segment(
+                    provider_config=provider_config,
+                    old_messages=old,
+                    llm=_recording_catchup_llm,
+                    usage_out=add_usage,
+                )
+            )
+            new_summary = segment_text or ""
+        else:
+            new_summary = await _within_deadline(
+                lambda: v2_compaction.compact(
+                    provider_config=provider_config,
+                    current_summary=summary,
+                    old_messages=old,
+                    llm=_recording_catchup_llm,
+                    usage_out=add_usage,
+                )
+            )
         _report_turn_progress("prompt_catchup_batch_complete")
-        if new_summary.strip() == summary.strip():
+        if (
+            (segmented_write and not new_summary.strip())
+            or (not segmented_write and new_summary.strip() == summary.strip())
+        ):
             # Genuine no-op fold (empty/failed LLM reply — mirrors
             # `_run_compaction`'s identical guard). Do NOT advance the
             # watermark: these messages were NOT actually folded into the
@@ -3188,15 +3535,55 @@ async def _ensure_prompt_coverage(
         await _renew_catchup_lease()
         new_watermark_ts = old[-1]["ts"]
         new_watermark_seq = old[-1].get("seq")
+        first_watermark_seq = old[0].get("seq")
+        if first_watermark_seq is None:
+            first_id = old[0].get("id")
+            if first_id is not None:
+                first_watermark_seq = await _within_deadline(
+                    lambda: asyncio.to_thread(
+                        db.chat_seq_for_msg_id, user_id, first_id
+                    )
+                )
         if new_watermark_seq is None:
             last_id = old[-1].get("id")
             if last_id is not None:
                 new_watermark_seq = await _within_deadline(
                     lambda: asyncio.to_thread(db.chat_seq_for_msg_id, user_id, last_id)
                 )
-        if seq_callbacks and new_watermark_seq is None:
+        if seq_callbacks and (
+            new_watermark_seq is None
+            or (segmented_write and first_watermark_seq is None)
+        ):
             raise TurnError("prompt_coverage_incomplete")
-        if new_watermark_seq is not None:
+        if segmented_write:
+            wrote = await _within_deadline(
+                lambda: asyncio.to_thread(
+                    deps.append_summary_segment,
+                    user_id,
+                    new_summary,
+                    current_summary=summary,
+                    start_seq=int(first_watermark_seq),
+                    end_seq=int(new_watermark_seq),
+                    source_message_count=len(old),
+                    watermark_ts=new_watermark_ts,
+                    expected_version=version,
+                    previous_watermark_seq=int(summary_fields[3]),
+                )
+            )
+            if wrote:
+                await _within_deadline(
+                    lambda: _rebalance_summary_frontier(
+                        user_id,
+                        deps,
+                        provider_config=provider_config,
+                        enclave_sem=enclave_sem,
+                        claimed_by=claimed_by,
+                        job_id=job_id,
+                        add_usage=add_usage,
+                        trajectory_recorder=trajectory_recorder,
+                    )
+                )
+        elif new_watermark_seq is not None:
             await _within_deadline(
                 lambda: asyncio.to_thread(
                     deps.write_summary,
@@ -3332,6 +3719,7 @@ async def _run_wake(
                 job_id=job_id,
                 claimed_by=claimed_by,
                 add_usage=tm.add_call if tm is not None else None,
+                trajectory_recorder=trajectory_recorder,
             )
         async with enclave_sem:
             if seq_context:
@@ -3361,6 +3749,17 @@ async def _run_wake(
             tail = await asyncio.to_thread(
                 _inject_tail_files, tail, user_id=user_id, read_files=deps.read_files
             )
+        summary = await _bound_materialized_summary(
+            user_id,
+            summary,
+            deps,
+            provider_config=provider_config,
+            enclave_sem=enclave_sem,
+            claimed_by=claimed_by,
+            job_id=job_id,
+            add_usage=tm.add_call if tm is not None else None,
+            trajectory_recorder=trajectory_recorder,
+        )
         if seq_context:
             await _assert_prompt_tail_exact(
                 user_id,
@@ -4485,6 +4884,7 @@ async def process_job(
                 job_id=job_id,
                 claimed_by=claimed_by,
                 add_usage=tm.add_call,
+                trajectory_recorder=trajectory_recorder,
             )
             async with enclave_sem:
                 if seq_context:
@@ -4527,6 +4927,17 @@ async def process_job(
                     user_id=user_id,
                     read_files=deps.read_files,
                 )
+            summary = await _bound_materialized_summary(
+                user_id,
+                summary,
+                deps,
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=tm.add_call,
+                trajectory_recorder=trajectory_recorder,
+            )
             # Post-assembly hard assertion (D6): independent re-derivation,
             # not a reuse of `_ensure_prompt_coverage`'s return — see
             # `_assert_prompt_covers`'s docstring for why.

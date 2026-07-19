@@ -23,7 +23,7 @@
 | Requirement | Current status | Evidence and remaining gap |
 |---|---|---|
 | No silent wedges | ✅ | Admission checks the turn-worker heartbeat; pending jobs have queue deadlines and a reaper; terminal failures publish `error` status and `last_runtime_error`; the worker contains turn exceptions; provider I/O is async. A dead pool must fail visibly rather than leave a message in `processing` forever. |
-| Full conversation, not a fixed message window | ⚠️ | The prompt is built from an encrypted, append-only itemized summary plus a verbatim tail. Raw encrypted chat rows and attached R2 bodies are retained independently of compaction; the former 5,000-row value now bounds only the process hot window. The summary itself still grows forever; immutable encrypted summary segments and higher-level checkpoints are the remaining long-horizon task. |
+| Full conversation, not a fixed message window | ✅ | The prompt is built from an encrypted hierarchical summary frontier plus a verbatim tail. Raw encrypted chat rows and attached R2 bodies are retained independently of compaction; the former 5,000-row value bounds only the process hot window. Exact immutable leaf segments and immutable higher-level checkpoints keep the model-facing view bounded without deleting children or rewriting the source transcript. |
 | One native agent loop for every model | ✅ | Chat and wake use the same in-process provider-native tool loop. There is no `official`/`rule` tier, planner, or separate responder. A model that does not call a tool naturally returns once; malformed tool output gets bounded compatibility handling, not pre-assigned model routing. |
 | Reply inside the loop; eager late-message folding | ✅ | `reply` is a loop tool, so the model may acknowledge the user and continue working. New user messages are claimed without debounce and folded at every round boundary. |
 | Parallel tool use | ✅ | A provider turn may request a batch of tools. Independent reads and bounded `task` subagents execute concurrently. Disjoint workspace writes can execute in conflict-free waves while same/ancestor/descendant paths serialize; externally effectful platform/MCP mutations remain provider-ordered. Results are reconstructed in provider order. |
@@ -122,15 +122,23 @@ before the private read result existed in the model transcript.
 
 ## Conversation storage and prompt frontier
 
-V2 does not send ciphertext to the model. Chat content and the append-only
-summary are encrypted at rest in database-backed storage. The trusted runtime
-decrypts the selected summary and verbatim tail in memory, renders ordinary
-model-readable messages, and sends those plaintext messages over the user's
-configured provider connection.
+V2 does not send ciphertext to the model. Chat content, immutable summary
+segments, higher-level checkpoints, and the bounded materialized summary view
+are encrypted at rest in database-backed storage. The trusted runtime decrypts
+the selected view and verbatim tail in memory, renders ordinary model-readable
+messages, and sends those plaintext messages over the user's configured
+provider connection.
 
-Every source message must be covered: either by the committed append-only
-summary watermark or verbatim in the tail. Compaction appends itemized facts;
-it does not rewrite the full conversation into a new lossy summary.
+Every source message must be covered: either by the committed summary watermark
+or verbatim in the tail. New compaction batches become exact immutable leaf
+segments carrying their source-sequence range and row-count witness. A
+checkpoint names the exact ordered child IDs it summarizes; the children remain
+stored and immutable. The head CAS binds one encrypted, bounded materialized
+prompt view to the exact canonical segment IDs, so a partial or stale writer
+cannot silently publish an incomplete history. A pre-segmentation deployed
+summary is retained as an encrypted `legacy_opaque` leaf; even an oversized old
+blob can be reduced through bounded map/reduce provider calls without requiring
+a new chat message.
 
 Coverage is a prompt invariant, never a retention authorization. The durable
 `chat_messages` rows and their encrypted attachment bodies are not automatically
@@ -149,9 +157,11 @@ The **total prompt frontier** is the complete per-round budget calculation over
 the rendered system text, summary, verbatim messages, images, exact tool
 schemas, tool transcript, newly folded input, output reserve, and safety
 headroom. If required context no longer fits, V2 fails visibly. It does not
-silently truncate required history. The remaining long-horizon design is to
-replace one ever-growing summary blob with immutable encrypted segments and
-append-only higher-level checkpoints while preserving this coverage invariant.
+silently truncate required history. The hierarchical summary frontier targets a
+48,000-character materialized history view, but that storage/maintenance target
+does not replace the exact provider/model-specific total prompt calculation.
+Checkpoint creation changes only the dynamic summary portion after the stable
+system/tool/skill cache boundary.
 
 ## Prompt-cache boundaries and live evidence
 
@@ -305,15 +315,13 @@ identity cannot stand in for the fleet.
 
 1. Run the authoritative concurrent workload on target CVM-class hardware and
    complete the fault/recovery and cohort-soak gates.
-2. Add immutable encrypted summary segments and higher-level checkpoints before
-   a real conversation reaches the total prompt frontier.
-3. Design and instrument safe typing pre-warm; measure first-request/first-token
+2. Design and instrument safe typing pre-warm; measure first-request/first-token
    p50/p95 and wasted-prewarm rate.
-4. Define operator retention/export policy and restricted inspection tooling for
+3. Define operator retention/export policy and restricted inspection tooling for
    encrypted trajectories; neither is required by the live agent loop.
-5. Extend the live prompt-cache canary to exercise skills/working-memory
+4. Extend the live prompt-cache canary to exercise skills/working-memory
    boundaries and native Bedrock where credentials are available.
-6. Provision the second production runner, deploy the reviewed V2-only images
+5. Provision the second production runner, deploy the reviewed V2-only images
    across every live environment, and verify zero hosted resident processes.
 
 The encrypted workspace, artifact materialization boundary, optional E2B
@@ -341,6 +349,8 @@ At minimum, current-status changes should remain covered by:
 - `tests/test_v2_turn_metrics.py`
 - `tests/test_v2_summary_store.py`
 - `tests/test_v2_summary_watermark_seq.py`
+- `tests/test_v2_summary_frontier_unit.py`
+- `tests/test_v2_summary_frontier_store.py`
 - `tests/test_v2_prompt_invariant.py`
 - `tests/test_v2_p0_history_safety.py`
 - `tests/test_v2_gc_coverage_gate.py`

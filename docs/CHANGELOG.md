@@ -81,9 +81,12 @@
   compatible with later outbound work.
 - Raw encrypted Chat rows and attachment bodies remain the durable ledger. The
   5,000-message value is only an in-process hot-window bound, never a database
-  retention rule. The remaining full-conversation task is to replace the one
-  ever-growing summary blob with immutable encrypted segments and higher-level
-  checkpoints.
+  retention rule. Runtime V2 now stores exact-range conversation-summary leaves
+  and higher-level checkpoints as immutable encrypted rows, retains every child,
+  and binds a bounded materialized prompt view to the canonical IDs with a
+  versioned CAS. Existing aggregate summaries migrate lazily and oversized old
+  summaries are reduced through bounded hierarchical calls even without a new
+  message.
 - Explicit Chat clear is now a generation-fenced atomic reset of raw messages,
   summary, chat-derived artifacts, pending effects/status, and reply cursor.
   Paused old workers cannot recreate cleared context. Independent Memory,

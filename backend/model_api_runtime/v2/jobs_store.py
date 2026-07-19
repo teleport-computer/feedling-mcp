@@ -2152,7 +2152,8 @@ def get_summary_row(user_id) -> dict | None:
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT summary_envelope, watermark_ts, version, watermark_seq "
+                "SELECT summary_envelope, watermark_ts, version, watermark_seq,"
+                "materialized_segment_ids "
                 "FROM v2_conversation_summary WHERE user_id=%s",
                 (user_id,),
             )
@@ -2161,7 +2162,10 @@ def get_summary_row(user_id) -> dict | None:
         return None
     watermark_ts = float(row["watermark_ts"])
     watermark_seq = int(row["watermark_seq"] or 0)
-    if watermark_seq == 0 and watermark_ts > 0:
+    materialized_segment_ids = tuple(
+        int(value) for value in (row["materialized_segment_ids"] or [])
+    )
+    if watermark_seq == 0 and watermark_ts > 0 and not materialized_segment_ids:
         watermark_seq = db.seq_for_watermark_ts(user_id, watermark_ts)
     return {
         "summary_envelope": dict(row["summary_envelope"])
@@ -2170,6 +2174,7 @@ def get_summary_row(user_id) -> dict | None:
         "watermark_ts": watermark_ts,
         "version": int(row["version"]),
         "watermark_seq": watermark_seq,
+        "materialized_segment_ids": materialized_segment_ids,
     }
 
 
@@ -2241,6 +2246,569 @@ def upsert_summary_row_cas(
                         ),
                     )
                 return cur.rowcount == 1
+
+
+def get_summary_frontier_state(user_id) -> dict | None:
+    """Return the immutable canonical summary cover plus exact DB witnesses.
+
+    Checkpoints coexist with their retained children.  A child is absent from
+    the canonical cover only when a higher-level segment wholly contains its
+    range.  Rows beyond the committed head watermark are never considered,
+    which keeps a read that raced a later leaf append self-consistent.
+
+    The returned envelopes are still encrypted.  ``first_source_seq`` and
+    ``covered_source_count`` are content-free witnesses computed from retained
+    ``chat_messages``; the assembly layer validates them after decrypting the
+    canonical nodes and fails closed on any mismatch.
+    """
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                # One repeatable-read snapshot binds the head/version/materialized
+                # IDs to the canonical rows and source witnesses. A checkpoint
+                # committing between separate reads must not manufacture a false
+                # integrity failure on an otherwise healthy live turn.
+                cur.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                cur.execute(
+                    "SELECT summary_envelope,watermark_ts,version,watermark_seq,"
+                    "materialized_segment_ids,EXISTS(SELECT 1 FROM "
+                    "v2_conversation_summary_segments s WHERE s.user_id=%s) "
+                    "AS has_segment_rows FROM v2_conversation_summary "
+                    "WHERE user_id=%s",
+                    (user_id, user_id),
+                )
+                raw_head = cur.fetchone()
+                if raw_head is None:
+                    return None
+                watermark_ts = float(raw_head["watermark_ts"])
+                watermark_seq = int(raw_head["watermark_seq"] or 0)
+                raw_materialized_ids = tuple(
+                    int(value)
+                    for value in (raw_head["materialized_segment_ids"] or [])
+                )
+                if (
+                    watermark_seq == 0
+                    and watermark_ts > 0
+                    and not raw_materialized_ids
+                ):
+                    cur.execute(
+                        "SELECT COALESCE(MAX(seq),0) AS seq FROM chat_messages "
+                        "WHERE user_id=%s AND ts<%s",
+                        (user_id, watermark_ts),
+                    )
+                    watermark_seq = int(cur.fetchone()["seq"] or 0)
+                head = {
+                    "summary_envelope": dict(raw_head["summary_envelope"])
+                    if raw_head["summary_envelope"] is not None
+                    else None,
+                    "watermark_ts": watermark_ts,
+                    "version": int(raw_head["version"]),
+                    "watermark_seq": watermark_seq,
+                    "materialized_segment_ids": raw_materialized_ids,
+                    "has_segment_rows": bool(raw_head["has_segment_rows"]),
+                }
+                cur.execute(
+                    "WITH eligible AS ("
+                    " SELECT s.* FROM v2_conversation_summary_segments s "
+                    " WHERE s.user_id=%s AND s.end_seq<=%s"
+                    "), canonical AS ("
+                    " SELECT child.* FROM eligible child "
+                    " WHERE NOT EXISTS ("
+                    "   SELECT 1 FROM eligible parent "
+                    "   WHERE parent.level>child.level "
+                    "     AND parent.start_seq<=child.start_seq "
+                    "     AND parent.end_seq>=child.end_seq"
+                    " )"
+                    ") SELECT segment_id,format_version,coverage_kind,level,"
+                    "start_seq,end_seq,source_message_count,"
+                    "legacy_opaque_through_seq,child_segment_ids,summary_envelope "
+                    "FROM canonical ORDER BY start_seq,end_seq,level DESC",
+                    (user_id, watermark_seq),
+                )
+                segment_rows = [dict(row) for row in cur.fetchall()]
+                opaque_through = max(
+                    (
+                        int(row.get("legacy_opaque_through_seq") or 0)
+                        for row in segment_rows
+                        if row.get("coverage_kind") == "legacy_opaque"
+                    ),
+                    default=0,
+                )
+                if segment_rows:
+                    cur.execute(
+                        "SELECT COALESCE(MIN(seq),0) AS first_seq,"
+                        "COUNT(*) AS source_count FROM chat_messages "
+                        "WHERE user_id=%s AND seq>%s AND seq<=%s",
+                        (user_id, opaque_through, watermark_seq),
+                    )
+                    witness = cur.fetchone()
+                else:
+                    # Pre-segmentation heads are intentionally accepted as
+                    # opaque until lazy seeding. Their old watermark cannot
+                    # supply an exact source-count proof, and a full-history
+                    # COUNT on every ordinary rollout turn would be pure waste.
+                    witness = {"first_seq": 0, "source_count": 0}
+    return {
+        **head,
+        "segments": segment_rows,
+        "first_source_seq": int(witness["first_seq"]),
+        "covered_source_count": int(witness["source_count"]),
+    }
+
+
+def append_summary_leaf_cas(
+    user_id,
+    *,
+    summary_envelope: dict,
+    head_summary_envelope: dict | None = None,
+    start_seq: int,
+    end_seq: int,
+    source_message_count: int,
+    watermark_ts: float,
+    expected_version: int,
+    previous_watermark_seq: int,
+) -> bool:
+    """Append one immutable level-0 segment and advance the head atomically.
+
+    The previous single-blob row remains the CAS/watermark head.  On the first
+    segmented write, any existing legacy encrypted blob is copied verbatim into
+    one retained level-0 segment covering its already-committed source range.
+    Subsequent segment rows are never rewritten.  The head envelope is a
+    bounded, rollback-compatible materialized prompt view bound atomically to
+    the exact canonical segment IDs; normal turns decrypt it once, while
+    checkpoint work opens the immutable canonical nodes themselves.
+    """
+    start = int(start_seq)
+    end = int(end_seq)
+    count = int(source_message_count)
+    expected = int(expected_version)
+    previous = int(previous_watermark_seq)
+    compatibility_envelope = dict(head_summary_envelope or summary_envelope or {})
+    if start <= 0 or end < start or count <= 0 or expected < 0 or previous < 0:
+        raise ValueError("invalid summary leaf metadata")
+    if previous and start <= previous:
+        raise ValueError("summary leaf does not advance the watermark")
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                cur.execute(
+                    "SELECT summary_envelope,watermark_ts,version,watermark_seq "
+                    "FROM v2_conversation_summary WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                head = cur.fetchone()
+                if head is None:
+                    if expected != 0 or previous != 0:
+                        return False
+                else:
+                    if int(head["version"]) != expected:
+                        return False
+                    stored_previous = int(head["watermark_seq"] or 0)
+                    if stored_previous not in {0, previous}:
+                        return False
+
+                # Exact retained-row witness: a seq range may contain other
+                # users' global identities, so count only this user's rows.
+                cur.execute(
+                    "SELECT COALESCE(MIN(seq),0) AS first_seq,"
+                    "COALESCE(MAX(seq),0) AS last_seq,COUNT(*) AS n "
+                    "FROM chat_messages WHERE user_id=%s AND seq>%s AND seq<=%s",
+                    (user_id, previous, end),
+                )
+                source = cur.fetchone()
+                if (
+                    int(source["first_seq"]) != start
+                    or int(source["last_seq"]) != end
+                    or int(source["n"]) != count
+                ):
+                    return False
+
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM v2_conversation_summary_segments "
+                    "WHERE user_id=%s",
+                    (user_id,),
+                )
+                segment_count = int(cur.fetchone()["n"])
+                if segment_count == 0 and head is not None:
+                    legacy_envelope = head["summary_envelope"]
+                    if not legacy_envelope:
+                        return False
+                    legacy_end = previous if previous > 0 else max(0, start - 1)
+                    cur.execute(
+                        "INSERT INTO v2_conversation_summary_segments "
+                        "(user_id,format_version,coverage_kind,level,start_seq,end_seq,"
+                        " source_message_count,legacy_opaque_through_seq,"
+                        " child_segment_ids,summary_envelope) "
+                        "VALUES (%s,1,'legacy_opaque',0,0,%s,0,%s,"
+                        "'{}'::BIGINT[],%s)",
+                        (
+                            user_id,
+                            legacy_end,
+                            legacy_end,
+                            Jsonb(dict(legacy_envelope)),
+                        ),
+                    )
+
+                cur.execute(
+                    "INSERT INTO v2_conversation_summary_segments "
+                    "(user_id,format_version,coverage_kind,level,start_seq,end_seq,"
+                    " source_message_count,legacy_opaque_through_seq,"
+                    " child_segment_ids,summary_envelope) "
+                    "VALUES (%s,1,'exact',0,%s,%s,%s,0,'{}'::BIGINT[],%s) "
+                    "RETURNING segment_id",
+                    (
+                        user_id,
+                        start,
+                        end,
+                        count,
+                        Jsonb(dict(summary_envelope or {})),
+                    ),
+                )
+                leaf_id = int(cur.fetchone()["segment_id"])
+                cur.execute(
+                    "WITH eligible AS ("
+                    " SELECT s.* FROM v2_conversation_summary_segments s "
+                    " WHERE s.user_id=%s AND s.end_seq<=%s"
+                    "), canonical AS ("
+                    " SELECT child.* FROM eligible child WHERE NOT EXISTS ("
+                    "   SELECT 1 FROM eligible parent "
+                    "   WHERE parent.level>child.level "
+                    "     AND parent.start_seq<=child.start_seq "
+                    "     AND parent.end_seq>=child.end_seq"
+                    " )"
+                    ") SELECT segment_id FROM canonical "
+                    "ORDER BY start_seq,end_seq,level DESC",
+                    (user_id, end),
+                )
+                materialized_ids = [
+                    int(row["segment_id"]) for row in cur.fetchall()
+                ]
+                if not materialized_ids or materialized_ids[-1] != leaf_id:
+                    raise RuntimeError("new summary leaf is not canonical")
+                if head is None:
+                    cur.execute(
+                        "INSERT INTO v2_conversation_summary "
+                        "(user_id,summary_envelope,watermark_ts,version,watermark_seq,"
+                        " materialized_segment_ids) VALUES (%s,%s,%s,1,%s,%s)",
+                        (
+                            user_id,
+                            Jsonb(compatibility_envelope),
+                            float(watermark_ts),
+                            end,
+                            materialized_ids,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE v2_conversation_summary SET summary_envelope=%s,"
+                        "watermark_ts=%s,watermark_seq=%s,version=version+1,"
+                        "materialized_segment_ids=%s,updated_at=now() "
+                        "WHERE user_id=%s AND version=%s",
+                        (
+                            Jsonb(compatibility_envelope),
+                            float(watermark_ts),
+                            end,
+                            materialized_ids,
+                            user_id,
+                            expected,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise RuntimeError("summary head lock lost")
+                return True
+
+
+def seed_legacy_summary_segment(
+    user_id,
+    *,
+    expected_version: int,
+    translated_watermark_seq: int,
+) -> bool:
+    """Atomically bind a pre-segmentation head as one opaque immutable leaf.
+
+    This is the no-new-message migration path for an oversized legacy summary.
+    It copies the already-encrypted envelope; no plaintext enters the DB layer.
+    A concurrent leaf/checkpoint/clear either wins before the head lock or loses
+    its version/generation fence, so the materialized binding is never partial.
+    """
+    expected = int(expected_version)
+    translated = int(translated_watermark_seq)
+    if expected <= 0 or translated < 0:
+        raise ValueError("invalid legacy summary seed metadata")
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                cur.execute(
+                    "SELECT summary_envelope,version,watermark_seq,"
+                    "materialized_segment_ids FROM v2_conversation_summary "
+                    "WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                head = cur.fetchone()
+                if head is None:
+                    return False
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM v2_conversation_summary_segments "
+                    "WHERE user_id=%s",
+                    (user_id,),
+                )
+                if int(cur.fetchone()["n"]) > 0:
+                    # A legitimate concurrent seeder commits the segment and
+                    # its head-ID binding in one transaction, so it must also
+                    # have advanced the version we originally observed.  Do
+                    # not bless an orphan/corrupt segment set as a successful
+                    # lazy migration.
+                    return bool(tuple(head["materialized_segment_ids"] or ())) and (
+                        int(head["version"]) > expected
+                    )
+                if (
+                    int(head["version"]) != expected
+                    or tuple(head["materialized_segment_ids"] or ())
+                    or not head["summary_envelope"]
+                ):
+                    return False
+                stored = int(head["watermark_seq"] or 0)
+                if stored not in {0, translated}:
+                    return False
+                opaque_end = max(stored, translated)
+                cur.execute(
+                    "INSERT INTO v2_conversation_summary_segments "
+                    "(user_id,format_version,coverage_kind,level,start_seq,end_seq,"
+                    " source_message_count,legacy_opaque_through_seq,"
+                    " child_segment_ids,summary_envelope) "
+                    "VALUES (%s,1,'legacy_opaque',0,0,%s,0,%s,"
+                    "'{}'::BIGINT[],%s) RETURNING segment_id",
+                    (
+                        user_id,
+                        opaque_end,
+                        opaque_end,
+                        Jsonb(dict(head["summary_envelope"])),
+                    ),
+                )
+                segment_id = int(cur.fetchone()["segment_id"])
+                cur.execute(
+                    "UPDATE v2_conversation_summary SET watermark_seq=%s,"
+                    "materialized_segment_ids=%s,version=version+1,updated_at=now() "
+                    "WHERE user_id=%s AND version=%s",
+                    (opaque_end, [segment_id], user_id, expected),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("legacy summary seed CAS lost")
+                return True
+
+
+def insert_summary_checkpoint(
+    user_id,
+    *,
+    summary_envelope: dict,
+    head_summary_envelope: dict,
+    level: int,
+    start_seq: int,
+    end_seq: int,
+    source_message_count: int,
+    child_segment_ids: list[int] | tuple[int, ...],
+    expected_version: int,
+    expected_watermark_seq: int,
+    coverage_kind: str = "exact",
+    legacy_opaque_through_seq: int = 0,
+) -> bool:
+    """Insert one immutable parent over an exact current canonical run.
+
+    Locking the summary head serializes competing checkpoint writers without
+    mutating the head.  The chat-user fence prevents an in-flight pre-clear
+    provider result from recreating a checkpoint after explicit history clear.
+    """
+    child_ids = tuple(int(value) for value in child_segment_ids)
+    parent_level = int(level)
+    start = int(start_seq)
+    end = int(end_seq)
+    count = int(source_message_count)
+    coverage = str(coverage_kind)
+    opaque_through = int(legacy_opaque_through_seq)
+    expected = int(expected_version)
+    expected_watermark = int(expected_watermark_seq)
+    if (
+        parent_level <= 0
+        or (coverage == "exact" and start <= 0)
+        or (coverage == "legacy_opaque" and start != 0)
+        or end < start
+        or count < 0
+        or not child_ids
+        or len(child_ids) != len(set(child_ids))
+        or coverage not in {"exact", "legacy_opaque"}
+        or (coverage == "exact" and (count <= 0 or opaque_through != 0))
+        or (
+            coverage == "legacy_opaque"
+            and (opaque_through < 0 or opaque_through > end)
+        )
+        or expected <= 0
+        or expected_watermark < 0
+    ):
+        raise ValueError("invalid summary checkpoint metadata")
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                cur.execute(
+                    "SELECT watermark_seq,version,materialized_segment_ids "
+                    "FROM v2_conversation_summary "
+                    "WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                head = cur.fetchone()
+                if (
+                    head is None
+                    or int(head["watermark_seq"] or 0) != expected_watermark
+                    or int(head["version"] or 0) != expected
+                    or expected_watermark < end
+                ):
+                    return False
+                cur.execute(
+                    "WITH eligible AS ("
+                    " SELECT s.* FROM v2_conversation_summary_segments s "
+                    " WHERE s.user_id=%s AND s.end_seq<=%s"
+                    "), canonical AS ("
+                    " SELECT child.* FROM eligible child WHERE NOT EXISTS ("
+                    "   SELECT 1 FROM eligible parent "
+                    "   WHERE parent.level>child.level "
+                    "     AND parent.start_seq<=child.start_seq "
+                    "     AND parent.end_seq>=child.end_seq"
+                    " )"
+                    ") SELECT segment_id FROM canonical "
+                    "ORDER BY start_seq,end_seq,level DESC",
+                    (user_id, expected_watermark),
+                )
+                canonical_before = tuple(
+                    int(row["segment_id"]) for row in cur.fetchall()
+                )
+                if canonical_before != tuple(
+                    int(value) for value in head["materialized_segment_ids"]
+                ):
+                    return False
+                cur.execute(
+                    "SELECT segment_id,coverage_kind,level,start_seq,end_seq,"
+                    "source_message_count,legacy_opaque_through_seq,child_segment_ids "
+                    "FROM v2_conversation_summary_segments "
+                    "WHERE user_id=%s AND segment_id=ANY(%s) "
+                    "ORDER BY start_seq,end_seq,level DESC",
+                    (user_id, list(child_ids)),
+                )
+                children = [dict(row) for row in cur.fetchall()]
+                if len(children) != len(child_ids):
+                    return False
+                ordered_ids = tuple(int(row["segment_id"]) for row in children)
+                if ordered_ids != child_ids:
+                    return False
+                if (
+                    int(children[0]["start_seq"]) != start
+                    or int(children[-1]["end_seq"]) != end
+                    or sum(int(row["source_message_count"]) for row in children)
+                    != count
+                    or parent_level <= max(int(row["level"]) for row in children)
+                    or (
+                        coverage == "legacy_opaque"
+                        and opaque_through
+                        != max(int(row["legacy_opaque_through_seq"] or 0)
+                               for row in children)
+                    )
+                    or (
+                        coverage == "exact"
+                        and any(row["coverage_kind"] != "exact" for row in children)
+                    )
+                ):
+                    return False
+                for left, right in zip(children, children[1:]):
+                    if int(left["end_seq"]) >= int(right["start_seq"]):
+                        return False
+
+                # The supplied children must be the entire current canonical
+                # cover inside [start,end].  This rejects partial/crossing
+                # parents and makes containment-based projection unambiguous.
+                cur.execute(
+                    "WITH eligible AS ("
+                    " SELECT s.* FROM v2_conversation_summary_segments s "
+                    " WHERE s.user_id=%s AND s.end_seq<=("
+                    "   SELECT watermark_seq FROM v2_conversation_summary "
+                    "   WHERE user_id=%s"
+                    " )"
+                    "), canonical AS ("
+                    " SELECT child.* FROM eligible child WHERE NOT EXISTS ("
+                    "   SELECT 1 FROM eligible parent "
+                    "   WHERE parent.level>child.level "
+                    "     AND parent.start_seq<=child.start_seq "
+                    "     AND parent.end_seq>=child.end_seq"
+                    " )"
+                    ") SELECT segment_id FROM canonical "
+                    "WHERE start_seq>=%s AND end_seq<=%s "
+                    "ORDER BY start_seq,end_seq,level DESC",
+                    (user_id, user_id, start, end),
+                )
+                canonical_ids = tuple(int(row["segment_id"]) for row in cur.fetchall())
+                if canonical_ids != child_ids:
+                    return False
+                cur.execute(
+                    "INSERT INTO v2_conversation_summary_segments "
+                    "(user_id,format_version,coverage_kind,level,start_seq,end_seq,"
+                    " source_message_count,legacy_opaque_through_seq,"
+                    " child_segment_ids,summary_envelope) "
+                    "VALUES (%s,1,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (user_id,level,start_seq,end_seq) DO NOTHING "
+                    "RETURNING segment_id",
+                    (
+                        user_id,
+                        coverage,
+                        parent_level,
+                        start,
+                        end,
+                        count,
+                        opaque_through,
+                        list(child_ids),
+                        Jsonb(dict(summary_envelope or {})),
+                    ),
+                )
+                inserted = cur.fetchone()
+                if inserted is None:
+                    return False
+                parent_id = int(inserted["segment_id"])
+                cur.execute(
+                    "WITH eligible AS ("
+                    " SELECT s.* FROM v2_conversation_summary_segments s "
+                    " WHERE s.user_id=%s AND s.end_seq<=%s"
+                    "), canonical AS ("
+                    " SELECT child.* FROM eligible child WHERE NOT EXISTS ("
+                    "   SELECT 1 FROM eligible parent "
+                    "   WHERE parent.level>child.level "
+                    "     AND parent.start_seq<=child.start_seq "
+                    "     AND parent.end_seq>=child.end_seq"
+                    " )"
+                    ") SELECT segment_id FROM canonical "
+                    "ORDER BY start_seq,end_seq,level DESC",
+                    (user_id, expected_watermark),
+                )
+                materialized_ids = [
+                    int(row["segment_id"]) for row in cur.fetchall()
+                ]
+                if parent_id not in materialized_ids:
+                    raise RuntimeError("new summary checkpoint is not canonical")
+                cur.execute(
+                    "UPDATE v2_conversation_summary SET summary_envelope=%s,"
+                    "materialized_segment_ids=%s,version=version+1,updated_at=now() "
+                    "WHERE user_id=%s AND version=%s AND watermark_seq=%s",
+                    (
+                        Jsonb(dict(head_summary_envelope or {})),
+                        materialized_ids,
+                        user_id,
+                        expected,
+                        expected_watermark,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("summary head checkpoint CAS lost")
+                return True
 
 
 # ---------------------------------------------------------------------------

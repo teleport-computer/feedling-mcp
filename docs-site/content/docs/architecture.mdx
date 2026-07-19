@@ -67,14 +67,17 @@ protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
 
-Runtime V2 builds each turn from an encrypted itemized summary plus every
-uncovered source message verbatim. The trusted runner decrypts that selected
-view in memory before sending ordinary plaintext messages to the configured
-model. The durable encrypted `chat_messages` rows and referenced object-storage
-bodies remain the source ledger: compaction does not delete them, and the
-5,000-message constant bounds only a process-local hot window. The current
-single summary blob still grows over time; immutable encrypted segments and
-higher-level checkpoints are the remaining long-horizon prompt-bound task.
+Runtime V2 builds each turn from an encrypted hierarchical summary frontier plus
+every uncovered source message verbatim. The trusted runner decrypts that
+selected view in memory before sending ordinary plaintext messages to the
+configured model. Exact immutable leaf segments carry source-range/count
+witnesses; immutable higher-level checkpoints retain and name their ordered
+children, while one encrypted materialized view keeps ordinary turns to a
+single summary decrypt. The durable encrypted `chat_messages` rows and
+referenced object-storage bodies remain the source ledger: compaction never
+deletes them, and the 5,000-message constant bounds only a process-local hot
+window. Only explicit Chat clear or account deletion removes this conversation
+data.
 
 An [independent resident consumer](/docs/workflows/chat#independent-resident-loop)
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
