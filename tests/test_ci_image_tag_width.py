@@ -30,7 +30,9 @@ def test_image_tags_use_one_fixed_width_github_sha_prefix():
     # One producer assignment plus every main/test/pre main+runner deploy wait
     # and pin assignment. A variable-length `git rev-parse --short` can produce
     # different widths in the publisher's shallow clone and deploy's full clone.
-    assert len(assignments) == 14
+    # The shared production preflight adds one assignment and proves both
+    # backend + mandatory runner images before either live CVM is mutated.
+    assert len(assignments) == 15
     assert set(assignments) == {'"${GITHUB_SHA:0:7}"'}
 
 

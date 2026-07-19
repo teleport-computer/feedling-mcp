@@ -46,3 +46,23 @@ def test_main_deploy_depends_on_topology_preflight():
     assert "validate-prod-runner-topology:" in workflow
     deploy = workflow.split("\n  deploy-cvm:\n", 1)[1].split("\n  deploy-test-cvm:\n", 1)[0]
     assert "validate-prod-runner-topology" in "\n".join(deploy.split("\n", 8)[0:8])
+
+
+def test_prod_inventory_and_fleet_gates_trigger_the_shared_preflight():
+    workflow = WORKFLOW.read_text()
+    prod_filter = workflow.split("\n  detect-cvm-changes:\n", 1)[1].split(
+        "\n  detect-cvm-changes-test:\n", 1
+    )[0]
+    for path in (
+        "deploy/prod-runner-cvm-ids.txt",
+        "deploy/check-prod-runner-topology.sh",
+        "deploy/check-v2-runner-fleet.py",
+    ):
+        assert path in prod_filter
+    assert "tools/chat_resident_consumer.py" not in prod_filter
+
+    preflight = workflow.split("\n  validate-prod-runner-topology:\n", 1)[1].split(
+        "\n  detect-cvm-changes-pre:\n", 1
+    )[0]
+    assert "feedling feedling-agent-runner" in preflight
+    assert "docker manifest inspect" in preflight

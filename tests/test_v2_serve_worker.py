@@ -215,6 +215,20 @@ def test_managed_fleet_worker_id_rejects_arbitrary_override(monkeypatch):
         serve_worker.runner_identity.resolve_worker_id(lambda: "ephemeral")
 
 
+def test_main_rejects_invalid_fleet_identity_before_schema_mutation(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_FLEET_IDENTITY_REQUIRED", "1")
+    monkeypatch.delenv("FEEDLING_V2_RUNNER_CVM_ID", raising=False)
+    monkeypatch.delenv("FEEDLING_V2_DEPLOYED_BUILD", raising=False)
+    monkeypatch.delenv("FEEDLING_V2_WORKER_ID", raising=False)
+    schema_calls = []
+    monkeypatch.setattr(serve_worker.db, "init_schema", lambda: schema_calls.append(1))
+
+    with pytest.raises(RuntimeError, match="requires both"):
+        serve_worker.main()
+
+    assert schema_calls == []
+
+
 def test_build_production_deps_returns_turndeps():
     deps = serve_worker.build_production_deps()
     assert isinstance(deps, worker.TurnDeps)

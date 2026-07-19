@@ -287,13 +287,15 @@ jobs:
           filters: |
             cvm:
               - 'backend/**'
-              - 'tools/chat_resident_consumer.py'
               - 'tools/deploy_canary.py'
               - 'deploy/attestation-gate.sh'
               - 'deploy/Dockerfile'
               - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.yaml'
               - 'deploy/docker-compose.phala.prod.runner.yaml'
+              - 'deploy/prod-runner-cvm-ids.txt'
+              - 'deploy/check-prod-runner-topology.sh'
+              - 'deploy/check-v2-runner-fleet.py'
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
 
@@ -313,7 +315,6 @@ jobs:
           filters: |
             cvm:
               - 'backend/**'
-              - 'tools/chat_resident_consumer.py'
               - 'tools/deploy_canary.py'
               - 'deploy/attestation-gate.sh'
               - 'deploy/Dockerfile'
@@ -326,17 +327,44 @@ jobs:
   # Runtime V2 has no resident fallback. Fail before mutating live state unless
   # at least two independent production worker CVMs are recorded.
   validate-prod-runner-topology:
-    name: validate prod runner topology
+    name: validate prod deploy prerequisites
     needs: [detect-cvm-changes]
     if: |
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&
       needs.detect-cvm-changes.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
       - name: Require two production Runtime V2 worker CVMs
         run: ./deploy/check-prod-runner-topology.sh deploy/prod-runner-cvm-ids.txt
+      - name: Require both production images before mutating either CVM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          for name in feedling feedling-agent-runner; do
+            image="ghcr.io/${IMAGE_OWNER}/${name}:$SHA_SHORT"
+            echo "waiting for $image"
+            found=0
+            for i in $(seq 1 60); do
+              if docker manifest inspect "$image" >/dev/null 2>&1; then
+                found=1
+                break
+              fi
+              sleep 10
+            done
+            if [ "$found" != 1 ]; then
+              echo "::error::$image did not appear in 10 min — no production CVM was changed"
+              exit 1
+            fi
+          done
 
   detect-cvm-changes-pre:
     name: detect CVM changes (pre)
@@ -354,7 +382,6 @@ jobs:
           filters: |
             cvm:
               - 'backend/**'
-              - 'tools/chat_resident_consumer.py'
               - 'tools/deploy_canary.py'
               - 'tools/prompt_cache_canary.py'
               - 'deploy/attestation-gate.sh'

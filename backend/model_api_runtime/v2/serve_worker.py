@@ -3053,6 +3053,10 @@ def _run_forever(worker_id: str, poll_interval: float) -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    # Validate the deployment-supplied fleet identity before migrations or any
+    # other durable side effect. A mis-targeted production container must fail
+    # without first applying an irreversible schema upgrade.
+    worker_id = runner_identity.resolve_worker_id(_default_worker_id)
     db_pool_max = _configure_db_pool_capacity(v2_worker.MAX_WORKERS)
     # Schema single-point for this standalone process (idempotent — see
     # db.init_schema docstring). The ASGI backend's gunicorn on_starting also
@@ -3061,7 +3065,6 @@ def main() -> None:
     # not assume the schema is already at head.
     db.init_schema()
     wire_assembly()
-    worker_id = runner_identity.resolve_worker_id(_default_worker_id)
     poll_interval = _positive_float_env("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0")
     log.info(
         "[v2.serve_worker] configured db_pool_max=%s for max_workers=%s",
