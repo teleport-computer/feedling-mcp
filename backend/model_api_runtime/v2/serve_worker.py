@@ -517,7 +517,7 @@ def _resolve_provider(user_id: str):
         token = _mint_runtime_token(user_id)
     except Exception as e:  # noqa: BLE001
         return None, {"error": "runtime_token_mint_failed", "detail": str(e)[:160]}
-    # api_key=None: hosted/host-all turns never hold the user's long-term
+    # api_key=None: Runtime V2 turns never hold the user's long-term
     # Feedling API key — only the runtime token authenticates to the enclave.
     runtime = hosted_config_store._load_runtime_provider_config(
         store, None, runtime_token=token
@@ -2356,7 +2356,7 @@ def _build_scheduler_deps():
         fire_scheduled=_fire_scheduled_for_user,
         # capture/dream 抽取 lane 生产者（Task 4）：extraction_users 列出当前处于 db_action_v2
         # 模式的用户（admin_core.list_runtime_modes 已按模式分组，取 db_action_v2 那组即
-        # list_agent_runtime_enabled_users 的反集，无需另起一条查询）；_tick_extraction_for_user
+        # 与 hosted eligibility 同源，无需另起一条查询）；_tick_extraction_for_user
         # 逐用户跑 capture+dream 触发闸，各自命中安静窗口/夜间阈值时 enqueue 一个抽取 job。
         # scheduler.py 同样用 getattr 探测这两个属性（缺一即整段跳过，既有 FakeDeps 零改动）。
         extraction_users=lambda: (

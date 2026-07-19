@@ -101,7 +101,7 @@ def test_teardown_failure_is_a_hard_failure() -> None:
 
 def test_hosted_503_retry_reuses_client_message_id(monkeypatch) -> None:
     responses = [
-        FakeResponse(503, {"error": "hosting_runtime_unavailable"}),
+        FakeResponse(503, {"error": "workers_unavailable"}),
         FakeResponse(202, {"user_message": {"id": "m1", "ts": 123.5}}),
     ]
 

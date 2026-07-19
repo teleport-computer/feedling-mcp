@@ -283,125 +283,6 @@ def set_config(key: str, value: bytes) -> None:
     mirror.execute(sql, (key, value))
 
 
-# Retired resident-supervisor compatibility records. Managed hosted execution
-# neither writes nor reads these rows; Runtime V2 liveness uses its own typed
-# turn-worker heartbeats. Keep the helpers only while old rows remain in schema
-# and account deletion/TEE reconciliation must understand them.
-AGENT_RUNTIME_SUPERVISOR_HEARTBEAT_KEY = "agent_runtime_supervisor_heartbeat"
-
-
-def set_supervisor_heartbeat(payload: dict) -> None:
-    """Upsert the supervisor's global heartbeat (JSON in server_config)."""
-    set_config(AGENT_RUNTIME_SUPERVISOR_HEARTBEAT_KEY,
-               json.dumps(payload).encode("utf-8"))
-
-
-def read_supervisor_heartbeat() -> dict | None:
-    """Return the parsed supervisor heartbeat, or None when the row is absent or
-    malformed. Raises on a DB/connection error so the caller can fail-open rather
-    than mistake an outage for "no supervisor" (which would 503 every send)."""
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT value FROM server_config WHERE key = %s",
-            (AGENT_RUNTIME_SUPERVISOR_HEARTBEAT_KEY,),
-        ).fetchone()
-    if row is None:
-        return None
-    try:
-        obj = json.loads(bytes(row[0]))
-    except Exception:
-        return None
-    return obj if isinstance(obj, dict) else None
-
-
-# Per-owner supervisor heartbeats (migration 0009). Unlike the single global key
-# above, each runner writes its OWN row keyed by ``owner`` ("<host>:<pid>"), so
-# multiple runners don't clobber one another. The backend's wedge guard lists
-# these and treats the cluster as live iff any fresh row is actually hosting.
-# Liveness alone is in the lease table; this row additionally carries the
-# cluster-capability flags (host_all/gateway) + shard/capacity config.
-
-def set_supervisor_instance_heartbeat(owner: str, payload: dict) -> None:
-    """Upsert this runner's heartbeat row. ``payload`` is the rich heartbeat dict;
-    the typed columns are projected out of it for cheap aggregation, and the full
-    dict is also stored as JSONB for diagnostics. ``updated_at`` is stamped now()."""
-    def _i(key, default=0):
-        try:
-            return int(payload.get(key, default))
-        except (TypeError, ValueError):
-            return default
-    sql = (
-        "INSERT INTO agent_runtime_supervisor_heartbeats "
-        "(owner, host, shard_index, shard_count, max_children, active_children, "
-        " host_all, gateway, version, payload, updated_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
-        "ON CONFLICT (owner) DO UPDATE SET "
-        "  host = EXCLUDED.host, shard_index = EXCLUDED.shard_index, "
-        "  shard_count = EXCLUDED.shard_count, max_children = EXCLUDED.max_children, "
-        "  active_children = EXCLUDED.active_children, host_all = EXCLUDED.host_all, "
-        "  gateway = EXCLUDED.gateway, version = EXCLUDED.version, "
-        "  payload = EXCLUDED.payload, updated_at = now()"
-    )
-    params = (
-        str(owner),
-        payload.get("host"),
-        _i("shard_index", 0),
-        _i("shard_count", 1),
-        _i("max_children", 0),
-        _i("active_children", 0),
-        bool(payload.get("host_all")),
-        bool(payload.get("gateway")),
-        payload.get("version"),
-        json.dumps(payload),
-    )
-    with get_pool().connection() as conn:
-        conn.execute(sql, params)
-    from tee_shadow import mirror
-    mirror.execute(sql, params)
-
-
-def list_supervisor_instance_heartbeats() -> list[dict]:
-    """All runner heartbeat rows. Each dict carries the typed flags plus ``ts``
-    (the row's ``updated_at`` as an epoch float) so the caller can age-filter in
-    pure code. Freshness/aggregation is the guard's job, not this query's. Raises
-    on a DB error so the caller can fall back to the legacy key."""
-    with get_pool().connection() as conn:
-        rows = conn.execute(
-            "SELECT owner, host, shard_index, shard_count, max_children, "
-            "       active_children, host_all, gateway, version, "
-            "       extract(epoch FROM updated_at) AS ts, payload "
-            "FROM agent_runtime_supervisor_heartbeats"
-        ).fetchall()
-    out = []
-    for r in rows:
-        # ``pi`` has no promoted column (unlike host_all/gateway) — the supervisor
-        # only writes it into ``payload``. It MUST be read back out, or the wedge
-        # guard's ``hb.get("pi")`` is None → falsy → supervisor_pi_disabled → every
-        # pi-driver send 503s. See test_supervisor_instance_heartbeat_roundtrips_
-        # the_pi_capability_bit.
-        payload = r[10] if isinstance(r[10], dict) else {}
-        out.append({
-            "owner": r[0], "host": r[1], "shard_index": r[2], "shard_count": r[3],
-            "max_children": r[4], "active_children": r[5],
-            "host_all": bool(r[6]), "gateway": bool(r[7]), "version": r[8],
-            "ts": float(r[9]),
-            "pi": bool(payload.get("pi")),
-        })
-    return out
-
-
-def prune_supervisor_instance_heartbeats(max_age_sec: float) -> None:
-    """Delete heartbeat rows older than ``max_age_sec`` (dead runners that never
-    released). Best-effort housekeeping so the table doesn't accrete forever."""
-    sql = ("DELETE FROM agent_runtime_supervisor_heartbeats "
-           "WHERE updated_at < now() - make_interval(secs => %s)")
-    params = (float(max_age_sec),)
-    with get_pool().connection() as conn:
-        conn.execute(sql, params)
-    from tee_shadow import mirror
-    mirror.execute(sql, params)
-
-
 # ---------------------------------------------------------------------------
 # Global (non-per-user) JSON documents
 # ---------------------------------------------------------------------------
@@ -2456,10 +2337,8 @@ def hosted_runtime_config_mutation_lock(user_id: str):
 def list_hosted_runtime_eligible_controls() -> list[tuple[str, str, str, int]]:
     """Runnable hosted users and their control tuples in one DB snapshot.
 
-    Startup policy reconciliation must see resident users, V2 users, and
-    split-brain rows alike.  Reusing ``list_agent_runtime_enabled_users`` here
-    would miss blob-mode V2 users because that function is intentionally the
-    *resident* roster and excludes them.
+    Startup policy reconciliation must see unset, V2, and inconsistent control
+    rows alike; it is independent of the retired per-user process roster.
     """
     with get_pool().connection() as conn:
         rows = conn.execute(
@@ -2521,63 +2400,6 @@ def list_hosted_runtime_nonresident_controls() -> list[tuple[str, str, str, int]
         (str(user_id), str(mode), str(state), int(generation))
         for user_id, mode, state, generation in rows
     ]
-
-
-def list_agent_runtime_enabled_users() -> list[dict]:
-    """Compatibility roster for explicitly external resident consumers.
-
-    Managed hosted execution does not call this function: Runtime V2 eligibility
-    uses its own ownership controls and worker queue. The historical labels are
-    retained only for out-of-process/self-hosted consumers that deliberately use
-    the separate ``/v1/chat/*`` product path.
-
-    Returns [{"user_id","driver","provider","model","base_url","supports_responses",
-    "reasoning_effort"}] sorted by user_id.
-
-    Database failures propagate rather than being coerced to an authoritative
-    empty external roster."""
-    with get_pool().connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT r.user_id,
-              CASE LOWER(c.provider)
-                WHEN 'anthropic' THEN 'claude'
-                WHEN 'claude'    THEN 'claude'
-                WHEN 'deepseek'  THEN 'claude'
-                WHEN 'openai'    THEN 'codex'
-                ELSE 'pi'
-              END AS driver,
-              LOWER(c.provider) AS provider,
-              r.model AS model,
-              c.base_url AS base_url,
-              c.supports_responses AS supports_responses,
-              COALESCE(r.reasoning_effort, '') AS reasoning_effort
-            FROM model_api_routes r
-            JOIN model_api_credentials c ON c.id = r.credential_id
-            WHERE r.is_active
-              AND r.test_status = 'ok'
-              AND LOWER(c.provider) = ANY(%s)
-              -- D0 exclusivity guard (Hosted Runtime V2): a user flipped to
-              -- db_action_v2 runs on the V2 worker pool, so drop them from the
-              -- resident roster to prevent a double-run. hosted_runtime_mode
-              -- still lives in the user_blobs 'model_api_runtime' profile even
-              -- after the model-api-multi-profile migration moved provider
-              -- config into model_api_routes/credentials.
-              AND NOT EXISTS (
-                SELECT 1 FROM user_blobs mrt
-                WHERE mrt.user_id = r.user_id
-                  AND mrt.kind = 'model_api_runtime'
-                  AND COALESCE(mrt.doc->>'hosted_runtime_mode', '') = 'db_action_v2'
-              )
-            ORDER BY r.user_id
-            """,
-            (list(HOSTED_RUNTIME_SUPPORTED_PROVIDERS),),
-        ).fetchall()
-    return [{"user_id": uid, "driver": driver, "provider": provider,
-             "model": model, "base_url": base_url,
-             "supports_responses": bool(supports_responses),
-             "reasoning_effort": reasoning_effort}
-            for uid, driver, provider, model, base_url, supports_responses, reasoning_effort in rows]
 
 
 def try_stamp_hosted_tick(user_id: str, doc: dict, now: float, interval_sec: float) -> bool:
@@ -7309,7 +7131,6 @@ def delete_user_data(user_id: str) -> None:
         "user_blobs",
         "perception_items",
         "perception_daily",
-        "agent_runtime_instances",
         "genesis_import_chunks",
         "genesis_import_outputs",
         "genesis_import_jobs",

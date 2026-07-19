@@ -834,61 +834,13 @@ def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
         pass  # observability must never affect the turn
 
 
-# Stage D: when hosted, the supervisor writes a short-lived runtime token to this
-# file (and refreshes it). We authenticate with the token instead of the
-# long-term API key, re-reading the file so refreshes are picked up. Unset/empty
-# (e.g. a self-hosted VPS user) → we keep using X-API-Key, unchanged.
-FEEDLING_RUNTIME_TOKEN_FILE = os.environ.get("FEEDLING_RUNTIME_TOKEN_FILE", "").strip()
-
-
-def _runtime_token_exp(token: str) -> float | None:
-    """Read the ``exp`` claim from a runtime token WITHOUT verifying its signature
-    (no secret here). Lets us avoid sending a token we can already see is expired.
-    Returns the exp epoch, or None if unparseable."""
-    try:
-        payload_b64 = token.split(".", 1)[0]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
-        return float(claims.get("exp"))
-    except Exception:
-        return None
-
-
-def _refresh_auth_header() -> None:
-    """Choose the request auth header from the runtime-token file (Stage D).
-
-    Uses the token only when the file holds one that is NOT already expired
-    (decoding its ``exp``); otherwise falls back to the long-term api key. This
-    avoids wedging on a stale token if the supervisor stops refreshing the file.
-    Mutates ``_HEADERS`` in place so all existing call sites pick it up."""
-    if not FEEDLING_RUNTIME_TOKEN_FILE:
-        return
-    token = ""
-    try:
-        token = Path(FEEDLING_RUNTIME_TOKEN_FILE).read_text().strip()
-    except OSError:
-        token = ""
-    exp = _runtime_token_exp(token) if token else None
-    fresh = exp is not None and exp > time.time() + 5  # small skew margin
-    if fresh:
-        _HEADERS.pop("X-API-Key", None)
-        _HEADERS["X-Feedling-Runtime-Token"] = token
-    else:
-        _HEADERS.pop("X-Feedling-Runtime-Token", None)
-        _HEADERS["X-API-Key"] = FEEDLING_API_KEY
-
-
-_refresh_auth_header()  # adopt a token immediately if one is already present
-
-
 # ---------------------------------------------------------------------------
 # Self-update — keep a self-hosted resident on the commit the backend deploys.
 #
 # The backend advertises its deployed commit in the chat-poll response
 # (``client_release.expected_consumer_commit``). When ours differs AND the
 # difference actually touches a file this consumer loads, we fetch + checkout
-# that commit and re-exec in place. Hosted (supervisor-managed CVM) runs are
-# excluded — their code is baked into an attested, immutable image.
+# that commit and re-exec in place.
 # ---------------------------------------------------------------------------
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -901,11 +853,6 @@ AUTO_UPDATE = os.environ.get("FEEDLING_AUTO_UPDATE", "1").strip().lower() not in
     "off",
     "",
 )
-# A runtime-token file is only written by the in-CVM supervisor — treat its
-# presence as "hosted" and never self-mutate there.
-_HOSTED = bool(FEEDLING_RUNTIME_TOKEN_FILE)
-
-
 def _runtime_repo_files() -> set[str]:
     """Repo-relative ``.py`` files this process actually loaded (auto-derived
     dependency whitelist), plus files distributed alongside us that never show
@@ -945,14 +892,13 @@ def _should_self_update(
     target: str,
     dirty: bool,
     enabled: bool,
-    hosted: bool,
     relevant_changed: bool,
 ) -> bool:
     """Pure decision: should we update from ``local`` to ``target`` now?
 
     Side-effect-free so it is exhaustively unit-tested. The caller owns the git
     work and is responsible for warning when a dirty tree blocks an update."""
-    if not enabled or hosted:
+    if not enabled:
         return False
     if not target or target == "dev" or not local:
         return False
@@ -1094,7 +1040,7 @@ def _run_self_update(target: str) -> None:
     fetch/diff only runs when an update is genuinely plausible. Re-exec happens
     inside ``_apply_self_update`` and does not return."""
     global _last_self_update_mono
-    if not AUTO_UPDATE or _HOSTED or not target or target == "dev":
+    if not AUTO_UPDATE or not target or target == "dev":
         return
     now = time.monotonic()
     if now - _last_self_update_mono < _SELF_UPDATE_MIN_INTERVAL_SEC:
@@ -1112,7 +1058,7 @@ def _run_self_update(target: str) -> None:
     if not relevant:
         return  # backend release doesn't touch anything this consumer loads
     dirty = _git_tree_dirty()
-    if not _should_self_update(local, target, dirty, AUTO_UPDATE, _HOSTED, relevant):
+    if not _should_self_update(local, target, dirty, AUTO_UPDATE, relevant):
         if dirty:
             log.warning(
                 "self-update %s -> %s available but working tree has uncommitted "
@@ -4252,11 +4198,10 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     """Whether foreground turns get a resident-injected recent-chat transcript.
 
     Gated so we don't double up context for agents that already carry it:
-    codex (no --resume) injects every turn in ``auto``. claude injects only when
-    HOSTED (in-CVM, no durable session store — its scrape + --resume continuity
-    is unreliable there); a self-hosted resident's local claude has a reliable
-    --resume, so it keeps its persistent session and never injects in ``auto``
-    — injection would suppress --resume (see _prepare_cli_command) and cold-
+    codex (no --resume) injects every turn in ``auto``. A self-hosted resident's
+    local claude has a reliable --resume, so it keeps its persistent session and
+    never injects in ``auto`` — injection would suppress --resume (see
+    _prepare_cli_command) and cold-
     start a fresh model session on EVERY message, which made boot-ritual
     personas replay their arrival greeting per turn (the "来了" loop,
     usr_c190 2026-07-16; regression introduced by 7f3ff266). pi resumes
@@ -4267,8 +4212,7 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     A claude command that ALREADY carries its own continuity in the operator's
     template (``--resume`` / ``-r`` / ``--session-id``) is skipped in ``auto``
     too: it has native session, so a resident transcript would double-supply
-    context. The hosted default claude command has none of these, so it still
-    injects."""
+    context."""
     mode = FOREGROUND_CHAT_CONTEXT_MODE
     if mode in {"0", "false", "off", "no", "none", "disabled"}:
         return False
@@ -4278,9 +4222,7 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     if _is_codex_cmd(cmd):
         return True
     if _is_claude_code_cmd(cmd):
-        if _has_cli_resume(cmd) or _has_claude_session_id(cmd):
-            return False
-        return _HOSTED
+        return False
     if _is_pi_cmd(cmd):
         # pi resumes natively, so inside one session re-feeding the transcript is pure
         # waste. But every NEW session starts blank — rotation (AGENT_SESSION_MAX_TURNS),
@@ -5947,8 +5889,7 @@ def _fetch_user_mcp_envelopes() -> dict:
 def _decrypt_envelope(envelope: dict) -> bytes:
     """Decrypt a caller-owned v1 envelope through the enclave. Same crypto path
     the consumer already uses for chat/memory — no new trust surface. Auth rides
-    the shared ``_HEADERS`` (runtime-token or api-key, kept fresh by
-    ``_refresh_auth_header``)."""
+    the shared API-key ``_HEADERS``."""
     if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
         raise RuntimeError("enclave_unavailable")
     resp = _ENCLAVE_CLIENT.post(
@@ -7621,7 +7562,6 @@ def _capture_get_json(
     timeout: int = 15,
     base_url: str | None = None,
 ) -> dict:
-    _refresh_auth_header()
     root = (base_url or FEEDLING_API_URL).rstrip("/")
     try:
         resp = _client_for(root).get(
@@ -7645,7 +7585,6 @@ def _capture_post_json(
     timeout: int = 20,
     base_url: str | None = None,
 ) -> dict:
-    _refresh_auth_header()
     root = (base_url or FEEDLING_API_URL).rstrip("/")
     try:
         resp = _client_for(root).post(
@@ -10370,7 +10309,6 @@ def run() -> None:
 
     while _running:
         try:
-            _refresh_auth_header()  # pick up a freshly-minted runtime token (Stage D)
             if capture_tick_enabled and time.monotonic() >= next_capture_tick_mono:
                 try:
                     capture_result = fire_capture_tick()

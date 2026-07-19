@@ -148,7 +148,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0044_v2_workspace_batches").down_revision == (
         "0043_v2_encrypted_trajectories"
     )
-    assert script.get_current_head() == "0044_v2_workspace_batches"
+    assert script.get_revision("0045_drop_retired_supervisor").down_revision == (
+        "0044_v2_workspace_batches"
+    )
+    assert script.get_current_head() == "0045_drop_retired_supervisor"
 
 
 def test_0041_indexes_and_validated_frontier_constraint_exist():

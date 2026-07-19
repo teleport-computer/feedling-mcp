@@ -112,7 +112,7 @@ def seed_synthetic_users(n: int, *, mock_base_url: str) -> list[str]:
         _seed_user_row(uid)
         # Provider config lives in model_api_routes/credentials (model-api-multi-
         # profile), not a 'model_api' blob. Seed an active, test_status='ok' route so
-        # list_agent_runtime_enabled_users / _load_model_api_config see the user.
+        # Runtime V2 eligibility and _load_model_api_config see the user.
         credential_id = db.model_api_credential_create(
             uid, provider="anthropic", base_url=mock_base_url, label="Loadtest",
             api_key_envelope={"body_ct": "x", "nonce": "n", "K_user": "k"},

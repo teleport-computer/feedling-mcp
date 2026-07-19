@@ -18,7 +18,6 @@ from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
 from chat import chat_core  # noqa: E402
-from hosted import agent_runtime_cutover  # noqa: E402
 from hosted import chat_send_core  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
@@ -131,9 +130,6 @@ def test_pre_v2_only_fresh_setup_sends_through_v2_without_admin_flip(
     mode, state, generation = db.get_hosted_runtime_control_strict(user_id)
     assert (mode, state, generation) == ("db_action_v2", "v2", 3)
     assert jobs_store.get_wake_schedule(user_id) is not None
-    assert user_id not in {
-        row["user_id"] for row in db.list_agent_runtime_enabled_users()
-    }
 
     monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
     monkeypatch.setattr(

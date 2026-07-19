@@ -306,7 +306,7 @@ def test_activate_untested_route_runs_test_and_switches(
     assert db.model_api_route_get(uid, r2)["test_status"] == "ok"
 
 
-def test_v2_only_route_activation_cannot_bypass_auto_cutover(
+def test_retired_runtime_selector_cannot_bypass_v2_route_activation(
         client, registered_user, fake_provider, fake_envelope, fake_enclave,
         monkeypatch):
     uid = registered_user["user_id"]
@@ -314,11 +314,11 @@ def test_v2_only_route_activation_cannot_bypass_auto_cutover(
     cid = db.model_api_credentials_list(uid)[0]["id"]
     r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
 
-    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
-    config_store.set_hosted_runtime_mode(
-        core_store.get_store(uid), config_store.HOSTED_RUNTIME_MODE_RESIDENT
-    )
     monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    with pytest.raises(ValueError, match="hosted resident runtime is retired"):
+        config_store.set_hosted_runtime_mode(
+            core_store.get_store(uid), config_store.HOSTED_RUNTIME_MODE_RESIDENT
+        )
 
     resp = client.post(f"/v1/model_api/routes/{r2}/activate", headers=headers)
 
@@ -499,9 +499,7 @@ def test_route_test_unknown_route_404(client, registered_user, fake_provider,
 # ── /routes/{id}/test on the ACTIVE route: takeover on failure (Fix 1) ──
 #
 # Symmetric with DELETE /routes/{id}: testing the active route and having it
-# fail must not strand it — is_active + test_status='failed' would drop the
-# user out of db.list_agent_runtime_enabled_users(), and the supervisor kills
-# a consumer that never self-heals.
+# fail must atomically select another tested route when one exists.
 
 def test_route_test_active_route_failure_takes_over_to_other_ok_route(
         client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
@@ -528,15 +526,14 @@ def test_route_test_active_route_failure_takes_over_to_other_ok_route(
     assert r1_row["is_active"] is False
     assert db.model_api_active_route(uid)["id"] == r2
 
-    roster = {u["user_id"] for u in db.list_agent_runtime_enabled_users()}
-    assert uid in roster
+    assert uid in db.list_hosted_runtime_eligible_user_ids()
 
 
 def test_route_test_active_route_failure_no_candidate_leaves_none_active(
         client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
     """Only route → no autoselect candidate. active_route_id: null is the
     correct (legal) response, not a 500 — the user just has no working config
-    anymore and drops out of the roster."""
+    anymore and drops out of Runtime V2 eligibility."""
     uid = registered_user["user_id"]
     headers = _setup_one(client, registered_user)
     r1 = db.model_api_active_route(uid)["id"]
@@ -551,8 +548,7 @@ def test_route_test_active_route_failure_no_candidate_leaves_none_active(
     assert body["active_route_id"] is None
 
     assert db.model_api_active_route(uid) is None
-    roster = {u["user_id"] for u in db.list_agent_runtime_enabled_users()}
-    assert uid not in roster
+    assert uid not in db.list_hosted_runtime_eligible_user_ids()
 
 
 def test_route_test_non_active_route_failure_does_not_touch_active(

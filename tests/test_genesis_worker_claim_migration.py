@@ -27,4 +27,4 @@ def test_alembic_single_head():
     cfg = Config(str(here / "alembic.ini"))
     cfg.set_main_option("script_location", str(here / "alembic"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
-    assert list(heads) == ["0042_v2_workspace_foundation"]
+    assert list(heads) == ["0045_drop_retired_supervisor"]

@@ -1,5 +1,8 @@
 # Phase C：四个生产者接入通知设施 — 实现计划
 
+> **RETIRED / DO NOT DEPLOY.** Historical implementation record; managed hosted
+> supervisor references describe retired source.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把 genesis / history_import / memory 退避 / runner 四个子系统的失败点接线到

@@ -43,11 +43,9 @@ BACKEND = REPO_ROOT / "backend"
 def _ensure_env_and_db() -> None:
     """Replicate tests/conftest.py's minimal boot env so `import asgi_app` succeeds.
 
-    The hosting-ready gate and a reachable DATABASE_URL are prerequisites for
-    importing the backend (db.init_schema() runs at startup). We only
-    provision a throwaway DB when DATABASE_URL is not already supplied.
+    A reachable DATABASE_URL is required because db.init_schema() runs at
+    startup. We only provision a throwaway DB when one is not supplied.
     """
-    os.environ.setdefault("FEEDLING_HOST_ALL", "1")
     os.environ.setdefault("FEEDLING_RUNTIME_TOKEN_SECRET", "url-map-snapshot-secret")
 
     if os.environ.get("DATABASE_URL"):

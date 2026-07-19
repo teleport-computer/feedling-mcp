@@ -71,6 +71,42 @@ Do not set `FEEDLING_HOST_ALL`, `AGENT_RUNTIME_USERS`,
 `AGENT_RUNTIME_AUTODISCOVER`, `AGENT_RUNTIME_MAX_CHILDREN`, or a
 `resident_only` policy. They are retired hosted controls.
 
+After production is running the same V2-only source and the release checklist
+below is green, remove the retired repository-level controls. Do not remove
+`FEEDLING_RUNTIME_TOKEN_SECRET`; the pooled V2 workers still require it.
+
+```bash
+repo=teleport-computer/feedling-mcp
+legacy_names=(
+  FEEDLING_HOST_ALL
+  AGENT_RUNTIME_USERS
+  AGENT_RUNTIME_AUTODISCOVER
+  AGENT_RUNTIME_MAX_CHILDREN
+  DEPLOY_TEST_RUNNER_CVM
+  DEPLOY_PRE_RUNNER_CVM
+  DEPLOY_PROD_RUNNER_CVM
+)
+
+# Inventory first. An empty result is valid.
+gh variable list --repo "$repo" | rg "$(IFS='|'; echo "${legacy_names[*]}")"
+gh secret list --repo "$repo" | rg "$(IFS='|'; echo "${legacy_names[*]}")"
+
+# Delete only the exact retired names; tolerate names that were never present.
+for name in "${legacy_names[@]}"; do
+  gh variable delete "$name" --repo "$repo" 2>/dev/null || true
+  gh secret delete "$name" --repo "$repo" 2>/dev/null || true
+done
+
+# Postcondition: both commands should print nothing.
+gh variable list --repo "$repo" | rg "$(IFS='|'; echo "${legacy_names[*]}")" || true
+gh secret list --repo "$repo" | rg "$(IFS='|'; echo "${legacy_names[*]}")" || true
+```
+
+If the repository uses GitHub environment-scoped values, repeat the same
+inventory and deletion with `--env test`, `--env pre`, and `--env prod` only
+after confirming those environment names in repository settings. Never use a
+prefix or wildcard delete.
+
 ## Deployment order
 
 For a CVM-affecting release:

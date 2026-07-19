@@ -33,10 +33,8 @@ def test_resolve_driver_rejects_missing_provider():
         cutover.resolve_driver(None)
 
 
-def test_hosting_ready_requires_token_but_not_resident_flags(monkeypatch):
+def test_hosting_ready_accepts_runtime_token_secret(monkeypatch):
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
-    monkeypatch.delenv("FEEDLING_HOST_ALL", raising=False)
-    monkeypatch.delenv("AGENT_RUNTIME_USERS", raising=False)
     cutover.assert_hosting_ready()
 
 

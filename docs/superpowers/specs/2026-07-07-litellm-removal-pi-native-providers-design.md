@@ -1,5 +1,8 @@
 # Spec: Retire LiteLLM — route gemini/openrouter through pi natively
 
+> **RETIRED / DO NOT DEPLOY.** Historical design; resident/supervisor topology
+> references are not current operations.
+
 **Date:** 2026-07-07
 **Status:** Draft (awaiting review)
 **Author:** brainstormed with Claude

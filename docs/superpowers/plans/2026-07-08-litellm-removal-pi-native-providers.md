@@ -1,5 +1,8 @@
 # LiteLLM Removal — pi-native gemini/openrouter Implementation Plan
 
+> **RETIRED / DO NOT DEPLOY.** Historical implementation record; managed hosted
+> resident/supervisor references are no longer executable.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Remove the in-CVM LiteLLM gateway entirely by routing gemini and openrouter through the pi driver's native provider adapters, leaving `claude`/`codex`(openai-only)/`pi` as the drivers.

@@ -1,5 +1,8 @@
 # 全后端统一错误透出 — 后端设计 spec
 
+> **RETIRED / DO NOT DEPLOY.** Historical design; managed hosted supervisor
+> instructions describe retired source.
+
 日期：2026-07-07
 状态：设计定稿，待实现（Phase A → B → C 三个独立实现计划）
 对外契约：`docs/FRONTEND_ERROR_CONTRACT.md`（iOS 消费面，字段形状以它为准；本文是后端实现面）

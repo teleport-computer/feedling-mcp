@@ -104,9 +104,6 @@ def test_v2_only_reconciles_every_runnable_shape_idempotently(monkeypatch):
         mode, state, _generation = db.get_hosted_runtime_control_strict(user_id)
         assert (mode, state) == ("db_action_v2", "v2")
         assert jobs_store.get_wake_schedule(user_id) is not None
-        assert user_id not in {
-            row["user_id"] for row in db.list_agent_runtime_enabled_users()
-        }
     assert db.get_hosted_runtime_control_strict(split)[2] == 13
     assert db.get_hosted_runtime_control_strict(failed)[:2] == (
         "resident_cli",

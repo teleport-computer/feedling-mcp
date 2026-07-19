@@ -46,7 +46,7 @@ async def model_api_chat_send(request: Request, auth: AuthResult = Depends(requi
     # worker thread (worldbook match in hosted.context, screen-frame decrypt in
     # screen.frames/caption) can read X-Feedling-Runtime-Token off the proxy.
     # run_db copies THIS context into the threadpool worker, so binding on the
-    # loop is sufficient. Without it a host-all user (api_key=None, runtime token
+    # loop is sufficient. Without it a Runtime V2 user (api_key=None, runtime token
     # only) silently loses worldbook + screen context — a Flask→ASGI regression
     # (the old global flask.request always carried the header). Plan §5.2: the
     # whole synchronous persistence path runs on the threadpool, never the loop.

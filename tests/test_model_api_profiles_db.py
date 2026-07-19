@@ -306,7 +306,7 @@ def test_concurrent_activate_keeps_exactly_one_active(backend_env):
     assert total_losers >= 1, "concurrency test never hit the rollback path — lost its guard value"
 
 
-def test_roster_only_returns_active_ok_routes(backend_env):
+def test_active_route_tracks_activation_and_reasoning_effort(backend_env):
     uid = _uid()
     seed_user(uid)
     cid = _cred(uid)
@@ -316,40 +316,36 @@ def test_roster_only_returns_active_ok_routes(backend_env):
     db.model_api_route_mark_test(uid, r_haiku, status="ok")
     db.model_api_route_activate(uid, r_sonnet)
 
-    roster = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
-    assert len(roster) == 1
-    assert roster[0]["model"] == "claude-sonnet-4-5"
-    assert roster[0]["driver"] == "claude"       # anthropic → claude
-    assert roster[0]["provider"] == "anthropic"
-    assert roster[0]["reasoning_effort"] == "high"
+    active = db.model_api_active_route(uid)
+    assert active["model"] == "claude-sonnet-4-5"
+    assert active["provider"] == "anthropic"
+    assert active["reasoning_effort"] == "high"
 
-    # 切到 haiku 后 roster 跟着换
+    # 切到 haiku 后 active route 跟着换。
     db.model_api_route_activate(uid, r_haiku)
-    roster = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
-    assert roster[0]["model"] == "claude-haiku-4-5"
-    assert roster[0]["reasoning_effort"] == ""
+    active = db.model_api_active_route(uid)
+    assert active["model"] == "claude-haiku-4-5"
+    assert active["reasoning_effort"] == ""
 
 
-def test_roster_excludes_untested_active_route(backend_env):
+def test_hosted_eligibility_excludes_untested_active_route(backend_env):
     uid = _uid()
     seed_user(uid)
     cid = _cred(uid)
     r = db.model_api_route_upsert(uid, cid, "claude-sonnet-4-5", None)
     db.model_api_route_activate(uid, r)   # test_status 仍是 untested
 
-    assert [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid] == []
+    assert uid not in db.list_hosted_runtime_eligible_user_ids()
 
 
-def test_roster_gemini_discovered_as_pi_unconditionally(backend_env):
+def test_active_route_preserves_gemini_provider(backend_env):
     uid = _uid()
     seed_user(uid)
     cid = _cred(uid, provider="gemini")
     r = db.model_api_route_upsert(uid, cid, "gemini-2.5-flash", None)
     db.model_api_route_mark_test(uid, r, status="ok")
     db.model_api_route_activate(uid, r)
-    rows = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
-    assert len(rows) == 1
-    assert rows[0]["driver"] == "pi"
+    assert db.model_api_active_route(uid)["provider"] == "gemini"
 
 
 def test_account_deletion_clears_credentials_and_routes(backend_env):
@@ -445,6 +441,4 @@ def test_roster_supports_responses_bool_conversion_from_real_column(backend_env)
     db.model_api_route_mark_test(uid, r, status="ok")
     db.model_api_route_activate(uid, r)
 
-    rows = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
-    assert len(rows) == 1
-    assert rows[0]["supports_responses"] is True
+    assert db.model_api_active_route(uid)["supports_responses"] is True

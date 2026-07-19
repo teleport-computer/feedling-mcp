@@ -413,7 +413,7 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runt
     envelope = route.get("api_key_envelope")
     if not isinstance(envelope, dict):
         return None, {"error": "model_api_key_envelope_missing"}
-    # A hosted (host-all) turn authenticates with a runtime token, not the
+    # A Runtime V2 turn authenticates with a runtime token, not the
     # long-term api_key — forward it so the enclave can authorize the unwrap.
     # The enclave's /v1/envelope/decrypt accepts either credential. Only pass
     # runtime_token through when present, so api-key callers are unchanged.

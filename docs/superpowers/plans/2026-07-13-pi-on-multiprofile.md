@@ -1,5 +1,8 @@
 # Pi driver on multi-profile schema — Implementation Plan
 
+> **RETIRED / DO NOT DEPLOY.** Historical implementation record; managed hosted
+> execution no longer has host-all or supervisor modes.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development.
 > Steps use `- [ ]` checkboxes. Spec: `docs/superpowers/specs/2026-07-13-pi-on-multiprofile-schema-design.md`.
 

@@ -91,7 +91,7 @@ def test_load_runtime_provider_config_rejects_untested_active(backend_env, fake_
 
 
 def test_load_runtime_provider_config_forwards_runtime_token(backend_env, monkeypatch):
-    """host-all 托管回合走 runtime_token，不带 api_key；只有 runtime_token 非空时才
+    """Runtime V2 托管回合走 runtime_token，不带 api_key；只有 runtime_token 非空时才
     透传给 enclave 解密调用（api-key 调用者行为不受影响 — 见下一条测试）。"""
     uid = _uid()
     seed_user(uid)

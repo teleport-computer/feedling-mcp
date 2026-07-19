@@ -1,5 +1,8 @@
 # TEE Postgres Phase 2–3（明文 schema + 双写 + 解密复制）Implementation Plan
 
+> **RETIRED / DO NOT DEPLOY.** Historical implementation record; references to
+> hosted supervisor tables describe a retired topology.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 达到目标形态「RDS 主 + TEE 明文影子库」：13 张明文表同步双写 + reconciler 兜底，6 类密文内容经 enclave 解密异步复制成明文，一致性验证全绿。切读（Phase 4+）不在本 plan 内。

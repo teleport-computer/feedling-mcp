@@ -102,7 +102,7 @@ services:
       # backend's + pooled V2 worker's secret. Empty = falls back to the backend
       # round-trip (old behavior, no regression). Encrypted env, not baked into
       # compose_hash. Without this line the local-verify code is dead and every
-      # host-all (runtime-token) decrypt reentrantly hits the backend.
+      # Runtime V2 decrypt reentrantly hits the backend.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       # gunicorn worker (process) count for the enclave (enclave_app.py
       # _enclave_worker_count, default 1). Prod CVM is 8 vCPU so >1 parallelizes

@@ -12,12 +12,11 @@ Design notes:
   - Two-head routing:
       perception.*   -> main backend (FEEDLING_API_URL)   [coarse, no decrypt]
       photo/memory   -> enclave (FEEDLING_ENCLAVE_URL)     [decrypt; phase 2]
-  - Auth: X-API-Key = FEEDLING_API_KEY, or (zero-roster host-all) the Stage-D
-    runtime token from FEEDLING_RUNTIME_TOKEN_FILE as X-Feedling-Runtime-Token.
-    Both backend and enclave accept either.
+  - Auth: X-API-Key = FEEDLING_API_KEY. Runtime V2 tools execute in-process and
+    do not launch this CLI or materialize a managed-hosted token file.
 
 Config via env (same as the resident consumer): FEEDLING_API_URL,
-FEEDLING_API_KEY (or FEEDLING_RUNTIME_TOKEN_FILE), FEEDLING_ENCLAVE_URL.
+FEEDLING_API_KEY, FEEDLING_ENCLAVE_URL.
 
 MVP = `perception`. send / wait-for-wake / schedule-wake / photo are phase 2 and
 currently return a clean "not implemented" JSON so the agent degrades gracefully.
@@ -107,22 +106,9 @@ def _trace_id():
 
 
 def _auth_headers():
-    """Auth header for backend/enclave calls. Prefer ``FEEDLING_API_KEY``; in
-    zero-roster host-all mode it is absent, so fall back to the Stage-D runtime
-    token written to ``FEEDLING_RUNTIME_TOKEN_FILE`` (both backend and enclave
-    accept ``X-Feedling-Runtime-Token``). Empty dict when neither is available."""
+    """Auth header for the independent API-key resident product."""
     api_key = _env("FEEDLING_API_KEY")
-    if api_key:
-        return {"X-API-Key": api_key}
-    token_file = _env("FEEDLING_RUNTIME_TOKEN_FILE")
-    if token_file:
-        try:
-            tok = open(token_file).read().strip()
-        except Exception:
-            tok = ""
-        if tok:
-            return {"X-Feedling-Runtime-Token": tok}
-    return {}
+    return {"X-API-Key": api_key} if api_key else {}
 
 
 def _http_json(method, url, auth, *, payload=None, insecure=False, timeout=30):
@@ -239,7 +225,7 @@ def cmd_perception(args):
     api_url = _env("FEEDLING_API_URL")
     auth = _auth_headers()
     if not api_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
     signals = list(args.signals) or list(FAST_SIGNALS)
     unknown = [s for s in signals if s not in PERCEPTION_SIGNALS]
     if unknown:
@@ -260,7 +246,7 @@ def cmd_perception_trend(args):
     api_url = _env("FEEDLING_API_URL")
     auth = _auth_headers()
     if not api_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
     params = {"signal": args.signal, "days": str(args.days)}
     if args.field:
         params["field"] = args.field
@@ -275,7 +261,7 @@ def cmd_perception_history(args):
     api_url = _env("FEEDLING_API_URL")
     auth = _auth_headers()
     if not api_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
     params = {"signal": args.signal, "days": str(args.days)}
     url = f"{api_url.rstrip('/')}/v1/agent/perception/history?{urllib.parse.urlencode(params)}"
     status, body = _http_json("GET", url, auth)
@@ -285,12 +271,11 @@ def cmd_perception_history(args):
 
 
 def _require_backend():
-    """Resolve (api_url, auth_headers). auth uses _auth_headers() so memory/screen
-    work in both api-key and host-all runtime-token modes (mirrors perception)."""
+    """Resolve the API-key resident backend and auth headers."""
     api_url = _env("FEEDLING_API_URL")
     auth = _auth_headers()
     if not api_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
     return api_url.rstrip("/"), auth
 
 
@@ -468,7 +453,7 @@ def cmd_chat_image(args):
     auth = _auth_headers()
     mid = (args.message_id or "").strip()
     if not enclave_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_ENCLAVE_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_ENCLAVE_URL / FEEDLING_API_KEY in env"}, 2)
     if not mid:
         _emit({"ok": False, "error": "chat-image needs --id <message_id> (from the [image] placeholder in the recent-chat transcript)"}, 2)
     qs = urllib.parse.urlencode({"since": 0, "limit": args.limit})
@@ -508,7 +493,7 @@ def cmd_identity_read(args):
     to the backend when no enclave is configured."""
     auth = _auth_headers()
     if not auth:
-        _emit({"ok": False, "error": "missing auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+        _emit({"ok": False, "error": "missing FEEDLING_API_KEY in env"}, 2)
     enclave_url = _env("FEEDLING_ENCLAVE_URL")
     status, body = -1, {}
     if enclave_url:

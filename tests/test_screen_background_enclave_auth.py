@@ -1,5 +1,5 @@
 """Background screen reads (model_api context / proactive caption) must forward the
-Stage-D runtime token for host-all agents (no api_key), not return api_key_unavailable.
+Scoped runtime token for Runtime V2 workers (no api_key), not return api_key_unavailable.
 Covers screen.frames._enclave_auth_headers + screen.caption._enclave_auth_headers."""
 from __future__ import annotations
 

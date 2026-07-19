@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from admin import admin_core  # noqa: E402
 from core import store as core_store  # noqa: E402
+import db  # noqa: E402
 
 
 ROOT = Path(__file__).parent.parent
@@ -242,3 +244,82 @@ def test_hosted_resident_implementation_is_absent():
         "backend/agent_runtime/tokens.py",
     ):
         assert not (ROOT / relative).exists(), relative
+
+
+def test_external_resident_tools_have_api_key_auth_only():
+    for relative in (
+        "tools/chat_resident_consumer.py",
+        "tools/io_cli.py",
+    ):
+        source = (ROOT / relative).read_text()
+        for retired in (
+            "FEEDLING_RUNTIME_TOKEN_FILE",
+            "X-Feedling-Runtime-Token",
+            "_HOSTED",
+            "host-all",
+        ):
+            assert retired not in source, (relative, retired)
+        assert "FEEDLING_API_KEY" in source, relative
+        assert "X-API-Key" in source, relative
+
+
+def test_retired_supervisor_db_surface_and_tables_are_absent():
+    for name in (
+        "set_supervisor_heartbeat",
+        "read_supervisor_heartbeat",
+        "set_supervisor_instance_heartbeat",
+        "list_supervisor_instance_heartbeats",
+        "prune_supervisor_instance_heartbeats",
+        "list_agent_runtime_enabled_users",
+    ):
+        assert not hasattr(db, name), name
+
+    with db.get_pool().connection() as conn:
+        for table in (
+            "agent_runtime_instances",
+            "agent_runtime_supervisor_heartbeats",
+        ):
+            assert conn.execute(
+                "SELECT to_regclass(%s)", (f"public.{table}",)
+            ).fetchone()[0] is None, table
+        assert conn.execute(
+            "SELECT 1 FROM server_config "
+            "WHERE key='agent_runtime_supervisor_heartbeat'"
+        ).fetchone() is None
+
+
+def test_active_e2e_utilities_do_not_reintroduce_managed_resident_semantics():
+    for relative in (
+        "tools/e2e/hosted.py",
+        "tools/e2e/unlock.py",
+        "tools/genesis_e2e.py",
+        "tools/gen_url_map.py",
+    ):
+        source = (ROOT / relative).read_text()
+        for retired in (
+            "FEEDLING_RUNTIME_TOKEN_FILE",
+            "FEEDLING_HOST_ALL",
+            "host-all",
+            "agent_runtime_instances",
+            "agent_runtime/supervisor.py",
+        ):
+            assert retired not in source, (relative, retired)
+
+
+def test_historical_supervisor_docs_are_prominently_non_operational():
+    retired_pattern = re.compile(
+        r"FEEDLING_HOST_ALL|agent_runtime_instances|"
+        r"agent_runtime_supervisor_heartbeats|backend/agent_runtime/supervisor\.py|"
+        r"host-all|host_all|resident supervisor|FEEDLING_RUNTIME_TOKEN_FILE",
+        re.IGNORECASE,
+    )
+    historical_roots = (
+        ROOT / "docs" / "superpowers" / "plans",
+        ROOT / "docs" / "superpowers" / "specs",
+    )
+    for root in historical_roots:
+        for path in root.glob("*.md"):
+            source = path.read_text()
+            if retired_pattern.search(source):
+                preamble = "\n".join(source.splitlines()[:12])
+                assert "RETIRED / DO NOT DEPLOY" in preamble, path

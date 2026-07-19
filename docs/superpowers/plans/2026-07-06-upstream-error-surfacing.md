@@ -1,5 +1,8 @@
 # 托管回合上游报错透出 — 实现计划
 
+> **RETIRED / DO NOT DEPLOY.** Historical implementation record; managed hosted
+> execution is Runtime V2-only and has no resident supervisor path.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 托管回合失败时，把可判读的原因以 role="system" 聊天消息 + 设置页

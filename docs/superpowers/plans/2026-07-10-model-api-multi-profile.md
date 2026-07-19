@@ -1,5 +1,8 @@
 # Model API 多配置（credentials + routes）实施计划
 
+> **RETIRED / DO NOT DEPLOY.** Historical implementation record; process-roster
+> and supervisor instructions are not current operations.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让用户保存多把 provider API key、每把派生多条 model 路由，并选择其中一条生效。

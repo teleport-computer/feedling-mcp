@@ -248,7 +248,7 @@ def _make_decrypt(user_id: str) -> Callable[[dict, str], bytes]:
     真实签名：``core.enclave._decrypt_envelope_via_enclave(envelope, api_key, *,
     purpose, runtime_token)`` 成功返回明文 bytes、失败 raise RuntimeError
     （brief 骨架里的 ``pt, err =`` 元组返回形是错的，实际是 raise-or-bytes）。
-    托管零 roster（host-all）下没有 per-user api_key，只能用 runtime token
+    Runtime V2 下没有 per-user api_key，只能用 runtime token
     （scope=envelope_decrypt，见 supervisor.py 的 mint_token 用法）。
     """
     from core import enclave as core_enclave

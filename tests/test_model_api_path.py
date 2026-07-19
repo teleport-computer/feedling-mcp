@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import sys
 import threading
 import time
@@ -306,8 +305,6 @@ def test_model_api_setup_persists_reasoning_effort(client, monkeypatch):
     route = db.model_api_active_route(user_id)
     assert route["reasoning_effort"] == "medium"
 
-    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users()}
-    assert user_id not in rows
     mode, state, _generation = db.get_hosted_runtime_control_strict(user_id)
     assert (mode, state) == ("db_action_v2", "v2")
 
@@ -2003,7 +2000,14 @@ def test_chat_history_hides_stale_verify_ping(client):
     fresh = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:fresh"))
     stale = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:stale"))
     # Backdate the stale ping past the visible TTL (verify_loop long dead).
-    stale["ts"] = time.time() - (chat_core.VERIFY_PING_VISIBLE_TTL_SEC + 60)
+    stale_ts = time.time() - (chat_core.VERIFY_PING_VISIBLE_TTL_SEC + 60)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE chat_messages SET ts=%s, "
+            "doc=jsonb_set(doc, '{ts}', to_jsonb(%s::double precision), true) "
+            "WHERE user_id=%s AND msg_id=%s",
+            (stale_ts, stale_ts, user_id, stale["id"]),
+        )
 
     res = client.get("/v1/chat/history?limit=50", headers=_headers(api_key))
     assert res.status_code == 200, res.get_data(as_text=True)
