@@ -47,6 +47,15 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-18（hermes/openclaw 自托管用户 MCP 接线）
+
+### [DONE] 给自托管 hermes/openclaw 用户加 user-MCP 接线
+
+- 自托管 hermes 与 OpenClaw 用户此前完全无 MCP 接线：config sync 抵达机器但 `_materialize_user_mcp` 仅输出 claude/codex 目标——hermes 读自己的 `~/.hermes/config.yaml` `mcp_servers`、OpenClaw 读 `~/.openclaw/openclaw.json` `mcp.servers`，两者都够不着；CA 注入只支持 Node（`NODE_EXTRA_CA_CERTS` 对 Python hermes 无效）。
+- **hermes 接线**：materialize 加 hermes 目标，用 pyyaml 合并进 `config.yaml` `mcp_servers`，保留其他键和用户新增 server，备份 `.feedling-bak`；hermes CA 复用 codex 的 `SSL_CERT_FILE=castore`（纯 Python）。决策：hermes CLI `hermes mcp add` 因交互式+discovery 阻塞（~10s，无人值守不可用）被否决，改走 pyyaml 合并。
+- **OpenClaw 接线**：OpenClaw 是**独立 Node runtime**（不是 hermes 别名——起草时误判，已订正），读 `openclaw.json` 的 `mcp.servers`。materialize 加 OpenClaw 目标，JSON 合并（含 `transport:"streamable-http"`）；CA 走 Node `NODE_EXTRA_CA_CERTS`（复用 claude/pi 分支，无新代码）。docker 端到端验证：`openclaw agent --local` 自动加载 `mcp.servers` 并调用 `<server>__<tool>`（deepwiki 真被调用）。
+- 文档：tools/README.md 加 hermes/OpenClaw MCP 一节；io-onboarding `skill-resident-agent.md` 补 hermes（`pip install mcp` 前提）与 OpenClaw 路线说明。
+
 ## 2026-07-18（第六批：终局——全局复扫 + 灰区 16 项终审全保留）
 
 ### [DONE] 仓库清理第三轮·第六批（真收官）

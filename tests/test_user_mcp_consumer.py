@@ -62,6 +62,8 @@ except ModuleNotFoundError:
     sys.modules.setdefault("content_encryption", _fake_enc)
 
 import tools.chat_resident_consumer as c  # noqa: E402  (after env setup)
+import yaml  # noqa: F401, E402
+import user_mcp_materialize as um  # noqa: F401, E402
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +681,7 @@ def test_enrich_prefers_manual_ca_over_fetch():
 
     def _fetch(url):
         called.append(url)
-        return "FETCHED"
+        return ("FETCHED", None)
 
     out = c._enrich_with_fetched_ca(
         [{"name": "m", "enabled": True, "url": "https://m/", "ca_pem": "MANUAL"}],
@@ -691,7 +693,7 @@ def test_enrich_prefers_manual_ca_over_fetch():
 def test_enrich_fetches_when_no_manual_ca():
     out = c._enrich_with_fetched_ca(
         [{"name": "a", "enabled": True, "url": "https://a/"}],
-        fetch=lambda url: "FETCHED")
+        fetch=lambda url: ("FETCHED", None))
     assert out[0]["ca_pem"] == "FETCHED"
 
 
@@ -699,7 +701,7 @@ def test_enrich_one_failure_does_not_affect_others():
     def _fetch(url):
         if "bad" in url:
             raise OSError("boom")
-        return "FETCHED"
+        return ("FETCHED", None)
 
     out = c._enrich_with_fetched_ca([
         {"name": "bad", "enabled": True, "url": "https://bad/"},
@@ -712,7 +714,7 @@ def test_enrich_one_failure_does_not_affect_others():
 def test_enrich_fetch_returning_none_yields_empty():
     out = c._enrich_with_fetched_ca(
         [{"name": "a", "enabled": True, "url": "https://a/"}],
-        fetch=lambda url: None)
+        fetch=lambda url: (None, None))
     assert out[0]["ca_pem"] == ""
 
 
@@ -722,7 +724,7 @@ def test_enrich_skips_disabled_servers_entirely():
     called = []
     out = c._enrich_with_fetched_ca(
         [{"name": "old", "enabled": False, "url": "https://old/"}],
-        fetch=lambda url: called.append(url) or "FETCHED")
+        fetch=lambda url: (called.append(url) or "FETCHED", None))
     assert called == []
     assert out[0]["ca_pem"] == ""
 
@@ -737,7 +739,7 @@ def test_enrich_disabled_servers_do_not_starve_enabled_ones_budget():
 
     def _fetch(url):
         called.append(url)
-        return "FETCHED"
+        return ("FETCHED", None)
 
     # now() 序列只给 3 次调用的余地：一次算 deadline，两次判断。如果 disabled
     # 也走判断+抓取分支，budget 会在到达 enabled server 之前被耗尽（或 now()
@@ -769,7 +771,7 @@ def test_enrich_stops_fetching_once_budget_spent():
          {"name": "b", "enabled": True, "url": "https://b/"},
          {"name": "d", "enabled": True, "url": "https://d/"}],
         budget_s=15.0, now=lambda: next(ticks),
-        fetch=lambda url: called.append(url) or "FETCHED")
+        fetch=lambda url: (called.append(url) or "FETCHED", None))
     assert called == ["https://a/"]        # 只抓了第一个
     assert out[0]["ca_pem"] == "FETCHED"
     assert out[1]["ca_pem"] == ""          # 超预算 → 空，留待下次 fingerprint 变更
@@ -859,3 +861,252 @@ def test_child_env_pi_no_config_path_without_servers(tmp_path, monkeypatch):
     monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "nope2.pem"))
     monkeypatch.setattr(c, "_user_mcp_applied", {"fingerprint": None, "servers": []})
     assert c._user_mcp_child_env(["pi", "--mode", "json"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# hermes_config_merged — merge servers into config.yaml mcp_servers (Task 1)
+# ---------------------------------------------------------------------------
+
+
+def _srv(name, url, enabled=True, headers=None):
+    return {"name": name, "enabled": enabled, "url": url, "headers": headers or {}}
+
+
+def test_hermes_merge_empty_config_adds_enabled_servers():
+    out = um.hermes_config_merged(
+        None, [_srv("jira", "https://a.example/mcp", headers={"Authorization": "Bearer x"})], {"jira"})
+    doc = yaml.safe_load(out)
+    assert doc["mcp_servers"]["jira"] == {
+        "url": "https://a.example/mcp", "headers": {"Authorization": "Bearer x"}}
+
+
+def test_hermes_merge_preserves_other_top_level_keys_and_user_servers():
+    existing = "model: gpt-4\nmcp_servers:\n  old:\n    url: https://old/mcp\n"
+    out = um.hermes_config_merged(existing, [_srv("new", "https://new/mcp")], {"new"})
+    doc = yaml.safe_load(out)
+    assert doc["model"] == "gpt-4"                 # unrelated key untouched
+    assert doc["mcp_servers"]["new"]["url"] == "https://new/mcp"
+    assert doc["mcp_servers"]["old"]["url"] == "https://old/mcp"  # user's own, not managed → kept
+
+
+def test_hermes_merge_prunes_only_managed_names():
+    existing = ("mcp_servers:\n  mine:\n    url: https://mine/mcp\n"
+                "  yours:\n    url: https://yours/mcp\n")
+    out = um.hermes_config_merged(existing, [], {"mine"})   # 'mine' ours & removed; 'yours' user's
+    doc = yaml.safe_load(out)
+    assert "mine" not in (doc.get("mcp_servers") or {})
+    assert doc["mcp_servers"]["yours"]["url"] == "https://yours/mcp"
+
+
+def test_hermes_merge_skips_disabled_and_omits_empty_headers():
+    out = um.hermes_config_merged(
+        None, [_srv("off", "https://off/mcp", enabled=False),
+               _srv("on", "https://on/mcp")], {"off", "on"})
+    doc = yaml.safe_load(out)
+    assert "off" not in doc["mcp_servers"]
+    assert doc["mcp_servers"]["on"] == {"url": "https://on/mcp"}   # no empty headers key
+
+
+def test_hermes_merge_idempotent_and_unicode():
+    servers = [_srv("n", "https://n/mcp", headers={"X-Note": "你好"})]
+    out1 = um.hermes_config_merged(None, servers, {"n"})
+    out2 = um.hermes_config_merged(out1, servers, {"n"})
+    assert yaml.safe_load(out1) == yaml.safe_load(out2)          # stable
+    assert "你好" in out1                                        # allow_unicode, not \uXXXX
+
+
+# ---------------------------------------------------------------------------
+# hermes CA injection (Task 2: route hermes CA via SSL_CERT_FILE)
+# ---------------------------------------------------------------------------
+
+
+def _applied_one():
+    return {"fingerprint": "x", "servers": [
+        {"name": "j", "enabled": True, "url": "https://a/mcp", "headers": {}}]}
+
+
+def test_env_injection_hermes_uses_castore_like_codex(tmp_path, monkeypatch):
+    """hermes is python — SSL_CERT_FILE (REPLACE) → concat castore, exactly like
+    codex. It must NOT get NODE_EXTRA_CA_CERTS (that is Node-only, inert here)."""
+    castore = tmp_path / "castore.pem"
+    castore.write_text("PEM-SYSTEM+USER\n")
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(castore))
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(tmp_path / "ca.pem"))
+    monkeypatch.setattr(c, "_user_mcp_applied", _applied_one())
+    env = c._user_mcp_child_env(["hermes", "chat", "-Q", "--source", "tool", "-q", "hi"])
+    assert env == {"SSL_CERT_FILE": str(castore)}
+
+
+def test_env_injection_hermes_no_castore_injects_nothing(tmp_path, monkeypatch):
+    """No self-signed CA → no castore file → hermes falls back to default
+    certifi (works for public HTTPS). Nothing injected."""
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "absent.pem"))
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(tmp_path / "ca.pem"))
+    monkeypatch.setattr(c, "_user_mcp_applied", _applied_one())
+    env = c._user_mcp_child_env(["hermes", "chat", "-q", "hi"])
+    assert env == {}
+
+
+# ---------------------------------------------------------------------------
+# hermes config.yaml materialization (Task 3: _materialize_hermes_config /
+# _materialize_user_mcp's hermes target)
+# ---------------------------------------------------------------------------
+
+
+def _isolate_targets(tmp_path, monkeypatch):
+    """Point every materialize target at tmp so the test never touches ~ or /tmp."""
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(tmp_path / "user-mcp.json"))
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(tmp_path / "ca.pem"))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "castore.pem"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("HERMES_CONFIG_DIR", str(tmp_path / "no-hermes"))
+    monkeypatch.setenv("OPENCLAW_CONFIG_DIR", str(tmp_path / "no-openclaw"))
+
+
+def test_materialize_writes_hermes_config_when_dir_present(tmp_path, monkeypatch):
+    _isolate_targets(tmp_path, monkeypatch)
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    monkeypatch.setenv("HERMES_CONFIG_DIR", str(hermes_dir))
+    c._materialize_user_mcp(
+        [{"name": "j", "enabled": True, "url": "https://a/mcp", "headers": {}}], {"j"})
+    doc = yaml.safe_load((hermes_dir / "config.yaml").read_text())
+    assert doc["mcp_servers"]["j"]["url"] == "https://a/mcp"
+
+
+def test_materialize_backs_up_existing_hermes_config(tmp_path, monkeypatch):
+    _isolate_targets(tmp_path, monkeypatch)
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    (hermes_dir / "config.yaml").write_text("model: gpt-4\n# a user comment\n")
+    monkeypatch.setenv("HERMES_CONFIG_DIR", str(hermes_dir))
+    c._materialize_user_mcp(
+        [{"name": "j", "enabled": True, "url": "https://a/mcp", "headers": {}}], {"j"})
+    bak = hermes_dir / "config.yaml.feedling-bak"
+    assert bak.exists()
+    assert "a user comment" in bak.read_text()       # original preserved in backup
+    doc = yaml.safe_load((hermes_dir / "config.yaml").read_text())
+    assert doc["model"] == "gpt-4" and "j" in doc["mcp_servers"]
+
+
+def test_materialize_skips_hermes_when_dir_absent(tmp_path, monkeypatch):
+    _isolate_targets(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CONFIG_DIR", str(tmp_path / "nonexistent"))
+    # must not raise, must not create anything
+    c._materialize_user_mcp(
+        [{"name": "j", "enabled": True, "url": "https://a/mcp", "headers": {}}], {"j"})
+    assert not (tmp_path / "nonexistent").exists()
+
+
+# ---------------------------------------------------------------------------
+# openclaw.json materialization + CA guard (Task 2: _materialize_openclaw_config /
+# _materialize_user_mcp's openclaw target)
+# ---------------------------------------------------------------------------
+
+
+def test_materialize_writes_openclaw_config_when_dir_present(tmp_path, monkeypatch):
+    _isolate_targets(tmp_path, monkeypatch)
+    oc_dir = tmp_path / ".openclaw"
+    oc_dir.mkdir()
+    monkeypatch.setenv("OPENCLAW_CONFIG_DIR", str(oc_dir))
+    c._materialize_user_mcp(
+        [{"name": "j", "enabled": True, "url": "https://a/mcp", "headers": {}}], {"j"})
+    doc = json.loads((oc_dir / "openclaw.json").read_text())
+    assert doc["mcp"]["servers"]["j"] == {"url": "https://a/mcp", "transport": "streamable-http"}
+
+
+def test_materialize_backs_up_existing_openclaw_config(tmp_path, monkeypatch):
+    _isolate_targets(tmp_path, monkeypatch)
+    oc_dir = tmp_path / ".openclaw"
+    oc_dir.mkdir()
+    (oc_dir / "openclaw.json").write_text(json.dumps({"commands": {"native": "auto"}}))
+    monkeypatch.setenv("OPENCLAW_CONFIG_DIR", str(oc_dir))
+    c._materialize_user_mcp(
+        [{"name": "j", "enabled": True, "url": "https://a/mcp", "headers": {}}], {"j"})
+    bak = oc_dir / "openclaw.json.feedling-bak"
+    assert bak.exists() and json.loads(bak.read_text())["commands"] == {"native": "auto"}
+    doc = json.loads((oc_dir / "openclaw.json").read_text())
+    assert doc["commands"] == {"native": "auto"} and "j" in doc["mcp"]["servers"]
+
+
+def test_materialize_skips_openclaw_when_dir_absent(tmp_path, monkeypatch):
+    _isolate_targets(tmp_path, monkeypatch)
+    monkeypatch.setenv("OPENCLAW_CONFIG_DIR", str(tmp_path / "nonexistent"))
+    c._materialize_user_mcp(
+        [{"name": "j", "enabled": True, "url": "https://a/mcp", "headers": {}}], {"j"})
+    assert not (tmp_path / "nonexistent").exists()
+
+
+def test_env_injection_openclaw_uses_node_ca_not_ssl_cert(tmp_path, monkeypatch):
+    """Guard: openclaw is Node → falls through to NODE_EXTRA_CA_CERTS (like claude/pi),
+    NOT codex/hermes's SSL_CERT_FILE. No child_env code change needed; this pins it."""
+    ca = tmp_path / "ca.pem"
+    ca.write_text("PEM-USER\n")
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(ca))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "castore.pem"))
+    monkeypatch.setattr(c, "_user_mcp_applied", _applied_one())
+    env = c._user_mcp_child_env(["openclaw", "agent", "--local", "--json", "-m", "hi"])
+    assert env == {"NODE_EXTRA_CA_CERTS": str(ca)}
+
+
+# ---------------------------------------------------------------------------
+# openclaw_config_merged — merge servers into openclaw.json mcp.servers (Task 1)
+# ---------------------------------------------------------------------------
+
+
+def test_openclaw_merge_empty_adds_enabled_with_transport():
+    out = um.openclaw_config_merged(
+        None, [_srv("jira", "https://a.example/mcp", headers={"Authorization": "Bearer x"})], {"jira"})
+    doc = json.loads(out)
+    assert doc["mcp"]["servers"]["jira"] == {
+        "url": "https://a.example/mcp", "transport": "streamable-http",
+        "headers": {"Authorization": "Bearer x"}}
+
+
+def test_openclaw_merge_preserves_other_top_level_keys_and_user_servers():
+    existing = json.dumps({
+        "commands": {"native": "auto"},
+        "mcp": {"servers": {"old": {"url": "https://old/mcp", "transport": "streamable-http"}}},
+    })
+    out = um.openclaw_config_merged(existing, [_srv("new", "https://new/mcp")], {"new"})
+    doc = json.loads(out)
+    assert doc["commands"] == {"native": "auto"}                 # unrelated key kept
+    assert doc["mcp"]["servers"]["new"]["url"] == "https://new/mcp"
+    assert doc["mcp"]["servers"]["old"]["url"] == "https://old/mcp"  # user's own, not managed
+
+
+def test_openclaw_merge_prunes_only_managed_names():
+    existing = json.dumps({"mcp": {"servers": {
+        "mine": {"url": "https://mine/mcp", "transport": "streamable-http"},
+        "yours": {"url": "https://yours/mcp", "transport": "streamable-http"}}}})
+    out = um.openclaw_config_merged(existing, [], {"mine"})
+    doc = json.loads(out)
+    assert "mine" not in doc["mcp"]["servers"]
+    assert doc["mcp"]["servers"]["yours"]["url"] == "https://yours/mcp"
+
+
+def test_openclaw_merge_skips_disabled_and_omits_empty_headers():
+    out = um.openclaw_config_merged(
+        None, [_srv("off", "https://off/mcp", enabled=False),
+               _srv("on", "https://on/mcp")], {"off", "on"})
+    doc = json.loads(out)
+    assert "off" not in doc["mcp"]["servers"]
+    assert doc["mcp"]["servers"]["on"] == {"url": "https://on/mcp", "transport": "streamable-http"}
+
+
+def test_openclaw_merge_empty_result_drops_mcp_key_but_keeps_others():
+    existing = json.dumps({"commands": {"native": "auto"},
+                           "mcp": {"servers": {"mine": {"url": "https://mine/mcp"}}}})
+    out = um.openclaw_config_merged(existing, [], {"mine"})   # prune all managed → mcp empties
+    doc = json.loads(out)
+    assert "mcp" not in doc               # mcp dropped when it becomes empty
+    assert doc["commands"] == {"native": "auto"}
+
+
+def test_openclaw_merge_idempotent_and_unicode():
+    servers = [_srv("n", "https://n/mcp", headers={"X-Note": "你好"})]
+    out1 = um.openclaw_config_merged(None, servers, {"n"})
+    out2 = um.openclaw_config_merged(out1, servers, {"n"})
+    assert json.loads(out1) == json.loads(out2)
+    assert "你好" in out1                  # ensure_ascii=False

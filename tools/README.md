@@ -431,6 +431,17 @@ curl -s -H "X-API-Key: <new_key>" $FEEDLING_API_URL/v1/users/whoami
 # Expect: 200 with the user_id matching what iOS shows
 ```
 
+### hermes / OpenClaw 用户的 MCP
+
+自托管 hermes 用户在 app 上配置的 MCP server 会自动物化进
+`$HERMES_CONFIG_DIR/config.yaml`（默认 `~/.hermes/config.yaml`）的 `mcp_servers`，
+hermes 下一回合启动时经 `discover_mcp_tools` 自动发现并注册为 `mcp_<server>_<tool>`。
+
+**前提**：hermes 的 venv 必须装 `mcp` 包（`pip install mcp`），否则 hermes 静默
+禁用 MCP，配了也不生效。正规 HTTPS 与自签 CA 均支持（自签走 `SSL_CERT_FILE` 注入
+的 concat 信任库）。物化会先把既有 config.yaml 备份成 `config.yaml.feedling-bak`
+（pyyaml round-trip 不保留注释）。
+
 ---
 
 ## `check_chat_pipeline.py` — health check

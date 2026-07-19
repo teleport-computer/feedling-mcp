@@ -5791,7 +5791,11 @@ def _user_mcp_child_env(cmd: list[str]) -> dict:
     if not enabled_servers:
         return {}
     env: dict = {}
-    if _is_codex_cmd(cmd):
+    if _is_codex_cmd(cmd) or _is_hermes_chat_cmd(cmd):
+        # codex AND hermes are python. SSL_CERT_FILE REPLACES the trust store,
+        # so it points at the concat castore (certifi system CA + user CA), not
+        # the user-only bundle. httpx (hermes's mcp SDK client) reads
+        # SSL_CERT_FILE, verified locally against a self-signed server.
         if Path(USER_MCP_CASTORE_FILE).exists():
             env["SSL_CERT_FILE"] = USER_MCP_CASTORE_FILE   # REPLACES → concat bundle
     else:
@@ -5836,6 +5840,22 @@ def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
             os.chmod(config_path, 0o600)  # holds plaintext MCP headers/token
         elif config_path.exists():
             config_path.unlink()
+    hermes_dir = os.environ.get("HERMES_CONFIG_DIR") or str(Path.home() / ".hermes")
+    if Path(hermes_dir).is_dir():
+        try:
+            _materialize_hermes_config(
+                Path(hermes_dir) / "config.yaml", servers, managed_names)
+        except Exception as e:  # noqa: BLE001 — one target must never break others/chat
+            log.warning("[user_mcp] hermes config.yaml write failed: %s: %s",
+                        type(e).__name__, e)
+    openclaw_dir = os.environ.get("OPENCLAW_CONFIG_DIR") or str(Path.home() / ".openclaw")
+    if Path(openclaw_dir).is_dir():
+        try:
+            _materialize_openclaw_config(
+                Path(openclaw_dir) / "openclaw.json", servers, managed_names)
+        except Exception as e:  # noqa: BLE001 — one target must never break others/chat
+            log.warning("[user_mcp] openclaw.json write failed: %s: %s",
+                        type(e).__name__, e)
     _write_user_mcp_ca(servers)
 
 
