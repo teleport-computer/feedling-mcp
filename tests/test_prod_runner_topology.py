@@ -10,11 +10,11 @@ SCRIPT = ROOT / "deploy" / "check-prod-runner-topology.sh"
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
-def _run(tmp_path: Path, body: str, enabled: str = "true") -> subprocess.CompletedProcess[str]:
+def _run(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
     ids = tmp_path / "ids.txt"
     ids.write_text(body)
     return subprocess.run(
-        ["bash", str(SCRIPT), str(ids), enabled],
+        ["bash", str(SCRIPT), str(ids)],
         text=True,
         capture_output=True,
         check=False,
@@ -39,12 +39,6 @@ def test_topology_gate_counts_unique_runner_ids(tmp_path):
     redundant = _run(tmp_path, "runner-a\n\n# separate failure domain\nrunner-b\n")
     assert redundant.returncode == 0
     assert "2 independent" in redundant.stdout
-
-
-def test_topology_gate_is_inert_when_standalone_deploy_is_disabled(tmp_path):
-    result = _run(tmp_path, "", enabled="false")
-    assert result.returncode == 0
-    assert "inactive" in result.stdout
 
 
 def test_main_deploy_depends_on_topology_preflight():

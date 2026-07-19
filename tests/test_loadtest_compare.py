@@ -1,6 +1,6 @@
 """Tests for scripts/loadtest/compare_tokens.py — the D4 Task 4 tokens/turn
-vs resident-baseline comparison (the ROLLBACK gate: V2 tokens/turn must not
-regress vs the resident runtime on identical fixtures).
+vs frozen resident-baseline comparison. V2 must not regress against the
+historical benchmark; the retired hosted runtime is not a rollback target.
 
 Two pieces under test:
   1. ``compare_tokens_per_turn`` — pure math, no I/O.
@@ -152,7 +152,7 @@ def test_measure_v2_tokens_per_turn_reflects_configured_usage():
     assert mean_tokens == 120.0
 
 
-# --- exit-code / rollback-signal logic (no subprocess needed) -----------
+# --- exit-code / regression-signal logic (no subprocess needed) --------
 
 
 def test_regression_result_is_the_nonzero_exit_signal():

@@ -164,9 +164,9 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_hosted_runtime_policy.py \
+            tests/test_hosted_resident_retirement.py \
             tests/test_hosted_runtime_mode.py \
             tests/test_chat_send_v2_enqueue.py \
-            tests/test_v2_exclusivity_guard.py \
             tests/test_model_api_chat_send_routing.py \
             tests/test_model_api_profiles_endpoints.py \
             tests/test_provider_prompt_cache.py \
@@ -180,6 +180,7 @@ jobs:
             tests/test_v2_prompt_cache_key.py \
             tests/test_v2_prompt_frontier.py \
             tests/test_v2_metrics_endpoint.py \
+            tests/test_prod_runner_fleet_gate.py \
             tests/test_v2_turn_metrics.py \
             tests/test_v2_whole_turn_metric.py \
             tests/test_v2_jobs_migration.py \
