@@ -2303,7 +2303,9 @@ ENCRYPTED_TOOL_EFFECT_TYPES = {
     "workspace_batch": "workspace_batch_encrypted_v1",
 }
 
-MAX_WORKSPACE_BATCH_OPERATIONS = 24
+MAX_WORKSPACE_BATCH_OPERATIONS = (
+    v2_effect_outbox.WORKSPACE_BATCH_RESULT_MAX_ITEMS
+)
 
 
 def _workspace_batch_effect_payload(
@@ -2329,6 +2331,70 @@ def _workspace_batch_effect_payload(
             }
         )
     return {"operations": operations}
+
+
+def _workspace_batch_tool_results(
+    tool_calls,
+    *,
+    parent_effect_id: str,
+    disposition: dict,
+) -> list[ToolResult]:
+    """Map one applied batch's durable child truth back to provider order.
+
+    Rows written by the first workspace-batch release have no structured
+    result. Those legacy ``applied`` parents were all-or-nothing successes, so
+    the no-result case remains compatible. New parents carry an ordered,
+    non-sensitive result after the encrypted request payload is scrubbed.
+    """
+    calls = list(tool_calls)
+    if disposition.get("status") not in {
+        "applied",
+        v2_effect_outbox.APPLIED_WITH_RESULTS_STATUS,
+    }:
+        raise RuntimeError("workspace batch parent is not applied")
+    result = disposition.get("result")
+    if result is None:
+        return [
+            ToolResult(
+                call_id=tc.id,
+                content=f"ok: {tc.name} applied",
+            )
+            for tc in calls
+        ]
+    if not isinstance(result, dict) or set(result) != {"kind", "items"}:
+        raise RuntimeError("workspace batch result shape is invalid")
+    if result.get("kind") != v2_effect_outbox.WORKSPACE_BATCH_RESULT_KIND:
+        raise RuntimeError("workspace batch result kind is invalid")
+    items = result.get("items")
+    if not isinstance(items, list) or len(items) != len(calls):
+        raise RuntimeError("workspace batch result cardinality is invalid")
+
+    mapped = []
+    for index, (tc, item) in enumerate(zip(calls, items)):
+        if not isinstance(item, dict):
+            raise RuntimeError("workspace batch child result is invalid")
+        expected_effect_id = v2_effect_id.derive_batch_item(
+            parent_effect_id=parent_effect_id,
+            ordinal=index,
+        )
+        if str(item.get("effect_id") or "") != expected_effect_id:
+            raise RuntimeError("workspace batch child result identity is invalid")
+        status = str(item.get("status") or "")
+        if status == "applied" and set(item) == {"effect_id", "status"}:
+            content = f"ok: {tc.name} applied"
+        elif status == "discarded" and set(item) == {
+            "effect_id",
+            "status",
+            "error",
+        }:
+            expected_error = f"{tc.name}_failed"
+            if item.get("error") != expected_error:
+                raise RuntimeError("workspace batch child error is invalid")
+            content = f"error: {expected_error}"
+        else:
+            raise RuntimeError("workspace batch child status is invalid")
+        mapped.append(ToolResult(call_id=tc.id, content=content))
+    return mapped
 
 
 @dataclass
@@ -5220,7 +5286,10 @@ async def process_job(
                     job_id=job_id,
                     effect_type=effect_type,
                 )
-                if disposition is None or disposition["status"] != "applied":
+                if disposition is None or disposition["status"] not in {
+                    "applied",
+                    v2_effect_outbox.APPLIED_WITH_RESULTS_STATUS,
+                }:
                     status = (
                         "missing"
                         if disposition is None
@@ -5229,13 +5298,11 @@ async def process_job(
                     raise RuntimeError(
                         "workspace batch was not durably applied: " + status
                     )
-                return [
-                    ToolResult(
-                        call_id=tc.id,
-                        content=f"ok: {tc.name} applied",
-                    )
-                    for tc in calls
-                ]
+                return _workspace_batch_tool_results(
+                    calls,
+                    parent_effect_id=effect_id,
+                    disposition=disposition,
+                )
 
             # Schema omission is the provider-facing control; this runtime
             # gate is the independent fail-closed boundary. A broken relay or

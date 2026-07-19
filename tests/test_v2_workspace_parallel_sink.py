@@ -258,6 +258,179 @@ def test_partial_batch_retry_skips_completed_children(monkeypatch):
     assert all(state == "completed" for state in states.values())
 
 
+def test_terminal_child_preserves_successful_sibling_in_ordered_parent_result(
+    monkeypatch,
+):
+    states = _install_sink_seams(monkeypatch)
+    monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "2")
+    parent = "job9:workspace_batch_encrypted_v1:terminal"
+    operations = [
+        _operation(parent, 0, "/workspace/applied.md"),
+        _operation(parent, 1, "/workspace/conflict.md"),
+    ]
+
+    def run_capability(op, _store, *, api_key, runtime_token, params):
+        assert op == "workspace_write"
+        assert api_key is None
+        assert runtime_token == "token"
+        if params["path"].endswith("conflict.md"):
+            return SimpleNamespace(
+                ok=False,
+                error={"retryable": False},
+            )
+        return SimpleNamespace(ok=True, error=None)
+
+    monkeypatch.setattr(
+        serve_worker.cap_registry,
+        "run_capability",
+        run_capability,
+    )
+
+    result = serve_worker._sink_workspace_batch(
+        "u_terminal",
+        {"effect_id": parent, "operations": operations},
+        runtime_token="token",
+    )
+
+    assert result == effect_outbox.WorkspaceBatchAppliedResult(
+        {
+            "kind": effect_outbox.WORKSPACE_BATCH_RESULT_KIND,
+            "items": [
+                {
+                    "effect_id": operations[0]["sub_effect_id"],
+                    "status": "applied",
+                },
+                {
+                    "effect_id": operations[1]["sub_effect_id"],
+                    "status": "discarded",
+                    "error": "workspace_write_failed",
+                },
+            ],
+        },
+        status=effect_outbox.APPLIED_WITH_RESULTS_STATUS,
+    )
+    assert states == {operations[0]["sub_effect_id"]: "completed"}
+    calls = [
+        ToolCall(
+            id="applied",
+            name="workspace_write",
+            args={
+                "path": "/workspace/applied.md",
+                "content": "applied",
+                "expected_revision": 0,
+            },
+        ),
+        ToolCall(
+            id="conflict",
+            name="workspace_write",
+            args={
+                "path": "/workspace/conflict.md",
+                "content": "conflict",
+                "expected_revision": 0,
+            },
+        ),
+    ]
+    mapped = worker._workspace_batch_tool_results(
+        calls,
+        parent_effect_id=parent,
+        disposition={
+            "status": effect_outbox.APPLIED_WITH_RESULTS_STATUS,
+            "result": result.result,
+        },
+    )
+    assert [(item.call_id, item.content) for item in mapped] == [
+        ("applied", "ok: workspace_write applied"),
+        ("conflict", "error: workspace_write_failed"),
+    ]
+
+
+def test_terminal_child_does_not_block_a_later_conflicting_path(monkeypatch):
+    _install_sink_seams(monkeypatch)
+    monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "2")
+    parent = "job9:workspace_batch_encrypted_v1:later"
+    operations = [
+        _operation(parent, 0, "/workspace/project"),
+        _operation(parent, 1, "/workspace/project/child.md"),
+    ]
+    called = []
+
+    def run_capability(op, _store, *, api_key, runtime_token, params):
+        called.append(params["path"])
+        return SimpleNamespace(
+            ok=params["path"].endswith("child.md"),
+            error={"retryable": False},
+        )
+
+    monkeypatch.setattr(
+        serve_worker.cap_registry,
+        "run_capability",
+        run_capability,
+    )
+    result = serve_worker._sink_workspace_batch(
+        "u_later",
+        {"effect_id": parent, "operations": operations},
+        runtime_token="token",
+    )
+
+    assert called == [
+        "/workspace/project",
+        "/workspace/project/child.md",
+    ]
+    assert [item["status"] for item in result.result["items"]] == [
+        "discarded",
+        "applied",
+    ]
+
+
+def test_applied_batch_result_rejects_plaintext_metadata():
+    with pytest.raises(RuntimeError, match="child status"):
+        effect_outbox._serialized_applied_result(
+            effect_outbox.WorkspaceBatchAppliedResult(
+                {
+                    "kind": effect_outbox.WORKSPACE_BATCH_RESULT_KIND,
+                    "items": [
+                        {
+                            "effect_id": "job1:workspace_batch_encrypted_v1:0:item:0",
+                            "status": "applied",
+                            "path": "/workspace/private.md",
+                        }
+                    ],
+                }
+            )
+        )
+
+
+def test_retryable_child_keeps_parent_unresolved_despite_terminal_sibling(
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "2")
+    parent = "job9:workspace_batch_encrypted_v1:retry-dominates"
+
+    def apply(_user_id, operation, *, runtime_token):
+        if operation["path"].endswith("terminal.md"):
+            raise db.EffectTerminalError("workspace_write_failed")
+        raise RuntimeError("transient backend failure")
+
+    monkeypatch.setattr(
+        serve_worker,
+        "_apply_workspace_batch_operation",
+        apply,
+    )
+    with pytest.raises(RuntimeError, match="transient backend failure") as exc_info:
+        serve_worker._sink_workspace_batch(
+            "u_retry_dominates",
+            {
+                "effect_id": parent,
+                "operations": [
+                    _operation(parent, 0, "/workspace/terminal.md"),
+                    _operation(parent, 1, "/workspace/retry.md"),
+                ],
+            },
+            runtime_token="token",
+        )
+    assert not isinstance(exc_info.value, db.EffectTerminalError)
+
+
 def test_uncertain_child_dominates_terminal_sibling(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "2")
     parent = "job9:workspace_batch_encrypted_v1:uncertain"
@@ -405,6 +578,138 @@ def test_encrypted_parent_outbox_applies_real_child_rows_and_claims(
     assert child_claims == [
         (effect_id.derive_batch_item(parent_effect_id=parent, ordinal=0), "completed"),
         (effect_id.derive_batch_item(parent_effect_id=parent, ordinal=1), "completed"),
+    ]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DATABASE_URL"),
+    reason="workspace outbox integration requires PostgreSQL",
+)
+def test_parent_outbox_is_applied_with_persisted_partial_terminal_results(
+    monkeypatch,
+):
+    uid = "u_workspace_batch_partial_terminal"
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+    seed_user(uid)
+    set_v2_runtime_owner(uid)
+    generation = db.get_runtime_generation(uid)
+    job_id = 9018
+    stored_type = worker.ENCRYPTED_TOOL_EFFECT_TYPES["workspace_batch"]
+    parent = effect_id.derive(
+        job_id=job_id,
+        effect_type=stored_type,
+        ordinal=0,
+    )
+    operations = [
+        _operation(parent, 0, "/workspace/partial-applied.md"),
+        _operation(parent, 1, "/workspace/partial-conflict.md"),
+    ]
+
+    monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "2")
+    monkeypatch.setattr(
+        serve_worker,
+        "_mint_runtime_token",
+        lambda _uid: "token",
+    )
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda user_id: SimpleNamespace(user_id=user_id),
+    )
+
+    def decrypt(_user_id, stored_payload, *, runtime_token):
+        assert runtime_token == "token"
+        return {
+            "effect_id": stored_payload["effect_id"],
+            "operations": operations,
+        }
+
+    monkeypatch.setattr(
+        serve_worker,
+        "_decrypt_tool_effect_payload",
+        decrypt,
+    )
+    durable_calls = []
+
+    def run_capability(op, _store, *, api_key, runtime_token, params):
+        assert op == "workspace_write"
+        assert api_key is None
+        assert runtime_token == "token"
+        durable_calls.append(params["path"])
+        if params["path"].endswith("partial-conflict.md"):
+            return SimpleNamespace(
+                ok=False,
+                error={"retryable": False},
+            )
+        return SimpleNamespace(ok=True, error=None)
+
+    monkeypatch.setattr(
+        serve_worker.cap_registry,
+        "run_capability",
+        run_capability,
+    )
+    effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=stored_type,
+        ordinal=0,
+        expected_generation=generation,
+        payload={
+            "effect_envelope": {
+                "id": worker._tool_effect_item_id(parent),
+                "body_ct": "opaque-batch-ciphertext",
+            }
+        },
+    )
+
+    assert serve_worker._apply_pending_effects_for_user(uid) == {
+        "applied": 1,
+        "discarded": 0,
+    }
+    assert sorted(durable_calls) == sorted(
+        operation["path"] for operation in operations
+    )
+    expected_result = {
+        "kind": effect_outbox.WORKSPACE_BATCH_RESULT_KIND,
+        "items": [
+            {
+                "effect_id": operations[0]["sub_effect_id"],
+                "status": "applied",
+            },
+            {
+                "effect_id": operations[1]["sub_effect_id"],
+                "status": "discarded",
+                "error": "workspace_write_failed",
+            },
+        ],
+    }
+    assert effect_outbox.get_effect_disposition(
+        parent,
+        user_id=uid,
+        job_id=job_id,
+        effect_type=stored_type,
+    ) == {
+        "status": effect_outbox.APPLIED_WITH_RESULTS_STATUS,
+        "last_error": "",
+        "result": expected_result,
+    }
+    with db.get_pool().connection() as conn:
+        parent_row = conn.execute(
+            "SELECT status,payload FROM v2_effect_outbox WHERE effect_id=%s",
+            (parent,),
+        ).fetchone()
+        child_claims = conn.execute(
+            "SELECT effect_id,claim_state FROM v2_effect_sink_applied "
+            "WHERE effect_id LIKE %s ORDER BY effect_id",
+            (parent + ":item:%",),
+        ).fetchall()
+    assert parent_row[0] == effect_outbox.APPLIED_WITH_RESULTS_STATUS
+    assert parent_row[1] == {
+        effect_outbox.APPLIED_RESULT_PAYLOAD_KEY: expected_result
+    }
+    assert child_claims == [
+        (operations[0]["sub_effect_id"], "completed"),
     ]
 
 
@@ -695,7 +1000,10 @@ def test_scheduler_splits_workspace_runs_at_encrypted_batch_limit():
             read_parallelism=2,
             mcp_timeout_sec=1,
         )
-        assert [len(run) for run in prepared] == [24, 1]
+        assert [len(run) for run in prepared] == [
+            worker.MAX_WORKSPACE_BATCH_OPERATIONS,
+            1,
+        ]
         assert dispatched == prepared
         assert [result.call_id for result in results] == [
             call.id for call in calls

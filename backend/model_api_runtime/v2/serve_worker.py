@@ -2127,11 +2127,11 @@ def _apply_workspace_batch_operation(
     operation: dict,
     *,
     runtime_token: str,
-) -> None:
+) -> dict:
     """Apply one child with its own crash-safe idempotency claim."""
     child_effect_id = str(operation["sub_effect_id"])
     if not db.effect_sink_claim(child_effect_id):
-        return
+        return {"effect_id": child_effect_id, "status": "applied"}
     try:
         op = str(operation["op"])
         store = core_store.get_store(user_id)
@@ -2156,6 +2156,7 @@ def _apply_workspace_batch_operation(
         db.effect_sink_release(child_effect_id)
         raise
     db.effect_sink_complete(child_effect_id)
+    return {"effect_id": child_effect_id, "status": "applied"}
 
 
 def _sink_workspace_batch(
@@ -2163,39 +2164,89 @@ def _sink_workspace_batch(
     payload: dict,
     *,
     runtime_token: str,
-) -> None:
-    """Apply one encrypted workspace batch with real durable concurrency."""
+) -> v2_effect_outbox.WorkspaceBatchAppliedResult:
+    """Apply a workspace batch and retain every child's terminal truth.
+
+    Deterministic conflicts are item results, not parent delivery failures. A
+    transient or uncertain child still keeps the parent unresolved exactly as
+    before; already-completed siblings are skipped safely on replay by their
+    individual sink claims.
+    """
     operations = list(payload.get("operations") or [])
     waves = _workspace_mutation_waves(operations)
     executor = _workspace_write_executor()
+    outcomes: dict[str, dict] = {}
     for wave in waves:
         futures = [
-            executor.submit(
-                _apply_workspace_batch_operation,
-                user_id,
+            (
                 operation,
-                runtime_token=runtime_token,
+                executor.submit(
+                    _apply_workspace_batch_operation,
+                    user_id,
+                    operation,
+                    runtime_token=runtime_token,
+                ),
             )
             for operation in wave
         ]
-        errors: list[Exception] = []
+        retryable_errors: list[Exception] = []
+        uncertain_errors: list[db.EffectDeliveryUncertainError] = []
         # Read results in provider order. All futures are already running, so
-        # this preserves deterministic error selection without serializing the
-        # actual backend work.
-        for future in futures:
+        # this preserves deterministic results/error selection without
+        # serializing the actual backend work.
+        for operation, future in futures:
+            child_effect_id = str(operation["sub_effect_id"])
             try:
-                future.result()
+                outcome = future.result()
+            except db.EffectDeliveryUncertainError as exc:
+                uncertain_errors.append(exc)
+            except db.EffectTerminalError:
+                outcomes[child_effect_id] = {
+                    "effect_id": child_effect_id,
+                    "status": "discarded",
+                    # The capability adapter deliberately exposes only this
+                    # stable code; never persist exception text from a sink.
+                    "error": f"{operation['op']}_failed",
+                }
             except Exception as exc:  # noqa: BLE001 - re-raised after siblings settle
-                errors.append(exc)
-        if errors:
-            # Uncertain delivery dominates deterministic conflicts and ordinary
-            # retryable failures. Discarding the parent because an earlier
-            # sibling hit a terminal CAS conflict would otherwise orphan a
-            # later child whose durable outcome is genuinely unknown.
-            for error in errors:
-                if isinstance(error, db.EffectDeliveryUncertainError):
-                    raise error
-            raise errors[0]
+                retryable_errors.append(exc)
+            else:
+                if not isinstance(outcome, dict) or outcome != {
+                    "effect_id": child_effect_id,
+                    "status": "applied",
+                }:
+                    retryable_errors.append(
+                        RuntimeError("workspace child returned an invalid outcome")
+                    )
+                else:
+                    outcomes[child_effect_id] = outcome
+        # Delivery uncertainty dominates every other outcome. Ordinary
+        # retryable failures dominate deterministic item rejections so a
+        # terminal sibling can never discard work that still needs a replay.
+        if uncertain_errors:
+            raise uncertain_errors[0]
+        if retryable_errors:
+            raise retryable_errors[0]
+
+    ordered = []
+    for operation in operations:
+        child_effect_id = str(operation["sub_effect_id"])
+        outcome = outcomes.get(child_effect_id)
+        if outcome is None:
+            raise RuntimeError("workspace batch child outcome is missing")
+        ordered.append(outcome)
+    parent_status = (
+        v2_effect_outbox.APPLIED_WITH_RESULTS_STATUS
+        if any(item["status"] == "discarded" for item in ordered)
+        else "applied"
+    )
+    return v2_effect_outbox.WorkspaceBatchAppliedResult(
+        {
+            "kind": v2_effect_outbox.WORKSPACE_BATCH_RESULT_KIND,
+            "items": ordered,
+        },
+        status=parent_status,
+    )
 
 
 def build_production_effect_dispatch(
@@ -2449,7 +2500,7 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
         runtime_token_provider=get_runtime_token,
     )
 
-    def dispatch(effect_type: str, payload: dict) -> None:
+    def dispatch(effect_type: str, payload: dict) -> object:
         if "effect_envelope" in payload:
             logical_effect_type = _ENCRYPTED_TOOL_EFFECT_TYPES.get(effect_type)
             if logical_effect_type is None:
@@ -2461,14 +2512,14 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
             )
             _validate_decrypted_tool_effect(logical_effect_type, payload)
             if logical_effect_type == "workspace_batch":
-                _sink_workspace_batch(
+                return _sink_workspace_batch(
                     user_id,
                     payload,
                     runtime_token=get_runtime_token(),
                 )
-                return
             effect_type = logical_effect_type
         production_dispatch(effect_type, payload)
+        return None
 
     return v2_effect_outbox.apply_pending_effects(
         user_id,

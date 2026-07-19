@@ -5,6 +5,7 @@ FOR UPDATE, so a concurrent cutover cannot slip between the authoritative
 ``state == v2`` + generation check and the apply.
 """
 from __future__ import annotations
+from dataclasses import dataclass
 import json
 import logging
 from typing import Callable
@@ -43,6 +44,91 @@ FINAL_REPLY_INVALID_FENCE = "invalid_final_reply_fence"
 FINAL_REPLY_SOURCE_JOB_INACTIVE = "source_job_not_active"
 EFFECT_RUNTIME_STATE_CHANGED = "runtime_state_not_v2"
 EFFECT_RUNTIME_GENERATION_CHANGED = "runtime_generation_advanced"
+APPLIED_RESULT_PAYLOAD_KEY = "_applied_result_v1"
+APPLIED_WITH_RESULTS_STATUS = "applied_with_results"
+WORKSPACE_BATCH_RESULT_KIND = "workspace_batch_v1"
+WORKSPACE_BATCH_RESULT_MAX_ITEMS = 24
+WORKSPACE_BATCH_TERMINAL_ERRORS = frozenset(
+    {"workspace_write_failed", "workspace_delete_failed"}
+)
+_APPLIED_RESULT_MAX_BYTES = 16_384
+_SAFE_EFFECT_ID_PUNCTUATION = frozenset(":_-.")
+
+
+@dataclass(frozen=True)
+class WorkspaceBatchAppliedResult:
+    """A successful sink outcome that carries non-sensitive structured results.
+
+    Delivery is complete even when a composite sink reports deterministic
+    per-item rejections. Such a parent uses ``applied_with_results`` so an older
+    producer fails visibly instead of mistaking partial success for all-success.
+    The result replaces the encrypted request payload, letting a current
+    producer recover exact terminal truth without retaining plaintext.
+    """
+
+    result: dict
+    status: str = "applied"
+
+
+def _validate_applied_result(value: WorkspaceBatchAppliedResult) -> None:
+    result = value.result
+    if not isinstance(result, dict) or set(result) != {"kind", "items"}:
+        raise RuntimeError("applied effect result shape is invalid")
+    if result.get("kind") != WORKSPACE_BATCH_RESULT_KIND:
+        raise RuntimeError("applied effect result kind is invalid")
+    items = result.get("items")
+    if (
+        not isinstance(items, list)
+        or not 1 <= len(items) <= WORKSPACE_BATCH_RESULT_MAX_ITEMS
+    ):
+        raise RuntimeError("applied effect result items are invalid")
+    has_discarded = False
+    for item in items:
+        if not isinstance(item, dict):
+            raise RuntimeError("applied effect child result is invalid")
+        effect_id = item.get("effect_id")
+        if (
+            not isinstance(effect_id, str)
+            or not 1 <= len(effect_id) <= 256
+            or not all(
+                char.isascii()
+                and (char.isalnum() or char in _SAFE_EFFECT_ID_PUNCTUATION)
+                for char in effect_id
+            )
+        ):
+            raise RuntimeError("applied effect child identity is invalid")
+        status = item.get("status")
+        if status == "applied" and set(item) == {"effect_id", "status"}:
+            continue
+        if (
+            status == "discarded"
+            and set(item) == {"effect_id", "status", "error"}
+            and item.get("error") in WORKSPACE_BATCH_TERMINAL_ERRORS
+        ):
+            has_discarded = True
+            continue
+        raise RuntimeError("applied effect child status is invalid")
+    expected_status = APPLIED_WITH_RESULTS_STATUS if has_discarded else "applied"
+    if value.status != expected_status:
+        raise RuntimeError("applied effect result status is inconsistent")
+
+
+def _serialized_applied_result(value: object) -> tuple[str, str] | None:
+    if not isinstance(value, WorkspaceBatchAppliedResult):
+        # Dispatch was historically a void callback. Preserve compatibility
+        # with adapters that happen to return an incidental value; only the
+        # explicit wrapper opts into durable structured results.
+        return None
+    _validate_applied_result(value)
+    rendered = json.dumps(
+        {APPLIED_RESULT_PAYLOAD_KEY: value.result},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if len(rendered.encode("utf-8")) > _APPLIED_RESULT_MAX_BYTES:
+        raise RuntimeError("applied effect result exceeds the durable size limit")
+    return rendered, value.status
 
 
 def _sanitized_dispatch_error(exc: Exception) -> str:
@@ -451,11 +537,12 @@ def get_effect_disposition(
     An independent sweeper may win the row before the producing worker's drain.
     A per-call list of rows changed by that drain is therefore not a delivery
     acknowledgement.  The producer uses this identity-checked read after the
-    drain and accepts only ``status == 'applied'`` as successful publication.
+    drain and accepts only the effect type's explicit applied status as
+    successful publication.
     """
     with db.get_pool().connection() as conn:
         row = conn.execute(
-            "SELECT user_id,job_id,effect_type,status,last_error "
+            "SELECT user_id,job_id,effect_type,status,last_error,payload "
             "FROM v2_effect_outbox WHERE effect_id=%s FOR UPDATE",
             (str(effect_id),),
         ).fetchone()
@@ -467,13 +554,29 @@ def get_effect_disposition(
         or str(row[2]) != str(effect_type)
     ):
         raise RuntimeError("effect identity mismatch")
-    return {"status": str(row[3]), "last_error": str(row[4] or "")}
+    disposition = {
+        "status": str(row[3]),
+        "last_error": str(row[4] or ""),
+    }
+    stored_payload = row[5]
+    if isinstance(stored_payload, str):
+        stored_payload = json.loads(stored_payload)
+    if (
+        disposition["status"] in {"applied", APPLIED_WITH_RESULTS_STATUS}
+        and isinstance(stored_payload, dict)
+        and set(stored_payload) == {APPLIED_RESULT_PAYLOAD_KEY}
+    ):
+        result = stored_payload[APPLIED_RESULT_PAYLOAD_KEY]
+        if not isinstance(result, dict):
+            raise RuntimeError("persisted applied effect result is invalid")
+        disposition["result"] = result
+    return disposition
 
 
 def apply_pending_effects(
     user_id: str,
     *,
-    dispatch: Callable[[str, dict], None],
+    dispatch: Callable[[str, dict], object],
     dispatch_reply_in_transaction: Callable | None = None,
 ) -> dict:
     applied = discarded = 0
@@ -485,6 +588,7 @@ def apply_pending_effects(
         dispatch_error_committed = False
         deferred_dispatch_error: Exception | None = None
         terminal_discard = False
+        serialized_applied_result: tuple[str, str] | None = None
         finalized_job_id_in_transaction: int | None = None
         post_commit_reply: Callable[[], None] | None = None
         try:
@@ -688,9 +792,14 @@ def apply_pending_effects(
                                             with db._chat_user_fence_held_by_outer_transaction(
                                                 user_id
                                             ):
-                                                dispatch(
+                                                dispatch_result = dispatch(
                                                     logical_effect_type,
                                                     payload,
+                                                )
+                                                serialized_applied_result = (
+                                                    _serialized_applied_result(
+                                                        dispatch_result
+                                                    )
                                                 )
                                             post_commit_candidate = None
 
@@ -746,7 +855,17 @@ def apply_pending_effects(
                                 deferred_dispatch_error is None
                                 and final_reply_discard_reason is None
                             ):
-                                if effect_type in _LEGACY_SENSITIVE_EFFECT_TYPES:
+                                if serialized_applied_result is not None:
+                                    result_payload, result_status = (
+                                        serialized_applied_result
+                                    )
+                                    cur.execute(
+                                        "UPDATE v2_effect_outbox SET status=%s, "
+                                        "applied_at=now(), last_error='', payload=%s::jsonb "
+                                        "WHERE effect_id=%s",
+                                        (result_status, result_payload, eid),
+                                    )
+                                elif effect_type in _LEGACY_SENSITIVE_EFFECT_TYPES:
                                     cur.execute(
                                         "UPDATE v2_effect_outbox SET status='applied', "
                                         "applied_at=now(), last_error='', payload=%s::jsonb "
