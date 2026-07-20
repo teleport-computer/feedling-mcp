@@ -354,3 +354,29 @@ def test_content_filtered_classified():
     from chat_resident_consumer import classify_agent_error
     n = classify_agent_error(RuntimeError("response was blocked by content_filter policy"))
     assert n.error_class == "content_filtered" and n.blame == "provider_transient"
+
+
+def test_turn_failure_post_kwargs_from_notice():
+    """兜底回复必须把分类结果带给后端——这是 iOS 实时看到失败原因的唯一通路。
+    只带 error_class/blame/user_text，detail 绝不下发（可能夹带 provider HTML、
+    request id、敏感上下文）。"""
+    notice = crc.classify_agent_error(RuntimeError("cli agent exited 1: 402 余额不足"))
+    kwargs = crc.turn_failure_post_kwargs(notice)
+
+    assert kwargs["turn_failure_error_class"] == "quota_insufficient"
+    assert kwargs["turn_failure_blame"] == "user_provider"
+    assert kwargs["turn_failure_user_text"] == notice.user_text
+    assert "detail" not in kwargs
+    assert not any("detail" in k for k in kwargs)
+    assert len(kwargs["turn_failure_user_text"]) <= 500
+
+
+def test_turn_failure_kwargs_empty_for_none():
+    """无失败时返回空 dict —— 成功路径不得凭空带字段。"""
+    assert crc.turn_failure_post_kwargs(None) == {}
+
+
+def test_turn_failure_kwargs_truncate_long_user_text():
+    """契约：user_text ≤ 500，杜绝把长文灌进用户可见文案。"""
+    notice = crc.AgentErrorNotice("unknown", "system", "x" * 900, "detail")
+    assert len(crc.turn_failure_post_kwargs(notice)["turn_failure_user_text"]) == 500
