@@ -722,3 +722,73 @@ def test_probe_sse_malformed_endpoint_port_is_400_not_500(monkeypatch, _direct_l
         srv.shutdown()
     assert e.value.kind == "protocol"
     assert "invalid endpoint" in e.value.detail
+
+
+# --- IP pinning: prefer a reachable validated IP (dual-stack / IPv4-only env) --
+#
+# net_safety.resolve_ips returns IPv6 addresses first for dual-stack hosts; a
+# runner CVM with no IPv6 egress could never reach them. _pin_public_target used
+# to pin ips[0] unconditionally (session-wide, no fallback), so a single
+# unreachable IPv6 broke every user-MCP connection. It now pins the first
+# validated IP that accepts a TCP connection; all candidates are already
+# is_global-validated, so trying them in turn is still SSRF-safe and still pins
+# ONE address for the whole session (no DNS-rebinding window).
+
+_V6 = "2600:1f14:36ec:d00:c4d0:fedd:9df1:9d7b"   # global unicast (2000::/3)
+
+
+def test_pin_single_ip_skips_reachability_probe(monkeypatch):
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr(
+        mcp_probe, "_probe_tcp",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("single IP must not be probed")))
+    target = mcp_probe._pin_public_target("https://mcp.example.com/mcp")
+    assert target.request_url.host == "93.184.216.34"
+    assert target.sni_hostname == "mcp.example.com"
+
+
+def test_pin_prefers_reachable_ip_when_first_is_unreachable(monkeypatch):
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: [_V6, "93.184.216.34"])
+    # IPv4-only env: the IPv6 candidate never connects.
+    monkeypatch.setattr(mcp_probe, "_probe_tcp",
+                        lambda ip, port, timeout: ip == "93.184.216.34")
+    target = mcp_probe._pin_public_target("https://mcp.example.com/mcp")
+    assert target.request_url.host == "93.184.216.34"
+    assert target.host_header == "mcp.example.com"
+    assert target.sni_hostname == "mcp.example.com"
+
+
+def test_pin_probes_the_configured_port(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: [_V6, "93.184.216.34"])
+
+    def _probe(ip, port, timeout):
+        seen["port"] = port
+        return ip == "93.184.216.34"
+
+    monkeypatch.setattr(mcp_probe, "_probe_tcp", _probe)
+    target = mcp_probe._pin_public_target("https://mcp.example.com:8443/mcp")
+    assert seen["port"] == 8443
+    assert target.request_url.host == "93.184.216.34"
+
+
+def test_pin_falls_back_to_first_ip_when_none_reachable(monkeypatch):
+    # Nothing connects (probe can't run / all filtered) -> keep ips[0] so the
+    # later real attempt surfaces the concrete error, exactly as before.
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: [_V6, "93.184.216.34"])
+    monkeypatch.setattr(mcp_probe, "_probe_tcp", lambda ip, port, timeout: False)
+    target = mcp_probe._pin_public_target("https://mcp.example.com/mcp")
+    assert target.request_url.host == _V6
+
+
+def test_first_reachable_ip_returns_first_success_and_stops(monkeypatch):
+    probed = []
+
+    def _probe(ip, port, timeout):
+        probed.append(ip)
+        return ip == "8.8.8.8"
+
+    monkeypatch.setattr(mcp_probe, "_probe_tcp", _probe)
+    chosen = mcp_probe._first_reachable_ip([_V6, "8.8.8.8", "1.1.1.1"], 443)
+    assert chosen == "8.8.8.8"
+    assert probed == [_V6, "8.8.8.8"]   # stopped before 1.1.1.1

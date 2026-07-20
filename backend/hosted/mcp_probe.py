@@ -227,6 +227,40 @@ def _validated_public_ips(url: str) -> tuple[str, list[str]]:
     return host, [str(literal)]
 
 
+_REACHABILITY_PROBE_TIMEOUT = 2.0
+
+
+def _probe_tcp(ip: str, port: int, timeout: float) -> bool:
+    """True if a TCP connection to (ip, port) is accepted. Never raises."""
+    try:
+        socket.create_connection((ip, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def _first_reachable_ip(
+    ips: list[str], port: int, *, timeout: float = _REACHABILITY_PROBE_TIMEOUT
+) -> str:
+    """Pick the first validated IP that accepts a TCP connection on ``port``.
+
+    net_safety.resolve_ips returns IPv6 addresses first for dual-stack hosts; a
+    runner with no IPv6 egress can never reach them, and pinning ips[0] blindly
+    then failed the whole session. Every candidate here is already
+    ``is_global``-validated, so trying them in order stays SSRF-safe while a
+    single dead address family no longer wedges the connection. A single
+    candidate is pinned WITHOUT a probe (no alternative to fall back to, and the
+    unit tests that mock one IP must stay network-free). If none connect, keep
+    ips[0] so the real attempt surfaces the concrete error, exactly as before.
+    """
+    if len(ips) <= 1:
+        return ips[0]
+    for ip in ips:
+        if _probe_tcp(ip, port, timeout):
+            return ip
+    return ips[0]
+
+
 def _pin_public_target(url: str) -> _PinnedTarget:
     _resolved_host, ips = _validated_public_ips(url)
     try:
@@ -241,7 +275,11 @@ def _pin_public_target(url: str) -> _PinnedTarget:
 
     # A single operation deliberately pins one validated address for initialize,
     # initialized, and the subsequent list/call. A new operation resolves afresh.
-    request_url = configured_url.copy_with(host=ips[0])
+    # Among the validated IPs, pin the first that is actually reachable so a
+    # dual-stack host's unreachable-family address (IPv6 on an IPv4-only runner)
+    # does not wedge the session.
+    probe_port = configured_url.port or (443 if configured_url.scheme == "https" else 80)
+    request_url = configured_url.copy_with(host=_first_reachable_ip(ips, probe_port))
     host_header = f"[{host}]" if ":" in host else host
     if configured_url.port is not None:
         default_port = 443 if configured_url.scheme == "https" else 80
