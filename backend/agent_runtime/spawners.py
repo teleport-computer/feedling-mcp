@@ -807,6 +807,18 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     # --add-dir {home}/files grant); without this the consumer defaults to
     # /tmp/feedling_chat_files, outside the workspace, and claude's Read is denied.
     env["FILE_TEMP_DIR"] = f"{home}/files"
+    # Materialized user-MCP config + CA bundles. The consumer defaults these to
+    # /tmp/feedling_user_mcp[_ca|_castore]_<sha1(FEEDLING_API_KEY)[:10]>. Stage-D
+    # host-all entries carry NO api_key (line above), so that fingerprint collides
+    # to sha1("") for EVERY host-all user on the runner — the /tmp defaults would
+    # be ONE shared file holding the last writer's decrypted MCP url + auth headers
+    # + CA, which every co-resident agent then reads (cross-user credential + data
+    # leak). Pin them under the per-user home exactly like the checkpoint above so
+    # two host-all agents on one container never share a file. (pi's per-user
+    # bridge config path rides USER_MCP_FILE too — see _user_mcp_child_env.)
+    env["USER_MCP_FILE"] = f"{home}/user-mcp.json"
+    env["USER_MCP_CA_FILE"] = f"{home}/user-mcp-ca.pem"
+    env["USER_MCP_CASTORE_FILE"] = f"{home}/user-mcp-castore.pem"
     env["CONSUMER_ID"] = f"agent-runner:{user_id}"
     # Ambient timezone for the hosted agent process tree (this consumer + the CLI
     # it spawns). Without it the process inherits the CVM's UTC clock, so the CLI
@@ -966,6 +978,10 @@ _CONSUMER_ENV_KEYS = (
     "FEEDLING_API_KEY", "FEEDLING_API_URL", "FEEDLING_ENCLAVE_URL",
     "AGENT_MODE", "AGENT_CLI_CMD", "CHECKPOINT_FILE", "AGENT_SESSION_FILE",
     "IMAGE_TEMP_DIR", "FILE_TEMP_DIR", "CONSUMER_ID", "FEEDLING_RUNTIME_TOKEN_FILE",
+    # Per-user MCP config + CA paths (consumer_env pins them under home to stop the
+    # sha1("") fingerprint collision leak); the container strategy must forward
+    # them or the strong-isolation path silently reverts to the shared /tmp default.
+    "USER_MCP_FILE", "USER_MCP_CA_FILE", "USER_MCP_CASTORE_FILE",
     "ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
     # Per-user ambient timezone so the containerized agent's clock isn't the
     # container's default UTC (the process-spawn path sets it in consumer_env;
