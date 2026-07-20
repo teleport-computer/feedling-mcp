@@ -748,6 +748,24 @@ def write_response(
 # POST /v1/chat/verify_loop
 # --------------------------------------------------------------------------- #
 
+def _verify_synthetic_ids_to_gc(messages) -> list[str]:
+    """Ids of the synthetic verify-loop rows (ping + ack) safe to delete.
+
+    ONLY ``source == 'verify_ping'`` rows qualify. A real reply that merely
+    landed after the ping must NEVER be collected here: deleting it orphans its
+    parent's ``reply_message_id`` (the hosted dangling-pointer lost-reply bug,
+    2026-07-20). Every genuine ack carries ``source='verify_ping'``, so this
+    loses no coverage.
+    """
+    return [
+        str(m.get("id"))
+        for m in messages
+        if isinstance(m, dict)
+        and m.get("source") == "verify_ping"
+        and m.get("id")
+    ]
+
+
 def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
     """Synthetic ping: insert a marker user message, wait up to ``timeout_sec``
     for an agent-role reply, return whether a reply pipeline is alive.
@@ -815,24 +833,30 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
         boot_gates._log_bootstrap_event(store, "chat_loop_verified", success=True)
         _maybe_enqueue_resident_introduction(store)
 
-    # Cleanup: remove synthetic ping from history regardless of outcome. If a
-    # reply landed, also remove the matching agent response. The verify exchange
-    # is a private liveness test; it must not open Chat as the user's visible
-    # "First message."
+    # Cleanup: remove the synthetic ping AND its ack from history regardless of
+    # outcome. The verify exchange is a private liveness test; it must not open
+    # Chat as the user's visible "First message."
+    #
+    # GC keys ONLY off source="verify_ping" — NEVER off "the first agent reply
+    # after the ping". found_reply(_id) above is matched by role+ts alone, so
+    # under concurrency (supervisor._maybe_autoverify runs verify_loop while the
+    # agent-runner answers this user's first REAL message) it can point at a real
+    # reply that merely landed inside the verify window. Deleting that reply
+    # orphaned its parent's reply_message_id — a dangling pointer / silent lost
+    # reply (DIAGNOSIS_hosted_reply_dangling_pointer_2026-07-20). Genuine acks
+    # always carry source="verify_ping" (tools/chat_resident_consumer.py posts
+    # them so in a dedicated branch), so the source guard loses no coverage while
+    # making a real reply impossible to GC. found_reply is kept purely for the
+    # liveness verdict above.
     with store.chat_lock:
-        def _is_synthetic(m):
-            return (
-                isinstance(m, dict)
-                and (
-                    m.get("source") == "verify_ping"
-                    or (found_reply_id and m.get("id") == found_reply_id)
-                )
-            )
-        removed_ids = [m.get("id") for m in store.chat_messages if _is_synthetic(m)]
-        store.chat_messages = [m for m in store.chat_messages if not _is_synthetic(m)]
+        removed_ids = _verify_synthetic_ids_to_gc(store.chat_messages)
+        removed_set = set(removed_ids)
+        store.chat_messages = [
+            m for m in store.chat_messages
+            if not (isinstance(m, dict) and str(m.get("id") or "") in removed_set)
+        ]
         for rid in removed_ids:
-            if rid:
-                db.chat_delete(store.user_id, rid)
+            db.chat_delete(store.user_id, rid)
 
     suggestions = []
     if not found_reply:

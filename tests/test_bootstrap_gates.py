@@ -218,14 +218,21 @@ def _chat_response(
     api_key: str,
     *,
     consumer_headers: bool = False,
+    source: str | None = None,
+    reply_to_message_id: str | None = None,
 ) -> requests.Response:
     env = _stub_envelope(user_id, "chat-reply")
     headers = {"X-API-Key": api_key}
     if consumer_headers:
         headers.update(_CONSUMER_HEADERS)
+    body: dict = {"envelope": env, "alert_body": "hi"}
+    if source is not None:
+        body["source"] = source
+    if reply_to_message_id is not None:
+        body["reply_to_message_id"] = reply_to_message_id
     return requests.post(
         f"{base_url}/v1/chat/response",
-        json={"envelope": env, "alert_body": "hi"},
+        json=body,
         headers=headers,
         timeout=TIMEOUT,
     )
@@ -944,7 +951,14 @@ def test_chat_verify_loop_marks_live_connection_without_first_message(backend):
 
     def delayed_agent_reply():
         time.sleep(0.5)
-        _chat_response(backend["base_url"], user_id, api_key, consumer_headers=True)
+        # A genuine verify ack carries source="verify_ping" (the resident/hosted
+        # consumer posts it so in a dedicated branch) — that source is what makes
+        # verify_loop's GC remove it from visible history. A bare source="chat"
+        # reply is a REAL message and must NOT be GC'd.
+        _chat_response(
+            backend["base_url"], user_id, api_key,
+            consumer_headers=True, source="verify_ping",
+        )
 
     t = threading.Thread(target=delayed_agent_reply)
     t.start()
@@ -968,6 +982,88 @@ def test_chat_verify_loop_marks_live_connection_without_first_message(backend):
     assert status["chat_loop_verified"] is True
     assert status["agent_messages_count"] == 0
     assert status["is_complete"] is False
+
+
+def test_verify_loop_does_not_gc_real_reply_dangling_pointer(backend):
+    """Regression (DIAGNOSIS_hosted_reply_dangling_pointer_2026-07-20): a REAL
+    reply that lands inside the verify window must survive verify_loop's GC.
+
+    Reproduces the hosted lost-reply bug end-to-end: supervisor._maybe_autoverify
+    runs verify_loop while the agent-runner answers this user's first real turn.
+    The real reply is linked to its parent (reply_to_message_id) — finalize marks
+    the parent reply_status=replied + reply_message_id=X — and lands with
+    ts>ping_ts. verify_loop used to match "the first agent reply after the ping"
+    by role+ts and DELETE it as if it were the ping's ack, orphaning the parent's
+    reply_message_id (dangling pointer, silent lost reply). GC now keys only off
+    source="verify_ping", so a real (source="chat") reply is never collected.
+    """
+    base = backend["base_url"]
+    user_id, api_key = _register(base)
+    _seed_passing_bootstrap(base, user_id, api_key)
+    assert _init_identity(base, user_id, api_key).status_code == 201
+    _record_consumer_poll(base, api_key)
+
+    result: dict = {}
+
+    def run_verify():
+        r = requests.post(
+            f"{base}/v1/chat/verify_loop",
+            json={"timeout_sec": 8},
+            headers={"X-API-Key": api_key},
+            timeout=15,
+        )
+        result["status"] = r.status_code
+        result["body"] = r.json()
+
+    t = threading.Thread(target=run_verify)
+    t.start()
+    real_reply_id = ""
+    try:
+        # Ping lands first; then a real user turn arrives and gets answered by
+        # the consumer WITH a reply link — exactly the concurrent interleave.
+        time.sleep(1.0)
+        real_env = _stub_envelope(user_id, "real-user-msg")
+        rm = requests.post(
+            f"{base}/v1/chat/message",
+            json={"envelope": real_env},
+            headers={"X-API-Key": api_key},
+            timeout=TIMEOUT,
+        )
+        assert rm.status_code in (200, 201), rm.text
+        parent_id = rm.json()["id"]
+
+        rr = _chat_response(
+            base, user_id, api_key,
+            consumer_headers=True, reply_to_message_id=parent_id,
+        )
+        assert rr.status_code == 200, rr.text
+        real_reply_id = rr.json()["id"]
+    finally:
+        t.join(timeout=12)
+
+    assert result.get("status") == 200, result
+    assert result["body"]["passing"] is True, result["body"]
+
+    # The parent turn is marked replied AND its reply row still exists — no
+    # dangling pointer. The real reply is visible; only the synthetic ping/ack
+    # were GC'd.
+    hist = requests.get(
+        f"{base}/v1/chat/history",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    ).json()
+    ids = {m.get("id") for m in hist.get("messages", [])}
+    assert real_reply_id and real_reply_id in ids, (
+        f"real reply {real_reply_id} was GC'd by verify_loop -> parent "
+        f"reply_message_id dangles. history={hist}"
+    )
+
+    status = requests.get(
+        f"{base}/v1/bootstrap/status",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    ).json()
+    assert status["agent_messages_count"] == 1, status
 
 
 def test_verify_reply_allowed_despite_newer_real_user_message(backend):
