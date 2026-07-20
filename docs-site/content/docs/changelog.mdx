@@ -123,6 +123,14 @@ change must not be interpreted as an API guarantee.
   rejection when the server had, in fact, already saved successfully. Clients
   matching on the literal string `blocked_url` for this case must update to
   `unreachable_from_backend`.
+- **`codex` + self-signed MCP servers:** `codex`'s TLS stack (rustls) rejects
+  a CA certificate used directly as a server certificate, so a single
+  self-signed cert works with `claude`/`pi` but not `codex`. Configure such
+  servers with a certificate chain (a CA cert plus a separate server cert it
+  signs). `POST /v1/mcp/servers/{name}/test` now returns
+  `codex_cert_chain_required` (instead of a generic `tls` result) when a
+  `codex`-driven account tests a server presenting a lone self-signed cert.
+  See [MCP servers workflow](/docs/workflows/mcp).
 
 ### Behavior
 
