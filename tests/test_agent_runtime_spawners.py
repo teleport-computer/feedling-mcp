@@ -232,6 +232,39 @@ def test_consumer_env_tolerates_missing_api_key_for_zero_roster():
     assert env["ANTHROPIC_API_KEY"] == "sk-ant"
 
 
+def test_consumer_env_isolates_user_mcp_paths_per_user():
+    # P0 cross-user leak guard. The materialized user-MCP config (server URL +
+    # auth headers) and its CA bundles live at consumer-side paths keyed by
+    # sha1(FEEDLING_API_KEY). For Stage-D host-all users FEEDLING_API_KEY is ""
+    # so that fingerprint COLLIDES to sha1("") for every user on the host — the
+    # /tmp defaults would then be one shared file. consumer_env must pin all
+    # three MCP paths under the per-user home (exactly as it already does for
+    # CHECKPOINT_FILE) so two host-all agents never read each other's MCP creds.
+    env = spawners.consumer_env(
+        {}, {"provider_key": "sk-ant", "driver": "claude"},
+        user_id="u_a", home="/agent-data/users/u_a",
+    )
+    assert env["USER_MCP_FILE"] == "/agent-data/users/u_a/user-mcp.json"
+    assert env["USER_MCP_CA_FILE"] == "/agent-data/users/u_a/user-mcp-ca.pem"
+    assert env["USER_MCP_CASTORE_FILE"] == "/agent-data/users/u_a/user-mcp-castore.pem"
+
+    # Two host-all users (both empty api_key -> colliding fingerprint) must get
+    # DISTINCT paths — this is the actual leak the fix closes.
+    env_b = spawners.consumer_env(
+        {}, {"provider_key": "sk-ant", "driver": "claude"},
+        user_id="u_b", home="/agent-data/users/u_b",
+    )
+    assert env["FEEDLING_API_KEY"] == "" and env_b["FEEDLING_API_KEY"] == ""
+    assert env["USER_MCP_FILE"] != env_b["USER_MCP_FILE"]
+    assert env["USER_MCP_CA_FILE"] != env_b["USER_MCP_CA_FILE"]
+    assert env["USER_MCP_CASTORE_FILE"] != env_b["USER_MCP_CASTORE_FILE"]
+
+    # ...and the container strategy must forward them, or the strong-isolation
+    # path would silently drop back to the shared /tmp default.
+    for key in ("USER_MCP_FILE", "USER_MCP_CA_FILE", "USER_MCP_CASTORE_FILE"):
+        assert key in spawners._CONSUMER_ENV_KEYS
+
+
 def test_consumer_env_honors_custom_cli_cmd():
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "cli_cmd": "claude --resume -p {message}"},
