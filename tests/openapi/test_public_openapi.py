@@ -45,6 +45,7 @@ EXPECTED_PUBLIC_OPERATIONS = {
     ("post", "/v1/account/recover/challenge"),
     ("post", "/v1/account/recover/verify"),
     ("post", "/v1/users/register"),
+    ("post", "/v1/notify-relay/register"),
 }
 
 EXPECTED_API_KEY_ONLY_OPERATIONS = {
@@ -158,9 +159,10 @@ def _resolve_local_ref(document: dict[str, Any], ref: str) -> Any:
 def test_public_operation_and_parameter_inventory(
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
-    # 144 since GET /v1/agent/perception/recent_apps (Lark t100530)
-    assert len(operations) == 144
-    assert sum("requestBody" in operation for operation in operations.values()) == 65
+    # 144 since GET /v1/agent/perception/recent_apps (Lark t100530);
+    # 146 since the two notify-relay endpoints (register/push, both with bodies)
+    assert len(operations) == 146
+    assert sum("requestBody" in operation for operation in operations.values()) == 67
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
@@ -294,6 +296,9 @@ def test_chat_memory_and_perception_contracts_are_concrete(
         assert client_msg_id["format"] == "uuid"
         assert "600 seconds" in client_msg_id["description"]
 
+    response_sources = schemas["ChatResponseRequest"]["properties"]["source"]["enum"]
+    assert "resident_maintenance" in response_sources
+
     poll_query = _parameters(operations[("get", "/v1/chat/poll")], "query")
     assert set(poll_query) == {"since", "timeout", "consumer_id", "claim"}
     assert poll_query["timeout"]["schema"]["maximum"] == 60
@@ -386,6 +391,7 @@ def test_error_response_supports_unified_and_mcp_shapes(
     assert error["properties"]["blame"]["enum"] == [
         "user_provider",
         "provider_transient",
+        "user_environment",
         "system",
     ]
 

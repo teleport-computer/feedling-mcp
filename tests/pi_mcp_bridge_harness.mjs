@@ -29,6 +29,27 @@ async function main() {
     const called = await client.callTool(tools[0].name, { q: "x" });
     return { tools, called };
   }
+  if (mode === "sse-client" || mode === "sse-client-noclose") {
+    // Drive the legacy HTTP+SSE client against a real loopback server.
+    // "sse-client-noclose" deliberately does NOT call close(): the still-open
+    // GET stream is left as the only outstanding handle, so the process can
+    // only exit if that stream's socket was unref'd. That is the real
+    // production shape (a connected bridge client is never explicitly closed),
+    // and the only version that actually proves unref — calling close() would
+    // destroy the socket regardless of unref and mask a regression.
+    const { SseMcpClient } = await import(path.join(BRIDGE, "mcp_client.js"));
+    const client = new SseMcpClient(arg, {}, { timeoutMs: 5000 });
+    await client.initialize();
+    const tools = await client.listTools();
+    const called = await client.callTool(tools[0].name, { q: "x" });
+    if (mode === "sse-client") client.close();
+    return { tools, called };
+  }
+  if (mode === "transport") {
+    // effectiveTransport routing — pure, no network.
+    const { effectiveTransport } = await import(path.join(BRIDGE, "mcp_client.js"));
+    return JSON.parse(arg).map((cfg) => effectiveTransport(cfg));
+  }
   if (mode === "mapping") {
     const { buildToolTable } = await import(path.join(BRIDGE, "tool_mapping.js"));
     return buildToolTable(JSON.parse(arg));
