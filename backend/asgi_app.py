@@ -57,6 +57,7 @@ _ASGI_PACKAGES = (
     "hosted.history_import_asgi",
     "hosted.onboarding_validation_asgi",
     "notices.routes_asgi",
+    "notify_relay.routes_asgi",
 )
 
 # Disable the auto OpenAPI/docs routes so the ASGI route surface is exactly the
@@ -97,6 +98,7 @@ if settings.cors_allowed_origins:
             "X-Feedling-Consumer-Id",
             "X-Feedling-Consumer-Version",
             "X-Feedling-Runtime-Token",
+            "X-Relay-Token",
         ],
         expose_headers=[
             "Accept-Ranges",

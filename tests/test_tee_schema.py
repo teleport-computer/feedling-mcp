@@ -15,7 +15,7 @@ def test_tee_schema_has_all_tables():
             "genesis_import_jobs","genesis_import_outputs","agent_runtime_instances",
             "agent_runtime_supervisor_heartbeats","chat_messages","memory_moments",
             "world_book_entries","frames","tee_replication_cursors",
-            "tee_pending_device_migration"}
+            "tee_pending_device_migration","notify_relay_configs","notify_relay_logs"}
     with _tee_conn() as c:
         rows = c.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'").fetchall()
     assert want <= {r[0] for r in rows}
