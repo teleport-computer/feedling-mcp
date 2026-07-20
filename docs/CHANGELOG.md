@@ -49,6 +49,18 @@
 
 ## 2026-07-20
 
+### [DONE] Runtime and product telemetry share one honest operator dashboard
+
+- The existing admin data-track page now combines 30-day Runtime V2 effective
+  input/output/cache token totals, provider-usage coverage, V2 account/turn
+  counts, current hosted/self-hosted activated-account coverage, and the
+  existing iOS foreground-duration roll-up.
+- Missing provider usage stays unknown and lowers the displayed coverage ratio
+  instead of becoming a false zero. Self-hosted coverage is explicitly the
+  observable activated account-route count: fully offline instances that never
+  contact the official backend cannot be counted, and reinstall orphan rows can
+  keep it from being an exact human or deployment count.
+
 ### [DONE] Runtime V2 release closure makes trajectories durably debuggable
 
 - Encrypted raw chat, trajectory, and review content has no time-based TTL or

@@ -3073,6 +3073,77 @@ def recent_mean_tokens_per_turn(*, lane: str = "chat", limit: int = 50) -> float
             return None if row is None or row[0] is None else float(row[0])
 
 
+def recent_token_usage_summary(
+    *,
+    lane: str = "chat",
+    within_days: int = 30,
+) -> dict:
+    """Content-free token roll-up for the operator dashboard.
+
+    Token totals are deliberately nullable: a provider call whose response did
+    not include usage must lower ``usage_telemetry_coverage`` instead of being
+    presented as a zero-token call. ``prompt_tokens`` is the normalized,
+    effective prompt size (including cache reads/writes); cache counters remain
+    separate so the same input is never double-counted in ``total_tokens``.
+    """
+    safe_days = max(1, min(int(within_days), 366))
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*)::int, count(DISTINCT user_id)::int, "
+                "coalesce(sum(model_calls), 0)::bigint, "
+                "coalesce(sum(usage_reported_calls), 0)::bigint, "
+                "coalesce(sum(cache_reported_calls), 0)::bigint, "
+                "sum(prompt_tokens)::bigint, sum(completion_tokens)::bigint, "
+                "sum(cache_read_tokens)::bigint, "
+                "sum(cache_write_tokens)::bigint, "
+                "sum(cache_miss_tokens)::bigint "
+                "FROM v2_turn_metrics "
+                "WHERE lane=%s "
+                "AND created_at >= now() - make_interval(days => %s)",
+                (str(lane), safe_days),
+            )
+            row = cur.fetchone()
+
+    sampled_turns = int(row[0] or 0) if row is not None else 0
+    users = int(row[1] or 0) if row is not None else 0
+    model_calls = int(row[2] or 0) if row is not None else 0
+    usage_calls = int(row[3] or 0) if row is not None else 0
+    cache_calls = int(row[4] or 0) if row is not None else 0
+
+    def _optional_int(index: int) -> int | None:
+        if row is None or row[index] is None:
+            return None
+        return int(row[index])
+
+    prompt_tokens = _optional_int(5)
+    completion_tokens = _optional_int(6)
+    return {
+        "window_days": safe_days,
+        "sampled_turns": sampled_turns,
+        "users": users,
+        "model_calls": model_calls,
+        "usage_reported_calls": usage_calls,
+        "cache_reported_calls": cache_calls,
+        "usage_telemetry_coverage": (
+            float(usage_calls) / float(model_calls) if model_calls else None
+        ),
+        "cache_telemetry_coverage": (
+            float(cache_calls) / float(model_calls) if model_calls else None
+        ),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": (
+            prompt_tokens + completion_tokens
+            if prompt_tokens is not None and completion_tokens is not None
+            else None
+        ),
+        "cache_read_tokens": _optional_int(7),
+        "cache_write_tokens": _optional_int(8),
+        "cache_miss_tokens": _optional_int(9),
+    }
+
+
 def recent_chat_operational_health(
     *,
     within_hours: int = 24,
