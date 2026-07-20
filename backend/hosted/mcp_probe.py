@@ -702,6 +702,97 @@ async def _bounded_body(resp) -> str:
     return raw[:4096].decode("utf-8", errors="replace")
 
 
+class _SseSession:
+    """An initialized legacy HTTP+SSE session.
+
+    Replies arrive on the shared long-lived GET stream (via ``_SseReader``);
+    requests/notifications are POSTed to the same-origin ``endpoint`` the
+    handshake validated. Used by BOTH the control-plane probe and the
+    runtime-V2 ``mcp_client`` so the SSE wire logic lives in one place.
+    """
+
+    def __init__(self, reader: "_SseReader", msg_url: str, post):
+        self._reader = reader
+        self._msg_url = msg_url
+        self._post = post
+
+    async def request(self, rpc_id: int, method: str, params=None) -> dict:
+        """POST one JSON-RPC request and return its matching reply frame."""
+        payload = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        await self._post(self._msg_url, payload)
+        return await self._reader.next_rpc(rpc_id)
+
+    async def notify(self, method: str) -> None:
+        """POST a JSON-RPC notification, tolerating a 4xx (some servers reject
+        ``notifications/initialized``)."""
+        await self._post(
+            self._msg_url,
+            {"jsonrpc": "2.0", "method": method},
+            tolerate_4xx=True,
+        )
+
+
+@contextlib.asynccontextmanager
+async def _sse_session(*, stream_get, post, url: str):
+    """Open a legacy HTTP+SSE session and yield an initialized ``_SseSession``.
+
+    ``stream_get()`` returns the httpx streaming context manager for the
+    long-lived GET (the caller sets the target/headers so the pinned runtime
+    path and the raw probe path both work). ``post(msg_url, payload, *,
+    tolerate_4xx=False)`` sends one JSON-RPC frame to the endpoint and enforces
+    the HTTP status. ``url`` is the configured URL the ``endpoint`` event must
+    stay same-origin with.
+
+    ONE implementation drives both callers, so the security-critical steps —
+    redirect refusal, the ``text/event-stream`` requirement, the ``_SseReader``
+    byte budget, and the endpoint same-origin (anti-SSRF) check — exist in
+    exactly one place. ``_NotSseServer`` is raised on a "wrong transport"
+    signal (non-stream GET) so the caller can fall back; a ``ProbeError`` raised
+    here (cross-origin refusal, malformed endpoint, rpc error) is a confirmed
+    failure that must propagate, never trigger fallback.
+    """
+    async with _safe_stream(stream_get()) as stream:
+        if stream.status_code in _REDIRECT_STATUSES:
+            raise ProbeError("protocol", "redirects not allowed")
+        if stream.status_code >= 400:
+            # "wrong transport" signal — let the caller try streamable.
+            raise _NotSseServer()
+        if "text/event-stream" not in stream.headers.get("content-type", ""):
+            raise _NotSseServer()
+        reader = _SseReader(stream.aiter_bytes())
+        event, data = await reader.next_event()
+        if event != "endpoint":
+            raise _NotSseServer()
+        # The endpoint value is server-controlled data. Parsing it (or the
+        # origin comparison) can raise ValueError — a malformed port
+        # (https://h:bad) or IPv6 literal — which must surface as a clean 400
+        # protocol error, never a 500 (codex3 R2).
+        try:
+            msg_url = urljoin(url, data.strip())
+            same_origin = (
+                _effective_origin(urlparse(msg_url))
+                == _effective_origin(urlparse(url)))
+        except ValueError:
+            raise ProbeError("protocol", "invalid endpoint URI")
+        # Refusing a cross-origin target keeps this from becoming an SSRF
+        # primitive (the exchange echoes upstream bodies back to the caller).
+        # Origins are NORMALIZED so an omitted default port
+        # (https://x vs https://x:443) isn't a false mismatch, while a
+        # genuinely different port still is.
+        if not same_origin:
+            raise ProbeError("protocol", "endpoint origin mismatch")
+        await post(msg_url, _init_payload())
+        init_doc = await reader.next_rpc(1)
+        if "error" in init_doc:
+            raise ProbeError("protocol", json.dumps(init_doc["error"])[:160])
+        session = _SseSession(reader, msg_url, post)
+        # spec-required before further requests; tolerate servers that 4xx it
+        await session.notify("notifications/initialized")
+        yield session
+
+
 def probe(url: str, headers: dict, *, ca_pem: str | None = None,
           transport=None, transport_hint: str = "") -> dict:
     """Sync entry point (the callers — routes/CLI — are sync). ``httpx.ASGITransport``
@@ -815,10 +906,15 @@ async def _probe_async(url: str, headers: dict, ca_pem: str | None,
 
     async def _sse_flow(client: httpx.AsyncClient) -> dict:
         """Legacy HTTP+SSE handshake: GET stream → ``endpoint`` event →
-        POST requests to the (same-origin) endpoint, replies on the stream."""
-        get_headers = {k: v for k, v in send_headers.items()
-                       if k.lower() != "content-type"}
-        get_headers["Accept"] = "text/event-stream"
+        POST requests to the (same-origin) endpoint, replies on the stream.
+        The GET/endpoint/same-origin/init machinery lives in the shared
+        module-level ``_sse_session`` — this closure only supplies the raw
+        (unpinned) probe transport and drives tools/list."""
+        def _stream_get():
+            get_headers = {k: v for k, v in send_headers.items()
+                           if k.lower() != "content-type"}
+            get_headers["Accept"] = "text/event-stream"
+            return client.stream("GET", url, headers=get_headers)
 
         async def _sse_post(msg_url: str, payload: dict, *, tolerate_4xx: bool = False):
             try:
@@ -829,48 +925,10 @@ async def _probe_async(url: str, headers: dict, ca_pem: str | None,
                 raise ProbeError(_classify_http(resp.status_code), resp.text[:160])
 
         try:
-            cm = client.stream("GET", url, headers=get_headers)
-            async with _safe_stream(cm) as stream:
-                if stream.status_code in _REDIRECT_STATUSES:
-                    raise ProbeError("protocol", "redirects not allowed")
-                if stream.status_code >= 400:
-                    # "wrong transport" signal — let the caller try streamable.
-                    raise _NotSseServer()
-                if "text/event-stream" not in stream.headers.get("content-type", ""):
-                    raise _NotSseServer()
-                reader = _SseReader(stream.aiter_bytes())
-                event, data = await reader.next_event()
-                if event != "endpoint":
-                    raise _NotSseServer()
-                # The endpoint value is server-controlled data. Parsing it (or
-                # the origin comparison) can raise ValueError — a malformed port
-                # (https://h:bad) or IPv6 literal — which must surface as a clean
-                # 400 protocol error, never a 500 (codex3 R2).
-                try:
-                    msg_url = urljoin(url, data.strip())
-                    same_origin = (
-                        _effective_origin(urlparse(msg_url))
-                        == _effective_origin(urlparse(url)))
-                except ValueError:
-                    raise ProbeError("protocol", "invalid endpoint URI")
-                # Refusing a cross-origin target keeps this from becoming an SSRF
-                # primitive (probe echoes upstream bodies back to the caller).
-                # Origins are NORMALIZED so an omitted default port
-                # (https://x vs https://x:443) isn't a false mismatch, while a
-                # genuinely different port still is.
-                if not same_origin:
-                    raise ProbeError("protocol", "endpoint origin mismatch")
-                await _sse_post(msg_url, _init_payload())
-                init_doc = await reader.next_rpc(1)
-                if "error" in init_doc:
-                    raise ProbeError("protocol", json.dumps(init_doc["error"])[:160])
-                # spec-required; tolerate servers that reject the notification
-                await _sse_post(msg_url, {"jsonrpc": "2.0",
-                                          "method": "notifications/initialized"},
-                                tolerate_4xx=True)
-                await _sse_post(msg_url, {"jsonrpc": "2.0", "id": 2,
-                                          "method": "tools/list"})
-                body = await reader.next_rpc(2)
+            async with _sse_session(
+                stream_get=_stream_get, post=_sse_post, url=url,
+            ) as session:
+                body = await session.request(2, "tools/list")
                 return {**_tools_from_rpc(body), "transport": "sse"}
         except _LegacySseEndpoint:
             # endpoint events after the handshake are nonsense — treat as broken

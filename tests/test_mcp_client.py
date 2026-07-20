@@ -421,3 +421,246 @@ def test_one_shot_sse_is_bounded_then_parsed(monkeypatch):
         transport=httpx.MockTransport(handler),
     ))
     assert tools[0]["name"] == "search"
+
+
+# ---------------------------------------------------------------------------
+# Legacy HTTP+SSE transport (mcp_transport="sse")
+#
+# httpx.ASGITransport buffers the whole response, so a long-lived legacy GET
+# stream can't be faked in-process with it. httpx.MockTransport, by contrast,
+# hands back a streaming Response whose custom AsyncByteStream is consumed
+# lazily — the GET stream generator awaits a shared asyncio.Queue that the
+# interleaved POST handler feeds, exactly reproducing the GET→endpoint→POST→
+# read-stream code path in mcp_client's SSE session (no real socket needed).
+# ---------------------------------------------------------------------------
+
+SSE_URL = "https://mcp.example.com/sse"
+
+
+class _FakeSseServer:
+    """MockTransport handler for one legacy HTTP+SSE MCP server.
+
+    GET (any path) → event-stream: first an ``endpoint`` event, then whatever
+    JSON-RPC replies the interleaved POSTs enqueue. POST to the message path →
+    enqueue the matching reply + 202. POST to the base path (a streamable
+    initialize probe) → ``base_post_status`` (405 = standard legacy 'use GET').
+    """
+
+    def __init__(self, *, endpoint="/message?session_id=s1", base_path="/sse",
+                 tools=None, call_result="tool-said-hi", call_is_error=False,
+                 base_post_status=405):
+        self.endpoint = endpoint
+        self.base_path = base_path
+        self.tools = tools if tools is not None else [
+            {"name": "search",
+             "inputSchema": {"type": "object",
+                             "properties": {"q": {"type": "string"}},
+                             "required": ["q"]}}]
+        self.call_result = call_result
+        self.call_is_error = call_is_error
+        self.base_post_status = base_post_status
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.post_urls: list[str] = []
+        self.methods: list[str] = []
+
+    def _stream(self):
+        server = self
+
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield f"event: endpoint\ndata: {server.endpoint}\n\n".encode()
+                while True:
+                    doc = await server.queue.get()
+                    yield (b"event: message\ndata: "
+                           + json.dumps(doc).encode() + b"\n\n")
+
+            async def aclose(self):
+                return None
+
+        return Stream()
+
+    async def handler(self, request):
+        self.methods.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"},
+                stream=self._stream())
+        self.post_urls.append(str(request.url))
+        # The base-path POST is a streamable-transport probe, not a message.
+        if request.url.path == self.base_path:
+            return httpx.Response(self.base_post_status, json={"error": "use GET"})
+        req = json.loads(request.content)
+        method = req.get("method")
+        if method == "initialize":
+            await self.queue.put({"jsonrpc": "2.0", "id": req["id"], "result": {
+                "protocolVersion": "2025-03-26", "capabilities": {},
+                "serverInfo": {"name": "legacy", "version": "0"}}})
+        elif method == "tools/list":
+            await self.queue.put({"jsonrpc": "2.0", "id": req["id"],
+                                  "result": {"tools": self.tools}})
+        elif method == "tools/call":
+            await self.queue.put({"jsonrpc": "2.0", "id": req["id"], "result": {
+                "content": [{"type": "text", "text": self.call_result}],
+                "isError": self.call_is_error}})
+        return httpx.Response(202)
+
+
+def test_sse_list_tools_returns_full_schemas(monkeypatch):
+    _global_ip(monkeypatch)
+    srv = _FakeSseServer()
+    tools = asyncio.run(mcp_client.list_tools(
+        SSE_URL, {}, transport=httpx.MockTransport(srv.handler),
+        mcp_transport="sse"))
+    assert len(tools) == 1
+    assert tools[0]["name"] == "search"
+    assert tools[0]["inputSchema"]["properties"]["q"]["type"] == "string"
+    # never POSTed to the streamable base path — went straight to the endpoint
+    assert all("/message" in u for u in srv.post_urls)
+
+
+def test_sse_call_tool_happy_path(monkeypatch):
+    _global_ip(monkeypatch)
+    srv = _FakeSseServer(call_result="weather is sunny")
+    out = asyncio.run(mcp_client.call_tool(
+        SSE_URL, {}, "search", {"q": "weather"},
+        transport=httpx.MockTransport(srv.handler), mcp_transport="sse"))
+    assert out["is_error"] is False
+    assert "weather is sunny" in out["text"]
+
+
+def test_sse_call_tool_surfaces_tool_error(monkeypatch):
+    _global_ip(monkeypatch)
+    srv = _FakeSseServer(call_result="nope", call_is_error=True)
+    out = asyncio.run(mcp_client.call_tool(
+        SSE_URL, {}, "search", {},
+        transport=httpx.MockTransport(srv.handler), mcp_transport="sse"))
+    assert out["is_error"] is True
+    assert "nope" in out["text"]
+
+
+def test_sse_endpoint_cross_origin_is_refused_and_never_posted(monkeypatch):
+    """The endpoint event is server-controlled. A cross-origin target must
+    raise (origin mismatch) and NO request may be sent to that other host —
+    the anti-SSRF invariant. The refusal is a confirmed-session ProbeError,
+    so it must NOT be masked by a fallback attempt."""
+    _global_ip(monkeypatch)
+    srv = _FakeSseServer(endpoint="https://evil.example/msg")
+    with pytest.raises(mcp_probe.ProbeError) as e:
+        asyncio.run(mcp_client.list_tools(
+            SSE_URL, {}, transport=httpx.MockTransport(srv.handler),
+            mcp_transport="sse"))
+    assert e.value.kind == "protocol"
+    assert "origin mismatch" in e.value.detail
+    # the cross-origin endpoint was never contacted, and no streamable
+    # fallback masked the refusal
+    assert srv.post_urls == []
+    assert "GET" in srv.methods and "POST" not in srv.methods
+
+
+def test_sse_pinned_ip_is_connect_target_host_and_sni_preserved(monkeypatch):
+    """The GET stream and every endpoint POST connect to the validated IP while
+    carrying the configured Host/SNI — the message channel is pinned too, so a
+    same-origin endpoint can't trigger a second DNS lookup."""
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
+    seen = []
+    q: asyncio.Queue = asyncio.Queue()
+
+    def _stream():
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"event: endpoint\ndata: /message?s=1\n\n"
+                while True:
+                    doc = await q.get()
+                    yield b"event: message\ndata: " + json.dumps(doc).encode() + b"\n\n"
+
+            async def aclose(self):
+                return None
+        return Stream()
+
+    async def handler(request):
+        seen.append({
+            "url_host": request.url.host,
+            "host": request.headers.get("host"),
+            "sni": request.extensions.get("sni_hostname"),
+        })
+        if request.method == "GET":
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=_stream())
+        req = json.loads(request.content)
+        method = req.get("method")
+        if method == "initialize":
+            await q.put({"jsonrpc": "2.0", "id": req["id"], "result": {}})
+        elif method == "tools/list":
+            await q.put({"jsonrpc": "2.0", "id": req["id"],
+                         "result": {"tools": [{"name": "search", "inputSchema": {}}]}})
+        return httpx.Response(202)
+
+    tools = asyncio.run(mcp_client.list_tools(
+        "https://mcp.example.com:8443/sse",
+        {"Host": "attacker.invalid"},
+        transport=httpx.MockTransport(handler), mcp_transport="sse"))
+    assert tools[0]["name"] == "search"
+    assert {item["url_host"] for item in seen} == {"93.184.216.34"}
+    assert {item["host"] for item in seen} == {"mcp.example.com:8443"}
+    assert {item["sni"] for item in seen} == {"mcp.example.com"}
+
+
+def _streamable_mock_handler(*, get_status=405):
+    """MockTransport handler for a streamable-only server: GET is rejected,
+    POST speaks JSON-RPC. For the wrong-hint ("sse") fallback test."""
+    async def handler(request):
+        if request.method == "GET":
+            return httpx.Response(get_status, json={"error": "use POST"})
+        req = json.loads(request.content)
+        method = req.get("method")
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if method == "tools/list":
+            result = {"tools": [{"name": "search", "inputSchema": {}}]}
+        elif method == "tools/call":
+            result = {"content": [{"type": "text", "text": "done"}], "isError": False}
+        else:
+            result = {"protocolVersion": "2025-03-26", "capabilities": {},
+                      "serverInfo": {"name": "streamable", "version": "0"}}
+        return httpx.Response(
+            200, json={"jsonrpc": "2.0", "id": req.get("id"), "result": result},
+            headers={"mcp-session-id": "s"})
+    return handler
+
+
+@pytest.mark.parametrize("mcp_transport", [None, "http"])
+def test_default_and_http_hint_use_streamable(monkeypatch, mcp_transport):
+    """Default/'http' goes straight to streamable POST — no wasteful SSE GET."""
+    _global_ip(monkeypatch)
+    methods = []
+
+    async def handler(request):
+        methods.append(request.method)
+        return await _streamable_mock_handler()(request)
+
+    tools = asyncio.run(mcp_client.list_tools(
+        URL, {}, transport=httpx.MockTransport(handler),
+        mcp_transport=mcp_transport))
+    assert tools[0]["name"] == "search"
+    assert "GET" not in methods  # never probed the SSE transport first
+
+
+def test_wrong_http_hint_falls_back_to_sse(monkeypatch):
+    """Persisted transport says 'http' but the server is actually legacy SSE
+    (405 on the streamable POST) → narrow fallback connects over SSE."""
+    _global_ip(monkeypatch)
+    srv = _FakeSseServer(base_post_status=405)
+    tools = asyncio.run(mcp_client.list_tools(
+        SSE_URL, {}, transport=httpx.MockTransport(srv.handler),
+        mcp_transport="http"))
+    assert tools[0]["name"] == "search"
+
+
+def test_wrong_sse_hint_falls_back_to_streamable(monkeypatch):
+    """Persisted transport says 'sse' but the server is streamable (405 on GET)
+    → narrow fallback connects over streamable HTTP."""
+    _global_ip(monkeypatch)
+    tools = asyncio.run(mcp_client.list_tools(
+        URL, {}, transport=httpx.MockTransport(_streamable_mock_handler()),
+        mcp_transport="sse"))
+    assert tools[0]["name"] == "search"

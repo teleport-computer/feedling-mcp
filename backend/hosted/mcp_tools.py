@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass
 
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolResult, ToolSpec
-from hosted import mcp_core, mcp_client, mcp_probe
+from hosted import mcp_core, mcp_client, mcp_probe, mcp_ca_fetch
 
 log = logging.getLogger("feedling.hosted.mcp_tools")
 
@@ -68,6 +68,9 @@ class _Route:
     headers: dict
     ca_pem: str | None
     tool: str  # the raw tool name on the server (un-namespaced)
+    # The persisted MCP transport ("sse"/"http"/None) the probe detected; the
+    # client tries it first and narrow-falls-back to the other.
+    transport: str | None = None
     # The server hint is advisory. Runtime read privileges require both the
     # strict hint and an exact user-approved catalog fingerprint.
     read_only_hint: bool = False
@@ -124,7 +127,8 @@ class McpTurn:
             return ToolResult(call_id=call.id, content="error: unknown mcp tool")
         try:
             out = await mcp_client.call_tool(
-                route.url, route.headers, route.tool, call.args or {}, ca_pem=route.ca_pem)
+                route.url, route.headers, route.tool, call.args or {},
+                ca_pem=route.ca_pem, mcp_transport=route.transport)
             text = str(out.get("text") or "").strip()
             if out.get("is_error"):
                 # This is a completed protocol response with a known tool-level
@@ -354,14 +358,41 @@ async def load_turn_mcp(
             return None
         try:
             tools = await mcp_client.list_tools(
-                secret["url"], secret.get("headers") or {}, ca_pem=secret.get("ca_pem"))
+                secret["url"], secret.get("headers") or {},
+                ca_pem=secret.get("ca_pem"), mcp_transport=secret.get("transport"))
         except Exception as exc:  # noqa: BLE001 — one bad server never sinks turn
-            log.warning(
-                "mcp server skipped server=%r kind=%s",
-                name,
-                _stable_failure_kind(exc, fallback="transport_failure"),
-            )
-            return None
+            # Auto-CA fallback: a self-signed server with no configured ca_pem
+            # fails the handshake with a TLS error. Fetch its own chain's anchor
+            # (SSRF-safe, verification stays ON) and retry ONCE. The resolved
+            # anchor is threaded into the secret so this turn's tools/call reuses
+            # it without re-fetching. A configured ca_pem is never overridden.
+            anchor = None
+            if (
+                secret.get("ca_pem") is None
+                and isinstance(exc, mcp_client.ProbeError)
+                and str(getattr(exc, "kind", "")) == "tls"
+            ):
+                anchor = await mcp_ca_fetch.fetch_anchor_for_url(secret["url"])
+            if anchor is None:
+                log.warning(
+                    "mcp server skipped server=%r kind=%s",
+                    name,
+                    _stable_failure_kind(exc, fallback="transport_failure"),
+                )
+                return None
+            secret = {**secret, "ca_pem": anchor}
+            try:
+                tools = await mcp_client.list_tools(
+                    secret["url"], secret.get("headers") or {},
+                    ca_pem=anchor, mcp_transport=secret.get("transport"))
+            except Exception as retry_exc:  # noqa: BLE001 — anchor didn't help
+                log.warning(
+                    "mcp server skipped server=%r kind=%s (after auto-ca)",
+                    name,
+                    _stable_failure_kind(retry_exc, fallback="transport_failure"),
+                )
+                return None
+            log.info("mcp server auto-ca pinned server=%r", name)
         return (name, secret, tools)
 
     results = await asyncio.gather(*[_one(s) for s in servers])
@@ -436,6 +467,7 @@ async def load_turn_mcp(
                 headers=secret.get("headers") or {},
                 ca_pem=secret.get("ca_pem"),
                 tool=raw,
+                transport=secret.get("transport"),
                 read_only_hint=read_only_hint,
                 read_only_approved=read_only_approved,
             )
