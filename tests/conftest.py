@@ -148,6 +148,7 @@ if not _provisioned:
         "test_user_mcp_probe.py",
         "test_user_mcp_materialize.py",
         "test_user_mcp_ca_fetch.py",
+        "test_user_mcp_ca_fetch_leaf.py",
         "test_identity_value_write_path.py",
     }
     collect_ignore = sorted(

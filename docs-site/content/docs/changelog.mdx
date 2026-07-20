@@ -32,6 +32,33 @@ change must not be interpreted as an API guarantee.
   the reported open instead of 5 minutes. Because the shortcut reports opens and
   never closes, these fields mean "last open observed within the window", not
   "currently on screen".
+- `POST /v1/content/rewrap-to-current-key` now also normalizes the **identity
+  card plaintext** while rewrapping: dimension values are coerced onto the
+  documented 0–100 integer contract (0–1-scale floats such as `0.95` rescale to
+  `95`; a `score` key is adopted as `value`; malformed dimensions are repaired
+  instead of dropped). The identity record is probed (decrypted) even when its
+  envelope is already sealed to the current key, and re-sealed only if
+  normalization changed the card — reported as `rewrapped` with reason
+  `identity_plaintext_normalized`. A probe decryption failure on an
+  already-current envelope reports `skipped_sanitize_probe_failed` instead of
+  an error, so clients do not retry a record that needs no rewrap. Server-side
+  identity writes (genesis import, init, profile patch, dimension nudge) apply
+  the same normalization before sealing.
+
+- New **Notify Relay** endpoints for self-hosted deployments, which cannot hold
+  the official APNs signing key. Anonymous `POST /v1/notify-relay/register`
+  enrolls a device's APNs token and mints a relay auth token (`nrt_…`), returned
+  only on first enrollment (or when you re-enroll while presenting the token you
+  already hold); re-registering an already-enrolled device returns
+  `already_enrolled` without disclosing the token, since an APNs device token is
+  not a secret. `POST /v1/notify-relay/push` (authenticated by the new
+  `X-Relay-Token` header) delivers alert notifications and Live Activity
+  start/update/end through the hosted service's APNs credentials. Alert
+  pushes (type 1) are scoped to the enrolled device; types 2-4 pass the
+  rotating Live Activity target token per call. Both endpoints are
+  rate limited (`429` with `Retry-After`); pushes are logged server-side with
+  content truncated (default 512 chars) for triage, as disclosed in the
+  self-hosting guide.
 - `POST /v1/model_api/chat/send` and `POST /v1/chat/message` now accept an
   optional UUID `client_msg_id`. Reusing the same value for the same user within
   600 seconds returns the first stored user row without appending or waking a
@@ -96,6 +123,14 @@ change must not be interpreted as an API guarantee.
   rejection when the server had, in fact, already saved successfully. Clients
   matching on the literal string `blocked_url` for this case must update to
   `unreachable_from_backend`.
+- **`codex` + self-signed MCP servers:** `codex`'s TLS stack (rustls) rejects
+  a CA certificate used directly as a server certificate, so a single
+  self-signed cert works with `claude`/`pi` but not `codex`. Configure such
+  servers with a certificate chain (a CA cert plus a separate server cert it
+  signs). `POST /v1/mcp/servers/{name}/test` now returns
+  `codex_cert_chain_required` (instead of a generic `tls` result) when a
+  `codex`-driven account tests a server presenting a lone self-signed cert.
+  See [MCP servers workflow](/docs/workflows/mcp).
 
 ### Behavior
 

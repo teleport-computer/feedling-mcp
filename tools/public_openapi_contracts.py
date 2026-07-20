@@ -305,6 +305,27 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "description": "JSON response object. Endpoint-specific fields may be added compatibly.",
         "additionalProperties": True,
     },
+    # Pin the FastAPI-generated ValidationError shape so the published contract
+    # doesn't gain/lose `input`/`ctx` with the fastapi/pydantic version of
+    # whoever runs the exporter (older builds omit them, newer include them).
+    # Fixing it here keeps `npm run openapi:generate` deterministic regardless
+    # of the generating environment.
+    "ValidationError": {
+        "type": "object",
+        "required": ["loc", "msg", "type"],
+        "properties": {
+            "loc": {
+                "type": "array",
+                "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                "title": "Location",
+            },
+            "msg": {"type": "string", "title": "Message"},
+            "type": {"type": "string", "title": "Error Type"},
+            "input": {"title": "Input"},
+            "ctx": {"type": "object", "title": "Context"},
+        },
+        "title": "ValidationError",
+    },
     "ErrorResponse": {
         "type": "object",
         "required": ["error"],
@@ -945,6 +966,128 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "additionalProperties": True,
         "example": {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"], "transport": "http"},
     },
+    "NotifyRelayRegisterRequest": {
+        "type": "object",
+        "required": ["device_token"],
+        "properties": {
+            "device_token": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32,200}$",
+                "description": "APNs device token (hex) of the enrolling device.",
+            },
+            "apns_env": {
+                "type": "string",
+                "enum": ["sandbox", "production"],
+                "default": "production",
+                "description": "APNs environment the device token belongs to.",
+            },
+            "auth_token": {
+                "type": "string",
+                "description": (
+                    "Previously issued relay token (nrt_…). Pass it to re-enroll "
+                    "after a device-token rotation or device change; the same "
+                    "token is returned. Unknown tokens are ignored and the "
+                    "request falls back to matching by device_token."
+                ),
+            },
+            "user_id": {
+                "type": "string",
+                "description": "Optional official-account user id, if the caller has one.",
+            },
+        },
+        "additionalProperties": True,
+        "example": {"device_token": "ab12…ef90", "apns_env": "production"},
+    },
+    "NotifyRelayPushRequest": {
+        "type": "object",
+        "required": ["type", "content"],
+        "properties": {
+            "type": {
+                "type": "integer",
+                "enum": [1, 2, 3, 4],
+                "description": (
+                    "1 = alert notification, 2 = Live Activity update (the "
+                    "Dynamic Island is the same Live Activity), 3 = Live "
+                    "Activity start (push-to-start), 4 = Live Activity end."
+                ),
+            },
+            "token": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32,200}$",
+                "description": (
+                    "Target APNs token. For type 1 it may be omitted — the "
+                    "enrolled device token is always used, and an explicit "
+                    "value must match it (alert pushes are scoped to the "
+                    "enrolled device; anything else is rejected with 400). "
+                    "Required for types 2-4: Live Activity tokens rotate per "
+                    "activity, so always pass the latest one your backend "
+                    "received from the app."
+                ),
+            },
+            "apns_env": {
+                "type": "string",
+                "enum": ["sandbox", "production"],
+                "description": "Defaults to the environment stored at enrollment.",
+            },
+            "content": {
+                "type": "object",
+                "additionalProperties": True,
+                "description": (
+                    "Type-specific payload. type 1: title, body, subtitle?, "
+                    "sound?, badge?, data? (custom keys merged into the push "
+                    "payload). types 2-4: visualState? (default|sharing|reply), "
+                    "name?, desc?, aiStart?, alert_title?, alert_body?; type 2 "
+                    "also stale_date?; type 3 also attributes? "
+                    "({\"activityId\": …}) and attributes_type? (defaults to "
+                    "ScreenActivityAttributes); type 4 also dismissal_date? "
+                    "(unix seconds, defaults to now)."
+                ),
+            },
+        },
+        "additionalProperties": True,
+        "example": {
+            "type": 1,
+            "content": {"title": "IO", "body": "Your agent replied."},
+        },
+    },
+    "NotifyRelayRegisterResponse": {
+        "type": "object",
+        # Only device_token and created are always present. auth_token/apns_env
+        # are omitted on the already_enrolled response (an already-enrolled
+        # device matched by its non-secret device_token gets no token back), so
+        # they must NOT be required or a generated client rejects that valid 200.
+        "required": ["device_token", "created"],
+        "properties": {
+            "auth_token": {"type": "string",
+                           "description": "Relay token (nrt_…) for X-Relay-Token. Present only "
+                                          "on first enrollment or a re-enroll that presented a "
+                                          "valid token; omitted when already_enrolled is true."},
+            "device_token": {"type": "string"},
+            "apns_env": {"type": "string", "enum": ["sandbox", "production"],
+                         "description": "Omitted on the already_enrolled response."},
+            "created": {"type": "boolean", "description": "False when the device was already enrolled."},
+            "already_enrolled": {"type": "boolean",
+                                 "description": "True when the device was already enrolled and no "
+                                                "token is disclosed; recover the token via a "
+                                                "re-enroll that presents it."},
+        },
+        "additionalProperties": True,
+        "example": {"auth_token": "nrt_0123…", "device_token": "ab12…ef90",
+                    "apns_env": "production", "created": True},
+    },
+    "NotifyRelayPushResponse": {
+        "type": "object",
+        "required": ["status", "apns_env"],
+        "properties": {
+            "status": {"type": "string", "enum": ["delivered", "error"]},
+            "apns_env": {"type": "string", "description": "Environment actually delivered to (after automatic sandbox/production fallback)."},
+            "log_id": {"type": "integer", "description": "Server-side delivery-log row id."},
+            "reason": {"type": "string", "description": "APNs rejection reason when status is error (e.g. BadDeviceToken — refresh the token)."},
+            "error_code": {"type": "integer", "description": "APNs HTTP status when status is error."},
+        },
+        "additionalProperties": True,
+        "example": {"status": "delivered", "apns_env": "production", "log_id": 42},
+    },
 }
 
 
@@ -968,6 +1111,8 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/perception/photo/evaluate"): "PerceptionPhotoEvaluateRequest",
     ("post", "/v1/mcp/servers"): "McpServerUpsertRequest",
     ("patch", "/v1/mcp/servers/{name}"): "McpServerPatchRequest",
+    ("post", "/v1/notify-relay/register"): "NotifyRelayRegisterRequest",
+    ("post", "/v1/notify-relay/push"): "NotifyRelayPushRequest",
 }
 
 # These handlers deliberately accept an absent body and apply server defaults.
@@ -1071,11 +1216,37 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "address or a tunnel endpoint that only your agent's environment can reach. For those "
         "servers, skip this probe and instead ask your agent to call the MCP server directly in "
         "chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS "
-        "handshake failure — check ca_pem), timeout (connect/read timeout, or the whole probe "
-        "exceeded its 45-second wall-clock ceiling — e.g. a legacy HTTP+SSE endpoint answering "
-        "with a never-ending event stream), http_401/http_403/http_404/http_4xx/http_5xx "
-        "(server responded with an HTTP error), protocol (malformed MCP handshake), decrypt_failed. "
+        "handshake failure — check ca_pem), codex_cert_chain_required (a hosted codex agent uses a "
+        "rustls TLS stack that rejects a CA certificate presented as the server's own leaf/"
+        "end-entity certificate; reissue the server with a proper CA+leaf chain — a pasted ca_pem "
+        "does not fix this, since rustls rejects the leaf's shape regardless of what is trusted), "
+        "timeout (connect/read timeout, or the whole probe exceeded its 45-second wall-clock "
+        "ceiling — e.g. a legacy HTTP+SSE endpoint answering with a never-ending event stream), "
+        "http_401/http_403/http_404/http_4xx/http_5xx (server responded with an HTTP error), "
+        "protocol (malformed MCP handshake), decrypt_failed. "
         "404 not_found when no server with that name exists."
+    ),
+    ("post", "/v1/notify-relay/register"): (
+        "Enroll a device for the self-hosted push relay and mint (or return) its "
+        "relay auth token. Anonymous and idempotent: re-enrolling the same "
+        "device_token returns the existing token (created=false); passing a "
+        "previously issued auth_token re-binds it to a new device_token. The "
+        "token authorizes POST /v1/notify-relay/push via the X-Relay-Token "
+        "header. Per-IP rate limited; 429 carries Retry-After."
+    ),
+    ("post", "/v1/notify-relay/push"): (
+        "Push through the official APNs relay using the X-Relay-Token header "
+        "(issued by POST /v1/notify-relay/register). Types: 1 alert, 2 Live "
+        "Activity update (Dynamic Island included), 3 Live Activity start "
+        "(push-to-start token), 4 Live Activity end. Type 1 always delivers "
+        "to the enrolled device (a mismatching explicit token is rejected). "
+        "Types 2-4 must pass the target token — Live Activity tokens rotate "
+        "per activity. APNs "
+        "rejections return HTTP 200 with status=error plus the APNs reason; "
+        "handle BadDeviceToken/Unregistered by refreshing tokens on your side. "
+        "Per-token rate limited (429 + Retry-After); every call is logged "
+        "server-side with the content truncated for privacy. 503 means the "
+        "relay's APNs key is unavailable — retry later."
     ),
 }
 
@@ -1135,6 +1306,18 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         "202": {
             "description": "Turn accepted for asynchronous processing.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HostedChatAcceptedResponse"}}},
+        }
+    },
+    ("post", "/v1/notify-relay/register"): {
+        "200": {
+            "description": "Relay enrollment created or refreshed; the relay auth token is returned.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/NotifyRelayRegisterResponse"}}},
+        }
+    },
+    ("post", "/v1/notify-relay/push"): {
+        "200": {
+            "description": "Relay attempt completed; status reports the APNs outcome (delivered or error).",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/NotifyRelayPushResponse"}}},
         }
     },
     ("post", "/v1/users/register"): {

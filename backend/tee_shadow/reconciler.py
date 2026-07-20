@@ -63,6 +63,21 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         "owner, host, shard_index, shard_count, max_children, active_children, "
         "host_all, gateway, version, payload, updated_at",
     ),
+    # Notify Relay（自部署推送中继，0020）。configs 的 PK 是 auth_token（明文中继
+    # 凭证）；logs 的 id 是 GENERATED ALWAYS AS IDENTITY，见下 _IDENTITY_TABLES。
+    # 注意：TEE 侧 configs 有意不带主库的 device_token UNIQUE（见 alembic_tee
+    # 0002 注释）——否则换机顶替 + 镜像漏删 DELETE 时，copy 阶段按 auth_token
+    # upsert 会在 prune 之前撞唯一约束，reconciler 恰好治不了漏写。
+    "notify_relay_configs": (
+        ("auth_token",),
+        "auth_token, device_token, user_id, apns_env, disabled, "
+        "created_at, updated_at, last_used_at",
+    ),
+    "notify_relay_logs": (
+        ("id",),
+        "id, auth_token, push_type, target_token, apns_env, status, err_msg, "
+        "content, created_at, updated_at",
+    ),
 }
 
 # 每表可选的辖区 WHERE 子句：不满足的行完全不归本 reconciler 管——既不 copy、
@@ -90,7 +105,7 @@ _SCOPE_WHERE: dict[str, str] = {
 # TEE 会按自己的序列生成一个不同的 seq，破坏行内容一致性 + 打破依赖 seq 排序的
 # 读路径）。回填后还必须 setval 该序列到已复制的 MAX（见 reconcile_table 末尾），
 # 否则 TEE 侧后续普通 INSERT 会从序列起点重新发号、与已搬入的高 seq 撞 PK。
-_IDENTITY_TABLES: dict[str, str] = {"user_logs": "seq"}
+_IDENTITY_TABLES: dict[str, str] = {"user_logs": "seq", "notify_relay_logs": "id"}
 
 BATCH = 1000
 
