@@ -122,6 +122,31 @@ def test_blob_get_set():
     assert db.get_blob(uid, "tokens") == [{"token": "abc", "status": "active"}]
 
 
+def test_set_blob_if_unchanged_cas():
+    uid = _uid()
+    seed_user(uid)
+    base = {"fingerprint": "f0", "servers": [{"name": "a", "transport": "http"}]}
+    db.set_blob(uid, "user_mcp", base)
+
+    # CAS with the current value swaps and returns True; JSONB equality is
+    # semantic, so a re-ordered but equal expected still matches.
+    expected_reordered = {"servers": [{"transport": "http", "name": "a"}],
+                          "fingerprint": "f0"}
+    nxt = {"fingerprint": "f1", "servers": [{"name": "a", "transport": "sse"}]}
+    assert db.set_blob_if_unchanged(uid, "user_mcp", expected_reordered, nxt) is True
+    assert db.get_blob(uid, "user_mcp") == nxt
+
+    # CAS against a now-stale expectation must NOT write and returns False.
+    stale = base
+    other = {"fingerprint": "f2", "servers": []}
+    assert db.set_blob_if_unchanged(uid, "user_mcp", stale, other) is False
+    assert db.get_blob(uid, "user_mcp") == nxt   # unchanged
+
+    # Missing row (kind never written) also returns False without resurrecting.
+    assert db.set_blob_if_unchanged(uid, "never", {"x": 1}, {"x": 2}) is False
+    assert db.get_blob(uid, "never") is None
+
+
 def test_get_blobs_for_users_batches_and_omits_missing_rows():
     uid_a = _uid()
     uid_b = _uid()
@@ -514,6 +539,39 @@ def test_admin_data_track_dau_aggregates_app_sessions_by_beijing_day():
     assert by_day["2030-06-04"]["foreground_sec"] == 0
     assert by_day["2030-06-04"]["session_count"] == 0
     assert by_day["2030-06-04"]["session_dau"] == 0
+    # Median of per-user daily totals: user_a=60+180=240, user_b=120 → median 180;
+    # a chat-only day has no sessions → 0.
+    assert by_day["2030-06-02"]["median_user_sec"] == 180.0
+    assert by_day["2030-06-04"]["median_user_sec"] == 0.0
+
+
+def test_admin_data_track_dau_median_is_robust_to_heavy_users():
+    """Median per-user foreground ≠ the mean when a heavy user skews the day."""
+    light_a = _uid()
+    light_b = _uid()
+    heavy = _uid()
+    for uid in (light_a, light_b, heavy):
+        seed_user(uid)
+
+    since = _epoch("2031-03-01T17:00:00Z")
+    base = _epoch("2031-03-01T18:00:00Z")  # 2031-03-02 Beijing
+    # Per-user daily totals: 10, 20, 300 → mean 110, median 20.
+    for uid, duration in ((light_a, 10), (light_b, 20), (heavy, 300)):
+        db.log_append(
+            uid,
+            "tracking_events",
+            {"type": "app_session_end", "payload": {"duration_sec": duration}},
+            ts=base,
+        )
+
+    by_day = {
+        row["day"]: row
+        for row in db.admin_data_track_dau(since_epoch=since, days=10, tz="Asia/Shanghai")
+    }
+    day = by_day["2031-03-02"]
+    assert day["session_dau"] == 3
+    assert day["foreground_sec"] == 330            # mean per user = 110
+    assert day["median_user_sec"] == 20.0          # median is not fooled by the heavy user
 
 
 def test_dau_daily_snapshot_freezes_completed_days_and_preserves_live_fallback():
@@ -569,6 +627,9 @@ def test_dau_daily_snapshot_freezes_completed_days_and_preserves_live_fallback()
         assert by_day["2042-08-11"]["dau"] == 2
         assert by_day["2042-08-11"]["session_count"] == 1
         assert by_day["2042-08-11"]["foreground_sec"] == 120
+        # Median per-user foreground survives the freeze round-trip (single user
+        # with a 120s total → median 120).
+        assert by_day["2042-08-11"]["median_user_sec"] == 120.0
         assert by_day["2042-08-12"]["frozen"] is False  # current Beijing day
         with pool.connection() as conn:
             assert conn.execute(
@@ -629,6 +690,146 @@ def test_dau_daily_snapshot_freezes_completed_days_and_preserves_live_fallback()
                 "DELETE FROM dau_daily_snapshot WHERE day BETWEEN %s AND %s",
                 ("2042-08-10", "2042-08-13"),
             )
+
+
+def _bj_epoch(y, m, d, h=12):
+    from datetime import timezone, timedelta
+    return datetime(y, m, d, h, tzinfo=timezone(timedelta(hours=8))).timestamp()
+
+
+def _cohort_week_of(user_id: str) -> str:
+    """The Beijing-week Monday a seeded user falls in — matches the retention SQL
+    exactly, so tests identify their own cohort robustly amid co-resident data
+    (the session DB is shared and other tests' cohorts also appear)."""
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT to_char(date_trunc('week', timezone('Asia/Shanghai', "
+            "created_at::timestamptz))::date, 'YYYY-MM-DD') FROM users WHERE user_id = %s",
+            (user_id,),
+        ).fetchone()
+    return row[0]
+
+
+def test_user_growth_new_cumulative_and_deletion_proof_freeze():
+    # 3 users register Beijing 2038-03-01, 2 on 2038-03-02. Midday created_at is
+    # tz-robust (same Beijing day whether the session casts naive as UTC or CST).
+    a_users = [_uid() for _ in range(3)]
+    b_users = [_uid() for _ in range(2)]
+    for u in a_users:
+        seed_user(u, created_at="2038-03-01T12:00:00")
+    for u in b_users:
+        seed_user(u, created_at="2038-03-02T12:00:00")
+    try:
+        by_day = {r["day"]: r for r in db.admin_data_track_growth(days=365)}
+        assert by_day["2038-03-01"]["new_users"] == 3
+        assert by_day["2038-03-02"]["new_users"] == 2
+        # cumulative is a running sum; 03-02 sits 3 higher than 03-01.
+        assert by_day["2038-03-02"]["cumulative"] - by_day["2038-03-01"]["cumulative"] == 2
+
+        # Freeze establishes the boundary at "yesterday": run at 03-02 to freeze
+        # 03-01, then at 03-03 to freeze 03-02.
+        assert "2038-03-01" in db.freeze_completed_growth_days(now_epoch=_bj_epoch(2038, 3, 2))
+        assert "2038-03-02" in db.freeze_completed_growth_days(now_epoch=_bj_epoch(2038, 3, 3))
+        frozen = {r["day"]: r for r in db.admin_data_track_growth(days=365)}
+        assert frozen["2038-03-01"]["frozen"] is True
+        assert frozen["2038-03-01"]["new_users"] == 3
+
+        # Delete one 2038-03-01 user: the FROZEN day must not change.
+        db.delete_user(a_users[0])
+        after = {r["day"]: r for r in db.admin_data_track_growth(days=365)}
+        assert after["2038-03-01"]["new_users"] == 3   # deletion-proof
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM user_growth_daily_snapshot WHERE day IN ('2038-03-01','2038-03-02')")
+
+
+def test_retention_cohort_matrix_and_pinned_denominator():
+    # Cohort A: 3 users reg 2038-05-03; B: 2 users reg 2038-05-10 (one week later
+    # -> distinct Beijing weeks). Activity at reg_date = period 0, reg_date+7 = 1.
+    a = [_uid() for _ in range(3)]
+    b = [_uid() for _ in range(2)]
+    for u in a:
+        seed_user(u, created_at="2038-05-03T12:00:00")
+    for u in b:
+        seed_user(u, created_at="2038-05-10T12:00:00")
+
+    def chat(uid, ts):
+        db.chat_append(uid, f"m_{uid}_{ts}", ts,
+                       {"id": f"m_{uid}_{ts}", "role": "user", "source": "chat"}, max_messages=0)
+
+    # A: u0 active period 0 and 1; u1 active period 0 only; u2 never.
+    chat(a[0], _bj_epoch(2038, 5, 3)); chat(a[0], _bj_epoch(2038, 5, 10))
+    chat(a[1], _bj_epoch(2038, 5, 4))
+    # B: u0 active period 0 only.
+    chat(b[0], _bj_epoch(2038, 5, 11))
+    a_week = _cohort_week_of(a[0])
+    b_week = _cohort_week_of(b[0])
+    try:
+        matrix = {c["cohort_week"]: c for c in db.admin_data_track_retention()["cohorts"]}
+        cohort_a = matrix[a_week]
+        cohort_b = matrix[b_week]
+        assert cohort_a["cohort_size"] == 3
+        assert cohort_b["cohort_size"] == 2
+        assert cohort_a["cells"][0]["active"] == 2      # u0,u1 in signup week
+        assert cohort_a["cells"][1]["active"] == 1      # u0 the next week
+        assert cohort_a["cells"][0]["pct"] == round(100 * 2 / 3, 1)
+        assert cohort_b["cells"][0]["active"] == 1
+
+        frozen = db.freeze_completed_retention_cohorts(now_epoch=_bj_epoch(2038, 6, 1))
+        assert any(k.startswith(a_week) for k in frozen)
+
+        # Delete the churned A user (u2, never active): cohort_size stays 3, so
+        # retention is NOT fake-inflated (the whole point of freezing).
+        db.delete_user(a[2])
+        after = {c["cohort_week"]: c for c in db.admin_data_track_retention()["cohorts"]}
+        assert after[a_week]["cohort_size"] == 3               # pinned denominator
+        assert after[a_week]["cells"][0]["pct"] == round(100 * 2 / 3, 1)
+        assert after[a_week]["cells"][0]["frozen"] is True
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM retention_cohort_snapshot WHERE cohort_week IN (%s, %s)",
+                (a_week, b_week))
+
+
+def test_retention_total_churn_still_freezes_zero_cells():
+    # Regression (codex R1): a cohort whose W0 is frozen, then ALL members delete,
+    # must still get later-period 0-cells frozen — otherwise total churn is hidden
+    # (the opposite of deletion-proofing). Anchor keeps the cohort in the freeze set.
+    users = [_uid() for _ in range(2)]
+    for u in users:
+        seed_user(u, created_at="2039-02-07T12:00:00")  # a Monday-ish week
+
+    def chat(uid, ts):
+        db.chat_append(uid, f"m_{uid}_{ts}", ts,
+                       {"id": f"m_{uid}_{ts}", "role": "user", "source": "chat"}, max_messages=0)
+
+    chat(users[0], _bj_epoch(2039, 2, 7))  # active W0
+    week = _cohort_week_of(users[0])
+    try:
+        # Freeze W0 (one week later): cohort_size=2, W0 active=1.
+        frozen0 = db.freeze_completed_retention_cohorts(now_epoch=_bj_epoch(2039, 2, 14))
+        assert any(k.startswith(week) for k in frozen0)
+
+        # Everyone deletes; the cohort drops out of live `users`.
+        for u in users:
+            db.delete_user(u)
+
+        # A later period completes: W1 must be frozen as active=0 / 0%, and the
+        # cohort must still appear (denominator pinned at 2 via the anchor).
+        frozen1 = db.freeze_completed_retention_cohorts(now_epoch=_bj_epoch(2039, 2, 21))
+        assert f"{week}#1" in frozen1
+        after = {c["cohort_week"]: c for c in db.admin_data_track_retention()["cohorts"]}
+        assert week in after
+        assert after[week]["cohort_size"] == 2
+        assert after[week]["cells"][1]["active"] == 0
+        assert after[week]["cells"][1]["pct"] == 0.0
+        assert after[week]["cells"][1]["frozen"] is True
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM retention_cohort_snapshot WHERE cohort_week = %s", (week,))
 
 
 def test_log_patch_item_only_if_status():

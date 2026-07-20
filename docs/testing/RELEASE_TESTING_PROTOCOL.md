@@ -289,9 +289,14 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 | debug_trace 写后读竞态 | TESTING §6 flaky 规范（e4b38e39，bounded best-effort 契约） |
 | 注入文本污染（usr_fee1"用户"称谓） | §4.7 注入文本审计 |
 | admin debug 慢查询（>400s 不可用） | §6 admin 三读性能打表（get_blobs_for_users） |
+| resident 旧版 consumer 永不认领蒸馏任务（usr_f13f，5 连失败+错怪网络/模型设置） | 已入 pytest（test_resident_maintenance 6 DB 例 + unit 节流/措辞例）；`tools/e2e/resident_maintenance_smoke.py`（触碰 consumer 识别/poll/notice/genesis claim 时加跑，~17min：模拟无 commit header poll→15min 注入→用户密钥解密→notice+copyable_prompt→封信封回复→限流→收敛 resolve）；P1 #12 归因抽查含 resident_never_claimed→"resident 端过旧/离线"（blame=user_environment，不再引导查网络/模型设置） |
+| app 感知断供 + 读侧缺口（usr_7f30，快捷指令停报 2 天 AI 只字未提） | 已入 pytest（perception recent_apps 权限/TTL/route 共 85 项）；**io_cli allowlist parity test**（防"verb 实现了但没进 _IO_CLI_VERBS"——driver=pi 用户才踩得到的暗坑，两次都是它）；排查口径：客户端快捷指令断供属用户侧，先查 user_logs 对应 stream 最后上报时间再谈后端 |
 
 **规则**：以后每个 prod 事故结案时，必须在本表加一行 + 在对应层落一条用例，
 否则不算结案。
+
+**分诊前置**：用户报障先确认接入路线（①API 托管 / ②自有服务器 / ③完全自部署），
+三条排查路径完全不同——权威定义见 `docs/ACCESS_ROUTES.md`。
 
 ## 8. 报告格式与阻断规则
 

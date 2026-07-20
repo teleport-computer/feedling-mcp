@@ -11,6 +11,7 @@ from core.store import UserStore
 from accounts import onboarding as accounts_onboarding
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
+from chat import service as chat_service
 from identity import service as identity_service
 from genesis import service as genesis_service
 from hosted import config_store as hosted_config_store
@@ -61,7 +62,7 @@ def _visible_agent_message_count(store) -> int:
         1 for m in chat_msgs
         if isinstance(m, dict)
         and m.get("role") in ("agent", "openclaw")
-        and m.get("source") != "verify_ping"
+        and m.get("source") not in chat_service.NON_CONVERSATION_USER_SOURCES
     )
 
 
@@ -75,7 +76,7 @@ def _real_user_agent_exchange_verified(store) -> bool:
     seen_user = False
     for m in sorted_msgs:
         role = m.get("role")
-        if role == "user" and m.get("source") != "verify_ping":
+        if chat_service.is_conversation_user_message(m):
             seen_user = True
         elif role in ("agent", "openclaw") and seen_user:
             return True

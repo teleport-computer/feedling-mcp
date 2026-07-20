@@ -62,6 +62,14 @@ def test_stale_unclaimed_job_failed():
     blob = db.get_blob(uid, "genesis_state")
     assert blob["job_id"] == "genesis_unclaimed1"
     assert blob["status"] == "failed"
+    notices = {
+        r["dedupe_key"]: r
+        for r in db.log_read_all(uid, "user_notices")
+    }
+    notice = notices["genesis:genesis_unclaimed1"]
+    assert notice["error_class"] == "resident_never_claimed"
+    assert notice["blame"] == "user_environment"
+    assert notice["severity"] == "error"
 
 
 def test_fresh_unclaimed_job_untouched():

@@ -21,12 +21,19 @@ def _live_activity_identity_context(store: UserStore) -> dict:
     }
 
 
-def _live_activity_content_state(store: UserStore, payload: dict, *, default_visual_state: str = "reply") -> dict:
+def build_content_state(payload: dict, *, default_visual_state: str = "reply",
+                        ai_start: str | None = None) -> dict:
+    """Pure Live Activity content-state builder — no UserStore dependency.
+
+    ``ai_start`` is the fallback when the payload carries no aiStart of its own;
+    the store-backed wrapper below passes the identity card's value, the notify
+    relay passes whatever the self-hosted caller supplied (the official side has
+    no identity for relay users).
+    """
     title = (payload.get("title") or "").strip()
     body = (payload.get("body") or payload.get("message") or payload.get("desc") or "").strip()
     subtitle = (payload.get("subtitle") or "").strip() or None
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    identity_context = _live_activity_identity_context(store)
     visual_state = str(
         payload.get("visualState")
         or payload.get("visual_state")
@@ -45,7 +52,7 @@ def _live_activity_content_state(store: UserStore, payload: dict, *, default_vis
         "visualState": visual_state,
         "name": name,
         "desc": body,
-        "aiStart": payload.get("aiStart") or payload.get("ai_start") or identity_context.get("aiStart"),
+        "aiStart": payload.get("aiStart") or payload.get("ai_start") or ai_start,
         "title": title,
         "subtitle": subtitle,
         "body": body,
@@ -54,6 +61,40 @@ def _live_activity_content_state(store: UserStore, payload: dict, *, default_vis
         "data": data,
         "updatedAt": time.time(),
     }
+
+
+def build_live_activity_aps(content_state: dict, *, event: str, alert: dict | None = None,
+                            attributes_type: str | None = None,
+                            attributes: dict | None = None,
+                            dismissal_date: int | None = None,
+                            stale_date: int | None = None) -> dict:
+    """Pure APNs ``aps`` envelope for a Live Activity push.
+
+    Shared by the store-backed ``push_live_*`` paths AND the notify relay so the
+    wire shape — the exact keys iOS's ActivityKit Codable reads — can't drift
+    between the two call sites (they previously reimplemented this each). Only
+    fallback strings (e.g. the alert title) legitimately differ per caller and
+    stay in the caller's ``alert``/``attributes`` args."""
+    aps: dict = {"timestamp": int(time.time()), "event": event, "content-state": content_state}
+    if alert is not None:
+        aps["alert"] = alert
+    if attributes_type is not None:
+        aps["attributes-type"] = attributes_type
+        aps["attributes"] = attributes if isinstance(attributes, dict) else {}
+    if dismissal_date is not None:
+        aps["dismissal-date"] = dismissal_date
+    if stale_date is not None:
+        aps["stale-date"] = stale_date
+    return {"aps": aps}
+
+
+def _live_activity_content_state(store: UserStore, payload: dict, *, default_visual_state: str = "reply") -> dict:
+    identity_context = _live_activity_identity_context(store)
+    return build_content_state(
+        payload,
+        default_visual_state=default_visual_state,
+        ai_start=identity_context.get("aiStart"),
+    )
 
 
 def _live_activity_body(payload: dict) -> str:
@@ -94,17 +135,14 @@ def push_live_activity_dict(store: UserStore, payload: dict) -> dict:
             "mode": "update",
         }
 
-    apns_payload = {
-        "aps": {
-            "timestamp": int(time.time()),
-            "event": payload.get("event", "update"),
-            "content-state": _live_activity_content_state(store, payload, default_visual_state="reply"),
-            # Non-empty alert text is what makes a remote Live Activity update
-            # user-visible instead of only refreshing the lock-screen/Island
-            # content state silently.
-            "alert": {"title": alert_title or "IO", "body": alert_body[:240]},
-        }
-    }
+    # Non-empty alert text is what makes a remote Live Activity update
+    # user-visible instead of only refreshing the lock-screen/Island content
+    # state silently.
+    apns_payload = build_live_activity_aps(
+        _live_activity_content_state(store, payload, default_visual_state="reply"),
+        event=payload.get("event", "update"),
+        alert={"title": alert_title or "IO", "body": alert_body[:240]},
+    )
     topic = f"{apns.BUNDLE_ID}.push-type.liveactivity"
     result = apns._send_apns_to_active_tokens(
         store,
@@ -142,14 +180,11 @@ def push_live_activity_end_inner(store: UserStore, payload: dict | None = None) 
     body = _live_activity_body(payload)
     top_app = _live_activity_top_app(payload)
     activity_id = payload.get("activity_id")
-    apns_payload = {
-        "aps": {
-            "timestamp": int(time.time()),
-            "event": "end",
-            "content-state": _live_activity_content_state(store, payload, default_visual_state="default"),
-            "dismissal-date": int(time.time()),
-        }
-    }
+    apns_payload = build_live_activity_aps(
+        _live_activity_content_state(store, payload, default_visual_state="default"),
+        event="end",
+        dismissal_date=int(time.time()),
+    )
     topic = f"{apns.BUNDLE_ID}.push-type.liveactivity"
     result = apns._send_apns_to_active_tokens(
         store,
@@ -206,19 +241,13 @@ def push_live_start_dict(
     if end_existing and existing_live_entry and not update_result:
         end_result = push_live_activity_end_inner(store, payload)
 
-    apns_payload = {
-        "aps": {
-            "timestamp": int(time.time()),
-            "event": "start",
-            "content-state": _live_activity_content_state(store, payload, default_visual_state="reply"),
-            "attributes-type": attributes_type,
-            "attributes": attributes,
-            "alert": {
-                "title": title or "OpenClaw",
-                "body": body_text or "Live Activity started",
-            },
-        }
-    }
+    apns_payload = build_live_activity_aps(
+        _live_activity_content_state(store, payload, default_visual_state="reply"),
+        event="start",
+        alert={"title": title or "OpenClaw", "body": body_text or "Live Activity started"},
+        attributes_type=attributes_type,
+        attributes=attributes,
+    )
 
     topic = f"{apns.BUNDLE_ID}.push-type.liveactivity"
     result = apns._send_apns(

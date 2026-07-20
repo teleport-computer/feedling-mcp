@@ -378,6 +378,13 @@ class UserStore:
         # be decrypted through the normal enclave/MCP history path.
         if source == "verify_ping" and envelope.get("synthetic_marker"):
             msg["content"] = envelope["synthetic_marker"]
+        # Server-authored maintenance prompts must also be readable on the
+        # direct /v1/chat/poll fallback path. Unlike user chat, this prompt is
+        # operational copy, not private user content.
+        if source == "resident_maintenance":
+            content = str((extra or {}).get("content") or "").strip()
+            if content:
+                msg["content"] = content
         if envelope.get("K_enclave") is not None:
             msg["K_enclave"] = envelope["K_enclave"]
         if extra:
@@ -441,6 +448,13 @@ class UserStore:
                 "reply_message_id",
                 "replied_by",
                 "replied_at",
+                # Turn-failure metadata (spec 2026-07-18 §2): carried on the
+                # fallback reply doc itself so it survives /v1/chat/history's
+                # `since` incremental filter — see chat_core.write_response.
+                "turn_failure_error_class",
+                "turn_failure_blame",
+                "turn_failure_user_text",
+                "reply_to_message_id",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
@@ -480,6 +494,73 @@ class UserStore:
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return msg
+
+    def apply_finalized_chat_reply(
+        self,
+        parent_msg_id: str,
+        parent_doc: dict,
+        reply_doc: dict,
+    ) -> dict:
+        """Reconcile an atomic reply winner into this worker's cache.
+
+        PostgreSQL has already committed both rows.  This method is therefore
+        deliberately memory-only: it must never call chat_update_metadata (or
+        any other persistence helper) for the parent.  It emits the same genuine
+        append wake/capture side effects as append_chat, and callers invoke it
+        only for the CAS winner.
+        """
+        cached_reply = dict(reply_doc)
+        with self.chat_lock:
+            for index, existing in enumerate(self.chat_messages):
+                if str(existing.get("id") or "") == parent_msg_id:
+                    self.chat_messages[index] = dict(parent_doc)
+                    break
+
+            replaced_reply = False
+            for index, existing in enumerate(self.chat_messages):
+                if str(existing.get("id") or "") == str(cached_reply.get("id") or ""):
+                    self.chat_messages[index] = cached_reply
+                    replaced_reply = True
+                    break
+            if not replaced_reply:
+                self.chat_messages.append(cached_reply)
+            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
+                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+
+        wake_bus.notify("chat", self.user_id)
+        try:
+            from proactive import capture_scheduler
+
+            capture_scheduler.record_chat_append(self, cached_reply)
+        except Exception as e:
+            print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
+        return cached_reply
+
+    def finalize_chat_reply_once(
+        self,
+        parent_msg_id: str,
+        candidate: dict,
+        replied_fields: dict,
+    ) -> tuple[dict, dict] | None:
+        """Persist one reply atomically, then apply winner-only side effects."""
+        finalized = db.chat_finalize_reply_once(
+            self.user_id,
+            parent_msg_id,
+            str(candidate.get("id") or ""),
+            float(candidate.get("ts") or 0),
+            candidate,
+            replied_fields,
+        )
+        if finalized is None:
+            return None
+        parent_doc, reply_doc = finalized
+        db.chat_finalize_reply_post_commit(
+            self.user_id, reply_doc, MAX_CHAT_MESSAGES
+        )
+        cached_reply = self.apply_finalized_chat_reply(
+            parent_msg_id, parent_doc, reply_doc
+        )
+        return parent_doc, cached_reply
 
     def append_chat_idempotent(
         self,
@@ -596,6 +677,11 @@ class UserStore:
             "reply_message_id",
             "replied_by",
             "replied_at",
+            # 回合失败冗余持久化（spec 2026-07-18 §2.2）。权威载体是兜底回复消息；
+            # 这里是全量 history / 重启后的恢复路径。
+            "reply_error_class",
+            "reply_blame",
+            "reply_user_text",
         }
         clean: dict = {}
         for key, value in (fields or {}).items():

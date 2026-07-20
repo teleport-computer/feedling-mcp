@@ -27,6 +27,7 @@ Wake calls preserved (byte-for-byte with the old Flask routes):
 from __future__ import annotations
 
 import base64
+import logging
 import time
 import uuid
 
@@ -39,8 +40,12 @@ from chat import service as chat_service
 from core import envelope as core_envelope
 from core import wake_bus
 from core.store import UserStore
+from notices import catalog as notices_catalog
+from notices import core as notices_core
 from proactive import service as proactive_service
 from push import service as push_service
+
+log = logging.getLogger(__name__)
 
 _ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
 
@@ -126,6 +131,37 @@ def _proactive_delivery_decision_v2(store: UserStore, payload: dict):
 # debug-trace helpers (moved verbatim from the Flask route; pure store logic)
 # --------------------------------------------------------------------------- #
 
+def _turn_failure_attribution(error_class: str, payload: dict) -> tuple[str, str]:
+    """回合失败的归责与用户文案 —— **服务端按 error_class 查表，不信 payload**。
+
+    归责红线（docs/FRONTEND_ERROR_CONTRACT.md §二）：provider 的错要抛给用户，
+    但不是他的错**绝不能赖给他**。透传 payload 的 blame 意味着一个写错/被改的
+    consumer 能把我们自己的故障标成 user_provider，让用户白跑一趟改配置——这
+    正是红线要防的那件事。catalog.blame_for 对未知 error_class 安全落 system，
+    与另外两条通道（notices.core 丢弃坏枚举、asgi.responses 直接 raise）同纪律。
+
+    user_text 同理：注释和 OpenAPI 都宣称「服务端组好、绝不含原始 provider
+    detail」，那就必须真由服务端组——payload 里的任意 500 字撑不起这个保证
+    （截断不是脱敏）。catalog 的文案与 consumer 分类器由
+    tests/test_catalog_consumer_parity.py 锁住不漂移。
+
+    payload 里的同名字段只在 catalog 未收录该 error_class 时作降级兜底，且
+    blame 仍强制落在合法枚举内。
+    """
+    blame = notices_catalog.blame_for(error_class)
+    user_text = notices_catalog.user_text_for(error_class)
+    if error_class not in notices_catalog.ERROR_CLASSES:
+        # 未收录的新 slug：文案退回 poster 提供的（老后端 + 新 consumer 的过渡期），
+        # 但 blame 绝不退让——非法值一律 system，宁可我们背锅也不误导用户。
+        fallback_text = str(payload.get("turn_failure_user_text") or "")[:500]
+        if fallback_text:
+            user_text = fallback_text
+        raw_blame = str(payload.get("turn_failure_blame") or "")
+        if raw_blame in notices_core.VALID_BLAME:
+            blame = raw_blame
+    return blame, user_text
+
+
 def _reply_to_message_id(payload: dict) -> str:
     """The reply target id from any of the accepted payload aliases (trimmed)."""
     return str(
@@ -145,6 +181,19 @@ def _chat_message_by_id(store: UserStore, msg_id: str) -> dict | None:
             if str(msg.get("id") or "") == msg_id:
                 return dict(msg)
     return None
+
+
+def _is_resident_maintenance_reply(store: UserStore, payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("source") or "").strip() != "resident_maintenance":
+        return False
+    parent = _chat_message_by_id(store, _reply_to_message_id(payload))
+    return bool(
+        parent
+        and str(parent.get("role") or "") == "user"
+        and str(parent.get("source") or "") == "resident_maintenance"
+    )
 
 
 FIRST_CHAT_OK_USER_SOURCES = {"chat", "model_api"}
@@ -512,7 +561,7 @@ def trace_response_gated(store: UserStore, payload: dict, allow_verify_reply: bo
     )
 
 
-def gate_response_dict(store: UserStore, allow_verify_reply: bool):
+def gate_response_dict(store: UserStore, allow_verify_reply: bool, payload: dict | None = None):
     """Bridge to the shared bootstrap gate.
 
     ``boot_gates._gate_bootstrap_for_chat`` returns a framework-neutral
@@ -527,6 +576,8 @@ def gate_response_dict(store: UserStore, allow_verify_reply: bool):
         store, allow_verify_reply=allow_verify_reply
     )
     if gated is None:
+        return None
+    if _is_resident_maintenance_reply(store, payload):
         return None
     body, status = gated
     return body, status
@@ -598,11 +649,17 @@ def write_response(
     else:
         thinking_extra.update(chat_service._chat_plaintext_thinking_extra_for_store(store, payload))
     source = str(payload.get("source") or "chat").strip() or "chat"
-    # "verify_ping": the resident consumer stamps its synthetic liveness reply
-    # with this source so the visible /v1/chat/history feed can filter it out
-    # (and verify_loop's GC can match it) regardless of GC timing. It is never a
-    # user-visible message.
-    if source not in {"chat", "live_activity", "heartbeat", "verify_ping", proactive_service.PROACTIVE_JOB_SOURCE}:
+    # "verify_ping": synthetic liveness reply, hidden from visible history.
+    # "resident_maintenance": reply to a server-authored maintenance prompt; it
+    # is visible in history but must not trigger push or bootstrap success.
+    if source not in {
+        "chat",
+        "live_activity",
+        "heartbeat",
+        "verify_ping",
+        "resident_maintenance",
+        proactive_service.PROACTIVE_JOB_SOURCE,
+    }:
         return {"error": "invalid source"}, 400
     # role: 消费者可声明 "system"（技术通知气泡，spec 2026-07-06-upstream-error-
     # surfacing）。白名单外一律落 openclaw——新增 role 前先过 spec 的 role 审计表。
@@ -637,48 +694,79 @@ def write_response(
         if push_body.strip():
             extra["push_body_preview"] = push_body.strip()[:240]
         extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
+    turn_failure_error_class = str(payload.get("turn_failure_error_class") or "")[:64]
     reply_to_message_id = _reply_to_message_id(payload)
     if reply_to_message_id and role != "system":
-        _parent = _chat_message_by_id(store, reply_to_message_id)
-        if _parent is not None and (
-            _parent.get("reply_status") == "replied" or _parent.get("reply_message_id")
-        ):
-            # Reply-exclusivity guard (delivery exclusivity is the claim CAS's job).
-            # If this turn was ALREADY answered — e.g. THIS consumer's claim expired
-            # mid-turn (>CHAT_POLL_CLAIM_TTL_SEC), the lease failed over, and the new
-            # consumer already replied — don't append a duplicate reply and
-            # double-burn the user's model key. Drop it with 409. (Guarding only on
-            # already-replied, not claim ownership, so a legit reply that omits its
-            # consumer_id is never rejected.)
-            return {"error": "already_answered", "reply_status": "replied"}, 409
-    msg = store.append_chat(
-        role,
-        source,
-        envelope,
-        content_type=content_type,
-        extra=extra,
-    )
-    if reply_to_message_id and role != "system":
-        store.update_chat_message_metadata(reply_to_message_id, {
+        # Turn-failure metadata（spec 2026-07-18 §2）：兜底回复是【实时载体】——它是
+        # 新消息、有新 ts，能通过 /v1/chat/history 的 `since` 增量过滤；而对用户那条
+        # 旧消息就地更新 metadata 不产生新 ts，永远进不了增量流。reply_to_message_id
+        # 必须一并落在回复消息上，否则客户端在增量流里拿到失败事件却无法配对回它
+        # 失败的那条用户消息。只做加法：不携带这些字段时本段完全不执行。
+        #
+        # 必须在 _build_chat_message 之前写进 extra —— 那一行之后 candidate 已定型，
+        # 再改 extra 不会进入原子 CAS 的那条 INSERT（3d160bf9 的新结构）。
+        turn_failure_blame = ""
+        turn_failure_user_text = ""
+        if turn_failure_error_class and source == "chat":
+            turn_failure_blame, turn_failure_user_text = _turn_failure_attribution(
+                turn_failure_error_class, payload
+            )
+            extra["turn_failure_error_class"] = turn_failure_error_class
+            extra["turn_failure_blame"] = turn_failure_blame
+            extra["turn_failure_user_text"] = turn_failure_user_text
+            extra["reply_to_message_id"] = reply_to_message_id
+        # Build the exact append_chat row immediately before the one-statement
+        # parent-CAS + reply-INSERT.  No slow work belongs in this gap: two workers
+        # may arrive together, and PostgreSQL decides the sole winner.
+        candidate = store._build_chat_message(
+            role,
+            source,
+            envelope,
+            content_type=content_type,
+            extra=extra,
+        )
+        replied_fields = {
             "reply_status": "replied",
-            "reply_message_id": str(msg.get("id") or ""),
+            "reply_message_id": str(candidate.get("id") or ""),
             "replied_by": consumer_id,
-            "replied_at": f"{time.time():.3f}",
-        })
+            "replied_at": f"{float(candidate['ts']):.3f}",
+        }
+        # 冗余持久化到用户消息上（供全量 history / 重启后恢复）。权威载体仍是兜底
+        # 回复消息本身；这里搭 finalize 的原子 CAS 顺风车，比旧结构的事后 metadata
+        # 更新更可靠——旧写法在 parent 不在本 worker 内存时会静默丢失。
+        if turn_failure_error_class and source == "chat":
+            replied_fields["reply_error_class"] = turn_failure_error_class
+            replied_fields["reply_blame"] = turn_failure_blame
+            replied_fields["reply_user_text"] = turn_failure_user_text
+        finalized = store.finalize_chat_reply_once(
+            reply_to_message_id, candidate, replied_fields
+        )
+        if finalized is None:
+            return {"error": "already_answered", "reply_status": "replied"}, 409
+        _parent_doc, msg = finalized
         _maybe_mark_first_chat_ok(store, reply_to_message_id)
+    else:
+        # System notices bypass reply exclusivity by design, as do ordinary
+        # response writes with no reply target.
+        msg = store.append_chat(
+            role,
+            source,
+            envelope,
+            content_type=content_type,
+            extra=extra,
+        )
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
-    # Defense-in-depth: a synthetic verify-loop liveness reply must NEVER surface
-    # as a push / Live Activity, no matter what the caller passed. The resident
-    # consumer already sends suppress_push=True, so this changes nothing today —
-    # it just closes the gap if a future caller regression posts source=verify_ping
-    # with a body.
-    if source == "verify_ping":
+    # Defense-in-depth: synthetic/maintenance replies must NEVER surface as push
+    # or Live Activity, no matter what the caller passed.
+    if source in {"verify_ping", "resident_maintenance"}:
         visible_push_body = ""
     # Any plaintext AI reply supplied by the caller enters the same app-state
     # policy: background/unknown app state gets Live Activity + APNs alert;
     # foreground app state records a suppression instead of interrupting.
-    if source != "verify_ping" and (visible_push_body or payload.get("push_live_activity")):
+    if source not in {"verify_ping", "resident_maintenance"} and (
+        visible_push_body or payload.get("push_live_activity")
+    ):
         delivery = None
         if source == proactive_service.PROACTIVE_JOB_SOURCE:
             delivery = _proactive_delivery_decision_v2(store, payload)
@@ -721,6 +809,24 @@ def write_response(
 # --------------------------------------------------------------------------- #
 # POST /v1/chat/verify_loop
 # --------------------------------------------------------------------------- #
+
+def _verify_synthetic_ids_to_gc(messages) -> list[str]:
+    """Ids of the synthetic verify-loop rows (ping + ack) safe to delete.
+
+    ONLY ``source == 'verify_ping'`` rows qualify. A real reply that merely
+    landed after the ping must NEVER be collected here: deleting it orphans its
+    parent's ``reply_message_id`` (the hosted dangling-pointer lost-reply bug,
+    2026-07-20). Every genuine ack carries ``source='verify_ping'``, so this
+    loses no coverage.
+    """
+    return [
+        str(m.get("id"))
+        for m in messages
+        if isinstance(m, dict)
+        and m.get("source") == "verify_ping"
+        and m.get("id")
+    ]
+
 
 def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
     """Synthetic ping: insert a marker user message, wait up to ``timeout_sec``
@@ -789,24 +895,30 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
         boot_gates._log_bootstrap_event(store, "chat_loop_verified", success=True)
         _maybe_enqueue_resident_introduction(store)
 
-    # Cleanup: remove synthetic ping from history regardless of outcome. If a
-    # reply landed, also remove the matching agent response. The verify exchange
-    # is a private liveness test; it must not open Chat as the user's visible
-    # "First message."
+    # Cleanup: remove the synthetic ping AND its ack from history regardless of
+    # outcome. The verify exchange is a private liveness test; it must not open
+    # Chat as the user's visible "First message."
+    #
+    # GC keys ONLY off source="verify_ping" — NEVER off "the first agent reply
+    # after the ping". found_reply(_id) above is matched by role+ts alone, so
+    # under concurrency (supervisor._maybe_autoverify runs verify_loop while the
+    # agent-runner answers this user's first REAL message) it can point at a real
+    # reply that merely landed inside the verify window. Deleting that reply
+    # orphaned its parent's reply_message_id — a dangling pointer / silent lost
+    # reply (DIAGNOSIS_hosted_reply_dangling_pointer_2026-07-20). Genuine acks
+    # always carry source="verify_ping" (tools/chat_resident_consumer.py posts
+    # them so in a dedicated branch), so the source guard loses no coverage while
+    # making a real reply impossible to GC. found_reply is kept purely for the
+    # liveness verdict above.
     with store.chat_lock:
-        def _is_synthetic(m):
-            return (
-                isinstance(m, dict)
-                and (
-                    m.get("source") == "verify_ping"
-                    or (found_reply_id and m.get("id") == found_reply_id)
-                )
-            )
-        removed_ids = [m.get("id") for m in store.chat_messages if _is_synthetic(m)]
-        store.chat_messages = [m for m in store.chat_messages if not _is_synthetic(m)]
+        removed_ids = _verify_synthetic_ids_to_gc(store.chat_messages)
+        removed_set = set(removed_ids)
+        store.chat_messages = [
+            m for m in store.chat_messages
+            if not (isinstance(m, dict) and str(m.get("id") or "") in removed_set)
+        ]
         for rid in removed_ids:
-            if rid:
-                db.chat_delete(store.user_id, rid)
+            db.chat_delete(store.user_id, rid)
 
     suggestions = []
     if not found_reply:

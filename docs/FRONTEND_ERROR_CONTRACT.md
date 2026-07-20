@@ -46,13 +46,16 @@
 | `blame` | 归责方向（下表） | 决定文案能不能给行动指引 |
 | `detail` | 上游原始报错/调试信息（已截断） | 默认折叠，「详情」展开；不要当主文案 |
 
-**blame 三分类——本地化文案必须遵守的纪律**：
+**blame 分类——本地化文案必须遵守的纪律**：
 
 | blame | 含义 | 文案方向 | 禁止 |
 |---|---|---|---|
 | `user_provider` | 用户自己的 API 服务问题（额度/key/模型名） | 给明确行动指引：「充值」「重新保存 Key」 | — |
 | `provider_transient` | 上游临时问题（限流/5xx/超时） | 「稍等会自动恢复」 | 让用户改配置 |
+| `user_environment` | 用户自己的自托管运行环境问题（VPS resident consumer 过旧/离线/未接任务） | 给明确行动指引：「更新并重启 resident consumer」「把维护提示发给 agent」 | 说成模型服务商问题或 Feedling 后端故障 |
 | `system` | 我们的问题 | 「系统出了点问题，我们会尽快处理」 | **绝不能**引导用户充值/改 key（有用户白折腾的真实案例） |
+
+客户端必须把未知 `blame` 当作默认/`system` 桶处理，不得因为 enum 不认识而丢弃整条错误或通知；主展示仍以 `error_class`/`user_text` 为准。
 
 ---
 
@@ -132,6 +135,7 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
       "severity":    "error",            // error=红/问题态, warning=黄/降级
       "user_text":   "入住蒸馏失败：你的 API 服务额度不足（第 3 次尝试）",
       "detail":      "403 … 预扣费额度失败 …",
+      "copyable_prompt": "可选：需要用户转发给 agent 的修复提示",
       "dedupe_key":  "genesis:job_ab12", // 同 key 始终只有一条
       "occurrences": 3,                  // 重复发生次数
       "first_ts":    1783300000.1,
@@ -172,6 +176,8 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 | `runner` | `runner_spawn_failed` / `runner_key_decrypt_failed` | AI 进程起不来（用户表现为「永远没回复」） | 设置页 |
 | `runner` | `runner_degraded`（warning） | AI 在跑但部分能力受损 | 设置页 |
 | `model_api` | `responses_unsupported`（warning，blame=user_provider） | openai_compatible 中转不支持 `/v1/responses`，codex 工具循环被桥接 mangle→记忆/工具静默不可靠（回合仍 rc=0，AI 嘴上说调工具却从不真调）。**setup 探测时发**，非回合失败时 | 设置页 |
+| `chat` | `resident_consumer_stale`（warning，blame=user_environment） | 自托管 resident consumer 仍在 poll，但 commit 缺失/不匹配，或 resident-only 蒸馏任务迟迟没被 claim。通知可带 `copyable_prompt`，同时可能有一条 `source=resident_maintenance` 的维护消息进入聊天 | 聊天/设置页 |
+| `genesis` | `resident_never_claimed`（error，blame=user_environment） | resident-only 入住/记忆蒸馏 job 超过 reaper 阈值仍无人 claim，已失败 | 蒸馏进度/重试页 |
 | `chat` | 上游类全套（§五的列表） | 对话回合失败（与 system 气泡同源双写） | 聊天 |
 
 ---
@@ -192,6 +198,69 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 - `provider_incompatible`（user_provider）——上游不兼容请求格式（如部分中转/xAI 拒收工具 schema）
 - `context_overflow`（user_provider）——上下文超限，指引清理会话/换模型
 - `content_filtered`（provider_transient）——上游安全过滤拒答，换个说法重试
+
+---
+
+## 五之二、通道④：回合失败挂在消息上 [2026-07-18 新增]
+
+通道③解决的是「有没有一条技术说明」，这条解决的是「**这一轮到底成没成**」。
+兜底话术是 agent 口吻的正常回复，从数据上看这轮是「已回复、成功」——用户看到的
+是一句「我这会儿有点慢」，不知道真实原因。本通道让失败**显示成失败**。
+
+设计见 `docs/superpowers/specs/2026-07-18-provider-error-visibility-design.md` §2。
+
+### 双载体（两个都要读）
+
+| 载体 | 出现在哪 | 承担 |
+|---|---|---|
+| **兜底回复消息**（权威） | 该 agent 消息自身带 `turn_failure_*` + `reply_to_message_id` | **实时事件**。它是新消息、有新 ts，能通过 `since` 增量过滤 |
+| 用户消息 metadata（冗余） | 该 user 消息带 `reply_error_class` / `reply_blame` / `reply_user_text` | 全量 history / 重启后恢复 |
+
+**为什么必须双载体**：`/v1/chat/history?since=` 按消息**原始 ts** 过滤，对用户那条
+旧消息就地更新 metadata 不产生新 ts，永远进不了增量流。只读 metadata 的话，实际
+效果是「杀掉 App 重开才看得到失败态」。
+
+**冲突时以兜底消息为准**：`update_chat_message_metadata` 仅在 parent 存在于当前
+worker 内存时才落库，跨 worker 可能静默写失败。
+
+### 字段
+
+| 字段 | 值域 | 说明 |
+|---|---|---|
+| `turn_failure_error_class` / `reply_error_class` | 见通道③的 error_class 全集 | 非空即表示这轮是兜底糊的、不是真回复 |
+| `turn_failure_blame` / `reply_blame` | `user_provider` \| `provider_transient` \| `system` | 决定渲染，见下 |
+| `turn_failure_user_text` / `reply_user_text` | ≤500 字 | 服务端已组好的用户可见文案，**直接显示，不要本地映射** |
+
+**blame 与 user_text 由服务端按 `error_class` 查 `notices/catalog.py` 下发，不采信
+poster 提交的值**（`chat_core._turn_failure_attribution`）。理由是归责红线：透传意味着
+一个写错的 consumer 能把我们自己的故障标成 `user_provider`、让用户白跑一趟改配置。
+未知 `error_class` 一律落 `system`——宁可我们背锅，也不误导用户。客户端因此可以信任
+这两个字段，无需再做合法性判断。
+| `reply_to_message_id` | 消息 id | 兜底消息指向的用户消息，客户端靠它配对 |
+
+**不下发 detail**：原始上游报错可能夹带 provider HTML、request id 乃至敏感上下文。
+排障走设置页 `last_runtime_error` 与 admin 面。
+
+### 渲染规则（显示矩阵）
+
+| blame | 用户消息 | 兜底气泡 | 行动入口 |
+|---|---|---|---|
+| `user_provider` | 失败态 + `user_text` | **隐藏** | 「去设置」→ 模型配置页 |
+| `provider_transient` | 失败态 + `user_text` | **隐藏** | 无（会自愈） |
+| `system` | 不变 | **保留显示** | 无（我们的锅，留住有温度的兜底话术） |
+
+**不给重试按钮**：余额不足时重试无效，用户需要的是充值。
+
+### 归并规则（分页边界）
+
+配对必须在**每次**消息列表变更后重跑（增量、全量、加载 older），不能只在实时收到
+新消息时做。若兜底事件已加载而它指向的用户消息还在上一页，**不得隐藏该兜底气泡**
+——否则失败原因会连兜底一起消失；等加载 older 后再归并。
+
+### 兼容
+
+新增字段是 additive：不认识这些字段的旧版 App 渲染结果与改动前完全一致
+（兜底话术照显）。
 
 ---
 

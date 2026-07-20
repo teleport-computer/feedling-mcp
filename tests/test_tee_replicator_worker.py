@@ -18,6 +18,7 @@ from psycopg.types.json import Jsonb
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
+from core import store as core_store  # noqa: E402
 from tee_replicator import worker  # noqa: E402
 from conftest import seed_user  # noqa: E402
 
@@ -96,6 +97,101 @@ def test_first_run_copies_and_advances_cursor(backend_env):
     assert leak[0][0] == 0
     cur = _tee("SELECT watermark_ts, watermark_id FROM tee_replication_cursors WHERE table_name='chat_messages'")
     assert cur[0][0] == 20.0 and cur[0][1] == "b"
+
+
+def test_finalized_reply_real_chat_pass_preserves_parity_seq_and_watermark(
+    backend_env, monkeypatch
+):
+    """The real chat table pass must be the reply row's only TEE insert path."""
+    monkeypatch.delenv("FEEDLING_TEE_DUAL_WRITE", raising=False)
+    _reset_cursor("chat_messages")
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    parent_id = "finalize_parent"
+    reply_id = "finalize_reply"
+    parent_ts = 10.0
+    reply_ts = 20.0
+    _insert_chat(uid, parent_id, parent_ts, "PARENT")
+    # Use the production row builder, under a scoped fixed clock, so this test
+    # also pins the reply's DB ts/doc ts to append_chat's timestamp semantics.
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(core_store.time, "time", lambda: reply_ts)
+        reply_doc = core_store.get_store(uid)._build_chat_message(
+            "openclaw", "chat", _chat_doc(uid, reply_id, "REPLY")
+        )
+    replied_fields = {
+        "reply_status": "replied",
+        "reply_message_id": reply_id,
+        "replied_by": "replicator-test-consumer",
+        "replied_at": f"{reply_ts:.3f}",
+    }
+
+    finalized = db.chat_finalize_reply_once(
+        uid,
+        parent_id,
+        reply_id,
+        reply_ts,
+        reply_doc,
+        replied_fields,
+    )
+    assert finalized is not None
+
+    # Parent-only inline mirror is disabled in this integration fixture.  The
+    # TEE content table must remain empty until the real decrypting pass runs;
+    # in particular, no encrypted reply row or independently allocated seq may
+    # have been pre-created there.
+    assert _tee(
+        "SELECT count(*) FROM chat_messages WHERE user_id = %s", (uid,)
+    )[0][0] == 0
+
+    with db.get_pool().connection() as conn:
+        rds_rows = conn.execute(
+            "SELECT msg_id, seq, ts, doc FROM chat_messages "
+            "WHERE user_id = %s ORDER BY ts, msg_id",
+            (uid,),
+        ).fetchall()
+    assert [row[0] for row in rds_rows] == [parent_id, reply_id]
+    rds_seq = {row[0]: row[1] for row in rds_rows}
+    assert rds_rows[1][2] == reply_ts
+    assert rds_rows[1][3]["ts"] == reply_ts
+
+    report = worker.run_table("chat_messages", qps=1000, dry_run=False)
+    assert report["copied"] == 2
+    assert report["pending"] == report["errors"] == report["skipped"] == 0
+
+    tee_rows = _tee(
+        "SELECT msg_id, seq, ts, doc FROM chat_messages "
+        "WHERE user_id = %s ORDER BY ts, msg_id",
+        (uid,),
+    )
+    assert [row[0] for row in tee_rows] == [parent_id, reply_id]
+    assert {row[0]: row[1] for row in tee_rows} == rds_seq
+    assert len({row[1] for row in tee_rows}) == 2
+    tee_docs = {row[0]: row[3] for row in tee_rows}
+    assert tee_docs[parent_id]["body"] == "PT:PARENT"
+    assert tee_docs[parent_id]["reply_status"] == "replied"
+    assert tee_docs[parent_id]["reply_message_id"] == reply_id
+    assert tee_docs[reply_id]["body"] == "PT:REPLY"
+    assert tee_docs[reply_id]["role"] == "openclaw"
+    crypto_keys = {
+        "v", "body_ct", "nonce", "K_user", "K_enclave",
+        "enclave_pk_fpr", "content_pk_fpr",
+    }
+    assert all(not (crypto_keys & doc.keys()) for doc in tee_docs.values())
+
+    cursor = _tee(
+        "SELECT watermark_ts, watermark_id FROM tee_replication_cursors "
+        "WHERE table_name = 'chat_messages'"
+    )[0]
+    assert cursor == (reply_ts, reply_id)
+
+    # A second real pass is idempotent: no duplicate row and no second seq.
+    rerun = worker.run_table("chat_messages", qps=1000, dry_run=False)
+    assert rerun["copied"] == 0
+    assert _tee(
+        "SELECT count(*), count(DISTINCT seq) FROM chat_messages WHERE user_id = %s",
+        (uid,),
+    )[0] == (2, 2)
 
 
 def test_idempotent_increment(backend_env):

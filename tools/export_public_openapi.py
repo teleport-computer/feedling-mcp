@@ -49,6 +49,15 @@ PUBLIC_OPERATIONS = {
     ("post", "/v1/account/recover/verify"),
     ("post", "/v1/users/register"),
     ("get", "/v1/copytext"),
+    # Anonymous by design: self-hosted users often have no official account.
+    # Abuse is damped by a per-IP rate limit (notify_relay/routes_asgi.py).
+    ("post", "/v1/notify-relay/register"),
+}
+
+# Authenticated by the relay's own credential (X-Relay-Token issued by the
+# register operation), outside the account api-key/runtime-token system.
+RELAY_TOKEN_OPERATIONS = {
+    ("post", "/v1/notify-relay/push"),
 }
 
 # These operations intentionally reject runtime tokens. Perception report is
@@ -81,6 +90,7 @@ TAG_RULES = (
     (("/v1/content",), "Content"),
     (("/v1/proactive", "/v1/device", "/v1/capture", "/v1/dream"), "Proactive"),
     (("/v1/push",), "Push"),
+    (("/v1/notify-relay",), "Notify Relay"),
     (("/v1/notices",), "Notices"),
     (("/v1/diagnostics",), "Diagnostics"),
     (("/v1/track",), "Tracking"),
@@ -103,6 +113,11 @@ TAG_DESCRIPTIONS = {
     "Content": "Encrypted content, key rotation, exports, and account reset.",
     "Proactive": "Proactive jobs, scheduling, capture, and device events.",
     "Push": "Push notification and Live Activity integration.",
+    "Notify Relay": (
+        "Push relay for self-hosted deployments: enroll a device for a relay "
+        "token, then push APNs notifications and Live Activities through the "
+        "official backend, which holds the APNs signing key."
+    ),
     "Notices": "User-facing service notices.",
     "Diagnostics": "Client diagnostic uploads.",
     "Tracking": "Product telemetry events.",
@@ -158,6 +173,8 @@ def _build_public_schema(schema: dict[str, Any]) -> dict[str, Any]:
                 operation["security"] = []
             elif operation_key in API_KEY_ONLY_OPERATIONS:
                 operation["security"] = [{"ApiKeyAuth": []}]
+            elif operation_key in RELAY_TOKEN_OPERATIONS:
+                operation["security"] = [{"RelayTokenAuth": []}]
             rendered_item[key] = operation
             used_tags.add(tag)
         if any(key.lower() in HTTP_METHODS for key in rendered_item):
@@ -178,6 +195,15 @@ def _build_public_schema(schema: dict[str, Any]) -> dict[str, Any]:
                 "in": "header",
                 "name": "X-Feedling-Runtime-Token",
                 "description": "Short-lived scoped token used by hosted runtimes.",
+            },
+            "RelayTokenAuth": {
+                "type": "apiKey",
+                "in": "header",
+                "name": "X-Relay-Token",
+                "description": (
+                    "Notify-relay token (nrt_…) issued by "
+                    "POST /v1/notify-relay/register. Not an account credential."
+                ),
             },
         }
     )

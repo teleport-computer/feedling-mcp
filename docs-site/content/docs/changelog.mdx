@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- Self-hosted resident polls may now receive server-generated maintenance turns
+  with `role: "user"` and `source: "resident_maintenance"` when the resident
+  consumer appears stale or is not claiming resident-only distill jobs. These
+  rows use shared envelopes so enclave-backed consumers can decrypt the repair
+  prompt. Notices and API errors can now use `blame: "user_environment"` for
+  issues in the user's VPS/runtime environment. The resident-only distill job
+  fallback scan is throttled by `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default
+  300 seconds).
 - New `GET /v1/agent/perception/recent_apps` returns recent app-open history
   (`app`, `category`, `ts`, `minutes_ago`), newest first, with optional `limit`
   (1–100, default 20) and `hours` query parameters. It reads the same app-open
@@ -24,6 +32,33 @@ change must not be interpreted as an API guarantee.
   the reported open instead of 5 minutes. Because the shortcut reports opens and
   never closes, these fields mean "last open observed within the window", not
   "currently on screen".
+- `POST /v1/content/rewrap-to-current-key` now also normalizes the **identity
+  card plaintext** while rewrapping: dimension values are coerced onto the
+  documented 0–100 integer contract (0–1-scale floats such as `0.95` rescale to
+  `95`; a `score` key is adopted as `value`; malformed dimensions are repaired
+  instead of dropped). The identity record is probed (decrypted) even when its
+  envelope is already sealed to the current key, and re-sealed only if
+  normalization changed the card — reported as `rewrapped` with reason
+  `identity_plaintext_normalized`. A probe decryption failure on an
+  already-current envelope reports `skipped_sanitize_probe_failed` instead of
+  an error, so clients do not retry a record that needs no rewrap. Server-side
+  identity writes (genesis import, init, profile patch, dimension nudge) apply
+  the same normalization before sealing.
+
+- New **Notify Relay** endpoints for self-hosted deployments, which cannot hold
+  the official APNs signing key. Anonymous `POST /v1/notify-relay/register`
+  enrolls a device's APNs token and mints a relay auth token (`nrt_…`), returned
+  only on first enrollment (or when you re-enroll while presenting the token you
+  already hold); re-registering an already-enrolled device returns
+  `already_enrolled` without disclosing the token, since an APNs device token is
+  not a secret. `POST /v1/notify-relay/push` (authenticated by the new
+  `X-Relay-Token` header) delivers alert notifications and Live Activity
+  start/update/end through the hosted service's APNs credentials. Alert
+  pushes (type 1) are scoped to the enrolled device; types 2-4 pass the
+  rotating Live Activity target token per call. Both endpoints are
+  rate limited (`429` with `Retry-After`); pushes are logged server-side with
+  content truncated (default 512 chars) for triage, as disclosed in the
+  self-hosting guide.
 - `POST /v1/model_api/chat/send` and `POST /v1/chat/message` now accept an
   optional UUID `client_msg_id`. Reusing the same value for the same user within
   600 seconds returns the first stored user row without appending or waking a
@@ -88,9 +123,40 @@ change must not be interpreted as an API guarantee.
   rejection when the server had, in fact, already saved successfully. Clients
   matching on the literal string `blocked_url` for this case must update to
   `unreachable_from_backend`.
+- **`codex` + self-signed MCP servers:** `codex`'s TLS stack (rustls) rejects
+  a CA certificate used directly as a server certificate, so a single
+  self-signed cert works with `claude`/`pi` but not `codex`. Configure such
+  servers with a certificate chain (a CA cert plus a separate server cert it
+  signs). `POST /v1/mcp/servers/{name}/test` now returns
+  `codex_cert_chain_required` (instead of a generic `tls` result) when a
+  `codex`-driven account tests a server presenting a lone self-signed cert.
+  See [MCP servers workflow](/docs/workflows/mcp).
 
 ### Behavior
 
+- Concurrent `POST /v1/chat/response` calls for the same parent are now resolved
+  by one PostgreSQL compare-and-swap across all backend workers. Exactly one
+  request marks the parent answered and inserts its encrypted reply; later
+  contenders receive the existing `409 already_answered` response and emit no
+  reply-side wake, capture, push, or trace effects. `role: "system"` notices
+  continue to bypass reply exclusivity.
+- User MCP servers now support the legacy **HTTP+SSE** transport in addition to
+  streamable HTTP. Some providers (e.g. Chinese map services) still ship their
+  MCP endpoint only as an `…/sse` URL; those now connect end-to-end. The
+  transport is detected automatically — from the URL path at save time and,
+  authoritatively, from the server's handshake when a connectivity test runs —
+  and reported on each server record as a new `transport` field (`"http"` or
+  `"sse"`). The hosted runtime and the `claude` self-hosted runtime speak both
+  transports; the `codex` self-hosted runtime remains streamable-HTTP only, so
+  a legacy-SSE server is left out of its generated config with a note to use the
+  provider's `/mcp` URL instead.
+- `POST /v1/mcp/servers/{name}/test` now enforces a 45-second wall-clock
+  ceiling over the whole probe and returns `400 timeout` when it is exceeded.
+  Previously a server that answered the handshake with a never-ending event
+  stream (a legacy HTTP+SSE endpoint, e.g. `…/sse` URLs) could hold the
+  request open indefinitely — the app sat on "saving…" with no reply. Saving
+  the server (`POST /v1/mcp/servers`) was never affected and still succeeds
+  first; only the connectivity probe is bounded.
 - Proactive wake bubbles no longer post on top of an active conversation: right
   before delivery, the consumer re-checks the latest chat rows and skips the
   wake (recorded as `skipped` / `chat_collision`) when a user message or an
