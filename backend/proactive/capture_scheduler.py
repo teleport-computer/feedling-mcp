@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 import db
+from psycopg.types.json import Jsonb
 from proactive import capture_jobs
 from memory import migration as memory_migration
 
@@ -78,9 +79,18 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _state_doc(raw: Any) -> dict[str, Any]:
     doc = dict(raw) if isinstance(raw, dict) else {}
+    seq_initialized = (
+        bool(doc.get("capture_seq_initialized"))
+        if "capture_seq_initialized" in doc
+        else "last_captured_until_seq" in doc
+    )
     return {
         "last_captured_until_message_id": str(doc.get("last_captured_until_message_id") or "")[:160],
         "last_captured_until_ts": _safe_float(doc.get("last_captured_until_ts"), 0.0),
+        "last_captured_until_seq": max(
+            0, int(_safe_float(doc.get("last_captured_until_seq"), 0.0))
+        ),
+        "capture_seq_initialized": seq_initialized,
         "pending_capture_key": str(doc.get("pending_capture_key") or "")[:240],
         "last_capture_completed_at": _safe_float(doc.get("last_capture_completed_at"), 0.0),
         "capture_fail_streak": max(0, int(_safe_float(doc.get("capture_fail_streak"), 0.0))),
@@ -99,11 +109,110 @@ def load_capture_state(store) -> dict[str, Any]:
     return _state_doc(db.get_blob(store.user_id, CAPTURE_STATE_KIND))
 
 
+def load_capture_state_strict(store) -> dict[str, Any]:
+    """Runner-facing state read: a DB failure must not look like frontier zero."""
+    return _state_doc(db.get_blob_strict(store.user_id, CAPTURE_STATE_KIND))
+
+
 def save_capture_state(store, state: Mapping[str, Any], *, now: float | None = None) -> dict[str, Any]:
     doc = _state_doc(state)
     doc["updated_at"] = _now_iso(now)
     db.set_blob(store.user_id, CAPTURE_STATE_KIND, doc)
     return doc
+
+
+def _patch_capture_state(
+    store,
+    patch: Mapping[str, Any],
+    *,
+    now: float | None = None,
+    expected_frontier_id: str | None = None,
+    source_message_id: str | None = None,
+) -> dict[str, Any]:
+    """Atomically merge selected fields without clobbering another process.
+
+    Chat appends and runner completion happen in different backend processes.
+    Rewriting a previously read whole blob lets a late chat refresh restore an
+    old capture frontier. This SQL merge updates only the caller-owned fields;
+    completion additionally CAS-fences the frontier it processed.
+    """
+    normalized = _state_doc(patch)
+    update = {
+        key: normalized[key]
+        for key in patch
+        if key in normalized
+    }
+    update["updated_at"] = _now_iso(now)
+    persisted: dict[str, Any]
+    wrote = False
+    mirrored_under_fence = False
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                source_id = str(source_message_id or "")
+                source_valid = True
+                if source_id:
+                    # A chat-derived refresh uses the same shared fence as
+                    # ordinary writers. If Clear linearized first, the stale
+                    # in-process store row no longer exists and must not
+                    # recreate capture_state metadata.
+                    db._lock_chat_user_fence_on_cursor(cur, store.user_id)
+                    cur.execute(
+                        "SELECT 1 FROM chat_messages WHERE user_id=%s "
+                        "AND msg_id=%s AND doc->>'role' IN ('user','openclaw') "
+                        "AND COALESCE(doc->>'source','')=ANY(%s::text[])",
+                        (
+                            store.user_id,
+                            source_id,
+                            list(CAPTURE_LIVE_SOURCES),
+                        ),
+                    )
+                    source_valid = cur.fetchone() is not None
+                if source_valid:
+                    cur.execute(
+                        "INSERT INTO user_blobs (user_id,kind,doc) "
+                        "VALUES (%s,%s,%s) ON CONFLICT (user_id,kind) DO NOTHING",
+                        (store.user_id, CAPTURE_STATE_KIND, Jsonb({})),
+                    )
+                    sql = (
+                        "UPDATE user_blobs SET doc=doc || %s "
+                        "WHERE user_id=%s AND kind=%s"
+                    )
+                    params: list[Any] = [
+                        Jsonb(update),
+                        store.user_id,
+                        CAPTURE_STATE_KIND,
+                    ]
+                    if expected_frontier_id is not None:
+                        sql += (
+                            " AND COALESCE(doc->>'last_captured_until_message_id','')=%s"
+                        )
+                        params.append(str(expected_frontier_id))
+                    cur.execute(sql + " RETURNING doc", tuple(params))
+                    row = cur.fetchone()
+                    wrote = row is not None
+                else:
+                    row = None
+                if row is None:
+                    cur.execute(
+                        "SELECT doc FROM user_blobs "
+                        "WHERE user_id=%s AND kind=%s",
+                        (store.user_id, CAPTURE_STATE_KIND),
+                    )
+                    row = cur.fetchone()
+                persisted = _state_doc(row[0] if row is not None else {})
+                if wrote and source_id:
+                    # Keep the shared Chat Clear fence until the mirror lands.
+                    # Clear's primary delete + mirror delete therefore order
+                    # after every successful pre-clear refresh; a delayed
+                    # postcommit mirror cannot resurrect the row in TEE.
+                    db._mirror_persisted_blob(
+                        store.user_id, CAPTURE_STATE_KIND, persisted
+                    )
+                    mirrored_under_fence = True
+    if wrote and not mirrored_under_fence:
+        db._mirror_persisted_blob(store.user_id, CAPTURE_STATE_KIND, persisted)
+    return persisted
 
 
 def _is_live_capture_message(message: Mapping[str, Any] | None) -> bool:
@@ -117,6 +226,23 @@ def _is_live_capture_message(message: Mapping[str, Any] | None) -> bool:
 
 
 def _live_messages_after_capture(store, state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if bool(state.get("capture_seq_initialized")):
+        # Runtime V2's raw frontier may end on a synthetic/import row whose ID
+        # is intentionally absent from the live-message subset. Seq is the
+        # only safe discovery cursor: an out-of-order later live row can carry
+        # an older timestamp and must still trigger Capture.
+        rows = db.chat_capture_messages_after_seq(
+            store.user_id,
+            max(0, int(_safe_float(state.get("last_captured_until_seq"), 0.0))),
+            # Trigger discovery needs the newest live identity plus a capped
+            # turn-count backstop, not the entire uncaptured transcript. The
+            # worker independently pages exact oldest batches of 60. Keeping
+            # this synchronous append-path read bounded avoids O(backlog) work
+            # on every message (especially after a user opts out).
+            sources=tuple(CAPTURE_LIVE_SOURCES),
+            limit=max(64, min(1000, turn_backstop() * 2)),
+        )
+        return [dict(row) for row in rows if _is_live_capture_message(row)]
     after_id = str(state.get("last_captured_until_message_id") or "")
     after_ts = _safe_float(state.get("last_captured_until_ts"), 0.0)
     chat_messages = getattr(store, "chat_messages", None)
@@ -151,21 +277,36 @@ def _live_messages_after_capture(store, state: Mapping[str, Any]) -> list[dict[s
 def refresh_capture_state_from_chat(store, *, now: float | None = None) -> dict[str, Any]:
     state = load_capture_state(store)
     window_messages = _live_messages_after_capture(store, state)
+    patch: dict[str, Any] = {}
     if window_messages:
         last = window_messages[-1]
-        state["last_seen_message_id"] = str(last.get("id") or "")[:160]
-        state["last_seen_ts"] = _safe_float(last.get("ts"), 0.0)
-        state["message_count"] = len(window_messages)
-        state["turns_since_capture"] = sum(1 for msg in window_messages if str(msg.get("role") or "") == "user")
+        patch["last_seen_message_id"] = str(last.get("id") or "")[:160]
+        patch["last_seen_ts"] = _safe_float(last.get("ts"), 0.0)
+        patch["message_count"] = len(window_messages)
+        patch["turns_since_capture"] = sum(
+            1
+            for msg in window_messages
+            if str(msg.get("role") or "") == "user"
+        )
     else:
-        state["message_count"] = 0
-        state["turns_since_capture"] = 0
-    return save_capture_state(store, state, now=now)
+        patch["message_count"] = 0
+        patch["turns_since_capture"] = 0
+    return _patch_capture_state(
+        store,
+        patch,
+        now=now,
+        source_message_id=(
+            str(window_messages[-1].get("id") or "") if window_messages else None
+        ),
+    )
 
 
 def _current_window(state: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "after_message_id": str(state.get("last_captured_until_message_id") or "")[:160],
+        "after_seq": max(
+            0, int(_safe_float(state.get("last_captured_until_seq"), 0.0))
+        ),
         "until_message_id": str(state.get("last_seen_message_id") or "")[:160],
         "until_ts": _safe_float(state.get("last_seen_ts"), 0.0),
         "message_count": max(0, int(_safe_float(state.get("message_count"), 0.0))),
@@ -180,7 +321,21 @@ def capture_key_for_window(window: Mapping[str, Any]) -> str:
     return "capture:" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
-def _enqueue_window(store, *, trigger: str, now: float | None = None) -> dict[str, Any]:
+def _enqueue_window(
+    store,
+    *,
+    trigger: str,
+    now: float | None = None,
+    submit: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Apply every capture gate, then submit to exactly one job substrate.
+
+    ``submit=None`` is the unchanged resident path and therefore consults the
+    legacy ``proactive_jobs`` stream for active-job recovery.  A supplied
+    submitter is the Runtime V2 path: it must never inspect or wait behind that
+    abandoned stream.  V2's ``agent_jobs`` single-flight/coalescing result is
+    the authority for whether work is already active.
+    """
     now_ts = time.time() if now is None else float(now)
     state = refresh_capture_state_from_chat(store, now=now_ts)
     window = _current_window(state)
@@ -190,7 +345,7 @@ def _enqueue_window(store, *, trigger: str, now: float | None = None) -> dict[st
     if until_id == str(state.get("last_captured_until_message_id") or ""):
         return {"enqueued": False, "reason": "already_captured", "state": state, "job": None}
     pending_key = str(state.get("pending_capture_key") or "")
-    if pending_key:
+    if pending_key and submit is None:
         if capture_jobs._find_active_capture(store) is not None:
             return {"enqueued": False, "reason": "capture_already_pending", "state": state, "job": None}
         # Stale flag: the job it pointed to is terminal/gone (e.g. a failed capture
@@ -211,20 +366,36 @@ def _enqueue_window(store, *, trigger: str, now: float | None = None) -> dict[st
         return {"enqueued": False, "reason": "failure_backoff", "state": state, "job": None}
 
     key = capture_key_for_window(window)
-    job, enqueued, reason = capture_jobs.enqueue_memory_capture_job(
-        store,
-        trigger=trigger,
-        capture_key=key,
-        window=window,
-        now=now_ts,
-    )
+    if submit is None:
+        job, enqueued, reason = capture_jobs.enqueue_memory_capture_job(
+            store,
+            trigger=trigger,
+            capture_key=key,
+            window=window,
+            now=now_ts,
+        )
+    else:
+        submitted = submit(
+            store,
+            trigger=trigger,
+            now=now_ts,
+            window=window,
+            capture_key=key,
+        )
+        job = submitted.get("job")
+        enqueued = bool(submitted.get("enqueued"))
+        reason = submitted.get("reason")
     # Only arm pending for a genuinely in-flight job. Arming it on a terminal
     # (completed/failed) duplicate was the root cause of the permanent
     # capture_already_pending lock — a terminal job never re-fires a status event
     # to clear it.
     if job is not None and (enqueued or capture_jobs._active_capture_job(job)):
         state["pending_capture_key"] = str(job.get("capture_key") or key)[:240]
-        state = save_capture_state(store, state, now=now_ts)
+        if submit is None:
+            state = save_capture_state(store, state, now=now_ts)
+        # Runtime V2's durable single-flight authority is agent_jobs. Do not
+        # create a second, generation-unfenced pending marker that a delayed
+        # post-Clear submit callback could resurrect.
     return {"enqueued": bool(enqueued), "reason": reason, "state": state, "job": job}
 
 
@@ -261,20 +432,44 @@ def is_capture_boundary_event(event: Mapping[str, Any] | None) -> bool:
     }
 
 
-def handle_device_event(store, event: Mapping[str, Any]) -> dict[str, Any]:
+def handle_device_event(
+    store,
+    event: Mapping[str, Any],
+    *,
+    submit: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     if not is_capture_boundary_event(event):
         return {"enqueued": False, "reason": "not_capture_boundary", "state": load_capture_state(store), "job": None}
+    if not _capture_enabled(store):
+        return {
+            "enqueued": False,
+            "reason": "capture_disabled",
+            "state": load_capture_state(store),
+            "job": None,
+        }
     trigger = str(event.get("type") or "device_boundary").strip().lower() or "device_boundary"
     if trigger == "app_presence":
         trigger = "app_background"
-    return _enqueue_window(store, trigger=trigger, now=_safe_float(event.get("ts"), time.time()))
+    return _enqueue_window(
+        store,
+        trigger=trigger,
+        now=_safe_float(event.get("ts"), time.time()),
+        submit=submit,
+    )
 
 
 def _capture_enabled(store) -> bool:
     try:
-        return bool(store.load_proactive_settings().get("capture_enabled", True))
+        settings = db.get_blob_strict(store.user_id, "proactive_settings")
+        if settings is None:
+            return True
+        if not isinstance(settings, dict):
+            return False
+        return bool(settings.get("capture_enabled", True))
     except Exception:
-        return True
+        # Capture is background content processing.  A broken consent/settings
+        # read must never opt the user in.
+        return False
 
 
 def tick_quiet_capture(
@@ -290,15 +485,29 @@ def tick_quiet_capture(
         return {"enqueued": False, "reason": "no_new_messages", "state": state, "job": None}
     if until_id == str(state.get("last_captured_until_message_id") or ""):
         return {"enqueued": False, "reason": "already_captured", "state": state, "job": None}
+    # V2 chat writes only refresh capture state; the runner-owned sweep is the
+    # sole producer. Preserve the turn-count backstop with at most one scheduler
+    # cadence of delay, while resident/import paths keep their immediate legacy
+    # ``record_chat_append`` behavior.
+    if submit is not None and int(state.get("turns_since_capture") or 0) >= turn_backstop():
+        return _enqueue_window(
+            store,
+            trigger="turn_backstop",
+            now=now_ts,
+            submit=submit,
+        )
     quiet_for = now_ts - _safe_float(state.get("last_seen_ts"), 0.0)
     if quiet_for < quiet_sec():
         return {"enqueued": False, "reason": "quiet_not_due", "quiet_for_sec": quiet_for, "state": state, "job": None}
-    # V2 seam（spec §3.1）：默认 None = 今天的行为（append 进 legacy proactive_jobs 流）。
-    # V2 的 scheduler 传入一个把 job 塞进 agent_jobs 的 submitter —— 这样 gate 的五道早退
-    # （capture_disabled / no_new_messages / already_captured / quiet_not_due / min_interval）
-    # 和失败退避全部原样复用，零漂移。镜像 ScheduledWakeServiceV2.fire_due_timers(submit_wake=)。
-    _enqueue = submit if submit is not None else _enqueue_window
-    result = _enqueue(store, trigger="quiet_timeout", now=now_ts)
+    if submit is None:
+        result = _enqueue_window(store, trigger="quiet_timeout", now=now_ts)
+    else:
+        result = _enqueue_window(
+            store,
+            trigger="quiet_timeout",
+            now=now_ts,
+            submit=submit,
+        )
     result["quiet_for_sec"] = quiet_for
     return result
 
@@ -317,9 +526,83 @@ def force_capture(
         return {"enqueued": False, "reason": "no_new_messages", "state": state, "job": None}
     if until_id == str(state.get("last_captured_until_message_id") or ""):
         return {"enqueued": False, "reason": "already_captured", "state": state, "job": None}
-    # Same V2 seam as tick_quiet_capture — see comment there.
-    _enqueue = submit if submit is not None else _enqueue_window
-    return _enqueue(store, trigger="manual_force", now=now_ts)
+    if submit is None:
+        return _enqueue_window(store, trigger="manual_force", now=now_ts)
+    return _enqueue_window(
+        store, trigger="manual_force", now=now_ts, submit=submit
+    )
+
+
+def record_v2_capture_status(
+    store,
+    *,
+    status: str,
+    window: Mapping[str, Any] | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Apply a Runtime V2 capture terminal result to the shared frontier.
+
+    V2 jobs intentionally do not masquerade as legacy ``memory_capture`` rows.
+    The runner reports the exact oldest-contiguous batch it actually processed;
+    a successful no-card result advances the same frontier as a successful
+    memory write, while a provider/write failure only arms exponential backoff.
+    """
+    status_text = str(status or "").strip().lower()
+    if status_text not in CAPTURE_TERMINAL_STATUSES:
+        return load_capture_state(store)
+    now_ts = time.time() if now is None else float(now)
+    state = load_capture_state_strict(store)
+    if status_text == "completed":
+        processed = window if isinstance(window, Mapping) else {}
+        until_id = str(processed.get("until_message_id") or "")[:160]
+        until_ts = _safe_float(processed.get("until_ts"), 0.0)
+        until_seq = max(0, int(_safe_float(processed.get("through_seq"), 0.0)))
+        after_id = str(processed.get("after_message_id") or "")[:160]
+        current_id = str(state.get("last_captured_until_message_id") or "")
+        # Single-flight normally makes this equality tautological. The fence is
+        # still important for delayed/replayed callbacks: never move an already
+        # newer capture frontier backwards.
+        patch = {
+            "pending_capture_key": "",
+            "capture_fail_streak": 0,
+            "last_capture_failed_at": 0.0,
+        }
+        if until_id and current_id == after_id:
+            patch.update(
+                {
+                    "last_captured_until_message_id": until_id,
+                    "last_captured_until_ts": until_ts,
+                    "last_captured_until_seq": until_seq,
+                    "capture_seq_initialized": True,
+                    "last_capture_completed_at": now_ts,
+                }
+            )
+        state = _patch_capture_state(
+            store,
+            patch,
+            now=now_ts,
+            expected_frontier_id=after_id,
+        )
+    elif status_text == "failed":
+        state = _patch_capture_state(
+            store,
+            {
+                "pending_capture_key": "",
+                "capture_fail_streak": int(
+                    state.get("capture_fail_streak") or 0
+                )
+                + 1,
+                "last_capture_failed_at": now_ts,
+            },
+            now=now_ts,
+        )
+    capture_jobs.notify_backoff(
+        store,
+        lane="capture",
+        status=status_text,
+        streak=int(state.get("capture_fail_streak") or 0),
+    )
+    return refresh_capture_state_from_chat(store, now=now_ts)
 
 
 def tick_quiet_migrate(store, *, now: float | None = None) -> dict[str, Any]:

@@ -796,6 +796,30 @@ def test_r2_cleanup_loop_is_a_separate_driver(monkeypatch):
     )]
 
 
+def test_trajectory_cleanup_loop_is_a_separate_driver(monkeypatch):
+    calls = []
+
+    async def _fake_loop(stop_event, **kwargs):
+        calls.append((stop_event, kwargs))
+
+    monkeypatch.setattr(v2_reaper, "run_trajectory_cleanup_loop", _fake_loop)
+    stop_event = asyncio.Event()
+
+    asyncio.run(
+        serve_worker._trajectory_cleanup_loop(
+            stop_event,
+            interval=60.0,
+            retention_days=7,
+            limit=8,
+        )
+    )
+
+    assert calls == [(
+        stop_event,
+        {"interval": 60.0, "retention_days": 7, "limit": 8},
+    )]
+
+
 class _HealthySupervisor:
     """D3 (Task 4): `_heartbeat_loop` now derives capacity from
     `supervisor.poll_liveness()` — a fresh/alive child advertises full capacity."""

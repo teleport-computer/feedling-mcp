@@ -187,6 +187,12 @@ services:
       # Hosted model-API accounts have one runtime: pooled Runtime V2. This is a
       # literal measured-compose value, not an encrypted-env rollback selector.
       FEEDLING_HOSTED_RUNTIME_POLICY: "v2_only"
+      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+      # Managed trajectory retention is a measured-compose invariant. Keep
+      # these literals identical on the API and every pooled runner.
+      FEEDLING_V2_TRAJECTORY_RETENTION_DAYS: "7"
+      FEEDLING_V2_TRAJECTORY_GC_INTERVAL_SEC: "3600"
+      FEEDLING_V2_TRAJECTORY_GC_BATCH: "100"
       # TEST-ONLY: genesis v2 (foreground-fast onboarding). Greet on 3-5 core +
       # identity baseline, push the heavy reduce (the ~37% prod failure surface)
       # to the background. Prod compose deliberately omits this (keeps the v1

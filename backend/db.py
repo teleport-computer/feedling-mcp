@@ -1795,11 +1795,77 @@ def get_blobs_for_users(
 def set_blob_strict(user_id: str, kind: str, doc) -> None:
     """Persist a blob or raise."""
     with get_pool().connection() as conn:
-        conn.execute(
-            "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
-            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
-            (user_id, kind, Jsonb(doc)),
-        )
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if kind == "proactive_settings":
+                    _lock_chat_user_fence_on_cursor(cur, user_id)
+                    _lock_capture_consent_on_cursor(cur, user_id)
+                cur.execute(
+                    "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
+                    (user_id, kind, Jsonb(doc)),
+                )
+
+
+def patch_proactive_settings_strict(
+    user_id: str,
+    patch: dict,
+    *,
+    seed_doc: dict | None = None,
+) -> dict:
+    """Atomically merge one proactive-settings patch or raise.
+
+    The read happens *after* acquiring the Capture-consent advisory lock. This
+    is deliberately not implemented as ``get_blob`` followed by ``set_blob``:
+    two backend processes do not share ``UserStore.proactive_lock``, and an
+    unrelated stale full-document write must never restore an earlier
+    ``capture_enabled`` value. Permission-state updates are nested patches too,
+    so concurrent device-permission reports preserve each other's keys.
+    """
+    if not isinstance(patch, dict):
+        raise ValueError("proactive settings patch must be an object")
+    seed = dict(seed_doc) if isinstance(seed_doc, dict) else {}
+    persisted: dict
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, str(user_id))
+                _lock_capture_consent_on_cursor(cur, str(user_id))
+                cur.execute(
+                    "SELECT doc FROM user_blobs WHERE user_id=%s "
+                    "AND kind='proactive_settings' FOR UPDATE",
+                    (str(user_id),),
+                )
+                row = cur.fetchone()
+                current = dict(row[0] or {}) if row is not None else seed
+                update = dict(patch)
+                permission_patch = update.pop("permission_states", None)
+                current.update(update)
+                if isinstance(permission_patch, dict):
+                    permission_states = dict(
+                        current.get("permission_states") or {}
+                    )
+                    permission_states.update(permission_patch)
+                    current["permission_states"] = permission_states
+                if patch.get("capture_enabled") is False:
+                    # Prepared batches are encrypted but still derived from
+                    # conversation content. Opt-out is their immediate erasure
+                    # boundary; the shared consent lock prevents a provider
+                    # completion from creating another journal behind us.
+                    cur.execute(
+                        "DELETE FROM v2_capture_batches WHERE user_id=%s",
+                        (str(user_id),),
+                    )
+                cur.execute(
+                    "INSERT INTO user_blobs (user_id,kind,doc) "
+                    "VALUES (%s,'proactive_settings',%s) "
+                    "ON CONFLICT (user_id,kind) DO UPDATE SET doc=EXCLUDED.doc "
+                    "RETURNING doc",
+                    (str(user_id), Jsonb(current)),
+                )
+                persisted = dict(cur.fetchone()[0] or {})
+    _mirror_proactive_settings_current(str(user_id))
+    return persisted
 
 
 def set_blob(user_id: str, kind: str, doc) -> None:
@@ -1827,7 +1893,9 @@ def set_blob(user_id: str, kind: str, doc) -> None:
     # 两处辖区必须同步：reconciler._SCOPE_WHERE["user_blobs"] 同样排除这两个 kind，
     # 否则 reconciler 会把镜像端故意不写的行又 copy 回 TEE、并在两侧计数里要求它存在。
     # 其余 kind（如 model_api provider-key 信封）有意原样镜像（凭据保持加密）。
-    if kind not in ("identity", "consumer_state"):
+    if kind == "proactive_settings":
+        _mirror_proactive_settings_current(user_id)
+    elif kind not in ("identity", "consumer_state"):
         mirror.execute(sql, (user_id, kind, Jsonb(doc)))
 
 
@@ -1873,6 +1941,40 @@ def _mirror_persisted_blob(user_id: str, kind: str, doc) -> None:
         "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc"
     )
     mirror.execute(sql, (user_id, kind, Jsonb(doc)))
+
+
+def _mirror_proactive_settings_current(user_id: str) -> None:
+    """Mirror the authoritative settings row under the consent fence.
+
+    A postcommit mirror of an older full document could otherwise land after a
+    newer opt-out and restore ``capture_enabled=true`` in the TEE shadow. The
+    primary is re-read only after acquiring the same advisory lock used by all
+    settings mutations and Capture disclosure/commit boundaries.
+    """
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _lock_chat_user_fence_on_cursor(cur, str(user_id))
+                    _lock_capture_consent_on_cursor(cur, str(user_id))
+                    cur.execute(
+                        "SELECT doc FROM user_blobs WHERE user_id=%s "
+                        "AND kind='proactive_settings'",
+                        (str(user_id),),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        _mirror_persisted_blob(
+                            str(user_id),
+                            "proactive_settings",
+                            dict(row[0] or {}),
+                        )
+    except Exception as exc:  # noqa: BLE001 — primary setting is authoritative
+        log.warning(
+            "[db] proactive_settings mirror deferred user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
 
 
 def append_blob_events_strict(
@@ -2478,38 +2580,42 @@ def claim_and_enqueue_introduction(
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                row = conn.execute(claim_sql, (user_id, Jsonb(settings_doc), at_iso, at_iso)).fetchone()
-                if row is not None:
-                    claimed_doc = row[0]
-                    seq = conn.execute(job_sql, (user_id, ts, item_key, Jsonb(job))).fetchone()[0]
+                with conn.cursor() as cur:
+                    # Serialize with Capture effect commit and every ordinary
+                    # settings patch. The conflict UPDATE already preserves
+                    # peer fields; this lock also covers the no-row insertion
+                    # race where PostgreSQL has no tuple to lock yet.
+                    _lock_chat_user_fence_on_cursor(cur, str(user_id))
+                    _lock_capture_consent_on_cursor(cur, str(user_id))
+                    cur.execute(
+                        claim_sql,
+                        (user_id, Jsonb(settings_doc), at_iso, at_iso),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        claimed_doc = row[0]
+                        cur.execute(
+                            job_sql,
+                            (user_id, ts, item_key, Jsonb(job)),
+                        )
+                        seq = cur.fetchone()[0]
     except Exception as e:
         log.error("[db] claim_and_enqueue_introduction(%s) failed: %s", user_id, e)
         return None
     if claimed_doc is None or seq is None:
         return None
-    # Committed on the primary — mirror BOTH rows into the TEE shadow as ONE
-    # transaction (they are a single logical write). The blob merges the marker
-    # (jsonb_set + updated_at/version) rather than overwriting the whole doc, so
-    # a late-arriving introduction mirror can't briefly clobber peer fields the
-    # reconciler already advanced on the shadow; the job seq is pinned so the
-    # shadow keeps the row identity every seq-ordered read relies on.
+    # Committed on the primary. Re-read/mirror the settings row under the same
+    # consent fence so a late introduction callback cannot overwrite a newer
+    # Capture opt-out in TEE. The job seq remains pinned so the shadow keeps the
+    # row identity every seq-ordered read relies on.
     from tee_shadow import mirror
-    mirror.execute_many([
-        (
-            "INSERT INTO user_blobs (user_id, kind, doc) "
-            "VALUES (%s, 'proactive_settings', %s) "
-            "ON CONFLICT (user_id, kind) DO UPDATE "
-            "  SET doc = jsonb_set(user_blobs.doc, '{introduced_at}', to_jsonb(%s::text), true) "
-            "            || jsonb_build_object('updated_at', %s::text, 'version', 2)",
-            (user_id, Jsonb(claimed_doc), at_iso, at_iso),
-        ),
-        (
-            "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
-            "OVERRIDING SYSTEM VALUE VALUES (%s, 'proactive_jobs', %s, %s, %s, %s) "
-            "ON CONFLICT (user_id, stream, seq) DO NOTHING",
-            (user_id, seq, ts, item_key, Jsonb(job)),
-        ),
-    ])
+    _mirror_proactive_settings_current(str(user_id))
+    mirror.execute(
+        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s, 'proactive_jobs', %s, %s, %s, %s) "
+        "ON CONFLICT (user_id, stream, seq) DO NOTHING",
+        (user_id, seq, ts, item_key, Jsonb(job)),
+    )
     return {"job": job, "seq": seq}
 
 
@@ -3775,6 +3881,48 @@ def chat_messages_after_seq(
     ]
 
 
+def chat_capture_messages_after_seq(
+    user_id: str,
+    after_seq: int,
+    *,
+    sources: list[str] | tuple[str, ...],
+    limit: int,
+) -> list[dict]:
+    """Return newest bounded Capture-eligible metadata after an exact seq.
+
+    Eligibility is filtered in SQL *before* LIMIT. Filtering a newest raw
+    window in Python can permanently hide an older uncaptured live row behind
+    a long run of synthetic/import records.
+    """
+    cursor_seq = int(after_seq)
+    bounded = max(1, min(int(limit), 1000))
+    allowed = [str(source) for source in sources if str(source)]
+    if cursor_seq < 0:
+        raise ValueError("after_seq must be >= 0")
+    if not allowed:
+        return []
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq,msg_id,ts,doc FROM ("
+            " SELECT seq,msg_id,ts,doc FROM chat_messages "
+            " WHERE user_id=%s AND seq>%s "
+            " AND doc->>'role' IN ('user','openclaw') "
+            " AND COALESCE(doc->>'source','')=ANY(%s::text[]) "
+            " ORDER BY seq DESC LIMIT %s"
+            ") newest_live ORDER BY seq ASC",
+            (str(user_id), cursor_seq, allowed, bounded),
+        ).fetchall()
+    return [
+        {
+            **dict(row[3] or {}),
+            "id": str(row[1]),
+            "ts": float(row[2]),
+            "seq": int(row[0]),
+        }
+        for row in rows
+    ]
+
+
 def chat_seqs_after_seq(
     user_id: str,
     after_seq: int,
@@ -3944,6 +4092,19 @@ _chat_outer_fence_users: ContextVar[frozenset[str]] = ContextVar(
     default=frozenset(),
 )
 
+# One Memory Garden mutation may span a read, arbitrary in-process mutation,
+# and a full-set reconcile. The database transaction and advisory lock must
+# therefore outlive the individual ``memory_load``/``memory_replace_all`` calls;
+# taking the lock only inside the final replace leaves a stale snapshot free to
+# delete a Capture card committed in between. The value is
+# ``user_id -> (connection, post_commit_callbacks)``. Nested memory helpers
+# reuse the outer connection instead of acquiring the same lock on another
+# session or consuming another pool slot.
+_memory_mutation_contexts: ContextVar[dict[str, tuple[object, list]]] = ContextVar(
+    "memory_mutation_contexts",
+    default={},
+)
+
 
 @contextmanager
 def _chat_user_fence_held_by_outer_transaction(user_id: str):
@@ -3995,6 +4156,83 @@ def _lock_chat_user_fence_on_cursor(
         f"SELECT {lock_fn}(hashtextextended('chat-user-fence:' || %s, 0))",
         (user_id,),
     )
+
+
+def _lock_capture_consent_on_cursor(cur, user_id: str) -> None:
+    """Serialize proactive Capture consent changes with the effect commit."""
+    cur.execute(
+        "SELECT pg_advisory_xact_lock("
+        "hashtextextended('capture-consent:' || %s, 0))",
+        (str(user_id),),
+    )
+
+
+def _lock_memory_user_mutation_on_cursor(cur, user_id: str) -> None:
+    """Serialize every primary Memory Garden mutation for one user.
+
+    Global acquisition order is chat-user fence, then this memory fence, then
+    any narrower consent/row locks. Keeping the established chat fence first
+    matters when a V2 effect dispatch already owns it on an outer connection:
+    reversing the two can deadlock behind a queued exclusive account deletion.
+    """
+    cur.execute(
+        "SELECT pg_advisory_xact_lock("
+        "hashtextextended('memory-user-mutation:' || %s, 0))",
+        (str(user_id),),
+    )
+
+
+def _memory_mutation_context(user_id: str):
+    return _memory_mutation_contexts.get().get(str(user_id))
+
+
+def _defer_memory_post_commit(user_id: str, callback) -> None:
+    context = _memory_mutation_context(user_id)
+    if context is None:
+        callback()
+        return
+    context[1].append(callback)
+
+
+@contextmanager
+def memory_user_mutation_fence(user_id: str):
+    """Hold one cross-process mutation transaction across load→mutate→save.
+
+    This is reentrant within the current context. All memory DB helpers detect
+    the active connection and use it directly, so one logical mutation uses a
+    single pool slot and its TEE propagation runs only after primary commit.
+    """
+    normalized = str(user_id)
+    if _memory_mutation_context(normalized) is not None:
+        yield
+        return
+
+    callbacks: list = []
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, normalized)
+                _lock_memory_user_mutation_on_cursor(cur, normalized)
+            current = dict(_memory_mutation_contexts.get())
+            current[normalized] = (conn, callbacks)
+            token = _memory_mutation_contexts.set(current)
+            try:
+                yield
+            finally:
+                _memory_mutation_contexts.reset(token)
+
+    # The primary transaction is durably committed before any best-effort
+    # shadow work can observe/requeue its rows. A mirror failure must not turn a
+    # committed user mutation into an apparent request failure.
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception as exc:  # noqa: BLE001 — TEE shadow is best-effort
+            log.warning(
+                "[db] memory post-commit mirror deferred user=%s code=%s",
+                normalized,
+                type(exc).__name__.lower(),
+            )
 
 
 def _lock_chat_r2_lifecycle_on_cursor(cur, user_id: str) -> int:
@@ -5975,12 +6213,11 @@ def chat_clear(user_id: str) -> int | None:
     state or any child row.  The runtime-generation bump then rejects a worker
     that was doing provider work without holding a database transaction.
 
-    Terminal job metadata and encrypted trajectory/review rows are retained as
-    telemetry and are never prompt inputs.  Active jobs/reviews are fenced into
-    terminal states instead of deleting ``agent_jobs`` because trajectory rows
-    intentionally cascade from their source job.  Independent Memory Garden,
-    identity, schedules, user-authored workspace/working-memory, skills, and
-    content-free billing/token metrics are also preserved.
+    Terminal job metadata and content-free turn metrics are retained, but all
+    encrypted trajectory events and review output are chat-derived content and
+    are deleted. Active jobs are fenced into terminal states instead of deleting
+    ``agent_jobs``. Independent Memory Garden, identity, schedules, user-authored
+    workspace/working-memory, and skills are also preserved.
 
     Returns the number of raw chat rows deleted, or ``None`` if the database
     transaction failed.  Even an already-empty clear advances both the chat R2
@@ -6022,9 +6259,9 @@ def chat_clear(user_id: str) -> int | None:
                         (user_id,),
                     )
 
-                    # Preserve immutable encrypted trajectory history by
-                    # retaining its source jobs, but make every in-flight lane
-                    # lose ownership before the clear commits.
+                    # Retain content-free job/metric telemetry, but make every
+                    # in-flight lane lose ownership before deleting trajectory
+                    # content derived from the cleared chat.
                     cur.execute(
                         "UPDATE agent_jobs SET status='superseded',"
                         "last_error='chat_history_cleared',claimed_by=NULL,"
@@ -6033,11 +6270,25 @@ def chat_clear(user_id: str) -> int | None:
                         "AND status IN ('pending','claimed','running')",
                         (user_id,),
                     )
+                    # Mark every pre-clear job as intentionally content-purged.
+                    # Operational capture health can then distinguish Chat
+                    # Clear from a recorder that silently failed to create a
+                    # stream. Job and turn-metric rows remain available.
                     cur.execute(
-                        "UPDATE v2_trajectory_reviews SET status='failed',"
-                        "claimed_by_job_id=NULL,last_error='chat_history_cleared',"
-                        "finished_at=COALESCE(finished_at,now()) "
-                        "WHERE user_id=%s AND status IN ('pending','running')",
+                        "UPDATE agent_jobs SET trajectory_purged_at="
+                        "COALESCE(trajectory_purged_at,clock_timestamp()) "
+                        "WHERE user_id=%s",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM v2_trajectory_reviews WHERE user_id=%s",
+                        (user_id,),
+                    )
+                    # Stream deletion cascades every immutable event row. This
+                    # runs after review deletion so no encrypted review output
+                    # survives an explicit Chat Clear.
+                    cur.execute(
+                        "DELETE FROM v2_trajectory_streams WHERE user_id=%s",
                         (user_id,),
                     )
 
@@ -6047,6 +6298,18 @@ def chat_clear(user_id: str) -> int | None:
                     # also erases anything the earlier reconciler committed.
                     cur.execute(
                         "DELETE FROM v2_terminal_failure_outbox WHERE user_id=%s",
+                        (user_id,),
+                    )
+                    # Capture retry journals contain encrypted chat-derived
+                    # card bodies.  Clear removes prepared batches and their
+                    # exact frontier together; applied batches are deleted by
+                    # the successful Capture commit itself.
+                    cur.execute(
+                        "DELETE FROM v2_capture_batches WHERE user_id=%s",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM user_blobs WHERE user_id=%s AND kind='capture_state'",
                         (user_id,),
                     )
 
@@ -6152,6 +6415,7 @@ def chat_clear(user_id: str) -> int | None:
     mirror.execute_many([
         (sql, (user_id,)),
         ("DELETE FROM runtime_state WHERE user_id = %s", (user_id,)),
+        ("DELETE FROM user_blobs WHERE user_id = %s AND kind = 'capture_state'", (user_id,)),
         ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
          "AND table_name = 'chat_messages'", (user_id,)),
     ])
@@ -6169,12 +6433,20 @@ def chat_clear(user_id: str) -> int | None:
 
 def memory_load(user_id: str) -> list[dict]:
     try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
+        context = _memory_mutation_context(user_id)
+        if context is not None:
+            rows = context[0].execute(
                 "SELECT doc FROM memory_moments WHERE user_id = %s "
                 "ORDER BY occurred_at, moment_id",
                 (user_id,),
             ).fetchall()
+        else:
+            with get_pool().connection() as conn:
+                rows = conn.execute(
+                    "SELECT doc FROM memory_moments WHERE user_id = %s "
+                    "ORDER BY occurred_at, moment_id",
+                    (user_id,),
+                ).fetchall()
         return [r[0] for r in rows]
     except Exception as e:
         log.error("[db] memory_load(%s) failed: %s", user_id, e)
@@ -6185,8 +6457,19 @@ def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> 
     """Single-row upsert. Returns True iff the write committed — callers that
     advance state on success (e.g. memory.upgrade / migration) MUST check it."""
     try:
-        with get_pool().connection() as conn:
-            conn.execute(
+        context = _memory_mutation_context(user_id)
+        if context is None:
+            with memory_user_mutation_fence(user_id):
+                context = _memory_mutation_context(user_id)
+                context[0].execute(
+                    "INSERT INTO memory_moments (user_id, moment_id, occurred_at, doc) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (user_id, moment_id) DO UPDATE SET "
+                    "occurred_at = EXCLUDED.occurred_at, doc = EXCLUDED.doc",
+                    (user_id, moment_id, occurred_at or "", Jsonb(doc)),
+                )
+        else:
+            context[0].execute(
                 "INSERT INTO memory_moments (user_id, moment_id, occurred_at, doc) "
                 "VALUES (%s, %s, %s, %s) "
                 "ON CONFLICT (user_id, moment_id) DO UPDATE SET "
@@ -6202,25 +6485,39 @@ def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> 
     # forward scan order) — same requeue-lane pattern as memory_replace_all's
     # survivors. Best-effort: mirror swallows failures.
     from tee_shadow import mirror
-    mirror.mark_pending(user_id, "memory_moments", moment_id, "requeue")
+    _defer_memory_post_commit(
+        user_id,
+        lambda: mirror.mark_pending(
+            user_id, "memory_moments", moment_id, "requeue"
+        ),
+    )
     return True
 
 
 def memory_delete(user_id: str, moment_id: str) -> bool:
     sql = "DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s"
     try:
-        with get_pool().connection() as conn:
-            cur = conn.execute(sql, (user_id, moment_id))
+        context = _memory_mutation_context(user_id)
+        if context is None:
+            with memory_user_mutation_fence(user_id):
+                context = _memory_mutation_context(user_id)
+                cur = context[0].execute(sql, (user_id, moment_id))
+        else:
+            cur = context[0].execute(sql, (user_id, moment_id))
+        deleted = cur.rowcount > 0
     except Exception as e:
         log.error("[db] memory_delete(%s,%s) failed: %s", user_id, moment_id, e)
         return False
     from tee_shadow import mirror
-    mirror.execute_many([
-        (sql, (user_id, moment_id)),
-        ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
-         "AND table_name = 'memory_moments' AND item_id = %s", (user_id, moment_id)),
-    ])
-    return cur.rowcount > 0
+    _defer_memory_post_commit(
+        user_id,
+        lambda: mirror.execute_many([
+            (sql, (user_id, moment_id)),
+            ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+             "AND table_name = 'memory_moments' AND item_id = %s", (user_id, moment_id)),
+        ]),
+    )
+    return deleted
 
 
 def memory_replace_all(user_id: str, moments: list[dict]) -> None:
@@ -6232,45 +6529,51 @@ def memory_replace_all(user_id: str, moments: list[dict]) -> None:
     removed_ids: list[str] = []
     survivor_ids: list[str] = []
     try:
-        with get_pool().connection() as conn:
-            with conn.transaction():
-                rows = conn.execute(
-                    "SELECT moment_id, occurred_at, doc FROM memory_moments WHERE user_id = %s",
-                    (user_id,),
-                ).fetchall()
-                existing = {r[0]: (r[1], r[2]) for r in rows}
+        context = _memory_mutation_context(user_id)
+        if context is None:
+            with memory_user_mutation_fence(user_id):
+                memory_replace_all(user_id, moments)
+            return
+        conn = context[0]
+        rows = conn.execute(
+            "SELECT moment_id, occurred_at, doc FROM memory_moments WHERE user_id = %s",
+            (user_id,),
+        ).fetchall()
+        existing = {r[0]: (r[1], r[2]) for r in rows}
 
-                # last-writer-wins on duplicate ids, mirroring the old
-                # DELETE-then-INSERT/ON CONFLICT behavior; drop id-less dicts.
-                new = {str(m["id"]): m for m in moments if m.get("id")}
+        # last-writer-wins on duplicate ids, mirroring the old
+        # DELETE-then-INSERT/ON CONFLICT behavior; drop id-less dicts.
+        new = {str(m["id"]): m for m in moments if m.get("id")}
 
-                removed_ids = list(existing.keys() - new.keys())
-                survivor_ids = list(new.keys())
-                for mid in removed_ids:
-                    conn.execute(
-                        "DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s",
-                        (user_id, mid),
-                    )
-                for mid, m in new.items():
-                    occurred_at = str(m.get("occurred_at") or "")
-                    prev = existing.get(mid)
-                    # Skip only when BOTH the doc and the derived occurred_at
-                    # column match — the old full-replace path always rewrote
-                    # occurred_at from the input, so an unchanged doc paired with
-                    # a stale ordering column must still be rewritten or
-                    # memory_load() (ORDER BY occurred_at) returns wrong order.
-                    if prev is not None and prev[0] == occurred_at and prev[1] == m:
-                        continue
-                    conn.execute(
-                        "INSERT INTO memory_moments (user_id, moment_id, occurred_at, doc) "
-                        "VALUES (%s, %s, %s, %s) "
-                        "ON CONFLICT (user_id, moment_id) DO UPDATE SET "
-                        "occurred_at = EXCLUDED.occurred_at, doc = EXCLUDED.doc",
-                        (user_id, mid, occurred_at, Jsonb(m)),
-                    )
+        removed_ids = list(existing.keys() - new.keys())
+        survivor_ids = list(new.keys())
+        for mid in removed_ids:
+            conn.execute(
+                "DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s",
+                (user_id, mid),
+            )
+        for mid, m in new.items():
+            occurred_at = str(m.get("occurred_at") or "")
+            prev = existing.get(mid)
+            # Skip only when BOTH the doc and the derived occurred_at
+            # column match — the old full-replace path always rewrote
+            # occurred_at from the input, so an unchanged doc paired with
+            # a stale ordering column must still be rewritten or
+            # memory_load() (ORDER BY occurred_at) returns wrong order.
+            if prev is not None and prev[0] == occurred_at and prev[1] == m:
+                continue
+            conn.execute(
+                "INSERT INTO memory_moments (user_id, moment_id, occurred_at, doc) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (user_id, moment_id) DO UPDATE SET "
+                "occurred_at = EXCLUDED.occurred_at, doc = EXCLUDED.doc",
+                (user_id, mid, occurred_at, Jsonb(m)),
+            )
     except Exception as e:
         log.error("[db] memory_replace_all(%s) failed: %s", user_id, e)
-        return
+        # Callers may advance a durable frontier only after this write lands.
+        # Treating a database failure as success silently loses memory effects.
+        raise
     # Primary committed → propagate to the TEE shadow (best-effort). memory rows
     # are ciphertext→plaintext REPLICATED (not dual-written), and an in-place
     # edit keeps the same (occurred_at, moment_id) PK while a back-dated insert
@@ -6279,20 +6582,23 @@ def memory_replace_all(user_id: str, moments: list[dict]) -> None:
     # frame_prune_to) + enqueue every survivor on the requeue lane. memory sets
     # are small (tens), so requeue-all-survivors is acceptable churn (brief §C3).
     from tee_shadow import mirror
-    if removed_ids:
-        # Same "pin to actual eviction + clear its pending marker" pattern used
-        # throughout: a removed moment may itself carry a stale pending row
-        # (e.g. it was mid-requeue), which would otherwise outlive the now-gone
-        # RDS row and permanently unbalance verify's rds == tee + pending count.
-        mirror.execute_many([
-            ("DELETE FROM memory_moments WHERE user_id = %s AND moment_id = ANY(%s)",
-             (user_id, removed_ids)),
-            ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
-             "AND table_name = 'memory_moments' AND item_id = ANY(%s)",
-             (user_id, removed_ids)),
-        ])
-    for mid in survivor_ids:
-        mirror.mark_pending(user_id, "memory_moments", mid, "requeue")
+    def _propagate() -> None:
+        if removed_ids:
+            # Same "pin to actual eviction + clear its pending marker" pattern used
+            # throughout: a removed moment may itself carry a stale pending row
+            # (e.g. it was mid-requeue), which would otherwise outlive the now-gone
+            # RDS row and permanently unbalance verify's rds == tee + pending count.
+            mirror.execute_many([
+                ("DELETE FROM memory_moments WHERE user_id = %s AND moment_id = ANY(%s)",
+                 (user_id, removed_ids)),
+                ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+                 "AND table_name = 'memory_moments' AND item_id = ANY(%s)",
+                 (user_id, removed_ids)),
+            ])
+        for mid in survivor_ids:
+            mirror.mark_pending(user_id, "memory_moments", mid, "requeue")
+
+    _defer_memory_post_commit(user_id, _propagate)
 
 
 # ---------------------------------------------------------------------------

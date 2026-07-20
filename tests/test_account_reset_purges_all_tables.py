@@ -80,6 +80,25 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "latency_ms) VALUES (%s, 'chat', 'anthropic', 'claude-test', 10, 2, 50)",
             (user_id,),
         )
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) "
+            "VALUES (%s,'v2',1) ON CONFLICT (user_id) DO NOTHING",
+            (user_id,),
+        )
+        capture_job_id = conn.execute(
+            "INSERT INTO agent_jobs "
+            "(user_id,lane,status,expected_runtime_generation) "
+            "VALUES (%s,'capture','pending',1) RETURNING id",
+            (user_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO v2_capture_batches "
+            "(user_id,runtime_generation,after_seq,through_seq,"
+            "until_message_id,actions_json,action_count,prepared_by_job_id) "
+            "VALUES (%s,1,0,1,'m1','[]'::jsonb,0,%s)",
+            (user_id, capture_job_id),
+        )
     cid = db.model_api_credential_create(
         user_id, provider="anthropic", base_url="", label="k",
         api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
@@ -98,6 +117,7 @@ _PER_USER_TABLES = (
     "model_api_credentials",
     "model_api_routes",
     "v2_turn_metrics",
+    "v2_capture_batches",
 )
 
 

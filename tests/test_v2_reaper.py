@@ -110,3 +110,129 @@ def test_cleanup_loop_retries_without_killing_watchdog(monkeypatch):
 
     asyncio.run(_run())
     assert calls == [1, 2]
+
+
+def test_trajectory_retention_settings_are_default_on_and_bounded(monkeypatch):
+    for name in (
+        "FEEDLING_V2_TRAJECTORY_RETENTION_DAYS",
+        "FEEDLING_V2_TRAJECTORY_GC_INTERVAL_SEC",
+        "FEEDLING_V2_TRAJECTORY_GC_BATCH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert reaper.trajectory_retention_settings_from_env() == {
+        "retention_days": 7,
+        "interval": 3600.0,
+        "limit": 100,
+    }
+
+    monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_GC_BATCH", "0")
+    import pytest
+
+    with pytest.raises(RuntimeError, match="GC_BATCH"):
+        reaper.trajectory_retention_settings_from_env()
+
+
+def test_trajectory_cleanup_once_forwards_retention_boundary(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        jobs_store,
+        "purge_expired_trajectories",
+        lambda **kwargs: calls.append(kwargs) or 3,
+    )
+
+    assert reaper.trajectory_cleanup_once(retention_days=7, limit=11) == 3
+    assert calls == [{"retention_days": 7, "limit": 11}]
+
+
+def test_trajectory_cleanup_loop_retries_transient_db_failure(monkeypatch):
+    import asyncio
+
+    calls = []
+    stop_event = asyncio.Event()
+
+    def _cleanup_once(**_kwargs):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            raise RuntimeError("transient DB failure")
+        stop_event.set()
+        return 1
+
+    monkeypatch.setattr(reaper, "trajectory_cleanup_once", _cleanup_once)
+
+    async def _run():
+        await asyncio.wait_for(
+            reaper.run_trajectory_cleanup_loop(
+                stop_event,
+                interval=0.01,
+                retention_days=7,
+                limit=5,
+            ),
+            timeout=1,
+        )
+
+    asyncio.run(_run())
+    assert calls == [1, 2]
+
+
+def test_trajectory_cleanup_loop_drains_all_full_batches_in_one_cadence(monkeypatch):
+    import asyncio
+
+    results = iter((5, 5, 2))
+    calls = []
+    stop_event = asyncio.Event()
+
+    def _cleanup_once(**kwargs):
+        calls.append(kwargs)
+        result = next(results)
+        if result < kwargs["limit"]:
+            stop_event.set()
+        return result
+
+    monkeypatch.setattr(reaper, "trajectory_cleanup_once", _cleanup_once)
+
+    async def _run():
+        await asyncio.wait_for(
+            reaper.run_trajectory_cleanup_loop(
+                stop_event,
+                interval=60,
+                retention_days=7,
+                limit=5,
+            ),
+            timeout=1,
+        )
+
+    asyncio.run(_run())
+    assert calls == [
+        {"retention_days": 7, "limit": 5},
+        {"retention_days": 7, "limit": 5},
+        {"retention_days": 7, "limit": 5},
+    ]
+
+
+def test_trajectory_cleanup_loop_stops_after_current_full_batch(monkeypatch):
+    import asyncio
+
+    calls = []
+    stop_event = asyncio.Event()
+
+    def _cleanup_once(**kwargs):
+        calls.append(kwargs)
+        stop_event.set()
+        return kwargs["limit"]
+
+    monkeypatch.setattr(reaper, "trajectory_cleanup_once", _cleanup_once)
+
+    async def _run():
+        await asyncio.wait_for(
+            reaper.run_trajectory_cleanup_loop(
+                stop_event,
+                interval=60,
+                retention_days=7,
+                limit=5,
+            ),
+            timeout=1,
+        )
+
+    asyncio.run(_run())
+    assert calls == [{"retention_days": 7, "limit": 5}]

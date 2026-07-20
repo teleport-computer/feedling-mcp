@@ -497,8 +497,9 @@ class UserStore:
         same atomic transaction. `None` (the default) preserves
         today's `chat_append_strict`/`chat_append` behavior byte-for-byte —
         the in-memory cache append, trim, `wake_bus.notify`, and
-        `capture_scheduler.record_chat_append` side effects are unaffected
-        either way.
+        Capture bookkeeping still runs after a genuine write. Exact Runtime V2
+        sends only refresh that state; their runner-owned scheduler is the sole
+        capture producer and therefore never appends a legacy proactive job.
 
         `reply_through_seq` is the V2 final-reply path. It requires
         `strict=True` and no `enqueue`, and commits the deterministic reply row
@@ -722,7 +723,21 @@ class UserStore:
         try:
             from proactive import capture_scheduler
 
-            capture_scheduler.record_chat_append(self, msg)
+            scheduler_owned_capture = bool(
+                strict
+                and (
+                    reply_through_seq is not None
+                    or (
+                        enqueue is not None
+                        and str(enqueue.get("expected_runtime_mode") or "")
+                        == "db_action_v2"
+                    )
+                )
+            )
+            if scheduler_owned_capture:
+                capture_scheduler.refresh_capture_state_from_chat(self, now=msg["ts"])
+            else:
+                capture_scheduler.record_chat_append(self, msg)
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return msg
@@ -963,7 +978,12 @@ class UserStore:
             patch_doc["enabled"] = patch_doc["ambient"]
         if "reminders_delivery" in patch_doc:
             patch_doc["dnd"] = not bool(patch_doc["reminders_delivery"])
+        # ``cur`` supplies defaults only when the row does not exist. Persist
+        # just the validated patch: writing this pre-lock snapshot back as a
+        # whole document lets an unrelated process restore a stale Capture
+        # consent value.
         cur = self.load_proactive_settings()
+        update: dict = {}
         for key, value in patch_doc.items():
             if key not in allowed:
                 continue
@@ -978,50 +998,55 @@ class UserStore:
                 "arrival_wake_enabled",
                 "unlock_wake_enabled",
             }:
-                cur[key] = bool(value)
+                update[key] = bool(value)
             elif key == "ambient":
-                cur["enabled"] = bool(value)
+                update["enabled"] = bool(value)
             elif key == "reminders_delivery":
-                cur["dnd"] = not bool(value)
+                update["dnd"] = not bool(value)
             elif key == "timezone":
                 tz_name = str(value or "").strip()
                 try:
                     ZoneInfo(tz_name)
                 except ZoneInfoNotFoundError:
                     continue
-                cur[key] = tz_name
+                update[key] = tz_name
             elif key == "permission_states" and isinstance(value, dict):
-                states = dict(cur.get("permission_states") or {})
-                for pname, pstate in value.items():
-                    states[str(pname)] = str(pstate)
-                cur["permission_states"] = states
+                update["permission_states"] = {
+                    str(pname): str(pstate)
+                    for pname, pstate in value.items()
+                }
             elif key in {"user_state", "manual_user_state"}:
                 state = str(value or "").strip().lower()
                 if state in PROACTIVE_USER_STATES:
-                    cur[key] = state
+                    update[key] = state
             elif key == "ai_state":
                 state = str(value or "").strip().lower()
                 if state in PROACTIVE_AI_STATES:
-                    cur[key] = state
+                    update[key] = state
             elif key == "broadcast_state":
                 state = str(value or "").strip().lower()
                 if state in PROACTIVE_BROADCAST_STATES:
-                    cur[key] = state
+                    update[key] = state
             elif key == "wake_directive":
-                cur[key] = str(value or "").strip()[:1000]
+                update[key] = str(value or "").strip()[:1000]
             elif key == "wake_interval_sec":
                 try:
                     interval = int(value)
                 except (TypeError, ValueError):
                     continue
-                cur[key] = max(
+                update[key] = max(
                     PROACTIVE_WAKE_INTERVAL_MIN_SEC,
                     min(PROACTIVE_WAKE_INTERVAL_MAX_SEC, interval),
                 )
-        cur["version"] = 2
-        cur["updated_at"] = datetime.now().isoformat()
+        update["version"] = 2
+        update["updated_at"] = datetime.now().isoformat()
         with self.proactive_lock:
-            db.set_blob(self.user_id, "proactive_settings", cur)
+            persisted = db.patch_proactive_settings_strict(
+                self.user_id,
+                update,
+                seed_doc=cur,
+            )
+        cur.update(persisted)
         return cur
 
     def first_chat_ok_at(self) -> str:
@@ -1036,10 +1061,17 @@ class UserStore:
             cur = self.load_proactive_settings()
             if str(cur.get("first_chat_ok_at") or "").strip():
                 return cur
-            cur["first_chat_ok_at"] = str(at_iso or datetime.now().isoformat())
-            cur["version"] = 2
-            cur["updated_at"] = datetime.now().isoformat()
-            db.set_blob(self.user_id, "proactive_settings", cur)
+            updated_at = datetime.now().isoformat()
+            persisted = db.patch_proactive_settings_strict(
+                self.user_id,
+                {
+                    "first_chat_ok_at": str(at_iso or updated_at),
+                    "version": 2,
+                    "updated_at": updated_at,
+                },
+                seed_doc=cur,
+            )
+            cur.update(persisted)
         return cur
 
     def introduced_at(self) -> str:
@@ -1057,10 +1089,17 @@ class UserStore:
             cur = self.load_proactive_settings()
             if str(cur.get("introduced_at") or "").strip():
                 return cur
-            cur["introduced_at"] = str(at_iso or datetime.now().isoformat())
-            cur["version"] = 2
-            cur["updated_at"] = datetime.now().isoformat()
-            db.set_blob(self.user_id, "proactive_settings", cur)
+            updated_at = datetime.now().isoformat()
+            persisted = db.patch_proactive_settings_strict(
+                self.user_id,
+                {
+                    "introduced_at": str(at_iso or updated_at),
+                    "version": 2,
+                    "updated_at": updated_at,
+                },
+                seed_doc=cur,
+            )
+            cur.update(persisted)
         return cur
 
     def claim_and_enqueue_introduction(self, job: dict) -> dict | None:

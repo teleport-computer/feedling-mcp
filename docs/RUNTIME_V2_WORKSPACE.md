@@ -87,6 +87,11 @@ output path. User filenames, MIME types, and model content are never appended
 to that extractor command. `FEEDLING_V2_E2B_ALLOW_INTERNET=1` is an explicit
 deployment-level opt-in, not a model option.
 
+The materialization and extractor defaults both match the iOS upload ceiling of
+25 MiB (26,214,400 bytes). The extractor limit is part of the content-addressed
+template digest, so changing it requires rebuilding and deploying the new
+template tag rather than mutating an existing alias.
+
 The repository's older resident `container` strategy is not a usable adapter,
 and the old memory-sandbox compose is a local backend+enclave validation stack,
 not an artifact execution API. When the sandbox provider is disabled,

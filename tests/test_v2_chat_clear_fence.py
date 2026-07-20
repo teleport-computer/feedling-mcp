@@ -1,7 +1,7 @@
-"""Chat-history clear is a generation-fenced live-context boundary.
+"""Chat Clear generation-fences work and erases chat-derived content.
 
-It is intentionally narrower than account deletion: encrypted trajectory
-telemetry remains subject to its independent retention policy.
+It is intentionally narrower than account deletion: content-free job/turn
+telemetry remains, while encrypted trajectory/review content is erased.
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db
 from conftest import seed_user, set_v2_runtime_owner
 from model_api_runtime.v2 import effect_id, effect_outbox, jobs_store
+from proactive import capture_scheduler
 
 
 pytestmark = pytest.mark.skipif(
@@ -60,6 +61,7 @@ def _append_user_message(user_id: str, message_id: str, ts: float = 10.0) -> int
         {
             "id": message_id,
             "role": "user",
+            "source": "chat",
             "ts": ts,
             "body_ct": "opaque-chat-ciphertext",
             "nonce": "nonce",
@@ -69,6 +71,37 @@ def _append_user_message(user_id: str, message_id: str, ts: float = 10.0) -> int
         5000,
     )
     return int(db.chat_seq_for_msg_id(user_id, message_id))
+
+
+def test_delayed_pre_clear_capture_refresh_cannot_recreate_state():
+    uid = "u_clear_capture_refresh"
+    seed_user(uid)
+    _append_user_message(uid, "before-clear", ts=10.0)
+
+    class StaleStore:
+        user_id = uid
+        chat_lock = threading.RLock()
+        chat_messages = [
+            {
+                "id": "before-clear",
+                "role": "user",
+                "source": "chat",
+                "ts": 10.0,
+            }
+        ]
+
+    store = StaleStore()
+    before = capture_scheduler.refresh_capture_state_from_chat(store, now=11.0)
+    assert before["last_seen_message_id"] == "before-clear"
+    assert db.chat_clear(uid) == 1
+    assert db.get_blob_strict(uid, "capture_state") is None
+
+    # This callback retained the pre-clear in-process message list. The shared
+    # fence + source-row witness must observe that Clear already removed it and
+    # leave capture_state absent in both primary and mirror ordering.
+    after = capture_scheduler.refresh_capture_state_from_chat(store, now=12.0)
+    assert after["last_seen_message_id"] == ""
+    assert db.get_blob_strict(uid, "capture_state") is None
 
 
 def _running_job(user_id: str, owner: str = "clear-test-worker") -> tuple[int, int]:
@@ -90,6 +123,16 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
 ):
     monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", "1")
     monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE", "64")
+    from tee_shadow import mirror
+
+    mirrored_deletes = []
+    original_execute_many = mirror.execute_many
+
+    def _capture_mirror(statements):
+        mirrored_deletes.extend(statements)
+        return original_execute_many(statements)
+
+    monkeypatch.setattr(mirror, "execute_many", _capture_mirror)
     uid = "u_v2_clear_atomic_context"
     seed_user(uid)
     set_v2_runtime_owner(uid, generation=7)
@@ -147,8 +190,8 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
         payload_envelope=_envelope(uid, "trajectory-before-clear", "private turn"),
         payload_bytes=100,
     )
-    # Live effect/action/recovery state is still tied to this source job and
-    # must be erased even though its historical job/trajectory rows survive.
+    # Live effect/action/recovery state is tied to this source job and must be
+    # erased; only its content-free job/turn metrics survive.
     active_job_id = job_id
     active_generation = old_generation
     parent_effect_id = effect_id.derive(
@@ -193,8 +236,8 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
             (active_job_id, uid, seq, "a" * 64, "b" * 64),
         )
 
-    # Queue a review to prove that its encrypted/historical row survives while
-    # active review execution is stopped by clear.
+    # Queue a review to prove that both source trajectory and encrypted review
+    # state are removed while active review execution is stopped by clear.
     assert jobs_store.mark_failed(
         job_id,
         "turn_failed:providererror",
@@ -247,6 +290,31 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
         completion_tokens=2,
         latency_ms=20,
     )
+    capture_job_id, capture_coalesced = jobs_store.enqueue_job(uid, "capture")
+    assert not capture_coalesced
+    db.set_blob(
+        uid,
+        "capture_state",
+        {
+            "last_captured_until_seq": 0,
+            "capture_seq_initialized": True,
+            "pending_capture_key": "capture:pre-clear",
+        },
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_capture_batches "
+            "(user_id,runtime_generation,after_seq,through_seq,"
+            "until_message_id,actions_json,action_count,prepared_by_job_id) "
+            "VALUES (%s,%s,0,%s,'pre-clear-message',%s,1,%s)",
+            (
+                uid,
+                old_generation,
+                seq,
+                Jsonb([{"envelope": {"body_ct": "encrypted-capture-card"}}]),
+                capture_job_id,
+            ),
+        )
 
     assert db.chat_clear(uid) == 1
     assert db.get_runtime_generation(uid) == old_generation + 1
@@ -264,22 +332,35 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
                 "runtime_state",
                 "v2_effect_outbox",
                 "v2_mcp_mutation_attempts",
+                "v2_capture_batches",
             )
         }
+        counts["capture_state"] = conn.execute(
+            "SELECT COUNT(*) FROM user_blobs "
+            "WHERE user_id=%s AND kind='capture_state'",
+            (uid,),
+        ).fetchone()[0]
         workspace = conn.execute(
             "SELECT path,kind FROM v2_workspace_entries "
             "WHERE user_id=%s ORDER BY path",
             (uid,),
         ).fetchall()
         jobs = conn.execute(
-            "SELECT id,status,last_error FROM agent_jobs "
+            "SELECT id,status,last_error,trajectory_purged_at IS NOT NULL "
+            "AS trajectory_purged FROM agent_jobs "
             "WHERE user_id=%s ORDER BY id",
             (uid,),
         ).fetchall()
-        trajectories = conn.execute(
-            "SELECT COUNT(*) FROM v2_trajectory_events WHERE user_id=%s",
-            (uid,),
-        ).fetchone()[0]
+        trajectories = {
+            table: conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE user_id=%s", (uid,)
+            ).fetchone()[0]
+            for table in (
+                "v2_trajectory_streams",
+                "v2_trajectory_events",
+                "v2_trajectory_reviews",
+            )
+        }
         retained_review = conn.execute(
             "SELECT status,last_error FROM v2_trajectory_reviews "
             "WHERE source_job_id=%s",
@@ -317,14 +398,18 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
         }
 
     assert counts == {name: 0 for name in counts}
+    assert any(
+        "kind = 'capture_state'" in sql for sql, _params in mirrored_deletes
+    )
     assert workspace == [
         ("/memory/WORKING.md", "working_memory"),
         ("/skills/keep.md", "skill"),
         ("/workspace/keep.md", "workspace"),
     ]
     assert jobs and all(row[1] not in {"pending", "claimed", "running"} for row in jobs)
-    assert trajectories == 1
-    assert retained_review == ("failed", "chat_history_cleared")
+    assert all(row[3] is True for row in jobs)
+    assert trajectories == {name: 0 for name in trajectories}
+    assert retained_review is None
     assert sink_markers == 0
     assert action_rows == 0
     assert preserved == {key: 1 for key in preserved}

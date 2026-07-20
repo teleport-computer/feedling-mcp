@@ -1,6 +1,6 @@
 # Hosted Runtime V2 — Current Parity and Completion Matrix
 
-> **CURRENT SOURCE OF TRUTH — 2026-07-19.** This page describes the current
+> **CURRENT SOURCE OF TRUTH — 2026-07-20.** This page describes the current
 > Runtime V2 source and managed deployment manifests. A live environment changes
 > only after this source is deployed. Use
 > [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)
@@ -17,6 +17,7 @@
 | ✅ | Implemented and guarded in the current source |
 | ⚠️ | Correctness exists, but a rollout, scale, or long-horizon gate remains |
 | ❌ | Explicitly deferred or not implemented |
+| ➖ | Deliberately removed from the Runtime V2 release scope |
 
 ## Original V2 vision
 
@@ -30,10 +31,10 @@
 | Executable action vocabulary | ✅ | The exposed native catalog maps to registered executable capabilities. Scheduling, web search/fetch, and exact memory search are present; obsolete planner-only `sleep`/`capture_memory` vocabulary is absent. |
 | One deployment topology | ✅ | Local, test, pre, and production hosted model-API deployments are `v2_only`. A bounded `serve-worker` pool runs in the runner CVM, separate from the main backend/enclave CVM; there is no hosted per-account runtime flip. |
 | Prompt caching and cache telemetry | ⚠️ | Provider-aware cache controls/affinity and per-turn read/write/miss telemetry are implemented for OpenAI-compatible, Anthropic/OpenRouter, Gemini, and Bedrock paths. The existing Pre canary proves a route-bound OpenRouter cache read; the trusted `/skills` prefix and native Bedrock path still need post-deploy live cache-hit proof. Editable `WORKING.md` is deliberately pull-only and is not part of the eager cache prefix. |
-| Tokens/turn and admission ceiling | ✅ | Whole-turn token/call/latency metrics and an admission ceiling are implemented. The offline token regression gate is live. |
+| Tokens/turn and admission ceiling | ✅ | Whole-turn token/call/latency metrics and an admission ceiling are implemented. The offline token regression gate is live, and `/v1/admin/v2-metrics.turn_health` exposes bounded queue/lease expiry, failure/expiry rates, pending age, p95 latency, and trajectory completeness/gaps. |
 | Concurrent CVM-class load proof | ⚠️ | The harness exists, but the authoritative concurrent run on the target CVM class remains an operational gate. |
-| Typing-signal pre-warm | ❌ | Not implemented. See the definition below. |
-| Encrypted full trajectories and failure review | ⚠️ | Immutable encrypted per-job provider/tool/reply/fold/error capture is implemented. Oversized model-visible events use exact digest-verified encrypted chunks; every async provider HTTP attempt carries its effective request model, exact JSON body, result/error status and duration without an extra DB write. Tool timing/effect evidence and reply disposition are captured. Provider-backed offline review is explicit opt-in, fail-closed, globally admission-bounded, and structurally side-effect-free; it is analysis, not deterministic replay. Automatic retention/GC and restricted inspection/export policy remain open. |
+| Typing-signal pre-warm | ➖ | Removed from the release scope by product decision. Ordinary Send remains the only foreground trigger; V2 does not create speculative jobs or provider spend while the user types. |
+| Encrypted full trajectories and failure review | ✅ | Immutable encrypted per-job provider/tool/reply/fold/error capture is implemented. Oversized model-visible events use exact digest-verified encrypted chunks; every async provider HTTP attempt carries its effective request model, exact JSON body, result/error status and duration without an extra DB write. Tool timing/effect evidence and reply disposition are captured. Content has a default-on seven-day TTL, Chat Clear erases it immediately, and exact-job break-glass inspection is runner-local and durably audited. Provider-backed offline review remains explicit opt-in and side-effect-free; it is analysis, not deterministic replay. |
 | Fleet-wide resident-process retirement | ⚠️ | Source and managed topology are complete: hosted supervisors, per-user homes/leases/CLI toolchains, selectors, and the admin rollback flip are removed, and every managed manifest can launch only pooled V2 workers. Live closure still requires deploying the reviewed image to each environment, provisioning the required second production runner failure domain, and verifying that no legacy hosted process remains. The independent user-operated `/v1/chat/*` resident consumer is a separate product path. |
 
 ## Current turn shape
@@ -91,10 +92,10 @@ or arbitrary code-execution tool. The detailed facade and enclave mapping lives 
 | Manual, heartbeat, scheduled wake | ✅ | Same native loop as chat |
 | Screen watch | ✅ | Producer and wake handler are live |
 | Maintenance/compaction | ✅ | Encrypted summary compaction path is live |
-| Capture | ⚠️ | The real parser now emits validator-complete encrypted actions (`type`, `occurred_at`, ranking/source metadata), non-empty captures persist, and a rejected write fails the job rather than being marked completed. Rollout remains default-off pending lifecycle soak. |
-| Memory Dream | ⚠️ | Native `op/card_ids/result` consolidations now map to multi-card supersede actions and pass the real Garden validator. Rollout remains default-off pending lifecycle soak; this Dream organizes memory cards and is not runtime failure replay. |
+| Capture | ⚠️ | Pre now soaks automatic Capture independently; test, local, and production remain default-off, and Dream remains separately off. Capture consumes the exact oldest contiguous raw-seq window, discloses only eligible live chat rows, and advances synthetic/internal-only windows without a provider call. Provider output is sealed into an encrypted prepared journal; retry adopts it before provider/enclave setup, then Memory rows, canonical logs, frontier, and job terminal state commit atomically. Emergency halt, Chat Clear/account deletion, runtime assignment, and user consent are checked before disclosure and remain transactionally fenced for the complete provider call; prepare and commit recheck them. The commit also shares a cross-process per-user mutation fence with every ordinary Memory Garden writer, whose retype path derives its update from the fresh fenced row. Opt-out erases journals and every failure stays background-only. The warning is an operational/card-quality soak gate, not a known source-correctness gap. |
+| Memory Dream | ➖ | Native `op/card_ids/result` consolidations map to multi-card supersede actions and pass the real Garden validator, but activation is a separate optional product lane rather than a Runtime V2 release requirement. All managed defaults keep it off. This Dream organizes memory cards and is not runtime failure replay. |
 | Genesis import | ✅ | Rehomed under `serve-worker` with a dedicated heartbeat |
-| Trajectory review | ⚠️ | Encrypted capture is always on; provider-backed offline review is opt-in/default-off, globally capped, tools-disabled, and has no live effect surfaces. Retention/GC policy remains open. |
+| Trajectory review | ✅ | Encrypted capture is always on with a default seven-day TTL and immediate Chat Clear erasure. Provider-backed offline review is opt-in/default-off, globally capped, tools-disabled, and has no live effect surfaces; operators have a separate default-off, exact-job, runner-local audited inspector. |
 
 ## Workspace, working memory, and subagents
 
@@ -148,10 +149,12 @@ pages, and a message body can be fetched by stable id outside that hot window.
 Only explicit user/account deletion removes source chat history. The explicit
 Chat clear endpoint is generation-fenced and atomically removes raw messages,
 the summary, chat-derived artifact views, pending effects/status, and the reply
-cursor, so an old worker cannot resurrect cleared context. Independent Memory
-Garden, Identity, user-authored workspace/working memory, schedules, metrics,
-and encrypted trajectory telemetry remain; account deletion is the full-data
-erasure boundary.
+cursor, so an old worker cannot resurrect cleared context. It also tombstones
+the user's old jobs and deletes their encrypted trajectory/review content while
+preserving content-free job and turn metrics. Independent Memory Garden,
+Identity, user-authored workspace/working memory, schedules, job metadata,
+aggregate metrics, and prior trajectory-access audit rows remain; account
+deletion is the full-data erasure boundary.
 
 The **total prompt frontier** is the complete per-round budget calculation over
 the rendered system text, summary, verbatim messages, images, exact tool
@@ -210,6 +213,12 @@ records below each capture only one operational slice of the turn.
 | In-process native transcript | Enough ordered tool context for the next model round | Discarded when the turn/process ends; the encrypted trajectory is the durable copy |
 | `v2_trajectory_events` | Immutable per-job request/response, provider-attempt, fold, timed tool/effect, reply-disposition, exception, and terminal chronology | Sensitive payload is a user+enclave shared envelope; only fixed ordering/type/size metadata is plaintext |
 
+`GET /v1/admin/v2-metrics.turn_health` derives a bounded, content-free 24-hour
+snapshot from jobs, metrics, and trajectory metadata. It includes real
+queue/lease expiries, pending age, p95 latency, and complete/partial/missing/gap
+counts; jobs with an explicit lifecycle tombstone are excluded from the capture
+denominator so intentional erasure cannot masquerade as missing telemetry.
+
 Telemetry is the **odometer/instrument panel**: it tells us how much, how long,
 and whether the turn failed. The encrypted trajectory is the **flight
 recorder**: it records the exact model-visible causal chronology and explicit
@@ -244,30 +253,22 @@ safe 64 KiB batching floor); larger
 logical events are exact ordered chunks rather than clipped prefixes. Review
 reads at most the newest 256 physical rows and has its own 128 KiB prompt
 frontier; an incomplete chunk window is labeled incomplete. Those are analysis
-bounds, not deletion policies. Raw encrypted event rows remain until the owning
-job/account is explicitly deleted. The store has no public plaintext read API
-and is never injected into live conversation context.
+bounds, not retention policies. Raw encrypted event/review content is removed
+after the default seven-day terminal-job TTL, by Chat Clear, or by account
+deletion. The store has no public plaintext read API and is never injected into
+live conversation context. A default-off runner-local inspector can decrypt one
+exact user/job pair only after a durable requested-access audit; it records a
+success phase before returning plaintext to the controlled invoking terminal.
 
-## Deferred D items, precisely defined
+## Optional or separately gated capabilities
 
-### Typing-signal pre-warm
+Typing-signal pre-warm is intentionally not a Runtime V2 completion item. The
+runtime starts on authenticated Send and does not speculatively create work,
+reserve foreground capacity, call a provider, or spend tokens while the user is
+typing. Reconsidering a local-only latency experiment later would be a separate
+product project with its own benefit and waste measurements.
 
-This is a latency optimization triggered by an authenticated, short-lived iOS
-“user started typing” event before Send. It may warm deterministic work such as
-worker capacity/heartbeat checks, database/enclave reads, summary decryption,
-memory indexes, provider routing configuration, and HTTP/TLS connections. The
-speculative state must have a short TTL, be invalidated on conversation/config
-version drift, remain process-local, never occupy reserved foreground capacity,
-and fall back normally on a miss.
-
-It must not create a chat row/job/reply, execute a tool, call the model, reserve
-a slot indefinitely, or incur token billing before Send. In particular, a
-remote provider prompt cache normally cannot be populated without a provider
-request; provider-side speculative calls require a separate explicit budget and
-waste policy. The first implementation should warm only local/TEE/network work
-and preserve ordinary prompt-cache affinity for real turns.
-
-### Encrypted full trajectories and failure review (capture implemented; review opt-in)
+### Encrypted full trajectories and failure review (lifecycle and inspection implemented; review opt-in)
 
 The existing `dream` lane remains user-memory housekeeping. Encrypted
 trajectory capture remains on independently. Provider-backed review defaults
@@ -298,10 +299,13 @@ This is analysis, not production retry. The existing effect outbox handles
 durable effect recovery. Any future replay mechanism must never resend replies,
 rewrite memory/identity/schedules, or repeat remote MCP mutations.
 
-Automatic retention/GC is not implemented: encrypted rows follow explicit
-job/account deletion. Keep provider review opt-in until BYOK budget and
-retention policy are agreed; capture itself remains available while review is
-off or globally capped.
+Encrypted trajectory/review content has a default-on seven-day terminal-job TTL
+and Chat Clear removes it immediately; account deletion remains the complete
+per-user erasure boundary. The runner-local inspector is independently
+default-off and requires an exact user/job pair plus a durable operator, reason,
+case, and outcome audit. Keep provider review opt-in until its BYOK budget is
+approved; capture itself remains available while review is off or globally
+capped.
 
 ### Fleet-wide resident-process retirement
 
@@ -336,15 +340,20 @@ identity cannot stand in for the fleet.
 
 1. Run the authoritative concurrent workload on target CVM-class hardware and
    complete the fault/recovery and cohort-soak gates.
-2. Design and instrument safe typing pre-warm; measure first-request/first-token
-   p50/p95 and wasted-prewarm rate.
-3. Define operator retention/export policy and restricted inspection tooling for
-   encrypted trajectories; neither is required by the live agent loop.
+2. Soak Pre's independently enabled automatic Memory Capture, while keeping
+   Memory Dream disabled; record queue, failure/backoff, cost, and card-quality
+   behavior before any production enablement.
+3. Wire external polling/alerting to the content-free `turn_health` snapshot
+   (queue expiry, terminal error/expiry rate, p95 latency, and unexplained
+   trajectory `missing`/`capture_gap`) rather than relying on manual inspection.
 4. Extend the live prompt-cache canary to exercise trusted `/skills` mutation
    boundaries and native Bedrock where credentials are available. Editable
    working memory remains pull-only by design rather than an eager cache prefix.
 5. Provision the second production runner, deploy the reviewed V2-only images
    across every live environment, and verify zero hosted resident processes.
+6. If binary artifact reading is offered on Pre, provision the E2B credential
+   and versioned 25 MiB template and approve its data boundary; otherwise leave
+   the fail-closed sandbox disabled without blocking text/chat Runtime V2.
 
 The encrypted workspace, artifact materialization boundary, optional E2B
 adapter, and bounded subagents are implemented source capabilities. E2B remains
@@ -385,7 +394,17 @@ At minimum, current-status changes should remain covered by:
 - `tests/test_v2_subagents.py`
 - `tests/test_v2_trajectory_db.py`
 - `tests/test_v2_trajectory_unit.py`
+- `tests/test_v2_trajectory_retention.py`
+- `tests/test_v2_trajectory_access_audit.py`
+- `tests/test_v2_trajectory_inspect_unit.py`
+- `tests/test_v2_metrics_endpoint.py`
 - `tests/test_v2_atomic_reply_cursor.py`
+- `tests/test_v2_scheduler_wiring.py`
+- `tests/test_v2_capture_lifecycle.py`
+- `tests/test_v2_capture_batch_protocol.py`
+- `tests/test_v2_extraction_lanes.py`
+- `tests/test_v2_kill_switch.py`
+- `tests/test_v2_e2b_template_extractor.py`
 - `tests/test_hosted_runtime_policy.py`
 - `tests/test_hosted_resident_retirement.py`
 - `tests/test_prod_runner_topology.py`

@@ -39,7 +39,10 @@ import json
 import logging
 import math
 import os
+import threading
 import time
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -145,6 +148,147 @@ def _positive_float_env(name: str, default: str) -> float:
 # —— 三个有界闸 ——（spec §6）
 # 每进程并发 job 数（= 并发回合数）。线上多进程 × CVM 共抢同一张 agent_jobs → 线性扩容。
 MAX_WORKERS = _positive_int_env("FEEDLING_V2_MAX_WORKERS", "4")
+
+
+# Capture is the one provider path whose disclosure lifetime is deliberately
+# coupled to a synchronous PostgreSQL transaction: D4, consent, Chat Clear, and
+# runtime-generation locks must stay held until the async provider attempt (and
+# its nested trajectory writes) is completely finished.  Parking that long
+# transaction in asyncio's default executor creates a self-deadlock when the
+# provider task records a trajectory through ``asyncio.to_thread``.  Keep one
+# independent, process-wide guard lane per admitted worker instead.
+_capture_provider_guard_executor_lock = threading.Lock()
+_capture_provider_guard_executor: ThreadPoolExecutor | None = None
+_capture_provider_guard_executor_pid = 0
+_capture_provider_guard_executor_size = 0
+
+
+def _capture_provider_guard_pool_size() -> int:
+    try:
+        size = int(MAX_WORKERS)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be a positive integer") from exc
+    if size <= 0:
+        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be a positive integer")
+    return size
+
+
+def _reset_capture_provider_guard_executor_after_fork() -> None:
+    """Drop parent-only threads and replace a possibly inherited locked mutex."""
+    global _capture_provider_guard_executor_lock
+    global _capture_provider_guard_executor
+    global _capture_provider_guard_executor_pid
+    global _capture_provider_guard_executor_size
+
+    _capture_provider_guard_executor_lock = threading.Lock()
+    _capture_provider_guard_executor = None
+    _capture_provider_guard_executor_pid = 0
+    _capture_provider_guard_executor_size = 0
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_capture_provider_guard_executor_after_fork)
+
+
+def _capture_provider_guard_thread_pool() -> ThreadPoolExecutor:
+    """Return the lazy, fork-safe pool that owns long Capture DB fences."""
+    global _capture_provider_guard_executor
+    global _capture_provider_guard_executor_pid
+    global _capture_provider_guard_executor_size
+
+    size = _capture_provider_guard_pool_size()
+    pid = os.getpid()
+    previous: ThreadPoolExecutor | None = None
+    with _capture_provider_guard_executor_lock:
+        if (
+            _capture_provider_guard_executor is None
+            or _capture_provider_guard_executor_pid != pid
+            or _capture_provider_guard_executor_size != size
+        ):
+            if _capture_provider_guard_executor_pid == pid:
+                previous = _capture_provider_guard_executor
+            _capture_provider_guard_executor = ThreadPoolExecutor(
+                max_workers=size,
+                thread_name_prefix="v2-capture-provider-guard",
+            )
+            _capture_provider_guard_executor_pid = pid
+            _capture_provider_guard_executor_size = size
+        executor = _capture_provider_guard_executor
+    # Production sizing is immutable.  This is outside the mutex so a test
+    # reconfiguration cannot make unrelated callers wait on thread joins while
+    # trying to obtain the new executor.
+    if previous is not None:
+        previous.shutdown(wait=True)
+    return executor
+
+
+def _shutdown_capture_provider_guard_executor(*, wait: bool = True) -> None:
+    """Release dedicated guard threads after worker drain and between tests."""
+    global _capture_provider_guard_executor
+    global _capture_provider_guard_executor_pid
+    global _capture_provider_guard_executor_size
+
+    previous: ThreadPoolExecutor | None = None
+    with _capture_provider_guard_executor_lock:
+        if _capture_provider_guard_executor_pid == os.getpid():
+            previous = _capture_provider_guard_executor
+        _capture_provider_guard_executor = None
+        _capture_provider_guard_executor_pid = 0
+        _capture_provider_guard_executor_size = 0
+    if previous is not None:
+        previous.shutdown(wait=wait)
+
+
+class _CaptureProviderBridgeFuture(Future):
+    """Future whose cancellation drains the owner-loop provider Task.
+
+    ``asyncio.run_coroutine_threadsafe`` marks its concurrent Future cancelled
+    before the underlying Task has observed cancellation.  That is unsafe for
+    the disclosure fence: a database keepalive failure could then release every
+    privacy lock while the provider Task was still emitting bytes or writing a
+    trajectory.  This bridge requests Task cancellation but reaches a terminal
+    Future state only from the Task's own done callback, so ``result()`` is a
+    real synchronous drain point.
+    """
+
+    def __init__(self, owner_loop: asyncio.AbstractEventLoop) -> None:
+        super().__init__()
+        self._owner_loop = owner_loop
+        self._task_lock = threading.Lock()
+        self._task: asyncio.Task | None = None
+        self._cancel_requested = False
+
+    def bind_task(self, task: asyncio.Task) -> None:
+        with self._task_lock:
+            self._task = task
+            cancel_requested = self._cancel_requested
+        task.add_done_callback(self._task_done)
+        if cancel_requested:
+            task.cancel()
+
+    def cancel(self) -> bool:
+        with self._task_lock:
+            if self.done():
+                return False
+            self._cancel_requested = True
+            task = self._task
+        if task is not None:
+            self._owner_loop.call_soon_threadsafe(task.cancel)
+        return True
+
+    def _task_done(self, task: asyncio.Task) -> None:
+        if self.done():
+            return
+        try:
+            result = task.result()
+        except asyncio.CancelledError:
+            self.set_exception(FutureCancelledError())
+        except BaseException as exc:  # noqa: BLE001 — preserve provider failure
+            self.set_exception(exc)
+        else:
+            self.set_result(result)
+
+
 # 单 job 内 executor 并行读上限。
 MAX_READ_ACTION_PARALLELISM = _positive_int_env("FEEDLING_V2_MAX_READ_PARALLELISM", "4")
 # A provider/relay can return an arbitrarily large native tool-call array. The
@@ -255,6 +399,11 @@ def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
 _TAIL_BUDGET = int(os.environ.get("FEEDLING_V2_TAIL_BUDGET_MSGS", "20"))
 _TAIL_KEEP = int(os.environ.get("FEEDLING_V2_TAIL_KEEP_MSGS", "10"))
 _TAIL_HARD_CAP = int(os.environ.get("FEEDLING_V2_TAIL_HARD_CAP", "60"))
+_CAPTURE_BATCH_LIMIT = 60
+_CAPTURE_PROMPT_RAW_ROLES = frozenset({"user", "openclaw"})
+_CAPTURE_PROMPT_SOURCES = frozenset(
+    {"chat", "model_api", "live_activity", "agent_initiated_proactive"}
+)
 _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200")
 # A message-count cap alone is not a prompt-size bound: 200 maximum-size chat
 # rows can still produce a multi-megabyte compaction request.  Both inline
@@ -557,6 +706,10 @@ class RuntimeModeChanged(RuntimeError):
     """The user rolled back while this V2 job was queued or running."""
 
 
+class CaptureHalted(RuntimeError):
+    """The fleet halt closed while a background Capture job was in flight."""
+
+
 class TurnError(RuntimeError):
     """A turn cannot safely produce or cover its required final reply."""
 
@@ -683,7 +836,26 @@ class TurnDeps:
     apply_memory_actions: Callable[[str, list[dict]], dict] | None = None
     # (user_id, inner) -> envelope：把一张卡的明文草稿封成客户端加密信封（E2E）。传给
     # extraction.cards_to_actions/consolidations_to_actions 的 build_envelope。None 时同上跳过持久化。
-    build_memory_envelope: Callable[[str, dict], dict] | None = None
+    build_memory_envelope: Callable[..., dict] | None = None
+    # Runtime V2 Capture keeps its durable frontier in the existing content-free
+    # capture-state metadata, but worker.py may not import proactive modules.
+    # The assembly tier therefore injects the state read and terminal-status
+    # writer. ``record_extraction_status`` receives
+    # ``(user_id, lane, status, detail)``; capture detail carries the exact
+    # oldest-contiguous batch window processed by this job.
+    read_capture_state: Callable[[str], dict] | None = None
+    record_extraction_status: Callable[[str, str, str, dict], None] | None = None
+    # Capture-only crash-safe protocol.  Prepare journals encrypted actions;
+    # commit atomically applies them, advances the exact seq frontier, and
+    # terminalizes the owned job; fail atomically terminalizes + arms backoff.
+    prepare_capture_batch: Callable[..., dict | None] | None = None
+    get_prepared_capture_batch: Callable[..., dict | None] | None = None
+    authorize_capture_provider_call: Callable[..., dict] | None = None
+    commit_capture_batch: Callable[..., dict] | None = None
+    fail_capture_job: Callable[..., bool] | None = None
+    cancel_capture_job: Callable[..., bool] | None = None
+    capture_enabled: Callable[[str], bool] | None = None
+    dream_enabled: Callable[[str], bool] | None = None
     # user_id -> {"applied": int, "discarded": int}（Task 6 / spec A6）：run the
     # generation-fenced effect-outbox applier (`effect_outbox.apply_pending_effects`)
     # with this turn's real dispatch sinks at end-of-turn. worker.py itself never
@@ -4698,8 +4870,147 @@ async def _run_extraction(
     空结果（0 张卡 / 0 条合并）是**成功**：mark_completed，不写任何东西。与 wake lane 的
     「弱唤醒睡回去」同口径 —— 模型选择什么都不做，不是失败。
     """
+    extraction_status_recorded = False
+    capture_window: dict[str, Any] = {}
+
+    async def _ensure_capture_not_halted(stage: str) -> None:
+        """Bypass the polling cache at disclosure and durable-write boundaries."""
+        if lane != "capture":
+            return
+        halted = await asyncio.to_thread(
+            kill_switch.turns_halted_uncached,
+            default_on_error=True,
+        )
+        if halted:
+            raise CaptureHalted(stage)
+
+    def _float_or_zero(value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def _record_extraction_status(status: str, *, item_count: int = 0) -> None:
+        nonlocal extraction_status_recorded
+        # Production Capture terminal state is committed by the durable batch
+        # protocol below.  This callback remains only for the disabled Dream
+        # compatibility lane.
+        if lane == "capture" or deps.record_extraction_status is None:
+            return
+        await asyncio.to_thread(
+            deps.record_extraction_status,
+            user_id,
+            lane,
+            status,
+            {
+                "window": dict(capture_window),
+                "item_count": max(0, int(item_count)),
+            },
+        )
+        extraction_status_recorded = True
+
+    async def _complete_extraction(*, item_count: int) -> None:
+        landed = await asyncio.to_thread(
+            jobs_store.mark_completed, job_id, claimed_by=claimed_by
+        )
+        if claimed_by and not landed:
+            raise LostJobLease("extraction lease lost before terminalization")
+        # Terminalize first. If this auxiliary state merge fails or the process
+        # dies here, the old frontier remains conservative; V2 submission ignores
+        # the stale pending blob and agent_jobs single-flight permits a safe retry.
+        # Advancing before terminalization could instead skip the processed batch
+        # after a lost lease, which is not recoverable.
+        try:
+            await _record_extraction_status(
+                "completed", item_count=item_count
+            )
+        except Exception as status_exc:  # noqa: BLE001 — conservative retry repairs it
+            log.warning(
+                "[v2.worker] completed extraction status write deferred "
+                "user=%s lane=%s code=%s",
+                user_id,
+                lane,
+                type(status_exc).__name__.lower(),
+            )
+
     try:
         ctx = {}
+        capture_state: dict[str, Any] = {}
+        capture_after_seq = 0
+        capture_snapshot_through_seq: int | None = None
+        if lane == "capture" and deps.read_capture_state is not None:
+            capture_state = (
+                await asyncio.to_thread(deps.read_capture_state, user_id) or {}
+            )
+            after_id = str(
+                capture_state.get("last_captured_until_message_id") or ""
+            )
+            raw_seq = capture_state.get("last_captured_until_seq")
+            if capture_state.get("capture_seq_initialized") or raw_seq is not None and (
+                "capture_seq_initialized" not in capture_state
+                and "last_captured_until_seq" in capture_state
+            ):
+                try:
+                    capture_after_seq = max(0, int(raw_seq))
+                except (TypeError, ValueError):
+                    capture_after_seq = 0
+            elif after_id:
+                # One-time legacy upgrade.  A missing/pruned boundary is not
+                # evidence that any later timestamp was covered: restart from
+                # zero rather than risk skipping out-of-order rows.
+                exact_seq = await asyncio.to_thread(
+                    db.chat_seq_for_msg_id, user_id, after_id
+                )
+                capture_after_seq = int(exact_seq or 0)
+            capture_snapshot_through_seq = await asyncio.to_thread(
+                db.chat_max_seq, user_id
+            )
+            capture_window = {
+                "after_message_id": after_id,
+                "after_seq": capture_after_seq,
+                "until_message_id": "",
+                "until_ts": 0.0,
+                "through_seq": capture_after_seq,
+                "snapshot_through_seq": capture_snapshot_through_seq,
+                "message_count": 0,
+            }
+            if (
+                deps.get_prepared_capture_batch is None
+                or deps.authorize_capture_provider_call is None
+                or deps.commit_capture_batch is None
+                or deps.fail_capture_job is None
+                or not claimed_by
+            ):
+                raise RuntimeError("capture_commit_protocol_unavailable")
+            prepared_retry = await asyncio.to_thread(
+                deps.get_prepared_capture_batch,
+                job_id=job_id,
+                user_id=user_id,
+                claimed_by=claimed_by,
+                after_seq=capture_after_seq,
+            )
+            if prepared_retry is not None:
+                await _ensure_capture_not_halted("prepared_retry_commit")
+                committed_retry = await asyncio.to_thread(
+                    deps.commit_capture_batch,
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                    batch_id=prepared_retry["id"],
+                )
+                if isinstance(committed_retry, dict) and committed_retry.get(
+                    "committed"
+                ):
+                    if tm is not None:
+                        tm.flush(failed=False, status="ok")
+                    return "completed"
+                if isinstance(committed_retry, dict) and committed_retry.get(
+                    "rejected"
+                ):
+                    if tm is not None:
+                        tm.flush(failed=True, status=str(committed_retry.get("reason")))
+                    return "failed"
+                raise LostJobLease("capture ownership lost during prepared retry")
         # 两次读都是 enclave-bound（read_memory_context 内部 buckets/threads/index 各走一次
         # post_enclave 往返；read_tail 逐条解密），所以**必须同在 enclave_sem 闸内**——enclave
         # 是单线程瓶颈，正是整个子项目要保护的东西（spec §4）。
@@ -4713,7 +5024,17 @@ async def _run_extraction(
                     log.warning(
                         "[v2.worker] memory context unavailable for %s: %s", user_id, e
                     )
-            if deps.read_tail_after_seq is not None:
+            if lane == "capture" and deps.read_capture_state is not None:
+                if deps.read_compaction_tail_after_seq is None:
+                    raise RuntimeError("capture_oldest_reader_unavailable")
+                tail = await asyncio.to_thread(
+                    deps.read_compaction_tail_after_seq,
+                    user_id,
+                    capture_after_seq,
+                    _CAPTURE_BATCH_LIMIT,
+                    through_seq=capture_snapshot_through_seq,
+                )
+            elif deps.read_tail_after_seq is not None:
                 through_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
                 tail = await asyncio.to_thread(
                     deps.read_tail_after_seq,
@@ -4728,20 +5049,67 @@ async def _run_extraction(
                 )
             else:
                 tail = []
+        if lane == "capture" and deps.read_capture_state is not None and tail:
+            last = tail[-1]
+            last_id = str(last.get("id") or "")
+            last_seq = last.get("seq")
+            if last_seq is None and last_id:
+                last_seq = await asyncio.to_thread(
+                    db.chat_seq_for_msg_id, user_id, last_id
+                )
+            if last_seq is None or not last_id:
+                raise RuntimeError("capture_batch_frontier_unavailable")
+            capture_window.update(
+                {
+                    "until_message_id": last_id,
+                    "until_ts": _float_or_zero(last.get("ts")),
+                    "through_seq": int(last_seq),
+                    "message_count": len(tail),
+                }
+            )
+        if lane == "capture" and not tail:
+            # A stale scheduler can enqueue just after an earlier Capture
+            # advances the frontier and releases single-flight. The successor
+            # owns a valid job but has no raw seq left; settle it as no-work so
+            # it cannot arm failure backoff against the next real message.
+            landed = await asyncio.to_thread(
+                jobs_store.mark_completed,
+                job_id,
+                claimed_by=claimed_by,
+            )
+            if claimed_by and not landed:
+                raise LostJobLease("capture lease lost before no-work completion")
+            if tm is not None:
+                tm.flush(failed=False, status="ok")
+            return "completed"
+        prompt_tail = tail
+        if lane == "capture":
+            # Every raw seq remains in ``tail`` so the durable frontier stays
+            # contiguous, but only the same role+source set that can trigger
+            # Capture is disclosed to the model. Synthetic probes, imports,
+            # and future internal rows therefore advance as empty coverage
+            # instead of becoming duplicate/false Garden memories.
+            prompt_tail = [
+                message
+                for message in tail
+                if (
+                    bool(message.get("capture_eligible"))
+                    if "capture_eligible" in message
+                    else str(
+                        message.get("raw_role") or message.get("role") or ""
+                    )
+                    in _CAPTURE_PROMPT_RAW_ROLES
+                    and str(message.get("source") or "")
+                    in _CAPTURE_PROMPT_SOURCES
+                )
+            ]
         window = "\n".join(
-            f"- {m.get('role')}: {context.text_of(m.get('content'))}" for m in tail
+            f"- {m.get('role')}: {context.text_of(m.get('content'))}"
+            for m in prompt_tail
         ).strip()
-        source_ids = [str(m.get("id")) for m in tail if m.get("id")]
+        source_ids = [str(m.get("id")) for m in prompt_tail if m.get("id")]
 
         if lane == "capture":
-            prompt = build_capture_prompt(
-                ai_name=ctx.get("ai_name", ""),
-                user_name=ctx.get("user_name", ""),
-                buckets=ctx.get("buckets", ""),
-                threads=ctx.get("threads", ""),
-                identity=ctx.get("identity", ""),
-                window=window,
-            )
             parse, to_actions = parse_capture_cards, v2_extraction.cards_to_actions
         else:
             prompt = build_dream_prompt(
@@ -4757,35 +5125,201 @@ async def _run_extraction(
                 v2_extraction.consolidations_to_actions,
             )
 
-        _report_turn_progress("extraction_provider_start")
-        items, reason = await v2_extraction.extract(
-            provider_config=provider_config,
-            prompt=prompt,
-            parse=parse,
-            progress_cb=lambda stage, attempt: _report_turn_progress(
-                f"extraction_provider_{stage}_{attempt}"
-            ),
-            usage_out=tm.add_call if tm is not None else None,
-            trajectory_out=(
-                trajectory_recorder.record if trajectory_recorder is not None else None
-            ),
-        )
-        _report_turn_progress("extraction_provider_complete")
+        if lane == "capture" and not prompt_tail:
+            # The raw batch may consist entirely of synthetic/internal/import
+            # rows. Advance its exact seq frontier through an empty durable
+            # batch without exposing memory context to a provider that has no
+            # eligible conversation content to inspect.
+            items, reason = [], None
+        else:
+            if lane == "capture":
+                prompt = build_capture_prompt(
+                    ai_name=ctx.get("ai_name", ""),
+                    user_name=ctx.get("user_name", ""),
+                    buckets=ctx.get("buckets", ""),
+                    threads=ctx.get("threads", ""),
+                    identity=ctx.get("identity", ""),
+                    window=window,
+                )
+        if lane == "capture" and prompt_tail:
+            await _ensure_capture_not_halted("provider_authorization")
+            if deps.authorize_capture_provider_call is None or not claimed_by:
+                raise RuntimeError("capture_provider_authorization_unavailable")
+
+            # The database fence lives on one dedicated worker thread for the
+            # complete provider disclosure.  The provider coroutine itself stays
+            # on this turn's original event loop, so its async transport and
+            # loop-bound helpers remain valid while the psycopg connection is
+            # never touched outside the fence thread.
+            owner_loop = asyncio.get_running_loop()
+
+            async def _invoke_capture_provider() -> tuple[Any, str | None]:
+                _report_turn_progress("extraction_provider_start")
+                result = await v2_extraction.extract(
+                    provider_config=provider_config,
+                    prompt=prompt,
+                    parse=parse,
+                    progress_cb=lambda stage, attempt: _report_turn_progress(
+                        f"extraction_provider_{stage}_{attempt}"
+                    ),
+                    usage_out=tm.add_call if tm is not None else None,
+                    trajectory_out=(
+                        trajectory_recorder.record
+                        if trajectory_recorder is not None
+                        else None
+                    ),
+                )
+                _report_turn_progress("extraction_provider_complete")
+                return result
+
+            provider_cancelled = threading.Event()
+            provider_future_lock = threading.Lock()
+            provider_future: dict[str, Any] = {}
+
+            def _provider_call_under_fence() -> Any:
+                with provider_future_lock:
+                    if provider_cancelled.is_set():
+                        raise RuntimeError("capture_provider_call_cancelled")
+                    # jobs_store enters the outer-chat-fence context before this
+                    # callback. Explicitly install that context on the owner-loop
+                    # callback so both its outer-chat marker and the turn-progress
+                    # observer reach the provider Task.
+                    future = _CaptureProviderBridgeFuture(owner_loop)
+
+                    def _start_provider_task() -> None:
+                        try:
+                            task = owner_loop.create_task(_invoke_capture_provider())
+                        except BaseException as exc:  # noqa: BLE001
+                            future.set_exception(exc)
+                            return
+                        future.bind_task(task)
+
+                    owner_loop.call_soon_threadsafe(
+                        _start_provider_task,
+                        context=contextvars.copy_context(),
+                    )
+                    provider_future["future"] = future
+
+                def _clear_provider_future(_completed) -> None:
+                    with provider_future_lock:
+                        if provider_future.get("future") is future:
+                            provider_future.pop("future", None)
+
+                future.add_done_callback(_clear_provider_future)
+                # jobs_store polls this Future on the connection-owning thread,
+                # issuing a tiny SQL keepalive between waits so database idle
+                # transaction policy cannot drop the disclosure locks.
+                return future
+
+            guard_context = contextvars.copy_context()
+
+            def _authorize_provider_under_fence() -> dict:
+                return deps.authorize_capture_provider_call(
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                    provider_call=_provider_call_under_fence,
+                )
+
+            guard_task = owner_loop.run_in_executor(
+                _capture_provider_guard_thread_pool(),
+                guard_context.run,
+                _authorize_provider_under_fence,
+            )
+            try:
+                authorization = await asyncio.shield(guard_task)
+            except asyncio.CancelledError:
+                # asyncio cannot kill a running thread. If disclosure has not
+                # started, prevent it. Once it has started, do not cancel the
+                # bridged coroutine: trajectory appends may be in synchronous
+                # to_thread work under the inherited outer-fence context. Wait
+                # for the bounded provider call and all nested writes to finish
+                # before allowing the transaction to release its real lock.
+                with provider_future_lock:
+                    in_flight = provider_future.get("future")
+                    if in_flight is None:
+                        provider_cancelled.set()
+                try:
+                    await asyncio.shield(guard_task)
+                except BaseException:  # noqa: BLE001 — preserve outer cancellation
+                    pass
+                raise
+
+            if not isinstance(authorization, dict) or authorization.get(
+                "reason"
+            ) == "ownership_lost":
+                raise LostJobLease("capture ownership lost before provider call")
+            if not authorization.get("authorized"):
+                if tm is not None:
+                    tm.flush(
+                        failed=True,
+                        status=str(
+                            authorization.get("reason")
+                            or "capture_not_authorized"
+                        ),
+                    )
+                return "failed"
+            if authorization.get("provider_call_completed"):
+                provider_result = authorization.get("provider_result")
+                if not (
+                    isinstance(provider_result, tuple)
+                    and len(provider_result) == 2
+                ):
+                    raise RuntimeError("capture_provider_result_invalid")
+                items, reason = provider_result
+            else:
+                # Compatibility for isolated TurnDeps fakes used by legacy unit
+                # tests. Production's jobs_store callback protocol always sets
+                # provider_call_completed; accepting a bare authorization from
+                # that production function would reopen the disclosure race.
+                if (
+                    deps.authorize_capture_provider_call
+                    is jobs_store.authorize_capture_provider_call
+                ):
+                    raise RuntimeError("capture_provider_fence_incomplete")
+                await _ensure_capture_not_halted("legacy_provider_call")
+                items, reason = await _invoke_capture_provider()
+        elif lane != "capture":
+            _report_turn_progress("extraction_provider_start")
+            items, reason = await v2_extraction.extract(
+                provider_config=provider_config,
+                prompt=prompt,
+                parse=parse,
+                progress_cb=lambda stage, attempt: _report_turn_progress(
+                    f"extraction_provider_{stage}_{attempt}"
+                ),
+                usage_out=tm.add_call if tm is not None else None,
+                trajectory_out=(
+                    trajectory_recorder.record
+                    if trajectory_recorder is not None
+                    else None
+                ),
+            )
+            _report_turn_progress("extraction_provider_complete")
         if reason:
             raise RuntimeError(reason)
-        if not items:
-            await asyncio.to_thread(
-                jobs_store.mark_completed, job_id, claimed_by=claimed_by
-            )
+        if not items and lane != "capture":
+            await _complete_extraction(item_count=0)
             if tm is not None:
                 tm.flush(failed=False, status="ok")
             return "completed"
 
-        if deps.build_memory_envelope is None or deps.apply_memory_actions is None:
+        if deps.build_memory_envelope is None:
+            raise RuntimeError("extraction_memory_writer_unavailable")
+        if lane == "capture" and (
+            deps.prepare_capture_batch is None
+            or deps.get_prepared_capture_batch is None
+            or deps.authorize_capture_provider_call is None
+            or deps.commit_capture_batch is None
+            or deps.fail_capture_job is None
+            or not claimed_by
+        ):
+            raise RuntimeError("capture_commit_protocol_unavailable")
+        if lane != "capture" and deps.apply_memory_actions is None:
             raise RuntimeError("extraction_memory_writer_unavailable")
 
         occurred_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        for message in reversed(tail):
+        for message in reversed(prompt_tail):
             raw_ts = message.get("ts") if isinstance(message, dict) else None
             try:
                 ts = float(raw_ts or 0)
@@ -4799,12 +5333,32 @@ async def _run_extraction(
                 )
                 break
 
-        actions, _added, _superseded = to_actions(
-            items,
-            occurred_at=occurred_at,
-            source_ids=source_ids,
-            build_envelope=lambda inner: deps.build_memory_envelope(user_id, inner),
-        )
+        envelope_ordinal = 0
+
+        def _build_extraction_envelope(inner: dict) -> dict:
+            nonlocal envelope_ordinal
+            ordinal = envelope_ordinal
+            envelope_ordinal += 1
+            if lane != "capture":
+                return deps.build_memory_envelope(user_id, inner)
+            material = (
+                f"{user_id}:{capture_window.get('after_seq', 0)}:"
+                f"{capture_window.get('through_seq', 0)}:"
+                f"{capture_window.get('until_message_id', '')}:{ordinal}"
+            )
+            item_id = "mom_cap_" + hashlib.sha256(
+                material.encode("utf-8")
+            ).hexdigest()[:40]
+            return deps.build_memory_envelope(user_id, inner, item_id)
+
+        actions: list[dict] = []
+        if items:
+            actions, _added, _superseded = to_actions(
+                items,
+                occurred_at=occurred_at,
+                source_ids=source_ids,
+                build_envelope=_build_extraction_envelope,
+            )
         if claimed_by and not await asyncio.to_thread(
             jobs_store.renew_job_lease,
             job_id,
@@ -4816,6 +5370,40 @@ async def _run_extraction(
             deps.runtime_mode_enabled, user_id
         ):
             raise RuntimeModeChanged("user rolled back before memory write")
+        if lane == "capture":
+            await _ensure_capture_not_halted("batch_prepare")
+            prepared = await asyncio.to_thread(
+                deps.prepare_capture_batch,
+                job_id=job_id,
+                user_id=user_id,
+                claimed_by=claimed_by,
+                window=dict(capture_window),
+                actions=actions,
+            )
+            if isinstance(prepared, dict) and prepared.get("rejected"):
+                if tm is not None:
+                    tm.flush(failed=True, status=str(prepared.get("reason")))
+                return "failed"
+            if not isinstance(prepared, dict) or prepared.get("id") is None:
+                raise LostJobLease("capture ownership lost before prepare")
+            await _ensure_capture_not_halted("batch_commit")
+            committed = await asyncio.to_thread(
+                deps.commit_capture_batch,
+                job_id=job_id,
+                user_id=user_id,
+                claimed_by=claimed_by,
+                batch_id=prepared["id"],
+            )
+            if isinstance(committed, dict) and committed.get("rejected"):
+                if tm is not None:
+                    tm.flush(failed=True, status=str(committed.get("reason")))
+                return "failed"
+            if not isinstance(committed, dict) or not committed.get("committed"):
+                raise LostJobLease("capture ownership lost before commit")
+            if tm is not None:
+                tm.flush(failed=False, status="ok")
+            return "completed"
+
         write_result = await asyncio.to_thread(
             deps.apply_memory_actions, user_id, actions
         )
@@ -4829,14 +5417,61 @@ async def _run_extraction(
                 else "memory_action_result_invalid"
             )
             raise RuntimeError(f"extraction_memory_write_rejected:{error}")
-        await asyncio.to_thread(
-            jobs_store.mark_completed, job_id, claimed_by=claimed_by
-        )
+        await _complete_extraction(item_count=len(items))
         if tm is not None:
             tm.flush(failed=False, status="ok")
         return "completed"
+    except LostJobLease:
+        # A stale owner must not mutate Capture state/backoff or replace the
+        # winner/reaper's whole-turn metric. Let process_job's owner-neutral
+        # fence handler return without terminal writes or metric flush.
+        raise
+    except CaptureHalted as halted:
+        # Emergency halt is an operator fence, not a content/provider failure:
+        # purge any prepared journal and settle without arming Capture backoff.
+        await _record_trajectory(
+            trajectory_recorder,
+            "turn_exception",
+            {
+                "stage": f"capture_halt:{halted}",
+                "error_class": type(halted).__name__,
+                "error_code": "turns_halted",
+            },
+            best_effort=True,
+        )
+        landed = False
+        if deps.cancel_capture_job is not None and claimed_by:
+            landed = bool(
+                await asyncio.to_thread(
+                    deps.cancel_capture_job,
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                    error="turns_halted",
+                )
+            )
+        if not landed:
+            await asyncio.to_thread(
+                jobs_store.mark_failed,
+                job_id,
+                "turns_halted",
+                claimed_by=claimed_by,
+            )
+        if tm is not None:
+            tm.flush(failed=True, status="turns_halted")
+        return "failed"
     except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
         code = _safe_failure_code("extraction_failed", e)
+        if lane != "capture" and not extraction_status_recorded:
+            try:
+                await _record_extraction_status("failed")
+            except Exception as status_exc:  # noqa: BLE001 — primary failure still wins
+                log.warning(
+                    "[v2.worker] extraction status write failed user=%s lane=%s code=%s",
+                    user_id,
+                    lane,
+                    type(status_exc).__name__.lower(),
+                )
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
@@ -4850,12 +5485,57 @@ async def _run_extraction(
         log.warning(
             "[v2.worker] extraction job %s lane=%s failed code=%s", job_id, lane, code
         )
-        await asyncio.to_thread(
-            jobs_store.mark_failed, job_id, code, claimed_by=claimed_by
-        )
+        if lane == "capture" and deps.fail_capture_job is not None and claimed_by:
+            await asyncio.to_thread(
+                deps.fail_capture_job,
+                job_id=job_id,
+                user_id=user_id,
+                claimed_by=claimed_by,
+                error=code,
+            )
+        elif lane != "capture":
+            await asyncio.to_thread(
+                jobs_store.mark_failed, job_id, code, claimed_by=claimed_by
+            )
         if tm is not None:
             tm.flush(failed=True, status=code)
         return "failed"
+
+
+async def _terminalize_extraction_gate(
+    *,
+    job_id,
+    user_id: str,
+    lane: str,
+    claimed_by: str,
+    deps: TurnDeps,
+    tm: "TurnMetrics",
+    code: str,
+    cancel: bool,
+) -> str:
+    """Settle a background extraction gate without any chat-visible error."""
+    landed = False
+    if lane == "capture":
+        callback = deps.cancel_capture_job if cancel else deps.fail_capture_job
+        if callback is not None and claimed_by:
+            landed = bool(
+                await asyncio.to_thread(
+                    callback,
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                    error=code,
+                )
+            )
+    if not landed:
+        await asyncio.to_thread(
+            jobs_store.mark_failed,
+            job_id,
+            code,
+            claimed_by=claimed_by,
+        )
+    tm.flush(failed=True, status=code)
+    return "failed"
 
 
 _LEASE_KEEPALIVE_INTERVAL_SEC = max(
@@ -5125,6 +5805,36 @@ async def process_job(
             # parse → memory actions。同 _run_compaction/_run_wake 一样有自己的 try/except，
             # 绝不落进下面 chat-turn 的 except（那条会 emit 用户可见 error status +
             # record_terminal_error）——后台 job 永不写气泡、永不弹 error chip。
+            try:
+                enabled = (
+                    deps.capture_enabled is not None
+                    and await asyncio.to_thread(deps.capture_enabled, user_id)
+                    if lane == "capture"
+                    else deps.dream_enabled is not None
+                    and await asyncio.to_thread(deps.dream_enabled, user_id)
+                )
+            except Exception as gate_exc:  # noqa: BLE001 — background-only failure
+                return await _terminalize_extraction_gate(
+                    job_id=job_id,
+                    user_id=user_id,
+                    lane=lane,
+                    claimed_by=claimed_by,
+                    deps=deps,
+                    tm=tm,
+                    code=_safe_failure_code("extraction_gate_failed", gate_exc),
+                    cancel=False,
+                )
+            if not enabled:
+                return await _terminalize_extraction_gate(
+                    job_id=job_id,
+                    user_id=user_id,
+                    lane=lane,
+                    claimed_by=claimed_by,
+                    deps=deps,
+                    tm=tm,
+                    code=f"{lane}_disabled",
+                    cancel=(lane == "capture"),
+                )
             return await _run_extraction(
                 job_id,
                 user_id,
@@ -6436,7 +7146,7 @@ async def process_job(
         owned = await asyncio.to_thread(
             jobs_store.mark_failed, job_id, message, claimed_by=claimed_by
         )
-        if owned:
+        if owned and lane == "chat":
             await asyncio.to_thread(
                 _surface_terminal_error, deps, user_id, job_id, message
             )
@@ -6466,6 +7176,183 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
     tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
     if lane == _TRAJECTORY_REVIEW_LANE:
         return await _run_trajectory_review_turn(job, deps, tm)
+    if lane in _EXTRACTION_LANES:
+        try:
+            if await asyncio.to_thread(kill_switch.turns_halted):
+                return await _terminalize_extraction_gate(
+                    job_id=job_id,
+                    user_id=user_id,
+                    lane=lane,
+                    claimed_by=claimed_by,
+                    deps=deps,
+                    tm=tm,
+                    code="turns_halted",
+                    # A fleet halt is not a provider/content failure and must
+                    # not arm Capture's exponential backoff.
+                    cancel=(lane == "capture"),
+                )
+            enabled = (
+                deps.capture_enabled is not None
+                and await asyncio.to_thread(deps.capture_enabled, user_id)
+                if lane == "capture"
+                else deps.dream_enabled is not None
+                and await asyncio.to_thread(deps.dream_enabled, user_id)
+            )
+        except Exception as gate_exc:  # noqa: BLE001 — background-only failure
+            return await _terminalize_extraction_gate(
+                job_id=job_id,
+                user_id=user_id,
+                lane=lane,
+                claimed_by=claimed_by,
+                deps=deps,
+                tm=tm,
+                code=_safe_failure_code("extraction_gate_failed", gate_exc),
+                cancel=False,
+            )
+        if not enabled:
+            return await _terminalize_extraction_gate(
+                job_id=job_id,
+                user_id=user_id,
+                lane=lane,
+                claimed_by=claimed_by,
+                deps=deps,
+                tm=tm,
+                code=f"{lane}_disabled",
+                cancel=(lane == "capture"),
+            )
+        if lane == "capture":
+            if (
+                deps.read_capture_state is None
+                or deps.get_prepared_capture_batch is None
+                or deps.commit_capture_batch is None
+                or not claimed_by
+            ):
+                return await _terminalize_extraction_gate(
+                    job_id=job_id,
+                    user_id=user_id,
+                    lane=lane,
+                    claimed_by=claimed_by,
+                    deps=deps,
+                    tm=tm,
+                    code="capture_commit_protocol_unavailable",
+                    cancel=False,
+                )
+            recovery_recorder = None
+            try:
+                state = await asyncio.to_thread(deps.read_capture_state, user_id) or {}
+                raw_seq = state.get("last_captured_until_seq")
+                if state.get("capture_seq_initialized") or (
+                    raw_seq is not None
+                    and "capture_seq_initialized" not in state
+                    and "last_captured_until_seq" in state
+                ):
+                    after_seq = max(0, int(raw_seq or 0))
+                else:
+                    legacy_id = str(
+                        state.get("last_captured_until_message_id") or ""
+                    )
+                    after_seq = int(
+                        await asyncio.to_thread(
+                            db.chat_seq_for_msg_id, user_id, legacy_id
+                        )
+                        or 0
+                    )
+                prepared = await asyncio.to_thread(
+                    deps.get_prepared_capture_batch,
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                    after_seq=after_seq,
+                )
+                if prepared is not None:
+                    if await asyncio.to_thread(
+                        kill_switch.turns_halted_uncached,
+                        default_on_error=True,
+                    ):
+                        return await _terminalize_extraction_gate(
+                            job_id=job_id,
+                            user_id=user_id,
+                            lane=lane,
+                            claimed_by=claimed_by,
+                            deps=deps,
+                            tm=tm,
+                            code="turns_halted",
+                            cancel=True,
+                        )
+                    recovery_recorder = _make_trajectory_recorder(job, deps)
+                    await _record_trajectory(
+                        recovery_recorder,
+                        "turn_started",
+                        {
+                            "job_id": job_id,
+                            "lane": lane,
+                            "attempt_count": job.get("attempt_count", 0),
+                            "prepared_batch_recovery": True,
+                        },
+                    )
+                    committed = await asyncio.to_thread(
+                        deps.commit_capture_batch,
+                        job_id=job_id,
+                        user_id=user_id,
+                        claimed_by=claimed_by,
+                        batch_id=prepared["id"],
+                    )
+                    if isinstance(committed, dict) and committed.get("committed"):
+                        tm.flush(failed=False, status="ok")
+                        await _record_trajectory(
+                            recovery_recorder,
+                            "turn_terminal",
+                            {"outcome": "completed", "prepared_batch_recovery": True},
+                            best_effort=True,
+                        )
+                        return "completed"
+                    if isinstance(committed, dict) and committed.get("rejected"):
+                        tm.flush(
+                            failed=True,
+                            status=str(committed.get("reason") or "capture_rejected"),
+                        )
+                        await _record_trajectory(
+                            recovery_recorder,
+                            "turn_terminal",
+                            {"outcome": "failed", "prepared_batch_recovery": True},
+                            best_effort=True,
+                        )
+                        return "failed"
+                    # Ownership/generation loss is terminalized by the winner;
+                    # a stale worker must not overwrite its metric.
+                    await _record_trajectory(
+                        recovery_recorder,
+                        "turn_terminal",
+                        {"outcome": "failed", "prepared_batch_recovery": True},
+                        best_effort=True,
+                    )
+                    return "failed"
+            except Exception as recovery_exc:  # noqa: BLE001 — background-only
+                if recovery_recorder is not None:
+                    await _record_trajectory(
+                        recovery_recorder,
+                        "turn_exception",
+                        {
+                            "stage": "capture_prepared_recovery",
+                            "error_class": type(recovery_exc).__name__,
+                            "error_code": _safe_failure_code(
+                                "capture_recovery_failed", recovery_exc
+                            ),
+                        },
+                        best_effort=True,
+                    )
+                return await _terminalize_extraction_gate(
+                    job_id=job_id,
+                    user_id=user_id,
+                    lane=lane,
+                    claimed_by=claimed_by,
+                    deps=deps,
+                    tm=tm,
+                    code=_safe_failure_code(
+                        "capture_recovery_failed", recovery_exc
+                    ),
+                    cancel=False,
+                )
     recorder = _make_trajectory_recorder(job, deps)
     try:
         await _record_trajectory(
@@ -6812,3 +7699,5 @@ async def run_worker_loop(
                 slot.cancel()
         await asyncio.gather(*slots, return_exceptions=True)
         raise
+    finally:
+        _shutdown_capture_provider_guard_executor(wait=True)

@@ -131,11 +131,58 @@ platform capability dispatcher, MCP loader, Memory writer, schedule writer, or
 workspace backend. Its encrypted output is not added to Chat, Memory Garden,
 working memory, or later prompts automatically.
 
-There is deliberately no time-based trajectory/review retention job yet;
-encrypted rows survive until their owning job/account is explicitly deleted.
-`DELETE /v1/chat/history` clears the transcript and every live derived prompt
-surface, but deliberately retains these encrypted flight-recorder rows as
-telemetry; they are never reintroduced into conversation context. Account reset
-or explicit job deletion is the complete-erasure boundary. Production review
-should remain opt-in until the product has chosen a BYOK cost budget and
-retention/GC policy. Disabling review never disables capture.
+## Retention, Chat Clear, and inspected access
+
+Encrypted event and review content has a default-on seven-day terminal-job TTL.
+Raw/local deployments may change that window with
+`FEEDLING_V2_TRAJECTORY_RETENTION_DAYS` (1–3,650 days), while
+`FEEDLING_V2_TRAJECTORY_GC_INTERVAL_SEC` and
+`FEEDLING_V2_TRAJECTORY_GC_BATCH` bound cleanup work. Managed Phala manifests
+pin all three as measured-compose literals (7 days, 3,600 seconds, batch 100)
+on both API and runner; changing policy requires changing both manifests in one
+reviewed release. The independent GC loop runs in both processes and drains
+bounded batches until the current backlog is exhausted. `SKIP LOCKED` and a
+transactional `trajectory_purged_at` tombstone make concurrent passes
+idempotent and prevent a delayed recorder from recreating deleted content.
+Active jobs and active source jobs are not purged. Once the source job crosses
+its TTL, pending/running offline review is cancelled and removed rather than
+extending ciphertext lifetime. Content-free source-job and turn-metric rows
+remain.
+
+`DELETE /v1/chat/history` is an immediate content-erasure boundary. Under the
+same exclusive chat fence and runtime-generation bump used for transcript
+clear, it deletes every encrypted trajectory review and stream for that user;
+event rows cascade. It preserves independent Memory Garden, identity,
+user-authored workspace, schedules, job metadata, and aggregate turn metrics.
+Account deletion still cascades all per-user trajectory, metric, and access
+audit rows.
+
+There is no plaintext trajectory HTTP/admin endpoint. A break-glass inspection
+is available only as a runner-local module and is default-off. It requires one
+exact user/job pair, a validated operator identity, one fixed reason code, and a
+case reference. A durable `requested` audit row must commit before any
+decrypt; `succeeded` must commit before plaintext reaches stdout, and failures
+append only a stable content-free code. Example inside the runner container:
+
+```bash
+docker exec \
+  -e PYTHONPATH=/app/backend \
+  -e FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=1 \
+  serve-worker python -m model_api_runtime.v2.trajectory_inspect \
+  --user-id '<exact-user-id>' \
+  --job-id '<exact-job-id>' \
+  --operator-id 'alice@example.com' \
+  --reason-code incident \
+  --case-ref 'INC-123'
+```
+
+The plaintext appears only in the invoking terminal. Operators must use a
+controlled terminal that does not forward stdout to ordinary application logs.
+Provider-backed review remains opt-in for BYOK cost control; disabling review
+never disables capture.
+
+The inspector defaults to at most 4,096 physical events and 32 MiB of decoded
+or declared logical JSON. It fails closed on a frontier change, purge, gap, or
+budget overflow. The success audit is authorized atomically against the exact
+live stream frontier while serialized with Chat Clear, TTL GC, and late event
+appends.

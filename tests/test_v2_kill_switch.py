@@ -49,6 +49,18 @@ def test_set_turns_halted_false_resumes():
     assert kill_switch.turns_halted() is False
 
 
+def test_uncached_read_bypasses_a_stale_false_observation():
+    assert kill_switch.turns_halted() is False
+    # Simulate another backend/runner process changing the shared control row;
+    # this process's ordinary polling cache must remain stale for the contrast.
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_runtime_control SET turns_halted=true, updated_at=now() WHERE id=1"
+        )
+    assert kill_switch.turns_halted() is False
+    assert kill_switch.turns_halted_uncached(default_on_error=True) is True
+
+
 def test_default_on_error_true_on_db_failure(monkeypatch):
     def _boom():
         raise RuntimeError("control-plane DB unavailable")

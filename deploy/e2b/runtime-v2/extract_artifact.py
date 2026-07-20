@@ -28,7 +28,9 @@ ARTIFACT_PATH = Path("/tmp/feedling-artifact.bin")
 META_PATH = Path("/tmp/feedling-artifact-meta.json")
 OUTPUT_PATH = Path("/tmp/feedling-artifact-text.utf8")
 
-MAX_INPUT_BYTES = 25_000_000
+# Must match backend.hosted.turn.MODEL_API_MAX_FILE_BYTES and the iOS upload
+# ceiling. Keep this binary MiB value in the content-addressed template.
+MAX_INPUT_BYTES = 25 * 1024 * 1024
 MAX_OUTPUT_CHARS = 64_000
 MAX_ZIP_MEMBERS = 2_000
 MAX_ZIP_MEMBER_BYTES = 20_000_000

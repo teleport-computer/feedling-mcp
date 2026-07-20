@@ -47,6 +47,40 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-20
+
+### [DONE] Runtime V2 release closure adds trajectory lifecycle and a narrow Pre Capture soak
+
+- Encrypted trajectory and review content now has a default-on seven-day
+  terminal-job TTL. Chat Clear immediately tombstones old jobs and erases their
+  trajectory/review content while preserving content-free job and turn metrics;
+  account deletion remains the complete per-user erasure boundary.
+- Added a default-off, runner-local break-glass inspector for one exact user/job.
+  It requires a validated operator, fixed reason, and case reference, and writes
+  durable requested/outcome audit phases without creating a plaintext HTTP or
+  admin endpoint.
+- `GET /v1/admin/v2-metrics` now exposes a bounded content-free `turn_health`
+  snapshot covering terminal outcomes, queue/lease expiry, oldest pending age,
+  p95 latency, and trajectory completeness/capture gaps.
+- Automatic Memory Capture and Memory Dream are now independent deployment
+  controls. The checked-in Pre runner and CI default Capture on for
+  lifecycle/cost/card-quality soak; Dream and production Capture remain off by
+  default. Capture now uses exact raw-seq coverage with live-row-only provider
+  disclosure, encrypted prepared-batch recovery before provider setup, and one
+  atomic Memory/log/frontier/job commit. User opt-out, fleet halt, Chat Clear,
+  and runtime cutover now linearize against the complete provider disclosure,
+  while Memory retype derives changes from the fresh cross-process-fenced row.
+  Lost ownership and synthetic-only windows fail or advance without leaking
+  content, repeating the provider call, surfacing a chat error, or silently
+  skipping a frontier.
+- The optional E2B artifact path now shares the iOS/backend 25 MiB boundary and
+  a content-addressed template tag. Source is activation-ready, but remains
+  fail-closed until an environment supplies the provider credential/template
+  and approves the external data boundary.
+- Typing-signal pre-warm is explicitly removed from the Runtime V2 release scope.
+  Remaining release gates are operational: target-CVM load/fault soak, external
+  health alerting, a second production runner, and live zero-resident inventory.
+
 ## 2026-07-19
 
 ### [DONE] Runtime V2 flight recorder becomes byte-complete for model-visible turns

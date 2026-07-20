@@ -228,13 +228,28 @@ def _default_worker_id() -> str:
 
 
 _ASSISTANT_ROLES = ("openclaw", "assistant", "agent")
-_EXTRACTION_ENABLED = os.environ.get(
-    "FEEDLING_V2_EXTRACTION_ENABLED", "0"
+_CAPTURE_ENABLED = os.environ.get(
+    "FEEDLING_V2_CAPTURE_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_DREAM_ENABLED = os.environ.get(
+    "FEEDLING_V2_DREAM_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 _FILE_INLINE_MAX_CHARS = _positive_int_env(
     "FEEDLING_V2_FILE_INLINE_MAX_CHARS",
     "30000",
 )
+
+
+def _capture_enabled_for_user(user_id: str) -> bool:
+    """Fail-closed deployment + user consent gate for Capture execution."""
+    if not _CAPTURE_ENABLED:
+        return False
+    settings = db.get_blob_strict(str(user_id), "proactive_settings")
+    if settings is None:
+        return True
+    if not isinstance(settings, dict):
+        raise RuntimeError("proactive settings malformed")
+    return bool(settings.get("capture_enabled", True))
 
 
 def _configure_db_pool_capacity(max_workers: int) -> int:
@@ -552,6 +567,7 @@ def _decrypt_chat_rows(
     *,
     user_only: bool,
     preserve_unreadable: bool = False,
+    include_capture_metadata: bool = False,
 ) -> list[dict]:
     """Decrypt already-selected chat rows and preserve their exact seq IDs.
 
@@ -608,6 +624,14 @@ def _decrypt_chat_rows(
                 item = {"id": mid, "ts": ts, "role": role, "content": plaintext}
         if m.get("seq") is not None:
             item["seq"] = int(m["seq"])
+        if include_capture_metadata:
+            source = str(m.get("source") or "")
+            item["source"] = source
+            item["raw_role"] = raw_role
+            item["capture_eligible"] = (
+                raw_role in {"user", "openclaw"}
+                and source in capture_scheduler.CAPTURE_LIVE_SOURCES
+            )
         out.append(item)
     return out
 
@@ -726,6 +750,7 @@ def _read_tail_window_after_seq(
     *,
     oldest_first: bool,
     through_seq: int | None = None,
+    include_capture_metadata: bool = False,
 ) -> list[dict]:
     """Strict bounded two-role prompt window selected by exact seq identity."""
     rows = db.chat_messages_after_seq(
@@ -740,6 +765,7 @@ def _read_tail_window_after_seq(
         rows,
         user_only=False,
         preserve_unreadable=True,
+        include_capture_metadata=include_capture_metadata,
     )
 
 
@@ -774,6 +800,11 @@ def _read_compaction_tail_after_seq(
         limit,
         oldest_first=True,
         through_seq=through_seq,
+        # Capture shares this oldest-contiguous reader with compaction. The
+        # extra plaintext routing metadata is needed only to exclude synthetic
+        # and internal rows from provider disclosure; ordinary chat readers
+        # retain their existing exact output contract.
+        include_capture_metadata=True,
     )
 
 
@@ -1488,7 +1519,9 @@ def _apply_memory_actions(
     return body
 
 
-def _build_memory_envelope(user_id: str, inner: dict) -> dict:
+def _build_memory_envelope(
+    user_id: str, inner: dict, item_id: str | None = None
+) -> dict:
     """把一张记忆卡的明文草稿 inner 封成 shared 客户端加密信封（E2E，本地加密，非 enclave
     往返 —— 同 worker._write_encrypted_reply / _write_summary 的写法）。
 
@@ -1498,7 +1531,9 @@ def _build_memory_envelope(user_id: str, inner: dict) -> dict:
     也不要把半张卡/无信封的卡塞进 memory.actions。"""
     store = core_store.get_store(user_id)
     payload = json.dumps(inner, ensure_ascii=False).encode("utf-8")
-    env, err = core_envelope._build_shared_envelope_for_store(store, payload)
+    env, err = core_envelope._build_shared_envelope_for_store(
+        store, payload, item_id=item_id
+    )
     if env is None:
         raise RuntimeError(f"memory_envelope_build_failed: {err}")
     return env
@@ -1511,10 +1546,25 @@ def _tick_capture_for_user(user_id: str) -> int:
     返回 1，否则 0。"""
     store = core_store.get_store(user_id)
 
-    def _submit(store, *, trigger, now):
-        job_id, _coalesced = jobs_store.enqueue_job(user_id, "capture", reason=trigger)
-        core_wake_bus.notify("v2_jobs", user_id)
-        return {"enqueued": True, "reason": "v2", "job": {"id": job_id}}
+    def _submit(store, *, trigger, now, window, capture_key):
+        job_id, coalesced = jobs_store.enqueue_job(
+            user_id, "capture", reason=trigger
+        )
+        if not coalesced:
+            core_wake_bus.notify("v2_jobs", user_id)
+        return {
+            "enqueued": not coalesced,
+            "reason": "v2_coalesced" if coalesced else "v2",
+            "job": {
+                "id": job_id,
+                "job_id": str(job_id),
+                "job_kind": "memory_capture",
+                "source": "memory_capture",
+                "status": "pending",
+                "capture_key": capture_key,
+                "capture_window": dict(window),
+            },
+        }
 
     result = capture_scheduler.tick_quiet_capture(store, submit=_submit) or {}
     return 1 if result.get("enqueued") else 0
@@ -1528,18 +1578,38 @@ def _tick_dream_for_user(user_id: str) -> int:
     store = core_store.get_store(user_id)
 
     def _submit(store, *, trigger, now):
-        job_id, _coalesced = jobs_store.enqueue_job(user_id, "dream", reason=trigger)
-        core_wake_bus.notify("v2_jobs", user_id)
-        return {"enqueued": True, "reason": "v2", "job": {"id": job_id}}
+        job_id, coalesced = jobs_store.enqueue_job(user_id, "dream", reason=trigger)
+        if not coalesced:
+            core_wake_bus.notify("v2_jobs", user_id)
+        return {
+            "enqueued": not coalesced,
+            "reason": "v2_coalesced" if coalesced else "v2",
+            "job": {
+                "id": job_id,
+                "job_id": str(job_id),
+                "job_kind": "memory_dream",
+                "source": "memory_dream",
+                "status": "pending",
+            },
+        }
 
     result = dream_scheduler.tick_memory_dream(store, submit=_submit) or {}
     return 1 if result.get("enqueued") else 0
 
 
 def _tick_extraction_for_user(user_id: str) -> int:
-    """一个 scheduler dep 驱动两条抽取 lane：先 capture 再 dream，返回两者 enqueue 计数之和。
-    两个触发闸各自独立（capture 看安静窗口，dream 看夜间+新卡阈值），互不影响。"""
-    return _tick_capture_for_user(user_id) + _tick_dream_for_user(user_id)
+    """Run only the independently enabled memory-maintenance lanes.
+
+    Capture is safe to soak without also turning on provider-backed Dream.
+    Keeping two explicit flags prevents a broad extraction switch from
+    silently enrolling users in both background token consumers.
+    """
+    enqueued = 0
+    if _CAPTURE_ENABLED:
+        enqueued += _tick_capture_for_user(user_id)
+    if _DREAM_ENABLED:
+        enqueued += _tick_dream_for_user(user_id)
+    return enqueued
 
 
 def _latest_frame_meta(user_id: str) -> tuple[str, float]:
@@ -1787,7 +1857,12 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
             )
         if inserted:
             try:
-                capture_scheduler.record_chat_append(store, msg)
+                # Runtime V2's runner-owned sweep is the sole capture producer.
+                # Replies update the shared frontier counters but never append
+                # the dead resident ``proactive_jobs`` stream.
+                capture_scheduler.refresh_capture_state_from_chat(
+                    store, now=msg["ts"]
+                )
             except Exception as exc:  # noqa: BLE001 — auxiliary capture only
                 log.warning(
                     "[v2.reply] capture scheduling failed user=%s code=%s",
@@ -2556,6 +2631,31 @@ def _open_trajectory_payload(
     )
 
 
+def _read_capture_state(user_id: str) -> dict:
+    return capture_scheduler.load_capture_state_strict(
+        core_store.get_store(user_id)
+    )
+
+
+def _record_extraction_status(
+    user_id: str,
+    lane: str,
+    status: str,
+    detail: dict,
+) -> None:
+    # Capture is the only extraction lane enabled on Pre. Dream deliberately
+    # keeps its existing/default-off status behavior until its own frontier
+    # metadata is carried durably with agent_jobs.
+    if lane != "capture":
+        return
+    window = detail.get("window") if isinstance(detail, dict) else {}
+    capture_scheduler.record_v2_capture_status(
+        core_store.get_store(user_id),
+        status=status,
+        window=window if isinstance(window, dict) else {},
+    )
+
+
 def build_production_deps() -> v2_worker.TurnDeps:
     return v2_worker.TurnDeps(
         read_messages=_read_messages,
@@ -2583,6 +2683,16 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_memory_context=_read_memory_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
+        read_capture_state=_read_capture_state,
+        record_extraction_status=_record_extraction_status,
+        prepare_capture_batch=jobs_store.prepare_capture_batch,
+        get_prepared_capture_batch=jobs_store.get_prepared_capture_batch,
+        authorize_capture_provider_call=jobs_store.authorize_capture_provider_call,
+        commit_capture_batch=jobs_store.commit_capture_batch,
+        fail_capture_job=jobs_store.fail_capture_job,
+        cancel_capture_job=jobs_store.cancel_capture_job,
+        capture_enabled=_capture_enabled_for_user,
+        dream_enabled=lambda _user_id: _DREAM_ENABLED,
         apply_pending_effects=_apply_pending_effects_for_user,
         load_mcp_turn=mcp_tools.load_turn_mcp,
         load_workspace_prompt=_load_workspace_prompt,
@@ -2632,7 +2742,7 @@ def _build_scheduler_deps():
             admin_core.list_runtime_modes().get(
                 hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
             )
-            if _EXTRACTION_ENABLED
+            if _CAPTURE_ENABLED or _DREAM_ENABLED
             else []
         ),
         tick_extraction=_tick_extraction_for_user,
@@ -2695,6 +2805,7 @@ def build_health_app():
 
 _REAP_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_REAP_INTERVAL_SEC", "30")
 _R2_CLEANUP_SETTINGS = v2_reaper.cleanup_settings_from_env()
+_TRAJECTORY_RETENTION_SETTINGS = v2_reaper.trajectory_retention_settings_from_env()
 
 
 async def _reaper_loop(
@@ -2726,6 +2837,24 @@ async def _r2_cleanup_loop(
         interval=interval,
         limit=limit,
         inventory_limit=inventory_limit,
+    )
+
+
+async def _trajectory_cleanup_loop(
+    stop_event: asyncio.Event,
+    *,
+    interval: float = float(_TRAJECTORY_RETENTION_SETTINGS["interval"]),
+    retention_days: int = int(
+        _TRAJECTORY_RETENTION_SETTINGS["retention_days"]
+    ),
+    limit: int = int(_TRAJECTORY_RETENTION_SETTINGS["limit"]),
+) -> None:
+    """Run encrypted-trajectory retention independently of other watchdogs."""
+    await v2_reaper.run_trajectory_cleanup_loop(
+        stop_event,
+        interval=interval,
+        retention_days=retention_days,
+        limit=limit,
     )
 
 
@@ -3258,6 +3387,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     tasks = [
         asyncio.create_task(_reaper_loop(stop_event)),
         asyncio.create_task(_r2_cleanup_loop(stop_event)),
+        asyncio.create_task(_trajectory_cleanup_loop(stop_event)),
         asyncio.create_task(
             _heartbeat_loop(worker_id, stop_event, supervisor=supervisor)
         ),

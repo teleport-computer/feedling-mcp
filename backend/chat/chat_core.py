@@ -480,10 +480,10 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
     The database operation also generation-fences in-flight Runtime V2 work and
     removes summary/artifact/effect/status state derived from this transcript.
     It intentionally preserves Memory Garden, identity, user-authored workspace,
-    schedules, billing/token metrics, and encrypted trajectory/review telemetry.
-    Trajectories are not prompt inputs; their retention is independent of chat
-    history. The destructive account reset endpoint remains the only path that
-    wipes the whole user record.
+    schedules, and content-free billing/token/job metrics. Encrypted trajectory
+    events and review output are chat-derived content, so Chat Clear deletes
+    them as well. The destructive account reset endpoint remains the only path
+    that wipes the whole user record.
     """
     confirm = (payload.get("confirm") or "").strip()
     if confirm != "clear-chat-history":
@@ -509,7 +509,8 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
         "cleared": True,
         "deleted": deleted,
         "scope": "chat_history_and_live_runtime_context",
-        "encrypted_trajectory_telemetry_retained": True,
+        "encrypted_trajectory_telemetry_retained": False,
+        "encrypted_trajectory_content_deleted": True,
     }, 200
 
 

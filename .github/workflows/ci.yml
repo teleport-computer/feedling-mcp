@@ -961,6 +961,7 @@ jobs:
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.FEEDLING_MIGRATE_ENABLE }}
+          FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PROD_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
           # gunicorn worker counts (compose reads them; empty → compose default
           # 4/backend, 2/enclave). Encrypted env, NOT baked into compose_hash —
           # flip via repo var without on-chain re-auth. Gate: the deployed image
@@ -1002,6 +1003,7 @@ jobs:
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS" \
             --wait
@@ -1177,6 +1179,7 @@ jobs:
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
+          FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.TEST_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1216,6 +1219,7 @@ jobs:
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             --wait
 
@@ -1359,6 +1363,8 @@ jobs:
           FEEDLING_V2_MAX_WORKERS:       ${{ vars.TEST_FEEDLING_V2_MAX_WORKERS || '4' }}
           FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: ${{ vars.TEST_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0' }}
           FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: ${{ vars.TEST_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64' }}
+          FEEDLING_V2_CAPTURE_ENABLED:     ${{ vars.TEST_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          FEEDLING_V2_DREAM_ENABLED:       ${{ vars.TEST_FEEDLING_V2_DREAM_ENABLED || '0' }}
           FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.TEST_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
           E2B_API_KEY:                   ${{ secrets.TEST_E2B_API_KEY || secrets.E2B_API_KEY }}
           FEEDLING_V2_E2B_TEMPLATE:      ${{ vars.TEST_FEEDLING_V2_E2B_TEMPLATE }}
@@ -1396,6 +1402,8 @@ jobs:
             -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
             -e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE=$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE" \
+            -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED" \
             -e "FEEDLING_V2_SANDBOX_PROVIDER=$FEEDLING_V2_SANDBOX_PROVIDER" \
             -e "E2B_API_KEY=$E2B_API_KEY" \
             -e "FEEDLING_V2_E2B_TEMPLATE=$FEEDLING_V2_E2B_TEMPLATE" \
@@ -1530,6 +1538,7 @@ jobs:
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
+          FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '1' }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1566,6 +1575,7 @@ jobs:
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             --wait
 
@@ -1712,6 +1722,8 @@ jobs:
           FEEDLING_V2_MAX_WORKERS:       ${{ vars.PRE_FEEDLING_V2_MAX_WORKERS || '4' }}
           FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: ${{ vars.PRE_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0' }}
           FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: ${{ vars.PRE_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64' }}
+          FEEDLING_V2_CAPTURE_ENABLED:     ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '1' }}
+          FEEDLING_V2_DREAM_ENABLED:       ${{ vars.PRE_FEEDLING_V2_DREAM_ENABLED || '0' }}
           FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
           E2B_API_KEY:                   ${{ secrets.PRE_E2B_API_KEY || secrets.E2B_API_KEY }}
           FEEDLING_V2_E2B_TEMPLATE:      ${{ vars.PRE_FEEDLING_V2_E2B_TEMPLATE }}
@@ -1749,6 +1761,8 @@ jobs:
             -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
             -e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE=$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE" \
+            -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED" \
             -e "FEEDLING_V2_SANDBOX_PROVIDER=$FEEDLING_V2_SANDBOX_PROVIDER" \
             -e "E2B_API_KEY=$E2B_API_KEY" \
             -e "FEEDLING_V2_E2B_TEMPLATE=$FEEDLING_V2_E2B_TEMPLATE" \
@@ -1893,6 +1907,8 @@ jobs:
           FEEDLING_V2_MAX_WORKERS:       ${{ vars.PROD_FEEDLING_V2_MAX_WORKERS || '4' }}
           FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: ${{ vars.PROD_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0' }}
           FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: ${{ vars.PROD_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64' }}
+          FEEDLING_V2_CAPTURE_ENABLED:     ${{ vars.PROD_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          FEEDLING_V2_DREAM_ENABLED:       ${{ vars.PROD_FEEDLING_V2_DREAM_ENABLED || '0' }}
           FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PROD_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
           E2B_API_KEY:                   ${{ secrets.E2B_API_KEY }}
           FEEDLING_V2_E2B_TEMPLATE:      ${{ vars.PROD_FEEDLING_V2_E2B_TEMPLATE }}
@@ -1930,6 +1946,8 @@ jobs:
               -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
               -e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED" \
               -e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE=$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE" \
+              -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+              -e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED" \
               -e "FEEDLING_V2_SANDBOX_PROVIDER=$FEEDLING_V2_SANDBOX_PROVIDER" \
               -e "E2B_API_KEY=$E2B_API_KEY" \
               -e "FEEDLING_V2_E2B_TEMPLATE=$FEEDLING_V2_E2B_TEMPLATE" \

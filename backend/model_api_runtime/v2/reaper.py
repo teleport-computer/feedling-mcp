@@ -1,4 +1,4 @@
-"""Independent V2 watchdog and isolated chat-object cleanup loops."""
+"""Independent V2 watchdog and isolated content-cleanup loops."""
 from __future__ import annotations
 
 import asyncio
@@ -84,6 +84,48 @@ def cleanup_settings_from_env() -> dict[str, float | int]:
     }
 
 
+def trajectory_retention_settings_from_env() -> dict[str, float | int]:
+    """Read default-on, fail-fast encrypted trajectory retention settings."""
+    raw_days = os.environ.get(
+        "FEEDLING_V2_TRAJECTORY_RETENTION_DAYS", "7"
+    ).strip()
+    raw_interval = os.environ.get(
+        "FEEDLING_V2_TRAJECTORY_GC_INTERVAL_SEC", "3600"
+    ).strip()
+    raw_limit = os.environ.get("FEEDLING_V2_TRAJECTORY_GC_BATCH", "100").strip()
+    try:
+        retention_days = int(raw_days)
+        interval = float(raw_interval)
+        limit = int(raw_limit)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("invalid V2 trajectory retention configuration") from exc
+    if not 1 <= retention_days <= 3650:
+        raise RuntimeError(
+            "FEEDLING_V2_TRAJECTORY_RETENTION_DAYS must be an integer from 1 to 3650"
+        )
+    if not math.isfinite(interval) or interval <= 0:
+        raise RuntimeError(
+            "FEEDLING_V2_TRAJECTORY_GC_INTERVAL_SEC must be finite and > 0"
+        )
+    if not 1 <= limit <= 1000:
+        raise RuntimeError(
+            "FEEDLING_V2_TRAJECTORY_GC_BATCH must be an integer from 1 to 1000"
+        )
+    return {
+        "retention_days": retention_days,
+        "interval": interval,
+        "limit": limit,
+    }
+
+
+def trajectory_cleanup_once(*, retention_days: int, limit: int = 100) -> int:
+    """Expire one bounded batch without coupling it to job/R2 watchdogs."""
+    return jobs_store.purge_expired_trajectories(
+        retention_days=retention_days,
+        limit=limit,
+    )
+
+
 async def run_loop(
     stop_event: asyncio.Event,
     *,
@@ -126,6 +168,49 @@ async def run_cleanup_loop(
                 log.info("reclaimed %d retired chat R2 object(s)", count)
         except Exception:  # noqa: BLE001 — cleanup must survive transient R2/DB failures
             log.exception("chat R2 cleanup pass failed")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(interval))
+        except asyncio.TimeoutError:
+            pass
+
+
+async def run_trajectory_cleanup_loop(
+    stop_event: asyncio.Event,
+    *,
+    interval: float,
+    retention_days: int,
+    limit: int = 100,
+) -> None:
+    """Drain expired trajectories independently of deadline and R2 work.
+
+    Each database transaction remains bounded by ``limit``.  A scheduled pass
+    keeps taking bounded batches until it reaches a partial batch so retention
+    throughput is not capped at one batch per interval.
+    """
+    if not math.isfinite(float(interval)) or float(interval) <= 0:
+        raise ValueError("trajectory cleanup interval must be finite and > 0")
+    while not stop_event.is_set():
+        total = 0
+        try:
+            while not stop_event.is_set():
+                count = await asyncio.to_thread(
+                    trajectory_cleanup_once,
+                    retention_days=retention_days,
+                    limit=limit,
+                )
+                total += count
+                if count < limit or stop_event.is_set():
+                    break
+                # Yield between full batches so shutdown and sibling tasks are
+                # never starved by a large retention backlog.
+                await asyncio.sleep(0)
+        except Exception:  # noqa: BLE001 — retention survives transient DB failures
+            log.exception("V2 trajectory retention pass failed")
+        if total:
+            log.info(
+                "expired trajectory content for %d terminal V2 job(s)",
+                total,
+            )
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=float(interval))
         except asyncio.TimeoutError:

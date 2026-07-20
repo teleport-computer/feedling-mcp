@@ -1,6 +1,6 @@
 # Hosted Runtime V2 — Deployment and Recovery Runbook
 
-> **Current source of truth — 2026-07-19.** Hosted model-API execution is
+> **Current source of truth — 2026-07-20.** Hosted model-API execution is
 > Runtime V2-only in local, test, pre, and production manifests. There is no
 > hosted resident rollback, per-user runtime selector, supervisor service, or
 > empty resident roster to preserve. The independent user-operated
@@ -64,8 +64,41 @@ separate, defaults off, and must stay off unless
 `FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=1` and a valid
 `FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE` fleet ceiling are configured. The
 ceiling bounds pending plus running provider reviews; it is not a retention
-policy. There is no automatic trajectory/review GC yet, so keep review opt-in
-until BYOK budget and retention/export policy are approved.
+policy. Encrypted event/review content has a default-on seven-day terminal-job
+TTL (`FEEDLING_V2_TRAJECTORY_RETENTION_DAYS`) and Chat Clear deletes it
+immediately. The runner-local break-glass inspector remains default-off and
+requires durable requested/succeeded/failed audit phases tied to an operator and
+case. Keep provider review opt-in until its BYOK budget is approved. The API and
+runner both run GC; managed manifests intentionally use the same fixed defaults
+(7 days, 3,600-second interval, batch 100) as measured-compose literals. Do not
+inject one-sided CI overrides. A policy change must update both the main and
+runner manifests in the same reviewed PR; for retention, whichever process has
+the shorter effective value removes content first.
+
+Automatic Memory Capture and Memory Dream are independent switches. The
+checked-in Pre runner and CI default `FEEDLING_V2_CAPTURE_ENABLED=1` and
+`FEEDLING_V2_DREAM_ENABLED=0` so Capture can soak without silently enabling
+Dream. Test, local, and production default both to `0`; production enablement
+requires an explicit lifecycle/cost decision.
+
+Capture's durable contract is exact oldest-contiguous `chat_messages.seq`
+coverage, not a timestamp or fixed recent window. Only eligible live chat rows
+enter the provider prompt; synthetic/internal rows still advance the raw
+frontier through an empty batch without a provider call. A successful provider
+result is first sealed as an encrypted prepared batch. Redelivery adopts that
+batch before provider resolution, then applies Memory rows, canonical change
+logs, the Capture frontier, and the terminal job state in one transaction. That
+commit shares a cross-process per-user PostgreSQL mutation fence with ordinary
+Memory Garden load/mutate/save, upsert, and delete paths, so a stale whole-Garden
+snapshot cannot erase a captured card or restore a superseded target.
+Deployment halt, Chat Clear/account deletion, runtime generation, and per-user
+consent are checked before disclosure and their database fences remain held for
+the complete provider call. Ownership is validated without freezing lease
+renewal, then all gates are checked again at prepare/commit. Opt-out and Chat
+Clear erase prepared content, and Capture failures never create a chat-visible
+error. Ordinary Memory retype operations also load and mutate their target only
+inside the shared cross-process Garden fence, so they cannot restore a stale
+pre-Capture ciphertext or supersede state.
 
 Do not set `FEEDLING_HOST_ALL`, `AGENT_RUNTIME_USERS`,
 `AGENT_RUNTIME_AUTODISCOVER`, `AGENT_RUNTIME_MAX_CHILDREN`, or a
@@ -140,6 +173,8 @@ Check `GET /v1/admin/v2-metrics` with an admin token and require:
 - `genesis_alive: true`;
 - no runtime-policy inconsistencies for eligible active model routes;
 - bounded pending/oldest-job age and no expired job backlog;
+- `turn_health.jobs.queue_expired == 0`, bounded terminal error/expiry rate and
+  p95 latency, and no unexplained trajectory `missing`/`capture_gap` increase;
 - healthy effect-outbox and wake statistics; and
 - expected provider/model prompt-cache telemetry.
 
@@ -238,7 +273,11 @@ claim hosted V2 accounts and is not part of this incident procedure.
 - [ ] Main and runner Compose hashes are authorized.
 - [ ] Runtime-token secret and database URL match across deployment units.
 - [ ] Sandbox is intentionally disabled, or its provider/key/template and data-boundary policy are verified.
-- [ ] Trajectory review is intentionally disabled, or its fleet ceiling, BYOK budget, and retention policy are verified.
+- [ ] Trajectory review is intentionally disabled, or its fleet ceiling and BYOK provider-cost budget are verified.
+- [ ] Seven-day trajectory retention and Chat Clear erasure are accepted; any
+      break-glass inspection uses the runner-local audited command.
+- [ ] Pre Memory Capture is intentionally enabled and Dream remains disabled;
+      production keeps both off until the soak decision is recorded.
 - [ ] Worker capacity, Genesis, policy, queue, wake, and effect gates are green.
 - [ ] Encrypted real-device turn and `client_msg_id` retry pass.
 - [ ] Prompt-cache canary passes where configured.

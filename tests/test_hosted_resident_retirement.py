@@ -99,6 +99,57 @@ def test_every_hosted_worker_compose_wires_fail_closed_review_configuration():
         ), relative
 
 
+def test_memory_maintenance_lanes_are_independently_gated_and_pre_capture_only():
+    relatives = (
+        "deploy/docker-compose.agent-runner.yaml",
+        "deploy/docker-compose.phala.runner.yaml",
+        "deploy/docker-compose.phala.pre.runner.yaml",
+        "deploy/docker-compose.phala.prod.runner.yaml",
+    )
+    for relative in relatives:
+        compose = yaml.safe_load((ROOT / relative).read_text())
+        environment = compose["services"]["serve-worker"]["environment"]
+        capture = environment["FEEDLING_V2_CAPTURE_ENABLED"]
+        dream = environment["FEEDLING_V2_DREAM_ENABLED"]
+        assert dream.endswith(":-0}"), relative
+        if relative == "deploy/docker-compose.phala.pre.runner.yaml":
+            assert capture.endswith(":-1}"), relative
+        else:
+            assert capture.endswith(":-0}"), relative
+
+
+def test_main_api_capture_admission_matches_runner_environment_defaults():
+    for relative, expected in (
+        ("deploy/docker-compose.phala.test.yaml", ":-0}"),
+        ("deploy/docker-compose.phala.pre.yaml", ":-1}"),
+        ("deploy/docker-compose.phala.yaml", ":-0}"),
+    ):
+        compose = yaml.safe_load((ROOT / relative).read_text())
+        value = compose["services"]["backend"]["environment"][
+            "FEEDLING_V2_CAPTURE_ENABLED"
+        ]
+        assert value.endswith(expected), relative
+
+
+def test_managed_api_and_runner_trajectory_retention_is_symmetric_and_literal():
+    expected = {
+        "FEEDLING_V2_TRAJECTORY_RETENTION_DAYS": "7",
+        "FEEDLING_V2_TRAJECTORY_GC_INTERVAL_SEC": "3600",
+        "FEEDLING_V2_TRAJECTORY_GC_BATCH": "100",
+    }
+    for relative, service in (
+        ("deploy/docker-compose.phala.test.yaml", "backend"),
+        ("deploy/docker-compose.phala.pre.yaml", "backend"),
+        ("deploy/docker-compose.phala.yaml", "backend"),
+        ("deploy/docker-compose.phala.runner.yaml", "serve-worker"),
+        ("deploy/docker-compose.phala.pre.runner.yaml", "serve-worker"),
+        ("deploy/docker-compose.phala.prod.runner.yaml", "serve-worker"),
+    ):
+        compose = yaml.safe_load((ROOT / relative).read_text())
+        environment = compose["services"][service]["environment"]
+        assert {name: environment[name] for name in expected} == expected, relative
+
+
 def test_worker_image_contains_no_resident_runtime_or_cli_toolchain():
     source = (ROOT / "deploy/Dockerfile.agent-runner").read_text()
     instructions = "\n".join(
@@ -168,6 +219,21 @@ def test_ci_passes_opt_in_review_configuration_to_every_worker_deploy():
         )
         == 3
     )
+
+
+def test_ci_passes_split_capture_and_dream_configuration_to_worker_deploys():
+    source = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert "vars.TEST_FEEDLING_V2_CAPTURE_ENABLED || '0'" in source
+    assert "vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '1'" in source
+    assert "vars.PROD_FEEDLING_V2_CAPTURE_ENABLED || '0'" in source
+    for environment in ("TEST", "PRE", "PROD"):
+        assert f"vars.{environment}_FEEDLING_V2_DREAM_ENABLED || '0'" in source
+    assert source.count(
+        '-e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED"'
+    ) == 6
+    assert source.count(
+        '-e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED"'
+    ) == 3
     assert (
         source.count(
             '-e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE='

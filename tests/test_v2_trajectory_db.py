@@ -192,6 +192,211 @@ def test_capture_gap_keeps_terminal_trajectory_explicitly_partial():
     assert state["capture_status"] == "partial"
 
 
+def test_recent_chat_operational_health_counts_missing_capture_from_jobs():
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_turn_metrics")
+
+    terminal_statuses = {"completed", "failed", "expired", "superseded"}
+
+    def add_job(
+        user_id: str,
+        status: str,
+        *,
+        age_hours: int = 0,
+        last_error: str | None = None,
+    ) -> int:
+        seed_user(user_id)
+        set_v2_runtime_owner(user_id)
+        job_id, _ = jobs_store.enqueue_job(user_id, "chat")
+        with db.get_pool().connection() as conn:
+                conn.execute(
+                    "UPDATE agent_jobs SET status=%s,"
+                    "created_at=clock_timestamp()-make_interval(hours => %s),"
+                    "finished_at=CASE WHEN %s THEN "
+                    "clock_timestamp()-make_interval(hours => %s) ELSE NULL END "
+                    ",last_error=%s "
+                    "WHERE id=%s",
+                    (
+                        status,
+                        age_hours,
+                        status in terminal_statuses,
+                        age_hours,
+                        last_error,
+                        job_id,
+                    ),
+                )
+        return job_id
+
+    complete_job = add_job("u_health_complete", "completed")
+    gap_job = add_job("u_health_gap", "failed")
+    partial_job = add_job(
+        "u_health_partial", "expired", last_error="queue_timeout"
+    )
+    _missing_job = add_job("u_health_missing", "superseded")
+    open_job = add_job("u_health_open", "pending")
+    _active_missing_job = add_job("u_health_active_missing", "running")
+    add_job("u_health_old_pending", "pending", age_hours=48)
+    add_job("u_health_old_terminal", "completed", age_hours=48)
+    purged_job = add_job("u_health_purged", "completed")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET trajectory_purged_at=clock_timestamp() "
+            "WHERE id=%s",
+            (purged_job,),
+        )
+
+    seed_user("u_health_background")
+    set_v2_runtime_owner("u_health_background")
+    background_job, _ = jobs_store.enqueue_job("u_health_background", "heartbeat")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET created_at=clock_timestamp()-interval '72 hours' "
+            "WHERE id=%s",
+            (background_job,),
+        )
+
+    for job_id, event_kinds in (
+        (complete_job, ("turn_terminal",)),
+        (gap_job, ("capture_gap", "turn_terminal")),
+        (partial_job, ("provider_request",)),
+        (open_job, ("provider_request",)),
+    ):
+        user_id = {
+            complete_job: "u_health_complete",
+            gap_job: "u_health_gap",
+            partial_job: "u_health_partial",
+            open_job: "u_health_open",
+        }[job_id]
+        for event_index, event_kind in enumerate(event_kinds):
+            jobs_store.append_trajectory_event(
+                job_id,
+                user_id,
+                event_kind=event_kind,
+                idempotency_key=f"health_{event_index}_{event_kind}",
+                payload_envelope=_envelope(
+                    user_id,
+                    f"health-{job_id}-{event_index}",
+                    event_kind,
+                ),
+                payload_bytes=80,
+            )
+
+    recent_jobs = (
+        (complete_job, "u_health_complete"),
+        (gap_job, "u_health_gap"),
+        (partial_job, "u_health_partial"),
+        (_missing_job, "u_health_missing"),
+        (open_job, "u_health_open"),
+        (_active_missing_job, "u_health_active_missing"),
+    )
+    with db.get_pool().connection() as conn:
+        for latency_ms, (job_id, user_id) in enumerate(recent_jobs, start=1):
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(job_id,user_id,lane,latency_ms) VALUES (%s,%s,'chat',%s)",
+                (job_id, user_id, latency_ms * 100),
+            )
+        seed_user("u_health_old_metric")
+        seed_user("u_health_background_metric")
+        conn.execute(
+            "INSERT INTO v2_turn_metrics (user_id,lane,latency_ms,created_at) "
+            "VALUES ('u_health_old_metric','chat',999999,"
+            "clock_timestamp()-interval '48 hours'),"
+            "('u_health_background_metric','heartbeat',999999,clock_timestamp())"
+        )
+
+    health = jobs_store.recent_chat_operational_health()
+
+    assert health["window_hours"] == 24
+    assert health["sample_limit"] == 1000
+    assert health["jobs"] == {
+        "sampled_terminal_jobs": 5,
+        "completed": 2,
+        "failed": 1,
+        "expired": 1,
+        "queue_expired": 1,
+        "lease_expired": 0,
+        "superseded": 1,
+        "failure_rate": pytest.approx(1 / 4),
+        "expiry_rate": pytest.approx(1 / 4),
+        "error_or_expiry_rate": pytest.approx(1 / 2),
+        "pending": 2,
+        "oldest_pending_age_sec": health["jobs"]["oldest_pending_age_sec"],
+    }
+    assert 172790 <= health["jobs"]["oldest_pending_age_sec"] <= 172860
+    assert health["latency"] == {
+        "sampled_turns": 6,
+        "p95_ms": pytest.approx(575.0),
+    }
+    assert health["trajectory"] == {
+        "sampled_jobs": 6,
+        "complete": 1,
+        "partial": 2,
+        "missing": 1,
+        "open": 2,
+        "capture_gap": 1,
+        "complete_rate": pytest.approx(1 / 4),
+    }
+
+
+def test_recent_chat_operational_health_is_explicit_without_history():
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_turn_metrics")
+
+    health = jobs_store.recent_chat_operational_health()
+
+    assert health["jobs"] == {
+        "sampled_terminal_jobs": 0,
+        "completed": 0,
+        "failed": 0,
+        "expired": 0,
+        "queue_expired": 0,
+        "lease_expired": 0,
+        "superseded": 0,
+        "failure_rate": None,
+        "expiry_rate": None,
+        "error_or_expiry_rate": None,
+        "pending": 0,
+        "oldest_pending_age_sec": None,
+    }
+    assert health["latency"] == {"sampled_turns": 0, "p95_ms": None}
+    assert health["trajectory"] == {
+        "sampled_jobs": 0,
+        "complete": 0,
+        "partial": 0,
+        "missing": 0,
+        "open": 0,
+        "capture_gap": 0,
+        "complete_rate": None,
+    }
+
+
+def test_superseded_rows_cannot_evict_real_outcomes_from_bounded_sample():
+    for user_id in ("u_health_real_failure", "u_health_superseded"):
+        seed_user(user_id)
+        set_v2_runtime_owner(user_id)
+    failed_job, _ = jobs_store.enqueue_job("u_health_real_failure", "chat")
+    superseded_job, _ = jobs_store.enqueue_job("u_health_superseded", "chat")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET status='failed',finished_at=clock_timestamp()-"
+            "interval '1 second',last_error='turn_failed:test' WHERE id=%s",
+            (failed_job,),
+        )
+        conn.execute(
+            "UPDATE agent_jobs SET status='superseded',finished_at=clock_timestamp() "
+            "WHERE id=%s",
+            (superseded_job,),
+        )
+
+    health = jobs_store.recent_chat_operational_health(limit=1)
+
+    assert health["jobs"]["sampled_terminal_jobs"] == 2
+    assert health["jobs"]["failed"] == 1
+    assert health["jobs"]["superseded"] == 1
+    assert health["jobs"]["failure_rate"] == 1.0
+
+
 def test_required_append_failure_is_marked_partial_before_terminal():
     uid = "u_trajectory_required_gap"
     job_id, _job = _source_job(uid)

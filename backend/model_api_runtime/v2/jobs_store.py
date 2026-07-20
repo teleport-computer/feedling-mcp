@@ -13,6 +13,10 @@ import math
 import os
 import re
 import time
+import uuid
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 import psycopg
 from psycopg import sql
@@ -108,6 +112,16 @@ _TRAJECTORY_REVIEW_DEFAULT_MAX_ACTIVE = 64
 _TRAJECTORY_REVIEW_ADMISSION_LOCK = 0x46563254524A0001
 _TRAJECTORY_EVENT_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _TRAJECTORY_IDEMPOTENCY_RE = re.compile(r"^[a-zA-Z0-9_.:-]{1,96}$")
+_TRAJECTORY_ACCESS_OPERATOR_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._@:-]{2,79}$"
+)
+_TRAJECTORY_ACCESS_CASE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:/#-]{2,119}$"
+)
+_TRAJECTORY_ACCESS_RESULT_RE = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
+_TRAJECTORY_ACCESS_REASONS = frozenset(
+    {"incident", "support", "security", "debug"}
+)
 _TRAJECTORY_ENVELOPE_REQUIRED = frozenset(
     {
         "v",
@@ -757,7 +771,7 @@ def renew_job_lease(
                 return False
             control = conn.execute(
                 "SELECT hosted_runtime_state, runtime_generation "
-                "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                "FROM v2_runtime_state WHERE user_id=%s FOR SHARE",
                 (row[0],),
             ).fetchone()
             if control is None or str(control[0]) != "v2":
@@ -904,6 +918,20 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                 for row in rows:
                     _recover_review_runner_on_cursor(cur, row["id"])
                     _queue_failure_review_on_cursor(cur, row["id"])
+                # Prepared Capture journals are retry-only encrypted content.
+                # Retire obsolete runtime generations immediately and bound a
+                # current-generation crash orphan to 24h. Active turns have a
+                # five-minute lease, so this never races healthy execution.
+                cur.execute(
+                    "DELETE FROM v2_capture_batches WHERE id IN ("
+                    " SELECT b.id FROM v2_capture_batches b "
+                    " LEFT JOIN v2_runtime_state s ON s.user_id=b.user_id "
+                    " WHERE s.user_id IS NULL "
+                    "    OR b.runtime_generation<>s.runtime_generation "
+                    "    OR b.created_at<clock_timestamp()-interval '24 hours' "
+                    " ORDER BY b.created_at LIMIT 100"
+                    ")"
+                )
                 return rows
 
 
@@ -938,6 +966,1136 @@ def ensure_terminal_failure_outbox(job_id, user_id: str, error: str) -> bool:
                     (_terminal_error_code(error), job_id, str(user_id)),
                 )
                 return cur.rowcount == 1
+
+
+_CAPTURE_STATE_KIND = "capture_state"
+_CAPTURE_ACTION_TYPES = frozenset({"memory.add", "memory.supersede"})
+_CAPTURE_PROVIDER_DB_KEEPALIVE_SEC = 15.0
+_CAPTURE_ENVELOPE_FIELDS = frozenset(
+    {
+        "id",
+        "body_ct",
+        "nonce",
+        "K_user",
+        "K_enclave",
+        "enclave_pk_fpr",
+        "visibility",
+        "owner_user_id",
+        "occurred_at",
+        "type",
+        "source",
+        "status",
+        "importance",
+        "pulse",
+        "last_referenced_at",
+        "anchor_memory_ids",
+        "is_sensitive",
+        "sensitivity_class",
+    }
+)
+
+
+def _capture_provider_db_keepalive(cur) -> None:
+    cur.execute("SELECT 1")
+
+
+def _cancel_and_drain_capture_provider_future(pending_result: Future) -> None:
+    """Do not release disclosure locks until the provider Task is terminal."""
+    pending_result.cancel()
+    try:
+        pending_result.result()
+    except BaseException:
+        # The caller re-raises the original provider/poll/DB failure.  This
+        # result call exists solely as a synchronous privacy drain point.
+        pass
+
+
+def _capture_turns_halted_on_cursor(cur) -> bool:
+    """Read and lock D4 before any per-user Capture lock.
+
+    ``FOR SHARE`` permits unrelated users' short Capture boundaries to proceed
+    concurrently but conflicts with the control plane's halt ``UPDATE``. Thus a
+    provider authorization/preparation/commit either finishes before that
+    update linearizes, or observes ``turns_halted=true`` after it. Missing
+    singleton state fails closed.
+    """
+    cur.execute(
+        "SELECT turns_halted FROM v2_runtime_control WHERE id=1 FOR SHARE"
+    )
+    row = cur.fetchone()
+    if row is None:
+        return True
+    value = row["turns_halted"] if isinstance(row, dict) else row[0]
+    return bool(value)
+
+
+def _mirror_capture_state_current(user_id: str) -> None:
+    """Mirror only the current primary row while holding Chat Clear's fence.
+
+    Capture transactions commit before best-effort TEE I/O. Re-reading under a
+    fresh shared fence prevents an old postcommit callback from resurrecting a
+    row after Clear, and mirrors a newer state instead of an obsolete snapshot
+    when another Capture transition won in between.
+    """
+    try:
+        with _pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor(row_factory=dict_row) as cur:
+                    db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                    cur.execute(
+                        "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s",
+                        (str(user_id), _CAPTURE_STATE_KIND),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        db._mirror_persisted_blob(
+                            str(user_id),
+                            _CAPTURE_STATE_KIND,
+                            dict(row["doc"] or {}),
+                        )
+    except Exception as exc:  # noqa: BLE001 — primary transition already committed
+        log.warning(
+            "[v2.jobs] capture_state mirror deferred user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
+def _capture_owned_job_on_cursor(cur, job_id, user_id: str, claimed_by: str):
+    """Lock and validate one running Capture job after outer fences.
+
+    Capture disclosure/mutation boundaries take D4 first, then chat, optional
+    memory, and consent fences before entering here. Other lifecycle helpers
+    take chat first. Within either prefix, runtime row -> job row is invariant;
+    renew/claim use that same order and reversing the two can deadlock them.
+    """
+    cur.execute(
+        "SELECT hosted_runtime_state,runtime_generation FROM v2_runtime_state "
+        "WHERE user_id=%s FOR UPDATE",
+        (str(user_id),),
+    )
+    runtime = cur.fetchone()
+    if runtime is None or str(runtime["hosted_runtime_state"]) != "v2":
+        return None
+    cur.execute(
+        "SELECT id,user_id,lane,status,claimed_by,lease_expires_at,"
+        "expected_runtime_generation,"
+        "lease_expires_at > clock_timestamp() AS lease_valid "
+        "FROM agent_jobs WHERE id=%s FOR UPDATE",
+        (job_id,),
+    )
+    job = cur.fetchone()
+    if (
+        job is None
+        or str(job["user_id"]) != str(user_id)
+        or str(job["lane"]) != "capture"
+        or str(job["status"]) not in {"claimed", "running"}
+        or str(job["claimed_by"] or "") != str(claimed_by)
+        or job["lease_expires_at"] is None
+        or not bool(job["lease_valid"])
+        or int(job["expected_runtime_generation"] or 0)
+        != int(runtime["runtime_generation"])
+    ):
+        return None
+    return job
+
+
+def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
+    if not isinstance(actions, list) or len(actions) > 20:
+        raise ValueError("capture actions must be a list of at most 20 items")
+    normalized: list[dict] = []
+    seen_ids: set[str] = set()
+    for action in actions:
+        if not isinstance(action, dict):
+            raise ValueError("capture action must be an object")
+        action_type = str(action.get("type") or "")
+        if action_type not in _CAPTURE_ACTION_TYPES:
+            raise ValueError("unsupported capture action")
+        envelope = action.get("envelope")
+        if not isinstance(envelope, dict):
+            raise ValueError("capture action envelope required")
+        memory_id = str(envelope.get("id") or "")
+        if (
+            not memory_id
+            or len(memory_id) > 160
+            or memory_id in seen_ids
+            or str(envelope.get("owner_user_id") or "") != str(user_id)
+        ):
+            raise ValueError("invalid capture memory identity")
+        seen_ids.add(memory_id)
+        for field in (
+            "body_ct",
+            "nonce",
+            "K_user",
+            "K_enclave",
+            "visibility",
+            "occurred_at",
+            "type",
+        ):
+            if not envelope.get(field):
+                raise ValueError(f"capture envelope missing {field}")
+        if str(envelope["visibility"]) != "shared":
+            raise ValueError("capture envelope must be shared")
+        if str(envelope["type"]) not in {"moment", "quote", "fact", "event"}:
+            raise ValueError("invalid capture memory type")
+        if action_type == "memory.supersede":
+            raw = action.get("supersedes")
+            values = raw if isinstance(raw, list) else [raw]
+            targets = [str(value or "") for value in values if str(value or "")]
+            if not targets:
+                raise ValueError("capture supersede target required")
+        # Persist only ciphertext and non-content metadata.  Parser/provider
+        # scratch fields (including the plaintext draft) must never enter this
+        # retry journal.
+        clean_action = {
+            "type": action_type,
+            "envelope": {
+                key: envelope[key]
+                for key in _CAPTURE_ENVELOPE_FIELDS
+                if key in envelope
+            },
+        }
+        if action_type == "memory.supersede":
+            clean_action["supersedes"] = targets
+        normalized.append(clean_action)
+    return normalized
+
+
+def _capture_allowed_on_cursor(
+    cur, user_id: str, *, lock_row: bool = True
+) -> bool:
+    """Read Capture consent while the caller holds its advisory lock.
+
+    Mutation boundaries also lock the settings row because they update related
+    state in the same transaction.  The long provider-disclosure fence only
+    needs the advisory consent lock: keeping the settings row unlocked avoids
+    an unnecessary row lock while the network call is in flight.
+    """
+    cur.execute(
+        "SELECT doc FROM user_blobs WHERE user_id=%s "
+        "AND kind='proactive_settings'" + (" FOR UPDATE" if lock_row else ""),
+        (str(user_id),),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return True
+    doc = row["doc"]
+    if not isinstance(doc, dict):
+        return False
+    return bool(doc.get("capture_enabled", True))
+
+
+def _cancel_capture_on_cursor(
+    cur,
+    *,
+    job,
+    job_id,
+    user_id: str,
+    claimed_by: str,
+    error: str = "capture_disabled",
+) -> dict:
+    """Purge prepared content and cancel one already-fenced job without backoff."""
+    cur.execute(
+        "DELETE FROM v2_capture_batches WHERE user_id=%s "
+        "AND runtime_generation=%s",
+        (str(user_id), int(job["expected_runtime_generation"])),
+    )
+    cur.execute(
+        "INSERT INTO user_blobs (user_id,kind,doc) VALUES (%s,%s,'{}') "
+        "ON CONFLICT (user_id,kind) DO NOTHING",
+        (str(user_id), _CAPTURE_STATE_KIND),
+    )
+    cur.execute(
+        "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
+        (str(user_id), _CAPTURE_STATE_KIND),
+    )
+    return _capture_fail_on_cursor(
+        cur,
+        state=dict(cur.fetchone()["doc"] or {}),
+        job_id=job_id,
+        user_id=str(user_id),
+        claimed_by=str(claimed_by),
+        error=error,
+        increment_backoff=False,
+    )
+
+
+def prepare_capture_batch(
+    *,
+    job_id,
+    user_id: str,
+    claimed_by: str,
+    window: dict,
+    actions: list[dict],
+) -> dict | None:
+    """Persist encrypted prepared actions once under the Chat Clear fence.
+
+    A retry for the same runtime-generation/frontier returns the first durable
+    action list, so provider nondeterminism can never alter a partially retried
+    batch.
+    """
+    normalized = _validate_capture_actions(str(user_id), actions)
+    after_seq = int(window.get("after_seq") or 0)
+    through_seq = int(window.get("through_seq") or 0)
+    if through_seq <= after_seq:
+        raise ValueError("capture batch must advance the frontier")
+    persisted_state: dict | None = None
+    result: dict | None = None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                halted = _capture_turns_halted_on_cursor(cur)
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                db._lock_capture_consent_on_cursor(cur, str(user_id))
+                job = _capture_owned_job_on_cursor(
+                    cur, job_id, str(user_id), str(claimed_by)
+                )
+                if job is None:
+                    return None
+                if halted:
+                    persisted_state = _cancel_capture_on_cursor(
+                        cur,
+                        job=job,
+                        job_id=job_id,
+                        user_id=str(user_id),
+                        claimed_by=str(claimed_by),
+                        error="turns_halted",
+                    )
+                    result = {
+                        "rejected": True,
+                        "reason": "turns_halted",
+                    }
+                elif not _capture_allowed_on_cursor(cur, str(user_id)):
+                    persisted_state = _cancel_capture_on_cursor(
+                        cur,
+                        job=job,
+                        job_id=job_id,
+                        user_id=str(user_id),
+                        claimed_by=str(claimed_by),
+                    )
+                    result = {
+                        "rejected": True,
+                        "reason": "capture_disabled",
+                    }
+                else:
+                    generation = int(job["expected_runtime_generation"])
+                    cur.execute(
+                        "INSERT INTO v2_capture_batches "
+                        "(user_id,runtime_generation,after_seq,through_seq,"
+                        "after_message_id,until_message_id,until_ts,actions_json,"
+                        "action_count,prepared_by_job_id) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (user_id,runtime_generation,after_seq) DO NOTHING",
+                        (
+                            str(user_id),
+                            generation,
+                            after_seq,
+                            through_seq,
+                            str(window.get("after_message_id") or ""),
+                            str(window.get("until_message_id") or ""),
+                            float(window.get("until_ts") or 0.0),
+                            Jsonb(normalized),
+                            len(normalized),
+                            job_id,
+                        ),
+                    )
+                    cur.execute(
+                        "SELECT * FROM v2_capture_batches WHERE user_id=%s "
+                        "AND runtime_generation=%s AND after_seq=%s FOR UPDATE",
+                        (str(user_id), generation, after_seq),
+                    )
+                    row = cur.fetchone()
+                    if row is not None and str(row["status"]) == "prepared":
+                        result = dict(row)
+    if persisted_state is not None:
+        _mirror_capture_state_current(str(user_id))
+    return result
+
+
+def get_prepared_capture_batch(
+    *,
+    job_id,
+    user_id: str,
+    claimed_by: str,
+    after_seq: int,
+) -> dict | None:
+    """Adopt an earlier crash's encrypted journal before calling provider."""
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                job = _capture_owned_job_on_cursor(
+                    cur, job_id, str(user_id), str(claimed_by)
+                )
+                if job is None:
+                    return None
+                # At most one Capture job is active per user/lane/generation.
+                # A journal at another frontier can only be a stale legacy
+                # translation/crash artifact; retaining it would keep encrypted
+                # chat-derived content forever with no path that can adopt it.
+                cur.execute(
+                    "DELETE FROM v2_capture_batches WHERE user_id=%s "
+                    "AND (runtime_generation<>%s OR after_seq<>%s)",
+                    (
+                        str(user_id),
+                        int(job["expected_runtime_generation"]),
+                        max(0, int(after_seq)),
+                    ),
+                )
+                cur.execute(
+                    "SELECT * FROM v2_capture_batches WHERE user_id=%s "
+                    "AND runtime_generation=%s AND after_seq=%s "
+                    "AND status='prepared' FOR UPDATE",
+                    (
+                        str(user_id),
+                        int(job["expected_runtime_generation"]),
+                        max(0, int(after_seq)),
+                    ),
+                )
+                row = cur.fetchone()
+                return dict(row) if row is not None else None
+
+
+def _capture_memory_doc(user_id: str, action: dict) -> dict:
+    envelope = dict(action["envelope"])
+    occurred_at = str(envelope["occurred_at"])
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    doc = {
+        "v": 1,
+        "id": str(envelope["id"]),
+        "type": str(envelope["type"]),
+        "occurred_at": occurred_at,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "source": str(envelope.get("source") or "memory_capture"),
+        "body_ct": envelope["body_ct"],
+        "nonce": envelope["nonce"],
+        "K_user": envelope["K_user"],
+        "K_enclave": envelope["K_enclave"],
+        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "visibility": "shared",
+        "owner_user_id": str(user_id),
+        "status": str(envelope.get("status") or "active"),
+        "importance": float(envelope.get("importance") or 0.0),
+        "pulse": float(envelope.get("pulse") or 0.0),
+        "last_referenced_at": str(
+            envelope.get("last_referenced_at") or occurred_at
+        ),
+    }
+    if envelope.get("anchor_memory_ids"):
+        doc["anchor_memory_ids"] = list(envelope["anchor_memory_ids"])
+    for key in ("is_sensitive", "sensitivity_class"):
+        if key in envelope:
+            doc[key] = envelope[key]
+    if action["type"] == "memory.supersede":
+        raw = action.get("supersedes")
+        doc["supersedes"] = list(raw if isinstance(raw, list) else [raw])
+    return doc
+
+
+def _capture_same_memory(existing: dict, wanted: dict) -> bool:
+    return all(
+        existing.get(key) == wanted.get(key)
+        for key in (
+            "id",
+            "type",
+            "body_ct",
+            "nonce",
+            "K_user",
+            "K_enclave",
+            "visibility",
+            "owner_user_id",
+            "supersedes",
+        )
+    )
+
+
+def _capture_fail_on_cursor(
+    cur,
+    *,
+    state: dict,
+    job_id,
+    user_id: str,
+    claimed_by: str,
+    error: str,
+    increment_backoff: bool = True,
+) -> dict:
+    """Fail an already-validated owned Capture job in the caller's txn."""
+    failed = dict(state)
+    failed.update(
+        {
+            "pending_capture_key": "",
+            "capture_fail_streak": int(failed.get("capture_fail_streak") or 0)
+            + (1 if increment_backoff else 0),
+            "last_capture_failed_at": (
+                time.time()
+                if increment_backoff
+                else float(failed.get("last_capture_failed_at") or 0.0)
+            ),
+            "updated_at": datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+    )
+    cur.execute(
+        "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
+        (Jsonb(failed), str(user_id), _CAPTURE_STATE_KIND),
+    )
+    cur.execute(
+        "UPDATE agent_jobs SET status='failed',finished_at=now(),"
+        "last_error=%s,attempt_count=attempt_count+1 "
+        "WHERE id=%s AND status IN ('claimed','running') "
+        "AND claimed_by=%s AND lease_expires_at>now()",
+        (_terminal_error_code(error), job_id, str(claimed_by)),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError("capture ownership lost at failure commit")
+    return failed
+
+
+def _capture_owned_job_for_disclosure_on_cursor(
+    cur, job_id, user_id: str, claimed_by: str
+):
+    """Validate a Capture owner without freezing its lease row.
+
+    The caller already owns D4, Chat Clear, and consent transaction fences.  A
+    shared runtime-state row lock additionally keeps cutover/generation stable
+    for the whole disclosure.  The job row itself remains unlocked so the
+    normal keepalive can renew it during a multi-attempt provider call; prepare
+    and commit revalidate the exact owner afterwards before any durable write.
+    """
+    cur.execute(
+        "SELECT hosted_runtime_state,runtime_generation FROM v2_runtime_state "
+        "WHERE user_id=%s FOR SHARE",
+        (str(user_id),),
+    )
+    runtime = cur.fetchone()
+    if runtime is None or str(runtime["hosted_runtime_state"]) != "v2":
+        return None
+    cur.execute(
+        "SELECT id,user_id,lane,status,claimed_by,lease_expires_at,"
+        "expected_runtime_generation,"
+        "lease_expires_at > clock_timestamp() AS lease_valid "
+        "FROM agent_jobs WHERE id=%s",
+        (job_id,),
+    )
+    job = cur.fetchone()
+    if (
+        job is None
+        or str(job["user_id"]) != str(user_id)
+        or str(job["lane"]) != "capture"
+        or str(job["status"]) not in {"claimed", "running"}
+        or str(job["claimed_by"] or "") != str(claimed_by)
+        or job["lease_expires_at"] is None
+        or not bool(job["lease_valid"])
+        or int(job["expected_runtime_generation"] or 0)
+        != int(runtime["runtime_generation"])
+    ):
+        return None
+    return job
+
+
+def authorize_capture_provider_call(
+    *,
+    job_id,
+    user_id: str,
+    claimed_by: str,
+    provider_call: Callable[[], Any] | None = None,
+) -> dict:
+    """Run one Capture provider disclosure inside every revocation fence.
+
+    The pooled connection and transaction live entirely on the synchronous
+    caller thread.  ``worker`` supplies a callback which bridges the provider
+    coroutine back to its owning event loop; the psycopg connection is never
+    touched by that loop or another thread.  D4 ``FOR SHARE``, Chat Clear's
+    shared advisory lock, Capture consent's exclusive advisory lock, and the
+    runtime-generation ``FOR SHARE`` lock remain held until the callback has
+    completely returned.  Therefore halt, clear, opt-out, and cutover either
+    win before disclosure (the callback is never called) or wait until every
+    provider byte has finished.
+
+    ``provider_call=None`` is retained only for narrow compatibility tests that
+    inspect the gate result. Production callers must pass the callback and
+    require ``provider_call_completed=true`` before accepting a result.
+    """
+    persisted_state: dict | None = None
+    authorized = False
+    provider_result: Any = None
+    provider_call_completed = False
+    reason = "ownership_lost"
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                halted = _capture_turns_halted_on_cursor(cur)
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                db._lock_capture_consent_on_cursor(cur, str(user_id))
+                if halted:
+                    job = _capture_owned_job_on_cursor(
+                        cur, job_id, str(user_id), str(claimed_by)
+                    )
+                    if job is None:
+                        return {"authorized": False, "reason": "ownership_lost"}
+                    persisted_state = _cancel_capture_on_cursor(
+                        cur,
+                        job=job,
+                        job_id=job_id,
+                        user_id=str(user_id),
+                        claimed_by=str(claimed_by),
+                        error="turns_halted",
+                    )
+                    reason = "turns_halted"
+                elif not _capture_allowed_on_cursor(
+                    cur, str(user_id), lock_row=False
+                ):
+                    job = _capture_owned_job_on_cursor(
+                        cur, job_id, str(user_id), str(claimed_by)
+                    )
+                    if job is None:
+                        return {"authorized": False, "reason": "ownership_lost"}
+                    persisted_state = _cancel_capture_on_cursor(
+                        cur,
+                        job=job,
+                        job_id=job_id,
+                        user_id=str(user_id),
+                        claimed_by=str(claimed_by),
+                    )
+                    reason = "capture_disabled"
+                else:
+                    job = _capture_owned_job_for_disclosure_on_cursor(
+                        cur, job_id, str(user_id), str(claimed_by)
+                    )
+                    if job is None:
+                        return {"authorized": False, "reason": "ownership_lost"}
+                    authorized = True
+                    if provider_call is not None:
+                        # The callback may persist trajectory events through a
+                        # nested pooled connection. Propagate the fact that this
+                        # transaction already owns Chat Clear's shared fence so
+                        # PostgreSQL's fair lock queue cannot place that nested
+                        # shared request behind a waiting exclusive clear and
+                        # deadlock outer -> nested -> clear -> outer.
+                        with db._chat_user_fence_held_by_outer_transaction(
+                            str(user_id)
+                        ):
+                            pending_result = provider_call()
+                            if isinstance(pending_result, Future):
+                                # A provider attempt can legitimately span
+                                # minutes. Keep the transaction non-idle so a
+                                # database idle-in-transaction policy cannot
+                                # silently release D4/consent locks while bytes
+                                # are still crossing the provider boundary.
+                                try:
+                                    while True:
+                                        try:
+                                            provider_result = pending_result.result(
+                                                timeout=_CAPTURE_PROVIDER_DB_KEEPALIVE_SEC
+                                            )
+                                            break
+                                        except FutureTimeoutError:
+                                            _capture_provider_db_keepalive(cur)
+                                except BaseException:
+                                    _cancel_and_drain_capture_provider_future(
+                                        pending_result
+                                    )
+                                    raise
+                            else:
+                                # Narrow synchronous/test callback compatibility.
+                                provider_result = pending_result
+                        provider_call_completed = True
+                        # The row deliberately was not locked during network I/O.
+                        # Detect a reaper/owner loss before returning plaintext to
+                        # the rest of the Capture pipeline; prepare/commit repeat
+                        # this check under their stronger mutation locks.
+                        if _capture_owned_job_for_disclosure_on_cursor(
+                            cur, job_id, str(user_id), str(claimed_by)
+                        ) is None:
+                            authorized = False
+                            reason = "ownership_lost"
+    if persisted_state is not None:
+        _mirror_capture_state_current(str(user_id))
+    if authorized:
+        result = {"authorized": True}
+        if provider_call is not None:
+            result.update(
+                {
+                    "provider_call_completed": provider_call_completed,
+                    "provider_result": provider_result,
+                }
+            )
+        return result
+    if provider_call_completed:
+        return {
+            "authorized": False,
+            "reason": reason,
+            "provider_call_completed": True,
+            "provider_result": provider_result,
+        }
+    return {
+        "authorized": False,
+        "reason": reason,
+        "rejected": True,
+    }
+
+
+def commit_capture_batch(
+    *,
+    job_id,
+    user_id: str,
+    claimed_by: str,
+    batch_id,
+) -> dict:
+    """Atomically apply every memory effect, advance seq, and finish the job."""
+    affected_ids: set[str] = set()
+    persisted_state: dict | None = None
+    mirrored_logs: list[tuple[int, str, dict, str]] = []
+    result: dict = {"committed": False, "reason": "batch_unavailable"}
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                halted = _capture_turns_halted_on_cursor(cur)
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                db._lock_memory_user_mutation_on_cursor(cur, str(user_id))
+                db._lock_capture_consent_on_cursor(cur, str(user_id))
+                job = _capture_owned_job_on_cursor(
+                    cur, job_id, str(user_id), str(claimed_by)
+                )
+                if job is None:
+                    return {"committed": False, "reason": "ownership_lost"}
+                cur.execute(
+                    "SELECT * FROM v2_capture_batches WHERE id=%s "
+                    "AND user_id=%s FOR UPDATE",
+                    (batch_id, str(user_id)),
+                )
+                batch = cur.fetchone()
+                batch_unavailable = (
+                    batch is None
+                    or str(batch["status"]) != "prepared"
+                    or int(batch["runtime_generation"])
+                    != int(job["expected_runtime_generation"])
+                )
+                cur.execute(
+                    "INSERT INTO user_blobs (user_id,kind,doc) VALUES (%s,%s,'{}') "
+                    "ON CONFLICT (user_id,kind) DO NOTHING",
+                    (str(user_id), _CAPTURE_STATE_KIND),
+                )
+                cur.execute(
+                    "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s "
+                    "FOR UPDATE",
+                    (str(user_id), _CAPTURE_STATE_KIND),
+                )
+                state = dict(cur.fetchone()["doc"] or {})
+                capture_allowed = (
+                    False
+                    if halted
+                    else _capture_allowed_on_cursor(cur, str(user_id))
+                )
+                raw_seq = state.get("last_captured_until_seq")
+                if str(raw_seq or "").isdigit():
+                    current_seq = int(raw_seq)
+                else:
+                    legacy_id = str(
+                        state.get("last_captured_until_message_id") or ""
+                    )
+                    cur.execute(
+                        "SELECT seq FROM chat_messages WHERE user_id=%s "
+                        "AND msg_id=%s",
+                        (str(user_id), legacy_id),
+                    )
+                    legacy_row = cur.fetchone()
+                    current_seq = (
+                        int(legacy_row["seq"]) if legacy_row is not None else 0
+                    )
+                if halted:
+                    persisted_state = _cancel_capture_on_cursor(
+                        cur,
+                        job=job,
+                        job_id=job_id,
+                        user_id=str(user_id),
+                        claimed_by=str(claimed_by),
+                        error="turns_halted",
+                    )
+                    result = {
+                        "committed": False,
+                        "reason": "turns_halted",
+                        "rejected": True,
+                    }
+                elif not capture_allowed:
+                    cur.execute(
+                        "DELETE FROM v2_capture_batches WHERE user_id=%s "
+                        "AND runtime_generation=%s",
+                        (
+                            str(user_id),
+                            int(job["expected_runtime_generation"]),
+                        ),
+                    )
+                    persisted_state = _capture_fail_on_cursor(
+                        cur,
+                        state=state,
+                        job_id=job_id,
+                        user_id=str(user_id),
+                        claimed_by=str(claimed_by),
+                        error="capture_disabled",
+                        increment_backoff=False,
+                    )
+                    result = {
+                        "committed": False,
+                        "reason": "capture_disabled",
+                        "rejected": True,
+                    }
+                elif batch_unavailable:
+                    # The job is still owned, so terminalize it atomically
+                    # instead of masquerading as a stale lease. This can happen
+                    # when opt-out erased a journal and opt-in raced back before
+                    # the old worker resumed.
+                    persisted_state = _capture_fail_on_cursor(
+                        cur,
+                        state=state,
+                        job_id=job_id,
+                        user_id=str(user_id),
+                        claimed_by=str(claimed_by),
+                        error="capture_batch_unavailable",
+                    )
+                    result = {
+                        "committed": False,
+                        "reason": "batch_unavailable",
+                        "rejected": True,
+                    }
+                elif current_seq != int(batch["after_seq"]):
+                    cur.execute(
+                        "DELETE FROM v2_capture_batches WHERE id=%s", (batch_id,)
+                    )
+                    persisted_state = _capture_fail_on_cursor(
+                        cur,
+                        state=state,
+                        job_id=job_id,
+                        user_id=str(user_id),
+                        claimed_by=str(claimed_by),
+                        error="capture_frontier_changed",
+                    )
+                    result = {
+                        "committed": False,
+                        "reason": "frontier_changed",
+                        "rejected": True,
+                    }
+                else:
+                    actions = _validate_capture_actions(
+                        str(user_id), list(batch["actions_json"] or [])
+                    )
+                    prepared: list[
+                        tuple[dict, dict, dict | None, list[tuple[str, dict]]]
+                    ] = []
+                    rejection = ""
+                    # Validate and lock the complete effect set before the first
+                    # write.  Semantic poison is rejected durably; transient DB
+                    # errors still roll back and retain the prepared journal.
+                    for action in actions:
+                        wanted = _capture_memory_doc(str(user_id), action)
+                        memory_id = str(wanted["id"])
+                        cur.execute(
+                            "SELECT doc FROM memory_moments WHERE user_id=%s "
+                            "AND moment_id=%s FOR UPDATE",
+                            (str(user_id), memory_id),
+                        )
+                        existing_row = cur.fetchone()
+                        existing = (
+                            dict(existing_row["doc"] or {})
+                            if existing_row is not None
+                            else None
+                        )
+                        if existing is not None and not _capture_same_memory(
+                            existing, wanted
+                        ):
+                            rejection = "capture_memory_id_conflict"
+                            break
+                        targets_locked: list[tuple[str, dict]] = []
+                        if action["type"] == "memory.supersede":
+                            for target_id in action.get("supersedes") or []:
+                                target_id = str(target_id)
+                                cur.execute(
+                                    "SELECT doc FROM memory_moments "
+                                    "WHERE user_id=%s AND moment_id=%s FOR UPDATE",
+                                    (str(user_id), target_id),
+                                )
+                                target_row = cur.fetchone()
+                                if target_row is None:
+                                    rejection = "capture_supersede_target_missing"
+                                    break
+                                target = dict(target_row["doc"] or {})
+                                if str(target.get("owner_user_id") or "") != str(
+                                    user_id
+                                ):
+                                    rejection = "capture_supersede_not_owned"
+                                    break
+                                targets_locked.append((target_id, target))
+                        if rejection:
+                            break
+                        prepared.append((action, wanted, existing, targets_locked))
+
+                    if rejection:
+                        cur.execute(
+                            "DELETE FROM v2_capture_batches WHERE id=%s", (batch_id,)
+                        )
+                        persisted_state = _capture_fail_on_cursor(
+                            cur,
+                            state=state,
+                            job_id=job_id,
+                            user_id=str(user_id),
+                            claimed_by=str(claimed_by),
+                            error=rejection,
+                        )
+                        result = {
+                            "committed": False,
+                            "reason": rejection,
+                            "rejected": True,
+                        }
+                    else:
+                        now_iso = datetime.now(timezone.utc).isoformat().replace(
+                            "+00:00", "Z"
+                        )
+                        for ordinal, (
+                            action,
+                            wanted,
+                            existing,
+                            targets_locked,
+                        ) in enumerate(prepared):
+                            memory_id = str(wanted["id"])
+                            if existing is None:
+                                cur.execute(
+                                    "INSERT INTO memory_moments "
+                                    "(user_id,moment_id,occurred_at,doc) "
+                                    "VALUES (%s,%s,%s,%s)",
+                                    (
+                                        str(user_id),
+                                        memory_id,
+                                        str(wanted["occurred_at"]),
+                                        Jsonb(wanted),
+                                    ),
+                                )
+                                bootstrap_id = "capboot_" + hashlib.sha256(
+                                    f"{batch_id}:{ordinal}".encode("utf-8")
+                                ).hexdigest()[:24]
+                                bootstrap_doc = {
+                                    "user_id": str(user_id),
+                                    "event_type": "memory_action_added_envelope_v1",
+                                    "success": True,
+                                    "error_message": "",
+                                    "timestamp": now_iso,
+                                }
+                                cur.execute(
+                                    "INSERT INTO user_logs "
+                                    "(user_id,stream,item_key,doc) "
+                                    "VALUES (%s,'bootstrap_events',%s,%s) "
+                                    "RETURNING seq",
+                                    (
+                                        str(user_id),
+                                        bootstrap_id,
+                                        Jsonb(bootstrap_doc),
+                                    ),
+                                )
+                                mirrored_logs.append(
+                                    (
+                                        int(cur.fetchone()["seq"]),
+                                        "bootstrap_events",
+                                        bootstrap_doc,
+                                        bootstrap_id,
+                                    )
+                                )
+                            affected_ids.add(memory_id)
+                            for target_id, target in targets_locked:
+                                target.update(
+                                    {
+                                        "status": "superseded",
+                                        "superseded_by": memory_id,
+                                        "updated_at": now_iso,
+                                        "is_archived": True,
+                                        "archived_at": now_iso,
+                                        "archive_reason": f"superseded_by:{memory_id}",
+                                    }
+                                )
+                                cur.execute(
+                                    "UPDATE memory_moments SET doc=%s "
+                                    "WHERE user_id=%s AND moment_id=%s",
+                                    (Jsonb(target), str(user_id), target_id),
+                                )
+                                affected_ids.add(target_id)
+
+                            change_id = "capchg_" + hashlib.sha256(
+                                f"{batch_id}:{ordinal}".encode("utf-8")
+                            ).hexdigest()[:24]
+                            change_doc = {
+                                "id": change_id,
+                                "ts": now_iso,
+                                "action": (
+                                    "supersede"
+                                    if action["type"] == "memory.supersede"
+                                    else "insert"
+                                ),
+                                "memory_id": memory_id,
+                                "type": str(wanted.get("type") or ""),
+                                "capture_mode": "memory_capture",
+                            }
+                            if action["type"] == "memory.supersede":
+                                change_doc["supersedes"] = list(
+                                    action.get("supersedes") or []
+                                )
+                            cur.execute(
+                                "INSERT INTO user_logs "
+                                "(user_id,stream,item_key,doc) "
+                                "VALUES (%s,'memory_changes',%s,%s) RETURNING seq",
+                                (str(user_id), change_id, Jsonb(change_doc)),
+                            )
+                            mirrored_logs.append(
+                                (
+                                    int(cur.fetchone()["seq"]),
+                                    "memory_changes",
+                                    change_doc,
+                                    change_id,
+                                )
+                            )
+
+                        state.update(
+                            {
+                                "last_captured_until_message_id": str(
+                                    batch["until_message_id"]
+                                ),
+                                "last_captured_until_ts": float(batch["until_ts"]),
+                                "last_captured_until_seq": int(batch["through_seq"]),
+                                "capture_seq_initialized": True,
+                                "last_capture_completed_at": time.time(),
+                                "pending_capture_key": "",
+                                "capture_fail_streak": 0,
+                                "last_capture_failed_at": 0.0,
+                                "updated_at": now_iso,
+                            }
+                        )
+                        cur.execute(
+                            "UPDATE user_blobs SET doc=%s "
+                            "WHERE user_id=%s AND kind=%s",
+                            (Jsonb(state), str(user_id), _CAPTURE_STATE_KIND),
+                        )
+                        cur.execute(
+                            "UPDATE agent_jobs SET status='completed',finished_at=now() "
+                            "WHERE id=%s AND status IN ('claimed','running') "
+                            "AND claimed_by=%s AND lease_expires_at>now()",
+                            (job_id, str(claimed_by)),
+                        )
+                        if cur.rowcount != 1:
+                            raise RuntimeError("capture ownership lost at commit")
+                        cur.execute(
+                            "DELETE FROM v2_capture_batches WHERE id=%s", (batch_id,)
+                        )
+                        persisted_state = state
+                        result = {
+                            "committed": True,
+                            "batch_id": int(batch_id),
+                            "affected_memory_ids": sorted(affected_ids),
+                        }
+    if persisted_state is not None:
+        _mirror_capture_state_current(str(user_id))
+    if affected_ids:
+        from tee_shadow import mirror
+
+        for memory_id in sorted(affected_ids):
+            mirror.mark_pending(
+                str(user_id), "memory_moments", memory_id, "requeue"
+            )
+        for seq, stream, log_doc, item_key in mirrored_logs:
+            mirror.execute(
+                "INSERT INTO user_logs "
+                "(user_id,stream,seq,item_key,doc) OVERRIDING SYSTEM VALUE "
+                "VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (str(user_id), stream, seq, item_key, Jsonb(log_doc)),
+            )
+    return result
+
+
+def fail_capture_job(
+    *,
+    job_id,
+    user_id: str,
+    claimed_by: str,
+    error: str,
+) -> bool:
+    """Fail + arm backoff only while this worker still owns the Capture job."""
+    persisted_state: dict | None = None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                if _capture_owned_job_on_cursor(
+                    cur, job_id, str(user_id), str(claimed_by)
+                ) is None:
+                    return False
+                cur.execute(
+                    "INSERT INTO user_blobs (user_id,kind,doc) VALUES (%s,%s,'{}') "
+                    "ON CONFLICT (user_id,kind) DO NOTHING",
+                    (str(user_id), _CAPTURE_STATE_KIND),
+                )
+                cur.execute(
+                    "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s "
+                    "FOR UPDATE",
+                    (str(user_id), _CAPTURE_STATE_KIND),
+                )
+                state = dict(cur.fetchone()["doc"] or {})
+                persisted_state = _capture_fail_on_cursor(
+                    cur,
+                    state=state,
+                    job_id=job_id,
+                    user_id=str(user_id),
+                    claimed_by=str(claimed_by),
+                    error=error,
+                )
+    if persisted_state is not None:
+        _mirror_capture_state_current(str(user_id))
+    return True
+
+
+def cancel_capture_job(
+    *,
+    job_id,
+    user_id: str,
+    claimed_by: str,
+    error: str = "capture_disabled",
+) -> bool:
+    """Consent/global-off cancellation: purge retry content without backoff."""
+    persisted_state: dict | None = None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                db._lock_capture_consent_on_cursor(cur, str(user_id))
+                job = _capture_owned_job_on_cursor(
+                    cur, job_id, str(user_id), str(claimed_by)
+                )
+                if job is None:
+                    return False
+                cur.execute(
+                    "DELETE FROM v2_capture_batches WHERE user_id=%s "
+                    "AND runtime_generation=%s",
+                    (str(user_id), int(job["expected_runtime_generation"])),
+                )
+                cur.execute(
+                    "INSERT INTO user_blobs (user_id,kind,doc) VALUES (%s,%s,'{}') "
+                    "ON CONFLICT (user_id,kind) DO NOTHING",
+                    (str(user_id), _CAPTURE_STATE_KIND),
+                )
+                cur.execute(
+                    "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s "
+                    "FOR UPDATE",
+                    (str(user_id), _CAPTURE_STATE_KIND),
+                )
+                persisted_state = _capture_fail_on_cursor(
+                    cur,
+                    state=dict(cur.fetchone()["doc"] or {}),
+                    job_id=job_id,
+                    user_id=str(user_id),
+                    claimed_by=str(claimed_by),
+                    error=error,
+                    increment_backoff=False,
+                )
+    if persisted_state is not None:
+        _mirror_capture_state_current(str(user_id))
+    return True
 
 
 def _pending_terminal_failure_rows(
@@ -1913,6 +3071,183 @@ def recent_mean_tokens_per_turn(*, lane: str = "chat", limit: int = 50) -> float
             )
             row = cur.fetchone()
             return None if row is None or row[0] is None else float(row[0])
+
+
+def recent_chat_operational_health(
+    *,
+    within_hours: int = 24,
+    limit: int = 1000,
+) -> dict:
+    """Bounded, content-free health snapshot for foreground V2 turns.
+
+    Job outcomes and trajectory coverage deliberately start from
+    ``agent_jobs``.  Starting from metrics or trajectory rows would make a
+    completely missing write disappear from the denominator and report a
+    falsely healthy fleet.  ``superseded`` is reported separately from real
+    outcomes so a runtime-generation cutover cannot dilute the failure/expiry
+    rates. Jobs with an explicit lifecycle tombstone remain in outcome health
+    but leave the capture denominator; their absent ciphertext is intentional,
+    not a capture failure.
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_limit = max(1, min(int(limit), 1000))
+    terminal_statuses = ("completed", "failed", "expired", "superseded")
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "WITH recent_outcomes AS ("
+                "  SELECT id,status,last_error FROM agent_jobs "
+                "  WHERE lane='chat' "
+                "    AND status IN ('completed','failed','expired') "
+                "    AND finished_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                "), recent_superseded AS ("
+                "  SELECT id FROM agent_jobs WHERE lane='chat' "
+                "    AND status='superseded' "
+                "    AND finished_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                "), outcomes AS ("
+                "  SELECT COUNT(*)::int AS sampled_outcome_jobs,"
+                "    COUNT(*) FILTER (WHERE status='completed')::int AS completed,"
+                "    COUNT(*) FILTER (WHERE status='failed')::int AS failed,"
+                "    COUNT(*) FILTER (WHERE status='expired')::int AS expired,"
+                "    COUNT(*) FILTER (WHERE status='expired' "
+                "      AND last_error='queue_timeout')::int AS queue_expired,"
+                "    COUNT(*) FILTER (WHERE status='expired' "
+                "      AND last_error='lease_timeout')::int AS lease_expired "
+                "  FROM recent_outcomes"
+                "), superseded AS ("
+                "  SELECT COUNT(*)::int AS superseded FROM recent_superseded"
+                "), pending AS ("
+                "  SELECT COUNT(*)::int AS pending,"
+                "    EXTRACT(EPOCH FROM "
+                "      (clock_timestamp()-MIN(created_at))) AS oldest_pending_age_sec "
+                "  FROM agent_jobs WHERE lane='chat' AND status='pending'"
+                ") SELECT outcomes.*,superseded.superseded,pending.pending,"
+                "pending.oldest_pending_age_sec "
+                "FROM outcomes CROSS JOIN superseded CROSS JOIN pending",
+                (safe_hours, safe_limit, safe_hours, safe_limit),
+            )
+            job_row = cur.fetchone()
+
+            cur.execute(
+                "WITH recent AS ("
+                "  SELECT latency_ms FROM v2_turn_metrics "
+                "  WHERE lane='chat' AND latency_ms IS NOT NULL AND latency_ms >= 0 "
+                "    AND created_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY created_at DESC,id DESC LIMIT %s"
+                ") SELECT COUNT(*)::int AS sampled_turns,"
+                "  percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) "
+                "    AS p95_ms FROM recent",
+                (safe_hours, safe_limit),
+            )
+            latency_row = cur.fetchone()
+
+            cur.execute(
+                "WITH recent_jobs AS ("
+                "  SELECT id,status FROM agent_jobs "
+                "  WHERE lane='chat' "
+                "    AND created_at >= now() - make_interval(hours => %s) "
+                "    AND trajectory_purged_at IS NULL "
+                "  ORDER BY id DESC LIMIT %s"
+                "), classified AS ("
+                "  SELECT job.id,"
+                "    EXISTS (SELECT 1 FROM v2_trajectory_events gap "
+                "      WHERE gap.job_id=job.id AND gap.event_kind='capture_gap') "
+                "      AS has_capture_gap,"
+                "    CASE "
+                "      WHEN stream.job_id IS NULL "
+                "        AND job.status=ANY(%s::text[]) THEN 'missing' "
+                "      WHEN stream.job_id IS NULL THEN 'open' "
+                "      WHEN EXISTS (SELECT 1 FROM v2_trajectory_events gap "
+                "        WHERE gap.job_id=job.id AND gap.event_kind='capture_gap') "
+                "        THEN 'partial' "
+                "      WHEN EXISTS (SELECT 1 FROM v2_trajectory_events terminal "
+                "        WHERE terminal.job_id=job.id "
+                "          AND terminal.event_kind='turn_terminal') THEN 'complete' "
+                "      WHEN job.status=ANY(%s::text[]) THEN 'partial' "
+                "      ELSE 'open' "
+                "    END AS capture_status "
+                "  FROM recent_jobs job "
+                "  LEFT JOIN v2_trajectory_streams stream ON stream.job_id=job.id"
+                ") SELECT COUNT(*)::int AS sampled_jobs,"
+                "  COUNT(*) FILTER (WHERE capture_status='complete')::int AS complete,"
+                "  COUNT(*) FILTER (WHERE capture_status='partial')::int AS partial,"
+                "  COUNT(*) FILTER (WHERE capture_status='missing')::int AS missing,"
+                "  COUNT(*) FILTER (WHERE capture_status='open')::int AS open,"
+                "  COUNT(*) FILTER (WHERE has_capture_gap)::int AS capture_gap "
+                "FROM classified",
+                (
+                    safe_hours,
+                    safe_limit,
+                    list(terminal_statuses),
+                    list(terminal_statuses),
+                ),
+            )
+            trajectory_row = cur.fetchone()
+
+    completed = int(job_row["completed"] or 0)
+    failed = int(job_row["failed"] or 0)
+    expired = int(job_row["expired"] or 0)
+    outcome_jobs = completed + failed + expired
+    sampled_trajectories = int(trajectory_row["sampled_jobs"] or 0)
+    complete_trajectories = int(trajectory_row["complete"] or 0)
+    oldest_pending_age = job_row["oldest_pending_age_sec"]
+    p95_ms = latency_row["p95_ms"]
+    return {
+        "window_hours": safe_hours,
+        "sample_limit": safe_limit,
+        "jobs": {
+            "sampled_terminal_jobs": (
+                int(job_row["sampled_outcome_jobs"] or 0)
+                + int(job_row["superseded"] or 0)
+            ),
+            "completed": completed,
+            "failed": failed,
+            "expired": expired,
+            "queue_expired": int(job_row["queue_expired"] or 0),
+            "lease_expired": int(job_row["lease_expired"] or 0),
+            "superseded": int(job_row["superseded"] or 0),
+            "failure_rate": (failed / outcome_jobs) if outcome_jobs else None,
+            "expiry_rate": (expired / outcome_jobs) if outcome_jobs else None,
+            "error_or_expiry_rate": (
+                (failed + expired) / outcome_jobs if outcome_jobs else None
+            ),
+            "pending": int(job_row["pending"] or 0),
+            "oldest_pending_age_sec": (
+                max(0.0, float(oldest_pending_age))
+                if oldest_pending_age is not None
+                else None
+            ),
+        },
+        "latency": {
+            "sampled_turns": int(latency_row["sampled_turns"] or 0),
+            "p95_ms": float(p95_ms) if p95_ms is not None else None,
+        },
+        "trajectory": {
+            "sampled_jobs": sampled_trajectories,
+            "complete": complete_trajectories,
+            "partial": int(trajectory_row["partial"] or 0),
+            "missing": int(trajectory_row["missing"] or 0),
+            "open": int(trajectory_row["open"] or 0),
+            "capture_gap": int(trajectory_row["capture_gap"] or 0),
+            "complete_rate": (
+                complete_trajectories
+                / (
+                    complete_trajectories
+                    + int(trajectory_row["partial"] or 0)
+                    + int(trajectory_row["missing"] or 0)
+                )
+                if (
+                    complete_trajectories
+                    + int(trajectory_row["partial"] or 0)
+                    + int(trajectory_row["missing"] or 0)
+                )
+                else None
+            ),
+        },
+    }
 
 
 def recent_prompt_cache_stats(
@@ -3040,6 +4375,77 @@ def finish_sandbox_acquisition(
             return cur.rowcount == 1
 
 
+def purge_expired_trajectories(*, retention_days: int, limit: int = 100) -> int:
+    """Purge one bounded batch of expired, terminal trajectory content.
+
+    ``agent_jobs`` and ``v2_turn_metrics`` are deliberately preserved. The
+    content-lifecycle tombstone advances before review/stream ciphertext is
+    deleted, in the same transaction, so a delayed trajectory callback cannot
+    recreate content after the retention boundary. Retention is a hard content
+    boundary: pending/running offline reviews are cancelled and removed rather
+    than extending ciphertext lifetime indefinitely.
+    """
+    if type(retention_days) is not int or not 1 <= retention_days <= 3650:
+        raise ValueError("trajectory retention_days must be 1..3650")
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError("trajectory retention limit must be 1..1000")
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "WITH candidates AS ("
+                    " SELECT job.id FROM agent_jobs AS job "
+                    " WHERE job.status IN "
+                    " ('completed','failed','expired','superseded') "
+                    " AND job.finished_at IS NOT NULL "
+                    " AND job.finished_at < clock_timestamp() "
+                    "   - make_interval(days => %s) "
+                    " AND job.trajectory_purged_at IS NULL "
+                    " ORDER BY job.finished_at,job.id LIMIT %s "
+                    " FOR UPDATE OF job SKIP LOCKED"
+                    ") UPDATE agent_jobs AS job SET "
+                    " trajectory_purged_at=clock_timestamp() "
+                    "FROM candidates WHERE job.id=candidates.id "
+                    "RETURNING job.id",
+                    (retention_days, limit),
+                )
+                job_ids = [int(row["id"]) for row in cur.fetchall()]
+                if not job_ids:
+                    return 0
+
+                # A running review owns a separate low-priority runner job.
+                # Retention wins over analysis: fence that runner before the
+                # review/stream rows disappear so it cannot later commit an
+                # analysis of content whose TTL has expired. Pending reviews
+                # have no claimed runner and are simply removed below.
+                cur.execute(
+                    "UPDATE agent_jobs AS runner SET status='superseded',"
+                    "finished_at=clock_timestamp(),"
+                    "last_error='trajectory_retention_expired' "
+                    "FROM v2_trajectory_reviews AS review "
+                    "WHERE review.source_job_id=ANY(%s::bigint[]) "
+                    "AND review.claimed_by_job_id=runner.id "
+                    "AND runner.lane='trajectory_review' "
+                    "AND runner.status IN ('pending','claimed','running')",
+                    (job_ids,),
+                )
+
+                # Reviews may hold an encrypted model response in addition to
+                # stream events. Delete them first, then let deletion of each
+                # stream cascade its immutable event rows.
+                cur.execute(
+                    "DELETE FROM v2_trajectory_reviews "
+                    "WHERE source_job_id=ANY(%s::bigint[])",
+                    (job_ids,),
+                )
+                cur.execute(
+                    "DELETE FROM v2_trajectory_streams "
+                    "WHERE job_id=ANY(%s::bigint[])",
+                    (job_ids,),
+                )
+                return len(job_ids)
+
+
 def append_trajectory_events_batch(
     job_id: int | str,
     user_id: str,
@@ -3048,11 +4454,11 @@ def append_trajectory_events_batch(
 ) -> list[int]:
     """Atomically append encrypted event rows and return their immutable indices.
 
-    Stream-row locking serializes concurrent callbacks without locking the
-    source ``agent_jobs`` row. Repeating idempotency keys returns the existing
-    indices and never rewrites ciphertext. The batch form lets one oversized
-    logical trajectory event store every encrypted chunk under one transaction
-    and one stream-frontier advance.
+    A shared source-job lock serializes the first append with retention GC;
+    stream-row locking serializes concurrent callbacks. Repeating idempotency
+    keys returns the existing indices and never rewrites ciphertext. The batch
+    form lets one oversized logical trajectory event store every encrypted
+    chunk under one transaction and one stream-frontier advance.
     """
     if not isinstance(events, list) or not 1 <= len(events) <= 4096:
         raise ValueError("invalid trajectory event batch")
@@ -3087,10 +4493,12 @@ def append_trajectory_events_batch(
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
-                # Capture is retained across an explicit chat clear, but only
-                # events that linearize before that clear may be appended.  The
-                # shared fence lets clear wait for an already-started append;
-                # the generation witness rejects a worker resuming afterwards.
+                # Only events that linearize before an explicit chat clear may
+                # be appended. The shared chat fence lets clear wait for an
+                # already-started append; the generation witness rejects a
+                # worker resuming afterwards. FOR SHARE follows the global
+                # job->stream lock order and prevents retention GC from placing
+                # its tombstone between this check and stream creation.
                 db._lock_chat_user_fence_on_cursor(cur, str(user_id))
                 cur.execute(
                     "SELECT 1 FROM agent_jobs AS job "
@@ -3099,7 +4507,9 @@ def append_trajectory_events_batch(
                     "WHERE job.id=%s AND job.user_id=%s "
                     "AND state.hosted_runtime_state='v2' "
                     "AND job.expected_runtime_generation="
-                    "state.runtime_generation",
+                    "state.runtime_generation "
+                    "AND job.trajectory_purged_at IS NULL "
+                    "FOR SHARE OF job",
                     (job_id, str(user_id)),
                 )
                 if cur.fetchone() is None:
@@ -3254,6 +4664,201 @@ def list_trajectory_events(
                 (job_id, str(user_id), after_index, limit),
             )
             return [dict(row) for row in cur.fetchall()]
+
+
+def get_trajectory_source_job(job_id: int | str, user_id: str) -> dict | None:
+    """Return content-free source metadata only for the exact user/job pair."""
+    try:
+        source_job_id = int(job_id)
+    except (TypeError, ValueError):
+        return None
+    if source_job_id <= 0:
+        return None
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id,lane,status FROM agent_jobs "
+                "WHERE id=%s AND user_id=%s",
+                (source_job_id, str(user_id)),
+            )
+            row = cur.fetchone()
+            return dict(row) if row is not None else None
+
+
+def _trajectory_access_values(
+    *,
+    access_id: str,
+    phase: str,
+    user_id: str,
+    job_id: int | str,
+    operator_id: str,
+    reason_code: str,
+    case_ref: str,
+    event_count: int | None,
+    result_code: str,
+) -> tuple:
+    """Validate and normalize one content-free trajectory-access phase."""
+    try:
+        stable_access_id = str(uuid.UUID(str(access_id)))
+        source_job_id = int(job_id)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("invalid trajectory access identity") from exc
+    stable_phase = str(phase or "")
+    stable_operator = str(operator_id or "")
+    stable_reason = str(reason_code or "")
+    stable_case = str(case_ref or "")
+    stable_result = str(result_code or "")
+    if stable_phase not in {"requested", "succeeded", "failed"}:
+        raise ValueError("invalid trajectory access phase")
+    if source_job_id <= 0 or not str(user_id):
+        raise ValueError("invalid trajectory access target")
+    if _TRAJECTORY_ACCESS_OPERATOR_RE.fullmatch(stable_operator) is None:
+        raise ValueError("invalid trajectory access operator")
+    if stable_reason not in _TRAJECTORY_ACCESS_REASONS:
+        raise ValueError("invalid trajectory access reason")
+    if _TRAJECTORY_ACCESS_CASE_RE.fullmatch(stable_case) is None:
+        raise ValueError("invalid trajectory access case")
+    if _TRAJECTORY_ACCESS_RESULT_RE.fullmatch(stable_result) is None:
+        raise ValueError("invalid trajectory access result")
+    if event_count is not None and (
+        type(event_count) is not int or not 1 <= event_count <= 100_000
+    ):
+        raise ValueError("invalid trajectory access event count")
+    expected_shape = (
+        (stable_phase == "requested" and event_count is None and stable_result == "pending")
+        or (stable_phase == "succeeded" and event_count is not None and stable_result == "ok")
+        or (stable_phase == "failed" and event_count is None and stable_result != "pending")
+    )
+    if not expected_shape:
+        raise ValueError("invalid trajectory access phase shape")
+    return (
+        stable_access_id,
+        stable_phase,
+        str(user_id),
+        source_job_id,
+        stable_operator,
+        stable_reason,
+        stable_case,
+        event_count,
+        stable_result,
+    )
+
+
+def append_trajectory_access_audit(
+    *,
+    access_id: str,
+    phase: str,
+    user_id: str,
+    job_id: int | str,
+    operator_id: str,
+    reason_code: str,
+    case_ref: str,
+    event_count: int | None,
+    result_code: str,
+) -> None:
+    """Append one content-free access phase; plaintext is never accepted."""
+    values = _trajectory_access_values(
+        access_id=access_id,
+        phase=phase,
+        user_id=user_id,
+        job_id=job_id,
+        operator_id=operator_id,
+        reason_code=reason_code,
+        case_ref=case_ref,
+        event_count=event_count,
+        result_code=result_code,
+    )
+    with _pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_trajectory_access_audit "
+            "(access_id,phase,user_id,job_id,operator_id,reason_code,case_ref,"
+            "event_count,result_code) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            values,
+        )
+
+
+def authorize_trajectory_inspection_success(
+    *,
+    access_id: str,
+    user_id: str,
+    job_id: int | str,
+    operator_id: str,
+    reason_code: str,
+    case_ref: str,
+    event_count: int,
+    expected_next_event_index: int,
+) -> bool:
+    """Linearize a successful inspection against Chat Clear and retention GC.
+
+    The caller may decrypt before this point, but plaintext must not be returned
+    unless this transaction proves the exact source/frontier is still live and
+    commits the matching success phase. The chat-user fence serializes with
+    Chat Clear; the source-job and stream locks serialize with TTL GC and late
+    event appends. A false result is an authorization loss, never a soft audit
+    failure.
+    """
+    if type(expected_next_event_index) is not int or expected_next_event_index < 1:
+        raise ValueError("invalid trajectory inspection frontier")
+    values = _trajectory_access_values(
+        access_id=access_id,
+        phase="succeeded",
+        user_id=user_id,
+        job_id=job_id,
+        operator_id=operator_id,
+        reason_code=reason_code,
+        case_ref=case_ref,
+        event_count=event_count,
+        result_code="ok",
+    )
+    stable_access_id, _phase, stable_user_id, source_job_id = values[:4]
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                db._lock_chat_user_fence_on_cursor(cur, stable_user_id)
+                cur.execute(
+                    "SELECT stream.next_event_index FROM agent_jobs AS job "
+                    "JOIN v2_trajectory_streams AS stream ON stream.job_id=job.id "
+                    "WHERE job.id=%s AND job.user_id=%s "
+                    "AND stream.user_id=%s AND job.trajectory_purged_at IS NULL "
+                    "FOR SHARE OF job,stream",
+                    (source_job_id, stable_user_id, stable_user_id),
+                )
+                frontier = cur.fetchone()
+                if (
+                    frontier is None
+                    or int(frontier["next_event_index"]) != expected_next_event_index
+                ):
+                    return False
+                cur.execute(
+                    "SELECT COUNT(*)::int AS event_count "
+                    "FROM v2_trajectory_events WHERE job_id=%s AND user_id=%s",
+                    (source_job_id, stable_user_id),
+                )
+                if int(cur.fetchone()["event_count"]) != event_count:
+                    return False
+                cur.execute(
+                    "SELECT 1 FROM v2_trajectory_access_audit "
+                    "WHERE access_id=%s AND phase='requested' AND user_id=%s "
+                    "AND job_id=%s AND operator_id=%s AND reason_code=%s "
+                    "AND case_ref=%s AND result_code='pending' FOR SHARE",
+                    (
+                        stable_access_id,
+                        stable_user_id,
+                        source_job_id,
+                        values[4],
+                        values[5],
+                        values[6],
+                    ),
+                )
+                if cur.fetchone() is None:
+                    return False
+                cur.execute(
+                    "INSERT INTO v2_trajectory_access_audit "
+                    "(access_id,phase,user_id,job_id,operator_id,reason_code,case_ref,"
+                    "event_count,result_code) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    values,
+                )
+                return True
 
 
 def get_trajectory_capture_state(job_id: int | str, user_id: str) -> dict:
