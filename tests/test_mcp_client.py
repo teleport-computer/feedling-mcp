@@ -664,3 +664,50 @@ def test_wrong_sse_hint_falls_back_to_streamable(monkeypatch):
         URL, {}, transport=httpx.MockTransport(_streamable_mock_handler()),
         mcp_transport="sse"))
     assert tools[0]["name"] == "search"
+
+
+# --- SSE GET-stream connect/TLS errors must map to ProbeError -----------------
+#
+# The streamable path maps connect errors via _post_bounded, but the SSE GET
+# stream is opened inside _sse_session and was left unmapped: a self-signed SSE
+# server leaked a raw httpx.ConnectError, so load_turn_mcp's
+# `isinstance(exc, ProbeError) and exc.kind == "tls"` gate never fired and
+# auto-CA was never attempted for SSE servers. The GET connect error is now
+# classified exactly like _post_bounded.
+
+
+def test_map_sse_connect_error_classifies_by_family():
+    import ssl
+    tls = httpx.ConnectError("boom")
+    tls.__cause__ = ssl.SSLCertVerificationError("self signed certificate")
+    assert mcp_client._map_sse_connect_error(tls).kind == "tls"
+    assert mcp_client._map_sse_connect_error(httpx.ConnectTimeout("t")).kind == "timeout"
+    assert mcp_client._map_sse_connect_error(httpx.ConnectError("refused")).kind == "transport"
+
+
+def test_sse_get_tls_failure_surfaces_probeerror_tls(monkeypatch):
+    """A self-signed SSE server (GET TLS handshake fails) -> ProbeError kind=tls,
+    the exact signal load_turn_mcp uses to trigger the auto-CA fetch."""
+    import ssl
+    _global_ip(monkeypatch)
+
+    def handler(request):
+        raise httpx.ConnectError("tls handshake failed") from ssl.SSLCertVerificationError(
+            "[SSL: CERTIFICATE_VERIFY_FAILED] self signed certificate")
+
+    with pytest.raises(mcp_client.ProbeError) as e:
+        asyncio.run(mcp_client.list_tools(
+            SSE_URL, {}, transport=httpx.MockTransport(handler), mcp_transport="sse"))
+    assert e.value.kind == "tls"
+
+
+def test_sse_get_connect_failure_surfaces_probeerror_transport(monkeypatch):
+    _global_ip(monkeypatch)
+
+    def handler(request):
+        raise httpx.ConnectError("connection refused")
+
+    with pytest.raises(mcp_client.ProbeError) as e:
+        asyncio.run(mcp_client.list_tools(
+            SSE_URL, {}, transport=httpx.MockTransport(handler), mcp_transport="sse"))
+    assert e.value.kind == "transport"

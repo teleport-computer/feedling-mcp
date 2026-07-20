@@ -43,6 +43,7 @@ from hosted.mcp_probe import (
     _SseReader,
     _classify_http,
     _client_kwargs,
+    _contains_tls_error,
     _parse_rpc_response,
     _pin_public_target_async,
     _post_bounded,
@@ -167,8 +168,27 @@ async def _sse_pinned_session(client, url, target, send_headers):
             raise ProbeError(_classify_http(resp.status_code),
                              f"upstream HTTP {resp.status_code}")
 
-    async with _sse_session(stream_get=_stream_get, post=_post, url=url) as session:
-        yield session
+    try:
+        async with _sse_session(stream_get=_stream_get, post=_post, url=url) as session:
+            yield session
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        # The GET-stream connection (TLS handshake / TCP connect) is opened
+        # inside _sse_session and, unlike the streamable path's _post_bounded,
+        # is not otherwise mapped. Classify it exactly like _post_bounded so a
+        # self-signed SSE server surfaces ProbeError(kind="tls") — the signal
+        # load_turn_mcp needs to trigger the auto-CA fetch (POST-side errors
+        # already arrive as ProbeError via _post_bounded and are not re-caught).
+        raise _map_sse_connect_error(exc) from None
+
+
+def _map_sse_connect_error(exc: Exception) -> ProbeError:
+    if isinstance(exc, httpx.ConnectTimeout):
+        return ProbeError("timeout", "connect timeout")
+    if isinstance(exc, httpx.TimeoutException):
+        return ProbeError("timeout", "request timeout")
+    if _contains_tls_error(exc):
+        return ProbeError("tls", "TLS connection failed")
+    return ProbeError("transport", "connection failed")
 
 
 async def _streamable_list(client, target, send_headers) -> list[dict]:
