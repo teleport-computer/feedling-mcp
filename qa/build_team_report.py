@@ -548,6 +548,10 @@ def _persona_summary(
             "skip_reason",
         }
     )
+    embedded_pipeline_present = "pipeline_outcomes" in value
+    embedded_pipeline = value.get("pipeline_outcomes")
+    if embedded_pipeline_present:
+        expected_top = set(expected_top) | {"pipeline_outcomes"}
     row = _exact_keys(value, expected_top, "persona-memory summary")
     target = _exact_keys(
         row["target"],
@@ -568,6 +572,10 @@ def _persona_summary(
         or target["build_sha"] != result["target"]["expected_deployment_sha"]
         or target["runtime_mode"] != result["target"]["expected_runtime"]
         or coverage["repetitions"] != repetitions
+        or (
+            embedded_pipeline_present
+            and _persona_pipeline(embedded_pipeline) != _persona_pipeline(outcomes)
+        )
     ):
         raise TeamReportError("persona-memory summary is invalid")
     projected: dict[str, Any] = {
@@ -733,12 +741,13 @@ def _persona_markdown(summary: Mapping[str, Any]) -> str:
 def _persona_failure_rows(
     summary: Mapping[str, Any],
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Project formal persona failures without inventing exact identifiers.
+    """Project formal persona failures without publishing exact identifiers.
 
-    The persona publisher deliberately removes trajectory/account/correlation IDs.
-    These rows therefore carry only fixed codes and aggregate scenario/metric
-    evidence.  ``exact_id_debug_available`` is always false so downstream bundle
-    planning cannot imply that absent identifiers were retained.
+    A finalized formal scenario is backed by the owner-only private experiment
+    result. The public row remains strictly aggregate and ID-free, while the
+    boolean tells the protected builder that it may validate and encrypt exact
+    trajectory correlation IDs from that private source. Pipeline-level fallback
+    rows have no such source and remain unavailable.
     """
 
     reported_status = str(summary["status"])
@@ -767,7 +776,7 @@ def _persona_failure_rows(
                 "trajectory_status_counts": dict(scenario["trajectory_status_counts"]),
                 "metrics": metrics,
                 "pipeline_outcomes": dict(summary["pipeline_outcomes"]),
-                "exact_id_debug_available": False,
+                "exact_id_debug_available": True,
             }
         )
 
@@ -1508,6 +1517,9 @@ def _build_indexes(
     if persona_summary is not None:
         persona_status, persona_failures = _persona_failure_rows(persona_summary)
         failures.extend(persona_failures)
+    persona_exact_id_failure_count = sum(
+        row.get("exact_id_debug_available") is True for row in persona_failures
+    )
     persona_overall = PERSONA_TO_OVERALL_STATUS[persona_status]
     run_index["api_key_overall_status"] = derived_overall
     run_index["overall_status"] = max(
@@ -1520,7 +1532,9 @@ def _build_indexes(
         "failure_count": len(failures),
         "api_key_failure_count": api_key_failure_count,
         "persona_memory_failure_count": len(persona_failures),
-        "exact_id_failure_count": api_key_failure_count,
+        "exact_id_failure_count": (
+            api_key_failure_count + persona_exact_id_failure_count
+        ),
         "failures": failures,
         "redaction": dict(run_index["redaction"]),
     }
@@ -1856,8 +1870,15 @@ def _team_summary(
                         for stage, outcome in failure["pipeline_outcomes"].items()
                     )
                 ),
-                "- Exact-ID debug context: `unavailable by persona aggregate contract`; "
-                "no account, request, turn, trace, or job IDs were published.",
+                (
+                    "- Exact-ID debug context: `recipient-encrypted bundle eligible`; "
+                    "the team-safe report publishes no account, session, request, "
+                    "response, turn, trace, capture-job, or runtime-session IDs."
+                    if failure["exact_id_debug_available"] is True
+                    else "- Exact-ID debug context: `unavailable by persona aggregate "
+                    "contract`; no account, session, request, response, turn, trace, "
+                    "capture-job, or runtime-session IDs were published."
+                ),
             ]
         )
         metrics = failure["metrics"]

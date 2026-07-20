@@ -20,6 +20,7 @@ Two boundary actions are deliberately distinct:
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 import time
 import urllib.parse
@@ -35,6 +36,49 @@ BOUNDARY_NONE = "none"
 BOUNDARY_CLEAR_HISTORY = "clear_history"
 BOUNDARY_ROTATE_RUNTIME_SESSION = "rotate_runtime_session"
 DEFAULT_ALLOWED_FEEDLING_ORIGINS = ("https://test-api.feedling.app",)
+_PROTECTED_DEBUG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,159}$")
+_PROTECTED_DEBUG_ID_FIELDS = frozenset(
+    {
+        "capture_job_ids",
+        "request_ids",
+        "response_ids",
+        "trace_ids",
+        "runtime_session_ids",
+    }
+)
+
+
+def _protected_debug_identifiers(value: Any) -> dict[str, list[str]]:
+    """Validate the only raw identifier sidecar allowed in private evidence.
+
+    These identifiers never enter the public summary or the semantic judge
+    projection.  Keeping the allowlist here prevents an adapter exception from
+    smuggling response bodies, prompts, credentials, or arbitrary trace data
+    into the later encrypted debug projection.
+    """
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or set(value) - _PROTECTED_DEBUG_ID_FIELDS:
+        raise ValueError("protected debug identifiers have an invalid shape")
+    result: dict[str, list[str]] = {}
+    for identifier_kind in sorted(_PROTECTED_DEBUG_ID_FIELDS):
+        raw = value.get(identifier_kind, [])
+        if (
+            not isinstance(raw, Sequence)
+            or isinstance(raw, (str, bytes, bytearray))
+            or len(raw) > 64
+            or any(
+                not isinstance(item, str)
+                or _PROTECTED_DEBUG_ID_RE.fullmatch(item) is None
+                for item in raw
+            )
+            or len(raw) != len(set(raw))
+        ):
+            raise ValueError("protected debug identifiers are invalid")
+        if raw:
+            result[identifier_kind] = list(raw)
+    return result
 
 
 class TargetError(RuntimeError):
@@ -50,12 +94,16 @@ class TargetError(RuntimeError):
         *,
         status: str = INFRA_ERROR,
         detail: str = "",
+        protected_debug_identifiers: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         if status not in {INFRA_ERROR, BLOCKED_EVIDENCE}:
             raise ValueError("target error status must be INFRA_ERROR or BLOCKED_EVIDENCE")
         self.code = str(code or "TARGET_ERROR")
         self.status = status
         self.detail = str(detail or self.code)
+        self.protected_debug_identifiers = _protected_debug_identifiers(
+            protected_debug_identifiers
+        )
         super().__init__(f"{self.code}: {self.detail}")
 
 
@@ -148,15 +196,17 @@ class ConversationTarget(Protocol):
     def close_session(self, session: TargetSession) -> None: ...
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class _FeedlingOpaqueSession:
     client: Any = field(repr=False, compare=False)
     credentials: Any = field(repr=False, compare=False)
+    last_request_id: str = field(default="", repr=False, compare=False)
+    last_response_id: str = field(default="", repr=False, compare=False)
 
 
 SessionFactory = Callable[[TargetContext], Any]
 ClientFactory = Callable[[str], Any]
-RuntimeSessionRotator = Callable[[Any, Any], Mapping[str, Any]]
+RuntimeSessionRotator = Callable[[Any, Any, Mapping[str, str]], Mapping[str, Any]]
 SessionCloser = Callable[[Any, Any], None]
 
 
@@ -186,9 +236,11 @@ class FeedlingTarget:
 
     A ``session_factory`` is required so every repeat can receive an isolated
     synthetic account/session.  The optional runtime rotator is intentionally
-    separate from transcript clearing; it must return ``rotated=True`` plus
-    distinct ``before_runtime_session_id`` and ``after_runtime_session_id``
-    values before the adapter will publish rotation evidence.
+    separate from transcript clearing.  It receives the client, credentials,
+    and the exact request/response identifiers from the preceding correlated
+    turn, then must return ``rotated=True`` plus distinct
+    ``before_runtime_session_id`` and ``after_runtime_session_id`` values before
+    the adapter will publish rotation evidence.
     """
 
     def __init__(
@@ -352,6 +404,8 @@ class FeedlingTarget:
                     status=BLOCKED_EVIDENCE,
                     detail="Feedling reply has no correlated response id",
                 )
+            opaque.last_request_id = request_id
+            opaque.last_response_id = response_id
             return TargetResponse(
                 text=str(record.get("reply") or ""),
                 request_id=request_id,
@@ -438,7 +492,14 @@ class FeedlingTarget:
                 )
             try:
                 evidence = dict(
-                    self._runtime_session_rotator(opaque.client, opaque.credentials)
+                    self._runtime_session_rotator(
+                        opaque.client,
+                        opaque.credentials,
+                        {
+                            "prior_request_id": opaque.last_request_id,
+                            "prior_response_id": opaque.last_response_id,
+                        },
+                    )
                 )
             except TargetError:
                 raise
@@ -450,6 +511,16 @@ class FeedlingTarget:
                 ) from None
             before_id = str(evidence.get("before_runtime_session_id") or "").strip()
             after_id = str(evidence.get("after_runtime_session_id") or "").strip()
+            try:
+                protected_debug = _protected_debug_identifiers(
+                    evidence.get("protected_debug_identifiers")
+                )
+            except ValueError:
+                raise TargetError(
+                    "SESSION_BOUNDARY_UNPROVEN",
+                    status=BLOCKED_EVIDENCE,
+                    detail="Runtime session rotation debug identifiers are invalid",
+                ) from None
             if (
                 evidence.get("rotated") is not True
                 or not before_id
@@ -476,6 +547,7 @@ class FeedlingTarget:
                         if evidence.get("evidence_id")
                         else ""
                     ),
+                    "protected_debug_identifiers": protected_debug,
                 },
             )
         raise TargetError(

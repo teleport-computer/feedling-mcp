@@ -35,6 +35,10 @@ from qa.regression.contracts import (  # noqa: E402
     canonical_json_sha256,
 )
 from qa.regression.engine import run_experiment, validate_suite_contract  # noqa: E402
+from qa.regression.feedling_rotation import (  # noqa: E402
+    RotationEvidenceError,
+    prove_codex_runtime_session_rotation,
+)
 from qa.regression.codex_judge import (  # noqa: E402
     DEFAULT_CODEX_PROFILE,
     DEFAULT_PERMISSION_PROFILE,
@@ -57,7 +61,12 @@ from qa.regression.scenario_loader import (  # noqa: E402
     load_verified_source_fixture,
     read_contract_json,
 )
-from qa.regression.target import FeedlingTarget, TargetContext  # noqa: E402
+from qa.regression.target import (  # noqa: E402
+    BLOCKED_EVIDENCE,
+    FeedlingTarget,
+    TargetContext,
+    TargetError,
+)
 
 
 DEFAULT_PERSONA = Path("qa/regression/fixtures/golden-persona-mira-v1.json")
@@ -65,6 +74,7 @@ DEFAULT_SCENARIO_ROOT = Path("qa/regression/scenarios")
 DEFAULT_SOURCE_FIXTURE = Path("qa/fixtures/persona-import-v1.json")
 _BUILD_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROTECTED_DEBUG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,159}$")
 _ARM_RECEIPT_KIND = "persona_memory_arm_run"
 _ARM_RECEIPT_KEYS = {
     "schema_version",
@@ -253,12 +263,19 @@ def _deployment_receipt(
 def _required_sessions(suite: RegressionSuite, repetitions: int) -> int:
     per_repeat = 0
     for scenario in suite.scenarios:
-        # Strong scenarios block before mutation when the live target has no
-        # runtime rotation evidence provider, so they consume no account.
-        if "persistent_memory_strong" in scenario.requirements:
-            continue
         per_repeat += len({turn.session_key for turn in scenario.turns})
     return per_repeat * repetitions
+
+
+def formal_sessions_per_repetition() -> int:
+    """Return the checked-in formal suite's exact isolated-account count."""
+
+    suite = load_suite_directory(
+        _REPO_ROOT / DEFAULT_PERSONA,
+        _REPO_ROOT / DEFAULT_SCENARIO_ROOT,
+    )
+    validate_suite_contract(suite)
+    return _required_sessions(suite, 1)
 
 
 def _selected_suite(args: argparse.Namespace) -> RegressionSuite:
@@ -341,10 +358,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         suite.persona, args.source_fixture
     )
     output = _private_output_parent(args.output)
-    if any("persistent_memory_strong" in item.requirements for item in suite.scenarios):
-        raise CommandError(
-            "run-live does not yet have a deployment-specific runtime session rotator; strong nightly scenarios cannot run"
-        )
+    strong_rotation_required = any(
+        "persistent_memory_strong" in item.requirements for item in suite.scenarios
+    )
     semantic_judge = _judge(args)
     required = _required_sessions(suite, args.repetitions)
     live_metadata: dict[str, Any]
@@ -417,6 +433,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     first_profile = sessions[0][0]
     observed_account_runtime = str(first_profile.get("runtime_mode") or "")
     expected_runtime = deployment_runtime or observed_account_runtime
+    if strong_rotation_required and (
+        expected_runtime != "hosted_resident"
+        or first_profile.get("provider") != "openai"
+        or first_profile.get("configured_base_url") != "https://api.openai.com/v1"
+        or first_profile.get("trace_enabled") is not True
+    ):
+        raise CommandError(
+            "strong runtime rotation requires a verbose-traced official OpenAI "
+            "Hosted Runtime V2 account pool"
+        )
     _receipt, receipt_sha256 = _deployment_receipt(
         args.deployment_receipt,
         expected_sha=args.build_sha,
@@ -427,10 +453,33 @@ def _cmd_run(args: argparse.Namespace) -> int:
     def cleanup(client: Any, session: Any) -> None:
         client.reset_account(session)
 
+    def rotate_runtime_session(
+        client: Any,
+        session: Any,
+        prior_turn: dict[str, str],
+    ) -> dict[str, Any]:
+        try:
+            return dict(
+                prove_codex_runtime_session_rotation(client, session, prior_turn)
+            )
+        except RotationEvidenceError as exc:
+            raise TargetError(
+                "SESSION_BOUNDARY_UNPROVEN",
+                status=BLOCKED_EVIDENCE,
+                detail=(
+                    "Exact Codex runtime-session rotation evidence was unavailable "
+                    f"({exc.code})"
+                ),
+                protected_debug_identifiers=exc.protected_debug_identifiers,
+            ) from None
+
     target_adapter = FeedlingTarget(
         target_id=args.target_id,
         base_url=LOCKED_BASE_URL,
         session_factory=pool.checkout,
+        runtime_session_rotator=(
+            rotate_runtime_session if strong_rotation_required else None
+        ),
         session_closer=cleanup if args.cleanup_account else None,
         external_cleanup_guaranteed=args.external_cleanup_guaranteed,
     )
@@ -453,6 +502,27 @@ def _cmd_run(args: argparse.Namespace) -> int:
         },
     )
     experiment_id = args.experiment_id or f"persona-memory-{uuid.uuid4().hex}"
+    protected_debug_accounts = []
+    for _profile, session in sessions[:required]:
+        user_id = str(session.user_id)
+        if _PROTECTED_DEBUG_ID_RE.fullmatch(user_id) is None:
+            raise CommandError("synthetic account identifier is invalid")
+        protected_debug_accounts.append(
+            {
+                "account_fingerprint": hashlib.sha256(
+                    user_id.encode("utf-8")
+                ).hexdigest(),
+                "user_id": user_id,
+            }
+        )
+    if (
+        len(protected_debug_accounts) != len(account_fingerprints)
+        or len({row["user_id"] for row in protected_debug_accounts})
+        != len(protected_debug_accounts)
+        or sorted(row["account_fingerprint"] for row in protected_debug_accounts)
+        != account_fingerprints
+    ):
+        raise CommandError("synthetic debug account binding is invalid")
     result = run_experiment(
         suite=suite,
         target_adapter=target_adapter,
@@ -464,6 +534,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         metadata={
             "deployment_receipt_sha256": receipt_sha256,
             "account_fingerprints": account_fingerprints,
+            "protected_debug_accounts": protected_debug_accounts,
             "source_bundle_sha256": suite.persona.source_fixture_sha256,
             **live_metadata,
         },

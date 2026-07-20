@@ -34,13 +34,19 @@ ios/vendor/dcap-qvl/target/
 # Claude Code session scratch (task locks, transient state)
 .claude/
 
-# Local agent mailbox runtime (messages, inboxes, pane config)
-.agents/
+# Local agent mailbox runtime (messages, inboxes, pane config). Keep the
+# checked-in IO E2E skill discoverable while ignoring all other local state.
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/io-e2e/
+!.agents/skills/io-e2e/**
 buildServer.json
 deploy/backups/
 
 # Agent-driven release qualification output (may contain synthetic account metadata).
 /qualification-artifacts/
+/io-e2e-results/
 
 # Local dev virtualenvs (created for running the test suite / audit sessions)
 .venv/

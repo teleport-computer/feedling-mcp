@@ -9,6 +9,9 @@ PG_DEPLOY = (ROOT / ".github" / "workflows" / "pg-deploy.yml").read_text(
     encoding="utf-8"
 )
 E2E = (ROOT / ".github" / "workflows" / "api-key-e2e.yml").read_text(encoding="utf-8")
+CONTROL = (ROOT / ".github" / "workflows" / "io-e2e-control.yml").read_text(
+    encoding="utf-8"
+)
 REAPER = (ROOT / ".github" / "workflows" / "api-key-e2e-runner-reaper.yml").read_text(
     encoding="utf-8"
 )
@@ -39,26 +42,29 @@ def test_deterministic_qualification_contracts_gate_test_and_production_deploys(
     assert "qa-contract-tests" in production_deploy.split("steps:", 1)[0]
 
 
-def test_existing_default_branch_ci_dispatches_trusted_e2e_without_inheriting_secrets():
-    manual_job = _job("io-e2e-agent-driven-test", "forge-test")
+def test_dedicated_control_workflow_dispatches_trusted_e2e_without_inheriting_secrets():
+    ci_trigger = CI[CI.index("on:\n") : CI.index("concurrency:\n")]
+    control_trigger = CONTROL[CONTROL.index("on:\n") : CONTROL.index("permissions:\n")]
+    qualify = CONTROL[CONTROL.index("  qualify:\n") :]
 
-    assert "resolve-test-deployment-sha:" not in CI
-    assert "github.event_name == 'workflow_dispatch'" in manual_job
-    assert "github.ref == 'refs/heads/main'" in manual_job
-    assert "uses: ./.github/workflows/api-key-e2e.yml" in manual_job
-    assert "expected_deployment_sha" not in manual_job
-    assert "runtime_target: ${{ inputs.runtime_target }}" in manual_job
-    assert "persona_repetitions: ${{ inputs.persona_repetitions }}" in manual_job
-    trigger = CI[CI.index("on:\n") : CI.index("# Cancel in-progress")]
-    assert "persona_repetitions:" in trigger
-    assert 'default: "1"' in trigger
-    assert '- "3"' in trigger
-    assert "permissions:" in manual_job
-    assert "contents: read" in manual_job
-    assert "id-token: write" in manual_job
-    assert "secrets: inherit" not in manual_job
-    assert "secrets:" in manual_job
-    assert "IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}" in manual_job
+    assert "workflow_dispatch:" not in ci_trigger
+    assert "workflow_dispatch:" in control_trigger
+    assert "request_id:" in control_trigger
+    assert "target_ref:" in control_trigger
+    assert "target_sha:" in control_trigger
+    assert "lane:" in control_trigger
+    assert "suite:" in control_trigger
+    assert "runtime_target:" in control_trigger
+    assert "persona_repetitions:" in control_trigger
+    assert "uses: ./.github/workflows/api-key-e2e.yml" in qualify
+    assert "runtime_target: ${{ inputs.runtime_target }}" in qualify
+    assert "persona_repetitions: ${{ inputs.persona_repetitions }}" in qualify
+    assert "permissions:" in qualify
+    assert "contents: read" in qualify
+    assert "id-token: write" in qualify
+    assert "secrets: inherit" not in qualify
+    assert "secrets:" not in qualify
+    assert "IO_E2E_ADMIN_TOKEN" not in qualify
     for forbidden_secret in (
         "QA_CODEX_AUTH_JSON_B64",
         "QA_DEEPSEEK_API_KEY",
@@ -69,14 +75,13 @@ def test_existing_default_branch_ci_dispatches_trusted_e2e_without_inheriting_se
         "QA_KONGBEIQIE_API_KEY",
         "QA_RUNNER_GITHUB_APP_PRIVATE_KEY",
     ):
-        assert forbidden_secret not in manual_job
+        assert forbidden_secret not in qualify
+    assert "workflow_dispatch:" not in E2E
     assert "workflow_call:" in E2E
     workflow_call = E2E[E2E.index("  workflow_call:\n") : E2E.index("permissions:\n")]
-    assert "secrets:" in workflow_call
-    assert "IO_E2E_ADMIN_TOKEN:" in workflow_call
-    assert "required: true" in workflow_call
+    assert "secrets:" not in workflow_call
     assert "group: ci-${{ github.event_name }}-${{ github.ref }}" in CI
-    assert "cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}" in CI
+    assert "cancel-in-progress: true" in CI
 
 
 def test_manual_dispatch_skips_ordinary_ci_jobs_and_runs_only_qualification():
@@ -129,7 +134,9 @@ def test_e2e_pins_secret_bearing_code_and_treats_deployment_sha_as_metadata():
     ]
     qualify = E2E[E2E.index("  qualify-api-key-runtime:\n") :]
 
-    assert "expected_deployment_sha" not in trigger
+    assert "expected_test_head_sha:" in trigger
+    assert "expected_deployment_sha:" in trigger
+    assert trigger.count("required: true") == 3
     assert "group: io-e2e-agent-driven-test" in E2E
     assert 'if [ "$DISPATCH_REF" != "refs/heads/main" ]' in E2E
     assert "runs-on: ubuntu-24.04" in resolver
@@ -140,6 +147,10 @@ def test_e2e_pins_secret_bearing_code_and_treats_deployment_sha_as_metadata():
     assert "Resolve current serialized test deployment target" in resolver
     assert 'if [ "${#images[@]}" -ne 2 ]' in resolver
     assert "git merge-base --is-ancestor" in resolver
+    assert "EXPECTED_TEST_HEAD_SHA: ${{ inputs.expected_test_head_sha }}" in resolver
+    assert "EXPECTED_DEPLOYMENT_SHA: ${{ inputs.expected_deployment_sha }}" in resolver
+    assert 'if [ "$test_head" != "$EXPECTED_TEST_HEAD_SHA" ]' in resolver
+    assert 'if [ "$full_sha" != "$EXPECTED_DEPLOYMENT_SHA" ]' in resolver
     assert (
         "needs: [validate-dispatch, resolve-test-deployment, provision-aws-runner]"
         in qualify
@@ -201,7 +212,7 @@ def test_e2e_uses_pinned_jit_app_and_oidc_actions_with_hosted_cleanup():
     assert "allows_public_repositories" in provision
     assert "restricted_to_workflows" in provision
     assert "selected_workflows != [expected_workflow]" in provision
-    assert '"api-key-e2e.yml@refs/heads/main"' in provision
+    assert '"io-e2e-control.yml@refs/heads/main"' in provision
     assert 'runner.get("runner_group_id")' not in provision
     assert (
         "/actions/runner-groups/${RUNNER_GROUP_ID}/runners?per_page=100&page=1"
@@ -297,6 +308,7 @@ def test_io_e2e_admin_credential_is_narrow_and_not_deployed_to_production():
     test_deploy = _job("deploy-test-cvm", "deploy-test-runner-cvm")
     production_deploy = _job("deploy-cvm", "deploy-test-cvm")
 
+    assert "environment: io-test-deploy" in test_deploy
     assert "secrets.IO_E2E_ADMIN_TOKEN" in test_deploy
     assert "secrets.FEEDLING_ADMIN_TOKEN" in test_deploy
     assert "secrets.FEEDLING_ADMIN_TOKEN" in production_deploy
@@ -335,7 +347,8 @@ def test_every_test_environment_mutator_uses_the_qualification_lock():
 
 
 def test_manual_qualification_binds_agent_output_to_trusted_inputs():
-    assert "on:\n  workflow_dispatch:" in E2E
+    assert "on:\n  workflow_dispatch:" in CONTROL
+    assert "workflow_call:" in E2E
     assert '--provisioning-manifest "${{ steps.context.outputs.manifest }}"' in E2E
     assert "per-turn five-stage latency" in E2E
     assert "qualification-agent semantic judgment" in E2E

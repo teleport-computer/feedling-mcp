@@ -279,7 +279,7 @@ def test_all_pass_report_has_exact_owner_only_outputs(tmp_path):
     assert SENTINEL not in (output / "persona-memory-matrix.md").read_text()
 
 
-def test_formal_persona_failure_is_detailed_and_counted_without_exact_ids(tmp_path):
+def test_formal_persona_failure_is_detailed_and_marks_private_exact_ids(tmp_path):
     paths = _inputs(tmp_path)
     persona_path = paths["source"] / "persona-memory-summary.json"
     persona = _read_json(persona_path)
@@ -305,11 +305,11 @@ def test_formal_persona_failure_is_detailed_and_counted_without_exact_ids(tmp_pa
     assert failure_index["failure_count"] == 1
     assert failure_index["api_key_failure_count"] == 0
     assert failure_index["persona_memory_failure_count"] == 1
-    assert failure_index["exact_id_failure_count"] == 0
+    assert failure_index["exact_id_failure_count"] == 1
     failure = failure_index["failures"][0]
     assert failure["source"] == "persona_memory"
     assert failure["scenario_id"] == "persona-stability"
-    assert failure["exact_id_debug_available"] is False
+    assert failure["exact_id_debug_available"] is True
     assert failure["metrics"][0]["failure_codes"] == ["PERSONA_IDENTITY_DRIFT"]
     run_index = _read_json(output / "run-index.json")
     assert run_index["overall_status"] == "PRODUCT_FAIL"
@@ -320,7 +320,7 @@ def test_formal_persona_failure_is_detailed_and_counted_without_exact_ids(tmp_pa
     assert "## Persona-memory aggregate failures" in rendered
     assert "persona.tone_consistency" in rendered
     assert "PERSONA_IDENTITY_DRIFT" in rendered
-    assert "unavailable by persona aggregate contract" in rendered
+    assert "recipient-encrypted bundle eligible" in rendered
     assert not any(
         forbidden in json.dumps(failure)
         for forbidden in ("user_id", "request_id", "turn_id", "trace_id", "job_id")

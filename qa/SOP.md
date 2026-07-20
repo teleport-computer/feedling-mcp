@@ -1,4 +1,4 @@
-# Feedling API-Key Deployed-Runtime Qualification SOP
+# IO API-Key Deployed-Runtime Qualification SOP
 
 This file is the normative instruction set for an agent-driven, live end-to-end
 qualification of Feedling's deployed **test** environment. This first slice deliberately covers
@@ -6,6 +6,29 @@ API-key users only. VPS, OAuth subscription, iOS UI, and production-user testing
 are outside this SOP.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are requirements.
+
+## 0. On-demand control boundary
+
+- Qualification MUST be requested through the checked-in `tools.io_e2e` client
+  or an agent following `.agents/skills/io-e2e/SKILL.md`. It is not a push,
+  pull-request, deployment, or release trigger.
+- The manual control workflow and secret-bearing evaluator MUST execute from
+  protected `main`. A target ref/SHA is data and MUST NOT select controller,
+  workflow, harness, provisioner, validator, report, or cleanup code.
+- The caller MUST have GitHub repository write access. The client MUST use the
+  caller's existing GitHub CLI authentication without printing, copying, or
+  persisting its token.
+- The current `deployed_test` lane MUST resolve `test` to an immutable full SHA,
+  re-resolve it without secrets in the controller, and bind the separate
+  compose-pinned/live-reported backend SHA. It MUST NOT claim to test an
+  undeployed feature branch.
+- `branch_preview` MUST fail closed until a disposable target deployment and a
+  trusted provider broker issue only per-run, per-profile, provider/model/budget
+  scoped, expiring credentials. A free-form target URL or raw reusable provider
+  key in candidate code is forbidden.
+- The controller MUST retain a same-run sanitized request manifest binding its
+  request UUID, repository, controller SHA, target ref/SHA, deployed SHA, lane,
+  suite, runtime contract, and persona depth.
 
 ## 1. Fixed contract
 
@@ -644,9 +667,20 @@ separate public-safe failure section with allowlisted aggregate scenario,
 trajectory, metric, score/threshold, and fixed failure-code evidence. It MUST
 NOT include persona account, request, turn, trace, job, prompt/reply, rationale,
 or file-content data. The failure index MUST distinguish total, API-key,
-persona-memory, and exact-ID-debuggable counts; persona aggregate failures are
-not exact-ID-debuggable because the finalized public persona contract contains
-no such identifiers.
+persona-memory, and exact-ID-debuggable counts. A finalized non-PASS formal
+scenario is exact-ID-debuggable only through its owner-only private experiment
+result: trusted code MUST bind that result exactly to the canonical run,
+deployment, runtime, account pool, and scanned public summary before projecting
+failure-only identifiers into ciphertext. A pipeline-level persona fallback has
+no finalized trajectory source and MUST remain non-debuggable by exact ID.
+The formal arm MUST run `learned-memory-after-rotation` rather than merely list
+it in the report contract. Before clearing chat, trusted QA code MUST bind the
+exact learned request/reply to a completed capture job with at least one memory
+mutation. It MUST then correlate exact verbose Codex `thread.started` evidence
+for the learned turn and a controlled boundary probe, require distinct thread
+identifiers, and clear the probe before recall. Raw request, response, capture
+job, and runtime-session identifiers MUST remain private; missing evidence or
+probe cleanup blocks qualification.
 For a formal hosted arm, the summary MUST contain the exact ordered scenario IDs
 `contradiction-resistance`, `cross-user-memory-isolation`,
 `imported-memory-after-clear`, `learned-memory-after-rotation`,
@@ -675,19 +709,23 @@ key MUST be sealed independently to every configured recipient.
 
 Before encryption, the trusted builder MUST bind the canonical result and
 failure index to the retained provisioning manifest, selected runtime contract,
-exact expected deployment SHA, and the scanned public persona summary. Persona
-aggregate rows MUST remain out of the encrypted payload unless a future trusted
-private contract explicitly provides allowlisted exact identifiers. Decryption MUST require the scanned
-`failure-index.json` from the team-safe artifact and verify its binding to the
-encrypted envelope. Operators MUST download both artifacts from the same
-original GitHub Actions run; the run page is the provenance boundary, and a
-re-shared standalone bundle MUST NOT be trusted.
+exact expected deployment SHA, and the scanned public persona summary. For a
+finalized persona failure it MUST also require the owner-only private result and
+validate its exact run/deployment/runtime/pool/summary binding; missing,
+ambiguous, or extra trajectory/account bindings fail closed. Pipeline-level
+persona fallback rows MUST remain out of the encrypted payload. Decryption MUST
+require both scanned `failure-index.json` and `persona-memory-summary.json` from
+the team-safe artifact and verify their byte-exact bindings to the encrypted
+envelope. Operators MUST download both artifacts from the same original GitHub
+Actions run; the run page is the provenance boundary, and a re-shared standalone
+bundle MUST NOT be trusted.
 
-The protected plaintext MAY contain exact synthetic user, request, turn, trace,
-and persona-job IDs plus fixed failure/assertion/evidence codes, bounded attempt
-history, numeric latency, and allowlisted reasoning/persona/trace metadata. This
-supports exact backend-log lookup. It MUST NOT contain raw chat, prompt/reply
-text, persona/import file content, hidden or displayed COT, trace bodies,
+The protected plaintext MAY contain exact synthetic account, session, request,
+response, turn, trace, capture-job, and runtime-session IDs plus fixed scenario,
+repeat, status, failure/assertion/evidence codes, bounded attempt history,
+numeric latency, and allowlisted reasoning/persona/trace metadata. This supports
+exact backend-log lookup. It MUST NOT contain raw chat, prompt/reply text,
+persona/import file content, hidden or displayed COT, trace bodies,
 provider-response bodies, credentials, or free-form rationale. The builder MUST
 NOT write a plaintext temporary file. Only ciphertext may enter the public
 repository's Actions artifact store. When a bundle is expected, bundle build,

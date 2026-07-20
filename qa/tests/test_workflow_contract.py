@@ -9,6 +9,12 @@ WORKFLOW = (
 CI_WORKFLOW = (
     Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 ).read_text(encoding="utf-8")
+CONTROL_WORKFLOW = (
+    Path(__file__).resolve().parents[2]
+    / ".github"
+    / "workflows"
+    / "io-e2e-control.yml"
+).read_text(encoding="utf-8")
 PROVISIONER = (
     Path(__file__).resolve().parents[2] / "qa" / "provision_profiles.py"
 ).read_text(encoding="utf-8")
@@ -20,20 +26,22 @@ def _step(name: str, next_name: str) -> str:
     return WORKFLOW[start:end]
 
 
-def test_workflow_is_manual_only_and_uses_protected_jit_runner():
+def test_workflow_is_reusable_only_and_uses_protected_jit_runner():
     trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
-    assert "workflow_dispatch:" in trigger
+    assert "workflow_dispatch:" not in trigger
     assert "workflow_call:" in trigger
     assert "push:" not in trigger
     assert "pull_request:" not in trigger
     assert "schedule:" not in trigger
     assert "  deployment:" not in trigger
     assert WORKFLOW.startswith(
-        "name: IO agentic E2E qualification (trusted self-service)\n"
+        "name: IO agentic E2E evaluator (trusted reusable workflow)\n"
     )
-    assert "run-name: IO E2E · deployed test" in WORKFLOW
-    assert "name: CI / IO agentic E2E" in CI_WORKFLOW
-    assert "IO agentic E2E — deployed test (self-service)" in CI_WORKFLOW
+    assert "run-name:" not in WORKFLOW
+    assert "name: CI\n" in CI_WORKFLOW
+    assert "workflow_dispatch:" not in CI_WORKFLOW
+    assert "name: IO E2E tool\n" in CONTROL_WORKFLOW
+    assert "workflow_dispatch:" in CONTROL_WORKFLOW
     assert "validate-dispatch:" in WORKFLOW
     assert 'if [ "$DISPATCH_REF" != "refs/heads/main" ]' in WORKFLOW
     assert (
@@ -92,7 +100,7 @@ def test_github_hosted_controller_provisions_private_jit_aws_runner():
     assert 'group.get("restricted_to_workflows") is not True' in provision
     assert 'selected_workflows = group.get("selected_workflows")' in provision
     assert "selected_workflows != [expected_workflow]" in provision
-    assert '"api-key-e2e.yml@refs/heads/main"' in provision
+    assert '"io-e2e-control.yml@refs/heads/main"' in provision
     assert (
         "qualification runner group must select only the protected main workflow"
         in provision
@@ -268,12 +276,14 @@ def test_deployment_target_is_metadata_and_controller_code_is_immutable():
         "Verify deployed endpoint and selected runtime target before qualification",
     )
 
-    assert "expected_deployment_sha" not in trigger
+    assert "expected_test_head_sha:" in trigger
+    assert "expected_deployment_sha:" in trigger
     assert "group: io-e2e-agent-driven-test" in WORKFLOW
     assert "ref: ${{ github.sha }}" in checkout
     assert "fetch-depth: 1" in checkout
     assert "persist-credentials: false" in checkout
-    assert "inputs.expected_deployment_sha" not in WORKFLOW
+    assert "inputs.expected_test_head_sha" in WORKFLOW
+    assert "inputs.expected_deployment_sha" in WORKFLOW
     assert 'checked_out_sha="$(git rev-parse --verify HEAD)"' in controller_check
     assert 'if [ "$checked_out_sha" != "$CONTROLLER_SHA" ]' in controller_check
     assert "runs-on: ubuntu-24.04" in resolver
@@ -284,6 +294,10 @@ def test_deployment_target_is_metadata_and_controller_code_is_immutable():
     assert "Resolve current serialized test deployment target" in resolver
     assert 'if [ "${#images[@]}" -ne 2 ]' in resolver
     assert "git merge-base --is-ancestor" in resolver
+    assert "EXPECTED_TEST_HEAD_SHA: ${{ inputs.expected_test_head_sha }}" in resolver
+    assert "EXPECTED_DEPLOYMENT_SHA: ${{ inputs.expected_deployment_sha }}" in resolver
+    assert 'if [ "$test_head" != "$EXPECTED_TEST_HEAD_SHA" ]' in resolver
+    assert 'if [ "$full_sha" != "$EXPECTED_DEPLOYMENT_SHA" ]' in resolver
     assert "ref: test" not in qualify
     assert (
         "needs: [validate-dispatch, resolve-test-deployment, provision-aws-runner]"
@@ -632,8 +646,10 @@ def test_selected_runtime_target_is_checked_before_and_after_live_profile_agents
     assert "--orchestration-receipt" in validate
 
 
-def test_manual_dispatch_defaults_to_strict_v2_and_preserves_baseline_option():
-    trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
+def test_control_dispatch_defaults_to_strict_v2_and_preserves_baseline_option():
+    trigger = CONTROL_WORKFLOW[
+        CONTROL_WORKFLOW.index("on:\n") : CONTROL_WORKFLOW.index("permissions:\n")
+    ]
     assert "runtime_target:" in trigger
     assert "default: hosted_resident" in trigger
     assert "- deployed_current" in trigger
@@ -677,6 +693,9 @@ def test_manual_dispatch_defaults_to_strict_v2_and_preserves_baseline_option():
 
 def test_persona_depth_is_locked_for_dispatch_and_reusable_workflow_calls():
     trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
+    control_trigger = CONTROL_WORKFLOW[
+        CONTROL_WORKFLOW.index("on:\n") : CONTROL_WORKFLOW.index("permissions:\n")
+    ]
     validation = _step(
         "Reject qualification from any untrusted controller ref",
         "Check out deployed test metadata without secrets",
@@ -686,11 +705,12 @@ def test_persona_depth_is_locked_for_dispatch_and_reusable_workflow_calls():
         "Verify deployed endpoint and selected runtime target before qualification",
     )
 
-    assert trigger.count("persona_repetitions:") == 2
-    assert 'default: "1"' in trigger
-    assert trigger.count('- "1"') == 1
-    assert trigger.count('- "3"') == 1
+    assert trigger.count("persona_repetitions:") == 1
     assert "type: string" in trigger
+    assert control_trigger.count("persona_repetitions:") == 1
+    assert 'default: "1"' in control_trigger
+    assert control_trigger.count('- "1"') == 1
+    assert control_trigger.count('- "3"') == 1
     assert "PERSONA_REPETITIONS: ${{ inputs.persona_repetitions }}" in validation
     assert "must be exactly 1 or 3" in validation
     assert 'echo "persona_repetitions=$PERSONA_REPETITIONS"' in context
@@ -715,7 +735,9 @@ def test_persona_live_judge_reuses_codex_oauth_without_admin_or_provider_secrets
     assert "qa/provision_profiles.py provision-pool" in prepare
     assert "qa/prepare_persona_memory_accounts.py prepare" in prepare
     assert "--profile official-openai" in prepare
-    assert "PERSONA_REPETITIONS * 8" in prepare
+    assert "validate --include-nightly" in prepare
+    assert 'sessions_per_repetition" != "9"' in prepare
+    assert "PERSONA_REPETITIONS * sessions_per_repetition" in prepare
     assert "--require-runtime-v2" in prepare
     assert "codex exec" not in prepare.lower()
     assert "QA_CODEX_HOME" not in prepare
@@ -724,6 +746,7 @@ def test_persona_live_judge_reuses_codex_oauth_without_admin_or_provider_secrets
     assert "continue-on-error: true" in live
     assert "env -i" in live
     assert "qa/run_persona_memory_regression.py run-live" in live
+    assert "--include-nightly" in live
     assert '--codex-home "$QA_CODEX_HOME"' in live
     assert '--judge-work-root "${QA_PERSONA_JUDGE_ROOT}/work"' in live
     assert '--judge-work-root "$QA_PERSONA_JUDGE_SCRATCH_ROOT"' not in live
@@ -1167,7 +1190,9 @@ def test_cleanup_diagnostic_upload_and_final_gate_are_fail_closed():
     assert 'document.get("persona_memory_failure_count")' in debug_plan
     assert 'document.get("exact_id_failure_count")' in debug_plan
     assert "count != api_key_count + persona_count" in debug_plan
-    assert "exact_id_count != api_key_count" in debug_plan
+    assert "not api_key_count <= exact_id_count <= count" in debug_plan
+    assert "exact_id_count - api_key_count" in debug_plan
+    assert "persona_exact_id_failure_count" in debug_plan
     assert 'disposition = "no-failures"' in debug_plan
     assert 'disposition = "no-exact-id-failures"' in debug_plan
     assert 'disposition = "not-configured"' in debug_plan
@@ -1181,6 +1206,8 @@ def test_cleanup_diagnostic_upload_and_final_gate_are_fail_closed():
         '--persona-summary "$QA_TEAM_ARTIFACT_DIR/persona-memory-summary.json"'
         in debug_build
     )
+    assert "QA_PERSONA_EXACT_ID_FAILURE_COUNT" in debug_build
+    assert '[ "$QA_PERSONA_EXACT_ID_FAILURE_COUNT" -gt 0 ]' in debug_build
     assert '--manifest "$QA_PRIVATE_MANIFEST"' in debug_build
     assert '--expected-runtime "$QA_EXPECTED_RUNTIME"' in debug_build
     assert '--expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA"' in debug_build
@@ -1202,7 +1229,7 @@ def test_cleanup_diagnostic_upload_and_final_gate_are_fail_closed():
     assert "QA_DEBUG_RECIPIENT_PUBLIC_KEYS" in panel
     assert "exact synthetic IDs were not retained" in panel
     assert "No encrypted debug bundle was needed" in panel
-    assert "persona-memory aggregate regressions" in panel
+    assert "no finalized private exact-ID source" in panel
     assert "no encrypted exact-ID bundle was created" in panel
     assert "Download the 7-day encrypted exact-ID debug bundle" in panel
     assert "qa/protected_debug_bundle.py decrypt" in panel

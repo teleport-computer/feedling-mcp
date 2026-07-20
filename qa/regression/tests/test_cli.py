@@ -66,6 +66,16 @@ def test_validate_command_compiles_and_fingerprints_release_suite(capsys):
     assert len(output["evaluation_contract_sha256"]) == 64
 
 
+def test_formal_suite_includes_strong_rotation_and_derives_nine_sessions(capsys):
+    assert cli.main(["validate", "--include-nightly"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert len(output["scenario_fingerprints"]) == 8
+    assert "learned-memory-after-rotation" in output["scenario_fingerprints"]
+    assert output["sessions_per_repetition"] == 9
+    assert cli.formal_sessions_per_repetition() == 9
+
+
 def test_manifest_spec_requires_an_absolute_profile_mapping(tmp_path):
     profile_id, path = cli._manifest_spec(f"eval-001={tmp_path / 'one.json'}")
     assert profile_id == "eval-001"
@@ -225,7 +235,9 @@ def test_live_setup_errors_are_structured_and_do_not_traceback(capsys, tmp_path)
     assert "Traceback" not in captured.err
 
 
-def test_live_cli_refuses_unimplemented_strong_rotation_before_accounts(capsys, tmp_path):
+def test_live_cli_accepts_strong_rotation_suite_before_loading_accounts(
+    capsys, tmp_path
+):
     receipt = _receipt(tmp_path / "deployment.json")
     code = cli.main(
         [
@@ -250,7 +262,8 @@ def test_live_cli_refuses_unimplemented_strong_rotation_before_accounts(capsys, 
 
     error = json.loads(capsys.readouterr().err)
     assert code == 2
-    assert "runtime session rotator" in error["detail"]
+    assert "runtime session rotator" not in error["detail"]
+    assert "unavailable" in error["detail"]
 
 
 def test_strict_account_pool_requires_machine_readiness_and_batch_cleanup(

@@ -20,3 +20,9 @@ Before completing a relevant change, run the OpenAPI contract tests and, from
 `docs-site`, run `npm run types:check`, `npm run lint`, and `npm run build`.
 Changes that do not affect documented behavior do not require documentation
 edits.
+
+## IO E2E qualification
+
+For requests to plan, start, monitor, inspect, or cancel an agent-driven IO E2E
+qualification, read and follow `.agents/skills/io-e2e/SKILL.md`. Use the
+checked-in `tools.io_e2e` CLI; do not dispatch the protected workflow directly.

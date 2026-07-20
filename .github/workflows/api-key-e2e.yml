@@ -1,30 +1,19 @@
-name: IO agentic E2E qualification (trusted self-service)
-run-name: IO E2E · deployed test · ${{ inputs.runtime_target }} · persona x${{ inputs.persona_repetitions }}
+name: IO agentic E2E evaluator (trusted reusable workflow)
 
 on:
-  workflow_dispatch:
-    inputs:
-      runtime_target:
-        description: Test the current deployed runtime or require strict Hosted Runtime V2 proof
-        required: true
-        type: choice
-        default: hosted_resident
-        options:
-          - deployed_current
-          - hosted_resident
-      persona_repetitions:
-        description: Persona-memory depth (1 = developer smoke, 3 = release depth)
-        required: true
-        type: choice
-        default: "1"
-        options:
-          - "1"
-          - "3"
-  # The default-branch controller invokes the same trusted revision and passes
-  # only the narrow repository-scoped synthetic-account credential. Provider,
-  # Codex, and runner credentials remain Environment-scoped in this workflow.
+  # The dedicated default-branch control workflow invokes this trusted revision and passes
+  # no secrets. The narrow synthetic-account credential, provider keys, Codex,
+  # and runner credentials remain Environment-scoped in this workflow.
   workflow_call:
     inputs:
+      expected_test_head_sha:
+        description: Immutable test branch head authorized by the control workflow
+        required: true
+        type: string
+      expected_deployment_sha:
+        description: Immutable compose-pinned backend revision authorized by the control workflow
+        required: true
+        type: string
       runtime_target:
         description: Runtime qualification target
         required: true
@@ -34,10 +23,6 @@ on:
         required: false
         type: string
         default: "1"
-    secrets:
-      IO_E2E_ADMIN_TOKEN:
-        description: Narrow credential accepted only by test /v1/admin/qa/* routes
-        required: true
 
 permissions:
   contents: read
@@ -57,6 +42,8 @@ jobs:
           CONTROLLER_SHA: ${{ github.sha }}
           DISPATCH_REF: ${{ github.ref }}
           DISPATCH_REPOSITORY: ${{ github.repository }}
+          EXPECTED_TEST_HEAD_SHA: ${{ inputs.expected_test_head_sha }}
+          EXPECTED_DEPLOYMENT_SHA: ${{ inputs.expected_deployment_sha }}
           PERSONA_REPETITIONS: ${{ inputs.persona_repetitions }}
         run: |
           set -euo pipefail
@@ -70,6 +57,14 @@ jobs:
           fi
           if [[ ! "$CONTROLLER_SHA" =~ ^[a-f0-9]{40}$ ]]; then
             echo "::error::controller revision must be an immutable full Git SHA"
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_TEST_HEAD_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::expected test head must be an immutable full Git SHA"
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_DEPLOYMENT_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::expected deployment must be an immutable full Git SHA"
             exit 1
           fi
           if [ "$PERSONA_REPETITIONS" != "1" ] && [ "$PERSONA_REPETITIONS" != "3" ]; then
@@ -95,6 +90,8 @@ jobs:
       - name: Resolve current serialized test deployment target
         id: deployment_target
         env:
+          EXPECTED_TEST_HEAD_SHA: ${{ inputs.expected_test_head_sha }}
+          EXPECTED_DEPLOYMENT_SHA: ${{ inputs.expected_deployment_sha }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
@@ -138,6 +135,14 @@ jobs:
           fi
           if ! git merge-base --is-ancestor "$full_sha" "$test_head"; then
             echo "::error::pinned test deployment SHA is not in current test history"
+            exit 1
+          fi
+          if [ "$test_head" != "$EXPECTED_TEST_HEAD_SHA" ]; then
+            echo "::error::test moved after the IO E2E request was authorized"
+            exit 1
+          fi
+          if [ "$full_sha" != "$EXPECTED_DEPLOYMENT_SHA" ]; then
+            echo "::error::the serialized test deployment moved after authorization"
             exit 1
           fi
           echo "sha=$full_sha" >> "$GITHUB_OUTPUT"
@@ -296,7 +301,7 @@ jobs:
           selected_workflows = group.get("selected_workflows")
           expected_workflow = (
               f"{os.environ['GITHUB_REPOSITORY']}/.github/workflows/"
-              "api-key-e2e.yml@refs/heads/main"
+              "io-e2e-control.yml@refs/heads/main"
           )
           if (
               not isinstance(selected_workflows, list)
@@ -1440,7 +1445,16 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          account_count=$((PERSONA_REPETITIONS * 8))
+          suite_contract="$(python qa/run_persona_memory_regression.py validate --include-nightly)"
+          sessions_per_repetition="$(
+            python -c 'import json,sys; print(json.load(sys.stdin)["sessions_per_repetition"])' \
+              <<<"$suite_contract"
+          )"
+          if [ "$sessions_per_repetition" != "9" ]; then
+            echo "::error::formal persona-memory suite must consume exactly 9 isolated accounts per repetition"
+            exit 1
+          fi
+          account_count=$((PERSONA_REPETITIONS * sessions_per_repetition))
           python qa/provision_profiles.py provision-pool \
             --coverage qa/coverage-lock.json \
             --manifest "$PERSONA_POOL_MANIFEST" \
@@ -1501,9 +1515,11 @@ jobs:
             IO_E2E_BASE_URL="https://test-api.feedling.app" \
             QA_RUN_ID="$QA_RUN_ID" \
             python qa/run_persona_memory_regression.py run-live \
+              --include-nightly \
               --target-id "current-test-${QA_EXPECTED_DEPLOYMENT_SHA}" \
               --target-label candidate \
               --build-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+              --experiment-id "$QA_RUN_ID" \
               --deployment-receipt "$PERSONA_RUN_PRE_RECEIPT" \
               --account-pool "$PERSONA_POOL_MANIFEST" \
               --readiness-receipt "$PERSONA_READINESS_RECEIPT" \
@@ -1955,7 +1971,7 @@ jobs:
               or not 0 <= api_key_count <= 9 * 13
               or not 0 <= persona_count <= 8
               or count != api_key_count + persona_count
-              or exact_id_count != api_key_count
+              or not api_key_count <= exact_id_count <= count
               or not isinstance(failures, list)
               or len(failures) != count
               or sum(
@@ -1965,9 +1981,15 @@ jobs:
               or sum(
                   isinstance(row, dict)
                   and row.get("source") == "persona_memory"
-                  and row.get("exact_id_debug_available") is False
+                  and type(row.get("exact_id_debug_available")) is bool
                   for row in failures
               ) != persona_count
+              or sum(
+                  isinstance(row, dict)
+                  and row.get("source") == "persona_memory"
+                  and row.get("exact_id_debug_available") is True
+                  for row in failures
+              ) != exact_id_count - api_key_count
           ):
               raise SystemExit("team failure index count is invalid")
 
@@ -1993,6 +2015,9 @@ jobs:
               output.write(f"failure_count={count}\n")
               output.write(f"exact_id_failure_count={exact_id_count}\n")
               output.write(f"persona_memory_failure_count={persona_count}\n")
+              output.write(
+                  f"persona_exact_id_failure_count={exact_id_count - api_key_count}\n"
+              )
           PY
 
       - name: Build protected failure debug bundle
@@ -2002,11 +2027,13 @@ jobs:
           QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
           QA_TEAM_ARTIFACT_DIR: ${{ steps.context.outputs.team_artifact_dir }}
           QA_PRIVATE_MANIFEST: ${{ steps.context.outputs.manifest }}
+          QA_PERSONA_RESULT: ${{ steps.context.outputs.persona_result }}
           QA_PROTECTED_DEBUG_DIR: ${{ steps.context.outputs.protected_debug_dir }}
           QA_PROTECTED_DEBUG_BUNDLE: ${{ steps.context.outputs.protected_debug_bundle }}
           QA_DEBUG_RECIPIENT_PUBLIC_KEYS: ${{ vars.QA_DEBUG_RECIPIENT_PUBLIC_KEYS }}
           QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
           QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+          QA_PERSONA_EXACT_ID_FAILURE_COUNT: ${{ steps.debug_plan.outputs.persona_exact_id_failure_count }}
         run: |
           set -euo pipefail
           umask 077
@@ -2026,10 +2053,16 @@ jobs:
               raise SystemExit("protected debug output path is unsafe")
           root.mkdir(mode=0o700)
           PY
+          persona_args=()
+          if [ "$QA_PERSONA_EXACT_ID_FAILURE_COUNT" -gt 0 ] && \
+            [ -f "$QA_PERSONA_RESULT" ] && [ ! -L "$QA_PERSONA_RESULT" ]; then
+            persona_args=(--persona-result "$QA_PERSONA_RESULT")
+          fi
           python qa/protected_debug_bundle.py build \
             --result "$QA_ARTIFACT_DIR/run-result.json" \
             --failure-index "$QA_TEAM_ARTIFACT_DIR/failure-index.json" \
             --persona-summary "$QA_TEAM_ARTIFACT_DIR/persona-memory-summary.json" \
+            "${persona_args[@]}" \
             --manifest "$QA_PRIVATE_MANIFEST" \
             --expected-runtime "$QA_EXPECTED_RUNTIME" \
             --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
@@ -2098,7 +2131,7 @@ jobs:
 
           ## Protected failure debugging
 
-          The failures above are persona-memory aggregate regressions. Their public-safe scenario and metric evidence is complete, but the persona summary contract intentionally retains no exact account, request, turn, trace, or job IDs, so no encrypted exact-ID bundle was created.
+          The failures above have no finalized private exact-ID source (for example, a pipeline-level persona-arm failure), so no encrypted exact-ID bundle was created.
           EOF
             elif [ "$DEBUG_DISPOSITION" = "not-configured" ] && [ "$DEBUG_EXPECTED" = "false" ]; then
               cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
@@ -2128,6 +2161,7 @@ jobs:
             --identity "$HOME/.config/io-e2e/debug-identity.json" \
             --input ./io-e2e-protected-debug.bundle.json \
             --failure-index ./failure-index.json \
+            --persona-summary ./persona-memory-summary.json \
             --output ./io-e2e-protected-debug.payload.json
           ```
           EOF

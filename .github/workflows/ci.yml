@@ -1,56 +1,18 @@
-name: CI / IO agentic E2E
-run-name: ${{ github.event_name == 'workflow_dispatch' && format('IO E2E · deployed test · {0} · persona x{1}', inputs.runtime_target, inputs.persona_repetitions) || format('CI · {0} · {1}', github.event_name, github.ref_name) }}
+name: CI
+run-name: CI · ${{ github.event_name }} · ${{ github.ref_name }}
 
 on:
   push:
     branches: [main, test]
   pull_request:
     branches: [main, test]
-  workflow_dispatch:
-    inputs:
-      runtime_target:
-        description: Runtime contract expected from the deployed test endpoint
-        required: true
-        type: choice
-        default: hosted_resident
-        options:
-          - deployed_current
-          - hosted_resident
-      persona_repetitions:
-        description: Persona-memory depth (1 = developer smoke, 3 = release depth)
-        required: true
-        type: choice
-        default: "1"
-        options:
-          - "1"
-          - "3"
 
 # Cancel in-progress runs on the same ref — latest push wins.
 concurrency:
-  # A push must not cancel a manual qualification after it has provisioned
-  # synthetic users. Manual E2E runs queue on their own stricter environment
-  # lock; ordinary CI runs still use latest-push-wins behavior.
   group: ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: true
 
 jobs:
-  # Everyone with repository write access can dispatch this job. The controller
-  # and secret-bearing harness always come from protected main; deployed test
-  # code is resolved separately as metadata and is never executed on the
-  # evaluator runner.
-  io-e2e-agent-driven-test:
-    name: IO agentic E2E — deployed test (self-service)
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/api-key-e2e.yml
-    with:
-      runtime_target: ${{ inputs.runtime_target }}
-      persona_repetitions: ${{ inputs.persona_repetitions }}
-    secrets:
-      IO_E2E_ADMIN_TOKEN: ${{ secrets.IO_E2E_ADMIN_TOKEN }}
-
   # -------------------------------------------------------------------------
   # Solidity — FeedlingAppAuth contract tests
   # -------------------------------------------------------------------------
@@ -751,6 +713,9 @@ jobs:
       github.event_name == 'push' &&
       needs.detect-cvm-changes-test.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
+    # The narrow QA admin credential is an Environment secret, not a
+    # repository-wide secret that arbitrary branch workflows could reference.
+    environment: io-test-deploy
     permissions:
       contents: write
       packages: read

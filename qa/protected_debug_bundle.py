@@ -38,13 +38,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 from qa import atomic_private_file  # noqa: E402
 from qa import build_team_report as team_report  # noqa: E402
+from qa import persona_protected_debug as persona_debug  # noqa: E402
 from qa import render_artifacts as result_renderer  # noqa: E402
 from qa import validate_run as release_gate  # noqa: E402
 
 
 IDENTITY_SCHEMA_VERSION = 1
 ENVELOPE_SCHEMA_VERSION = 1
-PAYLOAD_SCHEMA_VERSION = 1
+PAYLOAD_SCHEMA_VERSION = 2
 IDENTITY_KIND = "io_e2e_debug_identity"
 ENVELOPE_KIND = "io_e2e_protected_debug_bundle"
 PAYLOAD_KIND = "io_e2e_protected_debug_payload"
@@ -56,6 +57,7 @@ MAX_IDENTITY_BYTES = 16 * 1024
 MAX_RESULT_BYTES = 20 * 1024 * 1024
 MAX_FAILURE_INDEX_BYTES = 8 * 1024 * 1024
 MAX_PERSONA_SUMMARY_BYTES = 2 * 1024 * 1024
+MAX_PERSONA_RESULT_BYTES = 64 * 1024 * 1024
 MAX_ENVELOPE_BYTES = 24 * 1024 * 1024
 MAX_PAYLOAD_BYTES = 20 * 1024 * 1024
 MAX_RECIPIENTS = 32
@@ -100,9 +102,13 @@ _PAYLOAD_FIELDS = frozenset(
         "kind",
         "run_id_sha256",
         "failure_index_sha256",
+        "persona_summary_sha256",
         "suite_id",
         "failure_count",
+        "api_key_failure_count",
+        "persona_memory_failure_count",
         "failures",
+        "persona_memory_failures",
     }
 )
 _FAILURE_FIELDS = frozenset(
@@ -807,6 +813,8 @@ def _build_payload(
     profiles: Sequence[Mapping[str, Any]],
     *,
     failure_index_sha256: str,
+    persona_summary_sha256: str,
+    persona_memory_failures: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     failures: list[dict[str, Any]] = []
     for profile in profiles:
@@ -855,9 +863,15 @@ def _build_payload(
         "kind": PAYLOAD_KIND,
         "run_id_sha256": run_id_hash,
         "failure_index_sha256": failure_index_sha256,
+        "persona_summary_sha256": persona_summary_sha256,
         "suite_id": result["suite_id"],
-        "failure_count": len(failures),
+        "failure_count": len(failures) + len(persona_memory_failures),
+        "api_key_failure_count": len(failures),
+        "persona_memory_failure_count": len(persona_memory_failures),
         "failures": failures,
+        "persona_memory_failures": [
+            dict(failure) for failure in persona_memory_failures
+        ],
     }
     _validate_payload(payload)
     return payload
@@ -1155,7 +1169,11 @@ def _reject_forbidden_keys(value: Any) -> None:
         # Assertion names are themselves locked by coverage.  Several safe
         # boolean attestations deliberately contain words such as ``raw`` or
         # ``credential`` (for example ``raw_private_reasoning_omitted``).
-        if key == "assertions":
+        if (
+            key == "assertions"
+            or key == "api_key_failure_count"
+            or key in persona_debug.PERSONA_TRAJECTORY_FIELDS
+        ):
             continue
         if _FORBIDDEN_KEY_RE.search(key):
             raise ProtectedDebugError(
@@ -1173,10 +1191,19 @@ def _validate_payload(value: Any) -> None:
         or _SHA256_RE.fullmatch(value["run_id_sha256"]) is None
         or not isinstance(value.get("failure_index_sha256"), str)
         or _SHA256_RE.fullmatch(value["failure_index_sha256"]) is None
+        or not isinstance(value.get("persona_summary_sha256"), str)
+        or _SHA256_RE.fullmatch(value["persona_summary_sha256"]) is None
         or value.get("suite_id") != "io-e2e-agent-driven-test-p0"
         or type(value.get("failure_count")) is not int
+        or type(value.get("api_key_failure_count")) is not int
+        or type(value.get("persona_memory_failure_count")) is not int
         or not isinstance(value.get("failures"), list)
-        or value["failure_count"] != len(value["failures"])
+        or not isinstance(value.get("persona_memory_failures"), list)
+        or value["api_key_failure_count"] != len(value["failures"])
+        or value["persona_memory_failure_count"]
+        != len(value["persona_memory_failures"])
+        or value["failure_count"]
+        != value["api_key_failure_count"] + value["persona_memory_failure_count"]
         or len(value["failures"]) > MAX_FAILURES
     ):
         raise ProtectedDebugError("protected debug payload is invalid")
@@ -1190,6 +1217,12 @@ def _validate_payload(value: Any) -> None:
                 "protected debug payload contains duplicate failures"
             )
         seen.add(identity)
+    try:
+        persona_debug.validate_persona_failures(value["persona_memory_failures"])
+    except persona_debug.PersonaDebugError:
+        raise ProtectedDebugError(
+            "protected persona debug payload is invalid"
+        ) from None
 
 
 def _validate_envelope(value: Any) -> Mapping[str, Any]:
@@ -1234,6 +1267,7 @@ def build_bundle(
     result_path: Path,
     failure_index_path: Path,
     persona_summary_path: Path | None = None,
+    persona_result_path: Path | None = None,
     provisioning_manifest_path: Path,
     expected_runtime: str,
     expected_deployment_sha: str,
@@ -1271,14 +1305,57 @@ def build_bundle(
         else None
     )
     _validate_failure_index_binding(failure_index, result, profiles, persona_summary)
-    recipients = _parse_recipients(recipients_csv)
-    payload_bytes = _json_bytes(
-        _build_payload(
-            result,
-            profiles,
-            failure_index_sha256=hashlib.sha256(failure_index_bytes).hexdigest(),
+    persona_summary_bytes = (
+        _read_regular(
+            persona_summary_path,
+            "public persona summary",
+            max_bytes=MAX_PERSONA_SUMMARY_BYTES,
+            owner_only=True,
         )
+        if persona_summary_path is not None
+        else b"{}\n"
     )
+    expected_persona_exact = sum(
+        isinstance(row, dict)
+        and row.get("source") == "persona_memory"
+        and row.get("exact_id_debug_available") is True
+        for row in failure_index.get("failures", [])
+    )
+    persona_memory_failures: list[dict[str, Any]] = []
+    if persona_result_path is not None and expected_persona_exact > 0:
+        if persona_summary is None:
+            raise ProtectedDebugError("persona debug summary binding is missing")
+        persona_result = _read_json(
+            persona_result_path,
+            "private persona result",
+            max_bytes=MAX_PERSONA_RESULT_BYTES,
+            owner_only=True,
+        )
+        try:
+            persona_memory_failures = persona_debug.build_persona_failures(
+                persona_result,
+                persona_summary,
+                canonical_run_id=result["run_id"],
+                expected_runtime=expected_runtime,
+                expected_deployment_sha=expected_deployment_sha.lower(),
+            )
+        except persona_debug.PersonaDebugError:
+            raise ProtectedDebugError(
+                "private persona debug binding is invalid"
+            ) from None
+    if len(persona_memory_failures) != expected_persona_exact:
+        raise ProtectedDebugError("private persona debug coverage is incomplete")
+    recipients = _parse_recipients(recipients_csv)
+    payload = _build_payload(
+        result,
+        profiles,
+        failure_index_sha256=hashlib.sha256(failure_index_bytes).hexdigest(),
+        persona_summary_sha256=hashlib.sha256(persona_summary_bytes).hexdigest(),
+        persona_memory_failures=persona_memory_failures,
+    )
+    if payload["failure_count"] != failure_index.get("exact_id_failure_count"):
+        raise ProtectedDebugError("protected debug failure coverage is incomplete")
+    payload_bytes = _json_bytes(payload)
     if len(payload_bytes) > MAX_PAYLOAD_BYTES:
         raise ProtectedDebugError("protected debug payload exceeds the size limit")
 
@@ -1322,6 +1399,7 @@ def decrypt_bundle(
     identity_path: Path,
     input_path: Path,
     failure_index_path: Path,
+    persona_summary_path: Path | None = None,
     output_path: Path,
 ) -> None:
     """Decrypt a bundle for one recipient and publish owner-only plaintext."""
@@ -1372,6 +1450,16 @@ def decrypt_bundle(
         max_bytes=MAX_FAILURE_INDEX_BYTES,
     )
     failure_index = _decode_json(failure_index_bytes, "public failure index")
+    persona_summary_bytes = (
+        _read_regular(
+            persona_summary_path,
+            "public persona summary",
+            max_bytes=MAX_PERSONA_SUMMARY_BYTES,
+        )
+        if persona_summary_path is not None
+        else b"{}\n"
+    )
+    persona_summary = _decode_json(persona_summary_bytes, "public persona summary")
     if (
         hashlib.sha256(failure_index_bytes).hexdigest()
         != payload["failure_index_sha256"]
@@ -1382,14 +1470,43 @@ def decrypt_bundle(
         or type(failure_index.get("persona_memory_failure_count")) is not int
         or type(failure_index.get("exact_id_failure_count")) is not int
         or failure_index.get("exact_id_failure_count") != payload["failure_count"]
-        or failure_index.get("api_key_failure_count") != payload["failure_count"]
+        or failure_index.get("api_key_failure_count")
+        != payload["api_key_failure_count"]
+        or payload["persona_memory_failure_count"]
+        > failure_index.get("persona_memory_failure_count")
+        or not isinstance(failure_index.get("failures"), list)
+        or sum(
+            isinstance(row, dict) and row.get("source") == "api_key_matrix"
+            for row in failure_index.get("failures", [])
+        )
+        != payload["api_key_failure_count"]
+        or sum(
+            isinstance(row, dict)
+            and row.get("source") == "persona_memory"
+            and row.get("exact_id_debug_available") is True
+            for row in failure_index.get("failures", [])
+        )
+        != payload["persona_memory_failure_count"]
         or failure_index.get("failure_count")
-        != payload["failure_count"] + failure_index.get("persona_memory_failure_count")
+        != failure_index.get("api_key_failure_count")
+        + failure_index.get("persona_memory_failure_count")
         or not isinstance(failure_index.get("run_id"), str)
         or hashlib.sha256(failure_index["run_id"].encode("utf-8")).hexdigest()
         != payload["run_id_sha256"]
     ):
         raise ProtectedDebugError("public failure index digest is invalid")
+    if (
+        hashlib.sha256(persona_summary_bytes).hexdigest()
+        != payload["persona_summary_sha256"]
+        or not isinstance(persona_summary, dict)
+        or (
+            persona_summary_path is not None
+            and persona_summary.get("kind")
+            != "persona_memory_qualification_summary"
+        )
+        or (persona_summary_path is None and persona_summary != {})
+    ):
+        raise ProtectedDebugError("public persona summary digest is invalid")
     canonical_payload = _json_bytes(payload)
     if canonical_payload != payload_bytes:
         raise ProtectedDebugError("protected debug payload encoding is invalid")
@@ -1409,6 +1526,7 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--result", required=True, type=Path)
     build.add_argument("--failure-index", required=True, type=Path)
     build.add_argument("--persona-summary", required=True, type=Path)
+    build.add_argument("--persona-result", type=Path)
     build.add_argument(
         "--manifest", required=True, type=Path, dest="provisioning_manifest"
     )
@@ -1425,6 +1543,7 @@ def _parser() -> argparse.ArgumentParser:
     decrypt.add_argument("--identity", required=True, type=Path)
     decrypt.add_argument("--input", required=True, type=Path)
     decrypt.add_argument("--failure-index", required=True, type=Path)
+    decrypt.add_argument("--persona-summary", required=True, type=Path)
     decrypt.add_argument("--output", required=True, type=Path)
     return parser
 
@@ -1440,6 +1559,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result_path=args.result.absolute(),
                 failure_index_path=args.failure_index.absolute(),
                 persona_summary_path=args.persona_summary.absolute(),
+                persona_result_path=(
+                    args.persona_result.absolute()
+                    if args.persona_result is not None
+                    else None
+                ),
                 provisioning_manifest_path=args.provisioning_manifest.absolute(),
                 expected_runtime=args.expected_runtime,
                 expected_deployment_sha=args.expected_deployment_sha,
@@ -1451,6 +1575,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 identity_path=args.identity.absolute(),
                 input_path=args.input.absolute(),
                 failure_index_path=args.failure_index.absolute(),
+                persona_summary_path=args.persona_summary.absolute(),
                 output_path=args.output.absolute(),
             )
         else:  # pragma: no cover - argparse makes this unreachable

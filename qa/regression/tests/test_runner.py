@@ -712,7 +712,7 @@ def test_feedling_adapter_rejects_unproven_runtime_rotation():
         base_url="https://test-api.feedling.app",
         session_factory=lambda _context: _feedling_credentials(),
         client_factory=_FeedlingClient,
-        runtime_session_rotator=lambda _client, _credentials: {
+        runtime_session_rotator=lambda _client, _credentials, _prior_turn: {
             "rotated": True,
             "before_runtime_session_id": "same",
             "after_runtime_session_id": "same",
@@ -732,6 +732,53 @@ def test_feedling_adapter_rejects_unproven_runtime_rotation():
 
     assert raised.value.status == BLOCKED_EVIDENCE
     assert raised.value.code == "SESSION_BOUNDARY_UNPROVEN"
+
+
+def test_feedling_adapter_passes_exact_prior_turn_to_runtime_rotator():
+    observed = {}
+
+    def rotate(_client, _credentials, prior_turn):
+        observed.update(prior_turn)
+        return {
+            "rotated": True,
+            "before_runtime_session_id": "before",
+            "after_runtime_session_id": "after",
+            "protected_debug_identifiers": {
+                "capture_job_ids": ["capture-job-1"],
+                "runtime_session_ids": ["before", "after"],
+            },
+        }
+
+    target = FeedlingTarget(
+        target_id="candidate",
+        base_url="https://test-api.feedling.app",
+        session_factory=lambda _context: _feedling_credentials(),
+        client_factory=_FeedlingClient,
+        runtime_session_rotator=rotate,
+        session_closer=lambda _client, _credentials: None,
+    )
+    session = target.open_session(
+        TargetContext(
+            run_id="run-1",
+            scenario_id="scenario-1",
+            repeat_index=0,
+        )
+    )
+    target.send(session, turn_id="learn", prompt="Remember this", timeout_seconds=1)
+
+    boundary = target.apply_boundary(
+        session, action=BOUNDARY_ROTATE_RUNTIME_SESSION
+    )
+
+    assert observed == {
+        "prior_request_id": "user-1",
+        "prior_response_id": "assistant-1",
+    }
+    assert boundary.runtime_session_rotated is True
+    assert boundary.evidence["protected_debug_identifiers"] == {
+        "capture_job_ids": ["capture-job-1"],
+        "runtime_session_ids": ["before", "after"],
+    }
 
 
 def test_feedling_target_rejects_untrusted_origin_and_reused_account():

@@ -94,7 +94,7 @@ as the Environment variable `QA_RUNNER_GITHUB_APP_ID`.
 
 Use a dedicated GitHub Actions runner group. Configure its workflow access to
 allow **only**
-`teleport-computer/feedling-mcp/.github/workflows/api-key-e2e.yml@refs/heads/main`;
+`teleport-computer/feedling-mcp/.github/workflows/io-e2e-control.yml@refs/heads/main`;
 repository-only access is too broad because another workflow could race for a
 new runner through its generic `self-hosted` label. Record the group's positive
 numeric ID as `QA_RUNNER_GROUP_ID` and its exact name as
@@ -122,7 +122,7 @@ Add the App PEM as the one new infrastructure secret:
 
 - `QA_RUNNER_GITHUB_APP_PRIVATE_KEY`
 
-The provider, model, repository-scoped IO E2E admin secret, and Codex
+The provider, model, Environment-scoped IO E2E admin secret, and Codex
 variables/secrets are listed in the parent [`qa/README.md`](../README.md).
 Store a complete refreshable ChatGPT
 `auth.json` as base64 without printing it:
@@ -143,9 +143,11 @@ deployed through the normal protected `test` process, any collaborator with
 write access can run:
 
 ```bash
-gh workflow run ci.yml --ref main \
-  -f runtime_target=hosted_resident \
-  -f persona_repetitions=1
+python3 -m tools.io_e2e plan --ref test
+python3 -m tools.io_e2e run --ref test \
+  --runtime-target hosted_resident \
+  --persona-repetitions 1 \
+  --wait
 ```
 
 Use `hosted_resident` when every configured synthetic profile is expected to
@@ -154,9 +156,10 @@ read back exact mode `hosted_resident` and version `2` through
 P0-05/P0-07 live probes. `deployed_current` remains the baseline target: it
 verifies the exact deployed backend SHA and the configured user path without
 claiming V2, and records persona-memory as `NOT_FORMALLY_QUALIFIED`. Use
-`persona_repetitions=1` for the default eight-account developer smoke lane or
-`3` for the 24-account release-depth lane. Neither target invents unavailable
-worker SHA/count evidence.
+`persona_repetitions=1` for the default developer smoke lane or `3` for the
+release-depth lane. Neither target invents unavailable worker SHA/count
+evidence. The separate IO E2E tool contract and the intentionally unavailable
+branch-preview lane are documented in `docs/testing/IO_E2E_TOOL.md`.
 
 Provisioning waits for an exact-name, exact-label, online, idle runner before
 the secret-bearing job is queued. Startup failure triggers immediate hosted

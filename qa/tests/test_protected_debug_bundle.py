@@ -12,6 +12,7 @@ import pytest
 
 from qa import build_team_report as team_report
 from qa import protected_debug_bundle as protected
+from qa.tests.test_build_team_report import _persona_summary as _formal_persona_summary
 from qa.tests import test_validate_run as validate_fixtures
 from qa.tests.test_validate_run import _valid_result
 
@@ -149,6 +150,7 @@ def _build_bundle(
     output_path: Path,
     provisioning_manifest_path: Path | None = None,
     persona_summary_path: Path | None = None,
+    persona_result_path: Path | None = None,
     expected_runtime: str | None = None,
     expected_deployment_sha: str | None = None,
 ) -> None:
@@ -167,6 +169,7 @@ def _build_bundle(
         result_path=result_path,
         failure_index_path=failure_index_path,
         persona_summary_path=persona_summary_path,
+        persona_result_path=persona_result_path,
         provisioning_manifest_path=manifest,
         expected_runtime=(
             expected_runtime or manifest_source["target"]["expected_runtime"]
@@ -186,6 +189,7 @@ def _decrypt_bundle(
     input_path: Path,
     output_path: Path,
     failure_index_path: Path | None = None,
+    persona_summary_path: Path | None = None,
 ) -> None:
     protected.decrypt_bundle(
         identity_path=identity_path,
@@ -193,6 +197,7 @@ def _decrypt_bundle(
         failure_index_path=(
             failure_index_path or input_path.parent / "failure-index.json"
         ),
+        persona_summary_path=persona_summary_path,
         output_path=output_path,
     )
 
@@ -239,6 +244,9 @@ def test_round_trip_preserves_failure_only_exact_ids_and_metadata(tmp_path):
     payload, _identity_path, _envelope, _plaintext, source = _round_trip(tmp_path)
 
     assert payload["failure_count"] == 3
+    assert payload["api_key_failure_count"] == 3
+    assert payload["persona_memory_failure_count"] == 0
+    assert payload["persona_memory_failures"] == []
     assert (
         payload["failure_index_sha256"]
         == hashlib.sha256(
@@ -317,10 +325,15 @@ def test_mixed_persona_failure_binds_public_index_but_encrypts_only_exact_ids(
     )
     identity_path, public = _identity(tmp_path)
     envelope_path = tmp_path / "mixed-bundle.json"
+    unused_private_persona = _write_json(
+        tmp_path / "private-persona-result.json",
+        {"raw_persona_result": "must-not-be-read-for-pipeline-fallback"},
+    )
     _build_bundle(
         result_path=result_path,
         failure_index_path=failure_index_path,
         persona_summary_path=persona_path,
+        persona_result_path=unused_private_persona,
         recipients_csv=public["public_key_b64"],
         output_path=envelope_path,
     )
@@ -329,6 +342,7 @@ def test_mixed_persona_failure_binds_public_index_but_encrypts_only_exact_ids(
         identity_path=identity_path,
         input_path=envelope_path,
         failure_index_path=failure_index_path,
+        persona_summary_path=persona_path,
         output_path=plaintext_path,
     )
 
@@ -338,7 +352,83 @@ def test_mixed_persona_failure_binds_public_index_but_encrypts_only_exact_ids(
     assert public_index["persona_memory_failure_count"] == 1
     assert public_index["exact_id_failure_count"] == 3
     assert payload["failure_count"] == 3
+    assert payload["persona_memory_failure_count"] == 0
+    assert payload["persona_memory_failures"] == []
     assert all(row["scenario_id"].startswith("P0-") for row in payload["failures"])
+
+
+def test_exact_persona_failure_without_private_result_fails_closed(tmp_path):
+    result_path, failure_index_path, result = _inputs(tmp_path)
+    persona_summary = deepcopy(_formal_persona_summary())
+    persona_summary["status"] = "FAIL"
+    scenario = persona_summary["scenarios"][0]
+    scenario["status"] = "FAIL"
+    scenario["metrics"][0].update(
+        status="FAIL",
+        pass_count=0,
+        fail_count=1,
+        pass_rate=0.0,
+        average_score=0.4,
+        failure_codes=["PERSONA_IDENTITY_DRIFT"],
+    )
+    persona_summary["pipeline_outcomes"] = {
+        "prepare": "success",
+        "live": "success",
+        "cleanup": "success",
+        "finalize": "failure",
+    }
+    persona_path = _write_json(
+        tmp_path / "persona-memory-summary.json", persona_summary
+    )
+    _write_json(
+        failure_index_path,
+        team_report._build_indexes(
+            result,
+            _coverage(),
+            result["profiles"],
+            {
+                "generated_at": result["finished_at"],
+                "attempted": 10,
+                "cleaned": 10,
+                "failed_profile_ids": [],
+                "manifest_deleted": True,
+                "manifest_retained_for_scan": False,
+            },
+            "unit-test",
+            persona_summary,
+        )[1],
+    )
+    _identity_path, public = _identity(tmp_path)
+
+    with pytest.raises(
+        protected.ProtectedDebugError,
+        match="private persona debug coverage is incomplete",
+    ):
+        _build_bundle(
+            result_path=result_path,
+            failure_index_path=failure_index_path,
+            persona_summary_path=persona_path,
+            recipients_csv=public["public_key_b64"],
+            output_path=tmp_path / "missing-persona-private-bundle.json",
+        )
+    assert not (tmp_path / "missing-persona-private-bundle.json").exists()
+
+
+def test_decrypt_cli_requires_public_persona_summary_binding():
+    with pytest.raises(SystemExit):
+        protected._parser().parse_args(
+            [
+                "decrypt",
+                "--identity",
+                "identity.json",
+                "--input",
+                "bundle.json",
+                "--failure-index",
+                "failure-index.json",
+                "--output",
+                "payload.json",
+            ]
+        )
 
 
 def test_multiple_recipients_can_decrypt_the_same_bundle(tmp_path):

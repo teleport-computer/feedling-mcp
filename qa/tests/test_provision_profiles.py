@@ -2554,7 +2554,7 @@ def test_cleanup_run_cli_is_manifest_independent_and_fails_closed(
     }
 
 
-@pytest.mark.parametrize("count", [1, 8, 24])
+@pytest.mark.parametrize("count", [1, 8, 24, 27])
 def test_provision_pool_creates_strict_same_route_accounts(tmp_path, count):
     from qa.regression.live_accounts import load_account_pool
 
@@ -2756,7 +2756,7 @@ def test_provision_pool_supports_strict_baseline_runtime(tmp_path):
     assert live_pool.deployment_runtime == provisioner.BASELINE_RUNTIME_REQUIREMENT
 
 
-@pytest.mark.parametrize("count", [True, 0, -1, 25])
+@pytest.mark.parametrize("count", [True, 0, -1, 28])
 def test_provision_pool_rejects_invalid_count_before_external_state(tmp_path, count):
     smoke = FakeSmokeClient()
     admin = FakeAdminClient(smoke)

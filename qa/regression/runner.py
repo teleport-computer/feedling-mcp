@@ -32,6 +32,7 @@ from qa.regression.target import (
     TargetError,
     TargetResponse,
     TargetSession,
+    _protected_debug_identifiers,
 )
 
 
@@ -436,6 +437,18 @@ def _boundary_evidence(
         evidence_sha256 = str(evidence.get("evidence_sha256") or "").strip()
         if _SHA256_RE.fullmatch(evidence_sha256):
             safe_evidence["evidence_sha256"] = evidence_sha256
+        try:
+            protected_debug = _protected_debug_identifiers(
+                evidence.get("protected_debug_identifiers")
+            )
+        except ValueError:
+            raise TargetError(
+                "INVALID_BOUNDARY_EVIDENCE",
+                status=BLOCKED_EVIDENCE,
+                detail="Runtime boundary debug identifiers are invalid",
+            ) from None
+        if protected_debug:
+            safe_evidence["protected_debug_identifiers"] = protected_debug
     return {
         "turn_id": turn_id,
         "session_key": session_key,
@@ -641,6 +654,18 @@ def run_scenario(
                         status=BLOCKED_EVIDENCE,
                         detail="Target session identity does not match the request",
                     )
+                if opened.account_fingerprint:
+                    if _SHA256_RE.fullmatch(opened.account_fingerprint) is None:
+                        raise TargetError(
+                            "INVALID_TARGET_SESSION",
+                            status=BLOCKED_EVIDENCE,
+                            detail="Target session account fingerprint is invalid",
+                        )
+                    fingerprints = trajectory_metadata.setdefault(
+                        "protected_debug_account_fingerprints", []
+                    )
+                    if opened.account_fingerprint not in fingerprints:
+                        fingerprints.append(opened.account_fingerprint)
 
             boundary = _boundary_before(turn)
             if boundary not in {
@@ -740,6 +765,15 @@ def run_scenario(
                             else {}
                         ),
                         "transition": {"source": "pending", "next_turn_id": None},
+                        "protected_debug": (
+                            {
+                                "account_fingerprint": sessions[
+                                    session_key
+                                ].account_fingerprint
+                            }
+                            if sessions[session_key].account_fingerprint
+                            else {}
+                        ),
                     },
                 }
             )
@@ -783,6 +817,10 @@ def run_scenario(
     except TargetError as exc:
         status = exc.status
         failure_code = exc.code
+        if exc.protected_debug_identifiers:
+            trajectory_metadata["protected_debug_identifiers"] = dict(
+                exc.protected_debug_identifiers
+            )
         if active_turn_id:
             trajectory_metadata["failed_turn_id"] = active_turn_id
     except Exception:

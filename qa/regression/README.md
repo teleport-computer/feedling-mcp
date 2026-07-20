@@ -50,6 +50,12 @@ The release lane currently includes:
 - cross-user memory isolation using two accounts; and
 - honesty about an unknown shared event.
 
+The formal hosted qualification adds an eighth scenario,
+`learned-memory-after-rotation`. It verifies that a fact learned during the run
+is committed to memory, the exact preceding and boundary-probe Codex calls have
+different runtime thread identifiers, the transcript is clear, and the fact is
+then recalled without transcript support.
+
 Deterministic hard gates cover narrow facts that code can establish: exact
 identity/role claims, question/length limits, fact markers in one complete probe
 turn, privacy canaries, and narrowly configured contradictions. A structured
@@ -68,8 +74,10 @@ errors, and contract mismatches do.
 - `clear_history` proves a transcript boundary. It does not prove that the
   underlying model runtime session rotated.
 - `rotate_runtime_session` requires deployment-specific before/after runtime
-  evidence. The protocol and nightly fixture support this distinction, but the
-  current live CLI has no production rotator and therefore refuses that nightly
+  evidence. The formal official-OpenAI Hosted Runtime V2 arm forces and verifies
+  the learned-memory capture, correlates exact verbose Codex trace events, proves
+  distinct before/after thread identifiers, and removes its synthetic boundary
+  probe before recall. Missing capture, trace, or cleanup evidence blocks the
   scenario rather than making a false persistence claim.
 
 ## Commands
@@ -78,12 +86,13 @@ Validate all checked-in contracts without network access:
 
 ```bash
 python qa/run_persona_memory_regression.py validate
+python qa/run_persona_memory_regression.py validate --include-nightly
 ```
 
-The release suite consumes eight isolated accounts per repetition: six
+The formal suite consumes nine isolated accounts per repetition: seven
 single-session scenarios plus two accounts for cross-user isolation. A smoke
-run (`--repetitions 1`) therefore provisions 8 accounts; the release default
-(`--repetitions 3`) provisions 24 per arm, or 48 disjoint accounts across the
+run (`--repetitions 1`) therefore provisions 9 accounts; the release default
+(`--repetitions 3`) provisions 27 per arm, or 54 disjoint accounts across the
 baseline and candidate.
 
 ### Run one real arm
@@ -142,8 +151,8 @@ Exit `0` is a passing finalized arm. Exit `1` is a hard-gate product failure in
 that arm, but post verification, cleanup, and arm finalization still completed;
 only the later baseline/candidate comparison can establish a regression. Exit
 `2` means evidence or orchestration was blocked and must not be scored. A smoke
-arm uses `--repetitions 1` and eight accounts; the release arm uses three
-repetitions and 24 accounts.
+arm uses `--repetitions 1` and nine accounts; the release arm uses three
+repetitions and 27 accounts.
 
 The manual arm supervisor removes `IO_E2E_ADMIN_TOKEN` and all
 provisioning-provider credentials from the conversation-runner subprocess. The
@@ -163,7 +172,7 @@ cannot skip cleanup.
 ```bash
 python qa/provision_profiles.py provision-pool \
   --profile official-openai \
-  --count 24 \
+  --count 27 \
   --require-runtime-v2 \
   --manifest "$PRIVATE_ROOT/account-pool.json"
 
@@ -198,6 +207,7 @@ python qa/verify_deployment.py \
   --receipt "$PRIVATE_ROOT/deployment-pre.json"
 
 python qa/run_persona_memory_regression.py run-live \
+  --include-nightly \
   --target-id "${TARGET_LABEL}-${BUILD_SHA}" \
   --target-label "$TARGET_LABEL" \
   --build-sha "$BUILD_SHA" \

@@ -35,6 +35,9 @@ from qa.regression.live_accounts import (  # noqa: E402
     read_private_json,
     verify_cleanup_receipt,
 )
+from qa.run_persona_memory_regression import (  # noqa: E402
+    formal_sessions_per_repetition,
+)
 from qa.provision_profiles import (  # noqa: E402
     ProvisionError,
     SYNTHETIC_CLEANUP_RUN_KIND,
@@ -316,7 +319,7 @@ def _run_arm_impl(
     paths = _paths(private_root)
     run_state.paths = paths
     target_id = args.target_id or f"{args.target_label}-{args.build_sha}"
-    account_count = args.repetitions * 8
+    account_count = args.repetitions * formal_sessions_per_repetition()
     common_verify = [
         "--expected-sha",
         args.build_sha,
@@ -453,6 +456,7 @@ def _run_arm_impl(
             run = _script(
                 "run_persona_memory_regression.py",
                 "run-live",
+                "--include-nightly",
                 "--target-id",
                 target_id,
                 "--target-label",

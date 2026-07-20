@@ -27,10 +27,11 @@ There are two targets:
 
 The protected workflow is deliberately split across explicit trust zones:
 
-- Any collaborator with repository write access may press **Run workflow** on
-  `ci.yml` at protected `main`; there is no per-run Environment reviewer. The
-  controller and all secret-bearing harness code are fixed to the immutable
-  `main` SHA selected when the run starts.
+- Any collaborator with repository write access may use `tools.io_e2e` (directly
+  or through the checked-in agent skill) to dispatch `io-e2e-control.yml` at
+  protected `main`; there is no per-run Environment reviewer. The controller
+  and all secret-bearing harness code are fixed to the immutable `main` SHA
+  selected when the run starts.
 - A GitHub-hosted resolver checks out `test` without QA Environment, provider,
   admin, or OAuth secrets and derives the currently deployed backend SHA from
   the serialized compose image pin. The resolved SHA is data passed into
@@ -414,13 +415,14 @@ not admin operations. The bounded QA admin calls include:
   proof covers a lost registration response or a destroyed runner.
 
 It does not authorize the application's ordinary admin routes or admin login.
-Store it once as the repository or organization Actions secret
-`IO_E2E_ADMIN_TOKEN`. Both the `test` deployment and trusted qualification
-workflow reference that one secret and pass the same variable name into the
-backend/client boundary. Never expose it to Codex, prompts, logs, or uploaded
-artifacts. The application's existing legacy admin credential is unchanged and
-is not accepted by these QA routes. Configure `IO_E2E_ADMIN_TOKEN` before merging
-the CI change or the next test deploy will intentionally fail closed.
+Store the same logical credential as an Environment secret named
+`IO_E2E_ADMIN_TOKEN` in both `io-test-deploy` (protected `test`) and
+`io-e2e-agent-driven-test` (protected `main`). Do not store it as a
+repository-wide Actions secret: arbitrary branch workflow code could reference
+such a secret. The backend and evaluator use the same variable name while their
+workflows remain independently branch-scoped. Never expose it to Codex, prompts,
+logs, or uploaded artifacts. The application's existing legacy admin credential
+is unchanged and is not accepted by these QA routes.
 
 ## Test backend and runner infrastructure
 
@@ -452,19 +454,38 @@ review, while a workflow dispatch can only use an already trusted immutable
 `refs/heads/main`; that in-repository guard is defense in depth and does not
 replace the Environment branch restriction.
 
-First add the one repository or organization Actions secret used by both test
-deployment and qualification:
+The dedicated self-hosted runner group must also restrict selected workflows to
+exactly
+`teleport-computer/feedling-mcp/.github/workflows/io-e2e-control.yml@refs/heads/main`.
+This is the top-level caller GitHub uses when authorizing a self-hosted job from
+the reusable evaluator. Remove the old direct
+`api-key-e2e.yml@refs/heads/main` selection when the control workflow is merged;
+the evaluator fails before JIT registration if the allowlist is broader or
+different.
+
+Create a second GitHub Environment named `io-test-deploy`, allow only protected
+`test`, and configure no required reviewer. Store the same generated token in
+both protected Environments:
 
 - `IO_E2E_ADMIN_TOKEN`
-
-Create it once, without `--env`, so both the protected `test` deployment and
-the trusted `main` qualification controller read the same repository secret:
 
 ```bash
 token="$(openssl rand -hex 32)"
 printf '%s' "$token" |
-  gh secret set IO_E2E_ADMIN_TOKEN --repo teleport-computer/feedling-mcp
+  gh secret set IO_E2E_ADMIN_TOKEN \
+    --repo teleport-computer/feedling-mcp \
+    --env io-test-deploy
+printf '%s' "$token" |
+  gh secret set IO_E2E_ADMIN_TOKEN \
+    --repo teleport-computer/feedling-mcp \
+    --env io-e2e-agent-driven-test
 unset token
+```
+
+After both Environment secrets exist, delete any earlier repository-wide copy:
+
+```bash
+gh secret delete IO_E2E_ADMIN_TOKEN --repo teleport-computer/feedling-mcp
 ```
 
 The backend deliberately accepts this credential only when it is exactly the
@@ -627,27 +648,38 @@ Prompt rules and artifact scanning are not credential-isolation controls.
 
 ### Scope of self-service branch testing
 
-The implemented self-service path evaluates the backend that is **already
-deployed to the shared protected `test` environment**. It does not yet build an
-arbitrary feature branch, create a per-SHA preview deployment, or broker provider
-requests for untrusted candidate code. To evaluate a code change today, deploy
-that change through the normal protected `test` process, then dispatch the
-trusted `main` controller. The artifact identifies the exact compose-pinned and
-live-reported deployment SHA that was evaluated.
+The checked-in `tools.io_e2e` client and `.agents/skills/io-e2e` agent skill are
+the self-service control surface. They dispatch the dedicated manual-only
+`io-e2e-control.yml` workflow at protected `main`; ordinary CI has no manual E2E
+job. GitHub remains the first execution/state/artifact backend, but qualification
+is an on-demand tool rather than a push, pull-request, deployment, or release
+gate.
+
+The implemented `deployed_test` lane evaluates the backend that is **already
+deployed to the shared protected `test` environment**. It requires
+`target_ref=test`, resolves that ref to an immutable full SHA before dispatch,
+re-resolves it without secrets in the controller, and separately binds the
+compose-pinned/live-reported backend SHA. It does not claim that an undeployed
+feature branch is under test.
 
 Do not attach these raw provider/admin keys to a workflow that checks out or
 executes an arbitrary candidate branch. The current keys are acceptable only
 for this protected deployed-test topology: untrusted branch code never runs on
 the evaluator, and the secret-bearing harness always comes from protected
-`main`. True "evaluate any branch" support needs a separate preview-deployment
-and credential-broker design (for example, short-lived scoped credentials or a
-trusted provider proxy) before it can preserve the same boundary. That preview
-and broker layer is explicitly not implemented by this version.
+`main`. The reserved `branch_preview` lane therefore fails closed. True
+"evaluate any branch" support needs a separate disposable target deployment and
+a trusted provider broker with short-lived provider/model/budget-scoped tokens
+before it can preserve the same boundary. A free-form base URL is not an
+acceptable substitute. See `docs/testing/IO_E2E_TOOL.md` for the control-tool
+contract and preview design.
 
 The same dispatch also runs candidate-only persona and memory qualification
 after the mandatory nine-provider P0 matrix. `persona_repetitions=1` is the
-default developer smoke lane and uses eight fresh official-OpenAI synthetic
-accounts; `persona_repetitions=3` is release depth and uses 24. The deep lane is
+default developer smoke lane and uses nine fresh official-OpenAI synthetic
+accounts; `persona_repetitions=3` is release depth and uses 27. The formal suite
+includes the strong learned-memory scenario: it verifies a real memory mutation,
+proves distinct exact Codex thread identifiers across a cleared transcript, and
+removes the synthetic boundary probe before recall. The deep lane is
 formal only for `runtime_target=hosted_resident`, where every account must prove
 the expected Hosted Runtime V2 user-path mode and version. Worker binary SHA and
 live-worker count remain unavailable and are not claimed. `deployed_current`
@@ -717,19 +749,21 @@ the candidate. They deliberately record `observed_worker_sha: null` and
 `live_worker_count: null`: current Runtime V2 does not expose trustworthy worker
 binary identity, so this suite does not fabricate that stronger attestation.
 
-Trigger **CI / IO agentic E2E** manually at protected `main`. Any collaborator
-with repository write access may do this; no Environment reviewer needs to be
-online. In the Actions UI, press **Run workflow**, keep the branch set to
-`main`, choose the runtime contract and persona depth, and start the run:
+Use the IO E2E client. Any collaborator with repository write access may do
+this; no Environment reviewer needs to be online. The client verifies that
+permission, resolves the target before spending credits, and dispatches the
+dedicated controller at protected `main`:
 
 ```bash
-gh workflow run ci.yml --ref main -f runtime_target=deployed_current
+python3 -m tools.io_e2e plan --ref test
+python3 -m tools.io_e2e run --ref test --wait
 ```
 
-A manual dispatch starts only the self-service IO E2E entrypoint. The ordinary
-contract, backend, Docker, lint, and DCAP CI jobs remain push/PR-only; deploy
-jobs remain push-only. Pressing **Run workflow** therefore does not also launch
-an unrelated full CI or deployment run.
+Coding agents must read `.agents/skills/io-e2e/SKILL.md` and invoke the same
+client; they do not receive a separate privileged API. Direct Actions UI use is
+an operator fallback: dispatch **IO E2E tool** at `main` only and provide a UUID,
+`target_ref=test`, and the immutable test-head SHA. A manual dispatch never
+launches ordinary CI or a deployment.
 
 The GitHub Actions job summary is the V1 team panel. It shows the full
 nine-profile coverage matrix, latency summary, and expandable fixed-code context
@@ -739,10 +773,11 @@ open the completed run, read the summary, then download the linked report or
 protected bundle when deeper debugging is needed. This is intentionally an
 on-demand Actions UI rather than a separately hosted dashboard.
 
-The manual-only `io-e2e-agent-driven-test` job calls the reusable E2E workflow
-from that selected immutable `main` revision and does not inherit caller secrets. A
-separate GitHub-hosted job, outside `io-e2e-agent-driven-test`, checks out `test`
-without QA Environment secrets, reads the backend image tag pinned in
+The manual-only control workflow calls the reusable E2E evaluator from that
+selected immutable `main` revision and does not inherit caller secrets. A
+GitHub-hosted authorization job checks out `test` without QA Environment
+secrets, rejects a moved ref, writes a same-run `request-manifest.json`, and
+reads the backend image tag pinned in
 `deploy/docker-compose.phala.test.yaml`, and resolves the short tag to a full Git
 commit. The secret-bearing evaluator then checks out only the trusted `main`
 harness and receives that resolved commit as expected-deployment metadata. This
@@ -752,7 +787,7 @@ SHA. The run fails closed if the compose file has mixed tags, the tag does not
 resolve inside current `test` history, or the protected live backend reports a
 different full SHA.
 
-There is deliberately no free-form deployment-SHA or candidate-branch input.
+There is deliberately no free-form base URL or executable controller-ref input.
 Use `runtime_target=deployed_current` to qualify whichever configured runtime is
 currently deployed, or `hosted_resident` to require the exact V2 user path. Any
 controller ref other than protected `main` fails before the Environment or its
@@ -805,10 +840,13 @@ The panel keeps API-key matrix failures and the formal persona-memory arm in
 separate sections. Persona-memory failures include the allowlisted scenario
 status, trajectory counts, evaluator type, hard/soft gate, pass/fail/blocked/
 infrastructure counts, score/threshold, and fixed public failure codes. The
-persona publisher intentionally removes account, request, turn, trace, and job
-IDs before this boundary, so these rows explicitly say that exact-ID debugging
-is unavailable instead of inventing or implying identifiers that were never
-retained.
+persona publisher intentionally removes account, session, request, response,
+turn, trace, capture-job, and runtime-session IDs before this public boundary.
+For a finalized non-PASS scenario, the failure index may mark encrypted exact-ID
+debugging available only because trusted code separately validates the
+owner-only private experiment result against the same canonical run,
+deployment, runtime, pool, and public summary. Pipeline-level fallback failures
+without finalized trajectory evidence remain unavailable.
 The formal hosted arm is accepted only when it contains all eight checked-in
 version `1.0.0` scenarios in locked order, with exactly the selected repetition
 count per scenario and `8 × repetitions` trajectories overall. A partial or
@@ -832,12 +870,13 @@ debuggable failure counts. When its exact-ID failure count is non-zero and
 creates `io-e2e-protected-debug-<run-id>`, retained for 7 days. The repository
 is public, so the uploaded object is ciphertext: a random authenticated symmetric
 key encrypts the failure-only payload and is separately sealed to every listed
-X25519 recipient. The decrypted payload contains exact synthetic user, request,
-turn, trace, and persona-job IDs plus bounded fixed-code, latency, reasoning,
-persona, and trace metadata needed to look up backend logs. It never contains
-raw chats, prompt/reply text, imported persona files, hidden or displayed COT,
-trace bodies, provider response bodies, credentials, or free-form rationale.
-The builder writes no plaintext temporary artifact.
+X25519 recipient. The decrypted payload contains exact synthetic account,
+session, request, response, turn, trace, capture-job, and runtime-session IDs
+plus bounded fixed-code, latency, reasoning, persona, and trace metadata needed
+to look up backend logs. It never contains raw chats, prompt/reply text,
+imported persona files, hidden or displayed COT, trace bodies, provider response
+bodies, credentials, or free-form rationale. The builder writes no plaintext
+temporary artifact.
 
 The job summary links both artifacts and gives the decrypt command. A listed
 teammate must download the team-safe report and protected bundle from the same
@@ -851,6 +890,7 @@ python qa/protected_debug_bundle.py decrypt \
   --identity "$HOME/.config/io-e2e/debug-identity.json" \
   --input ./io-e2e-protected-debug.bundle.json \
   --failure-index ./failure-index.json \
+  --persona-summary ./persona-memory-summary.json \
   --output ./io-e2e-protected-debug.payload.json
 ```
 
@@ -858,11 +898,12 @@ The decrypted file is owner-only and should be deleted after log correlation.
 A green run produces no protected bundle. A failing run without configured
 recipients keeps only the public-safe hashed report; that optional configuration
 gap does not turn the product result into an infrastructure failure. A
-persona-only failing run also produces no encrypted bundle: its aggregate
-failure is fully visible in the team panel, but the persona summary contract has
-no exact identifiers to encrypt. A mixed run still creates a bundle for its
-API-key exact-ID failures and binds it to the complete scanned failure index and
-persona summary from the same Actions run.
+persona-only failing run with finalized non-PASS trajectories produces an
+encrypted bundle when recipients are configured and the owner-only result binds
+exactly; a pipeline-level persona fallback still produces no exact-ID bundle. A
+mixed run creates one bundle for both API-key and eligible persona failures and
+binds it to the complete scanned failure index and persona summary from the same
+Actions run.
 
 The seven summary fields count the exact terminal statuses of the nine profiles
 and must sum to nine. The gate is green only when all nine profiles and all

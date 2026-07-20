@@ -207,6 +207,22 @@ def test_judge_request_blinds_variant_and_transport_identity():
             "target_id": "candidate",
             "trajectory_id": "candidate-trajectory",
             "scenario_id": "persona-pressure",
+            "metadata": {
+                "protected_debug_account_fingerprints": ["9" * 64],
+                "protected_debug_identifiers": {
+                    "capture_job_ids": ["private-capture-job-id"],
+                    "runtime_session_ids": ["private-runtime-session-id"],
+                },
+            },
+            "boundary_evidence": [
+                {
+                    "evidence": {
+                        "protected_debug_identifiers": {
+                            "trace_ids": ["private-boundary-trace-id"]
+                        }
+                    }
+                }
+            ],
             "turns": [
                 {
                     "turn_id": "probe",
@@ -216,6 +232,9 @@ def test_judge_request_blinds_variant_and_transport_identity():
                     "session_id": "private-session-id",
                     "request_id": "private-request-id",
                     "response_id": "private-response-id",
+                    "metadata": {
+                        "protected_debug": {"account_fingerprint": "9" * 64}
+                    },
                 }
             ],
         },
@@ -228,6 +247,10 @@ def test_judge_request_blinds_variant_and_transport_identity():
     serialized = str(request)
     assert "candidate" not in serialized
     assert "private-session-id" not in serialized
+    assert "private-capture-job-id" not in serialized
+    assert "private-runtime-session-id" not in serialized
+    assert "private-boundary-trace-id" not in serialized
+    assert "protected_debug" not in serialized
     assert request["trajectory"]["turns"][0]["session_key"] == "primary"
 
 

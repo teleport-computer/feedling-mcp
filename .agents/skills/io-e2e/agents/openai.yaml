@@ -1,0 +1,4 @@
+interface:
+  display_name: "IO E2E"
+  short_description: "Run and inspect trusted IO agent qualifications"
+  default_prompt: "Use $io-e2e to plan, run, monitor, and summarize an IO E2E qualification."

@@ -38,6 +38,13 @@ When coordinating with another local coding/audit agent in this repo, use
 under `.agents/mailbox/` and is ignored by git; tmux wakeups only inject a
 fixed read command, never the full message body.
 
+## IO E2E qualification
+
+For requests to plan, start, monitor, inspect, or cancel an agent-driven IO E2E
+qualification, read and follow `.agents/skills/io-e2e/SKILL.md`. Use the
+checked-in `tools.io_e2e` CLI; do not dispatch the protected workflow directly
+or request qualification secrets from the user.
+
 ## Other repo conventions
 
 - TDX enclave operations — cross-reference the local `dstack-tutorial`

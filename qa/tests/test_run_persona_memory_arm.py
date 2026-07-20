@@ -196,11 +196,19 @@ def test_product_regression_still_post_verifies_cleans_and_finalizes(
     assert run_env["CODEX_HOME"] == str(args.codex_home)
     assert run_env["QA_CODEX_MODEL"] == args.judge_model
     run_command = seen[run_index][0]
+    assert "--include-nightly" in run_command
     assert run_command[run_command.index("--codex-home") + 1] == str(args.codex_home)
     assert run_command[run_command.index("--judge-work-root") + 1] == str(
         args.private_root / "codex-judge"
     )
     assert "--judge-api-key-env" not in run_command
+    provision_command = next(
+        command
+        for command, _env in seen
+        if Path(command[1]).name == "provision_profiles.py"
+        and command[2] == "provision-pool"
+    )
+    assert provision_command[provision_command.index("--count") + 1] == "27"
     assert (args.private_root / "account-pool.json").exists() is False
     assert (args.private_root / "arm-receipt.json").is_file()
     summary = json.loads(capsys.readouterr().out)

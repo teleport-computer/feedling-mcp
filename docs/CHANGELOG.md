@@ -47,6 +47,21 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-20
+
+### [DONE] IO E2E 从 CI 手动入口拆成 agent 可调用的独立工具
+
+- 新增 dependency-light `tools.io_e2e` 控制客户端和仓库内
+  `.agents/skills/io-e2e`：有 write 权限的队友或其 coding agent 可 plan、启动、
+  等待、查看结果、打开和取消 qualification；稳定 JSON 输出复用 GitHub 身份，
+  不接触 provider/admin/Codex 凭据。
+- 手动入口从 `ci.yml` 移到 protected-main-only `io-e2e-control.yml`；target ref/SHA
+  只作为数据，控制器二次解析并写同 run request manifest，再复用现有一次性 AWS
+  evaluator、九 provider matrix、persona-memory judge、确定性 gate/cleanup 和报告。
+- 当前可用 lane 明确限定为已部署 `test`；任意 branch preview 在独立 target host
+  和短期限额 provider broker 落地前 fail closed，避免把 raw BYOK 暴露给 candidate
+  code 或误报未部署分支已经被测。
+
 ## 2026-07-18（第六批：终局——全局复扫 + 灰区 16 项终审全保留）
 
 ### [DONE] 仓库清理第三轮·第六批（真收官）
