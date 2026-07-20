@@ -784,7 +784,9 @@ jobs:
   #             into one compare-and-swap [skip ci] release commit
   #         (3) compute compose_hash from the pinned compose, authorize it
   #             on-chain via FeedlingAppAuth.addComposeHash (idempotent)
-  #         (4) phala deploy --cvm-id <uuid> --wait
+  #         (4) phala deploy --cvm-id <uuid>, then poll readiness with our
+  #             own deadline via deploy/wait-cvm-ready.sh (the CLI's --wait is
+  #             hard-capped at 300s, which the main CVM boot regularly exceeds)
   #
   # iOS side: audit card sees new compose_hash and prompts consent. By
   # design — this is the trust boundary the user explicitly accepts.
@@ -1003,8 +1005,11 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
-            -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS" \
-            --wait
+            -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS"
+          # NOT --wait: the CLI's readiness wait is hard-capped at 300s and the
+          # main CVM image pull + backend/enclave boot regularly exceeds it. Poll
+          # with our own configurable deadline instead (deploy/wait-cvm-ready.sh).
+          ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
 
       - name: Publish live compose_hash on Sepolia
         env:
@@ -1216,8 +1221,11 @@ jobs:
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
-            -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
-            --wait
+            -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS"
+          # NOT --wait: the CLI's readiness wait is hard-capped at 300s and the
+          # main CVM image pull + backend/enclave boot regularly exceeds it. Poll
+          # with our own configurable deadline instead (deploy/wait-cvm-ready.sh).
+          ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
 
       - name: Publish live compose_hash on Sepolia (test contract)
         env:
