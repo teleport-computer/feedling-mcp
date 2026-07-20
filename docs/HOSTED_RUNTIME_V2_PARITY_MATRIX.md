@@ -1,6 +1,6 @@
 # Hosted Runtime V2 — Current Parity and Completion Matrix
 
-> **CURRENT SOURCE OF TRUTH — 2026-07-18.** This page describes the current
+> **CURRENT SOURCE OF TRUTH — 2026-07-19.** This page describes the current
 > Runtime V2 source and managed deployment manifests. A live environment changes
 > only after this source is deployed. Use
 > [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)
@@ -33,7 +33,7 @@
 | Tokens/turn and admission ceiling | ✅ | Whole-turn token/call/latency metrics and an admission ceiling are implemented. The offline token regression gate is live. |
 | Concurrent CVM-class load proof | ⚠️ | The harness exists, but the authoritative concurrent run on the target CVM class remains an operational gate. |
 | Typing-signal pre-warm | ❌ | Not implemented. See the definition below. |
-| Encrypted full trajectories and failure review | ⚠️ | Immutable encrypted per-job provider/tool/reply/fold/error capture is implemented. Provider-backed offline review is explicit opt-in, fail-closed, globally admission-bounded, and structurally side-effect-free; it is analysis, not deterministic replay. Automatic retention/GC and operator inspection/export policy remain open. |
+| Encrypted full trajectories and failure review | ⚠️ | Immutable encrypted per-job provider/tool/reply/fold/error capture is implemented. Oversized model-visible events use exact digest-verified encrypted chunks; every async provider HTTP attempt carries its effective request model, exact JSON body, result/error status and duration without an extra DB write. Tool timing/effect evidence and reply disposition are captured. Provider-backed offline review is explicit opt-in, fail-closed, globally admission-bounded, and structurally side-effect-free; it is analysis, not deterministic replay. Automatic retention/GC and restricted inspection/export policy remain open. |
 | Fleet-wide resident-process retirement | ⚠️ | Source and managed topology are complete: hosted supervisors, per-user homes/leases/CLI toolchains, selectors, and the admin rollback flip are removed, and every managed manifest can launch only pooled V2 workers. Live closure still requires deploying the reviewed image to each environment, provisioning the required second production runner failure domain, and verifying that no legacy hosted process remains. The independent user-operated `/v1/chat/*` resident consumer is a separate product path. |
 
 ## Current turn shape
@@ -202,40 +202,51 @@ records below each capture only one operational slice of the turn.
 
 | Persisted record | What it answers | Scope boundary |
 |---|---|---|
-| `v2_turn_metrics` | Total prompt/completion/cache tokens, calls, retries, latency, provider/model, final status | Aggregate and content-free; failed sends may still have unknown provider usage |
+| `v2_turn_metrics` | Total prompt/completion/cache tokens, calls, retries, latency, configured provider/model, final status | Aggregate and content-free; failed sends may still have unknown provider usage; account deletion cascades these rows |
 | `agent_jobs` and status events | Whether/when a job queued, ran, failed, or expired | Status vocabulary is coarse and original content is intentionally excluded |
 | Runtime action digest | Counts and success by tool name | No arguments, results, ordering, or context |
 | Encrypted effect outbox | Durable replies and platform mutations | Captures business effects, not read tools or model exchanges |
 | MCP mutation frontier | Whether a remote mutation may have an ambiguous outcome | Stores hashes/status, not the remote arguments or result |
 | In-process native transcript | Enough ordered tool context for the next model round | Discarded when the turn/process ends; the encrypted trajectory is the durable copy |
-| `v2_trajectory_events` | Immutable per-job request/response, fold, tool, reply, exception, and terminal chronology | Sensitive payload is a user+enclave shared envelope; only fixed ordering/type/size metadata is plaintext |
+| `v2_trajectory_events` | Immutable per-job request/response, provider-attempt, fold, timed tool/effect, reply-disposition, exception, and terminal chronology | Sensitive payload is a user+enclave shared envelope; only fixed ordering/type/size metadata is plaintext |
 
 Telemetry is the **odometer/instrument panel**: it tells us how much, how long,
 and whether the turn failed. The encrypted trajectory is the **flight
-recorder**: it records the bounded causal chronology and explicit completeness
-state. Token telemetry alone therefore does not explain a failed turn, and the
-flight recorder still is not a deterministic replay engine: truncated events,
-external read changes, and fresh model sampling can make exact re-execution
-impossible.
+recorder**: it records the exact model-visible causal chronology and explicit
+completeness state. Token telemetry alone therefore does not explain a failed
+turn. The flight recorder still is not a deterministic replay engine: external
+read changes, provider-side state, and fresh model sampling can make exact
+re-execution impossible.
 
-Runtime V2 now also writes the flight recorder: each causal event is bounded,
-compressed, sealed to the user's content key and enclave key in the trusted
-worker, then appended under an immutable per-job index. Provider credentials
-and raw exception strings are never part of an event. Capture-state metadata is
+Runtime V2 now also writes the flight recorder: each causal event is compressed,
+sealed to the user's content key and enclave key in the trusted worker, then
+appended under an immutable per-job index. A logical event above the physical
+part boundary is stored losslessly as digest-verified encrypted chunks in one
+stream transaction and one multi-row INSERT. Provider credentials, HTTP
+headers/base URLs, and raw
+exception strings are never part of an event. Capture-state metadata is
 explicitly `open`, `complete`, `partial`, or `missing` and exposes the terminal
-event index plus truncation bit. A terminal source job without a terminal event
-is `partial`; per-event idempotency preserves the durable prefix.
+event index, explicit required-or-best-effort `capture_gap` flag, and legacy
+truncation bit.
+A terminal source job without a terminal event—or with a gap marker—is
+`partial`; per-event idempotency preserves the durable prefix.
 Attempt-scoped idempotency plus deterministic call-ID child scopes keep parallel
-subagent/tool events stable across redelivery. Each child provider round and
-each parallel call's start/result/error is captured independently, so one
-failing sibling cannot erase evidence already produced by another.
+subagent/tool events stable across redelivery. Each child provider round, every
+underlying compatibility/transient HTTP attempt, and each parallel call's
+start/result/error/duration is captured independently, so one failing sibling
+cannot erase evidence already produced by another. Attempt wire evidence is
+accumulated in memory and joins the existing encrypted provider response/error
+event, avoiding one database write per retry. Attempt `model` is the effective
+wire model; aggregate metrics deliberately retain the user-configured model.
 
-One event's pre-compression JSON is capped (512 KiB by default), with explicit
-`truncated` and original-size markers rather than a silent clip. Review reads at
-most the newest 256 events and has its own 128 KiB prompt frontier; those are
-analysis bounds, not deletion policies. Raw encrypted event rows remain until
-the owning job/account is explicitly deleted. The store has no public plaintext
-read API and is never injected into live conversation context.
+One physical part's pre-compression JSON is capped (512 KiB by default, with a
+safe 64 KiB batching floor); larger
+logical events are exact ordered chunks rather than clipped prefixes. Review
+reads at most the newest 256 physical rows and has its own 128 KiB prompt
+frontier; an incomplete chunk window is labeled incomplete. Those are analysis
+bounds, not deletion policies. Raw encrypted event rows remain until the owning
+job/account is explicitly deleted. The store has no public plaintext read API
+and is never injected into live conversation context.
 
 ## Deferred D items, precisely defined
 

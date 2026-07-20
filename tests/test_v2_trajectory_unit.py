@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from pathlib import Path
 import sys
+import threading
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -31,6 +34,163 @@ def test_payload_is_bounded_compressed_and_explicitly_truncated():
     assert decoded["truncated"] is True
     assert decoded["original_json_bytes"] == original_size
     assert len(decoded["json_prefix"].encode("utf-8")) < 600
+
+
+def test_exact_payload_parts_round_trip_without_truncation():
+    secret = "完整上下文-" * 12_000
+    encoded_parts, original_size = trajectory.encode_payload_parts(
+        "provider_request",
+        {"messages": [{"role": "user", "content": secret}]},
+        max_json_bytes=64 * 1024,
+    )
+    assert len(encoded_parts) > 1
+    assert original_size > 64 * 1024
+    physical = []
+    for index, encoded in enumerate(encoded_parts):
+        decoded = trajectory.decode_payload(encoded)
+        decoded["event_index"] = index
+        decoded["capture_truncated"] = False
+        physical.append(decoded)
+    logical = trajectory.reassemble_payload_parts(physical)
+    assert len(logical) == 1
+    assert logical[0]["payload"]["messages"][0]["content"] == secret
+    assert logical[0]["storage_chunk_count"] == len(encoded_parts)
+
+
+def test_identical_chunked_events_remain_distinct_logical_documents():
+    payload = {"messages": [{"role": "user", "content": "same" * 30_000}]}
+    physical = []
+    for document_id in ("logical-a", "logical-b"):
+        encoded_parts, _ = trajectory.encode_payload_parts(
+            "provider_request",
+            payload,
+            max_json_bytes=64 * 1024,
+            document_id=document_id,
+        )
+        for encoded in encoded_parts:
+            event = trajectory.decode_payload(encoded)
+            event["event_index"] = len(physical)
+            physical.append(event)
+    logical = trajectory.reassemble_payload_parts(physical)
+    assert len(logical) == 2
+    assert logical[0]["payload"] == logical[1]["payload"] == payload
+
+
+def test_chunk_reassembly_rejects_tampering_and_labels_incomplete_windows():
+    encoded_parts, _ = trajectory.encode_payload_parts(
+        "provider_request",
+        {"messages": [{"role": "user", "content": "private" * 20_000}]},
+        max_json_bytes=64 * 1024,
+        document_id="logical-tamper-test",
+    )
+    decoded = [trajectory.decode_payload(part) for part in encoded_parts]
+    incomplete = trajectory.reassemble_payload_parts(decoded[1:])
+    assert incomplete == [
+        {
+            "schema": "feedling.runtime_v2.trajectory_chunk_incomplete.v1",
+            "kind": "provider_request",
+            "document_id": "logical-tamper-test",
+            "document_sha256": decoded[0]["document_sha256"],
+            "original_json_bytes": decoded[0]["original_json_bytes"],
+            "chunk_count": len(decoded),
+            "captured_chunk_count": len(decoded) - 1,
+            "event_index": None,
+            "capture_truncated": False,
+        }
+    ]
+    original_chunk = base64.b64decode(decoded[0]["chunk_b64"])
+    decoded[0]["chunk_b64"] = base64.b64encode(
+        bytes([original_chunk[0] ^ 1]) + original_chunk[1:]
+    ).decode("ascii")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        trajectory.reassemble_payload_parts(decoded)
+
+
+def test_exact_codec_rejects_part_caps_below_safe_batch_floor():
+    with pytest.raises(ValueError, match="invalid trajectory event byte cap"):
+        trajectory.encode_payload_parts(
+            "provider_request",
+            {"messages": []},
+            max_json_bytes=(64 * 1024) - 1,
+        )
+
+
+def test_recorder_batches_exact_large_event_once():
+    plaintext_by_item: dict[str, bytes] = {}
+    batches: list[list[dict]] = []
+
+    def seal(user_id, plaintext, item_id):
+        plaintext_by_item[item_id] = plaintext
+        return {
+            "v": 1,
+            "id": item_id,
+            "owner_user_id": user_id,
+            "visibility": "shared",
+            "body_ct": base64.b64encode(plaintext).decode(),
+            "nonce": "n",
+            "K_user": "u",
+            "K_enclave": "e",
+        }
+
+    def append(_job_id, _user_id, **_kwargs):
+        raise AssertionError("large production event should use the batch append")
+
+    def append_batch(_job_id, _user_id, *, events):
+        batches.append(events)
+        return list(range(9, 9 + len(events)))
+
+    content = "x" * (trajectory.MAX_EVENT_JSON_BYTES + 1024)
+    recorder = trajectory.TrajectoryRecorder(
+        job_id=11,
+        user_id="u1",
+        seal=seal,
+        append=append,
+        append_batch=append_batch,
+    )
+    index = asyncio.run(
+        recorder.record(
+            "provider_request",
+            {"messages": [{"role": "user", "content": content}]},
+        )
+    )
+    assert index == 9
+    assert len(batches) == 1
+    assert len(batches[0]) > 1
+    physical = []
+    for offset, event in enumerate(batches[0]):
+        assert event["truncated"] is False
+        decoded = trajectory.decode_payload(
+            plaintext_by_item[event["payload_envelope"]["id"]]
+        )
+        decoded["event_index"] = 9 + offset
+        decoded["capture_truncated"] = False
+        physical.append(decoded)
+    logical = trajectory.reassemble_payload_parts(physical)
+    assert logical[0]["payload"]["messages"][0]["content"] == content
+
+
+def test_exact_codec_preserves_deep_json_without_omission():
+    payload: dict = {"leaf": "kept"}
+    for index in range(40):
+        payload = {f"level_{index}": payload}
+
+    parts, _size = trajectory.encode_payload_parts(
+        "provider_request",
+        payload,
+        max_json_bytes=900 * 1024,
+    )
+
+    decoded = trajectory.decode_payload(parts[0])
+    assert "omitted" not in json.dumps(decoded)
+    cursor = decoded["payload"]
+    for index in reversed(range(40)):
+        cursor = cursor[f"level_{index}"]
+    assert cursor == {"leaf": "kept"}
+
+
+def test_exact_codec_rejects_unsupported_values_instead_of_omitting():
+    with pytest.raises(TypeError, match="unsupported exact trajectory value"):
+        trajectory.encode_payload_parts("provider_request", {"bad": object()})
 
 
 def test_recorder_seals_before_append_and_uses_deterministic_ids():
@@ -67,6 +227,109 @@ def test_recorder_seals_before_append_and_uses_deterministic_ids():
     assert event_key.endswith("_0000_reply_planned")
     assert calls[0][2] == trajectory.trajectory_item_id(12, event_key)
     assert "secret" not in str(calls[1][3]["payload_envelope"])
+
+
+def test_best_effort_failure_emits_gap_marker_before_terminal():
+    plaintext_by_id: dict[str, dict] = {}
+    appended: list[dict] = []
+
+    def seal(user_id, plaintext, item_id):
+        plaintext_by_id[item_id] = trajectory.decode_payload(plaintext)
+        return {
+            "v": 1,
+            "id": item_id,
+            "owner_user_id": user_id,
+            "visibility": "shared",
+            "body_ct": "ct",
+            "nonce": "n",
+            "K_user": "u",
+            "K_enclave": "e",
+        }
+
+    def append(_job_id, _user_id, **event):
+        if event["event_kind"] == "reply_effect_disposition":
+            raise RuntimeError("simulated append failure")
+        appended.append(event)
+        return len(appended) - 1
+
+    recorder = trajectory.TrajectoryRecorder(
+        job_id=13,
+        user_id="u1",
+        seal=seal,
+        append=append,
+    )
+    assert asyncio.run(
+        recorder.record_best_effort(
+            "reply_effect_disposition",
+            {"status": "applied"},
+        )
+    ) is False
+    assert asyncio.run(
+        recorder.record_best_effort("turn_terminal", {"outcome": "completed"})
+    ) is True
+    assert [event["event_kind"] for event in appended] == [
+        "capture_gap",
+        "turn_terminal",
+    ]
+    gap_envelope = appended[0]["payload_envelope"]
+    gap = plaintext_by_id[gap_envelope["id"]]["payload"]
+    assert gap == {
+        "failed_capture_events": 1,
+        "failed_event_kinds": {"reply_effect_disposition": 1},
+    }
+
+
+def test_terminal_waits_for_parallel_scope_failure_before_gap_snapshot():
+    entered = threading.Event()
+    release = threading.Event()
+    appended = []
+
+    def seal(user_id, _plaintext, item_id):
+        return {
+            "v": 1,
+            "id": item_id,
+            "owner_user_id": user_id,
+            "visibility": "shared",
+            "body_ct": "ct",
+            "nonce": "n",
+            "K_user": "u",
+            "K_enclave": "e",
+        }
+
+    def append(_job_id, _user_id, **event):
+        if event["event_kind"] == "provider_response":
+            entered.set()
+            assert release.wait(timeout=2)
+            raise RuntimeError("parallel append failed")
+        appended.append(event["event_kind"])
+        return len(appended) - 1
+
+    recorder = trajectory.TrajectoryRecorder(
+        job_id=14,
+        user_id="u1",
+        seal=seal,
+        append=append,
+    )
+
+    async def scenario():
+        child = asyncio.create_task(
+            recorder.scoped("child").record(
+                "provider_response",
+                {"reply": "late"},
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        terminal = asyncio.create_task(
+            recorder.record("turn_terminal", {"outcome": "failed"})
+        )
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(RuntimeError, match="parallel append failed"):
+            await child
+        await terminal
+
+    asyncio.run(scenario())
+    assert appended == ["capture_gap", "turn_terminal"]
 
 
 def test_recorder_attempt_identity_dedupes_redelivery_but_separates_new_attempt():
@@ -197,6 +460,83 @@ def test_recorder_retries_ambiguous_append_with_the_same_event_key():
     assert len(stored) == 1
 
 
+def test_tool_trajectory_result_includes_durable_effect_evidence():
+    captured = []
+
+    class Recorder:
+        def scoped(self, _scope):
+            return self
+
+        async def record(self, kind, payload):
+            captured.append((kind, payload))
+
+    callback = worker._make_tool_trajectory_callback(
+        Recorder(),
+        {
+            "call-1": {
+                "domain": "platform",
+                "effect_id": "effect-1",
+                "effect_type": "workspace_write",
+                "status": "applied",
+            }
+        },
+    )
+    asyncio.run(
+        callback(
+            SimpleNamespace(id="call-1", name="workspace_write"),
+            "tool_call_result",
+            {
+                "phase": "platform_mutation",
+                "duration_ms": 4.25,
+                "result": ToolResult(call_id="call-1", content="ok"),
+            },
+        )
+    )
+    assert captured[0][1]["effect"] == {
+        "domain": "platform",
+        "effect_id": "effect-1",
+        "effect_type": "workspace_write",
+        "status": "applied",
+    }
+    assert captured[0][1]["duration_ms"] == 4.25
+
+
+def test_reused_tool_call_id_does_not_inherit_prior_round_effect():
+    captured = []
+
+    class Recorder:
+        def scoped(self, _scope):
+            return self
+
+        async def record(self, kind, payload):
+            captured.append((kind, payload))
+
+    evidence = {
+        "same-id": {
+            "domain": "platform",
+            "effect_id": "old-effect",
+            "status": "applied",
+        }
+    }
+    callback = worker._make_tool_trajectory_callback(Recorder(), evidence)
+    call = SimpleNamespace(id="same-id", name="memory_search")
+    asyncio.run(
+        callback(call, "tool_call_started", {"phase": "platform_read"})
+    )
+    asyncio.run(
+        callback(
+            call,
+            "tool_call_result",
+            {
+                "phase": "platform_read",
+                "result": ToolResult(call_id="same-id", content="found"),
+            },
+        )
+    )
+    assert evidence == {}
+    assert all("effect" not in payload for _kind, payload in captured)
+
+
 def test_tool_loop_records_request_response_tools_results_and_replies(monkeypatch):
     responses = iter(
         [
@@ -268,7 +608,19 @@ def test_tool_loop_records_request_response_tools_results_and_replies(monkeypatc
 
 def test_provider_failure_leaves_a_partial_request_error_trajectory(monkeypatch):
     async def provider(_config, _messages, *, tools=None):
-        raise RuntimeError("upstream private diagnostic")
+        error = RuntimeError("upstream private diagnostic")
+        error.feedling_provider_attempt_trace = {
+            "version": 1,
+            "attempts": [
+                {
+                    "ordinal": 1,
+                    "kind": "http_attempt",
+                    "status": 503,
+                    "duration_ms": 12.5,
+                }
+            ],
+        }
+        raise error
 
     async def forbidden_dispatch(_calls):
         raise AssertionError("failed provider call must not dispatch")
@@ -306,6 +658,7 @@ def test_provider_failure_leaves_a_partial_request_error_trajectory(monkeypatch)
         "provider_error",
     ]
     assert events[0][1]["messages"][0]["content"] == "private prompt"
+    assert events[1][1]["provider_attempt_trace"]["attempts"][0]["status"] == 503
 
 
 def test_failure_review_has_no_reply_effect_mcp_or_workspace_surface(monkeypatch):

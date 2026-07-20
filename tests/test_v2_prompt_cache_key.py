@@ -146,6 +146,8 @@ def test_prompt_cache_key_is_deterministic_opaque_and_non_mutating(monkeypatch):
     # user id or derived key is written back into the user's stored config.
     assert original_config.prompt_cache_key == ""
     assert original_config.prompt_cache_route_fingerprint == ""
+    assert original_config.capture_attempt_trace is False
+    assert first.capture_attempt_trace is True
     assert store == {"sentinel": "unchanged"}
     assert user_id not in repr(original_config)
     assert first is not original_config

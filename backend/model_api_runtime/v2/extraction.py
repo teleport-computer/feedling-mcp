@@ -51,7 +51,12 @@ async def extract(
         if trajectory_out is not None:
             await trajectory_out(
                 "provider_error",
-                {"error_class": type(e).__name__},
+                {
+                    "error_class": type(e).__name__,
+                    "provider_attempt_trace": (
+                        provider_client.runtime_provider_attempt_trace(e)
+                    ),
+                },
             )
         if usage_out is not None:
             usage_out(None)

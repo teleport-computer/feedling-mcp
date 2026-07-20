@@ -542,6 +542,7 @@ def _resolve_provider(user_id: str):
         runtime,
         prompt_cache_key=f"feedling-v2-{cache_key}",
         prompt_cache_route_fingerprint=f"feedling-v2-route-{route_fingerprint}",
+        capture_attempt_trace=True,
     ), {}
 
 

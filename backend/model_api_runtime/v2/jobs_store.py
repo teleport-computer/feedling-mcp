@@ -15,6 +15,7 @@ import re
 import time
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -1807,7 +1808,7 @@ def record_turn_metric(
     completion_tokens: int | None,
     latency_ms: int | None,
 ) -> None:
-    """插一行到 v2_turn_metrics（append-only，无 FK）。由 turn 调用方在
+    """插一行到 v2_turn_metrics（append-only，账号删除级联清除）。由 turn 调用方在
     一轮结束后调用；provider 未回 usage 时 prompt/completion_tokens 传 None，
     该行仍落地（latency 仍可信），只是不参与 recent_mean_tokens_per_turn 的均值。"""
     with _pool().connection() as conn:
@@ -3039,31 +3040,50 @@ def finish_sandbox_acquisition(
             return cur.rowcount == 1
 
 
-def append_trajectory_event(
+def append_trajectory_events_batch(
     job_id: int | str,
     user_id: str,
     *,
-    event_kind: str,
-    idempotency_key: str,
-    payload_envelope: dict,
-    payload_bytes: int,
-    truncated: bool = False,
-) -> int:
-    """Append one encrypted event and return its immutable per-job index.
+    events: list[dict],
+) -> list[int]:
+    """Atomically append encrypted event rows and return their immutable indices.
 
     Stream-row locking serializes concurrent callbacks without locking the
-    source ``agent_jobs`` row. Repeating an idempotency key returns the existing
-    index and never rewrites its ciphertext.
+    source ``agent_jobs`` row. Repeating idempotency keys returns the existing
+    indices and never rewrites ciphertext. The batch form lets one oversized
+    logical trajectory event store every encrypted chunk under one transaction
+    and one stream-frontier advance.
     """
-    event_kind = str(event_kind or "")
-    idempotency_key = str(idempotency_key or "")
-    if not _TRAJECTORY_EVENT_KIND_RE.fullmatch(event_kind):
-        raise ValueError("invalid trajectory event kind")
-    if not _TRAJECTORY_IDEMPOTENCY_RE.fullmatch(idempotency_key):
-        raise ValueError("invalid trajectory idempotency key")
-    if type(payload_bytes) is not int or not 1 <= payload_bytes <= 1024 * 1024:
-        raise ValueError("invalid trajectory payload size")
-    envelope = _validate_trajectory_envelope(str(user_id), payload_envelope)
+    if not isinstance(events, list) or not 1 <= len(events) <= 4096:
+        raise ValueError("invalid trajectory event batch")
+    normalized: list[dict] = []
+    seen_keys: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError("invalid trajectory event")
+        event_kind = str(event.get("event_kind") or "")
+        idempotency_key = str(event.get("idempotency_key") or "")
+        payload_bytes = event.get("payload_bytes")
+        if not _TRAJECTORY_EVENT_KIND_RE.fullmatch(event_kind):
+            raise ValueError("invalid trajectory event kind")
+        if not _TRAJECTORY_IDEMPOTENCY_RE.fullmatch(idempotency_key):
+            raise ValueError("invalid trajectory idempotency key")
+        if idempotency_key in seen_keys:
+            raise ValueError("duplicate trajectory idempotency key in batch")
+        if type(payload_bytes) is not int or not 1 <= payload_bytes <= 1024 * 1024:
+            raise ValueError("invalid trajectory payload size")
+        seen_keys.add(idempotency_key)
+        normalized.append(
+            {
+                "event_kind": event_kind,
+                "idempotency_key": idempotency_key,
+                "payload_envelope": _validate_trajectory_envelope(
+                    str(user_id), event.get("payload_envelope")
+                ),
+                "payload_bytes": payload_bytes,
+                "truncated": bool(event.get("truncated", False)),
+            }
+        )
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
@@ -3098,36 +3118,61 @@ def append_trajectory_event(
                 stream = cur.fetchone()
                 if stream is None:
                     raise ValueError("trajectory source job not found")
+                keys = [event["idempotency_key"] for event in normalized]
                 cur.execute(
-                    "SELECT event_index FROM v2_trajectory_events "
-                    "WHERE job_id=%s AND idempotency_key=%s",
-                    (job_id, idempotency_key),
+                    "SELECT idempotency_key,event_index FROM v2_trajectory_events "
+                    "WHERE job_id=%s AND idempotency_key=ANY(%s::text[])",
+                    (job_id, keys),
                 )
-                existing = cur.fetchone()
-                if existing is not None:
-                    return int(existing["event_index"])
-                event_index = int(stream["next_event_index"])
-                cur.execute(
-                    "INSERT INTO v2_trajectory_events "
-                    "(job_id,user_id,event_index,event_kind,idempotency_key,"
-                    "payload_envelope,payload_bytes,truncated) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (
-                        job_id,
-                        str(user_id),
-                        event_index,
-                        event_kind,
-                        idempotency_key,
-                        Jsonb(dict(envelope)),
-                        payload_bytes,
-                        bool(truncated),
-                    ),
-                )
-                cur.execute(
-                    "UPDATE v2_trajectory_streams SET next_event_index=%s "
-                    "WHERE job_id=%s AND user_id=%s",
-                    (event_index + 1, job_id, str(user_id)),
-                )
+                existing = {
+                    str(row["idempotency_key"]): int(row["event_index"])
+                    for row in cur.fetchall()
+                }
+                next_event_index = int(stream["next_event_index"])
+                event_indices: list[int] = []
+                rows_to_insert: list[tuple] = []
+                for event in normalized:
+                    prior = existing.get(event["idempotency_key"])
+                    if prior is not None:
+                        event_indices.append(prior)
+                        continue
+                    event_index = next_event_index
+                    next_event_index += 1
+                    rows_to_insert.append(
+                        (
+                            job_id,
+                            str(user_id),
+                            event_index,
+                            event["event_kind"],
+                            event["idempotency_key"],
+                            Jsonb(dict(event["payload_envelope"])),
+                            event["payload_bytes"],
+                            event["truncated"],
+                        )
+                    )
+                    event_indices.append(event_index)
+                inserted = bool(rows_to_insert)
+                if inserted:
+                    # All physical chunks for one logical event land in one SQL
+                    # statement. This avoids one client/server round trip per
+                    # chunk while the stream frontier lock is held.
+                    values_sql = sql.SQL(",").join(
+                        sql.SQL("(%s,%s,%s,%s,%s,%s,%s,%s)")
+                        for _row in rows_to_insert
+                    )
+                    cur.execute(
+                        sql.SQL(
+                            "INSERT INTO v2_trajectory_events "
+                            "(job_id,user_id,event_index,event_kind,idempotency_key,"
+                            "payload_envelope,payload_bytes,truncated) VALUES {}"
+                        ).format(values_sql),
+                        [value for row in rows_to_insert for value in row],
+                    )
+                    cur.execute(
+                        "UPDATE v2_trajectory_streams SET next_event_index=%s "
+                        "WHERE job_id=%s AND user_id=%s",
+                        (next_event_index, job_id, str(user_id)),
+                    )
                 # A terminal event can land just after an offline review
                 # completed. Reopen it while holding the same stream frontier
                 # lock so the completed analysis can never remain authoritative
@@ -3139,7 +3184,7 @@ def append_trajectory_event(
                     "WHERE source_job_id=%s AND user_id=%s AND status='completed'",
                     (job_id, str(user_id)),
                 )
-                if cur.fetchone() is not None:
+                if inserted and cur.fetchone() is not None:
                     admitted = _review_admission_available_on_cursor(cur)
                     cur.execute(
                         "UPDATE v2_trajectory_reviews SET status=%s,"
@@ -3159,7 +3204,33 @@ def append_trajectory_event(
                     )
                     if admitted and cur.rowcount:
                         _ensure_review_runner_on_cursor(cur, str(user_id))
-                return event_index
+                return event_indices
+
+
+def append_trajectory_event(
+    job_id: int | str,
+    user_id: str,
+    *,
+    event_kind: str,
+    idempotency_key: str,
+    payload_envelope: dict,
+    payload_bytes: int,
+    truncated: bool = False,
+) -> int:
+    """Backward-compatible single-event wrapper around the atomic batch path."""
+    return append_trajectory_events_batch(
+        job_id,
+        user_id,
+        events=[
+            {
+                "event_kind": event_kind,
+                "idempotency_key": idempotency_key,
+                "payload_envelope": payload_envelope,
+                "payload_bytes": payload_bytes,
+                "truncated": truncated,
+            }
+        ],
+    )[0]
 
 
 def list_trajectory_events(
@@ -3192,9 +3263,11 @@ def get_trajectory_capture_state(job_id: int | str, user_id: str) -> dict:
             cur.execute(
                 "SELECT s.next_event_index,COALESCE(MAX(e.event_index),-1) AS last_event_index,"
                 "COUNT(e.event_index)::int AS event_count,BOOL_OR(e.truncated) AS any_truncated,"
+                "COALESCE(BOOL_OR(e.event_kind='capture_gap'),false) AS has_capture_gap,"
                 "COALESCE(MAX(e.event_index) FILTER "
                 "(WHERE e.event_kind='turn_terminal'),-1) AS terminal_event_index,"
                 "j.status AS source_job_status,CASE "
+                "WHEN COALESCE(BOOL_OR(e.event_kind='capture_gap'),false) THEN 'partial' "
                 "WHEN BOOL_OR(e.event_kind='turn_terminal') THEN 'complete' "
                 "WHEN j.status IN ('completed','failed','expired','superseded') THEN 'partial' "
                 "ELSE 'open' END AS capture_status "
@@ -3213,6 +3286,7 @@ def get_trajectory_capture_state(job_id: int | str, user_id: str) -> dict:
                     "last_event_index": -1,
                     "event_count": 0,
                     "any_truncated": False,
+                    "has_capture_gap": False,
                     "terminal_event_index": -1,
                     "source_job_status": None,
                     "capture_status": "missing",

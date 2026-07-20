@@ -7187,6 +7187,7 @@ def delete_user_data(user_id: str) -> None:
     tables = (
         "v2_conversation_summary_segments",
         "v2_conversation_summary",
+        "v2_turn_metrics",
         "chat_messages",
         "memory_moments",
         "world_book_entries",
@@ -7217,6 +7218,7 @@ def delete_user_data(user_id: str) -> None:
     _no_tee_tables = {
         "v2_conversation_summary_segments",
         "v2_conversation_summary",
+        "v2_turn_metrics",
         "genesis_import_chunks",
         "model_api_routes",
         "model_api_credentials",
