@@ -23,7 +23,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { McpClient } from "./mcp_client.js";
+import { McpClient, SseMcpClient, effectiveTransport } from "./mcp_client.js";
 import { buildToolTable, MAX_TOOLS } from "./tool_mapping.js";
 
 // Matches mcp_probe.py's _CONNECT_TIMEOUT — same servers, same patience.
@@ -68,9 +68,19 @@ function loadServers(path) {
   const out = [];
   for (const [name, cfg] of Object.entries((doc && doc.mcpServers) || {})) {
     if (!cfg || !cfg.url) continue;
-    out.push({ name, url: cfg.url, headers: cfg.headers || {} });
+    out.push({ name, url: cfg.url, headers: cfg.headers || {},
+               transport: effectiveTransport(cfg) });
   }
   return out;
+}
+
+function makeClient(s) {
+  // "sse" → legacy HTTP+SSE (long-lived GET stream + POST endpoint);
+  // anything else → streamable HTTP. Materialized configs carry an explicit
+  // type; hand-written VPS ones fall back to the /sse URL heuristic inside
+  // effectiveTransport (already resolved into s.transport by loadServers).
+  const Ctor = s.transport === "sse" ? SseMcpClient : McpClient;
+  return new Ctor(s.url, s.headers, { timeoutMs: CONNECT_TIMEOUT_MS });
 }
 
 export default async function feedlingUserMcpBridge(pi) {
@@ -97,8 +107,7 @@ export default async function feedlingUserMcpBridge(pi) {
     // tools for the turn — exactly the failure this bridge exists to prevent.
     // allSettled keeps one server's rejection from taking the others down.
     const settled = await Promise.allSettled(servers.map(async (s) => {
-      const client = new McpClient(s.url, s.headers,
-                                   { timeoutMs: CONNECT_TIMEOUT_MS });
+      const client = makeClient(s);
       try {
         const tools = await withDeadline((async () => {
           await client.initialize();
@@ -107,7 +116,11 @@ export default async function feedlingUserMcpBridge(pi) {
         clients.set(s.name, client);
         return { name: s.name, tools };
       } catch (err) {
-        // Skip this server, keep the others, let pi start.
+        // Skip this server, keep the others, let pi start. An SSE client may
+        // have a half-open stream at this point — abort it eagerly (its
+        // socket is unref'd either way, so it could not hang teardown, but
+        // there is no reason to keep the connection).
+        if (typeof client.close === "function") client.close();
         console.error(
           `[user_mcp] server "${s.name}" unreachable, skipped: ${err && err.message}`);
         return { name: s.name, tools: [] };

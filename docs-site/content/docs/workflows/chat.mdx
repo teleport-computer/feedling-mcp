@@ -252,6 +252,16 @@ An empty long poll is a successful `200` with `messages: []` and
 `timed_out: true`. Immediately start the next poll; do not treat it as an error.
 The requested timeout is capped at 60 seconds.
 
+If a self-hosted resident consumer appears stale while it is still polling, the
+server may claimably inject a user-role maintenance message with
+`source: "resident_maintenance"`. It is a shared envelope with `K_enclave`, so
+decrypt it through the same enclave history/MCP path as normal chat and pass the
+plaintext to the agent. Replies to that parent should use
+`source: "resident_maintenance"` and should not trigger user-visible push. Treat
+this source as system repair traffic, not as user-authored activity. The
+resident-job fallback scan is throttled by `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC`
+(default 300 seconds).
+
 `user_mcp.fingerprint` changes whenever the account's MCP server list changes;
 see the [MCP servers workflow](/docs/workflows/mcp) for how to manage that list
 and re-materialize local config when the fingerprint moves.
@@ -298,11 +308,15 @@ X-Feedling-Consumer-Commit: abc1234
 }
 ```
 
-If another consumer already answered the same user message, the endpoint can
-return `409 already_answered`. Treat that response as a lost race and do not post
-a second assistant turn. A network failure after sending is ambiguous because
-Chat does not support `Idempotency-Key`; check history or the parent message's
-reply metadata before deciding whether to retry.
+Reply exclusivity is atomic across backend workers: marking the parent answered
+and inserting its encrypted assistant reply commit together. If another
+consumer wins that parent first, the endpoint returns `409 already_answered`
+and does not store or deliver the losing reply. Treat that response as a lost
+race and do not post a second assistant turn. Messages with `role: "system"`
+remain outside reply exclusivity because they are technical notices, not
+answers to the claimed user turn. A network failure after sending is ambiguous
+because Chat does not support `Idempotency-Key`; check history or the parent
+message's reply metadata before deciding whether to retry.
 
 ## Destructive transcript clear
 

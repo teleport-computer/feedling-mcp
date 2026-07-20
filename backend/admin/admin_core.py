@@ -39,6 +39,11 @@ def dau_payload(query_string: str) -> dict:
         return data_track._data_track_dau_payload()
 
 
+def growth_payload(query_string: str) -> dict:
+    with bind(query_string):
+        return data_track._data_track_growth_payload()
+
+
 def debug_payload(query_string: str) -> dict:
     with bind(query_string):
         return data_track._data_track_debug_payload()
@@ -60,6 +65,8 @@ def page_html(query_string: str) -> str:
         view = (request.args.get("view") or "").strip().lower()
         if view == "dau":
             return data_track._render_data_track_dau_page(data_track._data_track_dau_payload())
+        if view == "growth":
+            return data_track._render_data_track_growth_page(data_track._data_track_growth_payload())
         if view == "proactive":
             return data_track._render_proactive_daily_page(data_track._data_track_proactive_daily_payload())
         if view == "debug":

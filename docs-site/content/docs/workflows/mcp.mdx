@@ -4,11 +4,19 @@ description: Connect your agent to remote MCP tool servers, including plain HTTP
 ---
 
 Feedling lets each account register up to 10 remote [MCP](https://modelcontextprotocol.io)
-servers (streamable HTTP transport). The active agent runtime calls the tools
-those servers expose: a self-hosted runtime dials from your machine, while
-Hosted Runtime V2 dials from its cloud worker. The management API stores the
-configuration and does not connect at save time; its explicit `/test` operation
-is the only control-plane probe.
+servers. Both MCP transports are supported: modern **streamable HTTP** and the
+older **HTTP+SSE** transport that some providers still ship as their `…/sse`
+URL. The transport is detected automatically from the URL and the server's
+handshake — you don't declare it. The active agent runtime reads this list and
+calls the tools those servers expose: a self-hosted runtime dials from your
+machine, while Hosted Runtime V2 dials from its cloud worker. The management API
+stores the configuration and does not proxy MCP traffic or connect at save
+time; its explicit `/test` operation is the only control-plane probe.
+
+> **Runtime support:** the hosted runtime and the `claude` self-hosted runtime
+> speak both transports. The `codex` self-hosted runtime speaks streamable HTTP
+> only — for a legacy HTTP+SSE server, prefer the provider's `/mcp` (streamable)
+> URL if they offer one.
 
 Every `/v1/chat/poll` response includes a `user_mcp.fingerprint` that changes
 whenever your server list changes, so a resident consumer can re-materialize
@@ -54,6 +62,7 @@ forbidden header name.
   "url_hint": "mcp.example.com",
   "header_names": ["Authorization"],
   "has_ca": false,
+  "transport": "http",
   "created_at": "2026-07-16T00:00:00Z",
   "updated_at": "2026-07-16T00:00:00Z"
 }
@@ -61,7 +70,10 @@ forbidden header name.
 
 The response never echoes back the URL, header values, or CA certificate.
 `url_hint` is the hostname only; `header_names` lists header keys only;
-`has_ca` reports whether a CA certificate is currently stored.
+`has_ca` reports whether a CA certificate is currently stored. `transport` is
+`"http"` (streamable HTTP) or `"sse"` (legacy HTTP+SSE): it starts as a guess
+from the URL path (`…/sse` ⇒ `"sse"`) and is corrected to whatever the server
+actually speaks the first time a connectivity test succeeds.
 
 `GET /v1/mcp/servers` returns `{"servers": [...]}` with the same shape.
 `PATCH /v1/mcp/servers/{name}` with `{"enabled": false}` toggles a server
@@ -223,6 +235,35 @@ automatically, since those live only in your agent's local runtime and are
 never sent to this backend. The certificate content itself is never returned
 by any endpoint.
 
+### `codex` needs a certificate chain, not a lone self-signed certificate
+
+"Supported and verified" above still comes with one shape requirement that is
+specific to `codex`. Its TLS stack (rustls) rejects a CA certificate that is
+presented directly as the server's own certificate — it wants a distinct leaf
+below the CA, not the CA acting as its own end entity. A single self-signed
+certificate produced the ordinary way (`openssl req -x509`, which defaults to
+`CA:TRUE`) *is* a CA acting as its own end entity: `claude` and `pi` complete
+the handshake against it without issue, but `codex` cannot use it as-is.
+
+Serve a **certificate chain** instead: a self-issued CA certificate, plus a
+separate server certificate that CA signs with `basicConstraints=CA:FALSE` and
+a `subjectAltName`. This two-certificate shape verified successfully against
+`codex` in testing.
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout ca.key -out ca.crt -days 397 -nodes -subj "/CN=my-mcp-ca"
+openssl req -newkey rsa:2048 -keyout server.key -out server.csr -nodes -subj "/CN=my-mcp"
+printf 'basicConstraints=CA:FALSE\nsubjectAltName=DNS:your.host\n' > ext.cnf
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 397 -extfile ext.cnf
+# Serve the full chain (server.crt followed by ca.crt); the private key is server.key
+cat server.crt ca.crt > fullchain.crt
+```
+
+If a `codex`-driven account tests a server that presents only the single
+self-signed certificate, `POST /v1/mcp/servers/{name}/test` returns `400
+codex_cert_chain_required` instead of the generic `tls` kind — see
+[Verify a server](#verify-a-server) below.
+
 ### Hosted-runtime users: this does not change reachability
 
 Automatic trust-anchor fetching only removes a certificate-pasting step; it
@@ -246,9 +287,15 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   "tool_names": ["search", "fetch"],
   "read_only_tool_fingerprints": {
     "search": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  }
+  },
+  "transport": "http"
 }
 ```
+
+`transport` is the transport this probe actually spoke — `"http"` (streamable
+HTTP) or `"sse"` (legacy HTTP+SSE). It is the authoritative detection: a
+successful test persists it to the server record, so a server saved on a
+non-`/sse` URL that turns out to speak the legacy transport is corrected here.
 
 This runs a best-effort `initialize` → `tools/list` probe **from this
 backend's own network**, as a convenience for validating servers that are
@@ -272,8 +319,9 @@ Other `400` kinds from this endpoint:
 | `dns` | The hostname did not resolve. |
 | `dns_busy` | The backend resolver is at capacity; retry later. |
 | `tls` | Certificate/TLS handshake failure — check `ca_pem` if the server uses a private CA. |
+| `codex_cert_chain_required` | The calling account's agent driver is `codex` and the server presented a single self-signed certificate (a CA acting as its own end entity) instead of a CA+leaf chain. See [`codex` needs a certificate chain](#codex-needs-a-certificate-chain-not-a-lone-self-signed-certificate) above. |
 | `transport` | The connection failed before a valid HTTP response arrived. |
-| `timeout` | Connect or read timeout. |
+| `timeout` | Connect or read timeout, or the whole probe exceeded its 45-second wall-clock ceiling. A legacy HTTP+SSE endpoint that answers with a never-ending event stream lands here instead of hanging the request. |
 | `response_too_large` | An MCP response exceeded the 1 MiB probe limit. |
 | `http_401` / `http_403` / `http_404` / `http_4xx` / `http_5xx` | The server responded with an HTTP error status. |
 | `protocol` | The response wasn't a valid MCP handshake (bad JSON-RPC envelope, redirect, or empty SSE stream). |

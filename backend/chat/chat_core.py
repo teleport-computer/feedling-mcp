@@ -147,6 +147,19 @@ def _chat_message_by_id(store: UserStore, msg_id: str) -> dict | None:
     return None
 
 
+def _is_resident_maintenance_reply(store: UserStore, payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("source") or "").strip() != "resident_maintenance":
+        return False
+    parent = _chat_message_by_id(store, _reply_to_message_id(payload))
+    return bool(
+        parent
+        and str(parent.get("role") or "") == "user"
+        and str(parent.get("source") or "") == "resident_maintenance"
+    )
+
+
 FIRST_CHAT_OK_USER_SOURCES = {"chat", "model_api"}
 
 
@@ -628,7 +641,7 @@ def trace_response_gated(store: UserStore, payload: dict, allow_verify_reply: bo
     )
 
 
-def gate_response_dict(store: UserStore, allow_verify_reply: bool):
+def gate_response_dict(store: UserStore, allow_verify_reply: bool, payload: dict | None = None):
     """Bridge to the shared bootstrap gate.
 
     ``boot_gates._gate_bootstrap_for_chat`` returns a framework-neutral
@@ -643,6 +656,8 @@ def gate_response_dict(store: UserStore, allow_verify_reply: bool):
         store, allow_verify_reply=allow_verify_reply
     )
     if gated is None:
+        return None
+    if _is_resident_maintenance_reply(store, payload):
         return None
     body, status = gated
     return body, status
@@ -714,11 +729,17 @@ def write_response(
     else:
         thinking_extra.update(chat_service._chat_plaintext_thinking_extra_for_store(store, payload))
     source = str(payload.get("source") or "chat").strip() or "chat"
-    # "verify_ping": the resident consumer stamps its synthetic liveness reply
-    # with this source so the visible /v1/chat/history feed can filter it out
-    # (and verify_loop's GC can match it) regardless of GC timing. It is never a
-    # user-visible message.
-    if source not in {"chat", "live_activity", "heartbeat", "verify_ping", proactive_service.PROACTIVE_JOB_SOURCE}:
+    # "verify_ping": synthetic liveness reply, hidden from visible history.
+    # "resident_maintenance": reply to a server-authored maintenance prompt; it
+    # is visible in history but must not trigger push or bootstrap success.
+    if source not in {
+        "chat",
+        "live_activity",
+        "heartbeat",
+        "verify_ping",
+        "resident_maintenance",
+        proactive_service.PROACTIVE_JOB_SOURCE,
+    }:
         return {"error": "invalid source"}, 400
     # role: 消费者可声明 "system"（技术通知气泡，spec 2026-07-06-upstream-error-
     # surfacing）。白名单外一律落 openclaw——新增 role 前先过 spec 的 role 审计表。
@@ -763,55 +784,73 @@ def write_response(
             extra["push_body_preview"] = push_body.strip()[:240]
         extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
     reply_to_message_id = _reply_to_message_id(payload)
-    try:
+    if reply_to_message_id and role != "system":
+        # Build the exact append_chat row immediately before the one-statement
+        # parent-CAS + reply-INSERT.  No slow work belongs in this gap: two workers
+        # may arrive together, and PostgreSQL decides the sole winner.
+        candidate = store._build_chat_message(
+            role,
+            source,
+            envelope,
+            content_type=content_type,
+            extra=extra,
+        )
+        replied_fields = {
+            "reply_status": "replied",
+            "reply_message_id": str(candidate.get("id") or ""),
+            "replied_by": consumer_id,
+            "replied_at": f"{float(candidate['ts']):.3f}",
+        }
+        finalized = store.finalize_chat_reply_once(
+            reply_to_message_id, candidate, replied_fields
+        )
+        if finalized is None:
+            # The parent already carries a committed reply. finalize never
+            # overwrites the winner, so distinguish an idempotent replay of the
+            # SAME resident delivery (a transport/process retry re-posting the
+            # identical reply id) from a genuinely different competing reply.
+            # The resident reply id IS the resident_delivery_id (== candidate id
+            # == envelope.id): if the answered parent points back at this exact
+            # id, this is a retry of the already-committed winner. Return that
+            # winner as a 200 with NO duplicate push or side effects, and still
+            # self-heal the idempotent first-chat activation marker in case the
+            # original process committed the reply but died before writing it.
+            parent_doc = db.chat_get_strict(store.user_id, reply_to_message_id)
+            winner_reply_id = str((parent_doc or {}).get("reply_message_id") or "")
+            if winner_reply_id and winner_reply_id == str(candidate.get("id") or ""):
+                winner = db.chat_get_strict(store.user_id, winner_reply_id)
+                if winner is not None:
+                    _maybe_mark_first_chat_ok(store, reply_to_message_id)
+                    return {
+                        "id": winner["id"],
+                        "ts": winner["ts"],
+                        "v": winner["v"],
+                    }, 200
+            return {"error": "already_answered", "reply_status": "replied"}, 409
+        _parent_doc, msg = finalized
+        _maybe_mark_first_chat_ok(store, reply_to_message_id)
+    else:
+        # System notices bypass reply exclusivity by design, as do ordinary
+        # response writes with no reply target.
         msg = store.append_chat(
             role,
             source,
             envelope,
             content_type=content_type,
             extra=extra,
-            resident_runtime_fenced=True,
-            resident_reply_to=(
-                reply_to_message_id
-                if reply_to_message_id and role != "system"
-                else None
-            ),
-            resident_replied_by=consumer_id,
         )
-    except db.ResidentReplyRejected as exc:
-        # The DB transaction is authoritative: this covers stale worker caches,
-        # a competing responder, and an in-flight resident turn that reaches
-        # its final write after hosted runtime cutover.
-        return {
-            "error": "already_answered",
-            "reply_status": "replied",
-            "detail": exc.reason,
-        }, 409
-    if msg.get("_resident_replayed"):
-        # The database returned the row that already won this delivery key.
-        # A transport/process retry is an acknowledgement only: first-chat,
-        # APNs/Live Activity, metadata, capture, wake, and trace side effects
-        # must all remain exactly-once. First-chat activation is the exception:
-        # it is an idempotent marker and must self-heal when the original process
-        # committed the reply but died before reaching the marker write.
-        if reply_to_message_id and role != "system":
-            _maybe_mark_first_chat_ok(store, reply_to_message_id)
-        return {"id": msg["id"], "ts": msg["ts"], "v": msg["v"]}, 200
-    if reply_to_message_id and role != "system":
-        _maybe_mark_first_chat_ok(store, reply_to_message_id)
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
-    # Defense-in-depth: a synthetic verify-loop liveness reply must NEVER surface
-    # as a push / Live Activity, no matter what the caller passed. The resident
-    # consumer already sends suppress_push=True, so this changes nothing today —
-    # it just closes the gap if a future caller regression posts source=verify_ping
-    # with a body.
-    if source == "verify_ping":
+    # Defense-in-depth: synthetic/maintenance replies must NEVER surface as push
+    # or Live Activity, no matter what the caller passed.
+    if source in {"verify_ping", "resident_maintenance"}:
         visible_push_body = ""
     # Any plaintext AI reply supplied by the caller enters the same app-state
     # policy: background/unknown app state gets Live Activity + APNs alert;
     # foreground app state records a suppression instead of interrupting.
-    if source != "verify_ping" and (visible_push_body or payload.get("push_live_activity")):
+    if source not in {"verify_ping", "resident_maintenance"} and (
+        visible_push_body or payload.get("push_live_activity")
+    ):
         delivery = None
         if source == proactive_service.PROACTIVE_JOB_SOURCE:
             delivery = _proactive_delivery_decision_v2(store, payload)

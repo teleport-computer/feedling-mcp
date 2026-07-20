@@ -25,7 +25,7 @@ NOTICES_MAX = 200
 RESOLVED_WINDOW_SEC = 7 * 86400
 
 VALID_SOURCES = ("genesis", "history_import", "memory", "runner", "chat", "model_api")
-VALID_BLAME = ("user_provider", "provider_transient", "system")
+VALID_BLAME = ("user_provider", "provider_transient", "user_environment", "system")
 VALID_SEVERITY = ("error", "warning")
 
 
@@ -34,7 +34,7 @@ def _now() -> float:
 
 
 def emit(store, *, source, error_class, blame, severity, user_text,
-         detail="", dedupe_key) -> None:
+         detail="", dedupe_key, copyable_prompt="") -> None:
     """Upsert 一条通知。dedupe_key 命中一条**未 resolved** 的现存通知 →
     occurrences+1、刷新 last_ts/detail/user_text/blame/severity/error_class；
     否则（不存在，或最新一条已 resolved）→ 新建（occurrences=1，新 notice_id）。
@@ -53,8 +53,9 @@ def emit(store, *, source, error_class, blame, severity, user_text,
                 existing = r          # rows 按 seq 升序，保留最新一条（= log_patch_item 会命中的那条）
         now = _now()
         clipped = str(detail or "")[:300]
+        prompt = str(copyable_prompt or "")[:4000]
         if existing is not None and not existing.get("resolved"):
-            db.log_patch_item(uid, NOTICES_STREAM, dedupe_key, {
+            patch = {
                 "occurrences": int(existing.get("occurrences", 1)) + 1,
                 "last_ts": now,
                 "detail": clipped,
@@ -62,7 +63,10 @@ def emit(store, *, source, error_class, blame, severity, user_text,
                 "blame": blame,
                 "severity": severity,
                 "error_class": error_class,
-            })
+            }
+            if prompt:
+                patch["copyable_prompt"] = prompt
+            db.log_patch_item(uid, NOTICES_STREAM, dedupe_key, patch)
             return
         doc = {
             "notice_id": "ntc_" + uuid.uuid4().hex[:12],
@@ -79,6 +83,8 @@ def emit(store, *, source, error_class, blame, severity, user_text,
             "resolved": False,
             "resolved_ts": None,
         }
+        if prompt:
+            doc["copyable_prompt"] = prompt
         db.log_append(uid, NOTICES_STREAM, doc, ts=now, item_key=dedupe_key)
         db.log_trim(uid, NOTICES_STREAM, NOTICES_MAX)
     except Exception:

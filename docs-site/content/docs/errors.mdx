@@ -30,6 +30,14 @@ Feedling errors use a stable machine-readable slug:
 Clients should branch on `error`, not human-readable `detail`. A new message may
 be added to `detail` without changing the stable slug contract.
 
+When an error includes `blame`, use it to decide the next action:
+`user_provider` means the user's model provider settings need attention,
+`provider_transient` means retry/backoff is appropriate, `user_environment`
+means the user's self-hosted runtime or VPS needs attention, and `system` means
+Feedling owns the failure.
+Treat unknown `blame` values as `system`/generic copy and do not drop the error
+or notice.
+
 Not every historical route uses the same slug for the same status, and not every
 `429` is transient. See [retry safety](/docs/reliability#retry-safety) before
 retrying a failed write.

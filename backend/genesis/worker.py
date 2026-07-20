@@ -23,6 +23,7 @@ import provider_client
 from core.store import get_store
 from genesis import checkpoint, foreground, prompts, service
 from genesis.llm_client import GenesisLLMClient
+from notices import catalog as notices_catalog, core as notices_core
 
 GENESIS_WORKER_SCOPES = ["envelope_decrypt", "genesis"]
 AI_PERSONA_SOURCE_KINDS = {
@@ -1748,6 +1749,17 @@ def reap_stale_unclaimed_jobs() -> list[dict]:
             _write_genesis_state_if_current(store, job)
         except Exception as e:  # noqa: BLE001
             print(f"[genesis:reaper] unclaimed blob sync failed for {user_id}/{job_id}: {type(e).__name__}:{str(e)[:120]}")
+        klass = notices_catalog.classify_upstream(error) or "resident_never_claimed"
+        notices_core.emit(
+            store,
+            source="genesis",
+            error_class=klass,
+            blame=notices_catalog.blame_for(klass),
+            severity="error",
+            user_text=notices_catalog.user_text_for(klass),
+            detail=error,
+            dedupe_key=f"genesis:{job_id}",
+        )
         _trace_genesis(
             store,
             "genesis.worker.unclaimed_stale_reaped",

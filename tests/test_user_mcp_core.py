@@ -294,7 +294,123 @@ def test_envelopes_payload_shape(store, monkeypatch):
     assert status == 200
     assert body["fingerprint"] == mcp_core.fingerprint_for_store(store)
     (srv,) = body["servers"]
-    assert set(srv) == {"name", "enabled", "config_envelope"}
+    assert set(srv) == {"name", "enabled", "transport", "config_envelope"}
+    # /mcp URL → http; the consumer reads this mirror without decrypting.
+    assert srv["transport"] == "http"
+
+
+def test_transport_hint_stamped_at_save_and_listed(store, monkeypatch):
+    _fake_envelope(monkeypatch)
+    mcp_core.upsert_server(store, {
+        "name": "modern", "url": "https://x.example.com/mcp", "headers": {}})
+    mcp_core.upsert_server(store, {
+        "name": "legacy", "url": "https://mcp.map.qq.com/sse?key=K", "headers": {}})
+    body, _ = mcp_core.list_servers(store)
+    by_name = {s["name"]: s for s in body["servers"]}
+    assert by_name["modern"]["transport"] == "http"
+    assert by_name["legacy"]["transport"] == "sse"   # /sse path heuristic
+    # envelopes mirror agrees (used by the consumer to pick the client)
+    env, _ = mcp_core.envelopes_payload(store)
+    assert {s["name"]: s["transport"] for s in env["servers"]} == {
+        "modern": "http", "legacy": "sse"}
+
+
+def test_probe_detected_transport_persisted(store, monkeypatch):
+    """A server saved on a non-/sse path defaults to http, but if the probe
+    detects it actually speaks legacy SSE, test_server re-seals the record so
+    the materialized agent config uses the right transport."""
+    _fake_envelope(monkeypatch)
+    mcp_core.upsert_server(store, {
+        "name": "sneaky", "url": "https://maps.example.com/api", "headers": {}})
+    body, _ = mcp_core.list_servers(store)
+    assert body["servers"][0]["transport"] == "http"   # save-time guess
+
+    # Stub the enclave decrypt (returns the secret we sealed) and the probe.
+    from core import enclave as core_enclave
+    monkeypatch.setattr(
+        core_enclave, "_decrypt_envelope_via_enclave",
+        lambda env, key, purpose=None: bytes.fromhex(env["ct"]))
+    from hosted import mcp_probe
+    monkeypatch.setattr(
+        mcp_probe, "probe",
+        lambda url, headers, ca_pem=None, transport_hint="": {
+            "ok": True, "tool_count": 1, "tool_names": ["geocode"],
+            "transport": "sse"})
+
+    out, status = mcp_core.test_server(store, "sneaky", caller_api_key="k")
+    assert status == 200 and out["ok"] is True
+    body, _ = mcp_core.list_servers(store)
+    assert body["servers"][0]["transport"] == "sse"   # corrected + persisted
+
+
+def test_probe_persist_does_not_clobber_concurrent_write(store, monkeypatch):
+    """codex3 P0 regression: test_server snapshots the whole blob, then runs a
+    slow probe. A save/delete that lands DURING the probe must survive — the
+    transport persistence is a CAS on the snapshot, so a moved blob makes it
+    no-op rather than roll the concurrent change back."""
+    _fake_envelope(monkeypatch)
+    mcp_core.upsert_server(store, {
+        "name": "sneaky", "url": "https://maps.example.com/api", "headers": {}})
+
+    from core import enclave as core_enclave
+    monkeypatch.setattr(
+        core_enclave, "_decrypt_envelope_via_enclave",
+        lambda env, key, purpose=None: bytes.fromhex(env["ct"]))
+
+    # The probe stub simulates a concurrent client landing a NEW server (and so
+    # rewriting the blob) while this probe is "in flight", then reports sse.
+    from hosted import mcp_probe
+
+    def _probe_with_concurrent_write(url, headers, ca_pem=None, transport_hint=""):
+        mcp_core.upsert_server(store, {
+            "name": "added_meanwhile", "url": "https://b.example.com/mcp",
+            "headers": {}})
+        return {"ok": True, "tool_count": 1, "tool_names": ["geocode"],
+                "transport": "sse"}
+
+    monkeypatch.setattr(mcp_probe, "probe", _probe_with_concurrent_write)
+
+    out, status = mcp_core.test_server(store, "sneaky", caller_api_key="k")
+    assert status == 200 and out["ok"] is True
+
+    body, _ = mcp_core.list_servers(store)
+    names = {s["name"] for s in body["servers"]}
+    # The concurrent upsert must NOT have been rolled back.
+    assert names == {"sneaky", "added_meanwhile"}
+    # And the stale-snapshot transport persistence was dropped (CAS no-op):
+    # sneaky keeps its save-time http, not the detected sse. The next test
+    # against the current blob will persist it correctly.
+    by_name = {s["name"]: s for s in body["servers"]}
+    assert by_name["sneaky"]["transport"] == "http"
+
+
+def test_probe_persist_metadata_only_uses_cas(store, monkeypatch):
+    """The metadata-only stamp path (pre-transport record, hint matched) also
+    goes through CAS and must not clobber a concurrent write."""
+    _fake_envelope(monkeypatch)
+    mcp_core.upsert_server(store, {
+        "name": "old", "url": "https://x.example.com/mcp", "headers": {}})
+    # Simulate a pre-transport record: strip the stored transport field.
+    data = mcp_core._load(store)
+    for s in data["servers"]:
+        s.pop("transport", None)
+    mcp_core._save(store, data["servers"])
+
+    from core import enclave as core_enclave
+    monkeypatch.setattr(
+        core_enclave, "_decrypt_envelope_via_enclave",
+        lambda env, key, purpose=None: bytes.fromhex(env["ct"]))
+    from hosted import mcp_probe
+    # hint is http (/mcp path) and detected is http → metadata-only stamp path.
+    monkeypatch.setattr(
+        mcp_probe, "probe",
+        lambda url, headers, ca_pem=None, transport_hint="": {
+            "ok": True, "tool_count": 0, "tool_names": [], "transport": "http"})
+
+    out, status = mcp_core.test_server(store, "old", caller_api_key="k")
+    assert status == 200
+    body, _ = mcp_core.list_servers(store)
+    assert body["servers"][0]["transport"] == "http"   # stamped
 
 
 def _spy_wakes(store, monkeypatch):

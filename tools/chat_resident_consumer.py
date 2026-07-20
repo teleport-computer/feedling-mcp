@@ -268,6 +268,7 @@ PI_MCP_BRIDGE_FILE = os.environ.get(
     "PI_MCP_BRIDGE_FILE", "/app/tools/pi_mcp_bridge/index.js",
 )
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
+RESIDENT_MAINTENANCE_SOURCE = "resident_maintenance"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
 PROACTIVE_POLL_TIMEOUT = int(os.environ.get("PROACTIVE_POLL_TIMEOUT", "1"))
@@ -1349,6 +1350,7 @@ def _pending_reply_checkpoint_plaintext(
         "prepared": {
             "replies": [str(item) for item in (prepared.get("replies") or [])],
             "reply_to_message_id": str(prepared.get("reply_to_message_id") or ""),
+            "source": str(prepared.get("source") or ""),
             "thinking_summary": str(prepared.get("thinking_summary") or ""),
             "thinking_kind": str(prepared.get("thinking_kind") or ""),
             "thinking_source": str(prepared.get("thinking_source") or ""),
@@ -1412,6 +1414,7 @@ def _decrypt_pending_reply_retry(raw: dict[str, Any]) -> tuple[str, dict[str, An
     prepared = {
         "replies": tuple(replies),
         "reply_to_message_id": str(saved.get("reply_to_message_id") or ""),
+        "source": str(saved.get("source") or ""),
         "thinking_summary": str(saved.get("thinking_summary") or ""),
         "thinking_kind": str(saved.get("thinking_kind") or ""),
         "thinking_source": str(saved.get("thinking_source") or ""),
@@ -5954,27 +5957,72 @@ def _enrich_with_fetched_ca(servers: list[dict], *, budget_s: float = 15.0,
     retried on the next fingerprint change.
 
     ``now``/``fetch`` are injected so the budget and failure branches are
-    testable without real clocks or sockets.
+    testable without real clocks or sockets. ``fetch`` returns a
+    ``(anchor_pem_or_None, leaf_is_ca_or_None)`` tuple (see
+    ``user_mcp_ca_fetch.fetch_anchor_and_leaf_ca``): the anchor fills
+    ``ca_pem`` as before, and the leaf flag drives the codex compatibility
+    warning below — it does not change what gets materialized.
 
     Never raises: one server's fetch failure just means that server has no
     anchor.
     """
     if fetch is None:
         import user_mcp_ca_fetch  # noqa: PLC0415 — sibling on tools/ path
-        fetch = user_mcp_ca_fetch.fetch_trust_anchor
+        fetch = user_mcp_ca_fetch.fetch_anchor_and_leaf_ca
     deadline = now() + budget_s
+    is_codex = _cli_template_is_codex()
     out = []
     for s in servers:
         ca = s.get("ca_pem") or ""
         if not ca and s.get("enabled") and now() < deadline:
             try:
-                ca = fetch(s.get("url") or "") or ""
+                fetched, leaf_ca = fetch(s.get("url") or "")
+                ca = fetched or ""
+                if is_codex and leaf_ca is True:
+                    log.warning(
+                        "[user_mcp] server %r presents a single self-signed "
+                        "certificate (leaf is a CA); codex (rustls) will reject "
+                        "it as CaUsedAsEndEntity — regenerate it as a CA + "
+                        "server-leaf chain. claude/pi accept it as-is.",
+                        s.get("name"))
             except Exception as e:  # noqa: BLE001 — never wedge materialization
                 log.warning("[user_mcp] ca fetch failed for %s: %s: %s",
                             s.get("name"), type(e).__name__, e)
                 ca = ""
         out.append({**s, "ca_pem": ca})
     return out
+
+
+def _materialize_hermes_config(cfg_path: Path, servers: list[dict],
+                               managed_names) -> None:
+    """Write the user's MCP servers into hermes's ``config.yaml`` (mcp_servers).
+
+    hermes discovers MCP tools by re-reading config.yaml every spawn
+    (native-mcp.md), so this is all that's needed for the next turn to see the
+    tools. pyyaml round-trips the file (dropping comments), so we back up the
+    user's original to ``config.yaml.feedling-bak`` first, then write atomically
+    (temp + rename) so a crash never leaves a half-written config.
+    """
+    import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
+    existing = cfg_path.read_text() if cfg_path.exists() else None
+    merged = _m.hermes_config_merged(existing, servers, managed_names)
+    if cfg_path.exists():
+        shutil.copy2(cfg_path, cfg_path.parent / (cfg_path.name + ".feedling-bak"))
+    _atomic_write_text(str(cfg_path), merged)
+
+
+def _materialize_openclaw_config(cfg_path: Path, servers: list[dict],
+                                 managed_names) -> None:
+    """Write the user's MCP servers into OpenClaw's ``openclaw.json``
+    (nested ``mcp.servers``). OpenClaw re-loads it every ``agent --local`` turn.
+    JSON has no comments to lose, but we still back up the user's file to
+    ``openclaw.json.feedling-bak`` and write atomically (temp + rename)."""
+    import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
+    existing = cfg_path.read_text() if cfg_path.exists() else None
+    merged = _m.openclaw_config_merged(existing, servers, managed_names)
+    if cfg_path.exists():
+        shutil.copy2(cfg_path, cfg_path.parent / (cfg_path.name + ".feedling-bak"))
+    _atomic_write_text(str(cfg_path), merged)
 
 
 def _write_user_mcp_ca(servers: list[dict]) -> None:
@@ -6052,7 +6100,11 @@ def _user_mcp_child_env(cmd: list[str]) -> dict:
     if not enabled_servers:
         return {}
     env: dict = {}
-    if _is_codex_cmd(cmd):
+    if _is_codex_cmd(cmd) or _is_hermes_chat_cmd(cmd):
+        # codex AND hermes are python. SSL_CERT_FILE REPLACES the trust store,
+        # so it points at the concat castore (certifi system CA + user CA), not
+        # the user-only bundle. httpx (hermes's mcp SDK client) reads
+        # SSL_CERT_FILE, verified locally against a self-signed server.
         if Path(USER_MCP_CASTORE_FILE).exists():
             env["SSL_CERT_FILE"] = USER_MCP_CASTORE_FILE   # REPLACES → concat bundle
     else:
@@ -6097,6 +6149,22 @@ def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
             os.chmod(config_path, 0o600)  # holds plaintext MCP headers/token
         elif config_path.exists():
             config_path.unlink()
+    hermes_dir = os.environ.get("HERMES_CONFIG_DIR") or str(Path.home() / ".hermes")
+    if Path(hermes_dir).is_dir():
+        try:
+            _materialize_hermes_config(
+                Path(hermes_dir) / "config.yaml", servers, managed_names)
+        except Exception as e:  # noqa: BLE001 — one target must never break others/chat
+            log.warning("[user_mcp] hermes config.yaml write failed: %s: %s",
+                        type(e).__name__, e)
+    openclaw_dir = os.environ.get("OPENCLAW_CONFIG_DIR") or str(Path.home() / ".openclaw")
+    if Path(openclaw_dir).is_dir():
+        try:
+            _materialize_openclaw_config(
+                Path(openclaw_dir) / "openclaw.json", servers, managed_names)
+        except Exception as e:  # noqa: BLE001 — one target must never break others/chat
+            log.warning("[user_mcp] openclaw.json write failed: %s: %s",
+                        type(e).__name__, e)
     _write_user_mcp_ca(servers)
 
 
@@ -6118,6 +6186,9 @@ def _maybe_apply_user_mcp() -> None:
                     "name": srv["name"], "enabled": bool(srv.get("enabled")),
                     "url": secret["url"], "headers": secret.get("headers") or {},
                     "ca_pem": secret.get("ca_pem") or "",
+                    # "" for pre-transport envelopes — materializers fall back
+                    # to user_mcp_materialize.effective_transport's URL heuristic.
+                    "transport": secret.get("transport") or "",
                 })
         # Union of the previously-applied and newly-advertised server names:
         # anything just removed still needs its old allow rule pruned, while
@@ -6184,7 +6255,15 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
     if _cli_template_is_codex():
         if lane == "chat":
             return ""
-        names = sorted(str(s.get("name") or "") for s in enabled_servers)
+        import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
+        # Only servers that were actually materialized into config.toml need a
+        # disable override; legacy-SSE servers are comment-skipped there
+        # (codex_config_merged), and a ``-c mcp_servers.<name>.enabled=false``
+        # for a table that doesn't exist would deep-merge a partial entry into
+        # codex's config instead.
+        names = sorted(
+            str(s.get("name") or "") for s in enabled_servers
+            if _m.effective_transport(s) != "sse")
         return " ".join(
             f"-c mcp_servers.{name}.enabled=false" for name in names if name
         )
@@ -6765,6 +6844,8 @@ def _clean_messages_for_proactive_context(history: list[dict] | None) -> list[di
             # system 通知（如上游报错提醒）不是 agent 自己说过的话，混进前台/proactive
             # 上下文会被误认成历史发言（审查发现的串扰源）。
             continue
+        if str(msg.get("source") or "") == RESIDENT_MAINTENANCE_SOURCE:
+            continue
         text = _message_text_for_context(msg)
         if not text or "__VERIFY_PING__" in text:
             continue
@@ -6878,7 +6959,8 @@ def _proactive_chat_collision(now: float | None = None) -> bool:
     for msg in history:
         if not isinstance(msg, dict):
             continue
-        if str(msg.get("source") or "") == "verify_ping":
+        source = str(msg.get("source") or "")
+        if source in {"verify_ping", RESIDENT_MAINTENANCE_SOURCE}:
             continue
         ts = _message_ts_for_context(msg)  # defensive: malformed ts → 0.0
         if ts <= 0:
@@ -9154,12 +9236,18 @@ def _post_prepared_replies(prepared: dict[str, Any]) -> tuple[bool, bool]:
     """
     replies = list(prepared.get("replies") or [])
     reply_to_message_id = str(prepared.get("reply_to_message_id") or "")
+    prepared_source = str(prepared.get("source") or "")
     terminal_reply_posted = False
     terminal_response_error = False
     for idx, reply in enumerate(replies):
         is_terminal_reply = idx == len(replies) - 1
         try:
             post_kwargs: dict[str, Any] = {}
+            # resident_maintenance replies stay visible in history but must never
+            # surface as push/bootstrap — tag the source and suppress the alert.
+            if prepared_source == RESIDENT_MAINTENANCE_SOURCE:
+                post_kwargs["source"] = RESIDENT_MAINTENANCE_SOURCE
+                post_kwargs["suppress_push"] = True
             if reply_to_message_id:
                 slot = "terminal" if is_terminal_reply else f"intermediate:{idx}"
                 post_kwargs["delivery_id"] = _resident_reply_delivery_id(
@@ -9276,7 +9364,8 @@ def _process_messages(messages: list) -> float:
         # excluded) means the loop is not idle and the user is engaged — clear the
         # proactive idle-loop guard and any failure backoff so proactive resumes,
         # and stamp the maintenance soft-idle clock (memory upkeep waits for a lull).
-        if msg.get("source") != "verify_ping":
+        source = str(msg.get("source") or "")
+        if source not in {"verify_ping", RESIDENT_MAINTENANCE_SOURCE}:
             _reset_proactive_idle_guard()
             _clear_proactive_failure()
             _last_user_message_wall = time.time()
@@ -9295,7 +9384,7 @@ def _process_messages(messages: list) -> float:
         # routing the probe through the full agent — a hermes turn can exceed
         # verify_loop's timeout and is fragile to mid-run SIGTERM, so the probe
         # would time out (passing=false) even on a healthy reply pipeline.
-        if msg.get("source") == "verify_ping":
+        if source == "verify_ping":
             # Exercise the REAL agent path so verify catches a broken reply
             # pipeline (e.g. an agent whose output the consumer can't parse).
             # The old canned short-circuit let verify pass while the live loop
@@ -9349,7 +9438,7 @@ def _process_messages(messages: list) -> float:
             latest = max(latest, ts)
             continue
 
-        content = msg.get("content", "").strip()
+        content = str(msg.get("content") or "").strip()
         source_message_text = content
         content_type = msg.get("content_type", "text")
         image_payloads: list[dict[str, str]] = []
@@ -9558,6 +9647,7 @@ def _process_messages(messages: list) -> float:
             action_recovery_reply = {
                 "replies": (_identity_action_indeterminate_reply(source_message_text),),
                 "reply_to_message_id": reply_to_message_id,
+                "source": source,
                 "thinking_summary": turn.thinking_summary,
                 "thinking_kind": turn.thinking_kind,
                 "thinking_source": turn.thinking_source,
@@ -9607,6 +9697,7 @@ def _process_messages(messages: list) -> float:
         prepared_reply = {
             "replies": tuple(replies),
             "reply_to_message_id": reply_to_message_id,
+            "source": source,
             "thinking_summary": turn.thinking_summary,
             "thinking_kind": turn.thinking_kind,
             "thinking_source": turn.thinking_source,

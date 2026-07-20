@@ -6,10 +6,11 @@
 model_not_found[裸404] / unknown）。两处各自维护（consumer 在 tools/ 不能
 import backend），一致性由 tests/test_catalog_consumer_parity.py 锁定。
 
-blame 三分类纪律（照 docs/FRONTEND_ERROR_CONTRACT.md §二）：
+blame 分类纪律（照 docs/FRONTEND_ERROR_CONTRACT.md §二）：
 - user_provider      → 可以引导用户去充值 / 改 key / 改模型名
 - provider_transient → 上游临时问题，等它自己恢复
 - system             → 我们的问题，绝不能引导用户改配置（会误导用户，dded 案例的教训）
+- user_environment   → 用户自托管运行环境问题，例如 VPS resident consumer 过旧/离线
 """
 from __future__ import annotations
 
@@ -47,6 +48,10 @@ ERROR_CLASSES = frozenset({
     # then force-bridges responses→chat-completions, which mangles codex's tool
     # loop so memory/tool calls silently go unreliable (turn still rc=0).
     "responses_unsupported",
+    # Self-hosted resident maintenance classes. They are not upstream model
+    # errors; blame points at the user's own VPS/runtime environment.
+    "resident_consumer_stale",
+    "resident_never_claimed",
 })
 
 # error_class -> (blame, user_text)
@@ -95,6 +100,10 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "responses_unsupported": (
         "user_provider", "你选的中转不支持 Responses 协议，AI 的记忆和工具调用可能不稳定。"
         "建议换一个支持 /v1/responses 的中转，或改用 Claude 类模型。"),
+    "resident_consumer_stale": (
+        "user_environment", "你的 VPS resident consumer 版本可能太旧或没有正常接走任务，请更新并重启。"),
+    "resident_never_claimed": (
+        "user_environment", "你的 VPS resident consumer 长时间没有接走入住/记忆蒸馏任务，请更新并重启。"),
 }
 
 _FALLBACK_BLAME = "system"
@@ -109,7 +118,7 @@ def blame_for(error_class: str) -> str:
 
 
 def user_text_for(error_class: str, **ctx) -> str:
-    """``**ctx`` 为未来动态占位（如失败次数）预留——当前 19 类均静态文案，
+    """``**ctx`` 为未来动态占位（如失败次数）预留——当前类均静态文案，
     ctx 暂被忽略；保留形参使接口稳定，未来加占位不必改调用方签名。"""
     entry = _CATALOG.get(error_class)
     return entry[1] if entry is not None else _FALLBACK_USER_TEXT
@@ -157,6 +166,8 @@ def classify_upstream(text: str) -> str:
     的分支——那两类不会出现在 genesis/import 的错误文本里）。"""
     t = text or ""
     lowered = t.lower()
+    if "resident_never_claimed" in lowered:
+        return "resident_never_claimed"
     if re.search(r"\b404\b", t) and "model" in lowered:   # 与 consumer 裸404+model 分支对齐
         return "model_not_found"
     for klass, pat in _UPSTREAM_RULES:

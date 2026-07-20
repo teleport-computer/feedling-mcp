@@ -81,6 +81,15 @@ CHAT_REDELIVERY_WINDOW_SEC = int(os.environ.get("FEEDLING_CHAT_REDELIVERY_WINDOW
 # immediately — a rolling recovery, never a TTL stall. Sized so
 # batch × turn-time stays under CHAT_POLL_CLAIM_TTL_SEC.
 CHAT_REDELIVERY_BATCH_MAX = int(os.environ.get("FEEDLING_CHAT_REDELIVERY_BATCH_MAX", "5"))
+NON_CONVERSATION_USER_SOURCES = frozenset({"verify_ping", "resident_maintenance"})
+
+
+def is_conversation_user_message(msg: dict) -> bool:
+    return (
+        isinstance(msg, dict)
+        and msg.get("role") == "user"
+        and str(msg.get("source") or "") not in NON_CONVERSATION_USER_SOURCES
+    )
 
 
 def _chat_thinking_extra_from_envelope(envelope: dict | None) -> dict:
@@ -408,14 +417,14 @@ def _redelivery_floor(store: UserStore, now: float) -> float:
     visible user message: if the conversation already moved past an unanswered
     message (the user re-asked and got an answer), a late reply to the old one
     would land out of order — it is superseded, not lost. Synthetic
-    verify_ping rows are liveness probes, not conversation; their replies
-    don't supersede anything. Caller holds store.chat_lock.
+    verify_ping rows and resident-maintenance prompts are not conversation;
+    their replies don't supersede anything. Caller holds store.chat_lock.
     """
     if CHAT_REDELIVERY_WINDOW_SEC <= 0:
         return float("inf")
     floor = now - CHAT_REDELIVERY_WINDOW_SEC
     for msg in store.chat_messages:
-        if msg.get("role") != "user" or msg.get("source") == "verify_ping":
+        if not is_conversation_user_message(msg):
             continue
         if msg.get("reply_status") == "replied" or msg.get("reply_message_id"):
             floor = max(floor, _float_meta(msg.get("ts"), 0.0))
@@ -475,7 +484,7 @@ def _pending_chat_messages_for_poll(
                 # TTL expiry instead.
                 if ts <= redelivery_floor:
                     continue
-                if msg.get("source") == "verify_ping":
+                if str(msg.get("source") or "") in NON_CONVERSATION_USER_SOURCES:
                     continue
                 claimed_by = str(msg.get("reply_claimed_by") or "").strip()
                 expires_at = _float_meta(msg.get("reply_claim_expires_at"), 0.0)
