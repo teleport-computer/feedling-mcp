@@ -1,7 +1,7 @@
 """Notify Relay: push relay for self-hosted deployments.
 
-Revision ID: 0020_notify_relay
-Revises: 0019_tee_reconcile_state
+Revision ID: 0022_notify_relay
+Revises: 0021_growth_retention
 Create Date: 2026-07-18
 
 Self-hosted backends have no official APNs .p8 key (it cannot be shared), so
@@ -23,8 +23,8 @@ twice resolves to the existing row via ``ON CONFLICT (device_token)``.
 from alembic import op
 
 
-revision = "0020_notify_relay"
-down_revision = "0019_tee_reconcile_state"
+revision = "0022_notify_relay"
+down_revision = "0021_growth_retention"
 branch_labels = None
 depends_on = None
 

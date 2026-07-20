@@ -1,10 +1,10 @@
-"""TEE 影子库：Notify Relay 两表（列与主库 0020_notify_relay 对齐）。
+"""TEE 影子库：Notify Relay 两表（列与主库 0022_notify_relay 对齐）。
 
 Revision ID: 0002_notify_relay
 Revises: 0001_tee_baseline
 Create Date: 2026-07-18
 
-列定义必须与 backend/alembic/versions/0020_notify_relay.py 对齐——
+列定义必须与 backend/alembic/versions/0022_notify_relay.py 对齐——
 tee_shadow/reconciler.py 的全列 SELECT/UPSERT 依赖两侧同形（见 reconciler
 头注释）。notify_relay_logs.id 是 GENERATED ALWAYS AS IDENTITY，镜像写与
 reconciler 都必须 OVERRIDING SYSTEM VALUE 搬主库发的号。
