@@ -27,6 +27,7 @@ Wake calls preserved (byte-for-byte with the old Flask routes):
 from __future__ import annotations
 
 import base64
+import logging
 import time
 import uuid
 
@@ -39,8 +40,12 @@ from chat import service as chat_service
 from core import envelope as core_envelope
 from core import wake_bus
 from core.store import UserStore
+from notices import catalog as notices_catalog
+from notices import core as notices_core
 from proactive import service as proactive_service
 from push import service as push_service
+
+log = logging.getLogger(__name__)
 
 _ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
 
@@ -125,6 +130,37 @@ def _proactive_delivery_decision_v2(store: UserStore, payload: dict):
 # --------------------------------------------------------------------------- #
 # debug-trace helpers (moved verbatim from the Flask route; pure store logic)
 # --------------------------------------------------------------------------- #
+
+def _turn_failure_attribution(error_class: str, payload: dict) -> tuple[str, str]:
+    """回合失败的归责与用户文案 —— **服务端按 error_class 查表，不信 payload**。
+
+    归责红线（docs/FRONTEND_ERROR_CONTRACT.md §二）：provider 的错要抛给用户，
+    但不是他的错**绝不能赖给他**。透传 payload 的 blame 意味着一个写错/被改的
+    consumer 能把我们自己的故障标成 user_provider，让用户白跑一趟改配置——这
+    正是红线要防的那件事。catalog.blame_for 对未知 error_class 安全落 system，
+    与另外两条通道（notices.core 丢弃坏枚举、asgi.responses 直接 raise）同纪律。
+
+    user_text 同理：注释和 OpenAPI 都宣称「服务端组好、绝不含原始 provider
+    detail」，那就必须真由服务端组——payload 里的任意 500 字撑不起这个保证
+    （截断不是脱敏）。catalog 的文案与 consumer 分类器由
+    tests/test_catalog_consumer_parity.py 锁住不漂移。
+
+    payload 里的同名字段只在 catalog 未收录该 error_class 时作降级兜底，且
+    blame 仍强制落在合法枚举内。
+    """
+    blame = notices_catalog.blame_for(error_class)
+    user_text = notices_catalog.user_text_for(error_class)
+    if error_class not in notices_catalog.ERROR_CLASSES:
+        # 未收录的新 slug：文案退回 poster 提供的（老后端 + 新 consumer 的过渡期），
+        # 但 blame 绝不退让——非法值一律 system，宁可我们背锅也不误导用户。
+        fallback_text = str(payload.get("turn_failure_user_text") or "")[:500]
+        if fallback_text:
+            user_text = fallback_text
+        raw_blame = str(payload.get("turn_failure_blame") or "")
+        if raw_blame in notices_core.VALID_BLAME:
+            blame = raw_blame
+    return blame, user_text
+
 
 def _reply_to_message_id(payload: dict) -> str:
     """The reply target id from any of the accepted payload aliases (trimmed)."""
@@ -783,8 +819,27 @@ def write_response(
         if push_body.strip():
             extra["push_body_preview"] = push_body.strip()[:240]
         extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
+    turn_failure_error_class = str(payload.get("turn_failure_error_class") or "")[:64]
     reply_to_message_id = _reply_to_message_id(payload)
     if reply_to_message_id and role != "system":
+        # Turn-failure metadata（spec 2026-07-18 §2）：兜底回复是【实时载体】——它是
+        # 新消息、有新 ts，能通过 /v1/chat/history 的 `since` 增量过滤；而对用户那条
+        # 旧消息就地更新 metadata 不产生新 ts，永远进不了增量流。reply_to_message_id
+        # 必须一并落在回复消息上，否则客户端在增量流里拿到失败事件却无法配对回它
+        # 失败的那条用户消息。只做加法：不携带这些字段时本段完全不执行。
+        #
+        # 必须在 _build_chat_message 之前写进 extra —— 那一行之后 candidate 已定型，
+        # 再改 extra 不会进入原子 CAS 的那条 INSERT（3d160bf9 的新结构）。
+        turn_failure_blame = ""
+        turn_failure_user_text = ""
+        if turn_failure_error_class and source == "chat":
+            turn_failure_blame, turn_failure_user_text = _turn_failure_attribution(
+                turn_failure_error_class, payload
+            )
+            extra["turn_failure_error_class"] = turn_failure_error_class
+            extra["turn_failure_blame"] = turn_failure_blame
+            extra["turn_failure_user_text"] = turn_failure_user_text
+            extra["reply_to_message_id"] = reply_to_message_id
         # Build the exact append_chat row immediately before the one-statement
         # parent-CAS + reply-INSERT.  No slow work belongs in this gap: two workers
         # may arrive together, and PostgreSQL decides the sole winner.
@@ -801,6 +856,13 @@ def write_response(
             "replied_by": consumer_id,
             "replied_at": f"{float(candidate['ts']):.3f}",
         }
+        # 冗余持久化到用户消息上（供全量 history / 重启后恢复）。权威载体仍是兜底
+        # 回复消息本身；这里搭 finalize 的原子 CAS 顺风车，比旧结构的事后 metadata
+        # 更新更可靠——旧写法在 parent 不在本 worker 内存时会静默丢失。
+        if turn_failure_error_class and source == "chat":
+            replied_fields["reply_error_class"] = turn_failure_error_class
+            replied_fields["reply_blame"] = turn_failure_blame
+            replied_fields["reply_user_text"] = turn_failure_user_text
         finalized = store.finalize_chat_reply_once(
             reply_to_message_id, candidate, replied_fields
         )
