@@ -213,6 +213,13 @@ async def data_track_dau(request: Request):
     return JSONResponse(payload)
 
 
+@router.get("/v1/admin/data-track/growth")
+async def data_track_growth(request: Request):
+    _require_admin(request)
+    payload = await threadpool.run_db(admin_core.growth_payload, request.url.query)
+    return JSONResponse(payload)
+
+
 @router.get("/v1/admin/data-track/debug")
 async def data_track_debug(request: Request):
     _require_admin(request)

@@ -334,11 +334,15 @@ X-Feedling-Consumer-Commit: abc1234
 }
 ```
 
-If another consumer already answered the same user message, the endpoint can
-return `409 already_answered`. Treat that response as a lost race and do not post
-a second assistant turn. A network failure after sending is ambiguous because
-Chat does not support `Idempotency-Key`; check history or the parent message's
-reply metadata before deciding whether to retry.
+Reply exclusivity is atomic across backend workers: marking the parent answered
+and inserting its encrypted assistant reply commit together. If another
+consumer wins that parent first, the endpoint returns `409 already_answered`
+and does not store or deliver the losing reply. Treat that response as a lost
+race and do not post a second assistant turn. Messages with `role: "system"`
+remain outside reply exclusivity because they are technical notices, not
+answers to the claimed user turn. A network failure after sending is ambiguous
+because Chat does not support `Idempotency-Key`; check history or the parent
+message's reply metadata before deciding whether to retry.
 
 ## Destructive transcript clear
 

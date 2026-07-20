@@ -660,33 +660,39 @@ def write_response(
         extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
     reply_to_message_id = _reply_to_message_id(payload)
     if reply_to_message_id and role != "system":
-        _parent = _chat_message_by_id(store, reply_to_message_id)
-        if _parent is not None and (
-            _parent.get("reply_status") == "replied" or _parent.get("reply_message_id")
-        ):
-            # Reply-exclusivity guard (delivery exclusivity is the claim CAS's job).
-            # If this turn was ALREADY answered — e.g. THIS consumer's claim expired
-            # mid-turn (>CHAT_POLL_CLAIM_TTL_SEC), the lease failed over, and the new
-            # consumer already replied — don't append a duplicate reply and
-            # double-burn the user's model key. Drop it with 409. (Guarding only on
-            # already-replied, not claim ownership, so a legit reply that omits its
-            # consumer_id is never rejected.)
-            return {"error": "already_answered", "reply_status": "replied"}, 409
-    msg = store.append_chat(
-        role,
-        source,
-        envelope,
-        content_type=content_type,
-        extra=extra,
-    )
-    if reply_to_message_id and role != "system":
-        store.update_chat_message_metadata(reply_to_message_id, {
+        # Build the exact append_chat row immediately before the one-statement
+        # parent-CAS + reply-INSERT.  No slow work belongs in this gap: two workers
+        # may arrive together, and PostgreSQL decides the sole winner.
+        candidate = store._build_chat_message(
+            role,
+            source,
+            envelope,
+            content_type=content_type,
+            extra=extra,
+        )
+        replied_fields = {
             "reply_status": "replied",
-            "reply_message_id": str(msg.get("id") or ""),
+            "reply_message_id": str(candidate.get("id") or ""),
             "replied_by": consumer_id,
-            "replied_at": f"{time.time():.3f}",
-        })
+            "replied_at": f"{float(candidate['ts']):.3f}",
+        }
+        finalized = store.finalize_chat_reply_once(
+            reply_to_message_id, candidate, replied_fields
+        )
+        if finalized is None:
+            return {"error": "already_answered", "reply_status": "replied"}, 409
+        _parent_doc, msg = finalized
         _maybe_mark_first_chat_ok(store, reply_to_message_id)
+    else:
+        # System notices bypass reply exclusivity by design, as do ordinary
+        # response writes with no reply target.
+        msg = store.append_chat(
+            role,
+            source,
+            envelope,
+            content_type=content_type,
+            extra=extra,
+        )
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
     # Defense-in-depth: synthetic/maintenance replies must NEVER surface as push

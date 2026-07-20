@@ -1097,7 +1097,8 @@ def _dau_row(row) -> dict:
         "foreground_sec": int(row[10] or 0),
         "session_count": int(row[11] or 0),
         "session_dau": int(row[12] or 0),
-        "frozen": bool(row[13]),
+        "median_user_sec": float(row[13] or 0),
+        "frozen": bool(row[14]),
     }
 
 
@@ -1173,20 +1174,44 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                     FROM usage_events
                     GROUP BY day
                 ),
+                -- Per-user daily foreground total, then the median across users:
+                -- the "typical user" counterpart to foreground_sec/session_dau
+                -- (a mean that a few heavy users skew high). Frozen snapshots
+                -- store only aggregates, so this only populates for live days
+                -- and days frozen after this column shipped.
+                usage_per_user AS (
+                    SELECT
+                        to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                        user_id,
+                        SUM(duration_sec) AS user_sec
+                    FROM usage_events
+                    GROUP BY day, user_id
+                ),
+                usage_median AS (
+                    SELECT day,
+                           COALESCE(
+                             percentile_cont(0.5) WITHIN GROUP (ORDER BY user_sec), 0
+                           )::double precision AS median_user_sec
+                    FROM usage_per_user
+                    GROUP BY day
+                ),
                 live AS (
                     SELECT d.day, d.dau, d.chat_dau, d.tracking_dau, d.active_events,
                            d.user_messages, d.tracking_events, d.first_ts, d.last_ts,
                            COALESCE(u.avg_session_sec, 0)::double precision AS avg_session_sec,
                            COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
                            COALESCE(u.session_count, 0)::int AS session_count,
-                           COALESCE(u.session_dau, 0)::int AS session_dau
+                           COALESCE(u.session_dau, 0)::int AS session_dau,
+                           COALESCE(m.median_user_sec, 0)::double precision AS median_user_sec
                     FROM daily d
                     LEFT JOIN usage_daily u ON u.day = d.day
+                    LEFT JOIN usage_median m ON m.day = d.day
                 ),
                 frozen_rows AS (
                     SELECT day, dau, chat_dau, tracking_dau, active_events,
                            user_messages, tracking_events, first_ts, last_ts,
-                           avg_session_sec, foreground_sec, session_count, session_dau
+                           avg_session_sec, foreground_sec, session_count, session_dau,
+                           median_user_sec
                     FROM dau_daily_snapshot
                     WHERE active_events > 0
                       AND (%s = 0 OR first_ts >= %s)
@@ -1201,12 +1226,12 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                 SELECT day, dau, chat_dau, tracking_dau, active_events,
                        user_messages, tracking_events, first_ts, last_ts,
                        avg_session_sec, foreground_sec, session_count, session_dau,
-                       frozen
+                       median_user_sec, frozen
                 FROM merged
                 ORDER BY day DESC
                 LIMIT %s
                 """,
-                (since, since, since, since, since, since, tz, tz, since, since, day_limit),
+                (since, since, since, since, since, since, tz, tz, tz, since, since, day_limit),
             ).fetchall()
         return [_dau_row(row) for row in rows]
     except Exception as e:
@@ -1261,7 +1286,15 @@ def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
             COALESCE((SELECT AVG(duration_sec) FROM usage_events), 0)::double precision,
             COALESCE((SELECT SUM(duration_sec) FROM usage_events), 0)::bigint,
             (SELECT COUNT(*)::int FROM usage_events),
-            (SELECT COUNT(DISTINCT user_id)::int FROM usage_events)
+            (SELECT COUNT(DISTINCT user_id)::int FROM usage_events),
+            COALESCE((
+                SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY user_sec)
+                FROM (
+                    SELECT SUM(duration_sec) AS user_sec
+                    FROM usage_events
+                    GROUP BY user_id
+                ) per_user
+            ), 0)::double precision
         FROM active
         """,
         (start, end, start, end, start, end),
@@ -1280,6 +1313,7 @@ def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
         "foreground_sec": int(row[9] or 0),
         "session_count": int(row[10] or 0),
         "session_dau": int(row[11] or 0),
+        "median_user_sec": float(row[12] or 0),
     }
 
 
@@ -1320,9 +1354,9 @@ def freeze_completed_dau_days(*, now_epoch: float | None = None,
                             day, dau, chat_dau, tracking_dau, active_events,
                             user_messages, tracking_events, session_dau,
                             avg_session_sec, foreground_sec, session_count,
-                            first_ts, last_ts
+                            first_ts, last_ts, median_user_sec
                         ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (day) DO NOTHING
                         RETURNING day
@@ -1333,7 +1367,7 @@ def freeze_completed_dau_days(*, now_epoch: float | None = None,
                             snap["user_messages"], snap["tracking_events"],
                             snap["session_dau"], snap["avg_session_sec"],
                             snap["foreground_sec"], snap["session_count"],
-                            snap["first_ts"], snap["last_ts"],
+                            snap["first_ts"], snap["last_ts"], snap["median_user_sec"],
                         ),
                     ).fetchone()
                     if saved:
@@ -1360,6 +1394,304 @@ def admin_dau_snapshot_bounds() -> dict:
     except Exception as e:
         log.error("[db] admin_dau_snapshot_bounds failed: %s", e)
         return {"first_day": "", "last_day": "", "days": 0}
+
+
+# --- User growth (new + cumulative signups) ------------------------------- #
+# ``users.created_at`` is a naive server-local ISO string; cast ::timestamptz
+# (session tz) then bucket into Beijing days, matching the onboarding funnel's
+# EXTRACT(EPOCH FROM created_at::timestamptz) contract. Frozen days come from
+# user_growth_daily_snapshot (deletion-proof); pre-boundary days are computed
+# live and understate because deleted accounts drop out of ``users``.
+_CREATED_AT_ISO = "created_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'"
+
+
+def admin_data_track_growth(*, days: int = 60, tz: str = "Asia/Shanghai") -> list[dict]:
+    """Per-Beijing-day new signups + running cumulative, newest last-limited.
+
+    Cumulative is a running sum over the FULL series so the returned tail carries
+    a correct total; only the last ``days`` rows are returned for display.
+    """
+    day_limit = max(1, min(int(days or 60), 366))
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                f"""
+                WITH reg AS (
+                    SELECT to_char(timezone(%s, created_at::timestamptz), 'YYYY-MM-DD') AS day
+                    FROM users
+                    WHERE {_CREATED_AT_ISO}
+                ),
+                live AS (
+                    SELECT day, COUNT(*)::int AS new_users FROM reg GROUP BY day
+                ),
+                frozen_rows AS (
+                    SELECT day, new_users FROM user_growth_daily_snapshot
+                ),
+                merged AS (
+                    SELECT day, new_users, TRUE AS frozen FROM frozen_rows
+                    UNION ALL
+                    SELECT l.day, l.new_users, FALSE AS frozen
+                    FROM live l
+                    WHERE NOT EXISTS (SELECT 1 FROM frozen_rows f WHERE f.day = l.day)
+                )
+                SELECT day, new_users, frozen FROM merged ORDER BY day ASC
+                """,
+                (tz,),
+            ).fetchall()
+        cumulative = 0
+        out: list[dict] = []
+        for day, new_users, frozen in rows:
+            cumulative += int(new_users or 0)
+            out.append({
+                "day": day,
+                "new_users": int(new_users or 0),
+                "cumulative": cumulative,
+                "frozen": bool(frozen),
+            })
+        return out[-day_limit:]
+    except Exception as e:
+        log.error("[db] admin_data_track_growth failed: %s", e)
+        return []
+
+
+def _completed_growth_row(conn, *, day: date, tz: str) -> dict:
+    zone = ZoneInfo(tz)
+    start = datetime.combine(day, datetime.min.time(), tzinfo=zone).timestamp()
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=zone).timestamp()
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*)::int
+        FROM users
+        WHERE {_CREATED_AT_ISO}
+          AND EXTRACT(EPOCH FROM created_at::timestamptz) >= %s
+          AND EXTRACT(EPOCH FROM created_at::timestamptz) < %s
+        """,
+        (start, end),
+    ).fetchone()
+    return {"day": day.isoformat(), "new_users": int(row[0] or 0)}
+
+
+def freeze_completed_growth_days(*, now_epoch: float | None = None,
+                                 tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze immutable new-signup counts for completed Beijing days.
+
+    Mirrors ``freeze_completed_dau_days``: the first run establishes the rollout
+    boundary at yesterday; later runs fill the gap; ``ON CONFLICT DO NOTHING``
+    keeps it write-once so account deletion can never change a frozen day.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = datetime.fromtimestamp(float(now_epoch), zone) if now_epoch is not None else datetime.now(zone)
+        last_completed = now.date() - timedelta(days=1)
+        with get_pool().connection() as conn:
+            row = conn.execute("SELECT MIN(day) FROM user_growth_daily_snapshot").fetchone()
+            first_day = date.fromisoformat(row[0]) if row and row[0] else last_completed
+            if first_day > last_completed:
+                return []
+            existing = {
+                date.fromisoformat(r[0])
+                for r in conn.execute(
+                    "SELECT day FROM user_growth_daily_snapshot WHERE day >= %s AND day <= %s",
+                    (first_day.isoformat(), last_completed.isoformat()),
+                ).fetchall()
+            }
+            inserted: list[str] = []
+            cursor = first_day
+            while cursor <= last_completed:
+                if cursor not in existing:
+                    snap = _completed_growth_row(conn, day=cursor, tz=tz)
+                    saved = conn.execute(
+                        """
+                        INSERT INTO user_growth_daily_snapshot (day, new_users)
+                        VALUES (%s, %s)
+                        ON CONFLICT (day) DO NOTHING
+                        RETURNING day
+                        """,
+                        (snap["day"], snap["new_users"]),
+                    ).fetchone()
+                    if saved:
+                        inserted.append(saved[0])
+                cursor += timedelta(days=1)
+        return inserted
+    except Exception as e:
+        log.error("[db] freeze_completed_growth_days failed: %s", e)
+        return []
+
+
+def admin_growth_snapshot_bounds() -> dict:
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT MIN(day), MAX(day), COUNT(*) FROM user_growth_daily_snapshot"
+            ).fetchone()
+        return {"first_day": row[0] or "", "last_day": row[1] or "", "days": int(row[2] or 0)}
+    except Exception as e:
+        log.error("[db] admin_growth_snapshot_bounds failed: %s", e)
+        return {"first_day": "", "last_day": "", "days": 0}
+
+
+# --- Weekly cohort retention ---------------------------------------------- #
+# Cohort = the Beijing week a user registered in (Monday date). period_index k =
+# weeks since registration (0 = the signup week itself). A cell (W,k) freezes
+# once week k has fully ended; active = the same user-initiated activity DAU
+# uses (user chat message OR tracking event). cohort_size is pinned to the value
+# at the cohort's first frozen cell so deletion can't shrink the denominator and
+# fake-inflate retention.
+
+def _retention_cells(conn, tz: str) -> tuple[dict, dict]:
+    """(cohort_size_by_week, active_count_by_(week,period)) computed live now."""
+    size_rows = conn.execute(
+        f"""
+        SELECT to_char((date_trunc('week', timezone(%s, created_at::timestamptz)))::date,
+                       'YYYY-MM-DD') AS cohort_week,
+               COUNT(*)::int AS cohort_size
+        FROM users
+        WHERE {_CREATED_AT_ISO}
+        GROUP BY cohort_week
+        """,
+        (tz,),
+    ).fetchall()
+    sizes = {r[0]: int(r[1] or 0) for r in size_rows}
+
+    cell_rows = conn.execute(
+        f"""
+        WITH reg AS (
+            SELECT user_id,
+                   (date_trunc('week', timezone(%s, created_at::timestamptz)))::date AS cohort_monday
+            FROM users
+            WHERE {_CREATED_AT_ISO}
+        ),
+        act AS (
+            SELECT DISTINCT r.user_id, r.cohort_monday,
+                   (date_trunc('week', timezone(%s, to_timestamp(a.ts))))::date AS act_monday
+            FROM reg r
+            JOIN (
+                SELECT user_id, ts FROM chat_messages
+                  WHERE doc->>'role' = 'user'
+                    AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
+                UNION ALL
+                SELECT user_id, ts FROM user_logs
+                  WHERE stream = 'tracking_events' AND ts IS NOT NULL
+            ) a ON a.user_id = r.user_id
+        )
+        SELECT to_char(cohort_monday, 'YYYY-MM-DD') AS cohort_week,
+               ((act_monday - cohort_monday) / 7)::int AS period_index,
+               COUNT(DISTINCT user_id)::int AS active_count
+        FROM act
+        WHERE act_monday >= cohort_monday
+        GROUP BY cohort_monday, period_index
+        """,
+        (tz, tz),
+    ).fetchall()
+    cells = {(r[0], int(r[1])): int(r[2] or 0) for r in cell_rows}
+    return sizes, cells
+
+
+def admin_data_track_retention(*, tz: str = "Asia/Shanghai") -> dict:
+    """Weekly cohort retention matrix. Frozen cells win (deletion-proof); the
+    current in-progress period falls back to live. Returns
+    {cohorts: [{cohort_week, cohort_size, cells: {k: {active, pct, frozen}}}],
+     max_period}."""
+    try:
+        with get_pool().connection() as conn:
+            frozen = conn.execute(
+                "SELECT cohort_week, period_index, cohort_size, active_count "
+                "FROM retention_cohort_snapshot"
+            ).fetchall()
+            sizes, live_cells = _retention_cells(conn, tz)
+
+        frozen_cells = {(r[0], int(r[1])): (int(r[2] or 0), int(r[3] or 0)) for r in frozen}
+        # Denominator per cohort: prefer a frozen anchor (pinned size), else live.
+        anchor: dict[str, int] = {}
+        for (week, _period), (size, _active) in frozen_cells.items():
+            anchor.setdefault(week, size)
+        weeks = sorted(set(sizes) | {w for (w, _p) in frozen_cells})
+
+        cohorts = []
+        max_period = 0
+        for week in weeks:
+            size = anchor.get(week, sizes.get(week, 0))
+            cells: dict[int, dict] = {}
+            periods = {p for (w, p) in frozen_cells if w == week} | {
+                p for (w, p) in live_cells if w == week
+            }
+            for p in periods:
+                if (week, p) in frozen_cells:
+                    active = frozen_cells[(week, p)][1]
+                    is_frozen = True
+                else:
+                    active = live_cells.get((week, p), 0)
+                    is_frozen = False
+                pct = round(100.0 * active / size, 1) if size else 0.0
+                cells[p] = {"active": active, "pct": pct, "frozen": is_frozen}
+                max_period = max(max_period, p)
+            cohorts.append({"cohort_week": week, "cohort_size": size, "cells": cells})
+        return {"cohorts": cohorts, "max_period": max_period}
+    except Exception as e:
+        log.error("[db] admin_data_track_retention failed: %s", e)
+        return {"cohorts": [], "max_period": 0}
+
+
+def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
+                                       tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze (cohort_week, period) cells whose week has fully ended.
+
+    cohort_size is pinned to the cohort's earliest already-frozen cell so every
+    period shares one deletion-proof denominator. Returns the "week#period" keys
+    inserted. Best-effort per the scheduler contract.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = datetime.fromtimestamp(float(now_epoch), zone) if now_epoch is not None else datetime.now(zone)
+        now_date = now.date()
+        inserted: list[str] = []
+        with get_pool().connection() as conn:
+            sizes, live_cells = _retention_cells(conn, tz)
+            existing = {
+                (r[0], int(r[1])): int(r[2] or 0)
+                for r in conn.execute(
+                    "SELECT cohort_week, period_index, cohort_size FROM retention_cohort_snapshot"
+                ).fetchall()
+            }
+            # Pin denominator per cohort to the earliest frozen cell if any.
+            anchor: dict[str, int] = {}
+            for (week, period) in sorted(existing, key=lambda k: k[1]):
+                anchor.setdefault(week, existing[(week, period)])
+
+            # Freeze cohorts that still have live users OR an existing anchor. The
+            # anchor branch is essential: once a cohort's W0 is frozen, its whole
+            # membership can delete and it drops out of `sizes` — without this it
+            # would never get later-period 0 cells, HIDING total churn (the exact
+            # opposite of the deletion-proofing goal). A cohort deleted before its
+            # first freeze is genuinely unrecoverable and stays absent.
+            for week in set(sizes) | set(anchor):
+                cohort_monday = date.fromisoformat(week)
+                # periods 0..K-1 are complete: week k ends at monday + (k+1)*7 days.
+                completed = (now_date - cohort_monday).days // 7
+                if completed <= 0:
+                    continue
+                size = anchor.get(week, sizes.get(week, 0))
+                for k in range(completed):
+                    if (week, k) in existing:
+                        continue
+                    active = live_cells.get((week, k), 0)
+                    saved = conn.execute(
+                        """
+                        INSERT INTO retention_cohort_snapshot
+                            (cohort_week, period_index, cohort_size, active_count)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (cohort_week, period_index) DO NOTHING
+                        RETURNING cohort_week
+                        """,
+                        (week, k, size, active),
+                    ).fetchone()
+                    if saved:
+                        inserted.append(f"{week}#{k}")
+                        anchor.setdefault(week, size)
+            return inserted
+    except Exception as e:
+        log.error("[db] freeze_completed_retention_cohorts failed: %s", e)
+        return []
 
 
 def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30,
@@ -3168,6 +3500,168 @@ def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None
     from tee_shadow import mirror
     mirror.execute(sql, (Jsonb(fields), user_id, msg_id))
     return row[0] if row is not None else None
+
+
+_CHAT_FINALIZE_REPLY_ONCE_SQL = (
+    "WITH won AS ("
+    "  UPDATE chat_messages SET doc = doc || %s "
+    "  WHERE user_id = %s AND msg_id = %s "
+    "    AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+    "    AND COALESCE(doc->>'reply_message_id','') = '' "
+    "  RETURNING doc AS parent_doc"
+    "), inserted AS ("
+    "  INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+    "  SELECT %s, %s, %s, %s FROM won "
+    "  RETURNING doc AS reply_doc"
+    ") "
+    "SELECT won.parent_doc, inserted.reply_doc FROM won CROSS JOIN inserted"
+)
+
+_CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL = (
+    "UPDATE chat_messages SET doc = doc || %s "
+    "WHERE user_id = %s AND msg_id = %s"
+)
+
+
+def chat_finalize_reply_once(
+    user_id: str,
+    parent_msg_id: str,
+    reply_msg_id: str,
+    reply_ts: float,
+    reply_doc: dict,
+    replied_fields: dict,
+) -> tuple[dict, dict] | None:
+    """Atomically mark one parent answered and insert its encrypted reply.
+
+    The parent primary-key UPDATE is the compare-and-swap.  The data-modifying
+    CTE makes the reply INSERT conditional on winning that UPDATE and keeps the
+    two writes in one PostgreSQL statement: a duplicate reply id or any other
+    INSERT failure rolls the parent mutation back with the statement.  Losing
+    the CAS is the only normal ``None`` result; database failures deliberately
+    propagate so callers fail closed instead of accidentally retrying a reply.
+
+    This low-level helper performs no cache, wake, capture, R2, or inline reply
+    mirror side effects.  After the RDS statement commits, it best-effort
+    mirrors only the parent's plaintext metadata; the encrypted reply remains
+    exclusively on the normal decrypting TEE-replicator path.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            _CHAT_FINALIZE_REPLY_ONCE_SQL,
+            (
+                Jsonb(replied_fields),
+                user_id,
+                parent_msg_id,
+                user_id,
+                reply_msg_id,
+                reply_ts,
+                Jsonb(reply_doc),
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    # The encrypted reply row is intentionally NOT mirrored here.  The normal
+    # TEE replicator decrypts and copies that row in its canonical plaintext
+    # shape.  Only the already-existing parent's plaintext metadata is safe to
+    # merge inline; mirror.execute is best-effort and swallows TEE failures.
+    from tee_shadow import mirror
+
+    mirror.execute(
+        _CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL,
+        (Jsonb(replied_fields), user_id, parent_msg_id),
+    )
+    return row[0], row[1]
+
+
+def chat_finalize_reply_post_commit(
+    user_id: str, reply_doc: dict, max_messages: int
+) -> None:
+    """Run normal append maintenance after an atomic reply winner commits.
+
+    Finalization must commit the parent CAS and inline encrypted reply together,
+    so trimming and optional R2 offload happen afterwards.  This preserves
+    ``chat_append`` semantics: trim to the newest bounded history, write heavy
+    ciphertext inline first, upload outside a transaction, and only then flip
+    the current row to an R2 pointer.  Failures are logged and leave the already
+    committed inline reply readable.
+    """
+    reply_msg_id = str(reply_doc.get("id") or "")
+    offload = (
+        object_storage.chat_files_enabled()
+        and reply_doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
+        and reply_doc.get("body_ct") is not None
+    )
+    trimmed_docs: list = []
+    trimmed_ids: list[str] = []
+    try:
+        if max_messages and max_messages > 0:
+            with get_pool().connection() as conn:
+                rows = conn.execute(
+                    "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
+                    "  SELECT MIN(seq) FROM ("
+                    "    SELECT seq FROM chat_messages WHERE user_id = %s "
+                    "    ORDER BY seq DESC LIMIT %s"
+                    "  ) t"
+                    ") RETURNING msg_id, doc",
+                    (user_id, user_id, max_messages),
+                ).fetchall()
+                trimmed_ids = [row[0] for row in rows]
+                trimmed_docs = [row[1] for row in rows]
+
+        if offload:
+            try:
+                body_ct_len = len(reply_doc["body_ct"])
+                key = object_storage.put_chat_body(
+                    user_id,
+                    reply_msg_id,
+                    reply_doc["body_ct"],
+                    str(reply_doc.get("content_type") or "file"),
+                )
+                pointer = {"body_key": key, "body_ct_len": body_ct_len}
+                with get_pool().connection() as conn:
+                    conn.execute(
+                        "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
+                        "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
+                        (Jsonb(pointer), user_id, reply_msg_id),
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "[db] chat_finalize_reply_post_commit(%s,%s) R2 offload "
+                    "failed, left inline: %s",
+                    user_id,
+                    reply_msg_id,
+                    e,
+                )
+
+        if trimmed_docs and object_storage.chat_files_enabled():
+            for trimmed in trimmed_docs:
+                if isinstance(trimmed, dict) and trimmed.get("body_key"):
+                    object_storage.delete_chat_body(
+                        str(trimmed["body_key"]), user_id
+                    )
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "[db] chat_finalize_reply_post_commit(%s,%s) failed: %s",
+            user_id,
+            reply_msg_id,
+            e,
+        )
+        return
+
+    if trimmed_ids:
+        from tee_shadow import mirror
+
+        mirror.execute_many([
+            (
+                "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = ANY(%s)",
+                (user_id, trimmed_ids),
+            ),
+            (
+                "DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+                "AND table_name = 'chat_messages' AND item_id = ANY(%s)",
+                (user_id, trimmed_ids),
+            ),
+        ])
 
 
 def chat_try_claim_reply(
