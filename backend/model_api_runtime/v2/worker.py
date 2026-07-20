@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from concurrent.futures import CancelledError as FutureCancelledError
@@ -46,6 +47,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 import provider_client
@@ -566,26 +568,119 @@ def _finite_typed_scalar(value: object) -> bool:
     return isinstance(value, float) and math.isfinite(value)
 
 
-def _safe_eager_perception_snapshot(data: object) -> dict:
-    """Project a full snapshot to fixed numeric/bool/null fields only.
+# A tiny, format-constrained set of TEXT perception fields that are safe to
+# ground eagerly even though they are strings. The eager block sits before the
+# first round of outbound web/MCP/task tools, so — exactly like the scalar
+# allowlist above — every value here must be incapable of carrying a
+# natural-language instruction. Each field has an explicit validator that
+# returns the value ONLY if the WHOLE value is provably benign, else None
+# (fail-closed, never partial-clean):
+#   - place/city names come from the OS reverse geocoder (a bounded,
+#     non-user-controllable vocabulary), so `locality`/`country` are gated by a
+#     conservative character allowlist + length cap;
+#   - `now.local_time`/`now.timezone` are gated by ISO-8601 / IANA parsing.
+# The genuinely user-nameable free text — `place_label` (user-labeled places)
+# and `wifi_label` (an SSID can literally be "ignore previous instructions") —
+# is deliberately NOT here and stays pull-only behind the outbound fence.
+_COARSE_PLACE_TEXT_RE = re.compile(r"[0-9A-Za-zÀ-￿ .,'\-]+")
+_COARSE_PLACE_MAX_LEN = 48
 
-    Calendar/reminder titles, place/wifi/app/device labels, playback metadata,
-    weather alerts/condition strings, and every other free-form string are
-    intentionally absent. They remain available through an explicit tool read,
-    which activates the outbound fence below.
+
+def _safe_coarse_place_text(value: object) -> str | None:
+    """Reverse-geocoded locality/country: whole-value allowlist or drop."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not (1 <= len(text) <= _COARSE_PLACE_MAX_LEN):
+        return None
+    if _COARSE_PLACE_TEXT_RE.fullmatch(text) is None:
+        return None
+    return text
+
+
+def _safe_iso_local_time(value: object) -> str | None:
+    """Device-reported local wall clock: must parse as ISO-8601, else drop."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not (1 <= len(text) <= 40):
+        return None
+    try:
+        datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return text
+
+
+def _safe_iana_timezone(value: object) -> str | None:
+    """Device-reported timezone: must be a loadable IANA identifier, else drop."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not (1 <= len(text) <= 64):
+        return None
+    try:
+        ZoneInfo(text)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    return text
+
+
+# (signal, field) -> validator. Kept separate from the scalar allowlist so the
+# "scalars only, no strings" invariant of _EAGER_PERCEPTION_SCALAR_FIELDS stays
+# intact and each added string field is opted in with an explicit gate.
+_EAGER_PERCEPTION_TEXT_VALIDATORS: dict[tuple[str, str], Callable[[object], str | None]] = {
+    ("location", "locality"): _safe_coarse_place_text,
+    ("location", "country"): _safe_coarse_place_text,
+    ("now", "local_time"): _safe_iso_local_time,
+    ("now", "timezone"): _safe_iana_timezone,
+}
+# signal -> ordered text fields, derived from the validators above.
+_EAGER_PERCEPTION_TEXT_FIELDS: dict[str, tuple[str, ...]] = {}
+for _sig, _field in _EAGER_PERCEPTION_TEXT_VALIDATORS:
+    _EAGER_PERCEPTION_TEXT_FIELDS.setdefault(_sig, ())
+    _EAGER_PERCEPTION_TEXT_FIELDS[_sig] += (_field,)
+# Signals that contribute ONLY text fields (no scalar allowlist entry) — appended
+# after the scalar signals so projection order stays deterministic.
+_EAGER_PERCEPTION_TEXT_ONLY_SIGNALS = tuple(
+    signal
+    for signal in _EAGER_PERCEPTION_TEXT_FIELDS
+    if signal not in _EAGER_PERCEPTION_SCALAR_FIELDS
+)
+
+
+def _safe_eager_perception_snapshot(data: object) -> dict:
+    """Project a full snapshot to fixed numeric/bool/null fields plus a tiny set
+    of validated, format-constrained text fields.
+
+    Numeric/bool readings pass through the per-signal scalar allowlist. On top of
+    that, `location.locality`/`location.country` (reverse-geocoded, bounded
+    vocabulary) and `now.local_time`/`now.timezone` (ISO / IANA) pass through
+    per-field validators so the agent can answer "where am I / what day is it"
+    without guessing. Everything else free-form — calendar/reminder titles,
+    place/wifi/app/device labels, playback metadata, weather condition/alert
+    strings — is intentionally absent and remains available only through an
+    explicit tool read, which activates the outbound fence below.
     """
     if not isinstance(data, dict) or not isinstance(data.get("signals"), dict):
         return {}
     safe_signals: dict[str, dict] = {}
-    for signal, allowed_fields in _EAGER_PERCEPTION_SCALAR_FIELDS.items():
+    signal_order = list(_EAGER_PERCEPTION_SCALAR_FIELDS.keys())
+    signal_order.extend(_EAGER_PERCEPTION_TEXT_ONLY_SIGNALS)
+    for signal in signal_order:
         raw_doc = data["signals"].get(signal)
         if not isinstance(raw_doc, dict):
             continue
         safe_doc = {
             field: raw_doc[field]
-            for field in allowed_fields
+            for field in _EAGER_PERCEPTION_SCALAR_FIELDS.get(signal, ())
             if field in raw_doc and _finite_typed_scalar(raw_doc[field])
         }
+        for field in _EAGER_PERCEPTION_TEXT_FIELDS.get(signal, ()):
+            validator = _EAGER_PERCEPTION_TEXT_VALIDATORS[(signal, field)]
+            cleaned = validator(raw_doc.get(field))
+            if cleaned is not None:
+                safe_doc[field] = cleaned
         if raw_doc.get("disabled") is True:
             safe_doc["disabled"] = True
             reason = str(raw_doc.get("reason") or "").strip().lower()

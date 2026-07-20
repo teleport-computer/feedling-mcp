@@ -201,6 +201,69 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 
 ---
 
+## 五之二、通道④：回合失败挂在消息上 [2026-07-18 新增]
+
+通道③解决的是「有没有一条技术说明」，这条解决的是「**这一轮到底成没成**」。
+兜底话术是 agent 口吻的正常回复，从数据上看这轮是「已回复、成功」——用户看到的
+是一句「我这会儿有点慢」，不知道真实原因。本通道让失败**显示成失败**。
+
+设计见 `docs/superpowers/specs/2026-07-18-provider-error-visibility-design.md` §2。
+
+### 双载体（两个都要读）
+
+| 载体 | 出现在哪 | 承担 |
+|---|---|---|
+| **兜底回复消息**（权威） | 该 agent 消息自身带 `turn_failure_*` + `reply_to_message_id` | **实时事件**。它是新消息、有新 ts，能通过 `since` 增量过滤 |
+| 用户消息 metadata（冗余） | 该 user 消息带 `reply_error_class` / `reply_blame` / `reply_user_text` | 全量 history / 重启后恢复 |
+
+**为什么必须双载体**：`/v1/chat/history?since=` 按消息**原始 ts** 过滤，对用户那条
+旧消息就地更新 metadata 不产生新 ts，永远进不了增量流。只读 metadata 的话，实际
+效果是「杀掉 App 重开才看得到失败态」。
+
+**冲突时以兜底消息为准**：`update_chat_message_metadata` 仅在 parent 存在于当前
+worker 内存时才落库，跨 worker 可能静默写失败。
+
+### 字段
+
+| 字段 | 值域 | 说明 |
+|---|---|---|
+| `turn_failure_error_class` / `reply_error_class` | 见通道③的 error_class 全集 | 非空即表示这轮是兜底糊的、不是真回复 |
+| `turn_failure_blame` / `reply_blame` | `user_provider` \| `provider_transient` \| `system` | 决定渲染，见下 |
+| `turn_failure_user_text` / `reply_user_text` | ≤500 字 | 服务端已组好的用户可见文案，**直接显示，不要本地映射** |
+
+**blame 与 user_text 由服务端按 `error_class` 查 `notices/catalog.py` 下发，不采信
+poster 提交的值**（`chat_core._turn_failure_attribution`）。理由是归责红线：透传意味着
+一个写错的 consumer 能把我们自己的故障标成 `user_provider`、让用户白跑一趟改配置。
+未知 `error_class` 一律落 `system`——宁可我们背锅，也不误导用户。客户端因此可以信任
+这两个字段，无需再做合法性判断。
+| `reply_to_message_id` | 消息 id | 兜底消息指向的用户消息，客户端靠它配对 |
+
+**不下发 detail**：原始上游报错可能夹带 provider HTML、request id 乃至敏感上下文。
+排障走设置页 `last_runtime_error` 与 admin 面。
+
+### 渲染规则（显示矩阵）
+
+| blame | 用户消息 | 兜底气泡 | 行动入口 |
+|---|---|---|---|
+| `user_provider` | 失败态 + `user_text` | **隐藏** | 「去设置」→ 模型配置页 |
+| `provider_transient` | 失败态 + `user_text` | **隐藏** | 无（会自愈） |
+| `system` | 不变 | **保留显示** | 无（我们的锅，留住有温度的兜底话术） |
+
+**不给重试按钮**：余额不足时重试无效，用户需要的是充值。
+
+### 归并规则（分页边界）
+
+配对必须在**每次**消息列表变更后重跑（增量、全量、加载 older），不能只在实时收到
+新消息时做。若兜底事件已加载而它指向的用户消息还在上一页，**不得隐藏该兜底气泡**
+——否则失败原因会连兜底一起消失；等加载 older 后再归并。
+
+### 兼容
+
+新增字段是 additive：不认识这些字段的旧版 App 渲染结果与改动前完全一致
+（兜底话术照显）。
+
+---
+
 ## 六、场景内状态字段（页面就地显示）
 
 | 端点 | 字段 | 状态 |
