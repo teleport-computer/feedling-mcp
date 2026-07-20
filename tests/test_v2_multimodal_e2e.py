@@ -33,7 +33,7 @@ async def _run_native_turn(provider_config, content):
     async def _dispatch(_calls):
         raise AssertionError("plain provider reply must not dispatch tools")
 
-    async def _reply(_text, *, final):
+    async def _reply(_text, *, final, reasoning=""):
         assert final is True
 
     async def _fold():

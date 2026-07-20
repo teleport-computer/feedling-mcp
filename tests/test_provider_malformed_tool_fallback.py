@@ -107,7 +107,7 @@ def test_malformed_wire_uses_exactly_one_tools_disabled_fallback(
 
     replies = []
 
-    async def _on_reply(text, *, final):
+    async def _on_reply(text, *, final, reasoning=""):
         replies.append((text, final))
 
     async def _fold():
@@ -168,7 +168,7 @@ def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
 
     replies = []
 
-    async def _on_reply(text, *, final):
+    async def _on_reply(text, *, final, reasoning=""):
         replies.append((text, final))
 
     async def _fold():
@@ -243,7 +243,7 @@ def test_web_search_allows_only_exact_returned_url_for_followup_fetch(monkeypatc
 
     replies = []
 
-    async def _on_reply(text, *, final):
+    async def _on_reply(text, *, final, reasoning=""):
         replies.append((text, final))
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
@@ -304,7 +304,7 @@ def test_web_search_result_cannot_redirect_model_to_fresh_fetch_url(monkeypatch)
 
     replies = []
 
-    async def _on_reply(text, *, final):
+    async def _on_reply(text, *, final, reasoning=""):
         replies.append((text, final))
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
@@ -349,7 +349,7 @@ def test_reply_and_durable_write_same_batch_fail_closed(monkeypatch):
 
     replies = []
 
-    async def _on_reply(text, *, final):
+    async def _on_reply(text, *, final, reasoning=""):
         replies.append((text, final))
 
     async def _fold():

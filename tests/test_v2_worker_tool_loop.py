@@ -24,6 +24,7 @@ import db
 import provider_client
 from provider_types import ToolExchange
 from capabilities import registry as cap_registry
+from core import envelope as core_envelope
 from core import store as core_store
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_id as v2_effect_id
@@ -90,9 +91,11 @@ def _patch_real_write(monkeypatch):
     `append_chat`'s docstring) so `_bubbles` below reads back genuine
     chat_messages rows, only the encryption step itself is skipped."""
 
-    def _real_write(store, text):
+    def _real_write(store, text, *, extra=None):
         envelope = {"v": 1, "body_ct": text, "nonce": "n", "K_user": "k_test"}
-        return store.append_chat("openclaw", "model_api", envelope, strict=True)
+        return store.append_chat(
+            "openclaw", "model_api", envelope, strict=True, extra=(extra or None)
+        )
 
     monkeypatch.setattr(worker, "_write_encrypted_reply", _real_write)
 
@@ -105,7 +108,9 @@ def _reply_effect_dispatch(user_id):
     def dispatch(effect_type, payload):
         if effect_type == "reply":
             worker._write_encrypted_reply(
-                core_store.get_store(user_id), str(payload.get("text") or "")
+                core_store.get_store(user_id),
+                str(payload.get("text") or ""),
+                extra=worker._thinking_extra(payload.get("thinking")),
             )
 
     return dispatch
@@ -271,6 +276,91 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def _stub_envelope_build(monkeypatch):
+    """Deterministic stand-in for the enclave envelope round-trip so a test can
+    read the sealed plaintext straight off the row's ``*_body_ct``. Applies to
+    BOTH the reply body and the separately-sealed thinking body."""
+
+    def _fake(store, plaintext, item_id=None):
+        return (
+            {
+                "v": 1,
+                "id": item_id or "eid",
+                "body_ct": plaintext.decode("utf-8"),
+                "nonce": "n",
+                "K_user": "k",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake)
+
+
+def test_provider_reasoning_surfaces_as_thinking_bubble(monkeypatch):
+    """A final reply whose provider result carried chain-of-thought
+    (``result["reasoning"]``) must publish it as the row's separately-sealed
+    thinking envelope (``thinking_body_ct`` + ``thinking_kind``), not silently
+    drop it. Regression guard for the V2 reasoning-surfacing gap."""
+    uid = "u_toolloop_reasoning"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    _stub_envelope_build(monkeypatch)
+    calls = _script_provider(
+        monkeypatch,
+        [
+            {
+                "reply": "the answer",
+                "reasoning": "step one\nstep two",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+        ],
+    )
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    bubble = bubbles[0]
+    assert bubble["body_ct"] == "the answer"
+    assert bubble.get("thinking_kind") == "provider_reasoning"
+    assert bubble.get("thinking_body_ct") == "step one\nstep two"
+
+
+def test_reasoning_absent_leaves_no_thinking_fields(monkeypatch):
+    """A reply with no provider reasoning must NOT invent thinking metadata."""
+    uid = "u_toolloop_no_reasoning"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    _stub_envelope_build(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("plain answer")])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+
+    asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    bubble = _bubbles(uid)[0]
+    assert bubble["body_ct"] == "plain answer"
+    assert "thinking_kind" not in bubble
+    assert "thinking_body_ct" not in bubble
 
 
 def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(

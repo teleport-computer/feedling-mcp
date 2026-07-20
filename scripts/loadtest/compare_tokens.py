@@ -189,7 +189,7 @@ async def _drive_turn_async(
             for call in calls
         ]
 
-    async def _on_reply(text: str, *, final: bool) -> None:
+    async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
         replies.append((str(text), final))
 
     async def _fold_new_messages() -> list[dict]:

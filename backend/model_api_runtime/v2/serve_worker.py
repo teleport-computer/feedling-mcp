@@ -1703,6 +1703,10 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     reply-is-terminal invariant; restores the deleted
     `test_reply_envelope_failure_is_terminal_not_success` guarantee on the
     new PR A effect-sink path)."""
+    # Only forward ``extra`` when a thinking sub-envelope is present, so a
+    # no-reasoning reply keeps its exact prior sink call shape.
+    thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
+    extra_kwargs = {"extra": thinking_extra} if thinking_extra else {}
     envelope = payload.get("envelope")
     if isinstance(envelope, dict):
         store = core_store.get_store(user_id)
@@ -1710,6 +1714,7 @@ def _sink_reply(user_id: str, payload: dict) -> None:
             store,
             envelope,
             reply_through_seq=int(payload.get("reply_through_seq") or 0),
+            **extra_kwargs,
         )
         return
 
@@ -1718,7 +1723,9 @@ def _sink_reply(user_id: str, payload: dict) -> None:
         return  # replay after a crash between sink-write and status=applied -> no-op
     try:
         store = core_store.get_store(user_id)
-        row = v2_worker._write_encrypted_reply(store, str(payload.get("text") or ""))
+        row = v2_worker._write_encrypted_reply(
+            store, str(payload.get("text") or ""), **extra_kwargs
+        )
         if row is None:
             raise RuntimeError("reply envelope build failed")
     except Exception:
@@ -1741,7 +1748,9 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
     if not isinstance(envelope, dict):
         raise RuntimeError("transactional reply requires encrypted envelope")
     store = core_store.get_store(user_id)
-    msg = store._build_chat_message("openclaw", "model_api", envelope)
+    thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
+    build_kwargs = {"extra": thinking_extra} if thinking_extra else {}
+    msg = store._build_chat_message("openclaw", "model_api", envelope, **build_kwargs)
     msg_id = str(msg["id"])
     seq, inserted, finish_db_post_commit = db.chat_append_effect_with_cursor(
         user_id,

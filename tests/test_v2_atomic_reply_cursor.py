@@ -687,6 +687,86 @@ def test_pending_final_reply_recovers_before_any_new_provider_call(monkeypatch):
     assert effect_status == "applied"
 
 
+def test_final_reply_effect_surfaces_sealed_thinking(monkeypatch):
+    """A reply effect whose payload carries a sealed ``thinking`` sub-envelope
+    lands its provider chain-of-thought on the same chat row (thinking_body_ct +
+    thinking_kind), through the real production seq-native reply sink."""
+    uid = "u_atomic_reply_thinking"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    db.chat_append_strict(
+        uid, "user-message", 100.0,
+        {"id": "user-message", "role": "user", "ts": 100.0,
+         "body_ct": "u", "nonce": "n", "K_user": "k", "K_enclave": "e"},
+        5000,
+    )
+    input_seq = db.chat_messages_after_seq(uid, 0, limit=None)[0]["seq"]
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("thinking-worker")
+    generation = db.get_runtime_generation(uid)
+    effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="reply",
+        ordinal=0,
+        expected_generation=generation,
+        payload={
+            "envelope": _envelope("b" * 32, body="reply-ciphertext"),
+            "reply_through_seq": input_seq,
+            "thinking": {
+                "envelope": _envelope("c" * 32, body="thinking-ciphertext"),
+                "metadata": {
+                    "thinking_kind": "provider_reasoning",
+                    "thinking_source": "v2.deepseek",
+                    "thinking_model": "deepseek-v4-pro",
+                    "thinking_native": True,
+                },
+            },
+            effect_outbox.FINAL_REPLY_FENCE_KEY: {
+                "claimed_by": "thinking-worker",
+                "input_generation": 0,
+                "through_seq": input_seq,
+            },
+        },
+    )
+
+    async def _provider(*args, **kwargs):
+        raise AssertionError("recovery must drain the pending reply before model work")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+
+    def _read_after_seq(_uid: str, after_seq: int):
+        if after_seq >= input_seq:
+            return []
+        return [{"id": "user-message", "seq": input_seq, "ts": 100.0,
+                 "role": "user", "content": "hello"}]
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        read_messages_after_seq=_read_after_seq,
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_TEST_PROVIDER_CONFIG, api_key=None, runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    store = core_store.get_store(uid)
+    store.reload()
+    replies = [m for m in store.chat_messages if m.get("role") == "openclaw"]
+    assert len(replies) == 1
+    reply = replies[0]
+    assert reply["body_ct"] == "reply-ciphertext"
+    assert reply.get("thinking_body_ct") == "thinking-ciphertext"
+    assert reply.get("thinking_kind") == "provider_reasoning"
+    assert reply.get("thinking_model") == "deepseek-v4-pro"
+    assert reply.get("thinking_native") is True
+
+
 @pytest.mark.parametrize("advance_cursor_after_snapshot", [False, True])
 def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
     monkeypatch,
