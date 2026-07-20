@@ -3149,7 +3149,6 @@ def recent_chat_operational_health(
                 "  SELECT id,status FROM agent_jobs "
                 "  WHERE lane='chat' "
                 "    AND created_at >= now() - make_interval(hours => %s) "
-                "    AND trajectory_purged_at IS NULL "
                 "  ORDER BY id DESC LIMIT %s"
                 "), classified AS ("
                 "  SELECT job.id,"
@@ -4375,77 +4374,6 @@ def finish_sandbox_acquisition(
             return cur.rowcount == 1
 
 
-def purge_expired_trajectories(*, retention_days: int, limit: int = 100) -> int:
-    """Purge one bounded batch of expired, terminal trajectory content.
-
-    ``agent_jobs`` and ``v2_turn_metrics`` are deliberately preserved. The
-    content-lifecycle tombstone advances before review/stream ciphertext is
-    deleted, in the same transaction, so a delayed trajectory callback cannot
-    recreate content after the retention boundary. Retention is a hard content
-    boundary: pending/running offline reviews are cancelled and removed rather
-    than extending ciphertext lifetime indefinitely.
-    """
-    if type(retention_days) is not int or not 1 <= retention_days <= 3650:
-        raise ValueError("trajectory retention_days must be 1..3650")
-    if type(limit) is not int or not 1 <= limit <= 1000:
-        raise ValueError("trajectory retention limit must be 1..1000")
-    with _pool().connection() as conn:
-        with conn.transaction():
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    "WITH candidates AS ("
-                    " SELECT job.id FROM agent_jobs AS job "
-                    " WHERE job.status IN "
-                    " ('completed','failed','expired','superseded') "
-                    " AND job.finished_at IS NOT NULL "
-                    " AND job.finished_at < clock_timestamp() "
-                    "   - make_interval(days => %s) "
-                    " AND job.trajectory_purged_at IS NULL "
-                    " ORDER BY job.finished_at,job.id LIMIT %s "
-                    " FOR UPDATE OF job SKIP LOCKED"
-                    ") UPDATE agent_jobs AS job SET "
-                    " trajectory_purged_at=clock_timestamp() "
-                    "FROM candidates WHERE job.id=candidates.id "
-                    "RETURNING job.id",
-                    (retention_days, limit),
-                )
-                job_ids = [int(row["id"]) for row in cur.fetchall()]
-                if not job_ids:
-                    return 0
-
-                # A running review owns a separate low-priority runner job.
-                # Retention wins over analysis: fence that runner before the
-                # review/stream rows disappear so it cannot later commit an
-                # analysis of content whose TTL has expired. Pending reviews
-                # have no claimed runner and are simply removed below.
-                cur.execute(
-                    "UPDATE agent_jobs AS runner SET status='superseded',"
-                    "finished_at=clock_timestamp(),"
-                    "last_error='trajectory_retention_expired' "
-                    "FROM v2_trajectory_reviews AS review "
-                    "WHERE review.source_job_id=ANY(%s::bigint[]) "
-                    "AND review.claimed_by_job_id=runner.id "
-                    "AND runner.lane='trajectory_review' "
-                    "AND runner.status IN ('pending','claimed','running')",
-                    (job_ids,),
-                )
-
-                # Reviews may hold an encrypted model response in addition to
-                # stream events. Delete them first, then let deletion of each
-                # stream cascade its immutable event rows.
-                cur.execute(
-                    "DELETE FROM v2_trajectory_reviews "
-                    "WHERE source_job_id=ANY(%s::bigint[])",
-                    (job_ids,),
-                )
-                cur.execute(
-                    "DELETE FROM v2_trajectory_streams "
-                    "WHERE job_id=ANY(%s::bigint[])",
-                    (job_ids,),
-                )
-                return len(job_ids)
-
-
 def append_trajectory_events_batch(
     job_id: int | str,
     user_id: str,
@@ -4454,11 +4382,11 @@ def append_trajectory_events_batch(
 ) -> list[int]:
     """Atomically append encrypted event rows and return their immutable indices.
 
-    A shared source-job lock serializes the first append with retention GC;
-    stream-row locking serializes concurrent callbacks. Repeating idempotency
-    keys returns the existing indices and never rewrites ciphertext. The batch
-    form lets one oversized logical trajectory event store every encrypted
-    chunk under one transaction and one stream-frontier advance.
+    Stream-row locking serializes concurrent callbacks without locking the
+    source ``agent_jobs`` row. Repeating idempotency keys returns the existing
+    indices and never rewrites ciphertext. The batch form lets one oversized
+    logical trajectory event store every encrypted chunk under one transaction
+    and one stream-frontier advance.
     """
     if not isinstance(events, list) or not 1 <= len(events) <= 4096:
         raise ValueError("invalid trajectory event batch")
@@ -4493,12 +4421,10 @@ def append_trajectory_events_batch(
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
-                # Only events that linearize before an explicit chat clear may
-                # be appended. The shared chat fence lets clear wait for an
-                # already-started append; the generation witness rejects a
-                # worker resuming afterwards. FOR SHARE follows the global
-                # job->stream lock order and prevents retention GC from placing
-                # its tombstone between this check and stream creation.
+                # Capture is retained across an explicit chat clear, but only
+                # events that linearize before that clear may be appended. The
+                # shared fence lets clear wait for an already-started append;
+                # the generation witness rejects a worker resuming afterwards.
                 db._lock_chat_user_fence_on_cursor(cur, str(user_id))
                 cur.execute(
                     "SELECT 1 FROM agent_jobs AS job "
@@ -4507,9 +4433,7 @@ def append_trajectory_events_batch(
                     "WHERE job.id=%s AND job.user_id=%s "
                     "AND state.hosted_runtime_state='v2' "
                     "AND job.expected_runtime_generation="
-                    "state.runtime_generation "
-                    "AND job.trajectory_purged_at IS NULL "
-                    "FOR SHARE OF job",
+                    "state.runtime_generation",
                     (job_id, str(user_id)),
                 )
                 if cur.fetchone() is None:
@@ -4788,14 +4712,13 @@ def authorize_trajectory_inspection_success(
     event_count: int,
     expected_next_event_index: int,
 ) -> bool:
-    """Linearize a successful inspection against Chat Clear and retention GC.
+    """Linearize a successful inspection against concurrent stream appends.
 
     The caller may decrypt before this point, but plaintext must not be returned
     unless this transaction proves the exact source/frontier is still live and
-    commits the matching success phase. The chat-user fence serializes with
-    Chat Clear; the source-job and stream locks serialize with TTL GC and late
-    event appends. A false result is an authorization loss, never a soft audit
-    failure.
+    commits the matching success phase. The chat-user fence and stream lock
+    serialize with late event appends. A false result is an authorization loss,
+    never a soft audit failure.
     """
     if type(expected_next_event_index) is not int or expected_next_event_index < 1:
         raise ValueError("invalid trajectory inspection frontier")
@@ -4819,8 +4742,7 @@ def authorize_trajectory_inspection_success(
                     "SELECT stream.next_event_index FROM agent_jobs AS job "
                     "JOIN v2_trajectory_streams AS stream ON stream.job_id=job.id "
                     "WHERE job.id=%s AND job.user_id=%s "
-                    "AND stream.user_id=%s AND job.trajectory_purged_at IS NULL "
-                    "FOR SHARE OF job,stream",
+                    "AND stream.user_id=%s FOR SHARE OF stream",
                     (source_job_id, stable_user_id, stable_user_id),
                 )
                 frontier = cur.fetchone()

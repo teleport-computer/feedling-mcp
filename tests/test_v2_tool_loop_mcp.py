@@ -27,7 +27,7 @@ _TEST_PROVIDER_CONFIG = provider_client.ProviderConfig(
 
 
 async def _on_reply_collect(store):
-    async def _on_reply(text, *, final):
+    async def _on_reply(text, *, final, reasoning=""):
         store.append((text, final))
     return _on_reply
 
@@ -47,7 +47,7 @@ def _run(
 
     replies = []
 
-    async def _on_reply(text, *, final):
+    async def _on_reply(text, *, final, reasoning=""):
         replies.append((text, final))
 
     async def _fold():

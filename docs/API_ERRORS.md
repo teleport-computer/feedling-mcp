@@ -293,7 +293,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 > `{"error": "<slug>"}` 顶层字段值；这里列的是 `GET /v1/notices` 返回条目里
 > `error_class` 字段的取值，对应 `backend/notices/catalog.py` 的
 > `_CATALOG`，只用于通知中心展示话术，从不出现在 HTTP 错误响应体里。
-> `blame` 语义同 `docs/FRONTEND_ERROR_CONTRACT.md` §二三分类；`severity`
+> `blame` 语义同 `docs/FRONTEND_ERROR_CONTRACT.md` §二分类；`severity`
 > 取值 `error`/`warning`，决定通知中心 UI 展示优先级（`warning` 语气弱化，
 > 不打扰用户）。「状态码」列在本节恒为 `—`（notice 不走 HTTP 状态码，此列
 > 仅为复用上面表格的行格式/守卫测试）。
@@ -318,3 +318,5 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `runner_spawn_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 拉起 per-user 子进程失败 |
 | `runner_key_decrypt_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 为 per-user 子进程解密 provider key 失败 |
 | `runner_degraded` | — | system | warning | **历史兼容，不再产生**：旧 resident 子进程 runtime-token 刷新失败 |
+| `resident_consumer_stale` | — | user_environment | warning | chat：自托管 resident consumer 仍在 poll，但 commit 缺失/不匹配，或 resident-only 蒸馏任务迟迟没被 claim；notice 可带 `copyable_prompt` |
+| `resident_never_claimed` | — | user_environment | error | genesis：resident-only 入住/记忆蒸馏 job 超过 reaper 阈值仍无人 claim，已失败 |

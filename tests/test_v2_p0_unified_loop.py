@@ -514,7 +514,7 @@ def test_p0_four_providers_two_reads_dispatch_and_reply_by_call_id(monkeypatch, 
 
     on_reply_calls = []
 
-    async def _on_reply(text, *, final):
+    async def _on_reply(text, *, final, reasoning=""):
         on_reply_calls.append((text, final))
 
     async def _fold_new_messages():

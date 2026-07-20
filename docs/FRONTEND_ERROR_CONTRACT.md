@@ -46,13 +46,16 @@
 | `blame` | 归责方向（下表） | 决定文案能不能给行动指引 |
 | `detail` | 上游原始报错/调试信息（已截断） | 默认折叠，「详情」展开；不要当主文案 |
 
-**blame 三分类——本地化文案必须遵守的纪律**：
+**blame 分类——本地化文案必须遵守的纪律**：
 
 | blame | 含义 | 文案方向 | 禁止 |
 |---|---|---|---|
 | `user_provider` | 用户自己的 API 服务问题（额度/key/模型名） | 给明确行动指引：「充值」「重新保存 Key」 | — |
 | `provider_transient` | 上游临时问题（限流/5xx/超时） | 「稍等会自动恢复」 | 让用户改配置 |
+| `user_environment` | 用户自己的自托管运行环境问题（VPS resident consumer 过旧/离线/未接任务） | 给明确行动指引：「更新并重启 resident consumer」「把维护提示发给 agent」 | 说成模型服务商问题或 Feedling 后端故障 |
 | `system` | 我们的问题 | 「系统出了点问题，我们会尽快处理」 | **绝不能**引导用户充值/改 key（有用户白折腾的真实案例） |
+
+客户端必须把未知 `blame` 当作默认/`system` 桶处理，不得因为 enum 不认识而丢弃整条错误或通知；主展示仍以 `error_class`/`user_text` 为准。
 
 ---
 
@@ -132,6 +135,7 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
       "severity":    "error",            // error=红/问题态, warning=黄/降级
       "user_text":   "入住蒸馏失败：你的 API 服务额度不足（第 3 次尝试）",
       "detail":      "403 … 预扣费额度失败 …",
+      "copyable_prompt": "可选：需要用户转发给 agent 的修复提示",
       "dedupe_key":  "genesis:job_ab12", // 同 key 始终只有一条
       "occurrences": 3,                  // 重复发生次数
       "first_ts":    1783300000.1,
@@ -172,6 +176,8 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 | `runner` | `runner_spawn_failed` / `runner_key_decrypt_failed` | AI 进程起不来（用户表现为「永远没回复」） | 设置页 |
 | `runner` | `runner_degraded`（warning） | AI 在跑但部分能力受损 | 设置页 |
 | `model_api` | `responses_unsupported`（warning，blame=user_provider） | openai_compatible 中转不支持 `/v1/responses`，codex 工具循环被桥接 mangle→记忆/工具静默不可靠（回合仍 rc=0，AI 嘴上说调工具却从不真调）。**setup 探测时发**，非回合失败时 | 设置页 |
+| `chat` | `resident_consumer_stale`（warning，blame=user_environment） | 自托管 resident consumer 仍在 poll，但 commit 缺失/不匹配，或 resident-only 蒸馏任务迟迟没被 claim。通知可带 `copyable_prompt`，同时可能有一条 `source=resident_maintenance` 的维护消息进入聊天 | 聊天/设置页 |
+| `genesis` | `resident_never_claimed`（error，blame=user_environment） | resident-only 入住/记忆蒸馏 job 超过 reaper 阈值仍无人 claim，已失败 | 蒸馏进度/重试页 |
 | `chat` | 上游类全套（§五的列表） | 对话回合失败（与 system 气泡同源双写） | 聊天 |
 
 ---

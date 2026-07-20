@@ -1538,7 +1538,7 @@ jobs:
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
-          FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '1' }}
+          FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1722,7 +1722,7 @@ jobs:
           FEEDLING_V2_MAX_WORKERS:       ${{ vars.PRE_FEEDLING_V2_MAX_WORKERS || '4' }}
           FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: ${{ vars.PRE_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0' }}
           FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: ${{ vars.PRE_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64' }}
-          FEEDLING_V2_CAPTURE_ENABLED:     ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '1' }}
+          FEEDLING_V2_CAPTURE_ENABLED:     ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
           FEEDLING_V2_DREAM_ENABLED:       ${{ vars.PRE_FEEDLING_V2_DREAM_ENABLED || '0' }}
           FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
           E2B_API_KEY:                   ${{ secrets.PRE_E2B_API_KEY || secrets.E2B_API_KEY }}

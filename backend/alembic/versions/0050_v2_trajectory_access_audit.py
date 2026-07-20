@@ -1,14 +1,14 @@
 """Update-immutable break-glass trajectory access audit.
 
 Revision ID: 0050_v2_trajectory_access_audit
-Revises: 0049_v2_trajectory_retention
+Revises: 0049_merge_test_pre_heads
 """
 
 from alembic import op
 
 
 revision = "0050_v2_trajectory_access_audit"
-down_revision = "0049_v2_trajectory_retention"
+down_revision = "0049_merge_test_pre_heads"
 branch_labels = None
 depends_on = None
 

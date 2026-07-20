@@ -195,16 +195,16 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0048_v2_turn_metrics_user_fk").down_revision == (
         "0047_model_route_context_window"
     )
-    assert script.get_revision("0049_v2_trajectory_retention").down_revision == (
-        "0048_v2_turn_metrics_user_fk"
-    )
     assert script.get_revision("0050_v2_trajectory_access_audit").down_revision == (
-        "0049_v2_trajectory_retention"
+        "0049_merge_test_pre_heads"
     )
     assert script.get_revision("0051_v2_capture_batches").down_revision == (
         "0050_v2_trajectory_access_audit"
     )
-    assert script.get_current_head() == "0051_v2_capture_batches"
+    assert script.get_revision("0052_chat_clear_archive").down_revision == (
+        "0051_v2_capture_batches"
+    )
+    assert script.get_current_head() == "0052_chat_clear_archive"
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():

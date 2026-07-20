@@ -2387,6 +2387,7 @@ def _make_task_batch_dispatcher(
                 _text: str,
                 *,
                 final: bool,
+                reasoning: str = "",
             ) -> None:
                 if not final:
                     raise RuntimeError("subagent reply tool is disabled")
@@ -2816,12 +2817,96 @@ class _PlatformEffectReservations:
                 prepared.ready.set()
 
 
-def _write_encrypted_reply(store, text: str) -> dict | None:
+_THINKING_MAX_CHARS = 20000
+
+
+def _sanitize_reasoning(text: str) -> str:
+    """Bound provider chain-of-thought before it is sealed into a thinking body.
+
+    Only length-caps and trims; IO stores and renders reasoning as-provided and
+    never manufactures it.  An empty result means "no reasoning to surface"."""
+    cleaned = str(text or "").strip()
+    if len(cleaned) > _THINKING_MAX_CHARS:
+        cleaned = cleaned[:_THINKING_MAX_CHARS]
+    return cleaned
+
+
+def _build_thinking_payload(
+    store, reasoning: str, *, effect_id: str, provider_config
+) -> dict | None:
+    """Seal provider reasoning into its own shared envelope + routing metadata.
+
+    Stored alongside a reply effect payload so the durable outbox holds only
+    ciphertext (same at-rest boundary as the reply body) and a retry of the same
+    deterministic effect re-addresses the same thinking row.  Returns ``None``
+    when there is no reasoning or the envelope cannot be built — surfacing
+    reasoning must never block or fail the reply itself."""
+    cleaned = _sanitize_reasoning(reasoning)
+    if not cleaned:
+        return None
+    item_id = hashlib.sha256(f"v2-thinking:{effect_id}".encode("utf-8")).hexdigest()[
+        :32
+    ]
+    envelope, _err = core_envelope._build_shared_envelope_for_store(
+        store, cleaned.encode("utf-8"), item_id=item_id
+    )
+    if envelope is None:
+        return None
+    return {
+        "envelope": envelope,
+        "metadata": {
+            "thinking_kind": "provider_reasoning",
+            "thinking_source": f"v2.{getattr(provider_config, 'provider', '') or ''}",
+            "thinking_model": str(getattr(provider_config, "model", "") or ""),
+            "thinking_native": True,
+        },
+    }
+
+
+def _thinking_extra(thinking: dict | None) -> dict:
+    """Convert a stored ``{envelope, metadata}`` thinking payload into the
+    ``extra`` fields ``append_chat`` / ``_build_chat_message`` allowlist as the
+    separately-sealed thinking sub-envelope (``thinking_*``).  Mirrors
+    ``chat.service._chat_thinking_extra_from_envelope`` (inlined to keep V2 core
+    free of a ``chat`` import)."""
+    if not isinstance(thinking, dict):
+        return {}
+    env = thinking.get("envelope")
+    if not isinstance(env, dict):
+        return {}
+    extra = {
+        "thinking_v": str(env.get("v", 1)),
+        "thinking_id": str(env.get("id") or ""),
+        "thinking_body_ct": str(env.get("body_ct") or ""),
+        "thinking_nonce": str(env.get("nonce") or ""),
+        "thinking_K_user": str(env.get("K_user") or ""),
+        "thinking_visibility": str(env.get("visibility") or "shared"),
+        "thinking_owner_user_id": str(env.get("owner_user_id") or ""),
+        "thinking_enclave_pk_fpr": str(env.get("enclave_pk_fpr") or ""),
+    }
+    if env.get("K_enclave"):
+        extra["thinking_K_enclave"] = str(env.get("K_enclave") or "")
+    extra = {k: v for k, v in extra.items() if str(v).strip()}
+    meta = thinking.get("metadata") or {}
+    for key in ("thinking_kind", "thinking_source", "thinking_model"):
+        val = str(meta.get(key) or "").strip()
+        if val:
+            extra[key] = val
+    if isinstance(meta.get("thinking_native"), bool):
+        extra["thinking_native"] = meta["thinking_native"]
+    return extra
+
+
+def _write_encrypted_reply(store, text: str, *, extra: dict | None = None) -> dict | None:
     """把 model-authored 回复封 shared 信封落**加密** chat_messages，并唤醒本地 chat waiter。
 
     照既有 model_api 线的写法：服务器只持有密文（E2E）。信封构建失败（如用户从未
     onboard 过加密身份）返回 None——调用方视为「无法投递」，不当作 no-filler 违规
-    （已经拿到了 model-authored 文本，只是没法安全落库；上层记 last_error 更诚实）。"""
+    （已经拿到了 model-authored 文本，只是没法安全落库；上层记 last_error 更诚实）。
+
+    ``extra`` carries the optional separately-sealed thinking sub-envelope
+    (``thinking_*``) so a provider-reasoning reply lands its chain-of-thought on
+    the same row."""
     env, err = core_envelope._build_shared_envelope_for_store(
         store, text.encode("utf-8")
     )
@@ -2830,7 +2915,11 @@ def _write_encrypted_reply(store, text: str) -> dict | None:
     # Strict persistence is required for a terminal V2 reply.  The legacy
     # append API swallows DB failures after mutating its in-process cache, which
     # could otherwise let this job complete with no durable reply.
-    row = store.append_chat("openclaw", "model_api", env, strict=True)
+    #
+    # Only pass ``extra`` when there is a thinking sub-envelope: the common
+    # no-reasoning reply keeps its exact prior append_chat call shape.
+    kwargs = {"extra": extra} if extra else {}
+    row = store.append_chat("openclaw", "model_api", env, strict=True, **kwargs)
     store.notify_chat_waiters()
     return row
 
@@ -2910,14 +2999,21 @@ def _write_encrypted_reply_effect(
     envelope: dict,
     *,
     reply_through_seq: int = 0,
+    extra: dict | None = None,
 ) -> dict:
-    """Naturally-idempotent sink for encrypted V2 reply effects."""
+    """Naturally-idempotent sink for encrypted V2 reply effects.
+
+    ``extra`` carries the optional separately-sealed thinking sub-envelope so a
+    provider-reasoning reply lands its chain-of-thought on the same row.  It is
+    only forwarded when present, so a no-reasoning reply keeps its prior shape."""
+    kwargs = {"extra": extra} if extra else {}
     row = store.append_chat(
         "openclaw",
         "model_api",
         envelope,
         strict=True,
         reply_through_seq=int(reply_through_seq),
+        **kwargs,
     )
     store.notify_chat_waiters()
     return row
@@ -4519,7 +4615,7 @@ async def _run_wake(
                 ),
             )
 
-        async def _on_reply(text: str, *, final: bool) -> None:
+        async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
             text = str(text or "").strip()
             if not text:
                 # Silence is a legitimate wake outcome — both mid-loop (an empty
@@ -4577,6 +4673,24 @@ async def _run_wake(
                     payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
                         "claimed_by": claimed_by,
                     }
+            # Surface provider chain-of-thought on the same effect (sealed into a
+            # separate thinking envelope), matching the chat lane. Only a final
+            # reply carries it; intermediate reply{} bubbles are agent-authored.
+            if final and reasoning:
+                thinking_effect_id = v2_effect_id.derive(
+                    job_id=job_id,
+                    effect_type=reply_effect_type,
+                    ordinal=ordinal_value,
+                )
+                thinking_payload = await asyncio.to_thread(
+                    _build_thinking_payload,
+                    store,
+                    reasoning,
+                    effect_id=thinking_effect_id,
+                    provider_config=provider_config,
+                )
+                if thinking_payload:
+                    payload["thinking"] = thinking_payload
             enqueued_id = await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,
@@ -6577,7 +6691,7 @@ async def process_job(
 
         final_job_completed_atomically = False
 
-        async def _on_reply(text: str, *, final: bool) -> None:
+        async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
             nonlocal final_job_completed_atomically
             text = str(text or "").strip()
             if final and not text:
@@ -6631,6 +6745,21 @@ async def process_job(
                     payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
                         "claimed_by": claimed_by,
                     }
+            # Provider chain-of-thought rides the same effect as its final reply,
+            # sealed into a separate thinking envelope so the durable outbox holds
+            # only ciphertext and a retry re-addresses the same thinking row. Only
+            # final replies carry it — intermediate reply{} bubbles are
+            # agent-authored text, not provider reasoning.
+            if final and reasoning:
+                thinking_payload = await asyncio.to_thread(
+                    _build_thinking_payload,
+                    store,
+                    reasoning,
+                    effect_id=effect_id,
+                    provider_config=provider_config,
+                )
+                if thinking_payload:
+                    payload["thinking"] = thinking_payload
             enqueued_id = await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,

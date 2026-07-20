@@ -54,7 +54,7 @@ class _RecordingReply:
     def __init__(self):
         self.calls = []  # list of (text, final)
 
-    async def __call__(self, text, *, final):
+    async def __call__(self, text, *, final, reasoning=""):
         self.calls.append((text, final))
 
 
@@ -148,7 +148,7 @@ def test_superseded_final_folds_new_input_and_retries_without_stale_transcript(
             self.attempts = []
             self.visible = []
 
-        async def __call__(self, text, *, final):
+        async def __call__(self, text, *, final, reasoning=""):
             self.attempts.append((text, final))
             if text == "stale answer to A":
                 raise tool_loop.FinalReplySuperseded()
@@ -192,7 +192,7 @@ def test_superseded_final_at_budget_returns_clean_handoff_outcome(monkeypatch):
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
 
-    async def reject_final(_text, *, final):
+    async def reject_final(_text, *, final, reasoning=""):
         assert final is True
         raise tool_loop.FinalReplySuperseded()
 
@@ -293,7 +293,7 @@ def test_intermediate_reply_remains_visible_when_later_final_is_superseded(
 
     visible = []
 
-    async def publish(text, *, final):
+    async def publish(text, *, final, reasoning=""):
         if final and text == "stale final":
             raise tool_loop.FinalReplySuperseded()
         visible.append((text, final))

@@ -153,9 +153,6 @@ async def lifespan(app):
 
     reaper_stop = asyncio.Event()
     cleanup_settings = v2_reaper.cleanup_settings_from_env()
-    trajectory_retention_settings = (
-        v2_reaper.trajectory_retention_settings_from_env()
-    )
     reaper_task = asyncio.create_task(
         v2_reaper.run_loop(
             reaper_stop,
@@ -164,12 +161,6 @@ async def lifespan(app):
     )
     cleanup_task = asyncio.create_task(
         v2_reaper.run_cleanup_loop(reaper_stop, **cleanup_settings)
-    )
-    trajectory_cleanup_task = asyncio.create_task(
-        v2_reaper.run_trajectory_cleanup_loop(
-            reaper_stop,
-            **trajectory_retention_settings,
-        )
     )
 
     print(
@@ -187,6 +178,6 @@ async def lifespan(app):
         registry.wake_all()
         core_store.set_async_wake_hook(None)
         reaper_stop.set()
-        await asyncio.gather(reaper_task, cleanup_task, trajectory_cleanup_task)
+        await asyncio.gather(reaper_task, cleanup_task)
         await app.state.internal_http.aclose()
         await app.state.provider_http.aclose()

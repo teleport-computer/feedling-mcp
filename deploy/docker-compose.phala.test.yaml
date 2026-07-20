@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:ab2ab0f
+    image: ghcr.io/teleport-computer/feedling:6b504c9
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -146,7 +146,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:ab2ab0f
+    image: ghcr.io/teleport-computer/feedling:6b504c9
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -257,11 +257,6 @@ services:
       # Hosted model-API accounts have one runtime: pooled Runtime V2.
       FEEDLING_HOSTED_RUNTIME_POLICY: "v2_only"
       FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-0}"
-      # Managed trajectory retention is a measured-compose invariant. Keep
-      # these literals identical on the API and every pooled runner.
-      FEEDLING_V2_TRAJECTORY_RETENTION_DAYS: "7"
-      FEEDLING_V2_TRAJECTORY_GC_INTERVAL_SEC: "3600"
-      FEEDLING_V2_TRAJECTORY_GC_BATCH: "100"
       # TEST-ONLY: genesis v2 (foreground-fast onboarding). Greet on 3-5 core +
       # identity baseline, push the heavy reduce (the ~37% prod failure surface)
       # to the background. Prod compose deliberately omits this (keeps the v1

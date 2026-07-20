@@ -700,7 +700,10 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 """
                 SELECT user_id,
                        COUNT(*)::int AS total,
-                       COUNT(*) FILTER (WHERE doc->>'role' = 'user')::int AS user_messages,
+                       COUNT(*) FILTER (
+                         WHERE doc->>'role' = 'user'
+                           AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
+                       )::int AS user_messages,
                        COUNT(*) FILTER (WHERE doc->>'role' IN ('agent', 'openclaw'))::int AS agent_messages,
                        COUNT(*) FILTER (WHERE doc->>'content_type' = 'image')::int AS image_messages,
                        COUNT(*) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive')::int AS proactive_messages,
@@ -710,7 +713,10 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                        MIN(ts) AS first_ts,
                        MAX(ts) AS last_ts,
                        MAX(ts) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive') AS proactive_last_ts,
-                       MAX(ts) FILTER (WHERE doc->>'role' = 'user') AS last_user_ts,
+                       MAX(ts) FILTER (
+                         WHERE doc->>'role' = 'user'
+                           AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
+                       ) AS last_user_ts,
                        MAX(ts) FILTER (WHERE doc->>'role' IN ('agent', 'openclaw')) AS last_agent_ts
                 FROM chat_messages
                 WHERE user_id = ANY(%s)
@@ -1033,7 +1039,8 @@ def _dau_row(row) -> dict:
         "foreground_sec": int(row[10] or 0),
         "session_count": int(row[11] or 0),
         "session_dau": int(row[12] or 0),
-        "frozen": bool(row[13]),
+        "median_user_sec": float(row[13] or 0),
+        "frozen": bool(row[14]),
     }
 
 
@@ -1059,7 +1066,7 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                     SELECT user_id, ts, 'chat' AS source
                     FROM chat_messages
                     WHERE doc->>'role' = 'user'
-                      AND COALESCE(doc->>'source', '') <> 'verify_ping'
+                      AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
                       AND (%s = 0 OR ts >= %s)
 
                     UNION ALL
@@ -1109,20 +1116,44 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                     FROM usage_events
                     GROUP BY day
                 ),
+                -- Per-user daily foreground total, then the median across users:
+                -- the "typical user" counterpart to foreground_sec/session_dau
+                -- (a mean that a few heavy users skew high). Frozen snapshots
+                -- store only aggregates, so this only populates for live days
+                -- and days frozen after this column shipped.
+                usage_per_user AS (
+                    SELECT
+                        to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                        user_id,
+                        SUM(duration_sec) AS user_sec
+                    FROM usage_events
+                    GROUP BY day, user_id
+                ),
+                usage_median AS (
+                    SELECT day,
+                           COALESCE(
+                             percentile_cont(0.5) WITHIN GROUP (ORDER BY user_sec), 0
+                           )::double precision AS median_user_sec
+                    FROM usage_per_user
+                    GROUP BY day
+                ),
                 live AS (
                     SELECT d.day, d.dau, d.chat_dau, d.tracking_dau, d.active_events,
                            d.user_messages, d.tracking_events, d.first_ts, d.last_ts,
                            COALESCE(u.avg_session_sec, 0)::double precision AS avg_session_sec,
                            COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
                            COALESCE(u.session_count, 0)::int AS session_count,
-                           COALESCE(u.session_dau, 0)::int AS session_dau
+                           COALESCE(u.session_dau, 0)::int AS session_dau,
+                           COALESCE(m.median_user_sec, 0)::double precision AS median_user_sec
                     FROM daily d
                     LEFT JOIN usage_daily u ON u.day = d.day
+                    LEFT JOIN usage_median m ON m.day = d.day
                 ),
                 frozen_rows AS (
                     SELECT day, dau, chat_dau, tracking_dau, active_events,
                            user_messages, tracking_events, first_ts, last_ts,
-                           avg_session_sec, foreground_sec, session_count, session_dau
+                           avg_session_sec, foreground_sec, session_count, session_dau,
+                           median_user_sec
                     FROM dau_daily_snapshot
                     WHERE active_events > 0
                       AND (%s = 0 OR first_ts >= %s)
@@ -1137,12 +1168,12 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                 SELECT day, dau, chat_dau, tracking_dau, active_events,
                        user_messages, tracking_events, first_ts, last_ts,
                        avg_session_sec, foreground_sec, session_count, session_dau,
-                       frozen
+                       median_user_sec, frozen
                 FROM merged
                 ORDER BY day DESC
                 LIMIT %s
                 """,
-                (since, since, since, since, since, since, tz, tz, since, since, day_limit),
+                (since, since, since, since, since, since, tz, tz, tz, since, since, day_limit),
             ).fetchall()
         return [_dau_row(row) for row in rows]
     except Exception as e:
@@ -1160,7 +1191,7 @@ def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
             SELECT user_id, ts, 'chat' AS source
             FROM chat_messages
             WHERE doc->>'role' = 'user'
-              AND COALESCE(doc->>'source', '') <> 'verify_ping'
+              AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
               AND ts >= %s AND ts < %s
 
             UNION ALL
@@ -1197,7 +1228,15 @@ def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
             COALESCE((SELECT AVG(duration_sec) FROM usage_events), 0)::double precision,
             COALESCE((SELECT SUM(duration_sec) FROM usage_events), 0)::bigint,
             (SELECT COUNT(*)::int FROM usage_events),
-            (SELECT COUNT(DISTINCT user_id)::int FROM usage_events)
+            (SELECT COUNT(DISTINCT user_id)::int FROM usage_events),
+            COALESCE((
+                SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY user_sec)
+                FROM (
+                    SELECT SUM(duration_sec) AS user_sec
+                    FROM usage_events
+                    GROUP BY user_id
+                ) per_user
+            ), 0)::double precision
         FROM active
         """,
         (start, end, start, end, start, end),
@@ -1216,6 +1255,7 @@ def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
         "foreground_sec": int(row[9] or 0),
         "session_count": int(row[10] or 0),
         "session_dau": int(row[11] or 0),
+        "median_user_sec": float(row[12] or 0),
     }
 
 
@@ -1256,9 +1296,9 @@ def freeze_completed_dau_days(*, now_epoch: float | None = None,
                             day, dau, chat_dau, tracking_dau, active_events,
                             user_messages, tracking_events, session_dau,
                             avg_session_sec, foreground_sec, session_count,
-                            first_ts, last_ts
+                            first_ts, last_ts, median_user_sec
                         ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (day) DO NOTHING
                         RETURNING day
@@ -1269,7 +1309,7 @@ def freeze_completed_dau_days(*, now_epoch: float | None = None,
                             snap["user_messages"], snap["tracking_events"],
                             snap["session_dau"], snap["avg_session_sec"],
                             snap["foreground_sec"], snap["session_count"],
-                            snap["first_ts"], snap["last_ts"],
+                            snap["first_ts"], snap["last_ts"], snap["median_user_sec"],
                         ),
                     ).fetchone()
                     if saved:
@@ -1296,6 +1336,304 @@ def admin_dau_snapshot_bounds() -> dict:
     except Exception as e:
         log.error("[db] admin_dau_snapshot_bounds failed: %s", e)
         return {"first_day": "", "last_day": "", "days": 0}
+
+
+# --- User growth (new + cumulative signups) ------------------------------- #
+# ``users.created_at`` is a naive server-local ISO string; cast ::timestamptz
+# (session tz) then bucket into Beijing days, matching the onboarding funnel's
+# EXTRACT(EPOCH FROM created_at::timestamptz) contract. Frozen days come from
+# user_growth_daily_snapshot (deletion-proof); pre-boundary days are computed
+# live and understate because deleted accounts drop out of ``users``.
+_CREATED_AT_ISO = "created_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'"
+
+
+def admin_data_track_growth(*, days: int = 60, tz: str = "Asia/Shanghai") -> list[dict]:
+    """Per-Beijing-day new signups + running cumulative, newest last-limited.
+
+    Cumulative is a running sum over the FULL series so the returned tail carries
+    a correct total; only the last ``days`` rows are returned for display.
+    """
+    day_limit = max(1, min(int(days or 60), 366))
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                f"""
+                WITH reg AS (
+                    SELECT to_char(timezone(%s, created_at::timestamptz), 'YYYY-MM-DD') AS day
+                    FROM users
+                    WHERE {_CREATED_AT_ISO}
+                ),
+                live AS (
+                    SELECT day, COUNT(*)::int AS new_users FROM reg GROUP BY day
+                ),
+                frozen_rows AS (
+                    SELECT day, new_users FROM user_growth_daily_snapshot
+                ),
+                merged AS (
+                    SELECT day, new_users, TRUE AS frozen FROM frozen_rows
+                    UNION ALL
+                    SELECT l.day, l.new_users, FALSE AS frozen
+                    FROM live l
+                    WHERE NOT EXISTS (SELECT 1 FROM frozen_rows f WHERE f.day = l.day)
+                )
+                SELECT day, new_users, frozen FROM merged ORDER BY day ASC
+                """,
+                (tz,),
+            ).fetchall()
+        cumulative = 0
+        out: list[dict] = []
+        for day, new_users, frozen in rows:
+            cumulative += int(new_users or 0)
+            out.append({
+                "day": day,
+                "new_users": int(new_users or 0),
+                "cumulative": cumulative,
+                "frozen": bool(frozen),
+            })
+        return out[-day_limit:]
+    except Exception as e:
+        log.error("[db] admin_data_track_growth failed: %s", e)
+        return []
+
+
+def _completed_growth_row(conn, *, day: date, tz: str) -> dict:
+    zone = ZoneInfo(tz)
+    start = datetime.combine(day, datetime.min.time(), tzinfo=zone).timestamp()
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=zone).timestamp()
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*)::int
+        FROM users
+        WHERE {_CREATED_AT_ISO}
+          AND EXTRACT(EPOCH FROM created_at::timestamptz) >= %s
+          AND EXTRACT(EPOCH FROM created_at::timestamptz) < %s
+        """,
+        (start, end),
+    ).fetchone()
+    return {"day": day.isoformat(), "new_users": int(row[0] or 0)}
+
+
+def freeze_completed_growth_days(*, now_epoch: float | None = None,
+                                 tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze immutable new-signup counts for completed Beijing days.
+
+    Mirrors ``freeze_completed_dau_days``: the first run establishes the rollout
+    boundary at yesterday; later runs fill the gap; ``ON CONFLICT DO NOTHING``
+    keeps it write-once so account deletion can never change a frozen day.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = datetime.fromtimestamp(float(now_epoch), zone) if now_epoch is not None else datetime.now(zone)
+        last_completed = now.date() - timedelta(days=1)
+        with get_pool().connection() as conn:
+            row = conn.execute("SELECT MIN(day) FROM user_growth_daily_snapshot").fetchone()
+            first_day = date.fromisoformat(row[0]) if row and row[0] else last_completed
+            if first_day > last_completed:
+                return []
+            existing = {
+                date.fromisoformat(r[0])
+                for r in conn.execute(
+                    "SELECT day FROM user_growth_daily_snapshot WHERE day >= %s AND day <= %s",
+                    (first_day.isoformat(), last_completed.isoformat()),
+                ).fetchall()
+            }
+            inserted: list[str] = []
+            cursor = first_day
+            while cursor <= last_completed:
+                if cursor not in existing:
+                    snap = _completed_growth_row(conn, day=cursor, tz=tz)
+                    saved = conn.execute(
+                        """
+                        INSERT INTO user_growth_daily_snapshot (day, new_users)
+                        VALUES (%s, %s)
+                        ON CONFLICT (day) DO NOTHING
+                        RETURNING day
+                        """,
+                        (snap["day"], snap["new_users"]),
+                    ).fetchone()
+                    if saved:
+                        inserted.append(saved[0])
+                cursor += timedelta(days=1)
+        return inserted
+    except Exception as e:
+        log.error("[db] freeze_completed_growth_days failed: %s", e)
+        return []
+
+
+def admin_growth_snapshot_bounds() -> dict:
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT MIN(day), MAX(day), COUNT(*) FROM user_growth_daily_snapshot"
+            ).fetchone()
+        return {"first_day": row[0] or "", "last_day": row[1] or "", "days": int(row[2] or 0)}
+    except Exception as e:
+        log.error("[db] admin_growth_snapshot_bounds failed: %s", e)
+        return {"first_day": "", "last_day": "", "days": 0}
+
+
+# --- Weekly cohort retention ---------------------------------------------- #
+# Cohort = the Beijing week a user registered in (Monday date). period_index k =
+# weeks since registration (0 = the signup week itself). A cell (W,k) freezes
+# once week k has fully ended; active = the same user-initiated activity DAU
+# uses (user chat message OR tracking event). cohort_size is pinned to the value
+# at the cohort's first frozen cell so deletion can't shrink the denominator and
+# fake-inflate retention.
+
+def _retention_cells(conn, tz: str) -> tuple[dict, dict]:
+    """(cohort_size_by_week, active_count_by_(week,period)) computed live now."""
+    size_rows = conn.execute(
+        f"""
+        SELECT to_char((date_trunc('week', timezone(%s, created_at::timestamptz)))::date,
+                       'YYYY-MM-DD') AS cohort_week,
+               COUNT(*)::int AS cohort_size
+        FROM users
+        WHERE {_CREATED_AT_ISO}
+        GROUP BY cohort_week
+        """,
+        (tz,),
+    ).fetchall()
+    sizes = {r[0]: int(r[1] or 0) for r in size_rows}
+
+    cell_rows = conn.execute(
+        f"""
+        WITH reg AS (
+            SELECT user_id,
+                   (date_trunc('week', timezone(%s, created_at::timestamptz)))::date AS cohort_monday
+            FROM users
+            WHERE {_CREATED_AT_ISO}
+        ),
+        act AS (
+            SELECT DISTINCT r.user_id, r.cohort_monday,
+                   (date_trunc('week', timezone(%s, to_timestamp(a.ts))))::date AS act_monday
+            FROM reg r
+            JOIN (
+                SELECT user_id, ts FROM chat_messages
+                  WHERE doc->>'role' = 'user'
+                    AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
+                UNION ALL
+                SELECT user_id, ts FROM user_logs
+                  WHERE stream = 'tracking_events' AND ts IS NOT NULL
+            ) a ON a.user_id = r.user_id
+        )
+        SELECT to_char(cohort_monday, 'YYYY-MM-DD') AS cohort_week,
+               ((act_monday - cohort_monday) / 7)::int AS period_index,
+               COUNT(DISTINCT user_id)::int AS active_count
+        FROM act
+        WHERE act_monday >= cohort_monday
+        GROUP BY cohort_monday, period_index
+        """,
+        (tz, tz),
+    ).fetchall()
+    cells = {(r[0], int(r[1])): int(r[2] or 0) for r in cell_rows}
+    return sizes, cells
+
+
+def admin_data_track_retention(*, tz: str = "Asia/Shanghai") -> dict:
+    """Weekly cohort retention matrix. Frozen cells win (deletion-proof); the
+    current in-progress period falls back to live. Returns
+    {cohorts: [{cohort_week, cohort_size, cells: {k: {active, pct, frozen}}}],
+     max_period}."""
+    try:
+        with get_pool().connection() as conn:
+            frozen = conn.execute(
+                "SELECT cohort_week, period_index, cohort_size, active_count "
+                "FROM retention_cohort_snapshot"
+            ).fetchall()
+            sizes, live_cells = _retention_cells(conn, tz)
+
+        frozen_cells = {(r[0], int(r[1])): (int(r[2] or 0), int(r[3] or 0)) for r in frozen}
+        # Denominator per cohort: prefer a frozen anchor (pinned size), else live.
+        anchor: dict[str, int] = {}
+        for (week, _period), (size, _active) in frozen_cells.items():
+            anchor.setdefault(week, size)
+        weeks = sorted(set(sizes) | {w for (w, _p) in frozen_cells})
+
+        cohorts = []
+        max_period = 0
+        for week in weeks:
+            size = anchor.get(week, sizes.get(week, 0))
+            cells: dict[int, dict] = {}
+            periods = {p for (w, p) in frozen_cells if w == week} | {
+                p for (w, p) in live_cells if w == week
+            }
+            for p in periods:
+                if (week, p) in frozen_cells:
+                    active = frozen_cells[(week, p)][1]
+                    is_frozen = True
+                else:
+                    active = live_cells.get((week, p), 0)
+                    is_frozen = False
+                pct = round(100.0 * active / size, 1) if size else 0.0
+                cells[p] = {"active": active, "pct": pct, "frozen": is_frozen}
+                max_period = max(max_period, p)
+            cohorts.append({"cohort_week": week, "cohort_size": size, "cells": cells})
+        return {"cohorts": cohorts, "max_period": max_period}
+    except Exception as e:
+        log.error("[db] admin_data_track_retention failed: %s", e)
+        return {"cohorts": [], "max_period": 0}
+
+
+def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
+                                       tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze (cohort_week, period) cells whose week has fully ended.
+
+    cohort_size is pinned to the cohort's earliest already-frozen cell so every
+    period shares one deletion-proof denominator. Returns the "week#period" keys
+    inserted. Best-effort per the scheduler contract.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = datetime.fromtimestamp(float(now_epoch), zone) if now_epoch is not None else datetime.now(zone)
+        now_date = now.date()
+        inserted: list[str] = []
+        with get_pool().connection() as conn:
+            sizes, live_cells = _retention_cells(conn, tz)
+            existing = {
+                (r[0], int(r[1])): int(r[2] or 0)
+                for r in conn.execute(
+                    "SELECT cohort_week, period_index, cohort_size FROM retention_cohort_snapshot"
+                ).fetchall()
+            }
+            # Pin denominator per cohort to the earliest frozen cell if any.
+            anchor: dict[str, int] = {}
+            for (week, period) in sorted(existing, key=lambda k: k[1]):
+                anchor.setdefault(week, existing[(week, period)])
+
+            # Freeze cohorts that still have live users OR an existing anchor. The
+            # anchor branch is essential: once a cohort's W0 is frozen, its whole
+            # membership can delete and it drops out of `sizes` — without this it
+            # would never get later-period 0 cells, HIDING total churn (the exact
+            # opposite of the deletion-proofing goal). A cohort deleted before its
+            # first freeze is genuinely unrecoverable and stays absent.
+            for week in set(sizes) | set(anchor):
+                cohort_monday = date.fromisoformat(week)
+                # periods 0..K-1 are complete: week k ends at monday + (k+1)*7 days.
+                completed = (now_date - cohort_monday).days // 7
+                if completed <= 0:
+                    continue
+                size = anchor.get(week, sizes.get(week, 0))
+                for k in range(completed):
+                    if (week, k) in existing:
+                        continue
+                    active = live_cells.get((week, k), 0)
+                    saved = conn.execute(
+                        """
+                        INSERT INTO retention_cohort_snapshot
+                            (cohort_week, period_index, cohort_size, active_count)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (cohort_week, period_index) DO NOTHING
+                        RETURNING cohort_week
+                        """,
+                        (week, k, size, active),
+                    ).fetchone()
+                    if saved:
+                        inserted.append(f"{week}#{k}")
+                        anchor.setdefault(week, size)
+            return inserted
+    except Exception as e:
+        log.error("[db] freeze_completed_retention_cohorts failed: %s", e)
+        return []
 
 
 def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30,
@@ -1486,12 +1824,12 @@ def admin_events_overview() -> dict:
     rows = _run("reply", f"""
         {_EVENTS_ROUTES_CTE}, paired AS (
           SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
-            MAX(CASE WHEN c.doc->>'role' IN ('user','human') AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
+            MAX(CASE WHEN c.doc->>'role' IN ('user','human') AND COALESCE(c.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') THEN c.ts END)
               OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
           FROM chat_messages c
         )
         SELECT COALESCE(r.route,'resident') AS route,
-               (COUNT(*) FILTER (WHERE p.role IN ('user','human') AND p.src<>'verify_ping'))::int AS user_msgs,
+               (COUNT(*) FILTER (WHERE p.role IN ('user','human') AND p.src NOT IN ('verify_ping','resident_maintenance')))::int AS user_msgs,
                (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw')
                     AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')
                     AND p.last_user_ts IS NOT NULL))::int AS real_replies,
@@ -1603,12 +1941,12 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
         rows = _run(f"""
             {_EVENTS_ROUTES_CTE}, paired AS (
               SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
-                MAX(CASE WHEN c.doc->>'role' IN ('user','human') AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
+                MAX(CASE WHEN c.doc->>'role' IN ('user','human') AND COALESCE(c.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') THEN c.ts END)
                   OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
               FROM chat_messages c
             )
             SELECT p.user_id, COALESCE(r.route,'resident') AS route,
-                   (COUNT(*) FILTER (WHERE p.role IN ('user','human') AND p.src<>'verify_ping'))::int AS user_msgs,
+                   (COUNT(*) FILTER (WHERE p.role IN ('user','human') AND p.src NOT IN ('verify_ping','resident_maintenance')))::int AS user_msgs,
                    (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw') AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive') AND p.last_user_ts IS NOT NULL))::int AS real_replies,
                    (COUNT(*) FILTER (WHERE p.src='foreground_fallback'))::int AS fallback_replies,
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY
@@ -1866,6 +2204,48 @@ def patch_proactive_settings_strict(
                 persisted = dict(cur.fetchone()[0] or {})
     _mirror_proactive_settings_current(str(user_id))
     return persisted
+
+
+def set_blob_if_unchanged(user_id: str, kind: str, expected_doc, new_doc) -> bool:
+    """Compare-and-swap the (user_id, kind) blob: write ``new_doc`` only if the
+    row's current doc STILL equals ``expected_doc``. Returns True iff the swap
+    happened.
+
+    JSONB ``=`` is a semantic comparison (the column is stored normalized, so
+    key order and whitespace don't matter), and a single ``UPDATE ... WHERE doc
+    = expected RETURNING`` is atomic under the row lock — no read-modify-write
+    window, so a concurrent writer that moved the blob between the caller's read
+    and this call cannot be silently clobbered. Used by mcp_core.test_server:
+    it loads the whole server list, runs a probe that can take tens of seconds,
+    then wants to persist a detected transport WITHOUT rolling back any upsert /
+    delete / toggle that landed in the meantime. On CAS failure the caller drops
+    the (best-effort) persistence and keeps the probe result.
+
+    A missing row (``expected_doc`` from a blob that was since deleted) also
+    returns False: the WHERE matches nothing, so we never resurrect it.
+    """
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "UPDATE user_blobs SET doc = %s "
+                "WHERE user_id = %s AND kind = %s AND doc = %s "
+                "RETURNING user_id",
+                (Jsonb(new_doc), user_id, kind, Jsonb(expected_doc)),
+            ).fetchone()
+    except Exception as e:
+        log.error("[db] set_blob_if_unchanged(%s,%s) failed: %s", user_id, kind, e)
+        return False
+    if row is None:
+        return False
+    # Mirror the winning write to the TEE shadow on the same terms as set_blob
+    # (user_mcp is not an excluded kind). Best-effort; the CAS already committed.
+    if kind not in ("identity", "consumer_state"):
+        from tee_shadow import mirror
+        mirror.execute(
+            "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
+            (user_id, kind, Jsonb(new_doc)))
+    return True
 
 
 def set_blob(user_id: str, kind: str, doc) -> None:
@@ -3131,6 +3511,42 @@ def genesis_reap_stale_unclaimed_jobs(
     return out
 
 
+def genesis_oldest_awaiting_resident_job(user_id: str, *, older_than_sec: int) -> dict | None:
+    """Oldest still-unclaimed resident distill job for one user, or None.
+
+    Read-only early warning helper. The terminal state transition stays owned by
+    genesis_reap_stale_unclaimed_jobs, which uses a much longer cutoff.
+    """
+    safe_sec = max(60, int(older_than_sec or 0))
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT *,
+                   EXTRACT(EPOCH FROM (now() - updated_at)) AS age_sec
+            FROM genesis_import_jobs
+            WHERE user_id = %s
+              AND status = 'awaiting_resident'
+              AND updated_at < now() - make_interval(secs => %s)
+            ORDER BY updated_at ASC
+            LIMIT 1
+            """,
+            (user_id, safe_sec),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cur.description]
+    item = dict(zip(cols, row))
+    for key, value in list(item.items()):
+        if hasattr(value, "isoformat"):
+            item[key] = value.isoformat()
+    try:
+        item["age_sec"] = float(item.get("age_sec") or 0.0)
+    except (TypeError, ValueError):
+        item["age_sec"] = 0.0
+    return item
+
+
 def genesis_put_chunk(
     user_id: str,
     job_id: str,
@@ -4263,10 +4679,11 @@ def _mark_chat_r2_inventory_pending_on_cursor(
 ) -> int:
     """Durably request a generation inventory while holding its row fence.
 
-    Clear/account deletion advances the generation in the same transaction that
-    removes chat rows. The marker deliberately survives deletion of ``users``;
-    the isolated R2 worker can therefore retry a failed LIST after the account
-    and all ordinary request traffic are gone.
+    Account deletion advances the generation in the same transaction that
+    removes retained chat rows. The marker deliberately survives deletion of
+    ``users``; the isolated R2 worker can therefore retry a failed LIST after
+    the account and all ordinary request traffic are gone. Clear Chat does not
+    call this helper because it archives ciphertext instead of retiring it.
     """
     generation = _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
     next_generation = generation + 1 if advance_generation else generation
@@ -4283,12 +4700,15 @@ def _mark_chat_r2_inventory_pending_on_cursor(
 
 def _chat_body_referenced_on_cursor(cur, user_id: str, key: str) -> bool:
     cur.execute(
-        "SELECT 1 FROM chat_messages "
-        "WHERE user_id=%s AND doc->>'body_key'=%s "
-        "  AND (NOT (doc ? 'body_ct') "
-        "       OR doc->'body_ct' = 'null'::jsonb) "
+        "SELECT 1 FROM ("
+        " SELECT doc FROM chat_messages WHERE user_id=%s "
+        " UNION ALL "
+        " SELECT doc FROM chat_message_archive WHERE user_id=%s"
+        ") AS retained WHERE doc->>'body_key'=%s "
+        "AND (NOT (doc ? 'body_ct') "
+        "     OR doc->'body_ct' = 'null'::jsonb) "
         "LIMIT 1",
-        (user_id, key),
+        (user_id, user_id, key),
     )
     return cur.fetchone() is not None
 
@@ -6071,6 +6491,129 @@ def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None
     return row[0] if row is not None else None
 
 
+_CHAT_FINALIZE_REPLY_ONCE_SQL = (
+    "WITH won AS ("
+    "  UPDATE chat_messages SET doc = doc || %s "
+    "  WHERE user_id = %s AND msg_id = %s "
+    "    AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+    "    AND COALESCE(doc->>'reply_message_id','') = '' "
+    "  RETURNING doc AS parent_doc"
+    "), inserted AS ("
+    "  INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+    "  SELECT %s, %s, %s, %s FROM won "
+    "  RETURNING doc AS reply_doc"
+    ") "
+    "SELECT won.parent_doc, inserted.reply_doc FROM won CROSS JOIN inserted"
+)
+
+_CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL = (
+    "UPDATE chat_messages SET doc = doc || %s "
+    "WHERE user_id = %s AND msg_id = %s"
+)
+
+
+def chat_finalize_reply_once(
+    user_id: str,
+    parent_msg_id: str,
+    reply_msg_id: str,
+    reply_ts: float,
+    reply_doc: dict,
+    replied_fields: dict,
+) -> tuple[dict, dict] | None:
+    """Atomically mark one parent answered and insert its encrypted reply.
+
+    The parent primary-key UPDATE is the compare-and-swap.  The data-modifying
+    CTE makes the reply INSERT conditional on winning that UPDATE and keeps the
+    two writes in one PostgreSQL statement: a duplicate reply id or any other
+    INSERT failure rolls the parent mutation back with the statement.  Losing
+    the CAS is the only normal ``None`` result; database failures deliberately
+    propagate so callers fail closed instead of accidentally retrying a reply.
+
+    This low-level helper performs no cache, wake, capture, R2, or inline reply
+    mirror side effects.  After the RDS statement commits, it best-effort
+    mirrors only the parent's plaintext metadata; the encrypted reply remains
+    exclusively on the normal decrypting TEE-replicator path.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            _CHAT_FINALIZE_REPLY_ONCE_SQL,
+            (
+                Jsonb(replied_fields),
+                user_id,
+                parent_msg_id,
+                user_id,
+                reply_msg_id,
+                reply_ts,
+                Jsonb(reply_doc),
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    # The encrypted reply row is intentionally NOT mirrored here.  The normal
+    # TEE replicator decrypts and copies that row in its canonical plaintext
+    # shape.  Only the already-existing parent's plaintext metadata is safe to
+    # merge inline; mirror.execute is best-effort and swallows TEE failures.
+    from tee_shadow import mirror
+
+    mirror.execute(
+        _CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL,
+        (Jsonb(replied_fields), user_id, parent_msg_id),
+    )
+    return row[0], row[1]
+
+
+def chat_finalize_reply_post_commit(
+    user_id: str, reply_doc: dict, max_messages: int
+) -> None:
+    """Run normal append maintenance after an atomic reply winner commits.
+
+    Finalization must commit the parent CAS and inline encrypted reply together,
+    so optional R2 offload happens afterwards. ``max_messages`` is retained for
+    API compatibility and bounds only the process-local hot cache; it never
+    trims durable source rows. Failures are logged and leave the already
+    committed inline reply readable.
+    """
+    reply_msg_id = str(reply_doc.get("id") or "")
+    offload = (
+        object_storage.chat_files_enabled()
+        and reply_doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
+        and reply_doc.get("body_ct") is not None
+    )
+    try:
+        if offload:
+            try:
+                body_ct_len = len(reply_doc["body_ct"])
+                key = object_storage.put_chat_body(
+                    user_id,
+                    reply_msg_id,
+                    reply_doc["body_ct"],
+                    str(reply_doc.get("content_type") or "file"),
+                )
+                pointer = {"body_key": key, "body_ct_len": body_ct_len}
+                with get_pool().connection() as conn:
+                    conn.execute(
+                        "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
+                        "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
+                        (Jsonb(pointer), user_id, reply_msg_id),
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "[db] chat_finalize_reply_post_commit(%s,%s) R2 offload "
+                    "failed, left inline: %s",
+                    user_id,
+                    reply_msg_id,
+                    e,
+                )
+
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "[db] chat_finalize_reply_post_commit(%s,%s) failed: %s",
+            user_id,
+            reply_msg_id,
+            e,
+        )
+        return
+
 def chat_try_claim_reply(
     user_id: str, msg_id: str, consumer_id: str, now: float, fields: dict,
     *, redelivery: bool = False,
@@ -6094,7 +6637,8 @@ def chat_try_claim_reply(
       _redelivery_floor pre-filter can miss it because parent reply_status
       metadata updates are not broadcast across workers, and a late reply to a
       conversation that already moved on would land out of order. Synthetic
-      verify_ping probes are not conversation and never supersede."""
+      verify_ping probes and resident maintenance prompts are not conversation
+      and never supersede."""
     same_consumer_sql = "" if redelivery else "OR doc->>'reply_claimed_by' = %s "
     unanswered_tail_sql = (
         "  AND NOT EXISTS ("
@@ -6102,7 +6646,7 @@ def chat_try_claim_reply(
         "    WHERE n.user_id = chat_messages.user_id "
         "      AND n.ts > chat_messages.ts "
         "      AND n.doc->>'role' = 'user' "
-        "      AND COALESCE(n.doc->>'source','') <> 'verify_ping' "
+        "      AND COALESCE(n.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') "
         "      AND ((n.doc->>'reply_status') = 'replied' "
         "           OR COALESCE(n.doc->>'reply_message_id','') <> '')"
         "  ) "
@@ -6205,19 +6749,23 @@ def chat_delete(user_id: str, msg_id: str) -> bool:
 def chat_clear(user_id: str) -> int | None:
     """Atomically retire one user's complete *live* chat context.
 
-    The raw transcript is only one input to a V2 turn.  A history clear must
-    also remove its encrypted summary, chat-derived artifact text views,
+    The raw transcript is only one input to a V2 turn. A history clear moves
+    every encrypted source row into an immutable archive retained until account
+    deletion, while removing it from all live-chat reads. It must also remove
+    the encrypted summary, chat-derived artifact text views,
     pending effects, recovery barriers, and client status rows.  The existing
     per-user chat advisory fence is the linearization point: ordinary writers
     take it shared, while clear takes it exclusive *before* touching runtime
     state or any child row.  The runtime-generation bump then rejects a worker
     that was doing provider work without holding a database transaction.
 
-    Terminal job metadata and content-free turn metrics are retained, but all
-    encrypted trajectory events and review output are chat-derived content and
-    are deleted. Active jobs are fenced into terminal states instead of deleting
-    ``agent_jobs``. Independent Memory Garden, identity, schedules, user-authored
-    workspace/working-memory, and skills are also preserved.
+    Terminal job metadata, encrypted trajectory/review rows, and the encrypted
+    raw-chat archive are retained as debug records and are never prompt inputs.
+    Active jobs/reviews are fenced into terminal states instead of deleting
+    ``agent_jobs`` because trajectory rows intentionally cascade from their
+    source job. Independent Memory Garden, identity, schedules, user-authored
+    workspace/working-memory, skills, and content-free billing/token metrics are
+    also preserved.
 
     Returns the number of raw chat rows deleted, or ``None`` if the database
     transaction failed.  Even an already-empty clear advances both the chat R2
@@ -6237,9 +6785,11 @@ def chat_clear(user_id: str) -> int | None:
                     _lock_chat_user_fence_on_cursor(
                         cur, user_id, exclusive=True,
                     )
-                    _mark_chat_r2_inventory_pending_on_cursor(
-                        cur, user_id, advance_generation=True,
-                    )
+                    # Clear is a visibility boundary, not a retention boundary.
+                    # Keep the R2 storage generation stable so archived body
+                    # pointers remain readable; account deletion owns generation
+                    # retirement and inventory cleanup.
+                    _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
 
                     # Materialize the authority row for a known user and bump
                     # it without changing hosted ownership.  Every active job
@@ -6255,13 +6805,37 @@ def chat_clear(user_id: str) -> int | None:
                     cur.execute(
                         "UPDATE v2_runtime_state SET "
                         "runtime_generation=runtime_generation+1,updated_at=now() "
-                        "WHERE user_id=%s",
+                        "WHERE user_id=%s RETURNING runtime_generation",
                         (user_id,),
                     )
+                    generation_row = cur.fetchone()
+                    clear_generation = int(
+                        (
+                            generation_row["runtime_generation"]
+                            if isinstance(generation_row, dict)
+                            else generation_row[0]
+                        )
+                        if generation_row is not None
+                        else 1
+                    )
 
-                    # Retain content-free job/metric telemetry, but make every
-                    # in-flight lane lose ownership before deleting trajectory
-                    # content derived from the cleared chat.
+                    # The active table is the user/agent-visible conversation.
+                    # Preserve its encrypted source ledger first, then remove
+                    # the live rows in the same transaction. The archive-aware
+                    # trigger keeps any referenced R2 ciphertext alive.
+                    cur.execute(
+                        "INSERT INTO chat_message_archive "
+                        "(user_id,source_seq,msg_id,ts,doc,storage_generation,"
+                        "clear_generation) "
+                        "SELECT user_id,seq,msg_id,ts,doc,storage_generation,%s "
+                        "FROM chat_messages WHERE user_id=%s "
+                        "ON CONFLICT (user_id,source_seq) DO NOTHING",
+                        (clear_generation, user_id),
+                    )
+
+                    # Preserve immutable encrypted trajectory history by
+                    # retaining its source jobs, but make every in-flight lane
+                    # lose ownership before the clear commits.
                     cur.execute(
                         "UPDATE agent_jobs SET status='superseded',"
                         "last_error='chat_history_cleared',claimed_by=NULL,"
@@ -6270,25 +6844,11 @@ def chat_clear(user_id: str) -> int | None:
                         "AND status IN ('pending','claimed','running')",
                         (user_id,),
                     )
-                    # Mark every pre-clear job as intentionally content-purged.
-                    # Operational capture health can then distinguish Chat
-                    # Clear from a recorder that silently failed to create a
-                    # stream. Job and turn-metric rows remain available.
                     cur.execute(
-                        "UPDATE agent_jobs SET trajectory_purged_at="
-                        "COALESCE(trajectory_purged_at,clock_timestamp()) "
-                        "WHERE user_id=%s",
-                        (user_id,),
-                    )
-                    cur.execute(
-                        "DELETE FROM v2_trajectory_reviews WHERE user_id=%s",
-                        (user_id,),
-                    )
-                    # Stream deletion cascades every immutable event row. This
-                    # runs after review deletion so no encrypted review output
-                    # survives an explicit Chat Clear.
-                    cur.execute(
-                        "DELETE FROM v2_trajectory_streams WHERE user_id=%s",
+                        "UPDATE v2_trajectory_reviews SET status='failed',"
+                        "claimed_by_job_id=NULL,last_error='chat_history_cleared',"
+                        "finished_at=COALESCE(finished_at,now()) "
+                        "WHERE user_id=%s AND status IN ('pending','running')",
                         (user_id,),
                     )
 
@@ -6408,9 +6968,9 @@ def chat_clear(user_id: str) -> int | None:
     except Exception as e:
         log.error("[db] chat_clear(%s) failed: %s", user_id, e)
         return None
-    # The trigger queued referenced keys; the same transaction also left a
-    # durable inventory marker for pre-guard/legacy objects. Never LIST/DELETE
-    # R2 here: clear must return independently of object-store health.
+    # Clear deliberately queues no body deletion and no retired-generation
+    # inventory: archived pointers remain durable until account deletion. The
+    # plaintext TEE hot copy is still removed because it is live runtime state.
     from tee_shadow import mirror
     mirror.execute_many([
         (sql, (user_id,)),
@@ -7494,6 +8054,7 @@ def delete_user_data(user_id: str) -> None:
         "v2_conversation_summary_segments",
         "v2_conversation_summary",
         "v2_turn_metrics",
+        "chat_message_archive",
         "chat_messages",
         "memory_moments",
         "world_book_entries",
@@ -7525,6 +8086,7 @@ def delete_user_data(user_id: str) -> None:
         "v2_conversation_summary_segments",
         "v2_conversation_summary",
         "v2_turn_metrics",
+        "chat_message_archive",
         "genesis_import_chunks",
         "model_api_routes",
         "model_api_credentials",

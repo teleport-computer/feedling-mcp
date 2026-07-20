@@ -15,8 +15,8 @@ the append. PostgreSQL receives only the resulting shared envelope; the schema
 and store reject extra envelope keys that could become an accidental plaintext
 sibling.
 
-Event updates are rejected by a database trigger. Foreign-key cascades still
-allow explicit job/account deletion. There is no public plaintext trajectory
+Event updates are rejected by a database trigger. Account deletion cascades the
+user's trajectory rows. There is no public plaintext trajectory
 read endpoint and trajectory data is not copied to `runtime_state` or ordinary
 logs.
 
@@ -131,31 +131,25 @@ platform capability dispatcher, MCP loader, Memory writer, schedule writer, or
 workspace backend. Its encrypted output is not added to Chat, Memory Garden,
 working memory, or later prompts automatically.
 
-## Retention, Chat Clear, and inspected access
+## Durable retention, Chat Clear, and inspected access
 
-Encrypted event and review content has a default-on seven-day terminal-job TTL.
-Raw/local deployments may change that window with
-`FEEDLING_V2_TRAJECTORY_RETENTION_DAYS` (1–3,650 days), while
-`FEEDLING_V2_TRAJECTORY_GC_INTERVAL_SEC` and
-`FEEDLING_V2_TRAJECTORY_GC_BATCH` bound cleanup work. Managed Phala manifests
-pin all three as measured-compose literals (7 days, 3,600 seconds, batch 100)
-on both API and runner; changing policy requires changing both manifests in one
-reviewed release. The independent GC loop runs in both processes and drains
-bounded batches until the current backlog is exhausted. `SKIP LOCKED` and a
-transactional `trajectory_purged_at` tombstone make concurrent passes
-idempotent and prevent a delayed recorder from recreating deleted content.
-Active jobs and active source jobs are not purged. Once the source job crosses
-its TTL, pending/running offline review is cancelled and removed rather than
-extending ciphertext lifetime. Content-free source-job and turn-metric rows
-remain.
+Encrypted event and review content has no time-based TTL or background GC. It is
+kept for the lifetime of the account so an old incident can still be debugged.
+`DELETE /v1/chat/history` moves the encrypted raw conversation ledger into the
+immutable `chat_message_archive`, then clears the live prompt summaries,
+chat-derived artifact views, pending effects/status, reply cursor, and uncommitted
+Capture journals under one runtime-generation fence. Archived rows and their R2
+ciphertext bodies are excluded from every live chat/prompt read. The operation
+does **not** delete historical trajectory streams, events, reviews, access audits,
+job metadata, or aggregate turn metrics. Account deletion is the supported
+complete per-user erasure boundary and cascades all of those retained rows.
 
-`DELETE /v1/chat/history` is an immediate content-erasure boundary. Under the
-same exclusive chat fence and runtime-generation bump used for transcript
-clear, it deletes every encrypted trajectory review and stream for that user;
-event rows cascade. It preserves independent Memory Garden, identity,
-user-authored workspace, schedules, job metadata, and aggregate turn metrics.
-Account deletion still cascades all per-user trajectory, metric, and access
-audit rows.
+The split is deliberate: aggregate `v2_turn_metrics` remains content-free and
+cheap to query, while the encrypted raw-chat archive preserves the source
+conversation and the trajectory preserves exact prompts, provider attempts,
+tool arguments/results, reply evidence, and errors. Encryption is an at-rest and
+access-control boundary, not a one-way transform: a trusted runner can decrypt
+one exact user/job stream through the audited inspector below.
 
 There is no plaintext trajectory HTTP/admin endpoint. A break-glass inspection
 is available only as a runner-local module and is default-off. It requires one
@@ -182,7 +176,8 @@ Provider-backed review remains opt-in for BYOK cost control; disabling review
 never disables capture.
 
 The inspector defaults to at most 4,096 physical events and 32 MiB of decoded
-or declared logical JSON. It fails closed on a frontier change, purge, gap, or
-budget overflow. The success audit is authorized atomically against the exact
-live stream frontier while serialized with Chat Clear, TTL GC, and late event
-appends.
+or declared logical JSON. These are per-invocation safety bounds, not storage
+retention: stored events are never clipped or deleted to satisfy them. The
+inspector fails closed on a frontier change, gap, or budget overflow. The
+success audit is authorized atomically against the exact live stream frontier
+while serialized with late event appends.

@@ -494,7 +494,11 @@ async def run_tool_loop(
                 # the rejected assistant text in the transcript: the next round
                 # must answer the newly folded conversation, not critique a
                 # response the user never saw.
-                await on_reply(pr.text, final=True)
+                await on_reply(
+                    pr.text,
+                    final=True,
+                    reasoning=str(pr.raw.get("reasoning") or ""),
+                )
             except FinalReplySuperseded:
                 _progress("final_reply_superseded")
                 await _trajectory(

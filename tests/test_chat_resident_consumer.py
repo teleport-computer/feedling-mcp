@@ -1236,6 +1236,30 @@ def test_verify_ping_no_usable_reply_does_not_ack():
     assert result_ts == pytest.approx(4646.0)
 
 
+def test_resident_maintenance_decrypted_message_reaches_agent_and_suppresses_push(monkeypatch):
+    """Enclave/MCP delivery yields a normal decrypted user-role row with
+    source=resident_maintenance. The consumer must route its content to the
+    agent, but must not treat it as user activity or push the maintenance reply."""
+    prompt = "【Feedling 系统维护提醒】\n请更新 resident consumer。"
+    msg = _make_msg(role="user", content=prompt, ts=4747.0)
+    msg["id"] = "rm-consumer-1"
+    msg["source"] = crc.RESIDENT_MAINTENANCE_SOURCE
+    monkeypatch.setattr(crc, "_last_user_message_wall", 123.0)
+
+    with patch.object(crc, "_resident_chat_runtime_v2_enabled", return_value=False), \
+         patch.object(crc, "call_agent", return_value="已处理") as mock_agent, \
+         patch.object(crc, "post_reply") as mock_post:
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(4747.0)
+    assert prompt in mock_agent.call_args.args[0]
+    assert crc._last_user_message_wall == 123.0
+    mock_post.assert_called_once()
+    assert mock_post.call_args.kwargs["source"] == crc.RESIDENT_MAINTENANCE_SOURCE
+    assert mock_post.call_args.kwargs["suppress_push"] is True
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "rm-consumer-1"
+
+
 def test_post_reply_suppress_push_omits_alert_and_push_fields(monkeypatch):
     """post_reply(..., suppress_push=True) sends an empty alert_body and no
     push_body / push_live_activity, so /v1/chat/response's push policy is a
@@ -3701,6 +3725,11 @@ def test_proactive_chat_collision_classification(monkeypatch):
     assert not crc._proactive_chat_collision(now=now)
     # verify_ping is never conversation.
     _with_history([{"role": "user", "source": "verify_ping", "ts": now - 5}])
+    assert not crc._proactive_chat_collision(now=now)
+    # resident maintenance prompts/replies are system repair traffic, not chat.
+    _with_history([{"role": "user", "source": crc.RESIDENT_MAINTENANCE_SOURCE, "ts": now - 5}])
+    assert not crc._proactive_chat_collision(now=now)
+    _with_history([{"role": "openclaw", "source": crc.RESIDENT_MAINTENANCE_SOURCE, "ts": now - 5}])
     assert not crc._proactive_chat_collision(now=now)
     # system rows (upstream-error notices) are not the agent speaking.
     _with_history([{"role": "system", "source": "chat", "ts": now - 5}])

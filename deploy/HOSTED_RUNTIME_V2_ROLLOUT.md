@@ -63,23 +63,18 @@ Encrypted trajectory capture is always on. Provider-backed offline review is
 separate, defaults off, and must stay off unless
 `FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=1` and a valid
 `FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE` fleet ceiling are configured. The
-ceiling bounds pending plus running provider reviews; it is not a retention
-policy. Encrypted event/review content has a default-on seven-day terminal-job
-TTL (`FEEDLING_V2_TRAJECTORY_RETENTION_DAYS`) and Chat Clear deletes it
-immediately. The runner-local break-glass inspector remains default-off and
-requires durable requested/succeeded/failed audit phases tied to an operator and
-case. Keep provider review opt-in until its BYOK budget is approved. The API and
-runner both run GC; managed manifests intentionally use the same fixed defaults
-(7 days, 3,600-second interval, batch 100) as measured-compose literals. Do not
-inject one-sided CI overrides. A policy change must update both the main and
-runner manifests in the same reviewed PR; for retention, whichever process has
-the shorter effective value removes content first.
+ceiling bounds pending plus running provider reviews. Encrypted event/review
+content has no time-based GC and survives Chat Clear so historical incidents
+remain debuggable. Raw encrypted chat rows also move to an immutable non-prompt
+archive on Clear rather than being physically erased; account deletion is the
+complete-erasure boundary. The
+runner-local break-glass inspector remains default-off and requires durable
+requested/succeeded/failed audit phases tied to an operator and case. Keep
+provider review opt-in until its BYOK budget is approved.
 
-Automatic Memory Capture and Memory Dream are independent switches. The
-checked-in Pre runner and CI default `FEEDLING_V2_CAPTURE_ENABLED=1` and
-`FEEDLING_V2_DREAM_ENABLED=0` so Capture can soak without silently enabling
-Dream. Test, local, and production default both to `0`; production enablement
-requires an explicit lifecycle/cost decision.
+Automatic Memory Capture and Memory Dream are independent switches. Every
+checked-in environment, including Pre, defaults both to `0`; either lane requires
+an explicit lifecycle, quality, and cost decision before activation.
 
 Capture's durable contract is exact oldest-contiguous `chat_messages.seq`
 coverage, not a timestamp or fixed recent window. Only eligible live chat rows
@@ -274,10 +269,10 @@ claim hosted V2 accounts and is not part of this incident procedure.
 - [ ] Runtime-token secret and database URL match across deployment units.
 - [ ] Sandbox is intentionally disabled, or its provider/key/template and data-boundary policy are verified.
 - [ ] Trajectory review is intentionally disabled, or its fleet ceiling and BYOK provider-cost budget are verified.
-- [ ] Seven-day trajectory retention and Chat Clear erasure are accepted; any
-      break-glass inspection uses the runner-local audited command.
-- [ ] Pre Memory Capture is intentionally enabled and Dream remains disabled;
-      production keeps both off until the soak decision is recorded.
+- [ ] Durable trajectory retention is accepted; Chat Clear preserves historical
+      evidence and any break-glass inspection uses the runner-local audited command.
+- [ ] Automatic Memory Capture and Dream remain disabled unless an explicit
+      activation decision is recorded.
 - [ ] Worker capacity, Genesis, policy, queue, wake, and effect gates are green.
 - [ ] Encrypted real-device turn and `client_msg_id` retry pass.
 - [ ] Prompt-cache canary passes where configured.

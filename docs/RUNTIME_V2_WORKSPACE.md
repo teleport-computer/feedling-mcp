@@ -116,6 +116,16 @@ generic shell or arbitrary code-execution tool. The shell/code bullets above
 define the mandatory sandbox boundary if those tools are added later; they do
 not claim that arbitrary execution is already available.
 
+The sandbox lifecycle itself should not be a generic model-managed tool. Future
+model-visible capabilities should be named for the operation (`run_code`,
+`shell`, `transform_image`, or artifact extraction). The runtime broker acquires
+one `SandboxProvider` session on the first risky capability call, reuses it only
+within that bounded turn/task, and closes it at the deadline. It materializes
+only explicitly referenced encrypted artifacts, exposes no host mounts or
+ambient secrets, defaults network egress off, and re-ingests outputs into the
+encrypted VFS. Usage/billing follows the provider-session lifetime rather than
+charging text-only turns.
+
 ## Bounded subagents
 
 `task` is a native loop tool. Each child uses the same provider route with an

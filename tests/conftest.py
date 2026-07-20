@@ -144,6 +144,7 @@ if not _provisioned:
         "test_v2_status_stream.py",
         "test_v2_dependency_direction.py",
         "test_user_mcp_ca_fetch.py",
+        "test_user_mcp_ca_fetch_leaf.py",
         "test_identity_value_write_path.py",
         "test_v2_workspace_unit.py",
     }

@@ -124,35 +124,59 @@ def _is_well_formed_ca(pem: str) -> bool:
         return False
 
 
-def fetch_trust_anchor(url: str, *, timeout: float = 3.0) -> str | None:
-    """A PEM usable as a trust anchor for ``url``, or None. Never raises.
+def _leaf_is_ca_pem(pem: str) -> bool | None:
+    """One cert: is its basicConstraints CA:TRUE? None on parse failure."""
+    try:
+        from cryptography import x509  # noqa: PLC0415 — backend dep, lazy
+        cert = x509.load_pem_x509_certificate(pem.encode("utf-8"))
+    except Exception:  # noqa: BLE001 — malformed → "don't know", never raise
+        return None
+    try:
+        bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        return bool(bc.ca)
+    except x509.ExtensionNotFound:
+        return False  # no basicConstraints → not a CA → fine as an end-entity
 
-    None when: not https, already verifies against the public roots (nothing to
-    pin — see _verifies_against_public_roots), unreachable, or the fetched
-    anchor fails either self-check.
-    """
+
+def leaf_is_ca(chain_pems: list[str]) -> bool | None:
+    """The server's LEAF (chain_pems[0]) presented as end-entity: is it a CA
+    cert? True ⇒ rustls-based agents (codex) reject it as CaUsedAsEndEntity;
+    claude/pi (Node) accept it. None ⇒ empty chain or unparseable (don't warn)."""
+    if not chain_pems:
+        return None
+    return _leaf_is_ca_pem(chain_pems[0])
+
+
+def fetch_anchor_and_leaf_ca(url: str, *, timeout: float = 3.0) -> tuple[str | None, bool | None]:
+    """Like fetch_trust_anchor but ALSO reports whether the server's leaf is a
+    CA cert (the codex/rustls incompatibility signal). Never raises."""
     try:
         parsed = urlparse(url)
         if parsed.scheme != "https":
-            return None
+            return None, None
         host = parsed.hostname
         if not host:
-            return None
+            return None, None
         port = parsed.port or 443
     except ValueError:
-        return None
+        return None, None
 
     if _verifies_against_public_roots(host, port, timeout):
-        return None  # real cert — pinning it buys nothing, only widens the
-        # TOFU attack surface for free; see _verifies_against_public_roots
+        return None, None  # real cert — not pinned (see _verifies_against_public_roots)
 
-    pem = _pick_trust_anchor(_fetch_chain(host, port, timeout))
+    chain = _fetch_chain(host, port, timeout)
+    leaf_ca = leaf_is_ca(chain)
+    pem = _pick_trust_anchor(chain)
     if not pem:
-        return None
-    # Cheap local/CPU check before the expensive network round-trip: no point
-    # dialing a socket to verify an anchor that's already malformed.
+        return None, leaf_ca
     if not _is_well_formed_ca(pem):
-        return None
+        return None, leaf_ca
     if not _anchor_works(pem, host, port, timeout):
-        return None
-    return pem
+        return None, leaf_ca
+    return pem, leaf_ca
+
+
+def fetch_trust_anchor(url: str, *, timeout: float = 3.0) -> str | None:
+    """A PEM usable as a trust anchor for ``url``, or None. Never raises.
+    Thin wrapper over fetch_anchor_and_leaf_ca (which also reports leaf_is_ca)."""
+    return fetch_anchor_and_leaf_ca(url, timeout=timeout)[0]

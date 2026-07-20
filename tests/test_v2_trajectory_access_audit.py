@@ -160,11 +160,23 @@ def test_success_authorization_is_fenced_by_live_source_and_frontier():
         event_count=None,
         result_code="pending",
     )
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "UPDATE agent_jobs SET trajectory_purged_at=clock_timestamp() WHERE id=%s",
-            (job_id,),
-        )
+    jobs_store.append_trajectory_event(
+        job_id,
+        user_id,
+        event_kind="provider_response",
+        idempotency_key="inspect.response.1",
+        payload_envelope={
+            "v": 1,
+            "id": "inspect-event-1",
+            "owner_user_id": user_id,
+            "visibility": "shared",
+            "body_ct": base64.b64encode(b"ciphertext-2").decode(),
+            "nonce": "nonce",
+            "K_user": "wrapped-user",
+            "K_enclave": "wrapped-enclave",
+        },
+        payload_bytes=12,
+    )
     assert jobs_store.authorize_trajectory_inspection_success(
         access_id=denied_access_id,
         user_id=user_id,
@@ -175,3 +187,52 @@ def test_success_authorization_is_fenced_by_live_source_and_frontier():
         event_count=1,
         expected_next_event_index=1,
     ) is False
+
+
+def test_chat_clear_keeps_old_trajectory_authorizable_for_debugging():
+    user_id = "u_trajectory_audit_after_clear"
+    seed_user(user_id)
+    set_v2_runtime_owner(user_id)
+    job_id, _ = jobs_store.enqueue_job(user_id, "chat")
+    jobs_store.append_trajectory_event(
+        job_id,
+        user_id,
+        event_kind="provider_request",
+        idempotency_key="inspect.after_clear.request.0",
+        payload_envelope={
+            "v": 1,
+            "id": "inspect-after-clear-event-0",
+            "owner_user_id": user_id,
+            "visibility": "shared",
+            "body_ct": base64.b64encode(b"ciphertext").decode(),
+            "nonce": "nonce",
+            "K_user": "wrapped-user",
+            "K_enclave": "wrapped-enclave",
+        },
+        payload_bytes=10,
+    )
+
+    assert db.chat_clear(user_id) == 0
+
+    access_id = str(uuid.uuid4())
+    jobs_store.append_trajectory_access_audit(
+        access_id=access_id,
+        phase="requested",
+        user_id=user_id,
+        job_id=job_id,
+        operator_id="alice@example.com",
+        reason_code="debug",
+        case_ref="DBG-909",
+        event_count=None,
+        result_code="pending",
+    )
+    assert jobs_store.authorize_trajectory_inspection_success(
+        access_id=access_id,
+        user_id=user_id,
+        job_id=job_id,
+        operator_id="alice@example.com",
+        reason_code="debug",
+        case_ref="DBG-909",
+        event_count=1,
+        expected_next_event_index=1,
+    ) is True

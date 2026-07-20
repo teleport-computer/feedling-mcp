@@ -557,7 +557,7 @@ def test_tool_loop_records_request_response_tools_results_and_replies(monkeypatc
     async def dispatch(calls):
         return [ToolResult(call_id=calls[0].id, content="found" * 400_000)]
 
-    async def reply(_text, *, final):
+    async def reply(_text, *, final, reasoning=""):
         assert isinstance(final, bool)
 
     async def fold():
@@ -625,7 +625,7 @@ def test_provider_failure_leaves_a_partial_request_error_trajectory(monkeypatch)
     async def forbidden_dispatch(_calls):
         raise AssertionError("failed provider call must not dispatch")
 
-    async def forbidden_reply(_text, *, final):
+    async def forbidden_reply(_text, *, final, reasoning=""):
         raise AssertionError("failed provider call must not reply")
 
     events = []

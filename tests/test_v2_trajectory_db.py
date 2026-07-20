@@ -237,14 +237,6 @@ def test_recent_chat_operational_health_counts_missing_capture_from_jobs():
     _active_missing_job = add_job("u_health_active_missing", "running")
     add_job("u_health_old_pending", "pending", age_hours=48)
     add_job("u_health_old_terminal", "completed", age_hours=48)
-    purged_job = add_job("u_health_purged", "completed")
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "UPDATE agent_jobs SET trajectory_purged_at=clock_timestamp() "
-            "WHERE id=%s",
-            (purged_job,),
-        )
-
     seed_user("u_health_background")
     set_v2_runtime_owner("u_health_background")
     background_job, _ = jobs_store.enqueue_job("u_health_background", "heartbeat")
@@ -310,16 +302,16 @@ def test_recent_chat_operational_health_counts_missing_capture_from_jobs():
     assert health["window_hours"] == 24
     assert health["sample_limit"] == 1000
     assert health["jobs"] == {
-        "sampled_terminal_jobs": 5,
-        "completed": 2,
+        "sampled_terminal_jobs": 4,
+        "completed": 1,
         "failed": 1,
         "expired": 1,
         "queue_expired": 1,
         "lease_expired": 0,
         "superseded": 1,
-        "failure_rate": pytest.approx(1 / 4),
-        "expiry_rate": pytest.approx(1 / 4),
-        "error_or_expiry_rate": pytest.approx(1 / 2),
+        "failure_rate": pytest.approx(1 / 3),
+        "expiry_rate": pytest.approx(1 / 3),
+        "error_or_expiry_rate": pytest.approx(2 / 3),
         "pending": 2,
         "oldest_pending_age_sec": health["jobs"]["oldest_pending_age_sec"],
     }

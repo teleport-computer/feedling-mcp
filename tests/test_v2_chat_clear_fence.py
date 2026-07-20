@@ -1,7 +1,7 @@
-"""Chat Clear generation-fences work and erases chat-derived content.
+"""Chat-history clear is a generation-fenced live-context boundary.
 
-It is intentionally narrower than account deletion: content-free job/turn
-telemetry remains, while encrypted trajectory/review content is erased.
+It is intentionally narrower than account deletion: encrypted trajectory
+telemetry remains available for audited debugging.
 """
 from __future__ import annotations
 
@@ -191,7 +191,7 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
         payload_bytes=100,
     )
     # Live effect/action/recovery state is tied to this source job and must be
-    # erased; only its content-free job/turn metrics survive.
+    # erased even though its historical job/trajectory rows survive.
     active_job_id = job_id
     active_generation = old_generation
     parent_effect_id = effect_id.derive(
@@ -236,8 +236,8 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
             (active_job_id, uid, seq, "a" * 64, "b" * 64),
         )
 
-    # Queue a review to prove that both source trajectory and encrypted review
-    # state are removed while active review execution is stopped by clear.
+    # Queue a review to prove that encrypted historical state survives while
+    # active review execution is stopped by clear.
     assert jobs_store.mark_failed(
         job_id,
         "turn_failed:providererror",
@@ -340,14 +340,18 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
             "WHERE user_id=%s AND kind='capture_state'",
             (uid,),
         ).fetchone()[0]
+        archived_chat = conn.execute(
+            "SELECT source_seq,msg_id,doc,clear_generation "
+            "FROM chat_message_archive WHERE user_id=%s ORDER BY source_seq",
+            (uid,),
+        ).fetchall()
         workspace = conn.execute(
             "SELECT path,kind FROM v2_workspace_entries "
             "WHERE user_id=%s ORDER BY path",
             (uid,),
         ).fetchall()
         jobs = conn.execute(
-            "SELECT id,status,last_error,trajectory_purged_at IS NOT NULL "
-            "AS trajectory_purged FROM agent_jobs "
+            "SELECT id,status,last_error FROM agent_jobs "
             "WHERE user_id=%s ORDER BY id",
             (uid,),
         ).fetchall()
@@ -398,6 +402,11 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
         }
 
     assert counts == {name: 0 for name in counts}
+    assert len(archived_chat) == 1
+    assert archived_chat[0][0] == seq
+    assert archived_chat[0][1] == "pre-clear-message"
+    assert archived_chat[0][2]["body_ct"] == "opaque-chat-ciphertext"
+    assert archived_chat[0][3] == old_generation + 1
     assert any(
         "kind = 'capture_state'" in sql for sql, _params in mirrored_deletes
     )
@@ -407,9 +416,12 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
         ("/workspace/keep.md", "workspace"),
     ]
     assert jobs and all(row[1] not in {"pending", "claimed", "running"} for row in jobs)
-    assert all(row[3] is True for row in jobs)
-    assert trajectories == {name: 0 for name in trajectories}
-    assert retained_review is None
+    assert trajectories == {
+        "v2_trajectory_streams": 1,
+        "v2_trajectory_events": 1,
+        "v2_trajectory_reviews": 1,
+    }
+    assert retained_review == ("failed", "chat_history_cleared")
     assert sink_markers == 0
     assert action_rows == 0
     assert preserved == {key: 1 for key in preserved}
@@ -615,7 +627,7 @@ def test_onboarding_greeting_writer_first_linearizes_before_clear(monkeypatch):
     assert db.chat_onboarding_greeting_row(uid) is None
 
 
-def test_onboarding_greeting_after_clear_uses_live_storage_generation():
+def test_onboarding_greeting_after_clear_keeps_storage_retention_generation():
     uid = "u_v2_onboarding_after_clear_generation"
     seed_user(uid)
     assert db.chat_clear(uid) == 0
@@ -642,7 +654,7 @@ def test_onboarding_greeting_after_clear_uses_live_storage_generation():
             "WHERE message.user_id=%s AND message.msg_id=%s",
             (uid, greeting["id"]),
         ).fetchone()
-    assert row == (1, 1)
+    assert row == (0, 0)
 
 
 def test_reply_writer_first_linearizes_before_clear_and_clear_removes_reply(
@@ -709,6 +721,16 @@ def test_reply_writer_first_linearizes_before_clear_and_clear_removes_reply(
         assert conn.execute(
             "SELECT COUNT(*) FROM chat_messages WHERE user_id=%s", (uid,)
         ).fetchone()[0] == 0
+        archived = conn.execute(
+            "SELECT msg_id,doc FROM chat_message_archive "
+            "WHERE user_id=%s ORDER BY source_seq",
+            (uid,),
+        ).fetchall()
+    assert [row[0] for row in archived] == [
+        "source-before-clear",
+        "reply-before-clear",
+    ]
+    assert all(row[1].get("body_ct") for row in archived)
 
 
 def test_pending_reply_apply_cannot_publish_after_clear_generation_bump(

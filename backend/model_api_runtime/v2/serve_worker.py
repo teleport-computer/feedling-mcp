@@ -1774,6 +1774,10 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     reply-is-terminal invariant; restores the deleted
     `test_reply_envelope_failure_is_terminal_not_success` guarantee on the
     new PR A effect-sink path)."""
+    # Only forward ``extra`` when a thinking sub-envelope is present, so a
+    # no-reasoning reply keeps its exact prior sink call shape.
+    thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
+    extra_kwargs = {"extra": thinking_extra} if thinking_extra else {}
     envelope = payload.get("envelope")
     if isinstance(envelope, dict):
         store = core_store.get_store(user_id)
@@ -1781,6 +1785,7 @@ def _sink_reply(user_id: str, payload: dict) -> None:
             store,
             envelope,
             reply_through_seq=int(payload.get("reply_through_seq") or 0),
+            **extra_kwargs,
         )
         return
 
@@ -1789,7 +1794,9 @@ def _sink_reply(user_id: str, payload: dict) -> None:
         return  # replay after a crash between sink-write and status=applied -> no-op
     try:
         store = core_store.get_store(user_id)
-        row = v2_worker._write_encrypted_reply(store, str(payload.get("text") or ""))
+        row = v2_worker._write_encrypted_reply(
+            store, str(payload.get("text") or ""), **extra_kwargs
+        )
         if row is None:
             raise RuntimeError("reply envelope build failed")
     except Exception:
@@ -1812,7 +1819,9 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
     if not isinstance(envelope, dict):
         raise RuntimeError("transactional reply requires encrypted envelope")
     store = core_store.get_store(user_id)
-    msg = store._build_chat_message("openclaw", "model_api", envelope)
+    thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
+    build_kwargs = {"extra": thinking_extra} if thinking_extra else {}
+    msg = store._build_chat_message("openclaw", "model_api", envelope, **build_kwargs)
     msg_id = str(msg["id"])
     seq, inserted, finish_db_post_commit = db.chat_append_effect_with_cursor(
         user_id,
@@ -2805,7 +2814,6 @@ def build_health_app():
 
 _REAP_INTERVAL_SEC = _positive_float_env("FEEDLING_V2_REAP_INTERVAL_SEC", "30")
 _R2_CLEANUP_SETTINGS = v2_reaper.cleanup_settings_from_env()
-_TRAJECTORY_RETENTION_SETTINGS = v2_reaper.trajectory_retention_settings_from_env()
 
 
 async def _reaper_loop(
@@ -2837,24 +2845,6 @@ async def _r2_cleanup_loop(
         interval=interval,
         limit=limit,
         inventory_limit=inventory_limit,
-    )
-
-
-async def _trajectory_cleanup_loop(
-    stop_event: asyncio.Event,
-    *,
-    interval: float = float(_TRAJECTORY_RETENTION_SETTINGS["interval"]),
-    retention_days: int = int(
-        _TRAJECTORY_RETENTION_SETTINGS["retention_days"]
-    ),
-    limit: int = int(_TRAJECTORY_RETENTION_SETTINGS["limit"]),
-) -> None:
-    """Run encrypted-trajectory retention independently of other watchdogs."""
-    await v2_reaper.run_trajectory_cleanup_loop(
-        stop_event,
-        interval=interval,
-        retention_days=retention_days,
-        limit=limit,
     )
 
 
@@ -3387,7 +3377,6 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     tasks = [
         asyncio.create_task(_reaper_loop(stop_event)),
         asyncio.create_task(_r2_cleanup_loop(stop_event)),
-        asyncio.create_task(_trajectory_cleanup_loop(stop_event)),
         asyncio.create_task(
             _heartbeat_loop(worker_id, stop_event, supervisor=supervisor)
         ),

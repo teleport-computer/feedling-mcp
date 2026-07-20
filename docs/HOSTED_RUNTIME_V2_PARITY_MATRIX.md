@@ -24,7 +24,7 @@
 | Requirement | Current status | Evidence and remaining gap |
 |---|---|---|
 | No silent wedges | ✅ | Admission checks the turn-worker heartbeat; pending jobs have queue deadlines and a reaper; terminal failures publish `error` status and `last_runtime_error`; the worker contains turn exceptions; provider I/O is async. A dead pool must fail visibly rather than leave a message in `processing` forever. |
-| Full conversation, not a fixed message window | ✅ | The prompt is built from an encrypted hierarchical summary frontier plus a verbatim tail. Raw encrypted chat rows and attached R2 bodies are retained independently of compaction; the former 5,000-row value bounds only the process hot window. Exact immutable leaf segments and immutable higher-level checkpoints keep the model-facing view bounded without deleting children or rewriting the source transcript. |
+| Full conversation, not a fixed message window | ✅ | The prompt is built from an encrypted hierarchical summary frontier plus a verbatim tail. Raw encrypted chat rows and attached R2 bodies are retained independently of compaction; Clear Chat moves them to an immutable non-prompt archive rather than erasing them, and account deletion is the full retention boundary. The former 5,000-row value bounds only the process hot window. Exact immutable leaf segments and immutable higher-level checkpoints keep the model-facing view bounded without deleting children or rewriting the source transcript. |
 | One native agent loop for every model | ✅ | Chat and wake use the same in-process provider-native tool loop. There is no `official`/`rule` tier, planner, or separate responder. A model that does not call a tool naturally returns once; malformed tool output gets bounded compatibility handling, not pre-assigned model routing. |
 | Reply inside the loop; eager late-message folding | ✅ | `reply` is a loop tool, so the model may acknowledge the user and continue working. New user messages are claimed without debounce and folded at every round boundary. |
 | Parallel tool use | ✅ | A provider turn may request a batch of tools. Independent reads and bounded `task` subagents execute concurrently. Disjoint workspace writes can execute in conflict-free waves while same/ancestor/descendant paths serialize; externally effectful platform/MCP mutations remain provider-ordered. Results are reconstructed in provider order. |
@@ -34,7 +34,7 @@
 | Tokens/turn and admission ceiling | ✅ | Whole-turn token/call/latency metrics and an admission ceiling are implemented. The offline token regression gate is live, and `/v1/admin/v2-metrics.turn_health` exposes bounded queue/lease expiry, failure/expiry rates, pending age, p95 latency, and trajectory completeness/gaps. |
 | Concurrent CVM-class load proof | ⚠️ | The harness exists, but the authoritative concurrent run on the target CVM class remains an operational gate. |
 | Typing-signal pre-warm | ➖ | Removed from the release scope by product decision. Ordinary Send remains the only foreground trigger; V2 does not create speculative jobs or provider spend while the user types. |
-| Encrypted full trajectories and failure review | ✅ | Immutable encrypted per-job provider/tool/reply/fold/error capture is implemented. Oversized model-visible events use exact digest-verified encrypted chunks; every async provider HTTP attempt carries its effective request model, exact JSON body, result/error status and duration without an extra DB write. Tool timing/effect evidence and reply disposition are captured. Content has a default-on seven-day TTL, Chat Clear erases it immediately, and exact-job break-glass inspection is runner-local and durably audited. Provider-backed offline review remains explicit opt-in and side-effect-free; it is analysis, not deterministic replay. |
+| Encrypted full trajectories and failure review | ✅ | Immutable encrypted per-job provider/tool/reply/fold/error capture is implemented. Oversized model-visible events use exact digest-verified encrypted chunks; every async provider HTTP attempt carries its effective request model, exact JSON body, result/error status and duration without an extra DB write. Tool timing/effect evidence and reply disposition are captured. There is no time-based trajectory GC; Chat Clear preserves historical evidence and account deletion is the complete-erasure boundary. Exact-job break-glass inspection is runner-local, decryptable, and durably audited. Provider-backed offline review remains explicit opt-in and side-effect-free; it is analysis, not deterministic replay. |
 | Fleet-wide resident-process retirement | ⚠️ | Source and managed topology are complete: hosted supervisors, per-user homes/leases/CLI toolchains, selectors, and the admin rollback flip are removed, and every managed manifest can launch only pooled V2 workers. Live closure still requires deploying the reviewed image to each environment, provisioning the required second production runner failure domain, and verifying that no legacy hosted process remains. The independent user-operated `/v1/chat/*` resident consumer is a separate product path. |
 
 ## Current turn shape
@@ -92,10 +92,10 @@ or arbitrary code-execution tool. The detailed facade and enclave mapping lives 
 | Manual, heartbeat, scheduled wake | ✅ | Same native loop as chat |
 | Screen watch | ✅ | Producer and wake handler are live |
 | Maintenance/compaction | ✅ | Encrypted summary compaction path is live |
-| Capture | ⚠️ | Pre now soaks automatic Capture independently; test, local, and production remain default-off, and Dream remains separately off. Capture consumes the exact oldest contiguous raw-seq window, discloses only eligible live chat rows, and advances synthetic/internal-only windows without a provider call. Provider output is sealed into an encrypted prepared journal; retry adopts it before provider/enclave setup, then Memory rows, canonical logs, frontier, and job terminal state commit atomically. Emergency halt, Chat Clear/account deletion, runtime assignment, and user consent are checked before disclosure and remain transactionally fenced for the complete provider call; prepare and commit recheck them. The commit also shares a cross-process per-user mutation fence with every ordinary Memory Garden writer, whose retype path derives its update from the fresh fenced row. Opt-out erases journals and every failure stays background-only. The warning is an operational/card-quality soak gate, not a known source-correctness gap. |
+| Capture | ➖ | Automatic Capture is not a Runtime V2 release requirement and every managed default, including Pre, keeps it off. The dormant implementation remains available behind an explicit deployment and per-user gate. Its correctness path consumes the exact oldest contiguous raw-seq window, seals provider output into an encrypted prepared journal, and atomically commits Memory rows, canonical logs, frontier, and terminal job state under disclosure, consent, generation, and cross-process Memory Garden fences. |
 | Memory Dream | ➖ | Native `op/card_ids/result` consolidations map to multi-card supersede actions and pass the real Garden validator, but activation is a separate optional product lane rather than a Runtime V2 release requirement. All managed defaults keep it off. This Dream organizes memory cards and is not runtime failure replay. |
 | Genesis import | ✅ | Rehomed under `serve-worker` with a dedicated heartbeat |
-| Trajectory review | ✅ | Encrypted capture is always on with a default seven-day TTL and immediate Chat Clear erasure. Provider-backed offline review is opt-in/default-off, globally capped, tools-disabled, and has no live effect surfaces; operators have a separate default-off, exact-job, runner-local audited inspector. |
+| Trajectory review | ✅ | Encrypted capture is always on and retained until account deletion; Chat Clear preserves it. Provider-backed offline review is opt-in/default-off, globally capped, tools-disabled, and has no live effect surfaces; operators have a separate default-off, exact-job, runner-local audited inspector. |
 
 ## Workspace, working memory, and subagents
 
@@ -146,15 +146,15 @@ Coverage is a prompt invariant, never a retention authorization. The durable
 deleted at 5,000 rows or after a summary watermark advances. `MAX_CHAT_MESSAGES`
 only bounds each process's recent working set; iOS history uses bounded database
 pages, and a message body can be fetched by stable id outside that hot window.
-Only explicit user/account deletion removes source chat history. The explicit
-Chat clear endpoint is generation-fenced and atomically removes raw messages,
-the summary, chat-derived artifact views, pending effects/status, and the reply
-cursor, so an old worker cannot resurrect cleared context. It also tombstones
-the user's old jobs and deletes their encrypted trajectory/review content while
-preserving content-free job and turn metrics. Independent Memory Garden,
-Identity, user-authored workspace/working memory, schedules, job metadata,
-aggregate metrics, and prior trajectory-access audit rows remain; account
-deletion is the full-data erasure boundary.
+Clear Chat is a visibility boundary, not a retention authorization. It is
+generation-fenced and atomically moves raw encrypted rows into an immutable
+non-prompt archive while removing the summary, chat-derived artifact views,
+pending effects/status, and reply cursor, so an old worker cannot resurrect
+cleared context. Archived raw chat and R2 bodies, encrypted trajectory/review
+evidence, job metadata, aggregate metrics, and prior access audits remain
+available for debugging. Memory Garden, Identity, user-authored workspace/
+working memory, and schedules also remain; account deletion is the complete
+per-user erasure boundary.
 
 The **total prompt frontier** is the complete per-round budget calculation over
 the rendered system text, summary, verbatim messages, images, exact tool
@@ -253,9 +253,9 @@ safe 64 KiB batching floor); larger
 logical events are exact ordered chunks rather than clipped prefixes. Review
 reads at most the newest 256 physical rows and has its own 128 KiB prompt
 frontier; an incomplete chunk window is labeled incomplete. Those are analysis
-bounds, not retention policies. Raw encrypted event/review content is removed
-after the default seven-day terminal-job TTL, by Chat Clear, or by account
-deletion. The store has no public plaintext read API and is never injected into
+bounds, not retention policies. Raw encrypted event/review content has no
+time-based GC and survives Chat Clear; account deletion removes it. The store
+has no public plaintext read API and is never injected into
 live conversation context. A default-off runner-local inspector can decrypt one
 exact user/job pair only after a durable requested-access audit; it records a
 success phase before returning plaintext to the controlled invoking terminal.
@@ -299,9 +299,9 @@ This is analysis, not production retry. The existing effect outbox handles
 durable effect recovery. Any future replay mechanism must never resend replies,
 rewrite memory/identity/schedules, or repeat remote MCP mutations.
 
-Encrypted trajectory/review content has a default-on seven-day terminal-job TTL
-and Chat Clear removes it immediately; account deletion remains the complete
-per-user erasure boundary. The runner-local inspector is independently
+Encrypted trajectory/review content has no time-based GC and Chat Clear
+preserves it; account deletion remains the complete per-user erasure boundary.
+The runner-local inspector is independently
 default-off and requires an exact user/job pair plus a durable operator, reason,
 case, and outcome audit. Keep provider review opt-in until its BYOK budget is
 approved; capture itself remains available while review is off or globally
@@ -394,7 +394,6 @@ At minimum, current-status changes should remain covered by:
 - `tests/test_v2_subagents.py`
 - `tests/test_v2_trajectory_db.py`
 - `tests/test_v2_trajectory_unit.py`
-- `tests/test_v2_trajectory_retention.py`
 - `tests/test_v2_trajectory_access_audit.py`
 - `tests/test_v2_trajectory_inspect_unit.py`
 - `tests/test_v2_metrics_endpoint.py`

@@ -85,7 +85,9 @@ scp AuthKey_<KEY_ID>.p8 <user>@<host>:~/feedling-data/
 ```
 
 Without one, push endpoints log-only (chat / identity / memory still
-work; just no Live Activity / Dynamic Island delivery).
+work; just no Live Activity / Dynamic Island delivery). The official
+`.p8` key is never distributed — if you want real delivery to the
+official app, use the **push relay** (section 10) instead.
 
 ---
 
@@ -222,6 +224,90 @@ Ask the user to:
    always-on agent runtime. The reply should appear in iOS within ~30 seconds.
 
 If the reply never arrives, see **Troubleshooting** below.
+
+---
+
+## 10. Push relay (official APNs relay for self-hosted backends)
+
+Your self-hosted backend cannot deliver APNs pushes to the official app:
+the `.p8` signing key belongs to the app developer and is never shared.
+The **notify relay** solves this — the official backend pushes on your
+behalf.
+
+How it fits together:
+
+1. **Enroll (once, in the app).** In the iOS app (self-hosted mode),
+   Settings → 推送中继 → apply. The app calls the *official* server's
+   `POST /v1/notify-relay/register` with its APNs device token and gets
+   back a relay auth token (`nrt_…`). Copy it. The token is disclosed
+   **only when the device first enrolls** (or when you re-enroll while
+   presenting the token you already hold): an APNs device token is not a
+   secret, so registering a device that's already enrolled returns
+   `already_enrolled` **without** the token. The app keeps the token in
+   its Keychain; if it's lost there, re-mint by resetting the enrollment
+   rather than expecting the device token alone to fetch it back.
+2. **Configure your backend/agent.** Store the token wherever your
+   relay-calling code runs, e.g. in an env file:
+
+   ```bash
+   echo 'NOTIFY_RELAY_URL=https://api.feedling.app' >> ~/feedling-data/.env
+   echo 'NOTIFY_RELAY_AUTH_TOKEN=nrt_...' >> ~/feedling-data/.env
+   ```
+
+3. **Push through the relay.** Call `POST /v1/notify-relay/push` on the
+   official server with the `X-Relay-Token` header. Types:
+   `1` alert · `2` Live Activity update (Dynamic Island) ·
+   `3` Live Activity start (push-to-start) · `4` Live Activity end.
+
+Type `1` needs no target token — it always delivers to the enrolled
+device (an explicit `token` that isn't the enrolled one is rejected;
+the relay token never pushes alerts to other devices):
+
+```bash
+curl -s https://api.feedling.app/v1/notify-relay/push \
+  -H "X-Relay-Token: $NOTIFY_RELAY_AUTH_TOKEN" -H "Content-Type: application/json" \
+  -d '{"type": 1, "content": {"title": "IO", "body": "Your agent replied."}}'
+```
+
+Types `2`–`4` **must** pass the target token. Live Activity tokens
+rotate per activity: the app uploads them to *your* backend
+(`POST /v1/push/register-token`, they land in your `user_blobs`
+`kind='tokens'` row) — always forward the newest one:
+
+```bash
+# 3: start a Live Activity via the push-to-start token
+curl -s https://api.feedling.app/v1/notify-relay/push \
+  -H "X-Relay-Token: $NOTIFY_RELAY_AUTH_TOKEN" -H "Content-Type: application/json" \
+  -d '{"type": 3, "token": "<push_to_start_token>",
+       "content": {"name": "IO", "desc": "Working on it…", "alert_body": "Started"}}'
+
+# 2: update it (Dynamic Island refreshes with it) via the activity token
+curl -s https://api.feedling.app/v1/notify-relay/push \
+  -H "X-Relay-Token: $NOTIFY_RELAY_AUTH_TOKEN" -H "Content-Type: application/json" \
+  -d '{"type": 2, "token": "<live_activity_token>",
+       "content": {"visualState": "reply", "name": "IO", "desc": "Done!",
+                   "alert_title": "IO", "alert_body": "Done!"}}'
+
+# 4: end it
+curl -s https://api.feedling.app/v1/notify-relay/push \
+  -H "X-Relay-Token: $NOTIFY_RELAY_AUTH_TOKEN" -H "Content-Type: application/json" \
+  -d '{"type": 4, "token": "<live_activity_token>", "content": {}}'
+```
+
+Reading the result: HTTP 200 with `"status": "delivered"` or
+`"status": "error"` plus the raw APNs `reason`. On
+`BadDeviceToken`/`Unregistered`, refresh the token on your side (the
+relay does not manage pass-through token lifecycles). `401` = bad relay
+token, `429` = rate limited (respect `Retry-After`; limits are per
+token and generous for single-user use), `503` = the official relay is
+temporarily unable to sign pushes — retry later.
+
+**Privacy disclosure:** every relay call is logged on the official
+server for triage — push type, target token, delivery status, and the
+`content` object truncated to 512 characters. Don't route content
+through the relay that you are not comfortable having retained there;
+keep push text terse (e.g. a generic "new reply" alert) if that
+matters to you.
 
 ---
 

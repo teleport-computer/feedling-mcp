@@ -99,6 +99,12 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "VALUES (%s,1,0,1,'m1','[]'::jsonb,0,%s)",
             (user_id, capture_job_id),
         )
+        conn.execute(
+            "INSERT INTO chat_message_archive "
+            "(user_id,source_seq,msg_id,ts,doc,storage_generation,clear_generation) "
+            "VALUES (%s,1,'cleared-message',1.0,%s,0,1)",
+            (user_id, db.Jsonb({"body_ct": "encrypted-chat-body"})),
+        )
     cid = db.model_api_credential_create(
         user_id, provider="anthropic", base_url="", label="k",
         api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
@@ -118,6 +124,7 @@ _PER_USER_TABLES = (
     "model_api_routes",
     "v2_turn_metrics",
     "v2_capture_batches",
+    "chat_message_archive",
 )
 
 

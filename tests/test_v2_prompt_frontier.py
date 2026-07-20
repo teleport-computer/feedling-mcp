@@ -441,7 +441,7 @@ def _run_loop(*, monkeypatch, provider, fold, build_messages, **kwargs):
     async def dispatch(calls):
         return [ToolResult(call_id=call.id, content="x" * 65_000) for call in calls]
 
-    async def on_reply(_text, *, final):
+    async def on_reply(_text, *, final, reasoning=""):
         assert final is True
 
     return asyncio.run(
