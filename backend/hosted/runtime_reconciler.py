@@ -64,12 +64,19 @@ def _current_actual(user_id: str) -> str | None:
 def reconcile_once() -> dict:
     stats = {"checked": 0, "flipped": 0, "failed": 0, "skipped_backoff": 0}
     allow_map = db.get_runtime_allowlist_map()
-    # 范围 = 名单里的用户 + （默认为 v2 时）所有还在 resident 的托管用户。
+    # 范围 = 名单里的用户 + （默认为 v2 时）所有还在 resident 的托管用户 + 任何
+    # 当前 fence 不在 dormant resident 的用户（无条件并入，不受默认值门控）。
     # P4/P5（默认 resident）阶段名单就是全部工作集；P6 翻默认后由
-    # list_agent_runtime_enabled_users 提供存量 resident 用户集。
+    # list_agent_runtime_enabled_users 提供存量 resident 用户集。最后一条并入
+    # 是 spec §4a/§9 的回退保证：把用户从名单里删掉即视为 desired=resident
+    # （表即真相），但若默认值仍是 resident 且该用户已经被 flip 到 v2，光看
+    # allow_map 会让它从 scope 里彻底消失、永远收不回 resident —— 必须靠
+    # list_hosted_runtime_nonresident_controls（fence 当前 != resident 的存量）
+    # 兜底把它留在 scope 里，desired_for 才能把它判回 resident 并触发反向 flip。
     user_ids = set(allow_map)
     if os.environ.get(_DEFAULT_DESIRED_ENV, "resident").strip().lower() == "v2":
         user_ids.update(r["user_id"] for r in db.list_agent_runtime_enabled_users())
+    user_ids.update(row[0] for row in db.list_hosted_runtime_nonresident_controls())
     now = time.time()
     for uid in sorted(user_ids):
         stats["checked"] += 1

@@ -73,6 +73,11 @@ def perception_ingress_runtime_v2_enabled(user_or_store) -> bool:
     v2, fence says resident). ``perception_ingress_runtime_v2_enabled`` in a
     persisted ``model_api_runtime`` profile is now a vestigial/legacy field —
     nothing reads it anymore.
+
+    Reading only ``mode`` here (not the paired ``state``) is safe: the mode
+    field and the runtime-state row are the SAME writer's atomic commit
+    (``db.patch_blob_strict(runtime_state_target=...)`` flips both in one
+    transaction), so mode can never be observed ahead of state.
     """
     try:
         user_store = user_or_store

@@ -122,6 +122,36 @@ def test_post_desired_remove_deletes_row(env):
     assert body == {"user_id": uid, "removed": False}
 
 
+def test_post_desired_remove_on_v2_user_reverts_on_next_reconcile(env, monkeypatch):
+    """The rollback runbook (spec §9) is "移出名单回 V1" — this pins that a
+    reconcile tick after the removal actually flips the fence back, not just
+    that the allowlist row disappears (regression cover for the reconciler
+    scope bug: dropping the row must not strand a fenced-v2 user forever)."""
+    from core import store as core_store
+    from hosted import config_store, runtime_reconciler
+
+    monkeypatch.delenv("FEEDLING_RUNTIME_DEFAULT_DESIRED", raising=False)
+    uid = _uid("allow_remove_v2")
+    _seed_model_api_user(uid)
+    db.upsert_runtime_allowlist(uid, "v2")
+    runtime_reconciler.reconcile_once()
+    mode, state, _ = config_store.get_hosted_runtime_control_strict(core_store.get_store(uid))
+    assert (mode, state) == ("db_action_v2", "v2")
+
+    status, body = _asgi_json(
+        "POST", "/v1/admin/runtime-allowlist", headers=_admin(),
+        json={"user_id": uid, "desired": "remove"},
+    )
+    assert status == 200
+    assert body == {"user_id": uid, "removed": True}
+    assert uid not in db.get_runtime_allowlist_map()
+
+    stats = runtime_reconciler.reconcile_once()
+    assert stats["flipped"] >= 1
+    mode, state, _ = config_store.get_hosted_runtime_control_strict(core_store.get_store(uid))
+    assert (mode, state) == ("resident_cli", "resident")
+
+
 def test_post_invalid_desired_returns_400(env):
     uid = _uid("allow_bad")
     _seed_model_api_user(uid)

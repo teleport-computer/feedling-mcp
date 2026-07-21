@@ -88,3 +88,31 @@ def test_failed_user_backs_off(fresh_user, monkeypatch):
     runtime_reconciler.reconcile_once()
     stats = runtime_reconciler.reconcile_once()   # 退避窗口内
     assert stats["skipped_backoff"] >= 1
+
+
+def test_removed_v2_user_reverts_to_resident(fresh_user, monkeypatch):
+    """spec §4a/§9: deleting the allowlist row IS the documented rollback
+    path ("不在表里 = desired resident，表即真相" / emergency runbook "把 v2
+    用户移出名单回 V1"). Under the default-resident canary phase, dropping the
+    row must not strand the user off-scope at (db_action_v2, v2) forever —
+    ``reconcile_once`` has to keep unioning
+    ``list_hosted_runtime_nonresident_controls`` so a fenced-v2 user with no
+    allowlist row is still visited and flipped back."""
+    monkeypatch.delenv("FEEDLING_RUNTIME_DEFAULT_DESIRED", raising=False)
+    uid = fresh_user
+    from core import store as core_store
+    from hosted import config_store
+
+    db.upsert_runtime_allowlist(uid, "v2")
+    stats = runtime_reconciler.reconcile_once()
+    assert stats["flipped"] >= 1
+    mode, state, _ = config_store.get_hosted_runtime_control_strict(core_store.get_store(uid))
+    assert (mode, state) == ("db_action_v2", "v2")
+
+    db.delete_runtime_allowlist(uid)
+    assert uid not in db.get_runtime_allowlist_map()
+
+    stats = runtime_reconciler.reconcile_once()
+    assert stats["flipped"] >= 1
+    mode, state, _ = config_store.get_hosted_runtime_control_strict(core_store.get_store(uid))
+    assert (mode, state) == ("resident_cli", "resident")

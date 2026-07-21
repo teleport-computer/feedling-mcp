@@ -117,6 +117,10 @@ def model_api_chat_send_core(
             return {"error": "runtime_policy_not_ready"}, 503
         # else: fall through to the V2 path below (unchanged behavior).
     else:  # dual
+        # External readers rarely observe "draining" — the resident/v2 <->
+        # draining <-> target transition commits atomically (patch_blob_strict),
+        # so this window is narrow by construction. The guard below is
+        # defensive fail-closed cover for that narrow window, not dead code.
         if _runtime_state == "draining":
             debug_trace.trace_event(
                 store, subsystem="route", type="route.decided",
