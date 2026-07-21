@@ -151,8 +151,13 @@ def test_v2_blob_without_authoritative_v2_state_fails_closed(monkeypatch):
         store, api_key="key", runtime_tok="", payload={"message": "hi"},
     )
 
+    # Under the default ``dual`` policy the three-state dispatch classifies a
+    # ``db_action_v2`` blob over a ``resident`` authoritative state as an illegal
+    # split tuple → ``runtime_control_invalid`` (still fails closed before any
+    # persist). Under ``v2_only`` the same tuple is ``runtime_policy_not_ready``
+    # (covered by test_v2_only_policy_mismatch_never_repairs_or_routes_to_resident).
     assert status == 503
-    assert body == {"error": "runtime_policy_not_ready"}
+    assert body == {"error": "runtime_control_invalid"}
 
 
 def test_db_action_v2_input_write_failure_never_enqueues(monkeypatch):
