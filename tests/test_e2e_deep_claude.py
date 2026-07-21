@@ -93,14 +93,18 @@ def test_bare_person_label_targets_yonghu_and_ta():
     assert not exp._bare_person_label("She likes pour-over coffee")
 
 
-def test_wait_proactive_reply_correlates_by_job_id_only():
+def test_wait_proactive_reply_correlates_by_job_id_only(monkeypatch):
     correlated = FakeClient(lambda m, p, **kw: FakeResp(200, {"messages": [
         {"role": "agent", "id": "a1", "proactive_job_id": "J1"}]}))
-    assert exp._wait_proactive_reply(correlated, "J1", 0.0, timeout=1.0)["id"] == "a1"
-    # a late ORDINARY reply (no proactive_job_id) must NOT be accepted as the opener
+    assert exp._wait_proactive_reply(correlated, "J1", 0.0, timeout=5.0)["id"] == "a1"
+    # a late ORDINARY reply (no proactive_job_id) must be POLLED and then rejected —
+    # patched clock/sleep so the loop actually inspects the row before timing out.
+    clock = {"t": 100.0}
+    monkeypatch.setattr(exp.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr(exp.time, "time", lambda: clock.__setitem__("t", clock["t"] + 2) or clock["t"])
     ordinary = FakeClient(lambda m, p, **kw: FakeResp(200, {"messages": [
         {"role": "agent", "id": "a2", "reply_to_message_id": "u1"}]}))
-    assert exp._wait_proactive_reply(ordinary, "J1", 0.0, timeout=0.0) is None
+    assert exp._wait_proactive_reply(ordinary, "J1", 100.0, timeout=3.0) is None
 
 
 def test_replies_for_ignores_empty_user_id():
