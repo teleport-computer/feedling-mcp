@@ -71,6 +71,90 @@ def turns_halted(default_on_error: bool = False) -> bool:
     return value
 
 
+# ---------------------------------------------------------------- web tools
+# Separate cache slot from `turns_halted` — different column, different TTL
+# lifecycle, and mixing them would let a turns_halted read serve a stale web
+# answer (or vice versa).
+_web_cache_lock = threading.Lock()
+_web_cached: tuple[bool, bool] | None = None
+_web_cached_at: float = 0.0
+
+
+def _invalidate_web() -> None:
+    global _web_cached, _web_cached_at
+    with _web_cache_lock:
+        _web_cached = None
+        _web_cached_at = 0.0
+
+
+def _fetch_web_halted_row():
+    """Raw control-row read. Split out so tests can drive the error and
+    missing-row branches without a live database."""
+    with db.get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT web_search_halted, web_fetch_halted "
+                "FROM v2_runtime_control WHERE id=1"
+            )
+            return cur.fetchone()
+
+
+def web_halted() -> tuple[bool, bool]:
+    """`(search_halted, fetch_halted)`, cached ~`_CACHE_TTL_SEC` seconds.
+
+    Unlike `turns_halted` there is deliberately NO `default_on_error` knob: web
+    has no legitimate fail-open caller, so keeping one would just be a bypass
+    hatch on a safety gate. Fixed semantics:
+
+    - DB ok            -> the two real columns
+    - DB error         -> `(True, True)`, AND the error result is cached. Not
+      caching it would make every turn and every tool batch re-query while the
+      database is unhealthy, amplifying the outage into a query storm.
+    - row missing      -> unknown state -> `(True, True)`, also cached
+    - NEVER raises     -> callers treat `(True, True)` as "no web tools in this
+      batch" and let the model answer tool-less. Halting web must not fail the
+      turn — that is `turns_halted`'s job, not this one.
+    """
+    global _web_cached, _web_cached_at
+    now = time.monotonic()
+    with _web_cache_lock:
+        if _web_cached is not None and (now - _web_cached_at) < _CACHE_TTL_SEC:
+            return _web_cached
+    try:
+        row = _fetch_web_halted_row()
+        # A missing control row is an unknown state, not "nothing is halted".
+        value = (bool(row[0]), bool(row[1])) if row else (True, True)
+    except Exception as exc:  # noqa: BLE001 — must never raise into callers
+        log.warning("[v2.kill_switch] web_halted read failed, failing closed: %s", exc)
+        value = (True, True)
+    with _web_cache_lock:
+        _web_cached = value
+        _web_cached_at = now
+    return value
+
+
+def set_web_halted(*, search: bool | None = None, fetch: bool | None = None) -> None:
+    """UPDATE only the columns explicitly passed; the other keeps its value."""
+    sets: list[str] = []
+    params: list[bool] = []
+    if search is not None:
+        sets.append("web_search_halted=%s")
+        params.append(bool(search))
+    if fetch is not None:
+        sets.append("web_fetch_halted=%s")
+        params.append(bool(fetch))
+    if not sets:
+        return
+    with db.get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE v2_runtime_control SET {', '.join(sets)}, updated_at=now() "
+                "WHERE id=1",
+                tuple(params),
+            )
+    _invalidate_web()
+
+
 def set_turns_halted(halted: bool) -> None:
     """UPDATE the single control row and invalidate the cache so the next read
     (in this process and any other, once its own TTL lapses) observes it."""
@@ -81,3 +165,12 @@ def set_turns_halted(halted: bool) -> None:
                 (bool(halted),),
             )
     _invalidate()
+
+
+def _invalidate_all_for_tests() -> None:
+    """Drop BOTH cached values. The two switches have independent lifecycles —
+    `set_turns_halted` must not silently reset the web cache and vice versa — so
+    production code never calls this; it exists so a test can reset the module
+    without reaching into either private slot."""
+    _invalidate()
+    _invalidate_web()

@@ -164,6 +164,9 @@ def _tc(call_id, name, **args):
 
 def _deps(*, messages, token="rt-enclave"):
     return worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: token,
@@ -326,6 +329,9 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
     monkeypatch.setattr(v2_tool_loop, "run_tool_loop", _spy_run_tool_loop)
 
     deps = worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda uid: list(live_rows["rows"]),
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt-enclave",

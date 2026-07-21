@@ -65,6 +65,7 @@ from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
+from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
@@ -721,6 +722,11 @@ class TurnDeps:
     # same-timestamp message during rollout.
     read_messages_after_seq: Callable[[str, int], list[dict]] | None = None
     runtime_mode_enabled: Callable[[str], bool] | None = None
+    # (user_id) -> bool：用户的「联网搜索」开关。None / 抛异常 / 非 bool 返回值
+    # 一律按禁用处理（见 web_gate.resolve_user_enabled）。默认 None：worker.py
+    # 自身不 import hosted，测试不必提供；生产装配见
+    # serve_worker.build_production_deps。
+    web_tools_enabled: Callable[[str], bool] | None = None
     # (user_id, after_ts, limit) -> [{"id","ts","role","content"}]：最近窗口，BOTH
     # roles，ts>after_ts，enclave 解密明文（D1：让 turn 能看见真实对话上下文，不再局限于
     # "上次回复之后的 user 消息"那一批）。默认 None：worker.py 自身不 import hosted，
@@ -2179,6 +2185,57 @@ def _make_build_messages_fn(
     return build_messages
 
 
+async def _web_batch_cancellation(
+    tool_calls, *, disabled_web_snapshot
+) -> list[ToolResult] | None:
+    """Second fail-closed boundary for the web tools. ``None`` = let the batch run.
+
+    ``run_tool_loop`` builds ``turn_catalog`` ONCE at the entry of the turn
+    (tool_loop.py:307-320) and reuses it for every round, so an operator flipping
+    the kill switch mid-turn would not stop round 2 on the offer side alone. Every
+    batch therefore re-checks before executing. The control-table read is cached
+    ~2s, and we only pay for it when the batch actually contains a web call.
+
+    Semantic boundary, stated plainly because operations depends on it: this stops
+    NEW dispatches within roughly two seconds. HTTP requests already in flight are
+    not cancelled.
+
+    Checks the turn-entry snapshot (which already carries the user preference and
+    the lane decision) UNION the live halted flags. The live half deliberately does
+    NOT re-interpret the lane: re-deriving a policy the snapshot already encodes is
+    how two halves of a gate drift apart.
+
+    Cancellation is all-or-nothing, matching the loop's own malformed-batch
+    handling. Executing the siblings while dropping the web call would leave half a
+    batch applied: a sibling may be a write, or a ``memory_fetch`` whose private
+    result then rides into the next round, and the model cannot tell which results
+    were withheld by policy.
+    """
+    if not any(tc.name in v2_web_gate.WEB_TOOL_NAMES for tc in tool_calls):
+        return None
+    search_halted, fetch_halted = await asyncio.to_thread(kill_switch.web_halted)
+    blocked = frozenset(disabled_web_snapshot) | v2_web_gate.halted_web_tools(
+        search_halted=search_halted, fetch_halted=fetch_halted
+    )
+    if not any(tc.name in blocked for tc in tool_calls):
+        return None
+    # The error string follows what is ACTUALLY blocked, not "is this a web
+    # tool". Under a half-open kill switch (search halted, fetch fine) a batch
+    # holding both would otherwise tell the model fetch is unavailable too, and
+    # it would stop retrying something that still works.
+    return [
+        ToolResult(
+            call_id=tc.id,
+            content=(
+                "error: web_tool_halted"
+                if tc.name in blocked
+                else "error: batch_cancelled_web_halted"
+            ),
+        )
+        for tc in tool_calls
+    ]
+
+
 def _make_task_batch_dispatcher(
     *,
     provider_config,
@@ -2188,6 +2245,7 @@ def _make_task_batch_dispatcher(
     enclave_sem: asyncio.Semaphore,
     trusted_system_blocks: tuple[str, ...],
     add_usage: Callable[[dict | None], None],
+    disabled_web_tool_names: frozenset[str] = v2_web_gate.WEB_TOOL_NAMES,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
 ) -> Callable[[list], Awaitable[list[ToolResult]]]:
     """Bind the concrete, read-only child loop for one parent turn.
@@ -2247,9 +2305,28 @@ def _make_task_batch_dispatcher(
 
             child_tool_event = _make_tool_trajectory_callback(child_recorder)
             child_read_gate = asyncio.Semaphore(MAX_READ_ACTION_PARALLELISM)
+            # Computed ONCE and referenced by both the offer side
+            # (disabled_tool_names below) and the execute side
+            # (_child_dispatch). Deriving each independently is precisely how
+            # the two halves of a gate drift apart.
+            #
+            # The child inherits the PARENT LANE's decision, not the raw user
+            # preference: a subagent spawned from a wake turn stays offline
+            # even for a user who enabled web search.
+            child_allowed_tools = _SUBAGENT_ALLOWED_TOOLS - set(
+                disabled_web_tool_names
+            )
+            child_disabled_tools = _SUBAGENT_DISABLED_TOOLS | frozenset(
+                disabled_web_tool_names
+            )
 
             async def _child_dispatch(tool_calls) -> list[ToolResult]:
-                if any(tc.name not in _SUBAGENT_ALLOWED_TOOLS for tc in tool_calls):
+                cancelled = await _web_batch_cancellation(
+                    tool_calls, disabled_web_snapshot=disabled_web_tool_names
+                )
+                if cancelled is not None:
+                    return cancelled
+                if any(tc.name not in child_allowed_tools for tc in tool_calls):
                     # The child loop validates against its offered catalog before
                     # calling this closure. This is a second fail-closed boundary
                     # for direct/broken-relay invocations.
@@ -2338,7 +2415,7 @@ def _make_task_batch_dispatcher(
                 add_usage=_charge_child_usage,
                 max_calls=_SUBAGENT_MAX_LLM_CALLS,
                 before_provider_call=budget.before_provider_call,
-                disabled_tool_names=_SUBAGENT_DISABLED_TOOLS,
+                disabled_tool_names=child_disabled_tools,
                 allow_reply_tool=False,
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
@@ -4340,7 +4417,28 @@ async def _run_wake(
             if tm is not None:
                 tm.add_call(usage)
 
+        # The wake lane follows the SAME user switch as chat. The proactive
+        # companion could already reach the network before this feature existed
+        # (pre offered these tools here with no gate at all), so closing it
+        # unconditionally would be a capability regression, not a new setting.
+        # Same shape as the chat lane, deliberately — one switch, every lane.
+        wake_web_user_enabled = await asyncio.to_thread(
+            v2_web_gate.resolve_user_enabled, deps.web_tools_enabled, user_id
+        )
+        if wake_web_user_enabled:
+            wake_search_halted, wake_fetch_halted = await asyncio.to_thread(
+                kill_switch.web_halted
+            )
+        else:
+            wake_search_halted = wake_fetch_halted = True
+        wake_disabled_web_tool_names = v2_web_gate.disabled_web_tools(
+            user_enabled=wake_web_user_enabled,
+            search_halted=wake_search_halted,
+            fetch_halted=wake_fetch_halted,
+        )
+
         dispatch_task_batch = _make_task_batch_dispatcher(
+            disabled_web_tool_names=wake_disabled_web_tool_names,
             provider_config=provider_config,
             store=store,
             api_key=None,
@@ -4352,6 +4450,11 @@ async def _run_wake(
         )
 
         async def _dispatch_tools(tool_calls):
+            cancelled = await _web_batch_cancellation(
+                tool_calls, disabled_web_snapshot=wake_disabled_web_tool_names
+            )
+            if cancelled is not None:
+                return cancelled
             await _fence_wake_effect("tool dispatch")
 
             async def _dispatch_platform_one(tc) -> ToolResult:
@@ -4803,6 +4906,7 @@ async def _run_wake(
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
                 build_messages=build_messages,
+                disabled_tool_names=wake_disabled_web_tool_names,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
                 fold_new_messages=fold_new_messages,
@@ -5791,6 +5895,29 @@ async def process_job(
                 for spec in mcp_turn.tool_specs
                 if spec.name not in mcp_mutating_names
             )
+        # Web gate. UNION with the mutation set, never assignment — overwriting
+        # would re-expose the writes that mutation recovery just withheld.
+        # The store read is synchronous, hence to_thread (same shape as the
+        # runtime_mode_enabled read above); blocking here would stall the loop.
+        web_user_enabled = await asyncio.to_thread(
+            v2_web_gate.resolve_user_enabled, deps.web_tools_enabled, user_id
+        )
+        # Skip the control-plane read entirely when the user is off: the answer
+        # is already "both withheld", so that is one less DB round-trip.
+        if web_user_enabled:
+            web_search_halted, web_fetch_halted = await asyncio.to_thread(
+                kill_switch.web_halted
+            )
+        else:
+            web_search_halted = web_fetch_halted = True
+        disabled_web_tool_names = v2_web_gate.disabled_web_tools(
+            user_enabled=web_user_enabled,
+            search_halted=web_search_halted,
+            fetch_halted=web_fetch_halted,
+        )
+        disabled_tool_names_for_turn = (
+            frozenset(disabled_mutation_tool_names) | disabled_web_tool_names
+        )
         # Shared across every provider round in this chat turn. A per-dispatch
         # budget would reset whenever the model asks for another tool batch and
         # would therefore fail to bound the whole-turn MCP contribution.
@@ -5805,6 +5932,7 @@ async def process_job(
             store, runtime_token=runtime_token, enclave_sem=enclave_sem
         )
         dispatch_task_batch = _make_task_batch_dispatcher(
+            disabled_web_tool_names=disabled_web_tool_names,
             provider_config=provider_config,
             store=store,
             api_key=api_key,
@@ -5816,6 +5944,11 @@ async def process_job(
         )
 
         async def _dispatch_tools(tool_calls):
+            cancelled = await _web_batch_cancellation(
+                tool_calls, disabled_web_snapshot=disabled_web_tool_names
+            )
+            if cancelled is not None:
+                return cancelled
             # Fence once per round before any capability executes (mirrors the
             # old _run_tools's renewal ahead of the read burst); writes get a
             # second, per-write fence via before_write above.
@@ -6405,7 +6538,7 @@ async def process_job(
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             extra_mutating_tool_names=mcp_mutating_names,
-            disabled_tool_names=disabled_mutation_tool_names,
+            disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
             outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,

@@ -636,3 +636,46 @@ def test_screen_watch_lane_uses_its_own_prompt_and_screen_context(monkeypatch):
     assert '"recent_count":1' in joined
     assert "screen_recent" in {spec.name for spec in seen["tools"]}
     assert _bubbles(uid)[0]["body_ct"] == "你在看这个报错？"
+
+
+# --------------------------------------------------------------- web gate
+
+
+def _wake_offered(monkeypatch, *, user_enabled: bool, uid: str) -> set[str]:
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("hey")])
+    deps = _wake_deps(tail=[], sink_calls=[])
+    deps.web_tools_enabled = lambda uid_: user_enabled
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+    ))
+    assert status == "completed"
+    return {spec.name for spec in (calls[0]["tools"] or ())}
+
+
+def test_wake_offers_web_tools_when_the_user_enabled_them(monkeypatch):
+    """The proactive companion follows the SAME switch as chat.
+
+    It could already reach the network before this feature existed, so a
+    background carve-out would be a silent capability regression wearing the
+    costume of a new setting. One switch, every lane.
+    """
+    offered = _wake_offered(monkeypatch, user_enabled=True, uid="u_wake_web_on")
+    assert {"web_search", "web_fetch"} <= offered
+    # the rest of the wake tool surface is unchanged
+    assert "memory_index" in offered
+
+
+def test_wake_withholds_web_tools_when_the_user_turned_them_off(monkeypatch):
+    """...and turning the switch off closes the background lane too, which is
+    the whole reason it is allowed to be one switch."""
+    offered = _wake_offered(monkeypatch, user_enabled=False, uid="u_wake_web_off")
+    assert {"web_search", "web_fetch"}.isdisjoint(offered)
+    assert "memory_index" in offered

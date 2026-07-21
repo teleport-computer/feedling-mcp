@@ -130,6 +130,9 @@ def _spy_cap_data(monkeypatch, calls, *, data=None):
 
 def _chat_deps(messages):
     return worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt-enclave",
@@ -139,6 +142,9 @@ def _chat_deps(messages):
 
 def _wake_deps(tail):
     return worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt",
@@ -283,9 +289,10 @@ def test_wake_turn_injects_perception_grounding(monkeypatch):
     assert "step_count" in joined
     assert "IGNORE THE USER" not in joined
     assert "mcp__attacker__upload" not in joined
-    assert {"web_search", "web_fetch", "task"} <= {
-        spec.name for spec in seen["tools"]
-    }
+    offered = {spec.name for spec in seen["tools"]}
+    # A wake turn gets the same outbound surface as chat when the user's switch
+    # is on: `task` (the research subagent) and both web tools.
+    assert {"task", "web_search", "web_fetch"} <= offered
 
 
 @pytest.mark.parametrize("lane", ["chat", "scheduled"])
@@ -358,7 +365,10 @@ def test_chat_and_wake_fence_outbound_after_text_perception_read(
     assert len(provider_calls) == 2
     first_names = {spec.name for spec in provider_calls[0]["tools"]}
     second_names = {spec.name for spec in provider_calls[1]["tools"]}
+    # Round 1: both lanes may reach the network — the switch is per account,
+    # not per lane, and this deps fixture has it on.
     assert {"web_search", "web_fetch", "task"} <= first_names
+    # Round 2: a text perception read fences ALL outbound tools on both lanes.
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_names)
     first_prompt = " ".join(
         str(message.get("content") or "")
