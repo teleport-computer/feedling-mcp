@@ -295,6 +295,7 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 | admin debug 慢查询（>400s 不可用） | §6 admin 三读性能打表（get_blobs_for_users） |
 | resident 旧版 consumer 永不认领蒸馏任务（usr_f13f，5 连失败+错怪网络/模型设置） | 已入 pytest（test_resident_maintenance 6 DB 例 + unit 节流/措辞例）；`tools/e2e/resident_maintenance_smoke.py`（触碰 consumer 识别/poll/notice/genesis claim 时加跑，~17min：模拟无 commit header poll→15min 注入→用户密钥解密→notice+copyable_prompt→封信封回复→限流→收敛 resolve）；P1 #12 归因抽查含 resident_never_claimed→"resident 端过旧/离线"（blame=user_environment，不再引导查网络/模型设置） |
 | app 感知断供 + 读侧缺口（usr_7f30，快捷指令停报 2 天 AI 只字未提） | 已入 pytest（perception recent_apps 权限/TTL/route 共 85 项）；**io_cli allowlist parity test**（防"verb 实现了但没进 _IO_CLI_VERBS"——driver=pi 用户才踩得到的暗坑，两次都是它）；排查口径：客户端快捷指令断供属用户侧，先查 user_logs 对应 stream 最后上报时间再谈后端 |
+| **hosted OpenAI 多轮静默掉回复（pre V2，driver=codex）** | 2026-07-22 深度探针 + 手测 3/3 发现：`provider=openai model=gpt-5.2 driver=codex` **第 1 轮有回复、第 2 轮起无任何 agent row**（非空回复、非迟到、无气泡）。anthropic(claude)/relay(openai_compatible) 同探针多轮全绿→**codex driver 跨轮续接嫌疑**。handoff `docs/HANDOFF_openai_codex_multiturn_2026-07-22.md`（pre 分支），交后端。**教训①：多 provider 必分 driver 跑——换 driver 才暴此 bug，anthropic 永远碰不到；教训②：V2 agent_jobs(聊天)失败无用户/admin 可见信号=静默，该补错误气泡+admin 失败原因（观测缺口）** |
 
 **规则**：以后每个 prod 事故结案时，必须在本表加一行 + 在对应层落一条用例，
 否则不算结案。
