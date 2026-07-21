@@ -146,6 +146,13 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- The resident consumer's default per-turn agent timeout
+  (`FEEDLING_AGENT_TURN_TIMEOUT_SEC`) is raised from 120 to 300 seconds. Slow
+  self-hosted stacks (official Claude Code cold starts, heavy MCP, long-thinking
+  models) can legitimately take 100–120s+ per turn, and the old default was
+  terminating those turns right at the wire so real replies were dropped. The
+  minimum floor (30s) and the operator env override are unchanged, and the cap
+  still exists so a hung agent can never wedge the single-flight chat lane.
 - Resident agent replies now preserve Markdown markers, paragraph breaks, and
   list indentation when the consumer filters runtime noise. Headings, unordered
   lists, nested lists, blockquotes, thematic breaks, and fenced code therefore

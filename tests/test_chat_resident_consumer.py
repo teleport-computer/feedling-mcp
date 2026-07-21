@@ -8001,7 +8001,7 @@ def test_pi_without_message_placeholder_is_exempt(monkeypatch, tmp_path):
 
 def test_turn_timeout_is_env_tunable(monkeypatch, tmp_path):
     # Heavy self-hosted stacks (wrapper + MCP cold start + long thinking) need
-    # more than the 120s default; the cap rides AGENT_TURN_TIMEOUT_SEC.
+    # a custom operator cap; it rides AGENT_TURN_TIMEOUT_SEC via env.
     _bridge_session_env(monkeypatch, tmp_path, "usr_slow_stack")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
@@ -8124,3 +8124,13 @@ def test_chat_scratch_refusal_logs_once(monkeypatch):
     for _ in range(5):
         assert crc._chat_scratch_write_allowed() is False
     assert len(calls) == 1
+
+
+def test_agent_turn_timeout_default_is_300():
+    """Default per-turn cap raised 120s→300s: slow self-hosted CC on modest VPS
+    takes 100-120s+ and the old default clipped real replies at the wire
+    (usr_6c1971, 2026-07-21 — a real reply landed at 104s while most turns hit
+    the 120s cap and were silently dropped). Floor and env override unchanged."""
+    if os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC"):
+        pytest.skip("env override set for FEEDLING_AGENT_TURN_TIMEOUT_SEC")
+    assert crc.AGENT_TURN_TIMEOUT_SEC == 300

@@ -223,12 +223,15 @@ AGENT_HTTP_SESSION_KEY_HEADER = os.environ.get(
 )
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
-# Per-turn subprocess cap for the CLI agent. 120s suits the managed claude/codex/
-# pi templates; heavy self-hosted stacks (custom wrappers, slow MCP cold starts,
-# long-thinking models — usr_c190's xiake_wrapper+MCP+opus combo, 2026-07-18)
-# legitimately need more. Raise via env; the cap still exists so a hung agent
-# can never wedge the single-flight chat lane forever.
-AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "120")))
+# Per-turn subprocess cap for the CLI agent. Default 300s: the managed
+# claude/codex/pi templates finish well inside it, while self-hosted stacks on
+# modest VPS hardware (official Claude Code cold starts, slow MCP, long-thinking
+# models) legitimately take 100-120s+ per turn — the old 120s default was
+# clipping those right at the wire (usr_6c1971, 2026-07-21: a real reply landed
+# at 104s while most turns hit the cap and were silently dropped). Lower or
+# raise via env; the cap still exists so a hung agent can never wedge the
+# single-flight chat lane forever.
+AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "300")))
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
