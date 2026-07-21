@@ -2169,6 +2169,8 @@ _REASONING_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_RUNTIME_REASONING_FENCE_LANGUAGES = {"copy"}
+
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 _TAGGED_THINKING_RE = re.compile(
     r"<\s*(?P<tag>think|thinking|reasoning|thought)\s*>\s*"
@@ -2216,17 +2218,18 @@ def _strip_leading_non_cjk_preamble(lines: list[str]) -> list[str]:
     if first_cjk is None or first_cjk == 0:
         return lines
 
-    markdown_start = next(
-        (
-            i
-            for i, line in enumerate(lines[:first_cjk])
-            if re.match(
-                r"^\s*(?:#{1,6}\s|[-+*]\s|>\s|\d+[.)]\s|[`~]{3,}|\||\*\*|__)",
-                line,
-            )
-        ),
-        None,
-    )
+    markdown_start: int | None = None
+    for i, line in enumerate(lines[:first_cjk]):
+        stripped = line.strip()
+        if re.fullmatch(r"(?:---|\*\*\*|___|=+)", stripped):
+            markdown_start = max(0, i - 1) if i and lines[i - 1].strip() else i
+            break
+        if re.match(
+            r"^\s*(?:#{1,6}\s|[-+*]\s|>\s|\d+[.)]\s|[`~]{3,}|\||\*\*|__)",
+            line,
+        ):
+            markdown_start = i
+            break
     return lines[markdown_start if markdown_start is not None else first_cjk :]
 
 
@@ -2249,6 +2252,65 @@ def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
             out.append(lines[i])
             i += 1
     return out
+
+
+def _dedupe_reply_lines(lines: list[str]) -> list[str]:
+    """Collapse repeated prose while leaving fenced code untouched."""
+    out: list[str] = []
+    prose: list[str] = []
+    fence_char = ""
+    fence_length = 0
+
+    def flush_prose() -> None:
+        if not prose:
+            return
+        consecutive: list[str] = []
+        for line in prose:
+            if not consecutive or consecutive[-1] != line:
+                consecutive.append(line)
+        out.extend(_collapse_repeated_line_blocks(consecutive))
+        prose.clear()
+
+    for line in lines:
+        stripped = line.strip()
+        marker_match = re.match(r"^([`~]{3,})(?:.*)$", stripped)
+        marker = marker_match.group(1) if marker_match else ""
+
+        if not fence_char:
+            if marker:
+                flush_prose()
+                fence_char = marker[0]
+                fence_length = len(marker)
+                out.append(line)
+            else:
+                prose.append(line)
+            continue
+
+        out.append(line)
+        if (
+            marker
+            and marker[0] == fence_char
+            and len(marker) >= fence_length
+            and re.fullmatch(r"[`~]{3,}\s*", stripped)
+        ):
+            fence_char = ""
+            fence_length = 0
+
+    flush_prose()
+    return out
+
+
+def _is_runtime_reasoning_fence(info: str, content: list[str]) -> bool:
+    language = info.split(maxsplit=1)[0].casefold() if info else ""
+    if language not in _RUNTIME_REASONING_FENCE_LANGUAGES:
+        return False
+
+    for line in content:
+        inspection = re.sub(r"^[`#>*\-\s]+", "", line.strip()).strip()
+        inspection = re.sub(r"[`*_]+$", "", inspection).strip()
+        if _IDENTITY_LEAK_RE.search(inspection) or _REASONING_LINE_RE.match(inspection):
+            return True
+    return False
 
 
 def _strip_reasoning_sections(raw: str) -> str:
@@ -5124,43 +5186,54 @@ def _sanitize_reply_text(text: str) -> str:
         return ""
 
     kept: list[str] = []
-    fence_char = ""
-    fence_length = 0
-
-    for raw_ln in text.splitlines():
+    raw_lines = text.splitlines()
+    i = 0
+    while i < len(raw_lines):
+        raw_ln = raw_lines[i]
         line = raw_ln.rstrip()
         stripped = line.strip()
 
-        fence_match = re.match(r"^([`~]{3,})", stripped)
+        fence_match = re.match(r"^([`~]{3,})(.*)$", stripped)
         if fence_match:
             marker = fence_match.group(1)
-            if not fence_char:
-                fence_char = marker[0]
-                fence_length = len(marker)
-            elif marker[0] == fence_char and len(marker) >= fence_length:
-                fence_char = ""
-                fence_length = 0
-            kept.append(line)
-            continue
-
-        if fence_char:
-            kept.append(line)
+            info = fence_match.group(2).strip()
+            block_end = i + 1
+            while block_end < len(raw_lines):
+                closing = re.fullmatch(r"([`~]{3,})\s*", raw_lines[block_end].strip())
+                if (
+                    closing
+                    and closing.group(1)[0] == marker[0]
+                    and len(closing.group(1)) >= len(marker)
+                ):
+                    break
+                block_end += 1
+            closed = block_end < len(raw_lines)
+            content_end = block_end if closed else len(raw_lines)
+            content = raw_lines[i + 1 : content_end]
+            if not _is_runtime_reasoning_fence(info, content):
+                kept.extend(raw_lines[i : block_end + 1 if closed else len(raw_lines)])
+            i = block_end + 1 if closed else len(raw_lines)
             continue
 
         if not stripped:
             if kept and kept[-1] != "":
                 kept.append("")
+            i += 1
             continue
         if _NOISE_LINE_RE.match(stripped):
+            i += 1
             continue
 
         inspection = re.sub(r"^[`#>*\-\s]+", "", stripped).strip()
         inspection = re.sub(r"[`*_]+$", "", inspection).strip()
         if _IDENTITY_LEAK_RE.search(inspection):
+            i += 1
             continue
         if _REASONING_LINE_RE.match(inspection):
+            i += 1
             continue
         kept.append(line)
+        i += 1
 
     if not kept:
         return ""
@@ -5172,30 +5245,7 @@ def _sanitize_reply_text(text: str) -> str:
     if not kept:
         return ""
 
-    has_fenced_code = any(re.match(r"^\s*[`~]{3,}", line) for line in kept)
-
-    # Dedup consecutive identical lines outside fenced code.
-    deduped: list[str] = []
-    dedupe_fence_char = ""
-    dedupe_fence_length = 0
-    for ln in kept:
-        fence_match = re.match(r"^\s*([`~]{3,})", ln)
-        inside_fence = bool(dedupe_fence_char)
-        if inside_fence or not deduped or deduped[-1] != ln:
-            deduped.append(ln)
-        if fence_match:
-            marker = fence_match.group(1)
-            if not dedupe_fence_char:
-                dedupe_fence_char = marker[0]
-                dedupe_fence_length = len(marker)
-            elif marker[0] == dedupe_fence_char and len(marker) >= dedupe_fence_length:
-                dedupe_fence_char = ""
-                dedupe_fence_length = 0
-
-    if not has_fenced_code:
-        deduped = _collapse_repeated_line_blocks(deduped)
-
-    return "\n".join(deduped).strip()
+    return "\n".join(_dedupe_reply_lines(kept)).strip("\n")
 
 
 def _cap_agent_replies(replies: list[str], max_items: int | None = None) -> list[str]:

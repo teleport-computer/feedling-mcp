@@ -1174,10 +1174,54 @@ let title = "# 代码里的标记不能清理"
 
 
 def test_sanitize_reply_text_preserves_fenced_code_verbatim():
-    raw = """```swift
-let title = "# 中文代码"
-let title = "# 中文代码"
+    raw = (
+        "```swift\n"
+        'let title = "# 中文代码"  \n'
+        'let title = "# 中文代码"\t\n'
+        "```"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_drops_unlabeled_copy_reasoning_fence():
+    raw = """```copy
+**Executing updates**
+I need to inspect the repository before answering.
+```
+
+这是最终回复。"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+def test_sanitize_reply_text_dedupes_prose_outside_fenced_code():
+    raw = """第一行
+第二行
+第一行
+第二行
+
+```swift
+let value = 1
 ```"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "第一行\n第二行\n\n```swift\nlet value = 1\n```"
+
+
+def test_sanitize_reply_text_preserves_setext_and_thematic_breaks():
+    raw = """Title
+===
+
+Section
+---
+
+正文"""
 
     cleaned = crc._sanitize_reply_text(raw)
 
