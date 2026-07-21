@@ -78,18 +78,20 @@ model route as an image observer. Read the current choice with `GET
 }
 ```
 
-Before changing the selection, IO sends the candidate a generated image
-whose answer is not known in advance and verifies the returned observation.
-`mode: "follow_main"` performs the same check for a model-API main route; a VPS
-main model remains owned and validated by that VPS runtime. If a main route is
-known to be text-only and there is no dedicated route, an image send returns
-`409 vision_model_required` before storing the turn.
+IO sends the candidate a generated image whose answer is not known in advance
+and records whether the returned observation proves image understanding.
+Selection and capability are separate: a reachable text-only model may remain
+selected with `effective_status: "unsupported"`, but an image send then returns
+`409 vision_model_required` before storing the turn. `mode: "follow_main"`
+performs the same check for a model-API main route; a VPS main model remains
+owned and validated by that VPS runtime.
 
 Use `POST /v1/vision/config` when adding a dedicated image model. It creates or
 reuses the saved route, runs the generated-image check, and selects the route
-as one server-owned operation. When a newly created candidate fails the check,
-its route and newly supplied credential are removed before the error response;
-the rejected candidate never remains in the saved-route list.
+as one server-owned operation. A reachable model that proves text-only remains
+saved and selected with an `unsupported` warning, while authentication,
+provider, quota, and other operational failures remove only the route or
+credential created by that request.
 
 When a dedicated route is configured, the resident sends pixels only to that
 route. It asks for a neutral visual observation, marks the result as untrusted

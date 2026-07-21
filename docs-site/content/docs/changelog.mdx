@@ -371,14 +371,15 @@ change must not be interpreted as an API guarantee.
 - Add account-scoped vision-model routing for both hosted model-API and
   self-hosted resident users. `GET/PUT /v1/vision/config` reads or changes
   whether images use the main model or a dedicated saved route; `POST
-  /v1/vision/config` atomically creates, image-tests, and selects a candidate,
-  removing newly created routes and credentials when verification fails; `POST
+  /v1/vision/config` atomically creates, image-tests, and selects a candidate.
+  Reachable text-only candidates remain selectable with an `unsupported`
+  status, while operationally invalid new routes and credentials are removed; `POST
   /v1/vision/routes/{route_id}/test` verifies real image understanding; and the
   resident-only `GET /v1/vision/key_envelope` returns the selected or send-time
   pinned route with an encrypted provider-key envelope. Dedicated vision output is passed to the
   main model as untrusted observation text, and known text-only main routes now
-  return `409 vision_model_required` for image sends until a vision route is
-  selected. Concurrent selection changes cannot reroute an accepted image; a
+  return `409 vision_model_required` for image sends until a usable vision route
+  is selected. Concurrent selection changes cannot reroute an accepted image; a
   deleted pinned route fails closed instead of falling back to the main model.
 - Self-hosted resident polls may now receive server-generated maintenance turns
   with `role: "user"` and `source: "resident_maintenance"` when the resident
