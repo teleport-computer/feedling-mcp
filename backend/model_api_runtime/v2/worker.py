@@ -2185,6 +2185,56 @@ def _make_build_messages_fn(
     return build_messages
 
 
+async def _web_batch_cancellation(
+    tool_calls, *, disabled_web_snapshot, lane
+) -> list[ToolResult] | None:
+    """Second fail-closed boundary for the web tools. ``None`` = let the batch run.
+
+    ``run_tool_loop`` builds ``turn_catalog`` ONCE at the entry of the turn
+    (tool_loop.py:307-320) and reuses it for every round, so an operator flipping
+    the kill switch mid-turn would not stop round 2 on the offer side alone. Every
+    batch therefore re-checks before executing. The control-table read is cached
+    ~2s, and we only pay for it when the batch actually contains a web call.
+
+    Semantic boundary, stated plainly because operations depends on it: this stops
+    NEW dispatches within roughly two seconds. HTTP requests already in flight are
+    not cancelled.
+
+    Checks the turn-entry snapshot UNION the live halted state. Re-reading only the
+    kill switch would quietly assume ``user_enabled=True`` here — but this is
+    defined as an independent boundary, so it must carry the user/lane decision too.
+
+    Cancellation is all-or-nothing, matching the loop's own malformed-batch
+    handling. Executing the siblings while dropping the web call would leave half a
+    batch applied: a sibling may be a write, or a ``memory_fetch`` whose private
+    result then rides into the next round, and the model cannot tell which results
+    were withheld by policy.
+    """
+    if not any(tc.name in v2_web_gate.WEB_TOOL_NAMES for tc in tool_calls):
+        return None
+    search_halted, fetch_halted = await asyncio.to_thread(kill_switch.web_halted)
+    live = v2_web_gate.disabled_web_tools(
+        user_enabled=True,
+        lane=lane,
+        search_halted=search_halted,
+        fetch_halted=fetch_halted,
+    )
+    blocked = frozenset(disabled_web_snapshot) | live
+    if not any(tc.name in blocked for tc in tool_calls):
+        return None
+    return [
+        ToolResult(
+            call_id=tc.id,
+            content=(
+                "error: web_tool_halted"
+                if tc.name in v2_web_gate.WEB_TOOL_NAMES
+                else "error: batch_cancelled_web_halted"
+            ),
+        )
+        for tc in tool_calls
+    ]
+
+
 def _make_task_batch_dispatcher(
     *,
     provider_config,
@@ -2270,6 +2320,14 @@ def _make_task_batch_dispatcher(
             )
 
             async def _child_dispatch(tool_calls) -> list[ToolResult]:
+                cancelled = await _web_batch_cancellation(
+                    tool_calls,
+                    disabled_web_snapshot=disabled_web_tool_names,
+                    lane="chat",  # the child's own surface; the parent lane's
+                    # decision already rode in via disabled_web_tool_names
+                )
+                if cancelled is not None:
+                    return cancelled
                 if any(tc.name not in child_allowed_tools for tc in tool_calls):
                     # The child loop validates against its offered catalog before
                     # calling this closure. This is a second fail-closed boundary
@@ -4384,6 +4442,13 @@ async def _run_wake(
         )
 
         async def _dispatch_tools(tool_calls):
+            cancelled = await _web_batch_cancellation(
+                tool_calls,
+                disabled_web_snapshot=wake_disabled_web_tool_names,
+                lane=lane,
+            )
+            if cancelled is not None:
+                return cancelled
             await _fence_wake_effect("tool dispatch")
 
             async def _dispatch_platform_one(tc) -> ToolResult:
@@ -5882,6 +5947,13 @@ async def process_job(
         )
 
         async def _dispatch_tools(tool_calls):
+            cancelled = await _web_batch_cancellation(
+                tool_calls,
+                disabled_web_snapshot=disabled_web_tool_names,
+                lane=lane,
+            )
+            if cancelled is not None:
+                return cancelled
             # Fence once per round before any capability executes (mirrors the
             # old _run_tools's renewal ahead of the read burst); writes get a
             # second, per-write fence via before_write above.
