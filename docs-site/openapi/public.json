@@ -791,7 +791,8 @@
         "tags": [
           "Onboarding"
         ],
-        "x-feedling-contract-level": "documented"
+        "x-feedling-contract-level": "documented",
+        "description": "Return server-observed onboarding progress. Resident routes include decrypt_source_ready, decrypt_health, and decrypt_health_policy; a fresh resident poll report is required for new-account completion."
       }
     },
     "/v1/capture/force": {
@@ -1214,9 +1215,37 @@
               "maxLength": 80
             },
             "example": "a1b2c3d"
+          },
+          {
+            "name": "X-Feedling-Decrypt-Status",
+            "in": "header",
+            "required": false,
+            "description": "Current resident decrypt-source health. Report this on poll heartbeats; omitting it on a later official poll clears the previous report to unknown.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "ok",
+                "degraded",
+                "unconfigured",
+                "unreachable"
+              ]
+            },
+            "example": "ok"
+          },
+          {
+            "name": "X-Feedling-Decrypt-Checked-At",
+            "in": "header",
+            "required": false,
+            "description": "Unix epoch seconds when the resident last confirmed the reported decrypt status. The backend treats missing, invalid, future, or stale values as unknown.",
+            "schema": {
+              "type": "number",
+              "minimum": 0
+            },
+            "example": 1784625600.125
           }
         ],
-        "x-feedling-contract-level": "documented"
+        "x-feedling-contract-level": "documented",
+        "description": "Long-poll and optionally claim resident chat work. Official residents report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At."
       }
     },
     "/v1/chat/response": {
@@ -1316,7 +1345,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once."
+        "description": "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once."
       }
     },
     "/v1/chat/verify_loop": {
@@ -1358,7 +1387,8 @@
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "compatibility",
+        "description": "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded."
       }
     },
     "/v1/content/export": {
@@ -4924,7 +4954,8 @@
         "tags": [
           "Onboarding"
         ],
-        "x-feedling-contract-level": "documented"
+        "x-feedling-contract-level": "documented",
+        "description": "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields."
       }
     },
     "/v1/perception/app_open": {

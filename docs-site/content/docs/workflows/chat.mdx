@@ -241,6 +241,8 @@ X-Feedling-Consumer: feedling-chat-resident
 X-Feedling-Consumer-Id: resident-macbook-01
 X-Feedling-Consumer-Version: 1.4.0
 X-Feedling-Consumer-Commit: abc1234
+X-Feedling-Decrypt-Status: ok
+X-Feedling-Decrypt-Checked-At: 1783978499.500
 ```
 
 ```json
@@ -277,6 +279,49 @@ X-Feedling-Consumer-Commit: abc1234
 An empty long poll is a successful `200` with `messages: []` and
 `timed_out: true`. Immediately start the next poll; do not treat it as an error.
 The requested timeout is capped at 60 seconds.
+
+#### Decrypt-health heartbeat and onboarding
+
+An official resident reports decrypt-source health on poll requests only:
+
+| Status | Meaning |
+| --- | --- |
+| `ok` | A real message decrypted successfully, or the configured enclave reachability probe succeeded. This phase-one signal is operational self-reporting, not cryptographic proof of a challenge decrypt. |
+| `degraded` | A claimed message could not be recovered as non-empty plaintext. Only a later real non-empty decrypt clears this state. |
+| `unconfigured` | `FEEDLING_ENCLAVE_URL` is absent. |
+| `unreachable` | The configured enclave decrypt source could not be reached. |
+
+`X-Feedling-Decrypt-Checked-At` is the Unix epoch time of the confirmation. The
+backend accepts a report as fresh for 300 seconds. The standard resident
+refreshes an idle report every 120 seconds; use
+`FEEDLING_DECRYPT_HEALTH_REFRESH_SEC` to tune that interval, with a minimum of 5
+seconds. Missing, malformed, future, or stale reports normalize to `unknown`.
+Every official poll is authoritative: omitting the two headers clears any
+previous cached green report instead of inheriting it. Response requests do not
+update this poll-heartbeat state.
+
+For a resident-route account that has not completed one ordinary user/agent
+exchange, every non-`ok` result blocks onboarding validation, live-loop
+verification, and visible Chat with `409 bootstrap_incomplete` and
+`stage: "needs_decrypt_source"`. `GET /v1/onboarding/validate` exposes the
+ordered `decrypt_source` step, and `GET /v1/bootstrap/status` exposes
+`decrypt_source_ready`, `decrypt_health`, and `decrypt_health_policy`.
+
+After an account has a durable successful first Chat exchange, explicit
+`degraded`, `unconfigured`, or `unreachable` still blocks onboarding completion
+and a new sticky verification, but does not add a new hard block to ordinary
+Chat. An `unknown` report receives a seven-day warning-only onboarding grace;
+it cannot mint a sticky verification during the grace, and after the grace it
+blocks onboarding while ordinary Chat remains available. Any non-green report
+can emit an in-app `resident_decrypt_source_unavailable` maintenance notice with
+the status, confirmation time, and remediation guidance.
+
+`POST /v1/chat/verify_loop` inserts a private `source: "verify_ping"` user row.
+The resident's hidden ack must post `source: "verify_ping"` and set
+`reply_to_message_id` to that exact ping ID. An unrelated or stale agent reply
+does not satisfy the probe. The verify response distinguishes `loop_alive`
+(the exact ack arrived) from `passing` (the ack arrived and decrypt policy also
+allows verification); only `passing: true` records the sticky live-loop green.
 
 If a self-hosted resident consumer appears stale while it is still polling, the
 server may claimably inject a user-role maintenance message with

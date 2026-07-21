@@ -12,6 +12,18 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- Official resident consumers now report decrypt-source health on
+  `GET /v1/chat/poll` with `X-Feedling-Decrypt-Status`
+  (`ok`, `degraded`, `unconfigured`, or `unreachable`) and
+  `X-Feedling-Decrypt-Checked-At`. Missing, invalid, future, or reports older
+  than 300 seconds normalize to `unknown`. Resident onboarding exposes a new
+  `decrypt_source` validation step; unfinished accounts require a fresh `ok`
+  report before Chat or live-loop verification can pass. Existing accounts keep
+  ordinary Chat available, receive a seven-day warning-only grace for
+  `unknown`, and get an in-app decrypt-source maintenance notice. Verify-ping
+  replies must now use `source: "verify_ping"` and point
+  `reply_to_message_id` at the exact pending ping; `loop_alive` can therefore be
+  true while `passing` is false when decrypt policy blocks sticky verification.
 - Self-hosted resident polls may now receive server-generated maintenance turns
   with `role: "user"` and `source: "resident_maintenance"` when the resident
   consumer appears stale or is not claiming resident-only distill jobs. These
