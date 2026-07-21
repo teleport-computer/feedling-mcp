@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 
@@ -836,3 +837,29 @@ def test_probe_responses_support_false_on_network_error(monkeypatch):
     cfg = pc.ProviderConfig("openai_compatible", "m", "k", "https://relay.host/v1")
     # ambiguous failure → safe default is the bridge (False), never crash
     assert pc.probe_responses_support(cfg) is False
+
+
+def test_shared_client_never_replays_cookies_across_users():
+    # Cross-user credential bleed guard. The provider HTTP client is process-wide
+    # and shared across ALL users' BYOK calls. httpx's default cookie jar is keyed
+    # by origin, not by user — a relay/proxy that Set-Cookies a session cookie on
+    # user A's response would replay it on user B's request to the SAME host. Many
+    # users point base_url at the same relay domain, so this is reachable. The
+    # shared client must never persist cookies.
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("cookie"))
+        return httpx.Response(
+            200, headers=[("set-cookie", "sid=userA; Path=/")], json={"ok": True})
+
+    client = pc._build_shared_client(transport=httpx.MockTransport(handler))
+    try:
+        client.post("https://relay.example/v1/chat/completions", json={})
+        client.post("https://relay.example/v1/chat/completions", json={})
+    finally:
+        client.close()
+    # Second call must NOT carry the Set-Cookie from the first (it would if the
+    # jar persisted it) — and the jar itself stays empty.
+    assert seen == [None, None], f"cookie replayed across calls: {seen!r}"
+    assert len(list(client.cookies.jar)) == 0

@@ -819,6 +819,14 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     env["USER_MCP_FILE"] = f"{home}/user-mcp.json"
     env["USER_MCP_CA_FILE"] = f"{home}/user-mcp-ca.pem"
     env["USER_MCP_CASTORE_FILE"] = f"{home}/user-mcp-castore.pem"
+    # Same collision shape one layer over: the hermes/openclaw materializers
+    # fall back to Path.home()/.hermes and ~/.openclaw when these are unset —
+    # a single HOME shared by every consumer in the runner container. They only
+    # write when the directory exists (dormant on hosted today), but pin them
+    # per user like claude-home/codex-home so nothing can ever create a shared
+    # config dir that co-resident consumers cross-write plaintext MCP creds to.
+    env["HERMES_CONFIG_DIR"] = f"{home}/hermes-home"
+    env["OPENCLAW_CONFIG_DIR"] = f"{home}/openclaw-home"
     env["CONSUMER_ID"] = f"agent-runner:{user_id}"
     # Ambient timezone for the hosted agent process tree (this consumer + the CLI
     # it spawns). Without it the process inherits the CVM's UTC clock, so the CLI
@@ -982,7 +990,12 @@ _CONSUMER_ENV_KEYS = (
     # sha1("") fingerprint collision leak); the container strategy must forward
     # them or the strong-isolation path silently reverts to the shared /tmp default.
     "USER_MCP_FILE", "USER_MCP_CA_FILE", "USER_MCP_CASTORE_FILE",
+    "HERMES_CONFIG_DIR", "OPENCLAW_CONFIG_DIR",
     "ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+    # claude-wire third parties (deepseek) redirect the CLI off api.anthropic.com;
+    # consumer_env sets these, so the container strategy must forward them too or
+    # a containerized deepseek agent sends its key to the wrong endpoint.
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
     # Per-user ambient timezone so the containerized agent's clock isn't the
     # container's default UTC (the process-spawn path sets it in consumer_env;
     # without this the container strategy would silently drop it).
@@ -991,24 +1004,67 @@ _CONSUMER_ENV_KEYS = (
 )
 
 
+def container_env_file_path(user_id: str) -> str:
+    """Host path of the per-user ``--env-file`` for a containerized consumer."""
+    return f"/run/feedling-agent-env/{user_id}.env"
+
+
+# Only these GLOBAL (non-per-user, non-secret) values are pulled from the
+# supervisor env into a container's --env-file. Base must NOT be the whole
+# os.environ: _CONSUMER_ENV_KEYS also lists conditionally-set credential keys
+# (ANTHROPIC_API_KEY / CODEX_API_KEY / PI_*), so a keyless entry that leaves them
+# unset would otherwise inherit the SUPERVISOR's own copies — a platform-key
+# smear into the isolated container. consumer_env sets the credential keys only
+# from the per-user entry; everything else here is a fixed backend endpoint.
+_CONTAINER_GLOBAL_ENV_KEYS = ("FEEDLING_API_URL", "FEEDLING_ENCLAVE_URL")
+
+
+def container_env_file_content(entry: dict, *, user_id: str) -> str:
+    """The 0600 ``--env-file`` body for a container-isolated consumer.
+
+    Written by the spawn path before ``docker run`` (and removed after). Base is
+    a narrow allowlist of GLOBAL backend endpoints from the supervisor env (so
+    the container can reach backend), NEVER the whole os.environ — per-user
+    values (provider key, MCP paths) come from consumer_env, so no supervisor-env
+    smear. The ``_CONSUMER_ENV_KEYS`` whitelist then keeps only contract keys.
+    Container home is the volume mount /agent-data.
+    """
+    base = {k: os.environ[k] for k in _CONTAINER_GLOBAL_ENV_KEYS if k in os.environ}
+    env = consumer_env(base, entry, user_id=user_id, home="/agent-data")
+    lines = []
+    for k in _CONSUMER_ENV_KEYS:
+        if k not in env:
+            continue
+        v = env[k]
+        # docker --env-file parses one KEY=value per line; a value with a newline
+        # would inject an arbitrary extra env var into the container. Values in
+        # our contract (keys/urls/paths) never contain newlines — skip and warn
+        # if one ever does rather than emit an injectable line.
+        if "\n" in v or "\r" in v:
+            log.warning("[container_env] skipping %s: value contains a newline", k)
+            continue
+        lines.append(f"{k}={v}\n")
+    return "".join(lines)
+
+
 def build_container_argv(entry: dict, *, user_id: str, home: str, image: str) -> list[str]:
     """`docker run` argv for a per-user, strongly-isolated resident consumer.
 
-    Secrets pass by env-var *reference* (``-e KEY``, value inherited from the
-    supervisor's environment via ``consumer_env``) so they never appear as
-    plaintext argv. One named container + one named volume per user — no shared
-    home.
+    Env passes via a per-user ``--env-file`` (body from
+    ``container_env_file_content``), NOT ``-e`` flags. A bare ``-e KEY`` makes
+    docker inherit the value from the SHARED supervisor process env — dropping
+    every per-user value consumer_env computed or smearing one user's onto all
+    containers; ``-e KEY=value`` would fix the value but leak secrets into argv
+    (visible to ``ps`` / co-tenant containers). The env-file gets both right.
+    One named container + one named volume per user — no shared home.
     """
-    env = consumer_env({}, entry, user_id=user_id, home="/agent-data")
     argv = [
         "docker", "run", "-d",
         "--name", f"feedling-agent-{user_id}",
         "--restart", "unless-stopped",
         "-v", f"feedling-agent-vol-{user_id}:/agent-data",
+        "--env-file", container_env_file_path(user_id),
     ]
-    for key in _CONSUMER_ENV_KEYS:
-        if key in env:
-            argv += ["-e", key]
     argv += [image, "python", "-u", "tools/chat_resident_consumer.py"]
     return argv
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.cookiejar as _cookiejar
 import random
 import threading
 import time
@@ -112,8 +113,39 @@ def reliable_chat_completion(
 # the handshake. httpx.Client is thread-safe for issuing requests, which matters
 # because both the gunicorn backend (threads) and the threaded enclave call in.
 # Timeout stays per-request (passed to .post) since it varies by call site.
+class _NoStoreCookieJar(_cookiejar.CookieJar):
+    """A cookie jar that silently drops every cookie.
+
+    The provider HTTP clients below are process-wide and shared across ALL
+    users' BYOK calls. httpx's default jar keys cookies by ORIGIN, not by user,
+    so a relay/proxy that Set-Cookies a session cookie (sticky-session,
+    cf_clearance, or a cookie-form session credential) on user A's response
+    would replay it on user B's request to the same host — cross-user
+    credential bleed, and many users point base_url at the same relay domain.
+    Connection pooling / keep-alive is a transport concern (keyed per-origin,
+    independent of cookies), so refusing to store cookies costs nothing.
+    """
+
+    def set_cookie(self, cookie):  # noqa: D401 — no-op on purpose
+        return None
+
+    def extract_cookies(self, response, request):  # noqa: D401 — no-op
+        return None
+
+
 _shared_client: httpx.Client | None = None
 _shared_client_lock = threading.Lock()
+
+_CLIENT_LIMITS = httpx.Limits(
+    max_keepalive_connections=20,
+    max_connections=100,
+    keepalive_expiry=90.0,
+)
+
+
+def _build_shared_client(**kwargs) -> httpx.Client:
+    return httpx.Client(
+        cookies=_NoStoreCookieJar(), limits=_CLIENT_LIMITS, **kwargs)
 
 
 def _http_client() -> httpx.Client:
@@ -122,13 +154,7 @@ def _http_client() -> httpx.Client:
         return _shared_client
     with _shared_client_lock:
         if _shared_client is None:
-            _shared_client = httpx.Client(
-                limits=httpx.Limits(
-                    max_keepalive_connections=20,
-                    max_connections=100,
-                    keepalive_expiry=90.0,
-                ),
-            )
+            _shared_client = _build_shared_client()
     return _shared_client
 
 
@@ -1165,16 +1191,16 @@ def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
 _shared_async_client: httpx.AsyncClient | None = None
 
 
+def _build_shared_async_client(**kwargs) -> httpx.AsyncClient:
+    # Same no-store jar as the sync client — see _NoStoreCookieJar.
+    return httpx.AsyncClient(
+        cookies=_NoStoreCookieJar(), limits=_CLIENT_LIMITS, **kwargs)
+
+
 def _async_http_client() -> httpx.AsyncClient:
     global _shared_async_client
     if _shared_async_client is None or _shared_async_client.is_closed:
-        _shared_async_client = httpx.AsyncClient(
-            limits=httpx.Limits(
-                max_keepalive_connections=20,
-                max_connections=100,
-                keepalive_expiry=90.0,
-            ),
-        )
+        _shared_async_client = _build_shared_async_client()
     return _shared_async_client
 
 

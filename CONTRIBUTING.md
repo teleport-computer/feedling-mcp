@@ -204,6 +204,25 @@ result = chat_completion(runtime, messages)
   （参考 `docs/DESIGN_E2E.md`），明文只允许出现在 enclave 和客户端。
 - 路由集变更（增/删/改路径）在 PR 描述里显式列出——url_map 是我们做
   大改动时的回归基线。
+- **每用户数据隔离（共享主机上尤其致命）。** 托管 consumer 是同一台
+  agent-runner 容器里的兄弟进程，**共享 `/tmp` 和容器 `HOME`**。任何 per-user
+  的文件 / 目录 / 缓存 / 锁 / DB 作用域，其命名 key 必须在**所有模式下都逐用户
+  唯一**——用 `user_id` 或 `consumer_env` 钉进 `{home}/…`（per-user home）。
+  **绝不能用 `FEEDLING_API_KEY` 或它的 `sha1()` 指纹当隔离依据**：host-all
+  （Stage-D 零 roster）consumer 是 keyless 的，`FEEDLING_API_KEY=""` →
+  `sha1("")` 对同机每个用户塌成同一个值，指纹隔离直接归零。凡是把**解密后的
+  机密**（MCP url/auth headers/CA、token 等）落到会被这样塌缩的路径，就是
+  跨用户串泄（2026-07-20 host-all user-MCP 事故即此）。新增此类落盘时：
+  (a) 路径在 `consumer_env` 里钉成 per-user，(b) 加进 `_CONSUMER_ENV_KEYS`
+  让容器策略也透传，(c) 消费侧留一个 fail-safe——per-user pin 缺失时降级关闭
+  该功能，而不是退回共享默认路径。**指纹只是锦上添花，从不是隔离边界。**
+- **注释必须反映代码的实际行为。** 改代码时同步更正/删除过时注释——尤其是
+  断言「安全 / 已隔离 / 不会共享 / 不会发生」这类安保性描述。一条与实现不符的
+  安全注释比没有注释更危险：它会诱导后人相信某个不变量成立、从而跳过复核
+  （2026-07-20 host-all user-MCP 串泄的直接推手，就是一句「...so two accounts
+  on one host never share a file」的过时注释——它对有 key 的用户成立、对
+  keyless host-all 不成立，作者照它类推就漏了隔离）。**宁可不写注释，也不要写
+  与实际不符的注释；拿不准就照实描述边界条件，别断言绝对安全。**
 
 ---
 
@@ -217,4 +236,7 @@ result = chat_completion(runtime, messages)
 [ ] 没有引用已删除的 app.py facade；没有新造全局 re-export 门面
 [ ] 全量 pytest 零新增失败；pyflakes 干净
 [ ] 动了 compose / 路由集 / 加密路径的，PR 描述里写明
+[ ] 新增共享主机上的 per-user 文件/目录/缓存/锁/DB作用域，key 逐用户唯一
+    （user_id 或 {home}），未用 FEEDLING_API_KEY / sha1(key) 指纹当隔离依据
+[ ] 改动处的注释与代码实际行为一致；过时注释（尤其断言安全/隔离性的）已更正或删除
 ```
