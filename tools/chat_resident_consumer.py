@@ -2171,12 +2171,16 @@ _REASONING_LINE_RE = re.compile(
 
 _RUNTIME_REASONING_FENCE_LANGUAGES = {"copy"}
 _RUNTIME_REASONING_HEADER_RE = re.compile(
-    r"^(?:executing|checking|inspecting|analyzing|planning|thinking|reviewing|"
-    r"working|preparing|updating)\b|^(?:先)?(?:检查|查看|分析|思考|规划|准备|执行|处理)",
+    r"^(?:reasoning|chain\s+of\s+thought)\s*:?$|"
+    r"^(?:checking|inspecting|reviewing|analyzing)\s+(?:the\s+)?"
+    r"(?:repository|repo|codebase|workspace|files?|request|context)\b|"
+    r"^(?:executing\s+updates?|doing\s+(?:work|the\s+task))\s*[.!…]*$|"
+    r"^先(?:检查|查看|分析|思考|规划|准备|执行|处理)(?:一下)?"
+    r"(?:仓库|代码|文件|上下文|问题|请求|任务)",
     re.IGNORECASE,
 )
 _FENCE_LINE_RE = re.compile(
-    r"^(?:>\s*)*(?P<marker>[`~]{3,})(?P<info>.*)$"
+    r"^(?P<container>(?:>\s*)*)(?P<marker>[`~]{3,})(?P<info>.*)$"
 )
 _THEMATIC_BREAK_RE = re.compile(
     r"^(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$"
@@ -2232,14 +2236,16 @@ def _strip_leading_non_cjk_preamble(lines: list[str]) -> list[str]:
     markdown_start: int | None = None
     for i, line in enumerate(lines[:first_cjk]):
         stripped = line.strip()
-        if _THEMATIC_BREAK_RE.fullmatch(stripped) or re.fullmatch(r"={2,}", stripped):
-            previous = next(
-                (j for j in range(i - 1, -1, -1) if lines[j].strip()),
-                None,
-            )
-            if previous is not None:
-                markdown_start = previous
-                break
+        previous_is_text = i > 0 and bool(lines[i - 1].strip())
+        if previous_is_text and re.fullmatch(r"(?:=+|-+)", stripped):
+            markdown_start = i - 1
+            break
+        if _THEMATIC_BREAK_RE.fullmatch(stripped):
+            if i == 0:
+                continue
+            markdown_start = i - 1 if previous_is_text else i
+            break
+        if re.fullmatch(r"=+|-+", stripped):
             continue
         if re.match(
             r"^\s*(?:#{1,6}\s|[-+*]\s|>\s|\d+[.)]\s|[`~]{3,}|\||\*\*|__)",
@@ -2271,17 +2277,19 @@ def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
     return out
 
 
-def _fence_line_parts(line: str) -> tuple[str, str] | None:
+def _fence_line_parts(line: str) -> tuple[int, str, str] | None:
     match = _FENCE_LINE_RE.match(line.strip())
     if not match:
         return None
-    return match.group("marker"), match.group("info").strip()
+    depth = match.group("container").count(">")
+    return depth, match.group("marker"), match.group("info").strip()
 
 
 def _dedupe_reply_lines(lines: list[str]) -> list[str]:
     """Collapse repeated prose while leaving fenced code untouched."""
     out: list[str] = []
     prose: list[str] = []
+    fence_depth = 0
     fence_char = ""
     fence_length = 0
 
@@ -2297,11 +2305,12 @@ def _dedupe_reply_lines(lines: list[str]) -> list[str]:
 
     for line in lines:
         fence = _fence_line_parts(line)
-        marker, info = fence if fence else ("", "")
+        depth, marker, info = fence if fence else (0, "", "")
 
         if not fence_char:
             if marker:
                 flush_prose()
+                fence_depth = depth
                 fence_char = marker[0]
                 fence_length = len(marker)
                 out.append(line)
@@ -2312,10 +2321,12 @@ def _dedupe_reply_lines(lines: list[str]) -> list[str]:
         out.append(line)
         if (
             marker
+            and depth == fence_depth
             and marker[0] == fence_char
             and len(marker) >= fence_length
             and not info
         ):
+            fence_depth = 0
             fence_char = ""
             fence_length = 0
 
@@ -2337,8 +2348,6 @@ def _is_runtime_reasoning_fence(info: str, content: list[str]) -> bool:
 
     if not inspections:
         return False
-    if any(_IDENTITY_LEAK_RE.search(line) for line in inspections):
-        return True
     return bool(_RUNTIME_REASONING_HEADER_RE.match(inspections[0]))
 
 
@@ -5224,15 +5233,16 @@ def _sanitize_reply_text(text: str) -> str:
 
         fence = _fence_line_parts(raw_ln)
         if fence:
-            marker, info = fence
+            depth, marker, info = fence
             block_end = i + 1
             while block_end < len(raw_lines):
                 closing = _fence_line_parts(raw_lines[block_end])
                 if (
                     closing
-                    and closing[0][0] == marker[0]
-                    and len(closing[0]) >= len(marker)
-                    and not closing[1]
+                    and closing[0] == depth
+                    and closing[1][0] == marker[0]
+                    and len(closing[1]) >= len(marker)
+                    and not closing[2]
                 ):
                     break
                 block_end += 1

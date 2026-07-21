@@ -1229,6 +1229,22 @@ I need to update the deployment notes.
     assert cleaned == raw
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        'let reasoning = "visible output"',
+        "Working hours: 09:00-17:00",
+        "处理结果如下：成功",
+    ],
+)
+def test_sanitize_reply_text_preserves_non_runtime_copy_content(content):
+    raw = f"```copy\n{content}\n```"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
 def test_sanitize_reply_text_dedupes_prose_outside_fenced_code():
     raw = """第一行
 第二行
@@ -1257,6 +1273,20 @@ def test_sanitize_reply_text_preserves_blockquote_fenced_code_verbatim():
     assert cleaned == raw
 
 
+def test_sanitize_reply_text_preserves_fence_like_content_at_deeper_quote_depth():
+    raw = (
+        "> ~~~text\n"
+        "> > ~~~\n"
+        "> repeated line  \n"
+        "> repeated line  \n"
+        "> ~~~"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
 def test_sanitize_reply_text_preserves_setext_and_thematic_breaks():
     raw = """Title
 ===
@@ -1278,6 +1308,24 @@ def test_sanitize_reply_text_preserves_commonmark_thematic_variants(marker):
     cleaned = crc._sanitize_reply_text(raw)
 
     assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["=", "-"])
+def test_sanitize_reply_text_preserves_single_character_setext(marker):
+    raw = f"Title\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["---", "* * *", "_ _ _"])
+def test_sanitize_reply_text_does_not_recover_preamble_across_blank_line(marker):
+    raw = f"transport transcript\n\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == f"{marker}\n\n正文"
 
 
 def test_sanitize_reply_text_drops_unlabeled_english_meta_before_cjk_answer():
