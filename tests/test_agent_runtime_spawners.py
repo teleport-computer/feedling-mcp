@@ -501,7 +501,10 @@ def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
     allow = settings["permissions"]["allow"]
     assert any("io_cli.py perception" in rule for rule in allow)
     assert any("io_cli.py memory-index" in rule for rule in allow)
-    assert any("io_cli.py identity-write" in rule for rule in allow)  # 7.D post-respawn tool
+    assert any("io_cli.py identity-write" in rule for rule in allow)  # 7.D post-respawn tool + rename
+    # identity-read: the agent could write its own card but not read it, so a rename
+    # was a blind write and "你叫什么" had to be guessed. Granting the read closes both.
+    assert any("io_cli.py identity-read" in rule for rule in allow)
     assert any("io_cli.py screen-read" in rule for rule in allow)
     # and Read on the decrypted image temp dir, so the CLI can open attached images
     # (double leading slash = filesystem-absolute; single slash anchors at cwd /app)

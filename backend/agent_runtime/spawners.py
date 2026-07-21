@@ -52,6 +52,17 @@ _IO_CLI_VERBS = (
     "perception-history",
     "memory-index",
     "memory-fetch",
+    # identity-read/-write are the rename path. Without identity-write --agent-name
+    # the agent could only rewrite its self_introduction when asked to change its
+    # name, so the displayed name stayed stale while it reported success; without
+    # identity-read it patches the card blind and cannot answer "你叫什么" from it.
+    #
+    # ⚠️ Runtime V2 (origin/pre) reaches the same behaviour through
+    # backend/capabilities/identity.py + capabilities/tool_schema.py — this file and
+    # agent_tools_prompt.md do not exist there. When test merges into pre, the
+    # correct resolution for this hunk is "stay deleted": V1's allowlist retires with
+    # V1. The io_cli --agent-name flag is shared and already present on both lines.
+    "identity-read",
     "identity-write",
     "screen-recent",
     "screen-read",
