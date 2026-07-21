@@ -8134,3 +8134,30 @@ def test_agent_turn_timeout_default_is_300():
     if os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC"):
         pytest.skip("env override set for FEEDLING_AGENT_TURN_TIMEOUT_SEC")
     assert crc.AGENT_TURN_TIMEOUT_SEC == 300
+
+
+def test_agent_call_failed_reason_keeps_message_and_prefix():
+    """Capture/dream/migrate lanes must record the underlying error message, not
+    just the exception type — a relay 403 (RuntimeError "pi agent produced no
+    reply: 403 ... insufficient_user_quota") otherwise aggregates as an opaque
+    "RuntimeError" (usr_77b37bd1, 2026-07-21). Prefix stays stable for matching."""
+    e = RuntimeError("pi agent produced no reply: 403: insufficient_user_quota")
+    r = crc._agent_call_failed_reason("capture_agent_call_failed", e)
+    assert r.startswith("capture_agent_call_failed:")   # prefix preserved
+    assert "RuntimeError" in r
+    assert "403" in r and "insufficient_user_quota" in r  # message retained
+    # Control chars (CR/LF/tab AND NUL) must be scrubbed — a NUL would break the
+    # PostgreSQL status_reason write and drop the failure record entirely.
+    dirty = crc._agent_call_failed_reason(
+        "dream_agent_call_failed", RuntimeError("line1\r\nline2\tbad\x00tail"))
+    assert not any(c in dirty for c in ("\r", "\n", "\t", "\x00"))
+    assert "line1 line2 bad tail" in dirty  # collapsed to single spaces
+    # Detail portion (after "prefix:Type: ") bounded to 400 chars.
+    big = crc._agent_call_failed_reason("dream_agent_call_failed", RuntimeError("x" * 5000))
+    detail = big.split(": ", 1)[1]
+    assert len(detail) <= 400 and "\n" not in big
+    # empty (and control-only) message falls back to the type-only form
+    assert crc._agent_call_failed_reason("migrate_agent_call_failed", RuntimeError("")) \
+        == "migrate_agent_call_failed:RuntimeError"
+    assert crc._agent_call_failed_reason("migrate_agent_call_failed", RuntimeError("\x00\r\n")) \
+        == "migrate_agent_call_failed:RuntimeError"

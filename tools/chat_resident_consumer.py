@@ -742,6 +742,28 @@ def _note_agent_turn_success() -> None:
         _report_runtime_error("", "")
 
 
+def _agent_call_failed_reason(prefix: str, exc: BaseException) -> str:
+    """Failure reason that keeps the underlying message, not just the exception
+    type. The chat lane records the full error (``agent_call_failed: {e}``), but
+    the capture/dream/migrate lanes historically recorded only
+    ``{prefix}:{type(e).__name__}`` — so a relay rejection (call_agent raises
+    ``RuntimeError("pi agent produced no reply: 403 ...insufficient_user_quota")``)
+    surfaced in job aggregations as an opaque ``RuntimeError``, indistinguishable
+    from a real code fault (usr_77b37bd1, 2026-07-21: 7 such rows were actually
+    the same 403). Keep the ``prefix`` stable for any prefix matching, and append
+    a bounded message so these lanes are diagnosable.
+
+    The reason is persisted to ``status_reason`` (JSONB/text) via
+    ``/v1/proactive/jobs/{id}/status``. Strip ALL C0/DEL control characters
+    (not only LF) and collapse whitespace before truncating: a stray NUL would
+    make the PostgreSQL write fail and drop the very failure record this exists
+    to preserve; CR/tab would also break the single-line contract."""
+    detail = " ".join(re.sub(r"[\x00-\x1f\x7f]+", " ", str(exc)).split())
+    if not detail:
+        return f"{prefix}:{type(exc).__name__}"
+    return f"{prefix}:{type(exc).__name__}: {detail[:400]}"
+
+
 # Prompt routed only when an agent entry cannot receive a native image object.
 # The consumer still extracts decrypted image bytes and passes them through
 # the richest available channel:
@@ -8243,7 +8265,7 @@ def _process_capture_jobs(jobs: list) -> float:
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
-            reason = f"capture_agent_call_failed:{type(e).__name__}"
+            reason = _agent_call_failed_reason("capture_agent_call_failed", e)
             log.error("capture agent call failed id=%s: %s", job_id, e)
             _notify_agent_turn_failure(e, foreground=False)
             update_proactive_job_status(
@@ -8590,7 +8612,7 @@ def _process_dream_jobs(jobs: list) -> float:
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
-            reason = f"dream_agent_call_failed:{type(e).__name__}"
+            reason = _agent_call_failed_reason("dream_agent_call_failed", e)
             log.error("dream agent call failed id=%s: %s", job_id, e)
             _notify_agent_turn_failure(e, foreground=False)
             update_proactive_job_status(
@@ -9216,7 +9238,7 @@ def _process_migrate_jobs(jobs: list) -> float:
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
-            reason = f"migrate_agent_call_failed:{type(e).__name__}"
+            reason = _agent_call_failed_reason("migrate_agent_call_failed", e)
             log.error("migrate agent call failed id=%s: %s", job_id, e)
             update_proactive_job_status(
                 job_id, "failed", reason,
