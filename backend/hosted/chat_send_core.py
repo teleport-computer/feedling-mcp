@@ -347,17 +347,17 @@ def _send_resident(
     Validates the runtime provider (400 + action trace on failure), builds the
     user-message envelope (409 on failure), resolves the wire-compat driver (409
     when unconfigured), then gates on the resident supervisor wedge — a dead/stale
-    supervisor 503s ``supervisor_unavailable`` BEFORE any append, so no orphan turn
-    is left unanswered (fail-open on a DB hiccup inside ``check_supervisor_live``).
+    supervisor 503s ``hosting_runtime_unavailable`` BEFORE any append, so no orphan
+    turn is left unanswered (fail-open on a DB hiccup inside ``check_supervisor_live``).
     On a live supervisor it appends the user message (client-msg-id idempotent when
     present), wakes chat waiters, and hands off to
     ``agent_runtime_cutover.handle_send`` for the 202 processing/ready reply.
 
-    Restored from ``git show 2b294a1f^:backend/hosted/chat_send_core.py`` (the
-    ``not _v2_mode`` branch); the wedge error string is ``supervisor_unavailable``
-    per the Task 6 routing contract (the retirement-era body used
-    ``hosting_runtime_unavailable``; the debug-trace summary was already
-    ``supervisor_unavailable``).
+    Restored verbatim from ``git show 2b294a1f^:backend/hosted/chat_send_core.py``
+    (the ``not _v2_mode`` branch), including the historical wedge body
+    ``{"error": "hosting_runtime_unavailable", "reason": reason}``; the debug-trace
+    ``summary`` stays ``supervisor_unavailable`` (that is how the two were split
+    historically).
     """
     trace_start = time.time()
     config = hosted_config_store._load_model_api_config(store)
@@ -407,7 +407,7 @@ def _send_resident(
             detail={"mode": "blocked", "reason": "supervisor_unavailable",
                     "live_reason": str(reason or "")[:80]},
         )
-        return {"error": "supervisor_unavailable", "reason": reason}, 503
+        return {"error": "hosting_runtime_unavailable", "reason": reason}, 503
 
     extra: dict = {}
     if has_image and image_mime:

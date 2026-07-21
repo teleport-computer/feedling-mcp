@@ -10,7 +10,7 @@ runtime_state)`` and the process ``FEEDLING_HOSTED_RUNTIME_POLICY``:
     dual       (db_action_v2, v2) + workers up   -> 202 processing
     dual       (db_action_v2, v2) + workers down -> 503 workers_unavailable
     dual       (resident_cli, resident) + sup up -> resident branch (202)
-    dual       (resident_cli, resident) + sup dn -> 503 supervisor_unavailable
+    dual       (resident_cli, resident) + sup dn -> 503 hosting_runtime_unavailable
     dual       any other combo                   -> 503 runtime_control_invalid
 
 The error strings are an operational contract — asserted exactly. Drives
@@ -177,7 +177,7 @@ def test_dual_resident_tuple_with_live_supervisor_routes_to_resident(monkeypatch
     assert called["driver"] == "claude"
 
 
-def test_dual_resident_tuple_with_dead_supervisor_is_supervisor_unavailable(monkeypatch):
+def test_dual_resident_tuple_with_dead_supervisor_is_hosting_runtime_unavailable(monkeypatch):
     _seed("u_dr_resident_dead")
     store = core_store.get_store("u_dr_resident_dead")
     monkeypatch.setenv(POLICY_ENV, "dual")
@@ -202,7 +202,7 @@ def test_dual_resident_tuple_with_dead_supervisor_is_supervisor_unavailable(monk
     body, status = _send(store)
     assert status == 503
     assert body == {
-        "error": "supervisor_unavailable",
+        "error": "hosting_runtime_unavailable",
         "reason": "stale_supervisor_heartbeat_120s",
     }
 
