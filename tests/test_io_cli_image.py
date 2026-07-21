@@ -64,6 +64,24 @@ def test_materialize_handles_data_url_prefix(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Hardening (added with the cross-user-leak sweep): decrypted images must not be
+# world-readable on a shared host. The dir is 0700 and the file 0600, parity
+# with chat_resident_consumer's _write_scratch_file.
+# ---------------------------------------------------------------------------
+
+
+def test_materialize_image_is_0600(tmp_path, monkeypatch):
+    monkeypatch.setenv("IMAGE_TEMP_DIR", str(tmp_path / "imgs"))
+    monkeypatch.setenv("FEEDLING_API_KEY", "k")
+    out = io_cli._materialize_decrypted_image(
+        "pfx", {"image_b64": base64.b64encode(_PIXELS).decode(), "image_mime": "image/png"})
+    path = out["image_file"]
+    assert Path(path).read_bytes() == _PIXELS
+    assert (os.stat(path).st_mode & 0o777) == 0o600
+    assert (os.stat(tmp_path / "imgs").st_mode & 0o777) == 0o700
+
+
+# ---------------------------------------------------------------------------
 # chat-image: pull ONE past chat message's image by id.
 #
 # Chat-history images are not reachable via photo-read (that's the perception

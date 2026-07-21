@@ -240,9 +240,11 @@ CHECKPOINT_FILE = Path(
     )
 )
 # Materialized user-MCP config target. Scoped by the same api-key fingerprint as
-# the checkpoint so two accounts on one host never share a file. This single file
-# is BOTH the claude ``--mcp-config`` target AND the documented generic
-# ``user-mcp.json`` for VPS agents (io-onboarding skill).
+# the checkpoint so two accounts on one host never share a file (this external
+# tool always authenticates with a real FEEDLING_API_KEY, so the fingerprint is a
+# genuine per-account boundary). This single file is BOTH the claude
+# ``--mcp-config`` target AND the documented generic ``user-mcp.json`` for VPS
+# agents (io-onboarding skill).
 USER_MCP_FILE = os.environ.get(
     "USER_MCP_FILE",
     f"/tmp/feedling_user_mcp_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
@@ -342,7 +344,9 @@ AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
 AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
 AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
 HERMES_SESSION_REASONING_MAX_BYTES = int(os.environ.get("HERMES_SESSION_REASONING_MAX_BYTES", "2000000"))
-IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images"))
+IMAGE_TEMP_DIR = Path(os.environ.get(
+    "IMAGE_TEMP_DIR",
+    f"/tmp/feedling_chat_images_{CHECKPOINT_API_KEY_FINGERPRINT}"))
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
@@ -1924,13 +1928,14 @@ def _image_file_paths_for_msg(msg: dict) -> list[str]:
     if not payloads:
         return []
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", _msg_key(msg))[:96] or "image"
-    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    if not _mkdir_scratch(IMAGE_TEMP_DIR):
+        return []
     paths: list[str] = []
     for idx, payload in enumerate(payloads):
         ext = ".png" if payload.get("mime_type") == "image/png" else ".jpg"
         path = IMAGE_TEMP_DIR / f"{key}_{idx}{ext}"
         try:
-            path.write_bytes(base64.b64decode(payload["data"]))
+            _write_scratch_file(path, base64.b64decode(payload["data"]))
             paths.append(str(path))
         except Exception as e:
             log.warning("failed to write image temp file %s: %s", path, e)
@@ -1941,13 +1946,14 @@ def _image_file_paths_from_payloads(prefix: str, payloads: list[dict[str, str]])
     if not payloads:
         return []
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix)[:96] or "image"
-    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    if not _mkdir_scratch(IMAGE_TEMP_DIR):
+        return []
     paths: list[str] = []
     for idx, payload in enumerate(payloads):
         ext = ".png" if payload.get("mime_type") == "image/png" else ".jpg"
         path = IMAGE_TEMP_DIR / f"{key}_{idx}{ext}"
         try:
-            path.write_bytes(base64.b64decode(payload["data"]))
+            _write_scratch_file(path, base64.b64decode(payload["data"]))
             paths.append(str(path))
         except Exception as e:
             log.warning("failed to write image temp file %s: %s", path, e)
@@ -1956,7 +1962,55 @@ def _image_file_paths_from_payloads(prefix: str, payloads: list[dict[str, str]])
 
 _XLSX_MAX_SHEETS = 5
 _XLSX_MAX_ROWS = 2000
-FILE_TEMP_DIR = Path(os.environ.get("FILE_TEMP_DIR", "/tmp/feedling_chat_files"))
+FILE_TEMP_DIR = Path(os.environ.get(
+    "FILE_TEMP_DIR",
+    f"/tmp/feedling_chat_files_{CHECKPOINT_API_KEY_FINGERPRINT}"))
+# Both scratch dirs above hold DECRYPTED chat images/attachments, keyed by the
+# same api-key fingerprint as the other per-user scratch so two accounts on one
+# host never share a dir. They are created 0700 (see _mkdir_scratch) so a
+# co-tenant unix user on the same box can't read decrypted chat content.
+
+
+def _mkdir_scratch(dirp: Path) -> bool:
+    """Prepare a decrypted-scratch dir 0700, or return False if it can't be made.
+
+    Creates the dir 0700 so a co-tenant unix user can't read decrypted chat
+    content. Returns False (callers must skip writing) only when the dir can't
+    be created — a file/image turn must degrade, not crash.
+    """
+    try:
+        dirp.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as e:
+        # Read-only fs / disk full / path occupied. Degrade like the callers'
+        # old inline mkdir-in-try did — a file/image turn must not crash.
+        log.warning("[chat_scratch] could not create %s: %s", dirp, e)
+        return False
+    try:
+        os.chmod(dirp, 0o700)  # existing dir: enforce (mkdir mode is umask-masked)
+    except OSError:
+        pass
+    return True
+
+
+def _write_scratch_file(path: Path, data: bytes) -> None:
+    # Create at 0600 via open() itself (not write-then-chmod), so there is no
+    # world-readable window and no silent umask-default fallback if a later chmod
+    # is a no-op on the mount. O_CREAT's mode is umask-masked — that only ever
+    # removes group/other bits, so owner-rw is preserved.
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        f = os.fdopen(fd, "wb")
+    except BaseException:
+        # fdopen didn't take ownership of fd — close it ourselves or it leaks
+        # (repeated leaks → EMFILE → the consumer stops serving turns).
+        os.close(fd)
+        raise
+    with f:  # f owns fd now; closed even if write() raises
+        f.write(data)
+    try:
+        os.chmod(path, 0o600)  # existing file kept its prior mode on O_CREAT
+    except OSError:
+        pass
 
 
 def _strip_ns(tag: str) -> str:
@@ -2077,14 +2131,15 @@ def _human_size(n: int) -> str:
 
 
 def _land_file(msg_key: str, name: str, data: bytes) -> str:
+    if not _mkdir_scratch(FILE_TEMP_DIR):
+        return ""
     try:
-        FILE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else "bin"
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{msg_key}_{name}")[:120] or "file"
         if not safe.lower().endswith(f".{ext}"):
             safe = f"{safe}.{ext}"
         path = FILE_TEMP_DIR / safe
-        path.write_bytes(data)
+        _write_scratch_file(path, data)
     except Exception as e:
         log.warning("failed to write file temp for %s: %s", name, e)
         return ""
@@ -6145,8 +6200,11 @@ def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
     import user_mcp_materialize as _m  # noqa: PLC0415 — lazy: sibling on tools/ path
     # generic file — claude --mcp-config target AND the documented VPS user-mcp.json
     Path(USER_MCP_FILE).parent.mkdir(parents=True, exist_ok=True)
-    Path(USER_MCP_FILE).write_text(_m.claude_mcp_json(servers))
-    os.chmod(USER_MCP_FILE, 0o600)
+    # Atomic 0600 write (same as the CA bundles below). A bare write_text()
+    # then chmod leaves a brief 0644 window where the plaintext MCP url + auth
+    # headers are world-readable, and a concurrent reader could see a partial
+    # JSON — _atomic_write_text creates the temp at 0600 and renames into place.
+    _atomic_write_text(USER_MCP_FILE, _m.claude_mcp_json(servers), mode=0o600)
     claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
     if claude_dir and Path(claude_dir).is_dir():
         settings_path = Path(claude_dir) / "settings.json"

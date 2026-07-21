@@ -1132,3 +1132,30 @@ def test_openclaw_merge_idempotent_and_unicode():
     out2 = um.openclaw_config_merged(out1, servers, {"n"})
     assert json.loads(out1) == json.loads(out2)
     assert "你好" in out1                  # ensure_ascii=False
+
+
+def test_user_mcp_file_written_atomically_at_0600(monkeypatch, tmp_path):
+    # The claude --mcp-config file holds plaintext MCP url + auth headers. A
+    # bare write_text + chmod leaves a 0644 world-readable window and a
+    # non-atomic partial-JSON read; it must go through _atomic_write_text
+    # (0600 temp + rename) like the CA bundles.
+    seen: list = []
+    real = c._atomic_write_text
+
+    def spy(path, content, mode=0o600):
+        seen.append((path, mode))
+        real(path, content, mode)
+
+    monkeypatch.setattr(c, "_atomic_write_text", spy)
+    mcp = tmp_path / "mcp.json"
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(mcp))
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(tmp_path / "ca.pem"))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "castore.pem"))
+
+    c._materialize_user_mcp(
+        [{"name": "s", "enabled": True, "url": "https://s/mcp",
+          "headers": {"Authorization": "secret"}, "ca_pem": "", "transport": ""}],
+        {"s"})
+
+    assert (str(mcp), 0o600) in seen, "USER_MCP_FILE must use _atomic_write_text"
+    assert (mcp.stat().st_mode & 0o777) == 0o600

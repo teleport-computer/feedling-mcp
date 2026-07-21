@@ -8418,3 +8418,84 @@ def test_turn_timeout_is_env_tunable(monkeypatch, tmp_path):
     monkeypatch.setattr(crc.subprocess, "run", fake_run)
     assert crc.call_agent_cli("hello") == "ok"
     assert seen["timeout"] == 300
+
+
+def test_chat_scratch_dirs_default_fingerprinted():
+    # IMAGE_TEMP_DIR / FILE_TEMP_DIR were the only /tmp defaults with NO keying
+    # at all — on a shared host two accounts' decrypted images/files landed in
+    # one dir (cross-user plaintext read). The default must carry the api-key
+    # fingerprint like CHECKPOINT_FILE so distinct keys never share a dir.
+    fp = crc.CHECKPOINT_API_KEY_FINGERPRINT
+    assert fp and fp in str(crc.IMAGE_TEMP_DIR)
+    assert fp in str(crc.FILE_TEMP_DIR)
+    assert str(crc.IMAGE_TEMP_DIR) != str(crc.FILE_TEMP_DIR)
+
+
+def test_land_file_writes_0600(monkeypatch, tmp_path):
+    # A decrypted attachment must land 0600 (never world-readable on a shared
+    # host), in a 0700 dir. _write_scratch_file creates it at 0600 via open().
+    monkeypatch.setattr(crc, "FILE_TEMP_DIR", tmp_path / "files")
+    out = crc._land_file("msg1", "secret.txt", b"plaintext")
+    assert out and Path(out).read_bytes() == b"plaintext"
+    assert (Path(out).stat().st_mode & 0o777) == 0o600
+    assert (Path(out).parent.stat().st_mode & 0o777) == 0o700
+
+
+def test_land_file_degrades_on_unwritable_dir(monkeypatch, tmp_path):
+    # An mkdir failure (read-only fs, disk/inode full, path occupied by a file)
+    # must degrade to "" like the pre-hardening code did — a file-attachment turn
+    # must NOT crash. Regression guard: _mkdir_scratch moved dir creation out of
+    # _land_file's try/except, so the OSError must be swallowed inside the helper.
+    monkeypatch.setattr(crc, "FILE_TEMP_DIR", tmp_path / "files")
+
+    def boom(self, *a, **k):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(crc.Path, "mkdir", boom)
+    assert crc._land_file("m", "f.txt", b"x") == ""
+
+
+def test_image_paths_degrade_on_unwritable_dir(monkeypatch, tmp_path):
+    # Same guard for the image write path.
+    monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path / "images")
+
+    def boom(self, *a, **k):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(crc.Path, "mkdir", boom)
+    assert crc._image_file_paths_from_payloads(
+        "pfx", [{"data": "eA==", "mime_type": "image/png"}]) == []
+
+
+def test_write_scratch_file_is_0600_even_if_chmod_is_noop(monkeypatch, tmp_path):
+    # The decrypted file must be 0600 by virtue of open() itself, so a chmod
+    # that's a no-op / raises on some mounts can't leave it world-readable.
+    def boom(*a, **k):
+        raise OSError("chmod not supported")
+
+    monkeypatch.setattr(crc.os, "chmod", boom)
+    p = tmp_path / "secret.bin"
+    crc._write_scratch_file(p, b"decrypted")
+    assert p.read_bytes() == b"decrypted"
+    assert (p.stat().st_mode & 0o777) == 0o600
+
+
+def test_write_scratch_file_closes_fd_if_fdopen_fails(monkeypatch, tmp_path):
+    # os.open succeeds but os.fdopen raises (fd pressure / MemoryError): the raw
+    # fd must be closed, not leaked — a consumer hitting this on repeated
+    # attachment turns would otherwise leak descriptors until EMFILE.
+    real_close = crc.os.close
+    closed = []
+
+    def tracking_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    def fdopen_boom(fd, *a, **k):
+        raise MemoryError("interpreter under fd pressure")
+
+    monkeypatch.setattr(crc.os, "close", tracking_close)
+    monkeypatch.setattr(crc.os, "fdopen", fdopen_boom)
+    with pytest.raises(MemoryError):
+        crc._write_scratch_file(tmp_path / "x.bin", b"data")
+    assert closed, "os.open fd leaked when fdopen failed"
