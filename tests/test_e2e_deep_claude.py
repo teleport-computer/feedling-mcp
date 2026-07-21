@@ -40,12 +40,21 @@ class FakeResp:
             raise RuntimeError(f"HTTP {self.status_code}")
 
 
+class _Closeable:
+    def close(self):
+        pass
+
+
 class FakeClient:
     """Scriptable client: `handler(method, path, **kw) -> FakeResp`."""
     def __init__(self, handler):
         self.handler = handler
         self.user_id = "usr_fake"
         self.api_url = "https://pre-api.feedling.app"
+        self._http = _Closeable()
+
+    def teardown(self):
+        pass
 
     def post(self, path, **kw):
         return self.handler("POST", path, **kw)
@@ -61,14 +70,22 @@ class FakeClient:
 
 
 # -- pure functions ----------------------------------------------------------
-def test_is_english_rejects_cjk_and_short_gibberish():
-    # NOTE: _is_english is "latin-dominant, no CJK run" — it targets the §4.5
-    # Chinese-drift bug, and deliberately does NOT claim to tell English from other
-    # latin scripts (that needs a language-ID dep; see the probe docstring).
-    assert exp._is_english("Here is a short encouraging sentence for you today.")
-    assert not exp._is_english("今天你已经很努力了，继续加油哦。")          # Chinese drift
-    assert not exp._is_english("字字字字都是中文")                          # pure CJK
-    assert not exp._is_english("qwq")                                        # too few latin letters
+def test_no_cjk_drift_detects_chinese_only():
+    # HONEST scope: detects Chinese drift (§4.5), NOT English vs other Latin. French
+    # legitimately passes — the predicate never claims to prove "English".
+    assert exp._no_cjk_drift("Here is a short encouraging sentence for you today.")
+    assert exp._no_cjk_drift("Voici une phrase d'encouragement pour toi aujourd'hui.")  # French: no CJK
+    assert not exp._no_cjk_drift("今天你已经很努力了，继续加油哦。")       # Chinese drift
+    assert not exp._no_cjk_drift("字字字字都是中文")                       # pure CJK
+    assert not exp._no_cjk_drift("qwq")                                     # too few latin letters
+
+
+def test_bare_person_label_targets_yonghu_subject_only():
+    assert exp._bare_person_label("用户喜欢喝手冲咖啡")        # card calls the user "用户"
+    assert exp._bare_person_label("用户是一个安静的人")
+    assert not exp._bare_person_label("用户体验做得很好")      # legitimate compound, not over-blocked
+    assert not exp._bare_person_label("这是关于咖啡的记忆")    # unrelated text
+    assert not exp._bare_person_label("She likes pour-over coffee")
 
 
 def test_replies_for_ignores_empty_user_id():
@@ -152,15 +169,42 @@ def test_local_only_excludes_by_id(monkeypatch):
         c._enclave_pk = b"\x00" * 32
         return c
 
-    # excluded from both index and fetch → PASS
-    assert _r(mem._local_only(make([], {"items": [], "unavailable_ids": [mid]}))) == PASS
+    # stored-but-unavailable (correct local_only) → PASS
+    assert _r(mem._local_only(make([], {"items": [], "missing_ids": [], "unavailable_ids": [mid]}))) == PASS
     # leaked into index → PRODUCT_FAIL
     assert _r(mem._local_only(make([{"id": mid}], {"items": []}))) == PRODUCT_FAIL
     # leaked via fetch → PRODUCT_FAIL
     assert _r(mem._local_only(make([], {"items": [{"id": mid}]}))) == PRODUCT_FAIL
+    # MISSING (never stored) instead of unavailable → PRODUCT_FAIL, not a pass
+    assert _r(mem._local_only(make([], {"items": [], "missing_ids": [mid], "unavailable_ids": []}))) == PRODUCT_FAIL
 
 
 # -- injected-text empty fetch is not a pass ---------------------------------
+def test_cross_user_mutation_requires_exact_404(monkeypatch):
+    aid = "aid1"
+    monkeypatch.setattr(mem, "mem_add", lambda c, **kw: (200, {}))
+    monkeypatch.setattr(mem, "_id_of", lambda c, mk: aid)
+    monkeypatch.setattr(mem, "mem_index", lambda c, **kw: [])          # B index: no leak
+    fakeB = FakeClient(lambda m, p, **kw: FakeResp(200, {"items": [], "missing_ids": [aid]}))
+    monkeypatch.setattr(mem.E2EClient, "provision", classmethod(lambda cls, **kw: fakeB))
+
+    monkeypatch.setattr(mem, "mem_supersede", lambda b, i, **kw: (404, {"error": "not_found"}))
+    assert _r(mem._isolation(object())) == PASS                        # exact denial → isolated
+    monkeypatch.setattr(mem, "mem_supersede", lambda b, i, **kw: (500, {"error": "boom"}))
+    assert _r(mem._isolation(object())) == PRODUCT_FAIL                # server error ≠ isolation
+    monkeypatch.setattr(mem, "mem_supersede", lambda b, i, **kw: (200, {}))
+    assert _r(mem._isolation(object())) == PRODUCT_FAIL                # mutation succeeded → broken
+
+
+def test_cross_user_index_leak_fails(monkeypatch):
+    aid = "aid1"
+    monkeypatch.setattr(mem, "mem_add", lambda c, **kw: (200, {}))
+    monkeypatch.setattr(mem, "_id_of", lambda c, mk: aid)
+    monkeypatch.setattr(mem, "mem_index", lambda c, **kw: [{"id": aid}])   # B sees A's card
+    monkeypatch.setattr(mem.E2EClient, "provision", classmethod(lambda cls, **kw: FakeClient(lambda *a, **k: FakeResp(200, {}))))
+    assert _r(mem._isolation(object())) == PRODUCT_FAIL
+
+
 def test_injected_text_blocks_on_empty_fetch(monkeypatch):
     mk = "cat0001"
 
