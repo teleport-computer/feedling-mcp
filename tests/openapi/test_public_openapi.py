@@ -160,9 +160,11 @@ def test_public_operation_and_parameter_inventory(
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
     # 144 since GET /v1/agent/perception/recent_apps (Lark t100530);
-    # 146 since the two notify-relay endpoints (register/push, both with bodies)
-    assert len(operations) == 146
-    assert sum("requestBody" in operation for operation in operations.values()) == 67
+    # 146 since the two notify-relay endpoints (register/push, both with bodies);
+    # 148 since GET/POST /v1/web/settings (the web-search toggle, Lark t100535) —
+    # only the POST carries a body, hence 67 -> 68.
+    assert len(operations) == 148
+    assert sum("requestBody" in operation for operation in operations.values()) == 68
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

@@ -109,6 +109,7 @@ if not _provisioned:
     _PURE_UNIT = {
         "test_web_settings_store.py",
         "test_v2_web_gate.py",
+        "test_web_settings_core.py",
         "test_object_storage.py",
         "test_wake_bus.py",
         "test_chat_idempotency_unit.py",

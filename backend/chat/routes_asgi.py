@@ -28,6 +28,7 @@ from chat import consumer as chat_consumer
 from chat import poll_core as chat_poll_core
 from chat import resident_maintenance
 from chat import service as chat_service
+from chat import web_settings_core
 from runtime.waiters import registry
 
 router = APIRouter()
@@ -227,3 +228,21 @@ async def chat_verify_loop(request: Request, auth: AuthResult = Depends(require_
 
 def register_asgi(app) -> None:
     app.include_router(router)
+
+
+@router.get("/v1/web/settings")
+async def web_settings_get(auth: AuthResult = Depends(require_auth)):
+    body = await threadpool.run_db(web_settings_core.get_settings, auth.store)
+    return JSONResponse(body)
+
+
+@router.post("/v1/web/settings")
+async def web_settings_post(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    try:
+        body = await threadpool.run_db(
+            web_settings_core.update_settings, auth.store, payload
+        )
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse(body)
