@@ -227,4 +227,3 @@ async def chat_verify_loop(request: Request, auth: AuthResult = Depends(require_
 
 def register_asgi(app) -> None:
     app.include_router(router)
-
