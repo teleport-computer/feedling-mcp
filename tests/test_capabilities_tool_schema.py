@@ -49,6 +49,49 @@ def test_write_tools_have_object_params():
         assert specs[w].parameters["type"] == "object"
 
 
+def test_identity_patch_exposes_agent_name_so_a_rename_is_discoverable():
+    """The model can only rename the persona if the tool says it can.
+
+    agent_name was reachable only by hand-building a `patch` object — nothing in
+    the schema or the description mentioned it. Asked to rename itself the model
+    did the discoverable thing instead (rewrote self_introduction), so the app
+    kept showing the old name while the agent said it was done.
+    """
+    spec = next(s for s in tool_schema.build_tool_specs() if s.name == "identity_patch")
+    assert spec.parameters["properties"]["agent_name"] == {"type": "string"}
+    assert "agent_name" in spec.description
+    # top-level agent_name alone is a complete, valid call
+    assert tool_schema.validate_tool_args("identity_patch", {"agent_name": "老6"}) is None
+
+
+def test_identity_patch_validator_accepts_every_shape_the_old_code_accepted():
+    """validate_tool_args also gates REPLAY of already-persisted effects.
+
+    serve_worker validates a decrypted effect through this same function, and the
+    outbox only terminal-discards an EffectTerminalError — a plain RuntimeError
+    (which is what a validation failure becomes there) is treated as retryable. So
+    any shape a pre-upgrade worker could legally enqueue must still validate, or a
+    rolling upgrade turns those queued effects into infinite retries.
+
+    The pre-change code took `patch` whole and ignored top-level fields, so a
+    payload carrying BOTH — including the same key twice — was legal and is
+    reachable in an existing outbox row.
+    """
+    for shape in (
+        {"agent_name": "老6"},
+        {"agent_name": "老6", "patch": {"self_introduction": "我是老6"}},
+        {"agent_name": "老6", "patch": {"agent_name": "老6"}},
+        {"agent_name": "老6", "patch": {"agent_name": "老七"}},       # 旧语义：patch 胜出
+        {"self_introduction": "top", "patch": {"self_introduction": "nested"}},
+    ):
+        assert tool_schema.validate_tool_args("identity_patch", shape) is None, shape
+
+
+def test_identity_patch_validator_still_rejects_empty_calls():
+    assert tool_schema.validate_tool_args("identity_patch", {}) is not None
+    assert tool_schema.validate_tool_args("identity_patch", {"agent_name": "   "}) is not None
+
+
 def test_all_model_facing_tools_reject_unknown_top_level_fields():
     for spec in tool_schema.build_tool_specs():
         assert spec.parameters["additionalProperties"] is False, spec.name
