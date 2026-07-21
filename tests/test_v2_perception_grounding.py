@@ -130,6 +130,9 @@ def _spy_cap_data(monkeypatch, calls, *, data=None):
 
 def _chat_deps(messages):
     return worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt-enclave",
@@ -139,6 +142,9 @@ def _chat_deps(messages):
 
 def _wake_deps(tail):
     return worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt",

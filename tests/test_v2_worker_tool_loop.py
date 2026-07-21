@@ -179,8 +179,11 @@ def _tc(call_id, name, **args):
     return {"id": call_id, "name": name, "args": args}
 
 
-def _deps(*, messages, token="rt-enclave"):
+def _deps(*, messages, token="rt-enclave", web_enabled=True):
     return worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: web_enabled,
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: token,
@@ -256,6 +259,9 @@ def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
         return v2_effect_outbox.apply_pending_effects(user_id, dispatch=dispatch)
 
     return worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda _user_id: read_after_seq(uid, 0),
         read_messages_after_seq=read_after_seq,
         resolve_provider=lambda _user_id: (_BYOK, {}),
@@ -837,6 +843,9 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
         )
 
     deps = worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda _user_id: _read_after_seq(uid, 0),
         read_messages_after_seq=_read_after_seq,
         resolve_provider=lambda _user_id: (_BYOK, {}),
@@ -1032,6 +1041,9 @@ def test_committed_final_reply_survives_post_commit_bookkeeping_failures(
         )
 
     deps = worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda _uid: read_after_seq(uid, 0),
         read_messages_after_seq=read_after_seq,
         resolve_provider=lambda _uid: (_BYOK, {}),
@@ -1112,6 +1124,9 @@ def test_pre_commit_status_failure_still_fails_without_reply(monkeypatch):
         ]
 
     deps = worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda _uid: read_after_seq(uid, 0),
         read_messages_after_seq=read_after_seq,
         resolve_provider=lambda _uid: (_BYOK, {}),
@@ -1559,3 +1574,120 @@ def test_chat_turn_with_no_reply_produced_marks_job_failed_not_completed(monkeyp
     row = _turn_metric_row(job_id)
     assert row is not None
     assert row[1] is True  # failed=True in the metric row too
+
+
+# --------------------------------------------------------------- web gate
+
+
+def _offered(call) -> set[str]:
+    return {spec.name for spec in (call["tools"] or ())}
+
+
+def test_chat_offers_web_tools_when_the_user_enabled_them(monkeypatch):
+    uid = "u_web_gate_on"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("ok")])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=True,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert {"web_search", "web_fetch"} <= _offered(calls[0])
+
+
+def test_chat_hides_web_tools_when_the_user_disabled_them(monkeypatch):
+    """Closed state means the tools are ABSENT from the request, not offered
+    and then refused: nothing for the model to call, nothing to explain away."""
+    uid = "u_web_gate_off"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("ok")])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=False,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert {"web_search", "web_fetch"}.isdisjoint(_offered(calls[0]))
+    # the rest of the catalog is untouched — this gate is additive, not a
+    # wholesale narrowing of what the model can do
+    assert "memory_index" in _offered(calls[0])
+
+
+def test_chat_hides_web_tools_when_deps_seam_is_absent(monkeypatch):
+    """TurnDeps.web_tools_enabled defaults to None (worker never imports
+    hosted). That must read as OFF, not as "unconfigured, therefore allow"."""
+    uid = "u_web_gate_none"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("ok")])
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [
+            {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}
+        ],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt-enclave",
+        apply_pending_effects=_apply_effects,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert {"web_search", "web_fetch"}.isdisjoint(_offered(calls[0]))
+
+
+def test_web_kill_switch_removes_the_tools_even_when_the_user_enabled_them(monkeypatch):
+    uid = "u_web_gate_halted"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    monkeypatch.setattr(worker.kill_switch, "web_halted", lambda: (True, False))
+    calls = _script_provider(monkeypatch, [_text_round("ok")])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=True,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    offered = _offered(calls[0])
+    assert "web_search" not in offered      # halted
+    assert "web_fetch" in offered           # independently still allowed

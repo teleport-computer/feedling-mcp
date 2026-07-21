@@ -65,6 +65,7 @@ from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
+from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
@@ -5796,6 +5797,30 @@ async def process_job(
                 for spec in mcp_turn.tool_specs
                 if spec.name not in mcp_mutating_names
             )
+        # Web gate. UNION with the mutation set, never assignment — overwriting
+        # would re-expose the writes that mutation recovery just withheld.
+        # The store read is synchronous, hence to_thread (same shape as the
+        # runtime_mode_enabled read above); blocking here would stall the loop.
+        web_user_enabled = await asyncio.to_thread(
+            v2_web_gate.resolve_user_enabled, deps.web_tools_enabled, user_id
+        )
+        # Skip the control-plane read entirely when the answer is already known
+        # (user off, or a background lane): one less DB round-trip per turn.
+        if web_user_enabled and lane in v2_web_gate.FOREGROUND_LANES:
+            web_search_halted, web_fetch_halted = await asyncio.to_thread(
+                kill_switch.web_halted
+            )
+        else:
+            web_search_halted = web_fetch_halted = True
+        disabled_web_tool_names = v2_web_gate.disabled_web_tools(
+            user_enabled=web_user_enabled,
+            lane=lane,  # the real lane variable, never a "chat" literal
+            search_halted=web_search_halted,
+            fetch_halted=web_fetch_halted,
+        )
+        disabled_tool_names_for_turn = (
+            frozenset(disabled_mutation_tool_names) | disabled_web_tool_names
+        )
         # Shared across every provider round in this chat turn. A per-dispatch
         # budget would reset whenever the model asks for another tool batch and
         # would therefore fail to bound the whole-turn MCP contribution.
@@ -6410,7 +6435,7 @@ async def process_job(
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             extra_mutating_tool_names=mcp_mutating_names,
-            disabled_tool_names=disabled_mutation_tool_names,
+            disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
             outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,

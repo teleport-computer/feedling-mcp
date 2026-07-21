@@ -79,6 +79,9 @@ def _script_provider(monkeypatch, responses):
 
 def _deps(messages, *, load_mcp_turn=None):
     return worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt-enclave",
