@@ -610,23 +610,17 @@ def test_web_settings_schemas_pin_the_field_types(
 
     response = components["WebSettingsResponse"]
     assert set(response["required"]) == {
-        "enabled", "available", "effective", "unavailable_reason", "capabilities",
+        "enabled", "runtime_supported", "status", "effective_for_chat", "tools",
     }
-    for field in ("enabled", "available", "effective"):
+    for field in ("enabled", "runtime_supported", "effective_for_chat"):
         assert response["properties"][field]["type"] == "boolean", field
-    # OpenAPI 3.1: `nullable` is gone and `type: string` excludes null, so the
-    # null branch has to be a real anyOf member — otherwise the documented shape
-    # rejects the response the endpoint actually returns while available.
-    reason = response["properties"]["unavailable_reason"]
-    assert "nullable" not in reason
-    assert reason["anyOf"] == [
-        {"type": "string", "enum": ["globally_disabled"]},
-        {"type": "null"},
-    ]
-    capabilities = response["properties"]["capabilities"]
-    assert set(capabilities["required"]) == {"search", "fetch"}
-    for field in ("search", "fetch"):
-        assert capabilities["properties"][field]["type"] == "boolean", field
+    # `degraded` must be expressible: one tool halted, the other still usable.
+    assert set(response["properties"]["status"]["enum"]) == {
+        "available", "degraded", "unavailable",
+    }
+    tools = response["properties"]["tools"]
+    assert set(tools["required"]) == {"web_search", "web_fetch"}
+    assert components["WebToolState"]["properties"]["available"]["type"] == "boolean"
 
 
 def test_web_settings_response_schema_matches_what_the_core_actually_returns(
@@ -643,7 +637,7 @@ def test_web_settings_response_schema_matches_what_the_core_actually_returns(
     from pathlib import Path as _Path
 
     sys.path.insert(0, str(_Path(__file__).parent.parent.parent / "backend"))
-    from chat import web_settings_core
+    from web import settings_core as web_settings_core
 
     class _Store:
         def __init__(self, enabled):
@@ -654,22 +648,21 @@ def test_web_settings_response_schema_matches_what_the_core_actually_returns(
 
     schema = public_schema["components"]["schemas"]["WebSettingsResponse"]
     documented = set(schema["required"])
+    allowed_status = set(schema["properties"]["status"]["enum"])
 
-    available = web_settings_core.get_settings(
-        _Store(False), halted_reader=lambda: (False, False)
-    )
-    halted = web_settings_core.get_settings(
-        _Store(True), halted_reader=lambda: (True, True)
-    )
+    def _settings(enabled, halted, supported=True):
+        return web_settings_core.get_settings(
+            _Store(enabled),
+            halted_reader=lambda: halted,
+            runtime_supported_reader=lambda _s: supported,
+        )
 
-    for payload in (available, halted):
+    cases = [
+        _settings(False, (False, False)),               # available
+        _settings(True, (True, False)),                 # degraded
+        _settings(True, (True, True)),                  # unavailable via halts
+        _settings(True, (False, False), supported=False),  # unavailable: self-hosted
+    ]
+    for payload in cases:
         assert set(payload) == documented, payload
-
-    # the null branch the anyOf exists for
-    assert available["unavailable_reason"] is None
-    # and the only documented string value
-    string_branch = next(
-        branch for branch in schema["properties"]["unavailable_reason"]["anyOf"]
-        if branch.get("type") == "string"
-    )
-    assert halted["unavailable_reason"] in string_branch["enum"]
+        assert payload["status"] in allowed_status, payload

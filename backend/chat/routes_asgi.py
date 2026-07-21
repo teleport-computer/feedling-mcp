@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from accounts.auth_core import AuthResult
 from asgi import http as asgi_http
 from asgi import threadpool
-from asgi.deps import require_api_key, require_auth
+from asgi.deps import require_auth
 from asgi.settings import settings
 from bootstrap import gates as boot_gates
 from chat import chat_core
@@ -28,7 +28,6 @@ from chat import consumer as chat_consumer
 from chat import poll_core as chat_poll_core
 from chat import resident_maintenance
 from chat import service as chat_service
-from chat import web_settings_core
 from runtime.waiters import registry
 
 router = APIRouter()
@@ -229,27 +228,3 @@ async def chat_verify_loop(request: Request, auth: AuthResult = Depends(require_
 def register_asgi(app) -> None:
     app.include_router(router)
 
-
-# api-key ONLY, both verbs. This is the iOS control plane: `enabled` is the
-# user's own preference, so a hosted consumer holding a short-lived runtime
-# token must not be able to read or rewrite it. `require_auth` would accept
-# runtime tokens with no scope at all — "the model can't currently get a token"
-# is not a security boundary.
-@router.get("/v1/web/settings")
-async def web_settings_get(auth: AuthResult = Depends(require_api_key)):
-    body = await threadpool.run_db(web_settings_core.get_settings, auth.store)
-    return JSONResponse(body)
-
-
-@router.post("/v1/web/settings")
-async def web_settings_post(
-    request: Request, auth: AuthResult = Depends(require_api_key)
-):
-    payload = (await asgi_http.read_json_silent(request)) or {}
-    try:
-        body = await threadpool.run_db(
-            web_settings_core.update_settings, auth.store, payload
-        )
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-    return JSONResponse(body)

@@ -32,8 +32,10 @@ def store(monkeypatch):
     """
     saved: dict[tuple[str, str], object] = {}
     monkeypatch.setattr(db, "get_blob", lambda uid, kind: saved.get((uid, kind)))
+    # Patch the STRICT writer: the setting deliberately uses set_blob_strict so a
+    # failed write surfaces instead of being logged and swallowed.
     monkeypatch.setattr(
-        db, "set_blob", lambda uid, kind, doc: saved.__setitem__((uid, kind), doc))
+        db, "set_blob_strict", lambda uid, kind, doc: saved.__setitem__((uid, kind), doc))
     s = UserStore("u-web-settings-test")
     s._saved_blobs = saved
     return s
@@ -49,20 +51,20 @@ def test_default_is_disabled(store):
 
 
 def test_roundtrip_and_blob_kind(store):
-    assert store.save_web_settings({"enabled": True})["enabled"] is True
+    assert store.save_web_settings_strict({"enabled": True})["enabled"] is True
     assert store._saved_blobs[("u-web-settings-test", WEB_SETTINGS_BLOB)] == {
         "version": 1, "enabled": True}
     assert store.load_web_settings()["enabled"] is True
 
 
 def test_can_be_turned_back_off(store):
-    store.save_web_settings({"enabled": True})
-    assert store.save_web_settings({"enabled": False})["enabled"] is False
+    store.save_web_settings_strict({"enabled": True})
+    assert store.save_web_settings_strict({"enabled": False})["enabled"] is False
     assert store.load_web_settings()["enabled"] is False
 
 
 def test_unknown_keys_are_dropped(store):
-    assert "evil" not in store.save_web_settings({"enabled": True, "evil": "x"})
+    assert "evil" not in store.save_web_settings_strict({"enabled": True, "evil": "x"})
 
 
 @pytest.mark.parametrize("bad", ["yes", "no", "true", "false", "", 1, 0, None, []])
@@ -70,18 +72,18 @@ def test_non_bool_input_is_rejected(store, bad):
     """Strict booleans: never bool()-coerce. bool("no") is True — the user says
     no and would get web access switched on."""
     with pytest.raises(ValueError):
-        store.save_web_settings({"enabled": bad})
+        store.save_web_settings_strict({"enabled": bad})
 
 
 def test_only_real_bools_accepted(store):
-    assert store.save_web_settings({"enabled": True})["enabled"] is True
-    assert store.save_web_settings({"enabled": False})["enabled"] is False
+    assert store.save_web_settings_strict({"enabled": True})["enabled"] is True
+    assert store.save_web_settings_strict({"enabled": False})["enabled"] is False
 
 
 def test_rejected_write_does_not_touch_storage(store):
-    store.save_web_settings({"enabled": True})
+    store.save_web_settings_strict({"enabled": True})
     with pytest.raises(ValueError):
-        store.save_web_settings({"enabled": "no"})
+        store.save_web_settings_strict({"enabled": "no"})
     assert store.load_web_settings()["enabled"] is True
 
 
@@ -99,9 +101,9 @@ def test_load_rebuilds_the_contract_and_drops_unknown_fields(store):
 
 
 def test_empty_or_non_dict_patch_keeps_current(store):
-    store.save_web_settings({"enabled": True})
-    assert store.save_web_settings({})["enabled"] is True
-    assert store.save_web_settings("true")["enabled"] is True
+    store.save_web_settings_strict({"enabled": True})
+    assert store.save_web_settings_strict({})["enabled"] is True
+    assert store.save_web_settings_strict("true")["enabled"] is True
 
 
 def test_corrupt_blob_falls_back_to_disabled(store):

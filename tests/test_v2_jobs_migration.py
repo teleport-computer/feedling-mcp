@@ -195,7 +195,7 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0048_v2_turn_metrics_user_fk").down_revision == (
         "0047_model_route_context_window"
     )
-    assert script.get_current_head() == "0050_v2_web_halted_columns"
+    assert script.get_current_head() == "0051_web_settings_backfill"
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():

@@ -1147,15 +1147,21 @@ class UserStore:
             print(f"[{self.user_id}/web_settings] load failed: {e}")
         return default
 
-    def save_web_settings(self, patch: dict) -> dict:
+    def save_web_settings_strict(self, patch: dict) -> dict:
         """Accepts only a real ``bool`` under ``enabled`` — an allowlist, not a
-        denylist. Raises ValueError on any other type; nothing is written."""
+        denylist. Raises ValueError on any other type; nothing is written.
+
+        Uses ``set_blob_strict`` deliberately. ``db.set_blob`` logs and swallows
+        write failures, which for a user-initiated setting would mean the UI
+        reports "switched on" while the next turn still reads the old value.
+        A failed write has to surface as an error.
+        """
         cur = self.load_web_settings()
         if isinstance(patch, dict) and "enabled" in patch:
             if not isinstance(patch["enabled"], bool):
                 raise ValueError("enabled must be boolean")
             cur["enabled"] = patch["enabled"]
-        db.set_blob(self.user_id, WEB_SETTINGS_BLOB, cur)
+        db.set_blob_strict(self.user_id, WEB_SETTINGS_BLOB, cur)
         return cur
 
     def first_chat_ok_at(self) -> str:

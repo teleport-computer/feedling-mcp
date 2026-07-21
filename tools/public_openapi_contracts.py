@@ -317,51 +317,55 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "description": (
             "Web-search state. `enabled` is the user's saved preference and is "
-            "written only by the user — an operator halting web never rewrites "
-            "it. `effective` is derived (`enabled && available`) and is not "
-            "stored. Background turns (proactive wake / screen watch) never "
-            "reach the network regardless of these values."
+            "written only by the user — an operator halt never rewrites it. "
+            "`runtime_supported` is false for self-hosted accounts, whose "
+            "consumer does not run the tool loop these tools live in, so the "
+            "preference is inert there. `effective_for_chat` is derived and "
+            "covers foreground chat only: background turns (proactive wake / "
+            "screen watch) never reach the network regardless of any of these."
         ),
         "required": [
             "enabled",
-            "available",
-            "effective",
-            "unavailable_reason",
-            "capabilities",
+            "runtime_supported",
+            "status",
+            "effective_for_chat",
+            "tools",
         ],
         "additionalProperties": False,
         "properties": {
             "enabled": {"type": "boolean", "description": "The user's saved preference."},
-            "available": {
+            "runtime_supported": {
                 "type": "boolean",
-                "description": "False when the operator kill switch has halted search.",
+                "description": "Whether this account's runtime has the web tools at all.",
             },
-            "effective": {
+            "status": {
+                "type": "string",
+                "enum": ["available", "degraded", "unavailable"],
+                "description": (
+                    "`degraded` means one of the two tools is halted and the "
+                    "other still works — not a synonym for unavailable."
+                ),
+            },
+            "effective_for_chat": {
                 "type": "boolean",
-                "description": "`enabled && available`. Derived, never stored.",
+                "description": "Whether a foreground chat turn actually gets web tools.",
             },
-            "unavailable_reason": {
-                # OpenAPI 3.1 (this document) dropped `nullable`, and under JSON
-                # Schema `type: string` excludes null even when null appears in
-                # `enum` — the real response returns null while available, so
-                # that spelling would not validate. anyOf is the 3.1 form.
-                "anyOf": [
-                    {"type": "string", "enum": ["globally_disabled"]},
-                    {"type": "null"},
-                ],
-                "description": "Null when available. Unknown values must be treated as unavailable.",
-            },
-            "capabilities": {
+            "tools": {
                 "type": "object",
-                "description": "Per-tool live state, so a half-open kill switch is visible.",
-                "required": ["search", "fetch"],
+                "required": ["web_search", "web_fetch"],
                 "additionalProperties": False,
                 "properties": {
-                    "search": {"type": "boolean"},
-                    "fetch": {"type": "boolean"},
+                    "web_search": {"$ref": "#/components/schemas/WebToolState"},
+                    "web_fetch": {"$ref": "#/components/schemas/WebToolState"},
                 },
             },
         },
+    },
+    "WebToolState": {
+        "type": "object",
+        "required": ["available"],
+        "additionalProperties": False,
+        "properties": {"available": {"type": "boolean"}},
     },
     "FreeFormJsonObject": {
         "type": "object",

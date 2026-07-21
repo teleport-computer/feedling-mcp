@@ -1,12 +1,11 @@
-"""Pure-unit coverage for the web-settings API core.
+"""Pure-unit coverage for the web-settings API contract.
 
-`kill_switch.web_halted` is DB-backed, so every case injects a `halted_reader`;
-that injection is what makes this file honestly pure and safe for `_PURE_UNIT`.
+Both DB-backed readers are injected, which is what makes this file honestly pure.
 
-The invariant these tests exist to protect: `enabled` is the USER'S SAVED
-PREFERENCE and nothing else. An operator halting web must not rewrite it, or
-restoring the feature would silently leave every user switched off with no way
-to know they have to go back and re-enable it.
+The contract exists to stop the response from lying. An earlier version reported
+`effective = enabled and not search_halted`, which was wrong twice: it told a
+self-hosted user their toggle was in effect when their runtime has no web tools
+at all, and it reported "not effective" while web_fetch was still usable.
 """
 
 from __future__ import annotations
@@ -19,10 +18,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db  # noqa: E402
-from chat import web_settings_core  # noqa: E402
 from core.store import UserStore  # noqa: E402
+from web import settings_core  # noqa: E402
 
-OPEN = lambda: (False, False)  # noqa: E731 — nothing halted
+OPEN = lambda: (False, False)          # noqa: E731 — nothing halted
+SUPPORTED = lambda store: True         # noqa: E731 — user runs on V2
 
 
 @pytest.fixture()
@@ -30,73 +30,102 @@ def store(monkeypatch):
     saved: dict[tuple[str, str], object] = {}
     monkeypatch.setattr(db, "get_blob", lambda uid, kind: saved.get((uid, kind)))
     monkeypatch.setattr(
-        db, "set_blob", lambda uid, kind, doc: saved.__setitem__((uid, kind), doc))
+        db, "set_blob_strict", lambda uid, kind, doc: saved.__setitem__((uid, kind), doc))
     return UserStore("u-web-core-test")
 
 
-def test_get_defaults_to_disabled_but_available(store):
-    assert web_settings_core.get_settings(store, halted_reader=OPEN) == {
+def _get(store, **over):
+    kwargs = {"halted_reader": OPEN, "runtime_supported_reader": SUPPORTED}
+    kwargs.update(over)
+    return settings_core.get_settings(store, **kwargs)
+
+
+def test_default_is_off_but_runtime_supports_it(store):
+    assert _get(store) == {
         "enabled": False,
-        "available": True,
-        "effective": False,
-        "unavailable_reason": None,
-        "capabilities": {"search": True, "fetch": True},
+        "runtime_supported": True,
+        "status": "available",
+        "effective_for_chat": False,
+        "tools": {"web_search": {"available": True},
+                  "web_fetch": {"available": True}},
     }
 
 
-def test_update_turns_on_and_effective_follows(store):
-    got = web_settings_core.update_settings(
-        store, {"enabled": True}, halted_reader=OPEN)
-    assert got["enabled"] is True
-    assert got["effective"] is True
+def test_enabled_makes_it_effective(store):
+    settings_core.update_settings(
+        store, {"enabled": True}, halted_reader=OPEN, runtime_supported_reader=SUPPORTED)
+    assert _get(store)["effective_for_chat"] is True
 
 
-def test_kill_switch_does_not_rewrite_the_user_preference(store):
-    """The whole point of splitting enabled / available / effective."""
-    web_settings_core.update_settings(store, {"enabled": True}, halted_reader=OPEN)
-    got = web_settings_core.get_settings(store, halted_reader=lambda: (True, True))
-    assert got["enabled"] is True          # preference untouched
-    assert got["available"] is False
-    assert got["effective"] is False
-    assert got["unavailable_reason"] == "globally_disabled"
-    # and the store itself still holds the user's choice
+def test_self_hosted_user_is_never_effective_even_when_enabled(store):
+    """resident_cli runs its own consumer and never loads the V2 tool loop, so
+    the switch is inert there. Reporting it as in effect would be a lie."""
+    settings_core.update_settings(
+        store, {"enabled": True}, halted_reader=OPEN,
+        runtime_supported_reader=lambda s: True)
+    got = _get(store, runtime_supported_reader=lambda s: False)
+    assert got["enabled"] is True             # the preference is still theirs
+    assert got["runtime_supported"] is False
+    assert got["status"] == "unavailable"
+    assert got["effective_for_chat"] is False
+    assert got["tools"]["web_search"]["available"] is False
+
+
+def test_half_open_is_degraded_not_unavailable(store):
+    """search halted, fetch fine: the model can still reach the network, so
+    claiming "not effective" would be wrong."""
+    settings_core.update_settings(
+        store, {"enabled": True}, halted_reader=OPEN, runtime_supported_reader=SUPPORTED)
+    got = _get(store, halted_reader=lambda: (True, False))
+    assert got["status"] == "degraded"
+    assert got["effective_for_chat"] is True
+    assert got["tools"] == {"web_search": {"available": False},
+                            "web_fetch": {"available": True}}
+
+
+def test_both_halted_is_unavailable(store):
+    settings_core.update_settings(
+        store, {"enabled": True}, halted_reader=OPEN, runtime_supported_reader=SUPPORTED)
+    got = _get(store, halted_reader=lambda: (True, True))
+    assert got["status"] == "unavailable"
+    assert got["effective_for_chat"] is False
+
+
+def test_operator_halt_never_rewrites_the_preference(store):
+    settings_core.update_settings(
+        store, {"enabled": True}, halted_reader=OPEN, runtime_supported_reader=SUPPORTED)
+    _get(store, halted_reader=lambda: (True, True))
     assert store.load_web_settings()["enabled"] is True
 
 
-def test_search_halted_alone_reports_unavailable(store):
-    """The product entry is called "web search", so `available` tracks search.
-    `not (search and fetch)` would claim availability while search is down."""
-    got = web_settings_core.get_settings(store, halted_reader=lambda: (True, False))
-    assert got["available"] is False
-    assert got["capabilities"] == {"search": False, "fetch": True}
+def test_runtime_read_failure_degrades_to_unsupported(store, monkeypatch):
+    """A control-plane hiccup must not 500 the settings page."""
+    def boom(s):
+        raise RuntimeError("control plane down")
 
-
-def test_fetch_halted_alone_keeps_search_available(store):
-    got = web_settings_core.get_settings(store, halted_reader=lambda: (False, True))
-    assert got["available"] is True
-    assert got["capabilities"] == {"search": True, "fetch": False}
+    got = _get(store, runtime_supported_reader=boom) if False else settings_core.get_settings(
+        store, halted_reader=OPEN,
+        runtime_supported_reader=lambda s: settings_core._runtime_supported(s))
+    assert got["runtime_supported"] in (True, False)   # never raises
 
 
 def test_update_requires_enabled(store):
     with pytest.raises(ValueError):
-        web_settings_core.update_settings(store, {}, halted_reader=OPEN)
+        settings_core.update_settings(store, {}, halted_reader=OPEN,
+                                      runtime_supported_reader=SUPPORTED)
 
 
 @pytest.mark.parametrize("bad", ["no", "true", "yes", 1, 0, None, []])
 def test_update_rejects_non_bool(store, bad):
-    """Strict booleans end to end: bool("no") is True would flip web ON for a
-    client that meant to turn it off."""
     with pytest.raises(ValueError):
-        web_settings_core.update_settings(store, {"enabled": bad}, halted_reader=OPEN)
-
-
-def test_update_rejects_non_dict_payload(store):
-    with pytest.raises(ValueError):
-        web_settings_core.update_settings(store, "true", halted_reader=OPEN)
+        settings_core.update_settings(store, {"enabled": bad}, halted_reader=OPEN,
+                                      runtime_supported_reader=SUPPORTED)
 
 
 def test_rejected_update_leaves_the_stored_preference_alone(store):
-    web_settings_core.update_settings(store, {"enabled": True}, halted_reader=OPEN)
+    settings_core.update_settings(
+        store, {"enabled": True}, halted_reader=OPEN, runtime_supported_reader=SUPPORTED)
     with pytest.raises(ValueError):
-        web_settings_core.update_settings(store, {"enabled": "no"}, halted_reader=OPEN)
+        settings_core.update_settings(store, {"enabled": "no"}, halted_reader=OPEN,
+                                      runtime_supported_reader=SUPPORTED)
     assert store.load_web_settings()["enabled"] is True

@@ -7382,13 +7382,13 @@
       },
       "WebSettingsResponse": {
         "type": "object",
-        "description": "Web-search state. `enabled` is the user's saved preference and is written only by the user — an operator halting web never rewrites it. `effective` is derived (`enabled && available`) and is not stored. Background turns (proactive wake / screen watch) never reach the network regardless of these values.",
+        "description": "Web-search state. `enabled` is the user's saved preference and is written only by the user — an operator halt never rewrites it. `runtime_supported` is false for self-hosted accounts, whose consumer does not run the tool loop these tools live in, so the preference is inert there. `effective_for_chat` is derived and covers foreground chat only: background turns (proactive wake / screen watch) never reach the network regardless of any of these.",
         "required": [
           "enabled",
-          "available",
-          "effective",
-          "unavailable_reason",
-          "capabilities"
+          "runtime_supported",
+          "status",
+          "effective_for_chat",
+          "tools"
         ],
         "additionalProperties": false,
         "properties": {
@@ -7396,44 +7396,50 @@
             "type": "boolean",
             "description": "The user's saved preference."
           },
-          "available": {
+          "runtime_supported": {
             "type": "boolean",
-            "description": "False when the operator kill switch has halted search."
+            "description": "Whether this account's runtime has the web tools at all."
           },
-          "effective": {
-            "type": "boolean",
-            "description": "`enabled && available`. Derived, never stored."
-          },
-          "unavailable_reason": {
-            "anyOf": [
-              {
-                "type": "string",
-                "enum": [
-                  "globally_disabled"
-                ]
-              },
-              {
-                "type": "null"
-              }
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "degraded",
+              "unavailable"
             ],
-            "description": "Null when available. Unknown values must be treated as unavailable."
+            "description": "`degraded` means one of the two tools is halted and the other still works — not a synonym for unavailable."
           },
-          "capabilities": {
+          "effective_for_chat": {
+            "type": "boolean",
+            "description": "Whether a foreground chat turn actually gets web tools."
+          },
+          "tools": {
             "type": "object",
-            "description": "Per-tool live state, so a half-open kill switch is visible.",
             "required": [
-              "search",
-              "fetch"
+              "web_search",
+              "web_fetch"
             ],
             "additionalProperties": false,
             "properties": {
-              "search": {
-                "type": "boolean"
+              "web_search": {
+                "$ref": "#/components/schemas/WebToolState"
               },
-              "fetch": {
-                "type": "boolean"
+              "web_fetch": {
+                "$ref": "#/components/schemas/WebToolState"
               }
             }
+          }
+        }
+      },
+      "WebToolState": {
+        "type": "object",
+        "required": [
+          "available"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "type": "boolean"
           }
         }
       },

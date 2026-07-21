@@ -36,6 +36,7 @@ _ASGI_PACKAGES = (
     "accounts.routes_asgi",
     "bootstrap.routes_asgi",
     "chat.routes_asgi",
+    "web.routes_asgi",
     "proactive.routes_asgi",
     "agent.routes_asgi",
     "copytext.routes_asgi",
