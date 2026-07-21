@@ -250,7 +250,7 @@ def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch)
     assert voice_inputs == ["text for chunk-0", "text for chunk-1"]
     reducer_output = apply_payloads[0]["reducer_output"]
     assert reducer_output["persona"]["content"].startswith("## 你是谁")
-    assert reducer_output["memories"][0]["summary"] == "User likes tea"
+    assert reducer_output["memories"][0]["summary"] == "The person likes tea"
     assert "raw_text" not in reducer_output
     assert "chunks" not in reducer_output
 
@@ -630,8 +630,42 @@ def test_fact_write_retries_once_when_empty(monkeypatch):
 
     assert [call["task_id"] for call in calls] == ["fact-write-0", "fact-write-0-empty-retry-1"]
     assert calls[0]["idempotency_key"] != calls[1]["idempotency_key"]
-    assert output["memories"][0]["summary"] == "用户叫 Z"
+    assert output["memories"][0]["summary"] == "对方叫 Z"
     assert output["identity"]["agent_name"] == "乔伊"
+
+
+def test_fact_write_rewrites_person_references_but_preserves_product_terms():
+    class FakeLLM:
+        def complete(self, **kwargs):
+            return types.SimpleNamespace(
+                text=json.dumps({
+                    "memories": [{
+                        "summary": "用户喜欢研究用户增长和用户画像",
+                        "content": "用户在关注用户留存与用户体验。",
+                        "bucket": "关于用户",
+                        "threads": ["用户偏好", "用户增长"],
+                    }],
+                    "identity": {"agent_name": "Mira", "dimensions": []},
+                }, ensure_ascii=False),
+                usage={},
+                cached=False,
+                output_ref=kwargs["task_id"],
+            )
+
+    output = worker.build_memory_output_from_fact_candidates(
+        user_id="usr_1",
+        job_id="job_1",
+        runtime=types.SimpleNamespace(),
+        fact_candidates=[{"about": "user", "summary": "用户喜欢产品研究"}],
+        llm=FakeLLM(),
+        user_name="小雨",
+    )
+
+    memory = output["memories"][0]
+    assert memory["summary"] == "小雨喜欢研究用户增长和用户画像"
+    assert memory["content"] == "小雨在关注用户留存与用户体验。"
+    assert memory["bucket"] == "关于小雨"
+    assert memory["threads"] == ["小雨偏好", "用户增长"]
 
 
 def test_fact_write_provider_config_error_does_not_retry(monkeypatch):
@@ -769,7 +803,7 @@ def test_user_profile_source_writes_memory_facts_without_identity_or_persona(mon
     assert [call["task_id"] for call in llm_calls] == ["fact-map-0", "fact-write-0"]
     reducer_output = apply_payloads[0]["reducer_output"]
     assert reducer_output["source_family"] == "user_profile"
-    assert reducer_output["memories"][0]["summary"] == "User likes direct feedback"
+    assert reducer_output["memories"][0]["summary"] == "The person likes direct feedback"
     assert "identity" not in reducer_output
     assert "persona" not in reducer_output
 
@@ -815,7 +849,7 @@ def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatc
     assert [call["task_id"] for call in llm_calls] == ["fact-write-0"]
     reducer_output = apply_payloads[0]["reducer_output"]
     assert reducer_output["source_family"] == "memory_summary"
-    assert reducer_output["memories"][0]["summary"] == "User needs stable companionship"
+    assert reducer_output["memories"][0]["summary"] == "The person needs stable companionship"
     assert reducer_output["identity"] == {"agent_name": "Mira", "dimensions": []}
     assert "persona" not in reducer_output
 

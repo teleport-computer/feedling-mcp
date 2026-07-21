@@ -6,6 +6,8 @@ fallback semantics.
 """
 from __future__ import annotations
 
+import re
+
 
 _RESERVED_USER_NAMES = frozenset({"ta", "user", "用户"})
 
@@ -34,4 +36,29 @@ def _naming_rule(user_name: str) -> str:
         "确实需要主语时只用中性的「对方」。"
         "不要用「用户」/\"user\"、指代本人的「TA」、猜测性别的他/她，"
         "也不要用第二人称「你」来指代本人。"
+    )
+
+
+def rewrite_user_reference(text: str, user_name: str) -> str:
+    """Rewrite system-label leaks only where ``user`` is a person referent.
+
+    The positive predicate/particle anchors deliberately preserve product terms
+    such as ``用户增长`` / ``用户画像`` / ``user growth``.  Prompting is the primary
+    guard; this is the deterministic last mile for user-visible memory prose.
+    """
+    raw = str(text or "")
+    if not raw:
+        return raw
+    name = sanitize_user_name(user_name)
+    zh_referent = name if name != "TA" else "对方"
+    en_referent = name if name != "TA" else "The person"
+    raw = re.sub(
+        r"用户(?=(?:明确|要求|希望|想要?|喜欢|偏好|说|提到|需要|常常?|总是|通常|曾经?|会|能|愿意|拒绝|认为|觉得|正在|已经|仍然|依然|在|有|没有|是|不是|把|对|来自|住在|工作|习惯|倾向|计划|决定|担心|感到|名?叫|养|写|做|使用|选择|爱|讨厌|擅长|关注|的|$|[\s，。！？；;：:、,.!?]))",
+        zh_referent,
+        raw,
+    )
+    return re.sub(
+        r"(?i)\b(?:the\s+)?user(?=(?:'s|\s+(?:is|has|was|wants|needs|likes|prefers|often|usually|always|never|can|will|works|writes|feels|said|asked|lives|uses|chooses|plans|decided)\b))",
+        en_referent,
+        raw,
     )

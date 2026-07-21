@@ -146,6 +146,13 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- Genesis imports now use the person's saved preferred name in distilled
+  memory prose. When no name is known, generated cards omit the subject where
+  possible or use the neutral “the person”/“对方”; they no longer expose the
+  system labels `user`/`用户`, second-person address, or guessed gender for the
+  person. Product terms such as `用户增长`, `用户画像`, and `用户留存` remain
+  unchanged. An explicit preferred name found in uploaded User Profile material
+  is also retained on the encrypted Identity Card.
 - The resident consumer's default per-turn agent timeout
   (`FEEDLING_AGENT_TURN_TIMEOUT_SEC`) is raised from 120 to 300 seconds. Slow
   self-hosted stacks (official Claude Code cold starts, heavy MCP, long-thinking

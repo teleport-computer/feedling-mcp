@@ -509,6 +509,19 @@ def test_identity_payload_from_output_ignores_empty_identity():
     assert service._identity_payload_from_output({"identity": {"agent_name": "", "dimensions": []}}) is None
 
 
+def test_identity_payload_from_output_preserves_valid_user_preferred_name():
+    payload = service._identity_payload_from_output({
+        "identity": {
+            "agent_name": "Mira",
+            "dimensions": [],
+            "user_preferred_name": " Seven ",
+        }
+    })
+
+    assert payload is not None
+    assert payload["user_preferred_name"] == "Seven"
+
+
 def test_init_identity_upserts_genesis_fields_and_preserves_agent_profile(monkeypatch):
     captured: dict = {}
     existing = {

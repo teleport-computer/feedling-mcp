@@ -16,6 +16,7 @@ from core import envelope as core_envelope
 from core import util as core_util
 from core.store import UserStore
 from identity import card_policy
+from identity.user_naming import sanitize_user_name
 from identity import service as identity_service
 from memory import actions as memory_actions
 from notices import catalog
@@ -671,6 +672,9 @@ def _identity_payload_from_output(output: dict) -> dict | None:
         return None
     if category:
         payload["category"] = category
+    user_name = sanitize_user_name(identity.get("user_preferred_name"))
+    if user_name != "TA":
+        payload["user_preferred_name"] = user_name
     return payload
 
 

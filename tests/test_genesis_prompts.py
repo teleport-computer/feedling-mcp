@@ -70,3 +70,24 @@ def test_persona_build_prompt_outputs_system_prompt_markdown():
     payload = json.loads(messages[1]["content"])
     assert payload["persona_material"] == "你叫 Kai。"
     assert payload["behavior_notes"] == ["短句为主"]
+
+
+def test_genesis_prompts_apply_preferred_name_only_to_visible_prose():
+    builders = [
+        prompts.fact_map_messages("用户喜欢咖啡", user_name="Seven"),
+        prompts.combined_map_messages("用户喜欢咖啡", user_name="Seven"),
+        prompts.fact_write_messages([], user_name="Seven"),
+        prompts.persona_build_messages("", [], [], user_name="Seven"),
+    ]
+
+    for messages in builders:
+        system = messages[0]["content"]
+        assert "提到 Seven 就用「Seven」这个名字" in system
+        assert 'about 的固定值 "user|relationship" 是类型标签' in system
+
+
+def test_genesis_prompts_use_neutral_rule_when_name_is_unknown():
+    system = prompts.fact_write_messages([], user_name="用户")[0]["content"]
+
+    assert "优先省略主语" in system
+    assert "确实需要主语时只用中性的「对方」" in system
