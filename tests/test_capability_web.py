@@ -287,25 +287,120 @@ def test_fetch_exception_maps_to_retryable_err(monkeypatch):
     assert r.error["retryable"] is True
 
 
-def test_fetch_caps_response_body_before_stripping(monkeypatch):
-    huge = "<p>" + ("a" * 200_000) + "</p>"
+def test_fetch_truncates_an_oversized_body_instead_of_discarding_it(monkeypatch):
+    """The regression this pins: an over-cap page used to come back as an error.
+
+    That made the tool useless on the real web — Wikipedia is 360 KB, a weather
+    page 86 KB — and the model, seeing only failures, would tell the user it has
+    no web access at all. Reading the first N bytes bounds what we pull from an
+    untrusted host just as well, and actually answers the question.
+    """
+    lead = "<p>the part that matters</p>"
+    huge = lead + "<p>" + ("a" * 400_000) + "</p>"
     monkeypatch.setattr(cap_web, "_stream_get",
                         lambda *a, **k: _FakeResponse(status_code=200, text=huge))
     r = cap_web.fetch("STORE", params={"url": "https://example.com/huge"})
-    assert r.ok is False
-    assert "size limit" in r.error["message"]
+    assert r.ok is True
+    assert "the part that matters" in r.data["text"]
+    assert r.data["truncated"] is True
 
 
-def test_fetch_rejects_content_length_before_reading(monkeypatch):
+def test_fetch_reports_a_whole_page_as_not_truncated(monkeypatch):
+    monkeypatch.setattr(cap_web, "_stream_get",
+                        lambda *a, **k: _FakeResponse(status_code=200, text="<p>hi</p>"))
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/small"})
+    assert r.ok is True
+    assert r.data["truncated"] is False
+
+
+def test_fetch_stops_pulling_chunks_once_the_cap_is_reached(monkeypatch):
+    """Deliberately NOT "never reads past the cap".
+
+    httpx yields a whole decoded chunk before we can slice it, and a compressed
+    response can expand inside its decoder first, so this is a bound on what we
+    retain and on how far we keep iterating — not a hard bandwidth guarantee.
+    Naming it the stronger thing would be a claim the code cannot back.
+    """
+    seen = {"chunks": 0}
+
+    class _Endless(_FakeResponse):
+        def iter_bytes(self):
+            for _ in range(1000):
+                seen["chunks"] += 1
+                yield b"x" * 10_000
+
+    monkeypatch.setattr(cap_web, "_stream_get",
+                        lambda *a, **k: _Endless(status_code=200, text=""))
+    cap_web.fetch("STORE", params={"url": "https://example.com/endless"})
+    assert seen["chunks"] <= cap_web._FETCH_MAX_BODY_BYTES // 10_000 + 1
+
+
+def test_a_single_chunk_larger_than_the_cap_is_sliced(monkeypatch):
+    class _OneBigChunk(_FakeResponse):
+        def iter_bytes(self):
+            yield b"<p>lead</p>" + b"x" * (cap_web._FETCH_MAX_BODY_BYTES * 3)
+
+    monkeypatch.setattr(cap_web, "_stream_get",
+                        lambda *a, **k: _OneBigChunk(status_code=200, text=""))
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/onebig"})
+    assert r.ok is True
+    assert r.data["truncated"] is True
+
+
+def test_a_body_that_exactly_fills_the_cap_is_not_reported_as_truncated(monkeypatch):
+    """Off-by-one: nothing was dropped, so claiming truncation would send the
+    model looking for a rest of the page that does not exist."""
+    class _Exact(_FakeResponse):
+        def iter_bytes(self):
+            yield b"<p>all of it</p>".ljust(cap_web._FETCH_MAX_BODY_BYTES, b" ")
+
+    monkeypatch.setattr(cap_web, "_stream_get",
+                        lambda *a, **k: _Exact(status_code=200, text=""))
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/exact"})
+    assert r.ok is True
+    assert r.data["truncated"] is False
+
+
+def test_truncation_inside_a_script_does_not_leak_javascript_as_text(monkeypatch):
+    """The cut lands mid-script on plenty of real pages. `_strip_html_text`
+    needs a closing tag to remove the block, so without this the whole minified
+    JS body would be handed to the model as page content."""
+    js = "var a='" + ("JUNK" * 40_000) + "';"
+    html = "<p>the article body</p><script>" + js
+
+    monkeypatch.setattr(cap_web, "_stream_get",
+                        lambda *a, **k: _FakeResponse(status_code=200, text=html))
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/cut-in-script"})
+    assert r.ok is True
+    assert "the article body" in r.data["text"]
+    assert "JUNK" not in r.data["text"]
+    assert "var a=" not in r.data["text"]
+
+
+def test_truncated_is_true_when_only_the_text_cap_bit(monkeypatch):
+    """The body fit; the stripped text did not. Content still went missing, so
+    reporting `truncated: false` here would be a lie to the model."""
+    html = "<p>" + ("word " * 5_000) + "</p>"
+    assert len(html.encode()) < cap_web._FETCH_MAX_BODY_BYTES
+    monkeypatch.setattr(cap_web, "_stream_get",
+                        lambda *a, **k: _FakeResponse(status_code=200, text=html))
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/long-text"})
+    assert r.ok is True
+    assert r.data["truncated"] is True
+
+
+def test_a_lying_content_length_does_not_skip_the_page(monkeypatch):
+    """Content-Length is attacker-controlled and often wrong; it used to be
+    enough on its own to refuse a page that was in fact small."""
     response = _FakeResponse(
         status_code=200,
-        text="must not matter",
-        headers={"content-length": str(cap_web._FETCH_MAX_BODY_BYTES + 1)},
+        text="<p>small after all</p>",
+        headers={"content-length": str(cap_web._FETCH_MAX_BODY_BYTES * 10)},
     )
     monkeypatch.setattr(cap_web, "_stream_get", lambda *a, **k: response)
-    r = cap_web.fetch("STORE", params={"url": "https://example.com/huge"})
-    assert r.ok is False
-    assert "size limit" in r.error["message"]
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/liar"})
+    assert r.ok is True
+    assert "small after all" in r.data["text"]
 
 
 # ---------------------------------------------------------------------------

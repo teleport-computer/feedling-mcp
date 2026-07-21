@@ -28,7 +28,19 @@ _MAX_SEARCH_LIMIT = 10
 _SEARCH_TIMEOUT_SEC = 8.0
 
 _FETCH_TIMEOUT_SEC = 8.0
-_FETCH_MAX_BODY_BYTES = 40_000  # cap raw HTML before stripping — untrusted external body
+# Cap on raw HTML retained from an untrusted host before stripping. 40 KB was
+# the old value and no longer buys a whole page anywhere — Wikipedia is 360 KB,
+# a weather page 86 KB — so a fetch saw only the <head> and navigation.
+#
+# This bounds what we KEEP, not strictly what crosses the wire: httpx hands over
+# a whole decoded chunk before we slice it, and a compressed response can expand
+# inside its decoder first. It is a retention cap, not a bandwidth guarantee.
+#
+# It is deliberately NOT the bound that protects the prompt. Two later stages do
+# that, and they are the real limit on what reaches the model:
+# executor._RESULT_CHAR_CAP and tool_loop's tool_result_char_cap, both 2000.
+# Raising a limit here without raising those would only look like it worked.
+_FETCH_MAX_BODY_BYTES = 300_000
 _FETCH_USER_AGENT = "Mozilla/5.0 (compatible; FeedlingIO/1.0; +https://feedling.app)"
 _FETCH_MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -128,24 +140,63 @@ def _stream_get(
             yield response
 
 
-def _read_capped_body(resp) -> str | None:
-    """Read at most the configured raw-body cap; ``None`` means oversized."""
-    raw_length = str(resp.headers.get("content-length") or "").strip()
-    if raw_length:
-        try:
-            if int(raw_length) > _FETCH_MAX_BODY_BYTES:
-                return None
-        except ValueError:
-            pass
+def _read_capped_body(resp) -> tuple[str, bool]:
+    """Read up to the raw-body cap. Returns ``(text, was_truncated)``.
+
+    This used to discard the whole response once it crossed the cap, which made
+    the tool useless in practice: 40 KB no longer buys a whole page anywhere,
+    so every real site (Wikipedia 360 KB, a weather page 86 KB, even the Python
+    docs at 41.8 KB) came back as an upstream error and the model concluded it
+    had no web access at all.
+
+    Reading the first N bytes and stopping is both the useful behaviour and the
+    safe one — the point of the cap is to bound what we pull from an untrusted
+    host, and that is satisfied by not reading past it. Content-Length is only a
+    hint about what is coming, never a reason to skip a page: it is attacker-
+    controlled, often absent, and often wrong.
+    """
     chunks: list[bytes] = []
     total = 0
+    truncated = False
     for chunk in resp.iter_bytes():
-        total += len(chunk)
-        if total > _FETCH_MAX_BODY_BYTES:
-            return None
+        if total >= _FETCH_MAX_BODY_BYTES:
+            truncated = True  # there was more after a body that exactly filled it
+            break
+        room = _FETCH_MAX_BODY_BYTES - total
+        if len(chunk) > room:
+            chunks.append(chunk[:room])
+            truncated = True
+            break
         chunks.append(chunk)
+        total += len(chunk)
     encoding = getattr(resp, "encoding", None) or "utf-8"
-    return b"".join(chunks).decode(encoding, errors="replace")
+    # errors="replace": a hard byte cut lands mid-character on any multi-byte
+    # page, which is most of them.
+    return b"".join(chunks).decode(encoding, errors="replace"), truncated
+
+
+_UNCLOSED_TAGS = ("script", "style", "noscript")
+
+
+def _drop_unterminated_tail(html: str) -> str:
+    """Cut a trailing ``<script>``/``<style>`` block that has no closing tag.
+
+    ``tools._strip_html_text`` removes those blocks by matching a closing tag.
+    When the byte cut lands inside a big inline script — or the page just ships
+    malformed markup — the closing tag is not there, the regex matches nothing,
+    and the whole JavaScript body survives into the text handed to the model.
+    Dropping from the last unmatched opening tag onwards costs a little real
+    content in the worst case and keeps minified JS out of the answer.
+    """
+    cut = len(html)
+    lowered = html.lower()
+    for tag in _UNCLOSED_TAGS:
+        open_at = lowered.rfind(f"<{tag}")
+        if open_at == -1:
+            continue
+        if lowered.find(f"</{tag}", open_at) == -1:
+            cut = min(cut, open_at)
+    return html[:cut]
 
 
 def search(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
@@ -196,7 +247,8 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
     current_url = url
     status_code = 0
     response_headers: dict = {}
-    body: str | None = ""
+    body = ""
+    truncated = False
     for redirect_count in range(_FETCH_MAX_REDIRECTS + 1):
         blocked, resolved_ip = _validated_pinned_ip(current_url)
         if blocked == "blocked_url":
@@ -211,7 +263,10 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
             ) as resp:
                 status_code = resp.status_code
                 response_headers = dict(resp.headers)
-                body = _read_capped_body(resp) if 200 <= status_code < 300 else ""
+                if 200 <= status_code < 300:
+                    body, truncated = _read_capped_body(resp)
+                else:
+                    body, truncated = "", False
         except Exception as e:
             return err(errors.UPSTREAM,
                        f"web fetch failed: {type(e).__name__}: {e}", retryable=True)
@@ -228,8 +283,14 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
         return err(errors.code_for_status(status_code),
                    f"fetch failed with status {status_code}",
                    retryable=errors.retryable_for_status(status_code))
-    if body is None:
-        return err(errors.UPSTREAM, "web fetch body exceeded size limit", retryable=False)
-
-    text = tools._strip_html_text(body)
-    return ok(data={"url": current_url, "text": errors.cap_text(text)})
+    # Unconditional, not only when we truncated: a page can ship an unclosed
+    # <script> on its own, and the leak is identical either way.
+    text = tools._strip_html_text(_drop_unterminated_tail(body))
+    capped = errors.cap_text(text)
+    # One honest flag covering BOTH places content can go missing: the raw body
+    # cut, and the text cap right here. A model told `truncated: false` while the
+    # tail was silently dropped would read "not on this page" into a fact that
+    # simply was not in the part it got.
+    return ok(data={"url": current_url,
+                    "text": capped,
+                    "truncated": truncated or capped != text})
