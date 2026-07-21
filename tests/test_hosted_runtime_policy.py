@@ -51,8 +51,23 @@ def _clear_control(user_id: str) -> None:
         )
 
 
-def test_policy_parser_defaults_v2_and_rejects_retired_selectors(monkeypatch):
+@pytest.fixture()
+def fresh_user_store():
+    """A user_id with an active model_api route and a clean runtime-control
+    slate, wrapped in a UserStore (no ``conftest.fresh_user_store`` fixture
+    existed prior to this task — this local fixture follows the same
+    seed+clear pattern as ``_seed_runnable``/``_clear_control`` above)."""
+    user_id = _seed_runnable("policy_fresh")
+    _clear_control(user_id)
+    return core_store.get_store(user_id)
+
+
+def test_policy_parser_defaults_dual_and_rejects_retired_selectors(monkeypatch):
     monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+    assert config_store.hosted_runtime_policy() == "dual"
+    assert config_store.forced_hosted_runtime_mode() is None
+
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
     assert config_store.hosted_runtime_policy() == "v2_only"
     assert config_store.forced_hosted_runtime_mode() == "db_action_v2"
 
@@ -60,6 +75,25 @@ def test_policy_parser_defaults_v2_and_rejects_retired_selectors(monkeypatch):
         monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, invalid)
         with pytest.raises(RuntimeError, match="FEEDLING_HOSTED_RUNTIME_POLICY"):
             config_store.hosted_runtime_policy()
+
+
+def test_policy_dual_is_default_and_valid(monkeypatch):
+    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+    assert config_store.hosted_runtime_policy() == "dual"
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    assert config_store.hosted_runtime_policy() == "v2_only"
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "bogus")
+    with pytest.raises(RuntimeError):
+        config_store.hosted_runtime_policy()
+
+
+def test_set_runtime_mode_accepts_resident_again(fresh_user_store):
+    # 双向：v2 → resident → v2，fence generation 单调递增
+    config_store.set_hosted_runtime_mode(fresh_user_store, "db_action_v2")
+    _, state1, gen1 = config_store.get_hosted_runtime_control_strict(fresh_user_store)
+    config_store.set_hosted_runtime_mode(fresh_user_store, "resident_cli")
+    mode2, state2, gen2 = config_store.get_hosted_runtime_control_strict(fresh_user_store)
+    assert mode2 == "resident_cli" and state2 == "resident" and gen2 > gen1
 
 
 def test_v2_only_reconciles_every_runnable_shape_idempotently(monkeypatch):
@@ -72,6 +106,13 @@ def test_v2_only_reconciles_every_runnable_shape_idempotently(monkeypatch):
         _clear_control(user_id)
 
     monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+    # Restored (2b294a1f had removed this): establishes an explicit resident
+    # control row — distinct from ``missing`` (no control row at all) — so
+    # reconcile's v2_only forcing is exercised against an established resident
+    # state too. Bidirectional under the new "dual" default policy.
+    config_store.set_hosted_runtime_mode(
+        core_store.get_store(resident), config_store.HOSTED_RUNTIME_MODE_RESIDENT
+    )
     config_store.set_hosted_runtime_mode(
         core_store.get_store(already_v2),
         config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
@@ -325,6 +366,99 @@ def test_v2_cutover_immediately_enqueues_resident_unanswered_message(
         "resident-pending",
         generation,
     )]
+
+
+def test_v2_recutover_replaces_stale_generation_recovery_job(monkeypatch):
+    # Restored (2b294a1f had removed this): bidirectional under "dual".
+    user_id = _seed_runnable("policy_recutover_chat_recovery")
+    _clear_control(user_id)
+    store = core_store.get_store(user_id)
+    db.chat_append(
+        user_id,
+        "resident-pending",
+        1.0,
+        {"id": "resident-pending", "role": "user", "body_ct": "b"},
+        0,
+    )
+    db.chat_append(
+        user_id,
+        "resident-late-reply",
+        2.0,
+        {"id": "resident-late-reply", "role": "openclaw", "body_ct": "r"},
+        0,
+    )
+    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    )
+    first_generation = db.get_runtime_generation(user_id)
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_RESIDENT
+    )
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    )
+    current_generation = db.get_runtime_generation(user_id)
+
+    with db.get_pool().connection() as conn:
+        jobs = conn.execute(
+            "SELECT status,trace_id,expected_runtime_generation "
+            "FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    assert jobs == [
+        ("superseded", "resident-pending", first_generation),
+        ("pending", "resident-pending", current_generation),
+    ]
+
+
+def test_v2_recutover_does_not_fall_back_behind_newest_terminal_marker(
+    monkeypatch,
+):
+    # Restored (2b294a1f had removed this): bidirectional under "dual".
+    user_id = _seed_runnable("policy_recutover_terminal_latest")
+    _clear_control(user_id)
+    store = core_store.get_store(user_id)
+    db.chat_append(
+        user_id,
+        "older-unanswered",
+        1.0,
+        {"id": "older-unanswered", "role": "user", "body_ct": "a"},
+        0,
+    )
+    db.chat_append(
+        user_id,
+        "newest-terminal",
+        2.0,
+        {"id": "newest-terminal", "role": "user", "body_ct": "b"},
+        0,
+    )
+    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET status='failed',finished_at=now(),"
+            "last_error='terminal test marker' "
+            "WHERE user_id=%s AND trace_id='newest-terminal'",
+            (user_id,),
+        )
+
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_RESIDENT
+    )
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    )
+
+    with db.get_pool().connection() as conn:
+        jobs = conn.execute(
+            "SELECT status,trace_id FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    assert jobs == [("failed", "newest-terminal")]
 
 
 def test_v2_verify_loop_uses_worker_liveness_without_resident_ping(monkeypatch):

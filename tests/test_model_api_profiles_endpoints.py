@@ -342,7 +342,7 @@ def test_retired_runtime_selector_cannot_bypass_v2_route_activation(
     r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
 
     monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
-    with pytest.raises(ValueError, match="hosted resident runtime is retired"):
+    with pytest.raises(ValueError, match="requires 'db_action_v2'"):
         config_store.set_hosted_runtime_mode(
             core_store.get_store(uid), config_store.HOSTED_RUNTIME_MODE_RESIDENT
         )
