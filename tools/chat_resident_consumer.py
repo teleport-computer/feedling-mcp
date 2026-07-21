@@ -2147,11 +2147,9 @@ _NOISE_LINE_RE = re.compile(
     r"session_id\s*:.*"      # hermes session footer
     r"|[↻⟳]?\s*(resumed|created|started)\s+session\b.*"  # hermes session banner
     r"|[A-Za-z0-9_\-]{8,}\s*\(\d+\s+user\s+messages?,\s*\d+\s+total\s+messages?\)"
-    r"|---+|={3,}|[-–—_]{3,}" # separator lines
     r"|\[.*\]\s*$"           # [bracket] meta lines
     r"|💭.*"                 # hermes thinking-emoji prefix
     r"|[└┌│╰╭─].*"           # box-drawing UI chrome
-    r"|\*\*[^*]+\*\*\s*$"   # **standalone bold header**
     r"|</?think>"            # <think> XML tags
     r"|Reasoning:\s*$"       # bare "Reasoning:" label
     r"|[✵✦✧★☆※].*"          # decorative symbol lines
@@ -2169,6 +2167,23 @@ _REASONING_LINE_RE = re.compile(
     r"i\s+could\s+use|it\s+seems|i\s+really\s+should|let\'?s\s+(see|make)|"
     r"perhaps\b|maybe\s+through\b)",
     re.IGNORECASE,
+)
+
+_RUNTIME_REASONING_FENCE_LANGUAGES = {"copy"}
+_RUNTIME_REASONING_HEADER_RE = re.compile(
+    r"^(?:💭\s*)?(?:(?:reasoning|chain\s+of\s+thought)\s*:?$|"
+    r"(?:checking|inspecting|reviewing|analyzing)\s+(?:the\s+)?"
+    r"(?:repository|repo|project|codebase|workspace|(?:source\s+)?files?|request|context)\b|"
+    r"(?:executing\s+updates?|doing\s+(?:work|the\s+task))\s*[.!…]*|"
+    r"先(?:检查|查看|分析|思考|规划|准备|执行|处理)(?:一下)?"
+    r"(?:仓库|代码|文件|上下文|问题|请求|任务))",
+    re.IGNORECASE,
+)
+_FENCE_LINE_RE = re.compile(
+    r"^(?P<container>(?:>\s*)*)(?P<marker>[`~]{3,})(?P<info>.*)$"
+)
+_THEMATIC_BREAK_RE = re.compile(
+    r"^(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$"
 )
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
@@ -2217,7 +2232,29 @@ def _strip_leading_non_cjk_preamble(lines: list[str]) -> list[str]:
     first_cjk = next((i for i, ln in enumerate(lines) if _CJK_RE.search(ln)), None)
     if first_cjk is None or first_cjk == 0:
         return lines
-    return lines[first_cjk:]
+
+    markdown_start: int | None = None
+    for i, line in enumerate(lines[:first_cjk]):
+        stripped = line.strip()
+        previous_is_text = i > 0 and bool(lines[i - 1].strip())
+        if previous_is_text and re.fullmatch(r"(?:=+|-+)", stripped):
+            markdown_start = i - 1
+            break
+        if _THEMATIC_BREAK_RE.fullmatch(stripped):
+            if i == 0:
+                markdown_start = 0
+                break
+            markdown_start = i - 1 if previous_is_text else i
+            break
+        if re.fullmatch(r"=+|-+", stripped):
+            continue
+        if re.match(
+            r"^\s*(?:#{1,6}\s|[-+*]\s|>\s|\d+[.)]\s|[`~]{3,}|\||\*\*|__)",
+            line,
+        ):
+            markdown_start = i
+            break
+    return lines[markdown_start if markdown_start is not None else first_cjk :]
 
 
 def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
@@ -2239,6 +2276,113 @@ def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
             out.append(lines[i])
             i += 1
     return out
+
+
+def _fence_line_parts(line: str) -> tuple[int, str, str] | None:
+    match = _FENCE_LINE_RE.match(line.strip())
+    if not match:
+        return None
+    depth = match.group("container").count(">")
+    return depth, match.group("marker"), match.group("info").strip()
+
+
+def _blockquote_depth(line: str) -> int:
+    match = re.match(r"^(?P<container>(?:>\s*)*)", line.lstrip())
+    return match.group("container").count(">") if match else 0
+
+
+def _strip_blockquote_container(line: str, depth: int) -> str:
+    value = line.lstrip()
+    for _ in range(depth):
+        if not value.startswith(">"):
+            break
+        value = value[1:]
+        value = value.lstrip()
+    return value.strip()
+
+
+def _dedupe_reply_lines(lines: list[str]) -> list[str]:
+    """Collapse repeated prose while leaving fenced code untouched."""
+    out: list[str] = []
+    prose: list[str] = []
+    fence_depth = 0
+    fence_char = ""
+    fence_length = 0
+
+    def flush_prose() -> None:
+        if not prose:
+            return
+        consecutive: list[str] = []
+        for line in prose:
+            if not consecutive or consecutive[-1] != line:
+                consecutive.append(line)
+        out.extend(_collapse_repeated_line_blocks(consecutive))
+        prose.clear()
+
+    for line in lines:
+        fence = _fence_line_parts(line)
+        depth, marker, info = fence if fence else (0, "", "")
+
+        if (
+            fence_char
+            and fence_depth > 0
+            and line.strip()
+            and _blockquote_depth(line) < fence_depth
+        ):
+            fence_depth = 0
+            fence_char = ""
+            fence_length = 0
+
+        if not fence_char:
+            if marker:
+                flush_prose()
+                fence_depth = depth
+                fence_char = marker[0]
+                fence_length = len(marker)
+                out.append(line)
+            else:
+                prose.append(line)
+            continue
+
+        out.append(line)
+        if (
+            marker
+            and depth == fence_depth
+            and marker[0] == fence_char
+            and len(marker) >= fence_length
+            and not info
+        ):
+            fence_depth = 0
+            fence_char = ""
+            fence_length = 0
+
+    flush_prose()
+    return out
+
+
+def _is_runtime_reasoning_fence(info: str, content: list[str], depth: int) -> bool:
+    language = info.split(maxsplit=1)[0].casefold() if info else ""
+    if language not in _RUNTIME_REASONING_FENCE_LANGUAGES:
+        return False
+
+    inspections = []
+    for line in content:
+        inspection = _strip_blockquote_container(line, depth)
+        emoji = ""
+        if inspection.startswith("💭"):
+            emoji = "💭 "
+            inspection = inspection[1:].lstrip()
+        for wrapper in ("**", "__"):
+            if inspection.startswith(wrapper) and inspection.endswith(wrapper):
+                inspection = inspection[len(wrapper) : -len(wrapper)].strip()
+                break
+        inspection = emoji + inspection
+        if inspection:
+            inspections.append(inspection)
+
+    if not inspections:
+        return False
+    return bool(_RUNTIME_REASONING_HEADER_RE.match(inspections[0]))
 
 
 def _strip_reasoning_sections(raw: str) -> str:
@@ -5105,49 +5249,100 @@ def call_agent_cli(
 
 
 def _sanitize_reply_text(text: str) -> str:
-    """Strip formatting/system leakage and collapse accidental duplication."""
+    """Strip system leakage without rewriting user-visible Markdown."""
     if not isinstance(text, str):
         return ""
 
-    text = text.replace("\r\n", "\n")
-    text = text.strip()
-    if not text:
+    text = text.replace("\r\n", "\n").strip("\n")
+    if not text.strip():
         return ""
 
     kept: list[str] = []
-    for raw_ln in text.splitlines():
-        ln = raw_ln.strip()
-        if not ln:
+    dropped_leading_runtime = False
+    raw_lines = text.splitlines()
+    i = 0
+    while i < len(raw_lines):
+        raw_ln = raw_lines[i]
+        line = raw_ln.rstrip()
+        stripped = line.strip()
+
+        fence = _fence_line_parts(raw_ln)
+        if fence:
+            depth, marker, info = fence
+            block_end = i + 1
+            explicitly_closed = False
+            while block_end < len(raw_lines):
+                closing = _fence_line_parts(raw_lines[block_end])
+                if (
+                    closing
+                    and closing[0] == depth
+                    and closing[1][0] == marker[0]
+                    and len(closing[1]) >= len(marker)
+                    and not closing[2]
+                ):
+                    explicitly_closed = True
+                    break
+                if (
+                    depth > 0
+                    and raw_lines[block_end].strip()
+                    and _blockquote_depth(raw_lines[block_end]) < depth
+                ):
+                    break
+                block_end += 1
+            content = raw_lines[i + 1 : block_end]
+            slice_end = block_end + 1 if explicitly_closed else block_end
+            if not _is_runtime_reasoning_fence(info, content, depth):
+                kept.extend(raw_lines[i:slice_end])
+            elif not kept:
+                dropped_leading_runtime = True
+            i = slice_end
             continue
-        if _NOISE_LINE_RE.match(ln):
+
+        if not stripped:
+            if kept and kept[-1] != "":
+                kept.append("")
+            i += 1
             continue
-        if _IDENTITY_LEAK_RE.search(ln):
+        if _NOISE_LINE_RE.match(stripped):
+            if not kept:
+                dropped_leading_runtime = True
+            i += 1
             continue
-        if _REASONING_LINE_RE.match(ln):
+
+        if (
+            not kept
+            and dropped_leading_runtime
+            and _THEMATIC_BREAK_RE.fullmatch(stripped)
+        ):
+            i += 1
             continue
-        # Remove markdown-ish wrappers/bullets and decorative prefixes.
-        ln = re.sub(r"^[`#>*\-\s]+", "", ln).strip()
-        ln = re.sub(r"^[—–-]+\s*", "", ln).strip()
-        if not ln:
+
+        inspection = re.sub(r"^[`#>*\-\s]+", "", stripped).strip()
+        inspection = re.sub(r"[`*_]+$", "", inspection).strip()
+        if _IDENTITY_LEAK_RE.search(inspection):
+            if not kept:
+                dropped_leading_runtime = True
+            i += 1
             continue
-        kept.append(ln)
+        if _REASONING_LINE_RE.match(inspection):
+            if not kept:
+                dropped_leading_runtime = True
+            i += 1
+            continue
+        kept.append(line)
+        i += 1
 
     if not kept:
         return ""
+
+    while kept and kept[-1] == "":
+        kept.pop()
 
     kept = _strip_leading_non_cjk_preamble(kept)
     if not kept:
         return ""
 
-    # Dedup consecutive identical lines.
-    deduped: list[str] = []
-    for ln in kept:
-        if not deduped or deduped[-1] != ln:
-            deduped.append(ln)
-
-    deduped = _collapse_repeated_line_blocks(deduped)
-
-    return "\n".join(deduped).strip()
+    return "\n".join(_dedupe_reply_lines(kept)).strip("\n")
 
 
 def _cap_agent_replies(replies: list[str], max_items: int | None = None) -> list[str]:

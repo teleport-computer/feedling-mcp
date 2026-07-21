@@ -1149,6 +1149,229 @@ Tell me what you want to work on next."""
     assert cleaned == "Hello Seven — I see your message now.\nTell me what you want to work on next."
 
 
+def test_sanitize_reply_text_preserves_markdown_layout():
+    raw = """# 一级标题
+
+## 二级标题
+
+- 第一项
+  - 嵌套项
+1. 第一步
+   1. 子步骤
+
+> 引用内容
+
+**独立粗体标题**
+
+```swift
+let title = "# 代码里的标记不能清理"
+```
+"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw.strip()
+
+
+def test_sanitize_reply_text_preserves_fenced_code_verbatim():
+    raw = (
+        "```swift\n"
+        'let title = "# 中文代码"  \n'
+        'let title = "# 中文代码"\t\n'
+        "```"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_drops_unlabeled_copy_reasoning_fence():
+    raw = """```copy
+**Executing updates**
+I need to inspect the repository before answering.
+```
+
+这是最终回复。"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Checking the repository before answering.",
+        "Checking project before answering.",
+        "💭 Checking repository before answering.",
+        "💭 Inspecting source files before answering.",
+        "先检查仓库，再回复用户。",
+    ],
+)
+def test_sanitize_reply_text_drops_runtime_copy_fence_header_variants(header):
+    raw = f"""```copy
+{header}
+Collecting internal context.
+```
+
+这是最终回复。"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+def test_sanitize_reply_text_preserves_normal_copy_fence():
+    raw = """```copy
+I need to update the deployment notes.
+```"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'let reasoning = "visible output"',
+        "reasoning = true",
+        "# Checking repository permissions",
+        "- Checking repository status",
+        "Working hours: 09:00-17:00",
+        "处理结果如下：成功",
+    ],
+)
+def test_sanitize_reply_text_preserves_non_runtime_copy_content(content):
+    raw = f"```copy\n{content}\n```"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_dedupes_prose_outside_fenced_code():
+    raw = """第一行
+第二行
+第一行
+第二行
+
+```swift
+let value = 1
+```"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "第一行\n第二行\n\n```swift\nlet value = 1\n```"
+
+
+def test_sanitize_reply_text_preserves_blockquote_fenced_code_verbatim():
+    raw = (
+        "> ```text\n"
+        "> repeated line  \n"
+        "> repeated line  \n"
+        "> ```"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_preserves_fence_like_content_at_deeper_quote_depth():
+    raw = (
+        "> ~~~text\n"
+        "> > ~~~\n"
+        "> repeated line  \n"
+        "> repeated line  \n"
+        "> ~~~"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_filters_runtime_copy_with_tabbed_quote_container():
+    raw = (
+        ">\t> ```copy\n"
+        ">\t> **Executing updates**\n"
+        ">\t> Internal details.\n"
+        ">\t> ```\n"
+        "\n"
+        "这是最终回复。"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+def test_sanitize_reply_text_implicitly_closes_fence_when_blockquote_ends():
+    raw = (
+        "> ```text\n"
+        "> code line  \n"
+        "outside\n"
+        "outside\n"
+        "正文"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "> ```text\n> code line  \noutside\n正文"
+
+
+def test_sanitize_reply_text_preserves_setext_and_thematic_breaks():
+    raw = """Title
+===
+
+Section
+---
+
+正文"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["----", "* * *", "_ _ _"])
+def test_sanitize_reply_text_preserves_commonmark_thematic_variants(marker):
+    raw = f"Title\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["=", "-"])
+def test_sanitize_reply_text_preserves_single_character_setext(marker):
+    raw = f"Title\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["---", "* * *", "_ _ _"])
+def test_sanitize_reply_text_does_not_recover_preamble_across_blank_line(marker):
+    raw = f"transport transcript\n\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == f"{marker}\n\n正文"
+
+
+@pytest.mark.parametrize("marker", ["---", "* * *", "_ _ _", "----"])
+def test_sanitize_reply_text_preserves_leading_thematic_break(marker):
+    raw = f"{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
 def test_sanitize_reply_text_drops_unlabeled_english_meta_before_cjk_answer():
     raw = """specific tool is required for this factual question, so I can rely on my memory
 or general knowledge up to 2024. I remember Philip Daian as an Ethereum researcher
