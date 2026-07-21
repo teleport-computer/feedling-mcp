@@ -197,3 +197,19 @@ def test_authorize_scope_is_noop_for_api_key(user):
     res = auth_core.resolve_user({"X-API-Key": api_key})
     assert res.runtime_token_claims is None
     auth_core.authorize_scope(res.runtime_token_claims, res.user_id, "memory")
+
+
+def test_resolve_user_slow_path_does_not_rewrite_table(monkeypatch):
+    # A 401 probe with an unknown key hits the slow path. It must NEVER call
+    # _save_users(): save_all_users DELETEs the users table and reinserts from
+    # THIS worker's snapshot, which under -w N can be stale and erase a user
+    # another worker just registered. Normalization is idempotent (redone on
+    # load), so the read path must never persist it.
+    saved = []
+    monkeypatch.setattr(registry, "_save_users", lambda: saved.append(True))
+    monkeypatch.setattr(registry, "_normalize_all_users", lambda: True)  # force "changed"
+    monkeypatch.setattr(registry, "_hash_api_key", lambda k: "deadbeef")
+    monkeypatch.setattr(registry, "_users", [])
+    monkeypatch.setattr(registry, "_key_to_user", {})
+    assert registry._resolve_user("ak_unknown_probe") is None
+    assert saved == [], "slow path rewrote the whole users table"

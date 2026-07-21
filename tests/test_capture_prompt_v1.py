@@ -52,12 +52,14 @@ def test_prompt_naming_rule_uses_known_name():
 
 
 def test_prompt_naming_rule_without_name_uses_relationship_referent():
-    """No name yet → a natural relationship referent, NOT "TA" alone as the
-    card wording (the app surface reserves TA for the AI) and never 用户."""
+    """No name yet → omit the subject, or use neutral 对方 when necessary."""
     p = build_capture_prompt(
         ai_name="", user_name="", buckets="", threads="", identity="", window="",
     )
-    assert "你们关系里自然的称呼" in p
+    assert "优先省略主语" in p
+    assert "确实需要主语时只用中性的「对方」" in p
+    assert "猜测性别的他/她" in p
+    assert "第二人称「你」" in p
     assert '永远不要用"用户"/"user"' in p
     assert "不要用「TA」指代对方" in p
 
@@ -68,13 +70,13 @@ def test_reserved_placeholder_names_are_treated_as_unknown():
     very cards this rule fixes."""
     from memory.capture_prompt_v1 import sanitize_user_name
 
-    for reserved in ("用户", "user", "USER", "ta", "TA", "", "  "):
+    for reserved in ("用户", "user", "USER", "ta", "TA", "「用户」", "`user`", "", "  "):
         assert sanitize_user_name(reserved) == "TA", repr(reserved)
         p = build_capture_prompt(
             ai_name="", user_name=reserved,
             buckets="", threads="", identity="", window="",
         )
-        assert "你们关系里自然的称呼" in p, repr(reserved)
+        assert "优先省略主语" in p, repr(reserved)
         assert "就用「用户」" not in p and "就用「user」" not in p, repr(reserved)
     assert sanitize_user_name("Seven") == "Seven"
     assert sanitize_user_name("小雨") == "小雨"

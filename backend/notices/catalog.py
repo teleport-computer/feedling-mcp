@@ -102,6 +102,8 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "建议换一个支持 /v1/responses 的中转，或改用 Claude 类模型。"),
     "resident_consumer_stale": (
         "user_environment", "你的 VPS resident consumer 版本可能太旧或没有正常接走任务，请更新并重启。"),
+    "resident_decrypt_source_unavailable": (
+        "user_environment", "你的 VPS resident 解密源不可用，真实加密消息暂时无法回复。"),
     "resident_never_claimed": (
         "user_environment", "你的 VPS resident consumer 长时间没有接走入住/记忆蒸馏任务，请更新并重启。"),
 }

@@ -29,7 +29,12 @@ def _patch_state(monkeypatch, state_box: dict) -> None:
 
 def test_fallback_db_check_is_throttled(monkeypatch):
     store = _fake_store()
-    state_box: dict = {"state": {}}
+    state_box: dict = {
+        "state": {
+            "decrypt_status": "ok",
+            "decrypt_checked_at_epoch": "1000000",
+        }
+    }
     _patch_state(monkeypatch, state_box)
     now = {"t": 1_000_000.0}
     calls: list[tuple[str, int]] = []
@@ -77,3 +82,145 @@ def test_prompt_uses_deployment_repo_description_not_internal_clone_name(monkeyp
     assert "包含 tools/chat_resident_consumer.py 的仓库目录" in prompt
     assert "tools/chat_resident_requirements.txt" in prompt
     assert "FEEDLING_AUTO_UPDATE" in prompt
+
+
+def test_decrypt_health_failure_warns_immediately_with_diagnostics(monkeypatch):
+    store = _fake_store()
+    state_box = {
+        "state": {
+            "decrypt_status": "unconfigured",
+            "decrypt_checked_at_epoch": "1000000",
+        }
+    }
+    _patch_state(monkeypatch, state_box)
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: 1_000_001.0)
+    monkeypatch.setattr(
+        resident_maintenance.onboarding,
+        "_load_onboarding_route",
+        lambda _store: "resident",
+    )
+    monkeypatch.setattr(resident_maintenance, "_fallback_reason", lambda _store: None)
+    monkeypatch.setattr(
+        resident_maintenance,
+        "_append_maintenance_message",
+        lambda *_args, **_kwargs: {"id": "decrypt-warning"},
+    )
+    emitted: dict = {}
+    monkeypatch.setattr(
+        resident_maintenance,
+        "_emit_notice",
+        lambda _store, **kwargs: emitted.update(kwargs),
+    )
+    info = {
+        "official": True,
+        "consumer_id": "vps-resident-c1",
+        "consumer_commit": "abcdef1234567890",
+        "decrypt_status": "unconfigured",
+        "decrypt_checked_at_epoch": "1000000",
+    }
+
+    result = resident_maintenance._maybe_handle_poll(store, info)
+
+    assert result["triggered"] is True
+    assert result["reason"] == "decrypt_source_unavailable"
+    assert emitted["reason"]["decrypt_status"] == "unconfigured"
+    assert emitted["reason"]["checked_at_epoch"] == 1_000_000.0
+    assert "FEEDLING_ENCLAVE_URL" in emitted["prompt"]
+    assert "decrypt_status: unconfigured" in emitted["prompt"]
+
+
+def test_decrypt_health_recovery_resolves_its_own_notice(monkeypatch):
+    store = _fake_store()
+    state_box = {
+        "state": {
+            "decrypt_status": "ok",
+            "decrypt_checked_at_epoch": "1000000",
+            "resident_maintenance": {"decrypt_health_active": True},
+        }
+    }
+    _patch_state(monkeypatch, state_box)
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: 1_000_001.0)
+    monkeypatch.setattr(
+        resident_maintenance.onboarding,
+        "_load_onboarding_route",
+        lambda _store: "resident",
+    )
+    monkeypatch.setattr(resident_maintenance, "_fallback_reason", lambda _store: None)
+    resolved: list[str] = []
+    monkeypatch.setattr(
+        resident_maintenance.notices_core,
+        "resolve",
+        lambda _store, key: resolved.append(key),
+    )
+    info = {
+        "official": True,
+        "consumer_id": "vps-resident-c1",
+        "consumer_commit": "abcdef1234567890",
+        "decrypt_status": "ok",
+        "decrypt_checked_at_epoch": "1000000",
+    }
+
+    result = resident_maintenance._maybe_handle_poll(store, info)
+
+    assert result == {"triggered": False, "reason": "decrypt_resolved"}
+    assert resolved == [resident_maintenance.DECRYPT_DEDUPE_KEY]
+    maintenance = state_box["state"]["resident_maintenance"]
+    assert "decrypt_health_active" not in maintenance
+
+
+def test_commit_recovery_resolves_stale_notice_while_decrypt_alert_continues(monkeypatch):
+    store = _fake_store()
+    state_box = {
+        "state": {
+            "decrypt_status": "unconfigured",
+            "decrypt_checked_at_epoch": "1000000",
+            "resident_maintenance": {
+                "active_reason": "decrypt_source_unavailable:unconfigured",
+                "commit_notice_active": True,
+                "commit_mismatch_key": "abcdef1234567890:old1234567890",
+                "commit_mismatch_since_epoch": 900_000.0,
+            },
+        }
+    }
+    _patch_state(monkeypatch, state_box)
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: 1_000_001.0)
+    monkeypatch.setattr(
+        resident_maintenance.onboarding,
+        "_load_onboarding_route",
+        lambda _store: "resident",
+    )
+    monkeypatch.setattr(resident_maintenance, "_fallback_reason", lambda _store: None)
+    monkeypatch.setattr(
+        resident_maintenance,
+        "_append_maintenance_message",
+        lambda *_args, **_kwargs: {"id": "decrypt-warning"},
+    )
+    emitted: list[str] = []
+    monkeypatch.setattr(
+        resident_maintenance,
+        "_emit_notice",
+        lambda _store, **kwargs: emitted.append(str(kwargs["reason"]["reason"])),
+    )
+    resolved: list[str] = []
+    monkeypatch.setattr(
+        resident_maintenance.notices_core,
+        "resolve",
+        lambda _store, key: resolved.append(key),
+    )
+    info = {
+        "official": True,
+        "consumer_id": "vps-resident-c1",
+        "consumer_commit": "abcdef1234567890",
+    }
+
+    result = resident_maintenance._maybe_handle_poll(store, info)
+
+    assert result["triggered"] is True
+    assert result["reason"] == "decrypt_source_unavailable"
+    assert emitted == ["decrypt_source_unavailable"]
+    assert resolved == [resident_maintenance.DEDUPE_KEY]
+    maintenance = state_box["state"]["resident_maintenance"]
+    assert "commit_notice_active" not in maintenance

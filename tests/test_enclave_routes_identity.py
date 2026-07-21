@@ -109,6 +109,44 @@ def test_identity_omits_persona_voice_fields_when_absent(client, monkeypatch):
         assert key not in body
 
 
+def test_identity_forwards_every_writable_profile_field(client, monkeypatch):
+    """Generic round-trip guard: whatever profile_patch can WRITE, this route must
+    forward back.
+
+    profile_patch is read-modify-write — it rebuilds the card from THIS response and
+    re-encrypts it. So a field the route fails to forward is not merely hidden, it is
+    ERASED on the next patch. Four fields (tone_style/agent_role/do_not_say/boundaries)
+    were hand-patched for exactly this reason; the remaining five silently kept
+    dropping, taking the user-authored custom_persona_prompt with them.
+
+    Hand-written per-field forwarding is what let that happen twice, so this asserts
+    against card_policy's canonical list — a new writable field now fails here instead
+    of quietly eating data in prod.
+    """
+    from identity import card_policy
+
+    anchor = (dt.date.today() - dt.timedelta(days=10)).isoformat()
+    _wire(monkeypatch, {"v": 1, "K_enclave": "x", "body_ct": "x", "nonce": "x",
+                        "owner_user_id": "usr_a",
+                        "relationship_started_at": anchor,
+                        "created_at": "c", "updated_at": "u"})
+    inner = {"agent_name": "枫", "self_introduction": "hi",
+             "dimensions": [], "days_with_user": 999}
+    for key in card_policy.PROFILE_STRING_FIELDS:
+        inner.setdefault(key, f"value-of-{key}")
+    for key in card_policy.PROFILE_LIST_FIELDS:
+        inner.setdefault(key, [f"item-of-{key}"])
+    monkeypatch.setattr(envmod, "decrypt_envelope",
+                        lambda e, u, s: json.dumps(inner).encode())
+
+    body = client.get("/v1/identity/get", headers={"X-API-Key": "k"}).get_json()["identity"]
+    dropped = sorted(k for k in card_policy.PROFILE_FIELDS if not body.get(k))
+    assert not dropped, (
+        f"writable profile fields not forwarded by /v1/identity/get: {dropped} — "
+        f"the next identity.profile_patch will erase them from the card"
+    )
+
+
 def test_identity_local_only(client, monkeypatch):
     _wire(monkeypatch, {"v": 1, "visibility": "local_only",
                         "created_at": "c", "updated_at": "u"})

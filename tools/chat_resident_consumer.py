@@ -223,12 +223,15 @@ AGENT_HTTP_SESSION_KEY_HEADER = os.environ.get(
 )
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
-# Per-turn subprocess cap for the CLI agent. 120s suits the managed claude/codex/
-# pi templates; heavy self-hosted stacks (custom wrappers, slow MCP cold starts,
-# long-thinking models — usr_c190's xiake_wrapper+MCP+opus combo, 2026-07-18)
-# legitimately need more. Raise via env; the cap still exists so a hung agent
-# can never wedge the single-flight chat lane forever.
-AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "120")))
+# Per-turn subprocess cap for the CLI agent. Default 300s: the managed
+# claude/codex/pi templates finish well inside it, while self-hosted stacks on
+# modest VPS hardware (official Claude Code cold starts, slow MCP, long-thinking
+# models) legitimately take 100-120s+ per turn — the old 120s default was
+# clipping those right at the wire (usr_6c1971, 2026-07-21: a real reply landed
+# at 104s while most turns hit the cap and were silently dropped). Lower or
+# raise via env; the cap still exists so a hung agent can never wedge the
+# single-flight chat lane forever.
+AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "300")))
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
@@ -238,10 +241,13 @@ CHECKPOINT_FILE = Path(
         f"/tmp/feedling_chat_checkpoint_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
     )
 )
-# Materialized user-MCP config target. Scoped by the same api-key fingerprint as
-# the checkpoint so two accounts on one host never share a file. This single file
-# is BOTH the claude ``--mcp-config`` target AND the documented generic
-# ``user-mcp.json`` for VPS agents (io-onboarding skill).
+# Materialized user-MCP config target. The api-key fingerprint in the default
+# path is NOT the isolation boundary: it only separates accounts that hold
+# DISTINCT keys and collapses to ONE shared file for keyless host-all consumers
+# (see _USER_MCP_PATHS_PINNED below). Per-user isolation comes solely from the
+# spawner pinning USER_MCP_FILE via env (consumer_env) — never rely on the
+# fingerprint alone. This single file is BOTH the claude ``--mcp-config`` target
+# AND the documented generic ``user-mcp.json`` for VPS agents (io-onboarding skill).
 USER_MCP_FILE = os.environ.get(
     "USER_MCP_FILE",
     f"/tmp/feedling_user_mcp_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
@@ -249,8 +255,10 @@ USER_MCP_FILE = os.environ.get(
 # Two CA bundles, deliberately DIFFERENT content — the runtimes' semantics are
 # opposite (spec §2.2): claude's NODE_EXTRA_CA_CERTS ADDS to the trust store,
 # codex's SSL_CERT_FILE REPLACES it. Feeding codex the user-only bundle would
-# strip every public root and break its OpenAI calls. Keyed by the same API-key
-# fingerprint as USER_MCP_FILE so two accounts on one host never share a file.
+# strip every public root and break its OpenAI calls. Path defaults mirror
+# USER_MCP_FILE's fingerprint scheme, which is likewise NOT an isolation boundary
+# for keyless host-all consumers (see USER_MCP_FILE above) — the spawner pins
+# these per user via env; the fingerprint alone must never be trusted to isolate.
 USER_MCP_CA_FILE = os.environ.get(
     "USER_MCP_CA_FILE",
     f"/tmp/feedling_user_mcp_ca_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
@@ -259,6 +267,16 @@ USER_MCP_CASTORE_FILE = os.environ.get(
     "USER_MCP_CASTORE_FILE",
     f"/tmp/feedling_user_mcp_castore_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
 )
+# The fingerprint scoping above only isolates accounts while FEEDLING_API_KEY is
+# non-empty. Host-all (Stage-D zero-roster) consumers run keyless, so sha1("")
+# collides for every user on the host and the /tmp defaults become ONE shared
+# file — the spawner therefore pins all three paths via env (consumer_env). If
+# a spawn path ever forgets that, _maybe_apply_user_mcp uses this flag to
+# degrade to user-MCP-off instead of writing this user's decrypted MCP url +
+# auth headers where every co-resident agent would read them.
+_USER_MCP_PATHS_PINNED = all(
+    k in os.environ
+    for k in ("USER_MCP_FILE", "USER_MCP_CA_FILE", "USER_MCP_CASTORE_FILE"))
 # The pi user-MCP bridge extension. ONE shared static file for every user —
 # `COPY tools/ ./tools/` (Dockerfile.agent-runner) puts it here; the per-user
 # config path rides FEEDLING_USER_MCP_FILE instead (see _user_mcp_child_env).
@@ -341,7 +359,9 @@ AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
 AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
 AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
 HERMES_SESSION_REASONING_MAX_BYTES = int(os.environ.get("HERMES_SESSION_REASONING_MAX_BYTES", "2000000"))
-IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images"))
+IMAGE_TEMP_DIR = Path(os.environ.get(
+    "IMAGE_TEMP_DIR",
+    f"/tmp/feedling_chat_images_{CHECKPOINT_API_KEY_FINGERPRINT}"))
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
@@ -447,22 +467,26 @@ def _clear_provider_payment_cooldown() -> None:
     _provider_payment_cooldown_until = 0.0
 
 
-# --- Proactive idle-loop guard + failure backoff (Seven 2026-07-16) -----------
+# --- Proactive self-wake loop guard + failure backoff (Seven 2026-07-16/21) ---
 # The agent can self-schedule wakes ("check on them again soon"); a self-
 # sustaining loop (schedule -> wake -> post "(在)" -> schedule -> ...) floods the
 # user with no new input. Two consumer-side brakes, on top of the backend's
 # schedule_wake min-lead floor:
-#   1. Idle-loop guard: after N consecutive proactive (non-user-driven) sends
-#      with NO intervening user message, stand down — tell the gate via
-#      loop_guard_blocked (blocks the heartbeat tick enqueue) AND skip realizing
-#      further idle proactive jobs (covers the scheduled-wake fire lane, which
-#      does not pass through the tick gate) — until the user speaks again.
+#   1. Self-wake loop guard: after N consecutive turns in which the agent
+#      schedules its OWN next wake with NO intervening user message, stop
+#      scheduling further self-wakes — which breaks the loop at the source —
+#      until the user speaks. This counts ONLY self-wakes. Heartbeats, daily
+#      reminders and event-triggered wakes are NOT self-loops and are never
+#      capped here (Seven 2026-07-21: the old guard counted EVERY idle proactive
+#      send, so 2 unanswered heartbeats silenced the companion — a regression;
+#      normal-heartbeat cadence is governed by wake_interval + DND + the 90s
+#      chat-collision window below, nothing else).
 #   2. Failure backoff: any consecutive proactive realization failure backs off
 #      exponentially (the 402 payment cooldown stays as its own special case for
 #      messaging, but also feeds this general backoff).
 # A blunt hourly cap was deliberately NOT used (Seven): users who want frequent
-# proactive messages are legitimate; only a genuinely input-less loop is stopped.
-MAX_EMPTY_PROACTIVE_TURNS = int(os.environ.get("FEEDLING_MAX_EMPTY_PROACTIVE_TURNS", "2"))
+# proactive messages are legitimate; only a genuinely input-less SELF-loop is stopped.
+MAX_CONSECUTIVE_SELF_WAKES = int(os.environ.get("FEEDLING_MAX_CONSECUTIVE_SELF_WAKES", "3"))
 PROACTIVE_FAIL_BACKOFF_BASE_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60"))
 PROACTIVE_FAIL_BACKOFF_CAP_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600"))
 # Post-time chat-collision window: a visible proactive bubble must not land
@@ -472,26 +496,28 @@ PROACTIVE_FAIL_BACKOFF_CAP_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_CA
 # so any earlier check (enqueue gate, realize-time peek, prompt-side "prefer
 # silence" advisory) can miss it. 0 disables the gate.
 PROACTIVE_CHAT_COLLISION_WINDOW_SEC = float(os.environ.get("PROACTIVE_CHAT_COLLISION_WINDOW_SEC", "90"))
-_proactive_empty_streak: int = 0
+_self_wake_streak: int = 0
 _proactive_fail_streak: int = 0
 _proactive_backoff_until: float = 0.0
 
 
-def _proactive_idle_guard_tripped() -> bool:
-    return MAX_EMPTY_PROACTIVE_TURNS > 0 and _proactive_empty_streak >= MAX_EMPTY_PROACTIVE_TURNS
+def _self_wake_loop_tripped() -> bool:
+    return MAX_CONSECUTIVE_SELF_WAKES > 0 and _self_wake_streak >= MAX_CONSECUTIVE_SELF_WAKES
 
 
-def _note_idle_proactive_send() -> None:
-    """An idle proactive turn was realized with no new user input since the last
-    one — advance the empty streak toward the guard."""
-    global _proactive_empty_streak
-    _proactive_empty_streak += 1
+def _note_self_wake() -> None:
+    """The agent scheduled its OWN next wake with no intervening user input —
+    advance the self-loop streak. Only self-wakes reach here; heartbeats,
+    reminders and event-triggered wakes never touch this counter."""
+    global _self_wake_streak
+    _self_wake_streak += 1
 
 
 def _reset_proactive_idle_guard() -> None:
-    """The user spoke (new input) — the loop is not idle; allow proactive again."""
-    global _proactive_empty_streak
-    _proactive_empty_streak = 0
+    """The user spoke (new input) — the self-wake loop is broken; allow the
+    agent to schedule self-wakes again."""
+    global _self_wake_streak
+    _self_wake_streak = 0
 
 
 def _proactive_backing_off() -> bool:
@@ -1521,12 +1547,113 @@ def _fetch_from_enclave(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Resident decrypt-source health — reported to the backend on every poll.
+#
+# verify_ping liveness probes NEVER exercise decryption (the resident answers
+# them with a locally-generated token, server marks source="verify_ping"), so a
+# resident whose only decrypt source is missing/unreachable still passes the
+# onboarding live-loop check while EVERY real user message is claimed and then
+# silently skipped for want of plaintext (empty-content skip / wedge). That is
+# exactly the usr_6c1971 report (2026-07-21): claimed, no reply, agentMessages=0,
+# verify_ping fine. The backend can only distinguish "live but undecrypting" from
+# "healthy" if the resident tells it, so we derive a health status from REAL
+# decrypt outcomes and ship it on the poll headers:
+#   ok           decrypted >=1 non-empty plaintext, OR the reachability probe
+#                succeeded (a brand-new resident with no history yet is reachable
+#                but not yet proven on a real message — the phase-2 encrypted
+#                challenge closes that residual)
+#   degraded     a claimed message could not be read (empty-content / wedge) —
+#                only a later real success clears it; a reachability probe never
+#                upgrades degraded, so a per-message decrypt failure is not masked
+#   unreachable  the configured enclave source failed
+#   unconfigured no FEEDLING_ENCLAVE_URL at all
+# checked_at is refreshed on every confirmation so a long-idle "ok" cannot look
+# fresh forever; while idle the resident re-probes at most every
+# DECRYPT_HEALTH_REFRESH_SEC, kept well under the backend freshness window.
+# ---------------------------------------------------------------------------
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    """Parse a float env var, falling back on a bad/empty value instead of
+    killing the process at import, and clamping to a sane floor."""
+    try:
+        val = float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        val = default
+    if not (val == val) or val < minimum:  # NaN or below floor
+        return max(default, minimum)
+    return val
+
+
+DECRYPT_HEALTH_REFRESH_SEC = _env_float(
+    "FEEDLING_DECRYPT_HEALTH_REFRESH_SEC", 120.0, minimum=5.0
+)
+
+_decrypt_health: dict = {"status": "unknown", "checked_at": 0.0}
+
+
+def _set_decrypt_health(status: str) -> None:
+    _decrypt_health["status"] = status
+    _decrypt_health["checked_at"] = time.time()
+
+
+def _decrypt_health_headers() -> dict:
+    """Poll headers carrying the current decrypt-source health, or {} before the
+    first reading. The backend treats a missing header as ``unknown`` on purpose
+    (no inheritance of a previous green), so emitting nothing while status is
+    unknown is correct rather than shipping a hollow value."""
+    status = str(_decrypt_health.get("status") or "unknown")
+    if status == "unknown":
+        return {}
+    return {
+        "X-Feedling-Decrypt-Status": status,
+        "X-Feedling-Decrypt-Checked-At": f"{float(_decrypt_health.get('checked_at') or 0.0):.3f}",
+    }
+
+
+def _probe_decrypt_reachability() -> None:
+    """Refresh health from a reachability probe (startup + throttled idle).
+    Never upgrades a standing ``degraded`` to ``ok`` — a per-message decrypt
+    failure must not be masked by the source merely being dialable; only a real
+    non-empty decrypt clears degraded."""
+    if not FEEDLING_ENCLAVE_URL:
+        _set_decrypt_health("unconfigured")
+        return
+    try:
+        client = _client_for(FEEDLING_ENCLAVE_URL)
+        resp = client.get(
+            f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
+            params={"limit": 1}, headers=_HEADERS, timeout=10,
+        )
+        resp.raise_for_status()
+    except Exception:
+        _set_decrypt_health("unreachable")
+        return
+    if _decrypt_health.get("status") == "degraded":
+        _decrypt_health["checked_at"] = time.time()  # still degraded; heartbeat only
+    else:
+        _set_decrypt_health("ok")
+
+
+_decrypt_health_last_refresh = {"at": 0.0}
+
+
+def _maybe_refresh_decrypt_health() -> None:
+    """Throttled idle refresh so an idle-but-healthy resident keeps a fresh
+    checked_at without probing the enclave on every poll cycle."""
+    now = time.time()
+    if now - _decrypt_health_last_refresh["at"] < DECRYPT_HEALTH_REFRESH_SEC:
+        return
+    _decrypt_health_last_refresh["at"] = now
+    _probe_decrypt_reachability()
+
+
 def _verify_decrypt_sources() -> bool:
     """Probe all configured decrypt sources at startup.
 
     Returns True if at least one configured source is reachable.
     Each unreachable source is logged at ERROR level so the operator
     can distinguish "configured but broken" from "not configured at all".
+    Also seeds the reported decrypt-health status.
     """
     any_ok = False
 
@@ -1542,12 +1669,17 @@ def _verify_decrypt_sources() -> bool:
             resp.raise_for_status()
             log.info("decrypt source OK: enclave at %s", FEEDLING_ENCLAVE_URL)
             any_ok = True
+            _set_decrypt_health("ok")
         except Exception as e:
             log.error(
                 "decrypt source UNREACHABLE: enclave at %s — %s",
                 FEEDLING_ENCLAVE_URL, e,
             )
+            _set_decrypt_health("unreachable")
+    else:
+        _set_decrypt_health("unconfigured")
 
+    _decrypt_health_last_refresh["at"] = time.time()
     return any_ok
 
 
@@ -1683,13 +1815,14 @@ def _image_file_paths_for_msg(msg: dict) -> list[str]:
     if not payloads:
         return []
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", _msg_key(msg))[:96] or "image"
-    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    if not _mkdir_scratch(IMAGE_TEMP_DIR):
+        return []
     paths: list[str] = []
     for idx, payload in enumerate(payloads):
         ext = ".png" if payload.get("mime_type") == "image/png" else ".jpg"
         path = IMAGE_TEMP_DIR / f"{key}_{idx}{ext}"
         try:
-            path.write_bytes(base64.b64decode(payload["data"]))
+            _write_scratch_file(path, base64.b64decode(payload["data"]))
             paths.append(str(path))
         except Exception as e:
             log.warning("failed to write image temp file %s: %s", path, e)
@@ -1700,13 +1833,14 @@ def _image_file_paths_from_payloads(prefix: str, payloads: list[dict[str, str]])
     if not payloads:
         return []
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix)[:96] or "image"
-    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    if not _mkdir_scratch(IMAGE_TEMP_DIR):
+        return []
     paths: list[str] = []
     for idx, payload in enumerate(payloads):
         ext = ".png" if payload.get("mime_type") == "image/png" else ".jpg"
         path = IMAGE_TEMP_DIR / f"{key}_{idx}{ext}"
         try:
-            path.write_bytes(base64.b64decode(payload["data"]))
+            _write_scratch_file(path, base64.b64decode(payload["data"]))
             paths.append(str(path))
         except Exception as e:
             log.warning("failed to write image temp file %s: %s", path, e)
@@ -1715,7 +1849,86 @@ def _image_file_paths_from_payloads(prefix: str, payloads: list[dict[str, str]])
 
 _XLSX_MAX_SHEETS = 5
 _XLSX_MAX_ROWS = 2000
-FILE_TEMP_DIR = Path(os.environ.get("FILE_TEMP_DIR", "/tmp/feedling_chat_files"))
+FILE_TEMP_DIR = Path(os.environ.get(
+    "FILE_TEMP_DIR",
+    f"/tmp/feedling_chat_files_{CHECKPOINT_API_KEY_FINGERPRINT}"))
+# Both scratch dirs above hold DECRYPTED chat images/attachments. The api-key
+# fingerprint keeps distinct keys apart, but host-all consumers run keyless —
+# sha1("") collides for every user, so the spawner MUST pin both dirs per user
+# (consumer_env). If it did, these env vars are set; if a future spawn path
+# forgets, we must NOT fall back to the shared /tmp default and leak plaintext
+# to co-hosted agents. Same fail-safe shape as _USER_MCP_PATHS_PINNED.
+_CHAT_SCRATCH_PINNED = (
+    "IMAGE_TEMP_DIR" in os.environ and "FILE_TEMP_DIR" in os.environ)
+
+
+_chat_scratch_refusal_logged = False
+
+
+def _chat_scratch_write_allowed() -> bool:
+    """False when writing decrypted scratch would land in a shared default.
+
+    Safe whenever the process has a real api key (fingerprint disambiguates) or
+    the spawner explicitly pinned the dirs. Only the keyless-and-unpinned combo
+    — a misconfigured host-all spawn — is refused, and it logs the refusal ONCE
+    (like the sibling _maybe_apply_user_mcp fail-safe) so a stream of image/file
+    messages can't flood ERROR and bury other diagnostics.
+    """
+    global _chat_scratch_refusal_logged
+    if bool(FEEDLING_API_KEY) or _CHAT_SCRATCH_PINNED:
+        return True
+    if not _chat_scratch_refusal_logged:
+        log.error(
+            "[chat_scratch] refusing to write decrypted scratch: keyless "
+            "consumer with unpinned IMAGE_TEMP_DIR/FILE_TEMP_DIR would leak "
+            "plaintext to co-hosted agents; the spawner must pin them per user")
+        _chat_scratch_refusal_logged = True
+    return False
+
+
+def _mkdir_scratch(dirp: Path) -> bool:
+    """Prepare a decrypted-scratch dir, or refuse if it would be shared.
+
+    Returns False (callers must skip writing) when a keyless consumer has
+    unpinned scratch dirs — see _chat_scratch_write_allowed (which logs the
+    refusal, once). Otherwise creates the dir 0700 so a co-tenant unix user
+    can't read decrypted chat content.
+    """
+    if not _chat_scratch_write_allowed():
+        return False
+    try:
+        dirp.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as e:
+        # Read-only fs / disk full / path occupied. Degrade like the callers'
+        # old inline mkdir-in-try did — a file/image turn must not crash.
+        log.warning("[chat_scratch] could not create %s: %s", dirp, e)
+        return False
+    try:
+        os.chmod(dirp, 0o700)  # existing dir: enforce (mkdir mode is umask-masked)
+    except OSError:
+        pass
+    return True
+
+
+def _write_scratch_file(path: Path, data: bytes) -> None:
+    # Create at 0600 via open() itself (not write-then-chmod), so there is no
+    # world-readable window and no silent umask-default fallback if a later chmod
+    # is a no-op on the mount. O_CREAT's mode is umask-masked — that only ever
+    # removes group/other bits, so owner-rw is preserved.
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        f = os.fdopen(fd, "wb")
+    except BaseException:
+        # fdopen didn't take ownership of fd — close it ourselves or it leaks
+        # (repeated leaks → EMFILE → the consumer stops serving turns).
+        os.close(fd)
+        raise
+    with f:  # f owns fd now; closed even if write() raises
+        f.write(data)
+    try:
+        os.chmod(path, 0o600)  # existing file kept its prior mode on O_CREAT
+    except OSError:
+        pass
 
 
 def _strip_ns(tag: str) -> str:
@@ -1836,14 +2049,15 @@ def _human_size(n: int) -> str:
 
 
 def _land_file(msg_key: str, name: str, data: bytes) -> str:
+    if not _mkdir_scratch(FILE_TEMP_DIR):
+        return ""
     try:
-        FILE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else "bin"
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{msg_key}_{name}")[:120] or "file"
         if not safe.lower().endswith(f".{ext}"):
             safe = f"{safe}.{ext}"
         path = FILE_TEMP_DIR / safe
-        path.write_bytes(data)
+        _write_scratch_file(path, data)
     except Exception as e:
         log.warning("failed to write file temp for %s: %s", name, e)
         return ""
@@ -2147,11 +2361,9 @@ _NOISE_LINE_RE = re.compile(
     r"session_id\s*:.*"      # hermes session footer
     r"|[↻⟳]?\s*(resumed|created|started)\s+session\b.*"  # hermes session banner
     r"|[A-Za-z0-9_\-]{8,}\s*\(\d+\s+user\s+messages?,\s*\d+\s+total\s+messages?\)"
-    r"|---+|={3,}|[-–—_]{3,}" # separator lines
     r"|\[.*\]\s*$"           # [bracket] meta lines
     r"|💭.*"                 # hermes thinking-emoji prefix
     r"|[└┌│╰╭─].*"           # box-drawing UI chrome
-    r"|\*\*[^*]+\*\*\s*$"   # **standalone bold header**
     r"|</?think>"            # <think> XML tags
     r"|Reasoning:\s*$"       # bare "Reasoning:" label
     r"|[✵✦✧★☆※].*"          # decorative symbol lines
@@ -2169,6 +2381,23 @@ _REASONING_LINE_RE = re.compile(
     r"i\s+could\s+use|it\s+seems|i\s+really\s+should|let\'?s\s+(see|make)|"
     r"perhaps\b|maybe\s+through\b)",
     re.IGNORECASE,
+)
+
+_RUNTIME_REASONING_FENCE_LANGUAGES = {"copy"}
+_RUNTIME_REASONING_HEADER_RE = re.compile(
+    r"^(?:💭\s*)?(?:(?:reasoning|chain\s+of\s+thought)\s*:?$|"
+    r"(?:checking|inspecting|reviewing|analyzing)\s+(?:the\s+)?"
+    r"(?:repository|repo|project|codebase|workspace|(?:source\s+)?files?|request|context)\b|"
+    r"(?:executing\s+updates?|doing\s+(?:work|the\s+task))\s*[.!…]*|"
+    r"先(?:检查|查看|分析|思考|规划|准备|执行|处理)(?:一下)?"
+    r"(?:仓库|代码|文件|上下文|问题|请求|任务))",
+    re.IGNORECASE,
+)
+_FENCE_LINE_RE = re.compile(
+    r"^(?P<container>(?:>\s*)*)(?P<marker>[`~]{3,})(?P<info>.*)$"
+)
+_THEMATIC_BREAK_RE = re.compile(
+    r"^(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$"
 )
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
@@ -2217,7 +2446,29 @@ def _strip_leading_non_cjk_preamble(lines: list[str]) -> list[str]:
     first_cjk = next((i for i, ln in enumerate(lines) if _CJK_RE.search(ln)), None)
     if first_cjk is None or first_cjk == 0:
         return lines
-    return lines[first_cjk:]
+
+    markdown_start: int | None = None
+    for i, line in enumerate(lines[:first_cjk]):
+        stripped = line.strip()
+        previous_is_text = i > 0 and bool(lines[i - 1].strip())
+        if previous_is_text and re.fullmatch(r"(?:=+|-+)", stripped):
+            markdown_start = i - 1
+            break
+        if _THEMATIC_BREAK_RE.fullmatch(stripped):
+            if i == 0:
+                markdown_start = 0
+                break
+            markdown_start = i - 1 if previous_is_text else i
+            break
+        if re.fullmatch(r"=+|-+", stripped):
+            continue
+        if re.match(
+            r"^\s*(?:#{1,6}\s|[-+*]\s|>\s|\d+[.)]\s|[`~]{3,}|\||\*\*|__)",
+            line,
+        ):
+            markdown_start = i
+            break
+    return lines[markdown_start if markdown_start is not None else first_cjk :]
 
 
 def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
@@ -2239,6 +2490,113 @@ def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
             out.append(lines[i])
             i += 1
     return out
+
+
+def _fence_line_parts(line: str) -> tuple[int, str, str] | None:
+    match = _FENCE_LINE_RE.match(line.strip())
+    if not match:
+        return None
+    depth = match.group("container").count(">")
+    return depth, match.group("marker"), match.group("info").strip()
+
+
+def _blockquote_depth(line: str) -> int:
+    match = re.match(r"^(?P<container>(?:>\s*)*)", line.lstrip())
+    return match.group("container").count(">") if match else 0
+
+
+def _strip_blockquote_container(line: str, depth: int) -> str:
+    value = line.lstrip()
+    for _ in range(depth):
+        if not value.startswith(">"):
+            break
+        value = value[1:]
+        value = value.lstrip()
+    return value.strip()
+
+
+def _dedupe_reply_lines(lines: list[str]) -> list[str]:
+    """Collapse repeated prose while leaving fenced code untouched."""
+    out: list[str] = []
+    prose: list[str] = []
+    fence_depth = 0
+    fence_char = ""
+    fence_length = 0
+
+    def flush_prose() -> None:
+        if not prose:
+            return
+        consecutive: list[str] = []
+        for line in prose:
+            if not consecutive or consecutive[-1] != line:
+                consecutive.append(line)
+        out.extend(_collapse_repeated_line_blocks(consecutive))
+        prose.clear()
+
+    for line in lines:
+        fence = _fence_line_parts(line)
+        depth, marker, info = fence if fence else (0, "", "")
+
+        if (
+            fence_char
+            and fence_depth > 0
+            and line.strip()
+            and _blockquote_depth(line) < fence_depth
+        ):
+            fence_depth = 0
+            fence_char = ""
+            fence_length = 0
+
+        if not fence_char:
+            if marker:
+                flush_prose()
+                fence_depth = depth
+                fence_char = marker[0]
+                fence_length = len(marker)
+                out.append(line)
+            else:
+                prose.append(line)
+            continue
+
+        out.append(line)
+        if (
+            marker
+            and depth == fence_depth
+            and marker[0] == fence_char
+            and len(marker) >= fence_length
+            and not info
+        ):
+            fence_depth = 0
+            fence_char = ""
+            fence_length = 0
+
+    flush_prose()
+    return out
+
+
+def _is_runtime_reasoning_fence(info: str, content: list[str], depth: int) -> bool:
+    language = info.split(maxsplit=1)[0].casefold() if info else ""
+    if language not in _RUNTIME_REASONING_FENCE_LANGUAGES:
+        return False
+
+    inspections = []
+    for line in content:
+        inspection = _strip_blockquote_container(line, depth)
+        emoji = ""
+        if inspection.startswith("💭"):
+            emoji = "💭 "
+            inspection = inspection[1:].lstrip()
+        for wrapper in ("**", "__"):
+            if inspection.startswith(wrapper) and inspection.endswith(wrapper):
+                inspection = inspection[len(wrapper) : -len(wrapper)].strip()
+                break
+        inspection = emoji + inspection
+        if inspection:
+            inspections.append(inspection)
+
+    if not inspections:
+        return False
+    return bool(_RUNTIME_REASONING_HEADER_RE.match(inspections[0]))
 
 
 def _strip_reasoning_sections(raw: str) -> str:
@@ -5105,49 +5463,100 @@ def call_agent_cli(
 
 
 def _sanitize_reply_text(text: str) -> str:
-    """Strip formatting/system leakage and collapse accidental duplication."""
+    """Strip system leakage without rewriting user-visible Markdown."""
     if not isinstance(text, str):
         return ""
 
-    text = text.replace("\r\n", "\n")
-    text = text.strip()
-    if not text:
+    text = text.replace("\r\n", "\n").strip("\n")
+    if not text.strip():
         return ""
 
     kept: list[str] = []
-    for raw_ln in text.splitlines():
-        ln = raw_ln.strip()
-        if not ln:
+    dropped_leading_runtime = False
+    raw_lines = text.splitlines()
+    i = 0
+    while i < len(raw_lines):
+        raw_ln = raw_lines[i]
+        line = raw_ln.rstrip()
+        stripped = line.strip()
+
+        fence = _fence_line_parts(raw_ln)
+        if fence:
+            depth, marker, info = fence
+            block_end = i + 1
+            explicitly_closed = False
+            while block_end < len(raw_lines):
+                closing = _fence_line_parts(raw_lines[block_end])
+                if (
+                    closing
+                    and closing[0] == depth
+                    and closing[1][0] == marker[0]
+                    and len(closing[1]) >= len(marker)
+                    and not closing[2]
+                ):
+                    explicitly_closed = True
+                    break
+                if (
+                    depth > 0
+                    and raw_lines[block_end].strip()
+                    and _blockquote_depth(raw_lines[block_end]) < depth
+                ):
+                    break
+                block_end += 1
+            content = raw_lines[i + 1 : block_end]
+            slice_end = block_end + 1 if explicitly_closed else block_end
+            if not _is_runtime_reasoning_fence(info, content, depth):
+                kept.extend(raw_lines[i:slice_end])
+            elif not kept:
+                dropped_leading_runtime = True
+            i = slice_end
             continue
-        if _NOISE_LINE_RE.match(ln):
+
+        if not stripped:
+            if kept and kept[-1] != "":
+                kept.append("")
+            i += 1
             continue
-        if _IDENTITY_LEAK_RE.search(ln):
+        if _NOISE_LINE_RE.match(stripped):
+            if not kept:
+                dropped_leading_runtime = True
+            i += 1
             continue
-        if _REASONING_LINE_RE.match(ln):
+
+        if (
+            not kept
+            and dropped_leading_runtime
+            and _THEMATIC_BREAK_RE.fullmatch(stripped)
+        ):
+            i += 1
             continue
-        # Remove markdown-ish wrappers/bullets and decorative prefixes.
-        ln = re.sub(r"^[`#>*\-\s]+", "", ln).strip()
-        ln = re.sub(r"^[—–-]+\s*", "", ln).strip()
-        if not ln:
+
+        inspection = re.sub(r"^[`#>*\-\s]+", "", stripped).strip()
+        inspection = re.sub(r"[`*_]+$", "", inspection).strip()
+        if _IDENTITY_LEAK_RE.search(inspection):
+            if not kept:
+                dropped_leading_runtime = True
+            i += 1
             continue
-        kept.append(ln)
+        if _REASONING_LINE_RE.match(inspection):
+            if not kept:
+                dropped_leading_runtime = True
+            i += 1
+            continue
+        kept.append(line)
+        i += 1
 
     if not kept:
         return ""
+
+    while kept and kept[-1] == "":
+        kept.pop()
 
     kept = _strip_leading_non_cjk_preamble(kept)
     if not kept:
         return ""
 
-    # Dedup consecutive identical lines.
-    deduped: list[str] = []
-    for ln in kept:
-        if not deduped or deduped[-1] != ln:
-            deduped.append(ln)
-
-    deduped = _collapse_repeated_line_blocks(deduped)
-
-    return "\n".join(deduped).strip()
+    return "\n".join(_dedupe_reply_lines(kept)).strip("\n")
 
 
 def _cap_agent_replies(replies: list[str], max_items: int | None = None) -> list[str]:
@@ -5579,7 +5988,10 @@ def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> d
         # read-only peek: MUST NOT write the default 600s reply claim (that lease
         # would make other consumers wait on a message this call only glanced at).
         params["claim"] = "false"
-    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=poll_to + 10)
+    # Ship the decrypt-source health so the backend gate/alert can tell a
+    # live-but-undecrypting resident from a healthy one (see _decrypt_health).
+    headers = {**_HEADERS, **_decrypt_health_headers()}
+    resp = _HTTP.get(url, params=params, headers=headers, timeout=poll_to + 10)
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
@@ -5882,8 +6294,11 @@ def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
     import user_mcp_materialize as _m  # noqa: PLC0415 — lazy: sibling on tools/ path
     # generic file — claude --mcp-config target AND the documented VPS user-mcp.json
     Path(USER_MCP_FILE).parent.mkdir(parents=True, exist_ok=True)
-    Path(USER_MCP_FILE).write_text(_m.claude_mcp_json(servers))
-    os.chmod(USER_MCP_FILE, 0o600)
+    # Atomic 0600 write (same as the CA bundles below). A bare write_text()
+    # then chmod leaves a brief 0644 window where the plaintext MCP url + auth
+    # headers are world-readable, and a concurrent reader could see a partial
+    # JSON — _atomic_write_text creates the temp at 0600 and renames into place.
+    _atomic_write_text(USER_MCP_FILE, _m.claude_mcp_json(servers), mode=0o600)
     claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
     if claude_dir and Path(claude_dir).is_dir():
         settings_path = Path(claude_dir) / "settings.json"
@@ -5926,6 +6341,19 @@ def _maybe_apply_user_mcp() -> None:
     global _user_mcp_applied
     target = str(_user_mcp_advertised.get("fingerprint") or "")
     if target == (_user_mcp_applied.get("fingerprint") or ""):
+        return
+    if not FEEDLING_API_KEY and not _USER_MCP_PATHS_PINNED:
+        # Known-collision scenario (see _USER_MCP_PATHS_PINNED): keyless
+        # consumer + default /tmp paths shared with every co-hosted user.
+        # Fail safe: user MCP stays off. Record the fingerprint so this
+        # doesn't re-log on every poll; don't fetch/decrypt the envelopes.
+        log.error(
+            "[user_mcp] refusing to materialize: FEEDLING_API_KEY is empty "
+            "and USER_MCP_* paths were not pinned via env — the shared /tmp "
+            "defaults would leak this user's MCP url/auth headers to every "
+            "co-hosted agent. Fix the spawner to set USER_MCP_FILE/"
+            "USER_MCP_CA_FILE/USER_MCP_CASTORE_FILE per user.")
+        _user_mcp_applied = {"fingerprint": target, "servers": []}
         return
     try:
         servers: list[dict] = []
@@ -8359,9 +8787,11 @@ def _process_proactive_jobs(jobs: list) -> float:
             len(frame_ids),
         )
 
-        # Idle-loop guard + failure backoff apply only to genuine idle proactive
-        # turns — never to the first-greeting introduction or the screen-watch
-        # lane (the latter is user-activity-driven and gated separately).
+        # Failure backoff applies only to genuine idle proactive turns — never to
+        # the first-greeting introduction or the screen-watch lane. The self-wake
+        # LOOP guard is NOT here: it fires at the schedule point (where the agent
+        # asks for its own next wake), so realizing a heartbeat / reminder / event
+        # wake is never blocked by it — only the runaway self-wake chain is.
         is_idle_proactive = not is_introduction and not _is_screen_watch_job(job)
         if is_idle_proactive and _proactive_backing_off():
             log.warning(
@@ -8369,15 +8799,6 @@ def _process_proactive_jobs(jobs: list) -> float:
             )
             update_proactive_job_status(
                 job_id, "skipped", "proactive_backoff: cooling down after failures"
-            )
-            continue
-        if is_idle_proactive and _proactive_idle_guard_tripped():
-            log.info(
-                "proactive job skipped — idle loop guard (no new user input); job_id=%s",
-                job_id,
-            )
-            update_proactive_job_status(
-                job_id, "skipped", "proactive_idle_loop: no new user input"
             )
             continue
 
@@ -8467,8 +8888,10 @@ def _process_proactive_jobs(jobs: list) -> float:
             update_proactive_job_status(job_id, "failed", "degenerate_reply_suppressed")
             continue
         _note_agent_turn_success()
-        if is_idle_proactive:
-            _note_idle_proactive_send()
+        # NOTE: the self-wake loop streak is advanced at the schedule point below
+        # (only when the agent asks for its OWN next wake), NOT on every idle
+        # proactive send — a heartbeat/reminder landing must not count toward the
+        # loop guard (that was the regression that silenced quiet users).
         control_reply_reason = _proactive_control_reason_from_result(agent_result, replies)
         if control_reply_reason and not proactive_actions and not memory_identity_actions:
             update_proactive_job_status(
@@ -8514,7 +8937,20 @@ def _process_proactive_jobs(jobs: list) -> float:
         schedule_action_results: list[dict] = []
         scheduled_action_failed = False
         schedule_actions = _scheduled_wake_actions(proactive_actions)
+        # Self-wake loop guard — the ONLY brake on runaway self-scheduling. If the
+        # agent has already scheduled its own next wake MAX_CONSECUTIVE_SELF_WAKES
+        # times with no user input in between, drop this self-wake so no further
+        # wake fires: the chain ends here. Heartbeats/reminders/event wakes never
+        # reach this block, so they keep flowing. The streak clears the moment the
+        # user speaks (_reset_proactive_idle_guard in _process_messages).
+        if schedule_actions and _self_wake_loop_tripped():
+            log.info(
+                "self-wake dropped — loop guard (%d consecutive self-wakes, no user "
+                "input); job_id=%s", _self_wake_streak, job_id,
+            )
+            schedule_actions = []
         if schedule_actions:
+            _note_self_wake()
             try:
                 result = execute_scheduled_wake_actions(schedule_actions, job)
                 schedule_action_results = [
@@ -9011,6 +9447,12 @@ def _process_messages(messages: list) -> float:
             # dead loop. The probe reply is visibility=local_only and GC'd by the
             # server, so it never reaches the user's visible chat.
             log.info("verify ping [ts=%.3f] — exercising real agent path", ts)
+            # Bind every verify reply back to THIS ping so the server can match
+            # it strictly by (source=verify_ping ∧ reply_to_message_id=ping id)
+            # instead of "any agent message after ping_ts" — the loose match let
+            # a concurrent real reply, or a stale ack, falsely satisfy the probe
+            # and mint the sticky live-loop green (codex3 backend strict matcher).
+            _ping_id = str(msg.get("id") or msg.get("message_id") or "").strip()
             probe: dict[str, Any] = {}
 
             def _run_verify_probe() -> None:
@@ -9037,17 +9479,17 @@ def _process_messages(messages: list) -> float:
                 # stray visible message. suppress_push already kills the APNs push.
                 if probe_thread.is_alive():
                     log.warning("verify ping — agent slow (>%ss); canned ack fallback so verify still passes", VERIFY_PROBE_TIMEOUT_SEC)
-                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True)
+                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True, reply_to_message_id=_ping_id)
                 elif "result" in probe:
                     replies = _normalize_agent_replies(probe["result"]) or [VERIFY_PING_REPLY]
-                    post_reply(replies[0], source="verify_ping", suppress_push=True)
+                    post_reply(replies[0], source="verify_ping", suppress_push=True, reply_to_message_id=_ping_id)
                     log.info("verify ping — real agent reply OK")
                 elif "no_usable_reply" in probe:
                     log.error("verify ping — agent produced no usable reply; NOT acking so verify fails (live loop is broken): %s", probe["no_usable_reply"])
                     # post nothing — verify_loop stays unsatisfied on purpose
                 else:
                     log.warning("verify ping — agent call errored (%s); canned ack fallback", probe.get("error"))
-                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True)
+                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True, reply_to_message_id=_ping_id)
             except Exception as e:
                 log.error("failed to post verify-ping reply: %s", e)
             latest = max(latest, ts)
@@ -9112,8 +9554,13 @@ def _process_messages(messages: list) -> float:
             )
             content = BODY_UNAVAILABLE_PLACEHOLDER
         elif not content:
-            # Genuinely empty text — decrypt source missing or failed.
+            # Genuinely empty text — a message was CLAIMED but can't be read.
+            # Report the health so the backend surfaces the real blocker instead
+            # of a verify_ping-only false green. Preserve the actionable
+            # distinction: no source at all → unconfigured (the usr_6c1971 case);
+            # a configured source that still yielded no plaintext → degraded.
             # Never send a fallback for content we cannot read.
+            _set_decrypt_health("degraded" if FEEDLING_ENCLAVE_URL else "unconfigured")
             log.warning(
                 "user message has no plaintext content ts=%.3f content_type=%s "
                 "— skipping (set FEEDLING_ENCLAVE_URL to enable decryption)",
@@ -9122,6 +9569,9 @@ def _process_messages(messages: list) -> float:
             latest = max(latest, ts)
             continue
         else:
+            # A real user message decrypted to non-empty plaintext — decryption
+            # is genuinely working; clears any earlier degraded.
+            _set_decrypt_health("ok")
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
         trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
@@ -9943,6 +10393,13 @@ def run() -> None:
             )
             sys.exit(1)
     else:
+        # No decrypt source at all. Establish the reported health immediately so
+        # the FIRST poll already carries `unconfigured` — otherwise the initial
+        # value stays `unknown` and the first real message's empty-content path
+        # would mislabel it `degraded`, hiding the most actionable classification
+        # (FEEDLING_ENCLAVE_URL unset) for exactly the usr_6c1971 case.
+        _set_decrypt_health("unconfigured")
+        _decrypt_health_last_refresh["at"] = time.time()
         log.warning(
             "⚠️  No decryption source configured (FEEDLING_ENCLAVE_URL is unset). "
             "User messages in v1 encrypted mode have content=\"\" and will be "
@@ -10064,13 +10521,14 @@ def run() -> None:
                         }
                         if last_broadcast_state:
                             tick_payload["broadcast_state"] = last_broadcast_state
-                        # Idle-loop guard: tell the gate to skip enqueuing the
-                        # heartbeat presence wake once we've sent N proactive
-                        # turns with no intervening user input (contract shared
-                        # with backend/proactive/gate.py).
-                        if _proactive_idle_guard_tripped():
-                            tick_payload["loop_guard_blocked"] = True
-                            tick_payload["loop_guard_reason"] = "no_new_input"
+                        # NOTE: we deliberately no longer send loop_guard_blocked
+                        # here. That flag told the gate to skip enqueuing the
+                        # HEARTBEAT presence wake whenever the old idle guard was
+                        # tripped — which silenced heartbeats to quiet users (the
+                        # regression). The self-wake loop is now broken at its
+                        # source (the schedule point), so the heartbeat tick must
+                        # never be gated by it. (gate.py still accepts the flag for
+                        # back-compat; the consumer just stops sending it.)
                         tick = post_proactive_tick(tick_payload)
                         decision = tick.get("decision") or {}
                         last_broadcast_state = str(
@@ -10176,6 +10634,10 @@ def run() -> None:
             if result.get("timed_out"):
                 # Idle moment: safe to swap to the backend's commit and re-exec
                 # (no in-flight message to interrupt). Does not return if it updates.
+                # Also keep the reported decrypt health fresh while idle so a
+                # healthy-but-quiet resident doesn't drift into a stale reading
+                # (throttled; see DECRYPT_HEALTH_REFRESH_SEC).
+                _maybe_refresh_decrypt_health()
                 _maybe_self_update(result)
                 continue
 
@@ -10199,6 +10661,8 @@ def run() -> None:
                 )
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.
+                    # A poll carried messages but decryption is down: unreachable.
+                    _set_decrypt_health("unreachable")
                     log.warning(
                         "poll triggered but all decrypt sources failed; "
                         "skipping cycle (messages not processed)"
@@ -10215,6 +10679,10 @@ def run() -> None:
                     continue
                 messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
                 if not messages:
+                    # Claimed ids weren't in the decrypt history — the messages
+                    # exist and were leased but can't be read: degraded health,
+                    # same class as the empty-content skip.
+                    _set_decrypt_health("degraded")
                     if wedge_miss_ts == last_ts:
                         wedge_miss_count += 1
                     else:

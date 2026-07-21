@@ -1,5 +1,6 @@
 """Resident-consumer liveness state + validation gate input."""
 
+import math
 import os
 import time
 from datetime import datetime
@@ -11,6 +12,24 @@ from core.store import UserStore
 
 _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
 _CONSUMER_RECENT_SEC = int(os.environ.get("FEEDLING_CONSUMER_RECENT_SEC", "180"))
+_DECRYPT_HEALTH_STATUSES = frozenset(
+    {"ok", "degraded", "unconfigured", "unreachable"}
+)
+_DECRYPT_HEALTH_RECENT_SEC = max(
+    1, int(os.environ.get("FEEDLING_DECRYPT_HEALTH_RECENT_SEC", "300"))
+)
+_DECRYPT_HEALTH_FUTURE_SKEW_SEC = max(
+    0, int(os.environ.get("FEEDLING_DECRYPT_HEALTH_FUTURE_SKEW_SEC", "60"))
+)
+_DECRYPT_HEALTH_EXISTING_UNKNOWN_GRACE_SEC = max(
+    0,
+    int(
+        os.environ.get(
+            "FEEDLING_DECRYPT_HEALTH_EXISTING_UNKNOWN_GRACE_SEC",
+            str(7 * 24 * 60 * 60),
+        )
+    ),
+)
 _RESIDENT_BINDING_SEEN_INTERVAL_SEC = max(
     1, int(os.environ.get("FEEDLING_RESIDENT_BINDING_SEEN_INTERVAL_SEC", "60"))
 )
@@ -58,6 +77,12 @@ def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
         "consumer_id": (headers.get("X-Feedling-Consumer-Id") or "").strip(),
         "consumer_version": (headers.get("X-Feedling-Consumer-Version") or "").strip(),
         "consumer_commit": (headers.get("X-Feedling-Consumer-Commit") or "").strip(),
+        # Keep empty values: an old resident that omits these headers must clear
+        # a previously cached report instead of inheriting a stale green state.
+        "decrypt_status": (headers.get("X-Feedling-Decrypt-Status") or "").strip().lower(),
+        "decrypt_checked_at_epoch": (
+            headers.get("X-Feedling-Decrypt-Checked-At") or ""
+        ).strip(),
         "official": name == _OFFICIAL_CONSUMER_NAME,
         "remote_addr": remote_addr or "",
         "user_agent": headers.get("User-Agent", ""),
@@ -73,19 +98,211 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
     now_iso = datetime.now().isoformat()
     with store.consumer_state_lock:
         state = _load_consumer_state(store)
-        state.update(info)
+        event_info = dict(info)
+        if event_type != "poll":
+            # Decrypt health is a poll-heartbeat contract. Resident response
+            # requests use the static consumer headers and would otherwise
+            # replace the poll's fresh green report with empty/unknown exactly
+            # when verify_loop receives its hidden ack.
+            event_info.pop("decrypt_status", None)
+            event_info.pop("decrypt_checked_at_epoch", None)
+        state.update(event_info)
         state["last_event"] = event_type
         state["last_seen_at"] = now_iso
         state["last_seen_epoch"] = now_epoch
         if event_type == "poll":
             state["last_poll_at"] = now_iso
             state["last_poll_epoch"] = now_epoch
+            if state.get("official"):
+                health = _decrypt_health_from_state(state, now_epoch=now_epoch)
+                if health["status"] == "unknown":
+                    state.setdefault("decrypt_health_unknown_since_epoch", now_epoch)
+                else:
+                    state.pop("decrypt_health_unknown_since_epoch", None)
         elif event_type == "response":
             state["last_response_at"] = now_iso
             state["last_response_epoch"] = now_epoch
         _save_consumer_state(store, state)
     if event_type == "poll":
         _touch_resident_binding_seen(store, info=info, now_epoch=now_epoch)
+
+
+def _safe_epoch(value) -> float:
+    try:
+        parsed = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(parsed) or parsed <= 0:
+        return 0.0
+    return parsed
+
+
+def _decrypt_health_from_state(
+    state: dict,
+    *,
+    now_epoch: float | None = None,
+) -> dict:
+    """Normalize a resident's authenticated decrypt-health self-report.
+
+    Poll freshness and health freshness are deliberately separate. A resident
+    may keep polling while replaying an old ``ok`` report, so only a valid,
+    recent ``checked_at`` can pass this gate.
+    """
+    now = time.time() if now_epoch is None else float(now_epoch)
+    raw_status = str(state.get("decrypt_status") or "").strip().lower()
+    checked_at = _safe_epoch(state.get("decrypt_checked_at_epoch"))
+    valid_status = raw_status in _DECRYPT_HEALTH_STATUSES
+    future = checked_at > now + _DECRYPT_HEALTH_FUTURE_SKEW_SEC
+    age_sec = max(0.0, now - checked_at) if checked_at else None
+    fresh = bool(
+        checked_at
+        and not future
+        and age_sec is not None
+        and age_sec <= _DECRYPT_HEALTH_RECENT_SEC
+    )
+
+    if not valid_status:
+        status = "unknown"
+        reason = "decrypt_health_unknown"
+    elif not checked_at or future:
+        status = "unknown"
+        reason = "decrypt_health_invalid_timestamp"
+    elif not fresh:
+        status = "unknown"
+        reason = "decrypt_health_stale"
+    else:
+        status = raw_status
+        reason = {
+            "ok": "",
+            "degraded": "decrypt_source_degraded",
+            "unconfigured": "decrypt_source_unconfigured",
+            "unreachable": "decrypt_source_unreachable",
+        }[status]
+
+    required = {
+        "decrypt_health_unknown": (
+            "Update the resident consumer so every poll reports current decrypt "
+            "health, then retry onboarding verification."
+        ),
+        "decrypt_health_invalid_timestamp": (
+            "The resident consumer reported decrypt health without a valid "
+            "checked-at time. Check its clock and update the consumer."
+        ),
+        "decrypt_health_stale": (
+            "The resident consumer's decrypt-health check is stale. Confirm the "
+            "consumer is still checking its configured decrypt source."
+        ),
+        "decrypt_source_degraded": (
+            "The resident consumer claimed an encrypted message but could not "
+            "recover non-empty plaintext. Check its enclave key/decrypt path."
+        ),
+        "decrypt_source_unconfigured": (
+            "Configure FEEDLING_ENCLAVE_URL for the resident consumer; real "
+            "encrypted user messages cannot be answered without it."
+        ),
+        "decrypt_source_unreachable": (
+            "The resident consumer cannot reach FEEDLING_ENCLAVE_URL. Restore "
+            "network/TLS access before completing onboarding."
+        ),
+    }.get(reason, "")
+    return {
+        "passing": status == "ok",
+        "status": status,
+        "reported_status": raw_status if valid_status else "",
+        "checked_at_epoch": checked_at,
+        "age_sec": age_sec,
+        "fresh_window_sec": _DECRYPT_HEALTH_RECENT_SEC,
+        "reported": bool(valid_status and checked_at),
+        "fresh": fresh,
+        "reason": reason,
+        "required": required,
+        "unknown_since_epoch": _safe_epoch(
+            state.get("decrypt_health_unknown_since_epoch")
+        ),
+    }
+
+
+def _resident_onboarding_completed(store: UserStore) -> bool:
+    """Durable cohort marker for rollout compatibility.
+
+    ``first_chat_ok_at`` is written only after a reply to an ordinary user
+    message, which is also the resident onboarding validation's final real-chat
+    acceptance. Synthetic verify replies never set it.
+    """
+    try:
+        return bool(str(store.first_chat_ok_at() or "").strip())
+    except Exception:
+        return False
+
+
+def _decrypt_health_enforcement_state(
+    store: UserStore,
+    consumer_state: dict | None = None,
+    *,
+    now_epoch: float | None = None,
+) -> dict:
+    """Rollout policy for new onboarding versus established residents."""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    validation = consumer_state or _consumer_validation_state(store, now_epoch=now)
+    health = validation.get("decrypt_health")
+    if not isinstance(health, dict):
+        health = _decrypt_health_from_state({}, now_epoch=now)
+    established = _resident_onboarding_completed(store)
+
+    if health["passing"]:
+        mode = "healthy"
+        blocks_onboarding = blocks_verify = blocks_chat = False
+        grace_active = False
+        grace_remaining_sec = 0
+    elif not established:
+        mode = "new_onboarding_blocked"
+        blocks_onboarding = blocks_verify = blocks_chat = True
+        grace_active = False
+        grace_remaining_sec = 0
+    elif health["status"] != "unknown":
+        mode = "established_explicit_failure"
+        blocks_onboarding = blocks_verify = True
+        # Proven-working residents already fail naturally when decryption is
+        # genuinely down. Do not add a second hard chat outage for a transient
+        # enclave blip; surface the actionable warning and prevent a new green
+        # onboarding/verify result instead.
+        blocks_chat = False
+        grace_active = False
+        grace_remaining_sec = 0
+    else:
+        unknown_since = float(health.get("unknown_since_epoch") or now)
+        unknown_age = max(0.0, now - unknown_since)
+        grace_remaining_sec = max(
+            0, int(_DECRYPT_HEALTH_EXISTING_UNKNOWN_GRACE_SEC - unknown_age)
+        )
+        grace_active = unknown_age < _DECRYPT_HEALTH_EXISTING_UNKNOWN_GRACE_SEC
+        mode = (
+            "established_unknown_grace"
+            if grace_active
+            else "established_unknown_expired"
+        )
+        blocks_onboarding = not grace_active
+        # A diagnostic verify must never mint a new sticky green result from an
+        # unknown decrypt path, even while ordinary established chat is in grace.
+        blocks_verify = True
+        blocks_chat = False
+
+    return {
+        "mode": mode,
+        "established": established,
+        "blocks_onboarding": blocks_onboarding,
+        "blocks_verify": blocks_verify,
+        "blocks_chat": blocks_chat,
+        "warning_only": bool(
+            mode == "established_unknown_grace"
+        ),
+        "grace_active": grace_active,
+        "grace_remaining_sec": grace_remaining_sec,
+        "existing_unknown_grace_sec": (
+            _DECRYPT_HEALTH_EXISTING_UNKNOWN_GRACE_SEC
+        ),
+        "reason": health["reason"],
+    }
 
 
 def _touch_resident_binding_seen(
@@ -119,15 +336,20 @@ def _touch_resident_binding_seen(
         return False
 
 
-def _consumer_validation_state(store: UserStore) -> dict:
+def _consumer_validation_state(
+    store: UserStore,
+    *,
+    now_epoch: float | None = None,
+) -> dict:
     with store.consumer_state_lock:
         state = _load_consumer_state(store)
+    now = time.time() if now_epoch is None else float(now_epoch)
     last_poll_epoch = 0.0
     try:
         last_poll_epoch = float(state.get("last_poll_epoch") or 0)
     except Exception:
         last_poll_epoch = 0.0
-    age_sec = time.time() - last_poll_epoch if last_poll_epoch > 0 else None
+    age_sec = now - last_poll_epoch if last_poll_epoch > 0 else None
     official = bool(state.get("official"))
     recent = age_sec is not None and age_sec <= _CONSUMER_RECENT_SEC
     passing = official and recent
@@ -142,6 +364,7 @@ def _consumer_validation_state(store: UserStore) -> dict:
         "last_response_at": state.get("last_response_at", ""),
         "age_sec": age_sec,
         "recent_window_sec": _CONSUMER_RECENT_SEC,
+        "decrypt_health": _decrypt_health_from_state(state, now_epoch=now),
         "required": (
             "Run the standard independent feedling-chat-resident / IO resident "
             "consumer with the current FEEDLING_API_KEY. It must poll "

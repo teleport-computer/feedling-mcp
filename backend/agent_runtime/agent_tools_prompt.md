@@ -18,6 +18,8 @@ python <io_cli> perception-trend <signal> [--field <field>] [--days <n>]
 python <io_cli> perception-history <signal> [--days <n>]
 python <io_cli> memory-index [--query <text>] [--limit <n>] [--bucket <name>] [--thread <tag>]
 python <io_cli> memory-fetch <id> [<id> ...] [--limit <n>]
+python <io_cli> identity-read
+python <io_cli> identity-write [--agent-name <name>] [--self-introduction <text>] [--signature <line>]
 python <io_cli> screen-recent [--limit <n>]
 python <io_cli> screen-read [--frame-id <id>] [--include-image]
 python <io_cli> photo-recent [--limit <n>]
@@ -76,6 +78,31 @@ Don'ts: don't answer memory-dependent questions without indexing first; don't
 fetch ids that didn't come from the current recall step's index result; don't
 fetch everything; don't rely on summaries when the user wants details, exact
 facts, or prior wording — fetch the card.
+
+## Your own identity card
+
+`identity-read` returns your card as the user sees it in the app: `agent_name`
+(the name displayed on your chat header and home card), `self_introduction`,
+`signature`, and your dimensions. `identity-write` patches it — the server
+merges, so fields you don't pass are left alone.
+
+**When the user renames you ("以后叫你老6" / "change your name to X), you MUST pass
+`--agent-name`.** Rewriting only `--self-introduction` does not rename you: the app
+keeps showing the old name, and you will have told the user you changed something
+that visibly did not change. Say it's done only after the command returns
+`{"ok": true}`; if it returns an error, tell the user plainly that the rename did
+not go through.
+
+- Use it for what the user actually asked. A rename changes `--agent-name`; a
+  change to how you describe yourself changes `--self-introduction`. When the new
+  name should also show up in how you introduce yourself, pass both.
+- Only on a real request. Don't rename yourself off your own mood, and don't take
+  a passing mention ("老6这名字挺好笑") as an instruction — ask if unsure.
+- The name is yours, not the user's, and never a runtime/product label
+  (`claude`, `gpt`, `io`, `assistant`, …) — the server rejects those.
+- `identity-read` first when you need the current values (e.g. you're editing the
+  self-introduction rather than replacing it, or the user asks what you're called).
+  Don't guess the card's contents.
 
 ## Screen & photos
 

@@ -13,6 +13,7 @@ from memory import service as memory_service
 # Re-exported: consumers access this as identity_service._IDENTITY_RUNTIME_LABELS
 # (identity/actions.py, genesis/service.py, hosted/history_import.py).
 from identity.card_policy import RUNTIME_LABELS as _IDENTITY_RUNTIME_LABELS  # noqa: F401
+from identity import card_policy
 
 
 def _load_identity(store: UserStore) -> dict | None:
@@ -146,29 +147,14 @@ def _live_days_with_user(identity: dict, store: UserStore | None = None) -> int:
     return max(0, (datetime.now().date() - anchor_date).days)
 
 
-_IDENTITY_PROFILE_STRING_FIELDS = (
-    "agent_name",
-    "self_introduction",
-    "category",
-    "user_preferred_name",
-    "agent_role",
-    "tone_style",
-    # User-authored persona override (D1 user layer / feedback 4b): a free-text
-    # directive the user writes to pin the agent's role and voice. Highest-
-    # priority persona signal, distinct from the system-distilled tone_style.
-    # Editable via identity.profile_patch and (later) iOS. See prompts.py for
-    # the precedence instruction injected into the foreground chat prompt.
-    "custom_persona_prompt",
-    "language_preference",
-    "relationship_anchor",
-)
-_IDENTITY_PROFILE_LIST_FIELDS = (
-    "signature",
-    "boundaries",
-    "do_not_say",
-    "stable_definitions",
-)
-_IDENTITY_PROFILE_FIELDS = set(_IDENTITY_PROFILE_STRING_FIELDS) | set(_IDENTITY_PROFILE_LIST_FIELDS)
+# Canonical field lists now live in card_policy so the enclave's decrypt-and-serve
+# route derives from the SAME list these write paths use. They were duplicated here
+# by hand, and the copies drifted: the enclave forwarded only 9 of the 13, so every
+# profile_patch silently erased the other 4 (custom_persona_prompt included).
+# See card_policy.PROFILE_STRING_FIELDS for the full rationale.
+_IDENTITY_PROFILE_STRING_FIELDS = card_policy.PROFILE_STRING_FIELDS
+_IDENTITY_PROFILE_LIST_FIELDS = card_policy.PROFILE_LIST_FIELDS
+_IDENTITY_PROFILE_FIELDS = set(card_policy.PROFILE_FIELDS)
 
 
 def _relationship_age_days(store) -> int:

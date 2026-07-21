@@ -129,6 +129,8 @@
 | `delta_required` | 400 | — | | |
 | `agent_name_empty` | 400 | — | | |
 | `agent_name_is_runtime_label` | 400 | — | 名字撞 card_policy.RUNTIME_LABELS（原 `agent_name_too_generic`，已统一） | |
+| `user_preferred_name_empty` | 400 | — | identity.profile_patch 的本人称呼为空 | |
+| `user_preferred_name_is_reserved` | 400 | — | 本人称呼是保留占位词（用户/user/TA，不区分大小写） | |
 | `dimension_value_out_of_range` | 400 | — | dimension_nudge / patch dimensions / replace 三处共用（card_policy） | |
 | `dimension_value_not_number` | 400 | — | 同上 | |
 | `dimensions_must_be_list` | 400 | — | 同上 | |

@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+from identity.user_naming import _naming_rule, sanitize_user_name
+
 # Dream 只产这三种整理操作;拿不准的矛盾留到 questions_to_ask,不擅自决定。
 DREAM_OPS = ("merge", "thicken", "supersede")
 
@@ -46,7 +48,8 @@ _DREAM_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在
   （用「宠物」不是「pets」），别把中文的事归成英文桶/线索；专有名词/原话保留原文。
 · 称呼：{naming_rule}这些卡是 TA 会亲眼看到的记忆——写进卡里的字段永远不要用
   "用户"/"user"这类系统称谓，也不要用「TA」指代对方（「TA」只是这份指令里的标记）；
-  整理旧卡时顺手把指代对方本人的"用户"/"user"/「TA」改成正确称呼——
+  整理旧卡时顺手把指代对方本人的"用户"/"user"/「TA」/「你」/猜测性别的他或她
+  改成已知名字；名字未知时优先省略主语，确实需要主语才用中性的「对方」——
   卡里若有指代你（AI）的「TA」，那是 TA 视角对你的叫法，保留不动。
 · 没有需要整理的，就什么都不做（consolidations 为空）。这很正常。
 
@@ -84,8 +87,6 @@ def build_dream_prompt(
 
     Callers pass already-rendered strings (handler decides formatting/truncation).
     """
-    from memory.capture_prompt_v1 import _naming_rule, sanitize_user_name
-
     return _DREAM_PROMPT_TEMPLATE.format(
         ai_name=(ai_name or "我").strip(),
         user_name=sanitize_user_name(user_name),

@@ -128,6 +128,26 @@ CONSUMER_HEADERS = [
     ),
 ]
 
+DECRYPT_HEALTH_HEADERS = [
+    _header(
+        "X-Feedling-Decrypt-Status",
+        _schema(
+            "string",
+            enum=["ok", "degraded", "unconfigured", "unreachable"],
+        ),
+        "Current resident decrypt-source health. Report this on poll heartbeats; "
+        "omitting it on a later official poll clears the previous report to unknown.",
+        example="ok",
+    ),
+    _header(
+        "X-Feedling-Decrypt-Checked-At",
+        TIMESTAMP,
+        "Unix epoch seconds when the resident last confirmed the reported decrypt status. "
+        "The backend treats missing, invalid, future, or stale values as unknown.",
+        example=1784625600.125,
+    ),
+]
+
 
 OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
     ("get", "/v1/chat/poll"): [
@@ -136,6 +156,7 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("consumer_id", _schema("string", maxLength=160), "Stable resident consumer identifier.", example="resident_mbp_01"),
         _query("claim", _schema("boolean", default=True), "Whether this poll may claim queued work.", example=True),
         *CONSUMER_HEADERS,
+        *DECRYPT_HEALTH_HEADERS,
     ],
     ("post", "/v1/chat/response"): [
         _query("consumer_id", _schema("string", maxLength=160), "Stable resident consumer identifier.", example="resident_mbp_01"),
@@ -1208,8 +1229,12 @@ SPECIAL_REQUEST_BODIES: dict[Operation, dict[str, Any]] = {
 
 
 OPERATION_DESCRIPTIONS: dict[Operation, str] = {
+    ("get", "/v1/bootstrap/status"): "Return server-observed onboarding progress. Resident routes include decrypt_source_ready, decrypt_health, and decrypt_health_policy; a fresh resident poll report is required for new-account completion.",
+    ("get", "/v1/onboarding/validate"): "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields.",
+    ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
-    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
+    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
+    ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
     ("get", "/v1/chat/history"): "Read encrypted chat history using timestamp watermarks. Use oldest_ts as before for older pages and latest_ts as since for newer pages.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",

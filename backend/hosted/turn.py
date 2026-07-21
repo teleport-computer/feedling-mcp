@@ -342,6 +342,13 @@ def _run_model_api_memory_repair_job(
             return
 
         language = hosted_history_import._import_language_for_store(store, messages)
+        user_name, name_warnings = hosted_history_import._resolve_import_user_name(
+            store,
+            api_key,
+            runtime,
+            [],
+        )
+        warnings.extend(name_warnings)
         days = identity_service._relationship_age_days(store)
         relationship_start = date.today() - timedelta(days=max(0, days))
         windows = hosted_history_import._build_transcript_windows(messages, max_chars=14000, max_windows=8)
@@ -365,6 +372,7 @@ def _run_model_api_memory_repair_job(
             relationship_start,
             per_window_target=4,
             language=language,
+            user_name=user_name,
             on_progress=progress,
         )
         warnings.extend(provider_warnings)
@@ -379,6 +387,7 @@ def _run_model_api_memory_repair_job(
             },
             language=language,
             max_cards=target_total,
+            user_name=user_name,
         )
         cards = [
             card for card in cards

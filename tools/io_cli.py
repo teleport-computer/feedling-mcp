@@ -25,6 +25,7 @@ currently return a clean "not implemented" JSON so the agent degrades gracefully
 import argparse
 import base64
 import json
+import hashlib
 import os
 import re
 import ssl
@@ -82,13 +83,37 @@ def _materialize_decrypted_image(prefix, body):
     mime = str(body.get("image_mime") or "image/jpeg")
     ext = ".png" if "png" in mime.lower() else ".jpg"
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(prefix))[:96] or "image"
-    image_dir = os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images")
+    # Must match chat_resident_consumer's IMAGE_TEMP_DIR default byte-for-byte
+    # (fingerprinted by the api key) — the consumer writes, this tool reads the
+    # same dir. A bare /tmp default would (a) miss the consumer's images and
+    # (b) reintroduce the shared-dir cross-account leak on a multi-account host.
+    _img_fp = hashlib.sha1(
+        (os.environ.get("FEEDLING_API_KEY") or "").encode()).hexdigest()[:10]
+    image_dir = os.environ.get(
+        "IMAGE_TEMP_DIR", f"/tmp/feedling_chat_images_{_img_fp}")
     out = dict(body)
+    # Fail-safe mirroring the consumer's _chat_scratch_write_allowed: a keyless
+    # (host-all) tool with an unpinned IMAGE_TEMP_DIR would write the DECRYPTED
+    # image into the sha1("") shared dir every co-hosted agent reads. Refuse.
+    if not (os.environ.get("FEEDLING_API_KEY") or "IMAGE_TEMP_DIR" in os.environ):
+        out["image_error"] = "refusing to write decrypted image to a shared scratch dir"
+        return out
     try:
-        os.makedirs(image_dir, exist_ok=True)
+        # mode=0o700 up front (atomic, umask-masked) so there's no window where
+        # the decrypted-image dir is world-listable; chmod enforces it for a
+        # pre-existing dir. Matches the consumer's _mkdir_scratch.
+        os.makedirs(image_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(image_dir, 0o700)  # not readable by co-tenant unix users
+        except OSError:
+            pass
         path = os.path.join(image_dir, f"{safe}{ext}")
         with open(path, "wb") as f:
             f.write(base64.b64decode(raw_b64))
+        try:
+            os.chmod(path, 0o600)  # decrypted pixels — never world-readable
+        except OSError:
+            pass
     except Exception as e:  # pragma: no cover - defensive
         out["image_error"] = f"could not save decrypted image: {e}"
         return out
@@ -537,12 +562,17 @@ def cmd_identity_read(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
-def _identity_write_payload(self_introduction, signature):
+def _identity_write_payload(self_introduction, signature, agent_name=None):
     """Build the /v1/identity/actions body for a profile_patch. Pure (testable).
 
     Returns None when there's nothing to write. signature is a list of short strings.
+    agent_name is the agent's OWN display name — the field the user sees as the
+    companion's name in the app. Validation (empty / runtime label like "claude")
+    is the server's job, so anything non-None is passed straight through.
     """
     patch = {}
+    if agent_name is not None:
+        patch["agent_name"] = agent_name
     if self_introduction is not None:
         patch["self_introduction"] = self_introduction
     if signature:
@@ -553,16 +583,19 @@ def _identity_write_payload(self_introduction, signature):
 
 
 def cmd_identity_write(args):
-    """Patch the agent's display identity card (self_introduction / signature).
+    """Patch the agent's display identity card (agent_name / self_introduction / signature).
 
     POST /v1/identity/actions (identity.profile_patch). The server decrypts the
     existing card, merges, and re-encrypts (no client crypto). Used by post-respawn
-    7.D so the agent (now itself) writes its own intro + signature in-voice.
+    7.D so the agent (now itself) writes its own intro + signature in-voice, and by
+    any turn where the user renames it ("以后叫你老6") — without --agent-name the
+    rename can only land in the self_introduction text while the displayed name
+    stays stale, which reads to the user as "it said yes and did nothing".
     """
     api_url, auth = _require_backend()
-    payload = _identity_write_payload(args.self_introduction, args.signature)
+    payload = _identity_write_payload(args.self_introduction, args.signature, args.agent_name)
     if payload is None:
-        _emit({"ok": False, "error": "nothing_to_write: need --self-introduction and/or --signature"}, 2)
+        _emit({"ok": False, "error": "nothing_to_write: need --agent-name, --self-introduction and/or --signature"}, 2)
     status, body = _http_json("POST", f"{api_url}/v1/identity/actions", auth, payload=payload)
     if status == 200:
         _emit({"ok": True, **body})
@@ -973,7 +1006,9 @@ def main():
     ir.set_defaults(func=cmd_identity_read)
 
     iw = sub.add_parser("identity-write",
-                        help="Patch the agent's identity card (self_introduction / signature).")
+                        help="Patch the agent's identity card (agent_name / self_introduction / signature).")
+    iw.add_argument("--agent-name", dest="agent_name", default=None,
+                    help="your OWN display name — set it when the user renames you (以后叫你老6)")
     iw.add_argument("--self-introduction", dest="self_introduction", default=None)
     iw.add_argument("--signature", action="append", default=[],
                     help="repeatable short string(s) for the signature")

@@ -111,6 +111,8 @@ these settings:
 | `FEEDLING_HOST_ALL` | Current production entry points fail fast unless hosted discovery is enabled. Set consistently with the supervisor design you deploy. |
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and supervisor through a secret manager, and never bake it into an image. |
 | `FEEDLING_ENCLAVE_URL` | Required for enclave-backed Memory, screen, worldbook, and decrypt operations. Use a private authenticated network path. |
+| `FEEDLING_DECRYPT_HEALTH_REFRESH_SEC` | Optional resident idle-probe cadence in seconds (default 120, minimum 5). Keep it below the backend's 300-second freshness window. |
+| `FEEDLING_AGENT_TURN_TIMEOUT_SEC` | Optional wall-clock cap in seconds for one resident CLI agent turn (default 300, minimum 30). A turn exceeding it has its agent subprocess terminated and is treated as a timeout. Raise it for slow self-hosted stacks (cold starts, heavy MCP, long-thinking models); the cap always exists so a hung agent cannot wedge the single-flight chat lane. |
 | `FEEDLING_ASGI_BACKGROUND` | Enable on the real backend instance if it owns the wake bus and screen WebSocket listener. Do not enable competing development instances against the same ports without understanding leader election. |
 | `FEEDLING_PUBLIC_BASE_URL` | Set to the externally reachable HTTPS base URL. |
 | `FEEDLING_CORS_ALLOWED_ORIGINS` | Comma-separated exact browser origins. Leave empty if no browser client needs direct API access. Never use `*`. |
@@ -211,7 +213,10 @@ traffic until all enabled capabilities pass:
 - Memory `index` and `fetch` complete instead of returning
   `enclave_unavailable`.
 - Hosted Chat has a fresh supervisor heartbeat and a test turn produces an
-  encrypted assistant response; or the resident consumer polls and responds.
+  encrypted assistant response; or the resident consumer polls with fresh
+  `X-Feedling-Decrypt-Status: ok` and
+  `X-Feedling-Decrypt-Checked-At` headers, passes `POST /v1/chat/verify_loop`,
+  and replies to an ordinary encrypted test turn.
 - Screen WebSocket ingest works if enabled.
 - Push delivery works if APNs is configured; otherwise the operator has
   explicitly accepted that push is disabled.

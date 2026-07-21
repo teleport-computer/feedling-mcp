@@ -131,7 +131,7 @@ async def chat_message(request: Request, auth: AuthResult = Depends(require_auth
     return JSONResponse(body, status_code=status)
 
 
-def _allow_verify_reply_with_fresh_pending_check(store) -> bool:
+def _allow_verify_reply_with_fresh_pending_check(store, payload: dict) -> bool:
     """Check pending verify ping, reloading once before a negative decision.
 
     In multi-worker deployments, verify_loop inserts a synthetic ping in one
@@ -140,12 +140,16 @@ def _allow_verify_reply_with_fresh_pending_check(store) -> bool:
     stays cache-only; the negative path reloads once so we do not reject a valid
     verify reply based on stale chat_messages.
     """
-    if boot_gates._reply_is_for_pending_verify_ping(store):
-        return True
-    if boot_gates._chat_loop_verified_by_server(store):
+    source = str(payload.get("source") or "chat").strip() or "chat"
+    reply_to_message_id = chat_core._reply_to_message_id(payload)
+    if source != "verify_ping" or not reply_to_message_id:
         return False
+    if boot_gates._reply_is_for_pending_verify_ping(store, reply_to_message_id):
+        return True
+    # verify_loop is repeatable. A previous sticky green does not prove this
+    # worker has seen the new ping, so always reload once for an exact negative.
     store.reload()
-    return boot_gates._reply_is_for_pending_verify_ping(store)
+    return boot_gates._reply_is_for_pending_verify_ping(store, reply_to_message_id)
 
 
 @router.post("/v1/chat/response")
@@ -157,7 +161,7 @@ async def chat_response(request: Request, auth: AuthResult = Depends(require_aut
     consumer_info = chat_consumer._consumer_headers_from_map(request.headers, remote_addr)
     consumer_id = chat_service._parse_consumer_id(request.headers, request.query_params)
     allow_verify_reply = await threadpool.run_db(
-        _allow_verify_reply_with_fresh_pending_check, store
+        _allow_verify_reply_with_fresh_pending_check, store, payload
     )
     gated = await threadpool.run_db(
         chat_core.gate_response_dict, store, allow_verify_reply, payload

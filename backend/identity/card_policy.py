@@ -12,6 +12,8 @@ gates. Blocking on them would hurt onboarding success rate.
 """
 from __future__ import annotations
 
+from identity.user_naming import sanitize_user_name
+
 # Single source of truth. backend/identity/service.py imports this.
 RUNTIME_LABELS: frozenset[str] = frozenset({
     "io", "feedling", "p0", "p-zero",
@@ -21,6 +23,38 @@ RUNTIME_LABELS: frozenset[str] = frozenset({
     "gemini", "google ai", "google", "bard", "deepseek", "minimax", "copilot", "github copilot",
     "agent", "assistant", "ai", "bot",
 })
+
+# The writable profile fields, canonical. Every consumer that rebuilds a card
+# (identity/service.py's patch fields, the enclave's decrypt-and-serve route)
+# derives from these instead of hand-listing them.
+#
+# Hand-written copies drift, and here drift destroys data: profile_patch is
+# read-modify-write, so a field the enclave route forgets to serve is not merely
+# hidden from the caller — it is erased from the card on the next patch. That
+# happened once (tone_style/agent_role/do_not_say/boundaries were hand-patched
+# in after the fact) and the five fields nobody remembered kept dropping,
+# custom_persona_prompt — which the USER authors — among them.
+PROFILE_STRING_FIELDS: tuple[str, ...] = (
+    "agent_name",
+    "self_introduction",
+    "category",
+    "user_preferred_name",
+    "agent_role",
+    "tone_style",
+    # User-authored persona override (D1 user layer / feedback 4b): a free-text
+    # directive the user writes to pin the agent's role and voice. Highest-
+    # priority persona signal, distinct from the system-distilled tone_style.
+    "custom_persona_prompt",
+    "language_preference",
+    "relationship_anchor",
+)
+PROFILE_LIST_FIELDS: tuple[str, ...] = (
+    "signature",
+    "boundaries",
+    "do_not_say",
+    "stable_definitions",
+)
+PROFILE_FIELDS: frozenset[str] = frozenset(PROFILE_STRING_FIELDS) | frozenset(PROFILE_LIST_FIELDS)
 
 MAX_DIMENSIONS = 12  # sanity cap, NOT a floor
 _VALUE_MIN, _VALUE_MAX = 0, 100
@@ -102,6 +136,12 @@ def validate_profile_patch(patch: dict) -> tuple[bool, str]:
             return (False, "agent_name_empty")
         if is_runtime_label(name):
             return (False, "agent_name_is_runtime_label")
+    if "user_preferred_name" in patch:
+        name = str(patch.get("user_preferred_name") or "").strip()
+        if not name:
+            return (False, "user_preferred_name_empty")
+        if sanitize_user_name(name) == "TA":
+            return (False, "user_preferred_name_is_reserved")
     if "dimensions" in patch:
         return validate_dimensions_structure(patch.get("dimensions"))
     return _OK

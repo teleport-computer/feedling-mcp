@@ -1670,6 +1670,7 @@ def test_memory_summary_fallback_splits_high_recall_cards_without_ai_persona_sto
     assert not any("温柔稳定" in c["description"] and c["type"] in {"moment", "quote"} for c in cards)
     assert any("稳定陪伴" in c["description"] for c in cards)
     assert any("直接" in c["description"] for c in cards)
+    assert all("用户" not in c["description"] for c in cards)
 
 
 def test_identity_without_ai_source_does_not_use_user_profile_as_companion(monkeypatch):

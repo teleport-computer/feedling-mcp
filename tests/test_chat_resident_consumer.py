@@ -53,10 +53,10 @@ import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
 @pytest.fixture(autouse=True)
 def _reset_proactive_guard_state_between_tests():
-    """The proactive idle-loop guard + failure backoff are module-global state
-    that accumulates across proactive realizations. Reset before each test so a
-    prior test's proactive turns don't trip the guard and skip this one's."""
-    crc._proactive_empty_streak = 0
+    """The proactive self-wake loop guard + failure backoff are module-global
+    state that accumulates across proactive realizations. Reset before each test
+    so a prior test's self-wakes don't trip the guard and skip this one's."""
+    crc._self_wake_streak = 0
     crc._proactive_fail_streak = 0
     crc._proactive_backoff_until = 0.0
     crc._provider_payment_cooldown_until = 0.0
@@ -501,6 +501,7 @@ def test_verify_ping_enclave_path_probes_real_agent():
         "source": "verify_ping",
         "content": None,            # enclave returns null for local_only
         "content_type": "text",
+        "id": "ping-enclave-1",
     }
     with patch.object(crc, "call_agent", return_value="收到") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
@@ -508,6 +509,9 @@ def test_verify_ping_enclave_path_probes_real_agent():
 
     mock_agent.assert_called_once_with(crc.VERIFY_PROBE_MESSAGE)
     mock_post.assert_called_once()
+    # Every verify ack binds back to THIS ping so the backend strict matcher
+    # (source=verify_ping ∧ reply_to=ping id) can pair it precisely.
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "ping-enclave-1"
     assert result_ts == pytest.approx(4242.0)
 
 
@@ -517,6 +521,7 @@ def test_verify_ping_poll_marker_probes_real_agent():
     real bounded probe."""
     ping = _make_msg(role="user", content="__VERIFY_PING__:deadbeef0001", ts=4343.0)
     ping["source"] = "verify_ping"
+    ping["id"] = "ping-marker-1"
 
     with patch.object(crc, "call_agent", return_value="收到") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
@@ -524,6 +529,7 @@ def test_verify_ping_poll_marker_probes_real_agent():
 
     mock_agent.assert_called_once_with(crc.VERIFY_PROBE_MESSAGE)
     mock_post.assert_called_once()
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "ping-marker-1"
     assert result_ts == pytest.approx(4343.0)
 
 
@@ -538,6 +544,7 @@ def test_verify_ping_success_reply_suppresses_push():
         "source": "verify_ping",
         "content": None,
         "content_type": "text",
+        "id": "ping-success-1",
     }
     with patch.object(crc, "call_agent", return_value="我在") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
@@ -548,6 +555,7 @@ def test_verify_ping_success_reply_suppresses_push():
     assert mock_post.call_args.kwargs.get("suppress_push") is True
     # source="verify_ping" so the visible history feed filters the liveness reply
     assert mock_post.call_args.kwargs.get("source") == "verify_ping"
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "ping-success-1"
 
 
 def test_verify_ping_slow_agent_falls_back_to_canned_ack():
@@ -560,6 +568,7 @@ def test_verify_ping_slow_agent_falls_back_to_canned_ack():
         "source": "verify_ping",
         "content": None,
         "content_type": "text",
+        "id": "ping-slow-1",
     }
 
     # Block the probe on an Event (not a bare sleep) so the timeout fires
@@ -577,8 +586,11 @@ def test_verify_ping_slow_agent_falls_back_to_canned_ack():
              patch.object(crc, "call_agent", side_effect=_slow), \
              patch.object(crc, "post_reply") as mock_post:
             crc._process_messages([ping])
+            # Canned ack still binds to the ping so a slow-path fallback ack is
+            # matched as precisely as a real-reply ack.
             mock_post.assert_called_once_with(
-                crc.VERIFY_PING_REPLY, source="verify_ping", suppress_push=True
+                crc.VERIFY_PING_REPLY, source="verify_ping", suppress_push=True,
+                reply_to_message_id="ping-slow-1",
             )
     finally:
         release.set()
@@ -1147,6 +1159,229 @@ def test_sanitize_reply_text_allows_direct_english_reply():
 Tell me what you want to work on next."""
     cleaned = crc._sanitize_reply_text(raw)
     assert cleaned == "Hello Seven — I see your message now.\nTell me what you want to work on next."
+
+
+def test_sanitize_reply_text_preserves_markdown_layout():
+    raw = """# 一级标题
+
+## 二级标题
+
+- 第一项
+  - 嵌套项
+1. 第一步
+   1. 子步骤
+
+> 引用内容
+
+**独立粗体标题**
+
+```swift
+let title = "# 代码里的标记不能清理"
+```
+"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw.strip()
+
+
+def test_sanitize_reply_text_preserves_fenced_code_verbatim():
+    raw = (
+        "```swift\n"
+        'let title = "# 中文代码"  \n'
+        'let title = "# 中文代码"\t\n'
+        "```"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_drops_unlabeled_copy_reasoning_fence():
+    raw = """```copy
+**Executing updates**
+I need to inspect the repository before answering.
+```
+
+这是最终回复。"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Checking the repository before answering.",
+        "Checking project before answering.",
+        "💭 Checking repository before answering.",
+        "💭 Inspecting source files before answering.",
+        "先检查仓库，再回复用户。",
+    ],
+)
+def test_sanitize_reply_text_drops_runtime_copy_fence_header_variants(header):
+    raw = f"""```copy
+{header}
+Collecting internal context.
+```
+
+这是最终回复。"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+def test_sanitize_reply_text_preserves_normal_copy_fence():
+    raw = """```copy
+I need to update the deployment notes.
+```"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'let reasoning = "visible output"',
+        "reasoning = true",
+        "# Checking repository permissions",
+        "- Checking repository status",
+        "Working hours: 09:00-17:00",
+        "处理结果如下：成功",
+    ],
+)
+def test_sanitize_reply_text_preserves_non_runtime_copy_content(content):
+    raw = f"```copy\n{content}\n```"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_dedupes_prose_outside_fenced_code():
+    raw = """第一行
+第二行
+第一行
+第二行
+
+```swift
+let value = 1
+```"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "第一行\n第二行\n\n```swift\nlet value = 1\n```"
+
+
+def test_sanitize_reply_text_preserves_blockquote_fenced_code_verbatim():
+    raw = (
+        "> ```text\n"
+        "> repeated line  \n"
+        "> repeated line  \n"
+        "> ```"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_preserves_fence_like_content_at_deeper_quote_depth():
+    raw = (
+        "> ~~~text\n"
+        "> > ~~~\n"
+        "> repeated line  \n"
+        "> repeated line  \n"
+        "> ~~~"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_filters_runtime_copy_with_tabbed_quote_container():
+    raw = (
+        ">\t> ```copy\n"
+        ">\t> **Executing updates**\n"
+        ">\t> Internal details.\n"
+        ">\t> ```\n"
+        "\n"
+        "这是最终回复。"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+def test_sanitize_reply_text_implicitly_closes_fence_when_blockquote_ends():
+    raw = (
+        "> ```text\n"
+        "> code line  \n"
+        "outside\n"
+        "outside\n"
+        "正文"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "> ```text\n> code line  \noutside\n正文"
+
+
+def test_sanitize_reply_text_preserves_setext_and_thematic_breaks():
+    raw = """Title
+===
+
+Section
+---
+
+正文"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["----", "* * *", "_ _ _"])
+def test_sanitize_reply_text_preserves_commonmark_thematic_variants(marker):
+    raw = f"Title\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["=", "-"])
+def test_sanitize_reply_text_preserves_single_character_setext(marker):
+    raw = f"Title\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["---", "* * *", "_ _ _"])
+def test_sanitize_reply_text_does_not_recover_preamble_across_blank_line(marker):
+    raw = f"transport transcript\n\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == f"{marker}\n\n正文"
+
+
+@pytest.mark.parametrize("marker", ["---", "* * *", "_ _ _", "----"])
+def test_sanitize_reply_text_preserves_leading_thematic_break(marker):
+    raw = f"{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
 
 
 def test_sanitize_reply_text_drops_unlabeled_english_meta_before_cjk_answer():
@@ -2936,7 +3171,7 @@ def test_process_proactive_degenerate_only_reply_fails_without_post(monkeypatch)
     fail the job, post nothing — and do NOT count as a realized idle send
     (two truncated wakes in a row must not trip the idle-loop guard)."""
     captured = _degenerate_test_harness(monkeypatch, {"messages": ["."]})
-    monkeypatch.setattr(crc, "_proactive_empty_streak", 0)
+    monkeypatch.setattr(crc, "_self_wake_streak", 0)
 
     job = {
         "schema_version": 2,
@@ -2949,14 +3184,14 @@ def test_process_proactive_degenerate_only_reply_fails_without_post(monkeypatch)
     failed = [s for s in captured["statuses"] if s[1] == "failed"]
     assert failed and failed[-1][2] == "degenerate_reply_suppressed"
     assert captured["failures"] and captured["failures"][-1][1] is False
-    assert crc._proactive_empty_streak == 0  # suppressed ≠ realized idle send
+    assert crc._self_wake_streak == 0  # no self-wake scheduled → streak untouched
 
 
 def test_process_proactive_degenerate_fragment_dropped_real_reply_posted(monkeypatch):
     captured = _degenerate_test_harness(
         monkeypatch, {"messages": [".", "今晚月色不错"]}
     )
-    monkeypatch.setattr(crc, "_proactive_empty_streak", 0)
+    monkeypatch.setattr(crc, "_self_wake_streak", 0)
 
     job = {
         "schema_version": 2,
@@ -2968,7 +3203,7 @@ def test_process_proactive_degenerate_fragment_dropped_real_reply_posted(monkeyp
     assert captured["posted"] == ["今晚月色不错"]
     assert [s for s in captured["statuses"] if s[1] == "posted"]
     assert not [s for s in captured["statuses"] if s[1] == "failed"]
-    assert crc._proactive_empty_streak == 1  # real send keeps its accounting
+    assert crc._self_wake_streak == 0  # a plain proactive reply is not a self-wake
 
 
 def test_process_proactive_degenerate_reply_with_sleep_action_still_sleeps(monkeypatch):
@@ -7467,30 +7702,30 @@ def test_prepare_cli_command_heals_incident_windows_mcp_path(monkeypatch):
     assert os.path.basename(cmd[0]) == "claude"
 
 
-# --- Proactive idle-loop guard + failure backoff (Seven 2026-07-16) ----------
+# --- Proactive self-wake loop guard + failure backoff (Seven 2026-07-16/21) --
 
 def _reset_proactive_guard_state():
-    crc._proactive_empty_streak = 0
+    crc._self_wake_streak = 0
     crc._proactive_fail_streak = 0
     crc._proactive_backoff_until = 0.0
 
 
-def test_proactive_idle_guard_trips_after_max_empty_turns():
+def test_self_wake_loop_trips_after_max_consecutive_self_wakes():
     _reset_proactive_guard_state()
-    assert not crc._proactive_idle_guard_tripped()
-    for _ in range(crc.MAX_EMPTY_PROACTIVE_TURNS):
-        crc._note_idle_proactive_send()
-    assert crc._proactive_idle_guard_tripped()
+    assert not crc._self_wake_loop_tripped()
+    for _ in range(crc.MAX_CONSECUTIVE_SELF_WAKES):
+        crc._note_self_wake()
+    assert crc._self_wake_loop_tripped()
 
 
-def test_proactive_idle_guard_reset_clears_streak():
+def test_self_wake_loop_reset_clears_streak():
     _reset_proactive_guard_state()
-    for _ in range(crc.MAX_EMPTY_PROACTIVE_TURNS + 2):
-        crc._note_idle_proactive_send()
-    assert crc._proactive_idle_guard_tripped()
-    crc._reset_proactive_idle_guard()
-    assert not crc._proactive_idle_guard_tripped()
-    assert crc._proactive_empty_streak == 0
+    for _ in range(crc.MAX_CONSECUTIVE_SELF_WAKES + 2):
+        crc._note_self_wake()
+    assert crc._self_wake_loop_tripped()
+    crc._reset_proactive_idle_guard()  # the user spoke
+    assert not crc._self_wake_loop_tripped()
+    assert crc._self_wake_streak == 0
 
 
 def test_proactive_failure_backoff_grows_and_clears(monkeypatch):
@@ -7548,41 +7783,47 @@ def _idle_proactive_job(job_id="pj_idle"):
             "ts": 100.0, "trigger": "heartbeat_broadcast_off", "wake_kind": "presence"}
 
 
-def test_guard_skips_idle_proactive_when_tripped(monkeypatch):
+def test_loop_guard_never_skips_heartbeat_even_when_tripped(monkeypatch):
+    # THE regression guard (Seven 2026-07-21): a heartbeat/ambient wake must be
+    # realized even when the self-wake loop streak is maxed. The old guard
+    # skipped ALL idle proactive here, so 2 unanswered heartbeats silenced the
+    # companion. Now only the self-wake SCHEDULE is capped — the heartbeat flows.
     cap = _proactive_guard_harness(monkeypatch)
-    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._self_wake_streak = crc.MAX_CONSECUTIVE_SELF_WAKES
     crc._process_proactive_jobs([_idle_proactive_job()])
-    assert cap["agent_called"] is False
-    assert ("skipped", "proactive_idle_loop: no new user input") in cap["statuses"]
+    assert cap["agent_called"] is True                     # heartbeat NOT skipped
+    assert not any(r.startswith("proactive_idle_loop") for _s, r in cap["statuses"])
 
 
-def test_guard_realizes_idle_proactive_when_not_tripped(monkeypatch):
+def test_plain_proactive_send_does_not_advance_self_wake_streak(monkeypatch):
+    # A heartbeat that posts a reply but schedules NO self-wake must not count
+    # toward the loop guard (that was the over-counting bug).
     cap = _proactive_guard_harness(monkeypatch)
-    crc._proactive_empty_streak = 0
+    crc._self_wake_streak = 0
     crc._process_proactive_jobs([_idle_proactive_job()])
     assert cap["agent_called"] is True
-    assert crc._proactive_empty_streak == 1  # idle send advanced the streak
+    assert crc._self_wake_streak == 0                       # no self-wake → unchanged
 
 
-def test_guard_does_not_skip_screen_watch_when_tripped(monkeypatch):
+def test_loop_guard_does_not_skip_screen_watch_when_tripped(monkeypatch):
     cap = _proactive_guard_harness(monkeypatch)
-    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._self_wake_streak = crc.MAX_CONSECUTIVE_SELF_WAKES
     job = _idle_proactive_job("pj_sw")
     job["job_kind"] = "screen_watch"
     job["frame_ids"] = ["f1"]
     crc._process_proactive_jobs([job])
     assert cap["agent_called"] is True  # screen-watch is not an idle lane
-    assert crc._proactive_empty_streak == crc.MAX_EMPTY_PROACTIVE_TURNS  # unchanged
+    assert crc._self_wake_streak == crc.MAX_CONSECUTIVE_SELF_WAKES  # unchanged
 
 
-def test_guard_does_not_skip_introduction_when_tripped(monkeypatch):
+def test_loop_guard_does_not_skip_introduction_when_tripped(monkeypatch):
     cap = _proactive_guard_harness(monkeypatch)
-    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._self_wake_streak = crc.MAX_CONSECUTIVE_SELF_WAKES
     job = _idle_proactive_job("pj_intro")
     job["job_kind"] = "introduction"
     crc._process_proactive_jobs([job])
     assert cap["agent_called"] is True  # first-greeting must never be suppressed
-    assert crc._proactive_empty_streak == crc.MAX_EMPTY_PROACTIVE_TURNS  # unchanged
+    assert crc._self_wake_streak == crc.MAX_CONSECUTIVE_SELF_WAKES  # unchanged
 
 
 def test_backoff_skips_idle_proactive(monkeypatch):
@@ -7625,20 +7866,73 @@ def test_success_clears_failure_backoff(monkeypatch):
 def test_user_message_resets_guard_and_backoff():
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
-    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._self_wake_streak = crc.MAX_CONSECUTIVE_SELF_WAKES
     crc._proactive_fail_streak = 3
     msg = {"id": "u-reset", "role": "user", "content": "hi", "ts": 2000.0}
     with patch.object(crc, "call_agent", return_value="hey"), \
          patch.object(crc, "post_reply", return_value={"id": "r1"}):
         crc._process_messages([msg])
-    assert crc._proactive_empty_streak == 0
+    assert crc._self_wake_streak == 0
     assert crc._proactive_fail_streak == 0
 
 
-def test_max_empty_zero_disables_idle_guard(monkeypatch):
-    monkeypatch.setattr(crc, "MAX_EMPTY_PROACTIVE_TURNS", 0)
-    crc._proactive_empty_streak = 99
-    assert crc._proactive_idle_guard_tripped() is False
+def test_max_self_wakes_zero_disables_loop_guard(monkeypatch):
+    monkeypatch.setattr(crc, "MAX_CONSECUTIVE_SELF_WAKES", 0)
+    crc._self_wake_streak = 99
+    assert crc._self_wake_loop_tripped() is False
+
+
+def _self_wake_harness(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    cap = {"scheduled": [], "statuses": [], "posted": []}
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, []))
+    monkeypatch.setattr(
+        crc, "call_agent",
+        lambda message, images=None, image_paths=None, **kw: {
+            "actions": [{"type": "schedule_wake", "at": "2030-01-01T09:30:00",
+                         "tz": "Asia/Shanghai", "note": "check in"}],
+            "messages": [],
+        },
+    )
+    monkeypatch.setattr(
+        crc, "execute_scheduled_wake_actions",
+        lambda actions, job: cap["scheduled"].append((actions, job)) or {"results": []},
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kw: cap["posted"].append(reply) or {"id": "m"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kw: cap["statuses"].append((status, reason)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    return cap
+
+
+def _self_wake_job(job_id="pj_selfwake"):
+    return {"schema_version": 2, "job_id": job_id, "source": crc.PROACTIVE_JOB_SOURCE,
+            "ts": 130.0, "trigger": "scheduled_wake", "wake_kind": "presence"}
+
+
+def test_self_wake_schedule_advances_streak(monkeypatch):
+    # The agent asking for its OWN next wake is the only thing that feeds the
+    # loop guard.
+    cap = _self_wake_harness(monkeypatch)
+    crc._self_wake_streak = 0
+    crc._process_proactive_jobs([_self_wake_job()])
+    assert cap["scheduled"]                        # the self-wake was executed
+    assert crc._self_wake_streak == 1              # ...and counted toward the guard
+
+
+def test_self_wake_dropped_when_loop_tripped(monkeypatch):
+    # Runaway self-loop: once capped, a further self-wake is dropped at the
+    # source (no execute), so no next wake fires — but the turn itself still ran.
+    cap = _self_wake_harness(monkeypatch)
+    crc._self_wake_streak = crc.MAX_CONSECUTIVE_SELF_WAKES
+    crc._process_proactive_jobs([_self_wake_job()])
+    assert cap["scheduled"] == []                  # self-wake dropped
+    assert crc._self_wake_streak == crc.MAX_CONSECUTIVE_SELF_WAKES  # not advanced past cap
 
 
 # --- resident reply-language wiring (Seven 2026-07-16) ------------------------
@@ -7707,7 +8001,7 @@ def test_pi_without_message_placeholder_is_exempt(monkeypatch, tmp_path):
 
 def test_turn_timeout_is_env_tunable(monkeypatch, tmp_path):
     # Heavy self-hosted stacks (wrapper + MCP cold start + long thinking) need
-    # more than the 120s default; the cap rides AGENT_TURN_TIMEOUT_SEC.
+    # a custom operator cap; it rides AGENT_TURN_TIMEOUT_SEC via env.
     _bridge_session_env(monkeypatch, tmp_path, "usr_slow_stack")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
@@ -7723,3 +8017,120 @@ def test_turn_timeout_is_env_tunable(monkeypatch, tmp_path):
     monkeypatch.setattr(crc.subprocess, "run", fake_run)
     assert crc.call_agent_cli("hello") == "ok"
     assert seen["timeout"] == 300
+
+
+def test_chat_scratch_dirs_default_fingerprinted():
+    # IMAGE_TEMP_DIR / FILE_TEMP_DIR were the only /tmp defaults with NO keying
+    # at all — on a shared host two accounts' decrypted images/files landed in
+    # one dir (cross-user plaintext read). The default must carry the api-key
+    # fingerprint like CHECKPOINT_FILE so distinct keys never share a dir.
+    fp = crc.CHECKPOINT_API_KEY_FINGERPRINT
+    assert fp and fp in str(crc.IMAGE_TEMP_DIR)
+    assert fp in str(crc.FILE_TEMP_DIR)
+    assert str(crc.IMAGE_TEMP_DIR) != str(crc.FILE_TEMP_DIR)
+
+
+def test_chat_scratch_refuses_shared_default_when_keyless(monkeypatch, tmp_path):
+    # Host-all consumers run keyless (sha1("") collides for every user), so the
+    # spawner MUST pin IMAGE_TEMP_DIR/FILE_TEMP_DIR per user. If a future spawn
+    # path forgets, refuse to write DECRYPTED chat files to the shared default
+    # rather than leak them to co-hosted agents (mirrors _USER_MCP_PATHS_PINNED).
+    monkeypatch.setattr(crc, "FEEDLING_API_KEY", "")
+    monkeypatch.setattr(crc, "_CHAT_SCRATCH_PINNED", False)
+    monkeypatch.setattr(crc, "FILE_TEMP_DIR", tmp_path / "files")
+    assert crc._land_file("msg1", "secret.txt", b"plaintext") == ""
+    assert not (tmp_path / "files").exists()
+
+    # Pinned by the spawner → writes normally, and the file is 0600 (decrypted
+    # attachment must not be world-readable on a shared host).
+    monkeypatch.setattr(crc, "_CHAT_SCRATCH_PINNED", True)
+    out = crc._land_file("msg1", "secret.txt", b"plaintext")
+    assert out and Path(out).read_bytes() == b"plaintext"
+    assert (Path(out).stat().st_mode & 0o777) == 0o600
+
+
+def test_land_file_degrades_on_unwritable_dir(monkeypatch, tmp_path):
+    # An mkdir failure (read-only fs, disk/inode full, path occupied by a file)
+    # must degrade to "" like the pre-hardening code did — a file-attachment turn
+    # must NOT crash. Regression guard: _mkdir_scratch moved dir creation out of
+    # _land_file's try/except, so the OSError must be swallowed inside the helper.
+    monkeypatch.setattr(crc, "FEEDLING_API_KEY", "k")   # write allowed
+    monkeypatch.setattr(crc, "_CHAT_SCRATCH_PINNED", True)
+    monkeypatch.setattr(crc, "FILE_TEMP_DIR", tmp_path / "files")
+
+    def boom(self, *a, **k):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(crc.Path, "mkdir", boom)
+    assert crc._land_file("m", "f.txt", b"x") == ""
+
+
+def test_image_paths_degrade_on_unwritable_dir(monkeypatch, tmp_path):
+    # Same guard for the image write path.
+    monkeypatch.setattr(crc, "FEEDLING_API_KEY", "k")
+    monkeypatch.setattr(crc, "_CHAT_SCRATCH_PINNED", True)
+    monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path / "images")
+
+    def boom(self, *a, **k):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(crc.Path, "mkdir", boom)
+    assert crc._image_file_paths_from_payloads(
+        "pfx", [{"data": "eA==", "mime_type": "image/png"}]) == []
+
+
+def test_write_scratch_file_is_0600_even_if_chmod_is_noop(monkeypatch, tmp_path):
+    # The decrypted file must be 0600 by virtue of open() itself, so a chmod
+    # that's a no-op / raises on some mounts can't leave it world-readable.
+    def boom(*a, **k):
+        raise OSError("chmod not supported")
+
+    monkeypatch.setattr(crc.os, "chmod", boom)
+    p = tmp_path / "secret.bin"
+    crc._write_scratch_file(p, b"decrypted")
+    assert p.read_bytes() == b"decrypted"
+    assert (p.stat().st_mode & 0o777) == 0o600
+
+
+def test_write_scratch_file_closes_fd_if_fdopen_fails(monkeypatch, tmp_path):
+    # os.open succeeds but os.fdopen raises (fd pressure / MemoryError): the raw
+    # fd must be closed, not leaked — a consumer hitting this on repeated
+    # attachment turns would otherwise leak descriptors until EMFILE.
+    real_close = crc.os.close
+    closed = []
+
+    def tracking_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    def fdopen_boom(fd, *a, **k):
+        raise MemoryError("interpreter under fd pressure")
+
+    monkeypatch.setattr(crc.os, "close", tracking_close)
+    monkeypatch.setattr(crc.os, "fdopen", fdopen_boom)
+    with pytest.raises(MemoryError):
+        crc._write_scratch_file(tmp_path / "x.bin", b"data")
+    assert closed, "os.open fd leaked when fdopen failed"
+
+
+def test_chat_scratch_refusal_logs_once(monkeypatch):
+    # Keyless + unpinned refuses on every image/file message; the ERROR must be
+    # logged once, not per-message (would flood and bury diagnostics).
+    monkeypatch.setattr(crc, "FEEDLING_API_KEY", "")
+    monkeypatch.setattr(crc, "_CHAT_SCRATCH_PINNED", False)
+    monkeypatch.setattr(crc, "_chat_scratch_refusal_logged", False)
+    calls = []
+    monkeypatch.setattr(crc.log, "error", lambda *a, **k: calls.append(1))
+    for _ in range(5):
+        assert crc._chat_scratch_write_allowed() is False
+    assert len(calls) == 1
+
+
+def test_agent_turn_timeout_default_is_300():
+    """Default per-turn cap raised 120s→300s: slow self-hosted CC on modest VPS
+    takes 100-120s+ and the old default clipped real replies at the wire
+    (usr_6c1971, 2026-07-21 — a real reply landed at 104s while most turns hit
+    the 120s cap and were silently dropped). Floor and env override unchanged."""
+    if os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC"):
+        pytest.skip("env override set for FEEDLING_AGENT_TURN_TIMEOUT_SEC")
+    assert crc.AGENT_TURN_TIMEOUT_SEC == 300

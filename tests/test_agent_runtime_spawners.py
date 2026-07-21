@@ -265,6 +265,30 @@ def test_consumer_env_isolates_user_mcp_paths_per_user():
         assert key in spawners._CONSUMER_ENV_KEYS
 
 
+def test_consumer_env_isolates_hermes_openclaw_config_dirs():
+    # Same collision shape as the USER_MCP_* /tmp defaults, one layer over: the
+    # consumer's hermes/openclaw materializers fall back to Path.home()/.hermes
+    # and ~/.openclaw when their env vars are unset — a single shared HOME on the
+    # host-all runner. They only write when the directory exists (dormant on
+    # hosted today), but the moment anything creates ~/.openclaw every
+    # co-resident consumer starts cross-writing plaintext MCP creds there. Pin
+    # both dirs under the per-user home like claude-home/codex-home.
+    env_a = spawners.consumer_env(
+        {}, {"provider_key": "sk-ant", "driver": "claude"},
+        user_id="u_a", home="/agent-data/users/u_a",
+    )
+    env_b = spawners.consumer_env(
+        {}, {"provider_key": "sk-ant", "driver": "claude"},
+        user_id="u_b", home="/agent-data/users/u_b",
+    )
+    assert env_a["HERMES_CONFIG_DIR"] == "/agent-data/users/u_a/hermes-home"
+    assert env_a["OPENCLAW_CONFIG_DIR"] == "/agent-data/users/u_a/openclaw-home"
+    assert env_a["HERMES_CONFIG_DIR"] != env_b["HERMES_CONFIG_DIR"]
+    assert env_a["OPENCLAW_CONFIG_DIR"] != env_b["OPENCLAW_CONFIG_DIR"]
+    for key in ("HERMES_CONFIG_DIR", "OPENCLAW_CONFIG_DIR"):
+        assert key in spawners._CONSUMER_ENV_KEYS
+
+
 def test_consumer_env_honors_custom_cli_cmd():
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "cli_cmd": "claude --resume -p {message}"},
@@ -283,17 +307,17 @@ def test_build_container_argv_isolates_per_user():
     # one container + one volume per user (no shared home)
     assert "--name" in argv and "feedling-agent-u_1" in argv
     assert any(a.startswith("feedling-agent-vol-u_1:") for a in argv)
-    # secrets passed by env reference, not baked as plaintext args
-    assert "ANTHROPIC_API_KEY" in argv
+    # env passes via a per-user --env-file — secrets NEVER in argv (a bare
+    # `-e KEY` would inherit the shared supervisor env → per-user smear; a
+    # `-e KEY=value` would expose secrets to `ps`). The env-file gets both right.
+    assert "--env-file" in argv
+    assert spawners.container_env_file_path("u_1") in argv
     assert "sk-ant" not in argv
+    assert not any("ANTHROPIC_API_KEY" in a for a in argv)
     # image present, with the command following it (docker run [opts] IMAGE [cmd])
     img = "ghcr.io/x/feedling-agent-runner:dev"
     assert img in argv
     assert argv.index(img) < argv.index("python")
-    # per-user ambient timezone passed by env reference, so the container clock
-    # isn't UTC (consumer_env sets TZ; the container whitelist must forward it)
-    assert "TZ" in argv
-    assert argv[argv.index("TZ") - 1] == "-e"
 
 
 def test_process_spawner_reaps_exited_child_not_zombie():
@@ -477,7 +501,10 @@ def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
     allow = settings["permissions"]["allow"]
     assert any("io_cli.py perception" in rule for rule in allow)
     assert any("io_cli.py memory-index" in rule for rule in allow)
-    assert any("io_cli.py identity-write" in rule for rule in allow)  # 7.D post-respawn tool
+    assert any("io_cli.py identity-write" in rule for rule in allow)  # 7.D post-respawn tool + rename
+    # identity-read: the agent could write its own card but not read it, so a rename
+    # was a blind write and "你叫什么" had to be guessed. Granting the read closes both.
+    assert any("io_cli.py identity-read" in rule for rule in allow)
     assert any("io_cli.py screen-read" in rule for rule in allow)
     # and Read on the decrypted image temp dir, so the CLI can open attached images
     # (double leading slash = filesystem-absolute; single slash anchors at cwd /app)
@@ -1192,3 +1219,66 @@ def test_recent_apps_verb_is_granted():
         user_id="u", home="/agent-data/users/u",
     )
     assert "io_cli.py perception-recent-apps" in env["AGENT_CLI_CMD"]
+
+
+def test_consumer_env_keys_include_anthropic_wire_overrides():
+    # consumer_env sets ANTHROPIC_BASE_URL/MODEL/SMALL_FAST_MODEL for claude-wire
+    # third parties (deepseek), but the container strategy only forwards keys in
+    # _CONSUMER_ENV_KEYS. Missing them → a containerized deepseek agent hits
+    # api.anthropic.com with a foreign key and every turn fails.
+    for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"):
+        assert key in spawners._CONSUMER_ENV_KEYS
+
+
+def test_container_env_file_carries_per_user_values(monkeypatch):
+    # The env-file body must carry each user's OWN computed values (a bare
+    # `-e KEY` argv would have inherited the shared supervisor env → smear).
+    monkeypatch.setenv("FEEDLING_API_URL", "http://backend.internal:5001")
+    entry = {"provider_key": "sk-deepseek", "driver": "claude",
+             "provider": "deepseek", "model": "deepseek-chat"}
+    body = spawners.container_env_file_content(entry, user_id="u_a")
+    lines = dict(ln.split("=", 1) for ln in body.splitlines() if ln)
+
+    # per-user secret + claude-wire redirect present with real values
+    assert lines["ANTHROPIC_API_KEY"] == "sk-deepseek"
+    assert lines["ANTHROPIC_BASE_URL"].endswith("/anthropic")
+    assert lines["ANTHROPIC_MODEL"] == "deepseek-chat"
+    # per-user MCP path is the home-pinned one (container home = the volume mount
+    # /agent-data), never the shared /tmp default
+    assert lines["USER_MCP_FILE"] == "/agent-data/user-mcp.json"
+    # GLOBAL values (consumer_env flows them through from base_env) must survive
+    # the env-file build too, or the containerized consumer can't reach backend.
+    assert lines["FEEDLING_API_URL"] == "http://backend.internal:5001"
+
+
+def test_container_env_file_does_not_smear_supervisor_platform_key(monkeypatch):
+    # A keyless host-all claude entry (no provider_key) must NOT inherit the
+    # supervisor's OWN platform ANTHROPIC_API_KEY. The env-file base must be a
+    # narrow global allowlist, NOT dict(os.environ) — otherwise the supervisor's
+    # credentials smear into the "strongly isolated" per-user container and the
+    # keyless agent silently bills the platform key (violates the no-platform-
+    # key host-all invariant).
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-PLATFORM-supervisor")
+    monkeypatch.setenv("CODEX_API_KEY", "cdx-PLATFORM-supervisor")
+    monkeypatch.setenv("FEEDLING_API_URL", "http://backend.internal:5001")
+    body = spawners.container_env_file_content(
+        {"driver": "claude"}, user_id="u_a")  # no provider_key → keyless
+    lines = dict(ln.split("=", 1) for ln in body.splitlines() if ln)
+    assert "ANTHROPIC_API_KEY" not in lines
+    assert "CODEX_API_KEY" not in lines
+    # the intended global value still flows through
+    assert lines["FEEDLING_API_URL"] == "http://backend.internal:5001"
+
+
+def test_container_env_file_drops_newline_injecting_value(monkeypatch):
+    # A decrypted BYOK provider_key with a newline must NOT become an injectable
+    # second env-file line: docker --env-file would parse it as a separate env
+    # var (e.g. HTTP_PROXY) and redirect the agent's outbound calls.
+    body = spawners.container_env_file_content(
+        {"driver": "claude", "provider_key": "sk-abc\nHTTP_PROXY=http://attacker"},
+        user_id="u_a")
+    assert "HTTP_PROXY" not in body
+    assert "attacker" not in body
+    # the poisoned key is dropped, not emitted broken
+    lines = dict(ln.split("=", 1) for ln in body.splitlines() if ln)
+    assert "ANTHROPIC_API_KEY" not in lines

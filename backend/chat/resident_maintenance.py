@@ -23,6 +23,8 @@ from notices import core as notices_core
 SOURCE = "resident_maintenance"
 ERROR_CLASS = "resident_consumer_stale"
 DEDUPE_KEY = "chat:resident_consumer_stale"
+DECRYPT_ERROR_CLASS = "resident_decrypt_source_unavailable"
+DECRYPT_DEDUPE_KEY = "chat:resident_decrypt_source_unavailable"
 log = logging.getLogger("feedling.resident_maintenance")
 
 _MISSING_COMMIT_DEFAULT_SEC = 15 * 60
@@ -117,7 +119,9 @@ def _classify_commit_state(
 
     actual = str(actual_commit or "").strip()
     expected = str(expected_commit or "").strip()
-    previously_active = _active_reason_name(state) in _COMMIT_REASONS
+    previously_active = bool(state.get("commit_notice_active")) or (
+        _active_reason_name(state) in _COMMIT_REASONS
+    )
 
     if not actual:
         state.setdefault("missing_commit_since_epoch", now)
@@ -125,6 +129,7 @@ def _classify_commit_state(
         state.pop("commit_mismatch_since_epoch", None)
         since = _safe_float(state.get("missing_commit_since_epoch"), now)
         if now - since >= missing_sec:
+            state["commit_notice_active"] = True
             return {
                 "reason": "missing_consumer_commit",
                 "kind": "commit_missing",
@@ -134,6 +139,7 @@ def _classify_commit_state(
             }, False
         if _active_reason_name(state) in _COMMIT_REASONS:
             state.pop("active_reason", None)
+        state.pop("commit_notice_active", None)
         return None, previously_active
 
     state.pop("missing_commit_since_epoch", None)
@@ -144,6 +150,7 @@ def _classify_commit_state(
             state["commit_mismatch_since_epoch"] = now
         since = _safe_float(state.get("commit_mismatch_since_epoch"), now)
         if now - since >= mismatch_sec:
+            state["commit_notice_active"] = True
             return {
                 "reason": "consumer_commit_mismatch",
                 "kind": "commit_mismatch",
@@ -153,13 +160,39 @@ def _classify_commit_state(
             }, False
         if _active_reason_name(state) in _COMMIT_REASONS:
             state.pop("active_reason", None)
+        state.pop("commit_notice_active", None)
         return None, previously_active
 
     state.pop("commit_mismatch_key", None)
     state.pop("commit_mismatch_since_epoch", None)
     if _active_reason_name(state) in _COMMIT_REASONS:
         state.pop("active_reason", None)
+    state.pop("commit_notice_active", None)
     return None, previously_active
+
+
+def _classify_decrypt_health(
+    state: dict[str, Any],
+    *,
+    health: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, bool]:
+    """Return an immediate maintenance reason for any non-green decrypt path."""
+    previously_active = bool(state.get("decrypt_health_active"))
+    if health.get("passing") is True:
+        state.pop("decrypt_health_active", None)
+        return None, previously_active
+
+    state["decrypt_health_active"] = True
+    return {
+        "reason": "decrypt_source_unavailable",
+        "kind": "decrypt_health",
+        "decrypt_status": str(health.get("status") or "unknown"),
+        "decrypt_reason": str(health.get("reason") or "decrypt_health_unknown"),
+        "checked_at_epoch": _safe_float(health.get("checked_at_epoch"), 0.0),
+        "health_age_sec": health.get("age_sec"),
+        "expected_commit": "",
+        "actual_commit": "",
+    }, False
 
 
 def _oldest_unclaimed_resident_job(user_id: str, older_than_sec: int) -> dict[str, Any] | None:
@@ -207,11 +240,19 @@ def _prompt_for(reason: Mapping[str, Any], info: Mapping[str, Any]) -> str:
         "missing_consumer_commit": "你的 resident consumer 没有上报 commit，通常说明版本太旧，可能缺少最新的自更新和 resident distill 代码。",
         "consumer_commit_mismatch": "你的 resident consumer 上报的 commit 和当前 backend 期望 commit 不一致，可能卡在旧版本。",
         "awaiting_resident_unclaimed": "Feedling 发现有 resident-only 的蒸馏任务等待超过 15 分钟仍未被 claim，但你的 consumer 正在 poll，通常是 consumer 版本太旧或 distill lane 没有启动。",
+        "decrypt_source_unavailable": "你的 resident 解密源不可用，真实加密消息无法回复。请检查 FEEDLING_ENCLAVE_URL、网络/TLS 与 enclave 内容密钥。",
     }.get(reason_name, "Feedling 发现你的 resident consumer 可能卡在旧版本。")
 
     job_line = ""
     if reason.get("job_id"):
         job_line = f"\n- 等待中的 job_id: {reason['job_id']}"
+    decrypt_lines = ""
+    if reason_name == "decrypt_source_unavailable":
+        decrypt_lines = (
+            f"\n- decrypt_status: {str(reason.get('decrypt_status') or 'unknown')}"
+            f"\n- decrypt_reason: {str(reason.get('decrypt_reason') or '')}"
+            f"\n- decrypt_checked_at_epoch: {str(reason.get('checked_at_epoch') or '<missing>')}"
+        )
     return (
         "【Feedling 系统维护提醒】\n"
         f"{reason_text}\n\n"
@@ -227,11 +268,16 @@ def _prompt_for(reason: Mapping[str, Any], info: Mapping[str, Any]) -> str:
         f"- consumer_id: {str(info.get('consumer_id') or '')}\n"
         f"- actual_commit: {actual or '<missing>'}\n"
         f"- expected_commit: {expected or '<backend-not-advertised>'}"
-        f"{job_line}\n"
+        f"{job_line}{decrypt_lines}\n"
     )
 
 
 def _notice_text(reason: Mapping[str, Any]) -> str:
+    if str(reason.get("reason") or "") == "decrypt_source_unavailable":
+        return (
+            "你的 resident 解密源不可用，真实消息目前无法回复。"
+            "请检查 FEEDLING_ENCLAVE_URL、网络/TLS 和 enclave 密钥配置。"
+        )
     if str(reason.get("reason") or "") == "awaiting_resident_unclaimed":
         return (
             "你的 resident 端正在连接，但版本可能太旧，导致入住/记忆蒸馏任务没有被接走。"
@@ -272,16 +318,22 @@ def _emit_notice(store, *, reason: Mapping[str, Any], prompt: str, delivered: bo
     suffix = "维护提示也已写入聊天，在线 consumer 会像普通用户消息一样收到。" if delivered else (
         "如果 resident 端当前离线，请复制维护提示发给 agent。"
     )
+    decrypt_alert = str(reason.get("reason") or "") == "decrypt_source_unavailable"
     detail = f"{str(reason.get('reason') or '')}; {suffix}"
+    if decrypt_alert:
+        detail = (
+            f"decrypt_source_unavailable; status={str(reason.get('decrypt_status') or 'unknown')}; "
+            f"checked_at={str(reason.get('checked_at_epoch') or '<missing>')}; {suffix}"
+        )
     notices_core.emit(
         store,
         source="chat",
-        error_class=ERROR_CLASS,
+        error_class=DECRYPT_ERROR_CLASS if decrypt_alert else ERROR_CLASS,
         blame="user_environment",
         severity="warning",
         user_text=_notice_text(reason),
         detail=detail,
-        dedupe_key=DEDUPE_KEY,
+        dedupe_key=DECRYPT_DEDUPE_KEY if decrypt_alert else DEDUPE_KEY,
         copyable_prompt=prompt,
     )
 
@@ -326,12 +378,18 @@ def _maybe_handle_poll(
     msg_id = ""
     should_remind = False
     resolved = False
+    decrypt_resolved = False
     reason: dict[str, Any] | None = None
     interval = _env_int("FEEDLING_RESIDENT_MAINTENANCE_REMINDER_SEC", _REMINDER_DEFAULT_SEC, lo=3600)
 
     with store.consumer_state_lock:
         state = chat_consumer._load_consumer_state(store)
         maintenance = _maintenance_state(state.get("resident_maintenance"))
+        health = chat_consumer._decrypt_health_from_state(state, now_epoch=now)
+        decrypt_reason, decrypt_resolved = _classify_decrypt_health(
+            maintenance,
+            health=health,
+        )
         commit_reason, commit_resolved = _classify_commit_state(
             maintenance,
             actual_commit=str(info_map.get("consumer_commit") or ""),
@@ -356,7 +414,8 @@ def _maybe_handle_poll(
                 state["resident_maintenance"] = maintenance
                 chat_consumer._save_consumer_state(store, state)
 
-    reason = commit_reason or fallback
+    reason = decrypt_reason or commit_reason or fallback
+    resolved = resolved or commit_resolved
 
     with store.consumer_state_lock:
         state = chat_consumer._load_consumer_state(store)
@@ -364,13 +423,18 @@ def _maybe_handle_poll(
         if reason is None:
             state["resident_maintenance"] = maintenance
             chat_consumer._save_consumer_state(store, state)
-            resolved = resolved or (
-                commit_resolved and _active_reason_name(maintenance) != _FALLBACK_REASON
-            )
         else:
             reason_key = ":".join(
                 str(reason.get(k) or "")
-                for k in ("reason", "expected_commit", "actual_commit", "job_id")
+                for k in (
+                    "reason",
+                    "decrypt_status",
+                    "decrypt_reason",
+                    "checked_at_epoch",
+                    "expected_commit",
+                    "actual_commit",
+                    "job_id",
+                )
             )
             maintenance["active_reason"] = reason_key
             maintenance["last_reason"] = reason
@@ -385,10 +449,15 @@ def _maybe_handle_poll(
             state["resident_maintenance"] = maintenance
             chat_consumer._save_consumer_state(store, state)
 
+    if decrypt_resolved:
+        notices_core.resolve(store, DECRYPT_DEDUPE_KEY)
     if resolved:
         notices_core.resolve(store, DEDUPE_KEY)
-        return {"triggered": False, "reason": "resolved"}
     if reason is None:
+        if resolved:
+            return {"triggered": False, "reason": "resolved"}
+        if decrypt_resolved:
+            return {"triggered": False, "reason": "decrypt_resolved"}
         return {
             "triggered": False,
             "reason": "fallback_check_skipped" if fallback_skipped else "not_stale",
