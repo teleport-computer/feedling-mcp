@@ -65,6 +65,45 @@ For an image turn, add `image_b64` and `image_mime`. The decoded image limit is
 }
 ```
 
+### Image model selection
+
+An account can either use its main model for images or select a separate saved
+model route as an image observer. Read the current choice with `GET
+/v1/vision/config`, and change it with `PUT /v1/vision/config`:
+
+```json
+{
+  "mode": "dedicated",
+  "route_id": "a0a51b3f-35e0-4335-bf46-fac40bff3789"
+}
+```
+
+Before changing the selection, IO sends the candidate a generated image
+whose answer is not known in advance and verifies the returned observation.
+`mode: "follow_main"` performs the same check for a model-API main route; a VPS
+main model remains owned and validated by that VPS runtime. If a main route is
+known to be text-only and there is no dedicated route, an image send returns
+`409 vision_model_required` before storing the turn.
+
+Use `POST /v1/vision/config` when adding a dedicated image model. It creates or
+reuses the saved route, runs the generated-image check, and selects the route
+as one server-owned operation. When a newly created candidate fails the check,
+its route and newly supplied credential are removed before the error response;
+the rejected candidate never remains in the saved-route list.
+
+When a dedicated route is configured, the resident sends pixels only to that
+route. It asks for a neutral visual observation, marks the result as untrusted
+data, and passes only that text to the main agent. A vision-call failure does
+not fall back to sending the raw image to the main model.
+
+`POST /v1/vision/routes/{route_id}/test` repeats the capability check without
+changing the selection. Each accepted image turn records the dedicated route it
+preflighted. The resident passes that id as `GET /v1/vision/key_envelope?route_id=...`,
+so changing Settings cannot reroute an already queued image. If the pinned route
+was deleted, the turn fails instead of exposing raw pixels to the main model.
+Without `route_id`, the endpoint returns the currently selected route. Both forms
+return the provider credential's encrypted envelope, never the plaintext key.
+
 For a document, use `file_b64`, `file_name`, and `file_mime` instead. The decoded
 file limit is 25 MiB. PDF, DOCX, XLSX, supported images, and UTF-8 text/source
 files are accepted. Send only one binary attachment per turn.

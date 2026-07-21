@@ -1082,7 +1082,7 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
 
 
 def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
-    _, api_key = _register(client)
+    user_id, api_key = _register(client)
 
     monkeypatch.setattr(
         provider_client,
@@ -1100,6 +1100,9 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
+    active = db.model_api_active_route(user_id)
+    assert active is not None
+    assert db.model_api_route_mark_vision_test(user_id, active["id"], status="ok")
 
     # 图片 turn 和文本 turn 一样进入 pooled V2 lane。
     chat = client.post(

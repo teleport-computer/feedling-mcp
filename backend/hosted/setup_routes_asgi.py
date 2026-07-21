@@ -69,6 +69,61 @@ async def model_api_key_envelope(auth: AuthResult = Depends(require_auth)):
     return JSONResponse(body, status_code=status)
 
 
+@router.get("/v1/vision/config")
+async def vision_config_get(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(setup_core.vision_config_get, auth.store)
+    return JSONResponse(body, status_code=status)
+
+
+@router.put("/v1/vision/config")
+async def vision_config_set(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.vision_config_set,
+        auth.store,
+        payload,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/vision/config")
+async def vision_route_configure(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.vision_route_configure,
+        auth.store,
+        payload,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/vision/routes/{route_id}/test")
+async def vision_route_test(route_id: str, request: Request,
+                            auth: AuthResult = Depends(require_auth)):
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.vision_route_test,
+        auth.store,
+        route_id,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/vision/key_envelope")
+async def vision_key_envelope(route_id: str = "", auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(
+        setup_core.vision_key_envelope,
+        auth.store,
+        route_id,
+    )
+    return JSONResponse(body, status_code=status)
+
+
 @router.post("/v1/model_api/test")
 async def model_api_test(request: Request, auth: AuthResult = Depends(require_auth)):
     api_key = auth_core.extract_api_key(request.headers, request.query_params)
