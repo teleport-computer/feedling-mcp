@@ -721,6 +721,11 @@ class TurnDeps:
     # same-timestamp message during rollout.
     read_messages_after_seq: Callable[[str, int], list[dict]] | None = None
     runtime_mode_enabled: Callable[[str], bool] | None = None
+    # (user_id) -> bool：用户的「联网搜索」开关。None / 抛异常 / 非 bool 返回值
+    # 一律按禁用处理（见 web_gate.resolve_user_enabled）。默认 None：worker.py
+    # 自身不 import hosted，测试不必提供；生产装配见
+    # serve_worker.build_production_deps。
+    web_tools_enabled: Callable[[str], bool] | None = None
     # (user_id, after_ts, limit) -> [{"id","ts","role","content"}]：最近窗口，BOTH
     # roles，ts>after_ts，enclave 解密明文（D1：让 turn 能看见真实对话上下文，不再局限于
     # "上次回复之后的 user 消息"那一批）。默认 None：worker.py 自身不 import hosted，

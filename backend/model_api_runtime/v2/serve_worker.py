@@ -2575,6 +2575,11 @@ def build_production_deps() -> v2_worker.TurnDeps:
                 core_store.get_store(user_id)
             )
         ),
+        # ``is True``, never bool(...): strict booleans all the way down, so a
+        # corrupt setting cannot read as web access switched ON.
+        web_tools_enabled=lambda user_id: (
+            core_store.get_store(user_id).load_web_settings().get("enabled") is True
+        ),
         resolve_provider=_resolve_provider,
         mint_enclave_token=_mint_runtime_token,
         read_tail=_read_tail,
