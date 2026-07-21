@@ -4357,6 +4357,16 @@ async def _run_wake(
             trajectory_recorder=trajectory_recorder,
         )
 
+        # Background lane: web is closed regardless of the user's preference.
+        # Computed through the shared decision (rather than hardcoded) so the
+        # offer side and the dispatcher below cannot drift apart.
+        wake_disabled_web_tool_names = v2_web_gate.disabled_web_tools(
+            user_enabled=False,
+            lane=lane,
+            search_halted=True,
+            fetch_halted=True,
+        )
+
         async def _dispatch_tools(tool_calls):
             await _fence_wake_effect("tool dispatch")
 
@@ -4809,6 +4819,15 @@ async def _run_wake(
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
                 build_messages=build_messages,
+                # Background turns never reach the network, whatever the user's
+                # toggle says: searching here adds model rounds, tokens and
+                # latency, and is an outbound data flow the user never
+                # triggered. `lane` is the real variable (heartbeat /
+                # scheduled / manual_wake / screen_watch) — none of them are in
+                # web_gate.FOREGROUND_LANES, so this is always both tools, but
+                # it still goes through the shared decision so a future change
+                # to the lane policy cannot miss this call site.
+                disabled_tool_names=wake_disabled_web_tool_names,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
                 fold_new_messages=fold_new_messages,

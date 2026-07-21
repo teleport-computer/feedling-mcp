@@ -636,3 +636,37 @@ def test_screen_watch_lane_uses_its_own_prompt_and_screen_context(monkeypatch):
     assert '"recent_count":1' in joined
     assert "screen_recent" in {spec.name for spec in seen["tools"]}
     assert _bubbles(uid)[0]["body_ct"] == "你在看这个报错？"
+
+
+# --------------------------------------------------------------- web gate
+
+
+def test_wake_never_offers_web_tools_even_if_the_user_enabled_them(monkeypatch):
+    """Background turns stay offline whatever the settings page says.
+
+    A switch labelled "web search" should not quietly authorise the background
+    companion to go online: it costs the user model rounds, tokens and latency,
+    and it is an outbound data flow they never triggered.
+    """
+    uid = "u_wake_web_gate"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("hey")])
+    deps = _wake_deps(tail=[], sink_calls=[])
+    # Explicitly ON at the user level — the lane must still win.
+    deps.web_tools_enabled = lambda uid_: True
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    offered = {spec.name for spec in (calls[0]["tools"] or ())}
+    assert {"web_search", "web_fetch"}.isdisjoint(offered)
+    # the rest of the wake tool surface is unchanged
+    assert "memory_index" in offered
