@@ -98,7 +98,15 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
     now_iso = datetime.now().isoformat()
     with store.consumer_state_lock:
         state = _load_consumer_state(store)
-        state.update(info)
+        event_info = dict(info)
+        if event_type != "poll":
+            # Decrypt health is a poll-heartbeat contract. Resident response
+            # requests use the static consumer headers and would otherwise
+            # replace the poll's fresh green report with empty/unknown exactly
+            # when verify_loop receives its hidden ack.
+            event_info.pop("decrypt_status", None)
+            event_info.pop("decrypt_checked_at_epoch", None)
+        state.update(event_info)
         state["last_event"] = event_type
         state["last_seen_at"] = now_iso
         state["last_seen_epoch"] = now_epoch
@@ -236,7 +244,9 @@ def _decrypt_health_enforcement_state(
     """Rollout policy for new onboarding versus established residents."""
     now = time.time() if now_epoch is None else float(now_epoch)
     validation = consumer_state or _consumer_validation_state(store, now_epoch=now)
-    health = validation["decrypt_health"]
+    health = validation.get("decrypt_health")
+    if not isinstance(health, dict):
+        health = _decrypt_health_from_state({}, now_epoch=now)
     established = _resident_onboarding_completed(store)
 
     if health["passing"]:

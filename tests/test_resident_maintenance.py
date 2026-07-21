@@ -31,11 +31,62 @@ def _register(client) -> tuple[str, str]:
     return body["user_id"], body["api_key"]
 
 
-def _headers(api_key: str, *, consumer_id: str = "vps-resident-c1", commit: str | None = None):
-    out = {"X-API-Key": api_key, **_HEADERS, "X-Feedling-Consumer-Id": consumer_id}
+def _headers(
+    api_key: str,
+    *,
+    consumer_id: str = "vps-resident-c1",
+    commit: str | None = None,
+    decrypt_status: str = "ok",
+):
+    out = {
+        "X-API-Key": api_key,
+        **_HEADERS,
+        "X-Feedling-Consumer-Id": consumer_id,
+        "X-Feedling-Decrypt-Status": decrypt_status,
+        "X-Feedling-Decrypt-Checked-At": str(resident_maintenance._now()),
+    }
     if commit is not None:
         out["X-Feedling-Consumer-Commit"] = commit
     return out
+
+
+def test_unconfigured_decrypt_source_alerts_on_first_poll(backend_env, monkeypatch):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    now = {"t": 5_000_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+
+    poll = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(
+            api_key,
+            commit="abcdef1234567890",
+            decrypt_status="unconfigured",
+        ),
+    )
+
+    assert poll.status_code == 200, poll.get_data(as_text=True)
+    messages = poll.get_json()["messages"]
+    assert [m["source"] for m in messages] == [resident_maintenance.SOURCE]
+    assert "decrypt_source_unavailable" in captured["plaintext"]
+    assert "decrypt_status: unconfigured" in captured["plaintext"]
+    assert "FEEDLING_ENCLAVE_URL" in captured["plaintext"]
+
+    notices = client.get(
+        "/v1/notices", headers={"X-API-Key": api_key}
+    ).get_json()["notices"]
+    notice = next(
+        n for n in notices
+        if n["dedupe_key"] == resident_maintenance.DECRYPT_DEDUPE_KEY
+    )
+    assert notice["error_class"] == resident_maintenance.DECRYPT_ERROR_CLASS
+    assert "status=unconfigured" in notice["detail"]
+    assert len(
+        [m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE]
+    ) == 1
 
 
 def _fake_shared_envelope(monkeypatch, captured: dict):
@@ -126,11 +177,13 @@ def test_consumer_commit_mismatch_waits_for_floor_before_prompting(backend_env, 
     assert first.get_json()["messages"] == []
 
     now["t"] += 3599
+    headers["X-Feedling-Decrypt-Checked-At"] = str(now["t"])
     early = client.get("/v1/chat/poll?timeout=0", headers=headers)
     assert early.status_code == 200
     assert early.get_json()["messages"] == []
 
     now["t"] += 2
+    headers["X-Feedling-Decrypt-Checked-At"] = str(now["t"])
     late = client.get("/v1/chat/poll?timeout=0", headers=headers)
     assert late.status_code == 200
     messages = late.get_json()["messages"]

@@ -202,8 +202,16 @@ _CONSUMER_HEADERS = {
 }
 
 
+def _consumer_headers() -> dict[str, str]:
+    return {
+        **_CONSUMER_HEADERS,
+        "X-Feedling-Decrypt-Status": "ok",
+        "X-Feedling-Decrypt-Checked-At": str(time.time()),
+    }
+
+
 def _record_consumer_poll(base_url: str, api_key: str) -> None:
-    headers = {"X-API-Key": api_key, **_CONSUMER_HEADERS}
+    headers = {"X-API-Key": api_key, **_consumer_headers()}
     r = requests.get(
         f"{base_url}/v1/chat/poll?since=9999999999&timeout=0.01",
         headers=headers,
@@ -224,6 +232,8 @@ def _chat_response(
     env = _stub_envelope(user_id, "chat-reply")
     headers = {"X-API-Key": api_key}
     if consumer_headers:
+        # Production residents report decrypt health on poll heartbeats. Reply
+        # requests carry only their static consumer identity headers.
         headers.update(_CONSUMER_HEADERS)
     body: dict = {"envelope": env, "alert_body": "hi"}
     if source is not None:
@@ -236,6 +246,21 @@ def _chat_response(
         headers=headers,
         timeout=TIMEOUT,
     )
+
+
+def _claim_pending_verify_ping(base_url: str, api_key: str) -> str:
+    r = requests.get(
+        f"{base_url}/v1/chat/poll?since=0&timeout=1",
+        headers={"X-API-Key": api_key, **_consumer_headers()},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    pings = [
+        m for m in r.json().get("messages", [])
+        if m.get("role") == "user" and m.get("source") == "verify_ping"
+    ]
+    assert pings, r.text
+    return str(pings[-1]["id"])
 
 
 def test_chat_poll_claims_user_message_for_one_consumer(backend):
@@ -254,7 +279,7 @@ def test_chat_poll_claims_user_message_for_one_consumer(backend):
 
     headers_a = {
         "X-API-Key": api_key,
-        "X-Feedling-Consumer": "feedling-chat-resident",
+        **_consumer_headers(),
         "X-Feedling-Consumer-Id": "consumer-a",
     }
     headers_b = {
@@ -302,7 +327,7 @@ def test_chat_response_marks_claimed_user_message_replied(backend):
 
     headers_a = {
         "X-API-Key": api_key,
-        "X-Feedling-Consumer": "feedling-chat-resident",
+        **_consumer_headers(),
         "X-Feedling-Consumer-Id": "consumer-a",
     }
     poll = requests.get(
@@ -412,7 +437,15 @@ def _establish_live_connection(base_url: str, user_id: str, api_key: str) -> dic
 
     def delayed_agent_reply():
         time.sleep(0.5)
-        _chat_response(base_url, user_id, api_key, consumer_headers=True)
+        ping_id = _claim_pending_verify_ping(base_url, api_key)
+        _chat_response(
+            base_url,
+            user_id,
+            api_key,
+            consumer_headers=True,
+            source="verify_ping",
+            reply_to_message_id=ping_id,
+        )
 
     t = threading.Thread(target=delayed_agent_reply)
     t.start()
@@ -955,9 +988,11 @@ def test_chat_verify_loop_marks_live_connection_without_first_message(backend):
         # consumer posts it so in a dedicated branch) — that source is what makes
         # verify_loop's GC remove it from visible history. A bare source="chat"
         # reply is a REAL message and must NOT be GC'd.
+        ping_id = _claim_pending_verify_ping(backend["base_url"], api_key)
         _chat_response(
             backend["base_url"], user_id, api_key,
             consumer_headers=True, source="verify_ping",
+            reply_to_message_id=ping_id,
         )
 
     t = threading.Thread(target=delayed_agent_reply)
@@ -999,6 +1034,10 @@ def test_verify_loop_does_not_gc_real_reply_dangling_pointer(backend):
     """
     base = backend["base_url"]
     user_id, api_key = _register(base)
+    # This regression originated in the hosted supervisor path. Keep that
+    # route explicit: hosted replies are gate-free while verify runs, whereas a
+    # resident ordinary reply must no longer borrow the verify bypass.
+    _select_onboarding_route(base, api_key, "model_api")
     _seed_passing_bootstrap(base, user_id, api_key)
     assert _init_identity(base, user_id, api_key).status_code == 201
     _record_consumer_poll(base, api_key)
@@ -1042,7 +1081,8 @@ def test_verify_loop_does_not_gc_real_reply_dangling_pointer(backend):
         t.join(timeout=12)
 
     assert result.get("status") == 200, result
-    assert result["body"]["passing"] is True, result["body"]
+    assert result["body"]["passing"] is False, result["body"]
+    assert result["body"]["loop_alive"] is False, result["body"]
 
     # The parent turn is marked replied AND its reply row still exists — no
     # dangling pointer. The real reply is visible; only the synthetic ping/ack
@@ -1120,7 +1160,15 @@ def test_verify_reply_allowed_despite_newer_real_user_message(backend):
 
         # Consumer replies to the still-pending ping. Must be accepted even
         # though a real user message is now the most-recent entry.
-        rr = _chat_response(base, user_id, api_key, consumer_headers=True)
+        ping_id = _claim_pending_verify_ping(base, api_key)
+        rr = _chat_response(
+            base,
+            user_id,
+            api_key,
+            consumer_headers=True,
+            source="verify_ping",
+            reply_to_message_id=ping_id,
+        )
         assert rr.status_code == 200, (
             "verify reply 409'd despite a pending verify ping — an "
             "interleaved real user message wedged the live-connection gate: "

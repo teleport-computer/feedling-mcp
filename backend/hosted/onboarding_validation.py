@@ -492,6 +492,10 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
     relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
     relationship_ok = relationship_anchored and bool(relationship_evidence)
     resident = chat_consumer._consumer_validation_state(store)
+    decrypt_health = resident.get("decrypt_health") or (
+        chat_consumer._decrypt_health_from_state({})
+    )
+    decrypt_policy = chat_consumer._decrypt_health_enforcement_state(store, resident)
     chat_loop_ok = boot_gates._chat_loop_verified_by_server(store)
     first_greeting_count = _visible_agent_message_count(store)
     first_greeting_ok = first_greeting_count > 0
@@ -540,6 +544,24 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
             "last_poll_at": resident["last_poll_at"],
             "age_sec": resident["age_sec"],
             "required": resident["required"] if not resident["passing"] else "",
+        },
+        {
+            "id": "decrypt_source",
+            "label": "Resident Decryption",
+            "passing": not decrypt_policy["blocks_onboarding"],
+            "blocking": decrypt_policy["blocks_onboarding"],
+            "warning": decrypt_policy["warning_only"],
+            "status": decrypt_health["status"],
+            "reported_status": decrypt_health["reported_status"],
+            "checked_at_epoch": decrypt_health["checked_at_epoch"],
+            "age_sec": decrypt_health["age_sec"],
+            "reason": decrypt_health["reason"],
+            "policy": decrypt_policy,
+            "required": (
+                decrypt_health["required"]
+                if decrypt_policy["blocks_onboarding"]
+                else ""
+            ),
         },
         {
             "id": "live_loop",
