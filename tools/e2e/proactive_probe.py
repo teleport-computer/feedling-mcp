@@ -251,13 +251,18 @@ def _case_user_turn_priority(c) -> str:
     job = wake.get("job")
     if not isinstance(job, dict) or job.get("lane") != "manual_wake":
         raise _ProbeIssue("PRODUCT_FAIL", f"manual wake not admitted to V2: {wake}")
-    nonce = uuid.uuid4().hex[:10]
-    sent_at, user_id = _send_hosted(c, f"请只回复‘用户优先-{nonce}’，不要添加其他内容。")
+    sent_at, user_id = _send_hosted(
+        c,
+        "我刚看到窗外天色变了，想和你聊两句。你现在会怎么回应我？",
+    )
     reply, rows = _wait_for_correlated_reply(c, user_id, min(started, sent_at))
-    text = _decrypt(c, reply, action="priority reply")
-    if nonce not in text:
-        raise _ProbeIssue("PRODUCT_FAIL", f"correlated chat reply lost nonce: {text[:120]!r}")
+    _decrypt(c, reply, action="priority reply")
     reply_ts = _message_ts(reply)
+    correlated_reply_ids = {
+        str(row.get("reply_message_id") or "")
+        for row in rows
+        if str(row.get("role") or "") == "user" and str(row.get("reply_message_id") or "")
+    }
     earlier_agent = [
         row
         for row in rows
@@ -265,13 +270,17 @@ def _case_user_turn_priority(c) -> str:
         and _message_ts(row) > started
         and _message_ts(row) < reply_ts
         and str(row.get("id") or "") != str(reply.get("id") or "")
+        # A slow reply to an earlier user turn is not the competing wake. Exclude
+        # every agent row that history explicitly correlates to a user message.
+        and not str(row.get("reply_to_message_id") or "")
+        and str(row.get("id") or "") not in correlated_reply_ids
     ]
     if earlier_agent:
         raise _ProbeIssue(
             "PRODUCT_FAIL",
             f"wake produced {len(earlier_agent)} agent message(s) before the user reply",
         )
-    return f"user reply arrived first; wake_job={job.get('id')}; nonce observed"
+    return f"correlated user reply arrived before any uncorrelated wake output; wake_job={job.get('id')}"
 
 
 def _case_proactive_message_quality(c) -> str:

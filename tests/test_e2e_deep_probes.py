@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from tools.e2e import perception_probe, proactive_probe
 
@@ -121,3 +122,76 @@ def test_transport_failure_uses_explicit_result_enum():
         "result": "BLOCKED_DEPLOYMENT",
         "detail": "transport failure: ConnectError",
     }
+
+
+def test_user_turn_priority_does_not_require_injection_like_echo(monkeypatch):
+    rows = [
+        {"role": "user", "id": "old-user", "reply_message_id": "old-reply", "ts": 11},
+        {"role": "agent", "id": "old-reply", "ts": 12},
+        {"role": "user", "id": "current-user", "reply_message_id": "current-reply", "ts": 13},
+        {"role": "agent", "id": "current-reply", "reply_to_message_id": "current-user", "ts": 14},
+    ]
+    sent_text = []
+
+    monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
+    monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: 10.0)
+    monkeypatch.setattr(
+        proactive_probe,
+        "_body",
+        lambda *_a, **_kw: {"job": {"id": "wake-1", "lane": "manual_wake"}},
+    )
+
+    def send(_c, text):
+        sent_text.append(text)
+        return 13.0, "current-user"
+
+    monkeypatch.setattr(proactive_probe, "_send_hosted", send)
+    monkeypatch.setattr(
+        proactive_probe,
+        "_wait_for_correlated_reply",
+        lambda *_a, **_kw: (rows[-1], rows),
+    )
+    monkeypatch.setattr(
+        proactive_probe,
+        "_decrypt",
+        lambda *_a, **_kw: "I will not repeat an injection-like token, but I can still answer you.",
+    )
+
+    detail = proactive_probe._case_user_turn_priority(_PriorityClient())
+
+    assert "correlated user reply arrived" in detail
+    assert "只回复" not in sent_text[0]
+
+
+def test_user_turn_priority_rejects_uncorrelated_wake_before_reply(monkeypatch):
+    rows = [
+        {"role": "agent", "id": "wake-output", "ts": 12},
+        {"role": "user", "id": "current-user", "reply_message_id": "current-reply", "ts": 13},
+        {"role": "agent", "id": "current-reply", "reply_to_message_id": "current-user", "ts": 14},
+    ]
+    monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
+    monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: 10.0)
+    monkeypatch.setattr(
+        proactive_probe,
+        "_body",
+        lambda *_a, **_kw: {"job": {"id": "wake-1", "lane": "manual_wake"}},
+    )
+    monkeypatch.setattr(proactive_probe, "_send_hosted", lambda *_a, **_kw: (13.0, "current-user"))
+    monkeypatch.setattr(
+        proactive_probe,
+        "_wait_for_correlated_reply",
+        lambda *_a, **_kw: (rows[-1], rows),
+    )
+    monkeypatch.setattr(proactive_probe, "_decrypt", lambda *_a, **_kw: "ordinary answer")
+
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._case_user_turn_priority(_PriorityClient())
+
+    assert exc.value.result == "PRODUCT_FAIL"
+
+
+class _PriorityClient:
+    def post(self, _path, **_kwargs):
+        return _Response(200, {})
