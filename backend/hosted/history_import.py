@@ -12,6 +12,7 @@ from typing import Any
 
 
 import db
+from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core.store import UserStore
 
@@ -20,6 +21,7 @@ from accounts import registry
 from bootstrap import gates as boot_gates
 from core import util as core_util
 from identity import service as identity_service
+from identity.user_naming import _naming_rule, sanitize_user_name
 from memory import service as memory_service
 import provider_client
 from hosted import config_store as hosted_config_store
@@ -921,6 +923,89 @@ def _language_instruction(language: str) -> str:
     return "Write every user-visible field in natural English."
 
 
+def _sanitize_import_user_name(value: str) -> str:
+    clean = re.sub(r"\s+", " ", str(value or "")).strip()
+    clean = clean.strip(" `\"'“”‘’。，,.;；:：!！?？")
+    if len(clean) > 80 or any(ch in clean for ch in "\n\r{}[]"):
+        return "TA"
+    return sanitize_user_name(clean)
+
+
+def _existing_import_user_name(store: UserStore, api_key: str | None) -> str:
+    """Best-effort preferred-name read for returning users.
+
+    History import already receives plaintext upload material and uses the same
+    enclave-backed identity merge purpose as Genesis updates.  Keep failures
+    non-fatal: a User Profile can still supply the name, otherwise the canonical
+    unknown-name rule applies.
+    """
+    try:
+        identity = identity_service._load_identity(store)
+        if not isinstance(identity, dict) or not identity.get("body_ct"):
+            return "TA"
+        raw = core_enclave._decrypt_envelope_via_enclave(
+            identity,
+            api_key,
+            purpose="identity_update_merge",
+        )
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            return "TA"
+        return _sanitize_import_user_name(payload.get("user_preferred_name"))
+    except Exception:
+        return "TA"
+
+
+def _extract_import_user_name_with_provider(
+    provider: provider_client.ProviderConfig,
+    support_messages: list[dict],
+) -> str:
+    profiles = _messages_for_source_family(support_messages, _USER_PROFILE_SOURCE)
+    if not profiles:
+        return "TA"
+    sample = _sequential_transcript_sample(profiles, max_chars=7000)
+    if not sample:
+        return "TA"
+    prompt = (
+        "Extract only the person's explicitly self-stated preferred name from this User Profile. "
+        "A valid result requires first-person evidence such as 'my name is X', 'call me X', or an "
+        "unambiguous profile name field for the person. Do not use an AI companion name, account "
+        "handle, filename, third-party name, inferred legal name, title, pronoun, or system label. "
+        "If no preferred name is explicit, return an empty string. Return JSON only as "
+        "{\"user_preferred_name\":\"...\"}.\n\nUser Profile:\n"
+        + sample
+    )
+    result = provider_client.chat_completion(
+        provider,
+        [
+            {"role": "system", "content": "You extract one explicitly stated preferred name into strict JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=120,
+        temperature=0.0,
+        timeout=20.0,
+    )
+    parsed = core_util._json_from_model_text(result.get("reply") or "")
+    if not isinstance(parsed, dict):
+        return "TA"
+    return _sanitize_import_user_name(parsed.get("user_preferred_name"))
+
+
+def _resolve_import_user_name(
+    store: UserStore,
+    api_key: str | None,
+    provider: provider_client.ProviderConfig,
+    support_messages: list[dict],
+) -> tuple[str, list[str]]:
+    existing = _existing_import_user_name(store, api_key)
+    if existing != "TA":
+        return existing, []
+    try:
+        return _extract_import_user_name_with_provider(provider, support_messages), []
+    except Exception as e:
+        return "TA", [f"provider_user_name_resolution_failed:{type(e).__name__}:{str(e)[:120]}"]
+
+
 def _english_only_for_zh(text: str) -> bool:
     raw = str(text or "")
     return bool(re.search(r"[A-Za-z]{4,}", raw)) and not re.search(r"[\u4e00-\u9fff]", raw)
@@ -1701,7 +1786,7 @@ def _candidate_memory_type(candidate: dict) -> str:
     return "event"
 
 
-def _candidate_bucket(candidate: dict) -> str:
+def _candidate_bucket(candidate: dict, user_name: str = "") -> str:
     subject = str(candidate.get("subject") or "")
     ctype = str(candidate.get("candidate_type") or "")
     if subject == "ai" or ctype == "ai_character":
@@ -1710,14 +1795,27 @@ def _candidate_bucket(candidate: dict) -> str:
         return "我们的关系"
     if ctype in {"preference", "boundary", "communication_style"}:
         return "偏好与边界"
-    return "用户画像"
+    name = _sanitize_import_user_name(user_name)
+    return f"关于{name}" if name != "TA" else "关于对方"
+
+
+_CANDIDATE_THREAD_LABELS = {
+    "user_fact": "个人信息",
+    "preference": "偏好",
+    "boundary": "边界",
+    "relationship_event": "共同经历",
+    "emotional_pattern": "情绪模式",
+    "communication_style": "沟通方式",
+    "conflict_repair": "冲突与修复",
+    "ai_character": "AI 角色",
+    "external_memory": "外部记忆",
+}
 
 
 def _candidate_threads(candidate: dict) -> list[str]:
     values = [
         str(candidate.get("title") or "").strip(),
-        str(candidate.get("candidate_type") or "").strip(),
-        str(candidate.get("subject") or "").strip(),
+        _CANDIDATE_THREAD_LABELS.get(str(candidate.get("candidate_type") or ""), ""),
     ]
     out: list[str] = []
     for value in values:
@@ -1739,6 +1837,49 @@ def _memory_card_content(card: dict) -> str:
     ])
 
 
+def _rewrite_candidate_person_reference(text: str, subject: str, user_name: str) -> str:
+    """Guard final prose against the common system-label leak."""
+    raw = str(text or "")
+    if not raw:
+        return raw
+    name = _sanitize_import_user_name(user_name)
+    zh_referent = name if name != "TA" else "对方"
+    en_referent = name if name != "TA" else "The person"
+    raw = re.sub(r"(?i)\bthe user\b", en_referent, raw)
+    raw = re.sub(
+        r"(?i)\buser(?=\s+(?:is|has|was|wants|needs|likes|prefers|often|usually|always|never|can|will|works|writes|feels|said|asked)\b)",
+        en_referent,
+        raw,
+    )
+    raw = raw.replace("用户", zh_referent)
+    if str(subject or "") == "user":
+        raw = re.sub(
+            r"(^|[。！？.!?]\s*)(?:TA|你|他|她)(?=[\u4e00-\u9fff])",
+            lambda match: match.group(1) + zh_referent,
+            raw,
+        )
+        raw = re.sub(
+            r"(?i)(^|[.!?]\s+)(?:you|he|she)\b",
+            lambda match: match.group(1) + en_referent,
+            raw,
+        )
+    return raw
+
+
+def _candidate_source_context(candidate: dict) -> str:
+    labels = {
+        _AI_PERSONA_SOURCE: "ai_persona",
+        _USER_PROFILE_SOURCE: "profile",
+        _MEMORY_SUMMARY_SOURCE: "memory_summary",
+        _HISTORY_SOURCE: "chat_history",
+        _FRESH_START_SOURCE: "fresh_start",
+    }
+    return ",".join(
+        labels.get(str(source), "imported_material")
+        for source in (candidate.get("source_families") or [])
+    )
+
+
 def _render_candidates_to_memory_cards(
     candidates: list[dict],
     relationship_start: date,
@@ -1746,6 +1887,7 @@ def _render_candidates_to_memory_cards(
     *,
     language: str = "en",
     max_cards: int | None = None,
+    user_name: str = "",
 ) -> list[dict]:
     merged = _merge_import_candidates(candidates)
     quotas = {
@@ -1772,14 +1914,28 @@ def _render_candidates_to_memory_cards(
         occurred = str(c.get("first_seen_at") or "").strip()
         if not identity_service._parse_iso_calendar_date(occurred):
             occurred = ""
-        summary = str(c.get("summary") or "")[:1200]
+        rendered_candidate = dict(c)
+        rendered_candidate["title"] = _rewrite_candidate_person_reference(
+            str(c.get("title") or ""),
+            str(c.get("subject") or ""),
+            user_name,
+        )
+        summary = _rewrite_candidate_person_reference(
+            str(c.get("summary") or ""),
+            str(c.get("subject") or ""),
+            user_name,
+        )[:1200]
         context = (
             f"distilled from {len(c.get('chunk_ids') or [])} source window(s); "
-            f"sources={','.join(str(s) for s in (c.get('source_families') or []))}; "
+            f"sources={_candidate_source_context(c)}; "
             f"score={float(c.get('score') or _candidate_score(c)):.1f}"
         )
         quotes = c.get("evidence_quotes") or []
-        quote = str(quotes[0])[:500] if quotes else ""
+        quote = _rewrite_candidate_person_reference(
+            str(quotes[0]),
+            str(c.get("subject") or ""),
+            user_name,
+        )[:500] if quotes else ""
         body = {
             "summary": summary[:500],
             "content": "\n".join([
@@ -1787,8 +1943,8 @@ def _render_candidates_to_memory_cards(
                 f"上下文: {quote or context}",
                 "使用提示: 自然使用这条记忆，不要机械复述。",
             ]),
-            "bucket": _candidate_bucket(c),
-            "threads": _candidate_threads(c),
+            "bucket": _candidate_bucket(rendered_candidate, user_name),
+            "threads": _candidate_threads(rendered_candidate),
             "importance": max(0.1, min(1.0, float(c.get("confidence") or 0.55))),
             "pulse": 0.7 if "emotional_peak" in set(str(s) for s in (c.get("importance_signals") or [])) else 0.3,
             "occurred_at": occurred,
@@ -1832,6 +1988,7 @@ def _memory_candidate_extraction_prompt(
     per_window_target: int,
     relationship_start: date,
     language: str,
+    user_name: str = "",
 ) -> str:
     sample = str(window.get("text") or "")
     source_families = ", ".join(str(s) for s in (window.get("source_families") or [])) or "history_import"
@@ -1850,6 +2007,9 @@ def _memory_candidate_extraction_prompt(
         "Memory Summary is a high-recall migration source, so split every meaningful durable detail into candidates instead of returning empty just because the material is already summarized; "
         "Chat History is evidence for lived exchanges and relationship patterns. "
         "Never treat User Profile facts as the AI companion's identity, name, or self-description. "
+        f"Person-reference rule for every prose field: {_naming_rule(user_name)} "
+        "The schema value subject=user is a machine-readable type label and must remain exactly user; "
+        "the rule applies to title and summary prose, not schema enum values. "
         "Do not make one candidate per message; merge repeated details inside this window. "
         f"{_language_instruction(language)} "
         "If dates are unclear, leave first_seen_at and last_seen_at empty."
@@ -1883,6 +2043,7 @@ def _repair_candidate_json_with_provider(
     window_id: str,
     language: str,
     source_families: list[str] | None = None,
+    user_name: str = "",
 ) -> list[dict]:
     prompt = (
         "The previous model response was not valid JSON for Feedling memory candidate extraction. "
@@ -1892,6 +2053,8 @@ def _repair_candidate_json_with_provider(
         "\"evidence_quotes\":[\"short exact quote if available\"],\"first_seen_at\":\"YYYY-MM-DD or empty string\",\"last_seen_at\":\"YYYY-MM-DD or empty string\","
         "\"importance_signals\":[\"explicit_memory|repeated|emotional_peak|relationship_boundary|future_utility\"],\"confidence\":0.0}]}. "
         "Return JSON only. Drop raw JSON metadata, generic tasks, and filler. "
+        f"For title and summary prose, follow this person-reference rule: {_naming_rule(user_name)} "
+        "Keep subject=user as the schema enum; it is not user-visible prose. "
         f"{_language_instruction(language)} "
         f"If dates are unclear, leave first_seen_at and last_seen_at empty.\n\nPrevious response:\n{str(raw_reply or '')[:12000]}"
     )
@@ -1920,6 +2083,7 @@ def _extract_memory_candidates_with_provider(
     *,
     per_window_target: int,
     language: str = "en",
+    user_name: str = "",
     on_progress=None,
 ) -> tuple[list[dict], list[str]]:
     warnings: list[str] = []
@@ -1933,6 +2097,7 @@ def _extract_memory_candidates_with_provider(
             per_window_target=per_window_target,
             relationship_start=relationship_start,
             language=language,
+            user_name=user_name,
         )
         reply = ""
         try:
@@ -1965,6 +2130,7 @@ def _extract_memory_candidates_with_provider(
                         window_id=str(window.get("id") or idx),
                         language=language,
                         source_families=source_families,
+                        user_name=user_name,
                     )
                     all_candidates.extend(repaired_candidates)
                     warnings.append(f"provider_candidate_json_repaired_window_{idx}:{len(repaired_candidates)}")
@@ -1981,6 +2147,7 @@ def _extract_memory_candidates_with_provider(
                         per_window_target=max(2, per_window_target // 2),
                         relationship_start=relationship_start,
                         language=language,
+                        user_name=user_name,
                     )
                     try:
                         retry_result = provider_client.chat_completion(
@@ -2087,6 +2254,7 @@ def _fallback_memory_cards(
     story_needed: int,
     about_needed: int,
     language: str = "en",
+    user_name: str = "",
 ) -> list[dict]:
     cards: list[dict] = []
     story_pool: list[dict] = []
@@ -2131,6 +2299,9 @@ def _fallback_memory_cards(
     story_items = expand(story_pool, story_needed)
     while story_needed > 0 and idx < len(story_items):
         msg, content = story_items[idx]
+        family = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
+        if family in {_MEMORY_SUMMARY_SOURCE, _USER_PROFILE_SOURCE}:
+            content = _rewrite_candidate_person_reference(content, "user", user_name)
         mem_type = story_types[idx % len(story_types)]
         title = _natural_import_title(content, mem_type, language)
         cards.append({
@@ -2149,6 +2320,9 @@ def _fallback_memory_cards(
     about_items = expand(about_pool, about_needed)
     while about_needed > 0 and idx < len(about_items):
         msg, content = about_items[idx]
+        family = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
+        if family in {_MEMORY_SUMMARY_SOURCE, _USER_PROFILE_SOURCE}:
+            content = _rewrite_candidate_person_reference(content, "user", user_name)
         mem_type = about_types[idx % len(about_types)]
         title = _natural_import_title(content, mem_type, language)
         cards.append({
@@ -2229,6 +2403,7 @@ def _ensure_import_minimum_cards(
     min_story: int = 1,
     min_about: int = 1,
     language: str = "en",
+    user_name: str = "",
 ) -> list[dict]:
     counts = _memory_counts_for_cards(cards)
     story_needed = max(0, min_story - counts["story"])
@@ -2240,6 +2415,7 @@ def _ensure_import_minimum_cards(
             story_needed=story_needed,
             about_needed=about_needed,
             language=language,
+            user_name=user_name,
         )
     return _dedupe_memory_cards(cards)
 
@@ -2866,6 +3042,13 @@ def _process_history_import_sync(
     )
     import_targets = _import_memory_targets(history_messages, support_messages, profile)
     language = _import_language_for_store(store, analysis_messages)
+    user_name, name_warnings = _resolve_import_user_name(
+        store,
+        api_key,
+        runtime,
+        support_messages,
+    )
+    warnings.extend(name_warnings)
     windows = _build_transcript_windows(
         analysis_messages,
         max_chars=18000,
@@ -2913,6 +3096,7 @@ def _process_history_import_sync(
         "persona_chars": int(source_stats.get(_USER_PROFILE_SOURCE, {}).get("chars") or 0),
         "memory_summary_chars": int(source_stats.get(_MEMORY_SUMMARY_SOURCE, {}).get("chars") or 0),
         "import_language": language,
+        "user_name_resolved": user_name != "TA",
         "relationship_started_at": relationship_start.isoformat(),
         "relationship_days": days,
         "import_targets": import_targets,
@@ -2951,6 +3135,7 @@ def _process_history_import_sync(
         relationship_start,
         per_window_target=per_window_target,
         language=language,
+        user_name=user_name,
         on_progress=initial_progress,
     )
     warnings.extend(provider_warnings)
@@ -2961,6 +3146,7 @@ def _process_history_import_sync(
         import_targets,
         language=language,
         max_cards=int(import_targets.get("total") or 12),
+        user_name=user_name,
     )
     cards = _ensure_import_minimum_cards(
         cards,
@@ -2969,6 +3155,7 @@ def _process_history_import_sync(
         min_story=min(1, int(import_targets.get("story") or 0)),
         min_about=min(1, int(import_targets.get("about_me") or 0)),
         language=language,
+        user_name=user_name,
     )
     cards = _sort_memory_cards_newest_first(cards)
 
@@ -2996,6 +3183,8 @@ def _process_history_import_sync(
 
     identity_payload, id_warnings = _derive_identity_with_provider(runtime, analysis_messages, cards, days, language)
     warnings.extend(id_warnings)
+    if user_name != "TA":
+        identity_payload["user_preferred_name"] = user_name
     _update_history_job_phase(
         store,
         job,
@@ -3075,6 +3264,7 @@ def _process_history_import_sync(
                 relationship_start,
                 per_window_target=max(3, min(7, per_window_target - 1)),
                 language=language,
+                user_name=user_name,
                 on_progress=background_progress,
             )
             warnings.extend(bg_warnings)
@@ -3085,6 +3275,7 @@ def _process_history_import_sync(
                 import_targets,
                 language=language,
                 max_cards=int(import_targets.get("total") or 120),
+                user_name=user_name,
             )
             additional_cards = _new_cards_only(cards, all_cards)
             additional_cards = _sort_memory_cards_newest_first(additional_cards)

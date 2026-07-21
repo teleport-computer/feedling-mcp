@@ -44,17 +44,19 @@ def test_prompt_naming_rule_and_backfill_instruction():
     assert "不要用「TA」指代对方" in flat
     # Backfill is scoped: only TA that refers to the PERSON gets rewritten;
     # TA correctly referring to the AI (the app-surface meaning) is preserved.
-    assert '把指代对方本人的"用户"/"user"/「TA」改成正确称呼' in flat
+    assert '指代对方本人的"用户"/"user"/「TA」/「你」/猜测性别的他或她' in flat
+    assert "名字未知时优先省略主语" in flat
+    assert "中性的「对方」" in flat
     assert "指代你（AI）的「TA」" in flat and "保留不动" in flat
     p2 = build_dream_prompt(ai_name="", user_name="", cards="", recent_conversations="")
-    assert "你们关系里自然的称呼" in p2
+    assert "优先省略主语" in p2
 
 
 def test_reserved_placeholder_user_name_treated_as_unknown():
     p = build_dream_prompt(
         ai_name="", user_name="用户", cards="", recent_conversations="",
     )
-    assert "你们关系里自然的称呼" in p
+    assert "优先省略主语" in p
     assert "就用「用户」" not in p
 
 

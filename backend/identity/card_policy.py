@@ -12,6 +12,8 @@ gates. Blocking on them would hurt onboarding success rate.
 """
 from __future__ import annotations
 
+from identity.user_naming import sanitize_user_name
+
 # Single source of truth. backend/identity/service.py imports this.
 RUNTIME_LABELS: frozenset[str] = frozenset({
     "io", "feedling", "p0", "p-zero",
@@ -134,6 +136,12 @@ def validate_profile_patch(patch: dict) -> tuple[bool, str]:
             return (False, "agent_name_empty")
         if is_runtime_label(name):
             return (False, "agent_name_is_runtime_label")
+    if "user_preferred_name" in patch:
+        name = str(patch.get("user_preferred_name") or "").strip()
+        if not name:
+            return (False, "user_preferred_name_empty")
+        if sanitize_user_name(name) == "TA":
+            return (False, "user_preferred_name_is_reserved")
     if "dimensions" in patch:
         return validate_dimensions_structure(patch.get("dimensions"))
     return _OK
