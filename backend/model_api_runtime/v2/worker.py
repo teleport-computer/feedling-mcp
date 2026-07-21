@@ -2194,6 +2194,7 @@ def _make_task_batch_dispatcher(
     enclave_sem: asyncio.Semaphore,
     trusted_system_blocks: tuple[str, ...],
     add_usage: Callable[[dict | None], None],
+    disabled_web_tool_names: frozenset[str] = v2_web_gate.WEB_TOOL_NAMES,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
 ) -> Callable[[list], Awaitable[list[ToolResult]]]:
     """Bind the concrete, read-only child loop for one parent turn.
@@ -2253,9 +2254,23 @@ def _make_task_batch_dispatcher(
 
             child_tool_event = _make_tool_trajectory_callback(child_recorder)
             child_read_gate = asyncio.Semaphore(MAX_READ_ACTION_PARALLELISM)
+            # Computed ONCE and referenced by both the offer side
+            # (disabled_tool_names below) and the execute side
+            # (_child_dispatch). Deriving each independently is precisely how
+            # the two halves of a gate drift apart.
+            #
+            # The child inherits the PARENT LANE's decision, not the raw user
+            # preference: a subagent spawned from a wake turn stays offline
+            # even for a user who enabled web search.
+            child_allowed_tools = _SUBAGENT_ALLOWED_TOOLS - set(
+                disabled_web_tool_names
+            )
+            child_disabled_tools = _SUBAGENT_DISABLED_TOOLS | frozenset(
+                disabled_web_tool_names
+            )
 
             async def _child_dispatch(tool_calls) -> list[ToolResult]:
-                if any(tc.name not in _SUBAGENT_ALLOWED_TOOLS for tc in tool_calls):
+                if any(tc.name not in child_allowed_tools for tc in tool_calls):
                     # The child loop validates against its offered catalog before
                     # calling this closure. This is a second fail-closed boundary
                     # for direct/broken-relay invocations.
@@ -2344,7 +2359,7 @@ def _make_task_batch_dispatcher(
                 add_usage=_charge_child_usage,
                 max_calls=_SUBAGENT_MAX_LLM_CALLS,
                 before_provider_call=budget.before_provider_call,
-                disabled_tool_names=_SUBAGENT_DISABLED_TOOLS,
+                disabled_tool_names=child_disabled_tools,
                 allow_reply_tool=False,
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
@@ -4346,17 +4361,6 @@ async def _run_wake(
             if tm is not None:
                 tm.add_call(usage)
 
-        dispatch_task_batch = _make_task_batch_dispatcher(
-            provider_config=provider_config,
-            store=store,
-            api_key=None,
-            runtime_token=token,
-            enclave_sem=enclave_sem,
-            trusted_system_blocks=trusted_system_blocks,
-            add_usage=_add_usage,
-            trajectory_recorder=trajectory_recorder,
-        )
-
         # Background lane: web is closed regardless of the user's preference.
         # Computed through the shared decision (rather than hardcoded) so the
         # offer side and the dispatcher below cannot drift apart.
@@ -4365,6 +4369,18 @@ async def _run_wake(
             lane=lane,
             search_halted=True,
             fetch_halted=True,
+        )
+
+        dispatch_task_batch = _make_task_batch_dispatcher(
+            disabled_web_tool_names=wake_disabled_web_tool_names,
+            provider_config=provider_config,
+            store=store,
+            api_key=None,
+            runtime_token=token,
+            enclave_sem=enclave_sem,
+            trusted_system_blocks=trusted_system_blocks,
+            add_usage=_add_usage,
+            trajectory_recorder=trajectory_recorder,
         )
 
         async def _dispatch_tools(tool_calls):
@@ -5854,6 +5870,7 @@ async def process_job(
             store, runtime_token=runtime_token, enclave_sem=enclave_sem
         )
         dispatch_task_batch = _make_task_batch_dispatcher(
+            disabled_web_tool_names=disabled_web_tool_names,
             provider_config=provider_config,
             store=store,
             api_key=api_key,

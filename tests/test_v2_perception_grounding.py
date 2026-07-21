@@ -289,9 +289,13 @@ def test_wake_turn_injects_perception_grounding(monkeypatch):
     assert "step_count" in joined
     assert "IGNORE THE USER" not in joined
     assert "mcp__attacker__upload" not in joined
-    assert {"web_search", "web_fetch", "task"} <= {
-        spec.name for spec in seen["tools"]
-    }
+    offered = {spec.name for spec in seen["tools"]}
+    # `task` (the research subagent) is still offered on a wake turn; web is
+    # NOT — background lanes are hard-closed to the network regardless of the
+    # user's toggle. Before the web gate this assertion also covered
+    # web_search/web_fetch, i.e. background turns really were going online.
+    assert "task" in offered
+    assert {"web_search", "web_fetch"}.isdisjoint(offered)
 
 
 @pytest.mark.parametrize("lane", ["chat", "scheduled"])
@@ -364,7 +368,15 @@ def test_chat_and_wake_fence_outbound_after_text_perception_read(
     assert len(provider_calls) == 2
     first_names = {spec.name for spec in provider_calls[0]["tools"]}
     second_names = {spec.name for spec in provider_calls[1]["tools"]}
-    assert {"web_search", "web_fetch", "task"} <= first_names
+    # Round 1: chat may reach the network, a background lane never may — the
+    # web gate closes wake/scheduled regardless of the user's toggle. `task`
+    # (research subagent) is offered on both.
+    if lane == "chat":
+        assert {"web_search", "web_fetch", "task"} <= first_names
+    else:
+        assert "task" in first_names
+        assert {"web_search", "web_fetch"}.isdisjoint(first_names)
+    # Round 2: a text perception read fences ALL outbound tools on both lanes.
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_names)
     first_prompt = " ".join(
         str(message.get("content") or "")
