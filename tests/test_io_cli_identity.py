@@ -30,6 +30,32 @@ def test_identity_write_payload_empty_is_none():
     assert io_cli._identity_write_payload(None, []) is None
 
 
+def test_identity_write_payload_agent_name():
+    """Renaming is the whole point of --agent-name.
+
+    Regression: the agent had no way to express a rename. Asked "改个名字叫老6"
+    it could only rewrite self_introduction ("我是老6…"), so the card kept the old
+    agent_name while the agent cheerfully reported success — a silent no-op the
+    user only catches by looking at the identity card.
+    """
+    p = io_cli._identity_write_payload(None, [], "老6")
+    assert p == {"action": {"type": "identity.profile_patch", "patch": {"agent_name": "老6"}}}
+
+
+def test_identity_write_payload_agent_name_with_other_fields():
+    patch = io_cli._identity_write_payload("我是老6，老Z的专属伙伴", ["随时候着"], "老6")["action"]["patch"]
+    assert patch == {
+        "agent_name": "老6",
+        "self_introduction": "我是老6，老Z的专属伙伴",
+        "signature": ["随时候着"],
+    }
+
+
+def test_identity_write_payload_agent_name_omitted_is_unchanged():
+    """Not passing --agent-name must leave the patch byte-identical to before."""
+    assert io_cli._identity_write_payload("hi", [], None)["action"]["patch"] == {"self_introduction": "hi"}
+
+
 def test_identity_init_payload_fresh_start_and_sanitize():
     from io_cli import _identity_init_payload
     body = _identity_init_payload(

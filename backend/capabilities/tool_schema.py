@@ -44,11 +44,12 @@ PARAMS: dict[str, dict] = {
     # identity.get(store, ...): ignores params entirely.
     "identity_get": _NO_ARGS,
     # identity.patch(store, ...): params.get("patch") (dict), else falls back to
-    # top-level self_introduction/signature strings.
+    # top-level agent_name/self_introduction/signature strings.
     "identity_patch": {
         "type": "object",
         "properties": {
             "patch": {"type": "object"},
+            "agent_name": _STR,
             "self_introduction": _STR,
             "signature": _STR,
         },
@@ -233,7 +234,12 @@ for _parameters in PARAMS.values():
 
 DESCRIPTIONS: dict[str, str] = {
     "identity_get": "Read the persona's current identity/profile fields.",
-    "identity_patch": "Update the persona's identity/profile (self_introduction, signature, or an explicit patch object).",
+    "identity_patch": ("Update the persona's own identity/profile. Use 'agent_name' "
+                       "when the user renames you — that is the name shown to them, "
+                       "and rewriting only 'self_introduction' does NOT rename you. "
+                       "Pass both when the new name should also appear in how you "
+                       "introduce yourself, and only act on an explicit request. "
+                       "Also accepts 'signature' or an explicit 'patch' object."),
     "memory_index": "List recent memory cards, optionally capped by limit.",
     "memory_search": "Keyword-search memory cards by a required query string.",
     "memory_fetch": "Fetch specific memory cards by their ids.",
@@ -344,12 +350,17 @@ def validate_tool_args(name: str, args) -> str | None:
     if error:
         return error
     if name == "identity_patch":
-        has_patch = isinstance(args.get("patch"), dict) and bool(args["patch"])
-        has_top_level = any(
-            isinstance(args.get(field), str) and bool(args[field].strip())
-            for field in ("self_introduction", "signature")
-        )
-        if not has_patch and not has_top_level:
+        # Run the SAME merge the capability runs, so a call that validates here can't
+        # quietly lose a field later. Import direction is safe: registry already pulls
+        # capabilities.identity, and tool_schema imports registry.
+        # Same normalization the capability applies, so the pre-enqueue emptiness
+        # check and the actual payload can't disagree. It never rejects: this
+        # function also gates replay of already-persisted effects, where a new
+        # rejection rule would turn a legal-when-written payload into a retry loop
+        # (see capabilities.identity.merge_patch_fields).
+        from capabilities import identity as cap_identity
+        merged = cap_identity.merge_patch_fields(args)
+        if not any((v.strip() if isinstance(v, str) else v) for v in merged.values()):
             return "identity_patch requires a non-empty patch or profile field"
     if name == "memory_write":
         actions = args.get("actions") or []
