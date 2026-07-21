@@ -291,6 +291,11 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
     # cut, and the text cap right here. A model told `truncated: false` while the
     # tail was silently dropped would read "not on this page" into a fact that
     # simply was not in the part it got.
-    return ok(data={"url": current_url,
-                    "text": capped,
-                    "truncated": truncated or capped != text})
+    # Key order matters and is load-bearing. Downstream this dict is json-dumped
+    # and hard-cut at executor._RESULT_CHAR_CAP (2000), so anything placed after
+    # `text` is simply not delivered — a `truncated` flag at the end reached the
+    # model exactly never. The flag is what stops "absent from the part I read"
+    # from being reported as "absent from the page", so it goes first.
+    return ok(data={"truncated": truncated or capped != text,
+                    "url": current_url,
+                    "text": capped})

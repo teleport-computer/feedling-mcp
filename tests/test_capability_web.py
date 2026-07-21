@@ -426,3 +426,20 @@ def test_web_actions_are_read_actions():
     assert "web_fetch" in cap_registry.READ_ACTIONS
     assert "web_search" not in cap_registry.WRITE_ACTIONS
     assert "web_fetch" not in cap_registry.WRITE_ACTIONS
+
+
+def test_truncated_is_delivered_before_the_text_so_it_survives_the_result_cap(monkeypatch):
+    """Key order is load-bearing, not cosmetic.
+
+    The dict is json-dumped and hard-cut at executor._RESULT_CHAR_CAP (2000)
+    before it reaches the model. With `truncated` last it was cut off every
+    single time on exactly the pages where it mattered — the long ones.
+    """
+    import json as _json
+
+    monkeypatch.setattr(cap_web, "_stream_get",
+                        lambda *a, **k: _FakeResponse(
+                            status_code=200, text="<p>" + ("word " * 5_000) + "</p>"))
+    r = cap_web.fetch("STORE", params={"url": "https://example.com/long"})
+    assert list(r.data)[0] == "truncated"
+    assert "truncated" in _json.dumps(r.data, ensure_ascii=False)[:2000]
