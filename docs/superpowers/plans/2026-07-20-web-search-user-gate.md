@@ -34,6 +34,14 @@
   （`:109` 起）；DB-backed 的不要加（会把无库机器的优雅跳过变成硬收集错误）。
 - 本地已有 Postgres（`feedling-test-pg`，`127.0.0.1:55432`，
   `postgres/test`），conftest 默认就指向它，**全量测试可以本地跑**。
+- **Task 5–9 是不可分割的运行时原子组。** 每个 task 仍各自一个 commit，但：
+  - 不得把中间状态 cherry-pick 到任何环境
+  - 5–9 未全部完成，PR 不得标 ready
+  - backend release 必须包含 5–10 的全部内容
+
+  理由：只合到 5，wake 与子 agent 仍无门禁（用户关了开关，后台还能搜）；
+  合到 8 但没有 9，后端默认关已生效却**没有任何 API 能打开它**。
+  Task 1–4 是不产生任何行为的基础设施，可以独立存在。
 - 每个 Task 结束时提交，message 末尾加
   `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`。
 
@@ -127,10 +135,29 @@ def test_unknown_keys_are_dropped(store):
     assert "evil" not in store.save_web_settings({"enabled": True, "evil": "x"})
 
 
-@pytest.mark.parametrize("raw,expected", [
-    ("yes", True), ("", False), (1, True), (0, False), (None, False)])
-def test_enabled_is_coerced_to_bool(store, raw, expected):
-    assert store.save_web_settings({"enabled": raw})["enabled"] is expected
+@pytest.mark.parametrize("bad", ["yes", "no", "true", "false", "", 1, 0, None, []])
+def test_non_bool_input_is_rejected(store, bad):
+    """严格布尔:绝不 bool() 强转。bool("no") is True —— 用户说不要,却被开启。"""
+    with pytest.raises(ValueError):
+        store.save_web_settings({"enabled": bad})
+
+
+def test_only_real_bools_accepted(store):
+    assert store.save_web_settings({"enabled": True})["enabled"] is True
+    assert store.save_web_settings({"enabled": False})["enabled"] is False
+
+
+def test_corrupt_stored_value_reads_as_disabled(store):
+    """历史/腐坏 blob 里的非 bool 值 fail closed。"""
+    store._saved_blobs[("u-web-settings-test", WEB_SETTINGS_BLOB)] = {"enabled": "yes"}
+    assert store.load_web_settings()["enabled"] is False
+
+
+def test_load_rebuilds_the_contract_and_drops_unknown_fields(store):
+    """不要 {**default, **doc} —— 历史 blob 的未知字段会泄漏进 contract。"""
+    store._saved_blobs[("u-web-settings-test", WEB_SETTINGS_BLOB)] = {
+        "enabled": True, "version": 99, "legacy_junk": "x"}
+    assert store.load_web_settings() == {"version": 1, "enabled": True}
 
 
 def test_empty_or_non_dict_patch_keeps_current(store):
@@ -159,7 +186,7 @@ def test_load_survives_storage_errors(store, monkeypatch):
 ```
 python3 -m pytest tests/test_web_settings_store.py --collect-only -q
 ```
-Expected：列出 11 个 test（**若为 0，先修白名单**）
+Expected：列出 19 个 test（10 个函数，其中 1 个 9 参数化）。**若为 0，先修白名单**
 
 ```
 python3 -m pytest tests/test_web_settings_store.py -q
@@ -190,19 +217,26 @@ WEB_SETTINGS_BLOB = "web_settings"
         try:
             doc = db.get_blob(self.user_id, WEB_SETTINGS_BLOB)
             if isinstance(doc, dict):
-                merged = {**default, **doc}
-                merged["version"] = 1
-                merged["enabled"] = bool(merged.get("enabled", False))
-                return merged
+                # Rebuild the contract; never spread the stored doc — a historic
+                # blob's unknown fields would otherwise leak into the response.
+                # ``is True``, never ``bool(...)``: bool("no") is True.
+                return {"version": 1, "enabled": doc.get("enabled") is True}
         except Exception as e:
             print(f"[{self.user_id}/web_settings] load failed: {e}")
         return default
 
     def save_web_settings(self, patch: dict) -> dict:
-        """Accepts only ``enabled`` — an allowlist, not a denylist."""
+        """Accepts only a real ``bool`` under ``enabled``.
+
+        Strict on purpose: coercing would make ``{"enabled": "no"}`` turn web
+        access ON. Every layer of this feature uses ``is True`` / isinstance,
+        never ``bool(...)``.
+        """
         cur = self.load_web_settings()
         if isinstance(patch, dict) and "enabled" in patch:
-            cur["enabled"] = bool(patch.get("enabled"))
+            if not isinstance(patch["enabled"], bool):
+                raise ValueError("enabled must be boolean")
+            cur["enabled"] = patch["enabled"]
         db.set_blob(self.user_id, WEB_SETTINGS_BLOB, cur)
         return cur
 ```
@@ -212,7 +246,7 @@ WEB_SETTINGS_BLOB = "web_settings"
 ```
 python3 -m pytest tests/test_web_settings_store.py -q
 ```
-Expected：11 passed
+Expected：19 passed
 
 - [ ] **Step 5: 提交**
 
@@ -322,12 +356,27 @@ def test_read_error_fails_closed(monkeypatch):
     assert kill_switch.web_halted() == (True, True)
 
 
-def test_read_error_can_be_forced_open_for_non_gating_callers(monkeypatch):
+def test_read_error_is_cached_so_a_flapping_db_is_not_hammered(monkeypatch):
+    """没有这条,DB 抖动期间每个 turn/每批 dispatch 都会重查 —— 故障被放大。"""
+    calls = {"n": 0}
+
     def boom():
+        calls["n"] += 1
         raise RuntimeError("down")
+
     monkeypatch.setattr(kill_switch.db, "get_pool", boom)
     kill_switch._invalidate()
-    assert kill_switch.web_halted(default_on_error=False) == (False, False)
+    assert kill_switch.web_halted() == (True, True)
+    assert kill_switch.web_halted() == (True, True)
+    assert kill_switch.web_halted() == (True, True)
+    assert calls["n"] == 1          # 后两次走缓存
+
+
+def test_missing_control_row_fails_closed(monkeypatch):
+    """控制行不存在 = 未知状态 = 不给 web。绝不能 fail open。"""
+    monkeypatch.setattr(kill_switch, "_fetch_web_halted_row", lambda: None)
+    kill_switch._invalidate()
+    assert kill_switch.web_halted() == (True, True)
 ```
 
 - [ ] **Step 3: 运行确认 RED**
@@ -355,13 +404,19 @@ def _invalidate_web() -> None:
         _web_cached_at = 0.0
 
 
-def web_halted(default_on_error: bool = True) -> tuple[bool, bool]:
+def web_halted() -> tuple[bool, bool]:
     """``(search_halted, fetch_halted)``，缓存 ~`_CACHE_TTL_SEC` 秒。
 
-    默认 ``default_on_error=True`` —— 与 ``turns_halted`` 相反：控制面读不到时
-    宁可**不给** web 工具，也不能因为读失败而放行外部网络访问。注意这只影响
-    「是否提供 web 工具」，**绝不能让整个 turn 失败**：调用方在拿到 (True, True)
-    时应正常继续、让模型无工具作答。
+    与 ``turns_halted`` 不同，**没有 fail-open 入口**：web 目前不存在任何合法的
+    fail-open 调用方，留一个 ``default_on_error=False`` 参数等于在安全闸上预留
+    绕过接口（YAGNI）。固定语义：
+
+    - DB 正常 → 返回真实两列
+    - DB 异常 → 返回 ``(True, True)`` **并缓存 ~2s**（不缓存的话，DB 抖动期间
+      每个 turn / 每批 dispatch 都会重查，把故障放大成查询风暴）
+    - 控制行缺失 → 未知状态 → ``(True, True)``，同样缓存
+    - **绝不 raise**：调用方拿到 (True, True) 时正常继续，让模型无工具作答，
+      不能让整个 turn 失败
     """
     global _web_cached, _web_cached_at
     now = time.monotonic()
@@ -375,13 +430,13 @@ def web_halted(default_on_error: bool = True) -> tuple[bool, bool]:
                     "SELECT web_search_halted, web_fetch_halted "
                     "FROM v2_runtime_control WHERE id=1")
                 row = cur.fetchone()
-                value = (bool(row[0]), bool(row[1])) if row else (False, False)
+                # 控制行缺失 = 未知状态 → fail closed,不是 (False, False)
+                value = (bool(row[0]), bool(row[1])) if row else (True, True)
     except Exception as exc:  # noqa: BLE001 — must never raise into callers
-        log.warning("[v2.kill_switch] web_halted read failed, default=%s: %s",
-                    default_on_error, exc)
-        return (default_on_error, default_on_error)
+        log.warning("[v2.kill_switch] web_halted read failed, failing closed: %s", exc)
+        value = (True, True)
     with _web_cache_lock:
-        _web_cached = value
+        _web_cached = value          # 错误结果也要缓存,否则故障期变查询风暴
         _web_cached_at = now
     return value
 
@@ -628,8 +683,9 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 （`:2573-2577`）的形状加：
 
 ```python
-        web_tools_enabled=lambda user_id: bool(
-            core_store.get_store(user_id).load_web_settings().get("enabled", False)),
+        # ``is True``，不是 bool(...)：全链路严格布尔，见 Task 1。
+        web_tools_enabled=lambda user_id: (
+            core_store.get_store(user_id).load_web_settings().get("enabled") is True),
 ```
 
 ⚠️ 具体的 store 取用方式**照抄同文件相邻装配项**，不要引入本文件没有的符号。
@@ -699,17 +755,27 @@ Expected：FAIL
 ```python
         # web 门禁与 mutation recovery 是两件事,必须并集 —— 覆盖会让恢复期的
         # 写操作重新暴露。
-        search_halted, fetch_halted = await asyncio.to_thread(kill_switch.web_halted)
+        # store 读是同步的 → 必须 to_thread，否则阻塞 event loop（先例 :5291-5293）
+        user_enabled = await asyncio.to_thread(
+            web_gate.resolve_user_enabled, deps.web_tools_enabled, user_id)
+        # 用户关 / 后台 lane 时根本不必查控制表——省一次 DB 读，也缩小攻击面
+        if user_enabled and lane in web_gate.FOREGROUND_LANES:
+            search_halted, fetch_halted = await asyncio.to_thread(kill_switch.web_halted)
+        else:
+            search_halted = fetch_halted = True
         disabled_web = web_gate.disabled_web_tools(
-            user_enabled=web_gate.resolve_user_enabled(deps.web_tools_enabled, user_id),
-            lane="chat", search_halted=search_halted, fetch_halted=fetch_halted)
+            user_enabled=user_enabled,
+            lane=lane,                      # 真实 lane 变量（:5232），不写字面量
+            search_halted=search_halted, fetch_halted=fetch_halted)
         disabled_tool_names_for_turn = frozenset(disabled_mutation_tool_names) | disabled_web
 ```
 
 `:6408` 改为传 `disabled_tool_names=disabled_tool_names_for_turn`。
 
-⚠️ `resolve_user_enabled` 里是同步的 store 读，包在 `asyncio.to_thread` 里
-（先例：`:5291-5293`）。
+⚠️ **传真实的 `lane` 变量，不要写 `"chat"` 字面量**（Codex review 采纳）：
+`process_job` 已有 `lane = job.get("lane") or "chat"`（`:5232`）。写字面量会引入
+「有人打成 `"Chat"` 就静默全禁」的新风险；传变量则 chat 分支自然是 `"chat"`，
+且策略字面量只存在于 `web_gate.FOREGROUND_LANES` 一处。
 
 - [ ] **Step 4: GREEN + 回归**
 
@@ -751,14 +817,17 @@ async def test_wake_lane_never_offers_web_even_when_user_enabled(...):
 
 ```python
                 disabled_tool_names=web_gate.disabled_web_tools(
-                    user_enabled=..., lane="wake",
-                    search_halted=search_halted, fetch_halted=fetch_halted),
+                    user_enabled=False, lane=lane,
+                    search_halted=True, fetch_halted=True),
 ```
 
-因 `lane="wake"` 不在 `FOREGROUND_LANES`，该集合恒为两个工具全禁——但**仍然
-走同一个判定函数**，避免将来有人改了 lane 规则而这里漏掉。
+`_run_wake` 的签名里已经有 `lane: str`（`:3997`，取值 heartbeat / scheduled /
+manual_wake / screen_watch）——**直接传这个变量**，保留真实 lane 身份，不要压平
+成 `"wake"` 字面量。
 
-screen_watch 若走同一入口，`lane` 传其真实名字即可（同样不在前台白名单）。
+因这些 lane 都不在 `FOREGROUND_LANES`，结果恒为两个工具全禁；**但仍然走同一个
+判定函数**，将来若 lane 规则变化这里不会漏掉。这条路径**不查控制表**（结论已
+确定，省一次 DB 读）。
 
 - [ ] **Step 3: GREEN**
 
@@ -853,37 +922,80 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ⚠️ **`tool_loop.py` 不改**——它声明了不 import db、所有副作用注入。二次检查
 放在三个 dispatcher 里（那里访问 DB 是合法的）。
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 写失败测试 —— 三条路径各一条**
+
+实现会落在 chat / wake / child 三个 dispatcher，**就必须有三处证据**，否则
+「三处都写了」没有对应验证：
 
 ```python
-async def test_kill_switch_flipped_mid_turn_blocks_the_next_batch(...):
+async def test_chat_dispatcher_blocks_batch_when_flipped_mid_turn(...):
     """回合开始时 fetch 开 → 第一轮跑 → 运维关掉 → 第二轮整批不执行。"""
-    # 第一轮:正常执行
     # 之后 kill_switch.set_web_halted(fetch=True)
-    # 第二轮:整批返回稳定的 disabled error,且没有发生真实网络请求
-    assert all(r.content == "error: web_tool_halted" for r in second_batch)
+    assert web_result.content == "error: web_tool_halted"
+    assert sibling_result.content == "error: batch_cancelled_web_halted"
+
+
+async def test_wake_dispatcher_refuses_web_even_if_a_call_reaches_it(...):
+    """后台 lane 的 offer 侧已经禁了;dispatcher 是第二道闸,
+    即便有 web call 直达也不执行。"""
+    assert result.content == "error: web_tool_halted"
+
+
+async def test_child_dispatcher_refuses_after_parent_started(...):
+    """parent 建立 dispatcher 之后 flip,child 的 execute 侧仍然拒绝。"""
+    assert result.content == "error: web_tool_halted"
 ```
 
 - [ ] **Step 2: 实现**
 
-三个 dispatcher 的入口统一加：
+先在 `worker.py` 里写**一个共用 helper**（三处各写一遍必然漂移）：
 
 ```python
-        # turn_catalog 在回合入口只算一次,运维中途关闭开关对后续轮次无效 ——
-        # 因此每批真正执行前再查一次(控制表读带 ~2s TTL 缓存,不会打爆 DB)。
-        # 语义边界:约 2s 内阻止**新的** dispatch;已经在途的 HTTP 请求不保证取消。
-        if any(tc.name in web_gate.WEB_TOOL_NAMES for tc in tool_calls):
-            search_halted, fetch_halted = await asyncio.to_thread(kill_switch.web_halted)
-            blocked = web_gate.disabled_web_tools(
-                user_enabled=True, lane=<本 lane>,
-                search_halted=search_halted, fetch_halted=fetch_halted)
-            if any(tc.name in blocked for tc in tool_calls):
-                return [ToolResult(call_id=tc.id, content="error: web_tool_halted")
-                        for tc in tool_calls]
+async def _web_batch_cancellation(tool_calls, *, disabled_web_snapshot, lane):
+    """整批取消的判定。返回 None 表示放行,否则返回要回给模型的 ToolResult 列表。
+
+    turn_catalog 在回合入口只算一次(tool_loop.py:307-320),运维中途关闭开关对
+    后续轮次无效 —— 因此每批真正执行前再查一次。控制表读带 ~2s TTL 缓存。
+
+    语义边界:约 2s 内阻止**新的** dispatch;已经在途的 HTTP 请求不保证取消。
+
+    检查的是「回合入口快照 ∪ 当前 live halted」。只查 live kill switch 不够 ——
+    dispatcher 被定义为第二道 fail-closed 边界,就不能假设 user_enabled=True、
+    把用户偏好与 lane 的判定完全交给上游。
+    """
+    if not any(tc.name in web_gate.WEB_TOOL_NAMES for tc in tool_calls):
+        return None
+    search_halted, fetch_halted = await asyncio.to_thread(kill_switch.web_halted)
+    live = web_gate.disabled_web_tools(
+        user_enabled=True, lane=lane,
+        search_halted=search_halted, fetch_halted=fetch_halted)
+    blocked = frozenset(disabled_web_snapshot) | live
+    if not any(tc.name in blocked for tc in tool_calls):
+        return None
+    # 整批取消,但把 web 调用和被牵连的 sibling 区分开 —— 模型才知道
+    # memory_fetch 不是自己失败的。
+    return [
+        ToolResult(
+            call_id=tc.id,
+            content=("error: web_tool_halted" if tc.name in web_gate.WEB_TOOL_NAMES
+                     else "error: batch_cancelled_web_halted"))
+        for tc in tool_calls
+    ]
 ```
 
-⚠️ **整批不执行**（与 tool_loop 的 malformed 处理一致的 all-or-nothing 语义），
-不要只挑出 web 那几个。
+三个 dispatcher 入口各调一次，把**本 lane 在回合入口算出的** `disabled_web`
+作为快照传进来：
+
+```python
+        cancelled = await _web_batch_cancellation(
+            tool_calls, disabled_web_snapshot=disabled_web, lane=lane)
+        if cancelled is not None:
+            return cancelled
+```
+
+⚠️ **整批不执行**（与 tool_loop 的 malformed 处理一致的 all-or-nothing 语义）。
+只拒 web、放行 sibling 会造成半批副作用：sibling 可能是写操作，或者
+`memory_fetch` 先执行、把私密内容带进下一轮，而模型无法分辨哪些结果被策略取消。
 
 ⚠️ 控制表读失败时 `web_halted` 返回 `(True, True)` → 整批被拦。**这只影响这批
 工具，聊天继续**，绝不 raise。
@@ -891,10 +1003,12 @@ async def test_kill_switch_flipped_mid_turn_blocks_the_next_batch(...):
 - [ ] **Step 3: GREEN**
 
 ```
-python3 -m pytest tests/test_v2_worker_tool_loop.py -q -k "halted or kill"
+python3 -m pytest tests/test_v2_worker_tool_loop.py tests/test_v2_wake_worker.py \
+                  tests/test_v2_subagents.py -q -k "halted or cancel"
 python3 -m pytest tests/test_v2_tool_loop.py -q
 ```
-Expected：新测试通过；`test_v2_tool_loop.py` **一行未改，必须仍然 24 passed**
+Expected：三条路径的新测试各自通过；`test_v2_tool_loop.py` **一行未改，
+必须仍然 24 passed**
 
 - [ ] **Step 4: 提交**
 
@@ -926,23 +1040,30 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 响应形状：
 
 ```json
-{"enabled": true, "available": true, "effective": true, "unavailable_reason": null}
+{
+  "enabled": true,            // 用户偏好，只由用户改写
+  "available": true,          // = !search_halted（入口叫「联网搜索」）
+  "effective": true,          // = enabled && available，算出来的
+  "unavailable_reason": null,
+  "capabilities": {"search": true, "fetch": true}
+}
 ```
 
 - [ ] **Step 1: 写失败测试**
 
 ```python
 def test_get_defaults_to_disabled_but_available(store):
-    got = web_settings_core.get_settings(store)
-    assert got == {"enabled": False, "available": True,
-                   "effective": False, "unavailable_reason": None}
+    got = web_settings_core.get_settings(store, halted_reader=lambda: (False, False))
+    assert got == {"enabled": False, "available": True, "effective": False,
+                   "unavailable_reason": None,
+                   "capabilities": {"search": True, "fetch": True}}
 
 
-def test_effective_is_derived_not_stored(store, monkeypatch):
+def test_effective_is_derived_not_stored(store):
     """kill switch 关停时 available=False,但 enabled 保持用户的选择不被回写。"""
-    web_settings_core.update_settings(store, {"enabled": True})
-    monkeypatch.setattr(kill_switch, "web_halted", lambda *a, **k: (True, True))
-    got = web_settings_core.get_settings(store)
+    web_settings_core.update_settings(store, {"enabled": True},
+                                      halted_reader=lambda: (False, False))
+    got = web_settings_core.get_settings(store, halted_reader=lambda: (True, True))
     assert got["enabled"] is True            # 用户偏好原样保留
     assert got["available"] is False
     assert got["effective"] is False
@@ -954,6 +1075,25 @@ def test_effective_is_derived_not_stored(store, monkeypatch):
 def test_update_requires_enabled(store):
     with pytest.raises(ValueError):
         web_settings_core.update_settings(store, {})
+
+
+@pytest.mark.parametrize("bad", ["no", "true", 1, 0, None])
+def test_update_rejects_non_bool(store, bad):
+    with pytest.raises(ValueError):
+        web_settings_core.update_settings(store, {"enabled": bad})
+
+
+def test_search_halted_alone_reports_unavailable(store):
+    """入口叫「联网搜索」——只停了 search 就不能说可用。"""
+    got = web_settings_core.get_settings(store, halted_reader=lambda: (True, False))
+    assert got["available"] is False
+    assert got["capabilities"] == {"search": False, "fetch": True}
+
+
+def test_fetch_halted_alone_keeps_search_available(store):
+    got = web_settings_core.get_settings(store, halted_reader=lambda: (False, True))
+    assert got["available"] is True
+    assert got["capabilities"] == {"search": True, "fetch": False}
 ```
 
 - [ ] **Step 2 → 4: RED → 实现 → GREEN**
@@ -961,20 +1101,30 @@ def test_update_requires_enabled(store):
 `web_settings_core.py`：
 
 ```python
-def get_settings(store) -> dict:
-    enabled = bool(store.load_web_settings().get("enabled", False))
-    search_halted, fetch_halted = kill_switch.web_halted()
-    available = not (search_halted and fetch_halted)
-    reason = None if available else "globally_disabled"
-    return {"enabled": enabled, "available": available,
-            "effective": enabled and available, "unavailable_reason": reason}
+def get_settings(store, *, halted_reader=kill_switch.web_halted) -> dict:
+    """``halted_reader`` 注入是为了让本模块可纯单测——默认值是 DB-backed 的。"""
+    enabled = store.load_web_settings().get("enabled") is True
+    search_halted, fetch_halted = halted_reader()
+    # 产品入口叫「联网搜索」，所以 available 跟 search 走。用
+    # `not (search and fetch)` 会在「只停了搜索」时谎报可用。
+    available = not search_halted
+    return {
+        "enabled": enabled,
+        "available": available,
+        "effective": enabled and available,
+        "unavailable_reason": None if available else "globally_disabled",
+        # 半开状态显式暴露，不让一个 available 掩盖掉
+        "capabilities": {"search": not search_halted, "fetch": not fetch_halted},
+    }
 
 
-def update_settings(store, payload) -> dict:
+def update_settings(store, payload, *, halted_reader=kill_switch.web_halted) -> dict:
     if not isinstance(payload, dict) or "enabled" not in payload:
         raise ValueError("enabled is required")
-    store.save_web_settings({"enabled": payload.get("enabled")})
-    return get_settings(store)
+    if not isinstance(payload["enabled"], bool):
+        raise ValueError("enabled must be boolean")   # 严格布尔，见 Task 1
+    store.save_web_settings({"enabled": payload["enabled"]})
+    return get_settings(store, halted_reader=halted_reader)
 ```
 
 ⚠️ `enabled` **只由用户改写**，kill switch 绝不回写它。
@@ -1010,20 +1160,45 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ---
 
-### Task 11: iOS 开关
+### 发布顺序（⚠️ 不是"短窗口"问题）
+
+默认关 + 无迁移 + iOS 无法强制更新 ⇒ **所有仍在用旧客户端的用户会持续无法开启
+联网，直到他们更新 App**——这不是后端与 iOS 发布之间的一段窗口。
+
+**不要为此加一个"功能未启用"的隐藏总闸**：那正是本工作区明令禁止的、
+造成过「代码上线了功能没上线」的东西。正确顺序：
+
+1. iOS 版本先上架并确认可下载
+2. 通知内测用户更新
+3. 再发布后端 Task 1–10
+4. 交付说明写明：**旧客户端用户在更新前无法开启联网**
+5. 若该能力对内测体验关键，用**最低版本要求**，而不是再加隐形开关
+
+---
+
+### Task 11: iOS 开关 —— 拆成独立的 iOS 实施计划
 
 **Files:**（仓库 `/Users/hx/Projects/io/feedling-mcp-ios`，走 PR 不直接 merge）
 - `App/FeedlingTest/Pages/Settings/SettingsView.swift`（`customizationSettingsList`）
 - `App/FeedlingTest/API/FeedlingAPI.swift`
 - `App/FeedlingTest/Localizable.xcstrings`
 
-- [ ] **文案**（zh-Hans / en 双语），必须说清两件事：
-  - 打开只是把工具交给模型，**搜不搜由模型判断**
-  - **后台主动陪伴不会联网**
-- [ ] API 层照抄 `updateProactiveSwitch` 的结构，端点 `POST /v1/web/settings`
-- [ ] UI 照 `proactiveSwitchRow` 加一行，绑定服务端状态；`available=false` 时置灰
-      并显示 `unavailable_reason` 对应文案
-- [ ] 真机验证：翻开关 → 杀进程重开 → 状态仍正确（证明是服务端持久化）
+⚠️ **本 task 目前只是 checklist，不是可执行计划**（Codex review 指出）。它在
+另一个 repo、另一条 PR 线上，且**直接决定发布顺序**，因此必须单独写成一份
+`docs/superpowers/plans/` 下的 iOS 实施计划，至少覆盖：
+
+- 首次进入设置页的 `GET /v1/web/settings` 时机与 loading 态
+- `POST` 失败时 UI 回滚还是保留乐观值
+- **旧后端返回 404 时 fail closed**（置灰 + 说明，不能显示成可用）
+- response 的 decode model（含新增的 `capabilities` 对象）
+- 精确的 localization key 列表
+- 单测 / 构建命令与预期输出
+- 真机验证前可自动化的部分
+
+文案必须说清两件事：**打开只是把工具交给模型、搜不搜由模型判断**；
+**后台主动陪伴不会联网**。
+
+本后端计划的 Task 1–10 不依赖它，但**发布顺序依赖它先上架**（见上一节）。
 
 ---
 
@@ -1035,7 +1210,13 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 - 新增纯单测文件全部在 `_PURE_UNIT` 内且 `--collect-only` 确认被收集；
   DB-backed 的**不要**加进去。
 - `tests/test_v2_dependency_direction.py` 绿。
-- `backend/model_api_runtime/v2/tool_loop.py` 与 `capabilities/tool_schema.py`
-  **零改动**（`git diff --stat` 核对）。
+- 共享核心**零改动**，用机器断言而不是目测：
+
+  ```bash
+  git diff --exit-code origin/pre -- \
+    backend/model_api_runtime/v2/tool_loop.py \
+    backend/capabilities/tool_schema.py
+  ```
+  Expected：exit 0（有任何差异即失败）
 - 交付说明必须高亮：**这是一次能力回收**，现有用户会失去联网（详见设计文档
   §7），上线后**必须主动验证开启率**。
