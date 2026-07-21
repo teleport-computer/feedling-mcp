@@ -1203,6 +1203,8 @@ I need to inspect the repository before answering.
     "header",
     [
         "Checking the repository before answering.",
+        "Checking project before answering.",
+        "💭 Checking repository before answering.",
         "先检查仓库，再回复用户。",
     ],
 )
@@ -1233,6 +1235,8 @@ I need to update the deployment notes.
     "content",
     [
         'let reasoning = "visible output"',
+        "# Checking repository permissions",
+        "- Checking repository status",
         "Working hours: 09:00-17:00",
         "处理结果如下：成功",
     ],
@@ -1287,6 +1291,20 @@ def test_sanitize_reply_text_preserves_fence_like_content_at_deeper_quote_depth(
     assert cleaned == raw
 
 
+def test_sanitize_reply_text_implicitly_closes_fence_when_blockquote_ends():
+    raw = (
+        "> ```text\n"
+        "> code line  \n"
+        "outside\n"
+        "outside\n"
+        "正文"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "> ```text\n> code line  \noutside\n正文"
+
+
 def test_sanitize_reply_text_preserves_setext_and_thematic_breaks():
     raw = """Title
 ===
@@ -1326,6 +1344,15 @@ def test_sanitize_reply_text_does_not_recover_preamble_across_blank_line(marker)
     cleaned = crc._sanitize_reply_text(raw)
 
     assert cleaned == f"{marker}\n\n正文"
+
+
+@pytest.mark.parametrize("marker", ["---", "* * *", "_ _ _", "----"])
+def test_sanitize_reply_text_preserves_leading_thematic_break(marker):
+    raw = f"{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
 
 
 def test_sanitize_reply_text_drops_unlabeled_english_meta_before_cjk_answer():

@@ -2171,12 +2171,12 @@ _REASONING_LINE_RE = re.compile(
 
 _RUNTIME_REASONING_FENCE_LANGUAGES = {"copy"}
 _RUNTIME_REASONING_HEADER_RE = re.compile(
-    r"^(?:reasoning|chain\s+of\s+thought)\s*:?$|"
-    r"^(?:checking|inspecting|reviewing|analyzing)\s+(?:the\s+)?"
-    r"(?:repository|repo|codebase|workspace|files?|request|context)\b|"
-    r"^(?:executing\s+updates?|doing\s+(?:work|the\s+task))\s*[.!…]*$|"
-    r"^先(?:检查|查看|分析|思考|规划|准备|执行|处理)(?:一下)?"
-    r"(?:仓库|代码|文件|上下文|问题|请求|任务)",
+    r"^(?:💭\s*)?(?:(?:reasoning|chain\s+of\s+thought)\s*:?|"
+    r"(?:checking|inspecting|reviewing|analyzing)\s+(?:the\s+)?"
+    r"(?:repository|repo|project|codebase|workspace|files?|request|context)\b|"
+    r"(?:executing\s+updates?|doing\s+(?:work|the\s+task))\s*[.!…]*|"
+    r"先(?:检查|查看|分析|思考|规划|准备|执行|处理)(?:一下)?"
+    r"(?:仓库|代码|文件|上下文|问题|请求|任务))",
     re.IGNORECASE,
 )
 _FENCE_LINE_RE = re.compile(
@@ -2242,7 +2242,8 @@ def _strip_leading_non_cjk_preamble(lines: list[str]) -> list[str]:
             break
         if _THEMATIC_BREAK_RE.fullmatch(stripped):
             if i == 0:
-                continue
+                markdown_start = 0
+                break
             markdown_start = i - 1 if previous_is_text else i
             break
         if re.fullmatch(r"=+|-+", stripped):
@@ -2285,6 +2286,22 @@ def _fence_line_parts(line: str) -> tuple[int, str, str] | None:
     return depth, match.group("marker"), match.group("info").strip()
 
 
+def _blockquote_depth(line: str) -> int:
+    match = re.match(r"^(?P<container>(?:>\s*)*)", line.lstrip())
+    return match.group("container").count(">") if match else 0
+
+
+def _strip_blockquote_container(line: str, depth: int) -> str:
+    value = line.lstrip()
+    for _ in range(depth):
+        if not value.startswith(">"):
+            break
+        value = value[1:]
+        if value.startswith(" "):
+            value = value[1:]
+    return value.strip()
+
+
 def _dedupe_reply_lines(lines: list[str]) -> list[str]:
     """Collapse repeated prose while leaving fenced code untouched."""
     out: list[str] = []
@@ -2306,6 +2323,16 @@ def _dedupe_reply_lines(lines: list[str]) -> list[str]:
     for line in lines:
         fence = _fence_line_parts(line)
         depth, marker, info = fence if fence else (0, "", "")
+
+        if (
+            fence_char
+            and fence_depth > 0
+            and line.strip()
+            and _blockquote_depth(line) < fence_depth
+        ):
+            fence_depth = 0
+            fence_char = ""
+            fence_length = 0
 
         if not fence_char:
             if marker:
@@ -2334,15 +2361,23 @@ def _dedupe_reply_lines(lines: list[str]) -> list[str]:
     return out
 
 
-def _is_runtime_reasoning_fence(info: str, content: list[str]) -> bool:
+def _is_runtime_reasoning_fence(info: str, content: list[str], depth: int) -> bool:
     language = info.split(maxsplit=1)[0].casefold() if info else ""
     if language not in _RUNTIME_REASONING_FENCE_LANGUAGES:
         return False
 
     inspections = []
     for line in content:
-        inspection = re.sub(r"^[`#>*\-\s]+", "", line.strip()).strip()
-        inspection = re.sub(r"[`*_]+$", "", inspection).strip()
+        inspection = _strip_blockquote_container(line, depth)
+        emoji = ""
+        if inspection.startswith("💭"):
+            emoji = "💭 "
+            inspection = inspection[1:].lstrip()
+        for wrapper in ("**", "__"):
+            if inspection.startswith(wrapper) and inspection.endswith(wrapper):
+                inspection = inspection[len(wrapper) : -len(wrapper)].strip()
+                break
+        inspection = emoji + inspection
         if inspection:
             inspections.append(inspection)
 
@@ -5224,6 +5259,7 @@ def _sanitize_reply_text(text: str) -> str:
         return ""
 
     kept: list[str] = []
+    dropped_leading_runtime = False
     raw_lines = text.splitlines()
     i = 0
     while i < len(raw_lines):
@@ -5235,6 +5271,7 @@ def _sanitize_reply_text(text: str) -> str:
         if fence:
             depth, marker, info = fence
             block_end = i + 1
+            explicitly_closed = False
             while block_end < len(raw_lines):
                 closing = _fence_line_parts(raw_lines[block_end])
                 if (
@@ -5244,14 +5281,22 @@ def _sanitize_reply_text(text: str) -> str:
                     and len(closing[1]) >= len(marker)
                     and not closing[2]
                 ):
+                    explicitly_closed = True
+                    break
+                if (
+                    depth > 0
+                    and raw_lines[block_end].strip()
+                    and _blockquote_depth(raw_lines[block_end]) < depth
+                ):
                     break
                 block_end += 1
-            closed = block_end < len(raw_lines)
-            content_end = block_end if closed else len(raw_lines)
-            content = raw_lines[i + 1 : content_end]
-            if not _is_runtime_reasoning_fence(info, content):
-                kept.extend(raw_lines[i : block_end + 1 if closed else len(raw_lines)])
-            i = block_end + 1 if closed else len(raw_lines)
+            content = raw_lines[i + 1 : block_end]
+            slice_end = block_end + 1 if explicitly_closed else block_end
+            if not _is_runtime_reasoning_fence(info, content, depth):
+                kept.extend(raw_lines[i:slice_end])
+            elif not kept:
+                dropped_leading_runtime = True
+            i = slice_end
             continue
 
         if not stripped:
@@ -5260,15 +5305,29 @@ def _sanitize_reply_text(text: str) -> str:
             i += 1
             continue
         if _NOISE_LINE_RE.match(stripped):
+            if not kept:
+                dropped_leading_runtime = True
+            i += 1
+            continue
+
+        if (
+            not kept
+            and dropped_leading_runtime
+            and _THEMATIC_BREAK_RE.fullmatch(stripped)
+        ):
             i += 1
             continue
 
         inspection = re.sub(r"^[`#>*\-\s]+", "", stripped).strip()
         inspection = re.sub(r"[`*_]+$", "", inspection).strip()
         if _IDENTITY_LEAK_RE.search(inspection):
+            if not kept:
+                dropped_leading_runtime = True
             i += 1
             continue
         if _REASONING_LINE_RE.match(inspection):
+            if not kept:
+                dropped_leading_runtime = True
             i += 1
             continue
         kept.append(line)
