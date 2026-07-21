@@ -53,10 +53,10 @@ import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
 @pytest.fixture(autouse=True)
 def _reset_proactive_guard_state_between_tests():
-    """The proactive idle-loop guard + failure backoff are module-global state
-    that accumulates across proactive realizations. Reset before each test so a
-    prior test's proactive turns don't trip the guard and skip this one's."""
-    crc._proactive_empty_streak = 0
+    """The proactive self-wake loop guard + failure backoff are module-global
+    state that accumulates across proactive realizations. Reset before each test
+    so a prior test's self-wakes don't trip the guard and skip this one's."""
+    crc._self_wake_streak = 0
     crc._proactive_fail_streak = 0
     crc._proactive_backoff_until = 0.0
     crc._provider_payment_cooldown_until = 0.0
@@ -3171,7 +3171,7 @@ def test_process_proactive_degenerate_only_reply_fails_without_post(monkeypatch)
     fail the job, post nothing — and do NOT count as a realized idle send
     (two truncated wakes in a row must not trip the idle-loop guard)."""
     captured = _degenerate_test_harness(monkeypatch, {"messages": ["."]})
-    monkeypatch.setattr(crc, "_proactive_empty_streak", 0)
+    monkeypatch.setattr(crc, "_self_wake_streak", 0)
 
     job = {
         "schema_version": 2,
@@ -3184,14 +3184,14 @@ def test_process_proactive_degenerate_only_reply_fails_without_post(monkeypatch)
     failed = [s for s in captured["statuses"] if s[1] == "failed"]
     assert failed and failed[-1][2] == "degenerate_reply_suppressed"
     assert captured["failures"] and captured["failures"][-1][1] is False
-    assert crc._proactive_empty_streak == 0  # suppressed ≠ realized idle send
+    assert crc._self_wake_streak == 0  # no self-wake scheduled → streak untouched
 
 
 def test_process_proactive_degenerate_fragment_dropped_real_reply_posted(monkeypatch):
     captured = _degenerate_test_harness(
         monkeypatch, {"messages": [".", "今晚月色不错"]}
     )
-    monkeypatch.setattr(crc, "_proactive_empty_streak", 0)
+    monkeypatch.setattr(crc, "_self_wake_streak", 0)
 
     job = {
         "schema_version": 2,
@@ -3203,7 +3203,7 @@ def test_process_proactive_degenerate_fragment_dropped_real_reply_posted(monkeyp
     assert captured["posted"] == ["今晚月色不错"]
     assert [s for s in captured["statuses"] if s[1] == "posted"]
     assert not [s for s in captured["statuses"] if s[1] == "failed"]
-    assert crc._proactive_empty_streak == 1  # real send keeps its accounting
+    assert crc._self_wake_streak == 0  # a plain proactive reply is not a self-wake
 
 
 def test_process_proactive_degenerate_reply_with_sleep_action_still_sleeps(monkeypatch):
@@ -7702,30 +7702,30 @@ def test_prepare_cli_command_heals_incident_windows_mcp_path(monkeypatch):
     assert os.path.basename(cmd[0]) == "claude"
 
 
-# --- Proactive idle-loop guard + failure backoff (Seven 2026-07-16) ----------
+# --- Proactive self-wake loop guard + failure backoff (Seven 2026-07-16/21) --
 
 def _reset_proactive_guard_state():
-    crc._proactive_empty_streak = 0
+    crc._self_wake_streak = 0
     crc._proactive_fail_streak = 0
     crc._proactive_backoff_until = 0.0
 
 
-def test_proactive_idle_guard_trips_after_max_empty_turns():
+def test_self_wake_loop_trips_after_max_consecutive_self_wakes():
     _reset_proactive_guard_state()
-    assert not crc._proactive_idle_guard_tripped()
-    for _ in range(crc.MAX_EMPTY_PROACTIVE_TURNS):
-        crc._note_idle_proactive_send()
-    assert crc._proactive_idle_guard_tripped()
+    assert not crc._self_wake_loop_tripped()
+    for _ in range(crc.MAX_CONSECUTIVE_SELF_WAKES):
+        crc._note_self_wake()
+    assert crc._self_wake_loop_tripped()
 
 
-def test_proactive_idle_guard_reset_clears_streak():
+def test_self_wake_loop_reset_clears_streak():
     _reset_proactive_guard_state()
-    for _ in range(crc.MAX_EMPTY_PROACTIVE_TURNS + 2):
-        crc._note_idle_proactive_send()
-    assert crc._proactive_idle_guard_tripped()
-    crc._reset_proactive_idle_guard()
-    assert not crc._proactive_idle_guard_tripped()
-    assert crc._proactive_empty_streak == 0
+    for _ in range(crc.MAX_CONSECUTIVE_SELF_WAKES + 2):
+        crc._note_self_wake()
+    assert crc._self_wake_loop_tripped()
+    crc._reset_proactive_idle_guard()  # the user spoke
+    assert not crc._self_wake_loop_tripped()
+    assert crc._self_wake_streak == 0
 
 
 def test_proactive_failure_backoff_grows_and_clears(monkeypatch):
@@ -7783,41 +7783,47 @@ def _idle_proactive_job(job_id="pj_idle"):
             "ts": 100.0, "trigger": "heartbeat_broadcast_off", "wake_kind": "presence"}
 
 
-def test_guard_skips_idle_proactive_when_tripped(monkeypatch):
+def test_loop_guard_never_skips_heartbeat_even_when_tripped(monkeypatch):
+    # THE regression guard (Seven 2026-07-21): a heartbeat/ambient wake must be
+    # realized even when the self-wake loop streak is maxed. The old guard
+    # skipped ALL idle proactive here, so 2 unanswered heartbeats silenced the
+    # companion. Now only the self-wake SCHEDULE is capped — the heartbeat flows.
     cap = _proactive_guard_harness(monkeypatch)
-    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._self_wake_streak = crc.MAX_CONSECUTIVE_SELF_WAKES
     crc._process_proactive_jobs([_idle_proactive_job()])
-    assert cap["agent_called"] is False
-    assert ("skipped", "proactive_idle_loop: no new user input") in cap["statuses"]
+    assert cap["agent_called"] is True                     # heartbeat NOT skipped
+    assert not any(r.startswith("proactive_idle_loop") for _s, r in cap["statuses"])
 
 
-def test_guard_realizes_idle_proactive_when_not_tripped(monkeypatch):
+def test_plain_proactive_send_does_not_advance_self_wake_streak(monkeypatch):
+    # A heartbeat that posts a reply but schedules NO self-wake must not count
+    # toward the loop guard (that was the over-counting bug).
     cap = _proactive_guard_harness(monkeypatch)
-    crc._proactive_empty_streak = 0
+    crc._self_wake_streak = 0
     crc._process_proactive_jobs([_idle_proactive_job()])
     assert cap["agent_called"] is True
-    assert crc._proactive_empty_streak == 1  # idle send advanced the streak
+    assert crc._self_wake_streak == 0                       # no self-wake → unchanged
 
 
-def test_guard_does_not_skip_screen_watch_when_tripped(monkeypatch):
+def test_loop_guard_does_not_skip_screen_watch_when_tripped(monkeypatch):
     cap = _proactive_guard_harness(monkeypatch)
-    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._self_wake_streak = crc.MAX_CONSECUTIVE_SELF_WAKES
     job = _idle_proactive_job("pj_sw")
     job["job_kind"] = "screen_watch"
     job["frame_ids"] = ["f1"]
     crc._process_proactive_jobs([job])
     assert cap["agent_called"] is True  # screen-watch is not an idle lane
-    assert crc._proactive_empty_streak == crc.MAX_EMPTY_PROACTIVE_TURNS  # unchanged
+    assert crc._self_wake_streak == crc.MAX_CONSECUTIVE_SELF_WAKES  # unchanged
 
 
-def test_guard_does_not_skip_introduction_when_tripped(monkeypatch):
+def test_loop_guard_does_not_skip_introduction_when_tripped(monkeypatch):
     cap = _proactive_guard_harness(monkeypatch)
-    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._self_wake_streak = crc.MAX_CONSECUTIVE_SELF_WAKES
     job = _idle_proactive_job("pj_intro")
     job["job_kind"] = "introduction"
     crc._process_proactive_jobs([job])
     assert cap["agent_called"] is True  # first-greeting must never be suppressed
-    assert crc._proactive_empty_streak == crc.MAX_EMPTY_PROACTIVE_TURNS  # unchanged
+    assert crc._self_wake_streak == crc.MAX_CONSECUTIVE_SELF_WAKES  # unchanged
 
 
 def test_backoff_skips_idle_proactive(monkeypatch):
@@ -7860,20 +7866,73 @@ def test_success_clears_failure_backoff(monkeypatch):
 def test_user_message_resets_guard_and_backoff():
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
-    crc._proactive_empty_streak = crc.MAX_EMPTY_PROACTIVE_TURNS
+    crc._self_wake_streak = crc.MAX_CONSECUTIVE_SELF_WAKES
     crc._proactive_fail_streak = 3
     msg = {"id": "u-reset", "role": "user", "content": "hi", "ts": 2000.0}
     with patch.object(crc, "call_agent", return_value="hey"), \
          patch.object(crc, "post_reply", return_value={"id": "r1"}):
         crc._process_messages([msg])
-    assert crc._proactive_empty_streak == 0
+    assert crc._self_wake_streak == 0
     assert crc._proactive_fail_streak == 0
 
 
-def test_max_empty_zero_disables_idle_guard(monkeypatch):
-    monkeypatch.setattr(crc, "MAX_EMPTY_PROACTIVE_TURNS", 0)
-    crc._proactive_empty_streak = 99
-    assert crc._proactive_idle_guard_tripped() is False
+def test_max_self_wakes_zero_disables_loop_guard(monkeypatch):
+    monkeypatch.setattr(crc, "MAX_CONSECUTIVE_SELF_WAKES", 0)
+    crc._self_wake_streak = 99
+    assert crc._self_wake_loop_tripped() is False
+
+
+def _self_wake_harness(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    cap = {"scheduled": [], "statuses": [], "posted": []}
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, []))
+    monkeypatch.setattr(
+        crc, "call_agent",
+        lambda message, images=None, image_paths=None, **kw: {
+            "actions": [{"type": "schedule_wake", "at": "2030-01-01T09:30:00",
+                         "tz": "Asia/Shanghai", "note": "check in"}],
+            "messages": [],
+        },
+    )
+    monkeypatch.setattr(
+        crc, "execute_scheduled_wake_actions",
+        lambda actions, job: cap["scheduled"].append((actions, job)) or {"results": []},
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kw: cap["posted"].append(reply) or {"id": "m"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kw: cap["statuses"].append((status, reason)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    return cap
+
+
+def _self_wake_job(job_id="pj_selfwake"):
+    return {"schema_version": 2, "job_id": job_id, "source": crc.PROACTIVE_JOB_SOURCE,
+            "ts": 130.0, "trigger": "scheduled_wake", "wake_kind": "presence"}
+
+
+def test_self_wake_schedule_advances_streak(monkeypatch):
+    # The agent asking for its OWN next wake is the only thing that feeds the
+    # loop guard.
+    cap = _self_wake_harness(monkeypatch)
+    crc._self_wake_streak = 0
+    crc._process_proactive_jobs([_self_wake_job()])
+    assert cap["scheduled"]                        # the self-wake was executed
+    assert crc._self_wake_streak == 1              # ...and counted toward the guard
+
+
+def test_self_wake_dropped_when_loop_tripped(monkeypatch):
+    # Runaway self-loop: once capped, a further self-wake is dropped at the
+    # source (no execute), so no next wake fires — but the turn itself still ran.
+    cap = _self_wake_harness(monkeypatch)
+    crc._self_wake_streak = crc.MAX_CONSECUTIVE_SELF_WAKES
+    crc._process_proactive_jobs([_self_wake_job()])
+    assert cap["scheduled"] == []                  # self-wake dropped
+    assert crc._self_wake_streak == crc.MAX_CONSECUTIVE_SELF_WAKES  # not advanced past cap
 
 
 # --- resident reply-language wiring (Seven 2026-07-16) ------------------------

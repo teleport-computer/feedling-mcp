@@ -464,22 +464,26 @@ def _clear_provider_payment_cooldown() -> None:
     _provider_payment_cooldown_until = 0.0
 
 
-# --- Proactive idle-loop guard + failure backoff (Seven 2026-07-16) -----------
+# --- Proactive self-wake loop guard + failure backoff (Seven 2026-07-16/21) ---
 # The agent can self-schedule wakes ("check on them again soon"); a self-
 # sustaining loop (schedule -> wake -> post "(在)" -> schedule -> ...) floods the
 # user with no new input. Two consumer-side brakes, on top of the backend's
 # schedule_wake min-lead floor:
-#   1. Idle-loop guard: after N consecutive proactive (non-user-driven) sends
-#      with NO intervening user message, stand down — tell the gate via
-#      loop_guard_blocked (blocks the heartbeat tick enqueue) AND skip realizing
-#      further idle proactive jobs (covers the scheduled-wake fire lane, which
-#      does not pass through the tick gate) — until the user speaks again.
+#   1. Self-wake loop guard: after N consecutive turns in which the agent
+#      schedules its OWN next wake with NO intervening user message, stop
+#      scheduling further self-wakes — which breaks the loop at the source —
+#      until the user speaks. This counts ONLY self-wakes. Heartbeats, daily
+#      reminders and event-triggered wakes are NOT self-loops and are never
+#      capped here (Seven 2026-07-21: the old guard counted EVERY idle proactive
+#      send, so 2 unanswered heartbeats silenced the companion — a regression;
+#      normal-heartbeat cadence is governed by wake_interval + DND + the 90s
+#      chat-collision window below, nothing else).
 #   2. Failure backoff: any consecutive proactive realization failure backs off
 #      exponentially (the 402 payment cooldown stays as its own special case for
 #      messaging, but also feeds this general backoff).
 # A blunt hourly cap was deliberately NOT used (Seven): users who want frequent
-# proactive messages are legitimate; only a genuinely input-less loop is stopped.
-MAX_EMPTY_PROACTIVE_TURNS = int(os.environ.get("FEEDLING_MAX_EMPTY_PROACTIVE_TURNS", "2"))
+# proactive messages are legitimate; only a genuinely input-less SELF-loop is stopped.
+MAX_CONSECUTIVE_SELF_WAKES = int(os.environ.get("FEEDLING_MAX_CONSECUTIVE_SELF_WAKES", "3"))
 PROACTIVE_FAIL_BACKOFF_BASE_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60"))
 PROACTIVE_FAIL_BACKOFF_CAP_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600"))
 # Post-time chat-collision window: a visible proactive bubble must not land
@@ -489,26 +493,28 @@ PROACTIVE_FAIL_BACKOFF_CAP_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_CA
 # so any earlier check (enqueue gate, realize-time peek, prompt-side "prefer
 # silence" advisory) can miss it. 0 disables the gate.
 PROACTIVE_CHAT_COLLISION_WINDOW_SEC = float(os.environ.get("PROACTIVE_CHAT_COLLISION_WINDOW_SEC", "90"))
-_proactive_empty_streak: int = 0
+_self_wake_streak: int = 0
 _proactive_fail_streak: int = 0
 _proactive_backoff_until: float = 0.0
 
 
-def _proactive_idle_guard_tripped() -> bool:
-    return MAX_EMPTY_PROACTIVE_TURNS > 0 and _proactive_empty_streak >= MAX_EMPTY_PROACTIVE_TURNS
+def _self_wake_loop_tripped() -> bool:
+    return MAX_CONSECUTIVE_SELF_WAKES > 0 and _self_wake_streak >= MAX_CONSECUTIVE_SELF_WAKES
 
 
-def _note_idle_proactive_send() -> None:
-    """An idle proactive turn was realized with no new user input since the last
-    one — advance the empty streak toward the guard."""
-    global _proactive_empty_streak
-    _proactive_empty_streak += 1
+def _note_self_wake() -> None:
+    """The agent scheduled its OWN next wake with no intervening user input —
+    advance the self-loop streak. Only self-wakes reach here; heartbeats,
+    reminders and event-triggered wakes never touch this counter."""
+    global _self_wake_streak
+    _self_wake_streak += 1
 
 
 def _reset_proactive_idle_guard() -> None:
-    """The user spoke (new input) — the loop is not idle; allow proactive again."""
-    global _proactive_empty_streak
-    _proactive_empty_streak = 0
+    """The user spoke (new input) — the self-wake loop is broken; allow the
+    agent to schedule self-wakes again."""
+    global _self_wake_streak
+    _self_wake_streak = 0
 
 
 def _proactive_backing_off() -> bool:
@@ -8778,9 +8784,11 @@ def _process_proactive_jobs(jobs: list) -> float:
             len(frame_ids),
         )
 
-        # Idle-loop guard + failure backoff apply only to genuine idle proactive
-        # turns — never to the first-greeting introduction or the screen-watch
-        # lane (the latter is user-activity-driven and gated separately).
+        # Failure backoff applies only to genuine idle proactive turns — never to
+        # the first-greeting introduction or the screen-watch lane. The self-wake
+        # LOOP guard is NOT here: it fires at the schedule point (where the agent
+        # asks for its own next wake), so realizing a heartbeat / reminder / event
+        # wake is never blocked by it — only the runaway self-wake chain is.
         is_idle_proactive = not is_introduction and not _is_screen_watch_job(job)
         if is_idle_proactive and _proactive_backing_off():
             log.warning(
@@ -8788,15 +8796,6 @@ def _process_proactive_jobs(jobs: list) -> float:
             )
             update_proactive_job_status(
                 job_id, "skipped", "proactive_backoff: cooling down after failures"
-            )
-            continue
-        if is_idle_proactive and _proactive_idle_guard_tripped():
-            log.info(
-                "proactive job skipped — idle loop guard (no new user input); job_id=%s",
-                job_id,
-            )
-            update_proactive_job_status(
-                job_id, "skipped", "proactive_idle_loop: no new user input"
             )
             continue
 
@@ -8886,8 +8885,10 @@ def _process_proactive_jobs(jobs: list) -> float:
             update_proactive_job_status(job_id, "failed", "degenerate_reply_suppressed")
             continue
         _note_agent_turn_success()
-        if is_idle_proactive:
-            _note_idle_proactive_send()
+        # NOTE: the self-wake loop streak is advanced at the schedule point below
+        # (only when the agent asks for its OWN next wake), NOT on every idle
+        # proactive send — a heartbeat/reminder landing must not count toward the
+        # loop guard (that was the regression that silenced quiet users).
         control_reply_reason = _proactive_control_reason_from_result(agent_result, replies)
         if control_reply_reason and not proactive_actions and not memory_identity_actions:
             update_proactive_job_status(
@@ -8933,7 +8934,20 @@ def _process_proactive_jobs(jobs: list) -> float:
         schedule_action_results: list[dict] = []
         scheduled_action_failed = False
         schedule_actions = _scheduled_wake_actions(proactive_actions)
+        # Self-wake loop guard — the ONLY brake on runaway self-scheduling. If the
+        # agent has already scheduled its own next wake MAX_CONSECUTIVE_SELF_WAKES
+        # times with no user input in between, drop this self-wake so no further
+        # wake fires: the chain ends here. Heartbeats/reminders/event wakes never
+        # reach this block, so they keep flowing. The streak clears the moment the
+        # user speaks (_reset_proactive_idle_guard in _process_messages).
+        if schedule_actions and _self_wake_loop_tripped():
+            log.info(
+                "self-wake dropped — loop guard (%d consecutive self-wakes, no user "
+                "input); job_id=%s", _self_wake_streak, job_id,
+            )
+            schedule_actions = []
         if schedule_actions:
+            _note_self_wake()
             try:
                 result = execute_scheduled_wake_actions(schedule_actions, job)
                 schedule_action_results = [
@@ -10504,13 +10518,14 @@ def run() -> None:
                         }
                         if last_broadcast_state:
                             tick_payload["broadcast_state"] = last_broadcast_state
-                        # Idle-loop guard: tell the gate to skip enqueuing the
-                        # heartbeat presence wake once we've sent N proactive
-                        # turns with no intervening user input (contract shared
-                        # with backend/proactive/gate.py).
-                        if _proactive_idle_guard_tripped():
-                            tick_payload["loop_guard_blocked"] = True
-                            tick_payload["loop_guard_reason"] = "no_new_input"
+                        # NOTE: we deliberately no longer send loop_guard_blocked
+                        # here. That flag told the gate to skip enqueuing the
+                        # HEARTBEAT presence wake whenever the old idle guard was
+                        # tripped — which silenced heartbeats to quiet users (the
+                        # regression). The self-wake loop is now broken at its
+                        # source (the schedule point), so the heartbeat tick must
+                        # never be gated by it. (gate.py still accepts the flag for
+                        # back-compat; the consumer just stops sending it.)
                         tick = post_proactive_tick(tick_payload)
                         decision = tick.get("decision") or {}
                         last_broadcast_state = str(
