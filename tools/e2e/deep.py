@@ -104,9 +104,10 @@ def run_provider(cell, pool, *, run_invariants: bool, areas: set[str]) -> dict:
                     "probes": [{"area": a, "cases": [{"name": "setup", "result": block,
                                 "detail": detail}]} for a in sorted(areas)]}
         probes = []
-        # experience runs LAST: its error-attribution case reconfigures the account
-        # with a bad key, which would break any probe that ran after it.
-        for area in ("memory", "continuity", "proactive", "perception", "experience"):
+        # continuity runs FIRST so its cold-start case measures the account's genuine
+        # first chat turn (memory/capture also sends chat). experience runs LAST: its
+        # error-attribution case removes the model config, breaking any later probe.
+        for area in ("continuity", "memory", "proactive", "perception", "experience"):
             if area not in areas:
                 continue
             runner = runners.get(area)
@@ -136,6 +137,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--providers", default="", help="comma list of cell names (default: all 6)")
     ap.add_argument("--areas", default="memory,continuity,proactive,perception,experience")
+    ap.add_argument("--diagnostic", action="store_true",
+                    help="tolerate BLOCKED_EVIDENCE (exit 0); default qualification mode "
+                         "exits nonzero for EVERY non-PASS per qa SOP")
     args = ap.parse_args()
 
     # Fail closed: never qualify the wrong deployment. This suite exists to test
@@ -201,7 +205,8 @@ def main() -> int:
         for (p, a, n, r, d) in blocked:
             print(f"  {r:14s} {p:22s} {a}/{n}: {d[:80]}")
     if evidence:
-        print("BLOCKED_EVIDENCE (non-fatal, surfaced):")
+        tag = "tolerated in --diagnostic" if args.diagnostic else "NON-PASS in qualification mode"
+        print(f"BLOCKED_EVIDENCE ({tag}):")
         for (p, a, n, r, d) in evidence:
             print(f"  {p:22s} {a}/{n}: {d[:80]}")
     stamp = int(time.time())
@@ -210,7 +215,11 @@ def main() -> int:
         json.dump({"target": TEST_API, "overall": overall, "report": report}, f,
                   ensure_ascii=False, indent=1)
     print(f"full report → {out_path}")
-    return 1 if blocked else 0
+    # qualification mode (default): ANY non-PASS fails (qa SOP — overall PASS needs
+    # every status PASS). --diagnostic tolerates only BLOCKED_EVIDENCE.
+    if args.diagnostic:
+        return 1 if blocked else 0
+    return 0 if overall == PASS else 1
 
 
 if __name__ == "__main__":

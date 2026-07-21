@@ -24,8 +24,10 @@ from .probe_common import (
 )
 
 _CJK = re.compile(r"[一-鿿]")
-# transcript/system labels that must never leak into a user-visible card
-_FORBIDDEN_LABEL = re.compile(r"(?im)^\s*(user|agent|assistant|openclaw|system|role)\s*[:：]")
+# transcript/system labels (EN + zh) that must never head a user-visible card line
+# — the usr_fee1 bug was a card whose text began `user: ...`.
+_FORBIDDEN_LABEL = re.compile(
+    r"(?im)^\s*(user|agent|assistant|openclaw|system|role|用户|助手|系统|角色)\s*[:：]")
 # tolerate a stray CJK proper noun in an English reply; only a real run of CJK is drift
 _CJK_DRIFT_MIN = 4
 
@@ -37,10 +39,35 @@ def _cjk_count(text: str) -> int:
 def run_experience_probe(c: E2EClient, cfg: dict) -> dict:
     p = Probe("experience")
     p.guard("injected_text_audit", lambda: _injected_text(c))
-    p.guard("language_adherence", lambda: _language(c))
+    # install the English persona ONCE, then check reactive + proactive language
+    p.guard("no_chinese_drift_reactive", lambda: _language_reactive(c))
+    p.guard("no_chinese_drift_proactive", lambda: _language_proactive(c, cfg))
     # error attribution mutates the account's provider config, so run it LAST
     p.guard("error_bubble_attribution", lambda: _error_attribution(c, cfg))
     return p.result()
+
+
+def _english_persona(c: E2EClient) -> tuple[int, dict]:
+    return install_identity(c, {
+        "agent_name": "Ivy",
+        "self_introduction": "I am Ivy, a calm English-speaking companion. I always reply in English.",
+        "category": "companion",
+        "signature": "— Ivy",
+        "language_preference": "en",
+        "tone_style": "Warm, concise English. Never switch to Chinese unless the user does.",
+        "custom_persona_prompt": "Always speak English, including when you open a conversation proactively.",
+        "dimensions": [{"name": "warmth", "value": 80, "description": "gentle and present"}],
+    })
+
+
+def _is_english(text: str) -> bool:
+    """Not just 'few CJK' — require Latin letters to actually dominate, so French,
+    other scripts, or gibberish don't slip through as 'English'."""
+    if _cjk_count(text) >= _CJK_DRIFT_MIN:
+        return False
+    letters = [ch for ch in text if ch.isalpha()]
+    latin = [ch for ch in letters if ch.isascii()]
+    return len(latin) >= 8 and len(latin) / max(1, len(letters)) >= 0.7
 
 
 def _injected_text(c: E2EClient):
@@ -63,44 +90,79 @@ def _injected_text(c: E2EClient):
         time.sleep(15)
     if not card:
         return BLOCKED_EVIDENCE, f"no card captured for marker {mk} to audit"
-    r = c.post("/v1/memory/fetch", json={"ids": [card.get("id")], "limit": 5})
+    cid = str(card.get("id") or "")
+    r = c.post("/v1/memory/fetch", json={"ids": [cid], "limit": 5})
     r.raise_for_status()
-    full = (r.json().get("items") or [{}])[0]
+    full = next((it for it in (r.json().get("items") or [])
+                 if str(it.get("id") or "") == cid), None)
+    if full is None:
+        return BLOCKED_EVIDENCE, f"fetch returned no item for the captured card id {cid[:8]}"
     # audit every user-visible text field of the stored card, not just the summary
     parts = [str(full.get("summary") or ""), str(full.get("content") or ""),
              str(full.get("bucket") or "")]
     parts += [str(t) for t in (full.get("threads") or [])]
     hit = next((m for m in (_FORBIDDEN_LABEL.search(p) for p in parts) if m), None)
     return (PRODUCT_FAIL if hit else PASS,
-            f"card field carries transcript label {hit.group(0)!r}" if hit
-            else "captured card (summary/content/bucket/threads) free of role labels")
+            f"card field carries transcript/name label {hit.group(0)!r}" if hit
+            else "captured card (summary/content/bucket/threads) free of role/name labels")
 
 
-def _language(c: E2EClient):
-    st, body = install_identity(c, {
-        "agent_name": "Ivy",
-        "self_introduction": "I am Ivy, a calm English-speaking companion. I always reply in English.",
-        "category": "companion",
-        "signature": "— Ivy",
-        "language_preference": "en",
-        "tone_style": "Warm, concise English. Never switch to Chinese unless the user does.",
-        "dimensions": [{"name": "warmth", "value": 80, "description": "gentle and present"}],
-    })
+def _language_reactive(c: E2EClient):
+    """English persona stays English across 3 reactive turns, then mirrors one
+    Chinese message for that turn only (§4.5)."""
+    st, body = _english_persona(c)
     if st not in (200, 201):
         return BLOCKED_EVIDENCE, f"could not install English persona ({st} {str(body)[:80]})"
-    # three English turns must each stay English (tolerate a stray CJK proper noun)
     for i in range(3):
         text = _one_reply(c, f"Turn {i+1}: tell me one short encouraging sentence in English.")
         if text is None:
             return PRODUCT_FAIL, f"no reply on English turn {i+1}"
-        if _cjk_count(text) >= _CJK_DRIFT_MIN:
-            return PRODUCT_FAIL, f"English persona drifted to Chinese on turn {i+1}: {text[:60]!r}"
-    # one Chinese message → that turn mirrors Chinese
+        if not _is_english(text):
+            return PRODUCT_FAIL, f"English persona failed to stay English on turn {i+1}: {text[:60]!r}"
     mirror = _one_reply(c, "换成中文回我一句就好，谢谢。")
     if mirror is None:
         return PRODUCT_FAIL, "no reply on the Chinese mirror turn"
     return (PASS if _cjk_count(mirror) >= _CJK_DRIFT_MIN else PRODUCT_FAIL,
-            f"3 English turns stayed English; Chinese turn CJK={_cjk_count(mirror)}")
+            f"3 English turns stayed English; Chinese turn mirrored CJK={_cjk_count(mirror)}")
+
+
+def _language_proactive(c: E2EClient, cfg: dict):
+    """§4.5 requires BOTH paths: an English persona's PROACTIVE opener must also be
+    English. This MUST run on a clean account — the shared account's history is full
+    of Chinese turns from earlier probes, and a proactive opener rightly mirrors
+    recent user language, so testing it there measures contamination, not drift.
+    A fresh English-only account isolates the real question. If a proactive message
+    can't be driven, that is an explicit BLOCKED_EVIDENCE."""
+    b = E2EClient.provision(route="model_api")
+    try:
+        payload = {"provider": cfg.get("provider"), "model": cfg.get("model"), "api_key": cfg.get("key")}
+        if cfg.get("base_url"):
+            payload["base_url"] = cfg["base_url"]
+        if b.post("/v1/model_api/setup", json=payload).status_code != 200:
+            return BLOCKED_EVIDENCE, "could not set up the isolated proactive-language account"
+        st, _ = _english_persona(b)
+        if st not in (200, 201):
+            return BLOCKED_EVIDENCE, "could not install English persona on the isolated account"
+        b.post("/v1/proactive/settings", json={"ambient": True, "timezone": "Asia/Shanghai"})
+        if b.post("/v1/proactive/tick", json={"force": True}).status_code != 200:
+            return BLOCKED_EVIDENCE, "could not force a proactive wake on the isolated account"
+        since = time.time()
+        reply = b.wait_reply(since, timeout=180.0)
+        if reply is None:
+            return BLOCKED_EVIDENCE, "forced wake produced no proactive message to language-check"
+        text = b.message_text(reply)
+        if not text.strip():
+            return BLOCKED_EVIDENCE, "proactive message did not decrypt for a language check"
+        return (PASS if _is_english(text) else PRODUCT_FAIL,
+                f"isolated English account proactive opener "
+                f"{'stayed English' if _is_english(text) else 'DRIFTED to non-English'}: {text[:60]!r}")
+    finally:
+        try:
+            b.teardown()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            b._http.close()
 
 
 def _error_attribution(c: E2EClient, cfg: dict):
@@ -119,13 +181,23 @@ def _error_attribution(c: E2EClient, cfg: dict):
         return BLOCKED_EVIDENCE, "could not remove model config; auth-fault attribution needs mock relay (§4.6)"
     r = c.post("/v1/model_api/chat/send",
                json={"message": "no-model send", "client_msg_id": str(uuid.uuid4())})
-    if r.status_code >= 500 and r.status_code != 503:
-        return PRODUCT_FAIL, f"no-model send returned {r.status_code} (server error, not a clean reject)"
+    # the adjacent drivable assertion: exact 503 runtime_policy_not_ready (not a 500,
+    # not a 202-then-silence, not a wrong-route 404/401).
+    ok_reject = False
+    if r.status_code == 503:
+        try:
+            ok_reject = r.json().get("error") == "runtime_policy_not_ready"
+        except Exception:  # noqa: BLE001
+            ok_reject = False
     if r.status_code == 202:
         return PRODUCT_FAIL, "no-model send was ACCEPTED (202) — should reject, not silently drop the turn"
+    if r.status_code >= 500 and r.status_code != 503:
+        return PRODUCT_FAIL, f"no-model send returned {r.status_code} (server error, not a clean 503)"
+    if not ok_reject:
+        return PRODUCT_FAIL, f"no-model send off-contract: {r.status_code} {r.text[:80]} (want 503 runtime_policy_not_ready)"
     return (BLOCKED_EVIDENCE,
-            f"no-model send cleanly rejected ({r.status_code} {r.text[:60]}); but the true "
-            f"stopped-key attribution bubble needs the mock relay (§4.6) — not covered here")
+            "no-model send cleanly rejected 503 runtime_policy_not_ready; but the true "
+            "stopped-key attribution bubble needs the mock relay (§4.6) — not covered here")
 
 
 def _one_reply(c: E2EClient, text: str) -> str | None:

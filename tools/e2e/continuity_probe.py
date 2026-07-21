@@ -50,7 +50,13 @@ def _send(c: E2EClient, text: str) -> tuple[float, str]:
         r = c.post("/v1/model_api/chat/send", json={"message": text, "client_msg_id": cmid})
         if r.status_code == 202:
             u = r.json().get("user_message") or {}
-            return float(u.get("ts") or time.time()), str(u.get("id") or "")
+            uid = str(u.get("id") or "")
+            ts = u.get("ts")
+            if not uid or ts is None:
+                # an empty id would make _replies_for match every unrelated agent row
+                # ('' == ''), so a malformed 202 must fail loud, not fail open.
+                raise RuntimeError(f"202 missing user_message id/ts: {r.text[:120]}")
+            return float(ts), uid
         last = f"{r.status_code} {r.text[:100]}"
         if r.status_code == 503 and any(x in r.text for x in ("workers_unavailable", "runtime_policy_not_ready")):
             time.sleep(5)
@@ -68,6 +74,8 @@ def _rows_since(c: E2EClient, since: float) -> list[dict]:
 def _replies_for(rows: list[dict], user_id: str) -> list[dict]:
     """Agent rows that are THE correlated reply to user_id (by the user row's
     reply_message_id, or the agent row's reply_to_message_id)."""
+    if not user_id:
+        return []                       # never correlate against an empty id
     reply_id = ""
     for m in rows:
         if str(m.get("id") or "") == user_id:
@@ -94,7 +102,9 @@ def _multi_turn(c: E2EClient, p: Probe):
     correlated id, not timestamp); Turn 2 proves the model recalls it."""
     mk = new_marker()
     t0 = time.time()
-    sent, uid1 = _send(c, f"你好呀。请记住我的暗号是 {mk}，它很重要。")
+    # phrase it as conversational context, NOT "remember this" — the latter makes the
+    # model answer "saved!" on recall instead of reciting the value.
+    sent, uid1 = _send(c, f"随口跟你说个代号：{mk}。等会我会问你它是什么。")
     reply = _reply_for(c, uid1, sent, timeout=FIRST_REPLY_TIMEOUT)
     if reply is None:
         return PRODUCT_FAIL, f"no first reply within {FIRST_REPLY_TIMEOUT:.0f}s (cold start)"
@@ -115,7 +125,7 @@ def _multi_turn(c: E2EClient, p: Probe):
           f"{len(replies)} reply/replies correlated to one user turn (id={uid1[:8]})")
 
     # turn 2: recall
-    sent2, uid2 = _send(c, "我刚才告诉你的暗号是什么？原样回给我。")
+    sent2, uid2 = _send(c, "我刚才说的那个代号是什么？把它原样念给我。")
     reply2 = _reply_for(c, uid2, sent2, timeout=NEXT_REPLY_TIMEOUT)
     text2 = c.message_text(reply2) if reply2 else ""
     return (PASS if (reply2 is not None and mk in text2) else PRODUCT_FAIL,
@@ -133,10 +143,12 @@ def _idempotent(c: E2EClient):
         codes.append(r.status_code)
         time.sleep(1)
     time.sleep(4)
-    after = _user_row_count(c)
-    delta = after - before
+    delta = _user_row_count(c) - before
+    # both POSTs must have satisfied the send contract (202), AND only one row lands
+    if any(cd != 202 for cd in codes):
+        return PRODUCT_FAIL, f"idempotent send had a non-202 attempt (codes={codes})"
     return (PASS if delta == 1 else PRODUCT_FAIL,
-            f"same client_msg_id ×2 → {delta} user row(s) (codes={codes}); must be 1")
+            f"same client_msg_id ×2 (codes={codes}) → {delta} user row(s); must be 1")
 
 
 def _seq_order(c: E2EClient):
@@ -157,11 +169,15 @@ def _long_message(c: E2EClient):
     EXACTLY 413 and a length error — not any 4xx, and never a 5xx."""
     big = "长消息压力测试。" * 2000  # ~16k chars, well over the 12000 cap
     r = c.post("/v1/model_api/chat/send", json={"message": big, "client_msg_id": str(uuid.uuid4())})
-    if r.status_code == 413:
-        return PASS, f"oversized rejected 413: {r.text[:80]}"
-    if r.status_code >= 500:
-        return PRODUCT_FAIL, f"oversized → {r.status_code} (server error, must be 413)"
-    return PRODUCT_FAIL, f"oversized → {r.status_code} (expected exact 413 length cap): {r.text[:80]}"
+    if r.status_code != 413:
+        return PRODUCT_FAIL, f"oversized → {r.status_code} (expected exact 413 length cap): {r.text[:80]}"
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001
+        return PRODUCT_FAIL, f"413 body is not JSON: {r.text[:80]}"
+    if body.get("error") != "message too long" or int(body.get("max_chars") or 0) != 12000:
+        return PRODUCT_FAIL, f"413 body off-contract: {body}"
+    return PASS, "oversized rejected 413 error='message too long' max_chars=12000"
 
 
 def _rapid_double(c: E2EClient):

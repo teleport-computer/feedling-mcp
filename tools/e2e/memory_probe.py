@@ -67,15 +67,23 @@ def _isolation(c: E2EClient):
     st, body = mem_add(c, summary=f"A 的私密事实 {mk}", content="only A owns this")
     if st not in (200, 201):
         return PRODUCT_FAIL, f"A write failed {st} {body}"
+    a_id = _id_of(c, mk)
+    if not a_id:
+        return BLOCKED_EVIDENCE, "could not resolve A's card id to test isolation"
     b = E2EClient.provision(route="model_api")
-    result, detail = PASS, "B cannot read or mutate A's card"
+    result, detail = PASS, "B cannot read, fetch, or mutate A's card"
     try:
-        seen = any(mk in str(it.get("summary") or "") for it in mem_index(b, limit=100))
-        if seen:
-            result, detail = PRODUCT_FAIL, f"account B can SEE account A's card {mk} — isolation broken"
+        # 1) A's id must be absent from B's index
+        if a_id in {str(it.get("id") or "") for it in mem_index(b, limit=200)}:
+            result, detail = PRODUCT_FAIL, f"account B index exposes A's card {a_id} — read isolation broken"
         else:
-            a_id = _id_of(c, mk)
-            if a_id:
+            # 2) B fetch of A's id must not return it
+            fr = b.post("/v1/memory/fetch", json={"ids": [a_id], "limit": 5})
+            fr.raise_for_status()
+            if a_id in {str(it.get("id") or "") for it in (fr.json().get("items") or [])}:
+                result, detail = PRODUCT_FAIL, f"account B fetched A's card {a_id} — read isolation broken"
+            else:
+                # 3) B must not be able to mutate A's card
                 st2, _ = mem_supersede(b, a_id, summary="hijack")
                 if st2 in (200, 201):
                     result, detail = (PRODUCT_FAIL,
@@ -154,10 +162,22 @@ def _local_only(c: E2EClient):
     if r.status_code not in (200, 201):
         return BLOCKED_EVIDENCE, (f"could not store a local_only card to exercise "
                                   f"exclusion ({r.status_code} {r.text[:80]})")
-    idx_hit = any(mk in str(it.get("summary") or "") for it in mem_index(c, limit=200))
-    return (PRODUCT_FAIL if idx_hit else PASS,
-            "local_only card LEAKED into agent index" if idx_hit
-            else "local_only stored but correctly excluded from agent readside")
+    body = r.json()
+    mid = str((body.get("moment") or {}).get("id") or body.get("id") or "")
+    if not mid:
+        return BLOCKED_EVIDENCE, "local_only add response exposed no moment id"
+    # exclusion is proven by ID, not by (encrypted) marker text: the stored card
+    # must be absent from BOTH the agent index and a by-ID fetch.
+    if mid in {str(it.get("id") or "") for it in mem_index(c, limit=200)}:
+        return PRODUCT_FAIL, f"local_only id {mid} LEAKED into the agent index"
+    fr = c.post("/v1/memory/fetch", json={"ids": [mid], "limit": 5})
+    fr.raise_for_status()
+    fb = fr.json()
+    if mid in {str(it.get("id") or "") for it in (fb.get("items") or [])}:
+        return PRODUCT_FAIL, f"local_only id {mid} readable via fetch — agent can surface it"
+    unavailable = mid in (fb.get("unavailable_ids") or [])
+    return PASS, (f"local_only stored (id={mid[:8]}) absent from index & fetch items; "
+                  f"unavailable_ids={unavailable}")
 
 
 def _importance(c: E2EClient):
