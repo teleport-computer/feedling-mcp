@@ -39,15 +39,16 @@ def _naming_rule(user_name: str) -> str:
     )
 
 
-def rewrite_user_reference(text: str, user_name: str, subject: str = "user") -> str:
+def rewrite_user_reference(text: str, user_name: str, subject: str = "") -> str:
     """Rewrite system-label leaks and user-subject pronouns in visible prose.
 
     The positive predicate/particle anchors deliberately preserve product terms
     such as ``用户增长`` / ``用户画像`` / ``user growth``.  Prompting is the primary
     guard; this is the deterministic last mile for user-visible memory prose.
-    Pronoun rewriting is gated by ``subject`` so agent/relationship prose keeps
-    pronouns that do not refer to the person.  Genesis memory prose defaults to
-    the user subject because its fact-write output no longer carries ``about``.
+    Pronoun rewriting is gated by an explicit ``subject="user"`` so agent and
+    relationship prose keeps pronouns that do not refer to the person.  The
+    neutral default is intentional for Genesis fact-write output, which no
+    longer carries ``about`` and therefore cannot disambiguate ``TA`` safely.
     """
     raw = str(text or "")
     if not raw:
