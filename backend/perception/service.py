@@ -871,7 +871,12 @@ def admin_perception_freshness(user_id: str, now: float | None = None) -> dict:
                 continue
             seen.add(f)
             cell = state.get(f)
-            ts = float(cell.get("ts") or 0) if isinstance(cell, dict) else 0.0
+            # A single dirty cell.ts (non-numeric historical junk) must not blow
+            # up the whole freshness read — degrade that one field to "unreported".
+            try:
+                ts = float(cell.get("ts") or 0) if isinstance(cell, dict) else 0.0
+            except (TypeError, ValueError):
+                ts = 0.0
             reported = ts > 0
             stable = f in _STABLE_CONTEXT_FIELDS
             age = (now - ts) if reported else None
@@ -888,7 +893,10 @@ def admin_perception_freshness(user_id: str, now: float | None = None) -> dict:
             })
     fields.sort(key=lambda r: (r["capability"], r["field"]))
     apps = store.read_app_opens(user_id, limit=1)
-    last_app_ts = float(apps[0].get("ts") or 0) if (apps and isinstance(apps[0], dict)) else 0.0
+    try:
+        last_app_ts = float(apps[0].get("ts") or 0) if (apps and isinstance(apps[0], dict)) else 0.0
+    except (TypeError, ValueError):
+        last_app_ts = 0.0
     return {
         "fields": fields,
         "recent_app_open_ts": last_app_ts or None,
