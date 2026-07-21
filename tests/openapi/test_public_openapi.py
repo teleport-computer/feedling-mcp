@@ -614,10 +614,62 @@ def test_web_settings_schemas_pin_the_field_types(
     }
     for field in ("enabled", "available", "effective"):
         assert response["properties"][field]["type"] == "boolean", field
+    # OpenAPI 3.1: `nullable` is gone and `type: string` excludes null, so the
+    # null branch has to be a real anyOf member — otherwise the documented shape
+    # rejects the response the endpoint actually returns while available.
     reason = response["properties"]["unavailable_reason"]
-    assert reason["nullable"] is True
-    assert set(reason["enum"]) == {"globally_disabled", None}
+    assert "nullable" not in reason
+    assert reason["anyOf"] == [
+        {"type": "string", "enum": ["globally_disabled"]},
+        {"type": "null"},
+    ]
     capabilities = response["properties"]["capabilities"]
     assert set(capabilities["required"]) == {"search", "fetch"}
     for field in ("search", "fetch"):
         assert capabilities["properties"][field]["type"] == "boolean", field
+
+
+def test_web_settings_response_schema_matches_what_the_core_actually_returns(
+    public_schema: dict[str, Any],
+) -> None:
+    """Tie the published contract to the real producer.
+
+    The two are edited in different files, so without this they drift silently —
+    which is exactly how `unavailable_reason` ended up documented as a
+    non-nullable string while the endpoint returns null whenever web is
+    available.
+    """
+    import sys
+    from pathlib import Path as _Path
+
+    sys.path.insert(0, str(_Path(__file__).parent.parent.parent / "backend"))
+    from chat import web_settings_core
+
+    class _Store:
+        def __init__(self, enabled):
+            self._enabled = enabled
+
+        def load_web_settings(self):
+            return {"version": 1, "enabled": self._enabled}
+
+    schema = public_schema["components"]["schemas"]["WebSettingsResponse"]
+    documented = set(schema["required"])
+
+    available = web_settings_core.get_settings(
+        _Store(False), halted_reader=lambda: (False, False)
+    )
+    halted = web_settings_core.get_settings(
+        _Store(True), halted_reader=lambda: (True, True)
+    )
+
+    for payload in (available, halted):
+        assert set(payload) == documented, payload
+
+    # the null branch the anyOf exists for
+    assert available["unavailable_reason"] is None
+    # and the only documented string value
+    string_branch = next(
+        branch for branch in schema["properties"]["unavailable_reason"]["anyOf"]
+        if branch.get("type") == "string"
+    )
+    assert halted["unavailable_reason"] in string_branch["enum"]

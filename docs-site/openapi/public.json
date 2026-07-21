@@ -7405,11 +7405,16 @@
             "description": "`enabled && available`. Derived, never stored."
           },
           "unavailable_reason": {
-            "type": "string",
-            "nullable": true,
-            "enum": [
-              "globally_disabled",
-              null
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "globally_disabled"
+                ]
+              },
+              {
+                "type": "null"
+              }
             ],
             "description": "Null when available. Unknown values must be treated as unavailable."
           },

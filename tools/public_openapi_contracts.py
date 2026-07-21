@@ -341,9 +341,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "description": "`enabled && available`. Derived, never stored.",
             },
             "unavailable_reason": {
-                "type": "string",
-                "nullable": True,
-                "enum": ["globally_disabled", None],
+                # OpenAPI 3.1 (this document) dropped `nullable`, and under JSON
+                # Schema `type: string` excludes null even when null appears in
+                # `enum` — the real response returns null while available, so
+                # that spelling would not validate. anyOf is the 3.1 form.
+                "anyOf": [
+                    {"type": "string", "enum": ["globally_disabled"]},
+                    {"type": "null"},
+                ],
                 "description": "Null when available. Unknown values must be treated as unavailable.",
             },
             "capabilities": {
