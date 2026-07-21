@@ -236,6 +236,23 @@ def test_snapshot_ttl_nulls_stale(env):
     assert service.snapshot(UID)["motion_state"] is None
 
 
+def test_admin_perception_freshness_reports_fresh_stale_and_never(env):
+    # Admin/support triage: split "device stopped feeding X" from a backend read
+    # gap using timestamps only, no user key (usr_7f30 / usr_5d3d blind spots).
+    fake, _ = env
+    now = time.time()
+    service.ingest_snapshot(UID, [_item("motion_state", {"state": "running"})])
+    by = {f["field"]: f for f in service.admin_perception_freshness(UID, now=now)["fields"]}
+    assert by["motion_state"]["reported"] and by["motion_state"]["fresh"]        # fresh
+    assert by["motion_state"]["ttl_sec"] == 300 and by["motion_state"]["age_sec"] is not None
+    assert by["condition"]["reported"] is False and by["condition"]["fresh"] is False  # never (weather)
+
+    # backdate beyond motion's 300s ttl → now reported-but-stale (agent sees null)
+    fake.state[UID]["motion_state"]["ts"] = now - 10_000
+    by2 = {f["field"]: f for f in service.admin_perception_freshness(UID, now=now)["fields"]}
+    assert by2["motion_state"]["reported"] and not by2["motion_state"]["fresh"]  # stale
+
+
 def test_snapshot_timezone_survives_ttl_but_local_time_expires(env):
     """Stable identity fields (timezone/locale) must NOT be nulled out by the
     freshness TTL: a proactive wake fires long after the last foreground report,

@@ -848,6 +848,54 @@ def pull_snapshot(user_id: str, now: float | None = None) -> dict:
     return _catalog_snapshot_fields(user_id, now, include_query_tools=True)
 
 
+def admin_perception_freshness(user_id: str, now: float | None = None) -> dict:
+    """Per-field last-report freshness for admin/support triage.
+
+    Timestamps ONLY — never the (often encrypted) values. Answers "is the device
+    still feeding location / steps / … or did the client stop reporting?" without
+    the user's key. Every catalog signal field is listed; an unreported field
+    shows ``reported=False`` so "never sent" is distinct from "sent but stale".
+    ``fresh`` mirrors the snapshot's own TTL rule (``_catalog_snapshot_fields``),
+    so a field reading ``fresh=False`` is exactly one the agent currently sees as
+    null. Two prod blind spots (usr_7f30 app_open, usr_5d3d location/steps) —
+    this closes them from the admin side without any user key.
+    """
+    now = now or _now()
+    state = store.get_state(user_id)
+    fields: list[dict] = []
+    seen: set[str] = set()
+    for sig in catalog.SIGNALS.values():
+        cap = catalog.CAPABILITIES.get(sig.capability)
+        for f in sig.outputs:
+            if f == "user_state" or f in seen:
+                continue
+            seen.add(f)
+            cell = state.get(f)
+            ts = float(cell.get("ts") or 0) if isinstance(cell, dict) else 0.0
+            reported = ts > 0
+            stable = f in _STABLE_CONTEXT_FIELDS
+            age = (now - ts) if reported else None
+            fresh = bool(reported and (stable or age <= sig.ttl_sec))
+            fields.append({
+                "field": f,
+                "capability": sig.capability,
+                "capability_label": cap.label if cap else "",
+                "reported": reported,
+                "last_report_ts": ts if reported else None,
+                "age_sec": int(age) if age is not None else None,
+                "ttl_sec": None if stable else int(sig.ttl_sec),
+                "fresh": fresh,
+            })
+    fields.sort(key=lambda r: (r["capability"], r["field"]))
+    apps = store.read_app_opens(user_id, limit=1)
+    last_app_ts = float(apps[0].get("ts") or 0) if (apps and isinstance(apps[0], dict)) else 0.0
+    return {
+        "fields": fields,
+        "recent_app_open_ts": last_app_ts or None,
+        "recent_app_open_age_sec": int(now - last_app_ts) if last_app_ts else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # user_state
 # ---------------------------------------------------------------------------
