@@ -2147,11 +2147,9 @@ _NOISE_LINE_RE = re.compile(
     r"session_id\s*:.*"      # hermes session footer
     r"|[↻⟳]?\s*(resumed|created|started)\s+session\b.*"  # hermes session banner
     r"|[A-Za-z0-9_\-]{8,}\s*\(\d+\s+user\s+messages?,\s*\d+\s+total\s+messages?\)"
-    r"|---+|={3,}|[-–—_]{3,}" # separator lines
     r"|\[.*\]\s*$"           # [bracket] meta lines
     r"|💭.*"                 # hermes thinking-emoji prefix
     r"|[└┌│╰╭─].*"           # box-drawing UI chrome
-    r"|\*\*[^*]+\*\*\s*$"   # **standalone bold header**
     r"|</?think>"            # <think> XML tags
     r"|Reasoning:\s*$"       # bare "Reasoning:" label
     r"|[✵✦✧★☆※].*"          # decorative symbol lines
@@ -2217,7 +2215,19 @@ def _strip_leading_non_cjk_preamble(lines: list[str]) -> list[str]:
     first_cjk = next((i for i, ln in enumerate(lines) if _CJK_RE.search(ln)), None)
     if first_cjk is None or first_cjk == 0:
         return lines
-    return lines[first_cjk:]
+
+    markdown_start = next(
+        (
+            i
+            for i, line in enumerate(lines[:first_cjk])
+            if re.match(
+                r"^\s*(?:#{1,6}\s|[-+*]\s|>\s|\d+[.)]\s|[`~]{3,}|\||\*\*|__)",
+                line,
+            )
+        ),
+        None,
+    )
+    return lines[markdown_start if markdown_start is not None else first_cjk :]
 
 
 def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
@@ -5105,47 +5115,85 @@ def call_agent_cli(
 
 
 def _sanitize_reply_text(text: str) -> str:
-    """Strip formatting/system leakage and collapse accidental duplication."""
+    """Strip system leakage without rewriting user-visible Markdown."""
     if not isinstance(text, str):
         return ""
 
-    text = text.replace("\r\n", "\n")
-    text = text.strip()
-    if not text:
+    text = text.replace("\r\n", "\n").strip("\n")
+    if not text.strip():
         return ""
 
     kept: list[str] = []
+    fence_char = ""
+    fence_length = 0
+
     for raw_ln in text.splitlines():
-        ln = raw_ln.strip()
-        if not ln:
+        line = raw_ln.rstrip()
+        stripped = line.strip()
+
+        fence_match = re.match(r"^([`~]{3,})", stripped)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not fence_char:
+                fence_char = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_length:
+                fence_char = ""
+                fence_length = 0
+            kept.append(line)
             continue
-        if _NOISE_LINE_RE.match(ln):
+
+        if fence_char:
+            kept.append(line)
             continue
-        if _IDENTITY_LEAK_RE.search(ln):
+
+        if not stripped:
+            if kept and kept[-1] != "":
+                kept.append("")
             continue
-        if _REASONING_LINE_RE.match(ln):
+        if _NOISE_LINE_RE.match(stripped):
             continue
-        # Remove markdown-ish wrappers/bullets and decorative prefixes.
-        ln = re.sub(r"^[`#>*\-\s]+", "", ln).strip()
-        ln = re.sub(r"^[—–-]+\s*", "", ln).strip()
-        if not ln:
+
+        inspection = re.sub(r"^[`#>*\-\s]+", "", stripped).strip()
+        inspection = re.sub(r"[`*_]+$", "", inspection).strip()
+        if _IDENTITY_LEAK_RE.search(inspection):
             continue
-        kept.append(ln)
+        if _REASONING_LINE_RE.match(inspection):
+            continue
+        kept.append(line)
 
     if not kept:
         return ""
+
+    while kept and kept[-1] == "":
+        kept.pop()
 
     kept = _strip_leading_non_cjk_preamble(kept)
     if not kept:
         return ""
 
-    # Dedup consecutive identical lines.
-    deduped: list[str] = []
-    for ln in kept:
-        if not deduped or deduped[-1] != ln:
-            deduped.append(ln)
+    has_fenced_code = any(re.match(r"^\s*[`~]{3,}", line) for line in kept)
 
-    deduped = _collapse_repeated_line_blocks(deduped)
+    # Dedup consecutive identical lines outside fenced code.
+    deduped: list[str] = []
+    dedupe_fence_char = ""
+    dedupe_fence_length = 0
+    for ln in kept:
+        fence_match = re.match(r"^\s*([`~]{3,})", ln)
+        inside_fence = bool(dedupe_fence_char)
+        if inside_fence or not deduped or deduped[-1] != ln:
+            deduped.append(ln)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not dedupe_fence_char:
+                dedupe_fence_char = marker[0]
+                dedupe_fence_length = len(marker)
+            elif marker[0] == dedupe_fence_char and len(marker) >= dedupe_fence_length:
+                dedupe_fence_char = ""
+                dedupe_fence_length = 0
+
+    if not has_fenced_code:
+        deduped = _collapse_repeated_line_blocks(deduped)
 
     return "\n".join(deduped).strip()
 

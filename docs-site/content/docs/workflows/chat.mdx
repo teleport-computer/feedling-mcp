@@ -298,6 +298,11 @@ Decrypt the claimed user turn through the authorized enclave path, invoke the
 agent, then encrypt its reply. `reply_to_message_id` connects the two records and
 enables duplicate-reply protection.
 
+Preserve the final reply's Markdown, blank lines, and leading indentation before
+encryption. Transport logs and reasoning leakage may be filtered, but formatting
+such as headings, list markers, nested-list indentation, blockquotes, and fenced
+code is part of the user-visible reply and must reach the client unchanged.
+
 ```http
 POST /v1/chat/response HTTP/1.1
 Host: api.feedling.app

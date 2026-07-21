@@ -134,6 +134,10 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- Resident agent replies now preserve Markdown markers, paragraph breaks, and
+  list indentation when the consumer filters runtime noise. Headings, unordered
+  lists, nested lists, blockquotes, thematic breaks, and fenced code therefore
+  reach clients unchanged instead of being flattened before encryption.
 - Concurrent `POST /v1/chat/response` calls for the same parent are now resolved
   by one PostgreSQL compare-and-swap across all backend workers. Exactly one
   request marks the parent answered and inserts its encrypted reply; later

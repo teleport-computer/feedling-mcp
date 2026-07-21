@@ -1149,6 +1149,41 @@ Tell me what you want to work on next."""
     assert cleaned == "Hello Seven — I see your message now.\nTell me what you want to work on next."
 
 
+def test_sanitize_reply_text_preserves_markdown_layout():
+    raw = """# 一级标题
+
+## 二级标题
+
+- 第一项
+  - 嵌套项
+1. 第一步
+   1. 子步骤
+
+> 引用内容
+
+**独立粗体标题**
+
+```swift
+let title = "# 代码里的标记不能清理"
+```
+"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw.strip()
+
+
+def test_sanitize_reply_text_preserves_fenced_code_verbatim():
+    raw = """```swift
+let title = "# 中文代码"
+let title = "# 中文代码"
+```"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
 def test_sanitize_reply_text_drops_unlabeled_english_meta_before_cjk_answer():
     raw = """specific tool is required for this factual question, so I can rely on my memory
 or general knowledge up to 2024. I remember Philip Daian as an Ethereum researcher
