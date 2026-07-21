@@ -2171,9 +2171,9 @@ _REASONING_LINE_RE = re.compile(
 
 _RUNTIME_REASONING_FENCE_LANGUAGES = {"copy"}
 _RUNTIME_REASONING_HEADER_RE = re.compile(
-    r"^(?:💭\s*)?(?:(?:reasoning|chain\s+of\s+thought)\s*:?|"
+    r"^(?:💭\s*)?(?:(?:reasoning|chain\s+of\s+thought)\s*:?$|"
     r"(?:checking|inspecting|reviewing|analyzing)\s+(?:the\s+)?"
-    r"(?:repository|repo|project|codebase|workspace|files?|request|context)\b|"
+    r"(?:repository|repo|project|codebase|workspace|(?:source\s+)?files?|request|context)\b|"
     r"(?:executing\s+updates?|doing\s+(?:work|the\s+task))\s*[.!…]*|"
     r"先(?:检查|查看|分析|思考|规划|准备|执行|处理)(?:一下)?"
     r"(?:仓库|代码|文件|上下文|问题|请求|任务))",
@@ -2297,8 +2297,7 @@ def _strip_blockquote_container(line: str, depth: int) -> str:
         if not value.startswith(">"):
             break
         value = value[1:]
-        if value.startswith(" "):
-            value = value[1:]
+        value = value.lstrip()
     return value.strip()
 
 

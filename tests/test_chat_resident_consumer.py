@@ -1205,6 +1205,7 @@ I need to inspect the repository before answering.
         "Checking the repository before answering.",
         "Checking project before answering.",
         "💭 Checking repository before answering.",
+        "💭 Inspecting source files before answering.",
         "先检查仓库，再回复用户。",
     ],
 )
@@ -1235,6 +1236,7 @@ I need to update the deployment notes.
     "content",
     [
         'let reasoning = "visible output"',
+        "reasoning = true",
         "# Checking repository permissions",
         "- Checking repository status",
         "Working hours: 09:00-17:00",
@@ -1289,6 +1291,21 @@ def test_sanitize_reply_text_preserves_fence_like_content_at_deeper_quote_depth(
     cleaned = crc._sanitize_reply_text(raw)
 
     assert cleaned == raw
+
+
+def test_sanitize_reply_text_filters_runtime_copy_with_tabbed_quote_container():
+    raw = (
+        ">\t> ```copy\n"
+        ">\t> **Executing updates**\n"
+        ">\t> Internal details.\n"
+        ">\t> ```\n"
+        "\n"
+        "这是最终回复。"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
 
 
 def test_sanitize_reply_text_implicitly_closes_fence_when_blockquote_ends():
