@@ -257,13 +257,39 @@ def test_rendered_user_candidate_unknown_name_uses_neutral_referent():
     assert "用户" not in json.dumps(cards[0], ensure_ascii=False)
 
 
-def test_chinese_user_rewrite_preserves_product_compounds():
-    text = "用户要求聚焦用户增长和用户画像。用户喜欢研究用户留存与用户体验。"
+def test_history_import_uses_shared_rewrite_for_pronouns_and_product_terms():
+    text = "用户满意度和用户增长是研究主题。用户喜欢研究用户画像与用户留存。她常做复盘。"
 
-    assert hi._rewrite_candidate_person_reference(text, "user", "小雨") == (
-        "小雨要求聚焦用户增长和用户画像。小雨喜欢研究用户留存与用户体验。"
+    assert hi.rewrite_user_reference(text, "小雨", subject="user") == (
+        "用户满意度和用户增长是研究主题。小雨喜欢研究用户画像与用户留存。小雨常做复盘。"
     )
-    assert hi._rewrite_candidate_person_reference(text, "ai", "小雨") == text
+    assert hi.rewrite_user_reference("她说话很直接。", "小雨", subject="ai") == "她说话很直接。"
+
+
+def test_rendered_history_candidate_preserves_user_product_compounds():
+    candidates = hi._coerce_import_candidates(
+        {"candidates": [{
+            "candidate_type": "preference",
+            "subject": "user",
+            "title": "用户满意度研究",
+            "summary": "用户满意度和用户增长是工作主题，用户喜欢研究用户画像与用户留存。",
+            "confidence": 0.9,
+        }]},
+        date(2026, 5, 1),
+        window_id="w1",
+    )
+
+    cards = hi._render_candidates_to_memory_cards(
+        candidates,
+        date(2026, 5, 1),
+        {"story": 0, "about_me": 1, "ta_thinking": 0, "total": 1},
+        language="zh-Hans",
+        user_name="小雨",
+    )
+
+    assert cards[0]["summary"] == (
+        "用户满意度和用户增长是工作主题，小雨喜欢研究用户画像与用户留存。"
+    )
 
 
 def test_normalize_keeps_sparse_evidenced_dimensions_without_padding():

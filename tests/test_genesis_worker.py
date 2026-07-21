@@ -640,7 +640,7 @@ def test_fact_write_rewrites_person_references_but_preserves_product_terms():
             return types.SimpleNamespace(
                 text=json.dumps({
                     "memories": [{
-                        "summary": "用户喜欢研究用户增长和用户画像",
+                        "summary": "她喜欢研究用户增长和用户画像",
                         "content": "用户在关注用户留存与用户体验。",
                         "bucket": "关于用户",
                         "threads": ["用户偏好", "用户增长"],

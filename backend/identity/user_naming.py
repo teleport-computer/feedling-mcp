@@ -39,12 +39,15 @@ def _naming_rule(user_name: str) -> str:
     )
 
 
-def rewrite_user_reference(text: str, user_name: str) -> str:
-    """Rewrite system-label leaks only where ``user`` is a person referent.
+def rewrite_user_reference(text: str, user_name: str, subject: str = "user") -> str:
+    """Rewrite system-label leaks and user-subject pronouns in visible prose.
 
     The positive predicate/particle anchors deliberately preserve product terms
     such as ``用户增长`` / ``用户画像`` / ``user growth``.  Prompting is the primary
     guard; this is the deterministic last mile for user-visible memory prose.
+    Pronoun rewriting is gated by ``subject`` so agent/relationship prose keeps
+    pronouns that do not refer to the person.  Genesis memory prose defaults to
+    the user subject because its fact-write output no longer carries ``about``.
     """
     raw = str(text or "")
     if not raw:
@@ -57,8 +60,20 @@ def rewrite_user_reference(text: str, user_name: str) -> str:
         zh_referent,
         raw,
     )
-    return re.sub(
+    raw = re.sub(
         r"(?i)\b(?:the\s+)?user(?=(?:'s|\s+(?:is|has|was|wants|needs|likes|prefers|often|usually|always|never|can|will|works|writes|feels|said|asked|lives|uses|chooses|plans|decided)\b))",
         en_referent,
         raw,
     )
+    if str(subject or "") == "user":
+        raw = re.sub(
+            r"(^|[。！？.!?]\s*)(?:TA|你|他|她)(?=[\u4e00-\u9fff])",
+            lambda match: match.group(1) + zh_referent,
+            raw,
+        )
+        raw = re.sub(
+            r"(?i)(^|[.!?]\s+)(?:you|he|she)\b",
+            lambda match: match.group(1) + en_referent,
+            raw,
+        )
+    return raw

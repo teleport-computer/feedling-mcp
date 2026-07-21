@@ -21,7 +21,7 @@ from accounts import registry
 from bootstrap import gates as boot_gates
 from core import util as core_util
 from identity import service as identity_service
-from identity.user_naming import _naming_rule, sanitize_user_name
+from identity.user_naming import _naming_rule, rewrite_user_reference, sanitize_user_name
 from memory import service as memory_service
 import provider_client
 from hosted import config_store as hosted_config_store
@@ -1837,44 +1837,6 @@ def _memory_card_content(card: dict) -> str:
     ])
 
 
-def _rewrite_candidate_person_reference(text: str, subject: str, user_name: str) -> str:
-    """Guard final prose against the common system-label leak."""
-    raw = str(text or "")
-    if not raw:
-        return raw
-    name = _sanitize_import_user_name(user_name)
-    zh_referent = name if name != "TA" else "对方"
-    en_referent = name if name != "TA" else "The person"
-    raw = re.sub(r"(?i)\bthe user\b", en_referent, raw)
-    raw = re.sub(
-        r"(?i)\buser(?=\s+(?:is|has|was|wants|needs|likes|prefers|often|usually|always|never|can|will|works|writes|feels|said|asked)\b)",
-        en_referent,
-        raw,
-    )
-    if str(subject or "") == "user":
-        raw = re.sub(
-            r"用户(?=(?:明确|要求|希望|想要?|喜欢|偏好|说|提到|需要|常常?|总是|通常|曾经?|会|能|愿意|拒绝|认为|觉得|正在|已经|仍然|依然|的))",
-            zh_referent,
-            raw,
-        )
-        raw = re.sub(
-            r"(^|[。！？.!?；;：:,，、]\s*)用户(?!增长|留存|画像|体验|规模|数量|群体|反馈|研究|策略|需求|行为|运营|市场|旅程|界面|数据|测试|访谈|调研|转化|获取|分层|价值|生命周期|账户|账号|权限|协议|故事|场景|端|侧)",
-            lambda match: match.group(1) + zh_referent,
-            raw,
-        )
-        raw = re.sub(
-            r"(^|[。！？.!?]\s*)(?:TA|你|他|她)(?=[\u4e00-\u9fff])",
-            lambda match: match.group(1) + zh_referent,
-            raw,
-        )
-        raw = re.sub(
-            r"(?i)(^|[.!?]\s+)(?:you|he|she)\b",
-            lambda match: match.group(1) + en_referent,
-            raw,
-        )
-    return raw
-
-
 def _candidate_source_context(candidate: dict) -> str:
     labels = {
         _AI_PERSONA_SOURCE: "ai_persona",
@@ -1924,15 +1886,15 @@ def _render_candidates_to_memory_cards(
         if not identity_service._parse_iso_calendar_date(occurred):
             occurred = ""
         rendered_candidate = dict(c)
-        rendered_candidate["title"] = _rewrite_candidate_person_reference(
+        rendered_candidate["title"] = rewrite_user_reference(
             str(c.get("title") or ""),
-            str(c.get("subject") or ""),
             user_name,
+            subject=str(c.get("subject") or ""),
         )
-        summary = _rewrite_candidate_person_reference(
+        summary = rewrite_user_reference(
             str(c.get("summary") or ""),
-            str(c.get("subject") or ""),
             user_name,
+            subject=str(c.get("subject") or ""),
         )[:1200]
         context = (
             f"distilled from {len(c.get('chunk_ids') or [])} source window(s); "
@@ -1940,10 +1902,10 @@ def _render_candidates_to_memory_cards(
             f"score={float(c.get('score') or _candidate_score(c)):.1f}"
         )
         quotes = c.get("evidence_quotes") or []
-        quote = _rewrite_candidate_person_reference(
+        quote = rewrite_user_reference(
             str(quotes[0]),
-            str(c.get("subject") or ""),
             user_name,
+            subject=str(c.get("subject") or ""),
         )[:500] if quotes else ""
         body = {
             "summary": summary[:500],
@@ -2310,7 +2272,7 @@ def _fallback_memory_cards(
         msg, content = story_items[idx]
         family = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
         if family in {_MEMORY_SUMMARY_SOURCE, _USER_PROFILE_SOURCE}:
-            content = _rewrite_candidate_person_reference(content, "user", user_name)
+            content = rewrite_user_reference(content, user_name, subject="user")
         mem_type = story_types[idx % len(story_types)]
         title = _natural_import_title(content, mem_type, language)
         cards.append({
@@ -2331,7 +2293,7 @@ def _fallback_memory_cards(
         msg, content = about_items[idx]
         family = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
         if family in {_MEMORY_SUMMARY_SOURCE, _USER_PROFILE_SOURCE}:
-            content = _rewrite_candidate_person_reference(content, "user", user_name)
+            content = rewrite_user_reference(content, user_name, subject="user")
         mem_type = about_types[idx % len(about_types)]
         title = _natural_import_title(content, mem_type, language)
         cards.append({
