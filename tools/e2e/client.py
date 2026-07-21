@@ -24,14 +24,18 @@ from nacl.public import PrivateKey  # noqa: E402  (PyNaCl — backend dep)
 
 from content_encryption import build_envelope  # noqa: E402
 
-# The only environment this harness may touch. Prod is refused outright:
+# Target is env-overridable so the same harness can qualify the pre Runtime-V2
+# deployment; default stays the test env. Prod is refused outright:
 # provisioning/teardown on api.feedling.app would create (then hard-delete)
-# accounts in the real user registry.
-TEST_API = "https://test-api.feedling.app"
-TEST_ENCLAVE = (
-    "https://173c7f49aeb54acb424676b17b17f78e5e2b2938-5003s.dstack-pha-prod9.phala.network"
+# accounts in the real user registry — api.feedling.app is NOT in the allowlist.
+TEST_API = os.environ.get("FEEDLING_E2E_API", "https://test-api.feedling.app")
+TEST_ENCLAVE = os.environ.get(
+    "FEEDLING_E2E_ENCLAVE",
+    "https://173c7f49aeb54acb424676b17b17f78e5e2b2938-5003s.dstack-pha-prod9.phala.network",
 )
-_ALLOWED_HOSTS = ("test-api.feedling.app",)
+# Test-family hosts only. pre-api is the Runtime V2 qualification target
+# (2026-07-21); prod stays out → any provisioning against it is refused.
+_ALLOWED_HOSTS = ("test-api.feedling.app", "pre-api.feedling.app")
 # Credentials of not-yet-torn-down accounts (leak manifest; see provision()).
 _ORPHANS_DIR = Path.home() / ".feedling-e2e-orphans"
 
@@ -92,12 +96,21 @@ class E2EClient:
         manifest: Path | None = None
         with httpx.Client(timeout=30, verify=False) as boot:
             try:
-                r = boot.post(f"{api_url}/v1/users/register", json={
-                    "public_key": pk_b64,
-                    "archive_language": archive_language,
-                    "access_mode": route,
-                    "label": "e2e-p0",
-                })
+                # register is NOT idempotent (each call mints a new account), so we
+                # retry ONLY on ConnectError — a TLS/connect failure means the request
+                # never reached the server (no account created), safe to retry. A
+                # post-send ReadError could have created an account, so it is NOT
+                # retried here. The test env flaps on single-CVM deploy windows.
+                reg_body = {"public_key": pk_b64, "archive_language": archive_language,
+                            "access_mode": route, "label": "e2e-p0"}
+                for _attempt in range(3):
+                    try:
+                        r = boot.post(f"{api_url}/v1/users/register", json=reg_body)
+                        break
+                    except httpx.ConnectError:
+                        if _attempt == 2:
+                            raise
+                        time.sleep(3 * (_attempt + 1))
                 r.raise_for_status()
                 body = r.json()
                 user_id, api_key = body["user_id"], body["api_key"]
