@@ -238,10 +238,13 @@ CHECKPOINT_FILE = Path(
         f"/tmp/feedling_chat_checkpoint_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
     )
 )
-# Materialized user-MCP config target. Scoped by the same api-key fingerprint as
-# the checkpoint so two accounts on one host never share a file. This single file
-# is BOTH the claude ``--mcp-config`` target AND the documented generic
-# ``user-mcp.json`` for VPS agents (io-onboarding skill).
+# Materialized user-MCP config target. The api-key fingerprint in the default
+# path is NOT the isolation boundary: it only separates accounts that hold
+# DISTINCT keys and collapses to ONE shared file for keyless host-all consumers
+# (see _USER_MCP_PATHS_PINNED below). Per-user isolation comes solely from the
+# spawner pinning USER_MCP_FILE via env (consumer_env) — never rely on the
+# fingerprint alone. This single file is BOTH the claude ``--mcp-config`` target
+# AND the documented generic ``user-mcp.json`` for VPS agents (io-onboarding skill).
 USER_MCP_FILE = os.environ.get(
     "USER_MCP_FILE",
     f"/tmp/feedling_user_mcp_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
@@ -249,8 +252,10 @@ USER_MCP_FILE = os.environ.get(
 # Two CA bundles, deliberately DIFFERENT content — the runtimes' semantics are
 # opposite (spec §2.2): claude's NODE_EXTRA_CA_CERTS ADDS to the trust store,
 # codex's SSL_CERT_FILE REPLACES it. Feeding codex the user-only bundle would
-# strip every public root and break its OpenAI calls. Keyed by the same API-key
-# fingerprint as USER_MCP_FILE so two accounts on one host never share a file.
+# strip every public root and break its OpenAI calls. Path defaults mirror
+# USER_MCP_FILE's fingerprint scheme, which is likewise NOT an isolation boundary
+# for keyless host-all consumers (see USER_MCP_FILE above) — the spawner pins
+# these per user via env; the fingerprint alone must never be trusted to isolate.
 USER_MCP_CA_FILE = os.environ.get(
     "USER_MCP_CA_FILE",
     f"/tmp/feedling_user_mcp_ca_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
@@ -259,6 +264,16 @@ USER_MCP_CASTORE_FILE = os.environ.get(
     "USER_MCP_CASTORE_FILE",
     f"/tmp/feedling_user_mcp_castore_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
 )
+# The fingerprint scoping above only isolates accounts while FEEDLING_API_KEY is
+# non-empty. Host-all (Stage-D zero-roster) consumers run keyless, so sha1("")
+# collides for every user on the host and the /tmp defaults become ONE shared
+# file — the spawner therefore pins all three paths via env (consumer_env). If
+# a spawn path ever forgets that, _maybe_apply_user_mcp uses this flag to
+# degrade to user-MCP-off instead of writing this user's decrypted MCP url +
+# auth headers where every co-resident agent would read them.
+_USER_MCP_PATHS_PINNED = all(
+    k in os.environ
+    for k in ("USER_MCP_FILE", "USER_MCP_CA_FILE", "USER_MCP_CASTORE_FILE"))
 # The pi user-MCP bridge extension. ONE shared static file for every user —
 # `COPY tools/ ./tools/` (Dockerfile.agent-runner) puts it here; the per-user
 # config path rides FEEDLING_USER_MCP_FILE instead (see _user_mcp_child_env).
@@ -341,7 +356,9 @@ AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
 AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
 AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
 HERMES_SESSION_REASONING_MAX_BYTES = int(os.environ.get("HERMES_SESSION_REASONING_MAX_BYTES", "2000000"))
-IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images"))
+IMAGE_TEMP_DIR = Path(os.environ.get(
+    "IMAGE_TEMP_DIR",
+    f"/tmp/feedling_chat_images_{CHECKPOINT_API_KEY_FINGERPRINT}"))
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
@@ -1683,13 +1700,14 @@ def _image_file_paths_for_msg(msg: dict) -> list[str]:
     if not payloads:
         return []
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", _msg_key(msg))[:96] or "image"
-    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    if not _mkdir_scratch(IMAGE_TEMP_DIR):
+        return []
     paths: list[str] = []
     for idx, payload in enumerate(payloads):
         ext = ".png" if payload.get("mime_type") == "image/png" else ".jpg"
         path = IMAGE_TEMP_DIR / f"{key}_{idx}{ext}"
         try:
-            path.write_bytes(base64.b64decode(payload["data"]))
+            _write_scratch_file(path, base64.b64decode(payload["data"]))
             paths.append(str(path))
         except Exception as e:
             log.warning("failed to write image temp file %s: %s", path, e)
@@ -1700,13 +1718,14 @@ def _image_file_paths_from_payloads(prefix: str, payloads: list[dict[str, str]])
     if not payloads:
         return []
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix)[:96] or "image"
-    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    if not _mkdir_scratch(IMAGE_TEMP_DIR):
+        return []
     paths: list[str] = []
     for idx, payload in enumerate(payloads):
         ext = ".png" if payload.get("mime_type") == "image/png" else ".jpg"
         path = IMAGE_TEMP_DIR / f"{key}_{idx}{ext}"
         try:
-            path.write_bytes(base64.b64decode(payload["data"]))
+            _write_scratch_file(path, base64.b64decode(payload["data"]))
             paths.append(str(path))
         except Exception as e:
             log.warning("failed to write image temp file %s: %s", path, e)
@@ -1715,7 +1734,86 @@ def _image_file_paths_from_payloads(prefix: str, payloads: list[dict[str, str]])
 
 _XLSX_MAX_SHEETS = 5
 _XLSX_MAX_ROWS = 2000
-FILE_TEMP_DIR = Path(os.environ.get("FILE_TEMP_DIR", "/tmp/feedling_chat_files"))
+FILE_TEMP_DIR = Path(os.environ.get(
+    "FILE_TEMP_DIR",
+    f"/tmp/feedling_chat_files_{CHECKPOINT_API_KEY_FINGERPRINT}"))
+# Both scratch dirs above hold DECRYPTED chat images/attachments. The api-key
+# fingerprint keeps distinct keys apart, but host-all consumers run keyless —
+# sha1("") collides for every user, so the spawner MUST pin both dirs per user
+# (consumer_env). If it did, these env vars are set; if a future spawn path
+# forgets, we must NOT fall back to the shared /tmp default and leak plaintext
+# to co-hosted agents. Same fail-safe shape as _USER_MCP_PATHS_PINNED.
+_CHAT_SCRATCH_PINNED = (
+    "IMAGE_TEMP_DIR" in os.environ and "FILE_TEMP_DIR" in os.environ)
+
+
+_chat_scratch_refusal_logged = False
+
+
+def _chat_scratch_write_allowed() -> bool:
+    """False when writing decrypted scratch would land in a shared default.
+
+    Safe whenever the process has a real api key (fingerprint disambiguates) or
+    the spawner explicitly pinned the dirs. Only the keyless-and-unpinned combo
+    — a misconfigured host-all spawn — is refused, and it logs the refusal ONCE
+    (like the sibling _maybe_apply_user_mcp fail-safe) so a stream of image/file
+    messages can't flood ERROR and bury other diagnostics.
+    """
+    global _chat_scratch_refusal_logged
+    if bool(FEEDLING_API_KEY) or _CHAT_SCRATCH_PINNED:
+        return True
+    if not _chat_scratch_refusal_logged:
+        log.error(
+            "[chat_scratch] refusing to write decrypted scratch: keyless "
+            "consumer with unpinned IMAGE_TEMP_DIR/FILE_TEMP_DIR would leak "
+            "plaintext to co-hosted agents; the spawner must pin them per user")
+        _chat_scratch_refusal_logged = True
+    return False
+
+
+def _mkdir_scratch(dirp: Path) -> bool:
+    """Prepare a decrypted-scratch dir, or refuse if it would be shared.
+
+    Returns False (callers must skip writing) when a keyless consumer has
+    unpinned scratch dirs — see _chat_scratch_write_allowed (which logs the
+    refusal, once). Otherwise creates the dir 0700 so a co-tenant unix user
+    can't read decrypted chat content.
+    """
+    if not _chat_scratch_write_allowed():
+        return False
+    try:
+        dirp.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as e:
+        # Read-only fs / disk full / path occupied. Degrade like the callers'
+        # old inline mkdir-in-try did — a file/image turn must not crash.
+        log.warning("[chat_scratch] could not create %s: %s", dirp, e)
+        return False
+    try:
+        os.chmod(dirp, 0o700)  # existing dir: enforce (mkdir mode is umask-masked)
+    except OSError:
+        pass
+    return True
+
+
+def _write_scratch_file(path: Path, data: bytes) -> None:
+    # Create at 0600 via open() itself (not write-then-chmod), so there is no
+    # world-readable window and no silent umask-default fallback if a later chmod
+    # is a no-op on the mount. O_CREAT's mode is umask-masked — that only ever
+    # removes group/other bits, so owner-rw is preserved.
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        f = os.fdopen(fd, "wb")
+    except BaseException:
+        # fdopen didn't take ownership of fd — close it ourselves or it leaks
+        # (repeated leaks → EMFILE → the consumer stops serving turns).
+        os.close(fd)
+        raise
+    with f:  # f owns fd now; closed even if write() raises
+        f.write(data)
+    try:
+        os.chmod(path, 0o600)  # existing file kept its prior mode on O_CREAT
+    except OSError:
+        pass
 
 
 def _strip_ns(tag: str) -> str:
@@ -1836,14 +1934,15 @@ def _human_size(n: int) -> str:
 
 
 def _land_file(msg_key: str, name: str, data: bytes) -> str:
+    if not _mkdir_scratch(FILE_TEMP_DIR):
+        return ""
     try:
-        FILE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else "bin"
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{msg_key}_{name}")[:120] or "file"
         if not safe.lower().endswith(f".{ext}"):
             safe = f"{safe}.{ext}"
         path = FILE_TEMP_DIR / safe
-        path.write_bytes(data)
+        _write_scratch_file(path, data)
     except Exception as e:
         log.warning("failed to write file temp for %s: %s", name, e)
         return ""
@@ -5882,8 +5981,11 @@ def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
     import user_mcp_materialize as _m  # noqa: PLC0415 — lazy: sibling on tools/ path
     # generic file — claude --mcp-config target AND the documented VPS user-mcp.json
     Path(USER_MCP_FILE).parent.mkdir(parents=True, exist_ok=True)
-    Path(USER_MCP_FILE).write_text(_m.claude_mcp_json(servers))
-    os.chmod(USER_MCP_FILE, 0o600)
+    # Atomic 0600 write (same as the CA bundles below). A bare write_text()
+    # then chmod leaves a brief 0644 window where the plaintext MCP url + auth
+    # headers are world-readable, and a concurrent reader could see a partial
+    # JSON — _atomic_write_text creates the temp at 0600 and renames into place.
+    _atomic_write_text(USER_MCP_FILE, _m.claude_mcp_json(servers), mode=0o600)
     claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
     if claude_dir and Path(claude_dir).is_dir():
         settings_path = Path(claude_dir) / "settings.json"
@@ -5926,6 +6028,19 @@ def _maybe_apply_user_mcp() -> None:
     global _user_mcp_applied
     target = str(_user_mcp_advertised.get("fingerprint") or "")
     if target == (_user_mcp_applied.get("fingerprint") or ""):
+        return
+    if not FEEDLING_API_KEY and not _USER_MCP_PATHS_PINNED:
+        # Known-collision scenario (see _USER_MCP_PATHS_PINNED): keyless
+        # consumer + default /tmp paths shared with every co-hosted user.
+        # Fail safe: user MCP stays off. Record the fingerprint so this
+        # doesn't re-log on every poll; don't fetch/decrypt the envelopes.
+        log.error(
+            "[user_mcp] refusing to materialize: FEEDLING_API_KEY is empty "
+            "and USER_MCP_* paths were not pinned via env — the shared /tmp "
+            "defaults would leak this user's MCP url/auth headers to every "
+            "co-hosted agent. Fix the spawner to set USER_MCP_FILE/"
+            "USER_MCP_CA_FILE/USER_MCP_CASTORE_FILE per user.")
+        _user_mcp_applied = {"fingerprint": target, "servers": []}
         return
     try:
         servers: list[dict] = []

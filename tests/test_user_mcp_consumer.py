@@ -281,6 +281,56 @@ def test_apply_user_mcp_skips_when_fingerprint_unchanged(monkeypatch):
     assert calls["n"] == 0
 
 
+def test_apply_refuses_colliding_default_paths(monkeypatch):
+    """Fail-safe for the host-all cross-user leak (PR #97's belt-and-braces).
+
+    When FEEDLING_API_KEY is empty AND the spawner did not pin USER_MCP_* via
+    env, the module-scope defaults collide to /tmp/feedling_user_mcp_<sha1("")>
+    for every co-hosted user — materializing there would write THIS user's
+    decrypted MCP url + auth headers into a file every co-resident agent reads.
+    Any future spawn path that forgets the env pinning must degrade to
+    user-MCP-off, never to a shared file.
+    """
+    fetched = {"n": 0}
+    monkeypatch.setattr(c, "FEEDLING_API_KEY", "")
+    monkeypatch.setattr(c, "_USER_MCP_PATHS_PINNED", False)
+    monkeypatch.setattr(c, "_fetch_user_mcp_envelopes",
+                        lambda: fetched.__setitem__("n", fetched["n"] + 1) or {})
+    monkeypatch.setattr(
+        c, "_materialize_user_mcp",
+        lambda servers, names: (_ for _ in ()).throw(
+            AssertionError("must not materialize onto colliding shared paths")))
+    monkeypatch.setattr(c, "_user_mcp_advertised", {"fingerprint": "fp1"})
+    monkeypatch.setattr(c, "_user_mcp_applied", {"fingerprint": None, "servers": []})
+
+    c._maybe_apply_user_mcp()
+
+    # Refusal must not even fetch/decrypt the envelopes, must leave the applied
+    # server list empty (so `{mcp}` resolves to no injection), and must record
+    # the advertised fingerprint so the refusal doesn't re-log on every poll.
+    assert fetched["n"] == 0
+    assert c._user_mcp_applied == {"fingerprint": "fp1", "servers": []}
+
+    # Positive control: with the paths pinned by the spawner the same call DOES
+    # proceed to fetch + materialize (empty api key alone must not disable the
+    # feature — host-all consumers legitimately run keyless on runtime tokens).
+    seen = {}
+    monkeypatch.setattr(c, "_USER_MCP_PATHS_PINNED", True)
+    monkeypatch.setattr(c, "_fetch_user_mcp_envelopes", lambda: {
+        "fingerprint": "fp2",
+        "servers": [{"name": "s", "enabled": True, "config_envelope": {"x": 1}}],
+    })
+    monkeypatch.setattr(c, "_decrypt_envelope", lambda env: json.dumps(
+        {"url": "https://s/mcp", "headers": {}}))
+    monkeypatch.setattr(c, "_materialize_user_mcp",
+                        lambda servers, names: seen.update(servers=servers))
+    monkeypatch.setattr(c, "_user_mcp_advertised", {"fingerprint": "fp2"})
+
+    c._maybe_apply_user_mcp()
+
+    assert seen["servers"][0]["url"] == "https://s/mcp"
+
+
 # ---------------------------------------------------------------------------
 # Task 5: per-runtime CA bundles (claude adds, codex replaces)
 # ---------------------------------------------------------------------------
@@ -1132,3 +1182,30 @@ def test_openclaw_merge_idempotent_and_unicode():
     out2 = um.openclaw_config_merged(out1, servers, {"n"})
     assert json.loads(out1) == json.loads(out2)
     assert "你好" in out1                  # ensure_ascii=False
+
+
+def test_user_mcp_file_written_atomically_at_0600(monkeypatch, tmp_path):
+    # The claude --mcp-config file holds plaintext MCP url + auth headers. A
+    # bare write_text + chmod leaves a 0644 world-readable window and a
+    # non-atomic partial-JSON read; it must go through _atomic_write_text
+    # (0600 temp + rename) like the CA bundles.
+    seen: list = []
+    real = c._atomic_write_text
+
+    def spy(path, content, mode=0o600):
+        seen.append((path, mode))
+        real(path, content, mode)
+
+    monkeypatch.setattr(c, "_atomic_write_text", spy)
+    mcp = tmp_path / "mcp.json"
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(mcp))
+    monkeypatch.setattr(c, "USER_MCP_CA_FILE", str(tmp_path / "ca.pem"))
+    monkeypatch.setattr(c, "USER_MCP_CASTORE_FILE", str(tmp_path / "castore.pem"))
+
+    c._materialize_user_mcp(
+        [{"name": "s", "enabled": True, "url": "https://s/mcp",
+          "headers": {"Authorization": "secret"}, "ca_pem": "", "transport": ""}],
+        {"s"})
+
+    assert (str(mcp), 0o600) in seen, "USER_MCP_FILE must use _atomic_write_text"
+    assert (mcp.stat().st_mode & 0o777) == 0o600

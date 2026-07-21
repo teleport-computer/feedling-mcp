@@ -293,23 +293,23 @@ def _resolve_user(api_key: str) -> str | None:
     if uid:
         return uid
     with _users_lock:
-        changed = _normalize_all_users()
+        # In-process normalization only. We deliberately do NOT persist it here:
+        # _save_users() does a DELETE-all + reinsert from this worker's snapshot,
+        # which under -w N can be stale and erase a user another worker just
+        # registered. Normalization is idempotent and redone on every load_users,
+        # so a read path (this is reached by any unknown-key 401 probe) must
+        # never trigger a full-table rewrite.
+        _normalize_all_users()
         for u in _users:
             if u.get("api_key_hash") == h:
                 _key_to_user[h] = u["user_id"]
-                if changed:
-                    _save_users()
                 return u["user_id"]
             for key_entry in u.get("api_keys") or []:
                 if not isinstance(key_entry, dict) or key_entry.get("revoked_at"):
                     continue
                 if key_entry.get("api_key_hash") == h:
                     _key_to_user[h] = u["user_id"]
-                    if changed:
-                        _save_users()
                     return u["user_id"]
-        if changed:
-            _save_users()
     return None
 
 

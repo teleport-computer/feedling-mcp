@@ -25,6 +25,7 @@ currently return a clean "not implemented" JSON so the agent degrades gracefully
 import argparse
 import base64
 import json
+import hashlib
 import os
 import re
 import ssl
@@ -82,13 +83,37 @@ def _materialize_decrypted_image(prefix, body):
     mime = str(body.get("image_mime") or "image/jpeg")
     ext = ".png" if "png" in mime.lower() else ".jpg"
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(prefix))[:96] or "image"
-    image_dir = os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images")
+    # Must match chat_resident_consumer's IMAGE_TEMP_DIR default byte-for-byte
+    # (fingerprinted by the api key) — the consumer writes, this tool reads the
+    # same dir. A bare /tmp default would (a) miss the consumer's images and
+    # (b) reintroduce the shared-dir cross-account leak on a multi-account host.
+    _img_fp = hashlib.sha1(
+        (os.environ.get("FEEDLING_API_KEY") or "").encode()).hexdigest()[:10]
+    image_dir = os.environ.get(
+        "IMAGE_TEMP_DIR", f"/tmp/feedling_chat_images_{_img_fp}")
     out = dict(body)
+    # Fail-safe mirroring the consumer's _chat_scratch_write_allowed: a keyless
+    # (host-all) tool with an unpinned IMAGE_TEMP_DIR would write the DECRYPTED
+    # image into the sha1("") shared dir every co-hosted agent reads. Refuse.
+    if not (os.environ.get("FEEDLING_API_KEY") or "IMAGE_TEMP_DIR" in os.environ):
+        out["image_error"] = "refusing to write decrypted image to a shared scratch dir"
+        return out
     try:
-        os.makedirs(image_dir, exist_ok=True)
+        # mode=0o700 up front (atomic, umask-masked) so there's no window where
+        # the decrypted-image dir is world-listable; chmod enforces it for a
+        # pre-existing dir. Matches the consumer's _mkdir_scratch.
+        os.makedirs(image_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(image_dir, 0o700)  # not readable by co-tenant unix users
+        except OSError:
+            pass
         path = os.path.join(image_dir, f"{safe}{ext}")
         with open(path, "wb") as f:
             f.write(base64.b64decode(raw_b64))
+        try:
+            os.chmod(path, 0o600)  # decrypted pixels — never world-readable
+        except OSError:
+            pass
     except Exception as e:  # pragma: no cover - defensive
         out["image_error"] = f"could not save decrypted image: {e}"
         return out
