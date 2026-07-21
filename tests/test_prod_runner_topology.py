@@ -25,9 +25,12 @@ def _run(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
 def test_topology_gate_warns_but_does_not_block_below_two_runners(tmp_path):
     # Dual-runtime coexistence (2026-07-21 design, Task 11): the prod runner
     # fleet is V1 agent-runner again (V1 resident is the fallback, not pooled
-    # Runtime V2), so this script reverted to origin/test's soft-warning form.
-    # A hard "≥2 CVMs" block would now permanently wedge every prod main-CVM
-    # deploy — only one runner CVM is currently provisioned.
+    # Runtime V2), so this script's ≥2-CVM redundancy check now defaults to a
+    # warning, not a hard block (the default polarity + disable switch are
+    # new as of Task 11, not a restoration of origin/test's script — see
+    # check-prod-runner-topology.sh's header comment). A hard "≥2 CVMs" block
+    # would now permanently wedge every prod main-CVM deploy — only one
+    # runner CVM is currently provisioned.
     empty = _run(tmp_path, "# no runners yet\n")
     assert empty.returncode == 0
     assert "production has only 0 standalone runner CVM(s)" in empty.stdout
@@ -83,7 +86,7 @@ def test_topology_gate_can_be_disabled(tmp_path):
         env={**os.environ},
     )
     assert disabled.returncode == 0
-    assert "topology gate is inactive" in disabled.stdout
+    assert "redundancy gate is inactive" in disabled.stdout
 
 
 def test_topology_gate_rejects_the_main_cvm_as_a_runner(tmp_path):
@@ -91,6 +94,28 @@ def test_topology_gate_rejects_the_main_cvm_as_a_runner(tmp_path):
     result = _run(tmp_path, f"runner-a\n{main_id}\n")
     assert result.returncode == 1
     assert "main CVM" in result.stdout
+
+
+def test_main_cvm_membership_check_runs_even_when_redundancy_gate_is_disabled(
+    tmp_path,
+):
+    # Code-review regression: an earlier version of this script let the
+    # `enabled=false` early-return skip the "main CVM must never appear in
+    # the runner inventory" footgun guard too. That guard is unconditional —
+    # it must fire regardless of whether the redundancy preflight is active.
+    main_id = (ROOT / "deploy" / "prod-cvm-id.txt").read_text().strip()
+    ids = tmp_path / "ids.txt"
+    ids.write_text(f"runner-a\n{main_id}\n")
+    result = subprocess.run(
+        ["bash", str(SCRIPT), str(ids), str(ROOT / "deploy" / "prod-cvm-id.txt"), "false"],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ},
+    )
+    assert result.returncode == 1
+    assert "main CVM" in result.stdout
+    assert "topology gate is inactive" not in result.stdout
 
 
 def test_main_deploy_depends_on_topology_preflight():

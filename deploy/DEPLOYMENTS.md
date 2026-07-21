@@ -109,7 +109,7 @@ retirement when keeping the exact value no longer helps verification.
                                     │  FEEDLING_API_URL / FEEDLING_ENCLAVE_URL
                                     │  （公网 / gateway passthrough，不是内网地址）
                                     │
-┌─────────────────── runner CVM（独立 dstack app，prod/pre 各一份）────────────────┐
+┌────────────── runner CVM（独立 dstack app，prod/test/pre 各一份）───────────────┐
 │                                                                                  │
 │   agent-runner（V1 supervisor.py）── 走 Postgres lease，服务 allowlist 之外       │
 │                                       （fence=resident）的所有账号                │
@@ -117,9 +117,14 @@ retirement when keeping the exact value no longer helps verification.
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-test 环境目前**没有**对应的 V1 runner CVM（Task 11 范围内未新增；已有的
-`deploy/docker-compose.phala.runner.yaml` 是与此拓扑无关的、独立的额外 V2
-worker 容量，见下方遗留缺口说明）。
+test 与 prod/pre 同构：主 CVM 是 `dual`（backend + serve-worker），独立的
+runner CVM（`deploy/docker-compose.phala.runner.yaml`，`feedling-io-agents-test`）
+是 V1 `agent-runner`。test 环境**今天本来就是 V1 托管**——`origin/test` 上这
+份 runner compose 从来就是 agent-runner 形态，CI `deploy-test-runner-cvm` 把
+它部署到真实存在的 `feedling-io-agents-test` CVM（P0 的 host-all 修复正是在
+这个 CVM 上验证的）；仓库文件此前因分支上更早的一轮 Runtime-V2-only 迁移工作
+漂移成了纯 serve-worker 形态，未曾随之推送到该 CVM 的真实部署——本次连同 prod
+一起，从 `origin/test` 逐字节恢复回真实的 V1 形态。三环境不再有拓扑差异。
 
 **关键差异 vs 纯 V2-only 拓扑**：serve-worker 从独立 runner CVM 搬进主 CVM
 （与 backend 同镜像的第二个容器），`FEEDLING_ENCLAVE_URL`/`FEEDLING_API_URL`
@@ -155,13 +160,6 @@ runner 侧的 serve-worker 完全一致。
    （除非未来任务显式改它）。
 4. 部署完成瞬间：全员 fence 应为 `resident` → 行为与部署前完全一致
    （P3 验收点）；之后由 allowlist 逐步把个别账号切到 `v2`。
-
-**已知遗留缺口（Task 11 范围外，留给后续任务判断）**：test 主 CVM 的
-`FEEDLING_HOSTED_RUNTIME_POLICY` 同样设为 `dual`（brief 明确要求三环境同构），
-但 test 环境目前没有独立的 V1 `agent-runner` CVM——如果 test 上真的出现
-`fence=resident` 的账号，暂无 V1 执行器服务它们。test 已有的
-`deploy/docker-compose.phala.runner.yaml`（`feedling-io-agents-test` CVM）是
-纯 V2 `serve-worker`，与本次拓扑无关，仍照旧运行、不受影响。
 
 ### Production CVM (prod9, current)
 

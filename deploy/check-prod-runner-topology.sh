@@ -5,22 +5,24 @@ set -euo pipefail
 # to V1 agent-runner form (deploy/docker-compose.phala.prod.runner.yaml, see
 # Task 11). Pooled Runtime V2 now lives on the main CVM itself as the
 # serve-worker container, so "hosted Chat has no resident fallback" no longer
-# holds — V1 resident IS the fallback again. This script therefore reverts to
-# the origin/test soft-gate form (a warning, not a hard block) instead of the
-# short-lived "≥2 independent Runtime V2 worker CVMs" hard gate: with only one
-# runner CVM currently provisioned (deploy/prod-runner-cvm-ids.txt), the hard
-# form would block every future prod main-CVM deploy forever. The "main CVM
-# must never appear in the runner inventory" check is kept — it is a real
-# footgun regardless of what the runner CVM(s) run.
+# holds — V1 resident IS the fallback again. This script's ≥2-CVM check
+# therefore defaults to a warning (not a hard block): with only one runner CVM
+# currently provisioned (deploy/prod-runner-cvm-ids.txt), a hard block would
+# stop every future prod main-CVM deploy forever. Re-arm it per-run with
+# PROD_RUNNER_TOPOLOGY_ENFORCE=true, or disable the whole standalone-runner
+# preflight with the 3rd arg ("enabled", default true — CI passes
+# vars.DEPLOY_PROD_RUNNER_CVM). Note this default polarity and the disable
+# switch are NEW as of Task 11, not a restoration of prior behavior — origin/
+# test's script never had a disable arg or a main-CVM-membership check.
+#
+# The "main CVM must never appear in the runner inventory" check ALWAYS runs,
+# even when the ≥2-CVM preflight is disabled — it is an unconditional footgun
+# guard, not part of the "is redundancy provisioned" question the disable
+# switch answers.
 
 ids_file="${1:-deploy/prod-runner-cvm-ids.txt}"
 main_id_file="${2:-deploy/prod-cvm-id.txt}"
 enabled="${3:-true}"
-
-if [ "$enabled" != "true" ]; then
-  echo "standalone prod runner deployment disabled; topology gate is inactive"
-  exit 0
-fi
 
 if [ ! -f "$ids_file" ]; then
   echo "::error::$ids_file is missing"
@@ -36,6 +38,22 @@ main_id=$(tr -d '[:space:]' < "$main_id_file")
 if [ -z "$main_id" ]; then
   echo "::error::$main_id_file is empty"
   exit 1
+fi
+
+# Unconditional, regardless of $enabled: deploying the runner-only compose to
+# the main CVM would destroy the API/enclave release unit no matter whether
+# the redundancy preflight below is active.
+if grep -vE '^[[:space:]]*(#|$)' "$ids_file" \
+  | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+  | grep -Fxq "$main_id"; then
+  echo "::error::production main CVM $main_id must never appear in the runner inventory"
+  echo "::error::deploying runner-only compose to the main CVM would destroy the API/enclave release unit"
+  exit 1
+fi
+
+if [ "$enabled" != "true" ]; then
+  echo "standalone prod runner deployment disabled; redundancy gate is inactive (main-CVM-membership check above still ran)"
+  exit 0
 fi
 
 # Blank lines and comments are documentation, not runners. Duplicate IDs are
@@ -66,12 +84,4 @@ if [ "$count" -lt 2 ]; then
   echo "::warning::production has only $count standalone runner CVM(s) — deploys briefly drop the only hosting path (2026-07-15 outage mode). Provision a second runner and add it to $ids_file, then set PROD_RUNNER_TOPOLOGY_ENFORCE=true to re-arm the hard gate."
 else
   echo "production runner topology gate passed: $count independent CVM IDs"
-fi
-
-if grep -vE '^[[:space:]]*(#|$)' "$ids_file" \
-  | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-  | grep -Fxq "$main_id"; then
-  echo "::error::production main CVM $main_id must never appear in the runner inventory"
-  echo "::error::deploying runner-only compose to the main CVM would destroy the API/enclave release unit"
-  exit 1
 fi

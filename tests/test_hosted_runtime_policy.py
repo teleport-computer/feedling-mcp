@@ -553,32 +553,22 @@ def test_main_compose_serve_worker_shares_the_backend_image_and_stays_internal()
         assert env["FEEDLING_ENCLAVE_URL"] == "https://enclave:5003"
 
 
-def test_test_runner_compose_still_has_only_the_standalone_v2_worker():
-    # Unlike prod/pre, the test environment's separate Runtime V2 worker CVM
-    # (deploy/docker-compose.phala.runner.yaml) is untouched by Task 11 — it
-    # remains unrelated extra V2 capacity alongside the new main-CVM
-    # serve-worker.
-    path = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
-    source = path.read_text()
-    compose = yaml.safe_load(source)
-    assert set(compose["services"]) == {"serve-worker"}
-    worker = compose["services"]["serve-worker"]
-    assert worker["command"] == [
-        "python",
-        "-u",
-        "backend/model_api_runtime/v2/serve_worker.py",
-    ]
-    assert "backend/agent_runtime/supervisor.py" not in source
-    assert "AGENT_RUNTIME_USERS" not in source
-
-
-def test_pre_and_prod_runner_composes_are_back_to_v1_agent_runner_only():
-    # Dual-runtime coexistence (Task 11): pooled Runtime V2 moved onto the
-    # main CVM as the serve-worker container, so the pre/prod standalone
-    # runner CVMs reverted to V1 agent-runner form — prod's compose is
-    # restored byte-for-byte from origin/test (= prod's actual live
-    # topology); pre's is adapted from origin/test's test V1 runner template.
+def test_all_three_standalone_runner_composes_are_v1_agent_runner_only():
+    # Dual-runtime coexistence (Task 11, post-review correction): all three
+    # environments are topologically identical — main CVM is `dual` (backend
+    # + serve-worker), independent runner CVM is V1 agent-runner. Test is NOT
+    # a gap: deploy/docker-compose.phala.runner.yaml has ALWAYS been V1
+    # agent-runner form on origin/test (deploy-test-runner-cvm ships it to
+    # the real feedling-io-agents-test CVM today — the #97 host-all fix was
+    # verified there); this repo's file had drifted to a serve-worker-only
+    # shape during an earlier, never-fully-deployed Runtime-V2-only migration
+    # pass on this branch. Restored byte-for-byte from origin/test alongside
+    # prod's. pre's is adapted from that same origin/test V1 runner template
+    # (env var names unchanged, only naming — app/container/volume — is
+    # pre-specific). prod's is restored byte-for-byte from origin/test too
+    # (= prod's actual live topology).
     for name in (
+        "docker-compose.phala.runner.yaml",
         "docker-compose.phala.pre.runner.yaml",
         "docker-compose.phala.prod.runner.yaml",
     ):
@@ -595,3 +585,6 @@ def test_pre_and_prod_runner_composes_are_back_to_v1_agent_runner_only():
         assert "model_api_runtime/v2/serve_worker.py" not in source
         assert "AGENT_RUNTIME_USERS" in source
         assert "volumes" in compose
+        assert set(compose["volumes"]) == set(
+            runner["volumes"][0].split(":")[0:1]
+        )

@@ -1299,10 +1299,18 @@ jobs:
           python3 tools/deploy_canary.py
 
   # =========================================================================
-  # DEPLOY — standalone Runtime V2 worker CVM (test)
+  # DEPLOY — standalone V1 agent-runner worker CVM (test)
   #
-  # Deploys deploy/docker-compose.phala.runner.yaml to a separate Phala CVM.
-  # The worker is mandatory because hosted accounts have no resident fallback.
+  # Deploys deploy/docker-compose.phala.runner.yaml to a separate Phala CVM
+  # that runs only the V1 agent-runner supervisor. Dual-runtime coexistence
+  # (2026-07-21 design, Task 11, post-review correction): the test environment
+  # is V1-hosted TODAY (this compose has always been agent-runner form on
+  # origin/test — the branch's earlier Runtime-V2-only migration work had
+  # drifted it to a serve-worker-only shape without a live redeploy; restored
+  # here byte-for-byte from origin/test alongside prod's runner, matching how
+  # test/prod/pre now all default `FEEDLING_HOSTED_RUNTIME_POLICY=dual` with a
+  # `resident` day-1 fence). Pooled Runtime V2 also runs on the main test CVM
+  # itself as the serve-worker container (see docker-compose.phala.test.yaml).
   # It shares PostgreSQL + the runtime-token secret with the main CVM and reaches
   # the backend/enclave over their public/gateway paths.
   # =========================================================================
@@ -1373,54 +1381,37 @@ jobs:
           #   TEST_MAIN_ENCLAVE_URL = https://<main-app-id>-5003s.dstack-pha-prod9.phala.network
           FEEDLING_API_URL:             ${{ vars.TEST_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:         ${{ vars.TEST_MAIN_ENCLAVE_URL }}
+          AGENT_MAX_CHILDREN:           ${{ vars.TEST_AGENT_MAX_CHILDREN }}
           # Shared with the main test CVM — MUST match (esp. the token secret).
           DATABASE_URL:                 ${{ secrets.TEST_DATABASE_URL }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
-          FEEDLING_V2_RUNNER_CVM_ID:      ${{ steps.cvmid.outputs.cvm_id }}
-          FEEDLING_V2_MAX_WORKERS:       ${{ vars.TEST_FEEDLING_V2_MAX_WORKERS || '4' }}
-          FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: ${{ vars.TEST_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0' }}
-          FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: ${{ vars.TEST_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64' }}
-          FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.TEST_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
-          E2B_API_KEY:                   ${{ secrets.TEST_E2B_API_KEY || secrets.E2B_API_KEY }}
-          FEEDLING_V2_E2B_TEMPLATE:      ${{ vars.TEST_FEEDLING_V2_E2B_TEMPLATE }}
-          FEEDLING_V2_E2B_ALLOW_INTERNET: ${{ vars.TEST_FEEDLING_V2_E2B_ALLOW_INTERNET || '0' }}
+          AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
+          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
-            echo "::error::TEST_DATABASE_URL not set — worker has no durable job store"
+            echo "::error::TEST_DATABASE_URL not set — runner has no lease store"
             exit 1
           fi
           if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
             echo "::error::TEST_MAIN_API_URL / TEST_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"
             exit 1
           fi
-          if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
-            if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
-              FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
-            fi
-            if [ -z "$E2B_API_KEY" ] || [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
-              echo "::error::TEST E2B sandbox requires an E2B key and content-addressed template"
-              exit 1
-            fi
-          fi
-          DEPLOYED_BUILD="${GITHUB_SHA:0:7}"
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
             -c deploy/docker-compose.phala.runner.yaml \
             -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
             -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
+            -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-            -e "FEEDLING_V2_RUNNER_CVM_ID=$FEEDLING_V2_RUNNER_CVM_ID" \
-            -e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD" \
-            -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
-            -e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED" \
-            -e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE=$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE" \
-            -e "FEEDLING_V2_SANDBOX_PROVIDER=$FEEDLING_V2_SANDBOX_PROVIDER" \
-            -e "E2B_API_KEY=$E2B_API_KEY" \
-            -e "FEEDLING_V2_E2B_TEMPLATE=$FEEDLING_V2_E2B_TEMPLATE" \
-            -e "FEEDLING_V2_E2B_ALLOW_INTERNET=$FEEDLING_V2_E2B_ALLOW_INTERNET"
+            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE"
           # NOT --wait: the CLI's readiness wait is hard-capped at 300s and the
           # runner image pull + boot regularly exceeds it. Poll with our own
           # configurable deadline instead (deploy/wait-cvm-ready.sh).
@@ -1453,16 +1444,10 @@ jobs:
             fi
           done
           exit "$publish_status"
-
-      - name: Post-deploy Runtime V2 fleet identity gate (test)
-        env:
-          FEEDLING_API_URL:     ${{ vars.TEST_API_URL || 'https://test-api.feedling.app' }}
-          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
-        run: |
-          python3 deploy/check-v2-runner-fleet.py \
-            --base-url "$FEEDLING_API_URL" \
-            --inventory deploy/test-runner-cvm-id.txt \
-            --build "${GITHUB_SHA:0:7}"
+      # No post-deploy Runtime V2 fleet gate here — this CVM runs the V1
+      # agent-runner, which has no v2_worker_heartbeats identity to check.
+      # The main test CVM's serve-worker liveness is proved separately by the
+      # deploy-test-cvm job's post-deploy canary/attestation gates.
 
   deploy-pre-cvm:
     name: deploy CVM (pre)

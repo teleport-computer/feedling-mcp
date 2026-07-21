@@ -27,17 +27,19 @@ def test_image_tags_use_one_fixed_width_github_sha_prefix():
         for value in ASSIGNMENT.findall(workflow.read_text())
     ]
 
-    # One producer assignment plus every main/test/pre main deploy wait, the
-    # test runner deploy wait + fleet-build marker (test is still V2-only on
-    # its standalone runner), and the release preflights. Dual-runtime
-    # coexistence (Task 11) moved the pre/prod runner CVMs back to V1
-    # agent-runner, which has no FEEDLING_V2_DEPLOYED_BUILD fleet-identity
-    # marker to slice a SHA for, so the assignment count dropped from 13 (two
-    # fewer: pre-runner's and prod-runner's DEPLOYED_BUILD). Image pinning is
-    # centralized in deploy/pin-runtime-release.sh and slices the same
-    # trigger SHA exactly once. A variable-length `git rev-parse --short` can
-    # drift between clone depths.
-    assert len(assignments) == 11
+    # One producer assignment plus every main/test/pre main deploy wait and
+    # the release preflights. Dual-runtime coexistence (Task 11, post-review
+    # correction): ALL THREE standalone runner CVMs (test/pre/prod) are V1
+    # agent-runner — test's `deploy-test-runner-cvm` job was also restored to
+    # V1 form (it always should have matched origin/test's live
+    # feedling-io-agents-test CVM; the V2-only shape was drift, never fully
+    # deployed). V1 agent-runner has no FEEDLING_V2_DEPLOYED_BUILD
+    # fleet-identity marker to slice a SHA for, so the assignment count
+    # dropped from 13 (three fewer: test/pre/prod runner DEPLOYED_BUILD).
+    # Image pinning is centralized in deploy/pin-runtime-release.sh and
+    # slices the same trigger SHA exactly once. A variable-length
+    # `git rev-parse --short` can drift between clone depths.
+    assert len(assignments) == 10
     assert set(assignments) == {'"${GITHUB_SHA:0:7}"'}
 
 
@@ -62,15 +64,24 @@ def test_pre_runner_deploy_is_v1_agent_runner_not_pooled_v2():
     assert "prompt_cache_canary.py" not in pre_runner_job
 
 
-def test_test_runner_deploy_uses_the_same_closed_world_fleet_gate():
-    # Unchanged by Task 11 — test's standalone runner CVM stays pooled V2.
+def test_test_runner_deploy_is_v1_agent_runner_not_pooled_v2():
+    # Dual-runtime coexistence (Task 11, post-review correction): test's
+    # standalone runner CVM is V1 agent-runner — same as prod/pre, not the
+    # "unchanged, stays V2" claim from the pre-review version of this task
+    # (that claim was based on a stale repo file, not test's actual live
+    # feedling-io-agents-test CVM topology).
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    test_runner_job = workflow.split("\n  deploy-test-runner-cvm:\n", 1)[1].split(
+        "\n  deploy-pre-cvm:\n", 1
+    )[0]
 
-    assert "validate-test-runtime-prerequisites:" in workflow
-    assert "Post-deploy Runtime V2 fleet identity gate (test)" in workflow
-    assert "--inventory deploy/test-runner-cvm-id.txt" in workflow
-    assert '-e "FEEDLING_V2_RUNNER_CVM_ID=$FEEDLING_V2_RUNNER_CVM_ID"' in workflow
-    assert '-e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD"' in workflow
+    assert '-e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN"' in test_runner_job
+    assert '-e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS"' in test_runner_job
+    assert '-e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL"' in test_runner_job
+    assert "FEEDLING_V2_MAX_WORKERS" not in test_runner_job
+    assert "FEEDLING_V2_RUNNER_CVM_ID" not in test_runner_job
+    assert "Post-deploy Runtime V2 fleet identity gate (test)" not in test_runner_job
+    assert "check-v2-runner-fleet.py" not in test_runner_job
 
 
 def test_prod_runner_deploy_is_v1_agent_runner_not_pooled_v2():

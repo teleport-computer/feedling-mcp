@@ -63,34 +63,46 @@
 - `deploy/docker-compose.phala.prod.runner.yaml` 从 `origin/test` 逐字节
   恢复为 V1-only 形态（`agent-runner` + `supervisor.py`）——这就是 prod
   当前的真实部署形态，仓库文件此前因早前 Runtime-V2-only 迁移任务而漂移。
-- `deploy/docker-compose.phala.pre.runner.yaml` 移除 `serve-worker`，换回
-  V1 `agent-runner` 服务（从 `origin/test:deploy/docker-compose.phala.runner.yaml`
-  的 test V1 runner 模板改编，env var 名不变，仅重命名 app/container/volume
-  为 pre 前缀）——P1 用这一对（pre runner 的 V1 + pre 主 CVM 的
-  serve-worker）验证双跑全链路，早于 P3 动 prod。
+- `deploy/docker-compose.phala.runner.yaml`（test 独立 runner CVM）与
+  `deploy/docker-compose.phala.pre.runner.yaml` 均是/回到 V1 `agent-runner`
+  形态。**Code review 纠偏**：test 环境不是「需要新配一个 V1 runner 的缺口」——
+  test **今天本来就是 V1 托管**：`origin/test` 上的 `docker-compose.phala.
+  runner.yaml` 从来就是 agent-runner 形态，CI `deploy-test-runner-cvm` 把它
+  部署到真实存在的 `feedling-io-agents-test` CVM（P0 的 host-all 修复正是在
+  这个 CVM 上验证的）；仓库文件此前因分支上更早一轮 Runtime-V2-only 迁移工作
+  漂移成了纯 serve-worker 形态,未曾推送到该 CVM 的真实部署。本次连同 prod 一起
+  从 `origin/test` 逐字节恢复。pre 的 runner 是从
+  `origin/test:deploy/docker-compose.phala.runner.yaml` 的 V1 runner 模板改编
+  （env var 名不变，仅重命名 app/container/volume 为 pre 前缀）——三环境现在
+  拓扑完全同构：主 CVM `dual`（backend + serve-worker）+ 独立 runner CVM
+  V1 `agent-runner`。P1 用 pre 这一对验证双跑全链路，早于 P3 动 prod。
 - CI（`.github/workflows/ci.yml` + `deploy/pin-runtime-release.sh`）：
   release-pin 脚本**无需改动**——serve-worker 现在与 backend 共用
   `ghcr.io/…/feedling:<sha>` 镜像引用，脚本对 `main_compose` 的正则替换
-  本就覆盖它；已 dry-read 确认。`deploy-prod-runner-cvm` /
-  `deploy-pre-runner-cvm` 两个 job 的 `phala deploy -e` 参数改回 V1 变量
+  本就覆盖它；已 dry-read 确认。`deploy-test-runner-cvm` /
+  `deploy-prod-runner-cvm` / `deploy-pre-runner-cvm` 三个 job 的
+  `phala deploy -e` 参数都改回 V1 变量
   （`AGENT_MAX_CHILDREN`/`AGENT_RUNTIME_USERS`/`FEEDLING_HOST_ALL` 等），
-  移除了两个 V2-only 的 post-deploy 校验步骤（`check-v2-runner-fleet.py`
-  liveness gate、pre 的 prompt-cache canary）。`deploy/check-prod-runner-topology.sh`
-  从「≥2 个 Runtime V2 worker CVM」硬门槛降级回 origin/test 的软告警形态
-  （`DEPLOY_PROD_RUNNER_CVM` 开关），否则当前只有 1 个已配置的 prod runner
-  CVM 会让这道硬门槛永久卡死所有未来 prod 主 CVM 部署。
+  移除了各自 V2-only 的 post-deploy 校验步骤（`check-v2-runner-fleet.py`
+  liveness/fleet-identity gate、pre 的 prompt-cache canary）。
+  `deploy/check-prod-runner-topology.sh` 的「≥2 个独立 runner CVM」检查默认
+  降为软告警（`DEPLOY_PROD_RUNNER_CVM` 开关 + `PROD_RUNNER_TOPOLOGY_ENFORCE`
+  重新拉紧），否则当前只有 1 个已配置的 prod runner CVM 会让硬门槛永久卡死
+  所有未来 prod 主 CVM 部署——**这个默认极性与 disable 开关是 Task 11 新引入
+  的，不是「恢复」origin/test 的旧脚本**（origin/test 从无 disable 参数、也
+  从无「main CVM 不得出现在 runner inventory」检查）。Code review 还纠正了一处
+  安全回归：main-CVM-membership 检查此前被放在 `enabled` 提前返回之后，会被
+  `enabled=false` 一并跳过；已挪到提前返回之前、无条件执行，并补了组合回归
+  测试（`enabled=false` + main CVM 出现在 inventory → 仍必须 hard-fail）。
 - **CI 安全核对**：workflow 顶层 `on.push.branches: [main, test, pre]` /
   `on.pull_request.branches: [main, test, pre]` 已排除 `feat/dual-runtime`；
   每个 deploy/validate job 的 `if:` 额外要求
   `github.ref == 'refs/heads/{main|test|pre}' && github.event_name == 'push'`。
   推本分支不会匹配任何一个 job，不会触发对 prod/test/pre 的任何自动部署。
 - `deploy/DEPLOYMENTS.md` 新增「双运行时拓扑」小节（拓扑图 + 环境变量表 +
-  P3 部署序）。已知遗留缺口（未在本任务范围内处理，留给后续任务）：
-  test 主 CVM 现在也把 `FEEDLING_HOSTED_RUNTIME_POLICY` 设成 `dual` +
-  默认 `resident`，但 test 环境没有独立的 V1 runner CVM——test 若真的产生
-  "resident 期望" 的用户，目前无 V1 执行器可服务；这是 brief 明确指定的
-  三环境同构写法，按字面执行，风险已记录待后续任务决定是否给 test 也配
-  V1 runner。
+  P3 部署序）；三环境现已同构描述，删掉了此前一版里关于「test 缺 V1
+  runner」的条件式披露（那是基于 test 现状的错误前提写的，已用上面的纠偏
+  重写）。
 
 ## 2026-07-19
 
