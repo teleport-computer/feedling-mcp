@@ -482,8 +482,13 @@ jobs:
             fi
           done
 
-  # Runtime V2 has no resident fallback. Fail before mutating live state unless
-  # at least two independent production worker CVMs are recorded.
+  # Dual-runtime coexistence (2026-07-21 design, Task 11): the prod runner
+  # CVM(s) are V1 agent-runner again, so V1 resident is the fallback and the
+  # standalone-runner topology gate is a soft warning (DEPLOY_PROD_RUNNER_CVM),
+  # not a hard "≥2 Runtime V2 worker CVMs" block — see
+  # deploy/check-prod-runner-topology.sh. Pooled Runtime V2 for the main-CVM
+  # serve-worker still needs DATABASE_URL / FEEDLING_RUNTIME_TOKEN_SECRET, so
+  # the rest of this job's prerequisite checks are unchanged.
   validate-prod-runner-topology:
     name: validate prod deploy prerequisites
     needs: [detect-cvm-changes]
@@ -497,8 +502,10 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v4
-      - name: Require two production Runtime V2 worker CVMs
-        run: ./deploy/check-prod-runner-topology.sh deploy/prod-runner-cvm-ids.txt deploy/prod-cvm-id.txt
+      - name: Check standalone prod runner CVM topology
+        env:
+          DEPLOY_PROD_RUNNER_CVM: ${{ vars.DEPLOY_PROD_RUNNER_CVM || 'true' }}
+        run: ./deploy/check-prod-runner-topology.sh deploy/prod-runner-cvm-ids.txt deploy/prod-cvm-id.txt "$DEPLOY_PROD_RUNNER_CVM"
       - name: Confirm every production CVM exists before mutating the main CVM
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
@@ -638,9 +645,15 @@ jobs:
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
 
-  # Pre is V2-only and has no resident fallback. Validate the complete two-CVM
-  # release unit before changing the main CVM, so a missing runner image or
-  # configuration cannot leave the app accepting jobs with no executor.
+  # Dual-runtime coexistence (2026-07-21 design, Task 11): the pre runner CVM
+  # is V1 agent-runner again (P1 dual-fleet validation), and pooled Runtime V2
+  # now also runs on the main CVM as the serve-worker container. Validate the
+  # complete two-CVM release unit before changing the main CVM, so a missing
+  # runner image or configuration cannot leave either fleet unservable. The E2B
+  # sandbox checks below are effectively inert under this topology (the main
+  # CVM's serve-worker hardcodes FEEDLING_V2_SANDBOX_PROVIDER=disabled and the
+  # V1 runner has no sandbox concept); left in place as a harmless no-op for
+  # any future operator who explicitly re-enables it via the PRE_ vars.
   validate-pre-runtime-prerequisites:
     name: validate pre Runtime V2 deploy prerequisites
     needs: [detect-cvm-changes-pre]
@@ -1636,15 +1649,20 @@ jobs:
           python3 tools/deploy_canary.py
 
   # =========================================================================
-  # DEPLOY — standalone Runtime V2 worker CVM (pre)
+  # DEPLOY — standalone V1 agent-runner worker CVM (pre)
   #
-  # Deploys deploy/docker-compose.phala.pre.runner.yaml to a SEPARATE Phala CVM that
-  # runs only the pooled serve-worker. It shares the main CVM's PostgreSQL and
-  # token secret and reaches backend/enclave over public/gateway paths.
+  # Deploys deploy/docker-compose.phala.pre.runner.yaml to a SEPARATE Phala CVM
+  # that runs only the V1 agent-runner supervisor. Dual-runtime coexistence
+  # (2026-07-21 design, Task 11): pooled Runtime V2 moved onto the main pre CVM
+  # itself as the serve-worker container, so this CVM went back to V1-only form
+  # — P1 uses the pair (this V1 runner + the main CVM's serve-worker) to
+  # validate dual-fleet coexistence end to end before P3 touches production.
+  # It shares the main CVM's PostgreSQL and token secret and reaches
+  # backend/enclave over public/gateway paths.
   #
-  # Pre is V2-only by default, so this deploy/readiness gate is mandatory for
-  # every CVM-affecting pre push. Both CVMs are validated before either changes;
-  # deployment remains serialized because the runner must reach the new main CVM.
+  # This deploy/readiness gate is mandatory for every CVM-affecting pre push
+  # (mirrors deploy-test-runner-cvm's V1 form). Deployment remains serialized
+  # because the runner must reach the new main CVM.
   # =========================================================================
   deploy-pre-runner-cvm:
     name: deploy runner CVM (pre)
@@ -1713,54 +1731,37 @@ jobs:
           #   PRE_MAIN_ENCLAVE_URL = https://<main-app-id>-5003s.dstack-pha-prod9.phala.network
           FEEDLING_API_URL:             ${{ vars.PRE_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:         ${{ vars.PRE_MAIN_ENCLAVE_URL }}
+          AGENT_MAX_CHILDREN:           ${{ vars.PRE_AGENT_MAX_CHILDREN }}
           # Shared with the main pre CVM — MUST match (esp. the token secret).
           DATABASE_URL:                 ${{ secrets.PRE_DATABASE_URL }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
-          FEEDLING_V2_RUNNER_CVM_ID:      ${{ steps.cvmid.outputs.cvm_id }}
-          FEEDLING_V2_MAX_WORKERS:       ${{ vars.PRE_FEEDLING_V2_MAX_WORKERS || '4' }}
-          FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: ${{ vars.PRE_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0' }}
-          FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: ${{ vars.PRE_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64' }}
-          FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
-          E2B_API_KEY:                   ${{ secrets.PRE_E2B_API_KEY || secrets.E2B_API_KEY }}
-          FEEDLING_V2_E2B_TEMPLATE:      ${{ vars.PRE_FEEDLING_V2_E2B_TEMPLATE }}
-          FEEDLING_V2_E2B_ALLOW_INTERNET: ${{ vars.PRE_FEEDLING_V2_E2B_ALLOW_INTERNET || '0' }}
+          AGENT_RUNTIME_USERS:          ${{ secrets.PRE_AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.PRE_AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_HOST_ALL:            ${{ vars.PRE_FEEDLING_HOST_ALL }}
+          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
-            echo "::error::PRE_DATABASE_URL not set — worker has no durable job store"
+            echo "::error::PRE_DATABASE_URL not set — runner has no lease store"
             exit 1
           fi
           if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
             echo "::error::PRE_MAIN_API_URL / PRE_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"
             exit 1
           fi
-          if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
-            if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
-              FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
-            fi
-            if [ -z "$E2B_API_KEY" ] || [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
-              echo "::error::PRE E2B sandbox requires an E2B key and content-addressed template"
-              exit 1
-            fi
-          fi
-          DEPLOYED_BUILD="${GITHUB_SHA:0:7}"
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
             -c deploy/docker-compose.phala.pre.runner.yaml \
             -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
             -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
+            -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-            -e "FEEDLING_V2_RUNNER_CVM_ID=$FEEDLING_V2_RUNNER_CVM_ID" \
-            -e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD" \
-            -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
-            -e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED" \
-            -e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE=$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE" \
-            -e "FEEDLING_V2_SANDBOX_PROVIDER=$FEEDLING_V2_SANDBOX_PROVIDER" \
-            -e "E2B_API_KEY=$E2B_API_KEY" \
-            -e "FEEDLING_V2_E2B_TEMPLATE=$FEEDLING_V2_E2B_TEMPLATE" \
-            -e "FEEDLING_V2_E2B_ALLOW_INTERNET=$FEEDLING_V2_E2B_ALLOW_INTERNET"
+            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE"
           # phala deploy --wait has a fixed 300-second ceiling; runner image
           # pulls routinely exceed it. Use the repo's explicit bounded poll.
           ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
@@ -1792,36 +1793,30 @@ jobs:
             fi
           done
           exit "$publish_status"
-
-      - name: Post-deploy Runtime V2 liveness gate (pre)
-        env:
-          FEEDLING_API_URL:      ${{ vars.PRE_API_URL || 'https://pre-api.feedling.app' }}
-          FEEDLING_ADMIN_TOKEN:  ${{ secrets.FEEDLING_ADMIN_TOKEN }}
-        run: |
-          python3 deploy/check-v2-runner-fleet.py \
-            --base-url "$FEEDLING_API_URL" \
-            --inventory deploy/pre-runner-cvm-id.txt \
-            --build "${GITHUB_SHA:0:7}"
-
-      - name: Prove Runtime V2 prompt-cache hit (pre)
-        env:
-          FEEDLING_API_URL: ${{ vars.PRE_API_URL || 'https://pre-api.feedling.app' }}
-          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          FEEDLING_PROMPT_CACHE_CANARY_MODEL: ${{ vars.PRE_PROMPT_CACHE_CANARY_MODEL || 'openai/gpt-4.1-mini' }}
-          FEEDLING_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL: ${{ vars.PRE_PROMPT_CACHE_ANTHROPIC_CANARY_MODEL || 'anthropic/claude-sonnet-4.6' }}
-        run: python3 tools/prompt_cache_canary.py
+      # No post-deploy Runtime V2 fleet gate here — this CVM runs the V1
+      # agent-runner, which has no v2_worker_heartbeats identity to check.
+      # The main pre CVM's serve-worker still gets its own liveness proof via
+      # the same admin heartbeat surface (see deploy-pre-cvm's canary step);
+      # a dedicated dual-runtime post-deploy gate is tracked as follow-up work
+      # (P1/P2 gates in the design doc §8), not part of Task 11's scope.
 
   # =========================================================================
-  # DEPLOY — standalone production Runtime V2 worker CVM(s)
+  # DEPLOY — standalone production V1 agent-runner worker CVM(s)
   #
-  # One pooled worker service per CVM; scale out by listing more CVM ids in
-  # deploy/prod-runner-cvm-ids.txt (one per line). Deploys the SAME
-  # deploy/docker-compose.phala.prod.runner.yaml to each, sharing the main prod
-  # CVM's Postgres + secrets via the encrypted env channel. See deploy/DEPLOYMENTS.md.
+  # Dual-runtime coexistence (2026-07-21 design, Task 11): pooled Runtime V2
+  # moved onto the main prod CVM itself as the serve-worker container, so this
+  # fleet went back to V1 agent-runner (= prod's actual current topology; this
+  # compose file is restored byte-for-byte from origin/test). One V1 supervisor
+  # per CVM; scale out by listing more CVM ids in deploy/prod-runner-cvm-ids.txt
+  # (one per line). Deploys the SAME deploy/docker-compose.phala.prod.runner.yaml
+  # to each, sharing the main prod CVM's Postgres + secrets via the encrypted env
+  # channel. See deploy/DEPLOYMENTS.md.
   #
-  # This job is mandatory for every production CVM change because hosted Chat
-  # has no resident fallback. The preflight requires two independent IDs.
+  # This job runs alongside every production CVM change (§7b of the design doc:
+  # "runner CVM: 不动" — the compose content only changes when this file itself
+  # is edited, which after this commit it deliberately is not). The standalone
+  # topology preflight is a soft warning now, not a hard "≥2 CVMs" gate — see
+  # deploy/check-prod-runner-topology.sh.
   deploy-prod-runner-cvm:
     name: deploy runner CVM (prod)
     needs: [deploy-cvm, detect-cvm-changes]
@@ -1878,7 +1873,7 @@ jobs:
             | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
             | grep . || true)
           if [ -z "$IDS" ]; then
-            echo "::error::deploy/prod-runner-cvm-ids.txt has no CVM ids — provision two independent worker CVMs first"
+            echo "::error::deploy/prod-runner-cvm-ids.txt has no CVM ids — provision at least one runner CVM first"
             exit 1
           fi
           echo "count=$(printf '%s\n' "$IDS" | wc -l)"
@@ -1895,53 +1890,37 @@ jobs:
           #   PROD_MAIN_ENCLAVE_URL = https://<prod-app-id>-5003s.dstack-pha-prod9.phala.network
           FEEDLING_API_URL:              ${{ vars.PROD_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:          ${{ vars.PROD_MAIN_ENCLAVE_URL }}
+          AGENT_MAX_CHILDREN:            ${{ vars.AGENT_MAX_CHILDREN }}
           # Reused from the main prod CVM — MUST match (esp. the token secret).
           DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
-          FEEDLING_V2_MAX_WORKERS:       ${{ vars.PROD_FEEDLING_V2_MAX_WORKERS || '4' }}
-          FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: ${{ vars.PROD_FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED || '0' }}
-          FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: ${{ vars.PROD_FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE || '64' }}
-          FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PROD_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
-          E2B_API_KEY:                   ${{ secrets.E2B_API_KEY }}
-          FEEDLING_V2_E2B_TEMPLATE:      ${{ vars.PROD_FEEDLING_V2_E2B_TEMPLATE }}
-          FEEDLING_V2_E2B_ALLOW_INTERNET: ${{ vars.PROD_FEEDLING_V2_E2B_ALLOW_INTERNET || '0' }}
+          AGENT_RUNTIME_USERS:           ${{ secrets.AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:    ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_HOST_ALL:             ${{ vars.FEEDLING_HOST_ALL }}
+          FEEDLING_MIGRATE_ENABLE:       ${{ vars.FEEDLING_MIGRATE_ENABLE }}
         run: |
           if [ -z "$DATABASE_URL" ]; then
-            echo "::error::DATABASE_URL not set — worker has no durable job store"; exit 1
+            echo "::error::DATABASE_URL not set — runner has no lease store"; exit 1
           fi
           if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
             echo "::error::PROD_MAIN_API_URL / PROD_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"; exit 1
           fi
-          if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
-            if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
-              FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
-            fi
-            if [ -z "$E2B_API_KEY" ] || [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
-              echo "::error::PROD E2B sandbox requires a key and content-addressed template"
-              exit 1
-            fi
-          fi
-          DEPLOYED_BUILD="${GITHUB_SHA:0:7}"
           printf '%s\n' "$IDS" | while IFS= read -r CVM_ID; do
             [ -z "$CVM_ID" ] && continue
-            echo ">>> deploy prod runner CVM: $CVM_ID build=$DEPLOYED_BUILD"
+            echo ">>> deploy prod runner CVM: $CVM_ID"
             phala deploy \
               --api-token "$PHALA_CLOUD_API_KEY" \
               --cvm-id "$CVM_ID" \
               -c deploy/docker-compose.phala.prod.runner.yaml \
               -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
               -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
+              -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
               -e "DATABASE_URL=$DATABASE_URL" \
               -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
-              -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
-              -e "FEEDLING_V2_DEPLOYED_BUILD=$DEPLOYED_BUILD" \
-              -e "FEEDLING_V2_MAX_WORKERS=$FEEDLING_V2_MAX_WORKERS" \
-              -e "FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED=$FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED" \
-              -e "FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE=$FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE" \
-              -e "FEEDLING_V2_SANDBOX_PROVIDER=$FEEDLING_V2_SANDBOX_PROVIDER" \
-              -e "E2B_API_KEY=$E2B_API_KEY" \
-              -e "FEEDLING_V2_E2B_TEMPLATE=$FEEDLING_V2_E2B_TEMPLATE" \
-              -e "FEEDLING_V2_E2B_ALLOW_INTERNET=$FEEDLING_V2_E2B_ALLOW_INTERNET"
+              -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+              -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+              -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+              -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE"
             # NOT --wait: the CLI's readiness wait is hard-capped at 300s and
             # the runner image pull + boot regularly exceeds it. Poll with our
             # own configurable deadline instead (deploy/wait-cvm-ready.sh).
@@ -1980,16 +1959,10 @@ jobs:
             done
             [ "$publish_status" -eq 0 ] || { echo "::error::publish failed for $CVM_ID"; exit 1; }
           done
-
-      - name: Post-deploy Runtime V2 fleet identity gate (prod)
-        env:
-          FEEDLING_API_URL:     ${{ vars.PROD_API_URL || vars.PROD_MAIN_API_URL || 'https://api.feedling.app' }}
-          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
-        run: |
-          python3 deploy/check-v2-runner-fleet.py \
-            --base-url "$FEEDLING_API_URL" \
-            --inventory deploy/prod-runner-cvm-ids.txt \
-            --build "${GITHUB_SHA:0:7}"
+      # No post-deploy Runtime V2 fleet gate here — these CVMs run the V1
+      # agent-runner, which has no v2_worker_heartbeats identity to check.
+      # The main prod CVM's serve-worker liveness is proved separately by the
+      # deploy-cvm job's post-deploy canary/attestation gates.
 
   # =========================================================================
   # NOTIFY — Lark "deploy finished", sent only after the WHOLE prod deploy

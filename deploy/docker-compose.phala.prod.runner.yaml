@@ -1,36 +1,90 @@
-# docker-compose.phala.prod.runner.yaml — Production Runtime V2 worker CVM
+# docker-compose.phala.prod.runner.yaml — STANDALONE prod agent-runner CVM (Form B)
 #
-# Deploy this identical compose to each CVM listed in prod-runner-cvm-ids.txt.
-# PostgreSQL's queue claim provides horizontal coordination. There is no hosted
-# resident supervisor, per-user child process, lease, checkpoint, home, roster,
-# or resident rollback service in the production topology.
+# ONE runner per CVM (deliberate — see below). A separate Phala CVM that runs a
+# SINGLE agent-runner supervisor: no backend, no enclave, no ingress. It hosts the
+# API-user resident consumers OFF the main prod CVM, which (measured 2026-07-02)
+# was RAM-saturated running 99 consumers (~6.4GB) alongside backend+enclave on one
+# 15GB box (≈1.1GB free). Moving hosting here frees the main CVM.
+#
+# ── Why ONE runner per CVM (not N containers per CVM) ──────────────────────────
+#   A single supervisor already hosts ~99 users fine (that's exactly what the main
+#   prod CVM was doing). Capacity is RAM-bound (~65MB per idle consumer; concurrency
+#   is low, ~3% active turns), not supervisor-bound. So extra containers per CVM buy
+#   no throughput — only shared VM blast radius. Scaling out = add MORE runner CVMs
+#   (each 1 runner), giving VM-level failure domains: one CVM dying loses only its
+#   share, the rest take over via the Postgres lease TTL. List every runner CVM id
+#   in deploy/prod-runner-cvm-ids.txt (one per line); the CI job deploys this same
+#   compose to each.
+#
+# ── Cross-CVM reach to the main prod CVM ───────────────────────────────────────
+#   FEEDLING_API_URL     → https://api.feedling.app (public ingress; NOT backend:5001)
+#   FEEDLING_ENCLAVE_URL → the main prod enclave via dstack-gateway passthrough:
+#        https://9798850e096d770293c67305c6cfdceed68c1d28-5003s.dstack-pha-prod9.phala.network
+#        (in-enclave TLS + attestation; runner auths per-user with a short-lived
+#        Stage-D runtime token, verify=False on the self-signed enclave cert — the
+#        SAME decrypt path clients use, so it widens nothing. Validated on test:
+#        /v1/envelope/decrypt over this passthrough → 200.)
+#
+# ── Capacity ───────────────────────────────────────────────────────────────────
+#   AGENT_MAX_CHILDREN = 0 (UNBOUNDED) per runner. The main prod CVM's inline
+#   agent-runner has been removed, so this runner CVM is the ONLY host: a fixed cap
+#   could leave users beyond it unserved (the send guard does not capacity-gate),
+#   so 0 lets one runner hold everyone AND absorb future growth. Capacity ref:
+#   measured ~65MB/consumer, so ~120 consumers ~= 8GB fits a 15GB CVM -- watch RAM
+#   as users grow and add another runner CVM (also 0) before memory is exhausted.
+#   WARNING: ONE runner CVM = single point of failure (nothing takes over if it
+#   dies); run >=2 runner CVMs for failover.
+#
+# ── Deploy ─────────────────────────────────────────────────────────────────────
+#   Each runner CVM is its OWN dstack app (own app-id + compose_hash + on-chain auth
+#   on the prod FeedlingAppAuth 0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F). All
+#   secrets flow via the ENCRYPTED env channel (phala deploy -e …) — never baked.
+#   Reuses the main prod CVM's secrets (DATABASE_URL / FEEDLING_RUNTIME_TOKEN_SECRET
+#   — MUST match — / AGENT_RUNTIME_USERS). Provision +
+#   activation: see deploy/DEPLOYMENTS.md “prod Form B”. DORMANT until the CI job's
+#   repo var DEPLOY_PROD_RUNNER_CVM=true AND prod-runner-cvm-ids.txt is non-empty.
 
 name: feedling-prod-runner
 
 services:
-  serve-worker:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:164c64b   # CI pins the sha
-    command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
+  # Exactly one runner. Distinct CVM hostname → distinct lease owner + heartbeat row.
+  # No per-runner config: every prod runner CVM deploys this identical compose.
+  agent-runner:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:feef5e4   # CI pins the sha
+    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
-      FEEDLING_API_URL: "${FEEDLING_API_URL:-}"
-      FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"
+      FEEDLING_API_URL: "${FEEDLING_API_URL:-}"          # main prod ingress URL
+      FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"  # main prod enclave passthrough URL
+      AGENT_DATA_ROOT: "/agent-data"
+      AGENT_LEASE_TTL_SEC: "${AGENT_LEASE_TTL_SEC:-300}"
+      AGENT_TICK_INTERVAL_SEC: "${AGENT_TICK_INTERVAL_SEC:-15}"
+      AGENT_ENVELOPE_REFETCH_SEC: "${AGENT_ENVELOPE_REFETCH_SEC:-300}"
+      AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
+      AGENT_RUNTIME_ISOLATION: "process"
+      # Per-runner capacity ceiling. 0 = UNBOUNDED (no cap): this single runner
+      # takes every hosted user and absorbs future growth. With the main CVM's
+      # inline agent-runner now removed there is no other runner to split with, so
+      # a fixed cap could strand over-cap users; 0 avoids that. Scale by adding
+      # runner CVMs (each also 0 -> any one can hold the whole fleet).
+      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-0}"
       DATABASE_URL: "${DATABASE_URL:-}"
+      AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
+      AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-      # Fail closed unless CI injects the target inventory CVM and the exact
-      # seven-character build baked into this image. These values form the
-      # stable application-level heartbeat identity used by the fleet gate.
-      FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
-      FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-}"
-      FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
-      FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: "${FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED:-0}"
-      FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: "${FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE:-64}"
-      FEEDLING_V2_SANDBOX_PROVIDER: "${FEEDLING_V2_SANDBOX_PROVIDER:-disabled}"
-      E2B_API_KEY: "${E2B_API_KEY:-}"
-      FEEDLING_V2_E2B_TEMPLATE: "${FEEDLING_V2_E2B_TEMPLATE:-}"
-      FEEDLING_V2_E2B_ALLOW_INTERNET: "${FEEDLING_V2_E2B_ALLOW_INTERNET:-0}"
-      FEEDLING_V2_MAX_WORKERS: "${FEEDLING_V2_MAX_WORKERS:-4}"
-      FEEDLING_V2_IMAGE_MAX_B64_CHARS: "${FEEDLING_V2_IMAGE_MAX_B64_CHARS:-2700000}"
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
+      # Genesis import worker: ON here because once the main prod CVM's inline
+      # agent-runner is removed, the runner CVMs are the ONLY place genesis import
+      # jobs get drained. Safe on multiple runner CVMs — claim is FOR UPDATE SKIP
+      # LOCKED, so every runner CVM running it de-dupes. Reaches the main enclave
+      # over the passthrough URL above.
       FEEDLING_GENESIS_WORKER_ENABLED: "1"
       FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "${FEEDLING_GENESIS_WORKER_INTERVAL_SEC:-10}"
       FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "${FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC:-7200}"
+    volumes:
+      - feedling_agent_runtime_prod_runner:/agent-data
+
+volumes:
+  feedling_agent_runtime_prod_runner:
+    name: feedling_agent_runtime_prod_runner

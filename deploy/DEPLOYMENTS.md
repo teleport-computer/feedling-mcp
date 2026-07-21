@@ -68,6 +68,101 @@ retirement when keeping the exact value no longer helps verification.
 > deployed to every environment and a live process inventory shows no hosted
 > resident supervisor or per-user CLI process.
 
+> **⚠️ Superseded 2026-07-21/22 by dual-runtime coexistence (Task 11, see the
+> section immediately below).** The "Runtime V2-only" banner above and the
+> per-environment "Runtime V2 worker CVM" tables that follow describe a
+> topology this repo no longer ships: prod and pre main CVMs now default
+> `FEEDLING_HOSTED_RUNTIME_POLICY=dual` (not `v2_only`), the prod and pre
+> runner CVMs are V1 `agent-runner` again, and pooled Runtime V2 also runs
+> in-CVM on every main compose as a second `serve-worker` container. The
+> tables are left as historical/incident record (CVM IDs, on-chain contracts,
+> and most other facts in them are still accurate) — only their "Compose
+> contains only serve-worker" / "V2-only" framing is stale. Treat the
+> dual-runtime section immediately below as authoritative for current
+> topology.
+
+### 双运行时拓扑（dual-runtime coexistence，2026-07-21 起）
+
+设计文档：
+[`docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md`](../docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md)。
+本节只记录**部署拓扑**（compose 文件形态 + CI 部署顺序），路由/切换控制器等
+代码层设计见该 spec。
+
+**拓扑图**（prod / test / pre 三环境同构，仅 CVM 数量与域名不同）：
+
+```
+┌─────────────────────────── 主 CVM（单个 dstack app）───────────────────────────┐
+│                                                                                  │
+│   ingress ──► backend ──► enclave        backend/enclave 走法与此前完全一致       │
+│      │           │            ▲                                                 │
+│      │           │            │ https://enclave:5003（compose 内网）            │
+│      │           │            │                                                 │
+│      │           └──────► serve-worker ──┘   同 backend 镜像，第二个容器；        │
+│      │                        │               只服务 allowlist 里的 v2/draining  │
+│      │                        │               账号（backend/hosted 路由/reconciler │
+│      │                        ▼               决定谁去哪，见 spec §3/§4）         │
+│      │                   PostgreSQL（backend 与 serve-worker 共享同一个 DB）      │
+│      ▼                                                                          │
+│  公网 api.<env>.feedling.app                                                    │
+└───────────────────────────────────────────────────────────────────────────────┘
+                                    ▲
+                                    │  FEEDLING_API_URL / FEEDLING_ENCLAVE_URL
+                                    │  （公网 / gateway passthrough，不是内网地址）
+                                    │
+┌─────────────────── runner CVM（独立 dstack app，prod/pre 各一份）────────────────┐
+│                                                                                  │
+│   agent-runner（V1 supervisor.py）── 走 Postgres lease，服务 allowlist 之外       │
+│                                       （fence=resident）的所有账号                │
+│                                                                                  │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+test 环境目前**没有**对应的 V1 runner CVM（Task 11 范围内未新增；已有的
+`deploy/docker-compose.phala.runner.yaml` 是与此拓扑无关的、独立的额外 V2
+worker 容量，见下方遗留缺口说明）。
+
+**关键差异 vs 纯 V2-only 拓扑**：serve-worker 从独立 runner CVM 搬进主 CVM
+（与 backend 同镜像的第二个容器），`FEEDLING_ENCLAVE_URL`/`FEEDLING_API_URL`
+从「公网 / dstack-gateway passthrough」变成「compose 内网地址」（`https://
+enclave:5003` / `http://backend:5001`）——这是全部改动里唯一的地址形态差异，
+其余环境变量（`DATABASE_URL`、`FEEDLING_RUNTIME_TOKEN_SECRET` 等）与此前
+runner 侧的 serve-worker 完全一致。
+
+**环境变量表**（主 CVM 新增的 `serve-worker` 服务）：
+
+| 变量 | 值 | 说明 |
+|---|---|---|
+| `FEEDLING_API_URL` | `http://backend:5001`（字面量，非 `${VAR}`） | compose 内网地址，照抄 ingress `ROUTING_MAP` 的转发目标 |
+| `FEEDLING_ENCLAVE_URL` | `https://enclave:5003`（字面量） | compose 内网地址，照抄 backend 自己现用的同一个值 |
+| `DATABASE_URL` | `${DATABASE_URL}` | 与 backend/enclave 同一个加密 env 注入 |
+| `FEEDLING_RUNTIME_TOKEN_SECRET` | `${FEEDLING_RUNTIME_TOKEN_SECRET}` | 必须与 backend/enclave 同值，否则本地 whoami 校验失败退回 reentrant 往返 |
+| `FEEDLING_V2_MAX_WORKERS` | `"4"`（字面量，灰度期保守值） | 每 CVM 并发 turn 上限 |
+| `FEEDLING_V2_FLEET_IDENTITY_REQUIRED` | `"1"` | fail-closed，除非注入 `FEEDLING_V2_RUNNER_CVM_ID`/`FEEDLING_V2_DEPLOYED_BUILD` |
+| `FEEDLING_V2_RUNNER_CVM_ID` | `${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}` | 默认 `main-cvm`（区别于独立 runner CVM 用自己的 CVM UUID） |
+| `FEEDLING_V2_SANDBOX_PROVIDER` | `"disabled"`（字面量） | 灰度期不接 E2B 沙箱；照抄即可，不要用 `${VAR}` |
+| `FEEDLING_HOSTED_RUNTIME_POLICY` | `"dual"` | backend 与 serve-worker 都设，取代旧的 `"v2_only"` 字面量 |
+| `FEEDLING_RUNTIME_DEFAULT_DESIRED` | `"resident"` | 无 allowlist 记录的账号默认 fence；保证部署瞬间行为与部署前一致 |
+
+**P3 部署序（prod）**（design doc §7b）：
+
+1. **Migration 先行**：alembic 跑 V2 表（0017/0018 系）+ `v2_user_allowlist`。
+   纯增量，V1 不读这些表，先跑 migration 再起新镜像是安全序。
+2. **主 CVM**：原地部署新镜像（`backend` 双路由 + `serve-worker` 容器）。
+   原地重部署不翻 KMS 钥（2026-07-05 实证：compose_hash 变但钥不翻）；仍需
+   先走完 pre → test 全流程再碰 prod。
+3. **runner CVM：不动**。`deploy/docker-compose.phala.prod.runner.yaml`
+   本次仅做「文件追平现状」的一次性恢复提交，此后不再随主 CVM 部署改动
+   （除非未来任务显式改它）。
+4. 部署完成瞬间：全员 fence 应为 `resident` → 行为与部署前完全一致
+   （P3 验收点）；之后由 allowlist 逐步把个别账号切到 `v2`。
+
+**已知遗留缺口（Task 11 范围外，留给后续任务判断）**：test 主 CVM 的
+`FEEDLING_HOSTED_RUNTIME_POLICY` 同样设为 `dual`（brief 明确要求三环境同构），
+但 test 环境目前没有独立的 V1 `agent-runner` CVM——如果 test 上真的出现
+`fence=resident` 的账号，暂无 V1 执行器服务它们。test 已有的
+`deploy/docker-compose.phala.runner.yaml`（`feedling-io-agents-test` CVM）是
+纯 V2 `serve-worker`，与本次拓扑无关，仍照旧运行、不受影响。
+
 ### Production CVM (prod9, current)
 
 | | |

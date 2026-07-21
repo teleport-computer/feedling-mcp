@@ -510,34 +510,88 @@ def test_failed_active_model_test_fences_current_v2_generation(monkeypatch):
     )
 
 
-def test_all_managed_composes_force_literal_v2_policy():
+def test_all_main_composes_force_literal_dual_policy():
+    # Dual-runtime coexistence (2026-07-21 design, Task 11): the three main CVM
+    # composes each carry both backend AND a pooled serve-worker container, and
+    # both services force the same literal measured-compose policy values —
+    # "dual" (not the old "v2_only") plus a "resident" default fence, so a
+    # fresh deploy's day-1 behavior is identical to pre-dual-runtime.
     for name in (
         "docker-compose.phala.yaml",
         "docker-compose.phala.test.yaml",
         "docker-compose.phala.pre.yaml",
     ):
         compose = yaml.safe_load((ROOT / "deploy" / name).read_text())
-        assert compose["services"]["backend"]["environment"][
-            "FEEDLING_HOSTED_RUNTIME_POLICY"
-        ] == "v2_only"
+        for service in ("backend", "serve-worker"):
+            env = compose["services"][service]["environment"]
+            assert env["FEEDLING_HOSTED_RUNTIME_POLICY"] == "dual"
+            assert env["FEEDLING_RUNTIME_DEFAULT_DESIRED"] == "resident"
 
 
-def test_every_managed_runner_compose_has_only_v2_worker():
+def test_main_compose_serve_worker_shares_the_backend_image_and_stays_internal():
+    # The serve-worker container is a second copy of the SAME image as backend
+    # (so deploy/pin-runtime-release.sh's existing backend-image regex retags
+    # it automatically) and reaches enclave/backend over compose-internal
+    # URLs, never the public gateway passthrough the standalone runner CVMs
+    # use.
     for name in (
-        "docker-compose.phala.runner.yaml",
+        "docker-compose.phala.yaml",
+        "docker-compose.phala.test.yaml",
+        "docker-compose.phala.pre.yaml",
+    ):
+        compose = yaml.safe_load((ROOT / "deploy" / name).read_text())
+        services = compose["services"]
+        worker = services["serve-worker"]
+        assert worker["image"] == services["backend"]["image"]
+        assert worker["command"] == [
+            "python",
+            "-u",
+            "backend/model_api_runtime/v2/serve_worker.py",
+        ]
+        env = worker["environment"]
+        assert env["FEEDLING_API_URL"] == "http://backend:5001"
+        assert env["FEEDLING_ENCLAVE_URL"] == "https://enclave:5003"
+
+
+def test_test_runner_compose_still_has_only_the_standalone_v2_worker():
+    # Unlike prod/pre, the test environment's separate Runtime V2 worker CVM
+    # (deploy/docker-compose.phala.runner.yaml) is untouched by Task 11 — it
+    # remains unrelated extra V2 capacity alongside the new main-CVM
+    # serve-worker.
+    path = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
+    source = path.read_text()
+    compose = yaml.safe_load(source)
+    assert set(compose["services"]) == {"serve-worker"}
+    worker = compose["services"]["serve-worker"]
+    assert worker["command"] == [
+        "python",
+        "-u",
+        "backend/model_api_runtime/v2/serve_worker.py",
+    ]
+    assert "backend/agent_runtime/supervisor.py" not in source
+    assert "AGENT_RUNTIME_USERS" not in source
+
+
+def test_pre_and_prod_runner_composes_are_back_to_v1_agent_runner_only():
+    # Dual-runtime coexistence (Task 11): pooled Runtime V2 moved onto the
+    # main CVM as the serve-worker container, so the pre/prod standalone
+    # runner CVMs reverted to V1 agent-runner form — prod's compose is
+    # restored byte-for-byte from origin/test (= prod's actual live
+    # topology); pre's is adapted from origin/test's test V1 runner template.
+    for name in (
         "docker-compose.phala.pre.runner.yaml",
         "docker-compose.phala.prod.runner.yaml",
     ):
         path = ROOT / "deploy" / name
         source = path.read_text()
         compose = yaml.safe_load(source)
-        assert set(compose["services"]) == {"serve-worker"}
-        worker = compose["services"]["serve-worker"]
-        assert worker["command"] == [
+        assert set(compose["services"]) == {"agent-runner"}
+        runner = compose["services"]["agent-runner"]
+        assert runner["command"] == [
             "python",
             "-u",
-            "backend/model_api_runtime/v2/serve_worker.py",
+            "backend/agent_runtime/supervisor.py",
         ]
-        assert "volumes" not in compose
-        assert "backend/agent_runtime/supervisor.py" not in source
-        assert "AGENT_RUNTIME_USERS" not in source
+        assert "model_api_runtime/v2/serve_worker.py" not in source
+        assert "AGENT_RUNTIME_USERS" in source
+        assert "volumes" in compose

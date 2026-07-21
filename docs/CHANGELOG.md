@@ -47,6 +47,51 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-22
+
+### [DONE] Task 11 — 双运行时部署拓扑：serve-worker 并入主 CVM，runner 回 V1-only
+
+- 三份主 CVM compose（`docker-compose.phala.yaml` prod / `.test.yaml` /
+  `.pre.yaml`）各新增 `serve-worker` 服务：与 `backend` 同镜像、同 tag，
+  `command` 跑 `backend/model_api_runtime/v2/serve_worker.py`，
+  `FEEDLING_ENCLAVE_URL`/`FEEDLING_API_URL` 改为 compose 内网地址
+  （`https://enclave:5003` / `http://backend:5001`，照抄 backend 现用值，
+  不再走公网 gateway passthrough）。`backend` 与 `serve-worker` 都加
+  `FEEDLING_HOSTED_RUNTIME_POLICY: "dual"`（原 `v2_only` 字面量）+
+  `FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"`——日一部署行为与部署前
+  完全一致（全员 fence=resident），个别用户走 allowlist 单独切 v2。
+- `deploy/docker-compose.phala.prod.runner.yaml` 从 `origin/test` 逐字节
+  恢复为 V1-only 形态（`agent-runner` + `supervisor.py`）——这就是 prod
+  当前的真实部署形态，仓库文件此前因早前 Runtime-V2-only 迁移任务而漂移。
+- `deploy/docker-compose.phala.pre.runner.yaml` 移除 `serve-worker`，换回
+  V1 `agent-runner` 服务（从 `origin/test:deploy/docker-compose.phala.runner.yaml`
+  的 test V1 runner 模板改编，env var 名不变，仅重命名 app/container/volume
+  为 pre 前缀）——P1 用这一对（pre runner 的 V1 + pre 主 CVM 的
+  serve-worker）验证双跑全链路，早于 P3 动 prod。
+- CI（`.github/workflows/ci.yml` + `deploy/pin-runtime-release.sh`）：
+  release-pin 脚本**无需改动**——serve-worker 现在与 backend 共用
+  `ghcr.io/…/feedling:<sha>` 镜像引用，脚本对 `main_compose` 的正则替换
+  本就覆盖它；已 dry-read 确认。`deploy-prod-runner-cvm` /
+  `deploy-pre-runner-cvm` 两个 job 的 `phala deploy -e` 参数改回 V1 变量
+  （`AGENT_MAX_CHILDREN`/`AGENT_RUNTIME_USERS`/`FEEDLING_HOST_ALL` 等），
+  移除了两个 V2-only 的 post-deploy 校验步骤（`check-v2-runner-fleet.py`
+  liveness gate、pre 的 prompt-cache canary）。`deploy/check-prod-runner-topology.sh`
+  从「≥2 个 Runtime V2 worker CVM」硬门槛降级回 origin/test 的软告警形态
+  （`DEPLOY_PROD_RUNNER_CVM` 开关），否则当前只有 1 个已配置的 prod runner
+  CVM 会让这道硬门槛永久卡死所有未来 prod 主 CVM 部署。
+- **CI 安全核对**：workflow 顶层 `on.push.branches: [main, test, pre]` /
+  `on.pull_request.branches: [main, test, pre]` 已排除 `feat/dual-runtime`；
+  每个 deploy/validate job 的 `if:` 额外要求
+  `github.ref == 'refs/heads/{main|test|pre}' && github.event_name == 'push'`。
+  推本分支不会匹配任何一个 job，不会触发对 prod/test/pre 的任何自动部署。
+- `deploy/DEPLOYMENTS.md` 新增「双运行时拓扑」小节（拓扑图 + 环境变量表 +
+  P3 部署序）。已知遗留缺口（未在本任务范围内处理，留给后续任务）：
+  test 主 CVM 现在也把 `FEEDLING_HOSTED_RUNTIME_POLICY` 设成 `dual` +
+  默认 `resident`，但 test 环境没有独立的 V1 runner CVM——test 若真的产生
+  "resident 期望" 的用户，目前无 V1 执行器可服务；这是 brief 明确指定的
+  三环境同构写法，按字面执行，风险已记录待后续任务决定是否给 test 也配
+  V1 runner。
+
 ## 2026-07-19
 
 ### [DONE] Runtime V2 flight recorder becomes byte-complete for model-visible turns
