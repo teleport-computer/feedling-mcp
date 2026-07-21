@@ -87,6 +87,55 @@ disabled_tool_names=  (kwarg)
 
 wake lane 那处是新增 kwarg，其余两处是并集。
 
+⚠️ **合并必须是并集，不能覆盖**（Codex review 采纳）：
+
+```
+disabled_tool_names = disabled_mutation_tool_names ∪ disabled_web_tool_names
+```
+
+web 门禁不得盖掉 mutation recovery 的门禁。
+
+### 4.1.1 lane 语义：后台轮次即使用户开启也不放开
+
+| 用户设置 | chat | chat 子 agent | wake / screen_watch | wake 子 agent |
+|---|---|---|---|---|
+| 关闭 | 禁用 | 禁用 | 禁用 | 禁用 |
+| 开启 | 开放 | 开放 | **仍禁用** | **仍禁用** |
+
+即便 V2 的搜索是 keyless、不额外花搜索服务费，后台搜索仍然会增加模型轮次、
+token、延迟，以及**没有用户触发的对外数据流**。设置页里一个叫「联网搜索」的
+开关，不应该默默授权后台主动上网。
+
+实现上：**子 agent 继承父 lane 算出的结果，而不是只继承用户布尔值**——把父
+lane 解析出的 `web_names` 传给 `_make_task_batch_dispatcher`，wake 子 agent
+因此天然也是禁用。
+
+（待 hx 确认，见 §9。）
+
+### 4.2.1 【P0】turn_catalog 只在回合开始时算一次
+
+`disabled_tool_names` 在 `run_tool_loop` 入口生成一次 `turn_catalog`
+（`tool_loop.py:307-320`），之后整个多轮循环复用。因此：
+
+```
+回合开始时 fetch 是开的 → 模型第一轮跑
+→ 运维把 fetch 关掉
+→ 模型第二轮仍然可以调用 fetch          ← 仅靠初始 disabled_tool_names 挡不住
+```
+
+**运维开关必须做成两层**（Codex review 新增 P0，已采纳）：
+
+1. **回合开始**：读一次，从 offered catalog 摘掉工具
+2. **每批工具真正 dispatch 之前**：重新查一次控制表缓存；若该 web 工具已
+   halted，则**整批不执行**，返回稳定的 disabled error
+
+不能取消已经在途的 HTTP 请求。文档与运维说明必须如实写成：
+
+> 约 2 秒内阻止**新的**工具 dispatch；已经发出的网络请求不保证取消。
+
+控制表读取失败时：**web 视为 halted（fail closed），但不让整个聊天失败**——
+模型继续无工具作答。这与 `turns_halted` 的语义不同，后者是 fence 整个回合。
+
 ### 4.2 子 agent 需要改两处，不是一处
 
 `_SUBAGENT_DISABLED_TOOLS`（`worker.py:593-597`）是**导入时冻结的模块级常量**，
@@ -117,8 +166,20 @@ per-user 的值不能塞进去（且 `tests/test_v2_subagents.py:285,455` 与
 因此：新 blob kind `web_settings`，doc `{"version": 1, "enabled": bool}`，
 **零迁移**（`user_blobs` 是 JSONB）。
 
-**默认值 = 关闭。** 搜索目前是无条件开着的，所以这一条**改变了现有行为**，
-见 §7。
+**默认值 = 关闭**，但**老用户迁移时保留开启**——两者是不同的东西，不能混成
+一个布尔值（Codex review 采纳）：
+
+```
+新用户：blob 缺省 → enabled=false，必须明确开启才联网
+老用户：上线时一次性写入 enabled=true，避免回复能力突然回退
+```
+
+这样缺省值的语义始终干净，也不留「没有 blob 反而等于开」的历史债——那种规则
+只能作为**带清理计划的临时迁移规则**，绝不能变成永久 contract（否则将来任何
+初始化遗漏都会让新用户意外联网）。
+
+给 hx 的决策表述应该是：**是否为了避免现有回复质量回退而给现有用户保留联网
+能力**——这不等于决定未来所有新用户默认联网。见 §7 / §9。
 
 ### 5.2 读取：走 `TurnDeps` 注入，不在 worker 里直接读库
 
@@ -138,6 +199,10 @@ worker 的合法 import，依赖方向测试允许）：V2 的工具循环测试
 
 ⚠️ `tests/test_v2_dependency_direction.py` 禁止 `v2/*.py`（除
 `serve_worker.py`）import `hosted` / `agent_runtime`。本设计不违反。
+
+**fail-closed 护栏**（Codex review 采纳）：`web_tools_enabled is None`、
+callable 抛异常、返回非法值——**三者一律解释为「禁用 web」**，既不能默认开启，
+也不能让整个 turn 失败。
 
 ### 5.3 API
 
@@ -175,21 +240,49 @@ V2 里的环境变量只用于**导入时校验的调优常量**，不做实时�
 语义差别要注意：`turns_halted` 是**让整个回合失败**；web 的 kill switch 应该是
 **摘掉工具**（同一个 `disabled_tool_names` 机制），不能 fence 整个回合。
 
-**待定（§9）**：两个独立开关（search / fetch 分开）意味着 `v2_runtime_control`
-加两列，需要一次迁移。是否值得，见待确认项。
+### 6.1 拆成两列，用「停用」语义
+
+两个独立开关值得那次迁移（Codex review 采纳）——search 与 fetch 是**两个不同的
+事故面**：
+
+| 事故 | 该停什么 |
+|---|---|
+| DuckDuckGo 限流 / 页面结构变更 | 只停 search |
+| fetch 出现 URL / parser / redirect 类漏洞 | 只停 fetch，保留搜索摘要 |
+| 外部页面 prompt injection 风险升高 | 停全文 fetch，保留搜索结果 |
+
+两者的可用性、延迟、监控指标也完全不同。
+
+字段用**停用**语义，避免 `enabled` 的双重取反（与既有 `turns_halted` 一致）：
+
+```sql
+web_search_halted BOOLEAN NOT NULL DEFAULT false
+web_fetch_halted  BOOLEAN NOT NULL DEFAULT false
+```
+
+一次查询读三列、缓存成一个 control snapshot，**不增加 DB 查询次数**。
+
+执行边界见 §4.2.1（回合开始 + 每批 dispatch 前两层检查）。
 
 ## 7. ⚠️ 行为变更：默认关会让现有用户失去一个已有能力
 
 `pre` 上搜索目前**无条件可用**。本设计默认关闭后，所有用户在主动打开之前
 都会失去它——回复质量会变化。这是**改到了正常流程**，不是纯旁路。
 
-按工作区红线，这类改动必须高亮并留闸。这里的闸就是 §6 的 DB kill switch
-的反向用法：**先以「默认开」上线、把开关做成纯粹的用户选择，还是以「默认关」
-上线**，是一个需要 hx 明确拍板的产品决定，见 §9。
-
 （旧版基于 test 的设计里默认关是合理的——那边搜索本来就不存在，默认关只是
 「新能力不自动生效」。在 pre 上默认关的含义完全不同：**是收回一个已经在用的
 能力**。这个差别是基线更换带来的，必须重新决策。）
+
+**解法是把两件事拆开，不要挤进同一个布尔值**（§5.1）：
+
+- **产品长期默认：关。** 理由不只是费用——V2 的搜索虽然 keyless，但会把**模型
+  生成的 query 发给 DuckDuckGo**，这是一条新增的第三方数据流；查询词敏感信息
+  检测只能降低风险，**不等于知情同意**。搜索结果还会增加模型轮次与 token。
+- **老用户迁移：保留开。** 上线时一次性写入 `enabled=true`，避免现有用户的回复
+  能力突然回退。
+
+「pre 已经无条件开放了一段时间」这个事实支持的是**兼容迁移**，不足以证明用户
+同意未来默认联网。
 
 ## 8. 测试
 
@@ -211,14 +304,49 @@ web_fetch tool_result 数量 = 0**、**无真实网络请求**、且该工具**�
 offered catalog** 里；不要断言「模型没调用」——模型可能幻觉式调用一个不存在的
 工具，那是 UX 噪声不是安全边界。
 
+### 8.1 公开 API 的附带义务（Codex review 补充）
+
+`/v1/web/settings` 是**新增的公开 API + 用户可见行为**，按仓库 `CLAUDE.md`
+的「Public documentation synchronization」一节，同一个 PR 里还必须：
+
+- 更新 OpenAPI 源 / overrides，`cd docs-site && npm run openapi:generate`
+  重新生成 `docs-site/openapi/public.json` 并 review 生成的 diff
+- 更新 `docs-site/content/docs/` 下受影响的页面
+- 在 `docs-site/content/docs/changelog.mdx` 的 `Unreleased` 下记录
+- 跑 OpenAPI 契约测试，并在 `docs-site` 跑 `npm run types:check` /
+  `lint` / `build`
+
 ⚠️ 本地无 Postgres 时，上表这些文件**一个都不会跑**。`_PURE_UNIT` 白名单只在
 连不上库时生效，语义是「没库时只有名单里这些仍然收集」。加测试后必须
 `--collect-only` 核对。
 
 ## 9. 待确认
 
-- [ ] **§7 默认值**：`pre` 上搜索已无条件可用，默认关 = 收回现有能力。
-      默认开还是默认关？（这是基线更换后必须重新做的决策）
-- [ ] **§6 kill switch 粒度**：search / fetch 是否需要两个独立开关？
-      两个 = `v2_runtime_control` 加两列 + 一次迁移。
+- [ ] **§5.1 / §7 老用户迁移**：是否为了避免现有回复质量回退，给现有用户
+      一次性写入 `enabled=true`？（这**不等于**决定未来新用户默认联网——
+      新用户缺省一律为关）
+- [ ] **§4.1.1 lane 语义**：用户开启联网后，后台 wake / screen_watch 轮次
+      **是否仍然禁用**？本设计倾向仍禁用（后台搜索会增加轮次、token、延迟，
+      以及无用户触发的对外数据流）。除非明确需要「主动研究型陪伴」。
 - [ ] iOS 侧开关的落点与文案（设置 → 自定义设置）。
+
+已定（本轮 review 后不再是开放项）：kill switch 拆两列 `*_halted`（§6.1）；
+wake lane 本期只补 web 门禁、其余单独立审计项（§10）。
+
+## 10. 顺带发现（不在本期范围）
+
+**wake lane 没有显式的基础 capability policy。** `worker.py:4803` 的
+`run_tool_loop` 完全没有传 `disabled_tool_names`，其工具面主要依赖全局 catalog
+与 tool-loop 内的动态 provenance 规则。
+
+⚠️ 先纠正本文档初稿的一个不严谨表述：我原本写「wake 工具面比 chat 更宽」。
+**证据不足**——chat 的 `disabled_mutation_tool_names` 默认就是空集
+（`worker.py:5783`），只有 mutation recovery 时才收紧；chat 反而额外加载了
+用户 MCP。所以 wake 没传该 kwarg **不必然代表它整体更宽**。
+
+准确的表述是：**wake lane 缺一张明确的「首轮 offer 哪些 read / write /
+outbound 工具、为什么」的矩阵**，是否符合 proactive 的产品意图无从判断。
+
+建议单独立审计项，盘点五条 lane：`chat` / `wake+scheduled` / `screen_watch` /
+`chat 子 agent` / `wake 子 agent`。本期只补 web 的门禁，不借这个需求重构整套
+lane 权限。
