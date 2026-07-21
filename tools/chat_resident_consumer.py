@@ -1538,12 +1538,113 @@ def _fetch_from_enclave(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Resident decrypt-source health — reported to the backend on every poll.
+#
+# verify_ping liveness probes NEVER exercise decryption (the resident answers
+# them with a locally-generated token, server marks source="verify_ping"), so a
+# resident whose only decrypt source is missing/unreachable still passes the
+# onboarding live-loop check while EVERY real user message is claimed and then
+# silently skipped for want of plaintext (empty-content skip / wedge). That is
+# exactly the usr_6c1971 report (2026-07-21): claimed, no reply, agentMessages=0,
+# verify_ping fine. The backend can only distinguish "live but undecrypting" from
+# "healthy" if the resident tells it, so we derive a health status from REAL
+# decrypt outcomes and ship it on the poll headers:
+#   ok           decrypted >=1 non-empty plaintext, OR the reachability probe
+#                succeeded (a brand-new resident with no history yet is reachable
+#                but not yet proven on a real message — the phase-2 encrypted
+#                challenge closes that residual)
+#   degraded     a claimed message could not be read (empty-content / wedge) —
+#                only a later real success clears it; a reachability probe never
+#                upgrades degraded, so a per-message decrypt failure is not masked
+#   unreachable  the configured enclave source failed
+#   unconfigured no FEEDLING_ENCLAVE_URL at all
+# checked_at is refreshed on every confirmation so a long-idle "ok" cannot look
+# fresh forever; while idle the resident re-probes at most every
+# DECRYPT_HEALTH_REFRESH_SEC, kept well under the backend freshness window.
+# ---------------------------------------------------------------------------
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    """Parse a float env var, falling back on a bad/empty value instead of
+    killing the process at import, and clamping to a sane floor."""
+    try:
+        val = float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        val = default
+    if not (val == val) or val < minimum:  # NaN or below floor
+        return max(default, minimum)
+    return val
+
+
+DECRYPT_HEALTH_REFRESH_SEC = _env_float(
+    "FEEDLING_DECRYPT_HEALTH_REFRESH_SEC", 120.0, minimum=5.0
+)
+
+_decrypt_health: dict = {"status": "unknown", "checked_at": 0.0}
+
+
+def _set_decrypt_health(status: str) -> None:
+    _decrypt_health["status"] = status
+    _decrypt_health["checked_at"] = time.time()
+
+
+def _decrypt_health_headers() -> dict:
+    """Poll headers carrying the current decrypt-source health, or {} before the
+    first reading. The backend treats a missing header as ``unknown`` on purpose
+    (no inheritance of a previous green), so emitting nothing while status is
+    unknown is correct rather than shipping a hollow value."""
+    status = str(_decrypt_health.get("status") or "unknown")
+    if status == "unknown":
+        return {}
+    return {
+        "X-Feedling-Decrypt-Status": status,
+        "X-Feedling-Decrypt-Checked-At": f"{float(_decrypt_health.get('checked_at') or 0.0):.3f}",
+    }
+
+
+def _probe_decrypt_reachability() -> None:
+    """Refresh health from a reachability probe (startup + throttled idle).
+    Never upgrades a standing ``degraded`` to ``ok`` — a per-message decrypt
+    failure must not be masked by the source merely being dialable; only a real
+    non-empty decrypt clears degraded."""
+    if not FEEDLING_ENCLAVE_URL:
+        _set_decrypt_health("unconfigured")
+        return
+    try:
+        client = _client_for(FEEDLING_ENCLAVE_URL)
+        resp = client.get(
+            f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
+            params={"limit": 1}, headers=_HEADERS, timeout=10,
+        )
+        resp.raise_for_status()
+    except Exception:
+        _set_decrypt_health("unreachable")
+        return
+    if _decrypt_health.get("status") == "degraded":
+        _decrypt_health["checked_at"] = time.time()  # still degraded; heartbeat only
+    else:
+        _set_decrypt_health("ok")
+
+
+_decrypt_health_last_refresh = {"at": 0.0}
+
+
+def _maybe_refresh_decrypt_health() -> None:
+    """Throttled idle refresh so an idle-but-healthy resident keeps a fresh
+    checked_at without probing the enclave on every poll cycle."""
+    now = time.time()
+    if now - _decrypt_health_last_refresh["at"] < DECRYPT_HEALTH_REFRESH_SEC:
+        return
+    _decrypt_health_last_refresh["at"] = now
+    _probe_decrypt_reachability()
+
+
 def _verify_decrypt_sources() -> bool:
     """Probe all configured decrypt sources at startup.
 
     Returns True if at least one configured source is reachable.
     Each unreachable source is logged at ERROR level so the operator
     can distinguish "configured but broken" from "not configured at all".
+    Also seeds the reported decrypt-health status.
     """
     any_ok = False
 
@@ -1559,12 +1660,17 @@ def _verify_decrypt_sources() -> bool:
             resp.raise_for_status()
             log.info("decrypt source OK: enclave at %s", FEEDLING_ENCLAVE_URL)
             any_ok = True
+            _set_decrypt_health("ok")
         except Exception as e:
             log.error(
                 "decrypt source UNREACHABLE: enclave at %s — %s",
                 FEEDLING_ENCLAVE_URL, e,
             )
+            _set_decrypt_health("unreachable")
+    else:
+        _set_decrypt_health("unconfigured")
 
+    _decrypt_health_last_refresh["at"] = time.time()
     return any_ok
 
 
@@ -5873,7 +5979,10 @@ def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> d
         # read-only peek: MUST NOT write the default 600s reply claim (that lease
         # would make other consumers wait on a message this call only glanced at).
         params["claim"] = "false"
-    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=poll_to + 10)
+    # Ship the decrypt-source health so the backend gate/alert can tell a
+    # live-but-undecrypting resident from a healthy one (see _decrypt_health).
+    headers = {**_HEADERS, **_decrypt_health_headers()}
+    resp = _HTTP.get(url, params=params, headers=headers, timeout=poll_to + 10)
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
@@ -9321,6 +9430,12 @@ def _process_messages(messages: list) -> float:
             # dead loop. The probe reply is visibility=local_only and GC'd by the
             # server, so it never reaches the user's visible chat.
             log.info("verify ping [ts=%.3f] — exercising real agent path", ts)
+            # Bind every verify reply back to THIS ping so the server can match
+            # it strictly by (source=verify_ping ∧ reply_to_message_id=ping id)
+            # instead of "any agent message after ping_ts" — the loose match let
+            # a concurrent real reply, or a stale ack, falsely satisfy the probe
+            # and mint the sticky live-loop green (codex3 backend strict matcher).
+            _ping_id = str(msg.get("id") or msg.get("message_id") or "").strip()
             probe: dict[str, Any] = {}
 
             def _run_verify_probe() -> None:
@@ -9347,17 +9462,17 @@ def _process_messages(messages: list) -> float:
                 # stray visible message. suppress_push already kills the APNs push.
                 if probe_thread.is_alive():
                     log.warning("verify ping — agent slow (>%ss); canned ack fallback so verify still passes", VERIFY_PROBE_TIMEOUT_SEC)
-                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True)
+                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True, reply_to_message_id=_ping_id)
                 elif "result" in probe:
                     replies = _normalize_agent_replies(probe["result"]) or [VERIFY_PING_REPLY]
-                    post_reply(replies[0], source="verify_ping", suppress_push=True)
+                    post_reply(replies[0], source="verify_ping", suppress_push=True, reply_to_message_id=_ping_id)
                     log.info("verify ping — real agent reply OK")
                 elif "no_usable_reply" in probe:
                     log.error("verify ping — agent produced no usable reply; NOT acking so verify fails (live loop is broken): %s", probe["no_usable_reply"])
                     # post nothing — verify_loop stays unsatisfied on purpose
                 else:
                     log.warning("verify ping — agent call errored (%s); canned ack fallback", probe.get("error"))
-                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True)
+                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True, reply_to_message_id=_ping_id)
             except Exception as e:
                 log.error("failed to post verify-ping reply: %s", e)
             latest = max(latest, ts)
@@ -9422,8 +9537,13 @@ def _process_messages(messages: list) -> float:
             )
             content = BODY_UNAVAILABLE_PLACEHOLDER
         elif not content:
-            # Genuinely empty text — decrypt source missing or failed.
+            # Genuinely empty text — a message was CLAIMED but can't be read.
+            # Report the health so the backend surfaces the real blocker instead
+            # of a verify_ping-only false green. Preserve the actionable
+            # distinction: no source at all → unconfigured (the usr_6c1971 case);
+            # a configured source that still yielded no plaintext → degraded.
             # Never send a fallback for content we cannot read.
+            _set_decrypt_health("degraded" if FEEDLING_ENCLAVE_URL else "unconfigured")
             log.warning(
                 "user message has no plaintext content ts=%.3f content_type=%s "
                 "— skipping (set FEEDLING_ENCLAVE_URL to enable decryption)",
@@ -9432,6 +9552,9 @@ def _process_messages(messages: list) -> float:
             latest = max(latest, ts)
             continue
         else:
+            # A real user message decrypted to non-empty plaintext — decryption
+            # is genuinely working; clears any earlier degraded.
+            _set_decrypt_health("ok")
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
         trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
@@ -10253,6 +10376,13 @@ def run() -> None:
             )
             sys.exit(1)
     else:
+        # No decrypt source at all. Establish the reported health immediately so
+        # the FIRST poll already carries `unconfigured` — otherwise the initial
+        # value stays `unknown` and the first real message's empty-content path
+        # would mislabel it `degraded`, hiding the most actionable classification
+        # (FEEDLING_ENCLAVE_URL unset) for exactly the usr_6c1971 case.
+        _set_decrypt_health("unconfigured")
+        _decrypt_health_last_refresh["at"] = time.time()
         log.warning(
             "⚠️  No decryption source configured (FEEDLING_ENCLAVE_URL is unset). "
             "User messages in v1 encrypted mode have content=\"\" and will be "
@@ -10486,6 +10616,10 @@ def run() -> None:
             if result.get("timed_out"):
                 # Idle moment: safe to swap to the backend's commit and re-exec
                 # (no in-flight message to interrupt). Does not return if it updates.
+                # Also keep the reported decrypt health fresh while idle so a
+                # healthy-but-quiet resident doesn't drift into a stale reading
+                # (throttled; see DECRYPT_HEALTH_REFRESH_SEC).
+                _maybe_refresh_decrypt_health()
                 _maybe_self_update(result)
                 continue
 
@@ -10509,6 +10643,8 @@ def run() -> None:
                 )
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.
+                    # A poll carried messages but decryption is down: unreachable.
+                    _set_decrypt_health("unreachable")
                     log.warning(
                         "poll triggered but all decrypt sources failed; "
                         "skipping cycle (messages not processed)"
@@ -10525,6 +10661,10 @@ def run() -> None:
                     continue
                 messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
                 if not messages:
+                    # Claimed ids weren't in the decrypt history — the messages
+                    # exist and were leased but can't be read: degraded health,
+                    # same class as the empty-content skip.
+                    _set_decrypt_health("degraded")
                     if wedge_miss_ts == last_ts:
                         wedge_miss_count += 1
                     else:

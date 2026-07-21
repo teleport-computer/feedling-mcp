@@ -501,6 +501,7 @@ def test_verify_ping_enclave_path_probes_real_agent():
         "source": "verify_ping",
         "content": None,            # enclave returns null for local_only
         "content_type": "text",
+        "id": "ping-enclave-1",
     }
     with patch.object(crc, "call_agent", return_value="收到") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
@@ -508,6 +509,9 @@ def test_verify_ping_enclave_path_probes_real_agent():
 
     mock_agent.assert_called_once_with(crc.VERIFY_PROBE_MESSAGE)
     mock_post.assert_called_once()
+    # Every verify ack binds back to THIS ping so the backend strict matcher
+    # (source=verify_ping ∧ reply_to=ping id) can pair it precisely.
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "ping-enclave-1"
     assert result_ts == pytest.approx(4242.0)
 
 
@@ -517,6 +521,7 @@ def test_verify_ping_poll_marker_probes_real_agent():
     real bounded probe."""
     ping = _make_msg(role="user", content="__VERIFY_PING__:deadbeef0001", ts=4343.0)
     ping["source"] = "verify_ping"
+    ping["id"] = "ping-marker-1"
 
     with patch.object(crc, "call_agent", return_value="收到") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
@@ -524,6 +529,7 @@ def test_verify_ping_poll_marker_probes_real_agent():
 
     mock_agent.assert_called_once_with(crc.VERIFY_PROBE_MESSAGE)
     mock_post.assert_called_once()
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "ping-marker-1"
     assert result_ts == pytest.approx(4343.0)
 
 
@@ -538,6 +544,7 @@ def test_verify_ping_success_reply_suppresses_push():
         "source": "verify_ping",
         "content": None,
         "content_type": "text",
+        "id": "ping-success-1",
     }
     with patch.object(crc, "call_agent", return_value="我在") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
@@ -548,6 +555,7 @@ def test_verify_ping_success_reply_suppresses_push():
     assert mock_post.call_args.kwargs.get("suppress_push") is True
     # source="verify_ping" so the visible history feed filters the liveness reply
     assert mock_post.call_args.kwargs.get("source") == "verify_ping"
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "ping-success-1"
 
 
 def test_verify_ping_slow_agent_falls_back_to_canned_ack():
@@ -560,6 +568,7 @@ def test_verify_ping_slow_agent_falls_back_to_canned_ack():
         "source": "verify_ping",
         "content": None,
         "content_type": "text",
+        "id": "ping-slow-1",
     }
 
     # Block the probe on an Event (not a bare sleep) so the timeout fires
@@ -577,8 +586,11 @@ def test_verify_ping_slow_agent_falls_back_to_canned_ack():
              patch.object(crc, "call_agent", side_effect=_slow), \
              patch.object(crc, "post_reply") as mock_post:
             crc._process_messages([ping])
+            # Canned ack still binds to the ping so a slow-path fallback ack is
+            # matched as precisely as a real-reply ack.
             mock_post.assert_called_once_with(
-                crc.VERIFY_PING_REPLY, source="verify_ping", suppress_push=True
+                crc.VERIFY_PING_REPLY, source="verify_ping", suppress_push=True,
+                reply_to_message_id="ping-slow-1",
             )
     finally:
         release.set()
