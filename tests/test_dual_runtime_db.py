@@ -122,21 +122,23 @@ def test_v1_roster_excludes_v2_and_draining_users(three_users_with_routes):
 
 
 def test_perception_flag_follows_fence_after_flip(fresh_user):
-    # Task 8's runtime_reconciler doesn't exist yet — flip the fence directly
-    # via admin_core.set_runtime_mode (works since ef768eae) instead of the
-    # brief's reconciler-based fixture. Also needs an active route: v2 mode
+    # Task 8's runtime_reconciler now exists — flip the fence via the
+    # allowlist + reconciler (the real production path) rather than calling
+    # admin_core.set_runtime_mode directly. Needs an active route: v2 mode
     # requires it (require_active_hosted_route in db.patch_blob_strict).
-    from admin import admin_core
+    from hosted import runtime_reconciler
     from perception import service
 
     configure_model_api_route(fresh_user, provider="anthropic", model="claude-3-5-sonnet-latest")
 
     assert service.perception_ingress_runtime_v2_enabled(fresh_user) is False
 
-    _body, status = admin_core.set_runtime_mode(fresh_user, "db_action_v2")
-    assert status == 200
+    db.upsert_runtime_allowlist(fresh_user, "v2")
+    stats = runtime_reconciler.reconcile_once()
+    assert stats["flipped"] >= 1
     assert service.perception_ingress_runtime_v2_enabled(fresh_user) is True
 
-    _body, status = admin_core.set_runtime_mode(fresh_user, "resident_cli")
-    assert status == 200
+    db.upsert_runtime_allowlist(fresh_user, "resident")
+    stats = runtime_reconciler.reconcile_once()
+    assert stats["flipped"] >= 1
     assert service.perception_ingress_runtime_v2_enabled(fresh_user) is False

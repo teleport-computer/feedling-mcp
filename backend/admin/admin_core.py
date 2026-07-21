@@ -140,6 +140,40 @@ def get_runtime_mode(user_id: str) -> tuple[dict, int]:
     return {"user_id": user_id, "hosted_runtime_mode": mode}, 200
 
 
+def set_runtime_allowlist(user_id: str, desired: str, *, note: str = "") -> tuple[dict, int]:
+    if desired == "remove":
+        removed = db.delete_runtime_allowlist(user_id)
+        return {"user_id": user_id, "removed": removed}, 200
+    try:
+        db.upsert_runtime_allowlist(user_id, desired, updated_by="admin", note=note)
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    return {"user_id": user_id, "desired": desired}, 200
+
+
+def get_runtime_allowlist() -> dict:
+    """Reconciliation view: every allowlist row plus its live fence (mode/state/
+    generation) and a ``converged`` bool. A per-row read failure (e.g. transient
+    DB hiccup while resolving one user's fence) is captured on that row instead
+    of failing the whole endpoint — this is an admin dashboard, one bad row
+    should not hide the rest of the fleet."""
+    from core import store as core_store  # noqa: PLC0415
+    from hosted import config_store as cs  # noqa: PLC0415
+    rows = db.list_runtime_allowlist()
+    for row in rows:
+        try:
+            mode, state, gen = cs.get_hosted_runtime_control_strict(
+                core_store.get_store(row["user_id"]))
+            row["actual"] = {"mode": mode, "state": state, "generation": gen}
+            row["converged"] = (
+                (row["desired"] == "v2" and state == "v2")
+                or (row["desired"] == "resident" and state == "resident"))
+        except Exception as e:  # noqa: BLE001 — 对账视图不因单行炸
+            row["actual"] = {"error": str(e)[:80]}
+            row["converged"] = False
+    return {"allowlist": rows}
+
+
 def list_runtime_modes() -> dict:
     # Enumerate every user with an active provider route, not only users who
     # already have a runtime-profile blob. Otherwise an unset (effective

@@ -16,6 +16,7 @@ for the once-per-master items). Reconciliation table (plan §8.1 / §3.3):
 | `core_wake_bus.start_listener()`            | this lifespan (always — cross-worker poll wake)|
 | `core_leader.run_singleton("ws", ...)`      | this lifespan (gated: FEEDLING_ASGI_BACKGROUND)|
 | `core_leader.run_singleton("dau-snapshot")` | this lifespan (same background gate)          |
+| `core_leader.run_singleton("runtime-reconciler")` | this lifespan (same background gate)    |
 
 Only the :9998 WS-leader election is gated OFF by default, so the dev-time
 parallel instance (:5005, plan §8) sharing the live backend's DB does not
@@ -79,6 +80,15 @@ def _start_dau_snapshot_leader() -> None:
     core_leader.run_singleton("dau-snapshot", dau_snapshot_scheduler.start)
 
 
+def _start_runtime_reconciler_leader() -> None:
+    """Drive per-user hosted-runtime fences toward the allowlist's desired
+    state on exactly one backend worker (dual-runtime canary rollout)."""
+    from core import leader as core_leader
+    from hosted import runtime_reconciler
+
+    core_leader.run_singleton("runtime-reconciler", runtime_reconciler.start)
+
+
 @asynccontextmanager
 async def lifespan(app):
     # (1) Threadpool limiter — off anyio's 40-token default (§5.2).
@@ -140,6 +150,7 @@ async def lifespan(app):
     if settings.start_background:
         _start_ws_leader()
         _start_dau_snapshot_leader()
+        _start_runtime_reconciler_leader()
         # (6b) TEE 影子库自动同步单例 — 仅在双写已接时选举（env 决定，接=重部署）。
         from tee_shadow import mirror as _tee_mirror
 
