@@ -2170,6 +2170,17 @@ _REASONING_LINE_RE = re.compile(
 )
 
 _RUNTIME_REASONING_FENCE_LANGUAGES = {"copy"}
+_RUNTIME_REASONING_HEADER_RE = re.compile(
+    r"^(?:executing|checking|inspecting|analyzing|planning|thinking|reviewing|"
+    r"working|preparing|updating)\b|^(?:先)?(?:检查|查看|分析|思考|规划|准备|执行|处理)",
+    re.IGNORECASE,
+)
+_FENCE_LINE_RE = re.compile(
+    r"^(?:>\s*)*(?P<marker>[`~]{3,})(?P<info>.*)$"
+)
+_THEMATIC_BREAK_RE = re.compile(
+    r"^(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$"
+)
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 _TAGGED_THINKING_RE = re.compile(
@@ -2221,9 +2232,15 @@ def _strip_leading_non_cjk_preamble(lines: list[str]) -> list[str]:
     markdown_start: int | None = None
     for i, line in enumerate(lines[:first_cjk]):
         stripped = line.strip()
-        if re.fullmatch(r"(?:---|\*\*\*|___|=+)", stripped):
-            markdown_start = max(0, i - 1) if i and lines[i - 1].strip() else i
-            break
+        if _THEMATIC_BREAK_RE.fullmatch(stripped) or re.fullmatch(r"={2,}", stripped):
+            previous = next(
+                (j for j in range(i - 1, -1, -1) if lines[j].strip()),
+                None,
+            )
+            if previous is not None:
+                markdown_start = previous
+                break
+            continue
         if re.match(
             r"^\s*(?:#{1,6}\s|[-+*]\s|>\s|\d+[.)]\s|[`~]{3,}|\||\*\*|__)",
             line,
@@ -2254,6 +2271,13 @@ def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
     return out
 
 
+def _fence_line_parts(line: str) -> tuple[str, str] | None:
+    match = _FENCE_LINE_RE.match(line.strip())
+    if not match:
+        return None
+    return match.group("marker"), match.group("info").strip()
+
+
 def _dedupe_reply_lines(lines: list[str]) -> list[str]:
     """Collapse repeated prose while leaving fenced code untouched."""
     out: list[str] = []
@@ -2272,9 +2296,8 @@ def _dedupe_reply_lines(lines: list[str]) -> list[str]:
         prose.clear()
 
     for line in lines:
-        stripped = line.strip()
-        marker_match = re.match(r"^([`~]{3,})(?:.*)$", stripped)
-        marker = marker_match.group(1) if marker_match else ""
+        fence = _fence_line_parts(line)
+        marker, info = fence if fence else ("", "")
 
         if not fence_char:
             if marker:
@@ -2291,7 +2314,7 @@ def _dedupe_reply_lines(lines: list[str]) -> list[str]:
             marker
             and marker[0] == fence_char
             and len(marker) >= fence_length
-            and re.fullmatch(r"[`~]{3,}\s*", stripped)
+            and not info
         ):
             fence_char = ""
             fence_length = 0
@@ -2305,12 +2328,18 @@ def _is_runtime_reasoning_fence(info: str, content: list[str]) -> bool:
     if language not in _RUNTIME_REASONING_FENCE_LANGUAGES:
         return False
 
+    inspections = []
     for line in content:
         inspection = re.sub(r"^[`#>*\-\s]+", "", line.strip()).strip()
         inspection = re.sub(r"[`*_]+$", "", inspection).strip()
-        if _IDENTITY_LEAK_RE.search(inspection) or _REASONING_LINE_RE.match(inspection):
-            return True
-    return False
+        if inspection:
+            inspections.append(inspection)
+
+    if not inspections:
+        return False
+    if any(_IDENTITY_LEAK_RE.search(line) for line in inspections):
+        return True
+    return bool(_RUNTIME_REASONING_HEADER_RE.match(inspections[0]))
 
 
 def _strip_reasoning_sections(raw: str) -> str:
@@ -5193,17 +5222,17 @@ def _sanitize_reply_text(text: str) -> str:
         line = raw_ln.rstrip()
         stripped = line.strip()
 
-        fence_match = re.match(r"^([`~]{3,})(.*)$", stripped)
-        if fence_match:
-            marker = fence_match.group(1)
-            info = fence_match.group(2).strip()
+        fence = _fence_line_parts(raw_ln)
+        if fence:
+            marker, info = fence
             block_end = i + 1
             while block_end < len(raw_lines):
-                closing = re.fullmatch(r"([`~]{3,})\s*", raw_lines[block_end].strip())
+                closing = _fence_line_parts(raw_lines[block_end])
                 if (
                     closing
-                    and closing.group(1)[0] == marker[0]
-                    and len(closing.group(1)) >= len(marker)
+                    and closing[0][0] == marker[0]
+                    and len(closing[0]) >= len(marker)
+                    and not closing[1]
                 ):
                     break
                 block_end += 1

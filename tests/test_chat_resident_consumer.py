@@ -1199,6 +1199,36 @@ I need to inspect the repository before answering.
     assert cleaned == "这是最终回复。"
 
 
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Checking the repository before answering.",
+        "先检查仓库，再回复用户。",
+    ],
+)
+def test_sanitize_reply_text_drops_runtime_copy_fence_header_variants(header):
+    raw = f"""```copy
+{header}
+Collecting internal context.
+```
+
+这是最终回复。"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+def test_sanitize_reply_text_preserves_normal_copy_fence():
+    raw = """```copy
+I need to update the deployment notes.
+```"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
 def test_sanitize_reply_text_dedupes_prose_outside_fenced_code():
     raw = """第一行
 第二行
@@ -1214,6 +1244,19 @@ let value = 1
     assert cleaned == "第一行\n第二行\n\n```swift\nlet value = 1\n```"
 
 
+def test_sanitize_reply_text_preserves_blockquote_fenced_code_verbatim():
+    raw = (
+        "> ```text\n"
+        "> repeated line  \n"
+        "> repeated line  \n"
+        "> ```"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
 def test_sanitize_reply_text_preserves_setext_and_thematic_breaks():
     raw = """Title
 ===
@@ -1222,6 +1265,15 @@ Section
 ---
 
 正文"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["----", "* * *", "_ _ _"])
+def test_sanitize_reply_text_preserves_commonmark_thematic_variants(marker):
+    raw = f"Title\n{marker}\n\n正文"
 
     cleaned = crc._sanitize_reply_text(raw)
 
