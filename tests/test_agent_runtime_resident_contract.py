@@ -19,8 +19,6 @@ import sys
 import textwrap
 from pathlib import Path
 
-import pytest
-
 REPO = Path(__file__).parent.parent
 
 # Child script: build the hosted env via consumer_env, apply it, fake a `claude`
@@ -178,11 +176,6 @@ def _mint(ttl: float, *, now: float | None = None) -> str:
                               scope=["chat"], ttl=ttl, now=now)
 
 
-@pytest.mark.skip(
-    reason="TODO(dual-runtime Task 4): tools/chat_resident_consumer.py hosted-mode "
-    "runtime-token-file support (_HEADERS reading FEEDLING_RUNTIME_TOKEN_FILE) "
-    "not yet restored; _HEADERS is currently a static X-API-Key dict."
-)
 def test_consumer_uses_fresh_runtime_token_when_file_present(tmp_path):
     headers = _run_auth_child(tmp_path, _mint(ttl=3600))  # exp well in the future
     assert headers.get("X-Feedling-Runtime-Token")

@@ -5,6 +5,7 @@ Regression tests for tools/chat_resident_consumer.py
 Run with: pytest tests/test_chat_resident_consumer.py -v
 """
 
+import importlib
 import base64
 import json
 import os
@@ -82,21 +83,6 @@ def _make_image_msg(ts=1.0, image_bytes=b"fake-jpeg"):
     return msg
 
 
-@pytest.fixture(autouse=True)
-def _isolate_pending_reply_checkpoint(tmp_path, monkeypatch):
-    """Each test gets independent durable retry state, like a fresh resident."""
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", tmp_path / "resident-checkpoint.json")
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-    yield
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-
-
 # ---------------------------------------------------------------------------
 # Case 1: user message with empty content → no fallback, checkpoint advances
 # ---------------------------------------------------------------------------
@@ -164,209 +150,6 @@ def test_process_messages_posts_reply_with_source_message_id():
 
     assert result_ts == pytest.approx(1111.0)
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-1"
-
-
-def test_process_messages_multi_bubble_links_only_terminal_with_stable_ids():
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    msg = {
-        "id": "user-msg-multi",
-        "role": "user",
-        "content": "look it up",
-        "ts": 1111.5,
-    }
-    posted = []
-
-    def _post(reply, **kwargs):
-        posted.append((reply, kwargs))
-        return {"id": kwargs["delivery_id"]}
-
-    with patch.object(
-        crc,
-        "call_agent",
-        return_value={"messages": ["I’ll check.", "Here is the answer."]},
-    ), patch.object(crc, "post_reply", side_effect=_post):
-        result_ts = crc._process_messages([msg])
-
-    assert result_ts == pytest.approx(1111.5)
-    assert [item[0] for item in posted] == ["I’ll check.", "Here is the answer."]
-    assert "reply_to_message_id" not in posted[0][1]
-    assert posted[1][1]["reply_to_message_id"] == "user-msg-multi"
-    assert posted[0][1]["delivery_id"] == crc._resident_reply_delivery_id(
-        "user-msg-multi", "intermediate:0")
-    assert posted[1][1]["delivery_id"] == crc._resident_reply_delivery_id(
-        "user-msg-multi", "terminal")
-    assert posted[0][1]["delivery_id"] != posted[1][1]["delivery_id"]
-
-
-def test_process_messages_multi_bubble_terminal_failure_keeps_checkpoint():
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    msg = {
-        "id": "user-msg-terminal-fail",
-        "role": "user",
-        "content": "look it up",
-        "ts": 1111.75,
-    }
-    posted = []
-
-    terminal_attempts = 0
-
-    def _post(reply, **kwargs):
-        nonlocal terminal_attempts
-        posted.append((reply, kwargs))
-        if kwargs.get("reply_to_message_id"):
-            terminal_attempts += 1
-            if terminal_attempts == 1:
-                raise RuntimeError("terminal write failed")
-        return {"id": kwargs["delivery_id"]}
-
-    with patch.object(
-        crc,
-        "call_agent",
-        return_value={
-            "actions": [{"type": "memory.add", "memory": {"summary": "s"}}],
-            "messages": ["I’ll check.", "Final answer."],
-        },
-    ) as mock_agent, patch.object(
-        crc, "execute_agent_actions", return_value={"effects": []}
-    ) as mock_actions, patch.object(crc, "post_reply", side_effect=_post):
-        first_ts = crc._process_messages([msg])
-        second_ts = crc._process_messages([msg])
-
-    assert first_ts == 0.0
-    assert second_ts == pytest.approx(1111.75)
-    assert len(posted) == 4
-    assert "reply_to_message_id" not in posted[0][1]
-    assert posted[1][1]["reply_to_message_id"] == "user-msg-terminal-fail"
-    assert posted[3][1]["reply_to_message_id"] == "user-msg-terminal-fail"
-    assert posted[1][1]["delivery_id"] == posted[3][1]["delivery_id"]
-    mock_agent.assert_called_once()
-    mock_actions.assert_called_once()
-    assert crc._pending_reply_retries == {}
-    assert crc._seen_ids_order.count(crc._msg_key(msg)) == 1
-
-
-def test_process_messages_intermediate_failure_stops_then_retries_in_order(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", tmp_path / "checkpoint.json")
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-    msg = {
-        "id": "user-msg-intermediate-fail",
-        "role": "user",
-        "content": "look it up",
-        "ts": 1111.875,
-    }
-    posted = []
-
-    def _post(reply, **kwargs):
-        posted.append((reply, kwargs))
-        if len(posted) == 1:
-            raise RuntimeError("intermediate write failed")
-        return {"id": kwargs["delivery_id"]}
-
-    with patch.object(
-        crc,
-        "call_agent",
-        return_value={"messages": ["I’ll check.", "Final answer."]},
-    ) as mock_agent, patch.object(crc, "post_reply", side_effect=_post):
-        first_ts = crc._process_messages([msg])
-        second_ts = crc._process_messages([msg])
-
-    assert first_ts == 0.0
-    assert second_ts == pytest.approx(1111.875)
-    assert [item[0] for item in posted] == [
-        "I’ll check.",
-        "I’ll check.",
-        "Final answer.",
-    ]
-    assert posted[0][1]["delivery_id"] == posted[1][1]["delivery_id"]
-    assert "reply_to_message_id" not in posted[0][1]
-    assert posted[2][1]["reply_to_message_id"] == msg["id"]
-    mock_agent.assert_called_once()
-
-
-def test_process_messages_unresolved_turn_stops_newer_batch_message(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", tmp_path / "checkpoint.json")
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-    first = {"id": "batch-a", "role": "user", "content": "one", "ts": 10.0}
-    second = {"id": "batch-b", "role": "user", "content": "two", "ts": 20.0}
-
-    first_terminal_attempt = True
-
-    def _post(reply, **kwargs):
-        nonlocal first_terminal_attempt
-        if kwargs.get("reply_to_message_id") == "batch-a" and first_terminal_attempt:
-            first_terminal_attempt = False
-            raise RuntimeError("terminal write failed")
-        return {"id": kwargs["delivery_id"]}
-
-    with patch.object(crc, "call_agent", return_value="answer") as mock_agent, \
-         patch.object(crc, "post_reply", side_effect=_post) as mock_post:
-        result_ts = crc._process_messages([first, second])
-
-    assert result_ts == 0.0
-    assert mock_agent.call_count == 1
-    assert mock_post.call_count == 1
-    assert list(crc._pending_reply_retries) == ["batch-a"]
-    assert "batch-b" not in crc._seen_ids
-
-    # Simulate the common ambiguous transport outcome: A may have committed on
-    # the server and therefore is absent from the next poll. The consumer retries
-    # its prepared stable delivery before B, without rerunning A's provider turn.
-    with patch.object(crc, "call_agent", return_value="answer") as second_agent, \
-         patch.object(crc, "post_reply", side_effect=_post) as second_post:
-        resumed_ts = crc._process_messages([second])
-
-    assert resumed_ts == pytest.approx(20.0)
-    second_agent.assert_called_once()  # B only
-    assert second_post.call_count == 2  # prepared A, then fresh B
-    assert crc._pending_reply_retries == {}
-
-
-def test_pending_retry_cache_pressure_never_evicts_into_seen_skip(monkeypatch):
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = True
-    crc._pending_reply_retry_restore_error = ""
-    monkeypatch.setattr(crc, "_PENDING_REPLY_RETRY_MAX", 2)
-    monkeypatch.setattr(crc, "_persist_pending_reply_retry", lambda *a, **kw: True)
-    prepared = {"replies": ("reply",), "source_ts": 1.0}
-
-    for key in ("pending-a", "pending-b", "pending-c"):
-        assert crc._mark_seen(key) is True
-
-    assert crc._cache_pending_reply_retry("pending-a", prepared) is True
-    assert crc._cache_pending_reply_retry("pending-b", prepared) is True
-    assert crc._cache_pending_reply_retry("pending-c", prepared) is False
-
-    assert list(crc._pending_reply_retries) == ["pending-a", "pending-b"]
-    assert crc._pending_reply_retry_order == ["pending-a", "pending-b"]
-    assert "pending-a" in crc._seen_ids
-    assert "pending-b" in crc._seen_ids
-    assert "pending-c" not in crc._seen_ids
-    assert "pending-c" not in crc._seen_ids_order
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
 
 
 def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monkeypatch):
@@ -443,430 +226,16 @@ def test_process_messages_v2_drops_needs_background_without_ack(monkeypatch):
     mock_post.assert_not_called()
 
 
-def test_process_messages_retries_after_post_reply_failure_before_checkpoint():
+def test_process_messages_keeps_checkpoint_when_post_reply_fails():
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
     msg = {"id": "user-msg-2", "role": "user", "content": "hi", "ts": 2222.0}
 
-    with patch.object(crc, "call_agent", return_value="hey") as mock_agent, \
-         patch.object(
-             crc,
-             "post_reply",
-             side_effect=[RuntimeError("write failed"), {"id": "reply-msg-2"}],
-         ) as mock_post:
-        first_ts = crc._process_messages([msg])
-        second_ts = crc._process_messages([msg])
-
-    assert first_ts == 0.0
-    assert second_ts == pytest.approx(2222.0)
-    assert mock_agent.call_count == 1
-    assert mock_post.call_count == 2
-
-
-def test_bootstrap_incomplete_is_terminal_and_clears_pending(tmp_path, monkeypatch):
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", tmp_path / "checkpoint.json")
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-    msg = {
-        "id": "bootstrap-dead-end",
-        "role": "user",
-        "content": "hello",
-        "ts": 2222.5,
-    }
-
-    with patch.object(crc, "call_agent", return_value="hey") as mock_agent, \
-         patch.object(
-             crc,
-             "post_reply",
-             return_value={"error": "bootstrap_incomplete", "stage": "memory"},
-         ) as mock_post:
+    with patch.object(crc, "call_agent", return_value="hey"), \
+         patch.object(crc, "post_reply", side_effect=RuntimeError("write failed")):
         result_ts = crc._process_messages([msg])
 
-    assert result_ts == pytest.approx(2222.5)
-    mock_agent.assert_called_once()
-    mock_post.assert_called_once()
-    assert crc._pending_reply_retries == {}
-    saved = json.loads(crc.CHECKPOINT_FILE.read_text())
-    assert saved["last_ts"] == pytest.approx(2222.5)
-    assert crc._PENDING_REPLY_CHECKPOINT_FIELD not in saved
-
-
-def test_pending_reply_restores_after_restart_without_repeating_actions(
-    tmp_path, monkeypatch
-):
-    checkpoint_file = tmp_path / "checkpoint.json"
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", checkpoint_file)
-    monkeypatch.setattr(
-        crc,
-        "_whoami_cache",
-        {"user_id": "usr_restart", "user_pk": None, "enclave_pk": None},
-    )
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-    msg = {
-        "id": "restart-action-parent",
-        "role": "user",
-        "content": "remember this",
-        "ts": 3333.0,
-    }
-    agent_result = {
-        "actions": [{"type": "memory.add", "memory": {"summary": "secret fact"}}],
-        "messages": ["Saved."],
-    }
-
-    with patch.object(crc, "call_agent", return_value=agent_result) as first_agent, \
-         patch.object(
-             crc, "execute_agent_actions", return_value={"effects": [{"type": "memory_added"}]}
-         ) as first_actions, \
-         patch.object(crc, "post_reply", side_effect=RuntimeError("response lost")):
-        first_ts = crc._process_messages([msg])
-
-    assert first_ts == 0.0
-    first_agent.assert_called_once()
-    first_actions.assert_called_once()
-    raw_checkpoint = checkpoint_file.read_text()
-    saved_checkpoint = json.loads(raw_checkpoint)
-    assert crc._PENDING_REPLY_CHECKPOINT_FIELD in saved_checkpoint
-    assert "Saved." not in raw_checkpoint
-    assert "secret fact" not in raw_checkpoint
-
-    # Simulate a fresh resident process: all in-memory dedup/retry state is gone,
-    # but the encrypted write-ahead prepared turn remains in the checkpoint.
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-
-    with patch.object(crc, "call_agent") as restarted_agent, \
-         patch.object(crc, "execute_agent_actions") as restarted_actions, \
-         patch.object(
-             crc, "post_reply", return_value={"id": "restart-action-reply"}
-         ) as restarted_post:
-        second_ts = crc._process_messages([msg])
-
-    assert second_ts == pytest.approx(3333.0)
-    restarted_agent.assert_not_called()
-    restarted_actions.assert_not_called()
-    restarted_post.assert_called_once_with(
-        "Saved.",
-        delivery_id=crc._resident_reply_delivery_id(msg["id"], "terminal"),
-        reply_to_message_id=msg["id"],
-    )
-    completed = json.loads(checkpoint_file.read_text())
-    assert completed["last_ts"] == pytest.approx(3333.0)
-    assert crc._PENDING_REPLY_CHECKPOINT_FIELD not in completed
-
-
-def test_action_write_ahead_avoids_duplicate_after_uncertain_crash(
-    tmp_path, monkeypatch
-):
-    checkpoint_file = tmp_path / "checkpoint.json"
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", checkpoint_file)
-    monkeypatch.setattr(
-        crc,
-        "_whoami_cache",
-        {"user_id": "usr_uncertain", "user_pk": None, "enclave_pk": None},
-    )
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-    msg = {
-        "id": "uncertain-action-parent",
-        "role": "user",
-        "content": "remember this",
-        "ts": 3334.0,
-    }
-    real_cache = crc._cache_pending_reply_retry
-    cache_calls = 0
-
-    def _crash_before_final_prepare(key, prepared):
-        nonlocal cache_calls
-        cache_calls += 1
-        if cache_calls == 1:
-            return real_cache(key, prepared)  # durable pre-action failure reply
-        raise SystemExit("simulated crash after action outcome became uncertain")
-
-    with patch.object(
-        crc,
-        "call_agent",
-        return_value={
-            "actions": [{"type": "memory.add", "memory": {"summary": "fact"}}],
-            "messages": ["Optimistic success."],
-        },
-    ), patch.object(
-        crc, "execute_agent_actions", return_value={"effects": [{"type": "memory_added"}]}
-    ) as first_actions, patch.object(
-        crc, "_cache_pending_reply_retry", side_effect=_crash_before_final_prepare
-    ), patch.object(crc, "post_reply") as first_post, pytest.raises(SystemExit):
-        crc._process_messages([msg])
-
-    first_actions.assert_called_once()
-    first_post.assert_not_called()
-    assert "Optimistic success." not in checkpoint_file.read_text()
-
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-
-    with patch.object(crc, "call_agent") as restarted_agent, \
-         patch.object(crc, "execute_agent_actions") as restarted_actions, \
-         patch.object(crc, "post_reply", return_value={"id": "uncertain-reply"}) as post:
-        result_ts = crc._process_messages([msg])
-
-    assert result_ts == pytest.approx(3334.0)
-    restarted_agent.assert_not_called()
-    restarted_actions.assert_not_called()
-    assert post.call_args.args[0] != "Optimistic success."
-    assert post.call_args.args[0] == crc._identity_action_indeterminate_reply(
-        msg["content"]
-    )
-
-
-def test_corrupt_checkpoint_fails_closed_without_overwrite(tmp_path, monkeypatch):
-    checkpoint_file = tmp_path / "checkpoint.json"
-    corrupt = b'{"last_ts":12,"pending_reply_retry_v1":'
-    checkpoint_file.write_bytes(corrupt)
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", checkpoint_file)
-
-    with pytest.raises(crc._CheckpointStateError, match="checkpoint parse failed"):
-        crc._load_checkpoint()
-
-    assert checkpoint_file.read_bytes() == corrupt
-
-
-def test_checkpoint_read_error_fails_closed(tmp_path, monkeypatch):
-    checkpoint_file = tmp_path / "checkpoint.json"
-    checkpoint_file.write_text("{}")
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", checkpoint_file)
-
-    with patch.object(Path, "read_text", side_effect=OSError("disk unavailable")), \
-         pytest.raises(crc._CheckpointStateError, match="checkpoint read failed"):
-        crc._load_checkpoint()
-
-
-def test_bad_pending_aead_reports_error_and_refuses_new_turns(tmp_path, monkeypatch):
-    checkpoint_file = tmp_path / "checkpoint.json"
-    checkpoint_file.write_text(json.dumps({
-        "last_ts": 10.0,
-        "last_job_ts": 0.0,
-        "api_key_fingerprint": crc.CHECKPOINT_API_KEY_FINGERPRINT,
-        "pending_reply_retry_v1": {
-            "v": 1,
-            "nonce": base64.b64encode(b"n" * 12).decode("ascii"),
-            "ciphertext": base64.b64encode(b"not-a-valid-aead-tag").decode("ascii"),
-            "source_ts": 11.0,
-        },
-    }))
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", checkpoint_file)
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-    before = checkpoint_file.read_bytes()
-
-    with patch.object(crc, "_report_runtime_error", return_value=True) as report, \
-         pytest.raises(crc._CheckpointStateError):
-        crc._process_messages([
-            {"id": "newer", "role": "user", "content": "hi", "ts": 12.0}
-        ])
-
-    report.assert_called_once()
-    assert report.call_args.args[1] == "resident_checkpoint_corrupt"
-    assert checkpoint_file.read_bytes() == before
-
-
-def test_post_restore_checkpoint_corruption_raises_before_actions(
-    tmp_path, monkeypatch
-):
-    checkpoint_file = tmp_path / "checkpoint.json"
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", checkpoint_file)
-    crc._restore_pending_reply_retry()
-    assert crc._pending_reply_retry_checkpoint_loaded is True
-    corrupt = b'{"last_ts":10,"pending_reply_retry_v1":'
-    checkpoint_file.write_bytes(corrupt)
-    msg = {
-        "id": "post-restore-corrupt",
-        "role": "user",
-        "content": "remember this",
-        "ts": 12.0,
-    }
-
-    with patch.object(
-        crc,
-        "call_agent",
-        return_value={
-            "actions": [{"type": "memory.add", "memory": {"summary": "fact"}}],
-            "messages": ["Saved."],
-        },
-    ), patch.object(crc, "execute_agent_actions") as actions, patch.object(
-        crc, "post_reply"
-    ) as post, pytest.raises(crc._CheckpointStateError, match="checkpoint parse failed"):
-        crc._process_messages([msg])
-
-    actions.assert_not_called()
-    post.assert_not_called()
-    assert checkpoint_file.read_bytes() == corrupt
-
-
-def test_pending_persist_write_failure_raises_before_actions(monkeypatch):
-    msg = {
-        "id": "persist-write-failed",
-        "role": "user",
-        "content": "remember this",
-        "ts": 13.0,
-    }
-
-    with patch.object(
-        crc,
-        "call_agent",
-        return_value={
-            "actions": [{"type": "memory.add", "memory": {"summary": "fact"}}],
-            "messages": ["Saved."],
-        },
-    ), patch.object(crc, "execute_agent_actions") as actions, patch.object(
-        crc, "post_reply"
-    ) as post, patch.object(
-        crc.os, "replace", side_effect=OSError("disk full")
-    ), pytest.raises(crc._CheckpointIOError, match="checkpoint write failed"):
-        crc._process_messages([msg])
-
-    actions.assert_not_called()
-    post.assert_not_called()
-    assert msg["id"] in crc._pending_reply_retries
-
-
-def test_pending_clear_write_failure_raises_after_stable_reply(monkeypatch):
-    real_replace = crc.os.replace
-    replace_calls = 0
-
-    def _fail_second_replace(src, dst):
-        nonlocal replace_calls
-        replace_calls += 1
-        if replace_calls == 2:
-            raise OSError("disk full during clear")
-        return real_replace(src, dst)
-
-    msg = {
-        "id": "clear-write-failed",
-        "role": "user",
-        "content": "hello",
-        "ts": 14.0,
-    }
-    with patch.object(crc, "call_agent", return_value="reply"), patch.object(
-        crc, "post_reply", return_value={"id": "reply"}
-    ) as post, patch.object(crc.os, "replace", side_effect=_fail_second_replace), \
-         pytest.raises(crc._CheckpointIOError, match="checkpoint write failed"):
-        crc._process_messages([msg])
-
-    post.assert_called_once()
-    assert msg["id"] in crc._pending_reply_retries
-    saved = json.loads(crc.CHECKPOINT_FILE.read_text())
-    assert crc._PENDING_REPLY_CHECKPOINT_FIELD in saved
-
-
-def test_bad_pending_aead_during_clear_raises_and_keeps_memory_state():
-    key = "clear-bad-aead"
-    prepared = {
-        "replies": ("reply",),
-        "reply_to_message_id": key,
-        "source_ts": 15.0,
-    }
-    assert crc._cache_pending_reply_retry(key, prepared) is True
-    saved = json.loads(crc.CHECKPOINT_FILE.read_text())
-    saved[crc._PENDING_REPLY_CHECKPOINT_FIELD]["ciphertext"] = base64.b64encode(
-        b"invalid-aead"
-    ).decode("ascii")
-    crc.CHECKPOINT_FILE.write_text(json.dumps(saved))
-
-    with pytest.raises(
-        crc._CheckpointStateError,
-        match="cannot verify pending reply checkpoint before clear",
-    ):
-        crc._drop_pending_reply_retry(key, completed_ts=15.0)
-
-    assert key in crc._pending_reply_retries
-
-
-def test_pending_encryption_failure_raises_typed_checkpoint_error():
-    key = "encrypt-failed"
-    prepared = {"replies": ("reply",), "source_ts": 16.0}
-
-    with patch.object(
-        crc,
-        "_encrypt_pending_reply_retry",
-        side_effect=ValueError("cipher unavailable"),
-    ), pytest.raises(
-        crc._CheckpointStateError,
-        match="failed to encrypt pending reply recovery state",
-    ):
-        crc._cache_pending_reply_retry(key, prepared)
-
-    assert key in crc._pending_reply_retries
-
-
-def test_run_reports_initial_checkpoint_write_failure(monkeypatch):
-    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
-    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
-    monkeypatch.setattr(crc, "_pending_reply_retry_restore_error", "")
-
-    with patch.object(crc, "_load_whoami_with_retries", return_value=True), \
-         patch.object(crc, "_warn_if_agent_entry_may_drift"), \
-         patch.object(crc, "_load_checkpoint", return_value=10.0), \
-         patch.object(crc, "_restore_pending_reply_retry"), \
-         patch.object(
-             crc,
-             "_save_checkpoint",
-             side_effect=crc._CheckpointIOError("checkpoint write failed"),
-         ), patch.object(crc, "_report_runtime_error", return_value=True) as report, \
-         pytest.raises(crc._CheckpointIOError):
-        crc.run()
-
-    report.assert_called_once_with(
-        "checkpoint write failed", "resident_checkpoint_io"
-    )
-
-
-def test_run_reports_initial_proactive_checkpoint_write_failure(monkeypatch):
-    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
-    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
-    monkeypatch.setattr(crc, "PROACTIVE_POLL_ENABLED", True)
-    monkeypatch.setattr(crc, "_pending_reply_retry_restore_error", "")
-
-    with patch.object(crc, "_load_whoami_with_retries", return_value=True), \
-         patch.object(crc, "_warn_if_agent_entry_may_drift"), \
-         patch.object(crc, "_load_checkpoint", return_value=10.0), \
-         patch.object(crc, "_restore_pending_reply_retry"), \
-         patch.object(crc, "_save_checkpoint"), \
-         patch.object(crc, "_load_proactive_checkpoint", return_value=0.0), \
-         patch.object(
-             crc,
-             "_save_proactive_checkpoint",
-             side_effect=crc._CheckpointIOError("proactive checkpoint write failed"),
-         ), patch.object(crc, "_report_runtime_error", return_value=True) as report, \
-         pytest.raises(crc._CheckpointIOError):
-        crc.run()
-
-    report.assert_called_once_with(
-        "proactive checkpoint write failed", "resident_checkpoint_io"
-    )
+    assert result_ts == 0.0
 
 
 def test_checkpoint_records_owner_and_resets_when_user_changes(tmp_path, monkeypatch):
@@ -1528,16 +897,17 @@ def test_process_messages_executes_identity_actions_before_reply():
     assert events[1] == ("reply", "改好了。")
 
 
-def test_process_messages_posts_definite_failure_for_locally_unsupported_action():
+def test_process_messages_does_not_post_optimistic_reply_when_identity_action_fails():
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     action = {
-        "type": "unsupported.local_action",
+        "type": "identity.profile_patch",
         "patch": {"agent_name": "小秘"},
     }
     msg = _make_msg(role="user", content="把你的名字改成小秘", ts=3200.0)
 
     with patch.object(crc, "call_agent", return_value={"actions": [action], "messages": ["改好了。"]}), \
+         patch.object(crc, "execute_agent_actions", side_effect=RuntimeError("write failed")), \
          patch.object(crc, "post_reply") as mock_post:
         result_ts = crc._process_messages([msg])
 
@@ -1545,84 +915,6 @@ def test_process_messages_posts_definite_failure_for_locally_unsupported_action(
     mock_post.assert_called_once()
     assert "没能" in mock_post.call_args.args[0]
     assert mock_post.call_args.args[0] != "改好了。"
-
-
-def test_action_transport_response_loss_posts_indeterminate_reply():
-    import httpx as _httpx
-
-    action = {
-        "type": "identity.profile_patch",
-        "patch": {"agent_name": "小秘"},
-    }
-    msg = {
-        "id": "identity-response-lost",
-        "role": "user",
-        "content": "把你的名字改成小秘",
-        "ts": 3201.0,
-    }
-
-    with patch.object(
-        crc,
-        "call_agent",
-        return_value={"actions": [action], "messages": ["改好了。"]},
-    ), patch.object(
-        crc,
-        "execute_agent_actions",
-        side_effect=_httpx.ReadTimeout("response lost after request send"),
-    ), patch.object(crc, "post_reply", return_value={"id": "indeterminate"}) as post:
-        result_ts = crc._process_messages([msg])
-
-    assert result_ts == pytest.approx(3201.0)
-    post.assert_called_once()
-    assert post.call_args.args[0] == crc._identity_action_indeterminate_reply(
-        msg["content"]
-    )
-
-
-def test_identity_success_then_memory_rejection_posts_indeterminate_reply():
-    identity_action = {
-        "type": "identity.profile_patch",
-        "patch": {"agent_name": "小秘"},
-    }
-    memory_action = {
-        "type": "memory.content_patch",
-        "memory_id": "mom_1",
-        "patch": {"description": "corrected"},
-    }
-    msg = {
-        "id": "partial-action-outcome",
-        "role": "user",
-        "content": "改名字，也更新这条记忆",
-        "ts": 3202.0,
-    }
-
-    with patch.object(
-        crc,
-        "call_agent",
-        return_value={
-            "actions": [identity_action, memory_action],
-            "messages": ["都改好了。"],
-        },
-    ), patch.object(
-        crc,
-        "execute_identity_actions",
-        return_value={"status": "ok", "effects": [{"type": "identity_updated"}]},
-    ) as identity_write, patch.object(
-        crc,
-        "execute_memory_actions",
-        side_effect=RuntimeError("memory_actions_http_400:request rejected"),
-    ) as memory_write, patch.object(
-        crc, "post_reply", return_value={"id": "partial-indeterminate"}
-    ) as post:
-        result_ts = crc._process_messages([msg])
-
-    assert result_ts == pytest.approx(3202.0)
-    identity_write.assert_called_once_with([identity_action])
-    memory_write.assert_called_once_with([memory_action])
-    post.assert_called_once()
-    assert post.call_args.args[0] == crc._identity_action_indeterminate_reply(
-        msg["content"]
-    )
 
 
 def test_process_messages_executes_memory_actions_before_reply():
@@ -1661,6 +953,8 @@ def test_process_messages_executes_memory_actions_before_reply():
 def test_empty_content_decrypt_source_available_replies(monkeypatch):
     """poll returns content="" but decrypt source is available and returns
     plaintext — consumer must reply using the decrypted content."""
+    # Simulate poll returning empty-content message
+    empty_msg = _make_msg(role="user", content="", ts=4000.0)
     # Decrypt source returns the plaintext version
     decrypted_msg = _make_msg(role="user", content="what's the weather?", ts=4000.0)
 
@@ -1730,19 +1024,12 @@ def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
     assert result_ts == pytest.approx(100.0)
 
 
-def test_no_error_notice_when_fallback_rejected_already_answered(
-    tmp_path, monkeypatch
-):
+def test_no_error_notice_when_fallback_rejected_already_answered(monkeypatch):
     """Failover 去重（Codex review）：claim 过期后另一家已回复，本家兜底被
     already_answered 409 拒 → system 错误通知也必须一并压掉，不许出现
     重复的技术错误气泡。通知只跟随被服务端接受的那次回复。"""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
-    crc._pending_reply_retries.clear()
-    crc._pending_reply_retry_order.clear()
-    crc._pending_reply_retry_checkpoint_loaded = False
-    crc._pending_reply_retry_restore_error = ""
-    monkeypatch.setattr(crc, "CHECKPOINT_FILE", tmp_path / "checkpoint.json")
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
     monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: True)
     crc._reset_system_notice_state()
@@ -1756,17 +1043,12 @@ def test_no_error_notice_when_fallback_rejected_already_answered(
 
     with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
          patch.object(crc, "post_reply", side_effect=fake_post):
-        result_ts = crc._process_messages([
+        crc._process_messages([
             {"id": "agent-failure-409-1", "role": "user", "content": "msg1", "ts": 100.0}
         ])
 
     # 兜底尝试发出但被拒；system 通知绝不能跟着发出去。
     assert [kw.get("role") for _, kw in calls] == [None]
-    assert result_ts == pytest.approx(100.0)
-    assert crc._pending_reply_retries == {}
-    assert crc._PENDING_REPLY_CHECKPOINT_FIELD not in json.loads(
-        crc.CHECKPOINT_FILE.read_text()
-    )
 
 
 def test_agent_failure_reported_even_with_fallback_disabled(monkeypatch):
@@ -1865,6 +1147,229 @@ def test_sanitize_reply_text_allows_direct_english_reply():
 Tell me what you want to work on next."""
     cleaned = crc._sanitize_reply_text(raw)
     assert cleaned == "Hello Seven — I see your message now.\nTell me what you want to work on next."
+
+
+def test_sanitize_reply_text_preserves_markdown_layout():
+    raw = """# 一级标题
+
+## 二级标题
+
+- 第一项
+  - 嵌套项
+1. 第一步
+   1. 子步骤
+
+> 引用内容
+
+**独立粗体标题**
+
+```swift
+let title = "# 代码里的标记不能清理"
+```
+"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw.strip()
+
+
+def test_sanitize_reply_text_preserves_fenced_code_verbatim():
+    raw = (
+        "```swift\n"
+        'let title = "# 中文代码"  \n'
+        'let title = "# 中文代码"\t\n'
+        "```"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_drops_unlabeled_copy_reasoning_fence():
+    raw = """```copy
+**Executing updates**
+I need to inspect the repository before answering.
+```
+
+这是最终回复。"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Checking the repository before answering.",
+        "Checking project before answering.",
+        "💭 Checking repository before answering.",
+        "💭 Inspecting source files before answering.",
+        "先检查仓库，再回复用户。",
+    ],
+)
+def test_sanitize_reply_text_drops_runtime_copy_fence_header_variants(header):
+    raw = f"""```copy
+{header}
+Collecting internal context.
+```
+
+这是最终回复。"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+def test_sanitize_reply_text_preserves_normal_copy_fence():
+    raw = """```copy
+I need to update the deployment notes.
+```"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'let reasoning = "visible output"',
+        "reasoning = true",
+        "# Checking repository permissions",
+        "- Checking repository status",
+        "Working hours: 09:00-17:00",
+        "处理结果如下：成功",
+    ],
+)
+def test_sanitize_reply_text_preserves_non_runtime_copy_content(content):
+    raw = f"```copy\n{content}\n```"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_dedupes_prose_outside_fenced_code():
+    raw = """第一行
+第二行
+第一行
+第二行
+
+```swift
+let value = 1
+```"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "第一行\n第二行\n\n```swift\nlet value = 1\n```"
+
+
+def test_sanitize_reply_text_preserves_blockquote_fenced_code_verbatim():
+    raw = (
+        "> ```text\n"
+        "> repeated line  \n"
+        "> repeated line  \n"
+        "> ```"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_preserves_fence_like_content_at_deeper_quote_depth():
+    raw = (
+        "> ~~~text\n"
+        "> > ~~~\n"
+        "> repeated line  \n"
+        "> repeated line  \n"
+        "> ~~~"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+def test_sanitize_reply_text_filters_runtime_copy_with_tabbed_quote_container():
+    raw = (
+        ">\t> ```copy\n"
+        ">\t> **Executing updates**\n"
+        ">\t> Internal details.\n"
+        ">\t> ```\n"
+        "\n"
+        "这是最终回复。"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "这是最终回复。"
+
+
+def test_sanitize_reply_text_implicitly_closes_fence_when_blockquote_ends():
+    raw = (
+        "> ```text\n"
+        "> code line  \n"
+        "outside\n"
+        "outside\n"
+        "正文"
+    )
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == "> ```text\n> code line  \noutside\n正文"
+
+
+def test_sanitize_reply_text_preserves_setext_and_thematic_breaks():
+    raw = """Title
+===
+
+Section
+---
+
+正文"""
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["----", "* * *", "_ _ _"])
+def test_sanitize_reply_text_preserves_commonmark_thematic_variants(marker):
+    raw = f"Title\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["=", "-"])
+def test_sanitize_reply_text_preserves_single_character_setext(marker):
+    raw = f"Title\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
+
+
+@pytest.mark.parametrize("marker", ["---", "* * *", "_ _ _"])
+def test_sanitize_reply_text_does_not_recover_preamble_across_blank_line(marker):
+    raw = f"transport transcript\n\n{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == f"{marker}\n\n正文"
+
+
+@pytest.mark.parametrize("marker", ["---", "* * *", "_ _ _", "----"])
+def test_sanitize_reply_text_preserves_leading_thematic_break(marker):
+    raw = f"{marker}\n\n正文"
+
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert cleaned == raw
 
 
 def test_sanitize_reply_text_drops_unlabeled_english_meta_before_cjk_answer():
@@ -2459,8 +1964,9 @@ def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(mon
 
 
 def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
-    # Resume is claude's primary continuity path on a self-hosted resident.
-    # When a turn DOES carry a forced injected transcript,
+    # Resume is claude's primary continuity path on a self-hosted resident (auto
+    # injects only when _HOSTED — see test_resident_claude_auto_keeps_resume_*).
+    # When a turn DOES carry an injected transcript (hosted / forced on),
     # _prepare_cli_command suppresses --resume for that turn instead.
     sid = "123e4567-e89b-12d3-a456-426614174000"
     monkeypatch.setattr(
@@ -3143,8 +2649,10 @@ def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch
     assert calls[-1] == ("backend", "https://backend.local/v1/memory/buckets")
 
 
-def test_capture_json_helpers_use_api_key_for_each_request(monkeypatch):
+def test_capture_json_helpers_refresh_runtime_token_before_each_request(monkeypatch, tmp_path):
     calls = []
+    token_file = tmp_path / "runtime.jwt"
+    token_file.write_text("fresh-token")
 
     class _Resp:
         def raise_for_status(self):
@@ -3161,14 +2669,19 @@ def test_capture_json_helpers_use_api_key_for_each_request(monkeypatch):
         calls.append(("POST", url, dict(kwargs.get("headers") or {})))
         return _Resp()
 
-    monkeypatch.setitem(crc._HEADERS, "X-API-Key", "resident-api-key")
+    monkeypatch.setattr(crc, "FEEDLING_RUNTIME_TOKEN_FILE", str(token_file))
+    monkeypatch.setattr(crc, "_runtime_token_exp", lambda token: time.time() + 60)
+    monkeypatch.setitem(crc._HEADERS, "X-API-Key", "stale-api-key")
+    crc._HEADERS.pop("X-Feedling-Runtime-Token", None)
     monkeypatch.setattr(crc._HTTP, "get", _get)
     monkeypatch.setattr(crc._HTTP, "post", _post)
 
     assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
     assert crc._capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": 8}) == {"ok": True}
-    assert calls[0][2].get("X-API-Key") == "resident-api-key"
-    assert calls[1][2].get("X-API-Key") == "resident-api-key"
+    assert calls[0][2].get("X-Feedling-Runtime-Token") == "fresh-token"
+    assert calls[1][2].get("X-Feedling-Runtime-Token") == "fresh-token"
+    assert "X-API-Key" not in calls[0][2]
+    assert "X-API-Key" not in calls[1][2]
 
 
 def test_migrate_job_fails_when_legacy_batch_response_missing(monkeypatch):
@@ -6742,8 +6255,9 @@ def test_provider_payment_cooldown_lifecycle(monkeypatch):
 # ---------------------------------------------------------------------------
 # Foreground chat context injection (codex / claude hosted BYOK)
 # ---------------------------------------------------------------------------
-# codex has no --resume, so cross-turn continuity is injected by the resident:
-# a short recent-chat transcript is prepended to the current turn. pi resumes natively via
+# codex has no --resume and hosted claude's default command carries no session,
+# so cross-turn continuity is injected by the resident: a short recent-chat
+# transcript is prepended to the current turn. pi resumes natively via
 # --session-id, but a session rotates to a blank slate every N turns, so pi
 # gets bridged with the transcript exactly once per session (its first
 # foreground chat turn, gated on success — see _mark_agent_session_bridged in
@@ -6764,6 +6278,15 @@ def test_foreground_injection_enabled_for_codex(monkeypatch):
     assert crc._foreground_history_injection_enabled() is True
 
 
+def test_foreground_injection_enabled_for_hosted_claude(monkeypatch):
+    # In-CVM (hosted) claude has no durable session store: transcript injection
+    # IS its continuity.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", True)
+    assert crc._foreground_history_injection_enabled() is True
+
+
 def test_foreground_injection_skipped_for_resident_claude(monkeypatch):
     # A self-hosted resident's local claude has a reliable --resume. Injection
     # would suppress it (_prepare_cli_command) and cold-start a fresh model
@@ -6772,13 +6295,15 @@ def test_foreground_injection_skipped_for_resident_claude(monkeypatch):
     # the persistent-session path for resident claude.
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", False)
     assert crc._foreground_history_injection_enabled() is False
 
 
-def test_foreground_injection_on_mode_forces_resident_claude(monkeypatch):
-    # Explicit on is an operator escape hatch.
+def test_foreground_injection_on_mode_forces_even_resident_claude(monkeypatch):
+    # explicit on outranks the hosted/resident split (operator escape hatch)
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "on")
+    monkeypatch.setattr(crc, "_HOSTED", False)
     assert crc._foreground_history_injection_enabled() is True
 
 
@@ -6790,6 +6315,7 @@ def test_resident_claude_auto_keeps_resume_and_skips_transcript(monkeypatch):
     sid = "123e4567-e89b-12d3-a456-426614174000"
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     monkeypatch.setattr(
@@ -6824,6 +6350,7 @@ def _stale_resume_env(monkeypatch, tmp_path, user_id):
     _bridge_session_env(monkeypatch, tmp_path, user_id)
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     crc._save_agent_session_id(_STALE_SID)
 
@@ -8300,7 +7827,7 @@ def test_generic_failure_sets_backoff(monkeypatch):
 
 
 def test_402_failure_feeds_both_cooldown_and_general_backoff(monkeypatch):
-    _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("HTTP 402 payment required"))
+    cap = _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("HTTP 402 payment required"))
     crc._proactive_backoff_until = 0.0
     crc._clear_provider_payment_cooldown()
     crc._process_proactive_jobs([_idle_proactive_job()])
@@ -8407,6 +7934,7 @@ def test_turn_timeout_is_env_tunable(monkeypatch, tmp_path):
     _bridge_session_env(monkeypatch, tmp_path, "usr_slow_stack")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     monkeypatch.setattr(crc, "AGENT_TURN_TIMEOUT_SEC", 300)
     seen = {}
@@ -8431,14 +7959,23 @@ def test_chat_scratch_dirs_default_fingerprinted():
     assert str(crc.IMAGE_TEMP_DIR) != str(crc.FILE_TEMP_DIR)
 
 
-def test_land_file_writes_0600(monkeypatch, tmp_path):
-    # A decrypted attachment must land 0600 (never world-readable on a shared
-    # host), in a 0700 dir. _write_scratch_file creates it at 0600 via open().
+def test_chat_scratch_refuses_shared_default_when_keyless(monkeypatch, tmp_path):
+    # Host-all consumers run keyless (sha1("") collides for every user), so the
+    # spawner MUST pin IMAGE_TEMP_DIR/FILE_TEMP_DIR per user. If a future spawn
+    # path forgets, refuse to write DECRYPTED chat files to the shared default
+    # rather than leak them to co-hosted agents (mirrors _USER_MCP_PATHS_PINNED).
+    monkeypatch.setattr(crc, "FEEDLING_API_KEY", "")
+    monkeypatch.setattr(crc, "_CHAT_SCRATCH_PINNED", False)
     monkeypatch.setattr(crc, "FILE_TEMP_DIR", tmp_path / "files")
+    assert crc._land_file("msg1", "secret.txt", b"plaintext") == ""
+    assert not (tmp_path / "files").exists()
+
+    # Pinned by the spawner → writes normally, and the file is 0600 (decrypted
+    # attachment must not be world-readable on a shared host).
+    monkeypatch.setattr(crc, "_CHAT_SCRATCH_PINNED", True)
     out = crc._land_file("msg1", "secret.txt", b"plaintext")
     assert out and Path(out).read_bytes() == b"plaintext"
     assert (Path(out).stat().st_mode & 0o777) == 0o600
-    assert (Path(out).parent.stat().st_mode & 0o777) == 0o700
 
 
 def test_land_file_degrades_on_unwritable_dir(monkeypatch, tmp_path):
@@ -8446,6 +7983,8 @@ def test_land_file_degrades_on_unwritable_dir(monkeypatch, tmp_path):
     # must degrade to "" like the pre-hardening code did — a file-attachment turn
     # must NOT crash. Regression guard: _mkdir_scratch moved dir creation out of
     # _land_file's try/except, so the OSError must be swallowed inside the helper.
+    monkeypatch.setattr(crc, "FEEDLING_API_KEY", "k")   # write allowed
+    monkeypatch.setattr(crc, "_CHAT_SCRATCH_PINNED", True)
     monkeypatch.setattr(crc, "FILE_TEMP_DIR", tmp_path / "files")
 
     def boom(self, *a, **k):
@@ -8457,6 +7996,8 @@ def test_land_file_degrades_on_unwritable_dir(monkeypatch, tmp_path):
 
 def test_image_paths_degrade_on_unwritable_dir(monkeypatch, tmp_path):
     # Same guard for the image write path.
+    monkeypatch.setattr(crc, "FEEDLING_API_KEY", "k")
+    monkeypatch.setattr(crc, "_CHAT_SCRATCH_PINNED", True)
     monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path / "images")
 
     def boom(self, *a, **k):
@@ -8499,3 +8040,16 @@ def test_write_scratch_file_closes_fd_if_fdopen_fails(monkeypatch, tmp_path):
     with pytest.raises(MemoryError):
         crc._write_scratch_file(tmp_path / "x.bin", b"data")
     assert closed, "os.open fd leaked when fdopen failed"
+
+
+def test_chat_scratch_refusal_logs_once(monkeypatch):
+    # Keyless + unpinned refuses on every image/file message; the ERROR must be
+    # logged once, not per-message (would flood and bury diagnostics).
+    monkeypatch.setattr(crc, "FEEDLING_API_KEY", "")
+    monkeypatch.setattr(crc, "_CHAT_SCRATCH_PINNED", False)
+    monkeypatch.setattr(crc, "_chat_scratch_refusal_logged", False)
+    calls = []
+    monkeypatch.setattr(crc.log, "error", lambda *a, **k: calls.append(1))
+    for _ in range(5):
+        assert crc._chat_scratch_write_allowed() is False
+    assert len(calls) == 1

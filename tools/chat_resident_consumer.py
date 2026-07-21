@@ -90,7 +90,6 @@ import base64
 from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
-import hmac
 import io
 import json
 import logging
@@ -239,12 +238,13 @@ CHECKPOINT_FILE = Path(
         f"/tmp/feedling_chat_checkpoint_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
     )
 )
-# Materialized user-MCP config target. Scoped by the same api-key fingerprint as
-# the checkpoint so two accounts on one host never share a file (this external
-# tool always authenticates with a real FEEDLING_API_KEY, so the fingerprint is a
-# genuine per-account boundary). This single file is BOTH the claude
-# ``--mcp-config`` target AND the documented generic ``user-mcp.json`` for VPS
-# agents (io-onboarding skill).
+# Materialized user-MCP config target. The api-key fingerprint in the default
+# path is NOT the isolation boundary: it only separates accounts that hold
+# DISTINCT keys and collapses to ONE shared file for keyless host-all consumers
+# (see _USER_MCP_PATHS_PINNED below). Per-user isolation comes solely from the
+# spawner pinning USER_MCP_FILE via env (consumer_env) — never rely on the
+# fingerprint alone. This single file is BOTH the claude ``--mcp-config`` target
+# AND the documented generic ``user-mcp.json`` for VPS agents (io-onboarding skill).
 USER_MCP_FILE = os.environ.get(
     "USER_MCP_FILE",
     f"/tmp/feedling_user_mcp_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
@@ -252,8 +252,10 @@ USER_MCP_FILE = os.environ.get(
 # Two CA bundles, deliberately DIFFERENT content — the runtimes' semantics are
 # opposite (spec §2.2): claude's NODE_EXTRA_CA_CERTS ADDS to the trust store,
 # codex's SSL_CERT_FILE REPLACES it. Feeding codex the user-only bundle would
-# strip every public root and break its OpenAI calls. Keyed by the same API-key
-# fingerprint as USER_MCP_FILE so two accounts on one host never share a file.
+# strip every public root and break its OpenAI calls. Path defaults mirror
+# USER_MCP_FILE's fingerprint scheme, which is likewise NOT an isolation boundary
+# for keyless host-all consumers (see USER_MCP_FILE above) — the spawner pins
+# these per user via env; the fingerprint alone must never be trusted to isolate.
 USER_MCP_CA_FILE = os.environ.get(
     "USER_MCP_CA_FILE",
     f"/tmp/feedling_user_mcp_ca_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
@@ -262,6 +264,16 @@ USER_MCP_CASTORE_FILE = os.environ.get(
     "USER_MCP_CASTORE_FILE",
     f"/tmp/feedling_user_mcp_castore_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
 )
+# The fingerprint scoping above only isolates accounts while FEEDLING_API_KEY is
+# non-empty. Host-all (Stage-D zero-roster) consumers run keyless, so sha1("")
+# collides for every user on the host and the /tmp defaults become ONE shared
+# file — the spawner therefore pins all three paths via env (consumer_env). If
+# a spawn path ever forgets that, _maybe_apply_user_mcp uses this flag to
+# degrade to user-MCP-off instead of writing this user's decrypted MCP url +
+# auth headers where every co-resident agent would read them.
+_USER_MCP_PATHS_PINNED = all(
+    k in os.environ
+    for k in ("USER_MCP_FILE", "USER_MCP_CA_FILE", "USER_MCP_CASTORE_FILE"))
 # The pi user-MCP bridge extension. ONE shared static file for every user —
 # `COPY tools/ ./tools/` (Dockerfile.agent-runner) puts it here; the per-user
 # config path rides FEEDLING_USER_MCP_FILE instead (see _user_mcp_child_env).
@@ -870,13 +882,61 @@ def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
         pass  # observability must never affect the turn
 
 
+# Stage D: when hosted, the supervisor writes a short-lived runtime token to this
+# file (and refreshes it). We authenticate with the token instead of the
+# long-term API key, re-reading the file so refreshes are picked up. Unset/empty
+# (e.g. a self-hosted VPS user) → we keep using X-API-Key, unchanged.
+FEEDLING_RUNTIME_TOKEN_FILE = os.environ.get("FEEDLING_RUNTIME_TOKEN_FILE", "").strip()
+
+
+def _runtime_token_exp(token: str) -> float | None:
+    """Read the ``exp`` claim from a runtime token WITHOUT verifying its signature
+    (no secret here). Lets us avoid sending a token we can already see is expired.
+    Returns the exp epoch, or None if unparseable."""
+    try:
+        payload_b64 = token.split(".", 1)[0]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return float(claims.get("exp"))
+    except Exception:
+        return None
+
+
+def _refresh_auth_header() -> None:
+    """Choose the request auth header from the runtime-token file (Stage D).
+
+    Uses the token only when the file holds one that is NOT already expired
+    (decoding its ``exp``); otherwise falls back to the long-term api key. This
+    avoids wedging on a stale token if the supervisor stops refreshing the file.
+    Mutates ``_HEADERS`` in place so all existing call sites pick it up."""
+    if not FEEDLING_RUNTIME_TOKEN_FILE:
+        return
+    token = ""
+    try:
+        token = Path(FEEDLING_RUNTIME_TOKEN_FILE).read_text().strip()
+    except OSError:
+        token = ""
+    exp = _runtime_token_exp(token) if token else None
+    fresh = exp is not None and exp > time.time() + 5  # small skew margin
+    if fresh:
+        _HEADERS.pop("X-API-Key", None)
+        _HEADERS["X-Feedling-Runtime-Token"] = token
+    else:
+        _HEADERS.pop("X-Feedling-Runtime-Token", None)
+        _HEADERS["X-API-Key"] = FEEDLING_API_KEY
+
+
+_refresh_auth_header()  # adopt a token immediately if one is already present
+
+
 # ---------------------------------------------------------------------------
 # Self-update — keep a self-hosted resident on the commit the backend deploys.
 #
 # The backend advertises its deployed commit in the chat-poll response
 # (``client_release.expected_consumer_commit``). When ours differs AND the
 # difference actually touches a file this consumer loads, we fetch + checkout
-# that commit and re-exec in place.
+# that commit and re-exec in place. Hosted (supervisor-managed CVM) runs are
+# excluded — their code is baked into an attested, immutable image.
 # ---------------------------------------------------------------------------
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -889,6 +949,11 @@ AUTO_UPDATE = os.environ.get("FEEDLING_AUTO_UPDATE", "1").strip().lower() not in
     "off",
     "",
 )
+# A runtime-token file is only written by the in-CVM supervisor — treat its
+# presence as "hosted" and never self-mutate there.
+_HOSTED = bool(FEEDLING_RUNTIME_TOKEN_FILE)
+
+
 def _runtime_repo_files() -> set[str]:
     """Repo-relative ``.py`` files this process actually loaded (auto-derived
     dependency whitelist), plus files distributed alongside us that never show
@@ -942,13 +1007,14 @@ def _should_self_update(
     target: str,
     dirty: bool,
     enabled: bool,
+    hosted: bool,
     relevant_changed: bool,
 ) -> bool:
     """Pure decision: should we update from ``local`` to ``target`` now?
 
     Side-effect-free so it is exhaustively unit-tested. The caller owns the git
     work and is responsible for warning when a dirty tree blocks an update."""
-    if not enabled:
+    if not enabled or hosted:
         return False
     if not target or target == "dev" or not local:
         return False
@@ -1090,7 +1156,7 @@ def _run_self_update(target: str) -> None:
     fetch/diff only runs when an update is genuinely plausible. Re-exec happens
     inside ``_apply_self_update`` and does not return."""
     global _last_self_update_mono
-    if not AUTO_UPDATE or not target or target == "dev":
+    if not AUTO_UPDATE or _HOSTED or not target or target == "dev":
         return
     now = time.monotonic()
     if now - _last_self_update_mono < _SELF_UPDATE_MIN_INTERVAL_SEC:
@@ -1108,7 +1174,7 @@ def _run_self_update(target: str) -> None:
     if not relevant:
         return  # backend release doesn't touch anything this consumer loads
     dirty = _git_tree_dirty()
-    if not _should_self_update(local, target, dirty, AUTO_UPDATE, relevant):
+    if not _should_self_update(local, target, dirty, AUTO_UPDATE, _HOSTED, relevant):
         if dirty:
             log.warning(
                 "self-update %s -> %s available but working tree has uncommitted "
@@ -1211,39 +1277,11 @@ def _empty_checkpoint_data() -> dict[str, Any]:
     return data
 
 
-_PENDING_REPLY_CHECKPOINT_FIELD = "pending_reply_retry_v1"
-_PENDING_REPLY_CHECKPOINT_AAD = b"feedling-resident-pending-reply-v1"
-
-
-class _CheckpointStateError(RuntimeError):
-    """The durable resident cursor/recovery record cannot be trusted."""
-
-
-class _CheckpointIOError(_CheckpointStateError):
-    """The durable resident checkpoint could not be read or committed."""
-
-
-def _checkpoint_runtime_error_class(exc: BaseException) -> str:
-    return (
-        "resident_checkpoint_io"
-        if isinstance(exc, _CheckpointIOError)
-        else "resident_checkpoint_corrupt"
-    )
-
-
 def _load_checkpoint_data() -> dict[str, Any]:
     try:
-        raw = CHECKPOINT_FILE.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:
-        raise _CheckpointIOError(
-            f"checkpoint read failed: {type(exc).__name__}: {exc}"
-        ) from exc
-    try:
-        data = json.loads(raw)
+        data = json.loads(CHECKPOINT_FILE.read_text())
         if not isinstance(data, dict):
-            raise ValueError("checkpoint root is not an object")
+            return {}
         current_user_id = _checkpoint_user_id()
         stored_user_id = str(data.get("user_id") or "").strip()
         stored_fingerprint = str(data.get("api_key_fingerprint") or "").strip()
@@ -1270,45 +1308,16 @@ def _load_checkpoint_data() -> dict[str, Any]:
         }
         if stored_user_id or current_user_id:
             result["user_id"] = stored_user_id or current_user_id
-        if _PENDING_REPLY_CHECKPOINT_FIELD in data:
-            pending = data.get(_PENDING_REPLY_CHECKPOINT_FIELD)
-            if not isinstance(pending, dict):
-                raise ValueError("pending reply checkpoint is not an object")
-            # The opaque value contains only AEAD ciphertext plus nonce/version;
-            # plaintext replies, thinking, and error details never enter /tmp.
-            result[_PENDING_REPLY_CHECKPOINT_FIELD] = dict(pending)
         return result
-    except _CheckpointStateError:
-        raise
-    except Exception as exc:
-        raise _CheckpointStateError(
-            f"checkpoint parse failed: {type(exc).__name__}: {exc}"
-        ) from exc
+    except Exception:
+        return {}
 
 
 def _write_checkpoint_data(data: dict[str, Any]) -> None:
-    temp_path = CHECKPOINT_FILE.with_name(
-        f".{CHECKPOINT_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
     try:
-        # A write-ahead pending turn is a correctness boundary for non-idempotent
-        # actions.  Replace atomically so a process crash cannot leave half JSON,
-        # and keep the encrypted recovery record private even on shared hosts.
-        with temp_path.open("w", encoding="utf-8") as fh:
-            json.dump(data, fh, separators=(",", ":"))
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(temp_path, 0o600)
-        os.replace(temp_path, CHECKPOINT_FILE)
+        CHECKPOINT_FILE.write_text(json.dumps(data))
     except Exception as e:
         log.warning("checkpoint write failed: %s", e)
-        try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise _CheckpointIOError(
-            f"checkpoint write failed: {type(e).__name__}: {e}"
-        ) from e
 
 
 def _load_checkpoint() -> float:
@@ -1334,160 +1343,6 @@ def _save_proactive_checkpoint(ts: float) -> None:
     data = _load_checkpoint_data()
     data.setdefault("last_ts", 0.0)
     data["last_job_ts"] = ts
-    data["api_key_fingerprint"] = CHECKPOINT_API_KEY_FINGERPRINT
-    user_id = _checkpoint_user_id()
-    if user_id:
-        data["user_id"] = user_id
-    _write_checkpoint_data(data)
-
-
-def _pending_reply_checkpoint_key() -> bytes:
-    """Local-only AEAD key for pending turn recovery.
-
-    The API key is already required to run the resident and is never written to
-    the checkpoint.  Domain separation prevents this key from overlapping any
-    wire/content-encryption key derived elsewhere in the product.
-    """
-    return hashlib.sha256(
-        b"feedling-resident-pending-reply-key-v1\0"
-        + FEEDLING_API_KEY.encode("utf-8")
-    ).digest()
-
-
-def _pending_reply_checkpoint_plaintext(
-    key: str, prepared: dict[str, Any]
-) -> bytes:
-    notice = prepared.get("pending_failure_notice")
-    notice_data = None
-    if notice is not None:
-        notice_data = {
-            "type": type(notice).__name__,
-            "message": str(notice)[:4000],
-        }
-    safe = {
-        "key": str(key),
-        "prepared": {
-            "replies": [str(item) for item in (prepared.get("replies") or [])],
-            "reply_to_message_id": str(prepared.get("reply_to_message_id") or ""),
-            "source": str(prepared.get("source") or ""),
-            "thinking_summary": str(prepared.get("thinking_summary") or ""),
-            "thinking_kind": str(prepared.get("thinking_kind") or ""),
-            "thinking_source": str(prepared.get("thinking_source") or ""),
-            "thinking_model": str(prepared.get("thinking_model") or ""),
-            "thinking_native": prepared.get("thinking_native"),
-            "pending_failure_notice": notice_data,
-            "source_ts": float(prepared.get("source_ts") or 0.0),
-        },
-    }
-    return json.dumps(safe, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-
-def _encrypt_pending_reply_retry(
-    key: str, prepared: dict[str, Any]
-) -> dict[str, Any]:
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-
-    nonce = os.urandom(12)
-    ciphertext = ChaCha20Poly1305(_pending_reply_checkpoint_key()).encrypt(
-        nonce,
-        _pending_reply_checkpoint_plaintext(key, prepared),
-        _PENDING_REPLY_CHECKPOINT_AAD,
-    )
-    return {
-        "v": 1,
-        "nonce": base64.b64encode(nonce).decode("ascii"),
-        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
-        # Timestamp is routing metadata, not conversation content. Keeping it
-        # outside the ciphertext lets cursor saves prove whether it is safe to
-        # clear a completed pending record without exposing reply text.
-        "source_ts": float(prepared.get("source_ts") or 0.0),
-    }
-
-
-def _decrypt_pending_reply_retry(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-
-    if int(raw.get("v") or 0) != 1:
-        raise ValueError("unsupported pending reply checkpoint version")
-    plaintext = ChaCha20Poly1305(_pending_reply_checkpoint_key()).decrypt(
-        base64.b64decode(str(raw.get("nonce") or ""), validate=True),
-        base64.b64decode(str(raw.get("ciphertext") or ""), validate=True),
-        _PENDING_REPLY_CHECKPOINT_AAD,
-    )
-    decoded = json.loads(plaintext.decode("utf-8"))
-    if not isinstance(decoded, dict) or not isinstance(decoded.get("prepared"), dict):
-        raise ValueError("invalid pending reply checkpoint payload")
-    key = str(decoded.get("key") or "").strip()
-    if not key:
-        raise ValueError("pending reply checkpoint missing key")
-    saved = decoded["prepared"]
-    notice_data = saved.get("pending_failure_notice")
-    notice = None
-    if isinstance(notice_data, dict):
-        label = str(notice_data.get("type") or "RuntimeError")
-        message = str(notice_data.get("message") or "")
-        notice = RuntimeError(f"{label}: {message}" if message else label)
-    replies = saved.get("replies")
-    if not isinstance(replies, list) or any(not isinstance(item, str) for item in replies):
-        raise ValueError("pending reply checkpoint has invalid replies")
-    prepared = {
-        "replies": tuple(replies),
-        "reply_to_message_id": str(saved.get("reply_to_message_id") or ""),
-        "source": str(saved.get("source") or ""),
-        "thinking_summary": str(saved.get("thinking_summary") or ""),
-        "thinking_kind": str(saved.get("thinking_kind") or ""),
-        "thinking_source": str(saved.get("thinking_source") or ""),
-        "thinking_model": str(saved.get("thinking_model") or ""),
-        "thinking_native": saved.get("thinking_native"),
-        "pending_failure_notice": notice,
-        "source_ts": float(saved.get("source_ts") or raw.get("source_ts") or 0.0),
-    }
-    return key, prepared
-
-
-def _persist_pending_reply_retry(key: str, prepared: dict[str, Any]) -> None:
-    try:
-        encrypted = _encrypt_pending_reply_retry(key, prepared)
-    except Exception as exc:
-        raise _CheckpointStateError(
-            "failed to encrypt pending reply recovery state: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-    data = _load_checkpoint_data()
-    data.setdefault("last_ts", 0.0)
-    data.setdefault("last_job_ts", 0.0)
-    data["api_key_fingerprint"] = CHECKPOINT_API_KEY_FINGERPRINT
-    user_id = _checkpoint_user_id()
-    if user_id:
-        data["user_id"] = user_id
-    data[_PENDING_REPLY_CHECKPOINT_FIELD] = encrypted
-    _write_checkpoint_data(data)
-
-
-def _clear_pending_reply_checkpoint(
-    key: str, *, completed_ts: float | None = None
-) -> None:
-    data = _load_checkpoint_data()
-    raw = data.get(_PENDING_REPLY_CHECKPOINT_FIELD)
-    if isinstance(raw, dict):
-        try:
-            stored_key, _prepared = _decrypt_pending_reply_retry(raw)
-        except Exception as exc:
-            raise _CheckpointStateError(
-                "cannot verify pending reply checkpoint before clear: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-        if stored_key != key:
-            raise _CheckpointStateError(
-                "refusing to clear another pending reply "
-                f"key={stored_key} requested={key}"
-            )
-    data.pop(_PENDING_REPLY_CHECKPOINT_FIELD, None)
-    if completed_ts is not None:
-        data["last_ts"] = max(
-            float(data.get("last_ts", 0.0) or 0.0), float(completed_ts)
-        )
-    data.setdefault("last_job_ts", 0.0)
     data["api_key_fingerprint"] = CHECKPOINT_API_KEY_FINGERPRINT
     user_id = _checkpoint_user_id()
     if user_id:
@@ -1599,89 +1454,6 @@ def _mark_seen(key: str) -> bool:
     if len(_seen_ids_order) > _SEEN_MAX:
         _seen_ids.discard(_seen_ids_order.pop(0))
     return True
-
-
-def _cache_pending_reply_retry(key: str, prepared: dict[str, Any]) -> bool:
-    """Keep one already-executed turn for reply-only redelivery.
-
-    The provider call and agent actions may be non-idempotent (notably
-    ``memory.add``), so a terminal chat write failure must retry the stable
-    delivery ids without re-running either layer. The cache is deliberately
-    bounded like ``_seen_ids``; durable checkpointing remains the source of
-    truth across process restarts.
-    """
-    global _pending_reply_retry_checkpoint_loaded
-    if key not in _pending_reply_retries:
-        if len(_pending_reply_retry_order) >= _PENDING_REPLY_RETRY_MAX:
-            # Never evict an unresolved turn into `_seen_ids`: that silently
-            # advances its checkpoint on redelivery. Production is single-flight
-            # and stops at the first unresolved turn, so this is a defensive
-            # fail-closed boundary rather than an expected queueing path.
-            log.critical(
-                "pending reply retry cache full; refusing new key=%s without eviction",
-                key,
-            )
-            _seen_ids.discard(key)
-            try:
-                _seen_ids_order.remove(key)
-            except ValueError:
-                pass
-            return False
-        _pending_reply_retry_order.append(key)
-    _pending_reply_retries[key] = prepared
-    _pending_reply_retry_checkpoint_loaded = True
-    _persist_pending_reply_retry(key, prepared)
-    return True
-
-
-def _drop_pending_reply_retry(
-    key: str, *, completed_ts: float | None = None
-) -> None:
-    # Any trust/durability failure raises and leaves the in-memory prepared turn
-    # intact. The process must exit visibly; retrying in-place would wedge every
-    # newer message behind a checkpoint that can never be advanced safely.
-    _clear_pending_reply_checkpoint(key, completed_ts=completed_ts)
-    _pending_reply_retries.pop(key, None)
-    try:
-        _pending_reply_retry_order.remove(key)
-    except ValueError:
-        pass
-
-
-def _restore_pending_reply_retry() -> None:
-    global _pending_reply_retry_checkpoint_loaded, _pending_reply_retry_restore_error
-    if _pending_reply_retry_checkpoint_loaded:
-        return
-    _pending_reply_retry_checkpoint_loaded = True
-    try:
-        raw = _load_checkpoint_data().get(_PENDING_REPLY_CHECKPOINT_FIELD)
-    except _CheckpointStateError as exc:
-        _pending_reply_retry_restore_error = str(exc)
-        log.critical(
-            "resident checkpoint is unreadable; refusing to process turns: %s",
-            exc,
-        )
-        return
-    if not isinstance(raw, dict):
-        return
-    try:
-        key, prepared = _decrypt_pending_reply_retry(raw)
-    except Exception as exc:
-        _pending_reply_retry_restore_error = (
-            f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
-        )
-        log.critical(
-            "pending reply recovery state is unreadable; refusing to process newer turns: %s",
-            exc,
-        )
-        return
-    _pending_reply_retries[key] = prepared
-    if key not in _pending_reply_retry_order:
-        _pending_reply_retry_order.append(key)
-    _seen_ids.add(key)
-    if key not in _seen_ids_order:
-        _seen_ids_order.append(key)
-    log.warning("restored pending reply-only retry key=%s", key)
 
 
 # ---------------------------------------------------------------------------
@@ -1965,19 +1737,50 @@ _XLSX_MAX_ROWS = 2000
 FILE_TEMP_DIR = Path(os.environ.get(
     "FILE_TEMP_DIR",
     f"/tmp/feedling_chat_files_{CHECKPOINT_API_KEY_FINGERPRINT}"))
-# Both scratch dirs above hold DECRYPTED chat images/attachments, keyed by the
-# same api-key fingerprint as the other per-user scratch so two accounts on one
-# host never share a dir. They are created 0700 (see _mkdir_scratch) so a
-# co-tenant unix user on the same box can't read decrypted chat content.
+# Both scratch dirs above hold DECRYPTED chat images/attachments. The api-key
+# fingerprint keeps distinct keys apart, but host-all consumers run keyless —
+# sha1("") collides for every user, so the spawner MUST pin both dirs per user
+# (consumer_env). If it did, these env vars are set; if a future spawn path
+# forgets, we must NOT fall back to the shared /tmp default and leak plaintext
+# to co-hosted agents. Same fail-safe shape as _USER_MCP_PATHS_PINNED.
+_CHAT_SCRATCH_PINNED = (
+    "IMAGE_TEMP_DIR" in os.environ and "FILE_TEMP_DIR" in os.environ)
+
+
+_chat_scratch_refusal_logged = False
+
+
+def _chat_scratch_write_allowed() -> bool:
+    """False when writing decrypted scratch would land in a shared default.
+
+    Safe whenever the process has a real api key (fingerprint disambiguates) or
+    the spawner explicitly pinned the dirs. Only the keyless-and-unpinned combo
+    — a misconfigured host-all spawn — is refused, and it logs the refusal ONCE
+    (like the sibling _maybe_apply_user_mcp fail-safe) so a stream of image/file
+    messages can't flood ERROR and bury other diagnostics.
+    """
+    global _chat_scratch_refusal_logged
+    if bool(FEEDLING_API_KEY) or _CHAT_SCRATCH_PINNED:
+        return True
+    if not _chat_scratch_refusal_logged:
+        log.error(
+            "[chat_scratch] refusing to write decrypted scratch: keyless "
+            "consumer with unpinned IMAGE_TEMP_DIR/FILE_TEMP_DIR would leak "
+            "plaintext to co-hosted agents; the spawner must pin them per user")
+        _chat_scratch_refusal_logged = True
+    return False
 
 
 def _mkdir_scratch(dirp: Path) -> bool:
-    """Prepare a decrypted-scratch dir 0700, or return False if it can't be made.
+    """Prepare a decrypted-scratch dir, or refuse if it would be shared.
 
-    Creates the dir 0700 so a co-tenant unix user can't read decrypted chat
-    content. Returns False (callers must skip writing) only when the dir can't
-    be created — a file/image turn must degrade, not crash.
+    Returns False (callers must skip writing) when a keyless consumer has
+    unpinned scratch dirs — see _chat_scratch_write_allowed (which logs the
+    refusal, once). Otherwise creates the dir 0700 so a co-tenant unix user
+    can't read decrypted chat content.
     """
+    if not _chat_scratch_write_allowed():
+        return False
     try:
         dirp.mkdir(parents=True, exist_ok=True, mode=0o700)
     except OSError as e:
@@ -2443,11 +2246,9 @@ _NOISE_LINE_RE = re.compile(
     r"session_id\s*:.*"      # hermes session footer
     r"|[↻⟳]?\s*(resumed|created|started)\s+session\b.*"  # hermes session banner
     r"|[A-Za-z0-9_\-]{8,}\s*\(\d+\s+user\s+messages?,\s*\d+\s+total\s+messages?\)"
-    r"|---+|={3,}|[-–—_]{3,}" # separator lines
     r"|\[.*\]\s*$"           # [bracket] meta lines
     r"|💭.*"                 # hermes thinking-emoji prefix
     r"|[└┌│╰╭─].*"           # box-drawing UI chrome
-    r"|\*\*[^*]+\*\*\s*$"   # **standalone bold header**
     r"|</?think>"            # <think> XML tags
     r"|Reasoning:\s*$"       # bare "Reasoning:" label
     r"|[✵✦✧★☆※].*"          # decorative symbol lines
@@ -2465,6 +2266,23 @@ _REASONING_LINE_RE = re.compile(
     r"i\s+could\s+use|it\s+seems|i\s+really\s+should|let\'?s\s+(see|make)|"
     r"perhaps\b|maybe\s+through\b)",
     re.IGNORECASE,
+)
+
+_RUNTIME_REASONING_FENCE_LANGUAGES = {"copy"}
+_RUNTIME_REASONING_HEADER_RE = re.compile(
+    r"^(?:💭\s*)?(?:(?:reasoning|chain\s+of\s+thought)\s*:?$|"
+    r"(?:checking|inspecting|reviewing|analyzing)\s+(?:the\s+)?"
+    r"(?:repository|repo|project|codebase|workspace|(?:source\s+)?files?|request|context)\b|"
+    r"(?:executing\s+updates?|doing\s+(?:work|the\s+task))\s*[.!…]*|"
+    r"先(?:检查|查看|分析|思考|规划|准备|执行|处理)(?:一下)?"
+    r"(?:仓库|代码|文件|上下文|问题|请求|任务))",
+    re.IGNORECASE,
+)
+_FENCE_LINE_RE = re.compile(
+    r"^(?P<container>(?:>\s*)*)(?P<marker>[`~]{3,})(?P<info>.*)$"
+)
+_THEMATIC_BREAK_RE = re.compile(
+    r"^(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$"
 )
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
@@ -2513,7 +2331,29 @@ def _strip_leading_non_cjk_preamble(lines: list[str]) -> list[str]:
     first_cjk = next((i for i, ln in enumerate(lines) if _CJK_RE.search(ln)), None)
     if first_cjk is None or first_cjk == 0:
         return lines
-    return lines[first_cjk:]
+
+    markdown_start: int | None = None
+    for i, line in enumerate(lines[:first_cjk]):
+        stripped = line.strip()
+        previous_is_text = i > 0 and bool(lines[i - 1].strip())
+        if previous_is_text and re.fullmatch(r"(?:=+|-+)", stripped):
+            markdown_start = i - 1
+            break
+        if _THEMATIC_BREAK_RE.fullmatch(stripped):
+            if i == 0:
+                markdown_start = 0
+                break
+            markdown_start = i - 1 if previous_is_text else i
+            break
+        if re.fullmatch(r"=+|-+", stripped):
+            continue
+        if re.match(
+            r"^\s*(?:#{1,6}\s|[-+*]\s|>\s|\d+[.)]\s|[`~]{3,}|\||\*\*|__)",
+            line,
+        ):
+            markdown_start = i
+            break
+    return lines[markdown_start if markdown_start is not None else first_cjk :]
 
 
 def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
@@ -2535,6 +2375,113 @@ def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
             out.append(lines[i])
             i += 1
     return out
+
+
+def _fence_line_parts(line: str) -> tuple[int, str, str] | None:
+    match = _FENCE_LINE_RE.match(line.strip())
+    if not match:
+        return None
+    depth = match.group("container").count(">")
+    return depth, match.group("marker"), match.group("info").strip()
+
+
+def _blockquote_depth(line: str) -> int:
+    match = re.match(r"^(?P<container>(?:>\s*)*)", line.lstrip())
+    return match.group("container").count(">") if match else 0
+
+
+def _strip_blockquote_container(line: str, depth: int) -> str:
+    value = line.lstrip()
+    for _ in range(depth):
+        if not value.startswith(">"):
+            break
+        value = value[1:]
+        value = value.lstrip()
+    return value.strip()
+
+
+def _dedupe_reply_lines(lines: list[str]) -> list[str]:
+    """Collapse repeated prose while leaving fenced code untouched."""
+    out: list[str] = []
+    prose: list[str] = []
+    fence_depth = 0
+    fence_char = ""
+    fence_length = 0
+
+    def flush_prose() -> None:
+        if not prose:
+            return
+        consecutive: list[str] = []
+        for line in prose:
+            if not consecutive or consecutive[-1] != line:
+                consecutive.append(line)
+        out.extend(_collapse_repeated_line_blocks(consecutive))
+        prose.clear()
+
+    for line in lines:
+        fence = _fence_line_parts(line)
+        depth, marker, info = fence if fence else (0, "", "")
+
+        if (
+            fence_char
+            and fence_depth > 0
+            and line.strip()
+            and _blockquote_depth(line) < fence_depth
+        ):
+            fence_depth = 0
+            fence_char = ""
+            fence_length = 0
+
+        if not fence_char:
+            if marker:
+                flush_prose()
+                fence_depth = depth
+                fence_char = marker[0]
+                fence_length = len(marker)
+                out.append(line)
+            else:
+                prose.append(line)
+            continue
+
+        out.append(line)
+        if (
+            marker
+            and depth == fence_depth
+            and marker[0] == fence_char
+            and len(marker) >= fence_length
+            and not info
+        ):
+            fence_depth = 0
+            fence_char = ""
+            fence_length = 0
+
+    flush_prose()
+    return out
+
+
+def _is_runtime_reasoning_fence(info: str, content: list[str], depth: int) -> bool:
+    language = info.split(maxsplit=1)[0].casefold() if info else ""
+    if language not in _RUNTIME_REASONING_FENCE_LANGUAGES:
+        return False
+
+    inspections = []
+    for line in content:
+        inspection = _strip_blockquote_container(line, depth)
+        emoji = ""
+        if inspection.startswith("💭"):
+            emoji = "💭 "
+            inspection = inspection[1:].lstrip()
+        for wrapper in ("**", "__"):
+            if inspection.startswith(wrapper) and inspection.endswith(wrapper):
+                inspection = inspection[len(wrapper) : -len(wrapper)].strip()
+                break
+        inspection = emoji + inspection
+        if inspection:
+            inspections.append(inspection)
+
+    if not inspections:
+        return False
+    return bool(_RUNTIME_REASONING_HEADER_RE.match(inspections[0]))
 
 
 def _strip_reasoning_sections(raw: str) -> str:
@@ -2779,8 +2726,8 @@ def _reply_from_json_obj(obj: Any) -> str:
     if marker in _JSON_NON_FINAL_EVENTS:
         return ""
 
-    for reply_field in _JSON_REPLY_FIELDS:
-        value = obj.get(reply_field)
+    for field in _JSON_REPLY_FIELDS:
+        value = obj.get(field)
         if isinstance(value, str) and value.strip():
             return value.strip()
         if isinstance(value, (dict, list)):
@@ -4285,10 +4232,11 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     """Whether foreground turns get a resident-injected recent-chat transcript.
 
     Gated so we don't double up context for agents that already carry it:
-    codex (no --resume) injects every turn in ``auto``. A self-hosted resident's
-    local claude has a reliable --resume, so it keeps its persistent session and
-    never injects in ``auto`` — injection would suppress --resume (see
-    _prepare_cli_command) and cold-
+    codex (no --resume) injects every turn in ``auto``. claude injects only when
+    HOSTED (in-CVM, no durable session store — its scrape + --resume continuity
+    is unreliable there); a self-hosted resident's local claude has a reliable
+    --resume, so it keeps its persistent session and never injects in ``auto``
+    — injection would suppress --resume (see _prepare_cli_command) and cold-
     start a fresh model session on EVERY message, which made boot-ritual
     personas replay their arrival greeting per turn (the "来了" loop,
     usr_c190 2026-07-16; regression introduced by 7f3ff266). pi resumes
@@ -4299,7 +4247,8 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     A claude command that ALREADY carries its own continuity in the operator's
     template (``--resume`` / ``-r`` / ``--session-id``) is skipped in ``auto``
     too: it has native session, so a resident transcript would double-supply
-    context."""
+    context. The hosted default claude command has none of these, so it still
+    injects."""
     mode = FOREGROUND_CHAT_CONTEXT_MODE
     if mode in {"0", "false", "off", "no", "none", "disabled"}:
         return False
@@ -4309,7 +4258,9 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     if _is_codex_cmd(cmd):
         return True
     if _is_claude_code_cmd(cmd):
-        return False
+        if _has_cli_resume(cmd) or _has_claude_session_id(cmd):
+            return False
+        return _HOSTED
     if _is_pi_cmd(cmd):
         # pi resumes natively, so inside one session re-feeding the transcript is pure
         # waste. But every NEW session starts blank — rotation (AGENT_SESSION_MAX_TURNS),
@@ -5397,49 +5348,100 @@ def call_agent_cli(
 
 
 def _sanitize_reply_text(text: str) -> str:
-    """Strip formatting/system leakage and collapse accidental duplication."""
+    """Strip system leakage without rewriting user-visible Markdown."""
     if not isinstance(text, str):
         return ""
 
-    text = text.replace("\r\n", "\n")
-    text = text.strip()
-    if not text:
+    text = text.replace("\r\n", "\n").strip("\n")
+    if not text.strip():
         return ""
 
     kept: list[str] = []
-    for raw_ln in text.splitlines():
-        ln = raw_ln.strip()
-        if not ln:
+    dropped_leading_runtime = False
+    raw_lines = text.splitlines()
+    i = 0
+    while i < len(raw_lines):
+        raw_ln = raw_lines[i]
+        line = raw_ln.rstrip()
+        stripped = line.strip()
+
+        fence = _fence_line_parts(raw_ln)
+        if fence:
+            depth, marker, info = fence
+            block_end = i + 1
+            explicitly_closed = False
+            while block_end < len(raw_lines):
+                closing = _fence_line_parts(raw_lines[block_end])
+                if (
+                    closing
+                    and closing[0] == depth
+                    and closing[1][0] == marker[0]
+                    and len(closing[1]) >= len(marker)
+                    and not closing[2]
+                ):
+                    explicitly_closed = True
+                    break
+                if (
+                    depth > 0
+                    and raw_lines[block_end].strip()
+                    and _blockquote_depth(raw_lines[block_end]) < depth
+                ):
+                    break
+                block_end += 1
+            content = raw_lines[i + 1 : block_end]
+            slice_end = block_end + 1 if explicitly_closed else block_end
+            if not _is_runtime_reasoning_fence(info, content, depth):
+                kept.extend(raw_lines[i:slice_end])
+            elif not kept:
+                dropped_leading_runtime = True
+            i = slice_end
             continue
-        if _NOISE_LINE_RE.match(ln):
+
+        if not stripped:
+            if kept and kept[-1] != "":
+                kept.append("")
+            i += 1
             continue
-        if _IDENTITY_LEAK_RE.search(ln):
+        if _NOISE_LINE_RE.match(stripped):
+            if not kept:
+                dropped_leading_runtime = True
+            i += 1
             continue
-        if _REASONING_LINE_RE.match(ln):
+
+        if (
+            not kept
+            and dropped_leading_runtime
+            and _THEMATIC_BREAK_RE.fullmatch(stripped)
+        ):
+            i += 1
             continue
-        # Remove markdown-ish wrappers/bullets and decorative prefixes.
-        ln = re.sub(r"^[`#>*\-\s]+", "", ln).strip()
-        ln = re.sub(r"^[—–-]+\s*", "", ln).strip()
-        if not ln:
+
+        inspection = re.sub(r"^[`#>*\-\s]+", "", stripped).strip()
+        inspection = re.sub(r"[`*_]+$", "", inspection).strip()
+        if _IDENTITY_LEAK_RE.search(inspection):
+            if not kept:
+                dropped_leading_runtime = True
+            i += 1
             continue
-        kept.append(ln)
+        if _REASONING_LINE_RE.match(inspection):
+            if not kept:
+                dropped_leading_runtime = True
+            i += 1
+            continue
+        kept.append(line)
+        i += 1
 
     if not kept:
         return ""
+
+    while kept and kept[-1] == "":
+        kept.pop()
 
     kept = _strip_leading_non_cjk_preamble(kept)
     if not kept:
         return ""
 
-    # Dedup consecutive identical lines.
-    deduped: list[str] = []
-    for ln in kept:
-        if not deduped or deduped[-1] != ln:
-            deduped.append(ln)
-
-    deduped = _collapse_repeated_line_blocks(deduped)
-
-    return "\n".join(deduped).strip()
+    return "\n".join(_dedupe_reply_lines(kept)).strip("\n")
 
 
 def _cap_agent_replies(replies: list[str], max_items: int | None = None) -> list[str]:
@@ -5619,11 +5621,6 @@ _whoami_cache: dict = {
 # keys; 0.0 until the first success so the first reply still fetches.
 _whoami_cache_loaded_at: float = 0.0
 
-
-class _AgentActionPreflightRejectedError(RuntimeError):
-    """Local validation rejected the action before any endpoint was called."""
-
-
 def execute_identity_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
@@ -5671,11 +5668,7 @@ def execute_agent_actions(actions: list[dict]) -> dict:
         else:
             unsupported.append(action_type)
     if unsupported:
-        # No endpoint has been called yet, so this is a definite rejection rather
-        # than an ambiguous transport outcome.
-        raise _AgentActionPreflightRejectedError(
-            f"unsupported_agent_actions:{unsupported}"
-        )
+        raise RuntimeError(f"unsupported_agent_actions:{unsupported}")
     identity_result = execute_identity_actions(identity_actions)
     memory_result = execute_memory_actions(memory_actions)
     return {
@@ -5692,19 +5685,6 @@ def _identity_action_failure_reply(source_message: str) -> str:
     return "I could not write that update, so I will not pretend it changed."
 
 
-def _identity_action_indeterminate_reply(source_message: str) -> str:
-    """Honest recovery text for a crash during a non-idempotent action call."""
-    if re.search(r"[\u4e00-\u9fff]", source_message or ""):
-        return (
-            "我没法确认刚才的更新是否已经写入，所以不会自动重试，避免重复修改。"
-            "请先检查一下，再决定是否重试。"
-        )
-    return (
-        "I could not confirm whether that update finished, so I will not retry it "
-        "automatically and risk applying it twice. Please check before retrying."
-    )
-
-
 def _identity_action_success_reply(source_message: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", source_message or ""):
         return "改好了。"
@@ -5715,11 +5695,6 @@ def _identity_action_success_reply(source_message: str) -> str:
 # restart with a stale checkpoint or if poll races with checkpoint save.
 _seen_ids: set[str] = set()
 _seen_ids_order: list[str] = []
-_PENDING_REPLY_RETRY_MAX = 256
-_pending_reply_retries: dict[str, dict[str, Any]] = {}
-_pending_reply_retry_order: list[str] = []
-_pending_reply_retry_checkpoint_loaded = False
-_pending_reply_retry_restore_error = ""
 _SEEN_MAX = 500
 
 # Persisted agent conversation session id (for CLI agents like Hermes), keyed by user_id.
@@ -5965,7 +5940,8 @@ def _fetch_user_mcp_envelopes() -> dict:
 def _decrypt_envelope(envelope: dict) -> bytes:
     """Decrypt a caller-owned v1 envelope through the enclave. Same crypto path
     the consumer already uses for chat/memory — no new trust surface. Auth rides
-    the shared API-key ``_HEADERS``."""
+    the shared ``_HEADERS`` (runtime-token or api-key, kept fresh by
+    ``_refresh_auth_header``)."""
     if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
         raise RuntimeError("enclave_unavailable")
     resp = _ENCLAVE_CLIENT.post(
@@ -6247,6 +6223,19 @@ def _maybe_apply_user_mcp() -> None:
     global _user_mcp_applied
     target = str(_user_mcp_advertised.get("fingerprint") or "")
     if target == (_user_mcp_applied.get("fingerprint") or ""):
+        return
+    if not FEEDLING_API_KEY and not _USER_MCP_PATHS_PINNED:
+        # Known-collision scenario (see _USER_MCP_PATHS_PINNED): keyless
+        # consumer + default /tmp paths shared with every co-hosted user.
+        # Fail safe: user MCP stays off. Record the fingerprint so this
+        # doesn't re-log on every poll; don't fetch/decrypt the envelopes.
+        log.error(
+            "[user_mcp] refusing to materialize: FEEDLING_API_KEY is empty "
+            "and USER_MCP_* paths were not pinned via env — the shared /tmp "
+            "defaults would leak this user's MCP url/auth headers to every "
+            "co-hosted agent. Fix the spawner to set USER_MCP_FILE/"
+            "USER_MCP_CA_FILE/USER_MCP_CASTORE_FILE per user.")
+        _user_mcp_applied = {"fingerprint": target, "servers": []}
         return
     try:
         servers: list[dict] = []
@@ -6597,7 +6586,6 @@ def post_reply(
     thinking_native: bool | None = None,
     role: str = "",
     notice_kind: str = "",
-    delivery_id: str = "",
     turn_failure_error_class: str = "",
     turn_failure_blame: str = "",
     turn_failure_user_text: str = "",
@@ -6640,9 +6628,6 @@ def post_reply(
                 user_pk_bytes=seal_user_pk,
                 enclave_pk_bytes=seal_enc_pk,
                 visibility=visibility,
-                # Deterministic bubble id (pre): the delivery_id makes the resident
-                # reply envelope idempotent across retries/restarts.
-                item_id=(delivery_id or None),
             )
             thinking_envelope = None
             safe_thinking = _sanitize_thinking_summary(thinking_summary)
@@ -6683,8 +6668,6 @@ def post_reply(
                 body["turn_failure_user_text"] = turn_failure_user_text
             if reply_to_message_id:
                 body["reply_to_message_id"] = reply_to_message_id
-            if delivery_id:
-                body["resident_delivery_id"] = delivery_id
             if gate_decision_id:
                 body["gate_decision_id"] = gate_decision_id
             if proactive_job_id:
@@ -6737,7 +6720,6 @@ def post_reply(
             "gate_decision_id": gate_decision_id,
             "proactive_job_id": proactive_job_id,
             "reply_to_message_id": reply_to_message_id,
-            "resident_delivery_id": delivery_id,
             "thinking_summary": _sanitize_thinking_summary(thinking_summary),
             "thinking_kind": _sanitize_thinking_kind(thinking_kind),
             "thinking_source": _sanitize_thinking_meta(thinking_source, max_len=80),
@@ -6749,25 +6731,6 @@ def post_reply(
         headers=_HEADERS, timeout=15,
     )
     return _handle_post_reply_response(resp)
-
-
-def _resident_reply_delivery_id(parent_message_id: str, slot: str) -> str:
-    """Stable opaque idempotency key for one resident turn bubble.
-
-    Intermediate ordinals and the terminal bubble use separate namespaces, so
-    a retry that changes the number of intermediate bubbles still converges on
-    one terminal reply. The API key makes the deterministic value opaque to
-    observers while keeping it stable across resident process restarts.
-    """
-    material = (
-        "feedling-resident-reply-v1\0"
-        + str(parent_message_id or "")
-        + "\0"
-        + str(slot or "")
-    ).encode("utf-8")
-    return hmac.new(
-        FEEDLING_API_KEY.encode("utf-8"), material, hashlib.sha256
-    ).hexdigest()[:32]
 
 
 def _is_fpr_mismatch_response(resp) -> bool:
@@ -6805,12 +6768,6 @@ def _handle_post_reply_response(resp) -> dict:
                 body.get("memory_count"),
                 body.get("identity_written"),
             )
-            return body
-        if body.get("error") == "already_answered":
-            # This is an authoritative terminal outcome: another responder (or
-            # the same delivery replayed after cutover) already won the parent
-            # CAS. Returning the structured body lets the caller clear recovery
-            # state and advance without emitting a duplicate failure notice.
             return body
     resp.raise_for_status()
     try:
@@ -7772,6 +7729,7 @@ def _capture_get_json(
     timeout: int = 15,
     base_url: str | None = None,
 ) -> dict:
+    _refresh_auth_header()
     root = (base_url or FEEDLING_API_URL).rstrip("/")
     try:
         resp = _client_for(root).get(
@@ -7795,6 +7753,7 @@ def _capture_post_json(
     timeout: int = 20,
     base_url: str | None = None,
 ) -> dict:
+    _refresh_auth_header()
     root = (base_url or FEEDLING_API_URL).rstrip("/")
     try:
         resp = _client_for(root).post(
@@ -9307,120 +9266,10 @@ def _quoted_memory_context(msg: dict) -> str:
     )
 
 
-def _post_prepared_replies(prepared: dict[str, Any]) -> tuple[bool, bool]:
-    """Post an already action-processed turn using stable delivery ids.
-
-    Returns ``(terminal_reply_posted, terminal_response_error)``. Keeping this
-    operation separate lets a redelivery retry only the failed durable chat
-    write; it never calls the provider or repeats agent actions.
-    """
-    replies = list(prepared.get("replies") or [])
-    reply_to_message_id = str(prepared.get("reply_to_message_id") or "")
-    prepared_source = str(prepared.get("source") or "")
-    terminal_reply_posted = False
-    terminal_response_error = False
-    for idx, reply in enumerate(replies):
-        is_terminal_reply = idx == len(replies) - 1
-        try:
-            post_kwargs: dict[str, Any] = {}
-            # resident_maintenance replies stay visible in history but must never
-            # surface as push/bootstrap — tag the source and suppress the alert.
-            if prepared_source == RESIDENT_MAINTENANCE_SOURCE:
-                post_kwargs["source"] = RESIDENT_MAINTENANCE_SOURCE
-                post_kwargs["suppress_push"] = True
-            if reply_to_message_id:
-                slot = "terminal" if is_terminal_reply else f"intermediate:{idx}"
-                post_kwargs["delivery_id"] = _resident_reply_delivery_id(
-                    reply_to_message_id, slot)
-                # Only the terminal bubble consumes the parent's one-answer
-                # CAS. Intermediate progress bubbles remain fenced writes.
-                if is_terminal_reply:
-                    post_kwargs["reply_to_message_id"] = reply_to_message_id
-            if idx == 0 and prepared.get("thinking_summary"):
-                post_kwargs["thinking_summary"] = prepared["thinking_summary"]
-                post_kwargs["thinking_kind"] = prepared.get("thinking_kind") or ""
-                post_kwargs["thinking_source"] = prepared.get("thinking_source") or ""
-                post_kwargs["thinking_model"] = prepared.get("thinking_model") or ""
-                post_kwargs["thinking_native"] = prepared.get("thinking_native")
-            # Fallback replies carry turn-failure metadata for the client to
-            # render (spec 2026-07-18 §2.2). A non-null pending_failure_notice
-            # means this turn was papered over by a fallback bubble, not a real
-            # reply — tag only the first bubble. Classified here (not stored)
-            # so the crash-recovery retry path reclassifies from the restored
-            # notice; str(exc)-based classification survives that round-trip.
-            if idx == 0:
-                notice = prepared.get("pending_failure_notice")
-                if notice is not None:
-                    post_kwargs.update(
-                        turn_failure_post_kwargs(classify_agent_error(notice))
-                    )
-            result = post_reply(reply, **post_kwargs)
-            if isinstance(result, dict) and result.get("error"):
-                if result.get("error") in {"bootstrap_incomplete", "already_answered"}:
-                    terminal_response_error = True
-                    log.error(
-                        "reply reached terminal response error=%s; advancing without retry",
-                        result.get("error"),
-                    )
-                    break
-                raise RuntimeError(str(result)[:500])
-            if is_terminal_reply:
-                terminal_reply_posted = True
-            log.info("reply sent: %s", reply[:80])
-        except Exception as exc:
-            log.error("failed to post reply: %s", exc)
-            # Preserve bubble ordering. If an intermediate write is uncertain,
-            # do not let the terminal overtake it; retry the complete prepared
-            # sequence (server-side stable delivery ids dedupe accepted bubbles).
-            break
-    return terminal_reply_posted, terminal_response_error
-
-
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
     global _last_user_message_wall
     latest = 0.0
-    _restore_pending_reply_retry()
-    if _pending_reply_retry_restore_error:
-        error = _CheckpointStateError(_pending_reply_retry_restore_error)
-        _report_runtime_error(str(error), _checkpoint_runtime_error_class(error))
-        raise error
-    if _pending_reply_retry_order:
-        oldest_pending = _pending_reply_retry_order[0]
-        batch_keys = [
-            _msg_key(item)
-            for item in messages
-            if isinstance(item, dict) and item.get("role") == "user"
-        ]
-        if oldest_pending not in batch_keys:
-            # A terminal insert may have committed even though its HTTP response
-            # was lost. In that case the parent is already marked replied and the
-            # poll endpoint will correctly NEVER redeliver it. Retry the encrypted
-            # prepared turn directly before touching newer messages: the stable
-            # delivery id yields an idempotent replay/already_answered response.
-            log.warning(
-                "retrying pending reply key=%s ahead of newer chat batch",
-                oldest_pending,
-            )
-            prepared = _pending_reply_retries[oldest_pending]
-            replies = list(prepared.get("replies") or [])
-            if not replies:
-                log.critical(
-                    "pending reply key=%s has no prepared replies; refusing checkpoint advance",
-                    oldest_pending,
-                )
-                return latest
-            terminal_reply_posted, terminal_response_error = (
-                _post_prepared_replies(prepared)
-            )
-            if not terminal_reply_posted and not terminal_response_error:
-                return latest
-            source_ts = float(prepared.get("source_ts") or 0.0)
-            _drop_pending_reply_retry(oldest_pending, completed_ts=source_ts)
-            pending_notice = prepared.get("pending_failure_notice")
-            if pending_notice is not None and terminal_reply_posted:
-                _notify_agent_turn_failure(pending_notice, foreground=True)
-            latest = max(latest, source_ts)
     for msg in messages:
         # Tolerate both "ts" and "timestamp" key names across API versions.
         ts = float(msg.get("ts", msg.get("timestamp", 0)) or 0)
@@ -9431,22 +9280,6 @@ def _process_messages(messages: list) -> float:
 
         # Idempotency — skip messages already processed in this session.
         key = _msg_key(msg)
-        pending_retry = _pending_reply_retries.get(key)
-        if pending_retry is not None:
-            terminal_reply_posted, terminal_response_error = (
-                _post_prepared_replies(pending_retry)
-            )
-            replies = list(pending_retry.get("replies") or [])
-            if replies and not terminal_reply_posted and not terminal_response_error:
-                # Keep both the durable checkpoint and prepared turn behind this
-                # message; the next poll retries only the stable reply writes.
-                return latest
-            _drop_pending_reply_retry(key, completed_ts=ts)
-            pending_notice = pending_retry.get("pending_failure_notice")
-            if pending_notice is not None and terminal_reply_posted:
-                _notify_agent_turn_failure(pending_notice, foreground=True)
-            latest = max(latest, ts)
-            continue
         if not _mark_seen(key):
             log.debug("skipping already-processed message key=%s", key)
             latest = max(latest, ts)
@@ -9531,7 +9364,6 @@ def _process_messages(messages: list) -> float:
             continue
 
         content = str(msg.get("content") or "").strip()
-        source_message_text = content
         content_type = msg.get("content_type", "text")
         image_payloads: list[dict[str, str]] = []
         image_paths: list[str] = []
@@ -9663,7 +9495,7 @@ def _process_messages(messages: list) -> float:
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
-        # 服务端接受 terminal reply 后再发（Codex review）：claim 过期 failover 时另
+        # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
         # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
         # 发就成了重复错误气泡。让通知与回复共享同一份排他性。
         pending_failure_notice: BaseException | None = None
@@ -9726,96 +9558,65 @@ def _process_messages(messages: list) -> float:
                 action for action in actions
                 if _proactive_action_type(action).removeprefix("proactive.") != "needs_background"
             ]
-        reply_to_message_id = str(
-            msg.get("id") or msg.get("message_id") or ""
-        ).strip()
         if actions:
-            # Write-ahead recovery makes action execution at-most-once across a
-            # resident crash. If the process dies after the API accepts a
-            # memory.add but before the terminal chat write, restart posts this
-            # honest indeterminate/failure reply and NEVER calls the action API
-            # again. Once the action returns, the prepared reply is replaced
-            # durably below before any chat write is attempted.
-            action_recovery_reply = {
-                "replies": (_identity_action_indeterminate_reply(source_message_text),),
-                "reply_to_message_id": reply_to_message_id,
-                "source": source,
-                "thinking_summary": turn.thinking_summary,
-                "thinking_kind": turn.thinking_kind,
-                "thinking_source": turn.thinking_source,
-                "thinking_model": turn.thinking_model,
-                "thinking_native": turn.thinking_native,
-                "pending_failure_notice": pending_failure_notice,
-                "source_ts": ts,
-            }
-            action_write_ahead_ok = _cache_pending_reply_retry(
-                key, action_recovery_reply
-            )
-            if key not in _pending_reply_retries:
-                # Defensive cache-pressure path: no action has run, the seen
-                # marker was removed, and stopping here lets redelivery retry.
-                return latest
-            if not action_write_ahead_ok:
-                log.error(
-                    "action recovery checkpoint unavailable; refusing non-idempotent actions"
+            try:
+                action_result = execute_agent_actions(actions)
+                log.info(
+                    "agent action(s) executed count=%d effects=%d",
+                    len(actions),
+                    len(action_result.get("effects") or []),
                 )
-                replies = [_identity_action_failure_reply(source_message_text)]
-            else:
-                try:
-                    action_result = execute_agent_actions(actions)
-                    log.info(
-                        "agent action(s) executed count=%d effects=%d",
-                        len(actions),
-                        len(action_result.get("effects") or []),
+                if not replies:
+                    replies = [_identity_action_success_reply(content)]
+            except Exception as e:
+                log.error("agent action execution failed; suppressing optimistic agent reply: %s", e)
+                replies = [_identity_action_failure_reply(content)]
+
+        reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
+        posted_any = False
+        terminal_response_error = False
+        for idx, reply in enumerate(replies):
+            try:
+                post_kwargs = {}
+                if source == RESIDENT_MAINTENANCE_SOURCE:
+                    post_kwargs["source"] = RESIDENT_MAINTENANCE_SOURCE
+                    post_kwargs["suppress_push"] = True
+                if reply_to_message_id:
+                    post_kwargs["reply_to_message_id"] = reply_to_message_id
+                if idx == 0 and turn.thinking_summary:
+                    post_kwargs["thinking_summary"] = turn.thinking_summary
+                    post_kwargs["thinking_kind"] = turn.thinking_kind
+                    post_kwargs["thinking_source"] = turn.thinking_source
+                    post_kwargs["thinking_model"] = turn.thinking_model
+                    post_kwargs["thinking_native"] = turn.thinking_native
+                # 兜底回复才带失败元信息：pending_failure_notice 非空即表示本轮是
+                # 兜底糊的、不是真回复。只给第一条（兜底只有一条）。后台车道的
+                # post_kwargs（proactive 那处）刻意不带——后台失败不进聊天流。
+                if idx == 0 and pending_failure_notice is not None:
+                    post_kwargs.update(
+                        turn_failure_post_kwargs(classify_agent_error(pending_failure_notice))
                     )
-                    if not replies:
-                        replies = [_identity_action_success_reply(source_message_text)]
-                except _AgentActionPreflightRejectedError as e:
-                    log.error(
-                        "agent action request was rejected; suppressing optimistic reply: %s",
-                        e,
-                    )
-                    replies = [_identity_action_failure_reply(source_message_text)]
-                except Exception as e:
-                    # Transport loss, 5xx, invalid success payloads, and partial
-                    # multi-endpoint execution cannot prove whether an update
-                    # committed. Never turn that uncertainty into a false denial.
-                    log.error(
-                        "agent action outcome is indeterminate; suppressing optimistic reply: %s",
-                        e,
-                    )
-                    replies = [_identity_action_indeterminate_reply(source_message_text)]
+                result = post_reply(reply, **post_kwargs)
+                if isinstance(result, dict) and result.get("error"):
+                    if result.get("error") == "bootstrap_incomplete":
+                        terminal_response_error = True
+                        log.error("reply rejected by bootstrap gate; advancing past this dead-end message")
+                        continue
+                    raise RuntimeError(str(result)[:500])
+                posted_any = True
+                log.info("reply sent: %s", reply[:80])
+            except Exception as e:
+                log.error("failed to post reply: %s", e)
 
-        prepared_reply = {
-            "replies": tuple(replies),
-            "reply_to_message_id": reply_to_message_id,
-            "source": source,
-            "thinking_summary": turn.thinking_summary,
-            "thinking_kind": turn.thinking_kind,
-            "thinking_source": turn.thinking_source,
-            "thinking_model": turn.thinking_model,
-            "thinking_native": turn.thinking_native,
-            "pending_failure_notice": pending_failure_notice,
-            "source_ts": ts,
-        }
-        if replies:
-            _cache_pending_reply_retry(key, prepared_reply)
-            if key not in _pending_reply_retries:
-                return latest
-        terminal_reply_posted, terminal_response_error = (
-            _post_prepared_replies(prepared_reply)
-        )
+        if replies and not posted_any and not terminal_response_error:
+            # Keep checkpoint behind this message. The server-side claim lease
+            # will expire, allowing this or another responder to retry instead
+            # of permanently dropping a user turn after a transient write error.
+            # pending_failure_notice 随之丢弃：本家的回复没被接受（含 already_
+            # answered 409 failover），错误通知由真正被接受的那次尝试来发。
+            continue
 
-        if replies and not terminal_reply_posted and not terminal_response_error:
-            # Stop the batch here. Processing a newer turn would move the
-            # timestamp cursor beyond this one and make the redelivery floor
-            # classify the unresolved parent as superseded.
-            return latest
-
-        if replies:
-            _drop_pending_reply_retry(key, completed_ts=ts)
-
-        if pending_failure_notice is not None and terminal_reply_posted:
+        if pending_failure_notice is not None and posted_any:
             _notify_agent_turn_failure(pending_failure_notice, foreground=True)
 
         latest = max(latest, ts)
@@ -9965,7 +9766,7 @@ def _window_document(text: str, *, max_chars: int = 18000, overlap_lines: int = 
         if cur_len >= max_chars:
             windows.append("\n".join(cur))
             cur = cur[-overlap_lines:] if overlap_lines > 0 else []
-            cur_len = sum(len(line) + 1 for line in cur)
+            cur_len = sum(len(l) + 1 for l in cur)
     tail = "\n".join(cur).strip()
     if tail and (not windows or "\n".join(cur) != windows[-1]):
         windows.append("\n".join(cur))
@@ -10459,22 +10260,7 @@ def run() -> None:
             "Set FEEDLING_ENCLAVE_URL (direct enclave) to fix this."
         )
 
-    try:
-        last_ts = _load_checkpoint()
-    except _CheckpointStateError as exc:
-        _report_runtime_error(str(exc), _checkpoint_runtime_error_class(exc))
-        log.critical("resident checkpoint cannot be trusted; exiting: %s", exc)
-        raise
-
-    # Validate/decrypt pending recovery before history seeding or any checkpoint
-    # save. Otherwise malformed state could be mistaken for a fresh install and
-    # overwritten, erasing the only evidence of an already-executed action.
-    _restore_pending_reply_retry()
-    if _pending_reply_retry_restore_error:
-        exc = _CheckpointStateError(_pending_reply_retry_restore_error)
-        _report_runtime_error(str(exc), "resident_checkpoint_corrupt")
-        log.critical("pending reply recovery cannot be trusted; exiting: %s", exc)
-        raise exc
+    last_ts = _load_checkpoint()
 
     if last_ts == 0.0:
         try:
@@ -10483,18 +10269,13 @@ def run() -> None:
         except Exception as e:
             log.warning("could not seed from history: %s", e)
 
-    try:
-        _save_checkpoint(last_ts)
-        last_job_ts = _load_proactive_checkpoint()
-    except _CheckpointStateError as exc:
-        _report_runtime_error(str(exc), _checkpoint_runtime_error_class(exc))
-        log.critical("resident checkpoint initialization failed; exiting: %s", exc)
-        raise
+    _save_checkpoint(last_ts)
     # Wedge guard: consecutive poll cycles where the claimed ids never show up in
     # decrypt history, keyed on the cursor they're stuck behind (see
     # _advance_past_unfetchable). After CHAT_POLL_WEDGE_SKIP_AFTER we skip past them.
     wedge_miss_ts: float | None = None
     wedge_miss_count = 0
+    last_job_ts = _load_proactive_checkpoint()
     proactive_enabled = PROACTIVE_POLL_ENABLED
     # Unconditional: see the resident-distill contract note above. Only the 404
     # capability probe below may flip this off for the process lifetime.
@@ -10503,14 +10284,7 @@ def run() -> None:
         # Start from "now" on first boot so historical hidden jobs are not
         # replayed after an operator installs the consumer.
         last_job_ts = time.time()
-        try:
-            _save_proactive_checkpoint(last_job_ts)
-        except _CheckpointStateError as exc:
-            _report_runtime_error(str(exc), _checkpoint_runtime_error_class(exc))
-            log.critical(
-                "initial proactive checkpoint write failed; exiting: %s", exc
-            )
-            raise
+        _save_proactive_checkpoint(last_job_ts)
     last_broadcast_state = ""
     next_proactive_tick_mono = time.monotonic() + max(0, PROACTIVE_TICK_START_DELAY_SEC)
     scheduled_fire_enabled = proactive_enabled and PROACTIVE_SCHEDULED_FIRE_ENABLED
@@ -10540,6 +10314,7 @@ def run() -> None:
 
     while _running:
         try:
+            _refresh_auth_header()  # pick up a freshly-minted runtime token (Stage D)
             if capture_tick_enabled and time.monotonic() >= next_capture_tick_mono:
                 try:
                     capture_result = fire_capture_tick()
@@ -10803,10 +10578,6 @@ def run() -> None:
                     sys.exit(1)
             consecutive_errors += 1
             time.sleep(min(2 ** consecutive_errors, 60))
-        except _CheckpointStateError as e:
-            _report_runtime_error(str(e), _checkpoint_runtime_error_class(e))
-            log.critical("resident checkpoint became untrustworthy; exiting: %s", e)
-            raise
         except Exception as e:
             log.error("poll error: %s", e)
             consecutive_errors += 1

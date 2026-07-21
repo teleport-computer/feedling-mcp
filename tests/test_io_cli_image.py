@@ -65,8 +65,9 @@ def test_materialize_handles_data_url_prefix(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Hardening (added with the cross-user-leak sweep): decrypted images must not be
-# world-readable on a shared host. The dir is 0700 and the file 0600, parity
-# with chat_resident_consumer's _write_scratch_file.
+# world-readable on a shared host, and a keyless-unpinned tool must refuse to
+# write into the shared /tmp default. Parity with chat_resident_consumer's
+# _write_scratch_file / _chat_scratch_write_allowed.
 # ---------------------------------------------------------------------------
 
 
@@ -79,6 +80,16 @@ def test_materialize_image_is_0600(tmp_path, monkeypatch):
     assert Path(path).read_bytes() == _PIXELS
     assert (os.stat(path).st_mode & 0o777) == 0o600
     assert (os.stat(tmp_path / "imgs").st_mode & 0o777) == 0o700
+
+
+def test_materialize_refuses_keyless_unpinned(monkeypatch):
+    monkeypatch.delenv("IMAGE_TEMP_DIR", raising=False)
+    monkeypatch.setenv("FEEDLING_API_KEY", "")
+    out = io_cli._materialize_decrypted_image(
+        "pfx", {"image_b64": base64.b64encode(_PIXELS).decode(), "image_mime": "image/png"})
+    assert "image_error" in out
+    assert "image_file" not in out
+    assert "image_b64" in out  # left intact for graceful degrade
 
 
 # ---------------------------------------------------------------------------
