@@ -49,6 +49,8 @@ EXPECTED_PUBLIC_OPERATIONS = {
 }
 
 EXPECTED_API_KEY_ONLY_OPERATIONS = {
+    ("get", "/v1/web/settings"),
+    ("post", "/v1/web/settings"),
     ("post", "/v1/access/link-token"),
     ("post", "/v1/account/reset"),
     ("get", "/v1/mcp/servers"),
@@ -573,3 +575,49 @@ def test_every_reference_resolves_to_a_component(public_schema: dict[str, Any]) 
     for ref in refs:
         resolved = _resolve_local_ref(public_schema, ref)
         assert isinstance(resolved, dict) and resolved, ref
+
+
+def test_web_settings_contract_is_precise_not_free_form(
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    """The toggle is a security-relevant control plane, so its contract has to
+    be spelled out: a FreeFormJsonObject body would let a client send
+    `{"enabled": "no"}` and only find out at runtime that it is a 400."""
+    post = operations[("post", "/v1/web/settings")]
+    body = post["requestBody"]
+    assert body["required"] is True
+    assert body["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WebSettingsUpdateRequest"
+    }
+    assert post["x-feedling-contract-level"] == "documented"
+
+    for verb in ("get", "post"):
+        response = operations[(verb, "/v1/web/settings")]["responses"]["200"]
+        assert response["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/WebSettingsResponse"
+        }, verb
+
+
+def test_web_settings_schemas_pin_the_field_types(
+    public_schema: dict[str, Any],
+) -> None:
+    components = public_schema["components"]["schemas"]
+
+    request = components["WebSettingsUpdateRequest"]
+    assert request["required"] == ["enabled"]
+    assert request["properties"]["enabled"]["type"] == "boolean"
+    assert request["additionalProperties"] is False
+
+    response = components["WebSettingsResponse"]
+    assert set(response["required"]) == {
+        "enabled", "available", "effective", "unavailable_reason", "capabilities",
+    }
+    for field in ("enabled", "available", "effective"):
+        assert response["properties"][field]["type"] == "boolean", field
+    reason = response["properties"]["unavailable_reason"]
+    assert reason["nullable"] is True
+    assert set(reason["enum"]) == {"globally_disabled", None}
+    capabilities = response["properties"]["capabilities"]
+    assert set(capabilities["required"]) == {"search", "fetch"}
+    for field in ("search", "fetch"):
+        assert capabilities["properties"][field]["type"] == "boolean", field

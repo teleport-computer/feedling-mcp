@@ -7073,11 +7073,11 @@
         "operationId": "web_settings_get_v1_web_settings_get",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Current web-search state for the authenticated user.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/WebSettingsResponse"
                 }
               }
             }
@@ -7095,6 +7095,11 @@
         },
         "tags": [
           "Other"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ],
         "x-feedling-contract-level": "documented"
       },
@@ -7103,11 +7108,11 @@
         "operationId": "web_settings_post_v1_web_settings_post",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "The state after applying the update.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/WebSettingsResponse"
                 }
               }
             }
@@ -7126,17 +7131,22 @@
         "tags": [
           "Other"
         ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
         "requestBody": {
-          "required": false,
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/FreeFormJsonObject"
+                "$ref": "#/components/schemas/WebSettingsUpdateRequest"
               }
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "documented"
       }
     },
     "/v1/worldbook/delete": {
@@ -7355,6 +7365,72 @@
           }
         },
         "title": "ValidationError"
+      },
+      "WebSettingsUpdateRequest": {
+        "type": "object",
+        "description": "Set the user's web-search preference. `enabled` must be a real JSON boolean — strings such as \"no\" are rejected with 400 rather than coerced.",
+        "required": [
+          "enabled"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "The user's saved preference. Defaults to false."
+          }
+        }
+      },
+      "WebSettingsResponse": {
+        "type": "object",
+        "description": "Web-search state. `enabled` is the user's saved preference and is written only by the user — an operator halting web never rewrites it. `effective` is derived (`enabled && available`) and is not stored. Background turns (proactive wake / screen watch) never reach the network regardless of these values.",
+        "required": [
+          "enabled",
+          "available",
+          "effective",
+          "unavailable_reason",
+          "capabilities"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "The user's saved preference."
+          },
+          "available": {
+            "type": "boolean",
+            "description": "False when the operator kill switch has halted search."
+          },
+          "effective": {
+            "type": "boolean",
+            "description": "`enabled && available`. Derived, never stored."
+          },
+          "unavailable_reason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "globally_disabled",
+              null
+            ],
+            "description": "Null when available. Unknown values must be treated as unavailable."
+          },
+          "capabilities": {
+            "type": "object",
+            "description": "Per-tool live state, so a half-open kill switch is visible.",
+            "required": [
+              "search",
+              "fetch"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "search": {
+                "type": "boolean"
+              },
+              "fetch": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
       },
       "FreeFormJsonObject": {
         "type": "object",

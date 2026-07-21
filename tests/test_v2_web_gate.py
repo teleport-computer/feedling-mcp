@@ -108,3 +108,21 @@ def test_resolve_non_bool_is_disabled(bad):
     """`value is True`, never bool(value): bool("no") is True would turn a
     corrupt/mis-typed setting into web access switched ON."""
     assert g.resolve_user_enabled(lambda uid: bad, "u1") is False
+
+
+# ------------------------------------------------- halted_web_tools (live half)
+
+def test_halted_web_tools_maps_flags_to_names():
+    assert g.halted_web_tools(search_halted=False, fetch_halted=False) == frozenset()
+    assert g.halted_web_tools(search_halted=True, fetch_halted=False) == frozenset({"web_search"})
+    assert g.halted_web_tools(search_halted=False, fetch_halted=True) == frozenset({"web_fetch"})
+    assert g.halted_web_tools(search_halted=True, fetch_halted=True) == BOTH
+
+
+def test_halted_web_tools_does_not_consider_lane_or_user():
+    """The live half must not re-derive the policy the turn-entry snapshot
+    already encodes — that is how two halves of a gate drift apart."""
+    import inspect
+
+    params = set(inspect.signature(g.halted_web_tools).parameters)
+    assert params == {"search_halted", "fetch_halted"}

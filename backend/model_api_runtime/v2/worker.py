@@ -2186,7 +2186,7 @@ def _make_build_messages_fn(
 
 
 async def _web_batch_cancellation(
-    tool_calls, *, disabled_web_snapshot, lane
+    tool_calls, *, disabled_web_snapshot
 ) -> list[ToolResult] | None:
     """Second fail-closed boundary for the web tools. ``None`` = let the batch run.
 
@@ -2200,9 +2200,10 @@ async def _web_batch_cancellation(
     NEW dispatches within roughly two seconds. HTTP requests already in flight are
     not cancelled.
 
-    Checks the turn-entry snapshot UNION the live halted state. Re-reading only the
-    kill switch would quietly assume ``user_enabled=True`` here — but this is
-    defined as an independent boundary, so it must carry the user/lane decision too.
+    Checks the turn-entry snapshot (which already carries the user preference and
+    the lane decision) UNION the live halted flags. The live half deliberately does
+    NOT re-interpret the lane: re-deriving a policy the snapshot already encodes is
+    how two halves of a gate drift apart.
 
     Cancellation is all-or-nothing, matching the loop's own malformed-batch
     handling. Executing the siblings while dropping the web call would leave half a
@@ -2213,21 +2214,21 @@ async def _web_batch_cancellation(
     if not any(tc.name in v2_web_gate.WEB_TOOL_NAMES for tc in tool_calls):
         return None
     search_halted, fetch_halted = await asyncio.to_thread(kill_switch.web_halted)
-    live = v2_web_gate.disabled_web_tools(
-        user_enabled=True,
-        lane=lane,
-        search_halted=search_halted,
-        fetch_halted=fetch_halted,
+    blocked = frozenset(disabled_web_snapshot) | v2_web_gate.halted_web_tools(
+        search_halted=search_halted, fetch_halted=fetch_halted
     )
-    blocked = frozenset(disabled_web_snapshot) | live
     if not any(tc.name in blocked for tc in tool_calls):
         return None
+    # The error string follows what is ACTUALLY blocked, not "is this a web
+    # tool". Under a half-open kill switch (search halted, fetch fine) a batch
+    # holding both would otherwise tell the model fetch is unavailable too, and
+    # it would stop retrying something that still works.
     return [
         ToolResult(
             call_id=tc.id,
             content=(
                 "error: web_tool_halted"
-                if tc.name in v2_web_gate.WEB_TOOL_NAMES
+                if tc.name in blocked
                 else "error: batch_cancelled_web_halted"
             ),
         )
@@ -2321,10 +2322,7 @@ def _make_task_batch_dispatcher(
 
             async def _child_dispatch(tool_calls) -> list[ToolResult]:
                 cancelled = await _web_batch_cancellation(
-                    tool_calls,
-                    disabled_web_snapshot=disabled_web_tool_names,
-                    lane="chat",  # the child's own surface; the parent lane's
-                    # decision already rode in via disabled_web_tool_names
+                    tool_calls, disabled_web_snapshot=disabled_web_tool_names
                 )
                 if cancelled is not None:
                     return cancelled
@@ -4419,15 +4417,12 @@ async def _run_wake(
             if tm is not None:
                 tm.add_call(usage)
 
-        # Background lane: web is closed regardless of the user's preference.
-        # Computed through the shared decision (rather than hardcoded) so the
-        # offer side and the dispatcher below cannot drift apart.
-        wake_disabled_web_tool_names = v2_web_gate.disabled_web_tools(
-            user_enabled=False,
-            lane=lane,
-            search_halted=True,
-            fetch_halted=True,
-        )
+        # Background lanes never reach the network, whatever the user's toggle
+        # says. Stated as the constant rather than routed through
+        # disabled_web_tools(user_enabled=False, ..., halted=True, halted=True):
+        # every input there would be hardcoded anyway, so the indirection only
+        # looked like it would follow a future policy change. It would not.
+        wake_disabled_web_tool_names = v2_web_gate.WEB_TOOL_NAMES
 
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=wake_disabled_web_tool_names,
@@ -4443,9 +4438,7 @@ async def _run_wake(
 
         async def _dispatch_tools(tool_calls):
             cancelled = await _web_batch_cancellation(
-                tool_calls,
-                disabled_web_snapshot=wake_disabled_web_tool_names,
-                lane=lane,
+                tool_calls, disabled_web_snapshot=wake_disabled_web_tool_names
             )
             if cancelled is not None:
                 return cancelled
@@ -5948,9 +5941,7 @@ async def process_job(
 
         async def _dispatch_tools(tool_calls):
             cancelled = await _web_batch_cancellation(
-                tool_calls,
-                disabled_web_snapshot=disabled_web_tool_names,
-                lane=lane,
+                tool_calls, disabled_web_snapshot=disabled_web_tool_names
             )
             if cancelled is not None:
                 return cancelled

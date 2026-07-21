@@ -297,6 +297,67 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "WebSettingsUpdateRequest": {
+        "type": "object",
+        "description": (
+            "Set the user's web-search preference. `enabled` must be a real "
+            "JSON boolean — strings such as \"no\" are rejected with 400 "
+            "rather than coerced."
+        ),
+        "required": ["enabled"],
+        "additionalProperties": False,
+        "properties": {
+            "enabled": {
+                "type": "boolean",
+                "description": "The user's saved preference. Defaults to false.",
+            }
+        },
+    },
+    "WebSettingsResponse": {
+        "type": "object",
+        "description": (
+            "Web-search state. `enabled` is the user's saved preference and is "
+            "written only by the user — an operator halting web never rewrites "
+            "it. `effective` is derived (`enabled && available`) and is not "
+            "stored. Background turns (proactive wake / screen watch) never "
+            "reach the network regardless of these values."
+        ),
+        "required": [
+            "enabled",
+            "available",
+            "effective",
+            "unavailable_reason",
+            "capabilities",
+        ],
+        "additionalProperties": False,
+        "properties": {
+            "enabled": {"type": "boolean", "description": "The user's saved preference."},
+            "available": {
+                "type": "boolean",
+                "description": "False when the operator kill switch has halted search.",
+            },
+            "effective": {
+                "type": "boolean",
+                "description": "`enabled && available`. Derived, never stored.",
+            },
+            "unavailable_reason": {
+                "type": "string",
+                "nullable": True,
+                "enum": ["globally_disabled", None],
+                "description": "Null when available. Unknown values must be treated as unavailable.",
+            },
+            "capabilities": {
+                "type": "object",
+                "description": "Per-tool live state, so a half-open kill switch is visible.",
+                "required": ["search", "fetch"],
+                "additionalProperties": False,
+                "properties": {
+                    "search": {"type": "boolean"},
+                    "fetch": {"type": "boolean"},
+                },
+            },
+        },
+    },
     "FreeFormJsonObject": {
         "type": "object",
         "description": "Legacy compatibility payload. Consult the operation description before sending fields.",
@@ -1209,6 +1270,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 PRECISE_JSON_BODIES: dict[Operation, str] = {
+    ("post", "/v1/web/settings"): "WebSettingsUpdateRequest",
     ("post", "/v1/users/register"): "RegisterRequest",
     ("post", "/v1/access/link-token"): "LinkTokenRequest",
     ("post", "/v1/access/claim-token"): "ClaimTokenRequest",
@@ -1388,6 +1450,26 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/web/settings"): {
+        "200": {
+            "description": "Current web-search state for the authenticated user.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/WebSettingsResponse"}
+                }
+            },
+        },
+    },
+    ("post", "/v1/web/settings"): {
+        "200": {
+            "description": "The state after applying the update.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/WebSettingsResponse"}
+                }
+            },
+        },
+    },
     ("get", "/healthz"): {
         "503": {
             "description": (

@@ -28,10 +28,10 @@ from model_api_runtime.v2 import kill_switch  # noqa: E402
 @pytest.fixture(autouse=True)
 def _reset():
     kill_switch.set_web_halted(search=False, fetch=False)
-    kill_switch._invalidate()
+    kill_switch._invalidate_all_for_tests()
     yield
     kill_switch.set_web_halted(search=False, fetch=False)
-    kill_switch._invalidate()
+    kill_switch._invalidate_all_for_tests()
 
 
 def test_defaults_to_not_halted():
@@ -71,7 +71,7 @@ def test_read_error_fails_closed(monkeypatch):
         raise RuntimeError("control plane down")
 
     monkeypatch.setattr(kill_switch, "_fetch_web_halted_row", boom)
-    kill_switch._invalidate()
+    kill_switch._invalidate_all_for_tests()
     assert kill_switch.web_halted() == (True, True)
 
 
@@ -85,7 +85,7 @@ def test_read_error_is_cached_so_a_flapping_db_is_not_hammered(monkeypatch):
         raise RuntimeError("down")
 
     monkeypatch.setattr(kill_switch, "_fetch_web_halted_row", boom)
-    kill_switch._invalidate()
+    kill_switch._invalidate_all_for_tests()
     assert kill_switch.web_halted() == (True, True)
     assert kill_switch.web_halted() == (True, True)
     assert kill_switch.web_halted() == (True, True)
@@ -95,7 +95,7 @@ def test_read_error_is_cached_so_a_flapping_db_is_not_hammered(monkeypatch):
 def test_missing_control_row_fails_closed(monkeypatch):
     """No control row = unknown state = no web. Must not fail open."""
     monkeypatch.setattr(kill_switch, "_fetch_web_halted_row", lambda: None)
-    kill_switch._invalidate()
+    kill_switch._invalidate_all_for_tests()
     assert kill_switch.web_halted() == (True, True)
 
 
@@ -106,7 +106,7 @@ def test_web_halted_never_raises(monkeypatch):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(kill_switch, "_fetch_web_halted_row", boom)
-    kill_switch._invalidate()
+    kill_switch._invalidate_all_for_tests()
     kill_switch.web_halted()  # must not raise
 
 

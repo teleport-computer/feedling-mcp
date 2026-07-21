@@ -65,3 +65,18 @@ def resolve_user_enabled(web_tools_enabled, user_id: str) -> bool:
     except Exception:  # noqa: BLE001 — a settings read must never fail the turn
         return False
     return value is True
+
+
+def halted_web_tools(*, search_halted: bool, fetch_halted: bool) -> frozenset[str]:
+    """Just the live operator halts, as tool names.
+
+    Used by the dispatcher's second boundary, which unions this with the
+    turn-entry snapshot. Kept separate from ``disabled_web_tools`` so the live
+    check never re-derives the user/lane policy the snapshot already encodes.
+    """
+    withheld = set()
+    if search_halted:
+        withheld.add("web_search")
+    if fetch_halted:
+        withheld.add("web_fetch")
+    return frozenset(withheld)

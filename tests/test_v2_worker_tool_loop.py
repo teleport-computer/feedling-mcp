@@ -1831,3 +1831,50 @@ def test_non_web_batches_do_not_pay_for_a_control_read(monkeypatch):
     # exactly one read: the turn-entry offer decision. The memory_index batch
     # must not have triggered a second one.
     assert reads["n"] == 1
+
+
+def test_half_open_halt_gives_the_still_working_tool_a_collateral_error(monkeypatch):
+    """search halted, fetch fine, one batch holding both.
+
+    Cancelling the whole batch is right, but web_fetch is only collateral — if it
+    is told "web_tool_halted" the model concludes fetch is down too and stops
+    retrying something that still works.
+    """
+    uid = "u_web_half_open"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    reads = {"n": 0}
+
+    def _flipping():
+        reads["n"] += 1
+        # open at turn entry so both tools are offered; search halted by dispatch
+        return (False, False) if reads["n"] == 1 else (True, False)
+
+    monkeypatch.setattr(worker.kill_switch, "web_halted", _flipping)
+
+    calls = _script_provider(monkeypatch, [
+        _tool_round(
+            _tc("s1", "web_search", query="x"),
+            _tc("s2", "web_fetch", url="https://example.com/"),
+        ),
+        _text_round("done"),
+    ])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=True,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    contents = _tool_result_contents(calls[1])
+    assert "error: web_tool_halted" in contents           # search: really halted
+    assert "error: batch_cancelled_web_halted" in contents  # fetch: collateral

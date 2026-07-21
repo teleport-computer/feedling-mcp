@@ -40,7 +40,6 @@ def _invalidate() -> None:
     with _cache_lock:
         _cached_value = None
         _cached_at = 0.0
-    _invalidate_web()
 
 
 def turns_halted(default_on_error: bool = False) -> bool:
@@ -166,3 +165,12 @@ def set_turns_halted(halted: bool) -> None:
                 (bool(halted),),
             )
     _invalidate()
+
+
+def _invalidate_all_for_tests() -> None:
+    """Drop BOTH cached values. The two switches have independent lifecycles —
+    `set_turns_halted` must not silently reset the web cache and vice versa — so
+    production code never calls this; it exists so a test can reset the module
+    without reaching into either private slot."""
+    _invalidate()
+    _invalidate_web()
