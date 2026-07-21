@@ -28,30 +28,33 @@ def test_runtime_v2_default_on_reflects_env(monkeypatch):
     assert core_util.runtime_v2_default_on() is False
 
 
-def test_perception_flag_falls_through_to_env_default(monkeypatch):
+def test_perception_ignores_env_default_and_follows_hosted_runtime_fence(monkeypatch):
+    """Dual-runtime coexistence spec §6: perception ingress no longer has an
+    independent env baseline or per-user flag — it follows the same
+    ownership fence chat send routes on
+    (``hosted.config_store.get_hosted_runtime_mode_strict``), so it can't
+    drift from chat mode. The env default and any stale profile/config flag
+    value are both ignored now (see test_perception_ingress_v2.py's
+    ``test_ingress_flag_follows_hosted_runtime_fence_not_an_independent_flag``
+    for direct fence-mode coverage)."""
     user_store = SimpleNamespace(user_id="u_env")
-    monkeypatch.setattr(hosted_config_store, "_load_model_api_config", lambda store: {})
     monkeypatch.setattr(
-        hosted_config_store, "_ensure_model_api_runtime_profile", lambda store, config: {}
+        hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda store: hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT,
     )
 
     monkeypatch.setenv(ENV, "true")
-    assert perception_service.perception_ingress_runtime_v2_enabled(user_store) is True
+    assert perception_service.perception_ingress_runtime_v2_enabled(user_store) is False
     monkeypatch.delenv(ENV, raising=False)
     assert perception_service.perception_ingress_runtime_v2_enabled(user_store) is False
 
-
-def test_perception_explicit_value_overrides_env_default(monkeypatch):
-    user_store = SimpleNamespace(user_id="u_env")
-    monkeypatch.setenv(ENV, "true")  # baseline ON
-    monkeypatch.setattr(hosted_config_store, "_load_model_api_config", lambda store: {})
     monkeypatch.setattr(
         hosted_config_store,
-        "_ensure_model_api_runtime_profile",
-        lambda store, config: {perception_service.PERCEPTION_INGRESS_RUNTIME_V2_FLAG: False},
+        "get_hosted_runtime_mode_strict",
+        lambda store: hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
     )
-    # explicit opt-out wins over the ON baseline
-    assert perception_service.perception_ingress_runtime_v2_enabled(user_store) is False
+    assert perception_service.perception_ingress_runtime_v2_enabled(user_store) is True
 
 
 def test_resident_flags_honor_env_default_and_explicit_override(monkeypatch):

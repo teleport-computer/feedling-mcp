@@ -2914,7 +2914,14 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     "reasoning_effort"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
     /v1/responses capability, set at setup; selects native passthrough vs the
-    LiteLLM chat-completions bridge)。"""
+    LiteLLM chat-completions bridge)。
+
+    Anti-double-run gate (dual-runtime coexistence, spec §6): a user whose
+    hosted-runtime fence (``v2_runtime_state.hosted_runtime_state``) reads
+    ``v2`` or ``draining`` is excluded — the V2 fleet already owns them, and
+    the V1 supervisor spawning a consumer too would double the reply and the
+    BYOK spend. Absence of a fence row (never cut over) defaults to resident,
+    same COALESCE default as ``db.get_hosted_runtime_control_strict``."""
     providers = ["anthropic", "claude", "deepseek", "openai",
                  "gemini", "openrouter", "openai_compatible"]
     try:
@@ -2939,6 +2946,11 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                 WHERE r.is_active
                   AND r.test_status = 'ok'
                   AND LOWER(c.provider) = ANY(%s)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM v2_runtime_state vrs
+                    WHERE vrs.user_id = r.user_id
+                      AND vrs.hosted_runtime_state IN ('v2', 'draining')
+                  )
                 ORDER BY r.user_id
                 """,
                 (providers,),

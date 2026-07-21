@@ -445,32 +445,36 @@ def test_location_signal_null_or_unchanged_anchor_does_not_wake(monkeypatch):
     assert emitted == []
 
 
-def test_per_user_ingress_flag_defaults_off_and_prefers_runtime_profile(monkeypatch):
+def test_ingress_flag_follows_hosted_runtime_fence_not_an_independent_flag(monkeypatch):
+    """Dual-runtime coexistence spec §6: perception ingress follows the same
+    per-user fence chat send routes on, so it can never drift from chat mode.
+    The old independent ``perception_ingress_runtime_v2_enabled`` profile/config
+    flag and the env-gated baseline are both vestigial now — only the fence
+    (``hosted.config_store.get_hosted_runtime_mode_strict``) decides."""
     from hosted import config_store as hosted_config_store
 
     user_store = SimpleNamespace(user_id="u_flag")
 
+    # A stale/legacy flag value in the profile no longer has any effect —
+    # only the fence mode does.
     monkeypatch.setattr(
         hosted_config_store,
-        "_load_model_api_config",
-        lambda store: {service.PERCEPTION_INGRESS_RUNTIME_V2_FLAG: True},
-    )
-    monkeypatch.setattr(
-        hosted_config_store,
-        "_ensure_model_api_runtime_profile",
-        lambda store, config: {service.PERCEPTION_INGRESS_RUNTIME_V2_FLAG: False},
+        "get_hosted_runtime_mode_strict",
+        lambda store: hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT,
     )
     assert service.perception_ingress_runtime_v2_enabled(user_store) is False
 
     monkeypatch.setattr(
         hosted_config_store,
-        "_ensure_model_api_runtime_profile",
-        lambda store, config: {},
+        "get_hosted_runtime_mode_strict",
+        lambda store: hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
     )
     assert service.perception_ingress_runtime_v2_enabled(user_store) is True
 
-    monkeypatch.setattr(hosted_config_store, "_load_model_api_config", lambda store: None)
-    monkeypatch.setattr(hosted_config_store, "_ensure_model_api_runtime_profile", lambda store, config: None)
+    def _raise(store):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(hosted_config_store, "get_hosted_runtime_mode_strict", _raise)
     assert service.perception_ingress_runtime_v2_enabled(user_store) is False
 
 

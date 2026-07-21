@@ -65,13 +65,14 @@ def _coerce_ts(client_ts) -> float:
 
 
 def perception_ingress_runtime_v2_enabled(user_or_store) -> bool:
-    """Per-user rollout flag for live perception ingress cutover.
-
-    Baseline is the env-gated default (OFF prod / ON test) so the legacy ingest
-    path stays a dormant fallback in prod. An explicit per-user flag still wins,
-    so rollout/rollback remains a per-user toggle without a code deploy. The
-    profile no longer auto-seeds this key (see ``_ensure_model_api_runtime_profile``),
-    so absence genuinely means "unset" and falls through to the baseline.
+    """Per-user perception ingress lane — tied 1:1 to the hosted chat runtime
+    fence (dual-runtime coexistence spec §6: "perception ingress 跟随 chat
+    mode"). Delegates to the same ownership fence chat send routes on
+    (``hosted.config_store.get_hosted_runtime_mode_strict``) instead of an
+    independent flag, so this lane can never drift from chat mode (flag says
+    v2, fence says resident). ``perception_ingress_runtime_v2_enabled`` in a
+    persisted ``model_api_runtime`` profile is now a vestigial/legacy field —
+    nothing reads it anymore.
     """
     try:
         user_store = user_or_store
@@ -81,16 +82,11 @@ def perception_ingress_runtime_v2_enabled(user_or_store) -> bool:
 
         from hosted import config_store as hosted_config_store  # lazy
 
-        config = hosted_config_store._load_model_api_config(user_store) or {}
-        profile = hosted_config_store._ensure_model_api_runtime_profile(user_store, config) or {}
-        if PERCEPTION_INGRESS_RUNTIME_V2_FLAG in profile:
-            return bool(profile.get(PERCEPTION_INGRESS_RUNTIME_V2_FLAG))
-        if PERCEPTION_INGRESS_RUNTIME_V2_FLAG in config:
-            return bool(config.get(PERCEPTION_INGRESS_RUNTIME_V2_FLAG))
-        return core_util.runtime_v2_default_on()
+        mode = hosted_config_store.get_hosted_runtime_mode_strict(user_store)
+        return mode == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
     except Exception as e:
         uid = user_or_store if isinstance(user_or_store, str) else getattr(user_or_store, "user_id", "unknown")
-        log.warning("perception ingress v2 flag load failed for %s; using legacy ingress: %s", uid, e)
+        log.warning("perception ingress v2 fence read failed for %s; using legacy ingress: %s", uid, e)
         return False
 
 
