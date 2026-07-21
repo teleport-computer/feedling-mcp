@@ -28,14 +28,17 @@ _CJK = re.compile(r"[一-鿿]")
 # — the usr_fee1 bug was a card whose text began `user: ...`.
 _FORBIDDEN_LABEL = re.compile(
     r"(?im)^\s*(user|agent|assistant|openclaw|system|role|用户|助手|系统|角色)\s*[:：]")
-# bare "用户" standing in for the person (usr_fee1), i.e. the card/message calls the
-# user "用户" instead of their name. Matched only before a person-predicate so common
-# compounds (用户体验 / 用户界面 / 用户端) are NOT over-blocked.
-_BARE_PERSON = re.compile(r"用户(?=[是應应该喜欢會会想觉叫的名])")
+# bare "用户"/"TA" standing in for the person (usr_fee1) — a card/message calling the
+# user "用户"/"TA" instead of their name. Matched only before a person-predicate, so
+# common compounds (用户体验 / 用户界面 / 用户端 / 用户名) are NOT over-blocked.
+_PERSON_PRED = "是喜欢爱愛会會想觉得叫认為为很不在有说做喝吃住偏好习惯應应该的"
+_BARE_YONGHU = re.compile(f"用户(?=[{_PERSON_PRED}])")
+# TA as a bare Chinese pronoun subject (not embedded in a Latin word like "data").
+_BARE_TA = re.compile(f"(?<![0-9A-Za-z一-鿿])[Tt][Aa](?=[{_PERSON_PRED}\\s，,。])")
 
 
 def _bare_person_label(text: str):
-    return _BARE_PERSON.search(text or "")
+    return _BARE_YONGHU.search(text or "") or _BARE_TA.search(text or "")
 # tolerate a stray CJK proper noun in an English reply; only a real run of CJK is drift
 _CJK_DRIFT_MIN = 4
 
@@ -185,24 +188,46 @@ def _language_checks(b: E2EClient, cfg: dict):
 
 def _proactive_check(b: E2EClient):
     b.post("/v1/proactive/settings", json={"ambient": True, "timezone": "Asia/Shanghai"})
-    # prime a next-proactive-message intent (same technique codex2's proactive
-    # quality probe uses) so the wake actually produces an opener to language-check.
-    _one_reply(b, "Later, when you reach out to me first, just send a short warm check-in. "
-                  "For now, only confirm you got this.")
+    # prime a next-proactive-message intent so the wake actually produces an opener.
+    # The priming reply MUST land — otherwise there is no valid setup to language-check.
+    if _one_reply(b, "Later, when you reach out to me first, just send a short warm "
+                     "check-in. For now, only confirm you got this.") is None:
+        return BLOCKED_EVIDENCE, "priming reply never arrived; cannot set up the proactive check"
     since = time.time()
-    if b.post("/v1/proactive/tick", json={"force": True}).status_code != 200:
-        return BLOCKED_EVIDENCE, "could not force a proactive wake on the isolated account"
-    reply = b.wait_reply(since, timeout=180.0)
+    tick = b.post("/v1/proactive/tick", json={"force": True})
+    if tick.status_code != 200:
+        return BLOCKED_EVIDENCE, f"could not force a proactive wake ({tick.status_code})"
+    job = tick.json().get("job") if isinstance(tick.json().get("job"), dict) else {}
+    job_id = str(job.get("id") or "")
+    if job.get("lane") != "manual_wake" or not job_id:
+        return BLOCKED_EVIDENCE, f"tick did not admit a manual_wake job: {tick.text[:80]}"
+    # correlate the OPENER by proactive_job_id — never a late ordinary reply by timestamp
+    reply = _wait_proactive_reply(b, job_id, since, timeout=180.0)
     if reply is None:
-        return BLOCKED_EVIDENCE, "forced wake produced no proactive message to language-check"
+        return BLOCKED_EVIDENCE, f"no proactive message correlated to wake job {job_id[:8]}"
     text = b.message_text(reply)
     if not text.strip():
         return BLOCKED_EVIDENCE, "proactive message did not decrypt for a language check"
     if _FORBIDDEN_LABEL.search(text) or _bare_person_label(text):
         return PRODUCT_FAIL, f"proactive opener carries a system/bare-person label: {text[:60]!r}"
     return (PASS if _no_cjk_drift(text) else PRODUCT_FAIL,
-            f"isolated English-persona proactive opener "
+            f"isolated English-persona proactive opener (job {job_id[:8]}) "
             f"{'had no Chinese drift' if _no_cjk_drift(text) else 'DRIFTED to Chinese'}: {text[:60]!r}")
+
+
+def _wait_proactive_reply(b: E2EClient, job_id: str, since: float, *, timeout: float):
+    """An agent row correlated to THIS wake job by proactive_job_id — not any later
+    agent row (which could be a lagging ordinary reply)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = b.get("/v1/chat/history", params={"since": max(0, since - 1), "limit": 100})
+        r.raise_for_status()
+        for m in (r.json().get("messages") or []):
+            if (str(m.get("role") or "") in ("agent", "openclaw")
+                    and str(m.get("proactive_job_id") or "") == job_id):
+                return m
+        time.sleep(3)
+    return None
 
 
 def _error_attribution(c: E2EClient, cfg: dict):

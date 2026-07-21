@@ -77,15 +77,18 @@ def _isolation(c: E2EClient):
         if a_id in {str(it.get("id") or "") for it in mem_index(b, limit=200)}:
             result, detail = PRODUCT_FAIL, f"account B index exposes A's card {a_id} — read isolation broken"
         else:
-            # 2) B fetch of A's id must return it as MISSING (not readable, not present)
+            # 2) B fetch of A's id must be EXACTLY missing (items==[], missing==[A],
+            # unavailable==[]) — "unavailable" would imply B can see A's card exists.
             fr = b.post("/v1/memory/fetch", json={"ids": [a_id], "limit": 5})
             fr.raise_for_status()
             fb = fr.json()
-            if a_id in {str(it.get("id") or "") for it in (fb.get("items") or [])}:
+            items = [str(it.get("id") or "") for it in (fb.get("items") or [])]
+            if a_id in items:
                 result, detail = PRODUCT_FAIL, f"account B fetched A's card {a_id} — read isolation broken"
-            elif a_id not in (fb.get("missing_ids") or []):
-                result, detail = (BLOCKED_EVIDENCE,
-                                  f"B fetch of A's id neither returned nor marked missing: {fb}")
+            elif not (items == [] and list(fb.get("missing_ids") or []) == [a_id]
+                      and list(fb.get("unavailable_ids") or []) == []):
+                result, detail = (PRODUCT_FAIL,
+                                  f"B fetch of A's id not exactly missing: {fb}")
             else:
                 # 3) B mutating A's card must be EXACTLY denied 404 not_found (a 500 or
                 # any other code is not evidence of isolation).
@@ -99,10 +102,12 @@ def _isolation(c: E2EClient):
                                       f"(expected 404 not_found)")
     finally:
         try:
-            b.teardown()          # a swallowed teardown = a leaked account, so it downgrades the case
+            b.teardown()          # a swallowed teardown = a leaked account
         except Exception as e:  # noqa: BLE001
-            result = PRODUCT_FAIL if result == PASS else result
-            detail = f"{detail}; but account B teardown FAILED (orphan {b.user_id}): {e}"
+            # a leaked account is a hard failure regardless of the prior result — a
+            # BLOCKED_EVIDENCE must NOT let --diagnostic exit 0 with an orphan.
+            result = PRODUCT_FAIL
+            detail = f"{detail}; account B teardown FAILED (orphan {b.user_id}): {e}"
         finally:
             b._http.close()
     return result, detail
@@ -186,11 +191,12 @@ def _local_only(c: E2EClient):
         return PRODUCT_FAIL, f"local_only id {mid} readable via fetch — agent can surface it"
     missing = list(fb.get("missing_ids") or [])
     unavail = list(fb.get("unavailable_ids") or [])
-    # a genuine local_only card EXISTS but is undecryptable for the agent → it must be
-    # `unavailable`, NOT `missing` (missing would mean it was never stored at all).
-    if mid in unavail and mid not in missing:
-        return PASS, f"local_only stored (id={mid[:8]}) excluded from index & fetch; unavailable_ids=[id]"
-    return PRODUCT_FAIL, (f"local_only id {mid} not proven stored-but-unavailable "
+    # a genuine local_only card EXISTS but is undecryptable for the agent → the fetch
+    # must report EXACTLY unavailable_ids==[mid] and missing_ids==[] (no extras: an
+    # extra missing/unavailable id would mean the exclusion story is muddier than claimed).
+    if missing == [] and unavail == [mid]:
+        return PASS, f"local_only stored (id={mid[:8]}) excluded from index & fetch; unavailable_ids==[id]"
+    return PRODUCT_FAIL, (f"local_only id {mid} not proven exactly stored-but-unavailable "
                           f"(missing={missing} unavailable={unavail})")
 
 

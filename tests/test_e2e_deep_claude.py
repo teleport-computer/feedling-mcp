@@ -80,12 +80,27 @@ def test_no_cjk_drift_detects_chinese_only():
     assert not exp._no_cjk_drift("qwq")                                     # too few latin letters
 
 
-def test_bare_person_label_targets_yonghu_subject_only():
+def test_bare_person_label_targets_yonghu_and_ta():
     assert exp._bare_person_label("用户喜欢喝手冲咖啡")        # card calls the user "用户"
+    assert exp._bare_person_label("用户爱喝手冲咖啡")          # broader person-predicate (爱)
     assert exp._bare_person_label("用户是一个安静的人")
-    assert not exp._bare_person_label("用户体验做得很好")      # legitimate compound, not over-blocked
-    assert not exp._bare_person_label("这是关于咖啡的记忆")    # unrelated text
+    assert exp._bare_person_label("TA爱喝手冲咖啡")            # bare TA pronoun as the person
+    assert exp._bare_person_label("ta喜欢安静")
+    assert not exp._bare_person_label("用户体验做得很好")      # compound, not over-blocked
+    assert not exp._bare_person_label("用户名是什么")          # 用户名 compound
+    assert not exp._bare_person_label("这是关于咖啡的记忆")
+    assert not exp._bare_person_label("metadata about coffee")  # TA embedded in a Latin word
     assert not exp._bare_person_label("She likes pour-over coffee")
+
+
+def test_wait_proactive_reply_correlates_by_job_id_only():
+    correlated = FakeClient(lambda m, p, **kw: FakeResp(200, {"messages": [
+        {"role": "agent", "id": "a1", "proactive_job_id": "J1"}]}))
+    assert exp._wait_proactive_reply(correlated, "J1", 0.0, timeout=1.0)["id"] == "a1"
+    # a late ORDINARY reply (no proactive_job_id) must NOT be accepted as the opener
+    ordinary = FakeClient(lambda m, p, **kw: FakeResp(200, {"messages": [
+        {"role": "agent", "id": "a2", "reply_to_message_id": "u1"}]}))
+    assert exp._wait_proactive_reply(ordinary, "J1", 0.0, timeout=0.0) is None
 
 
 def test_replies_for_ignores_empty_user_id():
@@ -177,6 +192,20 @@ def test_local_only_excludes_by_id(monkeypatch):
     assert _r(mem._local_only(make([], {"items": [{"id": mid}]}))) == PRODUCT_FAIL
     # MISSING (never stored) instead of unavailable → PRODUCT_FAIL, not a pass
     assert _r(mem._local_only(make([], {"items": [], "missing_ids": [mid], "unavailable_ids": []}))) == PRODUCT_FAIL
+    # EXTRAS in the lists → not the exact contract → PRODUCT_FAIL
+    assert _r(mem._local_only(make([], {"items": [], "missing_ids": ["other"], "unavailable_ids": [mid, "x"]}))) == PRODUCT_FAIL
+
+
+def test_cross_user_fetch_must_be_exactly_missing(monkeypatch):
+    aid = "aid1"
+    monkeypatch.setattr(mem, "mem_add", lambda c, **kw: (200, {}))
+    monkeypatch.setattr(mem, "_id_of", lambda c, mk: aid)
+    monkeypatch.setattr(mem, "mem_index", lambda c, **kw: [])
+    monkeypatch.setattr(mem, "mem_supersede", lambda b, i, **kw: (404, {"error": "not_found"}))
+    # contradictory {missing:[A], unavailable:[A]} is NOT clean isolation
+    bad = FakeClient(lambda m, p, **kw: FakeResp(200, {"items": [], "missing_ids": [aid], "unavailable_ids": [aid]}))
+    monkeypatch.setattr(mem.E2EClient, "provision", classmethod(lambda cls, **kw: bad))
+    assert _r(mem._isolation(object())) == PRODUCT_FAIL
 
 
 # -- injected-text empty fetch is not a pass ---------------------------------
