@@ -7067,6 +7067,78 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/web/settings": {
+      "get": {
+        "summary": "Web Settings Get",
+        "operationId": "web_settings_get_v1_web_settings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented"
+      },
+      "post": {
+        "summary": "Web Settings Post",
+        "operationId": "web_settings_post_v1_web_settings_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreeFormJsonObject"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "compatibility"
+      }
+    },
     "/v1/worldbook/delete": {
       "delete": {
         "summary": "Worldbook Delete",

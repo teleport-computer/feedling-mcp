@@ -12,6 +12,21 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- **Web search is now opt-in and off by default.** `web_search` / `web_fetch`
+  are only offered to the model when the user turns the toggle on; before this
+  change they were always available. Existing users are **not** migrated — every
+  account starts closed and must enable it explicitly, so replies will stop
+  using live web results until the switch is flipped. Background turns
+  (proactive wake / screen watch, and any research subagent they spawn) never
+  reach the network, regardless of the toggle.
+- New `GET`/`POST` `/v1/web/settings`. The response separates the user's saved
+  preference from current availability:
+  `{"enabled", "available", "effective", "unavailable_reason", "capabilities"}`.
+  `enabled` is written only by the user — an operator halting web never rewrites
+  it. `effective` is `enabled && available` and is derived, never stored.
+  `POST` requires a real JSON boolean under `enabled`; strings such as `"no"`
+  are rejected with `400` rather than coerced.
+
 - Self-hosted resident polls may now receive server-generated maintenance turns
   with `role: "user"` and `source: "resident_maintenance"` when the resident
   consumer appears stale or is not claiming resident-only distill jobs. These
