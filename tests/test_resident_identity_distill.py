@@ -154,11 +154,17 @@ def _resident_job(job_id="job1", base_identity_replaced_at="2026-07-01T00:00:00"
 
 
 def _patch_distill_pipeline(monkeypatch, job, derive_results, execute_side_effects,
+                            snapshot_card=None, snapshot_error="identity_unreadable",
                              refreshed_baseline="2026-07-02T00:00:00"):
     monkeypatch.setattr(crc, "genesis_resident_pending", lambda: [job])
     monkeypatch.setattr(crc, "genesis_resident_heartbeat", lambda job_id: None)
     monkeypatch.setattr(crc, "_decrypt_sealed_material", lambda env: b"persona document")
     monkeypatch.setattr(crc, "_resident_current_replaced_at", lambda: refreshed_baseline)
+    # 读卡必须 mock：不 mock 的话 update_identity 用例会真去访问 fake.local
+    monkeypatch.setattr(
+        crc, "_resident_identity_snapshot",
+        lambda: (dict(snapshot_card), refreshed_baseline, "") if snapshot_card is not None
+        else (None, "", snapshot_error))
 
     completed: dict = {}
 
@@ -178,11 +184,12 @@ def _patch_distill_pipeline(monkeypatch, job, derive_results, execute_side_effec
 
     monkeypatch.setattr(crc, "_resident_derive_identity", fake_derive)
 
-    execute_calls = {"n": 0, "baselines": []}
+    execute_calls = {"n": 0, "baselines": [], "payloads": []}
 
     def fake_execute(actions):
         execute_calls["n"] += 1
         execute_calls["baselines"].append(actions[0].get("base_identity_replaced_at"))
+        execute_calls["payloads"].append(actions[0].get("identity"))
         idx = execute_calls["n"] - 1
         effect = execute_side_effects[min(idx, len(execute_side_effects) - 1)]
         if isinstance(effect, Exception):
@@ -199,6 +206,7 @@ def test_update_identity_forwards_job_baseline_on_first_attempt(monkeypatch):
         monkeypatch, job,
         derive_results=[{"agent_name": "A"}],
         execute_side_effects=[{"status": "ok"}],
+        snapshot_card={"agent_name": "旧", "custom_persona_prompt": "用户手写"},
     )
     crc._process_resident_distill_once()
     assert derive_calls["n"] == 1
@@ -211,6 +219,7 @@ def test_update_identity_conflict_once_then_succeeds(monkeypatch):
     job = _resident_job()
     completed, derive_calls, execute_calls = _patch_distill_pipeline(
         monkeypatch, job,
+        snapshot_card={"agent_name": "旧", "custom_persona_prompt": "用户手写"},
         derive_results=[{"agent_name": "A"}, {"agent_name": "B"}],
         execute_side_effects=[
             RuntimeError('identity_actions_http_409:{"error": "identity_base_stale"}'),
@@ -230,6 +239,7 @@ def test_update_identity_conflict_twice_gives_up_no_third_attempt(monkeypatch):
     job = _resident_job()
     completed, derive_calls, execute_calls = _patch_distill_pipeline(
         monkeypatch, job,
+        snapshot_card={"agent_name": "旧", "custom_persona_prompt": "用户手写"},
         derive_results=[{"agent_name": "A"}, {"agent_name": "B"}],
         execute_side_effects=[
             RuntimeError('identity_actions_http_409:{"error": "identity_base_stale"}'),
@@ -252,6 +262,7 @@ def test_update_identity_non_conflict_error_propagates_and_job_not_completed(mon
     job = _resident_job()
     completed, derive_calls, execute_calls = _patch_distill_pipeline(
         monkeypatch, job,
+        snapshot_card={"agent_name": "旧"},
         derive_results=[{"agent_name": "A"}],
         execute_side_effects=[RuntimeError("identity_actions_http_500:boom")],
     )
@@ -259,3 +270,137 @@ def test_update_identity_non_conflict_error_propagates_and_job_not_completed(mon
     assert derive_calls["n"] == 1
     assert execute_calls["n"] == 1
     assert completed == {}  # genesis_resident_complete never called
+
+
+# --- 二次蒸馏的字段保全（合并由代码做，不交给模型） ---
+
+FULL_CARD = {
+    "agent_name": "小明", "self_introduction": "我是小明。", "category": "锐 · 实",
+    "signature": ["有事直说"], "tone_style": "短句、直接", "agent_role": "同事",
+    "do_not_say": ["宝贝"], "boundaries": ["不聊政治"],
+    "dimensions": [{"name": "直接", "value": 90, "description": "从不绕"}],
+    # 蒸馏器不产出、prompt 里也没定义的字段 —— 用户自己的东西
+    "custom_persona_prompt": "像老朋友一样直接损我",
+    "user_preferred_name": "老Z",
+    "language_preference": "zh-Hans",
+    "stable_definitions": ["zz = 用户的狗"],
+    "relationship_anchor": "2026-07-19 第一次聊天",
+}
+
+
+def test_redistill_keeps_fields_the_distiller_never_owns():
+    """用户手写的字段不能被一次「重新总结」抹掉。
+
+    蒸馏器只产出 9 个字段，另外 4 个（custom_persona_prompt / user_preferred_name /
+    language_preference / stable_definitions）连 prompt 的字段清单里都没有 —— 模型
+    根本没见过，谈不上「保留」。identity.replace 又是整卡覆盖，所以每次重新总结
+    都会把用户亲手写的人设指令清掉。合并必须由代码做。
+    """
+    distilled = {"agent_name": "小6", "self_introduction": "我是小6。",
+                 "dimensions": [{"name": "直接", "value": 95, "description": "更直"}]}
+    merged = crc._resident_merge_identity_for_replace(FULL_CARD, distilled)
+
+    # 蒸馏器拥有的字段：用新值
+    assert merged["agent_name"] == "小6"
+    assert merged["dimensions"][0]["value"] == 95
+    # 蒸馏器不拥有的字段：原样保留
+    assert merged["custom_persona_prompt"] == "像老朋友一样直接损我"
+    assert merged["user_preferred_name"] == "老Z"
+    assert merged["language_preference"] == "zh-Hans"
+    assert merged["stable_definitions"] == ["zz = 用户的狗"]
+    assert merged["relationship_anchor"] == "2026-07-19 第一次聊天"
+
+
+def test_redistill_keeps_a_derived_field_the_model_happened_to_omit():
+    """模型漏说一句，那一项也不能消失。
+
+    parse_identity_payload 只返回模型真的输出且非空的字段。旧实现把这个结果当成
+    整张新卡，所以模型偶尔没提 tone_style，卡上的 tone_style 就被清空 —— 与
+    「保留旧值」这条 prompt 规则自相矛盾。
+    """
+    distilled = {"agent_name": "小6"}          # 模型这轮只吐了名字
+    merged = crc._resident_merge_identity_for_replace(FULL_CARD, distilled)
+
+    assert merged["agent_name"] == "小6"
+    assert merged["tone_style"] == "短句、直接"
+    assert merged["signature"] == ["有事直说"]
+    assert merged["do_not_say"] == ["宝贝"]
+
+
+def test_redistill_on_a_fresh_card_is_just_the_distilled_result():
+    """没有旧卡时行为不变（首次 derive 仍是纯新建）。"""
+    distilled = {"agent_name": "小6", "self_introduction": "我是小6。"}
+    assert crc._resident_merge_identity_for_replace({}, distilled) == distilled
+
+
+# --- Codex review 第二轮点名要的回归 ---
+
+def test_conflict_retry_still_carries_the_user_fields(monkeypatch):
+    """409 重试那一次提交，也必须是合并过的完整卡。
+
+    第一版只在首次提交前合并；冲突重试直接用 derive 的原始结果，于是重试成功时
+    custom_persona_prompt 照样全丢 —— 修复被一条支路完全绕过。
+    """
+    job = _resident_job()
+    completed, derive_calls, execute_calls = _patch_distill_pipeline(
+        monkeypatch, job,
+        snapshot_card={"agent_name": "旧", "custom_persona_prompt": "用户手写",
+                       "language_preference": "zh-Hans"},
+        derive_results=[{"agent_name": "A"}, {"agent_name": "B"}],
+        execute_side_effects=[RuntimeError("identity_base_stale"), {"status": "ok"}],
+    )
+    crc._process_resident_distill_once()
+    assert execute_calls["n"] == 2
+    second = execute_calls["payloads"][1]
+    assert second["agent_name"] == "B"
+    assert second["custom_persona_prompt"] == "用户手写"
+    assert second["language_preference"] == "zh-Hans"
+    assert completed["identity_status"] == "replaced"
+
+
+def test_unreadable_card_aborts_instead_of_overwriting(monkeypatch):
+    """读不到旧卡就不许写。
+
+    读卡失败时退化成「只提交蒸馏结果」，等于用残缺卡覆盖完整卡 —— 正是本次要修的
+    数据丢失。宁可这轮不更新，也不能覆盖。
+    """
+    for err in ("identity_unreadable", "identity_local_only_agent_cannot_read",
+                "identity_error: bad tag"):
+        job = _resident_job()
+        completed, derive_calls, execute_calls = _patch_distill_pipeline(
+            monkeypatch, job,
+            snapshot_card=None, snapshot_error=err,
+            derive_results=[{"agent_name": "A"}],
+            execute_side_effects=[{"status": "ok"}],
+        )
+        crc._process_resident_distill_once()
+        assert execute_calls["n"] == 0, err
+        assert completed["identity_status"] != "replaced", err
+
+
+def test_empty_distilled_value_does_not_clear_an_existing_field():
+    """模型吐了非法名字时解析器返回 agent_name=""，不能拿它覆盖已有合法名字。
+
+    parse_identity_payload 对 runtime label 是「置空不拒卡」，所以 distilled 里会
+    出现空串。第一版直接 update() 上去，把用户的名字清成了空。
+    """
+    merged = crc._resident_merge_identity_for_replace(
+        {"agent_name": "小明", "tone_style": "温和"},
+        {"agent_name": "", "self_introduction": "我是"})
+    assert merged["agent_name"] == "小明"
+    assert merged["self_introduction"] == "我是"
+    assert merged["tone_style"] == "温和"
+
+
+def test_merge_drops_outer_metadata_instead_of_submitting_it():
+    """只提交卡体字段。外层元数据（解密状态/可见性/时间戳）服务端目前会忽略，
+    但不该依赖服务端宽容 —— 调用方自己白名单。"""
+    merged = crc._resident_merge_identity_for_replace(
+        {"agent_name": "小明", "decrypt_status": "ok", "visibility": "shared",
+         "v": 1, "created_at": "c", "updated_at": "u", "replaced_at": "r",
+         "days_with_user": 3},
+        {"self_introduction": "我是"})
+    assert merged["agent_name"] == "小明"
+    for leaked in ("decrypt_status", "visibility", "v", "created_at",
+                   "updated_at", "replaced_at", "days_with_user"):
+        assert leaked not in merged, leaked

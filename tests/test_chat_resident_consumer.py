@@ -7133,6 +7133,10 @@ def test_distill_identity_job_postpones_whole_job_when_user_pending(monkeypatch)
     derives = []
     monkeypatch.setattr(crc, "_resident_derive_identity",
                         lambda document, job_id: derives.append(job_id) or None)
+    # 读卡现在是蒸馏的前置：读不到就中止、不烧一次模型调用。本用例测的是「用户在
+    # 聊天时整个 job 延后」，与卡无关，所以给一张可读的卡让它走到蒸馏那步。
+    monkeypatch.setattr(crc, "_resident_identity_snapshot",
+                        lambda: ({"agent_name": "旧"}, "", ""))
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: True)
     crc._process_resident_distill_once(chat_since=1.0)
     assert derives == []                            # zero model turns spent

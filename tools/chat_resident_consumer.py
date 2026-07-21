@@ -10150,6 +10150,111 @@ def _resident_existing_identity() -> dict:
         return {}
 
 
+def _resident_replace_card_fields() -> frozenset:
+    """Card-BODY fields a resident full-card replace may submit.
+
+    Derived from card_policy so a newly added profile field is covered automatically
+    (the hand-copied-list mistake that caused the enclave field loss is not worth
+    repeating). Everything else `/v1/identity/get` returns — decrypt_status,
+    visibility, v, created_at/updated_at/replaced_at, days_with_user — is OUTER
+    metadata: the server recomputes or preserves it and currently ignores it on the
+    way in, but the caller should not rely on that leniency.
+    """
+    from identity import card_policy as _cp
+    return frozenset(_cp.PROFILE_FIELDS) | {"dimensions"}
+
+
+def _resident_identity_snapshot() -> tuple[dict | None, str, str]:
+    """One read → (card_body, replaced_at, error). Card and baseline from the SAME
+    response, so a full replace landing between the two reads cannot produce
+    "old content + fresh baseline" and slip past the conflict check.
+
+    Returns ``(None, "", error)`` for every state where a full-card replace would
+    DESTROY data rather than update it: request failed, no card, local-only card the
+    resident cannot read, decrypt failure, or the encrypted-envelope shape we get
+    when the enclave is not configured and we fall back to the API. ``{}`` must never
+    be used to mean both "empty card" and "could not read" — treating the second as
+    the first is exactly how a re-derive overwrites a card it never saw.
+    """
+    body = (
+        _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
+        if FEEDLING_ENCLAVE_URL else {}
+    )
+    if not isinstance(body.get("identity"), dict):
+        body = _capture_get_json("/v1/identity/get")
+    identity = body.get("identity")
+    if not isinstance(identity, dict) or not identity:
+        return None, "", "identity_unreadable"
+    status = str(identity.get("decrypt_status") or "")
+    if status != "ok":
+        # Covers local_only_agent_cannot_read, "error: <reason>", and the API
+        # fallback's ciphertext envelope (no decrypt_status at all).
+        return None, "", f"identity_{status or 'not_plaintext'}"
+    allowed = _resident_replace_card_fields()
+    card = {
+        key: value for key, value in identity.items()
+        if key in allowed and value not in (None, "", [], {})
+    }
+    return card, str(identity.get("replaced_at") or ""), ""
+
+
+def _resident_merge_identity_for_replace(existing: dict, distilled: dict) -> dict:
+    """Compose the full card to hand to ``identity.replace``. Pure (testable).
+
+    ``identity.replace`` is a full-card overwrite by design, so the CALLER has to
+    submit a complete card. It used to submit the distiller's output verbatim, which
+    lost two different things:
+
+    1. Fields the distiller does not own — ``custom_persona_prompt``,
+       ``user_preferred_name``, ``language_preference``, ``stable_definitions``,
+       ``relationship_anchor``. These are not even named in the prompt's field spec,
+       so the model has never seen them and cannot "keep" them. custom_persona_prompt
+       is written by the USER and is the highest-priority persona signal there is.
+    2. Any owned field the model simply forgot to restate. ``parse_identity_payload``
+       returns only the keys the model actually emitted, so one silent omission
+       cleared that field.
+
+    Both come from the same mistake: preservation was delegated to the model (the
+    prompt asks it to keep unaddressed fields) instead of being done in code. The
+    cloud path never had this problem — it overlays only the fields genesis owns onto
+    the existing card. This is the same shape, for the resident path.
+
+    An EMPTY distilled value is dropped too, not just an absent key: the parser is
+    deliberately lenient about a runtime label and returns ``agent_name: ""`` rather
+    than rejecting the card, and letting that through would blank a perfectly good
+    name. Absent or empty therefore means "unchanged". Clearing a field needs its own
+    explicit signal; the current contract cannot express one, and conflating the two
+    is what caused the data loss in the first place.
+    """
+    allowed = _resident_replace_card_fields()
+    merged = {
+        key: value for key, value in (existing or {}).items()
+        if key in allowed and value not in (None, "", [], {})
+    }
+    for key, value in (distilled or {}).items():
+        if key not in allowed or value in (None, "", [], {}):
+            continue
+        merged[key] = value
+    return merged
+
+
+def _resident_identity_attempt(document: str, job_id: str) -> tuple[dict | None, str, str]:
+    """One complete attempt: snapshot the card, derive, compose the full card.
+
+    Returns ``(payload, baseline, error)``. Both the first submission and the
+    conflict retry go through this — the first version merged only before the first
+    submission, so a 409 retry silently fell back to submitting the distiller's raw
+    output and lost every preserved field.
+    """
+    card, baseline, error = _resident_identity_snapshot()
+    if error:
+        return None, "", error
+    distilled = _resident_derive_identity(document, job_id)
+    if distilled is None:
+        return None, "", "derive_failed"
+    return _resident_merge_identity_for_replace(card, distilled), baseline, ""
+
+
 def _resident_current_replaced_at() -> str:
     """Best-effort read of the current identity's outer ``replaced_at`` (P5 concurrency
     baseline, Task 3) — used to refresh the retry baseline after an identity_base_stale
@@ -10196,7 +10301,19 @@ def _resident_distill_identity(state: dict) -> None:
     job_id = state["job_id"]
     document = state["document"]
     identity_status = "skipped"
-    identity_payload = _resident_derive_identity(document, job_id)
+    identity_payload, _snapshot_baseline, attempt_error = _resident_identity_attempt(
+        document, job_id)
+    if attempt_error and attempt_error != "derive_failed":
+        # Could not read the current card (request failed / local-only / decrypt
+        # error). A full-card replace built without it would overwrite the card we
+        # never saw, which is the data loss this whole change exists to stop. Skip
+        # the identity write; the material is unchanged and the job can be re-run.
+        log.error(
+            "resident distill: skipping identity replace job=%s reason=%s "
+            "(refusing to overwrite a card we could not read)",
+            job_id, attempt_error,
+        )
+        identity_status = f"skipped_{attempt_error}"
     # base_identity_replaced_at (Task 4) is the P5 concurrency baseline snapshotted
     # at job-creation time; "" means no baseline (legacy job / no prior identity) —
     # the backend then skips the check entirely (back-compat). Only a full
@@ -10233,12 +10350,20 @@ def _resident_distill_identity(state: dict) -> None:
                 job_id,
             )
             conflict_retried = True
-            # _resident_derive_identity re-fetches the existing card internally
-            # (_resident_existing_identity), so this re-call already merges against
-            # whatever full replace won the race — then resubmit with a refreshed
-            # baseline so the retry itself can't spuriously re-conflict.
-            identity_payload = _resident_derive_identity(document, job_id)
-            base_identity_replaced_at = _resident_current_replaced_at()
+            # Re-run the WHOLE attempt, not just the derive: re-snapshot the card
+            # (so we merge onto whatever full replace won the race) and take the
+            # baseline from that same response. Re-deriving alone would resubmit the
+            # distiller's raw output and drop every preserved field — the first
+            # version of this fix had exactly that hole.
+            identity_payload, refreshed_baseline, retry_error = (
+                _resident_identity_attempt(document, job_id))
+            if retry_error:
+                log.error(
+                    "resident distill: retry aborted job=%s reason=%s", job_id, retry_error)
+                identity_payload = None
+                identity_status = f"skipped_{retry_error}"
+                break
+            base_identity_replaced_at = refreshed_baseline
     genesis_resident_complete(
         job_id, memory_action_count=0, identity_status=identity_status
     )
