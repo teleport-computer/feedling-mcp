@@ -450,6 +450,7 @@ def test_default_claude_cmd_grants_file_read():
     )
     cmd = env["AGENT_CLI_CMD"]
     assert "Read(//agent-data/users/u/files/" in cmd
+    assert "Write(//agent-data/users/u/files/" in cmd
     assert "--add-dir /agent-data/users/u/files" in cmd
     # …and the consumer is told to land files there (matches the grant).
     assert env["FILE_TEMP_DIR"] == "/agent-data/users/u/files"
@@ -467,6 +468,9 @@ def test_default_claude_cmd_substitutes_io_cli_path_in_prompt():
     prompt = files["/agent-data/users/u/agent-tools-prompt.md"]
     assert "<io_cli>" not in prompt
     assert "python /app/tools/io_cli.py perception" in prompt
+    assert "<file_temp_dir>" not in prompt
+    assert "/agent-data/users/u/files" in prompt
+    assert "native download card" in prompt
 
 
 def test_custom_cli_cmd_opts_out_of_default_grant():

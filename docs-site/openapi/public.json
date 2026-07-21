@@ -8457,9 +8457,23 @@
             "type": "string",
             "enum": [
               "text",
-              "image"
+              "image",
+              "file"
             ],
             "default": "text"
+          },
+          "file_name": {
+            "type": "string",
+            "maxLength": 120,
+            "description": "Required when content_type is file; the envelope plaintext contains the file bytes."
+          },
+          "file_mime": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "file_byte_count": {
+            "type": "integer",
+            "minimum": 0
           },
           "turn_failure_error_class": {
             "type": "string",

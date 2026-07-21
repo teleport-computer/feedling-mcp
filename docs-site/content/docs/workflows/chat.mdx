@@ -413,6 +413,33 @@ X-Feedling-Consumer-Commit: abc1234
 }
 ```
 
+To return a native downloadable attachment, post a second encrypted response
+with `content_type: "file"`. The envelope plaintext is the raw file bytes (not
+base64 text); `file_name` is required, while `file_mime` and `file_byte_count`
+provide display metadata. A resident should first win the parent turn with its
+text reply, then post the file without `reply_to_message_id`, so a losing
+consumer cannot leave an orphaned duplicate attachment.
+
+```json
+{
+  "envelope": {
+    "v": 1,
+    "id": "env_file_789",
+    "body_ct": "BASE64_CIPHERTEXT_OF_FILE_BYTES",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef"
+  },
+  "content_type": "file",
+  "file_name": "plan.md",
+  "file_mime": "text/markdown",
+  "file_byte_count": 846,
+  "source": "chat"
+}
+```
+
 ```json
 {
   "id": "msg_assistant_456",
