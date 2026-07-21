@@ -12,25 +12,23 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
-- **Web search is now opt-in and off by default.** `web_search` / `web_fetch`
-  are only offered to the model when the user turns the toggle on; before this
-  change they were always available. Existing users are **not** migrated — every
-  account starts closed and must enable it explicitly, so replies will stop
-  using live web results until the switch is flipped. Background turns
-  (proactive wake / screen watch, and any research subagent they spawn) never
-  reach the network, regardless of the toggle. Accounts whose persisted runtime
-  target was already the V2 runtime are backfilled to "on" once, so existing
-  users keep what they had; new accounts start off.
+- **Web search is now user-controlled.** `web_search` / `web_fetch` are only
+  offered to the model when the account's toggle is on; before this change they
+  were always available. The switch covers **every** turn — foreground chat, the
+  proactive companion's background turns, and any subagent spawned from either —
+  so there is one answer to "can my companion go online", not a per-lane matrix.
+  Accounts whose persisted runtime target was already the V2 runtime are
+  backfilled to "on" once, so existing users keep exactly what they had; new
+  accounts start off and enable it in the app.
 - New `GET`/`POST` `/v1/web/settings` (api-key only; runtime tokens are
   refused). The response keeps the user's saved preference separate from what is
   actually possible right now:
-  `{"enabled", "runtime_supported", "status", "effective_for_chat", "tools"}`.
+  `{"enabled", "runtime_supported", "status", "effective", "tools"}`.
   `enabled` is written only by the user — an operator halt never rewrites it.
   `runtime_supported` is false for self-hosted accounts, whose consumer does not
   run the tool loop these tools live in. `status` is `available` / `degraded` /
   `unavailable`, where `degraded` means one of the two tools is halted and the
-  other still works. `effective_for_chat` is derived and covers foreground chat
-  only. `POST` requires a real JSON boolean under `enabled`; strings such as
+  other still works. `effective` is derived, and covers every lane. `POST` requires a real JSON boolean under `enabled`; strings such as
   `"no"` are rejected with `400` rather than coerced.
 
 - Self-hosted resident polls may now receive server-generated maintenance turns

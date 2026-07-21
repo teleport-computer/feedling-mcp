@@ -28,47 +28,43 @@ def test_tool_names_match_the_capability_registry():
 
 
 def test_user_off_disables_everything():
-    assert g.disabled_web_tools(user_enabled=False, lane="chat",
+    assert g.disabled_web_tools(user_enabled=False,
                                 search_halted=False, fetch_halted=False) == BOTH
 
 
-def test_user_on_chat_enables_everything():
-    assert g.disabled_web_tools(user_enabled=True, lane="chat",
+def test_user_on_enables_everything():
+    assert g.disabled_web_tools(user_enabled=True,
                                 search_halted=False, fetch_halted=False) == frozenset()
 
 
-@pytest.mark.parametrize("lane", [
-    "wake", "screen_watch", "scheduled", "heartbeat", "manual_wake",
-    "maintenance", "capture", "dream", "", None, "future_lane", "Chat", "CHAT",
-])
-def test_background_and_unknown_lanes_always_disabled(lane):
-    """Background search adds model rounds, tokens and latency, and is an
-    outbound data flow the user never triggered. Anything not explicitly
-    foreground — including a typo'd "Chat" — fails closed."""
-    assert g.disabled_web_tools(user_enabled=True, lane=lane,
-                                search_halted=False, fetch_halted=False) == BOTH
+def test_the_gate_takes_no_lane_at_all():
+    """The regression this guards against is re-introducing a lane policy.
 
+    The proactive companion had web access before this feature existed, so a
+    background-lane carve-out would silently take a capability away under the
+    banner of adding a setting. One switch, every lane — and the signature is
+    where that is enforced, because a caller cannot pass a lane it does not take.
+    """
+    import inspect
 
-def test_only_chat_is_foreground():
-    """Pins the policy literal to one place. If a new foreground lane is added
-    this test is the reminder to think about it explicitly."""
-    assert g.FOREGROUND_LANES == frozenset({"chat"})
+    assert "lane" not in inspect.signature(g.disabled_web_tools).parameters
+    assert not hasattr(g, "FOREGROUND_LANES")
 
 
 def test_halted_flags_are_independent():
-    assert g.disabled_web_tools(user_enabled=True, lane="chat", search_halted=True,
+    assert g.disabled_web_tools(user_enabled=True, search_halted=True,
                                 fetch_halted=False) == frozenset({"web_search"})
-    assert g.disabled_web_tools(user_enabled=True, lane="chat", search_halted=False,
+    assert g.disabled_web_tools(user_enabled=True, search_halted=False,
                                 fetch_halted=True) == frozenset({"web_fetch"})
 
 
 def test_halted_wins_over_user_preference():
-    assert g.disabled_web_tools(user_enabled=True, lane="chat",
+    assert g.disabled_web_tools(user_enabled=True,
                                 search_halted=True, fetch_halted=True) == BOTH
 
 
 def test_returns_a_frozenset_so_callers_cannot_mutate_shared_state():
-    got = g.disabled_web_tools(user_enabled=True, lane="chat",
+    got = g.disabled_web_tools(user_enabled=True,
                                search_halted=False, fetch_halted=False)
     assert isinstance(got, frozenset)
 

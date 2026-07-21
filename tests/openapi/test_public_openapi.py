@@ -610,9 +610,9 @@ def test_web_settings_schemas_pin_the_field_types(
 
     response = components["WebSettingsResponse"]
     assert set(response["required"]) == {
-        "enabled", "runtime_supported", "status", "effective_for_chat", "tools",
+        "enabled", "runtime_supported", "status", "effective", "tools",
     }
-    for field in ("enabled", "runtime_supported", "effective_for_chat"):
+    for field in ("enabled", "runtime_supported", "effective"):
         assert response["properties"][field]["type"] == "boolean", field
     # `degraded` must be expressible: one tool halted, the other still usable.
     assert set(response["properties"]["status"]["enum"]) == {

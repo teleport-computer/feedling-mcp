@@ -1,5 +1,23 @@
 # 联网搜索用户开关（Runtime V2）Implementation Plan
 
+> ## ⚠️ 2026-07-21 修正：lane 策略已作废，本文下面关于「后台 lane 硬禁用」的
+> ## 所有内容都不再成立
+>
+> 原设计把 wake / screen_watch 等后台 lane 无条件断网，理由是「后台联网是用户
+> 没触发的外发数据流」。**这个理由站不住**：在这个功能存在之前，主动陪伴的
+> 后台轮次本来就能联网（`pre` 上 wake 的 `run_tool_loop` 压根没传
+> `disabled_tool_names`）。那不是「新设置不开放新能力」，是**拿掉一个既有能力**，
+> 而且这条是 Seven 早先定的调。
+>
+> 现在的规则：**一个开关管所有 lane**。前台聊天、主动陪伴、以及它们派生的
+> 子 agent，全部跟随同一个 `enabled`。用户不想让后台联网，就把开关关掉，
+> 关掉之后所有地方都不联网。
+>
+> 代码里 `web_gate.disabled_web_tools()` 已经**不接受 `lane` 参数**，
+> `FOREGROUND_LANES` 已删除，并有测试钉住这一点。契约字段
+> `effective_for_chat` 相应改名为 `effective`。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 给用户一个「联网搜索」开关；关闭时 `web_search` / `web_fetch` 对该用户

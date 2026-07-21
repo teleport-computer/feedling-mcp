@@ -4417,12 +4417,25 @@ async def _run_wake(
             if tm is not None:
                 tm.add_call(usage)
 
-        # Background lanes never reach the network, whatever the user's toggle
-        # says. Stated as the constant rather than routed through
-        # disabled_web_tools(user_enabled=False, ..., halted=True, halted=True):
-        # every input there would be hardcoded anyway, so the indirection only
-        # looked like it would follow a future policy change. It would not.
-        wake_disabled_web_tool_names = v2_web_gate.WEB_TOOL_NAMES
+        # The wake lane follows the SAME user switch as chat. The proactive
+        # companion could already reach the network before this feature existed
+        # (pre offered these tools here with no gate at all), so closing it
+        # unconditionally would be a capability regression, not a new setting.
+        # Same shape as the chat lane, deliberately — one switch, every lane.
+        wake_web_user_enabled = await asyncio.to_thread(
+            v2_web_gate.resolve_user_enabled, deps.web_tools_enabled, user_id
+        )
+        if wake_web_user_enabled:
+            wake_search_halted, wake_fetch_halted = await asyncio.to_thread(
+                kill_switch.web_halted
+            )
+        else:
+            wake_search_halted = wake_fetch_halted = True
+        wake_disabled_web_tool_names = v2_web_gate.disabled_web_tools(
+            user_enabled=wake_web_user_enabled,
+            search_halted=wake_search_halted,
+            fetch_halted=wake_fetch_halted,
+        )
 
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=wake_disabled_web_tool_names,
@@ -4893,14 +4906,6 @@ async def _run_wake(
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
                 build_messages=build_messages,
-                # Background turns never reach the network, whatever the user's
-                # toggle says: searching here adds model rounds, tokens and
-                # latency, and is an outbound data flow the user never
-                # triggered. `lane` is the real variable (heartbeat /
-                # scheduled / manual_wake / screen_watch) — none of them are in
-                # web_gate.FOREGROUND_LANES, so this is always both tools, but
-                # it still goes through the shared decision so a future change
-                # to the lane policy cannot miss this call site.
                 disabled_tool_names=wake_disabled_web_tool_names,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
@@ -5897,9 +5902,9 @@ async def process_job(
         web_user_enabled = await asyncio.to_thread(
             v2_web_gate.resolve_user_enabled, deps.web_tools_enabled, user_id
         )
-        # Skip the control-plane read entirely when the answer is already known
-        # (user off, or a background lane): one less DB round-trip per turn.
-        if web_user_enabled and lane in v2_web_gate.FOREGROUND_LANES:
+        # Skip the control-plane read entirely when the user is off: the answer
+        # is already "both withheld", so that is one less DB round-trip.
+        if web_user_enabled:
             web_search_halted, web_fetch_halted = await asyncio.to_thread(
                 kill_switch.web_halted
             )
@@ -5907,7 +5912,6 @@ async def process_job(
             web_search_halted = web_fetch_halted = True
         disabled_web_tool_names = v2_web_gate.disabled_web_tools(
             user_enabled=web_user_enabled,
-            lane=lane,  # the real lane variable, never a "chat" literal
             search_halted=web_search_halted,
             fetch_halted=web_fetch_halted,
         )

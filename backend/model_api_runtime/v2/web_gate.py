@@ -15,21 +15,20 @@ from __future__ import annotations
 
 WEB_TOOL_NAMES = frozenset({"web_search", "web_fetch"})
 
-# Only the foreground chat turn may reach the network. Background turns
-# (wake / scheduled / heartbeat / manual_wake / screen_watch, and any subagent
-# spawned from them) stay closed even when the user's toggle is ON: searching
-# there adds model rounds, tokens and latency, and is an outbound data flow the
-# user never triggered. A settings-page switch labelled "web search" should not
-# quietly authorise the background companion to go online.
+# The switch governs EVERY lane, foreground and background alike.
 #
-# This is the only place a lane name is written down. Call sites pass their real
-# `lane` variable rather than a literal, so a typo cannot silently reclassify a
-# turn — and any lane not listed here fails closed by construction, which makes
-# a future lane safe by default.
-FOREGROUND_LANES = frozenset({"chat"})
-
-
-def disabled_web_tools(*, user_enabled: bool, lane: str | None,
+# An earlier revision of this module hard-closed the background lanes (wake /
+# scheduled / heartbeat / manual_wake / screen_watch) regardless of the user's
+# preference. That was wrong on the facts: the proactive companion already had
+# web access before this feature existed, and taking it away would have been a
+# silent capability regression dressed up as a new setting. The rule is that
+# this switch *governs* web access, not that it *introduces* it.
+#
+# So there is deliberately no lane policy here. One switch, one meaning:
+# "may this account's model reach the network at all". A user who does not want
+# the background companion online turns the switch off and it is off
+# everywhere.
+def disabled_web_tools(*, user_enabled: bool,
                        search_halted: bool, fetch_halted: bool) -> frozenset[str]:
     """The web tool names to withhold from this turn.
 
@@ -38,7 +37,7 @@ def disabled_web_tools(*, user_enabled: bool, lane: str | None,
     request, therefore absent from ``offered_names`` — un-offered *and*
     un-executable, i.e. "this tool does not exist for this user this turn".
     """
-    if not user_enabled or lane not in FOREGROUND_LANES:
+    if not user_enabled:
         return WEB_TOOL_NAMES
     withheld = set()
     if search_halted:

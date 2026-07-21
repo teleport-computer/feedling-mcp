@@ -45,7 +45,7 @@ def test_default_is_off_but_runtime_supports_it(store):
         "enabled": False,
         "runtime_supported": True,
         "status": "available",
-        "effective_for_chat": False,
+        "effective": False,
         "tools": {"web_search": {"available": True},
                   "web_fetch": {"available": True}},
     }
@@ -54,7 +54,7 @@ def test_default_is_off_but_runtime_supports_it(store):
 def test_enabled_makes_it_effective(store):
     settings_core.update_settings(
         store, {"enabled": True}, halted_reader=OPEN, runtime_supported_reader=SUPPORTED)
-    assert _get(store)["effective_for_chat"] is True
+    assert _get(store)["effective"] is True
 
 
 def test_self_hosted_user_is_never_effective_even_when_enabled(store):
@@ -67,7 +67,7 @@ def test_self_hosted_user_is_never_effective_even_when_enabled(store):
     assert got["enabled"] is True             # the preference is still theirs
     assert got["runtime_supported"] is False
     assert got["status"] == "unavailable"
-    assert got["effective_for_chat"] is False
+    assert got["effective"] is False
     assert got["tools"]["web_search"]["available"] is False
 
 
@@ -78,7 +78,7 @@ def test_half_open_is_degraded_not_unavailable(store):
         store, {"enabled": True}, halted_reader=OPEN, runtime_supported_reader=SUPPORTED)
     got = _get(store, halted_reader=lambda: (True, False))
     assert got["status"] == "degraded"
-    assert got["effective_for_chat"] is True
+    assert got["effective"] is True
     assert got["tools"] == {"web_search": {"available": False},
                             "web_fetch": {"available": True}}
 
@@ -88,7 +88,7 @@ def test_both_halted_is_unavailable(store):
         store, {"enabled": True}, halted_reader=OPEN, runtime_supported_reader=SUPPORTED)
     got = _get(store, halted_reader=lambda: (True, True))
     assert got["status"] == "unavailable"
-    assert got["effective_for_chat"] is False
+    assert got["effective"] is False
 
 
 def test_operator_halt_never_rewrites_the_preference(store):

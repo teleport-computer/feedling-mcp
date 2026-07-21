@@ -122,9 +122,9 @@ def test_defaults_to_disabled(client):
     _, key = _register(client)
     body = client.get("/v1/web/settings", headers=_auth(key)).get_json()
     assert body["enabled"] is False
-    assert body["effective_for_chat"] is False
+    assert body["effective"] is False
     assert set(body) == {
-        "enabled", "runtime_supported", "status", "effective_for_chat", "tools",
+        "enabled", "runtime_supported", "status", "effective", "tools",
     }
     assert body["status"] in {"available", "degraded", "unavailable"}
 

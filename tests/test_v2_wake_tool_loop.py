@@ -641,14 +641,7 @@ def test_screen_watch_lane_uses_its_own_prompt_and_screen_context(monkeypatch):
 # --------------------------------------------------------------- web gate
 
 
-def test_wake_never_offers_web_tools_even_if_the_user_enabled_them(monkeypatch):
-    """Background turns stay offline whatever the settings page says.
-
-    A switch labelled "web search" should not quietly authorise the background
-    companion to go online: it costs the user model rounds, tokens and latency,
-    and it is an outbound data flow they never triggered.
-    """
-    uid = "u_wake_web_gate"
+def _wake_offered(monkeypatch, *, user_enabled: bool, uid: str) -> set[str]:
     conftest.seed_user(uid)
     _reset(uid)
     jobs_store.enqueue_job(uid, "heartbeat")
@@ -658,15 +651,31 @@ def test_wake_never_offers_web_tools_even_if_the_user_enabled_them(monkeypatch):
 
     calls = _script_provider(monkeypatch, [_text_round("hey")])
     deps = _wake_deps(tail=[], sink_calls=[])
-    # Explicitly ON at the user level — the lane must still win.
-    deps.web_tools_enabled = lambda uid_: True
+    deps.web_tools_enabled = lambda uid_: user_enabled
 
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
     ))
-
     assert status == "completed"
-    offered = {spec.name for spec in (calls[0]["tools"] or ())}
-    assert {"web_search", "web_fetch"}.isdisjoint(offered)
+    return {spec.name for spec in (calls[0]["tools"] or ())}
+
+
+def test_wake_offers_web_tools_when_the_user_enabled_them(monkeypatch):
+    """The proactive companion follows the SAME switch as chat.
+
+    It could already reach the network before this feature existed, so a
+    background carve-out would be a silent capability regression wearing the
+    costume of a new setting. One switch, every lane.
+    """
+    offered = _wake_offered(monkeypatch, user_enabled=True, uid="u_wake_web_on")
+    assert {"web_search", "web_fetch"} <= offered
     # the rest of the wake tool surface is unchanged
+    assert "memory_index" in offered
+
+
+def test_wake_withholds_web_tools_when_the_user_turned_them_off(monkeypatch):
+    """...and turning the switch off closes the background lane too, which is
+    the whole reason it is allowed to be one switch."""
+    offered = _wake_offered(monkeypatch, user_enabled=False, uid="u_wake_web_off")
+    assert {"web_search", "web_fetch"}.isdisjoint(offered)
     assert "memory_index" in offered

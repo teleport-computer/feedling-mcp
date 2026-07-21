@@ -320,15 +320,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "written only by the user — an operator halt never rewrites it. "
             "`runtime_supported` is false for self-hosted accounts, whose "
             "consumer does not run the tool loop these tools live in, so the "
-            "preference is inert there. `effective_for_chat` is derived and "
-            "covers foreground chat only: background turns (proactive wake / "
-            "screen watch) never reach the network regardless of any of these."
+            "preference is inert there. `effective` is derived, and covers "
+            "every lane: the proactive companion's background turns follow the "
+            "same switch as foreground chat."
         ),
         "required": [
             "enabled",
             "runtime_supported",
             "status",
-            "effective_for_chat",
+            "effective",
             "tools",
         ],
         "additionalProperties": False,
@@ -346,9 +346,9 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "other still works — not a synonym for unavailable."
                 ),
             },
-            "effective_for_chat": {
+            "effective": {
                 "type": "boolean",
-                "description": "Whether a foreground chat turn actually gets web tools.",
+                "description": "Whether this account's turns actually get web tools.",
             },
             "tools": {
                 "type": "object",

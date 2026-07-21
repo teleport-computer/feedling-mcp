@@ -18,6 +18,9 @@ An earlier version reported ``effective = enabled and not search_halted``. That
 was wrong twice over: it told a self-hosted user their toggle was in effect when
 their runtime has no web tools at all, and it reported "not effective" while
 ``web_fetch`` was still perfectly usable.
+
+The switch covers every lane, background companion included, so ``effective``
+carries no lane qualifier.
 """
 
 from __future__ import annotations
@@ -70,10 +73,10 @@ def get_settings(
         "enabled": enabled,
         "runtime_supported": supported,
         "status": status,
-        # What the user actually gets on a chat turn. Background lanes are a
-        # separate consent scope and are never covered by this switch — see
-        # web_gate.FOREGROUND_LANES.
-        "effective_for_chat": enabled and bool(live),
+        # What the user actually gets. Every lane follows this one switch —
+        # foreground chat and the background companion alike — so there is no
+        # per-lane qualifier to report.
+        "effective": enabled and bool(live),
         "tools": tools,
     }
 
