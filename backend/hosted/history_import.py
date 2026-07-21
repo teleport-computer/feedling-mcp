@@ -1851,8 +1851,17 @@ def _rewrite_candidate_person_reference(text: str, subject: str, user_name: str)
         en_referent,
         raw,
     )
-    raw = raw.replace("用户", zh_referent)
     if str(subject or "") == "user":
+        raw = re.sub(
+            r"用户(?=(?:明确|要求|希望|想要?|喜欢|偏好|说|提到|需要|常常?|总是|通常|曾经?|会|能|愿意|拒绝|认为|觉得|正在|已经|仍然|依然|的))",
+            zh_referent,
+            raw,
+        )
+        raw = re.sub(
+            r"(^|[。！？.!?；;：:,，、]\s*)用户(?!增长|留存|画像|体验|规模|数量|群体|反馈|研究|策略|需求|行为|运营|市场|旅程|界面|数据|测试|访谈|调研|转化|获取|分层|价值|生命周期|账户|账号|权限|协议|故事|场景|端|侧)",
+            lambda match: match.group(1) + zh_referent,
+            raw,
+        )
         raw = re.sub(
             r"(^|[。！？.!?]\s*)(?:TA|你|他|她)(?=[\u4e00-\u9fff])",
             lambda match: match.group(1) + zh_referent,

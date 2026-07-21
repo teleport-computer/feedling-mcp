@@ -257,6 +257,15 @@ def test_rendered_user_candidate_unknown_name_uses_neutral_referent():
     assert "用户" not in json.dumps(cards[0], ensure_ascii=False)
 
 
+def test_chinese_user_rewrite_preserves_product_compounds():
+    text = "用户要求聚焦用户增长和用户画像。用户喜欢研究用户留存与用户体验。"
+
+    assert hi._rewrite_candidate_person_reference(text, "user", "小雨") == (
+        "小雨要求聚焦用户增长和用户画像。小雨喜欢研究用户留存与用户体验。"
+    )
+    assert hi._rewrite_candidate_person_reference(text, "ai", "小雨") == text
+
+
 def test_normalize_keeps_sparse_evidenced_dimensions_without_padding():
     out = hi._normalize_identity_payload(
         _raw(
