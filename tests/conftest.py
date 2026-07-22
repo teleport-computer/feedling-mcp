@@ -136,6 +136,7 @@ if not _provisioned:
         "test_agent_runtime_tokens.py",
         "test_agent_runtime_resolve_cache.py",
         "test_agent_runtime_spawners.py",
+        "test_spawners_catalog.py",
         "test_agent_runtime_resident_contract.py",
         "test_hosted_agent_runtime_cutover.py",
         "test_worldbook_match.py",

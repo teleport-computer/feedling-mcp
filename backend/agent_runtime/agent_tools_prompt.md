@@ -12,19 +12,7 @@ user.
 Run (the absolute path is provided by the host):
 
 ```
-python <io_cli> perception <signal> [<signal> ...]
-python <io_cli> perception-recent-apps [--limit <n>] [--hours <n>]
-python <io_cli> perception-trend <signal> [--field <field>] [--days <n>]
-python <io_cli> perception-history <signal> [--days <n>]
-python <io_cli> memory-index [--query <text>] [--limit <n>] [--bucket <name>] [--thread <tag>]
-python <io_cli> memory-fetch <id> [<id> ...] [--limit <n>]
-python <io_cli> identity-read
-python <io_cli> identity-write [--agent-name <name>] [--self-introduction <text>] [--signature <line>]
-python <io_cli> screen-recent [--limit <n>]
-python <io_cli> screen-read [--frame-id <id>] [--include-image]
-python <io_cli> photo-recent [--limit <n>]
-python <io_cli> photo-read --id <photo_id> [--include-image]
-python <io_cli> chat-image --id <message_id>
+<io_cli_catalog>
 ```
 
 - Output is JSON on stdout (`{"ok": true, ...}` or `{"ok": false, "error": ...}`).

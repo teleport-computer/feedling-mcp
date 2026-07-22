@@ -77,6 +77,19 @@ _IO_CLI_VERBS = (
     # here too, or claude's acceptEdits mode denies it ("requires approval") and the
     # agent loops "waiting for permission approval" instead of showing the image.
     "chat-image",
+    # memory-write/-patch/-delete + schedule-wake/cancel-wake (T13): parity with
+    # the VPS/OpenClaw io_cli surface — writing memory cards and self-scheduling a
+    # wake are otherwise silently unavailable to hosted claude even though io_cli
+    # itself implements them (same prompt/allowlist-consistency requirement as
+    # photo-*/chat-image above; identity-redistill is intentionally NOT added here
+    # — it's VPS-local-IPC-only, see io_cli.py's identity-redistill help text).
+    #
+    # ⚠️ V2 云端注册表制不用本渲染;过渡期 V1 spawner 仍用。0727 后随 V1 退役。
+    "memory-write",
+    "memory-patch",
+    "memory-delete",
+    "schedule-wake",
+    "cancel-wake",
 )
 # Host-side resident sessions rotate at this many turns (vs the shared consumer
 # default of 40) so the persona file re-grounds voice more often within a long
@@ -86,6 +99,93 @@ _HOST_SESSION_MAX_TURNS = "24"
 # The how-to prompt shipped beside this module (into the image via COPY backend/).
 _AGENT_PROMPT_TEXT = (Path(__file__).resolve().parent / "agent_tools_prompt.md").read_text()
 _AGENT_PROMPT_BASENAME = "agent-tools-prompt.md"
+
+# T13: the "How to call it" command block in agent_tools_prompt.md is now the
+# placeholder token below, filled in at render time by _hosted_io_cli_catalog_text
+# with the LIVE io_cli --help catalog (tools/io_cli_catalog.py, T6's VPS mechanism)
+# so hosted never teaches a stale hand-written list. This is the pre-T13 hand-list,
+# kept verbatim as the fallback for when the live build fails (subprocess error,
+# --help format drift, io_cli.py mid-deploy write) — a catalog hiccup must never
+# ship an empty tools section.
+_IO_CLI_CATALOG_PLACEHOLDER = "<io_cli_catalog>"
+_AGENT_PROMPT_FALLBACK_COMMANDS = (
+    "python {io_cli} perception <signal> [<signal> ...]\n"
+    "python {io_cli} perception-recent-apps [--limit <n>] [--hours <n>]\n"
+    "python {io_cli} perception-trend <signal> [--field <field>] [--days <n>]\n"
+    "python {io_cli} perception-history <signal> [--days <n>]\n"
+    "python {io_cli} memory-index [--query <text>] [--limit <n>] [--bucket <name>] [--thread <tag>]\n"
+    "python {io_cli} memory-fetch <id> [<id> ...] [--limit <n>]\n"
+    "python {io_cli} identity-read\n"
+    "python {io_cli} identity-write [--agent-name <name>] [--self-introduction <text>] [--signature <line>]\n"
+    "python {io_cli} screen-recent [--limit <n>]\n"
+    "python {io_cli} screen-read [--frame-id <id>] [--include-image]\n"
+    "python {io_cli} photo-recent [--limit <n>]\n"
+    "python {io_cli} photo-read --id <photo_id> [--include-image]\n"
+    "python {io_cli} chat-image --id <message_id>"
+)
+
+# Module-level memo of the live catalog text, keyed by io_cli path (in practice
+# always _IO_CLI). A ``None``/failed build is NEVER cached — same rule as VPS's
+# ``_io_cli_catalog_cache`` (tools/chat_resident_consumer.py) — so a transient
+# failure (e.g. io_cli.py mid-deploy write) retries on the next spawn instead of
+# permanently sticking every subsequent user on the fallback text for this
+# process's lifetime. Without this memo, every agent_home_files() call (one per
+# user spawn) would shell out ~20 subprocesses (one --help per catalog verb).
+_hosted_io_cli_catalog_cache: dict[str, str] = {}
+
+
+def _hosted_io_cli_catalog_text(io_cli: str = _IO_CLI) -> str:
+    """Render the io_cli command catalog for the hosted prompt.
+
+    Unlike VPS's ``_prepend_io_cli_capability_catalog`` (which prepends
+    ``io_cli_catalog.build_catalog``'s output UNFILTERED — VPS has no Bash
+    allowlist to violate), hosted's claude driver DOES scope Bash via
+    ``--allowed-tools``/``settings.json`` to exactly ``_IO_CLI_VERBS``. Teaching a
+    verb the catalog's raw --help sweep would otherwise include but that isn't
+    allow-listed (e.g. ``identity-redistill`` — VPS-local-IPC-only, no [setup]/
+    [ops] tag to filter it) would reproduce the exact "documented but blocked"
+    bug ``test_every_verb_documented_in_the_prompt_is_also_allowlisted`` guards
+    against for the hand-written list. So this filters the live catalog down to
+    ``_IO_CLI_VERBS`` and re-prefixes each surviving line with the resolved
+    ``python <io_cli> `` invocation (the catalog's own lines are bare
+    ``verb --flag ...`` with no interpreter/path, since VPS's model already knows
+    the invocation convention from elsewhere in its prompt).
+
+    Falls back to ``_AGENT_PROMPT_FALLBACK_COMMANDS`` (module constant, the
+    pre-T13 hand list) whenever the live build fails, raises, or — after
+    filtering — has nothing left to teach, so a catalog hiccup never ships an
+    empty tools section.
+    """
+    cached = _hosted_io_cli_catalog_cache.get(io_cli)
+    if cached is not None:
+        return cached
+
+    fallback = _AGENT_PROMPT_FALLBACK_COMMANDS.format(io_cli=io_cli)
+    raw = None
+    try:
+        tools_dir = str(_REPO_ROOT / "tools")
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        import io_cli_catalog  # noqa: PLC0415 — sibling under repo tools/, same import convention as chat_resident_consumer.py's catalog injection (T6)
+
+        raw = io_cli_catalog.build_catalog(io_cli, python=sys.executable)
+    except Exception:
+        log.warning("hosted io_cli catalog build raised; falling back to static command list", exc_info=True)
+        raw = None
+
+    if not raw:
+        return fallback
+
+    lines = raw.split("\n")
+    header, body = lines[:2], lines[2:]  # header = build_catalog's D8/D3 guidance lines
+    allowed = set(_IO_CLI_VERBS)
+    commands = [f"python {io_cli} {line}" for line in body if line.split(" ", 1)[0] in allowed]
+    if not commands:
+        return fallback
+
+    text = "\n".join(header + commands)
+    _hosted_io_cli_catalog_cache[io_cli] = text
+    return text
 
 
 def runtime_token_path(home: str) -> str:
@@ -649,7 +749,14 @@ def agent_home_files(
     # (observed live: ``/feedling-io-cli/io_cli.py``) → every Bash call misses the
     # ``Bash(python /app/tools/io_cli.py …)`` allowlist and is denied ("requires
     # approval"), silently breaking perception/memory/photo tools.
-    system_append = _AGENT_PROMPT_TEXT.replace("<io_cli>", io_cli)
+    #
+    # T13 ⚠️ V2 云端注册表制不用本渲染;过渡期 V1 spawner 仍用。0727 后随 V1 退役。
+    # The hand-listed command block is now the ``<io_cli_catalog>`` placeholder;
+    # fill it with the LIVE catalog (falls back to the static list internally on
+    # any build failure — see _hosted_io_cli_catalog_text).
+    system_append = _AGENT_PROMPT_TEXT.replace("<io_cli>", io_cli).replace(
+        _IO_CLI_CATALOG_PLACEHOLDER, _hosted_io_cli_catalog_text(io_cli)
+    )
     persona = (persona_content or "").strip()
     if persona:
         system_append = f"{persona}\n\n---\n\n{system_append}"
