@@ -5,6 +5,7 @@ and the io_cli command catalog (tools/io_cli_catalog.py, T6's VPS mechanism)
 rendered into the hosted agent prompt at ``<io_cli_catalog>``.
 """
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -68,6 +69,33 @@ def test_build_catalog_none_falls_back_to_static_text_without_crashing(monkeypat
     assert text, "fallback text must not be empty"
     assert "memory-index" in text  # fallback (pre-T13 static list) covers the original verb set
     assert f"python {spawners._IO_CLI} chat-image" in text
+
+
+def test_fallback_text_covers_every_authorized_verb():
+    """Codex Minor (post-approval): the fallback constant must never silently
+    under-teach — if it lags behind _IO_CLI_VERBS, a production build_catalog
+    degradation makes the agent forget capabilities this task just granted,
+    the exact under-teaching failure mode this whole project fights. Pins
+    coverage generically (not just the 2 verbs called out in review) so a
+    FUTURE _IO_CLI_VERBS addition that forgets the fallback also fails loud."""
+    fallback = spawners._AGENT_PROMPT_FALLBACK_COMMANDS.format(io_cli=spawners._IO_CLI)
+    documented = set(re.findall(rf"python {re.escape(spawners._IO_CLI)} ([a-z][a-z0-9-]*)", fallback))
+    missing = sorted(set(spawners._IO_CLI_VERBS) - documented)
+    assert not missing, f"fallback text is missing authorized verbs: {missing}"
+
+    # the two verbs called out explicitly in review
+    assert "memory-delete" in documented
+    assert "schedule-wake" in documented
+
+
+def test_fallback_text_is_used_verbatim_when_catalog_degrades(monkeypatch):
+    """The fallback path in agent_home_files (not just _hosted_io_cli_catalog_text
+    directly) must surface the new verbs too — end-to-end, not just unit-level."""
+    monkeypatch.setattr(io_cli_catalog, "build_catalog", lambda *a, **kw: None)
+    files = spawners.agent_home_files("/h", driver="claude", provider="anthropic")
+    prompt = files["/h/agent-tools-prompt.md"]
+    assert f"python {spawners._IO_CLI} memory-delete" in prompt
+    assert f"python {spawners._IO_CLI} schedule-wake" in prompt
 
 
 def test_build_catalog_raising_falls_back_to_static_text_without_crashing(monkeypatch):

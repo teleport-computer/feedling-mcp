@@ -103,10 +103,16 @@ _AGENT_PROMPT_BASENAME = "agent-tools-prompt.md"
 # T13: the "How to call it" command block in agent_tools_prompt.md is now the
 # placeholder token below, filled in at render time by _hosted_io_cli_catalog_text
 # with the LIVE io_cli --help catalog (tools/io_cli_catalog.py, T6's VPS mechanism)
-# so hosted never teaches a stale hand-written list. This is the pre-T13 hand-list,
-# kept verbatim as the fallback for when the live build fails (subprocess error,
-# --help format drift, io_cli.py mid-deploy write) — a catalog hiccup must never
-# ship an empty tools section.
+# so hosted never teaches a stale hand-written list. This is the fallback for when
+# the live build fails (subprocess error, --help format drift, io_cli.py
+# mid-deploy write) — a catalog hiccup must never ship an empty tools section, AND
+# must never silently under-teach: it MUST cover every verb currently granted in
+# _IO_CLI_VERBS (post-T13 fix — the original pre-T13 version of this constant only
+# had the 13 verbs that existed before this task and silently dropped the 5 new
+# ones on a fallback render; test_spawners_catalog.py's
+# test_fallback_text_covers_every_authorized_verb pins this so it can't drift
+# stale again the next time _IO_CLI_VERBS grows). Static/hand-maintained by
+# design — no subprocess in the failure path.
 _IO_CLI_CATALOG_PLACEHOLDER = "<io_cli_catalog>"
 _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} perception <signal> [<signal> ...]\n"
@@ -115,13 +121,18 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} perception-history <signal> [--days <n>]\n"
     "python {io_cli} memory-index [--query <text>] [--limit <n>] [--bucket <name>] [--thread <tag>]\n"
     "python {io_cli} memory-fetch <id> [<id> ...] [--limit <n>]\n"
+    "python {io_cli} memory-write [--summary <text>] [--content <text>] [--bucket <name>] [--threads <tag>] [--importance <0-1>] [--pulse <0-1>] [--type <fact|event|quote|moment>]\n"
+    "python {io_cli} memory-patch --id <memory_id> [--summary <text>] [--content <text>] [--bucket <name>] [--threads <tag>] [--importance <0-1>] [--pulse <0-1>] [--type <fact|event|quote|moment>]\n"
+    "python {io_cli} memory-delete --id <memory_id> [--reason <text>]\n"
     "python {io_cli} identity-read\n"
     "python {io_cli} identity-write [--agent-name <name>] [--self-introduction <text>] [--signature <line>]\n"
     "python {io_cli} screen-recent [--limit <n>]\n"
     "python {io_cli} screen-read [--frame-id <id>] [--include-image]\n"
     "python {io_cli} photo-recent [--limit <n>]\n"
     "python {io_cli} photo-read --id <photo_id> [--include-image]\n"
-    "python {io_cli} chat-image --id <message_id>"
+    "python {io_cli} chat-image --id <message_id>\n"
+    "python {io_cli} schedule-wake --at <time> [--reason <text>] [--tz <tz>]\n"
+    "python {io_cli} cancel-wake --wake-id <id>"
 )
 
 # Module-level memo of the live catalog text, keyed by io_cli path (in practice
