@@ -1028,6 +1028,12 @@ def _runtime_repo_files() -> set[str]:
     files.update(
         {
             "tools/io_cli.py",
+            # Imported lazily inside _prepend_io_cli_capability_catalog, so it
+            # may not yet be in sys.modules when a release-diff check runs;
+            # register it explicitly so a release that only touches the
+            # catalog generator still triggers a self-update on self-hosted
+            # CLI residents.
+            "tools/io_cli_catalog.py",
             # Imported lazily inside _materialize_user_mcp, so it may not yet be
             # in sys.modules when a release-diff check runs; register it
             # explicitly so a user_mcp materialization change still triggers a
@@ -6099,6 +6105,97 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
     return content
 
 
+# ---------------------------------------------------------------------------
+# io_cli capability catalog injection — VPS/self-hosted CLI resident only.
+# V2 云端无此注入(注册表制);VPS 线长期资产,0727 合并原样保留。
+# ---------------------------------------------------------------------------
+
+_IO_CLI_PATH = str(_REPO / "tools" / "io_cli.py")
+
+# None = "never built (yet, or last attempt failed)". A successful build is
+# cached for the life of the process — io_cli's verb/flag surface only changes
+# on a restart (self-update or a manual deploy), so there is no need to shell
+# out to `io_cli --help` (+ one `--help` per verb) on every single foreground
+# turn. A FAILED build (None) is deliberately never cached here — the failure
+# is expected to be transient (e.g. io_cli.py mid-write during a deploy), so
+# the very next turn gets another attempt instead of going dark forever.
+_io_cli_catalog_cache: str | None = None
+
+# The agent session id (see _load_agent_session_id) this process already
+# injected the catalog for, on a resume-capable driver (claude/pi/hermes).
+# Starts at ``None`` — deliberately NOT ``""`` — because "" (no session
+# established yet) is itself a legitimate, distinct session key; keeping the
+# "never injected" sentinel out of band means a session going from "" to a
+# real id still reads as a session change and re-injects once.
+_io_cli_catalog_injected_session_id: str | None = None
+
+
+def _prepend_io_cli_capability_catalog(content: str) -> str:
+    """Prepend the live io_cli command catalog (io_cli_catalog.build_catalog,
+    T6) to a foreground CLI turn, so a self-hosted resident's model always
+    sees the io_cli surface actually shipped in THIS checkout — never a stale
+    hand-written list baked into a prompt.
+
+    Gate: VPS/self-hosted CLI only (``not _HOSTED and AGENT_MODE == "cli"``).
+    Hosted (image-baked, V2 registry-based tool calling — no io_cli.py to
+    shell out to) and http-backend agents (Hermes etc. — no io_cli, no local
+    subprocess) pass ``content`` through byte-identical.
+
+    Injection point: called between ``_prepend_time_anchor_foreground`` and
+    ``_foreground_agent_message`` in the foreground compose chain. It only
+    ever prepends to ``content`` BEFORE the transcript-header prepend runs, so
+    the recent-chat transcript header from ``_foreground_agent_message``
+    (when present) always ends up topmost — the invariant
+    ``_message_has_injected_history`` depends on (it keys on the header
+    prefix at position 0 of the final message).
+
+    Caching: see ``_io_cli_catalog_cache`` above — a ``None`` build result is
+    never cached, so injection is silently skipped THIS turn only and retried
+    next turn.
+
+    Once-per-session vs every-turn: codex has no ``--resume``, so every turn
+    starts context-blind and gets the catalog every turn. claude/pi/hermes
+    resume natively, so re-injecting every turn would just bloat every prompt
+    with a block the model already has in its resumed session — inject once
+    per agent session id (see ``_io_cli_catalog_injected_session_id`` above);
+    a session id change (rotation, a brand-new session) re-injects once."""
+    global _io_cli_catalog_cache, _io_cli_catalog_injected_session_id
+    if _HOSTED or AGENT_MODE != "cli":
+        return content
+
+    is_codex = _is_codex_cmd(_cli_cmd_tokens())
+    sid = None
+    if not is_codex:
+        sid = _load_agent_session_id()
+        if sid == _io_cli_catalog_injected_session_id:
+            return content  # already injected for this resume-capable session
+
+    catalog = _io_cli_catalog_cache
+    if catalog is None:
+        # The real entrypoint runs as `python tools/chat_resident_consumer.py`
+        # with tools/ auto-added to sys.path[0], so this bare sibling import
+        # normally just works (same convention as user_mcp_materialize /
+        # user_mcp_ca_fetch above). When this module is instead imported as
+        # `tools.chat_resident_consumer` (every test suite, some self-hosted
+        # wrappers), tools/ is NOT on sys.path — guard for that explicitly
+        # rather than relying on some other already-imported module to have
+        # inserted it first.
+        _tools_dir = str(Path(__file__).resolve().parent)
+        if _tools_dir not in sys.path:
+            sys.path.insert(0, _tools_dir)
+        import io_cli_catalog  # noqa: PLC0415 — sibling on tools/ path
+
+        catalog = io_cli_catalog.build_catalog(_IO_CLI_PATH, python=sys.executable)
+        if catalog is None:
+            return content  # build failed this turn — skip, retry next turn, don't cache
+        _io_cli_catalog_cache = catalog
+
+    if not is_codex:
+        _io_cli_catalog_injected_session_id = sid
+
+    return f"{catalog}\n\n{content}"
+
+
 def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
     """Short plaintext transcript of recent chat turns STRICTLY older than the
     current turn, for injecting cross-turn continuity into foreground messages.
@@ -10597,6 +10694,12 @@ def _process_messages(messages: list) -> float:
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
+        # VPS/self-hosted CLI resident only (no-op for hosted / http-backend):
+        # live io_cli command catalog, once per resume-capable session or every
+        # turn for codex. Must run BEFORE _foreground_agent_message below so the
+        # transcript header it prepends stays topmost (see that function's
+        # docstring and _message_has_injected_history).
+        content = _prepend_io_cli_capability_catalog(content)
         # Then inject cross-turn continuity for drivers with no reliable session of
         # their own (codex / hosted claude). No-op for pi / when disabled / when
         # there is no prior turn. Done once here so every dispatch branch below
