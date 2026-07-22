@@ -295,6 +295,27 @@ async def hosted_runtime_modes_list(request: Request):
     return JSONResponse(payload)
 
 
+@router.post("/v1/admin/runtime-allowlist")
+async def runtime_allowlist_set(request: Request):
+    _require_admin(request)
+    payload = (await read_json_silent(request)) or {}
+    user_id = str(payload.get("user_id") or "").strip()
+    desired = str(payload.get("desired") or "").strip()
+    note = str(payload.get("note") or "")
+    if not user_id or not desired:
+        return JSONResponse({"error": "user_id and desired required"}, status_code=400)
+    body, status = await threadpool.run_db(
+        admin_core.set_runtime_allowlist, user_id, desired, note=note)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/admin/runtime-allowlist")
+async def runtime_allowlist_get(request: Request):
+    _require_admin(request)
+    payload = await threadpool.run_db(admin_core.get_runtime_allowlist)
+    return JSONResponse(payload)
+
+
 @router.get("/v1/admin/v2-metrics")
 async def v2_metrics(request: Request):
     _require_admin(request)

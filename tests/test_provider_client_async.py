@@ -300,3 +300,30 @@ def test_reliable_async_attaches_complete_trace_to_terminal_exception(monkeypatc
     assert attempts[1]["outcome"] == "retry"
     assert attempts[3]["outcome"] == "terminal_error"
     assert all(item["error_class"] == "transient" for item in attempts)
+
+
+def test_shared_async_client_never_replays_cookies_across_users():
+    # Async twin of the sync cross-user cookie-bleed guard: the shared
+    # AsyncClient (enclave caption + openai-wire relays) must not persist a
+    # relay's Set-Cookie from one user's response onto another user's request
+    # to the same host.
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("cookie"))
+        return httpx.Response(
+            200, headers=[("set-cookie", "sid=userA; Path=/")], json={"ok": True})
+
+    async def _run() -> httpx.AsyncClient:
+        client = provider_client._build_shared_async_client(
+            transport=httpx.MockTransport(handler))
+        try:
+            await client.post("https://relay.example/v1/chat/completions", json={})
+            await client.post("https://relay.example/v1/chat/completions", json={})
+        finally:
+            await client.aclose()
+        return client
+
+    client = asyncio.run(_run())
+    assert seen == [None, None], f"cookie replayed across calls: {seen!r}"
+    assert len(list(client.cookies.jar)) == 0

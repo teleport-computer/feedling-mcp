@@ -1,5 +1,5 @@
-"""Introduction helper for explicitly independent resident accounts.
+"""Feedling hosted agent runtime (agent-runner).
 
-The hosted supervisor/runtime formerly in this package is retired. Managed and
-self-hosted model-API accounts execute through ``model_api_runtime.v2``.
+See docs/AGENT_RUNTIME_CC_CODEX_PLAN.zh.md. P0: single-user local prototype
+driven by the Claude Agent SDK.
 """

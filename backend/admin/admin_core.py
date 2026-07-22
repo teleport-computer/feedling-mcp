@@ -107,21 +107,21 @@ def store_evict(user_id: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Hosted Runtime V2 ownership repair/status surface. Resident selection is
-# retired; this endpoint may only materialize/repair V2 ownership.
+# hosted_runtime_mode control plane (Hosted Runtime V2 D0 rollout — gated flip
+# between resident_cli and db_action_v2 without a direct DB write).
 # --------------------------------------------------------------------------- #
 
 def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
-    if mode != config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
-        return {"error": "hosted resident runtime is retired"}, 400
     store = core_store.get_store(user_id)
-    try:
-        # Seed first. If profile persistence subsequently fails this row is
-        # dormant because every producer is mode-filtered; the reverse order
-        # creates a real window where V2 ownership has no durable wake schedule.
-        jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=time.time())
-    except Exception as e:  # noqa: BLE001 — do not report a half-ready repair
-        return {"error": "v2_schedule_seed_failed", "detail": str(e)[:160]}, 503
+    if mode == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        try:
+            # Seed first. If profile persistence subsequently fails this row is
+            # dormant because every producer is mode-filtered; the reverse order
+            # creates a real window where the resident is reaped but no V2 wake
+            # schedule exists.
+            jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=time.time())
+        except Exception as e:  # noqa: BLE001 — do not report a half-ready flip
+            return {"error": "v2_schedule_seed_failed", "detail": str(e)[:160]}, 503
     try:
         persisted_mode = config_store.set_hosted_runtime_mode(store, mode)
     except ValueError as e:
@@ -138,6 +138,40 @@ def get_runtime_mode(user_id: str) -> tuple[dict, int]:
     except Exception:
         return {"error": "runtime_control_unavailable"}, 503
     return {"user_id": user_id, "hosted_runtime_mode": mode}, 200
+
+
+def set_runtime_allowlist(user_id: str, desired: str, *, note: str = "") -> tuple[dict, int]:
+    if desired == "remove":
+        removed = db.delete_runtime_allowlist(user_id)
+        return {"user_id": user_id, "removed": removed}, 200
+    try:
+        db.upsert_runtime_allowlist(user_id, desired, updated_by="admin", note=note)
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    return {"user_id": user_id, "desired": desired}, 200
+
+
+def get_runtime_allowlist() -> dict:
+    """Reconciliation view: every allowlist row plus its live fence (mode/state/
+    generation) and a ``converged`` bool. A per-row read failure (e.g. transient
+    DB hiccup while resolving one user's fence) is captured on that row instead
+    of failing the whole endpoint — this is an admin dashboard, one bad row
+    should not hide the rest of the fleet."""
+    from core import store as core_store  # noqa: PLC0415
+    from hosted import config_store as cs  # noqa: PLC0415
+    rows = db.list_runtime_allowlist()
+    for row in rows:
+        try:
+            mode, state, gen = cs.get_hosted_runtime_control_strict(
+                core_store.get_store(row["user_id"]))
+            row["actual"] = {"mode": mode, "state": state, "generation": gen}
+            row["converged"] = (
+                (row["desired"] == "v2" and state == "v2")
+                or (row["desired"] == "resident" and state == "resident"))
+        except Exception as e:  # noqa: BLE001 — 对账视图不因单行炸
+            row["actual"] = {"error": str(e)[:80]}
+            row["converged"] = False
+    return {"allowlist": rows}
 
 
 def list_runtime_modes() -> dict:

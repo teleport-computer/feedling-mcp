@@ -35,6 +35,12 @@ def _b64(raw: bytes) -> str:
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
+    # Fresh-setup happy-path sends here rely on setup's startup
+    # materialization landing V2 with no explicit flip — the v2_only fleet
+    # contract (see test_asgi_hosted_chat_send.py's ``env`` fixture for the
+    # full rationale). Pin it here so the default "dual" policy (Task 5)
+    # doesn't leave fresh users on the still-resident per-user fence.
+    monkeypatch.setenv(hosted_config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     accounts_registry._users[:] = []
     accounts_registry._key_to_user.clear()

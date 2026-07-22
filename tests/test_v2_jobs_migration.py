@@ -195,7 +195,12 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0048_v2_turn_metrics_user_fk").down_revision == (
         "0047_model_route_context_window"
     )
-    assert script.get_current_head() == "0051_web_settings_backfill"
+    # 0052 restores the V1 supervisor tables 0045 dropped (dual-runtime
+    # coexistence) and chains linearly off 0051.
+    assert script.get_revision("0052_dual_runtime_coexistence").down_revision == (
+        "0051_web_settings_backfill"
+    )
+    assert script.get_current_head() == "0052_dual_runtime_coexistence"
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():

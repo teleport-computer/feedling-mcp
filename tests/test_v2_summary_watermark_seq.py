@@ -125,7 +125,12 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0051_web_settings_backfill").down_revision == (
         "0050_v2_web_halted_columns"
     )
-    assert script.get_current_head() == "0051_web_settings_backfill"
+    # 0052 restores the V1 supervisor tables 0045 dropped (dual-runtime
+    # coexistence) and chains linearly off 0051.
+    assert script.get_revision("0052_dual_runtime_coexistence").down_revision == (
+        "0051_web_settings_backfill"
+    )
+    assert script.get_current_head() == "0052_dual_runtime_coexistence"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

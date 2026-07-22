@@ -51,8 +51,23 @@ def _clear_control(user_id: str) -> None:
         )
 
 
-def test_policy_parser_defaults_v2_and_rejects_retired_selectors(monkeypatch):
+@pytest.fixture()
+def fresh_user_store():
+    """A user_id with an active model_api route and a clean runtime-control
+    slate, wrapped in a UserStore (no ``conftest.fresh_user_store`` fixture
+    existed prior to this task — this local fixture follows the same
+    seed+clear pattern as ``_seed_runnable``/``_clear_control`` above)."""
+    user_id = _seed_runnable("policy_fresh")
+    _clear_control(user_id)
+    return core_store.get_store(user_id)
+
+
+def test_policy_parser_defaults_dual_and_rejects_retired_selectors(monkeypatch):
     monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+    assert config_store.hosted_runtime_policy() == "dual"
+    assert config_store.forced_hosted_runtime_mode() is None
+
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
     assert config_store.hosted_runtime_policy() == "v2_only"
     assert config_store.forced_hosted_runtime_mode() == "db_action_v2"
 
@@ -60,6 +75,25 @@ def test_policy_parser_defaults_v2_and_rejects_retired_selectors(monkeypatch):
         monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, invalid)
         with pytest.raises(RuntimeError, match="FEEDLING_HOSTED_RUNTIME_POLICY"):
             config_store.hosted_runtime_policy()
+
+
+def test_policy_dual_is_default_and_valid(monkeypatch):
+    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+    assert config_store.hosted_runtime_policy() == "dual"
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    assert config_store.hosted_runtime_policy() == "v2_only"
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "bogus")
+    with pytest.raises(RuntimeError):
+        config_store.hosted_runtime_policy()
+
+
+def test_set_runtime_mode_accepts_resident_again(fresh_user_store):
+    # 双向：v2 → resident → v2，fence generation 单调递增
+    config_store.set_hosted_runtime_mode(fresh_user_store, "db_action_v2")
+    _, state1, gen1 = config_store.get_hosted_runtime_control_strict(fresh_user_store)
+    config_store.set_hosted_runtime_mode(fresh_user_store, "resident_cli")
+    mode2, state2, gen2 = config_store.get_hosted_runtime_control_strict(fresh_user_store)
+    assert mode2 == "resident_cli" and state2 == "resident" and gen2 > gen1
 
 
 def test_v2_only_reconciles_every_runnable_shape_idempotently(monkeypatch):
@@ -72,6 +106,13 @@ def test_v2_only_reconciles_every_runnable_shape_idempotently(monkeypatch):
         _clear_control(user_id)
 
     monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+    # Restored (2b294a1f had removed this): establishes an explicit resident
+    # control row — distinct from ``missing`` (no control row at all) — so
+    # reconcile's v2_only forcing is exercised against an established resident
+    # state too. Bidirectional under the new "dual" default policy.
+    config_store.set_hosted_runtime_mode(
+        core_store.get_store(resident), config_store.HOSTED_RUNTIME_MODE_RESIDENT
+    )
     config_store.set_hosted_runtime_mode(
         core_store.get_store(already_v2),
         config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
@@ -327,6 +368,99 @@ def test_v2_cutover_immediately_enqueues_resident_unanswered_message(
     )]
 
 
+def test_v2_recutover_replaces_stale_generation_recovery_job(monkeypatch):
+    # Restored (2b294a1f had removed this): bidirectional under "dual".
+    user_id = _seed_runnable("policy_recutover_chat_recovery")
+    _clear_control(user_id)
+    store = core_store.get_store(user_id)
+    db.chat_append(
+        user_id,
+        "resident-pending",
+        1.0,
+        {"id": "resident-pending", "role": "user", "body_ct": "b"},
+        0,
+    )
+    db.chat_append(
+        user_id,
+        "resident-late-reply",
+        2.0,
+        {"id": "resident-late-reply", "role": "openclaw", "body_ct": "r"},
+        0,
+    )
+    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    )
+    first_generation = db.get_runtime_generation(user_id)
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_RESIDENT
+    )
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    )
+    current_generation = db.get_runtime_generation(user_id)
+
+    with db.get_pool().connection() as conn:
+        jobs = conn.execute(
+            "SELECT status,trace_id,expected_runtime_generation "
+            "FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    assert jobs == [
+        ("superseded", "resident-pending", first_generation),
+        ("pending", "resident-pending", current_generation),
+    ]
+
+
+def test_v2_recutover_does_not_fall_back_behind_newest_terminal_marker(
+    monkeypatch,
+):
+    # Restored (2b294a1f had removed this): bidirectional under "dual".
+    user_id = _seed_runnable("policy_recutover_terminal_latest")
+    _clear_control(user_id)
+    store = core_store.get_store(user_id)
+    db.chat_append(
+        user_id,
+        "older-unanswered",
+        1.0,
+        {"id": "older-unanswered", "role": "user", "body_ct": "a"},
+        0,
+    )
+    db.chat_append(
+        user_id,
+        "newest-terminal",
+        2.0,
+        {"id": "newest-terminal", "role": "user", "body_ct": "b"},
+        0,
+    )
+    monkeypatch.delenv(config_store.HOSTED_RUNTIME_POLICY_ENV, raising=False)
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET status='failed',finished_at=now(),"
+            "last_error='terminal test marker' "
+            "WHERE user_id=%s AND trace_id='newest-terminal'",
+            (user_id,),
+        )
+
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_RESIDENT
+    )
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    )
+
+    with db.get_pool().connection() as conn:
+        jobs = conn.execute(
+            "SELECT status,trace_id FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    assert jobs == [("failed", "newest-terminal")]
+
+
 def test_v2_verify_loop_uses_worker_liveness_without_resident_ping(monkeypatch):
     user_id = _seed_runnable("policy_verify_loop")
     _clear_control(user_id)
@@ -376,19 +510,63 @@ def test_failed_active_model_test_fences_current_v2_generation(monkeypatch):
     )
 
 
-def test_all_managed_composes_force_literal_v2_policy():
+def test_all_main_composes_force_literal_dual_policy():
+    # Dual-runtime coexistence (2026-07-21 design, Task 11): the three main CVM
+    # composes each carry both backend AND a pooled serve-worker container, and
+    # both services force the same literal measured-compose policy values —
+    # "dual" (not the old "v2_only") plus a "resident" default fence, so a
+    # fresh deploy's day-1 behavior is identical to pre-dual-runtime.
     for name in (
         "docker-compose.phala.yaml",
         "docker-compose.phala.test.yaml",
         "docker-compose.phala.pre.yaml",
     ):
         compose = yaml.safe_load((ROOT / "deploy" / name).read_text())
-        assert compose["services"]["backend"]["environment"][
-            "FEEDLING_HOSTED_RUNTIME_POLICY"
-        ] == "v2_only"
+        for service in ("backend", "serve-worker"):
+            env = compose["services"][service]["environment"]
+            assert env["FEEDLING_HOSTED_RUNTIME_POLICY"] == "dual"
+            assert env["FEEDLING_RUNTIME_DEFAULT_DESIRED"] == "resident"
 
 
-def test_every_managed_runner_compose_has_only_v2_worker():
+def test_main_compose_serve_worker_shares_the_backend_image_and_stays_internal():
+    # The serve-worker container is a second copy of the SAME image as backend
+    # (so deploy/pin-runtime-release.sh's existing backend-image regex retags
+    # it automatically) and reaches enclave/backend over compose-internal
+    # URLs, never the public gateway passthrough the standalone runner CVMs
+    # use.
+    for name in (
+        "docker-compose.phala.yaml",
+        "docker-compose.phala.test.yaml",
+        "docker-compose.phala.pre.yaml",
+    ):
+        compose = yaml.safe_load((ROOT / "deploy" / name).read_text())
+        services = compose["services"]
+        worker = services["serve-worker"]
+        assert worker["image"] == services["backend"]["image"]
+        assert worker["command"] == [
+            "python",
+            "-u",
+            "backend/model_api_runtime/v2/serve_worker.py",
+        ]
+        env = worker["environment"]
+        assert env["FEEDLING_API_URL"] == "http://backend:5001"
+        assert env["FEEDLING_ENCLAVE_URL"] == "https://enclave:5003"
+
+
+def test_all_three_standalone_runner_composes_are_v1_agent_runner_only():
+    # Dual-runtime coexistence (Task 11, post-review correction): all three
+    # environments are topologically identical — main CVM is `dual` (backend
+    # + serve-worker), independent runner CVM is V1 agent-runner. Test is NOT
+    # a gap: deploy/docker-compose.phala.runner.yaml has ALWAYS been V1
+    # agent-runner form on origin/test (deploy-test-runner-cvm ships it to
+    # the real feedling-io-agents-test CVM today — the #97 host-all fix was
+    # verified there); this repo's file had drifted to a serve-worker-only
+    # shape during an earlier, never-fully-deployed Runtime-V2-only migration
+    # pass on this branch. Restored byte-for-byte from origin/test alongside
+    # prod's. pre's is adapted from that same origin/test V1 runner template
+    # (env var names unchanged, only naming — app/container/volume — is
+    # pre-specific). prod's is restored byte-for-byte from origin/test too
+    # (= prod's actual live topology).
     for name in (
         "docker-compose.phala.runner.yaml",
         "docker-compose.phala.pre.runner.yaml",
@@ -397,13 +575,16 @@ def test_every_managed_runner_compose_has_only_v2_worker():
         path = ROOT / "deploy" / name
         source = path.read_text()
         compose = yaml.safe_load(source)
-        assert set(compose["services"]) == {"serve-worker"}
-        worker = compose["services"]["serve-worker"]
-        assert worker["command"] == [
+        assert set(compose["services"]) == {"agent-runner"}
+        runner = compose["services"]["agent-runner"]
+        assert runner["command"] == [
             "python",
             "-u",
-            "backend/model_api_runtime/v2/serve_worker.py",
+            "backend/agent_runtime/supervisor.py",
         ]
-        assert "volumes" not in compose
-        assert "backend/agent_runtime/supervisor.py" not in source
-        assert "AGENT_RUNTIME_USERS" not in source
+        assert "model_api_runtime/v2/serve_worker.py" not in source
+        assert "AGENT_RUNTIME_USERS" in source
+        assert "volumes" in compose
+        assert set(compose["volumes"]) == set(
+            runner["volumes"][0].split(":")[0:1]
+        )

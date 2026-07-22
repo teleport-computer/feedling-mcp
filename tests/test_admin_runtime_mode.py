@@ -1,9 +1,11 @@
 """Hosted Runtime V2 ownership repair/status control plane.
 
 Admin-token-gated HTTP surface over ``hosted.config_store.set_hosted_runtime_mode``
-/ ``get_hosted_runtime_mode``. Ops can repair V2 ownership, but cannot select
-the retired hosted resident runtime. Mirrors the admin-token gate + route style of
-``admin.routes_asgi``/``tests/test_asgi_admin.py``.
+/ ``get_hosted_runtime_mode``, so ops can flip a user between ``resident_cli``
+(existing CLI consumer) and ``db_action_v2`` (V2 worker pool) without a direct
+DB write. Bidirectional under the default "dual" policy; the emergency
+"v2_only" override still fences resident selection fleet-wide. Mirrors the
+admin-token gate + route style of ``admin.routes_asgi``/``tests/test_asgi_admin.py``.
 """
 
 from __future__ import annotations
@@ -138,15 +140,30 @@ def test_post_invalid_mode_returns_400(env):
     assert config_store.get_hosted_runtime_mode(core_store.get_store(uid)) == "resident_cli"
 
 
-def test_post_resident_mode_is_retired_before_any_runtime_side_effect(env, monkeypatch):
-    uid = _uid("rtmode_resident_retired")
-    monkeypatch.setattr(
-        core_store,
-        "get_store",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("retired selector must fail before store hydration")
-        ),
+def test_post_resident_mode_sets_and_reflects_in_config_store(env):
+    # Restored (2b294a1f had made resident universally rejected here): the
+    # default "dual" policy routes by the per-user fence, so admin can flip a
+    # V2 user back to resident_cli.
+    uid = _uid("rtmode_resident_ok")
+    _seed_model_api_user(uid)
+    config_store.set_hosted_runtime_mode(core_store.get_store(uid), "db_action_v2")
+
+    status, body = _asgi_json(
+        "POST", "/v1/admin/hosted-runtime-mode", headers=_admin(),
+        json={"user_id": uid, "mode": "resident_cli"},
     )
+
+    assert status == 200
+    assert body == {"user_id": uid, "hosted_runtime_mode": "resident_cli"}
+    assert config_store.get_hosted_runtime_mode(core_store.get_store(uid)) == "resident_cli"
+
+
+def test_post_resident_mode_rejected_under_v2_only_policy_env(env, monkeypatch):
+    # The emergency v2_only override still fails closed for resident — enforced
+    # inside config_store.set_hosted_runtime_mode, no admin-specific gate needed.
+    monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
+    uid = _uid("rtmode_resident_v2only")
+    _seed_model_api_user(uid)
 
     status, body = _asgi_json(
         "POST",
@@ -156,7 +173,8 @@ def test_post_resident_mode_is_retired_before_any_runtime_side_effect(env, monke
     )
 
     assert status == 400
-    assert body == {"error": "hosted resident runtime is retired"}
+    assert "error" in body
+    assert config_store.get_hosted_runtime_mode(core_store.get_store(uid)) == "resident_cli"
 
 
 def test_post_user_with_no_model_api_config_returns_400(env):

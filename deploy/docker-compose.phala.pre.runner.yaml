@@ -1,56 +1,69 @@
-# docker-compose.phala.pre.runner.yaml — Pre Hosted Runtime V2 worker CVM
+# docker-compose.phala.pre.runner.yaml — Pre V1 agent-runner worker CVM
 #
-# This separate Phala CVM runs only the pooled Runtime V2 worker.  The retired
-# hosted resident supervisor is deliberately absent: Pre has no per-user CLI
-# child processes, leases, homes, checkpoints, static roster, or resident
-# rollback service.  All turn state lives in PostgreSQL and the worker calls the
-# main CVM's API/decrypt service with short-lived, user-bound runtime tokens.
+# Dual-runtime coexistence (2026-07-21 design doc §7, §8 P1): this CVM runs
+# ONLY the V1 agent-runner supervisor — no backend, no enclave, no ingress, no
+# pooled Runtime V2 serve-worker. The serve-worker that used to live here moved
+# onto the main Pre CVM (deploy/docker-compose.phala.pre.yaml) as a second
+# container sharing the backend's image; a runner-side serve-worker AND a
+# main-CVM serve-worker would double-pool the same job queue, so this file
+# reverts to the V1-only form to let P1 validate dual-fleet coexistence
+# (one resident CVM here, one pooled worker on the main CVM) before P3 touches
+# production. Adapted from origin/test:deploy/docker-compose.phala.runner.yaml
+# (the test V1 runner template, pre-Runtime-V2 migration) with pre-specific
+# naming (app name, container/volume names) — the env VAR NAMES themselves are
+# unchanged, only which secrets/vars CI maps into them differs (pre reuses
+# several TEST_-prefixed GitHub secrets/vars, same convention as the main pre
+# CVM's deploy job).
 #
 # Required encrypted env (must match the main Pre CVM where noted):
 #   DATABASE_URL                  same external PostgreSQL as the backend
 #   FEEDLING_RUNTIME_TOKEN_SECRET same value as the main backend
 #   FEEDLING_API_URL              main CVM public ingress URL
 #   FEEDLING_ENCLAVE_URL          main CVM enclave gateway-passthrough URL
-# Optional encrypted sandbox env (required together when provider=e2b):
-#   FEEDLING_V2_SANDBOX_PROVIDER  disabled (default) or e2b
-#   E2B_API_KEY                   E2B project API key
-#   FEEDLING_V2_E2B_TEMPLATE      audited Runtime V2 extractor template tag
+#   FEEDLING_HOST_ALL=1           mirror the backend
+#   AGENT_MAX_CHILDREN            per-runner capacity ceiling (must cover the
+#                                 user count or some users go unserved)
 
 name: feedling-pre-runner
 
-x-serve-worker-env: &serve-worker-env
-  FEEDLING_API_URL: "${FEEDLING_API_URL:-}"
-  FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"
+x-agent-runner-env: &agent-runner-env
+  FEEDLING_API_URL: "${FEEDLING_API_URL:-}"          # main pre CVM ingress URL
+  FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"  # main pre CVM enclave passthrough URL
+  AGENT_DATA_ROOT: "/agent-data"
+  AGENT_LEASE_TTL_SEC: "${AGENT_LEASE_TTL_SEC:-300}"
+  AGENT_TICK_INTERVAL_SEC: "${AGENT_TICK_INTERVAL_SEC:-15}"
+  AGENT_ENVELOPE_REFETCH_SEC: "${AGENT_ENVELOPE_REFETCH_SEC:-300}"
+  AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
+  AGENT_RUNTIME_ISOLATION: "process"
   DATABASE_URL: "${DATABASE_URL:-}"
+  AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
+  AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-  FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
-  FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-}"
-  FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
-  FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED: "${FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED:-0}"
-  FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE: "${FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE:-64}"
-  # web_fetch article extraction (trafilatura, worker-only). Default ON — it is a
-  # rollback lever, not a feature gate. Set to "0" to return web_fetch to the
-  # plain tag-strip; takes effect on the next runner restart, not live.
-  FEEDLING_WEB_EXTRACT_ARTICLE: "${FEEDLING_WEB_EXTRACT_ARTICLE:-1}"
-  FEEDLING_V2_SANDBOX_PROVIDER: "${FEEDLING_V2_SANDBOX_PROVIDER:-disabled}"
-  E2B_API_KEY: "${E2B_API_KEY:-}"
-  FEEDLING_V2_E2B_TEMPLATE: "${FEEDLING_V2_E2B_TEMPLATE:-}"
-  FEEDLING_V2_E2B_ALLOW_INTERNET: "${FEEDLING_V2_E2B_ALLOW_INTERNET:-0}"
-  # Genesis import is a queue worker hosted by Runtime V2. It never depended on
-  # the resident CLI process; claim uses FOR UPDATE SKIP LOCKED and has its own
-  # heartbeat kind on /v1/admin/v2-metrics.
+  FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+  FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
+  # Genesis import worker: dual-runtime routes V1-desired users' genesis jobs
+  # here. Claim is FOR UPDATE SKIP LOCKED, so it stays correct alongside the
+  # main CVM's own serve-worker genesis thread (both drain the same queue).
   FEEDLING_GENESIS_WORKER_ENABLED: "1"
   FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "${FEEDLING_GENESIS_WORKER_INTERVAL_SEC:-10}"
   FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "${FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC:-7200}"
 
 services:
-  serve-worker:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:5c461d1   # CI pins the sha
-    container_name: serve-worker
-    command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
+  # Single runner per CVM (mirrors prod/test). One data volume → a user's
+  # per-user home + chat checkpoint always live in one place, so a lease that
+  # re-acquires here resumes from a consistent cursor (no cross-runner
+  # stale-checkpoint wedge).
+  agent-runner:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:2e88477   # CI pins the sha
+    container_name: agent-runner
+    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
-      <<: *serve-worker-env
-      FEEDLING_V2_MAX_WORKERS: "${FEEDLING_V2_MAX_WORKERS:-4}"
-      # Must cover base64 length ceil(n/3)*4 for the 2,000,000-byte ingest cap.
-      FEEDLING_V2_IMAGE_MAX_B64_CHARS: "${FEEDLING_V2_IMAGE_MAX_B64_CHARS:-2700000}"
+      <<: *agent-runner-env
+      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-16}"
+    volumes:
+      - feedling_agent_runtime_pre_runner:/agent-data
+
+volumes:
+  feedling_agent_runtime_pre_runner:
+    name: feedling_agent_runtime_pre_runner

@@ -254,8 +254,17 @@ services:
       # Proactive wake is native-only after P2-2b and no longer uses this flag.
       # See core/util.runtime_v2_default_on().
       FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
-      # Hosted model-API accounts have one runtime: pooled Runtime V2.
-      FEEDLING_HOSTED_RUNTIME_POLICY: "v2_only"
+      # Dual-runtime coexistence (2026-07-21 design): hosted accounts default to
+      # the V1 resident runtime (per-user allowlist promotes individual users to
+      # pooled Runtime V2, served by the serve-worker container below). This is a
+      # literal measured-compose value, not an encrypted-env rollback selector —
+      # see backend/hosted/config_store.py HOSTED_RUNTIME_POLICY_ENV.
+      FEEDLING_HOSTED_RUNTIME_POLICY: "dual"
+      # Per-user allowlist fence default for accounts with no explicit runtime
+      # row yet (backend/hosted/runtime_reconciler.py _DEFAULT_DESIRED_ENV).
+      # "resident" keeps day-1 behavior identical to pre-dual-runtime test;
+      # allowlisted users' desired state overrides this default.
+      FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
       # TEST-ONLY: genesis v2 (foreground-fast onboarding). Greet on 3-5 core +
       # identity baseline, push the heavy reduce (the ~37% prod failure surface)
       # to the background. Prod compose deliberately omits this (keeps the v1
@@ -276,6 +285,41 @@ services:
       - "9998:9998"
     volumes:
       - feedling_backend_data_test:/data
+    depends_on:
+      enclave:
+        condition: service_healthy
+
+  # --- Pooled Runtime V2 worker (dual-runtime coexistence, in-CVM). ---
+  # Same image as backend — the release-pin script (deploy/pin-runtime-release.sh)
+  # retargets whichever `ghcr.io/…/feedling:<sha>` refs exist in this file, so
+  # backend and serve-worker are pinned to the same commit automatically. This
+  # container serves ONLY the per-user allowlist's v2/draining accounts (see
+  # docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+  # §7a). The separate test Runtime V2 worker CVM
+  # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
+  # and is untouched by this change.
+  serve-worker:
+    image: ghcr.io/teleport-computer/feedling:e8d1a93
+    container_name: serve-worker
+    command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
+    restart: unless-stopped
+    environment:
+      # Compose-internal URLs — NOT the public gateway. Mirrors backend's own
+      # FEEDLING_ENCLAVE_URL above; the ingress ROUTING_MAP entry
+      # (test-api.feedling.app=backend:5001) is the source of the backend port.
+      FEEDLING_API_URL: "http://backend:5001"
+      FEEDLING_ENCLAVE_URL: "https://enclave:5003"
+      DATABASE_URL: "${DATABASE_URL:-}"
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      FEEDLING_V2_MAX_WORKERS: "4"
+      FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
+      FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}"
+      FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
+      FEEDLING_GENESIS_WORKER_ENABLED: "1"
+      FEEDLING_V2_SANDBOX_PROVIDER: "disabled"
+      FEEDLING_V2_IMAGE_MAX_B64_CHARS: "2700000"
+      FEEDLING_HOSTED_RUNTIME_POLICY: "dual"
+      FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
     depends_on:
       enclave:
         condition: service_healthy

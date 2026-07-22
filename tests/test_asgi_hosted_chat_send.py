@@ -26,6 +26,7 @@ from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
 from hosted import chat_routes_asgi  # noqa: E402
 from hosted import chat_send_core  # noqa: E402
+from hosted import config_store as hosted_config_store  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 
@@ -73,6 +74,16 @@ def _fake_envelope_builder():
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
+    # This module's happy-path fixtures never flip ownership through
+    # config_store/admin — they rely on setup's startup materialization to
+    # land a fresh user on V2 automatically. That's the v2_only contract
+    # (apply_hosted_runtime_policy forces V2 fleet-wide); under the "dual"
+    # default (the default since Task 5) a fresh user's per-user fence stays
+    # resident until something explicitly flips it, and every send here would
+    # 503 runtime_policy_not_ready. Pin v2_only so this file keeps exercising
+    # that always-true-on-Pre contract (also the regression net for the
+    # eventual v2_only-only retirement).
+    monkeypatch.setenv(hosted_config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     registry._users[:] = []
     registry._key_to_user.clear()

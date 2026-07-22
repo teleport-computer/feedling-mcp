@@ -999,35 +999,55 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
             runtime_mode, runtime_state, _runtime_generation = (
                 hosted_config_store.get_hosted_runtime_control_strict(store)
             )
-            hosted_config_store.hosted_runtime_policy()
-            if (
-                runtime_mode
-                != hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
-                or runtime_state != "v2"
+            # Under ``v2_only`` a forced mode is set: a hosted account not on the
+            # exact forced tuple is not ready. Under ``dual`` (forced None) the
+            # per-user fence decides — a ``resident_cli``/``resident`` hosted
+            # account keeps the synthetic-ping protocol below (its resident
+            # consumer DOES poll /v1/chat/poll), only ``db_action_v2`` uses the
+            # worker-heartbeat proof.
+            forced_mode = hosted_config_store.forced_hosted_runtime_mode()
+            forced_state = (
+                "v2"
+                if forced_mode
+                == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+                else "resident"
+            )
+            if forced_mode is not None and (
+                runtime_mode != forced_mode or runtime_state != forced_state
             ):
                 return {"error": "runtime_policy_not_ready"}, 503
+            v2_mode = (
+                runtime_mode
+                == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+            )
+            expected_state = "v2" if v2_mode else "resident"
+            if runtime_state != expected_state:
+                return {"error": "runtime_control_inconsistent"}, 503
         except Exception:
             return {"error": "runtime_control_unavailable"}, 503
 
-        from model_api_runtime.v2 import jobs_store
+        if v2_mode:
+            from model_api_runtime.v2 import jobs_store
 
-        alive = jobs_store.workers_alive()
-        if alive:
-            boot_gates._log_bootstrap_event(
-                store, "chat_loop_verified", success=True
-            )
-        return {
-            "loop_alive": alive,
-            "response_time_sec": 0.0 if alive else None,
-            "ping_id": ping_uuid,
-            "timeout_sec": timeout_sec,
-            "suggestions": (
-                []
-                if alive
-                else ["Hosted Runtime V2 workers are not currently available."]
-            ),
-            "passing": alive,
-        }, 200
+            alive = jobs_store.workers_alive()
+            if alive:
+                boot_gates._log_bootstrap_event(
+                    store, "chat_loop_verified", success=True
+                )
+            return {
+                "loop_alive": alive,
+                "response_time_sec": 0.0 if alive else None,
+                "ping_id": ping_uuid,
+                "timeout_sec": timeout_sec,
+                "suggestions": (
+                    []
+                    if alive
+                    else ["Hosted Runtime V2 workers are not currently available."]
+                ),
+                "passing": alive,
+            }, 200
+        # else (dual + resident hosted account): fall through to the synthetic
+        # ping protocol below, exactly like an explicitly independent account.
 
     # append_chat acquires chat_lock internally — don't hold it here or we'd
     # deadlock on the non-reentrant lock.

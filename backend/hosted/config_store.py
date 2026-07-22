@@ -374,10 +374,13 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runt
 
 
 # ---------------------------------------------------------------------------
-# Hosted model-API execution is Runtime V2 only. ``resident_cli`` remains a
-# persisted *dormant fence* while credentials/routes are being deleted or
-# replaced and as the control default for explicitly independent `/v1/chat/*`
-# resident accounts. It is not a selectable hosted runtime.
+# hosted_runtime_mode — per-user ownership fence (dual-runtime coexistence).
+# resident_cli: the resident CLI consumer path. db_action_v2: chat/send
+# enqueues agent_jobs, drained by the independent V2 worker pool. Both
+# directions are selectable; ``hosted_runtime_policy()`` governs whether
+# ownership is forced fleet-wide (``v2_only``, the retirement-era emergency
+# override) or left to the per-user fence (``dual``, the default). Persisted
+# in the existing model_api_runtime profile blob.
 # ---------------------------------------------------------------------------
 
 HOSTED_RUNTIME_MODE_RESIDENT = "resident_cli"
@@ -386,11 +389,11 @@ _PERSISTED_HOSTED_RUNTIME_MODES = {
     HOSTED_RUNTIME_MODE_RESIDENT,
     HOSTED_RUNTIME_MODE_DB_ACTION_V2,
 }
-_SELECTABLE_HOSTED_RUNTIME_MODES = {HOSTED_RUNTIME_MODE_DB_ACTION_V2}
 
 HOSTED_RUNTIME_POLICY_ENV = "FEEDLING_HOSTED_RUNTIME_POLICY"
 HOSTED_RUNTIME_POLICY_V2_ONLY = "v2_only"
-_HOSTED_RUNTIME_POLICIES = {HOSTED_RUNTIME_POLICY_V2_ONLY}
+HOSTED_RUNTIME_POLICY_DUAL = "dual"
+_HOSTED_RUNTIME_POLICIES = {HOSTED_RUNTIME_POLICY_V2_ONLY, HOSTED_RUNTIME_POLICY_DUAL}
 
 # Provider/config-scoped fields can be discarded when the user deletes every
 # model API credential. Correctness state (notably v2_reply_cursor_seq), rollout
@@ -424,15 +427,12 @@ def effective_hosted_runtime_mode(value: object) -> str:
 
 
 def hosted_runtime_policy() -> str:
-    """Return the process-wide ownership policy, rejecting configuration typos.
-
-    The hosted resident rollback selector is retired. The only valid value is
-    ``v2_only``; ownership is materialized through the existing generation-
-    fenced transition before the HTTP workers start.
-    """
+    """Process-wide routing policy. ``dual`` routes per-user by the fence;
+    ``v2_only`` fails-closed for non-V2 users (the retirement-era behavior,
+    restored at P7)."""
     policy = str(
-        os.environ.get(HOSTED_RUNTIME_POLICY_ENV, HOSTED_RUNTIME_POLICY_V2_ONLY)
-        or HOSTED_RUNTIME_POLICY_V2_ONLY
+        os.environ.get(HOSTED_RUNTIME_POLICY_ENV, HOSTED_RUNTIME_POLICY_DUAL)
+        or HOSTED_RUNTIME_POLICY_DUAL
     ).strip().lower()
     if policy not in _HOSTED_RUNTIME_POLICIES:
         raise RuntimeError(
@@ -442,9 +442,13 @@ def hosted_runtime_policy() -> str:
     return policy
 
 
-def forced_hosted_runtime_mode() -> str:
-    hosted_runtime_policy()  # validate a possibly supplied environment value
-    return HOSTED_RUNTIME_MODE_DB_ACTION_V2
+def forced_hosted_runtime_mode() -> str | None:
+    """Fleet-wide forced target, or ``None`` when ``dual`` defers to each
+    user's own persisted ownership fence."""
+    policy = hosted_runtime_policy()
+    if policy == HOSTED_RUNTIME_POLICY_V2_ONLY:
+        return HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    return None
 
 
 def get_hosted_runtime_mode(store: UserStore) -> str:
@@ -497,11 +501,8 @@ def _set_hosted_runtime_mode_for_user_id_locked(
     store: UserStore | None = None,
 ) -> str:
     """Generation-fenced runtime transition used by policy and admin paths."""
-    if mode not in _SELECTABLE_HOSTED_RUNTIME_MODES:
-        raise ValueError(
-            f"hosted resident runtime is retired; expected "
-            f"{HOSTED_RUNTIME_MODE_DB_ACTION_V2!r}"
-        )
+    if mode not in _PERSISTED_HOSTED_RUNTIME_MODES:
+        raise ValueError(f"unknown hosted_runtime_mode: {mode!r}")
     # Fleet reconciliation runs before Gunicorn forks and must remain a DB-only
     # control-plane operation. Constructing UserStore here hydrates chat, frames,
     # memory, push state, and other per-user data; doing that serially for every
@@ -594,10 +595,9 @@ def set_hosted_runtime_mode(store: UserStore, mode: str) -> str:
     """切换该用户的 hosted 运行时模式。非法值、或用户尚无 model_api config
     导致无法落地时，抛 ValueError（绝不返回假成功）。返回真正落地后的 mode。"""
     forced_mode = forced_hosted_runtime_mode()
-    if mode != forced_mode:
+    if forced_mode is not None and mode != forced_mode:
         raise ValueError(
-            "hosted resident runtime is retired; "
-            f"policy {hosted_runtime_policy()!r} requires {forced_mode!r}"
+            f"hosted runtime policy {hosted_runtime_policy()!r} requires {forced_mode!r}"
         )
     return _set_hosted_runtime_mode_for_user_id(
         store.user_id, mode, store=store
@@ -607,6 +607,8 @@ def set_hosted_runtime_mode(store: UserStore, mode: str) -> str:
 def apply_hosted_runtime_policy(store: UserStore) -> str | None:
     """Materialize a forced policy for one configured user, if configured."""
     target = forced_hosted_runtime_mode()
+    if target is None:
+        return None
     return _set_hosted_runtime_mode_for_user_id(
         store.user_id, target, store=store
     )
@@ -621,6 +623,9 @@ def reconcile_hosted_runtime_policy() -> dict:
     """
     policy = hosted_runtime_policy()
     target = forced_hosted_runtime_mode()
+    if target is None:
+        return {"policy": policy, "eligible": 0, "reconciled": 0}
+
     controls = db.list_hosted_runtime_eligible_controls()
     user_ids = [row[0] for row in controls]
     for user_id in user_ids:
@@ -648,7 +653,7 @@ def hosted_runtime_policy_status() -> dict:
             if effective_mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2
             else "resident"
         )
-        target_ready = effective_mode == target
+        target_ready = target is None or effective_mode == target
         if state == expected_state and target_ready:
             ready += 1
         else:

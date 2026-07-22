@@ -22,6 +22,7 @@ from core import enclave as core_enclave  # noqa: E402
 from core import runtime_token  # noqa: E402
 from core import store as core_store  # noqa: E402
 from hosted import chat_send_core  # noqa: E402
+from hosted import config_store as hosted_config_store  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 _SECRET = "test-runtime-secret"
@@ -33,6 +34,12 @@ def _b64(raw: bytes) -> str:
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
+    # This send-path happy-path relies on setup's startup materialization
+    # landing V2 with no explicit flip — the v2_only fleet contract (see
+    # test_asgi_hosted_chat_send.py's ``env`` fixture for the full
+    # rationale). Pin it here so the default "dual" policy (Task 5) doesn't
+    # leave the fresh user on the still-resident per-user fence.
+    monkeypatch.setenv(hosted_config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     registry._users[:] = []
     registry._key_to_user.clear()

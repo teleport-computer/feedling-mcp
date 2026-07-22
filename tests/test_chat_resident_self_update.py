@@ -43,6 +43,7 @@ _BASE = dict(
     target="bbbbbbb",
     dirty=False,
     enabled=True,
+    hosted=False,
     relevant_changed=True,
 )
 
@@ -58,6 +59,11 @@ def test_updates_when_all_conditions_met():
 
 def test_skips_when_disabled():
     assert _call(enabled=False) is False
+
+
+def test_skips_when_hosted():
+    # Supervisor-managed CVM: immutable image, must never self-mutate.
+    assert _call(hosted=True) is False
 
 
 def test_skips_when_target_empty():
@@ -136,6 +142,7 @@ def update_seams(monkeypatch):
     """Wire deterministic git seams + capture whether an update is applied."""
     applied = []
     monkeypatch.setattr(crc, "AUTO_UPDATE", True)
+    monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "_last_self_update_mono", 0.0)
     monkeypatch.setattr(crc, "_consumer_commit", lambda: "local00")
     monkeypatch.setattr(crc, "_git_fetch", lambda target: True)
@@ -178,6 +185,12 @@ def test_run_self_update_skips_when_already_on_target(update_seams, monkeypatch)
 
 def test_run_self_update_skips_when_disabled(update_seams, monkeypatch):
     monkeypatch.setattr(crc, "AUTO_UPDATE", False)
+    crc._run_self_update("target99")
+    assert update_seams == []
+
+
+def test_run_self_update_skips_when_hosted(update_seams, monkeypatch):
+    monkeypatch.setattr(crc, "_HOSTED", True)
     crc._run_self_update("target99")
     assert update_seams == []
 
