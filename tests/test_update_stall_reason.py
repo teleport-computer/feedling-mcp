@@ -183,5 +183,3 @@ def test_self_heal_reexec_clears_reason(monkeypatch):
     crc._run_self_update("target99")
     assert applied == ["target99"]
     assert crc._self_update_stall_reason() == ""
-
-

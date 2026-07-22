@@ -541,13 +541,13 @@ def test_actions_profile_patch_rename_pairing_gate_agent_origin(user, monkeypatc
         return {}, ""
 
     monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_get)
-    
+
     _seed_identity(uid)
-    
+
     # Rename-only patch (no self_introduction) should be rejected with 400
     action_body = {"actions": [{"type": "identity.profile_patch", "patch": {"agent_name": "老8"}, "reason": "rename"}]}
     hdr = {"X-Feedling-Runtime-Token": tok}
-    
+
     status, body = _asgi("POST", "/v1/identity/actions", headers=hdr, json_body=action_body)
 
     assert status == 400

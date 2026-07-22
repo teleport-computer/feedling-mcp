@@ -379,12 +379,15 @@ def _update_stall_fix_line(info: Mapping[str, Any]) -> str:
     as the X-Feedling-Update-Stall header on poll). An old resident that omits
     the header reports "" here, so callers see nothing and the generic
     consumer_commit_mismatch copy is unchanged — backward compatible.
-    pre 同文件同改（自托管专属，不影响 hosted/V2 路径）。"""
+    pre 同文件同改（自托管专属，不影响 hosted/V2 路径）。
+
+    修法句只报告不指令——agent 不得据此自行改动用户工作区(D3);既有 348 行的
+    执行式框架属遗留问题,另案。"""
     reason = str(info.get("update_stall_reason") or "").strip().lower()
     return {
-        "dirty": "机器上有未提交改动挡住自动更新,`git stash` 后即可",
-        "disabled": "自动更新被手动关闭(FEEDLING_AUTO_UPDATE=0)",
-        "fetch_failed": "机器拉取 GitHub 失败,检查网络/代理",
+        "dirty": "请转告用户:机器上有未提交改动挡住了自动更新,由用户自行执行 git stash 或提交后即可恢复",
+        "disabled": "请转告用户:自动更新被手动关闭(FEEDLING_AUTO_UPDATE=0)",
+        "fetch_failed": "请转告用户:机器拉取 GitHub 失败,请用户检查网络/代理",
     }.get(reason, "")
 
 
