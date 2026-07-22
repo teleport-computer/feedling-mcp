@@ -154,6 +154,7 @@ if not _provisioned:
         "test_identity_list_ops.py",
         "test_io_cli_catalog.py",
         "test_io_cli_identity_write_full.py",
+        "test_consumer_action_admission.py",
     }
     collect_ignore = sorted(
         f

@@ -6207,27 +6207,224 @@ def execute_memory_actions(actions: list[dict]) -> dict:
     return body
 
 
+# ---------------------------------------------------------------------------
+# 夹带通道(identity./memory. actions)类型白名单 + 结果真实化 — spec 3.4
+#
+# V2 云端无夹带通道(原生 tool loop);本收口属 VPS 线长期资产,0727 合并原样
+# 保留。
+#
+# canonicalize_action_type 只用于两件事:①判定是否在允许清单内 ②结果上报打
+# 标(outcomes 里的 canonical_type)。它绝不改写下发到服务端的 action["type"]
+# ——/v1/identity/actions 与 /v1/memory/actions 本就原生接受这些别名
+# (memory.create / memory.add_correction / memory.patch / memory.content_patch
+# / identity.patch 的写法),改写 type 会让服务端观测到跟今天不一样的请求,
+# 这正是要避免的。
+# ---------------------------------------------------------------------------
+
+_ACTION_TYPE_ALIASES: dict[str, str] = {
+    "memory.create": "memory.add",
+    "memory.add_correction": "memory.add",
+    "memory.patch": "memory.supersede",
+    "memory.content_patch": "memory.supersede",
+    "identity.patch": "identity.profile_patch",
+}
+
+
+def canonicalize_action_type(action_type: str) -> str:
+    """Map a known alias to its canonical form; unknown types pass through
+    unchanged. Reuses the same alias table as _normalize_v2_action_type's
+    schedule-path mappings, plus identity.patch -> identity.profile_patch."""
+    return _ACTION_TYPE_ALIASES.get(str(action_type or ""), str(action_type or ""))
+
+
+# spec 3.4 十二类型(canonical 形态)。故意把别名字面量也留在集合里跟 spec 逐字
+# 对齐——canonicalize 之后真正会被查到的只有 7 个 canonical 值(其余 5 个别名
+# 经 canonicalize 后已经折叠掉,不会以别名形式出现在判定里),多留的条目是防御
+# 性的,无害。identity.replace 刻意不在清单里:写卡原则只有蒸馏任务可以整卡替
+# 换,其余一律走 profile_patch。
+_ACTION_ALLOWLIST: frozenset = frozenset({
+    "memory.add", "memory.create", "memory.add_correction",
+    "memory.patch", "memory.content_patch", "memory.supersede",
+    "memory.upgrade", "memory.delete",
+    "identity.profile_patch", "identity.patch",
+    "identity.dimension_nudge", "identity.relationship_days_set",
+})
+
+_ACTION_ALLOWLIST_MODES = {"shadow", "enforce", "off"}
+_action_allowlist_mode_warned = False
+# Shadow-mode visibility counter for allowlist-unknown types that still get
+# forwarded (mode has no enforcement effect on the wire, only counts+logs).
+_action_allowlist_shadow_unknown_count = 0
+
+
+def _action_allowlist_mode() -> str:
+    """FEEDLING_ACTION_ALLOWLIST ∈ shadow|enforce|off, default shadow. Read
+    live (not cached at import) so tests/ops can flip it without a restart.
+    An invalid value falls back to shadow with a one-time warning."""
+    global _action_allowlist_mode_warned
+    raw = str(os.environ.get("FEEDLING_ACTION_ALLOWLIST") or "shadow").strip().lower()
+    if raw in _ACTION_ALLOWLIST_MODES:
+        return raw
+    if not _action_allowlist_mode_warned:
+        log.warning(
+            "invalid FEEDLING_ACTION_ALLOWLIST=%r; defaulting to shadow", raw,
+        )
+        _action_allowlist_mode_warned = True
+    return "shadow"
+
+
+def _action_result_outcome(item: Any) -> tuple[str, str]:
+    """Map ONE action's per-item result (from execute_identity_actions /
+    execute_memory_actions' "results" array) to an outcome label. Both
+    backends early-abort a batch on the first item whose status is an error
+    (returning an HTTP >=400 the caller already turned into an exception
+    before this is reached), so on the success path every item's status is
+    "ok" — the only distinction left to make here is noop vs applied."""
+    if not isinstance(item, dict):
+        return "applied", ""
+    status = str(item.get("status") or "").strip().lower()
+    if status == "error":
+        return "failed_execution", str(item.get("error") or "")[:120]
+    if item.get("noop") or item.get("skipped"):
+        return "noop", ""
+    return "applied", ""
+
+
+def _outcomes_for_bucket(
+    entries: list[tuple[str, str]],
+    *,
+    error: Exception | None,
+    results: list | None,
+) -> list[dict]:
+    outcomes: list[dict] = []
+    for idx, (original_type, canonical_type) in enumerate(entries):
+        if error is not None:
+            outcomes.append({
+                "original_type": original_type,
+                "canonical_type": canonical_type,
+                "outcome": "failed_execution",
+                "error_code": type(error).__name__,
+            })
+            continue
+        item = results[idx] if isinstance(results, list) and idx < len(results) else None
+        outcome, error_code = _action_result_outcome(item)
+        outcomes.append({
+            "original_type": original_type,
+            "canonical_type": canonical_type,
+            "outcome": outcome,
+            "error_code": error_code,
+        })
+    return outcomes
+
+
 def execute_agent_actions(actions: list[dict]) -> dict:
+    """Dispatch identity./memory. actions to their executors.
+
+    Admission (allowlist) only ever changes whether an action is FORWARDED;
+    it never rewrites the action itself. In shadow mode (default) every
+    action that was forwarded before this change is still forwarded — the
+    only new thing shadow mode adds is a log line + counter for types not on
+    the allowlist. In enforce mode, not-allowlisted actions are dropped
+    before the HTTP call (never forwarded). In off mode this whole gate is a
+    no-op (matches pre-Task-7 behavior exactly).
+
+    The identity bucket and memory bucket are each tried independently (own
+    try/except) so a failure in one does not block the HTTP call for the
+    other bucket — deliberate: a mixed batch's memory write should not be
+    silently skipped just because the identity write failed.
+
+    Returns a dict that never raises for an ordinary HTTP-level failure —
+    callers read `outcomes` (one entry per forwarded-or-rejected action:
+    {"original_type", "canonical_type", "outcome", "error_code"}, outcome in
+    applied|noop|rejected_allowlist|failed_execution) and pass it to
+    rewrite_reply_for_outcomes to produce an honest reply. Still raises
+    RuntimeError for a garbage action type that is neither identity.* nor
+    memory.* — that is a caller/prompt bug, not a server-side outcome.
+    """
+    mode = _action_allowlist_mode()
     identity_actions: list[dict] = []
     memory_actions: list[dict] = []
+    identity_entries: list[tuple[str, str]] = []
+    memory_entries: list[tuple[str, str]] = []
     unsupported: list[str] = []
+    outcomes: list[dict] = []
+
     for action in actions:
-        action_type = str(action.get("type") or action.get("action") or "")
-        if action_type.startswith("identity."):
-            identity_actions.append(action)
-        elif action_type.startswith("memory."):
-            memory_actions.append(action)
+        original_type = str(action.get("type") or action.get("action") or "")
+        canonical_type = canonicalize_action_type(original_type)
+
+        if original_type.startswith("identity."):
+            bucket_actions, bucket_entries = identity_actions, identity_entries
+        elif original_type.startswith("memory."):
+            bucket_actions, bucket_entries = memory_actions, memory_entries
         else:
-            unsupported.append(action_type)
+            unsupported.append(original_type)
+            continue
+
+        if canonical_type not in _ACTION_ALLOWLIST:
+            if mode == "enforce":
+                log.warning(
+                    "action_allowlist rejected type=%s canonical=%s mode=enforce — "
+                    "dropped, not forwarded",
+                    original_type, canonical_type,
+                )
+                outcomes.append({
+                    "original_type": original_type,
+                    "canonical_type": canonical_type,
+                    "outcome": "rejected_allowlist",
+                    "error_code": "",
+                })
+                continue
+            if mode == "shadow":
+                global _action_allowlist_shadow_unknown_count
+                _action_allowlist_shadow_unknown_count += 1
+                log.info(
+                    "action_allowlist shadow-mode unknown type=%s canonical=%s — "
+                    "forwarded unchanged (shadow_unknown_count=%d)",
+                    original_type, canonical_type, _action_allowlist_shadow_unknown_count,
+                )
+            # off (or shadow, having logged above): forward unchanged, same as
+            # pre-Task-7 behavior.
+
+        bucket_actions.append(action)
+        bucket_entries.append((original_type, canonical_type))
+
     if unsupported:
         raise RuntimeError(f"unsupported_agent_actions:{unsupported}")
-    identity_result = execute_identity_actions(identity_actions)
-    memory_result = execute_memory_actions(memory_actions)
+
+    identity_result: dict = {"results": [], "effects": []}
+    memory_result: dict = {"results": [], "effects": []}
+    identity_error: Exception | None = None
+    memory_error: Exception | None = None
+
+    if identity_actions:
+        try:
+            identity_result = execute_identity_actions(identity_actions)
+        except Exception as e:
+            identity_error = e
+    if memory_actions:
+        try:
+            memory_result = execute_memory_actions(memory_actions)
+        except Exception as e:
+            memory_error = e
+
+    outcomes.extend(_outcomes_for_bucket(
+        identity_entries,
+        error=identity_error,
+        results=identity_result.get("results") if isinstance(identity_result, dict) else None,
+    ))
+    outcomes.extend(_outcomes_for_bucket(
+        memory_entries,
+        error=memory_error,
+        results=memory_result.get("results") if isinstance(memory_result, dict) else None,
+    ))
+
     return {
-        "status": "ok",
+        "status": "ok" if identity_error is None and memory_error is None else "error",
         "identity": identity_result,
         "memory": memory_result,
         "effects": (identity_result.get("effects") or []) + (memory_result.get("effects") or []),
+        "outcomes": outcomes,
     }
 
 
@@ -6241,6 +6438,66 @@ def _identity_action_success_reply(source_message: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", source_message or ""):
         return "改好了。"
     return "Done. I updated my identity."
+
+
+_ACTION_OUTCOME_ALL_FAILED_ZH = "刚才那个操作没有执行成功，我再试试或者你再说一次。"
+_ACTION_OUTCOME_ALL_FAILED_EN = (
+    "That last action did not actually go through — I'll try again, or you can say it once more."
+)
+
+
+def rewrite_reply_for_outcomes(
+    replies: list[str], outcomes: list[dict], fallback_ok: str
+) -> list[str]:
+    """Pure function — turn per-action outcomes into an honest reply list.
+
+    - outcomes empty, or every outcome is "applied": replies unchanged
+      (if replies is empty, use [fallback_ok] — but only when fallback_ok is
+      non-empty, so a caller with nothing to say stays silent rather than
+      posting a synthesized empty bubble).
+    - every outcome is NOT "applied" (noop / rejected_allowlist /
+      failed_execution — nothing actually happened): replies is REPLACED
+      with an honest failure sentence.
+    - mixed (some applied, some not): replies is kept and one sentence is
+      appended naming what did not take effect.
+    """
+    replies = [r for r in (replies or [])]
+    if not outcomes:
+        return replies
+
+    applied = [o for o in outcomes if isinstance(o, dict) and o.get("outcome") == "applied"]
+    not_applied = [
+        o for o in outcomes if not (isinstance(o, dict) and o.get("outcome") == "applied")
+    ]
+
+    zh = bool(re.search(r"[\u4e00-\u9fff]", str(fallback_ok) or "")) or any(
+        re.search(r"[\u4e00-\u9fff]", str(r)) for r in replies
+    )
+
+    if not not_applied:
+        if replies:
+            return replies
+        return [fallback_ok] if fallback_ok else []
+
+    if not applied:
+        return [_ACTION_OUTCOME_ALL_FAILED_ZH if zh else _ACTION_OUTCOME_ALL_FAILED_EN]
+
+    labels: list[str] = []
+    for o in not_applied:
+        label = str(o.get("canonical_type") or o.get("original_type") or "").strip()
+        if label and label not in labels:
+            labels.append(label)
+    joined = ("、".join(labels)) if zh else ", ".join(labels)
+    if joined:
+        note = (
+            f"不过其中「{joined}」没有真正生效。"
+            if zh else f"Note: {joined} did not actually take effect."
+        )
+    else:
+        note = _ACTION_OUTCOME_ALL_FAILED_ZH if zh else _ACTION_OUTCOME_ALL_FAILED_EN
+
+    base = replies if replies else ([fallback_ok] if fallback_ok else [])
+    return base + [note]
 
 
 # Message dedup — rolling window prevents reprocessing the same message on
@@ -9344,8 +9601,15 @@ def _process_proactive_jobs(jobs: list) -> float:
             log.info("proactive wake slept from control reply id=%s reason=%s", job_id, control_reply_reason)
             continue
         if memory_identity_actions:
+            # 结果真实化(Task 7): execute_agent_actions itself no longer raises
+            # for an ordinary HTTP-level failure (it reports it via
+            # outcomes) — only a caller/prompt bug (garbage action type) can
+            # still raise here, so the except below is a thin safety net,
+            # not the primary failure-detection path anymore.
+            memory_identity_error_label = ""
             try:
                 result = execute_agent_actions(memory_identity_actions)
+                outcomes = result.get("outcomes") or []
                 log.info(
                     "proactive memory/identity actions applied id=%s effects=%d",
                     job_id,
@@ -9353,18 +9617,62 @@ def _process_proactive_jobs(jobs: list) -> float:
                 )
             except Exception as e:
                 log.warning("proactive memory/identity actions failed id=%s error=%s", job_id, e)
+                outcomes = [
+                    {
+                        "original_type": str(a.get("type") or a.get("action") or ""),
+                        "canonical_type": canonicalize_action_type(
+                            str(a.get("type") or a.get("action") or "")
+                        ),
+                        "outcome": "failed_execution",
+                        "error_code": type(e).__name__,
+                    }
+                    for a in memory_identity_actions
+                ]
+                memory_identity_error_label = f":{type(e).__name__}"
+
+            applied_outcomes = [o for o in outcomes if o.get("outcome") == "applied"]
+            failed_outcomes = [o for o in outcomes if o.get("outcome") == "failed_execution"]
+            if failed_outcomes and not applied_outcomes:
+                # Whole batch genuinely failed on the wire (whether raised as
+                # an exception above or reported via outcomes) — same "mark
+                # failed + skip posting" shape the introduction lane already
+                # had, now generalized to every proactive job so a silent
+                # write failure is no longer invisible in job history. A
+                # noop or an enforce-mode allowlist rejection is NOT treated
+                # as a failure here — nothing going wrong, just nothing to do
+                # or a deliberate policy drop.
+                error_label = memory_identity_error_label or f":{failed_outcomes[0].get('error_code') or ''}"
                 if is_introduction:
                     update_proactive_job_status(
                         job_id,
                         "failed",
-                        f"introduction_identity_action_failed:{type(e).__name__}",
+                        f"introduction_identity_action_failed{error_label}",
                         extra={
                             "agent_action": "identity.profile_patch",
-                            "agent_action_status": str(e)[:240],
+                            "agent_action_status": str(failed_outcomes)[:240],
                             "wake_result": "identity_action_failed",
                         },
                     )
-                    continue
+                else:
+                    update_proactive_job_status(
+                        job_id,
+                        "failed",
+                        f"memory_identity_action_failed{error_label}",
+                        extra={
+                            "agent_action": "memory_identity_actions",
+                            "agent_action_status": str(failed_outcomes)[:240],
+                            "wake_result": "identity_action_failed",
+                        },
+                    )
+                continue
+
+            # Only touches a reply that was ALREADY going to be posted
+            # (replies non-empty) — an idle background write that produced
+            # no chat text stays silent exactly like before, so a routine
+            # noop (e.g. an already-capped nudge) does not start posting
+            # unsolicited "didn't work" bubbles.
+            if replies and outcomes:
+                replies = rewrite_reply_for_outcomes(replies, outcomes, fallback_ok=replies[0])
         if is_introduction and not replies and memory_identity_actions:
             reply = _introduction_greeting_from_identity_actions(memory_identity_actions)
             if reply:
@@ -10280,8 +10588,17 @@ def _process_messages(messages: list) -> float:
                     len(actions),
                     len(action_result.get("effects") or []),
                 )
-                if not replies:
-                    replies = [_identity_action_success_reply(content)]
+                # 结果真实化(Task 7): execute_agent_actions no longer fakes a
+                # "Done" reply just because the HTTP call didn't raise — it
+                # returns per-action outcomes (applied/noop/rejected_allowlist/
+                # failed_execution) and rewrite_reply_for_outcomes turns those
+                # into an honest reply. All-applied (or no outcomes at all)
+                # is a no-op here — same visible text as before.
+                replies = rewrite_reply_for_outcomes(
+                    replies,
+                    action_result.get("outcomes") or [],
+                    fallback_ok=_identity_action_success_reply(content),
+                )
             except Exception as e:
                 log.error("agent action execution failed; suppressing optimistic agent reply: %s", e)
                 replies = [_identity_action_failure_reply(content)]
