@@ -34,15 +34,16 @@ def test_punctuation_only_name_not_a_rename():
 
 def test_stripped_agent_name_curly_quotes():
     # Verify curly quotes are properly stripped. This was a regression:
-    # the original charset had U+201C/U+201D (""") but a retyping mistake
-    # dropped them, causing '"老8"' to not strip to '老8'.
-    stripped = card_policy.stripped_agent_name('"老8"')
-    assert stripped == '老8', f"Expected '老8' but got {repr(stripped)}"
+    # the original charset had U+201C/U+201D ("") but a retyping mistake
+    # dropped them, causing \u201c老8\u201d to not strip to "老8".
+    # Use Unicode escapes to prevent tools from flattening the curly quotes.
+    stripped = card_policy.stripped_agent_name("\u201c老8\u201d")
+    assert stripped == "老8", f"Expected '老8' but got {repr(stripped)}"
 
 
 def test_curly_quotes_only_not_a_rename():
     # Curly-quote-only name should not be considered a rename.
     # This tests the specific bug where dropping curly quotes from the
-    # charset caused '""' to count as non-empty.
-    ok, _ = card_policy.validate_rename_pairing({"agent_name": '""'})
+    # charset caused \u201c\u201d to count as non-empty.
+    ok, _ = card_policy.validate_rename_pairing({"agent_name": "\u201c\u201d"})
     assert ok  # Curly quotes only, should be treated as empty name
