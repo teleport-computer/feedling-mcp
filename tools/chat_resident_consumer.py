@@ -3146,6 +3146,191 @@ def _dedupe_agent_turn_messages(turn: AgentTurn) -> AgentTurn:
     return turn
 
 
+# --- Protocol-JSON leak fix (fix/protocol-json-leak-parse) ------------------
+# A model sometimes wraps its control payload in prose ("Written to the card.")
+# or a ```json fence instead of emitting bare JSON. The position-anchored guards
+# (_markdown_fenced_json_body / _looks_like_agent_protocol_text) only catch a
+# payload at the very start or as the whole string, so a prose prefix slips past
+# and the raw JSON reaches a chat bubble (prod: identity self_introduction,
+# proactive.sleep — across claude/pi/codex/Gemini). Even proactive.sleep leaks:
+# once a wrapped payload lands in turn.messages, the "and not replies" sleep/
+# broadcast handlers are bypassed and the raw JSON posts.
+#
+# The parse is split into two layers, kept strictly separate (mixing them was
+# the source of every earlier miss):
+#   1. TRANSPORT — machine framing from a driver: a whole-string JSON object, a
+#      whole-string fenced JSON, or an NDJSON stream of transport *events* (each
+#      line carrying a recognized event/type marker). Bare protocol envelopes in
+#      free text are NOT transport.
+#   2. VISIBLE REPLY — free model text (possibly with <think> tags and an
+#      embedded protocol payload). Thinking is stripped HERE, on the decoded
+#      visible text only (stripping before transport parse corrupts a legit
+#      `{"result":"<think>..</think>.."}`). Then a lexer-style scan looks for a
+#      protocol object anchored at a TEXT top-level boundary (line start / after
+#      a fence) — never a nested '{'. Exactly one such root routes (actions
+#      execute, its messages send); malformed debris, conflicting candidates,
+#      unclosed thinking, or an over-budget scan all fail closed (drop, never
+#      post). Ordinary prose and code fences are left untouched.
+#
+# v2 migration: backend/proactive/agent_protocol_v2.py has the same
+# position-anchored weakness (_looks_like_protocol_fragment / _json_payload_
+# from_text use fullmatch / [:1]). Before runtime_v2 ships to prod, port this
+# two-layer split (transport vs visible + _iter_root_json_spans + strict typing)
+# into that parser so it fails closed on the same shapes.
+_SUPPORTED_ACTION_PREFIXES = ("identity.", "memory.", "proactive.")
+_BARE_PROACTIVE_ACTION_TYPES = {
+    "sleep", "send_message", "schedule_wake", "cancel_wake", "request_broadcast",
+}
+# A protocol key sitting in a JSON key position ({ or , or line start, then the
+# quoted key + colon) — catches compact `prefix {"actions":[` too, not just
+# top-of-line. A prose mention like `the "actions": field` never matches.
+_PROTOCOL_DEBRIS_KEY_RE = re.compile(
+    r'(?:[{,]|^|\n)\s*"(?:actions|messages|tool_calls|cards)"\s*:'
+)
+_PROTOCOL_DEBRIS_TYPED_RE = re.compile(
+    r'"type"\s*:\s*"(?:identity|memory|proactive)\.\w+"'
+)
+_UNCLOSED_THINKING_RE = re.compile(r'<\s*(?:think|thinking|reasoning|thought)\s*>', re.I)
+_SCAN_ATTEMPT_BUDGET = 64
+
+
+def _is_supported_action_obj(action: Any) -> bool:
+    if not isinstance(action, dict):
+        return False
+    typ = str(action.get("type") or action.get("action") or "").strip()
+    if not typ:
+        return False
+    return typ.startswith(_SUPPORTED_ACTION_PREFIXES) or typ in _BARE_PROACTIVE_ACTION_TYPES
+
+
+def _is_protocol_object(obj: Any) -> bool:
+    """Strict top-level protocol typing. A bare {"type": ...} is NOT protocol —
+    only a top-level messages/actions/tool_calls/cards envelope qualifies, and
+    an `actions` list must carry at least one supported action type."""
+    if not isinstance(obj, dict):
+        return False
+    if isinstance(obj.get("messages"), list):
+        return True
+    actions = obj.get("actions")
+    if isinstance(actions, list) and any(_is_supported_action_obj(a) for a in actions):
+        return True
+    if isinstance(obj.get("tool_calls"), list) and obj.get("tool_calls"):
+        return True
+    if isinstance(obj.get("cards"), list):
+        return True
+    return False
+
+
+def _is_transport_event_obj(obj: Any) -> bool:
+    """A driver transport event (a stream frame), NOT the model's protocol
+    envelope. Has a non-protocol type/event marker and no top-level
+    actions/messages. `{"type":"result",...}` / `{"type":"message_end",...}` are
+    transport; `{"actions":[...]}` / `{"type":"proactive.sleep"}` are not."""
+    if not isinstance(obj, dict):
+        return False
+    if isinstance(obj.get("actions"), list) or isinstance(obj.get("messages"), list):
+        return False
+    marker = str(
+        obj.get("event") or obj.get("type") or obj.get("kind") or obj.get("phase") or ""
+    ).strip()
+    if not marker:
+        return False
+    return not (marker.startswith(_SUPPORTED_ACTION_PREFIXES)
+                or marker in _BARE_PROACTIVE_ACTION_TYPES)
+
+
+def _transport_objects(raw: str) -> list[Any]:
+    """Structured machine transport only (see the layer note above): whole-string
+    JSON, whole-string fenced JSON, or an NDJSON stream whose every non-empty
+    line is a transport event. Anything else (prose, or bare protocol envelopes)
+    returns [] so it falls through to the visible-reply scanner."""
+    fenced = _markdown_fenced_json_body(raw)
+    if fenced:
+        obj = _safe_json_loads(fenced)
+        if obj is not None:
+            return [obj]
+    whole = _safe_json_loads(raw)
+    if whole is not None:
+        return [whole]
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) < 2 or any(ln[0] not in "{[" for ln in lines):
+        return []
+    objs: list[Any] = []
+    for ln in lines:
+        obj = _safe_json_loads(ln)
+        if obj is None:
+            return []
+        objs.append(obj)
+    if all(_is_transport_event_obj(o) for o in objs):
+        return objs
+    return []
+
+
+def _truncate_at_unclosed_thinking(text: str) -> str:
+    """After closed <think>…</think> pairs are removed, an unclosed opening tag
+    means everything from it on is reasoning — never a command. Cut it so its
+    contents can't be scanned or executed."""
+    m = _UNCLOSED_THINKING_RE.search(text)
+    return text[: m.start()] if m else text
+
+
+def _iter_root_json_spans(text: str):
+    """Yield (obj, start, end) for JSON values whose opening bracket sits at a
+    TEXT top-level boundary — the start of the string or the start of a line
+    (after optional whitespace / a ``` fence line). raw_decode gives correct
+    string/escape/nesting handling and we skip past each consumed span, so a
+    nested '{' (after ':' or ',', or inside a value) is never mistaken for a
+    root. Yields the sentinel ("__budget__", i, i) if the attempt budget is hit
+    (caller must fail closed)."""
+    decoder = json.JSONDecoder()
+    attempts = 0
+    for m in re.finditer(r"(?:^|\n)[ \t]*(?=[{\[])", text):
+        i = m.end()
+        attempts += 1
+        if attempts > _SCAN_ATTEMPT_BUDGET:
+            yield ("__budget__", i, i)
+            return
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            continue
+        yield (obj, i, end)
+
+
+def _has_protocol_debris(text: str) -> bool:
+    """Structural evidence of a (possibly malformed) protocol payload: a protocol
+    key in a JSON key position or an identity/memory/proactive typed action,
+    alongside a JSON structural start or fence. A prose mention never counts."""
+    if not (_PROTOCOL_DEBRIS_KEY_RE.search(text) or _PROTOCOL_DEBRIS_TYPED_RE.search(text)):
+        return False
+    return "{" in text or "[" in text or "```" in text
+
+
+def _scan_visible_protocol(text: str) -> tuple[str, Any]:
+    """('route', obj) | ('drop', None) | ('none', None) for a visible reply.
+    Route ONLY when exactly one text-top-level root object is a valid protocol
+    envelope and no other protocol debris sits outside its span. Fail closed
+    (drop) on: an over-budget scan, >=2 protocol roots, or protocol debris with
+    no clean single root. No protocol evidence -> none (caller sanitizes,
+    preserving code fences)."""
+    roots: list[tuple[Any, int, int]] = []
+    for obj, start, end in _iter_root_json_spans(text):
+        if obj == "__budget__":
+            return ("drop", None)
+        if _is_protocol_object(obj):
+            roots.append((obj, start, end))
+    if len(roots) == 1:
+        obj, start, end = roots[0]
+        if _has_protocol_debris(text[:start] + text[end:]):
+            return ("drop", None)
+        return ("route", obj)
+    if len(roots) >= 2:
+        return ("drop", None)
+    if _has_protocol_debris(text):
+        return ("drop", None)
+    return ("none", None)
+
+
 def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     turn = AgentTurn()
 
@@ -3153,7 +3338,10 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw = obj.strip()
         if not raw:
             return turn
-        json_objects = _json_objects_from_cli_output(raw)
+        # LAYER 1 — transport. Machine framing only (whole JSON / whole fence /
+        # NDJSON event stream). A transport object's extracted reply text recurses
+        # back into this branch and is parsed as a visible reply below.
+        json_objects = _transport_objects(raw)
         if json_objects:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
@@ -3166,24 +3354,31 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
                 turn.thinking_native = stream_turn.thinking_native
             if stream_turn.messages and not turn.messages:
                 turn.messages = stream_turn.messages
-            if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
-                return _dedupe_agent_turn_messages(turn)
-        nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
-        if isinstance(nested, (dict, list)):
-            return _agent_turn_from_obj(nested)
+            # It WAS transport — return its result even when empty (e.g. a lone
+            # non-final event). Never re-process the raw framing as visible text;
+            # that path re-sanitized skipped-event JSON straight into a bubble.
+            return _dedupe_agent_turn_messages(turn)
+        # LAYER 2 — visible reply. Strip thinking HERE (after transport, so a
+        # legit `{"result":"<think>..</think>.."}` is not corrupted), truncate any
+        # unclosed thinking, then scan for a text-top-level protocol root.
         raw, tagged_thinking = _split_tagged_thinking(raw)
+        raw = _truncate_at_unclosed_thinking(raw)
         if tagged_thinking:
-            # Some runtimes inline their reasoning as <think>…</think> in the
-            # final text. Per the original design this is NOT provider-native
-            # reasoning, but it is useful display material — keep it as a
-            # non-native fallback (provider_reasoning_summary) so a genuine
-            # provider-native reasoning always wins in _merge_agent_turn.
+            # Inlined reasoning is NOT provider-native — keep it as a non-native
+            # fallback so a genuine provider-native reasoning still wins in
+            # _merge_agent_turn.
             turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
             turn.thinking_kind = "provider_reasoning_summary"
             turn.thinking_source = "tagged_content"
             turn.thinking_native = False
-            if not raw.strip():
-                return turn
+        if not raw.strip():
+            return turn
+        decision, payload = _scan_visible_protocol(raw)
+        if decision == "route":
+            _merge_agent_turn(turn, _agent_turn_from_obj(payload))
+            return turn
+        if decision == "drop":
+            return turn
         if _looks_like_agent_protocol_text(raw):
             return turn
         clean = _sanitize_reply_text(raw)

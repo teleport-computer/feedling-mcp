@@ -283,6 +283,15 @@ themselves add a backend endpoint or change production request handling.
 - The playground warns that Production requests operate on the authenticated
   account's live data and persists credentials in browser local storage.
 
+### Behavior
+
+- Resident consumers no longer surface an agent's control-protocol JSON as a
+  chat message. When a reply wraps its `{"actions":…,"messages":…}` envelope in
+  prose or a ```json fence, the consumer now parses out the payload — executing
+  the actions and sending only the natural-language messages — instead of
+  posting the raw JSON. Malformed, conflicting, or ambiguous payloads fail
+  closed (nothing is posted) rather than leaking. No public API shape changed.
+
 ### Deprecations
 
 - None in the public OpenAPI contract.
